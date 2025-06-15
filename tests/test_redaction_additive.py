@@ -1,13 +1,13 @@
 """The additive redaction rules (Consiliency/pmcp#234).
 
 `sanitize_auth_diagnostic` and `PolicyManager.redact_secrets` run the
-redactor's own rules unchanged, then the additive rules
+redactor's own rules with the Consiliency/pmcp#401 URL boundary correction, then the additive rules
 (`pmcp.redaction_additive`, rev 10's) over that output. Four guarantees:
 
 1. **Floor, by construction.** The additive rules only replace text with the
    marker, so every piece the redactor removed stays removed. Checked against
    an independent copy of the redactor (`tests/_main_redactor.py`): the base
-   pass is that redactor exactly, and every stretch of the final output
+   pass matches that independent corrected snapshot, and every stretch of the final output
    outside a marker appears, in order, in the base output.
 2. **JSON.** When the base output is a JSON document, the final output is
    one too, and a structured result that came back a dict still does.
@@ -617,6 +617,70 @@ def test_floor_mutant_a_restoring_pass_is_caught(
 
 
 # =================================================================== JSON ==== #
+
+
+@pytest.mark.parametrize("depth", [0, 2, 4])
+@pytest.mark.parametrize(
+    ("url", "suffix", "label", "secrets"),
+    [
+        ("https://example.test/watch?v=abc", "", "Person", ()),
+        (r"https://example.test/a\b?v=%5C", "\\\\", "人 café", ()),
+        ("https://example.test/watch?v=abc", "\\).,;\\", "人 café", ()),
+        (
+            r"https://userPiece:passPiece@example.test/watch?token=leftPiece\rightPiece&code=codePiece&v=abc",
+            "\\\\",
+            "人 café",
+            (
+                "userPiece",
+                "passPiece",
+                "leftPiece",
+                "rightPiece",
+                "codePiece",
+            ),
+        ),
+    ],
+)
+def test_url_escape_structured_result_regression(
+    depth: int, url: str, suffix: str, label: str, secrets: tuple[str, ...]
+) -> None:
+    snippet = f'<Card href="{url}{suffix}">{label}</Card>'
+    rows = {"results": [{"file": "example.dart", "snippet": snippet}]}
+    nested = snippet
+    for _ in range(depth):
+        nested = json.dumps(nested, ensure_ascii=False)
+    if depth:
+        rows["results"][0]["nested"] = nested
+    payload = {
+        "content": [{"type": "text", "text": json.dumps(rows)}],
+        "structuredContent": rows,
+        "isError": False,
+    }
+    policy = _policy()
+    processed = policy.process_output(payload, redact=True, max_bytes=200000)
+    assert processed["truncated"] is False
+    assert processed["summary"] is None
+    assert processed["raw_size"] == len(json.dumps(payload, indent=2).encode("utf-8"))
+    result = processed["result"]
+    assert isinstance(result, dict)
+    serialized = json.dumps(payload, indent=2, ensure_ascii=False)
+    results = [
+        result,
+        json.loads(sanitize_auth_diagnostic(serialized, max_length=None)),
+        json.loads(policy.redact_secrets(serialized)),
+    ]
+    for result in results:
+        assert json.loads(result["content"][0]["text"]) == result["structuredContent"]
+        assert result["isError"] is False
+        if not secrets:
+            assert result == payload
+        for secret in secrets:
+            assert secret not in json.dumps(result)
+        row = result["structuredContent"]["results"][0]
+        if depth:
+            decoded = row["nested"]
+            for _ in range(depth):
+                decoded = json.loads(decoded)
+            assert decoded == row["snippet"]
 
 
 def test_json_documents_stay_documents() -> None:

@@ -1,7 +1,8 @@
-"""The redactor's own rules, vendored VERBATIM from `origin/main` (260cc1a) for the additive-rule tests
-(Consiliency/pmcp#234): `origin/main`'s `sanitize_auth_diagnostic` and
-`PolicyManager.redact_secrets` as they are, so the differential compares the
-product with an independent copy of what ran before the additive rules. The
+"""The redactor's own rules, vendored from `origin/main` (260cc1a) for the additive-rule tests
+(Consiliency/pmcp#234), with only the URL suffix boundary corrected for
+Consiliency/pmcp#401 to preserve trailing quote-escape backslashes. The
+differential compares the product with an independent historical implementation
+plus that boundary correction, not an unmodified historical snapshot. The
 keyword rule runs through `pmcp.keyword_matcher`, as on `main`.
 """
 
@@ -96,7 +97,7 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> 
 
     def redact_url_match(match: re.Match[str]) -> str:
         whole = match.group(0)
-        raw_url = whole.rstrip(").,;")  # trailing sentence punctuation, in one pass
+        raw_url = whole.rstrip(").,;\\")  # trailing punctuation and quote escapes
         return redact_auth_url(raw_url) + whole[len(raw_url) :]
 
     text = re.sub(r"https?://[^\s\"'<>]+", redact_url_match, text)

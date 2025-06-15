@@ -1239,7 +1239,9 @@ def _sanitize_base(text: str) -> str:
 
     def redact_url_match(match: re.Match[str]) -> str:
         whole = match.group(0)
-        raw_url = whole.rstrip(").,;")  # trailing sentence punctuation, in one pass
+        # Return punctuation and quote-escape backslash runs verbatim; URL
+        # normalization must not consume the surrounding serialized syntax.
+        raw_url = whole.rstrip(").,;\\")
         return redact_auth_url(raw_url) + whole[len(raw_url) :]
 
     text = re.sub(r"https?://[^\s\"'<>]+", redact_url_match, text)
