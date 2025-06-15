@@ -647,6 +647,124 @@ def test_a_supplemental_copy_cannot_replace_the_authoritative_suite(
     _assert_reports(out, "R22", "ci_invocation_drift")
 
 
+@pytest.mark.parametrize(
+    ("scope", "context"),
+    [
+        ("step", 'shell: bash -c "uv run pytest tests/ -k smoke" {0}'),
+        ("step", "working-directory: tests/pytest_smoke"),
+        (
+            "earlier",
+            "- name: Configure pytest\n"
+            "  run: echo 'PYTEST_ADDOPTS=-k smoke' >> \"$GITHUB_ENV\"",
+        ),
+        (
+            "job",
+            "defaults: {run: {shell: 'bash -c \"uv run pytest tests/ -k smoke\" {0}'}}",
+        ),
+        (
+            "workflow",
+            "defaults: {run: {shell: 'bash -c \"uv run pytest tests/ -k smoke\" {0}'}}",
+        ),
+        ("step", "if: false"),
+        ("step", "continue-on-error: true"),
+        ("step", "shell: 'true {0}'"),
+        ("step", "env: {PYTEST_ADDOPTS: '-k smoke'}"),
+        ("job", "if: false"),
+        ("job", "continue-on-error: true"),
+        ("job", "env: {PYTEST_ADDOPTS: '-k smoke'}"),
+        ("workflow", "env: {PYTEST_ADDOPTS: '-k smoke'}"),
+        ("workflow", "defaults: {run: {shell: 'true {0}'}}"),
+        ("job", "defaults: {run: {working-directory: tests}}"),
+        ("workflow", "defaults: {run: {working-directory: tests}}"),
+        (
+            "job",
+            "strategy:\n  matrix:\n    python: ['3.12']\n"
+            "    exclude: [{python: '3.12'}]",
+        ),
+        (
+            "earlier",
+            "- name: Configure tests\n"
+            "  run: echo 'PYTEST_ADDOPTS=-k smoke' >> \"$GITHUB_ENV\"",
+        ),
+        ("earlier", "- run: echo '/tmp/replacement-tools' >> \"${GITHUB_PATH}\""),
+        ("earlier", "- run: echo 'PYTHONPATH=/tmp/replacements' >> $GITHUB_ENV"),
+        ("step", "<<: {if: false}"),
+        ("step", "env: {PYTEST_ADDOPTS: '-k first', PYTEST_ADDOPTS: '-k second'}"),
+        ("job", "name: Configure PyTeSt"),
+    ],
+    ids=[
+        "f001-step-shell",
+        "f001-step-directory",
+        "f001-github-env",
+        "f001-job-shell",
+        "f001-workflow-shell",
+        "step-disabled",
+        "step-nonfailing",
+        "step-noop-shell",
+        "step-env",
+        "job-disabled",
+        "job-nonfailing",
+        "job-env",
+        "workflow-env",
+        "workflow-noop-shell",
+        "job-directory",
+        "workflow-directory",
+        "matrix-excludes-all",
+        "earlier-env",
+        "earlier-path",
+        "earlier-pythonpath",
+        "merge-key",
+        "duplicate-env-key",
+        "case-insensitive-scalar",
+    ],
+)
+def test_ci_suite_execution_context_cannot_narrow_the_exact_command(
+    tmp_path, monkeypatch, capsys, scope, context
+):
+    workflow = WORKFLOW.format(invocation=CI_INVOCATION)
+    if scope == "step":
+        workflow = workflow.replace(
+            "        run:",
+            "        " + context.replace("\n", "\n        ") + "\n        run:",
+        )
+    elif scope == "earlier":
+        workflow = workflow.replace(
+            "      - name: Run tests",
+            "      " + context.replace("\n", "\n      ") + "\n      - name: Run tests",
+        )
+    elif scope == "job":
+        workflow = workflow.replace(
+            "    runs-on:", "    " + context.replace("\n", "\n    ") + "\n    runs-on:"
+        )
+    else:
+        workflow = context + "\n" + workflow
+    repo = _make_repo(tmp_path, workflow=workflow)
+    code, out = _check(monkeypatch, capsys, repo)
+    assert code != 0
+    _assert_reports(out, "R22", "ci_invocation_drift")
+
+
+def test_ci_context_restrictions_are_scoped_to_the_authoritative_suite(tmp_path):
+    workflow = (
+        WORKFLOW.format(invocation=CI_INVOCATION)
+        + """\
+  install-smoke:
+    if: false
+    defaults: {run: {shell: 'true {0}'}}
+    env: {PYTEST_ADDOPTS: '-k smoke'}
+    steps:
+      - run: echo 'PYTEST_ADDOPTS=-k smoke' >> "$GITHUB_ENV"
+      - run: python -c 'import pytest; pytest.main(["tests/test_http_transport.py"])'
+  min-version-smoke:
+    continue-on-error: true
+    steps:
+      - run: python -c 'import pytest; pytest.main(["tests/test_parse_error_echo.py"])'
+"""
+    )
+    repo = _make_repo(tmp_path, workflow=workflow)
+    assert checker._check_ci_invocation(repo.path) == []
+
+
 def test_a_parametrised_citation_is_discovered_but_a_missing_one_is_not(
     tmp_path, monkeypatch, capsys
 ):

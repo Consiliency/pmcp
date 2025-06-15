@@ -803,12 +803,62 @@ def _check_ci_invocation(repo_root: Path) -> list[Failure]:
             for step in steps
         ):
             raise ValueError("malformed jobs.test steps")
+        # The run string alone does not bind what the runner executes. Refuse
+        # overrides whose shell, directory, environment or gating R9 cannot mirror.
+        if any(key in document for key in ("defaults", "env")) or any(
+            key in suite for key in ("defaults", "env", "if", "continue-on-error")
+        ):
+            raise ValueError("overridden jobs.test execution context")
+        strategy = suite.get("strategy", {})
+        matrix = strategy.get("matrix", {}) if isinstance(strategy, dict) else None
+        if not isinstance(matrix, dict) or "exclude" in matrix:
+            raise ValueError("unverifiable jobs.test matrix")
+        for index, step in enumerate(steps):
+            if step.get("run", "").strip() != CI_PYTEST_INVOCATION:
+                continue
+            if any(
+                key in step
+                for key in (
+                    "shell",
+                    "working-directory",
+                    "env",
+                    "if",
+                    "continue-on-error",
+                )
+            ):
+                raise ValueError("overridden suite step execution context")
+            if any(
+                re.search(r"github_(env|path)", previous.get("run", ""), re.IGNORECASE)
+                for previous in steps[:index]
+            ):
+                raise ValueError("earlier step can override suite environment or path")
+
+        # Retain the old conservative pytest-text check within the authoritative
+        # job, including mapping keys and non-run scalars. Smoke jobs are separate.
+        pending = [suite]
+        seen = set()
+        pytest_scalars = []
+        while pending:
+            value = pending.pop()
+            if isinstance(value, str):
+                if "pytest" in value.casefold():
+                    pytest_scalars.append(value.strip())
+            elif isinstance(value, (dict, list)) and id(value) not in seen:
+                seen.add(id(value))
+                if isinstance(value, dict):
+                    pending.extend(value.keys())
+                    pending.extend(value.values())
+                else:
+                    pending.extend(value)
+        if pytest_scalars != [CI_PYTEST_INVOCATION]:
+            raise ValueError("unexpected pytest configuration in jobs.test")
     except (OSError, UnicodeError, yaml.YAMLError, ValueError):
         return [
             Failure(
                 "R22",
                 "ci_invocation_drift",
-                f"{CI_WORKFLOW_PATH} must define readable, valid jobs.test steps",
+                f"{CI_WORKFLOW_PATH} must define readable, valid jobs.test steps "
+                "with an unmodified suite execution context",
             )
         ]
     # Only the authoritative suite proves R9's discovery. Wheel smoke jobs
