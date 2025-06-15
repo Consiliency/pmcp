@@ -24,6 +24,9 @@ from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
 from pmcp.parsing import load_json
 from pmcp.redaction_additive import (
+    Covers,
+    URL_RE,
+    WEAK_SECRET_KEYS,
     _covers_anything,
     _json_string_context,
     redact_additive,
@@ -1237,7 +1240,7 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> 
     return text if max_length is None else text[:max_length]
 
 
-def _sanitize_base(text: str) -> str:
+def _sanitize_base(text: str, *, covers: Covers | None = None) -> str:
     """The redactor's own rules, in order: URLs, Authorization, Bearer, the
     keyword rule, JWTs."""
 
@@ -1259,24 +1262,30 @@ def _sanitize_base(text: str) -> str:
         # belong to a closing quote, including nested serialized strings.
         last_pair = raw_url.partition("?")[2].rsplit("&", 1)[-1]
         key, equals, value = last_pair.partition("=")
+        decoded_key = unquote(key).lower()
         covered_value = bool(
             "\\" in suffix
             and "?" in raw_url
             and equals
-            and _covers_anything(unquote(value), 0, None)
+            and _covers_anything(unquote(value), 0, covers)
         )
-        if "\\" in suffix and (
-            "#" in raw_url
-            or (
-                "?" in raw_url
-                and equals
-                and (
-                    unquote(key).lower()
-                    in AUTH_SECRET_QUERY_KEYS | {"credential", "credentials"}
-                    or covered_value
+        covered_pair = bool(
+            suffix
+            and "?" in raw_url
+            and equals
+            and (
+                decoded_key in AUTH_SECRET_QUERY_KEYS | WEAK_SECRET_KEYS
+                # A value made entirely of suffix characters leaves an
+                # empty core; the marker probes the same key grammar.
+                or _covers_anything(
+                    f"{unquote(key)}={unquote(value) or '[REDACTED]'}", 0, covers
                 )
+                or covered_value
             )
-        ):
+        )
+        if (
+            "\\" in suffix or (suffix and decoded_key in {"credential", "credentials"})
+        ) and ("#" in raw_url or covered_pair):
             escapes = quote_escapes.get(match.start(), 0)
             raw_url = whole[:-escapes] if escapes else whole
             suffix = "\\" * escapes
@@ -1284,11 +1293,11 @@ def _sanitize_base(text: str) -> str:
                 whole.rstrip(").,;\\")
             )
             if (
-                covered_value
+                covered_pair
                 and "#" not in raw_url
                 and len(raw_url) > len(whole.rstrip(").,;\\"))
             ):
-                # Complete a shaped value's redaction before a later policy
+                # Complete a secret value's redaction before a later policy
                 # pattern can replace only its recognizable prefix and hide
                 # the context that makes its encoded suffix secret too.
                 pair_start = max(raw_url.find("?"), raw_url.rfind("&")) + 1
@@ -1299,7 +1308,7 @@ def _sanitize_base(text: str) -> str:
             + suffix
         )
 
-    text = re.sub(r"https?://[^\s\"'<>]+", redact_url_match, text)
+    text = URL_RE.sub(redact_url_match, text)
     text = re.sub(
         r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;]+",
         r"\1[REDACTED]",

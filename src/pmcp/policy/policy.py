@@ -828,7 +828,7 @@ class PolicyManager:
         effective patterns (`_additive_spans`). They can only replace more of
         it with the marker.
         """
-        result = _sanitize_base(output)
+        result = _sanitize_base(output, covers=self._pattern_matches)
 
         for regex in self._redaction_regexes:
 

@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Preserve escaped URL quote boundaries in redacted structured output, keeping benign nested JSON text and structured content parseable (see Consiliency/pmcp#401).
 
-- Redact credential-shaped JSON mapping keys without dropping entries, reserving benign keys and adding numeric suffixes to `[REDACTED]` only to avoid collisions. Redact weak-key values in URL queries and secret-value backslash suffixes while retaining established JSON quote escapes (see Consiliency/pmcp#407, Consiliency/pmcp#409 and Consiliency/pmcp#410).
+- Extend JSON mapping-key protection to additive credential rules, reserving benign names and assigning collision-safe `[REDACTED]` markers by first occurrence. Keys matching credential detectors can also be renamed when used as identifiers, including base64url IDs, SRI digests and response identifiers. For covered URL forms, use validated quote boundaries to withhold recognized query values' actual backslash suffixes and `credential`/`credentials` punctuation suffixes. Earlier base/policy serialization limitations and key collisions remain (see Consiliency/pmcp#407, Consiliency/pmcp#409 and Consiliency/pmcp#410).
 
 - Gateway startup no longer SIGKILLs existing same-user processes whose command matches a configured stdio server (see Consiliency/pmcp#389). Command matching cannot establish ownership, so startup no longer attempts crash-orphan recovery. Normal cleanup of processes pmcp starts is unchanged; processes left by a hard crash need operator cleanup.
 

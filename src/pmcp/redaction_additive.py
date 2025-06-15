@@ -1423,7 +1423,9 @@ def _json_string_context(
     return keys, quote_escapes
 
 
-def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
+def _clip_to_json_strings(
+    text: str, spans: list[Span], *, covers: Covers | None = None
+) -> list[Span]:
     """When ``text`` is a JSON document, confine every span to the contents
     of strings, whole escapes at a time: a replacement then never
     touches a delimiting quote, a bracket, a separator, a bare scalar or a
@@ -1431,7 +1433,7 @@ def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
     receive collision-free markers, including inside nested JSON text.
     Anything a span covered outside strings is left as it is."""
     head = text.lstrip()[:1]
-    if head not in ("{", "[", '"') or not spans:
+    if head not in ("{", "[", '"'):
         return spans
     try:
         load_json(text, source="redaction candidate")
@@ -1439,12 +1441,13 @@ def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
         return spans
     work(3 * len(text))
     keys, _ = _json_string_context(text)
-    protected = {key for key, _, _ in keys if _shape_spans(key)}
-    reserved = {key for key, _, _ in keys} - protected
-    work(len(protected) * max(1, len(protected).bit_length()))
+    work(len(keys) * max(1, len(keys).bit_length()))
+    names = dict.fromkeys(key for key, _, _ in sorted(keys, key=lambda row: row[1]))
+    protected = [key for key in names if _covers_anything(key, 0, covers)]
+    reserved = set(names) - set(protected)
     replacements: dict[str, str] = {}
     number = 1
-    for key in sorted(protected):
+    for key in protected:
         marker = REDACTED if number == 1 else f"{REDACTED}#{number}"
         while marker in reserved:
             number += 1
@@ -1492,6 +1495,7 @@ def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
     for low, high, replacement in clipped:
         i = max(0, bisect.bisect_right(key_starts, low) - 1)
         while i < len(key_spans) and key_spans[i][0] < high:
+            work(1)
             start, end, _ = key_spans[i]
             if end > low:
                 if start > low:
@@ -1511,4 +1515,6 @@ def redact_additive(
     spans = collect_redaction_spans(text, covers=covers)
     if extra:
         spans.extend(extra)
-    return apply_redaction_spans(text, _clip_to_json_strings(text, spans))
+    return apply_redaction_spans(
+        text, _clip_to_json_strings(text, spans, covers=covers)
+    )
