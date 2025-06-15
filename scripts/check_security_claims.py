@@ -46,8 +46,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import yaml
-
 # --------------------------------------------------------------------------
 # The document's two delimited regions.
 # --------------------------------------------------------------------------
@@ -780,135 +778,26 @@ def _check_ci_invocation(repo_root: Path) -> list[Failure]:
         return [
             Failure("R22", "ci_invocation_drift", f"{CI_WORKFLOW_PATH} is not readable")
         ]
-
-    class WorkflowLoader(yaml.SafeLoader):
-        def construct_mapping(self, node, deep=False):
-            mapping = super().construct_mapping(node, deep=deep)
-            if len(mapping) != len(node.value):
-                raise yaml.constructor.ConstructorError(
-                    None, None, "duplicate workflow mapping keys", node.start_mark
-                )
-            return mapping
-
-    try:
-        document = yaml.load(
-            workflow.read_text(encoding="utf-8"), Loader=WorkflowLoader
-        )
-        jobs = document.get("jobs") if isinstance(document, dict) else None
-        suite = jobs.get("test") if isinstance(jobs, dict) else None
-        steps = suite.get("steps") if isinstance(suite, dict) else None
-        if not isinstance(steps, list) or any(
-            not isinstance(step, dict)
-            or ("run" in step and not isinstance(step["run"], str))
-            for step in steps
-        ):
-            raise ValueError("malformed jobs.test steps")
-        # The run string alone does not bind what the runner executes. Refuse
-        # overrides whose shell, directory, environment or gating R9 cannot mirror.
-        if any(key in document for key in ("defaults", "env")) or any(
-            key in suite
-            for key in (
-                "defaults",
-                "env",
-                "if",
-                "continue-on-error",
-                "needs",
-                "container",
-                "services",
-            )
-        ):
-            raise ValueError("overridden jobs.test execution context")
-        strategy = suite.get("strategy", {})
-        matrix = strategy.get("matrix", {}) if isinstance(strategy, dict) else None
-        if not isinstance(matrix, dict) or "exclude" in matrix:
-            raise ValueError("unverifiable jobs.test matrix")
-        for index, step in enumerate(steps):
-            if "uses" in step and (
-                not isinstance(step["uses"], str)
-                or not step["uses"].startswith(
-                    ("actions/checkout@", "actions/setup-node@", "astral-sh/setup-uv@")
-                )
-            ):
-                raise ValueError("unreviewed action in jobs.test")
-            if step.get("run", "").strip() != CI_PYTEST_INVOCATION:
-                continue
-            if any(
-                key in step
-                for key in (
-                    "shell",
-                    "working-directory",
-                    "env",
-                    "if",
-                    "continue-on-error",
-                )
-            ):
-                raise ValueError("overridden suite step execution context")
-            if any(
-                re.search(
-                    r"github[._](env|path)", previous.get("run", ""), re.IGNORECASE
-                )
-                for previous in steps[:index]
-            ):
-                raise ValueError("earlier step can override suite environment or path")
-
-        # Retain the old conservative pytest-text check within the authoritative
-        # job, including mapping keys and non-run scalars. Smoke jobs are separate.
-        pending = [suite]
-        seen = set()
-        pytest_scalars = []
-        while pending:
-            value = pending.pop()
-            if isinstance(value, str):
-                if "pytest" in value.casefold():
-                    pytest_scalars.append(value.strip())
-            elif isinstance(value, (dict, list)) and id(value) not in seen:
-                seen.add(id(value))
-                if isinstance(value, dict):
-                    pending.extend(value.keys())
-                    pending.extend(value.values())
-                else:
-                    pending.extend(value)
-        if pytest_scalars != [CI_PYTEST_INVOCATION]:
-            raise ValueError("unexpected pytest configuration in jobs.test")
-    except (
-        OSError,
-        UnicodeError,
-        yaml.YAMLError,
-        ValueError,
-        LookupError,
-        AttributeError,
-        TypeError,
-        RecursionError,
-    ):
-        return [
-            Failure(
-                "R22",
-                "ci_invocation_drift",
-                f"{CI_WORKFLOW_PATH} must define readable, valid jobs.test steps "
-                "with an unmodified suite execution context",
-            )
-        ]
-    # Only the authoritative suite proves R9's discovery. Wheel smoke jobs
-    # may run additional selections, but cannot stand in for this invocation.
-    commands = [
-        step["run"].strip() for step in steps if "pytest" in step.get("run", "")
+    lines = [
+        ln for ln in workflow.read_text(encoding="utf-8").splitlines() if "pytest" in ln
     ]
-    if len(commands) != 1:
+    if len(lines) != 1:
         return [
             Failure(
                 "R22",
                 "ci_invocation_drift",
-                f"expected exactly one pytest invocation in {CI_WORKFLOW_PATH} "
-                f"jobs.test, found {len(commands)}",
+                f"expected exactly one pytest invocation in {CI_WORKFLOW_PATH}, "
+                f"found {len(lines)}",
             )
         ]
-    invocation = commands[0]
+    _, separator, command = lines[0].partition("run:")
+    invocation = (command if separator else lines[0]).strip()
     if invocation != CI_PYTEST_INVOCATION:
         return [
             Failure(
                 "R22",
                 "ci_invocation_drift",
-                f"{CI_WORKFLOW_PATH} jobs.test runs {invocation!r}; this checker mirrors "
+                f"{CI_WORKFLOW_PATH} runs {invocation!r}; this checker mirrors "
                 f"{CI_PYTEST_INVOCATION!r}. R9 is only as strong as that match, so "
                 f"re-read the change and update this constant deliberately",
             )

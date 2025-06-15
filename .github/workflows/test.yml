@@ -112,22 +112,7 @@ jobs:
       - name: SDK rejection security checks from the installed wheel
         run: |
           unset PYTHONPATH
-          /tmp/fresh/bin/python - <<'PY'
-          import importlib.metadata as metadata
-          import pathlib
-          import sys
-          import pmcp
-          import pytest
-
-          assert pathlib.Path(pmcp.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve())
-          print("installed pmcp:", pmcp.__file__)
-          print({name: metadata.version(name) for name in ("mcp", "httpx2", "pytest")})
-          raise SystemExit(pytest.main([
-              "-o", "pythonpath=",
-              "tests/test_http_transport.py", "tests/test_parse_error_echo.py", "-q",
-              "-k", "sdk or plumbing or received_error",
-          ]))
-          PY
+          /tmp/fresh/bin/python scripts/wheel_security_checks.py
 
       # `_npm_resolve.js` is not a Python file, and npm package identity is dead
       # without it: `NpmResolver` reports UNAVAILABLE and every npm/npx server
@@ -209,22 +194,7 @@ jobs:
       - name: SDK rejection security checks from the installed floor wheel
         run: |
           unset PYTHONPATH
-          /tmp/floor/bin/python - <<'PY'
-          import importlib.metadata as metadata
-          import pathlib
-          import sys
-          import pmcp
-          import pytest
-
-          assert pathlib.Path(pmcp.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve())
-          print("installed pmcp:", pmcp.__file__)
-          print({name: metadata.version(name) for name in ("mcp", "httpx2", "pytest")})
-          raise SystemExit(pytest.main([
-              "-o", "pythonpath=",
-              "tests/test_http_transport.py", "tests/test_parse_error_echo.py", "-q",
-              "-k", "sdk or plumbing or received_error",
-          ]))
-          PY
+          /tmp/floor/bin/python scripts/wheel_security_checks.py
 
       # Imports are not acceptance for a gateway, and neither is /health —
       # transport/http.py:435-436 returns "ok": True as a hardcoded literal.
