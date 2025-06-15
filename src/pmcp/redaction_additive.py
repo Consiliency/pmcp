@@ -30,6 +30,7 @@ import re
 from collections.abc import Callable, Iterator
 from urllib.parse import unquote
 
+from pmcp.keyword_matcher import key_start_pattern
 from pmcp.parsing import _decode_json_string_token, load_json
 
 #: Test-only work counter. None in production; the complexity tests set it to
@@ -118,6 +119,12 @@ ADDITIVE_SECRET_KEYS = {
 #: derives its key-coverage property from both sets, so a key named here but
 #: not redacted in every form fails that test.
 WEAK_SECRET_KEYS = frozenset({"auth", "code", "credential", "credentials"})
+
+# Query names are whole identifiers containing any existing credential family.
+# Unlike prose, their values need not look like credentials.
+_QUERY_SECRET_KEYS = QUERY_SECRET_KEYS | ADDITIVE_SECRET_KEYS
+_QUERY_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_-]+", re.IGNORECASE)
+_QUERY_KEY_START = key_start_pattern(_QUERY_SECRET_KEYS | {"private-key", "privatekey"})
 
 _JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])"
@@ -291,8 +298,8 @@ def _reads_as_route(run: str) -> bool:
 Span = tuple[int, int, str]
 
 
-class _KeyReplacement(str):
-    """An atomic mapping-key replacement, including any marker inside it."""
+class _AtomicReplacement(str):
+    """A whole key or qualified query value, including markers inside it."""
 
 
 REDACTED = "[REDACTED]"
@@ -946,7 +953,7 @@ def _url_component_spans(
 ) -> list[Span]:
     """The parts of one URL `redact_auth_url` would strip or redact, as spans
     over the text the URL sits in: the userinfo (dropped), each value under an
-    `QUERY_SECRET_KEYS` key (`[REDACTED]`), and the fragment (dropped).
+    credential-like identifier query key (`[REDACTED]`), and the fragment (dropped).
 
     Spans, not a rewrite: a rewritten URL would be one span containing the
     query, and every keyed or shape span inside that query (`?pwd=hunter2`,
@@ -976,14 +983,23 @@ def _url_component_spans(
         position = query_start + 1
         for pair in raw_url[query_start + 1 : query_end].split("&"):
             key, equals, value = pair.partition("=")
+            decoded_key = unquote(key)
+            work(len(key) + len(decoded_key))
             value_start = position + len(key) + 1
             if (
                 equals
                 and value
-                and unquote(key).lower() in QUERY_SECRET_KEYS | WEAK_SECRET_KEYS
+                and _QUERY_IDENTIFIER_RE.fullmatch(decoded_key) is not None
+                and _QUERY_KEY_START.search(decoded_key) is not None
             ):
                 spans.append(
-                    (base + value_start, base + value_start + len(value), REDACTED)
+                    (
+                        base + value_start,
+                        base + value_start + len(value),
+                        _AtomicReplacement(REDACTED)
+                        if decoded_key.lower() not in _QUERY_SECRET_KEYS
+                        else REDACTED,
+                    )
                 )
             elif (
                 equals
@@ -1029,12 +1045,44 @@ def _covers_anything(text: str, depth: int, covers: Covers | None) -> bool:
 
 def _url_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
     spans: list[Span] = []
+    quote_escapes: dict[int, int] | None = None
+    if "\\u" in text and text.lstrip()[:1] in ('"', "{", "["):
+        quote_escapes = {}
+        try:
+            load_json(text, source="redaction candidate")
+            _, quote_escapes = _json_string_context(text, query_spans=spans)
+        except (ValueError, RecursionError):
+            pass
+        work(3 * len(text))
     for match in _counted(URL_RE.finditer(text)):
-        raw_url = match.group(0)
+        whole = match.group(0)
         # Trailing sentence punctuation is handed back, and so is a trailing
         # backslash: in a serialised leaf it escapes the closing quote
         # (`…?sid=x\\"`), and a query-value span that ate it broke the JSON.
-        raw_url = raw_url.rstrip(").,;\\")
+        raw_url = whole.rstrip(").,;\\")
+        key, equals, _ = raw_url.partition("?")[2].rsplit("&", 1)[-1].partition("=")
+        decoded_key = unquote(key)
+        work(len(key) + len(decoded_key))
+        if (
+            len(raw_url) < len(whole)
+            and equals
+            and "#" not in raw_url
+            and decoded_key.lower() not in _QUERY_SECRET_KEYS
+            and _QUERY_IDENTIFIER_RE.fullmatch(decoded_key) is not None
+            and _QUERY_KEY_START.search(decoded_key) is not None
+        ):
+            # Qualified query values include their own punctuation/backslashes;
+            # only validated serialized closing-quote escapes belong outside.
+            if quote_escapes is None:
+                quote_escapes = {}
+                if "\\" in text and text.lstrip()[:1] in ('"', "{", "["):
+                    try:
+                        load_json(text, source="redaction candidate")
+                        _, quote_escapes = _json_string_context(text, query_spans=spans)
+                    except (ValueError, RecursionError):
+                        pass
+            escapes = quote_escapes.get(match.start(), 0)
+            raw_url = whole[:-escapes] if escapes else whole
         spans.extend(_url_component_spans(match.start(), raw_url, depth, covers))
     return spans
 
@@ -1203,7 +1251,7 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
 
     Every marker already in the text -- `[REDACTED]`, and the URL rule's
     `%5BREDACTED%5D` -- is left exactly as it is, except inside an atomic
-    credential-key replacement whose collision-free name owns the whole key:
+    credential-key or qualified query-value replacement:
 
     * a span that starts ON a marker keeps the marker and replaces only the
       run glued to its end, up to whitespace, `&`, `#`, a quote, a
@@ -1226,7 +1274,7 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
       whole span and left `Secret` and `2024!`). A stretch of only
       whitespace between markers is left.
 
-    So a marker is never split, swallowed or re-spelled; run again over its
+    Outside those atomic replacements a marker is never split or re-spelled; run again over its
     own output, the pass keeps every marker and only adds. The rest merge: overlapping or nested spans
     become one `[REDACTED]`, except that a span inside one whose replacement
     covers it (the marker, or the empty string) is dropped.
@@ -1236,7 +1284,7 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
     marker_starts = [start for start, _ in markers]
     pieces: list[Span] = []
     for start, end, replacement in spans:
-        if isinstance(replacement, _KeyReplacement):
+        if isinstance(replacement, _AtomicReplacement):
             pieces.append((start, end, replacement))
             continue
         i = bisect.bisect_right(marker_starts, start) - 1
@@ -1364,7 +1412,7 @@ def _is_object_key(text: str, end: int) -> bool:
 
 
 def _json_string_context(
-    text: str,
+    text: str, *, query_spans: list[Span] | None = None
 ) -> tuple[list[tuple[str, int, int]], dict[int, int]]:
     """Decoded key names and URL quote escapes, with original source offsets.
 
@@ -1372,6 +1420,8 @@ def _json_string_context(
     Each decoded character keeps its source boundary, so a secret's literal
     backslashes and the escapes of a following quote remain distinguishable.
     The caller has already established that the outer text is valid JSON.
+    An optional collector maps qualified query values through the same
+    boundaries, including names spelled with JSON Unicode escapes.
     """
     keys: list[tuple[str, int, int]] = []
     quote_escapes: dict[int, int] = {}
@@ -1411,6 +1461,33 @@ def _json_string_context(
             else:
                 for url in URL_RE.finditer(decoded):
                     original_start = boundaries[url.start()]
+                    if query_spans is not None and original_start in urls:
+                        raw_url = url.group(0)
+                        query = raw_url.find("?")
+                        fragment = raw_url.find("#")
+                        query_end = fragment if fragment > query else len(raw_url)
+                        if query >= 0:
+                            position = url.start() + query + 1
+                            for pair in raw_url[query + 1 : query_end].split("&"):
+                                key, equals, value = pair.partition("=")
+                                name = unquote(key)
+                                work(len(pair) + len(name))
+                                if (
+                                    equals
+                                    and value
+                                    and name.lower() not in _QUERY_SECRET_KEYS
+                                    and _QUERY_IDENTIFIER_RE.fullmatch(name) is not None
+                                    and _QUERY_KEY_START.search(name) is not None
+                                ):
+                                    start = position + len(key) + 1
+                                    query_spans.append(
+                                        (
+                                            boundaries[start],
+                                            boundaries[start + len(value)],
+                                            _AtomicReplacement(REDACTED),
+                                        )
+                                    )
+                                position += len(pair) + 1
                     original_end = urls.get(original_start, boundaries[url.end()])
                     # The raw URL scanner can run past encoded whitespace
                     # that ends its decoded counterpart. Locate its actual
@@ -1452,7 +1529,7 @@ def _clip_to_json_strings(
         while marker in reserved:
             number += 1
             marker = f"{REDACTED}#{number}"
-        replacements[key] = _KeyReplacement(marker)
+        replacements[key] = _AtomicReplacement(marker)
         reserved.add(marker)
         number += 1
     key_spans = sorted(

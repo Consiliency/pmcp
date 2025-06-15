@@ -25,8 +25,9 @@ from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
 from pmcp.parsing import load_json
 from pmcp.redaction_additive import (
     Covers,
-    URL_RE,
     WEAK_SECRET_KEYS,
+    _QUERY_IDENTIFIER_RE,
+    _QUERY_KEY_START,
     _covers_anything,
     _json_string_context,
     redact_additive,
@@ -1281,6 +1282,14 @@ def _sanitize_base(text: str, *, covers: Covers | None = None) -> str:
                     f"{unquote(key)}={unquote(value) or '[REDACTED]'}", 0, covers
                 )
                 or covered_value
+                or (
+                    _QUERY_IDENTIFIER_RE.fullmatch(unquote(key)) is not None
+                    and _QUERY_KEY_START.search(unquote(key)) is not None
+                )
+                or "[REDACTED]"
+                in redact_keyword_values(
+                    f"{unquote(key)}={unquote(value) or 'xxx'}", _KEYWORD_KEY_START
+                )
             )
         )
         if (
@@ -1308,7 +1317,7 @@ def _sanitize_base(text: str, *, covers: Covers | None = None) -> str:
             + suffix
         )
 
-    text = URL_RE.sub(redact_url_match, text)
+    text = re.sub(r"https?://[^\s\"'<>]+", redact_url_match, text)
     text = re.sub(
         r"(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;]+",
         r"\1[REDACTED]",

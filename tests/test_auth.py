@@ -749,6 +749,39 @@ def test_auth_url_escape_prefixed_secret_boundary(
         )
 
 
+@pytest.mark.parametrize("key", ["csrftoken", "usertoken", "otp_code", "tokenizer"])
+@pytest.mark.parametrize("tail", ["\\", "\\\\", ";;;\\"])
+def test_auth_postcap_containing_keyword_suffix(key: str, tail: str) -> None:
+    from urllib.parse import unquote
+
+    for spelling in (
+        key,
+        key.upper(),
+        "%" + f"{ord(key[0]):02X}" + key[1:],
+        "scope." + key,
+        "scope%20" + key,
+    ):
+        url = f"https://example.test/p?{spelling}=hunterword{tail}"
+        for redact in (
+            _sanitize_base,
+            lambda text: sanitize_auth_diagnostic(text, max_length=None),
+        ):
+            free = redact(f"see {url} next")
+            assert "hunterword" not in free
+            assert "\\" not in free
+            assert unquote(free.split("=", 1)[1].split(" next")[0]) == "[REDACTED]"
+            for depth in range(4):
+                raw = json.dumps({"link": f'<a href="{url}">P</a>'})
+                for _ in range(depth):
+                    raw = json.dumps(raw)
+                output = redact(raw)
+                for _ in range(depth + 1):
+                    output = json.loads(output)
+                assert "hunterword" not in output["link"]
+                assert "\\" not in output["link"]
+                assert output["link"].endswith('">P</a>')
+
+
 def test_auth_redaction_covers_headers_userinfo_and_query_secrets() -> None:
     raw = (
         "Authorization: Bearer abc.def "
