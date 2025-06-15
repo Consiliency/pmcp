@@ -1494,8 +1494,8 @@ def _sdk_error_inventory() -> set[tuple[str, str, str, str]]:
 def _direct_message_plumbing(
     module: str, tree: ast.AST
 ) -> set[tuple[str, str, str, int | None]]:
-    """Direct parameter forwarding only; sink signatures are independent of
-    pmcp's runtime registry, so a missing wrapper cannot hide itself."""
+    """Direct parameter forwarding only, with sink signatures independent of
+    pmcp's runtime registry. Indirect forwarding needs separate coverage."""
     sinks = {
         "ErrorData": ("message", None),
         "MCPError": ("message", 1),
