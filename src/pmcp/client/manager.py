@@ -3471,6 +3471,8 @@ class ClientManager:
         # (httpx2's own default is False) and the same (30s connect, 300s read)
         # timeout. `headers` is omitted entirely when unset, matching 1.x's
         # create_mcp_http_client(headers=None) passthrough.
+        # These are client defaults; SDK 2.2+ enforces same-origin redirects
+        # itself rather than allowing this client to follow arbitrary targets.
         remote_timeout = httpx2.Timeout(30.0, read=300.0)
         if headers is not None:
             http_client = httpx2.AsyncClient(

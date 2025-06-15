@@ -95,7 +95,9 @@ jobs:
           uv build --wheel --out-dir dist
           uv venv /tmp/fresh
           # No --frozen / no uv.lock: resolve from pyproject constraints alone.
-          VIRTUAL_ENV=/tmp/fresh uv pip install dist/*.whl
+          for wheel in dist/*.whl; do
+            VIRTUAL_ENV=/tmp/fresh uv pip install "${wheel}[dev,http]"
+          done
 
       - name: Report the resolved versions (so a bad bump is visible in the log)
         run: VIRTUAL_ENV=/tmp/fresh uv pip list
@@ -106,6 +108,26 @@ jobs:
           # Import the modules a real startup touches, so a renamed or removed
           # upstream symbol fails here rather than in a user's service log.
           /tmp/fresh/bin/python -c "import pmcp.client.manager, pmcp.server, pmcp.config.loader"
+
+      - name: SDK rejection security checks from the installed wheel
+        run: |
+          unset PYTHONPATH
+          /tmp/fresh/bin/python - <<'PY'
+          import importlib.metadata as metadata
+          import pathlib
+          import sys
+          import pmcp
+          import pytest
+
+          assert pathlib.Path(pmcp.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve())
+          print("installed pmcp:", pmcp.__file__)
+          print({name: metadata.version(name) for name in ("mcp", "httpx2", "pytest")})
+          raise SystemExit(pytest.main([
+              "-o", "pythonpath=",
+              "tests/test_http_transport.py", "tests/test_parse_error_echo.py", "-q",
+              "-k", "sdk or plumbing or received_error",
+          ]))
+          PY
 
       # `_npm_resolve.js` is not a Python file, and npm package identity is dead
       # without it: `NpmResolver` reports UNAVAILABLE and every npm/npx server
@@ -177,10 +199,32 @@ jobs:
         run: |
           uv build --wheel --out-dir dist
           uv venv /tmp/floor
-          VIRTUAL_ENV=/tmp/floor uv pip install dist/*.whl "mcp==${FLOOR}"
+          for wheel in dist/*.whl; do
+            VIRTUAL_ENV=/tmp/floor uv pip install "${wheel}[dev,http]" "mcp==${FLOOR}"
+          done
           VIRTUAL_ENV=/tmp/floor uv pip list
           /tmp/floor/bin/pmcp --version
           /tmp/floor/bin/python -c "import pmcp.client.manager, pmcp.server, pmcp.config.loader"
+
+      - name: SDK rejection security checks from the installed floor wheel
+        run: |
+          unset PYTHONPATH
+          /tmp/floor/bin/python - <<'PY'
+          import importlib.metadata as metadata
+          import pathlib
+          import sys
+          import pmcp
+          import pytest
+
+          assert pathlib.Path(pmcp.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve())
+          print("installed pmcp:", pmcp.__file__)
+          print({name: metadata.version(name) for name in ("mcp", "httpx2", "pytest")})
+          raise SystemExit(pytest.main([
+              "-o", "pythonpath=",
+              "tests/test_http_transport.py", "tests/test_parse_error_echo.py", "-q",
+              "-k", "sdk or plumbing or received_error",
+          ]))
+          PY
 
       # Imports are not acceptance for a gateway, and neither is /health —
       # transport/http.py:435-436 returns "ok": True as a hardcoded literal.

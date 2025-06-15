@@ -36,6 +36,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "check_security_claims.py"
 
@@ -552,13 +553,95 @@ def test_the_checkers_discovery_invocation_matches_the_ci_workflow(
     real_workflow = (
         Path(__file__).resolve().parents[1] / ".github" / "workflows" / "test.yml"
     )
-    lines = [ln for ln in real_workflow.read_text().splitlines() if "pytest" in ln]
-    assert len(lines) == 1, f"expected one pytest invocation, got {lines}"
-    assert lines[0].split("run:", 1)[1].strip() == CI_INVOCATION
+    steps = yaml.safe_load(real_workflow.read_text())["jobs"]["test"]["steps"]
+    commands = [
+        step["run"].strip() for step in steps if "pytest" in step.get("run", "")
+    ]
+    assert commands == [CI_INVOCATION], f"expected one exact main suite, got {commands}"
     assert checker.CI_PYTEST_INVOCATION == CI_INVOCATION
 
     narrowed = WORKFLOW.format(invocation=CI_INVOCATION + " -k not_slow")
     repo = _make_repo(tmp_path, workflow=narrowed)
+    code, out = _check(monkeypatch, capsys, repo)
+    assert code != 0
+    _assert_reports(out, "R22", "ci_invocation_drift")
+
+
+def test_wheel_security_jobs_supplement_the_exact_main_suite(
+    tmp_path, monkeypatch, capsys
+):
+    workflow = (
+        WORKFLOW.format(invocation=CI_INVOCATION)
+        + """\
+  install-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - run: python -c 'import pytest; pytest.main(["tests/test_http_transport.py"])'
+  min-version-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - run: python -c 'import pytest; pytest.main(["tests/test_parse_error_echo.py"])'
+"""
+    )
+    repo = _make_repo(tmp_path, workflow=workflow)
+    code, out = _check(monkeypatch, capsys, repo)
+    assert code == 0, out
+
+
+@pytest.mark.parametrize("supplemental", ["install-smoke", "min-version-smoke"])
+@pytest.mark.parametrize(
+    "main_job",
+    [
+        "",
+        "  test: {}\n",
+        "  test:\n    steps: invalid\n",
+        "  test:\n    steps: [invalid]\n",
+        "  test:\n    steps:\n      - run: false\n",
+        "  test:\n    steps:\n      - run: echo tests\n",
+        "  test:\n    steps:\n      - run: " + CI_INVOCATION + " -k not_slow\n",
+        "  test:\n    steps:\n      - run: "
+        + CI_INVOCATION
+        + "\n      - run: "
+        + CI_INVOCATION
+        + "\n",
+        "  test:\n    steps:\n      - run: |\n          "
+        + CI_INVOCATION
+        + "\n          "
+        + CI_INVOCATION
+        + "\n",
+        "  test:\n    steps:\n      - run: "
+        + CI_INVOCATION
+        + " -k narrowed\n"
+        + "  test:\n    steps:\n      - run: "
+        + CI_INVOCATION
+        + "\n",
+        "  test: [\n",
+    ],
+    ids=[
+        "missing-job",
+        "missing-steps",
+        "malformed-steps",
+        "malformed-step",
+        "non-string-command",
+        "missing-command",
+        "narrowed-command",
+        "duplicate-steps",
+        "duplicate-commands",
+        "duplicate-job",
+        "malformed-yaml",
+    ],
+)
+def test_a_supplemental_copy_cannot_replace_the_authoritative_suite(
+    tmp_path, monkeypatch, capsys, supplemental, main_job
+):
+    workflow = (
+        "jobs:\n"
+        + main_job
+        + f"  {supplemental}:\n    steps:\n      - run: "
+        + CI_INVOCATION
+        + "\n"
+    )
+    repo = _make_repo(tmp_path, workflow=workflow)
     code, out = _check(monkeypatch, capsys, repo)
     assert code != 0
     _assert_reports(out, "R22", "ci_invocation_drift")

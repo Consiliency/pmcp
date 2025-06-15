@@ -60,6 +60,7 @@ _MESSAGE_ARGUMENTS: dict[str, tuple[str, int | None]] = {
     "InboundLadderRejection": ("message", None),
     "_create_error_response": ("error_message", 0),
     "_error_response": ("message", 0),
+    "_resolve_abandoned_request": ("message", 2),
 }
 
 # SDK helpers whose returned text is relayed as an ErrorData message.

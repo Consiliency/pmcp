@@ -1457,6 +1457,191 @@ _SDK_ERROR_CONSTRUCTIONS: dict[tuple[str, str, str, str], str] = {
 _DATA_CALLS = {"ErrorData", "MCPError", "McpError", "InboundLadderRejection"}
 
 
+def _sdk_minor() -> tuple[int, int]:
+    from importlib.metadata import version
+
+    minor = tuple(map(int, version("mcp").split(".")[:2]))
+    assert minor in {(2, 2), (2, 3)}, (
+        f"Review the MCP {version('mcp')} construction and direct-plumbing "
+        "inventories and add explicit minor-version deltas before admitting it"
+    )
+    return minor
+
+
+def _sdk_error_inventory() -> set[tuple[str, str, str, str]]:
+    # SDK 2.2 already relays redirects through the resolver. SDK 2.3 also
+    # formats the SSE exception there instead of using a benign literal.
+    expected = set(_SDK_ERROR_CONSTRUCTIONS) | {
+        (
+            "mcp.client.streamable_http",
+            "_resolve_abandoned_request",
+            "message",
+            "redirect",
+        )
+    }
+    if _sdk_minor() == (2, 3):
+        expected.add(
+            (
+                "mcp.client.streamable_http",
+                "_resolve_abandoned_request",
+                "message",
+                "f'SSE stream failed: {exc}'",
+            )
+        )
+    return expected
+
+
+def _direct_message_plumbing(
+    module: str, tree: ast.AST
+) -> set[tuple[str, str, str, int | None]]:
+    """Direct parameter forwarding only; sink signatures are independent of
+    pmcp's runtime registry, so a missing wrapper cannot hide itself."""
+    sinks = {
+        "ErrorData": ("message", None),
+        "MCPError": ("message", 1),
+        "McpError": ("message", 1),
+        "_create_error_response": ("error_message", 0),
+        "_error_response": ("message", 0),
+    }
+    found: set[tuple[str, str, str, int | None]] = set()
+
+    def visit(node: ast.AST, owners: tuple[str, ...] = ()) -> None:
+        if isinstance(node, ast.ClassDef):
+            for child in node.body:
+                visit(child, (*owners, node.name))
+            return
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            owner = (*owners, node.name)
+            positional = [*node.args.posonlyargs, *node.args.args]
+            bound = bool(positional and positional[0].arg in {"self", "cls"})
+            parameters = {
+                arg.arg: index - int(bound) for index, arg in enumerate(positional)
+            }
+            parameters.update({arg.arg: None for arg in node.args.kwonlyargs})
+            pending = list(node.body)
+            while pending:
+                child = pending.pop()
+                if isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    visit(child, owner)
+                    continue
+                if isinstance(child, ast.Call):
+                    name = getattr(child.func, "attr", getattr(child.func, "id", ""))
+                    if name in sinks:
+                        keyword, index = sinks[name]
+                        values = [k.value for k in child.keywords if k.arg == keyword]
+                        if index is not None:
+                            values += child.args[index : index + 1]
+                        for value in values:
+                            if isinstance(value, ast.Name) and value.id in parameters:
+                                found.add(
+                                    (
+                                        module,
+                                        ".".join(owner),
+                                        value.id,
+                                        parameters[value.id],
+                                    )
+                                )
+                pending.extend(ast.iter_child_nodes(child))
+            return
+        for child in ast.iter_child_nodes(node):
+            visit(child, owners)
+
+    visit(tree)
+    return found
+
+
+def test_every_sdk_direct_message_plumbing_is_registered() -> None:
+    from pathlib import Path
+
+    import mcp
+
+    from pmcp.sdk_rejections import _MESSAGE_ARGUMENTS
+
+    root = Path(mcp.__file__).parent
+    found = set()
+    for path in sorted(root.rglob("*.py")):
+        module = (
+            path.relative_to(root.parent).with_suffix("").as_posix().replace("/", ".")
+        )
+        found |= _direct_message_plumbing(module, ast.parse(path.read_text()))
+    # Reviewed exact inventories for SDK 2.2 and 2.3 have no plumbing delta.
+    _sdk_minor()
+    assert found == {
+        (
+            "mcp.client.streamable_http",
+            "StreamableHTTPTransport._resolve_abandoned_request",
+            "message",
+            2,
+        ),
+        (
+            "mcp.server.streamable_http",
+            "StreamableHTTPServerTransport._create_error_response",
+            "error_message",
+            0,
+        ),
+        ("mcp.server.streamable_http_manager", "_error_response", "message", 0),
+        ("mcp.shared.exceptions", "MCPError.__init__", "message", 1),
+    }
+    for module, owner, parameter, index in found:
+        names = owner.split(".")
+        callee = names[-2] if names[-1] == "__init__" else names[-1]
+        assert _MESSAGE_ARGUMENTS.get(callee) == (parameter, index), (module, owner)
+
+
+@pytest.mark.parametrize(
+    ("source", "owner", "index"),
+    [
+        (
+            "def renamed(code, message):\n    return MCPError(code, message)",
+            "renamed",
+            1,
+        ),
+        (
+            "class C:\n    def renamed(self, writer, request, message):\n        return ErrorData(message=message)",
+            "C.renamed",
+            2,
+        ),
+        (
+            "class C:\n    def renamed(cls, *, message):\n        return _error_response(message=message)",
+            "C.renamed",
+            None,
+        ),
+        (
+            "def renamed(*, message):\n    return _create_error_response(message)",
+            "renamed",
+            None,
+        ),
+    ],
+)
+def test_sdk_direct_plumbing_finds_unregistered_wrappers(source, owner, index) -> None:
+    from pmcp.sdk_rejections import _MESSAGE_ARGUMENTS
+
+    assert _direct_message_plumbing("synthetic", ast.parse(source)) == {
+        ("synthetic", owner, "message", index)
+    }
+    assert owner.split(".")[-1] not in _MESSAGE_ARGUMENTS
+
+
+@pytest.mark.parametrize(
+    "call",
+    [
+        "self._resolve_abandoned_request(writer, request, f'SSE stream failed: {exc}')",
+        "self._resolve_abandoned_request(writer, request, message=f'SSE stream failed: {exc}')",
+    ],
+)
+def test_sdk_message_collectors_include_resolver_plumbing(call: str) -> None:
+    from pmcp.sdk_rejections import error_message_arguments, message_arguments
+
+    tree = ast.parse(call)
+    expected = "f'SSE stream failed: {exc}'"
+    assert [ast.unparse(value) for value in message_arguments(tree)] == [expected]
+    assert [
+        (name, ast.unparse(value)) for name, value in error_message_arguments(tree)
+    ] == [("_resolve_abandoned_request", expected)]
+
+
 def _sdk_error_constructions() -> set[tuple[str, str, str, str]]:
     """Every non-literal message or `data` argument of a JSON-RPC error
     construction in the installed `mcp` package."""
@@ -1505,9 +1690,10 @@ def _sdk_error_constructions() -> set[tuple[str, str, str, str]]:
 def test_every_sdk_error_construction_is_classified() -> None:
     """The whole `mcp` package, exact both ways (round-18 ruling)."""
     found = _sdk_error_constructions()
-    assert found == set(_SDK_ERROR_CONSTRUCTIONS), (
-        sorted(found - set(_SDK_ERROR_CONSTRUCTIONS)),
-        sorted(set(_SDK_ERROR_CONSTRUCTIONS) - found),
+    expected = _sdk_error_inventory()
+    assert found == expected, (
+        sorted(found - expected),
+        sorted(expected - found),
     )
 
 
@@ -2067,6 +2253,7 @@ def test_every_sdk_exception_construction_is_withheld() -> None:
 
     from pmcp.sdk_rejections import _MESSAGE_ARGUMENTS, error_message_arguments
 
+    _sdk_minor()  # SDK 2.2 and 2.3 have the same reviewed exception inventory.
     root = Path(mcp.__file__).parent
     found: set[tuple[str, str, str]] = set()
     for path in sorted(root.rglob("*.py")):

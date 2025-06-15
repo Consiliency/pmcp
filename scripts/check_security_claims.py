@@ -46,6 +46,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import yaml
+
 # --------------------------------------------------------------------------
 # The document's two delimited regions.
 # --------------------------------------------------------------------------
@@ -778,26 +780,58 @@ def _check_ci_invocation(repo_root: Path) -> list[Failure]:
         return [
             Failure("R22", "ci_invocation_drift", f"{CI_WORKFLOW_PATH} is not readable")
         ]
-    lines = [
-        ln for ln in workflow.read_text(encoding="utf-8").splitlines() if "pytest" in ln
-    ]
-    if len(lines) != 1:
+
+    class WorkflowLoader(yaml.SafeLoader):
+        def construct_mapping(self, node, deep=False):
+            mapping = super().construct_mapping(node, deep=deep)
+            if len(mapping) != len(node.value):
+                raise yaml.constructor.ConstructorError(
+                    None, None, "duplicate workflow mapping keys", node.start_mark
+                )
+            return mapping
+
+    try:
+        document = yaml.load(
+            workflow.read_text(encoding="utf-8"), Loader=WorkflowLoader
+        )
+        jobs = document.get("jobs") if isinstance(document, dict) else None
+        suite = jobs.get("test") if isinstance(jobs, dict) else None
+        steps = suite.get("steps") if isinstance(suite, dict) else None
+        if not isinstance(steps, list) or any(
+            not isinstance(step, dict)
+            or ("run" in step and not isinstance(step["run"], str))
+            for step in steps
+        ):
+            raise ValueError("malformed jobs.test steps")
+    except (OSError, UnicodeError, yaml.YAMLError, ValueError):
         return [
             Failure(
                 "R22",
                 "ci_invocation_drift",
-                f"expected exactly one pytest invocation in {CI_WORKFLOW_PATH}, "
-                f"found {len(lines)}",
+                f"{CI_WORKFLOW_PATH} must define readable, valid jobs.test steps",
             )
         ]
-    _, separator, command = lines[0].partition("run:")
-    invocation = (command if separator else lines[0]).strip()
+    # Only the authoritative suite proves R9's discovery. Wheel smoke jobs
+    # may run additional selections, but cannot stand in for this invocation.
+    commands = [
+        step["run"].strip() for step in steps if "pytest" in step.get("run", "")
+    ]
+    if len(commands) != 1:
+        return [
+            Failure(
+                "R22",
+                "ci_invocation_drift",
+                f"expected exactly one pytest invocation in {CI_WORKFLOW_PATH} "
+                f"jobs.test, found {len(commands)}",
+            )
+        ]
+    invocation = commands[0]
     if invocation != CI_PYTEST_INVOCATION:
         return [
             Failure(
                 "R22",
                 "ci_invocation_drift",
-                f"{CI_WORKFLOW_PATH} runs {invocation!r}; this checker mirrors "
+                f"{CI_WORKFLOW_PATH} jobs.test runs {invocation!r}; this checker mirrors "
                 f"{CI_PYTEST_INVOCATION!r}. R9 is only as strong as that match, so "
                 f"re-read the change and update this constant deliberately",
             )
