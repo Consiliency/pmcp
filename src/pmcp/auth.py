@@ -1283,8 +1283,9 @@ def _sanitize_base(text: str, *, covers: Covers | None = None) -> str:
                 )
                 or covered_value
                 or (
-                    _QUERY_IDENTIFIER_RE.fullmatch(unquote(key)) is not None
-                    and _QUERY_KEY_START.search(unquote(key)) is not None
+                    (identifier := _QUERY_IDENTIFIER_RE.search(unquote(key)))
+                    is not None
+                    and _QUERY_KEY_START.search(identifier.group(0)) is not None
                 )
                 or "[REDACTED]"
                 in redact_keyword_values(

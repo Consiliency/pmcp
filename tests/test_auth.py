@@ -782,6 +782,39 @@ def test_auth_postcap_containing_keyword_suffix(key: str, tail: str) -> None:
                 assert output["link"].endswith('">P</a>')
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "user.credential",
+        "x:auth",
+        "scope%20credential",
+        "user+credential",
+        "scope.private_key_suffix",
+    ],
+)
+@pytest.mark.parametrize("depth", [0, 1, 3])
+def test_auth_final_identifier_query_suffix_keeps_only_quote_escapes(
+    name: str, depth: int
+) -> None:
+    url = f"https://example.test/p?{name}=hiddenword\\\\"
+    raw = json.dumps({"link": f'<a href="{url}">P</a>'})
+    for _ in range(depth):
+        raw = json.dumps(raw)
+    for redact in (
+        _sanitize_base,
+        lambda text: sanitize_auth_diagnostic(text, max_length=None),
+    ):
+        free = redact("see " + url + " next")
+        assert "hiddenword" not in free
+        assert "\\" not in free
+        output = redact(raw)
+        for _ in range(depth + 1):
+            output = json.loads(output)
+        assert "hiddenword" not in output["link"]
+        assert "\\" not in output["link"]
+        assert output["link"].endswith('">P</a>')
+
+
 def test_auth_redaction_covers_headers_userinfo_and_query_secrets() -> None:
     raw = (
         "Authorization: Bearer abc.def "

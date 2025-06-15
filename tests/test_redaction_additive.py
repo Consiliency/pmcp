@@ -1004,9 +1004,7 @@ def test_postcap_query_names_keep_existing_ignorecase_partners(name: str) -> Non
             assert "\\" not in output["link"]
 
 
-@pytest.mark.parametrize(
-    "name", ["q", "state", "trace", "offset", "mode", "api.key", "auth!name"]
-)
+@pytest.mark.parametrize("name", ["q", "state", "trace", "offset", "mode", "auth!name"])
 def test_postcap_nonmatching_query_names_and_prose_are_kept(name: str) -> None:
     rows = {
         "link": f"HTTPS://example.test/p?{name}=plainword\\\\",
@@ -1014,6 +1012,162 @@ def test_postcap_nonmatching_query_names_and_prose_are_kept(name: str) -> None:
     }
     for output in _round3_rows_on_surfaces(rows, 1):
         assert output == rows
+
+
+def test_final_identifier_api_dot_key_is_a_whole_query_value() -> None:
+    rows = {"link": "HTTPS://example.test/p?api.key=plainword\\\\", "note": "keep"}
+    assert json.loads(_main_e(json.dumps(rows))) == rows
+    assert json.loads(_main_p(json.dumps(rows))) == rows
+    expected = {"link": "HTTPS://example.test/p?api.key=[REDACTED]", "note": "keep"}
+    for output in _round3_rows_on_surfaces(rows, 1):
+        assert output == expected
+
+
+_FINAL_IDENTIFIER_JOINERS = sorted(set(string.punctuation) - set("_-&#=\"'<>\\%")) + [
+    "%20",
+    "%2E",
+    "%2B",
+    "%5C",
+    "é",
+    "%C3%A9",
+]
+
+
+@pytest.mark.parametrize("joiner", _FINAL_IDENTIFIER_JOINERS)
+def test_final_identifier_joiners_withhold_complete_query_values(joiner: str) -> None:
+    from urllib.parse import unquote
+
+    for depth, family in enumerate(("credential", "auth_suffix", "private_key_suffix")):
+        scheme = "https://" if depth == 0 and joiner.isascii() else "HTTPS://"
+        href = f"{scheme}example.test/p?scope{joiner}{family}=hiddenword\\\\).;"
+        policy = _policy()
+        for output in (
+            _ours_e("see " + href + " next"),
+            policy.redact_secrets("see " + href + " next"),
+            policy.process_output("see " + href + " next", redact=True)["result"],
+        ):
+            assert (
+                unquote(output.split("=", 1)[1].rsplit(" next", 1)[0]) == "[REDACTED]"
+            )
+        rows = {"link": f'<a href="{href}">😀</a>', "note": "keep"}
+        for output in _round3_rows_on_surfaces(rows, depth):
+            url = output["link"].split('href="', 1)[1].split('"', 1)[0]
+            assert unquote(url.split("=", 1)[1]) == "[REDACTED]"
+            assert output["link"].endswith('">😀</a>')
+            assert output["note"] == "keep"
+
+
+@pytest.mark.parametrize("family", _POSTCAP_QUERY_FAMILIES)
+def test_final_identifier_existing_families_at_name_end(family: str) -> None:
+    from urllib.parse import quote, unquote
+
+    name = "scope.pre" + family + "_field"
+    for depth, spelling in enumerate(
+        (name, name.upper(), quote(name).replace(".", "%2E"))
+    ):
+        href = f"HTTPS://example.test/p?{spelling}=firstword\\secondword\\\\"
+        rows = {"link": href, "sibling": "plainword"}
+        for output in _round3_rows_on_surfaces(rows, depth):
+            assert unquote(output["link"].split("=", 1)[1]) == "[REDACTED]"
+            assert "firstword" not in str(output)
+            assert "secondword" not in str(output)
+            assert output["sibling"] == "plainword"
+
+
+@pytest.mark.parametrize("ascii_only", [True, False])
+@pytest.mark.parametrize("depth", [0, 1, 3])
+def test_final_identifier_semantic_names_and_quote_boundaries(
+    ascii_only: bool, depth: int
+) -> None:
+    from urllib.parse import quote, unquote
+
+    for name in ("scope.credentıal", "x:prıvate_Key_suffix"):
+        for scheme, spelling in (("HTTPS://", name), ("https://", quote(name))):
+            rows = {
+                "link": f'<a href="{scheme}example.test/p?{spelling}=hiddenword\\\\).;">😀</a>',
+                "benign": "HTTPS://example.test/p?q=plainword\\\\",
+            }
+            nested = json.dumps(rows, ensure_ascii=ascii_only)
+            for _ in range(depth):
+                nested = json.dumps(nested, ensure_ascii=ascii_only)
+            payload = {"content": [{"text": nested}], "structuredContent": rows}
+            doc = json.dumps(payload, ensure_ascii=ascii_only)
+            policy = _policy()
+            for raw in (
+                _ours_e(doc),
+                policy.redact_secrets(doc),
+                policy.process_output(doc, redact=True, max_bytes=10**6)["result"],
+                policy.process_output(payload, redact=True, max_bytes=10**6)["result"],
+            ):
+                output = _round3_decode_payload(raw, depth)
+                url = output["link"].split('href="', 1)[1].split('"', 1)[0]
+                assert unquote(url.split("=", 1)[1]) == "[REDACTED]"
+                assert output["link"].endswith('">😀</a>')
+                assert output["benign"] == rows["benign"]
+
+
+@pytest.mark.parametrize(
+    "name", ["user.credential", "x:auth", "scope.private_key_suffix"]
+)
+def test_final_identifier_url_keys_keep_siblings_and_secret_pieces(name: str) -> None:
+    key = f"HTTPS://example.test/p?{name}=hiddenword"
+    rows = {"keys": {key: "protected", "[REDACTED]": "keep"}, "sibling": "keep"}
+    for output in _round3_rows_on_surfaces(rows, 1):
+        assert output == {
+            "keys": {"[REDACTED]#2": "protected", "[REDACTED]": "keep"},
+            "sibling": "keep",
+        }
+    for limit in (32, 400, None):
+        raw = "log " * 65 + key + "\\ next"
+        uncut = _ours_e(raw)
+        cut = sanitize_auth_diagnostic(raw, max_length=limit)
+        assert "hiddenword" not in uncut
+        assert "hidden" not in uncut
+        assert cut == (uncut if limit is None else uncut[:limit])
+
+
+@pytest.mark.parametrize(
+    "name", ["credential.user", "auth:mode", "private_key.scope", "credential."]
+)
+def test_final_identifier_family_before_last_segment_is_not_widened(name: str) -> None:
+    rows = {
+        "link": f"HTTPS://example.test/p?{name}=plainword",
+        "auth": "basic",
+        "credentials": "include",
+    }
+    expected = dict(rows)
+    if name == "auth:mode":
+        # Existing generic `auth:` handling still applies outside the new
+        # final-segment query classifier.
+        expected["link"] = "HTTPS://example.test/p?auth:[REDACTED]"
+    for output in _round3_rows_on_surfaces(rows, 1):
+        assert output == expected
+    for text in ("auth: basic", "credential: include", "X-Mode: plainword"):
+        assert _ours_e(text) == _main_e(text)
+        assert _ours_p(text) == _main_p(text)
+
+
+def test_final_identifier_restoration_mutant_is_red_then_restored_green(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import pmcp.auth as auth
+
+    with monkeypatch.context() as patch:
+        old_name = re.compile(r"\A[A-Za-z0-9_-]+\Z", re.IGNORECASE)
+        patch.setattr(A, "_QUERY_IDENTIFIER_RE", old_name)
+        patch.setattr(auth, "_QUERY_IDENTIFIER_RE", old_name)
+        with pytest.raises(AssertionError):
+            test_final_identifier_joiners_withhold_complete_query_values(".")
+    test_final_identifier_joiners_withhold_complete_query_values(".")
+
+
+def test_final_identifier_long_nonmatching_segments_with_punctuation() -> None:
+    for size in (512, 2048, 8192):
+        name = "credential" + "x" * size + "." + "n" * size + "!"
+        assert A._QUERY_IDENTIFIER_RE.search(name) is None
+        text = f"HTTPS://example.test/p?{name}=plainword"
+        assert _ours_e(text) == text
+        assert _ours_p(text) == text
 
 
 def test_postcap_query_coverage_mutant_restores_weak_values(
@@ -1088,18 +1242,25 @@ def test_postcap_keyword_classifier_mutant_restores_suffix(
 ) -> None:
     import pmcp.auth as auth
 
+    from pmcp.keyword_matcher import key_start_pattern
+
+    text = "see https://example.test/p?scope.csrftoken=hunterword\\\\ next"
     redact = auth.redact_keyword_values
-    monkeypatch.setattr(
-        auth,
-        "redact_keyword_values",
-        lambda text, keys: text
-        if text.startswith("scope.csrftoken=")
-        else redact(text, keys),
-    )
-    with pytest.raises(AssertionError):
-        assert "\\" not in _ours_e(
-            "see https://example.test/p?scope.csrftoken=hunterword\\\\ next"
+    with monkeypatch.context() as patch:
+        # Both query routes now recognize this dotted name independently.
+        patch.setattr(auth, "_QUERY_KEY_START", key_start_pattern(()))
+        patch.setattr(A, "_QUERY_KEY_START", key_start_pattern(()))
+        patch.setattr(
+            auth,
+            "redact_keyword_values",
+            lambda text, keys: text
+            if text.startswith("scope.csrftoken=")
+            else redact(text, keys),
         )
+        with pytest.raises(AssertionError):
+            assert "\\" not in _ours_e(text)
+    assert "\\" not in _ours_e(text)
+    assert "hunterword" not in _ours_e(text)
 
 
 @pytest.mark.parametrize(
@@ -1250,6 +1411,7 @@ def test_round3_independent_mutants_restore_newly_protected_bytes(
         # The new query-only classifier independently covers this name. A
         # restoration mutant must disable both routes to expose the old tail.
         patch.setattr(pmcp.auth, "_QUERY_KEY_START", key_start_pattern(()))
+        patch.setattr(A, "_QUERY_KEY_START", key_start_pattern(()))
         patch.setattr(
             pmcp.auth,
             "_covers_anything",
@@ -1261,12 +1423,14 @@ def test_round3_independent_mutants_restore_newly_protected_bytes(
             test_round3_query_grammar_has_no_secret_suffix(
                 "private_key", 1, "\\", "hunter2xKP"
             )
+    test_round3_query_grammar_has_no_secret_suffix("private_key", 1, "\\", "hunter2xKP")
     with monkeypatch.context() as patch:
         patch.setattr(
             A, "_covers_anything", lambda text, *args: bool(A._shape_spans(text))
         )
         with pytest.raises(AssertionError):
             test_round3_keyword_mapping_keys_are_secret("private_key", "=", 1)
+    test_round3_keyword_mapping_keys_are_secret("private_key", "=", 1)
 
 
 @pytest.mark.parametrize("depth", [0, 1, 3])
@@ -1811,6 +1975,7 @@ _PER_4X = 4 * (16 / 14) * 1.05
 #: Every shape four review rounds found (the additive rules' share of
 #: them), and the families derived from the rules' loops.
 LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
+    "final query segment ending in punctuation": lambda n: "HTTPS://example.test/p?credential" + "x" * (n // 2) + "." + "n" * (n // 2) + "!=plainword",
     "qualified Unicode query values": lambda n: json.dumps({str(i): 'HTTPS://example.test/p?myprıvate_Key=plainword\\\\).;' for i in range(n // 100)}),
     "nested encoded URL keys": lambda n: json.dumps({f"https://h.example/?q=https%3A%2F%2Fh.example%2F%3Fq%3Dhttps%253A%252F%252Fh.example%252F%253Ftoken%253Dpiece{i}": i for i in range(n // 160)}),
     "credential keys and escaped reserved marker": lambda n: json.dumps({"text": '{"\\u005bREDACTED\\u005d": 1, "AKIAABCDEFGHIJKLMNOP": 2}', "padding": "x " * (n // 2)}),

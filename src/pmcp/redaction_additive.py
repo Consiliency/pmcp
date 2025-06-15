@@ -120,10 +120,10 @@ ADDITIVE_SECRET_KEYS = {
 #: not redacted in every form fails that test.
 WEAK_SECRET_KEYS = frozenset({"auth", "code", "credential", "credentials"})
 
-# Query names are whole identifiers containing any existing credential family.
+# A query name's final identifier segment contains an existing credential family.
 # Unlike prose, their values need not look like credentials.
 _QUERY_SECRET_KEYS = QUERY_SECRET_KEYS | ADDITIVE_SECRET_KEYS
-_QUERY_IDENTIFIER_RE = re.compile(r"[A-Za-z0-9_-]+", re.IGNORECASE)
+_QUERY_IDENTIFIER_RE = re.compile(r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]+\Z", re.IGNORECASE)
 _QUERY_KEY_START = key_start_pattern(_QUERY_SECRET_KEYS | {"private-key", "privatekey"})
 
 _JWT_RE = re.compile(
@@ -989,8 +989,8 @@ def _url_component_spans(
             if (
                 equals
                 and value
-                and _QUERY_IDENTIFIER_RE.fullmatch(decoded_key) is not None
-                and _QUERY_KEY_START.search(decoded_key) is not None
+                and (identifier := _QUERY_IDENTIFIER_RE.search(decoded_key)) is not None
+                and _QUERY_KEY_START.search(identifier.group(0)) is not None
             ):
                 spans.append(
                     (
@@ -1068,8 +1068,8 @@ def _url_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
             and equals
             and "#" not in raw_url
             and decoded_key.lower() not in _QUERY_SECRET_KEYS
-            and _QUERY_IDENTIFIER_RE.fullmatch(decoded_key) is not None
-            and _QUERY_KEY_START.search(decoded_key) is not None
+            and (identifier := _QUERY_IDENTIFIER_RE.search(decoded_key)) is not None
+            and _QUERY_KEY_START.search(identifier.group(0)) is not None
         ):
             # Qualified query values include their own punctuation/backslashes;
             # only validated serialized closing-quote escapes belong outside.
@@ -1476,8 +1476,12 @@ def _json_string_context(
                                     equals
                                     and value
                                     and name.lower() not in _QUERY_SECRET_KEYS
-                                    and _QUERY_IDENTIFIER_RE.fullmatch(name) is not None
-                                    and _QUERY_KEY_START.search(name) is not None
+                                    and (
+                                        identifier := _QUERY_IDENTIFIER_RE.search(name)
+                                    )
+                                    is not None
+                                    and _QUERY_KEY_START.search(identifier.group(0))
+                                    is not None
                                 ):
                                     start = position + len(key) + 1
                                     query_spans.append(
