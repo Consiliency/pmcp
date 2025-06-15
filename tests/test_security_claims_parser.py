@@ -691,6 +691,23 @@ def test_a_supplemental_copy_cannot_replace_the_authoritative_suite(
         ("step", "<<: {if: false}"),
         ("step", "env: {PYTEST_ADDOPTS: '-k first', PYTEST_ADDOPTS: '-k second'}"),
         ("job", "name: Configure PyTeSt"),
+        ("job", "needs: gate"),
+        ("job", "needs: [gate]"),
+        ("job", "container: python:3.12"),
+        (
+            "job",
+            "container: {image: 'python:3.12', env: {PYTHONPATH: /tmp/replacements}}",
+        ),
+        (
+            "job",
+            "container: {image: 'python:3.12', options: '--env PYTHONPATH=/tmp/replacements'}",
+        ),
+        ("job", "services: {config: {image: 'python:3.12'}}"),
+        (
+            "earlier",
+            "- run: echo 'PYTHONPATH=/tmp/replacements' >> '${{ github.env }}'",
+        ),
+        ("earlier", "- run: echo '/tmp/replacement-tools' >> '${{ github.path }}'"),
     ],
     ids=[
         "f001-step-shell",
@@ -716,6 +733,14 @@ def test_a_supplemental_copy_cannot_replace_the_authoritative_suite(
         "merge-key",
         "duplicate-env-key",
         "case-insensitive-scalar",
+        "needed-job",
+        "needed-job-list",
+        "container-image",
+        "container-env",
+        "container-options",
+        "services",
+        "github-env-context",
+        "github-path-context",
     ],
 )
 def test_ci_suite_execution_context_cannot_narrow_the_exact_command(
@@ -744,15 +769,140 @@ def test_ci_suite_execution_context_cannot_narrow_the_exact_command(
     _assert_reports(out, "R22", "ci_invocation_drift")
 
 
+@pytest.mark.parametrize(
+    ("consumer", "needs"),
+    [
+        ("outputs", True),
+        ("artifact", True),
+        ("cache", True),
+        ("artifact", False),
+        ("cache", False),
+    ],
+)
+def test_ci_suite_cannot_consume_configuration_from_another_job(
+    tmp_path, consumer, needs
+):
+    document = yaml.safe_load(WORKFLOW.format(invocation=CI_INVOCATION))
+    suite = document["jobs"]["test"]
+    if needs:
+        suite["needs"] = "prep"
+    if consumer == "outputs":
+        step = {
+            "run": "printf '%b\\n' '${{ needs.prep.outputs.cfg }}' > '${{ needs.prep.outputs.file }}'"
+        }
+    else:
+        action = (
+            "actions/download-artifact"
+            if consumer == "artifact"
+            else "actions/cache/restore"
+        )
+        step = {
+            "uses": action + "@0123456789abcdef0123456789abcdef01234567",
+            "with": {"name": "cfg"}
+            if consumer == "artifact"
+            else {"path": "conftest.py", "key": "cfg"},
+        }
+    suite["steps"].insert(0, step)
+    document["jobs"]["prep"] = {
+        "runs-on": "ubuntu-latest",
+        "outputs": {
+            "cfg": "${{ steps.config.outputs.cfg }}",
+            "file": "${{ steps.config.outputs.file }}",
+        },
+        "steps": [
+            {
+                "id": "config",
+                "run": "echo 'cfg=[pytest]\\naddopts = -k smoke' >> \"$GITHUB_OUTPUT\"\necho 'file=pytest.ini' >> \"$GITHUB_OUTPUT\"\nprintf '[pytest]\\naddopts = -k smoke\\n' > pytest.ini\nprintf 'def pytest_collection_modifyitems(items):\\n    del items[1:]\\n' > conftest.py",
+            },
+            {
+                "uses": "actions/upload-artifact@0123456789abcdef0123456789abcdef01234567",
+                "with": {"name": "cfg", "path": "pytest.ini"},
+            },
+            {
+                "uses": "actions/cache/save@0123456789abcdef0123456789abcdef01234567",
+                "with": {"path": "conftest.py", "key": "cfg"},
+            },
+        ],
+    }
+    repo = _make_repo(tmp_path, workflow=yaml.safe_dump(document))
+    failures = checker._check_ci_invocation(repo.path)
+    assert [(failure.rule, failure.name) for failure in failures] == [
+        ("R22", "ci_invocation_drift")
+    ]
+
+
+@pytest.mark.parametrize(
+    "action",
+    [
+        "actions/github-script",
+        "./local-action",
+        "docker://python:3.12",
+        "actions/checkout-spoof",
+    ],
+)
+@pytest.mark.parametrize("after", [False, True])
+def test_ci_suite_refuses_actions_outside_its_reviewed_setup(tmp_path, action, after):
+    document = yaml.safe_load(WORKFLOW.format(invocation=CI_INVOCATION))
+    document["jobs"]["test"]["steps"].insert(
+        int(after), {"uses": action + "@0123456789abcdef0123456789abcdef01234567"}
+    )
+    repo = _make_repo(tmp_path, workflow=yaml.safe_dump(document))
+    assert checker._check_ci_invocation(repo.path)
+
+
+@pytest.mark.parametrize(
+    "action", ["actions/checkout", "actions/setup-node", "astral-sh/setup-uv"]
+)
+def test_ci_suite_permits_its_reviewed_setup_actions(tmp_path, action):
+    document = yaml.safe_load(WORKFLOW.format(invocation=CI_INVOCATION))
+    document["jobs"]["test"]["steps"].insert(
+        0, {"uses": action + "@0123456789abcdef0123456789abcdef01234567"}
+    )
+    repo = _make_repo(tmp_path, workflow=yaml.safe_dump(document))
+    assert checker._check_ci_invocation(repo.path) == []
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "!!bool maybe",
+        '!!int ""',
+        '!!float ""',
+        "!!timestamp foo",
+        "[" * 3000 + "]" * 3000,
+    ],
+    ids=[
+        "bool-keyerror",
+        "int-indexerror",
+        "float-indexerror",
+        "timestamp-attributeerror",
+        "deep-recursionerror",
+    ],
+)
+def test_malformed_ci_yaml_reports_r22_without_echoing_the_value(tmp_path, value):
+    workflow = WORKFLOW.format(invocation=CI_INVOCATION).replace(
+        "    runs-on:", "    x: " + value + "\n    runs-on:"
+    )
+    repo = _make_repo(tmp_path, workflow=workflow)
+    failures = checker._check_ci_invocation(repo.path)
+    assert [(failure.rule, failure.name) for failure in failures] == [
+        ("R22", "ci_invocation_drift")
+    ]
+    assert value not in str(failures[0])
+
+
 def test_ci_context_restrictions_are_scoped_to_the_authoritative_suite(tmp_path):
     workflow = (
         WORKFLOW.format(invocation=CI_INVOCATION)
         + """\
   install-smoke:
+    needs: prep
+    container: python:3.12
     if: false
     defaults: {run: {shell: 'true {0}'}}
     env: {PYTEST_ADDOPTS: '-k smoke'}
     steps:
+      - uses: actions/download-artifact@0123456789abcdef0123456789abcdef01234567
       - run: echo 'PYTEST_ADDOPTS=-k smoke' >> "$GITHUB_ENV"
       - run: python -c 'import pytest; pytest.main(["tests/test_http_transport.py"])'
   min-version-smoke:

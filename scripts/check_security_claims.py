@@ -806,7 +806,16 @@ def _check_ci_invocation(repo_root: Path) -> list[Failure]:
         # The run string alone does not bind what the runner executes. Refuse
         # overrides whose shell, directory, environment or gating R9 cannot mirror.
         if any(key in document for key in ("defaults", "env")) or any(
-            key in suite for key in ("defaults", "env", "if", "continue-on-error")
+            key in suite
+            for key in (
+                "defaults",
+                "env",
+                "if",
+                "continue-on-error",
+                "needs",
+                "container",
+                "services",
+            )
         ):
             raise ValueError("overridden jobs.test execution context")
         strategy = suite.get("strategy", {})
@@ -814,6 +823,13 @@ def _check_ci_invocation(repo_root: Path) -> list[Failure]:
         if not isinstance(matrix, dict) or "exclude" in matrix:
             raise ValueError("unverifiable jobs.test matrix")
         for index, step in enumerate(steps):
+            if "uses" in step and (
+                not isinstance(step["uses"], str)
+                or not step["uses"].startswith(
+                    ("actions/checkout@", "actions/setup-node@", "astral-sh/setup-uv@")
+                )
+            ):
+                raise ValueError("unreviewed action in jobs.test")
             if step.get("run", "").strip() != CI_PYTEST_INVOCATION:
                 continue
             if any(
@@ -828,7 +844,9 @@ def _check_ci_invocation(repo_root: Path) -> list[Failure]:
             ):
                 raise ValueError("overridden suite step execution context")
             if any(
-                re.search(r"github_(env|path)", previous.get("run", ""), re.IGNORECASE)
+                re.search(
+                    r"github[._](env|path)", previous.get("run", ""), re.IGNORECASE
+                )
                 for previous in steps[:index]
             ):
                 raise ValueError("earlier step can override suite environment or path")
@@ -852,7 +870,16 @@ def _check_ci_invocation(repo_root: Path) -> list[Failure]:
                     pending.extend(value)
         if pytest_scalars != [CI_PYTEST_INVOCATION]:
             raise ValueError("unexpected pytest configuration in jobs.test")
-    except (OSError, UnicodeError, yaml.YAMLError, ValueError):
+    except (
+        OSError,
+        UnicodeError,
+        yaml.YAMLError,
+        ValueError,
+        LookupError,
+        AttributeError,
+        TypeError,
+        RecursionError,
+    ):
         return [
             Failure(
                 "R22",
