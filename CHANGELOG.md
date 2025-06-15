@@ -11,6 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Preserve escaped URL quote boundaries in redacted structured output, keeping benign nested JSON text and structured content parseable (see Consiliency/pmcp#401).
 
+- Redact credential-shaped JSON mapping keys without dropping entries, reserving benign keys and adding numeric suffixes to `[REDACTED]` only to avoid collisions. Redact weak-key values in URL queries and secret-value backslash suffixes while retaining established JSON quote escapes (see Consiliency/pmcp#407, Consiliency/pmcp#409 and Consiliency/pmcp#410).
+
 - Gateway startup no longer SIGKILLs existing same-user processes whose command matches a configured stdio server (see Consiliency/pmcp#389). Command matching cannot establish ownership, so startup no longer attempts crash-orphan recovery. Normal cleanup of processes pmcp starts is unchanged; processes left by a hard crash need operator cleanup.
 
 - Require and lock MCP Python SDK 2.2.0 or later in the 2.x series, excluding GHSA-84m7-p3x7-pcfv's unbounded stateful HTTP session retention (see Consiliency/pmcp#403). SDK 2.2.0 expires idle legacy sessions after 30 minutes, caps concurrent sessions at 10,000, and releases ended sessions. MCP client redirects now stay within the endpoint's origin; configure the destination URL directly for a cross-origin move. Connection errors withhold the rejected redirect target, and HTTP session errors keep the SDK's fixed descriptions.

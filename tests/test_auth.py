@@ -685,6 +685,70 @@ def test_auth_redaction_preserves_url_escape_suffix(
         assert isinstance(json.loads(decoded), dict)
 
 
+@pytest.mark.parametrize("depth", [0, 1, 3])
+@pytest.mark.parametrize(
+    "value",
+    ["tokPieceO\\\\", "tokPieceO.\\", "\\", "\\\\", ";;;\\", "tokPieceO\\).,;\\\\"],
+)
+@pytest.mark.parametrize("component", ["?token=", "#access_token="])
+def test_auth_url_escape_secret_suffix_is_not_returned(
+    depth: int, value: str, component: str
+) -> None:
+    url = f"https://example.test/p{component}{value}"
+    snippet = f'<a href="{url}">Person</a>'
+    fixture = json.dumps({"snippet": snippet})
+    for _ in range(depth):
+        fixture = json.dumps(fixture)
+    for redact in (
+        _sanitize_base,
+        lambda text: sanitize_auth_diagnostic(text, max_length=None),
+    ):
+        raw = redact(f"see {url} next")
+        assert "tokPieceO" not in raw
+        assert "\\" not in raw
+        assert not any(
+            char in raw.removeprefix("see https://example.test/p").split(" next")[0]
+            for char in ").,;"
+        )
+        result = redact(fixture)
+        for _ in range(depth + 1):
+            result = json.loads(result)
+        assert "tokPieceO" not in result["snippet"]
+        assert "\\" not in result["snippet"]
+        assert result["snippet"].endswith('">Person</a>')
+
+
+@pytest.mark.parametrize("depth", [0, 1, 3])
+@pytest.mark.parametrize("prefix", ["url=", "GET "])
+@pytest.mark.parametrize("backslashes", ["", "\\", "\\\\"])
+@pytest.mark.parametrize("following_quote", ["", '"'])
+@pytest.mark.parametrize("component", ["?token=", "#access_token="])
+def test_auth_url_escape_prefixed_secret_boundary(
+    depth: int, prefix: str, backslashes: str, following_quote: str, component: str
+) -> None:
+    fixture = json.dumps(
+        {
+            "t": f"😀 {prefix}https://example.test/p{component}secretPiece{backslashes}{following_quote}"
+        }
+    )
+    for _ in range(depth):
+        fixture = json.dumps(fixture)
+    for redact in (
+        _sanitize_base,
+        lambda text: sanitize_auth_diagnostic(text, max_length=None),
+    ):
+        result = redact(fixture)
+        for _ in range(depth + 1):
+            result = json.loads(result)
+        assert "secretPiece" not in result["t"]
+        assert "\\" not in result["t"]
+        assert (
+            result["t"].endswith(following_quote)
+            if following_quote
+            else not result["t"].endswith('"')
+        )
+
+
 def test_auth_redaction_covers_headers_userinfo_and_query_secrets() -> None:
     raw = (
         "Authorization: Bearer abc.def "

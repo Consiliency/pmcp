@@ -429,6 +429,9 @@ _PASS_THROUGH = frozenset(
         "center",
         "encode",
         "decode",
+        # A lexical JSON string decoder carries its input, never an
+        # independent file-content source or a value-free sanitizer.
+        "scanstring",
         "get",
         "items",
         "values",
@@ -635,6 +638,28 @@ def test_the_walk_reports_file_content_at_every_direct_output(tmp_path: Path) ->
 
 
 # --- the messages (round 1 F001) ----------------------------------------------
+
+
+def test_string_token_decoder_preserves_file_taint(tmp_path: Path) -> None:
+    """The real token helper propagates file input, never an ambient source.
+    A literal token stays untainted; printing file-backed token text is found.
+    """
+    (tmp_path / "parsing.py").write_text((SRC / "parsing.py").read_text())
+    (tmp_path / "synthetic.py").write_text("""
+from pmcp.parsing import _decode_json_string_token, load_json_file
+
+def leaked(path):
+    data = load_json_file(open(path), source="fixture")
+    print(_decode_json_string_token(data["token"], 1, source="fixture token"))
+
+def literal():
+    print(_decode_json_string_token('"hello"', 1, source="fixture token"))
+""")
+    model = _model(tmp_path)
+    assert "text" in model.passes.get("_decode_json_string_token", set())
+    assert "_decode_json_string_token" not in model.sources
+    assert _reported(tmp_path) == {("synthetic.py", "leaked", "print")}
+
 
 #: Keys a repository's quoted dotenv entry can hold: a tab, a bell, an ANSI
 #: escape. Dummy text only.

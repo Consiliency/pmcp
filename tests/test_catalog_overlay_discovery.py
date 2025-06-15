@@ -2848,6 +2848,7 @@ DIAGNOSTIC_SITES_OUTSIDE_D9 = {
     ("cli.py", "_run_trust_revoke_package"): _NOT_A_FIELD,
     ("parsing.py", "load_yaml"): _PARSE_SOURCE,
     ("parsing.py", "load_json"): _PARSE_SOURCE,
+    ("parsing.py", "_decode_json_string_token"): _PARSE_SOURCE,
     ("parsing.py", "parse_timestamp"): _PARSE_SOURCE,
 }
 

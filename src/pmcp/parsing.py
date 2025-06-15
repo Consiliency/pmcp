@@ -23,6 +23,7 @@ already catch (``yaml.YAMLError``, ``json.JSONDecodeError`` and so
 from __future__ import annotations
 
 import json
+from _json import scanstring
 from datetime import datetime
 from typing import IO, Any
 
@@ -160,6 +161,24 @@ def load_json(
 def load_json_file(handle: IO[Any], *, source: str) -> Any:
     """``json.load(handle)`` through :func:`load_json`."""
     return load_json(handle.read(), source=source)
+
+
+def _decode_json_string_token(text: str, start: int, *, source: str) -> str:
+    """Decode one string token after its opening quote; perform no file IO.
+
+    Redaction uses this for tokens in already-validated JSON documents.
+    Classify failures here too, so the lexical decoder cannot echo input.
+    """
+    failure: tuple[int | None, int | None, str] | None = None
+    try:
+        return scanstring(text, start)[0]
+    except Exception as error:  # noqa: BLE001 -- classified by origin
+        if isinstance(error, json.JSONDecodeError):
+            failure = (error.lineno, error.colno, type(error).__name__)
+        else:
+            failure = (None, None, type(error).__name__)
+    line, column, cause = failure
+    raise JSONParseError("JSON", source, line, column, cause=cause)
 
 
 def parse_timestamp(text: str, *, source: str) -> datetime:
