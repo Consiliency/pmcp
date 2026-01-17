@@ -13,6 +13,12 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+try:
+    import resource
+    HAS_RESOURCE = True
+except ImportError:
+    HAS_RESOURCE = False
+
 from pmcp.config.loader import make_tool_id
 from pmcp.types import (
     PromptArgumentInfo,
@@ -36,6 +42,47 @@ HEALTH_CHECK_INTERVAL = 30.0  # Background health check every 30s
 # Connection retry settings
 MAX_CONNECTION_RETRIES = 3
 RETRY_DELAYS = [1.0, 2.0, 4.0]  # Exponential backoff delays in seconds
+
+# Memory monitoring
+MEMORY_LOG_INTERVAL = 60.0  # Log memory every 60s
+MEMORY_WARN_THRESHOLD_MB = 1024  # Warn if process uses > 1GB
+
+
+def _get_memory_usage_mb() -> float:
+    """Get current process memory usage in MB."""
+    try:
+        if HAS_RESOURCE:
+            # ru_maxrss is in KB on Linux, bytes on macOS
+            usage = resource.getrusage(resource.RUSAGE_SELF)
+            import sys
+            if sys.platform == "darwin":
+                return usage.ru_maxrss / 1024 / 1024
+            return usage.ru_maxrss / 1024
+        # Fallback: read from /proc
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_system_memory_pct() -> int:
+    """Get system memory usage percentage."""
+    try:
+        with open("/proc/meminfo") as f:
+            meminfo = {}
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2:
+                    meminfo[parts[0].rstrip(":")] = int(parts[1])
+            total = meminfo.get("MemTotal", 1)
+            available = meminfo.get("MemAvailable", total)
+            used_pct = int((total - available) * 100 / total)
+            return used_pct
+    except Exception:
+        return 0
 
 
 def _generate_revision_id() -> str:
@@ -825,10 +872,38 @@ class ClientManager:
 
     async def _health_monitor_loop(self) -> None:
         """Background task to monitor server and request health."""
+        last_memory_log = 0.0
         while True:
             try:
                 await asyncio.sleep(HEALTH_CHECK_INTERVAL)
                 now = time.time()
+
+                # Periodic memory logging
+                if now - last_memory_log >= MEMORY_LOG_INTERVAL:
+                    proc_mem = _get_memory_usage_mb()
+                    sys_mem_pct = _get_system_memory_pct()
+                    server_count = len(self._clients)
+
+                    # Count child processes
+                    child_count = 0
+                    for managed in self._clients.values():
+                        if managed.process and managed.process.returncode is None:
+                            child_count += 1
+
+                    log_msg = (
+                        f"[TELEMETRY] pmcp: {proc_mem:.1f}MB | "
+                        f"system: {sys_mem_pct}% | "
+                        f"servers: {server_count} ({child_count} alive)"
+                    )
+
+                    if proc_mem > MEMORY_WARN_THRESHOLD_MB:
+                        logger.warning(f"{log_msg} - HIGH MEMORY")
+                    elif sys_mem_pct > 80:
+                        logger.warning(f"{log_msg} - SYSTEM MEMORY HIGH")
+                    else:
+                        logger.info(log_msg)
+
+                    last_memory_log = now
 
                 for name, managed in self._clients.items():
                     # Check process health
