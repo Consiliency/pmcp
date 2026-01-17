@@ -119,7 +119,7 @@ _LOCK_FILE: Path | None = None
 _LOCK_FD = None
 
 
-def acquire_singleton_lock(lock_dir: Path | None = None) -> bool:
+def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     """Ensure only one gateway instance runs per user.
 
     Args:
@@ -132,15 +132,23 @@ def acquire_singleton_lock(lock_dir: Path | None = None) -> bool:
 
     import fcntl
 
+    # Already holding a lock
+    if _LOCK_FD is not None:
+        logger.debug("Already holding singleton lock")
+        return False
+
     if lock_dir is None:
         lock_dir = Path.home() / ".pmcp"
+    elif isinstance(lock_dir, str):
+        lock_dir = Path(lock_dir)
 
     lock_dir.mkdir(parents=True, exist_ok=True)
     _LOCK_FILE = lock_dir / "gateway.lock"
 
     try:
-        _LOCK_FD = open(_LOCK_FILE, "w")
-        fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fd = open(_LOCK_FILE, "w")
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _LOCK_FD = fd
         _LOCK_FD.write(str(os.getpid()))
         _LOCK_FD.flush()
         logger.debug(f"Acquired singleton lock: {_LOCK_FILE}")
