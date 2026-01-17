@@ -24,7 +24,7 @@ from pydantic import AnyUrl
 
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
-from pmcp.config.loader import load_configs, manifest_server_to_config
+from pmcp.config.loader import load_configs, load_disabled_auto_start, manifest_server_to_config
 from pmcp.identity import (
     filter_self_references,
     acquire_singleton_lock,
@@ -316,6 +316,10 @@ class GatewayServer:
 
         # Load manifest and add auto-start servers (if not already configured)
         manifest = None
+        disabled_auto_start = load_disabled_auto_start(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        )
         try:
             manifest = load_manifest()
             auto_start_servers = manifest.get_auto_start_servers()
@@ -324,6 +328,13 @@ class GatewayServer:
                 if server.name in seen_servers:
                     logger.debug(
                         f"Skipping manifest server '{server.name}' - already in .mcp.json"
+                    )
+                    continue
+
+                # Check if explicitly disabled in config
+                if server.name in disabled_auto_start:
+                    logger.info(
+                        f"Skipping auto-start server '{server.name}' - disabled in config"
                     )
                     continue
 

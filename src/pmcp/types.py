@@ -27,6 +27,7 @@ class McpConfigFile(BaseModel):
     """Structure of .mcp.json files."""
 
     mcpServers: dict[str, McpServerConfig] = Field(default_factory=dict)
+    disableAutoStart: list[str] = Field(default_factory=list)
 
 
 class ResolvedServerConfig(BaseModel):

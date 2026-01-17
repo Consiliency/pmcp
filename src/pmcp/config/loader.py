@@ -178,6 +178,50 @@ def load_configs(
     return configs
 
 
+def load_disabled_auto_start(
+    project_root: Path | None = None,
+    user_config_paths: Sequence[Path] | None = None,
+    custom_config_path: Path | None = None,
+) -> set[str]:
+    """Load disableAutoStart lists from all config sources."""
+    disabled: set[str] = set()
+
+    # Check project config
+    resolved_project_root = project_root or find_project_root(Path.cwd())
+    if resolved_project_root:
+        project_config = parse_json_file(resolved_project_root / ".mcp.json")
+        if project_config and project_config.disableAutoStart:
+            disabled.update(project_config.disableAutoStart)
+
+    # Check user configs
+    user_paths = (
+        list(user_config_paths)
+        if user_config_paths is not None
+        else DEFAULT_USER_CONFIG_PATHS
+    )
+    for user_path in user_paths:
+        user_config = parse_json_file(user_path)
+        if user_config and user_config.disableAutoStart:
+            disabled.update(user_config.disableAutoStart)
+
+    # Check custom config
+    resolved_custom_path = custom_config_path
+    if not resolved_custom_path:
+        env_path = os.environ.get("PMCP_CONFIG")
+        if env_path:
+            resolved_custom_path = Path(env_path)
+
+    if resolved_custom_path:
+        custom_config = parse_json_file(resolved_custom_path)
+        if custom_config and custom_config.disableAutoStart:
+            disabled.update(custom_config.disableAutoStart)
+
+    if disabled:
+        logger.info(f"Auto-start disabled for: {', '.join(sorted(disabled))}")
+
+    return disabled
+
+
 def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerConfig:
     """Convert a manifest ServerConfig to a ResolvedServerConfig.
 
