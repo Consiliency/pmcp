@@ -7,6 +7,9 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+# === Transport Types ===
+
+GatewayTransport = Literal["stdio", "http"]
 
 # === Config Types ===
 
@@ -57,6 +60,7 @@ class ServerStatusEnum(str, Enum):
     OFFLINE = "offline"
     CONNECTING = "connecting"
     ERROR = "error"
+    LAZY = "lazy"  # Registered but not yet connected (on-demand)
 
 
 class RequestState(str, Enum):

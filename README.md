@@ -20,7 +20,7 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 
 **PMCP** acts as a single MCP server that Claude Code connects to. Instead of exposing all downstream tools, it provides:
 
-- **9 stable meta-tools** (not the 50+ underlying tools)
+- **11 stable meta-tools** (not the 50+ underlying tools)
 - **Auto-starts** essential servers (Playwright, Context7) with no configuration
 - **Dynamically provisions** new servers on-demand from a manifest of 25+
 - **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
@@ -61,6 +61,42 @@ Create/update `~/.claude/mcp.json`:
 
 That's it! PMCP auto-starts with Playwright and Context7 servers ready to use.
 
+### Other MCP Clients
+
+PMCP works with any MCP-compatible client. Below are configuration examples for popular clients.
+
+#### Codex CLI
+
+Create `~/.codex/mcp.json` (verify path in Codex documentation):
+
+```json
+{
+  "mcpServers": {
+    "gateway": {
+      "command": "pmcp",
+      "args": []
+    }
+  }
+}
+```
+
+#### Gemini CLI
+
+Create the appropriate config file (verify path in Gemini CLI documentation):
+
+```json
+{
+  "mcpServers": {
+    "gateway": {
+      "command": "pmcp",
+      "args": []
+    }
+  }
+}
+```
+
+> **Note**: Configuration paths and formats vary by client. Verify the exact location and format in each client's official documentation.
+
 ### Your First Interaction
 
 ```
@@ -86,7 +122,7 @@ Returns: Screenshot of google.com
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                          PMCP                               │
-│  • 9 meta-tools (catalog, invoke, provision, etc.)          │
+│  • 11 meta-tools (catalog, invoke, provision, etc.)         │
 │  • Progressive disclosure (compact cards → full schemas)    │
 │  • Policy enforcement (allow/deny lists)                    │
 └────────────────────────────┬────────────────────────────────┘
@@ -105,14 +141,14 @@ The gateway discovers and manages all other servers.
 
 ### Why Single-Gateway?
 
-1. **No context bloat** - Claude sees 9 tools, not 50+
+1. **No context bloat** - Claude sees 11 tools, not 50+
 2. **No restarts** - Provision new servers without restarting Claude Code
 3. **Consistent interface** - All tools accessed via `gateway.invoke`
 4. **Policy control** - Centralized allow/deny rules
 
 ## Gateway Tools
 
-The gateway exposes **9 meta-tools** organized into two categories:
+The gateway exposes **11 meta-tools** organized into three categories:
 
 ### Core Tools
 
@@ -132,6 +168,13 @@ The gateway exposes **9 meta-tools** organized into two categories:
 | `gateway.sync_environment` | Detect platform and available CLIs |
 | `gateway.provision` | Install and start MCP servers on-demand |
 | `gateway.provision_status` | Check installation progress |
+
+### Monitoring Tools
+
+| Tool | Purpose |
+|------|---------|
+| `gateway.list_pending` | List pending tool invocations with health status |
+| `gateway.cancel` | Cancel a pending tool invocation |
 
 ## Progressive Disclosure Workflow
 
@@ -180,6 +223,26 @@ gateway.invoke({
   arguments: { libraryId: "/npm/react/19.0.0" }
 })
 ```
+
+### Offline Tool Discovery
+
+When using `gateway.catalog_search`, you can discover tools from servers that haven't started yet:
+
+```json
+// Search all tools including offline/lazy servers
+gateway.catalog_search({
+  "query": "browser",
+  "include_offline": true
+})
+```
+
+This uses pre-cached tool descriptions from `.mcp-gateway/descriptions.yaml`. To refresh the cache:
+
+```bash
+pmcp refresh
+```
+
+**Note**: Cached tools show metadata only. Full schemas are available after the server starts (use `gateway.describe` to trigger lazy start).
 
 ## Dynamic Server Provisioning
 
@@ -392,6 +455,27 @@ pmcp refresh --force            # Force reconnect all
 
 # Initialize config (interactive)
 pmcp init
+```
+
+### Singleton Lock
+
+By default, PMCP uses a global lock at `~/.pmcp/gateway.lock` to ensure only one gateway runs per user. This prevents multiple gateway instances from spawning duplicate downstream servers.
+
+**Override the lock directory:**
+
+```bash
+# CLI flag
+pmcp --lock-dir /custom/path
+
+# Environment variable
+export PMCP_LOCK_DIR=/custom/path
+pmcp
+```
+
+**Per-project lock (not recommended):**
+
+```bash
+pmcp --lock-dir ./.mcp-gateway
 ```
 
 ## Docker

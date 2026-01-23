@@ -33,6 +33,10 @@ class MockClientManager:
     def is_server_online(self, name: str) -> bool:
         return name in self._online_servers
 
+    def is_lazy_server(self, name: str) -> bool:
+        """Mock: no servers are lazy by default."""
+        return False
+
     def set_server_online(self, name: str) -> None:
         self._online_servers.add(name)
 

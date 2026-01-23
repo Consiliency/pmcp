@@ -49,8 +49,13 @@ dev = [
 llm = [
     "baml-py>=0.215.0",
 ]
+http = [
+    "starlette>=0.27.0",
+    "uvicorn>=0.23.0",
+    "sse-starlette>=1.6.0",
+]
 all = [
-    "pmcp[dev,llm]",
+    "pmcp[dev,llm,http]",
 ]
 
 [project.scripts]

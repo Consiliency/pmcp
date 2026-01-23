@@ -49,7 +49,35 @@ def test_detect_platform():
 @pytest.mark.asyncio
 async def test_probe_clis_with_mocked_which():
     """Test CLI probing with mocked which."""
-    with patch("pmcp.manifest.environment.shutil.which") as mock_which:
+    from unittest.mock import MagicMock
+
+    # Mock subprocess to simulate version output
+    async def mock_create_subprocess(*args, **kwargs):
+        mock_process = MagicMock()
+        mock_process.returncode = 0
+
+        # Return appropriate version string based on command
+        cmd = args[0] if args else ""
+        if cmd == "git":
+            stdout = b"git version 2.43.0\n"
+        elif cmd == "docker":
+            stdout = b"Docker version 24.0.0\n"
+        else:
+            stdout = b"version 1.0.0\n"
+
+        async def communicate():
+            return stdout, b""
+
+        mock_process.communicate = communicate
+        return mock_process
+
+    with (
+        patch("pmcp.manifest.environment.shutil.which") as mock_which,
+        patch(
+            "pmcp.manifest.environment.asyncio.create_subprocess_exec",
+            side_effect=mock_create_subprocess,
+        ),
+    ):
         # Only git and docker are "installed"
         mock_which.side_effect = (
             lambda cmd: f"/usr/bin/{cmd}" if cmd in ("git", "docker") else None

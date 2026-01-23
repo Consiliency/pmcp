@@ -54,10 +54,17 @@ class GatewayServer:
         policy_path: Path | None = None,
         cache_dir: Path | None = None,
         guidance_config_path: Path | None = None,
+        host: str = "127.0.0.1",
+        port: int = 3344,
+        lock_dir: Path | str | None = None,
     ) -> None:
         self._project_root = project_root
         self._custom_config_path = custom_config_path
         self._cache_dir = cache_dir or Path(".mcp-gateway")
+        self._host = host
+        self._port = port
+        # Lock directory - None means use global default (~/.pmcp)
+        self._lock_dir: Path | None = Path(lock_dir) if lock_dir else None
 
         # Initialize policy manager
         self._policy_manager = PolicyManager(policy_path)
@@ -300,6 +307,8 @@ class GatewayServer:
             logger.info(
                 f"Loaded pre-built descriptions for {len(self._descriptions_cache.servers)} servers"
             )
+            # Update GatewayTools with loaded cache for offline discovery
+            self._gateway_tools._descriptions_cache = self._descriptions_cache
         else:
             logger.info("No pre-built descriptions cache found")
 
@@ -314,7 +323,11 @@ class GatewayServer:
         configs = filter_self_references(configs)
         seen_servers = {c.name for c in configs}
 
-        # Load manifest and add auto-start servers (if not already configured)
+        # These are LAZY configs - from .mcp.json, not auto-start
+        lazy_configs = list(configs)  # Copy for lazy registration
+
+        # Load manifest and get auto-start servers
+        auto_start_configs: list = []
         manifest = None
         disabled_auto_start = load_disabled_auto_start(
             project_root=self._project_root,
@@ -347,29 +360,35 @@ class GatewayServer:
                         )
                         continue
 
-                # Add manifest server to configs
-                configs.append(manifest_server_to_config(server))
+                # This is an AUTO-START config (manifest servers)
+                auto_start_configs.append(manifest_server_to_config(server))
                 seen_servers.add(server.name)
                 logger.info(f"Added auto-start server from manifest: {server.name}")
 
         except Exception as e:
             logger.warning(f"Failed to load manifest auto-start servers: {e}")
 
-        # Filter by policy
-        allowed_configs = [
-            c for c in configs if self._policy_manager.is_server_allowed(c.name)
+        # Filter by policy (both auto-start and lazy)
+        allowed_auto_start = [
+            c for c in auto_start_configs if self._policy_manager.is_server_allowed(c.name)
+        ]
+        allowed_lazy = [
+            c for c in lazy_configs if self._policy_manager.is_server_allowed(c.name)
         ]
 
-        if not allowed_configs:
-            logger.warning("No MCP servers configured or all blocked by policy")
-        else:
-            logger.info(f"Found {len(allowed_configs)} allowed server configs")
+        # Log what we're doing
+        logger.info(f"Auto-start servers: {len(allowed_auto_start)}")
+        logger.info(f"Lazy servers (on-demand): {len(allowed_lazy)}")
 
-        # Connect to all servers
-        errors = await self._client_manager.connect_all(allowed_configs)
+        # Register lazy configs FIRST (before connecting auto-start)
+        self._client_manager.register_lazy_configs(allowed_lazy)
 
-        if errors:
-            logger.warning(f"Some servers failed to connect: {len(errors)} errors")
+        # Connect ONLY auto-start servers eagerly
+        errors: list[str] = []
+        if allowed_auto_start:
+            errors = await self._client_manager.connect_all(allowed_auto_start)
+            if errors:
+                logger.warning(f"Some auto-start servers failed to connect: {len(errors)} errors")
 
         # Start health monitor for heartbeat tracking
         self._client_manager.start_health_monitor()
@@ -402,6 +421,8 @@ class GatewayServer:
                     cache_path=cache_path,
                     servers=connected_names,
                 )
+                # Update GatewayTools with newly generated cache
+                self._gateway_tools._descriptions_cache = self._descriptions_cache
                 logger.info(
                     f"Cached descriptions for {len(self._descriptions_cache.servers)} servers"
                 )
@@ -413,12 +434,24 @@ class GatewayServer:
         # Create MCP server with capability instructions
         self._create_server(instructions=self._capability_summary)
 
-    async def run(self) -> None:
-        """Run the MCP server (stdio transport)."""
+    async def run(self, transport: str = "stdio") -> None:
+        """Run the MCP server with specified transport.
+
+        Args:
+            transport: "stdio" (default) or "http"
+        """
+        if transport == "http":
+            await self._run_http()
+        else:
+            await self._run_stdio()
+
+    async def _run_stdio(self) -> None:
+        """Run with stdio transport (default behavior)."""
         from mcp.server.stdio import stdio_server
 
         # Acquire singleton lock to prevent multiple gateway instances
-        if not acquire_singleton_lock(self._cache_dir):
+        # Uses self._lock_dir (None = global lock at ~/.pmcp)
+        if not acquire_singleton_lock(self._lock_dir):
             logger.error(
                 "Another gateway instance is already running. "
                 "Only one gateway should run at a time to prevent recursive spawning."
@@ -432,12 +465,47 @@ class GatewayServer:
 
         try:
             async with stdio_server() as (read_stream, write_stream):
-                logger.info("MCP Gateway server started")
+                logger.info("MCP Gateway server started (stdio)")
                 await self._server.run(
                     read_stream,
                     write_stream,
                     self._server.create_initialization_options(),
                 )
+        finally:
+            await self.shutdown()
+
+    async def _run_http(self) -> None:
+        """Run with HTTP/SSE transport."""
+        import uvicorn
+
+        from pmcp.transport.http import create_http_app
+
+        # Acquire singleton lock to prevent multiple gateway instances
+        # Uses self._lock_dir (None = global lock at ~/.pmcp)
+        if not acquire_singleton_lock(self._lock_dir):
+            logger.error(
+                "Another gateway instance is already running. "
+                "Only one gateway should run at a time to prevent recursive spawning."
+            )
+            raise RuntimeError("Another gateway instance is already running")
+
+        await self.initialize()
+
+        if self._server is None:
+            raise RuntimeError("Server not initialized after initialization")
+
+        try:
+            app = create_http_app(self._server)
+            logger.info(f"MCP Gateway server started (http://{self._host}:{self._port})")
+
+            config = uvicorn.Config(
+                app,
+                host=self._host,
+                port=self._port,
+                log_level="warning",
+            )
+            server = uvicorn.Server(config)
+            await server.serve()
         finally:
             await self.shutdown()
 

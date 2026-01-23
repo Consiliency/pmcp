@@ -197,6 +197,7 @@ class ClientManager:
         self._resources: dict[str, ResourceInfo] = {}
         self._prompts: dict[str, PromptInfo] = {}
         self._servers: dict[str, ServerStatus] = {}
+        self._lazy_configs: dict[str, ResolvedServerConfig] = {}  # On-demand configs
         self._revision_id: str = _generate_revision_id()
         self._last_refresh_ts: float = time.time()
         self._max_tools_per_server = max_tools_per_server
@@ -236,6 +237,78 @@ class ClientManager:
         self._last_refresh_ts = time.time()
 
         return errors
+
+    def register_lazy_configs(self, configs: list[ResolvedServerConfig]) -> None:
+        """Register configs for lazy (on-demand) server connections.
+
+        These servers won't connect until first use via ensure_connected().
+
+        Args:
+            configs: List of server configurations to register for lazy start
+        """
+        for config in configs:
+            name = config.name
+            if name in self._clients:
+                logger.debug(f"Server {name} already connected, skipping lazy registration")
+                continue
+
+            self._lazy_configs[name] = config
+            # Create LAZY status entry so server appears in status listings
+            self._servers[name] = ServerStatus(
+                name=name,
+                status=ServerStatusEnum.LAZY,
+                tool_count=0,
+            )
+            logger.info(f"Registered lazy server: {name}")
+
+    async def ensure_connected(self, server_name: str) -> bool:
+        """Ensure a server is connected, triggering lazy-start if needed.
+
+        Args:
+            server_name: Name of the server to ensure is connected
+
+        Returns:
+            True if server is online, False if connection failed
+
+        Raises:
+            ValueError: If server is not registered (neither connected nor lazy)
+        """
+        # Already connected and online?
+        if self.is_server_online(server_name):
+            return True
+
+        # Check if it's a lazy server we can connect
+        if server_name not in self._lazy_configs:
+            # Not a lazy server - check if it exists at all
+            if server_name not in self._servers:
+                raise ValueError(f"Unknown server: {server_name}")
+            # Server exists but is offline/error - can't auto-reconnect
+            return False
+
+        # Trigger lazy connection
+        config = self._lazy_configs[server_name]
+        logger.info(f"Lazy-starting server: {server_name}")
+
+        try:
+            await self._connect_with_retry(config)
+            # Remove from lazy configs after successful connection
+            del self._lazy_configs[server_name]
+            return True
+        except Exception as e:
+            logger.error(f"Failed to lazy-start {server_name}: {e}")
+            # Update status to ERROR
+            if server_name in self._servers:
+                self._servers[server_name].status = ServerStatusEnum.ERROR
+                self._servers[server_name].last_error = str(e)
+            return False
+
+    def is_lazy_server(self, name: str) -> bool:
+        """Check if server is registered for lazy start but not yet connected."""
+        return name in self._lazy_configs
+
+    def get_lazy_server_names(self) -> list[str]:
+        """Get list of servers registered for lazy start."""
+        return list(self._lazy_configs.keys())
 
     async def _connect_with_retry(self, config: ResolvedServerConfig) -> None:
         """Connect to a server with exponential backoff retry."""

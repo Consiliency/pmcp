@@ -99,6 +99,30 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only show errors",
     )
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "http"],
+        default="stdio",
+        help="Transport mode (default: stdio)",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default="127.0.0.1",
+        help="HTTP bind address (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=3344,
+        help="HTTP port (default: 3344)",
+    )
+    parser.add_argument(
+        "--lock-dir",
+        type=Path,
+        default=None,
+        help="Directory for singleton lock file. Default: ~/.pmcp (global per-user lock)",
+    )
 
     # Refresh command
     refresh_parser = subparsers.add_parser(
@@ -609,6 +633,19 @@ async def run_server(args: argparse.Namespace) -> None:
     if os.environ.get("PMCP_LOG_LEVEL"):
         args.log_level = os.environ["PMCP_LOG_LEVEL"]
 
+    # Transport environment overrides
+    if os.environ.get("PMCP_TRANSPORT"):
+        args.transport = os.environ["PMCP_TRANSPORT"]
+    if os.environ.get("PMCP_HOST"):
+        args.host = os.environ["PMCP_HOST"]
+    if os.environ.get("PMCP_PORT"):
+        args.port = int(os.environ["PMCP_PORT"])
+
+    # Lock directory - CLI flag takes precedence over env var
+    lock_dir = getattr(args, "lock_dir", None)
+    if not lock_dir and os.environ.get("PMCP_LOCK_DIR"):
+        lock_dir = Path(os.environ["PMCP_LOCK_DIR"])
+
     # Determine log level
     if args.debug:
         log_level = "debug"
@@ -626,6 +663,9 @@ async def run_server(args: argparse.Namespace) -> None:
         project_root=args.project,
         custom_config_path=args.config,
         policy_path=args.policy,
+        host=args.host,
+        port=args.port,
+        lock_dir=lock_dir,
     )
 
     # Handle graceful shutdown
@@ -641,7 +681,7 @@ async def run_server(args: argparse.Namespace) -> None:
 
     try:
         # Run server with shutdown handling
-        server_task = asyncio.create_task(server.run())
+        server_task = asyncio.create_task(server.run(transport=args.transport))
         shutdown_task = asyncio.create_task(shutdown_event.wait())
 
         done, pending = await asyncio.wait(

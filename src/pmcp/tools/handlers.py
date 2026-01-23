@@ -37,6 +37,7 @@ from pmcp.types import (
     CatalogSearchInput,
     CatalogSearchOutput,
     DescribeInput,
+    DescriptionsCache,
     HealthOutput,
     InvokeInput,
     InvokeOutput,
@@ -50,10 +51,12 @@ from pmcp.types import (
     ProvisionStatusInput,
     RefreshInput,
     RefreshOutput,
+    RiskHint,
     SchemaCard,
     ServerHealthInfo,
     SyncEnvironmentInput,
     SyncEnvironmentOutput,
+    ToolInfo,
 )
 
 logger = logging.getLogger(__name__)
@@ -345,30 +348,115 @@ class GatewayTools:
         project_root: Path | None = None,
         custom_config_path: Path | None = None,
         guidance_config: GuidanceConfig | None = None,
+        descriptions_cache: DescriptionsCache | None = None,
     ) -> None:
         self._client_manager = client_manager
         self._policy_manager = policy_manager
         self._project_root = project_root
         self._custom_config_path = custom_config_path
         self._guidance_config = guidance_config
+        self._descriptions_cache = descriptions_cache
         self._detected_clis: set[str] | None = None
         self._platform: str | None = None
+
+    async def _ensure_server_for_tool(self, tool_id: str) -> bool:
+        """Ensure server is connected for a tool, triggering lazy-start if needed.
+
+        Args:
+            tool_id: Tool ID in format "server::tool_name"
+
+        Returns:
+            True if server is ready, False if connection failed
+        """
+        # Parse server name from tool_id
+        if "::" not in tool_id:
+            return False
+        server_name = tool_id.split("::")[0]
+
+        # Check if server needs lazy-start
+        if self._client_manager.is_lazy_server(server_name):
+            logger.info(f"Triggering lazy-start for server: {server_name}")
+            return await self._client_manager.ensure_connected(server_name)
+
+        # Server is either online or in error state
+        return self._client_manager.is_server_online(server_name)
+
+    def _get_cached_tools_for_offline_servers(self) -> list[ToolInfo]:
+        """Get tool info from cache for servers that are not currently online.
+
+        Returns ToolInfo objects for offline servers so they can be
+        included in catalog_search results when include_offline=True.
+        """
+        if not self._descriptions_cache:
+            return []
+
+        cached_tools: list[ToolInfo] = []
+
+        for server_name, server_desc in self._descriptions_cache.servers.items():
+            # Skip servers that are already online (live tools take precedence)
+            if self._client_manager.is_server_online(server_name):
+                continue
+
+            # Check policy allows this server
+            if not self._policy_manager.is_server_allowed(server_name):
+                continue
+
+            # Convert cached PrebuiltToolInfo to ToolInfo
+            for tool in server_desc.tools:
+                tool_id = f"{server_name}::{tool.name}"
+
+                # Check policy allows this tool
+                if not self._policy_manager.is_tool_allowed(tool_id):
+                    continue
+
+                # Convert risk_hint string to RiskHint enum
+                risk = RiskHint.UNKNOWN
+                if tool.risk_hint == "low":
+                    risk = RiskHint.LOW
+                elif tool.risk_hint == "medium":
+                    risk = RiskHint.MEDIUM
+                elif tool.risk_hint == "high":
+                    risk = RiskHint.HIGH
+
+                cached_tools.append(ToolInfo(
+                    tool_id=tool_id,
+                    server_name=server_name,
+                    tool_name=tool.name,
+                    description=tool.description,
+                    short_description=tool.short_description,
+                    tags=tool.tags,
+                    risk_hint=risk,
+                    input_schema={},  # Not available in cache
+                ))
+
+        return cached_tools
 
     async def catalog_search(self, input_data: dict[str, Any]) -> CatalogSearchOutput:
         """gateway.catalog_search - Search for available tools."""
         parsed = CatalogSearchInput.model_validate(input_data)
 
         tools = self._client_manager.get_all_tools()
-        total_available = len(tools)
 
         # Filter by policy
         tools = [t for t in tools if self._policy_manager.is_tool_allowed(t.tool_id)]
 
-        # Filter by server online status
-        if not parsed.include_offline:
+        # Filter by server online status OR merge cached tools
+        if parsed.include_offline:
+            # Merge cached tools for offline servers
+            cached_tools = self._get_cached_tools_for_offline_servers()
+            # Build set of existing tool_ids to avoid duplicates
+            existing_ids = {t.tool_id for t in tools}
+            # Add cached tools that aren't already present
+            for ct in cached_tools:
+                if ct.tool_id not in existing_ids:
+                    tools.append(ct)
+        else:
+            # Default: only online servers
             tools = [
                 t for t in tools if self._client_manager.is_server_online(t.server_name)
             ]
+
+        total_available = len(tools)
 
         # Filter by server name
         if parsed.filters and parsed.filters.server:
@@ -454,11 +542,22 @@ class GatewayTools:
         parsed = DescribeInput.model_validate(input_data)
 
         tool_info = self._client_manager.get_tool(parsed.tool_id)
+
         if not tool_info:
-            raise GatewayException(
-                ErrorCode.E301_TOOL_NOT_FOUND,
-                details={"tool_id": parsed.tool_id},
-            )
+            # Tool not in registry - check if from lazy server
+            if "::" in parsed.tool_id:
+                server_name = parsed.tool_id.split("::")[0]
+                if self._client_manager.is_lazy_server(server_name):
+                    # Connect server to get tool info
+                    connected = await self._ensure_server_for_tool(parsed.tool_id)
+                    if connected:
+                        tool_info = self._client_manager.get_tool(parsed.tool_id)
+
+            if not tool_info:
+                raise GatewayException(
+                    ErrorCode.E301_TOOL_NOT_FOUND,
+                    details={"tool_id": parsed.tool_id},
+                )
 
         if not self._policy_manager.is_tool_allowed(parsed.tool_id):
             raise GatewayException(
@@ -529,20 +628,35 @@ class GatewayTools:
         """gateway.invoke - Call a downstream tool."""
         parsed = InvokeInput.model_validate(input_data)
 
+        # Check if tool exists in registry
         tool_info = self._client_manager.get_tool(parsed.tool_id)
-        if not tool_info:
-            error = make_error(
-                ErrorCode.E301_TOOL_NOT_FOUND,
-                tool_id=parsed.tool_id,
-            )
-            return InvokeOutput(
-                tool_id=parsed.tool_id,
-                ok=False,
-                truncated=False,
-                raw_size_estimate=0,
-                errors=[error.model_dump_json()],
-            )
 
+        if not tool_info:
+            # Tool not in registry - check if it might be from a lazy server
+            # that hasn't connected yet (no tools indexed)
+            if "::" in parsed.tool_id:
+                server_name = parsed.tool_id.split("::")[0]
+                if self._client_manager.is_lazy_server(server_name):
+                    # Try to connect the lazy server first
+                    connected = await self._ensure_server_for_tool(parsed.tool_id)
+                    if connected:
+                        # Re-check for tool after connection
+                        tool_info = self._client_manager.get_tool(parsed.tool_id)
+
+            if not tool_info:
+                error = make_error(
+                    ErrorCode.E301_TOOL_NOT_FOUND,
+                    tool_id=parsed.tool_id,
+                )
+                return InvokeOutput(
+                    tool_id=parsed.tool_id,
+                    ok=False,
+                    truncated=False,
+                    raw_size_estimate=0,
+                    errors=[error.model_dump_json()],
+                )
+
+        # Check policy
         if not self._policy_manager.is_tool_allowed(parsed.tool_id):
             error = make_error(
                 ErrorCode.E402_TOOL_DENIED,
