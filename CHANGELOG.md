@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2025-01-23
+
+### Added
+
+- **Advanced LLM Features Documentation**: Comprehensive README section explaining optional Groq-powered capabilities
+  - Semantic capability matching (vs keyword fallback)
+  - LLM-generated tool summaries (vs static templates)
+  - Dynamic code snippet generation
+  - Step-by-step setup guide with Groq API key
+
+- **Progressive Disclosure Integration Tests**: New test suite (`test_progressive_disclosure.py`)
+  - Tests for all 8 workflow scenarios (Context7 + Playwright)
+  - Coverage for search → describe → invoke workflow
+  - Verification of naive prompt tool discovery
+
+### Changed
+
+- **Installation instructions**: Updated to prioritize `uv` as recommended package manager
+- **baml-py dependency**: Updated to 0.215.2 for BAML compatibility
+
+### Fixed
+
+- BAML client version mismatch that prevented LLM features from working
+
 ## [1.1.0] - 2025-12-30
 
 ### Added

@@ -31,18 +31,48 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 ### Installation
 
 ```bash
-# With pip
-pip install pmcp
-
 # With uv (recommended)
 uv pip install pmcp
 
-# Or run directly with uvx
+# Or run directly without installing
 uvx pmcp
 
-# With LLM capability matching (optional)
-pip install pmcp[llm]
+# With pip
+pip install pmcp
+
+# With LLM-enhanced features (optional, see below)
+uv pip install pmcp[llm]
 ```
+
+### Advanced LLM Features (Optional)
+
+PMCP can use an LLM for smarter capability matching and summarization. Without an API key, it falls back to keyword matching and templates.
+
+**Features enabled with LLM:**
+
+| Feature | Without API Key | With API Key |
+|---------|-----------------|--------------|
+| Capability matching | Keyword-based | Semantic understanding |
+| Tool summaries | Static templates | LLM-generated descriptions |
+| Code snippets | Static examples | Dynamic, context-aware examples |
+
+**Setup:**
+
+1. Get a free API key from [Groq Console](https://console.groq.com/keys)
+2. Add to your `.env` file:
+
+```bash
+# In your project's .env file (or ~/.env)
+GROQ_API_KEY=gsk_your_groq_api_key_here
+```
+
+3. Install with LLM support:
+
+```bash
+uv pip install pmcp[llm]
+```
+
+PMCP uses [BAML](https://docs.boundaryml.com/) with Groq's fast inference API for sub-second LLM responses. The LLM features are entirely optional - PMCP works fully without them.
 
 ### Configure Claude Code
 
