@@ -51,6 +51,9 @@ Thumbs.db
 .env.local
 .env.*.local
 
+# MCP config (contains API keys)
+.mcp.json
+
 # BAML generated client
 src/mcp_gateway/baml_client/
 data.db
