@@ -106,10 +106,10 @@ def template_summary(tools: list[ToolInfo], include_code_guidance: bool = True) 
     # L0: Code execution philosophy (ultra-terse, ~25-35 tokens)
     if include_code_guidance:
         lines.append("")
+        lines.append("Workflow: catalog_search → describe → invoke.")
         lines.append(
-            "Write code to orchestrate tools - use loops, filters, conditionals."
+            "Need a capability not listed? Use gateway_request_capability to find or provision tools."
         )
-        lines.append("Search → describe → invoke via code execution.")
 
     lines.append("")
     lines.append("Available capabilities:")

@@ -50,7 +50,11 @@ def get_prebuilt_summary(
             if line.strip():
                 lines.append(line.strip())
 
-    lines.append("\nUse gateway.catalog_search to explore tools.")
+    lines.append("")
+    lines.append("Workflow: catalog_search → describe → invoke.")
+    lines.append("Need a capability not listed? Use gateway_request_capability to find or provision tools.")
+    lines.append("")
+    lines.append("Use gateway.catalog_search to explore tools.")
     return "\n".join(lines)
 
 
