@@ -138,6 +138,31 @@ class TestTemplateSummary:
         assert "3 tools" in summary
 
 
+class TestTemplateSummaryCustomInstructions:
+    """Tests for custom_instructions in template_summary."""
+
+    def test_uses_custom_instructions_when_provided(self) -> None:
+        tools = [make_tool("server", "tool")]
+        custom = "Custom workflow: search -> invoke.\nUse Context7 for docs."
+        summary = template_summary(tools, custom_instructions=custom)
+        assert "Custom workflow: search -> invoke." in summary
+        assert "Use Context7 for docs." in summary
+        # Default guidance should NOT appear
+        assert "catalog_search → describe → invoke" not in summary
+
+    def test_uses_default_guidance_without_custom(self) -> None:
+        tools = [make_tool("server", "tool")]
+        summary = template_summary(tools, custom_instructions=None)
+        assert "Workflow: catalog_search" in summary
+        assert "gateway_request_capability" in summary
+
+    def test_no_guidance_when_disabled(self) -> None:
+        tools = [make_tool("server", "tool")]
+        summary = template_summary(tools, include_code_guidance=False, custom_instructions="Ignored text")
+        assert "Ignored text" not in summary
+        assert "Workflow:" not in summary
+
+
 class TestGenerateCapabilitySummary:
     """Tests for main generate_capability_summary function."""
 
@@ -160,6 +185,23 @@ class TestGenerateCapabilitySummary:
         summary = await generate_capability_summary(tools, use_llm=True)
         # Should still generate something (either LLM or template fallback)
         assert len(summary) > 0
+
+    @pytest.mark.asyncio
+    async def test_passes_custom_instructions_to_template(self) -> None:
+        tools = [make_tool("server", "tool")]
+        custom = "My custom instructions."
+        summary = await generate_capability_summary(
+            tools, use_llm=False, custom_instructions=custom
+        )
+        assert "My custom instructions." in summary
+
+    @pytest.mark.asyncio
+    async def test_disables_guidance_when_flag_false(self) -> None:
+        tools = [make_tool("server", "tool")]
+        summary = await generate_capability_summary(
+            tools, use_llm=False, include_code_guidance=False
+        )
+        assert "Workflow:" not in summary
 
 
 class TestGetPrebuiltSummary:

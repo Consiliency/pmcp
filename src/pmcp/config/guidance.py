@@ -51,6 +51,10 @@ class GuidanceConfig(BaseModel):
         ),
     )
     layers: GuidanceLayers = Field(default_factory=GuidanceLayers)
+    custom_instructions: str | None = Field(
+        default=None,
+        description="Custom L0 text replacing default workflow guidance. Capabilities list still auto-generated.",
+    )
     max_hint_length: int = Field(
         default=8, description="Maximum characters for L1 code hints"
     )

@@ -5,7 +5,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # === Transport Types ===
 
@@ -28,6 +28,8 @@ class McpServerConfig(BaseModel):
 
 class McpConfigFile(BaseModel):
     """Structure of .mcp.json files."""
+
+    model_config = ConfigDict(extra="ignore")
 
     mcpServers: dict[str, McpServerConfig] = Field(default_factory=dict)
     disableAutoStart: list[str] = Field(default_factory=list)

@@ -465,3 +465,64 @@ class TestGuidanceConfigEdgeCases:
         )
         # "minimal" level should keep snippets OFF
         assert config.layers.code_snippets is False
+
+
+class TestCustomInstructions:
+    """Tests for custom_instructions field."""
+
+    def test_default_is_none(self) -> None:
+        config = GuidanceConfig()
+        assert config.custom_instructions is None
+
+    def test_accepts_string(self) -> None:
+        config = GuidanceConfig(custom_instructions="Custom workflow text.")
+        assert config.custom_instructions == "Custom workflow text."
+
+    def test_loads_from_yaml(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "guidance.yaml"
+        config_file.write_text(
+            yaml.dump(
+                {
+                    "guidance": {
+                        "level": "minimal",
+                        "custom_instructions": "Use Context7 for docs.\nUse gateway_provision for new servers.",
+                    }
+                }
+            )
+        )
+        config = load_guidance_config(config_file)
+        assert config.custom_instructions is not None
+        assert "Context7" in config.custom_instructions
+
+    def test_none_when_not_in_yaml(self, tmp_path: Path) -> None:
+        config_file = tmp_path / "guidance.yaml"
+        config_file.write_text(yaml.dump({"guidance": {"level": "minimal"}}))
+        config = load_guidance_config(config_file)
+        assert config.custom_instructions is None
+
+
+class TestMcpConfigFileExtraFields:
+    """Tests for McpConfigFile tolerating extra fields."""
+
+    def test_ignores_warning_field(self) -> None:
+        from pmcp.types import McpConfigFile
+
+        data = {
+            "_WARNING": "Do not add gateway here",
+            "mcpServers": {},
+        }
+        config = McpConfigFile.model_validate(data)
+        assert config.mcpServers == {}
+
+    def test_ignores_arbitrary_extra_fields(self) -> None:
+        from pmcp.types import McpConfigFile
+
+        data = {
+            "_comment": "Some comment",
+            "extraField": 42,
+            "mcpServers": {"test": {"command": "echo"}},
+            "disableAutoStart": ["playwright"],
+        }
+        config = McpConfigFile.model_validate(data)
+        assert "test" in config.mcpServers
+        assert config.disableAutoStart == ["playwright"]

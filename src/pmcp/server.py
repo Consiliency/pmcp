@@ -405,7 +405,10 @@ class GatewayServer:
         # Try pre-built cache first, then LLM, then template
         logger.info("Generating capability summary...")
         self._capability_summary = await generate_capability_summary(
-            tools, cache=self._descriptions_cache
+            tools,
+            cache=self._descriptions_cache,
+            include_code_guidance=self._guidance_config.include_mcp_instructions,
+            custom_instructions=self._guidance_config.custom_instructions,
         )
 
         # If no cache and we have tools, auto-generate cache for next time

@@ -74,14 +74,17 @@ def group_by_server(tools: list[ToolInfo]) -> dict[str, list[ToolInfo]]:
     return dict(by_server)
 
 
-def template_summary(tools: list[ToolInfo], include_code_guidance: bool = True) -> str:
+def template_summary(
+    tools: list[ToolInfo],
+    include_code_guidance: bool = True,
+    custom_instructions: str | None = None,
+) -> str:
     """Generate a simple template-based capability summary.
 
     Output format:
     MCP Gateway: Progressive tool discovery
 
-    Write code to orchestrate tools - use loops, filters, conditionals.
-    Search → describe → invoke via code execution.
+    <workflow guidance or custom instructions>
 
     Available capabilities:
     • server_name (N tools): capability1, capability2, capability3
@@ -91,7 +94,8 @@ def template_summary(tools: list[ToolInfo], include_code_guidance: bool = True) 
 
     Args:
         tools: List of tool info from connected servers
-        include_code_guidance: If True, include L0 code execution philosophy (default: True)
+        include_code_guidance: If True, include L0 workflow guidance (default: True)
+        custom_instructions: If set, replaces default workflow guidance lines
     """
     if not tools:
         return (
@@ -103,13 +107,17 @@ def template_summary(tools: list[ToolInfo], include_code_guidance: bool = True) 
 
     lines = ["MCP Gateway: Progressive tool discovery"]
 
-    # L0: Code execution philosophy (ultra-terse, ~25-35 tokens)
+    # L0: Workflow guidance (custom or default)
     if include_code_guidance:
         lines.append("")
-        lines.append("Workflow: catalog_search → describe → invoke.")
-        lines.append(
-            "Need a capability not listed? Use gateway_request_capability to find or provision tools."
-        )
+        if custom_instructions:
+            for line in custom_instructions.strip().splitlines():
+                lines.append(line.rstrip())
+        else:
+            lines.append("Workflow: catalog_search → describe → invoke.")
+            lines.append(
+                "Need a capability not listed? Use gateway_request_capability to find or provision tools."
+            )
 
     lines.append("")
     lines.append("Available capabilities:")
