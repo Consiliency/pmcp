@@ -19,12 +19,16 @@ logger = logging.getLogger(__name__)
 def get_prebuilt_summary(
     tools: list[ToolInfo],
     cache: DescriptionsCache | None = None,
+    include_code_guidance: bool = True,
+    custom_instructions: str | None = None,
 ) -> str | None:
     """Try to build summary from pre-built cache.
 
     Args:
         tools: List of tools (to get server names)
         cache: Pre-built descriptions cache
+        include_code_guidance: Whether to include L0 workflow guidance
+        custom_instructions: Custom L0 text replacing default workflow guidance
 
     Returns:
         Summary string if all servers found in cache, None otherwise
@@ -50,7 +54,17 @@ def get_prebuilt_summary(
             if line.strip():
                 lines.append(line.strip())
 
-    lines.append("\nUse gateway.catalog_search to explore tools.")
+    if include_code_guidance:
+        lines.append("")
+        if custom_instructions:
+            for line in custom_instructions.strip().splitlines():
+                lines.append(line.rstrip())
+        else:
+            lines.append("Workflow: catalog_search → describe → invoke.")
+            lines.append("Need a capability not listed? Use gateway_request_capability to find or provision tools.")
+
+    lines.append("")
+    lines.append("Use gateway.catalog_search to explore tools.")
     return "\n".join(lines)
 
 
@@ -58,6 +72,8 @@ async def generate_capability_summary(
     tools: list[ToolInfo],
     use_llm: bool = True,
     cache: DescriptionsCache | None = None,
+    include_code_guidance: bool = True,
+    custom_instructions: str | None = None,
 ) -> str:
     """Generate a capability summary for MCP tools.
 
@@ -70,6 +86,8 @@ async def generate_capability_summary(
         tools: List of tools to summarize
         use_llm: Whether to attempt LLM summarization (default True)
         cache: Pre-built descriptions cache
+        include_code_guidance: Whether to include L0 workflow guidance
+        custom_instructions: Custom L0 text replacing default workflow guidance
 
     Returns:
         Human-readable capability summary for MCP instructions
@@ -82,7 +100,11 @@ async def generate_capability_summary(
 
     # 1. Try pre-built cache first
     if cache:
-        prebuilt = get_prebuilt_summary(tools, cache)
+        prebuilt = get_prebuilt_summary(
+            tools, cache,
+            include_code_guidance=include_code_guidance,
+            custom_instructions=custom_instructions,
+        )
         if prebuilt:
             logger.info("Using pre-built capability summary from cache")
             return prebuilt
@@ -106,4 +128,8 @@ async def generate_capability_summary(
 
     # 3. Fall back to template-based summary
     logger.info("Generating template-based capability summary")
-    return template_summary(tools)
+    return template_summary(
+        tools,
+        include_code_guidance=include_code_guidance,
+        custom_instructions=custom_instructions,
+    )

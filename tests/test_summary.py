@@ -9,8 +9,8 @@ from pmcp.summary.template_fallback import (
     group_by_server,
     template_summary,
 )
-from pmcp.summary.generator import generate_capability_summary
-from pmcp.types import RiskHint, ToolInfo
+from pmcp.summary.generator import generate_capability_summary, get_prebuilt_summary
+from pmcp.types import DescriptionsCache, GeneratedServerDescriptions, RiskHint, ToolInfo
 
 
 def make_tool(
@@ -116,8 +116,9 @@ class TestTemplateSummary:
         ]
         summary = template_summary(tools)
 
-        # Format changed with L0 guidance
         assert "MCP Gateway:" in summary
+        assert "Workflow:" in summary
+        assert "gateway_request_capability" in summary
         assert "playwright" in summary
         assert "context7" in summary
         assert "gateway.catalog_search" in summary
@@ -135,6 +136,31 @@ class TestTemplateSummary:
         ]
         summary = template_summary(tools)
         assert "3 tools" in summary
+
+
+class TestTemplateSummaryCustomInstructions:
+    """Tests for custom_instructions in template_summary."""
+
+    def test_uses_custom_instructions_when_provided(self) -> None:
+        tools = [make_tool("server", "tool")]
+        custom = "Custom workflow: search -> invoke.\nUse Context7 for docs."
+        summary = template_summary(tools, custom_instructions=custom)
+        assert "Custom workflow: search -> invoke." in summary
+        assert "Use Context7 for docs." in summary
+        # Default guidance should NOT appear
+        assert "catalog_search → describe → invoke" not in summary
+
+    def test_uses_default_guidance_without_custom(self) -> None:
+        tools = [make_tool("server", "tool")]
+        summary = template_summary(tools, custom_instructions=None)
+        assert "Workflow: catalog_search" in summary
+        assert "gateway_request_capability" in summary
+
+    def test_no_guidance_when_disabled(self) -> None:
+        tools = [make_tool("server", "tool")]
+        summary = template_summary(tools, include_code_guidance=False, custom_instructions="Ignored text")
+        assert "Ignored text" not in summary
+        assert "Workflow:" not in summary
 
 
 class TestGenerateCapabilitySummary:
@@ -159,3 +185,68 @@ class TestGenerateCapabilitySummary:
         summary = await generate_capability_summary(tools, use_llm=True)
         # Should still generate something (either LLM or template fallback)
         assert len(summary) > 0
+
+    @pytest.mark.asyncio
+    async def test_passes_custom_instructions_to_template(self) -> None:
+        tools = [make_tool("server", "tool")]
+        custom = "My custom instructions."
+        summary = await generate_capability_summary(
+            tools, use_llm=False, custom_instructions=custom
+        )
+        assert "My custom instructions." in summary
+
+    @pytest.mark.asyncio
+    async def test_disables_guidance_when_flag_false(self) -> None:
+        tools = [make_tool("server", "tool")]
+        summary = await generate_capability_summary(
+            tools, use_llm=False, include_code_guidance=False
+        )
+        assert "Workflow:" not in summary
+
+
+class TestGetPrebuiltSummary:
+    """Tests for get_prebuilt_summary function."""
+
+    def test_includes_workflow_hint(self) -> None:
+        tools = [
+            make_tool("playwright", "navigate", "Navigate to URL"),
+            make_tool("context7", "search_docs", "Search documentation"),
+        ]
+        cache = DescriptionsCache(
+            generated_at="2025-01-01T00:00:00Z",
+            gateway_version="0.1.0",
+            servers={
+                "playwright": GeneratedServerDescriptions(
+                    package="@playwright/mcp",
+                    version="0.1.0",
+                    generated_at="2025-01-01T00:00:00Z",
+                    capability_summary="• Playwright (1 tools): browser",
+                    tools=[],
+                ),
+                "context7": GeneratedServerDescriptions(
+                    package="context7-mcp",
+                    version="0.1.0",
+                    generated_at="2025-01-01T00:00:00Z",
+                    capability_summary="• Context7 (1 tools): docs",
+                    tools=[],
+                ),
+            },
+        )
+        summary = get_prebuilt_summary(tools, cache)
+        assert summary is not None
+        assert "Workflow:" in summary
+        assert "gateway_request_capability" in summary
+        assert "gateway.catalog_search" in summary
+
+    def test_returns_none_without_cache(self) -> None:
+        tools = [make_tool("server", "tool")]
+        assert get_prebuilt_summary(tools, None) is None
+
+    def test_returns_none_with_missing_server(self) -> None:
+        tools = [make_tool("missing_server", "tool")]
+        cache = DescriptionsCache(
+            generated_at="2025-01-01T00:00:00Z",
+            gateway_version="0.1.0",
+            servers={},
+        )
+        assert get_prebuilt_summary(tools, cache) is None
