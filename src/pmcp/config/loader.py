@@ -49,6 +49,26 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
             return None
         content = file_path.read_text()
         data = json.loads(content)
+
+        # Some MCP clients support remote entries like {"type": "sse", "url": "..."}
+        # without a local command. PMCP only loads local command-based downstream
+        # servers from discovered config files, so skip non-command entries.
+        raw_servers = data.get("mcpServers")
+        if isinstance(raw_servers, dict):
+            filtered_servers = {
+                name: config
+                for name, config in raw_servers.items()
+                if isinstance(config, dict)
+                and isinstance(config.get("command"), str)
+                and config.get("command")
+            }
+            skipped_count = len(raw_servers) - len(filtered_servers)
+            if skipped_count > 0:
+                logger.info(
+                    f"Skipping {skipped_count} non-command MCP entries in {file_path}"
+                )
+            data["mcpServers"] = filtered_servers
+
         return McpConfigFile.model_validate(data)
     except Exception as e:
         logger.warning(f"Failed to parse config file {file_path}: {e}")

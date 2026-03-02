@@ -132,3 +132,27 @@ class TestLoadConfigs:
 
         assert configs[0].config.command == str(tmp_path / "bin" / "server")
         assert configs[0].config.cwd == str(tmp_path / "data")
+
+    def test_ignores_non_command_remote_entries(self, tmp_path: Path) -> None:
+        project_config = {
+            "mcpServers": {
+                "gateway": {
+                    "type": "sse",
+                    "url": "http://127.0.0.1:3344/sse",
+                },
+                "local": {
+                    "command": "node",
+                    "args": ["server.js"],
+                },
+            }
+        }
+        (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+
+        configs = load_configs(
+            project_root=tmp_path,
+            user_config_paths=[],
+        )
+
+        assert len(configs) == 1
+        assert configs[0].name == "local"
+        assert configs[0].config.command == "node"
