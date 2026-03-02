@@ -76,7 +76,7 @@ PMCP uses [BAML](https://docs.boundaryml.com/) with Groq's fast inference API fo
 
 ### Configure Claude Code
 
-Create/update `~/.claude/mcp.json`:
+Create/update your Claude MCP config (commonly `~/.mcp.json`):
 
 ```json
 {
@@ -90,6 +90,32 @@ Create/update `~/.claude/mcp.json`:
 ```
 
 That's it! PMCP auto-starts with Playwright and Context7 servers ready to use.
+
+### Shared Service Mode (Recommended for multi-client setups)
+
+If you use PMCP from multiple clients/sessions, run one shared PMCP service and point clients to SSE.
+
+Claude config example:
+
+```json
+{
+  "mcpServers": {
+    "gateway": {
+      "type": "sse",
+      "url": "http://127.0.0.1:3344/sse"
+    }
+  }
+}
+```
+
+Why this mode: PMCP uses a singleton lock (`~/.pmcp/gateway.lock`), so multiple local launches can conflict. One shared service avoids lock collisions and keeps tool state consistent.
+
+Quick verification:
+
+```bash
+systemctl --user is-active pmcp
+curl -sS -D - http://127.0.0.1:3344/sse -o /dev/null
+```
 
 ### Other MCP Clients
 
@@ -432,8 +458,34 @@ For MCP servers not in the manifest, add them to `~/.mcp.json`:
 }
 ```
 
+PMCP only loads command-based downstream entries from discovered config files. Remote client entries (for example `{ "type": "sse", "url": "..." }`) are ignored for downstream server loading.
+
 **Important**: Don't add `pmcp` itself to this file. PMCP is configured
-in Claude Code's config (`~/.claude/mcp.json`), not in the downstream server list.
+in your MCP client config, not in the downstream server list.
+
+### User-Scoped Credentials (systemd service)
+
+If PMCP runs as a user service, set API keys in `~/.config/pmcp/pmcp.env` so all sessions/apps share the same credentials.
+
+Example:
+
+```bash
+mkdir -p ~/.config/pmcp
+chmod 700 ~/.config/pmcp
+cat > ~/.config/pmcp/pmcp.env <<'EOF'
+API_TOKEN=your-bright-data-token
+WEB_UNLOCKER_ZONE=optional-zone
+BROWSER_ZONE=optional-zone
+PRO_MODE=optional
+GROUPS=optional
+TOOLS=optional
+EOF
+chmod 600 ~/.config/pmcp/pmcp.env
+systemctl --user daemon-reload
+systemctl --user restart pmcp
+```
+
+Note: service environment is separate from your interactive shell environment.
 
 ### Policy File
 
@@ -507,6 +559,14 @@ pmcp
 ```bash
 pmcp --lock-dir ./.mcp-gateway
 ```
+
+## Deprecations
+
+- `mcp-gateway` command naming is deprecated in documentation and examples.
+- Use `pmcp` for all CLI commands going forward.
+- Migration examples:
+  - `mcp-gateway refresh --force` -> `pmcp refresh --force`
+  - `mcp-gateway status --json` -> `pmcp status --json`
 
 ## Docker
 

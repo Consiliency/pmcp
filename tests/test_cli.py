@@ -144,6 +144,16 @@ class TestParseArgs:
         assert args.pending is True
         assert args.verbose is True
 
+    def test_version_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        """Test --version output uses pmcp naming."""
+        with patch("sys.argv", ["pmcp", "--version"]):
+            with pytest.raises(SystemExit) as exc_info:
+                parse_args()
+
+        assert exc_info.value.code == 0
+        output = capsys.readouterr().out
+        assert output.startswith("pmcp ")
+
 
 class TestSetupLogging:
     """Tests for logging setup."""

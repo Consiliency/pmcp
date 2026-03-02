@@ -79,6 +79,18 @@ class TestCLILockDirFlag:
             "CLI help should mention lock functionality"
         )
 
+    def test_cli_help_includes_examples_and_env_overrides(self) -> None:
+        """Top-level help should include usage examples and env vars."""
+        result = subprocess.run(
+            [sys.executable, "-m", "pmcp", "--help"],
+            capture_output=True,
+            text=True,
+        )
+
+        assert "Examples:" in result.stdout
+        assert "pmcp refresh --force" in result.stdout
+        assert "PMCP_CONFIG" in result.stdout
+
     def test_lock_dir_env_var_recognized(self) -> None:
         """PMCP_LOCK_DIR environment variable should be documented in CLI."""
         # The env var support is verified by checking the parse_args implementation

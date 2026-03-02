@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import importlib.metadata
 import logging
 import os
 import signal
@@ -34,7 +35,7 @@ def setup_logging(level: str, log_to_file: bool = True) -> None:
         stream=sys.stderr,
     )
 
-    # Also log to file for later viewing with 'mcp-gateway logs'
+    # Also log to file for later viewing with 'pmcp logs'
     if log_to_file:
         try:
             LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -55,9 +56,21 @@ def setup_logging(level: str, log_to_file: bool = True) -> None:
 
 def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
+    examples = """Examples:
+  pmcp
+  pmcp --transport http --host 127.0.0.1 --port 3344
+  pmcp status --json
+  pmcp refresh --force
+
+Environment overrides:
+  PMCP_CONFIG, PMCP_POLICY, PMCP_LOG_LEVEL,
+  PMCP_TRANSPORT, PMCP_HOST, PMCP_PORT, PMCP_LOCK_DIR
+"""
+
     parser = argparse.ArgumentParser(
         description="PMCP - Progressive MCP: Minimal context bloat with on-demand tool discovery",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=examples,
     )
 
     # Create subparsers for commands
@@ -122,6 +135,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=None,
         help="Directory for singleton lock file. Default: ~/.pmcp (global per-user lock)",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"pmcp {importlib.metadata.version('pmcp')}",
     )
 
     # Refresh command
@@ -304,7 +322,7 @@ async def run_refresh(args: argparse.Namespace) -> None:
             print(f"Found {len(stale)} servers with newer versions:")
             for name, (old, new) in stale.items():
                 print(f"  {name}: {old} -> {new}")
-            print("\nRun 'mcp-gateway refresh --force' to update.")
+            print("\nRun 'pmcp refresh --force' to update.")
         return
 
     # Refresh descriptions
@@ -618,7 +636,7 @@ async def run_init(args: argparse.Namespace) -> None:
 
     print(f"\nConfiguration saved to: {config_path}")
     print(f"Servers configured: {len(selected_servers)}")
-    print("\nRun 'mcp-gateway' to start the gateway.")
+    print("\nRun 'pmcp' to start the gateway.")
 
 
 async def run_server(args: argparse.Namespace) -> None:
