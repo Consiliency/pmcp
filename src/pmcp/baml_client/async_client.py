@@ -39,6 +39,7 @@ class BamlAsyncClient:
     def with_options(self,
         tb: typing.Optional[type_builder.TypeBuilder] = None,
         client_registry: typing.Optional[baml_py.baml_py.ClientRegistry] = None,
+        client: typing.Optional[str] = None,
         collector: typing.Optional[typing.Union[baml_py.baml_py.Collector, typing.List[baml_py.baml_py.Collector]]] = None,
         env: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None,
         tags: typing.Optional[typing.Dict[str, str]] = None,
@@ -49,6 +50,8 @@ class BamlAsyncClient:
             options["tb"] = tb
         if client_registry is not None:
             options["client_registry"] = client_registry
+        if client is not None:
+            options["client"] = client
         if collector is not None:
             options["collector"] = collector
         if env is not None:
@@ -79,6 +82,21 @@ class BamlAsyncClient:
     def parse_stream(self):
       return self.__llm_stream_parser
 
+    async def GenerateCodeSnippet(self, tool: types.ToolInfo,
+        baml_options: BamlCallOptions = {},
+    ) -> types.CodeSnippet:
+        # Check if on_tick is provided
+        if 'on_tick' in baml_options:
+            # Use streaming internally when on_tick is provided
+            __stream__ = self.stream.GenerateCodeSnippet(tool=tool,
+                baml_options=baml_options)
+            return await __stream__.get_final_response()
+        else:
+            # Original non-streaming code
+            __result__ = await self.__options.merge_options(baml_options).call_function_async(function_name="GenerateCodeSnippet", args={
+                "tool": tool,
+            })
+            return typing.cast(types.CodeSnippet, __result__.cast_to(types, types, stream_types, False, __runtime__))
     async def MatchCapability(self, query: str,manifest: types.ManifestSummary,available_clis: typing.List[str],running_servers: typing.List[str],
         baml_options: BamlCallOptions = {},
     ) -> types.CapabilityMatchResult:
@@ -118,6 +136,18 @@ class BamlStreamClient:
     def __init__(self, options: DoNotUseDirectlyCallManager):
         self.__options = options
 
+    def GenerateCodeSnippet(self, tool: types.ToolInfo,
+        baml_options: BamlCallOptions = {},
+    ) -> baml_py.BamlStream[stream_types.CodeSnippet, types.CodeSnippet]:
+        __ctx__, __result__ = self.__options.merge_options(baml_options).create_async_stream(function_name="GenerateCodeSnippet", args={
+            "tool": tool,
+        })
+        return baml_py.BamlStream[stream_types.CodeSnippet, types.CodeSnippet](
+          __result__,
+          lambda x: typing.cast(stream_types.CodeSnippet, x.cast_to(types, types, stream_types, True, __runtime__)),
+          lambda x: typing.cast(types.CodeSnippet, x.cast_to(types, types, stream_types, False, __runtime__)),
+          __ctx__,
+        )
     def MatchCapability(self, query: str,manifest: types.ManifestSummary,available_clis: typing.List[str],running_servers: typing.List[str],
         baml_options: BamlCallOptions = {},
     ) -> baml_py.BamlStream[stream_types.CapabilityMatchResult, types.CapabilityMatchResult]:
@@ -150,6 +180,13 @@ class BamlHttpRequestClient:
     def __init__(self, options: DoNotUseDirectlyCallManager):
         self.__options = options
 
+    async def GenerateCodeSnippet(self, tool: types.ToolInfo,
+        baml_options: BamlCallOptions = {},
+    ) -> baml_py.baml_py.HTTPRequest:
+        __result__ = await self.__options.merge_options(baml_options).create_http_request_async(function_name="GenerateCodeSnippet", args={
+            "tool": tool,
+        }, mode="request")
+        return __result__
     async def MatchCapability(self, query: str,manifest: types.ManifestSummary,available_clis: typing.List[str],running_servers: typing.List[str],
         baml_options: BamlCallOptions = {},
     ) -> baml_py.baml_py.HTTPRequest:
@@ -172,6 +209,13 @@ class BamlHttpStreamRequestClient:
     def __init__(self, options: DoNotUseDirectlyCallManager):
         self.__options = options
 
+    async def GenerateCodeSnippet(self, tool: types.ToolInfo,
+        baml_options: BamlCallOptions = {},
+    ) -> baml_py.baml_py.HTTPRequest:
+        __result__ = await self.__options.merge_options(baml_options).create_http_request_async(function_name="GenerateCodeSnippet", args={
+            "tool": tool,
+        }, mode="stream")
+        return __result__
     async def MatchCapability(self, query: str,manifest: types.ManifestSummary,available_clis: typing.List[str],running_servers: typing.List[str],
         baml_options: BamlCallOptions = {},
     ) -> baml_py.baml_py.HTTPRequest:

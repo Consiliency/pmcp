@@ -400,6 +400,20 @@ servers:
     env_var: "EXA_API_KEY"
     env_instructions: "Get API key at https://dashboard.exa.ai/api-keys"
 
+  brightdata:
+    description: "Bright Data MCP - search, scraping, and browser automation"
+    keywords: [bright data, brightdata, proxy, scraping, web data, unlocker, browser automation]
+    install:
+      mac: ["npx", "-y", "@brightdata/mcp"]
+      linux: ["npx", "-y", "@brightdata/mcp"]
+      wsl: ["npx", "-y", "@brightdata/mcp"]
+      windows: ["npx", "-y", "@brightdata/mcp"]
+    command: "npx"
+    args: ["-y", "@brightdata/mcp"]
+    requires_api_key: true
+    env_var: "API_TOKEN"
+    env_instructions: "Set API_TOKEN to your Bright Data API key (optional: WEB_UNLOCKER_ZONE, BROWSER_ZONE, PRO_MODE, GROUPS, TOOLS)"
+
   # === AI & LLM ===
 
   everart:

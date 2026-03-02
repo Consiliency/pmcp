@@ -20,7 +20,7 @@ from .globals import DO_NOT_USE_DIRECTLY_UNLESS_YOU_KNOW_WHAT_YOURE_DOING_RUNTIM
 class TypeBuilder(type_builder.TypeBuilder):
     def __init__(self):
         super().__init__(classes=set(
-          ["CapabilityCandidate","CapabilityCategory","CapabilityMatchResult","CapabilitySummary","ManifestCLI","ManifestServer","ManifestSummary","ToolDescription",]
+          ["CapabilityCandidate","CapabilityCategory","CapabilityMatchResult","CapabilitySummary","CodeSnippet","ManifestCLI","ManifestServer","ManifestSummary","ToolArg","ToolDescription","ToolInfo",]
         ), enums=set(
           []
         ), runtime=DO_NOT_USE_DIRECTLY_UNLESS_YOU_KNOW_WHAT_YOURE_DOING_RUNTIME)
@@ -31,7 +31,7 @@ class TypeBuilder(type_builder.TypeBuilder):
 
 
     # #########################################################################
-    # Generated classes 8
+    # Generated classes 11
     # #########################################################################
 
     @property
@@ -51,6 +51,10 @@ class TypeBuilder(type_builder.TypeBuilder):
         return CapabilitySummaryViewer(self)
 
     @property
+    def CodeSnippet(self) -> "CodeSnippetViewer":
+        return CodeSnippetViewer(self)
+
+    @property
     def ManifestCLI(self) -> "ManifestCLIViewer":
         return ManifestCLIViewer(self)
 
@@ -63,8 +67,16 @@ class TypeBuilder(type_builder.TypeBuilder):
         return ManifestSummaryViewer(self)
 
     @property
+    def ToolArg(self) -> "ToolArgViewer":
+        return ToolArgViewer(self)
+
+    @property
     def ToolDescription(self) -> "ToolDescriptionViewer":
         return ToolDescriptionViewer(self)
+
+    @property
+    def ToolInfo(self) -> "ToolInfoViewer":
+        return ToolInfoViewer(self)
 
 
 
@@ -74,7 +86,7 @@ class TypeBuilder(type_builder.TypeBuilder):
 
 
 # #########################################################################
-# Generated classes 8
+# Generated classes 11
 # #########################################################################
 
 class CapabilityCandidateAst:
@@ -265,6 +277,49 @@ class CapabilitySummaryProperties:
     
 
 
+class CodeSnippetAst:
+    def __init__(self, tb: type_builder.TypeBuilder):
+        _tb = tb._tb # type: ignore (we know how to use this private attribute)
+        self._bldr = _tb.class_("CodeSnippet")
+        self._properties: typing.Set[str] = set([  "snippet",  "pattern",  ])
+        self._props = CodeSnippetProperties(self._bldr, self._properties)
+
+    def type(self) -> baml_py.FieldType:
+        return self._bldr.field()
+
+    @property
+    def props(self) -> "CodeSnippetProperties":
+        return self._props
+
+
+class CodeSnippetViewer(CodeSnippetAst):
+    def __init__(self, tb: type_builder.TypeBuilder):
+        super().__init__(tb)
+
+    
+    def list_properties(self) -> typing.List[typing.Tuple[str, type_builder.ClassPropertyViewer]]:
+        return [(name, type_builder.ClassPropertyViewer(self._bldr.property(name))) for name in self._properties]
+    
+
+
+class CodeSnippetProperties:
+    def __init__(self, bldr: baml_py.ClassBuilder, properties: typing.Set[str]):
+        self.__bldr = bldr
+        self.__properties = properties # type: ignore (we know how to use this private attribute) # noqa: F821
+
+    
+    
+    @property
+    def snippet(self) -> type_builder.ClassPropertyViewer:
+        return type_builder.ClassPropertyViewer(self.__bldr.property("snippet"))
+    
+    @property
+    def pattern(self) -> type_builder.ClassPropertyViewer:
+        return type_builder.ClassPropertyViewer(self.__bldr.property("pattern"))
+    
+    
+
+
 class ManifestCLIAst:
     def __init__(self, tb: type_builder.TypeBuilder):
         _tb = tb._tb # type: ignore (we know how to use this private attribute)
@@ -410,6 +465,57 @@ class ManifestSummaryProperties:
     
 
 
+class ToolArgAst:
+    def __init__(self, tb: type_builder.TypeBuilder):
+        _tb = tb._tb # type: ignore (we know how to use this private attribute)
+        self._bldr = _tb.class_("ToolArg")
+        self._properties: typing.Set[str] = set([  "name",  "type",  "required",  "description",  ])
+        self._props = ToolArgProperties(self._bldr, self._properties)
+
+    def type(self) -> baml_py.FieldType:
+        return self._bldr.field()
+
+    @property
+    def props(self) -> "ToolArgProperties":
+        return self._props
+
+
+class ToolArgViewer(ToolArgAst):
+    def __init__(self, tb: type_builder.TypeBuilder):
+        super().__init__(tb)
+
+    
+    def list_properties(self) -> typing.List[typing.Tuple[str, type_builder.ClassPropertyViewer]]:
+        return [(name, type_builder.ClassPropertyViewer(self._bldr.property(name))) for name in self._properties]
+    
+
+
+class ToolArgProperties:
+    def __init__(self, bldr: baml_py.ClassBuilder, properties: typing.Set[str]):
+        self.__bldr = bldr
+        self.__properties = properties # type: ignore (we know how to use this private attribute) # noqa: F821
+
+    
+    
+    @property
+    def name(self) -> type_builder.ClassPropertyViewer:
+        return type_builder.ClassPropertyViewer(self.__bldr.property("name"))
+    
+    @property
+    def type(self) -> type_builder.ClassPropertyViewer:
+        return type_builder.ClassPropertyViewer(self.__bldr.property("type"))
+    
+    @property
+    def required(self) -> type_builder.ClassPropertyViewer:
+        return type_builder.ClassPropertyViewer(self.__bldr.property("required"))
+    
+    @property
+    def description(self) -> type_builder.ClassPropertyViewer:
+        return type_builder.ClassPropertyViewer(self.__bldr.property("description"))
+    
+    
+
+
 class ToolDescriptionAst:
     def __init__(self, tb: type_builder.TypeBuilder):
         _tb = tb._tb # type: ignore (we know how to use this private attribute)
@@ -453,6 +559,57 @@ class ToolDescriptionProperties:
     @property
     def description(self) -> type_builder.ClassPropertyViewer:
         return type_builder.ClassPropertyViewer(self.__bldr.property("description"))
+    
+    
+
+
+class ToolInfoAst:
+    def __init__(self, tb: type_builder.TypeBuilder):
+        _tb = tb._tb # type: ignore (we know how to use this private attribute)
+        self._bldr = _tb.class_("ToolInfo")
+        self._properties: typing.Set[str] = set([  "tool_id",  "tool_name",  "description",  "args",  ])
+        self._props = ToolInfoProperties(self._bldr, self._properties)
+
+    def type(self) -> baml_py.FieldType:
+        return self._bldr.field()
+
+    @property
+    def props(self) -> "ToolInfoProperties":
+        return self._props
+
+
+class ToolInfoViewer(ToolInfoAst):
+    def __init__(self, tb: type_builder.TypeBuilder):
+        super().__init__(tb)
+
+    
+    def list_properties(self) -> typing.List[typing.Tuple[str, type_builder.ClassPropertyViewer]]:
+        return [(name, type_builder.ClassPropertyViewer(self._bldr.property(name))) for name in self._properties]
+    
+
+
+class ToolInfoProperties:
+    def __init__(self, bldr: baml_py.ClassBuilder, properties: typing.Set[str]):
+        self.__bldr = bldr
+        self.__properties = properties # type: ignore (we know how to use this private attribute) # noqa: F821
+
+    
+    
+    @property
+    def tool_id(self) -> type_builder.ClassPropertyViewer:
+        return type_builder.ClassPropertyViewer(self.__bldr.property("tool_id"))
+    
+    @property
+    def tool_name(self) -> type_builder.ClassPropertyViewer:
+        return type_builder.ClassPropertyViewer(self.__bldr.property("tool_name"))
+    
+    @property
+    def description(self) -> type_builder.ClassPropertyViewer:
+        return type_builder.ClassPropertyViewer(self.__bldr.property("description"))
+    
+    @property
+    def args(self) -> type_builder.ClassPropertyViewer:
+        return type_builder.ClassPropertyViewer(self.__bldr.property("args"))
     
     
 

@@ -12,7 +12,7 @@
 
 import typing
 import typing_extensions
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 import baml_py
 
@@ -23,49 +23,65 @@ class StreamState(BaseModel, typing.Generic[StreamStateValueT]):
     value: StreamStateValueT
     state: typing_extensions.Literal["Pending", "Incomplete", "Complete"]
 # #########################################################################
-# Generated classes (8)
+# Generated classes (11)
 # #########################################################################
 
 class CapabilityCandidate(BaseModel):
-    name: typing.Optional[str] = None
-    candidate_type: typing.Optional[str] = None
-    relevance_score: typing.Optional[float] = None
-    reasoning: typing.Optional[str] = None
-    requires_api_key: typing.Optional[bool] = None
+    name: typing.Optional[str] = Field(default=None, description='Name of the server or CLI')
+    candidate_type: typing.Optional[str] = Field(default=None, description='\'cli\' or \'server\'')
+    relevance_score: typing.Optional[float] = Field(default=None, description='0.0 to 1.0 relevance score')
+    reasoning: typing.Optional[str] = Field(default=None, description='Brief explanation of why this matches (1-2 sentences)')
+    requires_api_key: typing.Optional[bool] = Field(default=None, description='Whether API key is needed (always false for CLIs)')
 
 class CapabilityCategory(BaseModel):
-    name: typing.Optional[str] = None
-    server: typing.Optional[str] = None
-    summary: typing.Optional[str] = None
+    name: typing.Optional[str] = Field(default=None, description='Category name like \'Browser Automation\' or \'File Operations\'')
+    server: typing.Optional[str] = Field(default=None, description='Server name providing this capability')
+    summary: typing.Optional[str] = Field(default=None, description='3-5 word capability summary')
 
 class CapabilityMatchResult(BaseModel):
-    candidates: typing.List["CapabilityCandidate"]
-    recommendation: typing.Optional[str] = None
+    candidates: typing.List["CapabilityCandidate"] = Field(description='Top 1-3 candidates ranked by relevance')
+    recommendation: typing.Optional[str] = Field(default=None, description='Brief recommendation for Claude Code on which to choose')
 
 class CapabilitySummary(BaseModel):
-    categories: typing.List["CapabilityCategory"]
-    usage_hint: typing.Optional[str] = None
+    categories: typing.List["CapabilityCategory"] = Field(description='3-5 high-level capability categories')
+    usage_hint: typing.Optional[str] = Field(default=None, description='Hint for how to explore tools further')
+
+class CodeSnippet(BaseModel):
+    snippet: typing.Optional[str] = Field(default=None, description='Python code snippet, max 4 lines, showing practical usage')
+    pattern: typing.Optional[str] = Field(default=None, description='Code pattern used: loop, filter, if/else, try/catch, or poll')
 
 class ManifestCLI(BaseModel):
-    name: typing.Optional[str] = None
-    description: typing.Optional[str] = None
-    keywords: typing.List[str]
+    name: typing.Optional[str] = Field(default=None, description='CLI tool name')
+    description: typing.Optional[str] = Field(default=None, description='What this CLI provides')
+    keywords: typing.List[str] = Field(description='Associated keywords')
 
 class ManifestServer(BaseModel):
-    name: typing.Optional[str] = None
-    description: typing.Optional[str] = None
-    keywords: typing.List[str]
-    requires_api_key: typing.Optional[bool] = None
-    env_var: typing.Optional[str] = None
+    name: typing.Optional[str] = Field(default=None, description='Server identifier')
+    description: typing.Optional[str] = Field(default=None, description='What this server provides')
+    keywords: typing.List[str] = Field(description='Associated keywords')
+    requires_api_key: typing.Optional[bool] = Field(default=None, description='Whether an API key is needed')
+    env_var: typing.Optional[str] = Field(default=None, description='Environment variable for API key if required')
 
 class ManifestSummary(BaseModel):
-    servers: typing.List["ManifestServer"]
-    clis: typing.List["ManifestCLI"]
+    servers: typing.List["ManifestServer"] = Field(description='Available MCP servers')
+    clis: typing.List["ManifestCLI"] = Field(description='Available CLI tools')
+
+class ToolArg(BaseModel):
+    name: typing.Optional[str] = None
+    type: typing.Optional[str] = None
+    required: typing.Optional[bool] = None
+    description: typing.Optional[str] = None
 
 class ToolDescription(BaseModel):
     server_name: typing.Optional[str] = None
     tool_name: typing.Optional[str] = None
     description: typing.Optional[str] = None
+
+class ToolInfo(BaseModel):
+    tool_id: typing.Optional[str] = None
+    tool_name: typing.Optional[str] = None
+    description: typing.Optional[str] = None
+    args: typing.List["ToolArg"]
 
 # #########################################################################
 # Generated type aliases (0)

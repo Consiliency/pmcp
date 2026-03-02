@@ -196,17 +196,17 @@ wheels = [
 
 [[package]]
 name = "baml-py"
-version = "0.215.2"
+version = "0.219.0"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/20/59/030b9f487c145fbe20c2ebc9b2170dce8b84f551558aa923895a7de7da41/baml_py-0.215.2-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:1ab7ac0b97e5a42ad6fe850c9938c972464bf1d55dc75ed5080ce9f1c3757620", size = 21674055, upload-time = "2025-12-23T08:31:50.298Z" },
-    { url = "https://files.pythonhosted.org/packages/80/34/d0b2d913c143c621d1fa7a39c1522cca69a3a4bb6fb9fe55fce73abe1743/baml_py-0.215.2-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:a0e287af8d2310c0e273907cdeb72527385857a0a528e1eaf080316bca562d8a", size = 20598753, upload-time = "2025-12-23T08:31:52.91Z" },
-    { url = "https://files.pythonhosted.org/packages/8b/83/d587a2d8dd5df403827aeac29f00af4e1c4196fc6270d5f5839cfb256e25/baml_py-0.215.2-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:c879f60d10563e73c70ba5f5d34992461b4e53c54c5899d40a41818fec811d34", size = 24395980, upload-time = "2025-12-23T08:31:56.162Z" },
-    { url = "https://files.pythonhosted.org/packages/78/51/c76d9e41f2491d94575ec8471fa4abf2f5636918709f9a22a8a325e912ad/baml_py-0.215.2-cp38-abi3-manylinux_2_24_aarch64.whl", hash = "sha256:8a61c7fec7ebacae85f4cc7ca54a46c415ce41e803a54a8d08a729c3cf403b05", size = 23772379, upload-time = "2025-12-23T08:31:59.021Z" },
-    { url = "https://files.pythonhosted.org/packages/8f/ab/adc91a3f121e298da966bb0e718a789261e10b3a85432bc33f72d849311c/baml_py-0.215.2-cp38-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:287a16b06bd743b4c5ef506f3411a43d124ec31cd58bca3e14cca36ba7b32c75", size = 24025751, upload-time = "2025-12-23T08:32:02.041Z" },
-    { url = "https://files.pythonhosted.org/packages/8f/44/a66677df3ac1a57e9cc945bb355f93de8964b501208806689ba6d113d6d8/baml_py-0.215.2-cp38-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:db7f2560cd8f6a460a77c91a1cc887cfb758a07f04518d700bf68b5f2014f125", size = 24581017, upload-time = "2025-12-23T08:32:04.803Z" },
-    { url = "https://files.pythonhosted.org/packages/f9/36/429c9a65fbd9a4b3a4e14bd550fa2eb4dca10a8ccda7e228a050b63ac8b5/baml_py-0.215.2-cp38-abi3-win_amd64.whl", hash = "sha256:5ad09c3028533ee39a335933ee5e60c5bfb3086fd8e8ad1dfbc513ef19a2f6b2", size = 22098186, upload-time = "2025-12-23T08:32:08.036Z" },
-    { url = "https://files.pythonhosted.org/packages/03/2a/b9e8d8280be95fa215060df55a1aeb645b45019e849f9a26a6fcd19e1e3b/baml_py-0.215.2-cp38-abi3-win_arm64.whl", hash = "sha256:ff84c6a2e03c00c55b813919507a4c55dd75a0ff925c76055d90a5d93cd8b206", size = 20148817, upload-time = "2025-12-23T08:32:11.111Z" },
+    { url = "https://files.pythonhosted.org/packages/62/eb/570b5f97496ef513f08214085796bf68e1499035cd39523cdb92a43731f3/baml_py-0.219.0-cp38-abi3-macosx_10_12_x86_64.whl", hash = "sha256:db10e488436465774b2503386d220a559df8dcbe4e8f832cc10d42fccb4fd747", size = 21581187, upload-time = "2026-02-12T22:30:05.542Z" },
+    { url = "https://files.pythonhosted.org/packages/01/cf/992dbbab9cfc0423fc742426330529940c524f6e11e97e5355d9a86ccdd8/baml_py-0.219.0-cp38-abi3-macosx_11_0_arm64.whl", hash = "sha256:e6b5b4fa38c4cef2a0f69afce5f2feb8cfa6075fbe529ef849ce71573a47e22d", size = 20394449, upload-time = "2026-02-12T22:30:08.382Z" },
+    { url = "https://files.pythonhosted.org/packages/9e/c5/739fae4d513f05e8d65f9b11d2e1533f25d8ef9493fba55d578b993968b0/baml_py-0.219.0-cp38-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9cecd2f4491c3df698be14cdcacda17e15358667358725dd14e2722669b21df3", size = 24120733, upload-time = "2026-02-12T22:30:10.541Z" },
+    { url = "https://files.pythonhosted.org/packages/db/d9/9a3b13fb674de657e8bbd95d057112d83676b2d2fa3add33abd2e0736378/baml_py-0.219.0-cp38-abi3-manylinux_2_24_aarch64.whl", hash = "sha256:7defb27b9fb479c72a4fd550561f74d1bd155ac6f949ab75a6755030076a54ff", size = 23502079, upload-time = "2026-02-12T22:30:13.683Z" },
+    { url = "https://files.pythonhosted.org/packages/2b/ee/378d495775100f324f7591293c54e2f1045bfd4fbe1835fcdf784cfc2fee/baml_py-0.219.0-cp38-abi3-musllinux_1_1_aarch64.whl", hash = "sha256:b5a7ff103c46cd7a8d34c0c9d612d3dc0716c9fbec68161d7d51a85b0e8e5189", size = 23895539, upload-time = "2026-02-12T22:30:17.144Z" },
+    { url = "https://files.pythonhosted.org/packages/ec/e8/716b9aef15f2362c979123bc09649ea5325dd48525b78708f1a71ac53c6f/baml_py-0.219.0-cp38-abi3-musllinux_1_1_x86_64.whl", hash = "sha256:8c7de9c7248117687407007efdd4891b331ae187d2f7794e56072b219216daf1", size = 24349171, upload-time = "2026-02-12T22:30:20.028Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/b3/62cb4d31316e7a90e41ad28d4ff17d5dba0c8abb2707d3ce94df0ee26418/baml_py-0.219.0-cp38-abi3-win_amd64.whl", hash = "sha256:019b70c88097825918b9f2a2f80266f0cefc768ea9dcf6cd0740f48bfe471b72", size = 21765159, upload-time = "2026-02-12T22:30:24.252Z" },
+    { url = "https://files.pythonhosted.org/packages/7c/b5/805f206d3ceba1b9382aad76a1e083612bef669f1a15c57e806872b657ff/baml_py-0.219.0-cp38-abi3-win_arm64.whl", hash = "sha256:7965609753ba11dbc12b7c3853ba81ee4d90eef19b629165c837472f5f334f4f", size = 20216236, upload-time = "2026-02-12T22:30:27.002Z" },
 ]
 
 [[package]]
@@ -1034,7 +1034,7 @@ wheels = [
 
 [[package]]
 name = "pmcp"
-version = "1.3.0"
+version = "1.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiohttp" },
@@ -1080,7 +1080,7 @@ llm = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
-    { name = "baml-py", specifier = "==0.215.2" },
+    { name = "baml-py", specifier = "==0.219.0" },
     { name = "baml-py", marker = "extra == 'llm'", specifier = ">=0.215.0" },
     { name = "mcp", specifier = ">=1.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0" },

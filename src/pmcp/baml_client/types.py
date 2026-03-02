@@ -15,7 +15,7 @@ import typing_extensions
 from enum import Enum
 
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 import baml_py
@@ -41,49 +41,65 @@ def all_succeeded(checks: typing.Dict[CheckName, Check]) -> bool:
 # #########################################################################
 
 # #########################################################################
-# Generated classes (8)
+# Generated classes (11)
 # #########################################################################
 
 class CapabilityCandidate(BaseModel):
-    name: str
-    candidate_type: str
-    relevance_score: float
-    reasoning: str
-    requires_api_key: bool
+    name: str = Field(description='Name of the server or CLI')
+    candidate_type: str = Field(description='\'cli\' or \'server\'')
+    relevance_score: float = Field(description='0.0 to 1.0 relevance score')
+    reasoning: str = Field(description='Brief explanation of why this matches (1-2 sentences)')
+    requires_api_key: bool = Field(description='Whether API key is needed (always false for CLIs)')
 
 class CapabilityCategory(BaseModel):
-    name: str
-    server: str
-    summary: str
+    name: str = Field(description='Category name like \'Browser Automation\' or \'File Operations\'')
+    server: str = Field(description='Server name providing this capability')
+    summary: str = Field(description='3-5 word capability summary')
 
 class CapabilityMatchResult(BaseModel):
-    candidates: typing.List["CapabilityCandidate"]
-    recommendation: str
+    candidates: typing.List["CapabilityCandidate"] = Field(description='Top 1-3 candidates ranked by relevance')
+    recommendation: str = Field(description='Brief recommendation for Claude Code on which to choose')
 
 class CapabilitySummary(BaseModel):
-    categories: typing.List["CapabilityCategory"]
-    usage_hint: str
+    categories: typing.List["CapabilityCategory"] = Field(description='3-5 high-level capability categories')
+    usage_hint: str = Field(description='Hint for how to explore tools further')
+
+class CodeSnippet(BaseModel):
+    snippet: str = Field(description='Python code snippet, max 4 lines, showing practical usage')
+    pattern: str = Field(description='Code pattern used: loop, filter, if/else, try/catch, or poll')
 
 class ManifestCLI(BaseModel):
-    name: str
-    description: str
-    keywords: typing.List[str]
+    name: str = Field(description='CLI tool name')
+    description: str = Field(description='What this CLI provides')
+    keywords: typing.List[str] = Field(description='Associated keywords')
 
 class ManifestServer(BaseModel):
-    name: str
-    description: str
-    keywords: typing.List[str]
-    requires_api_key: bool
-    env_var: typing.Optional[str] = None
+    name: str = Field(description='Server identifier')
+    description: str = Field(description='What this server provides')
+    keywords: typing.List[str] = Field(description='Associated keywords')
+    requires_api_key: bool = Field(description='Whether an API key is needed')
+    env_var: typing.Optional[str] = Field(default=None, description='Environment variable for API key if required')
 
 class ManifestSummary(BaseModel):
-    servers: typing.List["ManifestServer"]
-    clis: typing.List["ManifestCLI"]
+    servers: typing.List["ManifestServer"] = Field(description='Available MCP servers')
+    clis: typing.List["ManifestCLI"] = Field(description='Available CLI tools')
+
+class ToolArg(BaseModel):
+    name: str
+    type: str
+    required: bool
+    description: str
 
 class ToolDescription(BaseModel):
     server_name: str
     tool_name: str
     description: str
+
+class ToolInfo(BaseModel):
+    tool_id: str
+    tool_name: str
+    description: str
+    args: typing.List["ToolArg"]
 
 # #########################################################################
 # Generated type aliases (0)

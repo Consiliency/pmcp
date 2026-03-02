@@ -13,7 +13,6 @@
 import typing
 import typing_extensions
 
-import baml_py
 
 from . import stream_types, types
 from .runtime import DoNotUseDirectlyCallManager, BamlCallOptions
@@ -23,6 +22,12 @@ class LlmResponseParser:
 
     def __init__(self, options: DoNotUseDirectlyCallManager):
         self.__options = options
+
+    def GenerateCodeSnippet(
+        self, llm_response: str, baml_options: BamlCallOptions = {},
+    ) -> types.CodeSnippet:
+        __result__ = self.__options.merge_options(baml_options).parse_response(function_name="GenerateCodeSnippet", llm_response=llm_response, mode="request")
+        return typing.cast(types.CodeSnippet, __result__)
 
     def MatchCapability(
         self, llm_response: str, baml_options: BamlCallOptions = {},
@@ -43,6 +48,12 @@ class LlmStreamParser:
 
     def __init__(self, options: DoNotUseDirectlyCallManager):
         self.__options = options
+
+    def GenerateCodeSnippet(
+        self, llm_response: str, baml_options: BamlCallOptions = {},
+    ) -> stream_types.CodeSnippet:
+        __result__ = self.__options.merge_options(baml_options).parse_response(function_name="GenerateCodeSnippet", llm_response=llm_response, mode="stream")
+        return typing.cast(stream_types.CodeSnippet, __result__)
 
     def MatchCapability(
         self, llm_response: str, baml_options: BamlCallOptions = {},

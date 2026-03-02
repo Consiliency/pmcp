@@ -442,6 +442,7 @@ class JobManager:
             "running on stdio",
             "server running",
             "server started",
+            "starting server",
             "listening on stdio",
             "mcp server ready",
             "ready to accept connections",

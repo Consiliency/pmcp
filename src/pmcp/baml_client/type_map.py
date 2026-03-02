@@ -28,6 +28,9 @@ type_map = {
     "types.CapabilitySummary": types.CapabilitySummary,
     "stream_types.CapabilitySummary": stream_types.CapabilitySummary,
 
+    "types.CodeSnippet": types.CodeSnippet,
+    "stream_types.CodeSnippet": stream_types.CodeSnippet,
+
     "types.ManifestCLI": types.ManifestCLI,
     "stream_types.ManifestCLI": stream_types.ManifestCLI,
 
@@ -37,8 +40,14 @@ type_map = {
     "types.ManifestSummary": types.ManifestSummary,
     "stream_types.ManifestSummary": stream_types.ManifestSummary,
 
+    "types.ToolArg": types.ToolArg,
+    "stream_types.ToolArg": stream_types.ToolArg,
+
     "types.ToolDescription": types.ToolDescription,
     "stream_types.ToolDescription": stream_types.ToolDescription,
+
+    "types.ToolInfo": types.ToolInfo,
+    "stream_types.ToolInfo": stream_types.ToolInfo,
 
 
 }
