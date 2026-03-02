@@ -14,7 +14,6 @@ Run with: pytest tests/test_progressive_disclosure.py -v
 
 from __future__ import annotations
 
-import os
 import pytest
 
 from pathlib import Path
@@ -101,28 +100,31 @@ class TestScenario7_LibraryDocumentation:
     @pytest.mark.asyncio
     async def test_search_documentation_library(self, gateway_with_servers):
         """Step 1: Search for documentation-related tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "documentation library"
-        })
+        result = await gateway_with_servers.catalog_search(
+            {"query": "documentation library"}
+        )
 
-        print(f"\nSearch 'documentation library' returned {len(result.results)} results:")
+        print(
+            f"\nSearch 'documentation library' returned {len(result.results)} results:"
+        )
         for card in result.results:
             print(f"  - {card.tool_id}: {card.short_description}")
 
         # Should find context7 tools
         tool_ids = [r.tool_id for r in result.results]
-        assert any("context7" in tid for tid in tool_ids), \
+        assert any("context7" in tid for tid in tool_ids), (
             "Expected to find context7 tools for documentation query"
+        )
 
     @skip_no_context7
     @pytest.mark.asyncio
     async def test_describe_resolve_library_id(self, gateway_with_servers):
         """Step 2: Get full schema for resolve-library-id."""
-        result = await gateway_with_servers.describe({
-            "tool_id": "context7::resolve-library-id"
-        })
+        result = await gateway_with_servers.describe(
+            {"tool_id": "context7::resolve-library-id"}
+        )
 
-        print(f"\nDescribe 'context7::resolve-library-id':")
+        print("\nDescribe 'context7::resolve-library-id':")
         print(f"  Tool: {result.tool_name}")
         print(f"  Description: {result.description}")
         print(f"  Args: {[a.name for a in result.args]}")
@@ -134,13 +136,15 @@ class TestScenario7_LibraryDocumentation:
     @pytest.mark.asyncio
     async def test_invoke_resolve_library_id(self, gateway_with_servers):
         """Step 3: Invoke resolve-library-id for React."""
-        result = await gateway_with_servers.invoke({
-            "tool_id": "context7::resolve-library-id",
-            "arguments": {"libraryName": "react"},
-            "options": {"timeout_ms": 60000}  # Longer timeout for API calls
-        })
+        result = await gateway_with_servers.invoke(
+            {
+                "tool_id": "context7::resolve-library-id",
+                "arguments": {"libraryName": "react"},
+                "options": {"timeout_ms": 60000},  # Longer timeout for API calls
+            }
+        )
 
-        print(f"\nInvoke 'context7::resolve-library-id' with libraryName='react':")
+        print("\nInvoke 'context7::resolve-library-id' with libraryName='react':")
         print(f"  OK: {result.ok}")
         print(f"  Result: {result.result}")
 
@@ -152,11 +156,11 @@ class TestScenario7_LibraryDocumentation:
     @pytest.mark.asyncio
     async def test_describe_query_docs(self, gateway_with_servers):
         """Step 4: Get full schema for query-docs."""
-        result = await gateway_with_servers.describe({
-            "tool_id": "context7::query-docs"
-        })
+        result = await gateway_with_servers.describe(
+            {"tool_id": "context7::query-docs"}
+        )
 
-        print(f"\nDescribe 'context7::query-docs':")
+        print("\nDescribe 'context7::query-docs':")
         print(f"  Tool: {result.tool_name}")
         print(f"  Description: {result.description}")
         print(f"  Args: {[f'{a.name} ({a.type})' for a in result.args]}")
@@ -167,16 +171,15 @@ class TestScenario7_LibraryDocumentation:
     @pytest.mark.asyncio
     async def test_invoke_query_docs(self, gateway_with_servers):
         """Step 5: Invoke query-docs for React."""
-        result = await gateway_with_servers.invoke({
-            "tool_id": "context7::query-docs",
-            "arguments": {
-                "query": "react hooks",
-                "libraryId": "/npm/react/19.0.0"
-            },
-            "options": {"timeout_ms": 60000}  # Longer timeout for API calls
-        })
+        result = await gateway_with_servers.invoke(
+            {
+                "tool_id": "context7::query-docs",
+                "arguments": {"query": "react hooks", "libraryId": "/npm/react/19.0.0"},
+                "options": {"timeout_ms": 60000},  # Longer timeout for API calls
+            }
+        )
 
-        print(f"\nInvoke 'context7::query-docs':")
+        print("\nInvoke 'context7::query-docs':")
         print(f"  OK: {result.ok}")
         print(f"  Truncated: {result.truncated}")
         print(f"  Raw size: {result.raw_size_estimate}")
@@ -201,9 +204,9 @@ class TestScenario1_WebNavigation:
     @pytest.mark.asyncio
     async def test_search_navigate_website(self, gateway_with_servers):
         """Step 1: Search for navigation-related tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "navigate website"
-        })
+        result = await gateway_with_servers.catalog_search(
+            {"query": "navigate website"}
+        )
 
         print(f"\nSearch 'navigate website' returned {len(result.results)} results:")
         for card in result.results:
@@ -211,21 +214,24 @@ class TestScenario1_WebNavigation:
 
         # Should find playwright navigation tools
         tool_ids = [r.tool_id for r in result.results]
-        assert any("navigate" in tid.lower() for tid in tool_ids), \
+        assert any("navigate" in tid.lower() for tid in tool_ids), (
             "Expected to find navigation tools"
+        )
 
     @skip_no_playwright
     @pytest.mark.asyncio
     async def test_describe_browser_navigate(self, gateway_with_servers):
         """Step 2: Get full schema for browser_navigate."""
-        result = await gateway_with_servers.describe({
-            "tool_id": "playwright::browser_navigate"
-        })
+        result = await gateway_with_servers.describe(
+            {"tool_id": "playwright::browser_navigate"}
+        )
 
-        print(f"\nDescribe 'playwright::browser_navigate':")
+        print("\nDescribe 'playwright::browser_navigate':")
         print(f"  Tool: {result.tool_name}")
         print(f"  Description: {result.description}")
-        print(f"  Args: {[f'{a.name} ({a.type}, required={a.required})' for a in result.args]}")
+        print(
+            f"  Args: {[f'{a.name} ({a.type}, required={a.required})' for a in result.args]}"
+        )
 
         assert result.tool_name == "browser_navigate"
         assert any(a.name == "url" for a in result.args)
@@ -234,13 +240,15 @@ class TestScenario1_WebNavigation:
     @pytest.mark.asyncio
     async def test_invoke_browser_navigate(self, gateway_with_servers):
         """Step 3: Navigate to example.com."""
-        result = await gateway_with_servers.invoke({
-            "tool_id": "playwright::browser_navigate",
-            "arguments": {"url": "https://example.com"},
-            "options": {"timeout_ms": 120000}  # Browser startup can be slow
-        })
+        result = await gateway_with_servers.invoke(
+            {
+                "tool_id": "playwright::browser_navigate",
+                "arguments": {"url": "https://example.com"},
+                "options": {"timeout_ms": 120000},  # Browser startup can be slow
+            }
+        )
 
-        print(f"\nInvoke 'playwright::browser_navigate' to https://example.com:")
+        print("\nInvoke 'playwright::browser_navigate' to https://example.com:")
         print(f"  OK: {result.ok}")
         print(f"  Result summary: {result.summary if result.summary else 'N/A'}")
 
@@ -252,9 +260,7 @@ class TestScenario1_WebNavigation:
     @pytest.mark.asyncio
     async def test_search_screenshot(self, gateway_with_servers):
         """Step 4: Search for screenshot tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "screenshot"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "screenshot"})
 
         print(f"\nSearch 'screenshot' returned {len(result.results)} results:")
         for card in result.results:
@@ -267,13 +273,15 @@ class TestScenario1_WebNavigation:
     @pytest.mark.asyncio
     async def test_invoke_browser_take_screenshot(self, gateway_with_servers):
         """Step 5: Take a screenshot."""
-        result = await gateway_with_servers.invoke({
-            "tool_id": "playwright::browser_take_screenshot",
-            "arguments": {},
-            "options": {"timeout_ms": 60000}
-        })
+        result = await gateway_with_servers.invoke(
+            {
+                "tool_id": "playwright::browser_take_screenshot",
+                "arguments": {},
+                "options": {"timeout_ms": 60000},
+            }
+        )
 
-        print(f"\nInvoke 'playwright::browser_take_screenshot':")
+        print("\nInvoke 'playwright::browser_take_screenshot':")
         print(f"  OK: {result.ok}")
         print(f"  Truncated: {result.truncated}")
 
@@ -297,9 +305,7 @@ class TestScenario2_FormInteraction:
     @pytest.mark.asyncio
     async def test_search_fill_form(self, gateway_with_servers):
         """Step 1: Search for form-filling tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "fill form"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "fill form"})
 
         print(f"\nSearch 'fill form' returned {len(result.results)} results:")
         for card in result.results:
@@ -312,11 +318,11 @@ class TestScenario2_FormInteraction:
     @pytest.mark.asyncio
     async def test_describe_browser_type(self, gateway_with_servers):
         """Step 2: Get schema for browser_type."""
-        result = await gateway_with_servers.describe({
-            "tool_id": "playwright::browser_type"
-        })
+        result = await gateway_with_servers.describe(
+            {"tool_id": "playwright::browser_type"}
+        )
 
-        print(f"\nDescribe 'playwright::browser_type':")
+        print("\nDescribe 'playwright::browser_type':")
         print(f"  Tool: {result.tool_name}")
         print(f"  Args: {[f'{a.name} ({a.type})' for a in result.args]}")
 
@@ -326,9 +332,7 @@ class TestScenario2_FormInteraction:
     @pytest.mark.asyncio
     async def test_search_click_button(self, gateway_with_servers):
         """Step 3: Search for click tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "click button"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "click button"})
 
         print(f"\nSearch 'click button' returned {len(result.results)} results:")
         for card in result.results:
@@ -352,9 +356,7 @@ class TestScenario3_PageDebugging:
     @pytest.mark.asyncio
     async def test_search_console_logs(self, gateway_with_servers):
         """Step 1: Search for console-related tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "console logs"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "console logs"})
 
         print(f"\nSearch 'console logs' returned {len(result.results)} results:")
         for card in result.results:
@@ -364,9 +366,9 @@ class TestScenario3_PageDebugging:
     @pytest.mark.asyncio
     async def test_search_network_requests(self, gateway_with_servers):
         """Step 2: Search for network tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "network requests"
-        })
+        result = await gateway_with_servers.catalog_search(
+            {"query": "network requests"}
+        )
 
         print(f"\nSearch 'network requests' returned {len(result.results)} results:")
         for card in result.results:
@@ -387,9 +389,7 @@ class TestScenario4_ElementInteraction:
     @pytest.mark.asyncio
     async def test_search_click_element(self, gateway_with_servers):
         """Step 1: Search for click tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "click element"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "click element"})
 
         print(f"\nSearch 'click element' returned {len(result.results)} results:")
         for card in result.results:
@@ -399,11 +399,11 @@ class TestScenario4_ElementInteraction:
     @pytest.mark.asyncio
     async def test_describe_browser_click(self, gateway_with_servers):
         """Step 2: Get schema for browser_click."""
-        result = await gateway_with_servers.describe({
-            "tool_id": "playwright::browser_click"
-        })
+        result = await gateway_with_servers.describe(
+            {"tool_id": "playwright::browser_click"}
+        )
 
-        print(f"\nDescribe 'playwright::browser_click':")
+        print("\nDescribe 'playwright::browser_click':")
         print(f"  Tool: {result.tool_name}")
         print(f"  Args: {[f'{a.name} ({a.type})' for a in result.args]}")
 
@@ -413,9 +413,7 @@ class TestScenario4_ElementInteraction:
     @pytest.mark.asyncio
     async def test_search_drag_drop(self, gateway_with_servers):
         """Step 3: Search for drag tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "drag drop"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "drag drop"})
 
         print(f"\nSearch 'drag drop' returned {len(result.results)} results:")
         for card in result.results:
@@ -435,9 +433,7 @@ class TestScenario5_TabManagement:
     @pytest.mark.asyncio
     async def test_search_tabs(self, gateway_with_servers):
         """Step 1: Search for tab tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "tabs"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "tabs"})
 
         print(f"\nSearch 'tabs' returned {len(result.results)} results:")
         for card in result.results:
@@ -447,11 +443,11 @@ class TestScenario5_TabManagement:
     @pytest.mark.asyncio
     async def test_describe_browser_tabs(self, gateway_with_servers):
         """Step 2: Get schema for browser_tabs."""
-        result = await gateway_with_servers.describe({
-            "tool_id": "playwright::browser_tabs"
-        })
+        result = await gateway_with_servers.describe(
+            {"tool_id": "playwright::browser_tabs"}
+        )
 
-        print(f"\nDescribe 'playwright::browser_tabs':")
+        print("\nDescribe 'playwright::browser_tabs':")
         print(f"  Tool: {result.tool_name}")
         print(f"  Description: {result.description}")
 
@@ -461,9 +457,7 @@ class TestScenario5_TabManagement:
     @pytest.mark.asyncio
     async def test_search_resize_window(self, gateway_with_servers):
         """Step 3: Search for resize tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "resize window"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "resize window"})
 
         print(f"\nSearch 'resize window' returned {len(result.results)} results:")
         for card in result.results:
@@ -484,9 +478,7 @@ class TestScenario6_WaitingAndDialogs:
     @pytest.mark.asyncio
     async def test_search_wait(self, gateway_with_servers):
         """Step 1: Search for wait tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "wait"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "wait"})
 
         print(f"\nSearch 'wait' returned {len(result.results)} results:")
         for card in result.results:
@@ -496,9 +488,7 @@ class TestScenario6_WaitingAndDialogs:
     @pytest.mark.asyncio
     async def test_search_dialog_popup(self, gateway_with_servers):
         """Step 2: Search for dialog tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "dialog popup"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "dialog popup"})
 
         print(f"\nSearch 'dialog popup' returned {len(result.results)} results:")
         for card in result.results:
@@ -518,9 +508,7 @@ class TestScenario8_LibraryConcepts:
     @pytest.mark.asyncio
     async def test_search_library_docs(self, gateway_with_servers):
         """Step 1: Search for library docs tools."""
-        result = await gateway_with_servers.catalog_search({
-            "query": "library docs"
-        })
+        result = await gateway_with_servers.catalog_search({"query": "library docs"})
 
         print(f"\nSearch 'library docs' returned {len(result.results)} results:")
         for card in result.results:
@@ -531,16 +519,18 @@ class TestScenario8_LibraryConcepts:
     async def test_invoke_query_docs_conceptual(self, gateway_with_servers):
         """Step 2: Get conceptual docs about React hooks."""
         # Query docs for conceptual information about hooks
-        result = await gateway_with_servers.invoke({
-            "tool_id": "context7::query-docs",
-            "arguments": {
-                "query": "how do React hooks work",
-                "libraryId": "/npm/react/19.0.0"
-            },
-            "options": {"timeout_ms": 60000}
-        })
+        result = await gateway_with_servers.invoke(
+            {
+                "tool_id": "context7::query-docs",
+                "arguments": {
+                    "query": "how do React hooks work",
+                    "libraryId": "/npm/react/19.0.0",
+                },
+                "options": {"timeout_ms": 60000},
+            }
+        )
 
-        print(f"\nInvoke 'context7::query-docs' for conceptual info:")
+        print("\nInvoke 'context7::query-docs' for conceptual info:")
         print(f"  OK: {result.ok}")
         print(f"  Truncated: {result.truncated}")
         if not result.ok:
@@ -552,7 +542,9 @@ class TestToolsCoverageMatrix:
 
     @skip_no_playwright
     @pytest.mark.asyncio
-    async def test_high_priority_playwright_tools_searchable(self, gateway_with_servers):
+    async def test_high_priority_playwright_tools_searchable(
+        self, gateway_with_servers
+    ):
         """Verify HIGH priority Playwright tools are searchable."""
         high_priority_tools = [
             "browser_navigate",
@@ -563,10 +555,12 @@ class TestToolsCoverageMatrix:
 
         # Search for each and verify it appears
         for tool_name in high_priority_tools:
-            result = await gateway_with_servers.catalog_search({
-                "query": tool_name.replace("_", " "),
-                "filters": {"server": "playwright"}
-            })
+            result = await gateway_with_servers.catalog_search(
+                {
+                    "query": tool_name.replace("_", " "),
+                    "filters": {"server": "playwright"},
+                }
+            )
 
             tool_ids = [r.tool_id for r in result.results]
             found = any(tool_name in tid for tid in tool_ids)
@@ -582,10 +576,12 @@ class TestToolsCoverageMatrix:
         ]
 
         for tool_name in high_priority_tools:
-            result = await gateway_with_servers.catalog_search({
-                "query": tool_name.replace("-", " "),
-                "filters": {"server": "context7"}
-            })
+            result = await gateway_with_servers.catalog_search(
+                {
+                    "query": tool_name.replace("-", " "),
+                    "filters": {"server": "context7"},
+                }
+            )
 
             tool_ids = [r.tool_id for r in result.results]
             found = any(tool_name in tid for tid in tool_ids)

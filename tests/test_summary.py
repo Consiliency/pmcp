@@ -10,7 +10,12 @@ from pmcp.summary.template_fallback import (
     template_summary,
 )
 from pmcp.summary.generator import generate_capability_summary, get_prebuilt_summary
-from pmcp.types import DescriptionsCache, GeneratedServerDescriptions, RiskHint, ToolInfo
+from pmcp.types import (
+    DescriptionsCache,
+    GeneratedServerDescriptions,
+    RiskHint,
+    ToolInfo,
+)
 
 
 def make_tool(
@@ -158,7 +163,9 @@ class TestTemplateSummaryCustomInstructions:
 
     def test_no_guidance_when_disabled(self) -> None:
         tools = [make_tool("server", "tool")]
-        summary = template_summary(tools, include_code_guidance=False, custom_instructions="Ignored text")
+        summary = template_summary(
+            tools, include_code_guidance=False, custom_instructions="Ignored text"
+        )
         assert "Ignored text" not in summary
         assert "Workflow:" not in summary
 

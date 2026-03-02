@@ -418,16 +418,18 @@ class GatewayTools:
                 elif tool.risk_hint == "high":
                     risk = RiskHint.HIGH
 
-                cached_tools.append(ToolInfo(
-                    tool_id=tool_id,
-                    server_name=server_name,
-                    tool_name=tool.name,
-                    description=tool.description,
-                    short_description=tool.short_description,
-                    tags=tool.tags,
-                    risk_hint=risk,
-                    input_schema={},  # Not available in cache
-                ))
+                cached_tools.append(
+                    ToolInfo(
+                        tool_id=tool_id,
+                        server_name=server_name,
+                        tool_name=tool.name,
+                        description=tool.description,
+                        short_description=tool.short_description,
+                        tags=tool.tags,
+                        risk_hint=risk,
+                        input_schema={},  # Not available in cache
+                    )
+                )
 
         return cached_tools
 

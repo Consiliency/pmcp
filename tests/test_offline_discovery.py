@@ -79,10 +79,11 @@ class TestServerPassesCache:
         assert "_descriptions_cache" in init_source, (
             "GatewayServer.initialize should reference _descriptions_cache"
         )
-        assert "_gateway_tools._descriptions_cache" in init_source or \
-               "_gateway_tools" in init_source and "_descriptions_cache" in init_source, (
-            "GatewayServer.initialize should pass cache to GatewayTools"
-        )
+        assert (
+            "_gateway_tools._descriptions_cache" in init_source
+            or "_gateway_tools" in init_source
+            and "_descriptions_cache" in init_source
+        ), "GatewayServer.initialize should pass cache to GatewayTools"
 
 
 class TestCatalogSearchOfflineDiscovery:
@@ -142,9 +143,11 @@ class TestCatalogSearchOfflineDiscovery:
         self, gateway_tools_with_cache: GatewayTools
     ) -> None:
         """catalog_search with include_offline=True returns cached tools."""
-        result = await gateway_tools_with_cache.catalog_search({
-            "include_offline": True,
-        })
+        result = await gateway_tools_with_cache.catalog_search(
+            {
+                "include_offline": True,
+            }
+        )
 
         # Should find tools from offline server
         assert result.total_available >= 2, (
@@ -176,9 +179,11 @@ class TestCatalogSearchOfflineDiscovery:
         self, gateway_tools_with_cache: GatewayTools
     ) -> None:
         """Cached tools should be marked as from offline server."""
-        result = await gateway_tools_with_cache.catalog_search({
-            "include_offline": True,
-        })
+        result = await gateway_tools_with_cache.catalog_search(
+            {
+                "include_offline": True,
+            }
+        )
 
         # Tools from cache should have availability="offline"
         for tool in result.results:
@@ -191,9 +196,11 @@ class TestCatalogSearchOfflineDiscovery:
         self, gateway_tools_with_cache: GatewayTools
     ) -> None:
         """Cached tools should have correct server name in tool_id."""
-        result = await gateway_tools_with_cache.catalog_search({
-            "include_offline": True,
-        })
+        result = await gateway_tools_with_cache.catalog_search(
+            {
+                "include_offline": True,
+            }
+        )
 
         for tool in result.results:
             assert tool.server == "offline-server", (
@@ -261,7 +268,9 @@ class TestCacheMergeWithLiveTools:
         result = await tools.catalog_search({"include_offline": True})
 
         # Should have only 1 tool (live takes precedence)
-        assert len(result.results) == 1, f"Live tool should replace cached, got {len(result.results)}"
+        assert len(result.results) == 1, (
+            f"Live tool should replace cached, got {len(result.results)}"
+        )
         assert result.results[0].short_description == "Live version", (
             f"Live tool data should be used, not cached. Got: {result.results[0].short_description}"
         )
@@ -322,7 +331,9 @@ class TestCacheMergeWithLiveTools:
         mock_client_manager = MagicMock()
         mock_client_manager.get_all_tools.return_value = [mock_live_tool]
         # Only online-server is online
-        mock_client_manager.is_server_online.side_effect = lambda name: name == "online-server"
+        mock_client_manager.is_server_online.side_effect = (
+            lambda name: name == "online-server"
+        )
 
         mock_policy_manager = MagicMock()
         mock_policy_manager.is_tool_allowed.return_value = True
@@ -337,7 +348,9 @@ class TestCacheMergeWithLiveTools:
         result = await tools.catalog_search({"include_offline": True})
 
         # Should have 2 tools: live online + cached offline
-        assert len(result.results) == 2, f"Should have 2 tools, got {len(result.results)}"
+        assert len(result.results) == 2, (
+            f"Should have 2 tools, got {len(result.results)}"
+        )
 
         tool_ids = {t.tool_id for t in result.results}
         assert "online-server::online_tool" in tool_ids
@@ -394,7 +407,9 @@ class TestCachePolicyEnforcement:
         mock_policy_manager = MagicMock()
         mock_policy_manager.is_tool_allowed.return_value = True
         # Deny "denied-server"
-        mock_policy_manager.is_server_allowed.side_effect = lambda name: name != "denied-server"
+        mock_policy_manager.is_server_allowed.side_effect = (
+            lambda name: name != "denied-server"
+        )
 
         tools = GatewayTools(
             client_manager=mock_client_manager,
@@ -447,7 +462,9 @@ class TestCachePolicyEnforcement:
         mock_policy_manager = MagicMock()
         mock_policy_manager.is_server_allowed.return_value = True
         # Deny tools with "delete" in the name
-        mock_policy_manager.is_tool_allowed.side_effect = lambda tool_id: "delete" not in tool_id
+        mock_policy_manager.is_tool_allowed.side_effect = (
+            lambda tool_id: "delete" not in tool_id
+        )
 
         tools = GatewayTools(
             client_manager=mock_client_manager,

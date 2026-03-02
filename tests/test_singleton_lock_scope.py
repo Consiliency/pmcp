@@ -8,14 +8,10 @@ These tests verify that:
 
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
-import pytest
 
 from pmcp.server import GatewayServer
 from pmcp.identity import acquire_singleton_lock, release_singleton_lock
@@ -46,7 +42,9 @@ class TestGlobalLockDefault:
             "GatewayServer should store explicit lock_dir"
         )
 
-    def test_gateway_server_lock_dir_converts_string_to_path(self, tmp_path: Path) -> None:
+    def test_gateway_server_lock_dir_converts_string_to_path(
+        self, tmp_path: Path
+    ) -> None:
         """GatewayServer should convert string lock_dir to Path."""
         server = GatewayServer(lock_dir=str(tmp_path))
         assert server._lock_dir == tmp_path, (
@@ -66,9 +64,7 @@ class TestCLILockDirFlag:
             text=True,
         )
 
-        assert "--lock-dir" in result.stdout, (
-            "CLI should have --lock-dir option"
-        )
+        assert "--lock-dir" in result.stdout, "CLI should have --lock-dir option"
 
     def test_cli_lock_dir_help_text(self) -> None:
         """CLI --lock-dir should have descriptive help text."""

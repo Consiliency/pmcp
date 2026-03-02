@@ -15,6 +15,7 @@ from typing import Any
 
 try:
     import resource
+
     HAS_RESOURCE = True
 except ImportError:
     HAS_RESOURCE = False
@@ -55,6 +56,7 @@ def _get_memory_usage_mb() -> float:
             # ru_maxrss is in KB on Linux, bytes on macOS
             usage = resource.getrusage(resource.RUSAGE_SELF)
             import sys
+
             if sys.platform == "darwin":
                 return usage.ru_maxrss / 1024 / 1024
             return usage.ru_maxrss / 1024
@@ -249,7 +251,9 @@ class ClientManager:
         for config in configs:
             name = config.name
             if name in self._clients:
-                logger.debug(f"Server {name} already connected, skipping lazy registration")
+                logger.debug(
+                    f"Server {name} already connected, skipping lazy registration"
+                )
                 continue
 
             self._lazy_configs[name] = config

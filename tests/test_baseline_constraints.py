@@ -15,10 +15,9 @@ Constraints verified:
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -48,19 +47,21 @@ class TestGatewayToolSurface:
     """
 
     # The canonical list of gateway tools
-    EXPECTED_TOOL_NAMES = frozenset([
-        "gateway.catalog_search",
-        "gateway.describe",
-        "gateway.invoke",
-        "gateway.refresh",
-        "gateway.health",
-        "gateway.request_capability",
-        "gateway.sync_environment",
-        "gateway.provision",
-        "gateway.provision_status",
-        "gateway.list_pending",
-        "gateway.cancel",
-    ])
+    EXPECTED_TOOL_NAMES = frozenset(
+        [
+            "gateway.catalog_search",
+            "gateway.describe",
+            "gateway.invoke",
+            "gateway.refresh",
+            "gateway.health",
+            "gateway.request_capability",
+            "gateway.sync_environment",
+            "gateway.provision",
+            "gateway.provision_status",
+            "gateway.list_pending",
+            "gateway.cancel",
+        ]
+    )
 
     def test_gateway_tool_count_is_eleven(self) -> None:
         """Verify exactly 11 gateway tools are defined."""
@@ -110,9 +111,7 @@ class TestGatewayToolSurface:
         """Verify each tool has a non-empty description."""
         tools = get_gateway_tool_definitions()
         for tool in tools:
-            assert tool.description, (
-                f"Tool '{tool.name}' has no description"
-            )
+            assert tool.description, f"Tool '{tool.name}' has no description"
             assert len(tool.description) >= 10, (
                 f"Tool '{tool.name}' description is too short: '{tool.description}'"
             )
@@ -135,6 +134,7 @@ class TestTransportConstraints:
 
         # Check that _run_stdio uses stdio_server (the default transport path)
         import inspect
+
         run_stdio_source = inspect.getsource(server._run_stdio)
 
         assert "from mcp.server.stdio import stdio_server" in run_stdio_source, (
@@ -221,9 +221,7 @@ class TestSingletonLockConstraints:
         assert 'Path.home() / ".pmcp"' in source, (
             "Default lock directory should be ~/.pmcp"
         )
-        assert '"gateway.lock"' in source, (
-            "Lock file should be named 'gateway.lock'"
-        )
+        assert '"gateway.lock"' in source, "Lock file should be named 'gateway.lock'"
 
     def test_server_uses_global_lock_by_default(self) -> None:
         """Verify GatewayServer uses global lock (None) by default, not cache_dir."""
@@ -315,7 +313,9 @@ class TestSelfReferenceConstraints:
 
     def test_does_not_detect_other_commands(self) -> None:
         """Verify non-gateway commands are not flagged."""
-        config = self._make_config("github", "npx", ["-y", "@modelcontextprotocol/server-github"])
+        config = self._make_config(
+            "github", "npx", ["-y", "@modelcontextprotocol/server-github"]
+        )
         assert is_self_reference(config) is False, (
             "npx server-github should not be detected as self-reference"
         )
@@ -323,15 +323,21 @@ class TestSelfReferenceConstraints:
     def test_filter_removes_self_references(self) -> None:
         """Verify filter_self_references removes self-referential configs."""
         configs = [
-            self._make_config("github", "npx", ["-y", "@modelcontextprotocol/server-github"]),
+            self._make_config(
+                "github", "npx", ["-y", "@modelcontextprotocol/server-github"]
+            ),
             self._make_config("recursive-gateway", "pmcp"),
-            self._make_config("filesystem", "npx", ["-y", "@modelcontextprotocol/server-filesystem"]),
+            self._make_config(
+                "filesystem", "npx", ["-y", "@modelcontextprotocol/server-filesystem"]
+            ),
             self._make_config("uvx-gateway", "uvx", ["pmcp"]),
         ]
 
         filtered = filter_self_references(configs)
 
-        assert len(filtered) == 2, f"Expected 2 configs after filtering, got {len(filtered)}"
+        assert len(filtered) == 2, (
+            f"Expected 2 configs after filtering, got {len(filtered)}"
+        )
         names = [c.name for c in filtered]
         assert "github" in names
         assert "filesystem" in names
@@ -461,8 +467,12 @@ class TestClientManagerConstraints:
         assert isinstance(manager._servers, dict), "_servers must be a dict"
 
         # Verify accessor methods exist
-        assert hasattr(manager, "get_server_status"), "Must have get_server_status method"
-        assert hasattr(manager, "get_all_server_statuses"), "Must have get_all_server_statuses method"
+        assert hasattr(manager, "get_server_status"), (
+            "Must have get_server_status method"
+        )
+        assert hasattr(manager, "get_all_server_statuses"), (
+            "Must have get_all_server_statuses method"
+        )
         assert hasattr(manager, "is_server_online"), "Must have is_server_online method"
 
     def test_max_tools_per_server_configurable(self) -> None:
@@ -495,12 +505,23 @@ class TestInitializationSequence:
             server = GatewayServer()
 
             # Mock other dependencies
-            with patch.object(server._client_manager, "connect_all", new_callable=AsyncMock) as mock_connect:
+            with patch.object(
+                server._client_manager, "connect_all", new_callable=AsyncMock
+            ) as mock_connect:
                 mock_connect.return_value = []
                 with patch.object(server._client_manager, "start_health_monitor"):
-                    with patch.object(server._client_manager, "get_all_server_statuses", return_value=[]):
-                        with patch.object(server._client_manager, "get_all_tools", return_value=[]):
-                            with patch("pmcp.server.generate_capability_summary", new_callable=AsyncMock) as mock_summary:
+                    with patch.object(
+                        server._client_manager,
+                        "get_all_server_statuses",
+                        return_value=[],
+                    ):
+                        with patch.object(
+                            server._client_manager, "get_all_tools", return_value=[]
+                        ):
+                            with patch(
+                                "pmcp.server.generate_capability_summary",
+                                new_callable=AsyncMock,
+                            ) as mock_summary:
                                 mock_summary.return_value = "test summary"
                                 await server.initialize()
 
@@ -517,12 +538,23 @@ class TestInitializationSequence:
 
                 server = GatewayServer()
 
-                with patch.object(server._client_manager, "connect_all", new_callable=AsyncMock) as mock_connect:
+                with patch.object(
+                    server._client_manager, "connect_all", new_callable=AsyncMock
+                ) as mock_connect:
                     mock_connect.return_value = []
                     with patch.object(server._client_manager, "start_health_monitor"):
-                        with patch.object(server._client_manager, "get_all_server_statuses", return_value=[]):
-                            with patch.object(server._client_manager, "get_all_tools", return_value=[]):
-                                with patch("pmcp.server.generate_capability_summary", new_callable=AsyncMock) as mock_summary:
+                        with patch.object(
+                            server._client_manager,
+                            "get_all_server_statuses",
+                            return_value=[],
+                        ):
+                            with patch.object(
+                                server._client_manager, "get_all_tools", return_value=[]
+                            ):
+                                with patch(
+                                    "pmcp.server.generate_capability_summary",
+                                    new_callable=AsyncMock,
+                                ) as mock_summary:
                                     mock_summary.return_value = "test summary"
                                     await server.initialize()
 
@@ -536,12 +568,23 @@ class TestInitializationSequence:
 
             server = GatewayServer()
 
-            with patch.object(server._client_manager, "connect_all", new_callable=AsyncMock) as mock_connect:
+            with patch.object(
+                server._client_manager, "connect_all", new_callable=AsyncMock
+            ) as mock_connect:
                 mock_connect.return_value = []
                 with patch.object(server._client_manager, "start_health_monitor"):
-                    with patch.object(server._client_manager, "get_all_server_statuses", return_value=[]):
-                        with patch.object(server._client_manager, "get_all_tools", return_value=[]):
-                            with patch("pmcp.server.generate_capability_summary", new_callable=AsyncMock) as mock_summary:
+                    with patch.object(
+                        server._client_manager,
+                        "get_all_server_statuses",
+                        return_value=[],
+                    ):
+                        with patch.object(
+                            server._client_manager, "get_all_tools", return_value=[]
+                        ):
+                            with patch(
+                                "pmcp.server.generate_capability_summary",
+                                new_callable=AsyncMock,
+                            ) as mock_summary:
                                 mock_summary.return_value = "test summary"
                                 await server.initialize()
 
@@ -555,12 +598,25 @@ class TestInitializationSequence:
 
             server = GatewayServer()
 
-            with patch.object(server._client_manager, "connect_all", new_callable=AsyncMock) as mock_connect:
+            with patch.object(
+                server._client_manager, "connect_all", new_callable=AsyncMock
+            ) as mock_connect:
                 mock_connect.return_value = []
-                with patch.object(server._client_manager, "start_health_monitor") as mock_health:
-                    with patch.object(server._client_manager, "get_all_server_statuses", return_value=[]):
-                        with patch.object(server._client_manager, "get_all_tools", return_value=[]):
-                            with patch("pmcp.server.generate_capability_summary", new_callable=AsyncMock) as mock_summary:
+                with patch.object(
+                    server._client_manager, "start_health_monitor"
+                ) as mock_health:
+                    with patch.object(
+                        server._client_manager,
+                        "get_all_server_statuses",
+                        return_value=[],
+                    ):
+                        with patch.object(
+                            server._client_manager, "get_all_tools", return_value=[]
+                        ):
+                            with patch(
+                                "pmcp.server.generate_capability_summary",
+                                new_callable=AsyncMock,
+                            ) as mock_summary:
                                 mock_summary.return_value = "test summary"
                                 await server.initialize()
 
@@ -590,6 +646,7 @@ class TestReadmeToolCount:
         # Find tool count claims in README (e.g., "9 meta-tools", "11 meta-tools")
         # Pattern matches: "X meta-tools" or "X stable meta-tools"
         import re
+
         pattern = r"(\d+)\s+(?:stable\s+)?meta-tools"
         matches = re.findall(pattern, readme_content, re.IGNORECASE)
 
@@ -632,6 +689,7 @@ class TestReadmeToolCount:
 
         # Extract tools mentioned in markdown tables (| `gateway.xxx` |)
         import re
+
         table_pattern = r"\|\s*`(gateway\.[a-z_]+)`\s*\|"
         documented_in_tables = set(re.findall(table_pattern, readme_content))
 

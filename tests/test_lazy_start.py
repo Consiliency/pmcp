@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -596,8 +595,12 @@ class TestHealthOutputWithLazyServers:
 
         # One online, one lazy
         statuses = [
-            ServerStatus(name="online-server", status=ServerStatusEnum.ONLINE, tool_count=5),
-            ServerStatus(name="lazy-server", status=ServerStatusEnum.LAZY, tool_count=0),
+            ServerStatus(
+                name="online-server", status=ServerStatusEnum.ONLINE, tool_count=5
+            ),
+            ServerStatus(
+                name="lazy-server", status=ServerStatusEnum.LAZY, tool_count=0
+            ),
         ]
         mock_client_manager.get_all_server_statuses.return_value = statuses
         mock_client_manager.get_registry_meta.return_value = ("rev-123", 1234567890.0)

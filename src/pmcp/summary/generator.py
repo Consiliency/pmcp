@@ -61,7 +61,9 @@ def get_prebuilt_summary(
                 lines.append(line.rstrip())
         else:
             lines.append("Workflow: catalog_search → describe → invoke.")
-            lines.append("Need a capability not listed? Use gateway_request_capability to find or provision tools.")
+            lines.append(
+                "Need a capability not listed? Use gateway_request_capability to find or provision tools."
+            )
 
     lines.append("")
     lines.append("Use gateway.catalog_search to explore tools.")
@@ -101,7 +103,8 @@ async def generate_capability_summary(
     # 1. Try pre-built cache first
     if cache:
         prebuilt = get_prebuilt_summary(
-            tools, cache,
+            tools,
+            cache,
             include_code_guidance=include_code_guidance,
             custom_instructions=custom_instructions,
         )

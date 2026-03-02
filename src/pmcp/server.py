@@ -24,7 +24,11 @@ from pydantic import AnyUrl
 
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
-from pmcp.config.loader import load_configs, load_disabled_auto_start, manifest_server_to_config
+from pmcp.config.loader import (
+    load_configs,
+    load_disabled_auto_start,
+    manifest_server_to_config,
+)
 from pmcp.identity import (
     filter_self_references,
     acquire_singleton_lock,
@@ -370,7 +374,9 @@ class GatewayServer:
 
         # Filter by policy (both auto-start and lazy)
         allowed_auto_start = [
-            c for c in auto_start_configs if self._policy_manager.is_server_allowed(c.name)
+            c
+            for c in auto_start_configs
+            if self._policy_manager.is_server_allowed(c.name)
         ]
         allowed_lazy = [
             c for c in lazy_configs if self._policy_manager.is_server_allowed(c.name)
@@ -388,7 +394,9 @@ class GatewayServer:
         if allowed_auto_start:
             errors = await self._client_manager.connect_all(allowed_auto_start)
             if errors:
-                logger.warning(f"Some auto-start servers failed to connect: {len(errors)} errors")
+                logger.warning(
+                    f"Some auto-start servers failed to connect: {len(errors)} errors"
+                )
 
         # Start health monitor for heartbeat tracking
         self._client_manager.start_health_monitor()
@@ -499,7 +507,9 @@ class GatewayServer:
 
         try:
             app = create_http_app(self._server)
-            logger.info(f"MCP Gateway server started (http://{self._host}:{self._port})")
+            logger.info(
+                f"MCP Gateway server started (http://{self._host}:{self._port})"
+            )
 
             config = uvicorn.Config(
                 app,
