@@ -17,6 +17,7 @@ import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.secrets import (
     run_secrets_check,
     run_secrets_set,
@@ -1027,6 +1028,12 @@ async def run_doctor(args: argparse.Namespace) -> None:
                 )
     else:
         checks.append(("sse", "ok", "No SSE endpoint configured in local .mcp.json."))
+
+    remote_checks = collect_remote_header_diagnostics(config_data)
+    if remote_checks:
+        checks.extend(remote_checks)
+    else:
+        checks.append(("remote", "ok", "No remote downstream header issues detected."))
 
     status_icon = {"ok": "OK", "warn": "WARN", "fail": "FAIL"}
     print("PMCP Doctor")

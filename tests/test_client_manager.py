@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import time
-from unittest.mock import AsyncMock, MagicMock
+from typing import Any, cast
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -17,6 +19,8 @@ from pmcp.client.manager import (
     _truncate_description,
 )
 from pmcp.types import (
+    RemoteMcpServerConfig,
+    ResolvedServerConfig,
     RiskHint,
     ServerStatus,
     ServerStatusEnum,
@@ -146,7 +150,9 @@ class TestDisconnectAll:
 
         await manager.disconnect_all()
 
-        managed.process.terminate.assert_called_once()
+        process = managed.process
+        assert process is not None
+        cast(Any, process).terminate.assert_called_once()
         assert manager._clients == {}
         assert manager._servers == {}
 
@@ -183,12 +189,142 @@ class TestDisconnectAll:
         manager, managed = manager_with_client
 
         # Make wait timeout
-        managed.process.wait = AsyncMock(side_effect=asyncio.TimeoutError())
+        process = managed.process
+        assert process is not None
+        process.wait = AsyncMock(side_effect=asyncio.TimeoutError())
 
         await manager.disconnect_all()
 
-        managed.process.terminate.assert_called_once()
-        managed.process.kill.assert_called_once()
+        cast(Any, process).terminate.assert_called_once()
+        cast(Any, process).kill.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_all_closes_remote_stack(self) -> None:
+        """Test that disconnect_all closes remote SSE transports."""
+        manager = ClientManager()
+        status = ServerStatus(
+            name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+
+        sse_stack = MagicMock()
+        sse_stack.aclose = AsyncMock()
+
+        managed = ManagedClient(
+            config=MagicMock(),
+            process=None,
+            is_remote=True,
+            sse_exit_stack=sse_stack,
+            write_stream=MagicMock(),
+            status=status,
+        )
+        manager._clients["remote"] = managed
+        manager._servers["remote"] = status
+
+        await manager.disconnect_all()
+
+        sse_stack.aclose.assert_awaited_once()
+
+
+class TestRemoteSendRequest:
+    """Tests for remote request transport."""
+
+    @pytest.mark.asyncio
+    async def test_send_request_remote_uses_write_stream(self) -> None:
+        """Remote requests should be sent via write_stream.send."""
+        manager = ClientManager()
+        status = ServerStatus(
+            name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+
+        write_stream = MagicMock()
+        write_stream.send = AsyncMock()
+
+        managed = ManagedClient(
+            config=MagicMock(name="remote"),
+            process=None,
+            is_remote=True,
+            write_stream=write_stream,
+            status=status,
+        )
+        managed.config.name = "remote"
+
+        request_task = asyncio.create_task(
+            manager._send_request(managed, "tools/list", {}, timeout_ms=500)
+        )
+        await asyncio.sleep(0)
+
+        pending = managed.pending_requests[1]
+        pending.future.set_result({"tools": []})
+
+        result = await request_task
+        assert result == {"tools": []}
+        write_stream.send.assert_awaited_once()
+
+
+class TestRemoteConnectSseHeaders:
+    """Tests for remote SSE header interpolation."""
+
+    @pytest.mark.asyncio
+    async def test_connect_sse_interpolates_headers_from_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Header values like ${VAR} should be resolved from os.environ."""
+        manager = ClientManager()
+        monkeypatch.setenv("PMCP_TEST_TOKEN", "test-token")
+
+        config = ResolvedServerConfig(
+            name="remote",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                url="https://example.com/sse",
+                headers={
+                    "Authorization": "${PMCP_TEST_TOKEN}",
+                    "X-Static": "literal-value",
+                    "X-Missing": "${PMCP_MISSING}",
+                },
+            ),
+        )
+
+        captured_headers: dict[str, str] = {}
+
+        class EmptyReadStream:
+            def __aiter__(self) -> "EmptyReadStream":
+                return self
+
+            async def __anext__(self) -> None:
+                raise StopAsyncIteration
+
+        @asynccontextmanager
+        async def mock_sse_client(url: str, headers: dict[str, str] | None = None):
+            assert url == "https://example.com/sse"
+            captured_headers.update(headers or {})
+            yield EmptyReadStream(), MagicMock()
+
+        manager._send_initialize = AsyncMock()
+
+        async def mock_send_request(*args: object, **kwargs: object) -> dict:
+            method = args[1]
+            if method == "tools/list":
+                return {"tools": []}
+            if method == "resources/list":
+                return {"resources": []}
+            if method == "prompts/list":
+                return {"prompts": []}
+            return {}
+
+        manager._send_request = AsyncMock(side_effect=mock_send_request)
+        manager._read_sse = AsyncMock()
+
+        with patch("pmcp.client.manager.sse_client", mock_sse_client):
+            await manager._connect_sse(config)
+
+        assert captured_headers == {
+            "Authorization": "test-token",
+            "X-Static": "literal-value",
+            "X-Missing": "",
+        }
+
+        await manager.disconnect_all()
 
 
 class TestCallTool:
@@ -471,7 +607,7 @@ class TestParallelConnections:
         configs = [MagicMock(name=f"server{i}") for i in range(3)]
 
         start = time.time()
-        await manager.connect_all(configs, retry=False)
+        await manager.connect_all(configs, retry=False)  # type: ignore[arg-type]
         elapsed = time.time() - start
 
         # If parallel, should complete in ~0.1s, not ~0.3s
@@ -497,7 +633,7 @@ class TestParallelConnections:
             config.name = name
             configs.append(config)
 
-        errors = await manager.connect_all(configs, retry=False)
+        errors = await manager.connect_all(configs, retry=False)  # type: ignore[arg-type]
         assert len(errors) == 1
         assert "fail" in errors[0]
         assert "Connection failed" in errors[0]
@@ -559,7 +695,7 @@ class TestConnectionRetry:
         manager._connect_server = mock_connect  # type: ignore[method-assign]
 
         configs = [MagicMock(name="no-retry")]
-        errors = await manager.connect_all(configs, retry=False)
+        errors = await manager.connect_all(configs, retry=False)  # type: ignore[arg-type]
 
         assert attempts == 1  # No retry
         assert len(errors) == 1

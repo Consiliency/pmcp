@@ -6,9 +6,15 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
-from pmcp.types import McpConfigFile, McpServerConfig, ResolvedServerConfig
+from pmcp.types import (
+    LocalMcpServerConfig,
+    McpConfigFile,
+    McpServerConfig,
+    RemoteMcpServerConfig,
+    ResolvedServerConfig,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -20,6 +26,49 @@ DEFAULT_USER_CONFIG_PATHS = [
     Path.home() / ".mcp.json",
     Path.home() / ".claude" / ".mcp.json",
 ]
+
+
+def _coerce_server_entry(config: object) -> dict[str, Any] | None:
+    """Coerce legacy MCP server entries into typed local/remote records."""
+    if not isinstance(config, dict):
+        return None
+
+    coerced: dict[str, Any] = dict(config)
+    entry_type = coerced.get("type")
+    command = coerced.get("command")
+    url = coerced.get("url")
+
+    if isinstance(entry_type, str):
+        if entry_type in {"local", "remote", "sse", "http", "streamable-http"}:
+            if entry_type == "local":
+                if "command" not in coerced:
+                    coerced["command"] = ""
+                elif not isinstance(coerced.get("command"), str):
+                    return None
+            else:
+                if not (isinstance(url, str) and url):
+                    return None
+            return coerced
+        return None
+
+    # Legacy explicit local command form.
+    if isinstance(command, str) and command:
+        coerced["type"] = "local"
+        return coerced
+
+    # Legacy remote URL form with no type.
+    if isinstance(url, str) and url:
+        coerced["type"] = "remote"
+        return coerced
+
+    # Partial local override (for manifest default merge).
+    has_local_override = any(key in coerced for key in ("args", "cwd", "env"))
+    if command is None and has_local_override:
+        coerced["type"] = "local"
+        coerced["command"] = ""
+        return coerced
+
+    return None
 
 
 def find_project_root(start_dir: Path) -> Path | None:
@@ -50,40 +99,20 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
         content = file_path.read_text()
         data = json.loads(content)
 
-        # Some MCP clients support remote entries like {"type": "sse", "url": "..."}
-        # without a local command. PMCP only loads local command-based downstream
-        # servers from discovered config files, but keeps partial local overrides
-        # (e.g. args/env without command) so they can merge with manifest defaults.
         raw_servers = data.get("mcpServers")
         if isinstance(raw_servers, dict):
             filtered_servers: dict[str, dict[str, object]] = {}
             skipped_count = 0
             for name, config in raw_servers.items():
-                if not isinstance(config, dict):
+                coerced = _coerce_server_entry(config)
+                if coerced is None:
                     skipped_count += 1
                     continue
-
-                command = config.get("command")
-                has_local_override = any(
-                    key in config for key in ("args", "cwd", "env")
-                )
-
-                if isinstance(command, str) and command:
-                    filtered_servers[name] = config
-                    continue
-
-                if command is None and has_local_override:
-                    # Allow partial override; resolved later against manifest defaults.
-                    partial = dict(config)
-                    partial["command"] = ""
-                    filtered_servers[name] = partial
-                    continue
-
-                skipped_count += 1
+                filtered_servers[name] = coerced
 
             if skipped_count > 0:
                 logger.info(
-                    f"Skipping {skipped_count} non-command MCP entries in {file_path}"
+                    f"Skipping {skipped_count} invalid MCP server entries in {file_path}"
                 )
             data["mcpServers"] = filtered_servers
 
@@ -95,9 +124,9 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
 
 def _merge_manifest_defaults(
     name: str,
-    config: McpServerConfig,
+    config: LocalMcpServerConfig,
     manifest_servers: dict[str, "ManifestServerConfig"] | None,
-) -> McpServerConfig | None:
+) -> LocalMcpServerConfig | None:
     """Merge a partial config with manifest defaults when possible."""
     if config.command:
         return config
@@ -122,8 +151,8 @@ def _merge_manifest_defaults(
 
 
 def normalize_server_config(
-    config: McpServerConfig, base_path: Path
-) -> McpServerConfig:
+    config: LocalMcpServerConfig, base_path: Path
+) -> LocalMcpServerConfig:
     """Normalize server config (resolve relative paths)."""
     normalized = config.model_copy()
 
@@ -180,14 +209,18 @@ def load_configs(
         source: Literal["project", "user", "custom"],
         base_path: Path,
     ) -> ResolvedServerConfig | None:
-        normalized = normalize_server_config(config, base_path)
-        merged = _merge_manifest_defaults(name, normalized, manifest_servers)
-        if not merged:
-            return None
+        if isinstance(config, RemoteMcpServerConfig):
+            resolved_config: McpServerConfig = config
+        else:
+            normalized = normalize_server_config(config, base_path)
+            local_merged = _merge_manifest_defaults(name, normalized, manifest_servers)
+            if not local_merged:
+                return None
+            resolved_config = local_merged
         return ResolvedServerConfig(
             name=name,
             source=cast(Literal["project", "user", "custom", "manifest"], source),
-            config=merged,
+            config=resolved_config,
         )
 
     # 1. Load project config (highest priority)
@@ -330,7 +363,7 @@ def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerC
     return ResolvedServerConfig(
         name=server.name,
         source="manifest",
-        config=McpServerConfig(
+        config=LocalMcpServerConfig(
             command=server.command,
             args=server.args,
             env=env,

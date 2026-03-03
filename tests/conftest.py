@@ -11,7 +11,7 @@ import pytest
 
 from pmcp.policy.policy import PolicyManager
 from pmcp.types import (
-    McpServerConfig,
+    LocalMcpServerConfig,
     ResolvedServerConfig,
     RiskHint,
     ServerStatus,
@@ -70,7 +70,7 @@ def create_server_config(
     return ResolvedServerConfig(
         name=name,
         source="project",
-        config=McpServerConfig(
+        config=LocalMcpServerConfig(
             command=command,
             args=args or [],
             env=env,

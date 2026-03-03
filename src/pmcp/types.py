@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -14,16 +14,42 @@ GatewayTransport = Literal["stdio", "http"]
 # === Config Types ===
 
 
-class McpServerConfig(BaseModel):
-    """Configuration for a single MCP server."""
+class _DictLikeModel(BaseModel):
+    """Provide lightweight dict-style compatibility for config models."""
 
-    command: str
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
+class LocalMcpServerConfig(_DictLikeModel):
+    """Local process-backed MCP server configuration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["local"] = "local"
+    command: str = ""
     args: list[str] = Field(default_factory=list)
     cwd: str | None = None
     env: dict[str, str] | None = None
-    # HTTP transport (optional)
-    url: str | None = None
+
+
+class RemoteMcpServerConfig(_DictLikeModel):
+    """Remote MCP server configuration."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    type: Literal["remote", "sse", "http", "streamable-http"] = "remote"
+    url: str
     headers: dict[str, str] | None = None
+
+
+McpServerConfig = Annotated[
+    LocalMcpServerConfig | RemoteMcpServerConfig,
+    Field(discriminator="type"),
+]
 
 
 class McpConfigFile(BaseModel):

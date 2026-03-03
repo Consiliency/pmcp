@@ -9,6 +9,7 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 from pmcp.config.loader import find_project_root, load_configs
+from pmcp.types import LocalMcpServerConfig
 
 ENV_REF_PATTERN = re.compile(
     r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
@@ -105,6 +106,9 @@ def _extract_required_keys(
     per_server: dict[str, set[str]] = {}
     all_keys: set[str] = set()
     for cfg in configs:
+        if not isinstance(cfg.config, LocalMcpServerConfig):
+            continue
+
         env_map = cfg.config.env or {}
         server_keys: set[str] = set()
         for env_key, env_value in env_map.items():

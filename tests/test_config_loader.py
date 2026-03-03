@@ -57,8 +57,10 @@ class TestLoadConfigs:
         assert len(configs) == 1
         assert configs[0].name == "test-server"
         assert configs[0].source == "project"
-        assert configs[0].config.command == "node"
-        assert configs[0].config.args == ["server.js"]
+        cfg = configs[0].config
+        assert cfg.type == "local"
+        assert cfg.command == "node"
+        assert cfg.args == ["server.js"]
 
     def test_merges_configs_with_precedence(self, tmp_path: Path) -> None:
         # Create project config
@@ -92,6 +94,7 @@ class TestLoadConfigs:
         # Project 'shared-server' should take precedence
         shared = next(c for c in configs if c.name == "shared-server")
         assert shared.source == "project"
+        assert shared.config.type == "local"
         assert shared.config.command == "project-cmd"
 
         # Both unique servers should be present
@@ -130,10 +133,12 @@ class TestLoadConfigs:
             user_config_paths=[],
         )
 
-        assert configs[0].config.command == str(tmp_path / "bin" / "server")
-        assert configs[0].config.cwd == str(tmp_path / "data")
+        cfg = configs[0].config
+        assert cfg.type == "local"
+        assert cfg.command == str(tmp_path / "bin" / "server")
+        assert cfg.cwd == str(tmp_path / "data")
 
-    def test_ignores_non_command_remote_entries(self, tmp_path: Path) -> None:
+    def test_keeps_remote_entries(self, tmp_path: Path) -> None:
         project_config = {
             "mcpServers": {
                 "gateway": {
@@ -153,9 +158,35 @@ class TestLoadConfigs:
             user_config_paths=[],
         )
 
+        assert len(configs) == 2
+        gateway = next(c for c in configs if c.name == "gateway")
+        assert gateway.config.type == "sse"
+        assert gateway.config.url == "http://127.0.0.1:3344/sse"
+
+        local = next(c for c in configs if c.name == "local")
+        assert local.config.type == "local"
+        assert local.config.command == "node"
+
+    def test_coerces_legacy_url_entry_to_remote(self, tmp_path: Path) -> None:
+        project_config = {
+            "mcpServers": {
+                "gateway": {
+                    "url": "https://example.com/mcp",
+                    "headers": {"Authorization": "Bearer test"},
+                }
+            }
+        }
+        (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+
+        configs = load_configs(
+            project_root=tmp_path,
+            user_config_paths=[],
+        )
+
         assert len(configs) == 1
-        assert configs[0].name == "local"
-        assert configs[0].config.command == "node"
+        assert configs[0].name == "gateway"
+        assert configs[0].config.type == "remote"
+        assert configs[0].config.url == "https://example.com/mcp"
 
     def test_merges_manifest_defaults_for_partial_server_config(
         self, tmp_path: Path
@@ -176,8 +207,10 @@ class TestLoadConfigs:
 
         assert len(configs) == 1
         assert configs[0].name == "playwright"
-        assert configs[0].config.command == "npx"
-        assert configs[0].config.args == [
+        cfg = configs[0].config
+        assert cfg.type == "local"
+        assert cfg.command == "npx"
+        assert cfg.args == [
             "-y",
             "@playwright/mcp@latest",
             "--cdp-endpoint",

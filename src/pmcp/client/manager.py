@@ -3,27 +3,36 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import json
 import logging
 import os
 import random
+import re
 import string
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
+import mcp.types as mcp_types
+from mcp.client.sse import sse_client
+from mcp.shared.message import SessionMessage
+
 try:
     import resource
 
     HAS_RESOURCE = True
 except ImportError:
+    resource = None
     HAS_RESOURCE = False
 
 from pmcp.config.loader import make_tool_id
 from pmcp.types import (
+    LocalMcpServerConfig,
     PromptArgumentInfo,
     PromptInfo,
+    RemoteMcpServerConfig,
     ResolvedServerConfig,
     RequestState,
     ResourceInfo,
@@ -52,7 +61,7 @@ MEMORY_WARN_THRESHOLD_MB = 1024  # Warn if process uses > 1GB
 def _get_memory_usage_mb() -> float:
     """Get current process memory usage in MB."""
     try:
-        if HAS_RESOURCE:
+        if HAS_RESOURCE and resource is not None:
             # ru_maxrss is in KB on Linux, bytes on macOS
             usage = resource.getrusage(resource.RUSAGE_SELF)
             import sys
@@ -157,6 +166,17 @@ def _truncate_description(description: str, max_length: int = 100) -> str:
     return description[: max_length - 3] + "..."
 
 
+_ENV_VAR_HEADER_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _interpolate_header_value(value: str) -> str:
+    """Interpolate header value if it's an env-var placeholder like ${VAR}."""
+    match = _ENV_VAR_HEADER_PATTERN.fullmatch(value)
+    if not match:
+        return value
+    return os.environ.get(match.group(1), "")
+
+
 @dataclass
 class PendingRequest:
     """Metadata for tracking a pending tool invocation."""
@@ -176,6 +196,9 @@ class ManagedClient:
 
     config: ResolvedServerConfig
     process: asyncio.subprocess.Process | None = None
+    is_remote: bool = False
+    sse_exit_stack: AsyncExitStack | None = None
+    write_stream: Any | None = None
     status: ServerStatus = field(
         default_factory=lambda: ServerStatus(
             name="",
@@ -338,6 +361,14 @@ class ClientManager:
 
     async def _connect_server(self, config: ResolvedServerConfig) -> None:
         """Connect to a single MCP server."""
+        if isinstance(config.config, RemoteMcpServerConfig):
+            await self._connect_sse(config)
+            return
+
+        await self._connect_stdio(config)
+
+    async def _connect_stdio(self, config: ResolvedServerConfig) -> None:
+        """Connect to a local stdio MCP server."""
         name = config.name
 
         # Initialize status
@@ -348,7 +379,12 @@ class ClientManager:
         )
         self._servers[name] = status
 
-        if not config.config.command:
+        if not isinstance(config.config, LocalMcpServerConfig):
+            raise ValueError(f"Server {name} has unsupported local config type")
+
+        local_config = config.config
+
+        if not local_config.command:
             raise ValueError(
                 f"Server {name} missing command - only stdio transport supported"
             )
@@ -357,17 +393,17 @@ class ClientManager:
 
         # Build environment
         env = os.environ.copy()
-        if config.config.env:
-            env.update(config.config.env)
+        if local_config.env:
+            env.update(local_config.env)
 
         # Spawn process
         process = await asyncio.create_subprocess_exec(
-            config.config.command,
-            *config.config.args,
+            local_config.command,
+            *local_config.args,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=config.config.cwd,
+            cwd=local_config.cwd,
             env=env,
         )
 
@@ -499,6 +535,155 @@ class ClientManager:
                 process.kill()
             raise
 
+    async def _connect_sse(self, config: ResolvedServerConfig) -> None:
+        """Connect to a remote SSE MCP server."""
+        name = config.name
+
+        status = ServerStatus(
+            name=name,
+            status=ServerStatusEnum.CONNECTING,
+            tool_count=0,
+        )
+        self._servers[name] = status
+
+        if not isinstance(config.config, RemoteMcpServerConfig):
+            raise ValueError(f"Server {name} has unsupported remote config type")
+
+        remote_config = config.config
+        headers = None
+        if remote_config.headers:
+            headers = {
+                key: _interpolate_header_value(value)
+                for key, value in remote_config.headers.items()
+            }
+
+        logger.info(f"Connecting to remote MCP server: {name}")
+
+        sse_stack = AsyncExitStack()
+        read_stream, write_stream = await sse_stack.enter_async_context(
+            sse_client(remote_config.url, headers=headers)
+        )
+
+        managed = ManagedClient(
+            config=config,
+            process=None,
+            is_remote=True,
+            sse_exit_stack=sse_stack,
+            write_stream=write_stream,
+            status=status,
+        )
+        self._clients[name] = managed
+
+        try:
+            managed.read_task = asyncio.create_task(
+                self._read_sse(name, managed, read_stream)
+            )
+
+            await self._send_initialize(managed)
+
+            tools_result = await self._send_request(managed, "tools/list", {})
+            tools = tools_result.get("tools", [])
+
+            indexed = 0
+            for tool in tools:
+                if indexed >= self._max_tools_per_server:
+                    logger.warning(
+                        f"Server {name} has more than {self._max_tools_per_server} tools, truncating"
+                    )
+                    break
+
+                tool_id = make_tool_id(name, tool["name"])
+                description = tool.get("description", "")
+
+                tool_info = ToolInfo(
+                    tool_id=tool_id,
+                    server_name=name,
+                    tool_name=tool["name"],
+                    description=description,
+                    short_description=_truncate_description(description),
+                    input_schema=tool.get("inputSchema", {}),
+                    tags=_extract_tags(name, tool["name"], description),
+                    risk_hint=_infer_risk_hint(tool["name"], description),
+                )
+
+                self._tools[tool_id] = tool_info
+                indexed += 1
+
+            resource_count = 0
+            prompt_count = 0
+
+            resources_task = self._send_request(managed, "resources/list", {})
+            prompts_task = self._send_request(managed, "prompts/list", {})
+            listing_results = await asyncio.gather(
+                resources_task, prompts_task, return_exceptions=True
+            )
+
+            resources_result = listing_results[0]
+            if isinstance(resources_result, BaseException):
+                logger.debug(
+                    f"Server {name} doesn't support resources: {resources_result}"
+                )
+            else:
+                resources = resources_result.get("resources", [])
+                for resource in resources:
+                    uri = resource.get("uri", "")
+                    resource_id = f"{name}::{uri}"
+                    resource_info = ResourceInfo(
+                        resource_id=resource_id,
+                        server_name=name,
+                        uri=uri,
+                        name=resource.get("name"),
+                        description=resource.get("description"),
+                        mime_type=resource.get("mimeType"),
+                    )
+                    self._resources[resource_id] = resource_info
+                    resource_count += 1
+
+            prompts_result = listing_results[1]
+            if isinstance(prompts_result, BaseException):
+                logger.debug(f"Server {name} doesn't support prompts: {prompts_result}")
+            else:
+                prompts = prompts_result.get("prompts", [])
+                for prompt in prompts:
+                    prompt_name = prompt.get("name", "")
+                    prompt_id = f"{name}::{prompt_name}"
+                    arguments = None
+                    if prompt.get("arguments"):
+                        arguments = [
+                            PromptArgumentInfo(
+                                name=arg.get("name", ""),
+                                description=arg.get("description"),
+                                required=arg.get("required", False),
+                            )
+                            for arg in prompt["arguments"]
+                        ]
+                    prompt_info = PromptInfo(
+                        prompt_id=prompt_id,
+                        server_name=name,
+                        name=prompt_name,
+                        description=prompt.get("description"),
+                        arguments=arguments,
+                    )
+                    self._prompts[prompt_id] = prompt_info
+                    prompt_count += 1
+
+            status.status = ServerStatusEnum.ONLINE
+            status.tool_count = indexed
+            status.resource_count = resource_count
+            status.prompt_count = prompt_count
+            status.last_connected_at = time.time()
+
+            logger.info(
+                f"Connected to {name}: {indexed} tools, "
+                f"{resource_count} resources, {prompt_count} prompts indexed"
+            )
+
+        except Exception as e:
+            status.status = ServerStatusEnum.ERROR
+            status.last_error = str(e)
+            await sse_stack.aclose()
+            raise
+
     async def _read_stderr(self, name: str, stderr: asyncio.StreamReader) -> None:
         """Read stderr from a server process."""
         try:
@@ -580,6 +765,63 @@ class ClientManager:
             managed.pending_requests.clear()
             managed.status.pending_request_count = 0
 
+    async def _read_sse(
+        self, name: str, managed: ManagedClient, read_stream: Any
+    ) -> None:
+        """Read JSON-RPC messages from an SSE stream."""
+        try:
+            async for message in read_stream:
+                now = time.time()
+                managed.status.last_activity_at = now
+
+                if isinstance(message, Exception):
+                    for req in managed.pending_requests.values():
+                        req.last_heartbeat = now
+                    raise message
+
+                payload = message.message.model_dump(
+                    by_alias=True,
+                    mode="json",
+                    exclude_none=True,
+                )
+                msg_id = payload.get("id")
+                if msg_id is not None and msg_id in managed.pending_requests:
+                    pending = managed.pending_requests.pop(msg_id)
+                    pending.last_heartbeat = now
+
+                    elapsed_ms = (now - pending.started_at) * 1000
+                    managed.response_times.append(elapsed_ms)
+                    if managed.response_times:
+                        managed.status.avg_response_time_ms = sum(
+                            managed.response_times
+                        ) / len(managed.response_times)
+
+                    managed.status.pending_request_count = len(managed.pending_requests)
+
+                    if "error" in payload:
+                        pending.future.set_exception(
+                            Exception(payload["error"].get("message", "Unknown error"))
+                        )
+                    else:
+                        pending.future.set_result(payload.get("result", {}))
+        except Exception as e:
+            logger.debug(f"[{name}] SSE read error: {e}")
+        finally:
+            if managed.status.status == ServerStatusEnum.ONLINE:
+                logger.warning(f"Server {name} disconnected unexpectedly")
+                managed.status.status = ServerStatusEnum.ERROR
+                managed.status.last_error = "SSE connection closed"
+            else:
+                logger.debug(f"Server {name} disconnected (graceful shutdown)")
+
+            for request_id, pending in list(managed.pending_requests.items()):
+                if not pending.future.done():
+                    pending.future.set_exception(
+                        ConnectionError(f"Server {name} disconnected")
+                    )
+            managed.pending_requests.clear()
+            managed.status.pending_request_count = 0
+
     async def _send_request(
         self,
         managed: ManagedClient,
@@ -589,9 +831,6 @@ class ClientManager:
         timeout_ms: int = 30000,
     ) -> dict[str, Any]:
         """Send a JSON-RPC request and wait for response."""
-        if not managed.process or not managed.process.stdin:
-            raise RuntimeError("Process not running")
-
         managed.request_id += 1
         request_id = managed.request_id
         now = time.time()
@@ -618,9 +857,18 @@ class ClientManager:
         managed.status.pending_request_count = len(managed.pending_requests)
 
         # Send request
-        data = json.dumps(request) + "\n"
-        managed.process.stdin.write(data.encode())
-        await managed.process.stdin.drain()
+        if managed.is_remote:
+            if managed.write_stream is None:
+                raise RuntimeError("Remote stream not connected")
+            msg = mcp_types.JSONRPCMessage.model_validate(request)
+            await managed.write_stream.send(SessionMessage(msg))
+        else:
+            if not managed.process or not managed.process.stdin:
+                raise RuntimeError("Process not running")
+
+            data = json.dumps(request) + "\n"
+            managed.process.stdin.write(data.encode())
+            await managed.process.stdin.drain()
 
         # Wait for response with timeout
         try:
@@ -644,11 +892,16 @@ class ClientManager:
         )
 
         # Send initialized notification (no response expected)
-        if managed.process and managed.process.stdin:
-            notification = {
-                "jsonrpc": "2.0",
-                "method": "notifications/initialized",
-            }
+        notification = {
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+        }
+        if managed.is_remote:
+            if managed.write_stream is None:
+                raise RuntimeError("Remote stream not connected")
+            msg = mcp_types.JSONRPCMessage.model_validate(notification)
+            await managed.write_stream.send(SessionMessage(msg))
+        elif managed.process and managed.process.stdin:
             data = json.dumps(notification) + "\n"
             managed.process.stdin.write(data.encode())
             await managed.process.stdin.drain()
@@ -683,8 +936,11 @@ class ClientManager:
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         pass
 
-                # Terminate process
-                if managed.process and managed.process.returncode is None:
+                # Close transport
+                if managed.is_remote:
+                    if managed.sse_exit_stack is not None:
+                        await managed.sse_exit_stack.aclose()
+                elif managed.process and managed.process.returncode is None:
                     managed.process.terminate()
                     try:
                         await asyncio.wait_for(managed.process.wait(), timeout=5.0)
@@ -821,7 +1077,11 @@ class ClientManager:
             raise ValueError(f"Unknown tool: {tool_id}")
 
         managed = self._clients.get(tool_info.server_name)
-        if not managed or not managed.process:
+        if (
+            not managed
+            or (not managed.is_remote and managed.process is None)
+            or (managed.is_remote and managed.write_stream is None)
+        ):
             raise RuntimeError(f"Server {tool_info.server_name} is not connected")
 
         if managed.status.status != ServerStatusEnum.ONLINE:
@@ -847,7 +1107,11 @@ class ClientManager:
             raise ValueError(f"Unknown resource: {resource_id}")
 
         managed = self._clients.get(resource_info.server_name)
-        if not managed or not managed.process:
+        if (
+            not managed
+            or (not managed.is_remote and managed.process is None)
+            or (managed.is_remote and managed.write_stream is None)
+        ):
             raise RuntimeError(f"Server {resource_info.server_name} is not connected")
 
         if managed.status.status != ServerStatusEnum.ONLINE:
@@ -876,7 +1140,11 @@ class ClientManager:
             raise ValueError(f"Unknown prompt: {prompt_id}")
 
         managed = self._clients.get(prompt_info.server_name)
-        if not managed or not managed.process:
+        if (
+            not managed
+            or (not managed.is_remote and managed.process is None)
+            or (managed.is_remote and managed.write_stream is None)
+        ):
             raise RuntimeError(f"Server {prompt_info.server_name} is not connected")
 
         if managed.status.status != ServerStatusEnum.ONLINE:
@@ -991,16 +1259,8 @@ class ClientManager:
                     last_memory_log = now
 
                 for name, managed in self._clients.items():
-                    # Check process health
-                    if managed.process:
-                        returncode = managed.process.returncode
-                        if returncode is not None:
-                            logger.warning(
-                                f"Server {name} process exited with code {returncode}"
-                            )
-                            managed.status.status = ServerStatusEnum.ERROR
-                            managed.status.last_error = f"Process exited: {returncode}"
-                            continue
+                    if not self._check_server_health(name, managed):
+                        continue
 
                     # Check for stalled requests
                     for req_id, pending in list(managed.pending_requests.items()):
@@ -1020,6 +1280,34 @@ class ClientManager:
                 break
             except Exception as e:
                 logger.debug(f"Health monitor error: {e}")
+
+    def _check_server_health(self, name: str, managed: ManagedClient) -> bool:
+        """Check server transport health, preserving status error strings."""
+        if managed.is_remote:
+            if managed.read_task and managed.read_task.done():
+                if managed.status.status != ServerStatusEnum.ERROR:
+                    logger.warning(f"Server {name} remote stream disconnected")
+                    managed.status.status = ServerStatusEnum.ERROR
+                    managed.status.last_error = "Remote stream disconnected"
+                return False
+
+            if managed.write_stream is None:
+                if managed.status.status != ServerStatusEnum.ERROR:
+                    managed.status.status = ServerStatusEnum.ERROR
+                    managed.status.last_error = "Remote stream unavailable"
+                return False
+
+            return True
+
+        if managed.process:
+            returncode = managed.process.returncode
+            if returncode is not None:
+                logger.warning(f"Server {name} process exited with code {returncode}")
+                managed.status.status = ServerStatusEnum.ERROR
+                managed.status.last_error = f"Process exited: {returncode}"
+                return False
+
+        return True
 
     def get_pending_requests(self, server: str | None = None) -> list[PendingRequest]:
         """Get all pending requests, optionally filtered by server."""

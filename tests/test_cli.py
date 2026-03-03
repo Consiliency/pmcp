@@ -686,6 +686,94 @@ class TestRunDoctor:
         captured = capsys.readouterr()
         assert "probe failed" in captured.out
 
+    @pytest.mark.asyncio
+    async def test_doctor_warns_on_missing_remote_header_env(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """Doctor should warn when remote header interpolation is unresolved."""
+        from pmcp.cli import run_doctor
+
+        args = argparse.Namespace(
+            command="doctor", project=None, timeout=2.0, log_level="warn"
+        )
+
+        with patch.dict("pmcp.cli_commands.doctor.os.environ", {}, clear=True):
+            with patch("pmcp.cli.Path.home", return_value=tmp_path):
+                with patch("pmcp.cli_commands.doctor.Path.home", return_value=tmp_path):
+                    with patch(
+                        "pmcp.cli._is_pmcp_system_service_active",
+                        return_value=False,
+                    ):
+                        with patch(
+                            "pmcp.cli._load_local_mcp_json",
+                            return_value=(
+                                tmp_path / ".mcp.json",
+                                {
+                                    "mcpServers": {
+                                        "remote-api": {
+                                            "type": "remote",
+                                            "url": "https://example.com/sse",
+                                            "headers": {
+                                                "Authorization": "Bearer ${REMOTE_API_TOKEN}"
+                                            },
+                                        }
+                                    }
+                                },
+                            ),
+                        ):
+                            await run_doctor(args)
+
+        captured = capsys.readouterr()
+        assert "[WARN] remote:" in captured.out
+        assert "REMOTE_API_TOKEN" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_doctor_accepts_remote_header_env_from_pmcp_env(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """Doctor should accept ${VAR} headers resolved from user pmcp.env."""
+        from pmcp.cli import run_doctor
+
+        env_path = tmp_path / ".config" / "pmcp" / "pmcp.env"
+        env_path.parent.mkdir(parents=True)
+        env_path.write_text("REMOTE_API_TOKEN=test-token\n")
+
+        args = argparse.Namespace(
+            command="doctor", project=None, timeout=2.0, log_level="warn"
+        )
+
+        with patch.dict("pmcp.cli_commands.doctor.os.environ", {}, clear=True):
+            with patch("pmcp.cli.Path.home", return_value=tmp_path):
+                with patch("pmcp.cli_commands.doctor.Path.home", return_value=tmp_path):
+                    with patch(
+                        "pmcp.cli._is_pmcp_system_service_active",
+                        return_value=False,
+                    ):
+                        with patch(
+                            "pmcp.cli._load_local_mcp_json",
+                            return_value=(
+                                tmp_path / ".mcp.json",
+                                {
+                                    "mcpServers": {
+                                        "remote-api": {
+                                            "type": "remote",
+                                            "url": "https://example.com/sse",
+                                            "headers": {
+                                                "Authorization": "Bearer ${REMOTE_API_TOKEN}"
+                                            },
+                                        }
+                                    }
+                                },
+                            ),
+                        ):
+                            await run_doctor(args)
+
+        captured = capsys.readouterr()
+        assert "[WARN] remote:" not in captured.out
+        assert (
+            "[OK] remote: No remote downstream header issues detected." in captured.out
+        )
+
 
 class TestDoctorAndSecretsIntegration:
     """Integration-style tests for doctor/secrets parse and dispatch."""

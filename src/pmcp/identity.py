@@ -12,6 +12,8 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from pmcp.types import LocalMcpServerConfig
+
 if TYPE_CHECKING:
     from pmcp.types import ResolvedServerConfig
 
@@ -50,8 +52,13 @@ def is_self_reference(config: ResolvedServerConfig) -> bool:
     """
     # Handle both nested config (ResolvedServerConfig) and flat config (mock/test)
     if hasattr(config, "config") and config.config is not None:
-        command = config.config.command.lower()
-        args_lower = [a.lower() for a in config.config.args]
+        nested_config = config.config
+        if isinstance(nested_config, LocalMcpServerConfig):
+            command = nested_config.command.lower()
+            args_lower = [a.lower() for a in nested_config.args]
+        else:
+            command = ""
+            args_lower = []
     else:
         # Fallback for flat config objects (e.g., in tests)
         command = getattr(config, "command", "").lower()
@@ -100,8 +107,13 @@ def filter_self_references(
         if is_self_reference(config):
             # Get command info for logging
             if hasattr(config, "config") and config.config is not None:
-                cmd = config.config.command
-                args = config.config.args
+                nested_config = config.config
+                if isinstance(nested_config, LocalMcpServerConfig):
+                    cmd = nested_config.command
+                    args = nested_config.args
+                else:
+                    cmd = "<remote>"
+                    args = []
             else:
                 cmd = getattr(config, "command", "")
                 args = getattr(config, "args", [])

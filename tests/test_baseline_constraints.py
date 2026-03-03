@@ -279,12 +279,12 @@ class TestSelfReferenceConstraints:
         args: list[str] | None = None,
     ) -> ResolvedServerConfig:
         """Create a mock server config for testing."""
-        from pmcp.types import McpServerConfig, ResolvedServerConfig
+        from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
 
         return ResolvedServerConfig(
             name=name,
             source="project",  # Must be one of: project, user, custom, manifest
-            config=McpServerConfig(
+            config=LocalMcpServerConfig(
                 command=command,
                 args=args or [],
             ),

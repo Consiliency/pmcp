@@ -464,7 +464,37 @@ For MCP servers not in the manifest, add them to `~/.mcp.json`:
 }
 ```
 
-PMCP only loads command-based downstream entries from discovered config files. Remote client entries (for example `{ "type": "sse", "url": "..." }`) are ignored for downstream server loading.
+PMCP supports both local command-based and remote URL-based downstream entries from discovered config files.
+
+#### Remote Downstream Servers
+
+You can also configure downstream MCP servers over HTTP/SSE directly in `.mcp.json` using `type: "sse"` or `type: "http"` (or `type: "remote"` for generic remote transport):
+
+```json
+{
+  "mcpServers": {
+    "acme-sse": {
+      "type": "sse",
+      "url": "https://mcp.acme.dev/sse",
+      "headers": {
+        "Authorization": "Bearer ${ACME_MCP_TOKEN}",
+        "X-Tenant": "${ACME_TENANT_ID}"
+      }
+    },
+    "acme-http": {
+      "type": "http",
+      "url": "https://mcp.acme.dev/mcp",
+      "headers": {
+        "Authorization": "Bearer ${ACME_MCP_TOKEN}"
+      }
+    }
+  }
+}
+```
+
+- `url` should be the full remote endpoint for that server.
+- `headers` values support `${ENV_VAR}` interpolation (Issue #40).
+- Resolve those environment variables from your shell environment or `~/.config/pmcp/pmcp.env`.
 
 **Important**: Don't add `pmcp` itself to this file. PMCP is configured
 in your MCP client config, not in the downstream server list.

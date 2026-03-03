@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pmcp.types import McpServerConfig, ResolvedServerConfig, ServerStatusEnum
+from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig, ServerStatusEnum
 
 
 class TestServerStatusEnumLazy:
@@ -37,7 +37,7 @@ class TestClientManagerLazyConfigs:
         config = ResolvedServerConfig(
             name="test-server",
             source="project",
-            config=McpServerConfig(command="echo", args=["hello"]),
+            config=LocalMcpServerConfig(command="echo", args=["hello"]),
         )
 
         manager.register_lazy_configs([config])
@@ -53,7 +53,7 @@ class TestClientManagerLazyConfigs:
         config = ResolvedServerConfig(
             name="test-server",
             source="project",
-            config=McpServerConfig(command="echo", args=["hello"]),
+            config=LocalMcpServerConfig(command="echo", args=["hello"]),
         )
 
         manager.register_lazy_configs([config])
@@ -78,7 +78,7 @@ class TestClientManagerLazyConfigs:
         config = ResolvedServerConfig(
             name="test-server",
             source="project",
-            config=McpServerConfig(command="echo", args=["hello"]),
+            config=LocalMcpServerConfig(command="echo", args=["hello"]),
         )
 
         manager.register_lazy_configs([config])
@@ -96,7 +96,7 @@ class TestClientManagerLazyConfigs:
         config = ResolvedServerConfig(
             name="test-server",
             source="project",
-            config=McpServerConfig(command="echo", args=["hello"]),
+            config=LocalMcpServerConfig(command="echo", args=["hello"]),
         )
 
         manager.register_lazy_configs([config])
@@ -113,12 +113,12 @@ class TestClientManagerLazyConfigs:
             ResolvedServerConfig(
                 name="server-a",
                 source="project",
-                config=McpServerConfig(command="echo"),
+                config=LocalMcpServerConfig(command="echo"),
             ),
             ResolvedServerConfig(
                 name="server-b",
                 source="user",
-                config=McpServerConfig(command="echo"),
+                config=LocalMcpServerConfig(command="echo"),
             ),
         ]
 
@@ -158,7 +158,7 @@ class TestEnsureConnected:
         config = ResolvedServerConfig(
             name="lazy-server",
             source="project",
-            config=McpServerConfig(command="echo", args=["hello"]),
+            config=LocalMcpServerConfig(command="echo", args=["hello"]),
         )
         manager.register_lazy_configs([config])
 
@@ -187,7 +187,7 @@ class TestEnsureConnected:
         config = ResolvedServerConfig(
             name="lazy-server",
             source="project",
-            config=McpServerConfig(command="echo"),
+            config=LocalMcpServerConfig(command="echo"),
         )
         manager.register_lazy_configs([config])
 
@@ -252,7 +252,7 @@ class TestGatewayServerInitializeLazy:
                 ResolvedServerConfig(
                     name="config-server",
                     source="project",
-                    config=McpServerConfig(command="echo"),
+                    config=LocalMcpServerConfig(command="echo"),
                 )
             ]
             # No manifest auto-start servers
@@ -316,7 +316,7 @@ class TestGatewayServerInitializeLazy:
             auto_config = ResolvedServerConfig(
                 name="auto-server",
                 source="manifest",
-                config=McpServerConfig(command="echo"),
+                config=LocalMcpServerConfig(command="echo"),
             )
             mock_convert.return_value = auto_config
 
@@ -370,7 +370,7 @@ class TestGatewayServerInitializeLazy:
                 ResolvedServerConfig(
                     name="lazy-server",
                     source="project",
-                    config=McpServerConfig(command="echo"),
+                    config=LocalMcpServerConfig(command="echo"),
                 )
             ]
 
@@ -384,7 +384,7 @@ class TestGatewayServerInitializeLazy:
             mock_convert.return_value = ResolvedServerConfig(
                 name="auto-server",
                 source="manifest",
-                config=McpServerConfig(command="echo"),
+                config=LocalMcpServerConfig(command="echo"),
             )
 
             server = GatewayServer()

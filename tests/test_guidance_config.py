@@ -520,7 +520,7 @@ class TestMcpConfigFileExtraFields:
         data = {
             "_comment": "Some comment",
             "extraField": 42,
-            "mcpServers": {"test": {"command": "echo"}},
+            "mcpServers": {"test": {"type": "local", "command": "echo"}},
             "disableAutoStart": ["playwright"],
         }
         config = McpConfigFile.model_validate(data)
