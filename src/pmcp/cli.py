@@ -494,6 +494,7 @@ async def run_status(args: argparse.Namespace) -> None:
 
     from pmcp.client.manager import ClientManager
     from pmcp.config.loader import load_configs
+    from pmcp.identity import filter_self_references
     from pmcp.policy.policy import PolicyManager
     from pmcp.types import ServerStatusEnum
 
@@ -511,6 +512,10 @@ async def run_status(args: argparse.Namespace) -> None:
     project_root = args.project if hasattr(args, "project") else None
     config_path = args.config if hasattr(args, "config") else None
     configs = load_configs(project_root=project_root, custom_config_path=config_path)
+
+    # Exclude self-referential gateway entries (e.g. pmcp/mcp-gateway)
+    # so `pmcp status` only reports downstream servers.
+    configs = filter_self_references(configs)
 
     # Filter by policy
     allowed_configs = [c for c in configs if policy_manager.is_server_allowed(c.name)]

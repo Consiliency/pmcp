@@ -339,6 +339,30 @@ class TestRunStatus:
         assert output["servers"] == []
         assert output["tools"] == 0
 
+    @pytest.mark.asyncio
+    async def test_status_filters_self_referential_gateway_config(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Status should exclude gateway self-reference configs before connect."""
+        from pmcp.cli import run_status
+        from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+        gateway_config = ResolvedServerConfig(
+            name="gateway",
+            source="user",
+            config=LocalMcpServerConfig(command="pmcp", args=[]),
+        )
+
+        with patch("pmcp.config.loader.load_configs", return_value=[gateway_config]):
+            with patch(
+                "pmcp.client.manager.ClientManager.connect_all", new=AsyncMock()
+            ) as mock_connect_all:
+                await run_status(status_args)
+
+        captured = capsys.readouterr()
+        assert "No MCP servers configured" in captured.out
+        mock_connect_all.assert_not_awaited()
+
 
 class TestLogsCommand:
     """Tests for logs command parsing."""

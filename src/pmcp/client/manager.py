@@ -44,6 +44,18 @@ from pmcp.types import (
 
 logger = logging.getLogger(__name__)
 
+
+def _is_cancel_scope_task_mismatch_error(exc: BaseException) -> bool:
+    """Return True for benign anyio cancel-scope task mismatch during shutdown."""
+    msg = str(exc).lower()
+    return (
+        "cancel scope" in msg
+        and "different task" in msg
+        and "entered" in msg
+        and "exit" in msg
+    )
+
+
 # Heartbeat thresholds for health monitoring
 HEARTBEAT_WARN_THRESHOLD = 60.0  # Warn if no activity for 60s
 HEARTBEAT_STALL_THRESHOLD = 120.0  # Mark as stalled after 120s
@@ -939,7 +951,15 @@ class ClientManager:
                 # Close transport
                 if managed.is_remote:
                     if managed.sse_exit_stack is not None:
-                        await managed.sse_exit_stack.aclose()
+                        try:
+                            await managed.sse_exit_stack.aclose()
+                        except RuntimeError as e:
+                            if _is_cancel_scope_task_mismatch_error(e):
+                                logger.debug(
+                                    f"[{name}] Ignoring SSE shutdown cancel-scope mismatch: {e}"
+                                )
+                            else:
+                                raise
                 elif managed.process and managed.process.returncode is None:
                     managed.process.terminate()
                     try:

@@ -224,6 +224,39 @@ class TestDisconnectAll:
 
         sse_stack.aclose.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_disconnect_all_ignores_cancel_scope_task_mismatch(self) -> None:
+        """Benign anyio cancel-scope mismatch should not be logged as warning."""
+        manager = ClientManager()
+        status = ServerStatus(
+            name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+
+        sse_stack = MagicMock()
+        sse_stack.aclose = AsyncMock(
+            side_effect=RuntimeError(
+                "Attempted to exit cancel scope in a different task than it was entered in"
+            )
+        )
+
+        managed = ManagedClient(
+            config=MagicMock(),
+            process=None,
+            is_remote=True,
+            sse_exit_stack=sse_stack,
+            write_stream=MagicMock(),
+            status=status,
+        )
+        manager._clients["remote"] = managed
+        manager._servers["remote"] = status
+
+        with patch("pmcp.client.manager.logger.warning") as mock_warning:
+            await manager.disconnect_all()
+
+        assert manager._clients == {}
+        assert manager._servers == {}
+        mock_warning.assert_not_called()
+
 
 class TestRemoteSendRequest:
     """Tests for remote request transport."""
