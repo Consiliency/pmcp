@@ -13,18 +13,21 @@ import string
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from types import ModuleType
 from typing import Any
 
 import mcp.types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.shared.message import SessionMessage
 
+resource_module: ModuleType | None
+
 try:
-    import resource
+    import resource as resource_module
 
     HAS_RESOURCE = True
 except ImportError:
-    resource = None
+    resource_module = None
     HAS_RESOURCE = False
 
 from pmcp.config.loader import make_tool_id
@@ -73,9 +76,9 @@ MEMORY_WARN_THRESHOLD_MB = 1024  # Warn if process uses > 1GB
 def _get_memory_usage_mb() -> float:
     """Get current process memory usage in MB."""
     try:
-        if HAS_RESOURCE and resource is not None:
+        if HAS_RESOURCE and resource_module is not None:
             # ru_maxrss is in KB on Linux, bytes on macOS
-            usage = resource.getrusage(resource.RUSAGE_SELF)
+            usage = resource_module.getrusage(resource_module.RUSAGE_SELF)
             import sys
 
             if sys.platform == "darwin":
