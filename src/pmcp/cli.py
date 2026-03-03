@@ -6,13 +6,22 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.metadata
+import json
 import logging
 import os
+import shutil
 import signal
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
+from pmcp.cli_commands.secrets import (
+    run_secrets_check,
+    run_secrets_set,
+    run_secrets_sync,
+)
 
 
 from logging.handlers import RotatingFileHandler
@@ -59,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     examples = """Examples:
   pmcp
   pmcp --transport http --host 127.0.0.1 --port 3344
+  pmcp setup --client claude --mode stdio
+  pmcp setup --client claude --mode sse --write
+  pmcp setup --client opencode --mode sse --write
+  pmcp doctor
+  pmcp secrets set API_TOKEN my-token --scope user
+  pmcp secrets sync --from-scope user --to-scope project --overwrite
   pmcp status --json
   pmcp refresh --force
 
@@ -283,6 +298,30 @@ Environment overrides:
         help="Overwrite existing configuration",
     )
 
+    # Setup command
+    setup_parser = subparsers.add_parser(
+        "setup",
+        help="Render PMCP client config",
+        description="Render PMCP config for Claude/OpenCode; optionally write it.",
+    )
+    setup_parser.add_argument(
+        "--mode",
+        choices=["stdio", "sse"],
+        default="sse",
+        help="Connection mode to configure (default: sse)",
+    )
+    setup_parser.add_argument(
+        "--client",
+        choices=["claude", "opencode"],
+        default="claude",
+        help="Client config format to render (default: claude)",
+    )
+    setup_parser.add_argument(
+        "--write",
+        action="store_true",
+        help="Write merged config to the client config file",
+    )
+
     # Guidance command
     guidance_parser = subparsers.add_parser(
         "guidance",
@@ -293,6 +332,99 @@ Environment overrides:
         "--show-budget",
         action="store_true",
         help="Show estimated token budget for current config",
+    )
+
+    # Doctor command
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Diagnose PMCP configuration conflicts",
+        description="Detect lock/mode/SSE issues and print remediation steps.",
+    )
+    doctor_parser.add_argument(
+        "-p",
+        "--project",
+        type=Path,
+        help="Project root directory (defaults to auto-discovery)",
+    )
+    doctor_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=3.0,
+        help="SSE probe timeout in seconds (default: 3.0)",
+    )
+    doctor_parser.add_argument(
+        "-l",
+        "--log-level",
+        choices=["debug", "info", "warn", "error"],
+        default="warn",
+        help="Log level (default: warn)",
+    )
+
+    # Secrets command
+    secrets_parser = subparsers.add_parser(
+        "secrets",
+        help="Manage PMCP secret environment files",
+        description="Set, sync, and check secrets in user/project PMCP .env files.",
+    )
+    secrets_subparsers = secrets_parser.add_subparsers(
+        dest="secrets_command",
+        required=True,
+        help="Secrets subcommands",
+    )
+
+    secrets_set_parser = secrets_subparsers.add_parser(
+        "set",
+        help="Set a secret value in PMCP env file",
+    )
+    secrets_set_parser.add_argument("key", type=str, help="Secret key name")
+    secrets_set_parser.add_argument("value", type=str, help="Secret value")
+    secrets_set_parser.add_argument(
+        "--scope",
+        choices=["user", "project"],
+        default="project",
+        help="Where to store the secret (default: project)",
+    )
+    secrets_set_parser.add_argument(
+        "--project",
+        type=Path,
+        help="Project root directory (for project scope)",
+    )
+
+    secrets_sync_parser = secrets_subparsers.add_parser(
+        "sync",
+        help="Sync secrets between PMCP env scopes",
+    )
+    secrets_sync_parser.add_argument(
+        "--from-scope",
+        choices=["user", "project"],
+        default="user",
+        help="Source scope (default: user)",
+    )
+    secrets_sync_parser.add_argument(
+        "--to-scope",
+        choices=["user", "project"],
+        default="project",
+        help="Target scope (default: project)",
+    )
+    secrets_sync_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Overwrite existing keys in target scope",
+    )
+    secrets_sync_parser.add_argument(
+        "--project",
+        type=Path,
+        help="Project root directory (for project scope)",
+    )
+
+    secrets_check_parser = secrets_subparsers.add_parser(
+        "check",
+        help="Check required secrets and availability",
+    )
+    secrets_check_parser.add_argument(
+        "--project",
+        type=Path,
+        help="Project root directory (for project scope)",
     )
 
     return parser.parse_args()
@@ -639,6 +771,274 @@ async def run_init(args: argparse.Namespace) -> None:
     print("\nRun 'pmcp' to start the gateway.")
 
 
+def _build_setup_config(mode: str, client: str) -> dict:
+    """Build client config snippet for PMCP."""
+    if client == "claude":
+        if mode == "sse":
+            return {
+                "mcpServers": {
+                    "pmcp": {
+                        "type": "sse",
+                        "url": "http://127.0.0.1:3344/sse",
+                    }
+                }
+            }
+        return {
+            "mcpServers": {
+                "pmcp": {
+                    "command": "pmcp",
+                    "args": [],
+                }
+            }
+        }
+
+    # OpenCode
+    if mode == "sse":
+        return {
+            "mcp": {
+                "pmcp": {
+                    "type": "remote",
+                    "url": "http://127.0.0.1:3344/sse",
+                    "enabled": True,
+                }
+            }
+        }
+    return {
+        "mcp": {
+            "pmcp": {
+                "type": "local",
+                "command": "pmcp",
+                "enabled": True,
+            }
+        }
+    }
+
+
+def _get_setup_target_path(client: str) -> Path:
+    """Get the destination config path for a supported client."""
+    home = Path.home()
+    if client == "claude":
+        return home / ".mcp.json"
+    return home / ".config" / "opencode" / "opencode.json"
+
+
+def _merge_setup_config(existing: dict, generated: dict) -> dict:
+    """Merge generated top-level config keys into existing config."""
+    merged = dict(existing)
+    for key, value in generated.items():
+        if isinstance(value, dict):
+            current = merged.get(key)
+            if not isinstance(current, dict):
+                current = {}
+            current.update(value)
+            merged[key] = current
+        else:
+            merged[key] = value
+    return merged
+
+
+def _atomic_write_json(path: Path, data: dict) -> None:
+    """Atomically write JSON data to path."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, delete=False, encoding="utf-8"
+    ) as tmp_file:
+        json.dump(data, tmp_file, indent=2)
+        tmp_file.write("\n")
+        tmp_path = Path(tmp_file.name)
+    tmp_path.replace(path)
+
+
+def run_setup(args: argparse.Namespace) -> None:
+    """Render or write PMCP config for a supported client."""
+    config = _build_setup_config(mode=args.mode, client=args.client)
+
+    if not args.write:
+        print(json.dumps(config, indent=2))
+        return
+
+    target_path = _get_setup_target_path(args.client)
+    existing: dict = {}
+    if target_path.exists():
+        try:
+            parsed = json.loads(target_path.read_text())
+            if isinstance(parsed, dict):
+                existing = parsed
+            else:
+                raise ValueError("Top-level config must be a JSON object")
+        except Exception as exc:
+            print(
+                f"Error: Could not parse existing config at {target_path}: {exc}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    merged = _merge_setup_config(existing, config)
+    _atomic_write_json(target_path, merged)
+    print(f"Wrote PMCP setup to: {target_path}")
+
+
+def _is_pmcp_system_service_active() -> bool | None:
+    """Return user-service status when systemd is available."""
+    if os.name != "posix":
+        return None
+    if shutil.which("systemctl") is None:
+        return None
+
+    try:
+        proc = subprocess.run(
+            ["systemctl", "--user", "is-active", "pmcp"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+
+    return proc.returncode == 0 and proc.stdout.strip() == "active"
+
+
+def _load_local_mcp_json(project_root: Path | None) -> tuple[Path, dict | None]:
+    """Load local .mcp.json, if present and valid JSON."""
+    from pmcp.config.loader import find_project_root
+
+    base_dir = project_root or find_project_root(Path.cwd()) or Path.cwd()
+    config_path = base_dir / ".mcp.json"
+    if not config_path.exists():
+        return config_path, None
+
+    try:
+        with open(config_path) as f:
+            parsed = json.load(f)
+            return config_path, parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return config_path, None
+
+
+def _extract_mode_signals(
+    config_data: dict | None,
+) -> tuple[list[str], list[tuple[str, str]]]:
+    """Extract local command entries and SSE URLs from mcpServers."""
+    command_servers: list[str] = []
+    sse_endpoints: list[tuple[str, str]] = []
+
+    if not isinstance(config_data, dict):
+        return command_servers, sse_endpoints
+
+    servers = config_data.get("mcpServers")
+    if not isinstance(servers, dict):
+        return command_servers, sse_endpoints
+
+    for name, server_cfg in servers.items():
+        if not isinstance(server_cfg, dict):
+            continue
+        command = server_cfg.get("command")
+        if isinstance(command, str) and command.strip():
+            command_servers.append(name)
+        if server_cfg.get("type") == "sse":
+            url = server_cfg.get("url")
+            if isinstance(url, str) and url.strip():
+                sse_endpoints.append((name, url.strip()))
+
+    return command_servers, sse_endpoints
+
+
+async def _probe_sse_endpoint(url: str, timeout_s: float) -> tuple[bool, str]:
+    """Probe SSE endpoint and return (ok, details)."""
+    import httpx
+
+    try:
+        timeout = httpx.Timeout(timeout=timeout_s)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async with client.stream(
+                "GET",
+                url,
+                headers={"Accept": "text/event-stream"},
+            ) as response:
+                if response.status_code == 200:
+                    return True, "endpoint responded with HTTP 200"
+                return False, f"endpoint returned HTTP {response.status_code}"
+    except Exception as exc:
+        return False, str(exc)
+
+
+async def run_doctor(args: argparse.Namespace) -> None:
+    """Diagnose local PMCP conflict conditions and suggest fixes."""
+    setup_logging(args.log_level)
+
+    checks: list[tuple[str, str, str]] = []
+
+    lock_path = Path.home() / ".pmcp" / "gateway.lock"
+    if lock_path.exists():
+        checks.append(
+            (
+                "lock",
+                "warn",
+                "Lock file exists at ~/.pmcp/gateway.lock. If no gateway is running, remove stale lock: rm ~/.pmcp/gateway.lock",
+            )
+        )
+    else:
+        checks.append(("lock", "ok", "No gateway lock file detected."))
+
+    service_active = _is_pmcp_system_service_active()
+    config_path, config_data = _load_local_mcp_json(
+        args.project if hasattr(args, "project") else None
+    )
+    command_servers, sse_endpoints = _extract_mode_signals(config_data)
+
+    if service_active and command_servers:
+        joined = ", ".join(sorted(command_servers))
+        checks.append(
+            (
+                "mode",
+                "fail",
+                f"Local config {config_path} uses command mode for [{joined}] while system service is active. Use remote URL instead of command (type: sse, url: http://127.0.0.1:3344/sse).",
+            )
+        )
+    elif service_active:
+        checks.append(
+            (
+                "mode",
+                "ok",
+                "System service is active and no local command conflict was found.",
+            )
+        )
+    else:
+        checks.append(("mode", "ok", "No active PMCP system service detected."))
+
+    if sse_endpoints:
+        for server_name, sse_url in sse_endpoints:
+            ok, detail = await _probe_sse_endpoint(sse_url, args.timeout)
+            if ok:
+                checks.append(
+                    (
+                        "sse",
+                        "ok",
+                        f"{server_name}: {sse_url} reachable ({detail}).",
+                    )
+                )
+            else:
+                checks.append(
+                    (
+                        "sse",
+                        "fail",
+                        f"{server_name}: {sse_url} probe failed ({detail}). Ensure pmcp service is running and URL is correct.",
+                    )
+                )
+    else:
+        checks.append(("sse", "ok", "No SSE endpoint configured in local .mcp.json."))
+
+    status_icon = {"ok": "OK", "warn": "WARN", "fail": "FAIL"}
+    print("PMCP Doctor")
+    print("===========")
+    for check_name, status, message in checks:
+        icon = status_icon.get(status, status.upper())
+        print(f"[{icon}] {check_name}: {message}")
+
+    if any(status == "fail" for _, status, _ in checks):
+        sys.exit(1)
+
+
 async def run_server(args: argparse.Namespace) -> None:
     """Run the MCP gateway server."""
     from pmcp.server import GatewayServer
@@ -778,8 +1178,26 @@ async def async_main(args: argparse.Namespace) -> None:
         await run_logs(args)
     elif args.command == "init":
         await run_init(args)
+    elif args.command == "setup":
+        run_setup(args)  # Synchronous command
     elif args.command == "guidance":
         run_guidance(args)  # Synchronous command
+    elif args.command == "doctor":
+        await run_doctor(args)
+    elif args.command == "secrets":
+        if args.secrets_command == "set":
+            output = await run_secrets_set(args)
+        elif args.secrets_command == "sync":
+            output = await run_secrets_sync(args)
+        elif args.secrets_command == "check":
+            output = await run_secrets_check(args)
+        else:
+            output = {
+                "ok": False,
+                "command": "secrets",
+                "error": f"Unknown secrets subcommand: {args.secrets_command}",
+            }
+        print(json.dumps(output, indent=2))
     else:
         # Default: run server
         await run_server(args)
