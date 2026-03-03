@@ -93,6 +93,7 @@ def is_self_reference(config: ResolvedServerConfig) -> bool:
 
 def filter_self_references(
     configs: list[ResolvedServerConfig],
+    suppress_warnings: bool = False,
 ) -> list[ResolvedServerConfig]:
     """Filter out configs that would cause recursive gateway spawning.
 
@@ -117,10 +118,11 @@ def filter_self_references(
             else:
                 cmd = getattr(config, "command", "")
                 args = getattr(config, "args", [])
-            logger.warning(
-                f"Excluding server '{config.name}' to prevent recursive spawning "
-                f"(command: {cmd} {' '.join(args)})"
-            )
+            if not suppress_warnings:
+                logger.warning(
+                    f"Excluding server '{config.name}' to prevent recursive spawning "
+                    f"(command: {cmd} {' '.join(args)})"
+                )
         else:
             filtered.append(config)
     return filtered

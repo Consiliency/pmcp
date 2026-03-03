@@ -486,6 +486,94 @@ async def run_refresh(args: argparse.Namespace) -> None:
         sys.exit(1)
 
 
+def _extract_tool_payload(result: dict[str, object]) -> dict[str, object] | None:
+    """Extract JSON payload from MCP tool response content."""
+    content = result.get("content")
+    if not isinstance(content, list):
+        return None
+
+    for part in content:
+        if not isinstance(part, dict):
+            continue
+        text = part.get("text")
+        if not isinstance(text, str):
+            continue
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+async def _query_running_gateway_status(
+    args: argparse.Namespace, policy_manager: object
+) -> dict[str, object] | None:
+    """Query live gateway status over SSE, return None on failure."""
+    import time
+
+    from pmcp.client.manager import ClientManager
+    from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
+
+    probe_manager = ClientManager(
+        max_tools_per_server=policy_manager.get_max_tools_per_server()  # type: ignore[attr-defined]
+    )
+    probe_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/sse")
+    probe_config = ResolvedServerConfig(
+        name="pmcp-gateway",
+        source="custom",
+        config=RemoteMcpServerConfig(type="sse", url=probe_url),
+    )
+
+    try:
+        await probe_manager.connect_all([probe_config])
+        health_raw = await probe_manager.call_tool(
+            "pmcp-gateway::gateway.health", {}, timeout_ms=3000
+        )
+        health_payload = _extract_tool_payload(health_raw)
+        if not health_payload:
+            return None
+
+        servers = health_payload.get("servers", [])
+        if not isinstance(servers, list):
+            servers = []
+        if args.server and isinstance(servers, list):
+            servers = [
+                s
+                for s in servers
+                if isinstance(s, dict) and s.get("name") == args.server
+            ]
+
+        snapshot: dict[str, object] = {
+            "revision_id": health_payload.get("revision_id", ""),
+            "last_refresh_ts": health_payload.get("last_refresh_ts", time.time()),
+            "servers": servers,
+            "total_tools": sum(
+                s.get("tool_count", 0)
+                for s in servers
+                if isinstance(s, dict) and isinstance(s.get("tool_count"), int)
+            ),
+        }
+
+        if args.pending:
+            pending_raw = await probe_manager.call_tool(
+                "pmcp-gateway::gateway.list_pending",
+                {"server": args.server} if args.server else {},
+                timeout_ms=3000,
+            )
+            pending_payload = _extract_tool_payload(pending_raw) or {}
+            pending_requests = pending_payload.get("requests", [])
+            if isinstance(pending_requests, list):
+                snapshot["pending_requests"] = pending_requests
+
+        return snapshot
+    except Exception:
+        return None
+    finally:
+        await probe_manager.disconnect_all()
+
+
 async def run_status(args: argparse.Namespace) -> None:
     """Display gateway and server status."""
     import json
@@ -508,6 +596,73 @@ async def run_status(args: argparse.Namespace) -> None:
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )
 
+    live_snapshot = await _query_running_gateway_status(args, policy_manager)
+    if live_snapshot is not None:
+        servers = live_snapshot.get("servers", [])
+        if not isinstance(servers, list):
+            servers = []
+
+        if args.json:
+            print(json.dumps(live_snapshot, indent=2))
+            return
+
+        online = sum(
+            1
+            for s in servers
+            if isinstance(s, dict) and s.get("status") == ServerStatusEnum.ONLINE.value
+        )
+        offline = len(servers) - online
+
+        print("PMCP Status")
+        print("==================\n")
+
+        if servers:
+            print(f"Servers ({online} online, {offline} offline):")
+            for s in servers:
+                if not isinstance(s, dict):
+                    continue
+                status = s.get("status", "unknown")
+                if status == ServerStatusEnum.ONLINE.value:
+                    icon = "\u2713"
+                    details = f"{s.get('tool_count', 0):>3} tools"
+                else:
+                    icon = "\u2717"
+                    details = f"({s.get('error') or status})"
+                print(f"  {icon} {s.get('name', ''):<16} {status:<10} {details}")
+        else:
+            print("No servers found.")
+
+        print(f"\nTools: {live_snapshot.get('total_tools', 0)} indexed")
+        last_refresh = live_snapshot.get("last_refresh_ts", time.time())
+        if isinstance(last_refresh, (int, float)):
+            elapsed = time.time() - float(last_refresh)
+            if elapsed < 60:
+                time_str = "just now"
+            elif elapsed < 3600:
+                time_str = f"{int(elapsed / 60)} minutes ago"
+            else:
+                time_str = f"{int(elapsed / 3600)} hours ago"
+            print(f"Last refresh: {time_str}")
+
+        if args.pending:
+            pending_requests = live_snapshot.get("pending_requests", [])
+            if isinstance(pending_requests, list) and pending_requests:
+                print(f"\nPending Requests ({len(pending_requests)}):")
+                for p in pending_requests:
+                    if not isinstance(p, dict):
+                        continue
+                    warn = " \u26a0" if p.get("state") == "stalled" else ""
+                    print(
+                        f"  {p.get('tool_id', '')}  {p.get('elapsed_seconds', 0):.1f}s  [{p.get('state', 'unknown')}]{warn}"
+                    )
+            else:
+                print("\nNo pending requests.")
+
+        if args.verbose:
+            print(f"\nRevision: {live_snapshot.get('revision_id', '')}")
+
+        return
+
     # Load configs
     project_root = args.project if hasattr(args, "project") else None
     config_path = args.config if hasattr(args, "config") else None
@@ -515,7 +670,7 @@ async def run_status(args: argparse.Namespace) -> None:
 
     # Exclude self-referential gateway entries (e.g. pmcp/mcp-gateway)
     # so `pmcp status` only reports downstream servers.
-    configs = filter_self_references(configs)
+    configs = filter_self_references(configs, suppress_warnings=True)
 
     # Filter by policy
     allowed_configs = [c for c in configs if policy_manager.is_server_allowed(c.name)]

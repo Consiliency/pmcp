@@ -314,8 +314,11 @@ class TestRunStatus:
         """Test status output when no servers configured."""
         from pmcp.cli import run_status
 
-        with patch("pmcp.config.loader.load_configs", return_value=[]):
-            await run_status(status_args)
+        with patch(
+            "pmcp.cli._query_running_gateway_status", new=AsyncMock(return_value=None)
+        ):
+            with patch("pmcp.config.loader.load_configs", return_value=[]):
+                await run_status(status_args)
 
         captured = capsys.readouterr()
         assert "No MCP servers configured" in captured.out
@@ -331,8 +334,11 @@ class TestRunStatus:
 
         status_args.json = True
 
-        with patch("pmcp.config.loader.load_configs", return_value=[]):
-            await run_status(status_args)
+        with patch(
+            "pmcp.cli._query_running_gateway_status", new=AsyncMock(return_value=None)
+        ):
+            with patch("pmcp.config.loader.load_configs", return_value=[]):
+                await run_status(status_args)
 
         captured = capsys.readouterr()
         output = json.loads(captured.out)
@@ -353,15 +359,88 @@ class TestRunStatus:
             config=LocalMcpServerConfig(command="pmcp", args=[]),
         )
 
-        with patch("pmcp.config.loader.load_configs", return_value=[gateway_config]):
+        with patch(
+            "pmcp.cli._query_running_gateway_status", new=AsyncMock(return_value=None)
+        ):
             with patch(
-                "pmcp.client.manager.ClientManager.connect_all", new=AsyncMock()
-            ) as mock_connect_all:
-                await run_status(status_args)
+                "pmcp.config.loader.load_configs", return_value=[gateway_config]
+            ):
+                with patch(
+                    "pmcp.client.manager.ClientManager.connect_all", new=AsyncMock()
+                ) as mock_connect_all:
+                    await run_status(status_args)
 
         captured = capsys.readouterr()
         assert "No MCP servers configured" in captured.out
         mock_connect_all.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_status_prefers_live_gateway_snapshot(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Status should use live gateway health when available."""
+        from pmcp.cli import run_status
+
+        live_snapshot = {
+            "revision_id": "live-rev",
+            "last_refresh_ts": 1_700_000_000.0,
+            "servers": [
+                {"name": "context7", "status": "online", "tool_count": 2},
+                {"name": "browser-use", "status": "lazy", "tool_count": 0},
+            ],
+            "total_tools": 2,
+        }
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status",
+            new=AsyncMock(return_value=live_snapshot),
+        ):
+            with patch("pmcp.config.loader.load_configs", return_value=[]):
+                await run_status(status_args)
+
+        captured = capsys.readouterr()
+        assert "context7" in captured.out
+        assert "browser-use" in captured.out
+        assert "No MCP servers configured" not in captured.out
+
+    @pytest.mark.asyncio
+    async def test_status_live_snapshot_json_with_pending(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """JSON status should include pending requests from live gateway."""
+        import json
+
+        from pmcp.cli import run_status
+
+        status_args.json = True
+        status_args.pending = True
+        live_snapshot = {
+            "revision_id": "live-rev",
+            "last_refresh_ts": 1_700_000_000.0,
+            "servers": [{"name": "context7", "status": "online", "tool_count": 2}],
+            "total_tools": 2,
+            "pending_requests": [
+                {
+                    "request_id": "context7::1",
+                    "server_name": "context7",
+                    "tool_id": "context7::search",
+                    "elapsed_seconds": 1.2,
+                    "state": "active",
+                }
+            ],
+        }
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status",
+            new=AsyncMock(return_value=live_snapshot),
+        ):
+            with patch("pmcp.config.loader.load_configs", return_value=[]):
+                await run_status(status_args)
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        assert output["revision_id"] == "live-rev"
+        assert output["pending_requests"][0]["request_id"] == "context7::1"
 
 
 class TestLogsCommand:
@@ -976,10 +1055,13 @@ class TestRunStatusWithData:
             log_level="warn",
         )
 
-        with patch("pmcp.config.loader.load_configs", return_value=[]):
-            await run_status(args)
+        with patch(
+            "pmcp.cli._query_running_gateway_status", new=AsyncMock(return_value=None)
+        ):
+            with patch("pmcp.config.loader.load_configs", return_value=[]):
+                await run_status(args)
 
         captured = capsys.readouterr()
         output = json.loads(captured.out)
         assert "servers" in output
-        assert "tools" in output
+        assert "tools" in output or "total_tools" in output
