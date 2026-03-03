@@ -11,6 +11,8 @@ from pmcp.policy.policy import PolicyManager
 from pmcp.tools.handlers import GatewayTools
 from pmcp.types import (
     RiskHint,
+    ServerStatus,
+    ServerStatusEnum,
     ToolInfo,
 )
 
@@ -21,6 +23,7 @@ class MockClientManager:
     def __init__(self, tools: list[ToolInfo] | None = None) -> None:
         self._tools = {t.tool_id: t for t in (tools or [])}
         self._online_servers: set[str] = set()
+        self._server_statuses: list[ServerStatus] = []
         self._revision_id = "test-rev"
         self._last_refresh_ts = 1234567890.0
 
@@ -41,7 +44,10 @@ class MockClientManager:
         self._online_servers.add(name)
 
     def get_all_server_statuses(self) -> list[Any]:
-        return []
+        return self._server_statuses
+
+    def set_server_statuses(self, statuses: list[ServerStatus]) -> None:
+        self._server_statuses = statuses
 
     def get_registry_meta(self) -> tuple[str, float]:
         return (self._revision_id, self._last_refresh_ts)
@@ -254,3 +260,23 @@ class TestHealth:
 
         assert result.revision_id == "test-rev"
         assert isinstance(result.servers, list)
+
+    @pytest.mark.asyncio
+    async def test_includes_error_details_for_error_servers(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        gateway_tools._client_manager.set_server_statuses(
+            [
+                ServerStatus(
+                    name="playwright",
+                    status=ServerStatusEnum.ERROR,
+                    tool_count=0,
+                    last_error="Connection refused",
+                )
+            ]
+        )
+
+        result = await gateway_tools.health()
+
+        assert result.servers[0].status == "error"
+        assert result.servers[0].error == "Connection refused"

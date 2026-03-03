@@ -76,6 +76,17 @@ servers:
   playwright:
     description: "Browser automation - navigation, clicks, screenshots, DOM inspection"
     keywords: [browser, web, automation, playwright, screenshot, click, navigate, scrape, dom]
+    # To reuse an already-running browser (e.g. logged-in Chrome), add CDP args
+    # in your .mcp.json override for this server. PMCP can merge these args with
+    # the manifest defaults when command is omitted.
+    # Example:
+    #   {
+    #     "mcpServers": {
+    #       "playwright": {
+    #         "args": ["--cdp-endpoint", "http://localhost:9222"]
+    #       }
+    #     }
+    #   }
     install:
       mac: ["npx", "-y", "@playwright/mcp@latest"]
       linux: ["npx", "-y", "@playwright/mcp@latest"]

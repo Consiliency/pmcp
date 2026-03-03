@@ -6,7 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, cast
 
 from pmcp.types import McpConfigFile, McpServerConfig, ResolvedServerConfig
 
@@ -52,17 +52,35 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
 
         # Some MCP clients support remote entries like {"type": "sse", "url": "..."}
         # without a local command. PMCP only loads local command-based downstream
-        # servers from discovered config files, so skip non-command entries.
+        # servers from discovered config files, but keeps partial local overrides
+        # (e.g. args/env without command) so they can merge with manifest defaults.
         raw_servers = data.get("mcpServers")
         if isinstance(raw_servers, dict):
-            filtered_servers = {
-                name: config
-                for name, config in raw_servers.items()
-                if isinstance(config, dict)
-                and isinstance(config.get("command"), str)
-                and config.get("command")
-            }
-            skipped_count = len(raw_servers) - len(filtered_servers)
+            filtered_servers: dict[str, dict[str, object]] = {}
+            skipped_count = 0
+            for name, config in raw_servers.items():
+                if not isinstance(config, dict):
+                    skipped_count += 1
+                    continue
+
+                command = config.get("command")
+                has_local_override = any(
+                    key in config for key in ("args", "cwd", "env")
+                )
+
+                if isinstance(command, str) and command:
+                    filtered_servers[name] = config
+                    continue
+
+                if command is None and has_local_override:
+                    # Allow partial override; resolved later against manifest defaults.
+                    partial = dict(config)
+                    partial["command"] = ""
+                    filtered_servers[name] = partial
+                    continue
+
+                skipped_count += 1
+
             if skipped_count > 0:
                 logger.info(
                     f"Skipping {skipped_count} non-command MCP entries in {file_path}"
@@ -73,6 +91,34 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
     except Exception as e:
         logger.warning(f"Failed to parse config file {file_path}: {e}")
         return None
+
+
+def _merge_manifest_defaults(
+    name: str,
+    config: McpServerConfig,
+    manifest_servers: dict[str, "ManifestServerConfig"] | None,
+) -> McpServerConfig | None:
+    """Merge a partial config with manifest defaults when possible."""
+    if config.command:
+        return config
+
+    if not manifest_servers:
+        logger.warning(
+            f"Skipping server '{name}' - command missing and manifest unavailable"
+        )
+        return None
+
+    manifest_server = manifest_servers.get(name)
+    if not manifest_server:
+        logger.warning(
+            f"Skipping server '{name}' - command missing and no manifest default found"
+        )
+        return None
+
+    merged = config.model_copy(deep=True)
+    merged.command = manifest_server.command
+    merged.args = [*manifest_server.args, *config.args]
+    return merged
 
 
 def normalize_server_config(
@@ -119,6 +165,30 @@ def load_configs(
     """
     configs: list[ResolvedServerConfig] = []
     seen_servers: set[str] = set()
+    manifest_servers: dict[str, ManifestServerConfig] | None = None
+
+    try:
+        from pmcp.manifest.loader import load_manifest
+
+        manifest_servers = load_manifest().servers
+    except Exception as e:
+        logger.debug(f"Manifest defaults unavailable during config load: {e}")
+
+    def build_resolved_config(
+        name: str,
+        config: McpServerConfig,
+        source: Literal["project", "user", "custom"],
+        base_path: Path,
+    ) -> ResolvedServerConfig | None:
+        normalized = normalize_server_config(config, base_path)
+        merged = _merge_manifest_defaults(name, normalized, manifest_servers)
+        if not merged:
+            return None
+        return ResolvedServerConfig(
+            name=name,
+            source=cast(Literal["project", "user", "custom", "manifest"], source),
+            config=merged,
+        )
 
     # 1. Load project config (highest priority)
     resolved_project_root = project_root or find_project_root(Path.cwd())
@@ -130,16 +200,15 @@ def load_configs(
             logger.info(f"Loaded project config from {project_config_path}")
             for name, config in project_config.mcpServers.items():
                 if name not in seen_servers:
-                    configs.append(
-                        ResolvedServerConfig(
-                            name=name,
-                            source="project",
-                            config=normalize_server_config(
-                                config, resolved_project_root
-                            ),
-                        )
+                    resolved = build_resolved_config(
+                        name,
+                        config,
+                        "project",
+                        resolved_project_root,
                     )
-                    seen_servers.add(name)
+                    if resolved:
+                        configs.append(resolved)
+                        seen_servers.add(name)
 
     # 2. Load user configs
     user_paths = (
@@ -154,14 +223,15 @@ def load_configs(
             logger.info(f"Loaded user config from {user_path}")
             for name, config in user_config.mcpServers.items():
                 if name not in seen_servers:
-                    configs.append(
-                        ResolvedServerConfig(
-                            name=name,
-                            source="user",
-                            config=normalize_server_config(config, user_path.parent),
-                        )
+                    resolved = build_resolved_config(
+                        name,
+                        config,
+                        "user",
+                        user_path.parent,
                     )
-                    seen_servers.add(name)
+                    if resolved:
+                        configs.append(resolved)
+                        seen_servers.add(name)
                 else:
                     logger.debug(
                         f"Skipping user server '{name}' - already defined in project config"
@@ -181,16 +251,15 @@ def load_configs(
             logger.info(f"Loaded custom config from {resolved_custom_path}")
             for name, config in custom_config.mcpServers.items():
                 if name not in seen_servers:
-                    configs.append(
-                        ResolvedServerConfig(
-                            name=name,
-                            source="custom",
-                            config=normalize_server_config(
-                                config, resolved_custom_path.parent
-                            ),
-                        )
+                    resolved = build_resolved_config(
+                        name,
+                        config,
+                        "custom",
+                        resolved_custom_path.parent,
                     )
-                    seen_servers.add(name)
+                    if resolved:
+                        configs.append(resolved)
+                        seen_servers.add(name)
 
     logger.info(
         f"Loaded {len(configs)} server configs from {len(seen_servers)} unique servers"

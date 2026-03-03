@@ -268,6 +268,7 @@ class ServerHealthInfo(BaseModel):
     name: str
     status: str
     tool_count: int
+    error: str | None = None
 
 
 class HealthOutput(BaseModel):

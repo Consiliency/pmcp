@@ -830,6 +830,9 @@ class GatewayTools:
                     name=s.name,
                     status=s.status.value,
                     tool_count=s.tool_count,
+                    error=s.last_error
+                    if s.status.value == "error" and s.last_error
+                    else None,
                 )
                 for s in statuses
             ],

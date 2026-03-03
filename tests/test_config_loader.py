@@ -156,3 +156,49 @@ class TestLoadConfigs:
         assert len(configs) == 1
         assert configs[0].name == "local"
         assert configs[0].config.command == "node"
+
+    def test_merges_manifest_defaults_for_partial_server_config(
+        self, tmp_path: Path
+    ) -> None:
+        project_config = {
+            "mcpServers": {
+                "playwright": {
+                    "args": ["--cdp-endpoint", "http://localhost:9222"],
+                }
+            }
+        }
+        (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+
+        configs = load_configs(
+            project_root=tmp_path,
+            user_config_paths=[],
+        )
+
+        assert len(configs) == 1
+        assert configs[0].name == "playwright"
+        assert configs[0].config.command == "npx"
+        assert configs[0].config.args == [
+            "-y",
+            "@playwright/mcp@latest",
+            "--cdp-endpoint",
+            "http://localhost:9222",
+        ]
+
+    def test_skips_partial_server_without_manifest_default(
+        self, tmp_path: Path
+    ) -> None:
+        project_config = {
+            "mcpServers": {
+                "custom-server": {
+                    "args": ["--debug"],
+                }
+            }
+        }
+        (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+
+        configs = load_configs(
+            project_root=tmp_path,
+            user_config_paths=[],
+        )
+
+        assert configs == []
