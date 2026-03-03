@@ -5,11 +5,11 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from pmcp.cli import parse_args, setup_logging
+from pmcp.cli import async_main, parse_args, setup_logging
 
 
 class TestParseArgs:
@@ -143,6 +143,32 @@ class TestParseArgs:
         assert args.server == "github"
         assert args.pending is True
         assert args.verbose is True
+
+    def test_doctor_command(self) -> None:
+        """Test doctor subcommand."""
+        with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):
+            with patch("sys.argv", ["mcp-gateway", "doctor"]):
+                args = parse_args()
+        assert args.command == "doctor"
+
+    def test_doctor_with_options(self, tmp_path: Path) -> None:
+        """Test doctor command options."""
+        with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):
+            with patch(
+                "sys.argv",
+                [
+                    "mcp-gateway",
+                    "doctor",
+                    "--project",
+                    str(tmp_path),
+                    "--timeout",
+                    "5",
+                ],
+            ):
+                args = parse_args()
+        assert args.command == "doctor"
+        assert args.project == tmp_path
+        assert args.timeout == 5
 
     def test_version_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
         """Test --version output uses pmcp naming."""
@@ -586,6 +612,158 @@ class TestRunInit:
         # Config should be overwritten
         content = config_file.read_text()
         assert "old" not in content
+
+
+class TestRunDoctor:
+    """Tests for run_doctor function."""
+
+    @pytest.mark.asyncio
+    async def test_doctor_mode_conflict_exits(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """Doctor should fail when service active with command mode config."""
+        from pmcp.cli import run_doctor
+
+        lock_file = tmp_path / ".pmcp" / "gateway.lock"
+        lock_file.parent.mkdir(parents=True)
+        lock_file.write_text("")
+
+        args = argparse.Namespace(
+            command="doctor", project=None, timeout=3.0, log_level="warn"
+        )
+
+        with patch("pmcp.cli.Path.home", return_value=tmp_path):
+            with patch("pmcp.cli._is_pmcp_system_service_active", return_value=True):
+                with patch(
+                    "pmcp.cli._load_local_mcp_json",
+                    return_value=(
+                        tmp_path / ".mcp.json",
+                        {"mcpServers": {"gateway": {"command": "pmcp", "args": []}}},
+                    ),
+                ):
+                    with pytest.raises(SystemExit) as exc_info:
+                        await run_doctor(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "Use remote URL instead of command" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_doctor_sse_probe_failure_exits(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """Doctor should fail when configured SSE endpoint is unreachable."""
+        from pmcp.cli import run_doctor
+
+        args = argparse.Namespace(
+            command="doctor", project=None, timeout=2.0, log_level="warn"
+        )
+
+        with patch("pmcp.cli.Path.home", return_value=tmp_path):
+            with patch("pmcp.cli._is_pmcp_system_service_active", return_value=False):
+                with patch(
+                    "pmcp.cli._load_local_mcp_json",
+                    return_value=(
+                        tmp_path / ".mcp.json",
+                        {
+                            "mcpServers": {
+                                "gateway": {
+                                    "type": "sse",
+                                    "url": "http://127.0.0.1:3344/sse",
+                                }
+                            }
+                        },
+                    ),
+                ):
+                    with patch(
+                        "pmcp.cli._probe_sse_endpoint",
+                        new=AsyncMock(return_value=(False, "connection refused")),
+                    ):
+                        with pytest.raises(SystemExit) as exc_info:
+                            await run_doctor(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "probe failed" in captured.out
+
+
+class TestDoctorAndSecretsIntegration:
+    """Integration-style tests for doctor/secrets parse and dispatch."""
+
+    def test_parse_doctor_timeout_and_project(self, tmp_path: Path) -> None:
+        """Doctor parser should accept timeout and project options."""
+        with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):
+            with patch(
+                "sys.argv",
+                [
+                    "pmcp",
+                    "doctor",
+                    "--project",
+                    str(tmp_path),
+                    "--timeout",
+                    "1.25",
+                ],
+            ):
+                args = parse_args()
+
+        assert args.command == "doctor"
+        assert args.project == tmp_path
+        assert args.timeout == 1.25
+
+    def test_parse_secrets_sync_options(self, tmp_path: Path) -> None:
+        """Secrets sync parser should bind scope and project options."""
+        with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):
+            with patch(
+                "sys.argv",
+                [
+                    "pmcp",
+                    "secrets",
+                    "sync",
+                    "--from-scope",
+                    "project",
+                    "--to-scope",
+                    "user",
+                    "--overwrite",
+                    "--project",
+                    str(tmp_path),
+                ],
+            ):
+                args = parse_args()
+
+        assert args.command == "secrets"
+        assert args.secrets_command == "sync"
+        assert args.from_scope == "project"
+        assert args.to_scope == "user"
+        assert args.overwrite is True
+        assert args.project == tmp_path
+
+    @pytest.mark.asyncio
+    async def test_async_main_dispatches_doctor(self) -> None:
+        """async_main should invoke doctor runner for doctor command."""
+        args = argparse.Namespace(command="doctor")
+
+        with patch("pmcp.cli.run_doctor", new=AsyncMock()) as mock_run_doctor:
+            await async_main(args)
+
+        mock_run_doctor.assert_awaited_once_with(args)
+
+    @pytest.mark.asyncio
+    async def test_async_main_dispatches_secrets_set_and_prints_json(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """async_main should invoke secrets.set and print returned JSON."""
+        args = argparse.Namespace(command="secrets", secrets_command="set")
+        payload = {"ok": True, "command": "secrets.set", "scope": "project"}
+
+        with patch(
+            "pmcp.cli.run_secrets_set", new=AsyncMock(return_value=payload)
+        ) as mock_set:
+            await async_main(args)
+
+        mock_set.assert_awaited_once_with(args)
+        output = capsys.readouterr().out
+        assert '"command": "secrets.set"' in output
+        assert '"ok": true' in output
 
 
 class TestRunStatusWithData:

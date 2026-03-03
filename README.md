@@ -74,28 +74,34 @@ uv pip install pmcp[llm]
 
 PMCP uses [BAML](https://docs.boundaryml.com/) with Groq's fast inference API for sub-second LLM responses. The LLM features are entirely optional - PMCP works fully without them.
 
-### Configure Claude Code
+### Configure with `pmcp setup`
 
-Create/update your Claude MCP config (commonly `~/.mcp.json`):
+PMCP includes a wizard-style helper that can render ready-to-use MCP client config for Claude and OpenCode.
 
-```json
-{
-  "mcpServers": {
-    "gateway": {
-      "command": "pmcp",
-      "args": []
-    }
-  }
-}
+Use `pmcp setup` to print the generated config:
+
+```bash
+pmcp setup --client claude --mode stdio    # Claude local stdio
+pmcp setup --client claude --mode sse      # Claude shared-service SSE
+pmcp setup --client opencode --mode stdio  # OpenCode local stdio
+pmcp setup --client opencode --mode sse    # OpenCode shared-service SSE
 ```
 
-That's it! PMCP auto-starts with Playwright and Context7 servers ready to use.
+Write directly into your client config with `--write`:
 
-### Shared Service Mode (Recommended for multi-client setups)
+```bash
+pmcp setup --client claude --mode sse --write
+```
 
-If you use PMCP from multiple clients/sessions, run one shared PMCP service and point clients to SSE.
+Without `--write`, `pmcp setup` prints the config so you can paste it into:
+- Claude: `~/.mcp.json`
+- OpenCode: `~/.config/opencode/opencode.json`
 
-Claude config example:
+Use SSE mode when running one shared PMCP service for multiple sessions/clients. Use stdio mode for single-process local testing.
+
+### Shared Service Mode (Manual)
+
+If you prefer manual config, point each client to the shared SSE endpoint:
 
 ```json
 {
@@ -463,29 +469,32 @@ PMCP only loads command-based downstream entries from discovered config files. R
 **Important**: Don't add `pmcp` itself to this file. PMCP is configured
 in your MCP client config, not in the downstream server list.
 
-### User-Scoped Credentials (systemd service)
+### Credential Scope Management (`pmcp secrets`)
 
-If PMCP runs as a user service, set API keys in `~/.config/pmcp/pmcp.env` so all sessions/apps share the same credentials.
+PMCP stores secrets in environment files by scope:
 
-Example:
+- `user` scope: `~/.config/pmcp/pmcp.env`
+- `project` scope: `<project_root>/.env.pmcp`
+
+You can manage both scopes with `pmcp secrets`:
 
 ```bash
-mkdir -p ~/.config/pmcp
-chmod 700 ~/.config/pmcp
-cat > ~/.config/pmcp/pmcp.env <<'EOF'
-API_TOKEN=your-bright-data-token
-WEB_UNLOCKER_ZONE=optional-zone
-BROWSER_ZONE=optional-zone
-PRO_MODE=optional
-GROUPS=optional
-TOOLS=optional
-EOF
-chmod 600 ~/.config/pmcp/pmcp.env
-systemctl --user daemon-reload
-systemctl --user restart pmcp
+# Store a secret in user scope (shared by all projects)
+pmcp secrets set API_TOKEN your-token --scope user
+
+# Store a secret in project scope
+pmcp secrets set API_TOKEN your-token --scope project --project /path/to/project
+
+# Copy all user-scoped secrets into project scope
+pmcp secrets sync --from-scope user --to-scope project --overwrite
+
+# Copy project-scoped secrets into user scope
+pmcp secrets sync --from-scope project --to-scope user --overwrite
 ```
 
-Note: service environment is separate from your interactive shell environment.
+Use scope-appropriate values such as `API_TOKEN` and keep the values in the generated `.env` files; PMCP and downstream MCP servers read from these files according to your active mode.
+
+For service users, `~/.config/pmcp/pmcp.env` is ideal for shared tokens used by all sessions.
 
 ### Policy File
 
@@ -537,7 +546,36 @@ pmcp refresh --force            # Force reconnect all
 
 # Initialize config (interactive)
 pmcp init
+
+# Render client setup snippets
+pmcp setup
+pmcp setup --client claude --mode stdio
+pmcp setup --client opencode --mode sse --write
+
+# Run diagnostics for lock/mode/SSE checks
+pmcp doctor
+pmcp doctor --project /path/to/project
+
+# Manage project/user secrets
+pmcp secrets set API_TOKEN my-token --scope user
+pmcp secrets sync --from-scope user --to-scope project --overwrite
 ```
+
+### `pmcp doctor` (Recommended before/after upgrades)
+
+Use `pmcp doctor` to diagnose common PMCP startup and connectivity issues. It checks:
+
+- `lock`: detects singleton lock state and stale lock collisions at `~/.pmcp/gateway.lock`
+- `mode`: detects local command-mode MCP config conflicts when a shared PMCP system service is running
+- `sse`: probes discovered SSE endpoints in local `.mcp.json` and reports health
+
+Example:
+
+```bash
+pmcp doctor
+```
+
+If any checks fail, follow the command in the output and rerun `pmcp doctor`.
 
 ### Singleton Lock
 
