@@ -20,16 +20,6 @@ import mcp.types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.shared.message import SessionMessage
 
-resource_module: ModuleType | None
-
-try:
-    import resource as resource_module
-
-    HAS_RESOURCE = True
-except ImportError:
-    resource_module = None
-    HAS_RESOURCE = False
-
 from pmcp.config.loader import make_tool_id
 from pmcp.types import (
     LocalMcpServerConfig,
@@ -44,6 +34,16 @@ from pmcp.types import (
     ServerStatusEnum,
     ToolInfo,
 )
+
+resource_module: ModuleType | None
+
+try:
+    import resource as resource_module
+
+    HAS_RESOURCE = True
+except ImportError:
+    resource_module = None
+    HAS_RESOURCE = False
 
 logger = logging.getLogger(__name__)
 
