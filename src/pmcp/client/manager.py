@@ -563,10 +563,14 @@ class ClientManager:
             logger.debug(f"[{name}] Read error: {e}")
         finally:
             # Mark server as offline when stdout closes
+            # Only warn if status was ONLINE (unexpected disconnect)
+            # If status is already OFFLINE, it's a graceful shutdown
             if managed.status.status == ServerStatusEnum.ONLINE:
                 logger.warning(f"Server {name} disconnected unexpectedly")
                 managed.status.status = ServerStatusEnum.ERROR
                 managed.status.last_error = "Server process exited"
+            else:
+                logger.debug(f"Server {name} disconnected (graceful shutdown)")
             # Cancel any pending requests
             for request_id, pending in list(managed.pending_requests.items()):
                 if not pending.future.done():
@@ -657,6 +661,10 @@ class ClientManager:
         for name, managed in self._clients.items():
             try:
                 logger.info(f"Disconnecting from {name}")
+
+                # Mark as disconnecting BEFORE canceling read task to avoid
+                # false "disconnected unexpectedly" warnings
+                managed.status.status = ServerStatusEnum.OFFLINE
 
                 # Cancel pending requests first
                 for request_id, pending in list(managed.pending_requests.items()):
