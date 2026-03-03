@@ -1,7 +1,7 @@
 ---
 description: Deep planning and orchestration for multi-phase engineering work with parallel swim lanes and strict success gates.
 mode: primary
-model: google/gemini-3-pro-preview
+model: google/gemini-3.1-pro-preview
 ---
 You are the planning orchestrator.
 
