@@ -231,6 +231,20 @@ servers:
     env_var: "QDRANT_URL"
     env_instructions: "Set QDRANT_URL (e.g. http://localhost:6333), COLLECTION_NAME, and optionally QDRANT_API_KEY"
 
+  supabase:
+    description: "Supabase platform access - project metadata, SQL, auth, functions"
+    keywords: [supabase, sql, postgres, auth]
+    install:
+      mac: ["npx", "-y", "@supabase/mcp-server-supabase", "--project-ref", "${SUPABASE_PROJECT_REF}"]
+      linux: ["npx", "-y", "@supabase/mcp-server-supabase", "--project-ref", "${SUPABASE_PROJECT_REF}"]
+      wsl: ["npx", "-y", "@supabase/mcp-server-supabase", "--project-ref", "${SUPABASE_PROJECT_REF}"]
+      windows: ["npx", "-y", "@supabase/mcp-server-supabase", "--project-ref", "${SUPABASE_PROJECT_REF}"]
+    command: "npx"
+    args: ["-y", "@supabase/mcp-server-supabase", "--project-ref", "${SUPABASE_PROJECT_REF}"]
+    requires_api_key: true
+    env_var: "SUPABASE_ACCESS_TOKEN"
+    env_instructions: "Set SUPABASE_ACCESS_TOKEN and SUPABASE_PROJECT_REF from your Supabase project settings"
+
   # === Browser Automation ===
 
   puppeteer:
@@ -258,6 +272,32 @@ servers:
     requires_api_key: true
     env_var: "BROWSERBASE_API_KEY"
     env_instructions: "Set BROWSERBASE_API_KEY, BROWSERBASE_PROJECT_ID from https://browserbase.com"
+
+  browser-use:
+    description: "Browser Use local MCP - AI browser agent with autonomous multi-step actions"
+    keywords: [browser-use, browseruse, browser automation, mcp]
+    install:
+      mac: ["uvx", "--from", "browser-use[cli]", "browser-use", "--mcp"]
+      linux: ["uvx", "--from", "browser-use[cli]", "browser-use", "--mcp"]
+      wsl: ["uvx", "--from", "browser-use[cli]", "browser-use", "--mcp"]
+      windows: ["uvx", "--from", "browser-use[cli]", "browser-use", "--mcp"]
+    command: "uvx"
+    args: ["--from", "browser-use[cli]", "browser-use", "--mcp"]
+    requires_api_key: true
+    env_var: "OPENAI_API_KEY"
+    env_instructions: "Set OPENAI_API_KEY (or ANTHROPIC_API_KEY in env override) for Browser Use local agent"
+
+  chrome-devtools:
+    description: "Chrome DevTools MCP - inspect and control a live Chrome instance"
+    keywords: [chrome devtools, chrome, browser debugging, devtools]
+    install:
+      mac: ["npx", "-y", "chrome-devtools-mcp@latest"]
+      linux: ["npx", "-y", "chrome-devtools-mcp@latest"]
+      wsl: ["npx", "-y", "chrome-devtools-mcp@latest"]
+      windows: ["npx", "-y", "chrome-devtools-mcp@latest"]
+    command: "npx"
+    args: ["-y", "chrome-devtools-mcp@latest"]
+    requires_api_key: false
 
   # === Developer Tools ===
 
@@ -410,6 +450,34 @@ servers:
     requires_api_key: true
     env_var: "EXA_API_KEY"
     env_instructions: "Get API key at https://dashboard.exa.ai/api-keys"
+
+  firecrawl:
+    description: "Firecrawl MCP - structured web crawling, scraping, and extraction"
+    keywords: [firecrawl, scraping, crawling, extract]
+    install:
+      mac: ["npx", "-y", "firecrawl-mcp"]
+      linux: ["npx", "-y", "firecrawl-mcp"]
+      wsl: ["npx", "-y", "firecrawl-mcp"]
+      windows: ["npx", "-y", "firecrawl-mcp"]
+    command: "npx"
+    args: ["-y", "firecrawl-mcp"]
+    requires_api_key: true
+    env_var: "FIRECRAWL_API_KEY"
+    env_instructions: "Set FIRECRAWL_API_KEY from https://www.firecrawl.dev"
+
+  tavily:
+    description: "Tavily MCP - live web search and extraction tuned for AI workflows"
+    keywords: [tavily, web search, research, extract]
+    install:
+      mac: ["npx", "-y", "tavily-mcp"]
+      linux: ["npx", "-y", "tavily-mcp"]
+      wsl: ["npx", "-y", "tavily-mcp"]
+      windows: ["npx", "-y", "tavily-mcp"]
+    command: "npx"
+    args: ["-y", "tavily-mcp"]
+    requires_api_key: true
+    env_var: "TAVILY_API_KEY"
+    env_instructions: "Set TAVILY_API_KEY from https://app.tavily.com"
 
   brightdata:
     description: "Bright Data MCP - search, scraping, and browser automation"

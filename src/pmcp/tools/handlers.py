@@ -57,7 +57,12 @@ from pmcp.types import (
     SyncEnvironmentInput,
     SyncEnvironmentOutput,
     ToolInfo,
+    LocalMcpServerConfig,
+    RemoteMcpServerConfig,
+    ResolvedServerConfig,
 )
+
+from pmcp.manifest.loader import Manifest, ServerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -673,8 +678,10 @@ class GatewayTools:
             )
 
         # Call the tool
+        timeout_ms = 30000
+        if parsed.options:
+            timeout_ms = parsed.options.timeout_ms
         try:
-            timeout_ms = parsed.options.timeout_ms if parsed.options else 30000
             result = await self._client_manager.call_tool(
                 parsed.tool_id, parsed.arguments, timeout_ms
             )
@@ -856,6 +863,100 @@ class GatewayTools:
 
         return False
 
+    def _load_configured_servers(self) -> dict[str, ResolvedServerConfig]:
+        """Load user/project-configured servers that are allowed by policy."""
+        configs = load_configs(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        )
+        configs = filter_self_references(configs)
+
+        configured: dict[str, ResolvedServerConfig] = {}
+        for config in configs:
+            if self._policy_manager.is_server_allowed(config.name):
+                configured[config.name] = config
+        return configured
+
+    def _keywords_for_config_server(self, config: ResolvedServerConfig) -> list[str]:
+        """Build lightweight keywords for a configured server entry."""
+        keywords: list[str] = [config.name, "mcp", "server"]
+        if isinstance(config.config, LocalMcpServerConfig):
+            if config.config.command:
+                keywords.append(config.config.command)
+            keywords.extend(config.config.args)
+        elif isinstance(config.config, RemoteMcpServerConfig):
+            keywords.extend(["remote", "sse", "http", "api"])
+            keywords.append(config.config.url)
+
+        # Deduplicate while preserving order
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for keyword in keywords:
+            keyword_str = str(keyword).strip().lower()
+            if keyword_str and keyword_str not in seen:
+                seen.add(keyword_str)
+                deduped.append(keyword_str)
+        return deduped
+
+    def _build_manifest_with_config_servers(
+        self,
+        manifest: Manifest,
+        configured_servers: dict[str, ResolvedServerConfig],
+    ) -> Manifest:
+        """Create a manifest view that includes config-only server entries."""
+        merged_servers = dict(manifest.servers)
+
+        for name, config in configured_servers.items():
+            if name in merged_servers:
+                continue
+
+            command = ""
+            args: list[str] = []
+            description = f"User-configured MCP server '{name}'"
+
+            if isinstance(config.config, LocalMcpServerConfig):
+                command = config.config.command
+                args = list(config.config.args)
+                if command:
+                    description += f" (local command: {command})"
+            elif isinstance(config.config, RemoteMcpServerConfig):
+                description += f" (remote URL: {config.config.url})"
+
+            merged_servers[name] = ServerConfig(
+                name=name,
+                description=description,
+                keywords=self._keywords_for_config_server(config),
+                install={},
+                command=command,
+                args=args,
+                requires_api_key=False,
+            )
+
+        return Manifest(
+            version=manifest.version,
+            cli_alternatives=dict(manifest.cli_alternatives),
+            servers=merged_servers,
+            discovery_queue_path=manifest.discovery_queue_path,
+        )
+
+    def _get_server_env_metadata(
+        self,
+        server_name: str,
+        manifest: Manifest,
+        configured_servers: dict[str, ResolvedServerConfig],
+    ) -> tuple[bool, str | None, str | None]:
+        """Get API-key metadata for a server candidate."""
+        manifest_server = manifest.get_server(server_name)
+        if manifest_server:
+            return (
+                manifest_server.requires_api_key,
+                manifest_server.env_var,
+                manifest_server.env_instructions,
+            )
+
+        # No explicit API key metadata for plain .mcp.json entries.
+        return (False, None, None)
+
     async def request_capability(
         self, input_data: dict[str, Any]
     ) -> CapabilityResolution:
@@ -868,6 +969,10 @@ class GatewayTools:
 
         # Load manifest
         manifest = load_manifest()
+        configured_servers = self._load_configured_servers()
+        merged_manifest = self._build_manifest_with_config_servers(
+            manifest, configured_servers
+        )
 
         # Get detected CLIs (from input or probe)
         if parsed.available_clis:
@@ -914,7 +1019,7 @@ class GatewayTools:
                     requires_api_key=server.requires_api_key,
                     env_var=server.env_var,
                 )
-                for name, server in manifest.servers.items()
+                for name, server in merged_manifest.servers.items()
             ]
             clis = [
                 ManifestCLI(
@@ -955,11 +1060,14 @@ class GatewayTools:
                 requires_api_key = c.requires_api_key
 
                 if c.candidate_type == "server":
-                    server_config = manifest.get_server(c.name)
-                    if server_config:
-                        env_var = server_config.env_var
-                        env_instructions = server_config.env_instructions
-                        api_key_available = self._check_api_key_available(env_var)
+                    requires_api_key, env_var, env_instructions = (
+                        self._get_server_env_metadata(
+                            c.name,
+                            manifest,
+                            configured_servers,
+                        )
+                    )
+                    api_key_available = self._check_api_key_available(env_var)
 
                 candidates.append(
                     CapabilityCandidate(
@@ -1002,7 +1110,7 @@ class GatewayTools:
         # Fallback: use simple keyword matching
         match_result = await match_capability(
             query=parsed.query,
-            manifest=manifest,
+            manifest=merged_manifest,
             detected_clis=set(detected_clis),
             use_llm=False,  # Don't use LLM in fallback
         )
@@ -1027,22 +1135,21 @@ class GatewayTools:
                 )
             ]
         else:
-            server_config = manifest.get_server(match_result.entry_name)
-            env_var = server_config.env_var if server_config else None
+            requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
+                match_result.entry_name,
+                manifest,
+                configured_servers,
+            )
             candidates = [
                 CapabilityCandidate(
                     name=match_result.entry_name,
                     candidate_type="server",
                     relevance_score=match_result.confidence,
                     reasoning=match_result.reasoning,
-                    requires_api_key=server_config.requires_api_key
-                    if server_config
-                    else False,
+                    requires_api_key=requires_api_key,
                     api_key_available=self._check_api_key_available(env_var),
                     env_var=env_var,
-                    env_instructions=server_config.env_instructions
-                    if server_config
-                    else None,
+                    env_instructions=env_instructions,
                     is_running=match_result.entry_name in running_servers,
                 )
             ]
@@ -1059,17 +1166,7 @@ class GatewayTools:
         parsed = ProvisionInput.model_validate(input_data)
         server_name = parsed.server_name
 
-        # Load manifest
-        manifest = load_manifest()
-        server_config = manifest.get_server(server_name)
-
-        if not server_config:
-            return ProvisionOutput(
-                ok=False,
-                server=server_name,
-                status="failed",
-                message=f"Server '{server_name}' not found in manifest.",
-            )
+        configured_servers = self._load_configured_servers()
 
         # Check if already running
         if self._client_manager.is_server_online(server_name):
@@ -1095,6 +1192,62 @@ class GatewayTools:
                     )
                     for t in tools[:10]
                 ],
+            )
+
+        # User/project configured servers are lazy-started via ClientManager.
+        if server_name in configured_servers:
+            try:
+                connected = await self._client_manager.ensure_connected(server_name)
+            except ValueError:
+                connected = False
+
+            if connected:
+                tools = [
+                    t
+                    for t in self._client_manager.get_all_tools()
+                    if t.server_name == server_name
+                ]
+                return ProvisionOutput(
+                    ok=True,
+                    server=server_name,
+                    status="complete",
+                    message=f"Server '{server_name}' started from .mcp.json configuration with {len(tools)} tools.",
+                    new_tools=[
+                        CapabilityCard(
+                            tool_id=t.tool_id,
+                            server=t.server_name,
+                            tool_name=t.tool_name,
+                            short_description=t.short_description,
+                            tags=t.tags,
+                            availability="online",
+                            risk_hint=t.risk_hint.value,
+                        )
+                        for t in tools[:10]
+                    ],
+                )
+
+            return ProvisionOutput(
+                ok=False,
+                server=server_name,
+                status="failed",
+                message=(
+                    f"Server '{server_name}' is configured but could not be started. "
+                    "Run gateway.refresh and check gateway.health for connection errors."
+                ),
+            )
+
+        # Load manifest
+        manifest = load_manifest()
+        server_config = manifest.get_server(server_name)
+
+        if not server_config:
+            return ProvisionOutput(
+                ok=False,
+                server=server_name,
+                status="failed",
+                message=(
+                    f"Server '{server_name}' not found in manifest or .mcp.json configuration."
+                ),
             )
 
         # Check API key if required

@@ -2,14 +2,19 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
+import types
+import sys
 
 import pytest
 
+from pmcp.manifest.loader import CLIAlternative, Manifest, ServerConfig
 from pmcp.errors import GatewayException
 from pmcp.policy.policy import PolicyManager
 from pmcp.tools.handlers import GatewayTools
 from pmcp.types import (
+    LocalMcpServerConfig,
+    ResolvedServerConfig,
     RiskHint,
     ServerStatus,
     ServerStatusEnum,
@@ -23,6 +28,7 @@ class MockClientManager:
     def __init__(self, tools: list[ToolInfo] | None = None) -> None:
         self._tools = {t.tool_id: t for t in (tools or [])}
         self._online_servers: set[str] = set()
+        self._lazy_servers: set[str] = set()
         self._server_statuses: list[ServerStatus] = []
         self._revision_id = "test-rev"
         self._last_refresh_ts = 1234567890.0
@@ -37,11 +43,23 @@ class MockClientManager:
         return name in self._online_servers
 
     def is_lazy_server(self, name: str) -> bool:
-        """Mock: no servers are lazy by default."""
-        return False
+        return name in self._lazy_servers
+
+    def get_lazy_server_names(self) -> list[str]:
+        return list(self._lazy_servers)
+
+    def add_lazy_server(self, name: str) -> None:
+        self._lazy_servers.add(name)
 
     def set_server_online(self, name: str) -> None:
         self._online_servers.add(name)
+
+    async def ensure_connected(self, server_name: str) -> bool:
+        if server_name in self._lazy_servers:
+            self._lazy_servers.remove(server_name)
+            self._online_servers.add(server_name)
+            return True
+        raise ValueError(f"Unknown server: {server_name}")
 
     def get_all_server_statuses(self) -> list[Any]:
         return self._server_statuses
@@ -59,6 +77,33 @@ class MockClientManager:
 
     async def refresh(self, configs: list[Any]) -> list[str]:
         return []
+
+
+def create_manifest_for_request_tests() -> Manifest:
+    return Manifest(
+        version="1.0",
+        cli_alternatives={
+            "git": CLIAlternative(
+                name="git",
+                keywords=["git", "version control"],
+                check_command=["git", "--version"],
+                help_command=["git", "--help"],
+                description="Git CLI",
+            )
+        },
+        servers={
+            "playwright": ServerConfig(
+                name="playwright",
+                description="Browser automation",
+                keywords=["browser", "automation", "playwright"],
+                install={},
+                command="npx",
+                args=["@playwright/mcp"],
+                requires_api_key=False,
+            )
+        },
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
 
 
 def create_mock_tools() -> list[ToolInfo]:
@@ -265,7 +310,7 @@ class TestHealth:
     async def test_includes_error_details_for_error_servers(
         self, gateway_tools: GatewayTools
     ) -> None:
-        gateway_tools._client_manager.set_server_statuses(
+        cast(Any, gateway_tools._client_manager).set_server_statuses(
             [
                 ServerStatus(
                     name="playwright",
@@ -280,3 +325,153 @@ class TestHealth:
 
         assert result.servers[0].status == "error"
         assert result.servers[0].error == "Connection refused"
+
+
+class TestCapabilityAndProvision:
+    @pytest.mark.asyncio
+    async def test_request_capability_includes_configured_server(self, monkeypatch):
+        client_manager = MockClientManager(create_mock_tools())
+        client_manager.add_lazy_server("custom-browser")
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        configured = [
+            ResolvedServerConfig(
+                name="custom-browser",
+                source="project",
+                config=LocalMcpServerConfig(command="npx", args=["custom-browser-mcp"]),
+            )
+        ]
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+
+        async def fake_match_capability(**kwargs):
+            return types.SimpleNamespace(
+                matched=True,
+                entry_name="custom-browser",
+                entry_type="server",
+                confidence=0.82,
+                reasoning="Keyword match for server: custom-browser",
+            )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.match_capability",
+            fake_match_capability,
+        )
+
+        # Force BAML import failure so fallback matcher is used deterministically.
+        monkeypatch.setitem(
+            sys.modules, "pmcp.baml_client", types.ModuleType("pmcp.baml_client")
+        )
+
+        result = await gateway_tools.request_capability(
+            {"query": "browser automation", "available_clis": []}
+        )
+
+        assert result.status == "candidates"
+        assert result.candidates is not None
+        assert result.candidates[0].name == "custom-browser"
+        assert result.candidates[0].candidate_type == "server"
+
+    @pytest.mark.asyncio
+    async def test_provision_starts_configured_lazy_server(self, monkeypatch):
+        tool = ToolInfo(
+            tool_id="custom-browser::snapshot",
+            server_name="custom-browser",
+            tool_name="snapshot",
+            description="Take browser snapshot",
+            short_description="Take browser snapshot",
+            input_schema={"type": "object", "properties": {}},
+            tags=["browser"],
+            risk_hint=RiskHint.LOW,
+        )
+        client_manager = MockClientManager([tool])
+        client_manager.add_lazy_server("custom-browser")
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        configured = [
+            ResolvedServerConfig(
+                name="custom-browser",
+                source="project",
+                config=LocalMcpServerConfig(command="npx", args=["custom-browser-mcp"]),
+            )
+        ]
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+
+        result = await gateway_tools.provision({"server_name": "custom-browser"})
+
+        assert result.ok is True
+        assert result.status == "complete"
+        assert "started from .mcp.json configuration" in result.message
+
+    @pytest.mark.asyncio
+    async def test_request_then_provision_for_configured_server(self, monkeypatch):
+        tool = ToolInfo(
+            tool_id="custom-browser::snapshot",
+            server_name="custom-browser",
+            tool_name="snapshot",
+            description="Take browser snapshot",
+            short_description="Take browser snapshot",
+            input_schema={"type": "object", "properties": {}},
+            tags=["browser"],
+            risk_hint=RiskHint.LOW,
+        )
+        client_manager = MockClientManager([tool])
+        client_manager.add_lazy_server("custom-browser")
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        configured = [
+            ResolvedServerConfig(
+                name="custom-browser",
+                source="project",
+                config=LocalMcpServerConfig(command="npx", args=["custom-browser-mcp"]),
+            )
+        ]
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+
+        async def fake_match_capability(**kwargs):
+            return types.SimpleNamespace(
+                matched=True,
+                entry_name="custom-browser",
+                entry_type="server",
+                confidence=0.9,
+                reasoning="Keyword match for server: custom-browser",
+            )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.match_capability", fake_match_capability
+        )
+        monkeypatch.setitem(
+            sys.modules, "pmcp.baml_client", types.ModuleType("pmcp.baml_client")
+        )
+
+        capability = await gateway_tools.request_capability(
+            {"query": "browser automation", "available_clis": []}
+        )
+        assert capability.status == "candidates"
+        assert capability.candidates is not None
+        assert capability.candidates[0].name == "custom-browser"
+
+        provision = await gateway_tools.provision({"server_name": "custom-browser"})
+        assert provision.ok is True
+        assert provision.status == "complete"
+        assert client_manager.is_server_online("custom-browser") is True

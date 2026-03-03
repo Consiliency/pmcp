@@ -712,51 +712,59 @@ async def run_init(args: argparse.Namespace) -> None:
         manifest = load_manifest()
         available_servers = list(manifest.servers.keys())
     except Exception:
+        manifest = None
         available_servers = []
         print("Warning: Could not load server manifest.")
 
-    # Common servers to suggest
-    common_servers = [
-        ("filesystem", "@modelcontextprotocol/server-filesystem", None),
-        (
-            "github",
-            "@modelcontextprotocol/server-github",
-            "GITHUB_PERSONAL_ACCESS_TOKEN",
-        ),
-        ("postgres", "@modelcontextprotocol/server-postgres", "POSTGRES_URL"),
-        ("sqlite", "@modelcontextprotocol/server-sqlite", None),
-        ("puppeteer", "@anthropics/mcp-server-puppeteer", None),
+    # Curated setup starters surfaced during interactive init.
+    # These are intentionally high-utility and high-adoption servers.
+    recommended_servers = [
+        "filesystem",
+        "playwright",
+        "context7",
+        "github",
+        "postgres",
+        "sqlite",
+        "supabase",
+        "notion",
+        "firecrawl",
+        "tavily",
+        "browser-use",
+        "chrome-devtools",
+        "brightdata",
     ]
 
     selected_servers: dict[str, dict] = {}
 
     print("Select MCP servers to enable:\n")
-    for name, package, env_var in common_servers:
-        # Check if in manifest or known
-        is_available = name in available_servers or package.startswith("@")
+    for name in recommended_servers:
+        if name not in available_servers or manifest is None:
+            continue
 
-        if is_available:
-            prompt = f"  Enable {name} ({package})? [y/N]: "
-            response = input(prompt).strip().lower()
+        server = manifest.get_server(name)
+        if server is None:
+            continue
 
-            if response in ("y", "yes"):
-                config: dict = {
-                    "command": "npx",
-                    "args": ["-y", package],
-                }
+        prompt = f"  Enable {name} ({server.description})? [y/N]: "
+        response = input(prompt).strip().lower()
 
-                # Check for API key
-                if env_var:
-                    env_value = os.environ.get(env_var)
-                    if env_value:
-                        print(f"    Found {env_var} in environment")
-                        config["env"] = {env_var: f"${{{env_var}}}"}
-                    else:
-                        print(f"    Note: Set {env_var} in .env for this server")
-                        config["env"] = {env_var: f"${{{env_var}}}"}
+        if response in ("y", "yes"):
+            config: dict[str, object] = {
+                "command": server.command,
+                "args": server.args,
+            }
 
-                selected_servers[name] = config
-                print(f"    Added {name}")
+            # Check for API key
+            if server.env_var:
+                env_value = os.environ.get(server.env_var)
+                if env_value:
+                    print(f"    Found {server.env_var} in environment")
+                else:
+                    print(f"    Note: Set {server.env_var} in .env for this server")
+                config["env"] = {server.env_var: f"${{{server.env_var}}}"}
+
+            selected_servers[name] = config
+            print(f"    Added {name}")
 
     if not selected_servers:
         print("\nNo servers selected. Creating minimal config...")

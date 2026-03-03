@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -637,6 +637,31 @@ class TestRunInit:
         content = config_file.read_text()
         assert "old" not in content
 
+    @pytest.mark.asyncio
+    async def test_init_can_enable_browser_use(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """Init prompt should allow enabling browser-use from manifest."""
+        from pmcp.cli import run_init
+
+        args = argparse.Namespace(
+            command="init",
+            project=tmp_path,
+            force=False,
+        )
+
+        def _select_browser_use(prompt: str) -> str:
+            if "Enable browser-use" in prompt:
+                return "y"
+            return ""
+
+        with patch("builtins.input", side_effect=_select_browser_use):
+            await run_init(args)
+
+        content = (tmp_path / ".mcp.json").read_text()
+        assert '"browser-use"' in content
+        assert "browser-use[cli]" in content
+
 
 class TestRunDoctor:
     """Tests for run_doctor function."""
@@ -882,7 +907,7 @@ class TestRunStatusWithData:
     """Tests for run_status with actual server data."""
 
     @pytest.fixture
-    def mock_server_status(self) -> MagicMock:
+    def mock_server_status(self) -> object:
         """Create mock server status."""
         from pmcp.types import ServerStatus, ServerStatusEnum
 
@@ -898,7 +923,7 @@ class TestRunStatusWithData:
     async def test_status_shows_servers(
         self,
         capsys: pytest.CaptureFixture[str],
-        mock_server_status: MagicMock,
+        mock_server_status: object,
     ) -> None:
         """Test status shows server information."""
         from pmcp.cli import run_status

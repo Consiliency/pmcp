@@ -79,8 +79,8 @@ async def test_probe_clis_with_mocked_which():
         ),
     ):
         # Only git and docker are "installed"
-        mock_which.side_effect = (
-            lambda cmd: f"/usr/bin/{cmd}" if cmd in ("git", "docker") else None
+        mock_which.side_effect = lambda cmd: (
+            f"/usr/bin/{cmd}" if cmd in ("git", "docker") else None
         )
 
         cli_configs = {
@@ -113,7 +113,17 @@ def test_manifest_has_expected_servers():
     """Test that manifest has expected servers."""
     manifest = load_manifest()
 
-    expected_servers = ["playwright", "context7", "memory", "filesystem"]
+    expected_servers = [
+        "playwright",
+        "context7",
+        "memory",
+        "filesystem",
+        "browser-use",
+        "chrome-devtools",
+        "supabase",
+        "firecrawl",
+        "tavily",
+    ]
     for server in expected_servers:
         assert server in manifest.servers, f"Missing server: {server}"
 
@@ -141,6 +151,16 @@ def test_manifest_search_by_keyword():
     # Search for scraping
     results = manifest.search_by_keyword("scrape")
     assert len(results) > 0
+
+
+def test_keyword_match_browser_use_server():
+    """Keyword matcher should resolve browser-use capability requests."""
+    manifest = load_manifest()
+
+    result = _keyword_match("browser-use mcp server", manifest, set())
+    assert result.matched is True
+    assert result.entry_name == "browser-use"
+    assert result.entry_type == "server"
 
 
 def test_manifest_server_config():
@@ -590,6 +610,7 @@ class TestStartInstall:
         job = manager.get_job(job_id)
         assert job is not None
         assert job.status == "failed"
+        assert job.error is not None
         assert "not found" in job.error.lower()
 
 
