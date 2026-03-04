@@ -240,6 +240,13 @@ The gateway exposes **13 meta-tools** organized into three categories:
 | `gateway.list_pending` | List pending tool invocations with health status |
 | `gateway.cancel` | Cancel a pending tool invocation |
 
+### Subordinate MCP Updates
+
+- `gateway.update_server` is the phase-1 update path for subordinate MCPs.
+- `pmcp update <server>` and `pmcp update --all` call the same gateway update workflow.
+- `gateway.describe`, `gateway.invoke`, and `gateway.provision` may return `update_warning` when a newer package version is detected.
+- Planned follow-ups: background stale-version indexing, stronger stale prompts in client UX, and expanded package-manager coverage.
+
 ## Progressive Disclosure Workflow
 
 PMCP follows a progressive disclosure pattern - start with natural language, get recommendations, drill down as needed.
