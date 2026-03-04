@@ -29,12 +29,21 @@ class MatchResult:
 def _keyword_match_score(query: str, keywords: list[str]) -> float:
     """Simple keyword matching fallback."""
     query_lower = query.lower()
-    query_words = set(query_lower.split())
+    query_norm = query_lower.replace("-", " ").replace("_", " ")
+    query_words = set(query_norm.split())
 
     matches = 0
     for keyword in keywords:
         keyword_lower = keyword.lower()
-        if keyword_lower in query_lower or keyword_lower in query_words:
+        keyword_norm = keyword_lower.replace("-", " ").replace("_", " ")
+        keyword_words = set(keyword_norm.split())
+        if (
+            keyword_lower in query_lower
+            or keyword_norm in query_norm
+            or keyword_lower in query_words
+            or keyword_norm in query_words
+            or (keyword_words and keyword_words.issubset(query_words))
+        ):
             matches += 1
 
     if not keywords:

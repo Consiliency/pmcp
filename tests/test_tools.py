@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, cast
 import types
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,7 @@ from pmcp.errors import GatewayException
 from pmcp.policy.policy import PolicyManager
 from pmcp.tools.handlers import GatewayTools
 from pmcp.types import (
+    CapabilityCandidate,
     LocalMcpServerConfig,
     ResolvedServerConfig,
     RiskHint,
@@ -475,3 +477,189 @@ class TestCapabilityAndProvision:
         assert provision.ok is True
         assert provision.status == "complete"
         assert client_manager.is_server_online("custom-browser") is True
+
+    @pytest.mark.asyncio
+    async def test_request_capability_discovers_unknown_server(self, monkeypatch):
+        client_manager = MockClientManager(create_mock_tools())
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+        async def fake_match_capability(**kwargs):
+            return types.SimpleNamespace(
+                matched=False,
+                entry_name="",
+                entry_type="",
+                confidence=0.0,
+                reasoning="No matching capability found in manifest",
+            )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.match_capability", fake_match_capability
+        )
+        monkeypatch.setitem(
+            sys.modules, "pmcp.baml_client", types.ModuleType("pmcp.baml_client")
+        )
+        monkeypatch.setattr(
+            gateway_tools,
+            "_discover_external_servers",
+            lambda query: [
+                CapabilityCandidate(
+                    name="@acme/openbrowser-mcp",
+                    candidate_type="server",
+                    relevance_score=0.8,
+                    reasoning="Discovered from npm",
+                )
+            ],
+        )
+
+        result = await gateway_tools.request_capability({"query": "openbrowser mcp"})
+
+        assert result.status == "candidates"
+        assert result.candidates is not None
+        assert result.candidates[0].name == "@acme/openbrowser-mcp"
+
+    @pytest.mark.asyncio
+    async def test_provision_reports_auth_metadata_for_missing_key(self, monkeypatch):
+        client_manager = MockClientManager(create_mock_tools())
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "browser-use": ServerConfig(
+                    name="browser-use",
+                    description="Browser Use",
+                    keywords=["browser-use"],
+                    install={},
+                    command="uvx",
+                    args=["--from", "browser-use[cli]", "browser-use", "--mcp"],
+                    requires_api_key=True,
+                    env_var="OPENAI_API_KEY",
+                    env_instructions="Set OPENAI_API_KEY or ANTHROPIC_API_KEY",
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+        result = await gateway_tools.provision({"server_name": "browser-use"})
+
+        assert result.ok is False
+        assert result.needs_api_key is True
+        assert result.auth_required is True
+        assert result.auth_mode == "api_key"
+        assert result.alternative_env_vars == ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
+
+    @pytest.mark.asyncio
+    async def test_auth_connect_stores_credential(self, monkeypatch):
+        client_manager = MockClientManager(create_mock_tools())
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "browser-use": ServerConfig(
+                    name="browser-use",
+                    description="Browser Use",
+                    keywords=["browser-use"],
+                    install={},
+                    command="uvx",
+                    args=["browser-use"],
+                    requires_api_key=True,
+                    env_var="OPENAI_API_KEY",
+                    env_instructions="Set OPENAI_API_KEY",
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr(
+            gateway_tools,
+            "_write_secret",
+            lambda scope, key, value: Path("/tmp/pmcp-test.env"),
+        )
+
+        result = await gateway_tools.auth_connect(
+            {
+                "server_name": "browser-use",
+                "credential": "test-token",
+                "scope": "user",
+            }
+        )
+
+        assert result.ok is True
+        assert result.env_var == "OPENAI_API_KEY"
+        assert "gateway.provision" in (result.next_step or "")
+
+    @pytest.mark.asyncio
+    async def test_provision_uses_discovered_server_config(self, monkeypatch):
+        client_manager = MockClientManager(create_mock_tools())
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={},
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+        gateway_tools._discovered_server_configs["@acme/openbrowser-mcp"] = (
+            ServerConfig(
+                name="@acme/openbrowser-mcp",
+                description="Discovered package",
+                keywords=["mcp"],
+                install={
+                    "linux": ["npx", "-y", "@acme/openbrowser-mcp"],
+                    "mac": ["npx", "-y", "@acme/openbrowser-mcp"],
+                    "wsl": ["npx", "-y", "@acme/openbrowser-mcp"],
+                    "windows": ["npx", "-y", "@acme/openbrowser-mcp"],
+                },
+                command="npx",
+                args=["-y", "@acme/openbrowser-mcp"],
+                requires_api_key=False,
+            )
+        )
+
+        class FakeJobManager:
+            async def start_install(self, server_config, platform):
+                return "job-123"
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_job_manager", lambda: FakeJobManager()
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.detect_platform", lambda: "linux")
+
+        result = await gateway_tools.provision({"server_name": "@acme/openbrowser-mcp"})
+
+        assert result.ok is True
+        assert result.status == "started"
+        assert result.job_id == "job-123"

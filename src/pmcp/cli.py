@@ -428,6 +428,52 @@ Environment overrides:
         help="Project root directory (for project scope)",
     )
 
+    # Auth command
+    auth_parser = subparsers.add_parser(
+        "auth",
+        help="Authenticate MCP servers and store credentials",
+        description="Connect authentication for a server and optionally auto-provision it.",
+    )
+    auth_subparsers = auth_parser.add_subparsers(
+        dest="auth_command",
+        required=True,
+        help="Auth subcommands",
+    )
+
+    auth_connect_parser = auth_subparsers.add_parser(
+        "connect",
+        help="Store credential for a server and provision it",
+    )
+    auth_connect_parser.add_argument(
+        "server_name", type=str, help="Server name requiring authentication"
+    )
+    auth_connect_parser.add_argument(
+        "--credential",
+        type=str,
+        help="Credential/token value (if omitted, prompts securely)",
+    )
+    auth_connect_parser.add_argument(
+        "--env-var",
+        type=str,
+        help="Override target environment variable key",
+    )
+    auth_connect_parser.add_argument(
+        "--scope",
+        choices=["user", "project"],
+        default="user",
+        help="Where to store credential (default: user)",
+    )
+    auth_connect_parser.add_argument(
+        "--no-provision",
+        action="store_true",
+        help="Only store credentials; do not auto-retry provisioning",
+    )
+    auth_connect_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON output",
+    )
+
     return parser.parse_args()
 
 
@@ -1343,6 +1389,87 @@ def run_guidance(args: argparse.Namespace) -> None:
     print("  Or set level: off | minimal | standard")
 
 
+async def run_auth_connect(args: argparse.Namespace) -> None:
+    """Connect auth for a server and optionally provision it."""
+    import getpass
+
+    from pmcp.client.manager import ClientManager
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
+
+    setup_logging(args.log_level)
+
+    policy_path = args.policy if hasattr(args, "policy") else None
+    policy_manager = PolicyManager(policy_path)
+    client_manager = ClientManager(
+        max_tools_per_server=policy_manager.get_max_tools_per_server()
+    )
+
+    gateway_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/sse")
+    gateway_config = ResolvedServerConfig(
+        name="pmcp-gateway",
+        source="custom",
+        config=RemoteMcpServerConfig(type="sse", url=gateway_url),
+    )
+
+    async def _call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+        raw = await client_manager.call_tool(
+            f"pmcp-gateway::{tool_name}", arguments, timeout_ms=30000
+        )
+        payload = _extract_tool_payload(raw)
+        return payload or {}
+
+    await client_manager.connect_all([gateway_config])
+    try:
+        server_name = args.server_name
+        first = await _call("gateway.provision", {"server_name": server_name})
+
+        needs_auth = bool(first.get("needs_api_key") or first.get("auth_required"))
+        if not needs_auth:
+            if args.json:
+                print(json.dumps(first, indent=2))
+            else:
+                print(first.get("message", "Provision request completed."))
+            return
+
+        credential = args.credential
+        if not credential:
+            prompt = f"Enter credential for {server_name}: "
+            credential = getpass.getpass(prompt)
+            if not credential:
+                raise RuntimeError("No credential provided")
+
+        auth_args: dict[str, object] = {
+            "server_name": server_name,
+            "credential": credential,
+            "scope": args.scope,
+        }
+        if args.env_var:
+            auth_args["env_var"] = args.env_var
+
+        auth_result = await _call("gateway.auth_connect", auth_args)
+
+        output: dict[str, object] = {
+            "auth": auth_result,
+            "provision": None,
+        }
+
+        if not args.no_provision:
+            second = await _call("gateway.provision", {"server_name": server_name})
+            output["provision"] = second
+
+        if args.json:
+            print(json.dumps(output, indent=2))
+        else:
+            print(auth_result.get("message", "Credential stored."))
+            if output["provision"]:
+                provision = output["provision"]
+                if isinstance(provision, dict):
+                    print(provision.get("message", "Provision retried."))
+    finally:
+        await client_manager.disconnect_all()
+
+
 async def async_main(args: argparse.Namespace) -> None:
     """Async main entry point - dispatch to appropriate command."""
     if args.command == "refresh":
@@ -1373,6 +1500,20 @@ async def async_main(args: argparse.Namespace) -> None:
                 "error": f"Unknown secrets subcommand: {args.secrets_command}",
             }
         print(json.dumps(output, indent=2))
+    elif args.command == "auth":
+        if args.auth_command == "connect":
+            await run_auth_connect(args)
+        else:
+            print(
+                json.dumps(
+                    {
+                        "ok": False,
+                        "command": "auth",
+                        "error": f"Unknown auth subcommand: {args.auth_command}",
+                    },
+                    indent=2,
+                )
+            )
     else:
         # Default: run server
         await run_server(args)

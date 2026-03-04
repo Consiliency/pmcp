@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import json
 from pathlib import Path
 from typing import Any, Literal, cast
+from urllib.parse import quote_plus
+from urllib.request import urlopen
 
 from dotenv import load_dotenv
 from mcp.types import Tool
@@ -28,6 +32,8 @@ from pmcp.manifest.matcher import match_capability
 from pmcp.policy.policy import PolicyManager
 from pmcp.types import (
     ArgInfo,
+    AuthConnectInput,
+    AuthConnectOutput,
     CancelInput,
     CancelOutput,
     CapabilityCandidate,
@@ -282,6 +288,37 @@ def get_gateway_tool_definitions() -> list[Tool]:
             },
         ),
         Tool(
+            name="gateway.auth_connect",
+            description=(
+                "Store credentials for a server and make them available to provisioning. "
+                "Use this when gateway.provision reports missing authentication."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Server name that needs authentication",
+                    },
+                    "credential": {
+                        "type": "string",
+                        "description": "API key, token, or subscription credential to store",
+                    },
+                    "env_var": {
+                        "type": "string",
+                        "description": "Optional explicit environment variable key",
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["user", "project"],
+                        "default": "user",
+                        "description": "Where to store the credential",
+                    },
+                },
+                "required": ["server_name", "credential"],
+            },
+        ),
+        Tool(
             name="gateway.provision_status",
             description=(
                 "Check the status of a running server installation. "
@@ -363,6 +400,7 @@ class GatewayTools:
         self._descriptions_cache = descriptions_cache
         self._detected_clis: set[str] | None = None
         self._platform: str | None = None
+        self._discovered_server_configs: dict[str, ServerConfig] = {}
 
     async def _ensure_server_for_tool(self, tool_id: str) -> bool:
         """Ensure server is connected for a tool, triggering lazy-start if needed.
@@ -863,6 +901,119 @@ class GatewayTools:
 
         return False
 
+    def _check_any_api_key_available(self, env_vars: list[str]) -> bool:
+        """Check if any auth env var is available."""
+        return any(self._check_api_key_available(env_var) for env_var in env_vars)
+
+    def _auth_env_options(self, server_name: str, env_var: str | None) -> list[str]:
+        """Return acceptable auth env vars for a server."""
+        options: list[str] = []
+        if env_var:
+            options.append(env_var)
+        # Browser Use supports either OpenAI or Anthropic provider credentials.
+        if server_name == "browser-use":
+            for key in ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]:
+                if key not in options:
+                    options.append(key)
+        return options
+
+    def _auth_methods_for_server(self, server_name: str) -> list[str]:
+        """Return supported auth methods for UX hints."""
+        if server_name == "browser-use":
+            return ["api_key", "subscription_token"]
+        return ["api_key"]
+
+    def _write_secret(self, scope: str, key: str, value: str) -> Path:
+        """Persist a secret in PMCP env storage."""
+        if scope == "project":
+            path = Path.cwd() / ".env.pmcp"
+        else:
+            path = Path.home() / ".config" / "pmcp" / "pmcp.env"
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        values: dict[str, str] = {}
+        if path.exists():
+            for line in path.read_text().splitlines():
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                values[k.strip()] = v.strip().strip('"')
+
+        values[key] = value
+        body = "\n".join(f"{k}={v}" for k, v in sorted(values.items())) + "\n"
+        path.write_text(body)
+        return path
+
+    def _normalize_token(self, value: str) -> str:
+        """Normalize user query tokens for matching/discovery."""
+        return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+    def _discover_external_servers(self, query: str) -> list[CapabilityCandidate]:
+        """Discover likely MCP servers from npm registry when manifest has no match."""
+        normalized = self._normalize_token(query)
+        if not normalized:
+            return []
+
+        try:
+            url = (
+                "https://registry.npmjs.org/-/v1/search?text="
+                f"{quote_plus(normalized + ' mcp server')}&size=8"
+            )
+            with urlopen(url, timeout=5) as resp:  # nosec B310
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            return []
+
+        objects = payload.get("objects", []) if isinstance(payload, dict) else []
+        candidates: list[CapabilityCandidate] = []
+
+        for obj in objects:
+            if not isinstance(obj, dict):
+                continue
+            pkg = obj.get("package", {})
+            if not isinstance(pkg, dict):
+                continue
+            package_name = str(pkg.get("name", "")).strip()
+            description = str(pkg.get("description", "")).strip()
+            if not package_name:
+                continue
+
+            candidate_text = self._normalize_token(
+                f"{package_name} {description} {' '.join(pkg.get('keywords', []) or [])}"
+            )
+            if (
+                "mcp" not in candidate_text
+                and "model context protocol" not in candidate_text
+            ):
+                continue
+
+            score = 0.35
+            query_terms = set(normalized.split())
+            text_terms = set(candidate_text.split())
+            overlap = len(query_terms.intersection(text_terms))
+            if query_terms:
+                score += min(overlap / len(query_terms), 0.45)
+
+            candidates.append(
+                CapabilityCandidate(
+                    name=package_name,
+                    candidate_type="server",
+                    relevance_score=min(score, 0.9),
+                    reasoning=(
+                        f"Discovered from npm registry: {package_name}. "
+                        "Use gateway.provision with this package name to install via npx."
+                    ),
+                    requires_api_key=False,
+                    api_key_available=False,
+                    is_installed=False,
+                    is_running=False,
+                )
+            )
+
+        candidates.sort(key=lambda c: c.relevance_score, reverse=True)
+        return candidates[:3]
+
     def _load_configured_servers(self) -> dict[str, ResolvedServerConfig]:
         """Load user/project-configured servers that are allowed by policy."""
         configs = load_configs(
@@ -1116,6 +1267,39 @@ class GatewayTools:
         )
 
         if not match_result.matched:
+            discovered = self._discover_external_servers(parsed.query)
+            if discovered:
+                for candidate in discovered:
+                    package_name = candidate.name
+                    self._discovered_server_configs[package_name] = ServerConfig(
+                        name=package_name,
+                        description=f"Discovered MCP package: {package_name}",
+                        keywords=["mcp", "discovered", package_name],
+                        install={
+                            "mac": ["npx", "-y", package_name],
+                            "linux": ["npx", "-y", package_name],
+                            "wsl": ["npx", "-y", package_name],
+                            "windows": ["npx", "-y", package_name],
+                        },
+                        command="npx",
+                        args=["-y", package_name],
+                        requires_api_key=False,
+                    )
+                logger.info(
+                    f"No manifest match for '{parsed.query}', returning {len(discovered)} discovered candidates"
+                )
+                return CapabilityResolution(
+                    status="candidates",
+                    message=(
+                        f"No manifest match found for '{parsed.query}'. "
+                        "Found discovered MCP packages from registry."
+                    ),
+                    candidates=discovered,
+                    recommendation=(
+                        f"Try provisioning discovered server '{discovered[0].name}'"
+                    ),
+                )
+
             logger.info(f"Unmatched capability request: {parsed.query}")
             return CapabilityResolution(
                 status="not_available",
@@ -1241,6 +1425,9 @@ class GatewayTools:
         server_config = manifest.get_server(server_name)
 
         if not server_config:
+            server_config = self._discovered_server_configs.get(server_name)
+
+        if not server_config:
             return ProvisionOutput(
                 ok=False,
                 server=server_name,
@@ -1252,15 +1439,25 @@ class GatewayTools:
 
         # Check API key if required
         if server_config.requires_api_key and server_config.env_var:
-            if not self._check_api_key_available(server_config.env_var):
+            auth_env_options = self._auth_env_options(
+                server_name, server_config.env_var
+            )
+            if not self._check_any_api_key_available(auth_env_options):
                 return ProvisionOutput(
                     ok=False,
                     server=server_name,
                     status="failed",
-                    message=f"Server '{server_name}' requires API key {server_config.env_var}.",
+                    message=(
+                        f"Server '{server_name}' requires authentication. "
+                        f"Set one of: {', '.join(auth_env_options)}"
+                    ),
                     needs_api_key=True,
                     env_var=server_config.env_var,
                     env_instructions=server_config.env_instructions,
+                    auth_required=True,
+                    auth_mode="api_key",
+                    auth_methods=self._auth_methods_for_server(server_name),
+                    alternative_env_vars=auth_env_options,
                 )
 
         # Start background installation
@@ -1287,6 +1484,9 @@ class GatewayTools:
                 needs_api_key=True,
                 env_var=e.env_var,
                 env_instructions=e.env_instructions,
+                auth_required=True,
+                auth_mode="api_key",
+                auth_methods=self._auth_methods_for_server(server_name),
             )
 
         except InstallError as e:
@@ -1305,6 +1505,40 @@ class GatewayTools:
                 status="failed",
                 message=f"Failed to start provisioning '{server_name}': {e}",
             )
+
+    async def auth_connect(self, input_data: dict[str, Any]) -> AuthConnectOutput:
+        """gateway.auth_connect - Store auth credentials for a server."""
+        parsed = AuthConnectInput.model_validate(input_data)
+        server_name = parsed.server_name
+
+        manifest = load_manifest()
+        server_config = manifest.get_server(server_name)
+        env_var = parsed.env_var or (server_config.env_var if server_config else None)
+
+        if not env_var:
+            return AuthConnectOutput(
+                ok=False,
+                server=server_name,
+                message=(
+                    f"No auth env var is known for server '{server_name}'. "
+                    "Pass env_var explicitly or add auth metadata to manifest."
+                ),
+            )
+
+        path = self._write_secret(parsed.scope, env_var, parsed.credential)
+        os.environ[env_var] = parsed.credential
+
+        return AuthConnectOutput(
+            ok=True,
+            server=server_name,
+            message=(
+                f"Stored credential for '{server_name}' in {parsed.scope} scope. "
+                "You can now call gateway.provision."
+            ),
+            env_var=env_var,
+            env_path=str(path),
+            next_step=f"gateway.provision(server_name='{server_name}')",
+        )
 
     async def provision_status(self, input_data: dict[str, Any]) -> ProvisionJobStatus:
         """gateway.provision_status - Check status of a running installation."""

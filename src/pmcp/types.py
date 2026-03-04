@@ -510,6 +510,37 @@ class ProvisionOutput(BaseModel):
     needs_api_key: bool = False
     env_var: str | None = None
     env_instructions: str | None = None
+    auth_required: bool = False
+    auth_mode: Literal["api_key", "subscription", "oauth", "unknown"] | None = None
+    auth_methods: list[str] | None = None
+    alternative_env_vars: list[str] | None = None
+
+
+class AuthConnectInput(BaseModel):
+    """Input for gateway.auth_connect - save auth credentials for a server."""
+
+    server_name: str = Field(
+        min_length=1, description="Server requiring authentication"
+    )
+    credential: str = Field(min_length=1, description="Secret token/API key to store")
+    env_var: str | None = Field(
+        default=None,
+        description="Override environment variable key to store into",
+    )
+    scope: Literal["user", "project"] = Field(
+        default="user", description="Where to store credentials"
+    )
+
+
+class AuthConnectOutput(BaseModel):
+    """Output from gateway.auth_connect."""
+
+    ok: bool
+    server: str
+    message: str
+    env_var: str | None = None
+    env_path: str | None = None
+    next_step: str | None = None
 
 
 class ProvisionStatusInput(BaseModel):

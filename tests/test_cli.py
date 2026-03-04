@@ -953,6 +953,34 @@ class TestDoctorAndSecretsIntegration:
         assert args.overwrite is True
         assert args.project == tmp_path
 
+    def test_parse_auth_connect_options(self) -> None:
+        """Auth connect parser should bind auth options."""
+        with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):
+            with patch(
+                "sys.argv",
+                [
+                    "pmcp",
+                    "auth",
+                    "connect",
+                    "browser-use",
+                    "--scope",
+                    "user",
+                    "--env-var",
+                    "OPENAI_API_KEY",
+                    "--no-provision",
+                    "--json",
+                ],
+            ):
+                args = parse_args()
+
+        assert args.command == "auth"
+        assert args.auth_command == "connect"
+        assert args.server_name == "browser-use"
+        assert args.scope == "user"
+        assert args.env_var == "OPENAI_API_KEY"
+        assert args.no_provision is True
+        assert args.json is True
+
     @pytest.mark.asyncio
     async def test_async_main_dispatches_doctor(self) -> None:
         """async_main should invoke doctor runner for doctor command."""
@@ -980,6 +1008,16 @@ class TestDoctorAndSecretsIntegration:
         output = capsys.readouterr().out
         assert '"command": "secrets.set"' in output
         assert '"ok": true' in output
+
+    @pytest.mark.asyncio
+    async def test_async_main_dispatches_auth_connect(self) -> None:
+        """async_main should invoke auth connect runner."""
+        args = argparse.Namespace(command="auth", auth_command="connect")
+
+        with patch("pmcp.cli.run_auth_connect", new=AsyncMock()) as mock_auth:
+            await async_main(args)
+
+        mock_auth.assert_awaited_once_with(args)
 
 
 class TestRunStatusWithData:
