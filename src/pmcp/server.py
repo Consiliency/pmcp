@@ -135,6 +135,8 @@ class GatewayServer:
                     result = await self._gateway_tools.sync_environment(arguments)
                 elif name == "gateway.provision":
                     result = await self._gateway_tools.provision(arguments)
+                elif name == "gateway.update_server":
+                    result = await self._gateway_tools.update_server(arguments)
                 elif name == "gateway.auth_connect":
                     result = await self._gateway_tools.auth_connect(arguments)
                 elif name == "gateway.provision_status":

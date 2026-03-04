@@ -240,6 +240,7 @@ class SchemaCard(BaseModel):
     invoke_template: InvokeTemplate | None = None
     # L2: Minimal code example (3-4 lines, opt-in via guidance config)
     code_snippet: str | None = None
+    update_warning: str | None = None
 
 
 class InvokeOptions(BaseModel):
@@ -268,6 +269,7 @@ class InvokeOutput(BaseModel):
     summary: str | None = None
     raw_size_estimate: int
     errors: list[str] | None = None
+    update_warning: str | None = None
 
 
 class RefreshInput(BaseModel):
@@ -514,6 +516,25 @@ class ProvisionOutput(BaseModel):
     auth_mode: Literal["api_key", "subscription", "oauth", "unknown"] | None = None
     auth_methods: list[str] | None = None
     alternative_env_vars: list[str] | None = None
+    update_warning: str | None = None
+
+
+class UpdateServerInput(BaseModel):
+    """Input for gateway.update_server."""
+
+    server_name: str = Field(min_length=1, description="Server to update")
+
+
+class UpdateServerOutput(BaseModel):
+    """Output for gateway.update_server."""
+
+    ok: bool
+    server: str
+    package_type: Literal["npm", "pypi", "unknown"]
+    package_name: str | None = None
+    refreshed: bool = False
+    latest_version: str | None = None
+    message: str
 
 
 class AuthConnectInput(BaseModel):

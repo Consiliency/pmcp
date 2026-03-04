@@ -663,3 +663,91 @@ class TestCapabilityAndProvision:
         assert result.ok is True
         assert result.status == "started"
         assert result.job_id == "job-123"
+
+    @pytest.mark.asyncio
+    async def test_update_server_success(self, monkeypatch):
+        client_manager = MockClientManager(create_mock_tools())
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "playwright": ServerConfig(
+                    name="playwright",
+                    description="Browser automation",
+                    keywords=["browser"],
+                    install={},
+                    command="npx",
+                    args=["@playwright/mcp"],
+                    requires_api_key=False,
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr(
+            gateway_tools,
+            "_run_update_probe_command",
+            lambda command: __import__("asyncio").sleep(0, result=(True, "ok")),
+        )
+        monkeypatch.setattr(
+            gateway_tools,
+            "refresh",
+            lambda input_data: __import__("asyncio").sleep(
+                0,
+                result=types.SimpleNamespace(ok=True),
+            ),
+        )
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            return ("1.2.3", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        result = await gateway_tools.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        assert result.server == "playwright"
+        assert result.package_type == "npm"
+        assert result.latest_version == "1.2.3"
+
+    @pytest.mark.asyncio
+    async def test_invoke_includes_update_warning(self, monkeypatch):
+        tools = [
+            ToolInfo(
+                tool_id="playwright::snapshot",
+                server_name="playwright",
+                tool_name="snapshot",
+                description="Take snapshot",
+                short_description="Take snapshot",
+                input_schema={"type": "object", "properties": {}},
+                tags=["browser"],
+                risk_hint=RiskHint.LOW,
+            )
+        ]
+        client_manager = MockClientManager(tools)
+        client_manager.set_server_online("playwright")
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        async def fake_update_warning(server_name: str):
+            return "Update available for 'playwright': 0.1.0 -> 0.2.0"
+
+        monkeypatch.setattr(gateway_tools, "_get_update_warning", fake_update_warning)
+
+        result = await gateway_tools.invoke(
+            {"tool_id": "playwright::snapshot", "arguments": {}}
+        )
+
+        assert result.ok is True
+        assert result.update_warning is not None

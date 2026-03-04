@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import json
+import asyncio
+import time
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import quote_plus
@@ -29,6 +31,11 @@ from pmcp.manifest.installer import (
 )
 from pmcp.manifest.loader import load_manifest
 from pmcp.manifest.matcher import match_capability
+from pmcp.manifest.version_checker import (
+    detect_package_type,
+    get_package_version,
+    is_version_newer,
+)
 from pmcp.policy.policy import PolicyManager
 from pmcp.types import (
     ArgInfo,
@@ -63,6 +70,8 @@ from pmcp.types import (
     SyncEnvironmentInput,
     SyncEnvironmentOutput,
     ToolInfo,
+    UpdateServerInput,
+    UpdateServerOutput,
     LocalMcpServerConfig,
     RemoteMcpServerConfig,
     ResolvedServerConfig,
@@ -288,6 +297,23 @@ def get_gateway_tool_definitions() -> list[Tool]:
             },
         ),
         Tool(
+            name="gateway.update_server",
+            description=(
+                "Update a subordinate MCP server package to latest version and reconnect it. "
+                "Use this when invoke/describe/provision warn that a newer version is available."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Name of server to update",
+                    }
+                },
+                "required": ["server_name"],
+            },
+        ),
+        Tool(
             name="gateway.auth_connect",
             description=(
                 "Store credentials for a server and make them available to provisioning. "
@@ -401,6 +427,8 @@ class GatewayTools:
         self._detected_clis: set[str] | None = None
         self._platform: str | None = None
         self._discovered_server_configs: dict[str, ServerConfig] = {}
+        self._stale_check_cache: dict[str, tuple[float, str | None, str | None]] = {}
+        self._stale_check_ttl_seconds = 6 * 60 * 60
 
     async def _ensure_server_for_tool(self, tool_id: str) -> bool:
         """Ensure server is connected for a tool, triggering lazy-start if needed.
@@ -610,6 +638,8 @@ class GatewayTools:
                 details={"tool_id": parsed.tool_id},
             )
 
+        update_warning = await self._get_update_warning(tool_info.server_name)
+
         # Extract args from schema
         args: list[ArgInfo] = []
         schema = tool_info.input_schema
@@ -667,6 +697,7 @@ class GatewayTools:
             safety_notes=safety_notes if safety_notes else None,
             invoke_template=invoke_template,
             code_snippet=code_snippet,
+            update_warning=update_warning,
         )
 
     async def invoke(self, input_data: dict[str, Any]) -> InvokeOutput:
@@ -715,6 +746,8 @@ class GatewayTools:
                 errors=[error.model_dump_json()],
             )
 
+        update_warning = await self._get_update_warning(tool_info.server_name)
+
         # Call the tool
         timeout_ms = 30000
         if parsed.options:
@@ -742,6 +775,7 @@ class GatewayTools:
                 truncated=processed["truncated"],
                 summary=processed["summary"],
                 raw_size_estimate=processed["raw_size"],
+                update_warning=update_warning,
             )
 
         except TimeoutError:
@@ -756,6 +790,7 @@ class GatewayTools:
                 truncated=False,
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
+                update_warning=update_warning,
             )
 
         except ConnectionError as e:
@@ -770,6 +805,7 @@ class GatewayTools:
                 truncated=False,
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
+                update_warning=update_warning,
             )
 
         except Exception as e:
@@ -784,6 +820,7 @@ class GatewayTools:
                 truncated=False,
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
+                update_warning=update_warning,
             )
 
     async def refresh(self, input_data: dict[str, Any]) -> RefreshOutput:
@@ -1108,6 +1145,65 @@ class GatewayTools:
         # No explicit API key metadata for plain .mcp.json entries.
         return (False, None, None)
 
+    def _get_server_config_for_update(self, server_name: str) -> ServerConfig | None:
+        """Resolve server config from manifest or discovered candidates."""
+        manifest = load_manifest()
+        server_config = manifest.get_server(server_name)
+        if server_config:
+            return server_config
+        return self._discovered_server_configs.get(server_name)
+
+    async def _get_update_warning(self, server_name: str) -> str | None:
+        """Best-effort stale version warning for a server."""
+        server_config = self._get_server_config_for_update(server_name)
+        if not server_config or not server_config.command:
+            return None
+
+        # Require a known local version to compare against.
+        current_version: str | None = None
+        if self._descriptions_cache and server_name in self._descriptions_cache.servers:
+            current_version = self._descriptions_cache.servers[server_name].version
+        if not current_version:
+            return None
+
+        now = time.time()
+        cached = self._stale_check_cache.get(server_name)
+        if cached and (now - cached[0]) < self._stale_check_ttl_seconds:
+            latest_cached = cached[2]
+            if latest_cached and is_version_newer(current_version, latest_cached):
+                return (
+                    f"Update available for '{server_name}': {current_version} -> {latest_cached}. "
+                    f"Call gateway.update_server with server_name='{server_name}'."
+                )
+            return None
+
+        latest, _pkg_type = await get_package_version(
+            server_config.command, server_config.args, timeout=3.0
+        )
+        self._stale_check_cache[server_name] = (now, current_version, latest)
+
+        if latest and is_version_newer(current_version, latest):
+            return (
+                f"Update available for '{server_name}': {current_version} -> {latest}. "
+                f"Call gateway.update_server with server_name='{server_name}'."
+            )
+        return None
+
+    async def _run_update_probe_command(self, command: list[str]) -> tuple[bool, str]:
+        """Run an update probe command and return (ok, output)."""
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
+        output = (
+            stdout.decode("utf-8", errors="replace")
+            + "\n"
+            + stderr.decode("utf-8", errors="replace")
+        ).strip()
+        return (process.returncode == 0, output)
+
     async def request_capability(
         self, input_data: dict[str, Any]
     ) -> CapabilityResolution:
@@ -1349,6 +1445,7 @@ class GatewayTools:
         """gateway.provision - Start background installation of an MCP server."""
         parsed = ProvisionInput.model_validate(input_data)
         server_name = parsed.server_name
+        update_warning = await self._get_update_warning(server_name)
 
         configured_servers = self._load_configured_servers()
 
@@ -1376,6 +1473,7 @@ class GatewayTools:
                     )
                     for t in tools[:10]
                 ],
+                update_warning=update_warning,
             )
 
         # User/project configured servers are lazy-started via ClientManager.
@@ -1408,6 +1506,7 @@ class GatewayTools:
                         )
                         for t in tools[:10]
                     ],
+                    update_warning=update_warning,
                 )
 
             return ProvisionOutput(
@@ -1418,6 +1517,7 @@ class GatewayTools:
                     f"Server '{server_name}' is configured but could not be started. "
                     "Run gateway.refresh and check gateway.health for connection errors."
                 ),
+                update_warning=update_warning,
             )
 
         # Load manifest
@@ -1435,6 +1535,7 @@ class GatewayTools:
                 message=(
                     f"Server '{server_name}' not found in manifest or .mcp.json configuration."
                 ),
+                update_warning=update_warning,
             )
 
         # Check API key if required
@@ -1458,6 +1559,7 @@ class GatewayTools:
                     auth_mode="api_key",
                     auth_methods=self._auth_methods_for_server(server_name),
                     alternative_env_vars=auth_env_options,
+                    update_warning=update_warning,
                 )
 
         # Start background installation
@@ -1473,6 +1575,7 @@ class GatewayTools:
                 status="started",
                 job_id=job_id,
                 message=f"Installation started for '{server_name}'. Poll gateway.provision_status('{job_id}') for progress.",
+                update_warning=update_warning,
             )
 
         except MissingApiKeyError as e:
@@ -1487,6 +1590,7 @@ class GatewayTools:
                 auth_required=True,
                 auth_mode="api_key",
                 auth_methods=self._auth_methods_for_server(server_name),
+                update_warning=update_warning,
             )
 
         except InstallError as e:
@@ -1495,6 +1599,7 @@ class GatewayTools:
                 server=server_name,
                 status="failed",
                 message=str(e),
+                update_warning=update_warning,
             )
 
         except Exception as e:
@@ -1504,6 +1609,7 @@ class GatewayTools:
                 server=server_name,
                 status="failed",
                 message=f"Failed to start provisioning '{server_name}': {e}",
+                update_warning=update_warning,
             )
 
     async def auth_connect(self, input_data: dict[str, Any]) -> AuthConnectOutput:
@@ -1538,6 +1644,88 @@ class GatewayTools:
             env_var=env_var,
             env_path=str(path),
             next_step=f"gateway.provision(server_name='{server_name}')",
+        )
+
+    async def update_server(self, input_data: dict[str, Any]) -> UpdateServerOutput:
+        """gateway.update_server - Update a subordinate MCP package and reconnect."""
+        parsed = UpdateServerInput.model_validate(input_data)
+        server_name = parsed.server_name
+
+        server_config = self._get_server_config_for_update(server_name)
+        if not server_config:
+            return UpdateServerOutput(
+                ok=False,
+                server=server_name,
+                package_type="unknown",
+                message=f"Server '{server_name}' not found in manifest or discovered servers.",
+            )
+
+        package_type, package_name = detect_package_type(
+            server_config.command, server_config.args
+        )
+        if package_type == "unknown" or not package_name:
+            return UpdateServerOutput(
+                ok=False,
+                server=server_name,
+                package_type="unknown",
+                message=(
+                    f"Could not determine package manager for '{server_name}'. "
+                    "Only npm (npx) and pypi (uvx) servers are supported."
+                ),
+            )
+
+        if package_type == "npm":
+            update_cmd = ["npx", "-y", f"{package_name}@latest", "--help"]
+        else:
+            update_cmd = ["uvx", "--refresh", package_name, "--help"]
+
+        try:
+            ok, output = await self._run_update_probe_command(update_cmd)
+        except TimeoutError:
+            return UpdateServerOutput(
+                ok=False,
+                server=server_name,
+                package_type=package_type,
+                package_name=package_name,
+                message="Update probe timed out after 60 seconds.",
+            )
+        except Exception as e:
+            return UpdateServerOutput(
+                ok=False,
+                server=server_name,
+                package_type=package_type,
+                package_name=package_name,
+                message=f"Failed to run update probe: {e}",
+            )
+
+        if not ok:
+            short_output = output[-300:] if output else "no output"
+            return UpdateServerOutput(
+                ok=False,
+                server=server_name,
+                package_type=package_type,
+                package_name=package_name,
+                message=f"Update command failed: {short_output}",
+            )
+
+        refresh_result = await self.refresh({"reason": f"update_server:{server_name}"})
+        latest_version, _ = await get_package_version(
+            server_config.command, server_config.args, timeout=5.0
+        )
+        self._stale_check_cache.pop(server_name, None)
+
+        message = f"Updated '{server_name}' ({package_type}:{package_name}) and refreshed gateway connections."
+        if not refresh_result.ok:
+            message += " Some servers failed to reconnect; inspect gateway.health."
+
+        return UpdateServerOutput(
+            ok=True,
+            server=server_name,
+            package_type=package_type,
+            package_name=package_name,
+            refreshed=refresh_result.ok,
+            latest_version=latest_version,
+            message=message,
         )
 
     async def provision_status(self, input_data: dict[str, Any]) -> ProvisionJobStatus:

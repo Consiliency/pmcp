@@ -196,6 +196,36 @@ Environment overrides:
         help="Log level (default: info)",
     )
 
+    # Update command
+    update_parser = subparsers.add_parser(
+        "update",
+        help="Update subordinate MCP server packages",
+        description="Update one or more MCP servers to latest package version via gateway.update_server.",
+    )
+    update_parser.add_argument(
+        "server",
+        nargs="?",
+        type=str,
+        help="Server name to update",
+    )
+    update_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Update all servers reported by gateway.health",
+    )
+    update_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Output JSON",
+    )
+    update_parser.add_argument(
+        "-l",
+        "--log-level",
+        choices=["debug", "info", "warn", "error"],
+        default="info",
+        help="Log level (default: info)",
+    )
+
     # Status command
     status_parser = subparsers.add_parser(
         "status",
@@ -530,6 +560,77 @@ async def run_refresh(args: argparse.Namespace) -> None:
         logger.error(f"Refresh failed: {e}")
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)
+
+
+async def run_update(args: argparse.Namespace) -> None:
+    """Run explicit subordinate MCP update command."""
+    from pmcp.client.manager import ClientManager
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
+
+    setup_logging(args.log_level)
+
+    if not args.server and not args.all:
+        print("Error: provide a server name or --all", file=sys.stderr)
+        sys.exit(2)
+
+    policy_path = args.policy if hasattr(args, "policy") else None
+    policy_manager = PolicyManager(policy_path)
+    client_manager = ClientManager(
+        max_tools_per_server=policy_manager.get_max_tools_per_server()
+    )
+
+    gateway_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/sse")
+    gateway_config = ResolvedServerConfig(
+        name="pmcp-gateway",
+        source="custom",
+        config=RemoteMcpServerConfig(type="sse", url=gateway_url),
+    )
+
+    async def _call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
+        raw = await client_manager.call_tool(
+            f"pmcp-gateway::{tool_name}", arguments, timeout_ms=60000
+        )
+        return _extract_tool_payload(raw) or {}
+
+    await client_manager.connect_all([gateway_config])
+    try:
+        targets: list[str] = []
+        if args.all:
+            health = await _call("gateway.health", {})
+            servers = health.get("servers", [])
+            if isinstance(servers, list):
+                targets = [
+                    str(s.get("name"))
+                    for s in servers
+                    if isinstance(s, dict) and s.get("name")
+                ]
+        if args.server:
+            targets.append(args.server)
+
+        # Keep insertion order but dedupe
+        deduped_targets = list(dict.fromkeys(targets))
+        results: list[dict[str, object]] = []
+        for server_name in deduped_targets:
+            result = await _call("gateway.update_server", {"server_name": server_name})
+            results.append(result)
+
+        if args.json:
+            print(json.dumps({"results": results}, indent=2))
+            return
+
+        if not results:
+            print("No servers found to update.")
+            return
+
+        for item in results:
+            ok = bool(item.get("ok"))
+            status = "OK" if ok else "FAILED"
+            server = item.get("server", "unknown")
+            message = item.get("message", "")
+            print(f"[{status}] {server}: {message}")
+    finally:
+        await client_manager.disconnect_all()
 
 
 def _extract_tool_payload(result: dict[str, object]) -> dict[str, object] | None:
@@ -1474,6 +1575,8 @@ async def async_main(args: argparse.Namespace) -> None:
     """Async main entry point - dispatch to appropriate command."""
     if args.command == "refresh":
         await run_refresh(args)
+    elif args.command == "update":
+        await run_update(args)
     elif args.command == "status":
         await run_status(args)
     elif args.command == "logs":

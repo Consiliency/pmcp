@@ -20,7 +20,7 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 
 **PMCP** acts as a single MCP server that Claude Code connects to. Instead of exposing all downstream tools, it provides:
 
-- **12 stable meta-tools** (not the 50+ underlying tools)
+- **13 stable meta-tools** (not the 50+ underlying tools)
 - **Auto-starts** essential servers (Playwright, Context7) with no configuration
 - **Dynamically provisions** new servers on-demand from a manifest of 25+
 - **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
@@ -184,7 +184,7 @@ Returns: Screenshot of google.com
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                          PMCP                               │
-│  • 12 meta-tools (catalog, invoke, provision, etc.)         │
+│  • 13 meta-tools (catalog, invoke, provision, etc.)         │
 │  • Progressive disclosure (compact cards → full schemas)    │
 │  • Policy enforcement (allow/deny lists)                    │
 └────────────────────────────┬────────────────────────────────┘
@@ -203,14 +203,14 @@ The gateway discovers and manages all other servers.
 
 ### Why Single-Gateway?
 
-1. **No context bloat** - Claude sees 12 tools, not 50+
+1. **No context bloat** - Claude sees 13 tools, not 50+
 2. **No restarts** - Provision new servers without restarting Claude Code
 3. **Consistent interface** - All tools accessed via `gateway.invoke`
 4. **Policy control** - Centralized allow/deny rules
 
 ## Gateway Tools
 
-The gateway exposes **12 meta-tools** organized into three categories:
+The gateway exposes **13 meta-tools** organized into three categories:
 
 ### Core Tools
 
@@ -229,6 +229,7 @@ The gateway exposes **12 meta-tools** organized into three categories:
 | `gateway.request_capability` | Natural language capability matching with CLI preference |
 | `gateway.sync_environment` | Detect platform and available CLIs |
 | `gateway.provision` | Install and start MCP servers on-demand |
+| `gateway.update_server` | Update an MCP server package and reconnect it |
 | `gateway.auth_connect` | Store credentials for a server and retry provisioning |
 | `gateway.provision_status` | Check installation progress |
 

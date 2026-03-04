@@ -89,6 +89,23 @@ class TestParseArgs:
         assert args.command == "refresh"
         assert args.force is True
 
+    def test_update_command_with_server(self) -> None:
+        """Test update subcommand with explicit server."""
+        with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):
+            with patch("sys.argv", ["mcp-gateway", "update", "browser-use"]):
+                args = parse_args()
+        assert args.command == "update"
+        assert args.server == "browser-use"
+        assert args.all is False
+
+    def test_update_command_with_all(self) -> None:
+        """Test update subcommand with --all."""
+        with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):
+            with patch("sys.argv", ["mcp-gateway", "update", "--all"]):
+                args = parse_args()
+        assert args.command == "update"
+        assert args.all is True
+
     def test_status_command(self) -> None:
         """Test status subcommand."""
         with patch("sys.argv", ["mcp-gateway", "status"]):
@@ -1018,6 +1035,16 @@ class TestDoctorAndSecretsIntegration:
             await async_main(args)
 
         mock_auth.assert_awaited_once_with(args)
+
+    @pytest.mark.asyncio
+    async def test_async_main_dispatches_update(self) -> None:
+        """async_main should invoke update runner."""
+        args = argparse.Namespace(command="update")
+
+        with patch("pmcp.cli.run_update", new=AsyncMock()) as mock_update:
+            await async_main(args)
+
+        mock_update.assert_awaited_once_with(args)
 
 
 class TestRunStatusWithData:
