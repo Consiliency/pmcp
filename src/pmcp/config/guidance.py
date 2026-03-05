@@ -61,6 +61,12 @@ class GuidanceConfig(BaseModel):
     max_snippet_lines: int = Field(
         default=4, description="Maximum lines for L2 code snippets (if enabled)"
     )
+    enable_telemetry: bool = Field(
+        default=True,
+        description=(
+            "Enable PMCP feedback telemetry hints and submission workflow for failures"
+        ),
+    )
 
     def __init__(self, **data):
         """Initialize guidance config and apply level presets."""
@@ -191,6 +197,7 @@ def create_default_guidance_config(output_path: Path | None = None) -> Path:
             },
             "max_hint_length": 8,
             "max_snippet_lines": 4,
+            "enable_telemetry": True,
         }
     }
 
@@ -198,3 +205,34 @@ def create_default_guidance_config(output_path: Path | None = None) -> Path:
         yaml.dump(default_config, f, default_flow_style=False, sort_keys=False)
 
     return output_path
+
+
+def set_telemetry_enabled(
+    enabled: bool, config_path: Path | None = None
+) -> tuple[GuidanceConfig, Path]:
+    """Persist telemetry setting in guidance config and return updated config/path."""
+    if config_path is None:
+        config_path = Path.home() / ".claude" / "gateway-guidance.yaml"
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data: dict[str, object] = {}
+    if config_path.exists():
+        try:
+            loaded = yaml.safe_load(config_path.read_text())
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+
+    guidance_data = data.get("guidance")
+    if not isinstance(guidance_data, dict):
+        guidance_data = {}
+
+    guidance_data["enable_telemetry"] = enabled
+    data["guidance"] = guidance_data
+
+    with open(config_path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+    return (load_guidance_config(config_path), config_path)

@@ -241,6 +241,7 @@ class SchemaCard(BaseModel):
     # L2: Minimal code example (3-4 lines, opt-in via guidance config)
     code_snippet: str | None = None
     update_warning: str | None = None
+    feedback_hint: str | None = None
 
 
 class InvokeOptions(BaseModel):
@@ -270,6 +271,7 @@ class InvokeOutput(BaseModel):
     raw_size_estimate: int
     errors: list[str] | None = None
     update_warning: str | None = None
+    feedback_hint: str | None = None
 
 
 class RefreshInput(BaseModel):
@@ -517,6 +519,34 @@ class ProvisionOutput(BaseModel):
     auth_methods: list[str] | None = None
     alternative_env_vars: list[str] | None = None
     update_warning: str | None = None
+    feedback_hint: str | None = None
+
+
+class SubmitFeedbackInput(BaseModel):
+    """Input for gateway.submit_feedback."""
+
+    title: str = Field(min_length=8, max_length=160)
+    description: str = Field(min_length=1)
+    issue_type: Literal["bug", "feature_request"] = Field(default="bug")
+    subordinate_server: str | None = None
+    failed_tool_call: str | None = None
+    confirm_submission: bool = False
+
+
+class SubmitFeedbackOutput(BaseModel):
+    """Output for gateway.submit_feedback."""
+
+    ok: bool
+    submitted: bool
+    repository: str
+    repository_visibility: Literal["public", "private", "unknown"] = "unknown"
+    issue_title: str
+    issue_body: str
+    issue_url: str | None = None
+    issue_number: int | None = None
+    authenticated: bool = False
+    warning: str | None = None
+    message: str
 
 
 class UpdateServerInput(BaseModel):

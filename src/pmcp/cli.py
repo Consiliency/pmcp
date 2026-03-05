@@ -364,6 +364,11 @@ Environment overrides:
         action="store_true",
         help="Show estimated token budget for current config",
     )
+    guidance_parser.add_argument(
+        "--telemetry",
+        choices=["on", "off"],
+        help="Persistently enable or disable PMCP feedback telemetry prompts",
+    )
 
     # Doctor command
     doctor_parser = subparsers.add_parser(
@@ -1452,9 +1457,16 @@ async def run_server(args: argparse.Namespace) -> None:
 
 def run_guidance(args: argparse.Namespace) -> None:
     """Show guidance configuration status."""
-    from pmcp.config.guidance import load_guidance_config
+    from pmcp.config.guidance import load_guidance_config, set_telemetry_enabled
 
     setup_logging(args.log_level)
+
+    # Persist telemetry setting if requested
+    if getattr(args, "telemetry", None):
+        enabled = args.telemetry == "on"
+        _updated, path = set_telemetry_enabled(enabled)
+        state = "enabled" if enabled else "disabled"
+        print(f"Telemetry {state} in {path}")
 
     # Load guidance config
     config = load_guidance_config()
@@ -1471,6 +1483,7 @@ def run_guidance(args: argparse.Namespace) -> None:
     print(
         f"  L3 Methodology Resource: {'✓' if config.include_methodology_resource else '✗'}"
     )
+    print(f"  Feedback Telemetry: {'✓' if config.enable_telemetry else '✗'}")
     print()
 
     if args.show_budget:

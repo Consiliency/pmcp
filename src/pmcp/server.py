@@ -139,6 +139,8 @@ class GatewayServer:
                     result = await self._gateway_tools.update_server(arguments)
                 elif name == "gateway.auth_connect":
                     result = await self._gateway_tools.auth_connect(arguments)
+                elif name == "gateway.submit_feedback":
+                    result = await self._gateway_tools.submit_feedback(arguments)
                 elif name == "gateway.provision_status":
                     result = await self._gateway_tools.provision_status(arguments)
                 elif name == "gateway.list_pending":

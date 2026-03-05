@@ -20,7 +20,7 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 
 **PMCP** acts as a single MCP server that Claude Code connects to. Instead of exposing all downstream tools, it provides:
 
-- **13 stable meta-tools** (not the 50+ underlying tools)
+- **14 stable meta-tools** (not the 50+ underlying tools)
 - **Auto-starts** essential servers (Playwright, Context7) with no configuration
 - **Dynamically provisions** new servers on-demand from a manifest of 25+
 - **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
@@ -184,7 +184,7 @@ Returns: Screenshot of google.com
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                          PMCP                               │
-│  • 13 meta-tools (catalog, invoke, provision, etc.)         │
+│  • 14 meta-tools (catalog, invoke, provision, etc.)         │
 │  • Progressive disclosure (compact cards → full schemas)    │
 │  • Policy enforcement (allow/deny lists)                    │
 └────────────────────────────┬────────────────────────────────┘
@@ -203,14 +203,14 @@ The gateway discovers and manages all other servers.
 
 ### Why Single-Gateway?
 
-1. **No context bloat** - Claude sees 13 tools, not 50+
+1. **No context bloat** - Claude sees 14 tools, not 50+
 2. **No restarts** - Provision new servers without restarting Claude Code
 3. **Consistent interface** - All tools accessed via `gateway.invoke`
 4. **Policy control** - Centralized allow/deny rules
 
 ## Gateway Tools
 
-The gateway exposes **13 meta-tools** organized into three categories:
+The gateway exposes **14 meta-tools** organized into three categories:
 
 ### Core Tools
 
@@ -231,6 +231,7 @@ The gateway exposes **13 meta-tools** organized into three categories:
 | `gateway.provision` | Install and start MCP servers on-demand |
 | `gateway.update_server` | Update an MCP server package and reconnect it |
 | `gateway.auth_connect` | Store credentials for a server and retry provisioning |
+| `gateway.submit_feedback` | Preview/submit technical PMCP feedback issues to GitHub |
 | `gateway.provision_status` | Check installation progress |
 
 ### Monitoring Tools
@@ -246,6 +247,12 @@ The gateway exposes **13 meta-tools** organized into three categories:
 - `pmcp update <server>` and `pmcp update --all` call the same gateway update workflow.
 - `gateway.describe`, `gateway.invoke`, and `gateway.provision` may return `update_warning` when a newer package version is detected.
 - Planned follow-ups: background stale-version indexing, stronger stale prompts in client UX, and expanded package-manager coverage.
+
+### Feedback Telemetry
+
+- PMCP can emit failure feedback hints and generate GitHub issue payload previews for agents.
+- Telemetry is technical-only and warns before submission; payloads include PMCP/tool context.
+- Disable permanently with `pmcp guidance --telemetry off`.
 
 ## Progressive Disclosure Workflow
 

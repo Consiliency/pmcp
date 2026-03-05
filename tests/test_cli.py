@@ -161,6 +161,14 @@ class TestParseArgs:
         assert args.pending is True
         assert args.verbose is True
 
+    def test_guidance_with_telemetry_toggle(self) -> None:
+        """Test guidance command telemetry toggle parsing."""
+        with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):
+            with patch("sys.argv", ["pmcp", "guidance", "--telemetry", "off"]):
+                args = parse_args()
+        assert args.command == "guidance"
+        assert args.telemetry == "off"
+
     def test_doctor_command(self) -> None:
         """Test doctor subcommand."""
         with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):

@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from pmcp.manifest.loader import CLIAlternative, Manifest, ServerConfig
+from pmcp.config.guidance import GuidanceConfig
 from pmcp.errors import GatewayException
 from pmcp.policy.policy import PolicyManager
 from pmcp.tools.handlers import GatewayTools
@@ -751,3 +752,54 @@ class TestCapabilityAndProvision:
 
         assert result.ok is True
         assert result.update_warning is not None
+
+    @pytest.mark.asyncio
+    async def test_submit_feedback_preview_includes_telemetry_and_scrubs(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        result = await gateway_tools.submit_feedback(
+            {
+                "title": "Context7 failed to resolve docs",
+                "description": "Error with token sk-abcdef12345678901234567890 and details.",
+                "issue_type": "bug",
+                "subordinate_server": "context7",
+                "failed_tool_call": "context7::resolve-library-id",
+                "confirm_submission": False,
+            }
+        )
+
+        assert result.ok is True
+        assert result.submitted is False
+        assert "subordinate_server: context7" in result.issue_body
+        assert "failed_tool_call: context7::resolve-library-id" in result.issue_body
+        assert "pmcp_version" in result.issue_body
+        assert "REDACTED_API_KEY" in result.issue_body
+        assert "consent" in result.message.lower()
+
+    @pytest.mark.asyncio
+    async def test_submit_feedback_disabled(self):
+        client_manager = MockClientManager(create_mock_tools())
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+            guidance_config=GuidanceConfig(enable_telemetry=False),
+        )
+
+        result = await gateway_tools.submit_feedback(
+            {
+                "title": "Failure while invoking tool",
+                "description": "test",
+            }
+        )
+
+        assert result.ok is False
+        assert result.submitted is False
+        assert "disabled" in result.message.lower()

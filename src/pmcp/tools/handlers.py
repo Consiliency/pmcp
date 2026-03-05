@@ -8,13 +8,17 @@ import re
 import json
 import asyncio
 import time
+import platform
+import shutil
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import quote_plus
 from urllib.request import urlopen
+from urllib.parse import urlencode
 
 from dotenv import load_dotenv
 from mcp.types import Tool
+from pmcp import __version__ as PMCP_VERSION
 
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig
@@ -69,6 +73,8 @@ from pmcp.types import (
     ServerHealthInfo,
     SyncEnvironmentInput,
     SyncEnvironmentOutput,
+    SubmitFeedbackInput,
+    SubmitFeedbackOutput,
     ToolInfo,
     UpdateServerInput,
     UpdateServerOutput,
@@ -80,6 +86,8 @@ from pmcp.types import (
 from pmcp.manifest.loader import Manifest, ServerConfig
 
 logger = logging.getLogger(__name__)
+
+FEEDBACK_TOKEN_LIMIT = 4000
 
 # Risk level ordering for filtering
 RISK_ORDER = {"low": 1, "medium": 2, "high": 3, "unknown": 4}
@@ -345,6 +353,45 @@ def get_gateway_tool_definitions() -> list[Tool]:
             },
         ),
         Tool(
+            name="gateway.submit_feedback",
+            description=(
+                "Prepare and optionally submit a PMCP feedback issue to GitHub. "
+                "By default returns an exact preview payload; set confirm_submission=true to submit."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Issue title",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Issue details (technical data only)",
+                    },
+                    "issue_type": {
+                        "type": "string",
+                        "enum": ["bug", "feature_request"],
+                        "default": "bug",
+                    },
+                    "subordinate_server": {
+                        "type": "string",
+                        "description": "Subordinate MCP server involved (if known)",
+                    },
+                    "failed_tool_call": {
+                        "type": "string",
+                        "description": "Specific failed tool call (if known)",
+                    },
+                    "confirm_submission": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Set true only after user confirms submission",
+                    },
+                },
+                "required": ["title", "description"],
+            },
+        ),
+        Tool(
             name="gateway.provision_status",
             description=(
                 "Check the status of a running server installation. "
@@ -429,6 +476,7 @@ class GatewayTools:
         self._discovered_server_configs: dict[str, ServerConfig] = {}
         self._stale_check_cache: dict[str, tuple[float, str | None, str | None]] = {}
         self._stale_check_ttl_seconds = 6 * 60 * 60
+        self._feedback_events: list[dict[str, Any]] = []
 
     async def _ensure_server_for_tool(self, tool_id: str) -> bool:
         """Ensure server is connected for a tool, triggering lazy-start if needed.
@@ -639,6 +687,13 @@ class GatewayTools:
             )
 
         update_warning = await self._get_update_warning(tool_info.server_name)
+        self._record_feedback_event(
+            "invoke_attempt",
+            {
+                "tool_id": parsed.tool_id,
+                "server": tool_info.server_name,
+            },
+        )
 
         # Extract args from schema
         args: list[ArgInfo] = []
@@ -689,6 +744,11 @@ class GatewayTools:
                 use_llm_fallback=True,  # Enable LLM generation for tools without templates
             )
 
+        self._record_feedback_event(
+            "describe",
+            {"tool_id": parsed.tool_id, "server": tool_info.server_name},
+        )
+
         return SchemaCard(
             server=tool_info.server_name,
             tool_name=tool_info.tool_name,
@@ -698,6 +758,7 @@ class GatewayTools:
             invoke_template=invoke_template,
             code_snippet=code_snippet,
             update_warning=update_warning,
+            feedback_hint=self._feedback_hint(),
         )
 
     async def invoke(self, input_data: dict[str, Any]) -> InvokeOutput:
@@ -730,6 +791,7 @@ class GatewayTools:
                     truncated=False,
                     raw_size_estimate=0,
                     errors=[error.model_dump_json()],
+                    feedback_hint=self._feedback_hint(),
                 )
 
         # Check policy
@@ -744,6 +806,7 @@ class GatewayTools:
                 truncated=False,
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
+                feedback_hint=self._feedback_hint(),
             )
 
         update_warning = await self._get_update_warning(tool_info.server_name)
@@ -776,9 +839,14 @@ class GatewayTools:
                 summary=processed["summary"],
                 raw_size_estimate=processed["raw_size"],
                 update_warning=update_warning,
+                feedback_hint=None,
             )
 
         except TimeoutError:
+            self._record_feedback_event(
+                "invoke_failure",
+                {"tool_id": parsed.tool_id, "reason": "timeout"},
+            )
             error = make_error(
                 ErrorCode.E303_TOOL_TIMEOUT,
                 tool_id=parsed.tool_id,
@@ -791,9 +859,18 @@ class GatewayTools:
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
                 update_warning=update_warning,
+                feedback_hint=self._feedback_hint(),
             )
 
         except ConnectionError as e:
+            self._record_feedback_event(
+                "invoke_failure",
+                {
+                    "tool_id": parsed.tool_id,
+                    "reason": "connection_error",
+                    "error": str(e),
+                },
+            )
             error = make_error(
                 ErrorCode.E201_SERVER_OFFLINE,
                 message=str(e),
@@ -806,9 +883,14 @@ class GatewayTools:
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
                 update_warning=update_warning,
+                feedback_hint=self._feedback_hint(),
             )
 
         except Exception as e:
+            self._record_feedback_event(
+                "invoke_failure",
+                {"tool_id": parsed.tool_id, "reason": "exception", "error": str(e)},
+            )
             error = make_error(
                 ErrorCode.E302_TOOL_EXECUTION_FAILED,
                 message=str(e),
@@ -821,6 +903,7 @@ class GatewayTools:
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
                 update_warning=update_warning,
+                feedback_hint=self._feedback_hint(),
             )
 
     async def refresh(self, input_data: dict[str, Any]) -> RefreshOutput:
@@ -1204,6 +1287,97 @@ class GatewayTools:
         ).strip()
         return (process.returncode == 0, output)
 
+    def _telemetry_enabled(self) -> bool:
+        """Whether feedback telemetry workflow is enabled."""
+        if self._guidance_config is None:
+            return True
+        return self._guidance_config.enable_telemetry
+
+    def _feedback_hint(self) -> str | None:
+        """Guidance for agentic frameworks on feedback submission flow."""
+        if not self._telemetry_enabled():
+            return None
+        return (
+            "Technical failure detected. If your framework supports ask-user/question tools, "
+            "ask consent before submission. Then call gateway.submit_feedback with the exact "
+            "title/description payload you will send and show it verbatim to the user first. "
+            "Warning: submission may use model tokens and sends technical data to GitHub. "
+            "Do not include personal data, credentials, or secrets."
+        )
+
+    def _record_feedback_event(self, event_type: str, details: dict[str, Any]) -> None:
+        """Record compact event history for feedback telemetry context."""
+        event = {
+            "ts": int(time.time()),
+            "event_type": event_type,
+            "details": details,
+        }
+        self._feedback_events.append(event)
+        if len(self._feedback_events) > 12:
+            self._feedback_events = self._feedback_events[-12:]
+
+    def _truncate_token_text(
+        self, text: str, token_limit: int = FEEDBACK_TOKEN_LIMIT
+    ) -> str:
+        """Approximate token truncation using whitespace-delimited tokens."""
+        tokens = text.split()
+        if len(tokens) <= token_limit:
+            return text
+        return " ".join(tokens[:token_limit])
+
+    def _scrub_sensitive_text(self, text: str) -> str:
+        """Remove obvious secrets and personal identifiers from feedback text."""
+        scrubbed = text
+        patterns = [
+            (r"sk-[A-Za-z0-9_-]{20,}", "[REDACTED_API_KEY]"),
+            (r"github_pat_[A-Za-z0-9_]{20,}", "[REDACTED_GITHUB_TOKEN]"),
+            (r"ghp_[A-Za-z0-9]{20,}", "[REDACTED_GITHUB_TOKEN]"),
+            (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[REDACTED_EMAIL]"),
+        ]
+        for pattern, replacement in patterns:
+            scrubbed = re.sub(pattern, replacement, scrubbed)
+        return scrubbed
+
+    def _build_feedback_issue(
+        self,
+        parsed: SubmitFeedbackInput,
+        issue_repo: str,
+    ) -> tuple[str, str]:
+        """Build issue title/body with telemetry template."""
+        safe_description = self._truncate_token_text(
+            self._scrub_sensitive_text(parsed.description)
+        )
+        events_json = json.dumps(self._feedback_events[-6:], indent=2)
+        subordinate = parsed.subordinate_server or "unknown"
+        failed_call = parsed.failed_tool_call or "unknown"
+
+        title_prefix = (
+            "[Feedback][Bug]" if parsed.issue_type == "bug" else "[Feedback][Feature]"
+        )
+        issue_title = f"{title_prefix} {parsed.title.strip()}"
+        issue_title = issue_title[:160]
+
+        body = (
+            "## Privacy Notice\n"
+            "- Technical data only. No personal data should be included.\n"
+            "- Data is submitted to GitHub and may be publicly visible depending on repository settings.\n"
+            "- Payload is limited to approximately 4000 tokens.\n\n"
+            "## User Report\n"
+            f"{safe_description}\n\n"
+            "## Telemetry\n"
+            f"- pmcp_version: {PMCP_VERSION}\n"
+            f"- platform: {platform.platform()}\n"
+            f"- python_version: {platform.python_version()}\n"
+            f"- subordinate_server: {subordinate}\n"
+            f"- failed_tool_call: {failed_call}\n"
+            f"- target_repository: {issue_repo}\n\n"
+            "## Recent PMCP Events\n"
+            "```json\n"
+            f"{events_json}\n"
+            "```\n"
+        )
+        return issue_title, body
+
     async def request_capability(
         self, input_data: dict[str, Any]
     ) -> CapabilityResolution:
@@ -1213,6 +1387,7 @@ class GatewayTools:
         Use gateway.provision to actually install/start the chosen server.
         """
         parsed = CapabilityRequestInput.model_validate(input_data)
+        self._record_feedback_event("capability_request", {"query": parsed.query})
 
         # Load manifest
         manifest = load_manifest()
@@ -1333,6 +1508,9 @@ class GatewayTools:
 
             if not candidates:
                 logger.info(f"No matches for capability request: {parsed.query}")
+                self._record_feedback_event(
+                    "capability_unmatched", {"query": parsed.query, "path": "baml"}
+                )
                 return CapabilityResolution(
                     status="not_available",
                     message=f"No matching capability found for: {parsed.query}",
@@ -1384,6 +1562,13 @@ class GatewayTools:
                 logger.info(
                     f"No manifest match for '{parsed.query}', returning {len(discovered)} discovered candidates"
                 )
+                self._record_feedback_event(
+                    "capability_discovered_external",
+                    {
+                        "query": parsed.query,
+                        "candidates": [c.name for c in discovered],
+                    },
+                )
                 return CapabilityResolution(
                     status="candidates",
                     message=(
@@ -1397,6 +1582,9 @@ class GatewayTools:
                 )
 
             logger.info(f"Unmatched capability request: {parsed.query}")
+            self._record_feedback_event(
+                "capability_unmatched", {"query": parsed.query, "path": "fallback"}
+            )
             return CapabilityResolution(
                 status="not_available",
                 message=f"No matching capability found for: {parsed.query}",
@@ -1446,6 +1634,7 @@ class GatewayTools:
         parsed = ProvisionInput.model_validate(input_data)
         server_name = parsed.server_name
         update_warning = await self._get_update_warning(server_name)
+        self._record_feedback_event("provision_attempt", {"server": server_name})
 
         configured_servers = self._load_configured_servers()
 
@@ -1474,6 +1663,7 @@ class GatewayTools:
                     for t in tools[:10]
                 ],
                 update_warning=update_warning,
+                feedback_hint=None,
             )
 
         # User/project configured servers are lazy-started via ClientManager.
@@ -1507,6 +1697,7 @@ class GatewayTools:
                         for t in tools[:10]
                     ],
                     update_warning=update_warning,
+                    feedback_hint=None,
                 )
 
             return ProvisionOutput(
@@ -1518,6 +1709,7 @@ class GatewayTools:
                     "Run gateway.refresh and check gateway.health for connection errors."
                 ),
                 update_warning=update_warning,
+                feedback_hint=self._feedback_hint(),
             )
 
         # Load manifest
@@ -1536,6 +1728,7 @@ class GatewayTools:
                     f"Server '{server_name}' not found in manifest or .mcp.json configuration."
                 ),
                 update_warning=update_warning,
+                feedback_hint=self._feedback_hint(),
             )
 
         # Check API key if required
@@ -1560,6 +1753,7 @@ class GatewayTools:
                     auth_methods=self._auth_methods_for_server(server_name),
                     alternative_env_vars=auth_env_options,
                     update_warning=update_warning,
+                    feedback_hint=self._feedback_hint(),
                 )
 
         # Start background installation
@@ -1576,9 +1770,18 @@ class GatewayTools:
                 job_id=job_id,
                 message=f"Installation started for '{server_name}'. Poll gateway.provision_status('{job_id}') for progress.",
                 update_warning=update_warning,
+                feedback_hint=None,
             )
 
         except MissingApiKeyError as e:
+            self._record_feedback_event(
+                "provision_failure",
+                {
+                    "server": server_name,
+                    "reason": "missing_api_key",
+                    "env_var": e.env_var,
+                },
+            )
             return ProvisionOutput(
                 ok=False,
                 server=server_name,
@@ -1591,25 +1794,36 @@ class GatewayTools:
                 auth_mode="api_key",
                 auth_methods=self._auth_methods_for_server(server_name),
                 update_warning=update_warning,
+                feedback_hint=self._feedback_hint(),
             )
 
         except InstallError as e:
+            self._record_feedback_event(
+                "provision_failure",
+                {"server": server_name, "reason": "install_error", "error": str(e)},
+            )
             return ProvisionOutput(
                 ok=False,
                 server=server_name,
                 status="failed",
                 message=str(e),
                 update_warning=update_warning,
+                feedback_hint=self._feedback_hint(),
             )
 
         except Exception as e:
             logger.error(f"Failed to start provisioning {server_name}: {e}")
+            self._record_feedback_event(
+                "provision_failure",
+                {"server": server_name, "reason": "exception", "error": str(e)},
+            )
             return ProvisionOutput(
                 ok=False,
                 server=server_name,
                 status="failed",
                 message=f"Failed to start provisioning '{server_name}': {e}",
                 update_warning=update_warning,
+                feedback_hint=self._feedback_hint(),
             )
 
     async def auth_connect(self, input_data: dict[str, Any]) -> AuthConnectOutput:
@@ -1644,6 +1858,204 @@ class GatewayTools:
             env_var=env_var,
             env_path=str(path),
             next_step=f"gateway.provision(server_name='{server_name}')",
+        )
+
+    async def submit_feedback(self, input_data: dict[str, Any]) -> SubmitFeedbackOutput:
+        """gateway.submit_feedback - Prepare/submit PMCP feedback issue."""
+        parsed = SubmitFeedbackInput.model_validate(input_data)
+        repository = os.environ.get("PMCP_FEEDBACK_REPO", "ViperJuice/pmcp")
+
+        warning = (
+            "Submission sends technical telemetry to GitHub and may consume model tokens. "
+            "Send technical data only; never include personal data or secrets."
+        )
+
+        if not self._telemetry_enabled():
+            return SubmitFeedbackOutput(
+                ok=False,
+                submitted=False,
+                repository=repository,
+                repository_visibility="unknown",
+                issue_title=parsed.title,
+                issue_body=parsed.description,
+                warning=warning,
+                message="Feedback telemetry is disabled in guidance config (enable_telemetry=false).",
+            )
+
+        self._record_feedback_event(
+            "feedback_prepare",
+            {
+                "issue_type": parsed.issue_type,
+                "subordinate_server": parsed.subordinate_server,
+                "failed_tool_call": parsed.failed_tool_call,
+            },
+        )
+
+        issue_title, issue_body = self._build_feedback_issue(parsed, repository)
+
+        if not parsed.confirm_submission:
+            return SubmitFeedbackOutput(
+                ok=True,
+                submitted=False,
+                repository=repository,
+                repository_visibility="public",
+                issue_title=issue_title,
+                issue_body=issue_body,
+                warning=warning,
+                message=(
+                    "Preview generated. Ask the user for consent using your question tool, "
+                    "show this exact issue payload, then call again with confirm_submission=true."
+                ),
+            )
+
+        token = os.environ.get("PMCP_FEEDBACK_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if token:
+            try:
+                from urllib.request import Request
+
+                repo_visibility = "unknown"
+                try:
+                    repo_req = Request(
+                        f"https://api.github.com/repos/{repository}",
+                        headers={
+                            "Accept": "application/vnd.github+json",
+                            "Authorization": f"Bearer {token}",
+                            "X-GitHub-Api-Version": "2022-11-28",
+                        },
+                        method="GET",
+                    )
+                    with urlopen(repo_req, timeout=5) as repo_resp:  # nosec B310
+                        repo_info = json.loads(repo_resp.read().decode("utf-8"))
+                    private_flag = bool(repo_info.get("private"))
+                    repo_visibility = "private" if private_flag else "public"
+                except Exception:
+                    repo_visibility = "unknown"
+
+                issue_api = f"https://api.github.com/repos/{repository}/issues"
+                payload = json.dumps(
+                    {
+                        "title": issue_title,
+                        "body": issue_body,
+                        "labels": [
+                            "pmcp-feedback",
+                            "authenticated-feedback",
+                            parsed.issue_type,
+                        ],
+                    }
+                ).encode("utf-8")
+                req = Request(
+                    issue_api,
+                    data=payload,
+                    headers={
+                        "Accept": "application/vnd.github+json",
+                        "Authorization": f"Bearer {token}",
+                        "X-GitHub-Api-Version": "2022-11-28",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urlopen(req, timeout=10) as resp:  # nosec B310
+                    created = json.loads(resp.read().decode("utf-8"))
+
+                issue_url = created.get("html_url")
+                issue_number = created.get("number")
+                self._record_feedback_event(
+                    "feedback_submitted",
+                    {
+                        "repository": repository,
+                        "issue_url": issue_url,
+                        "authenticated": True,
+                    },
+                )
+                return SubmitFeedbackOutput(
+                    ok=True,
+                    submitted=True,
+                    repository=repository,
+                    repository_visibility=cast(
+                        Literal["public", "private", "unknown"], repo_visibility
+                    ),
+                    issue_title=issue_title,
+                    issue_body=issue_body,
+                    issue_url=issue_url,
+                    issue_number=issue_number,
+                    authenticated=True,
+                    warning=warning,
+                    message=(
+                        "Feedback issue submitted successfully. "
+                        "Share issue_url with the user so they can review/delete it if desired."
+                    ),
+                )
+            except Exception as e:
+                logger.warning(f"Authenticated feedback submission failed: {e}")
+
+        if shutil.which("gh"):
+            cmd = [
+                "gh",
+                "issue",
+                "create",
+                "--repo",
+                repository,
+                "--title",
+                issue_title,
+                "--body",
+                issue_body,
+                "--label",
+                "pmcp-feedback",
+                "--label",
+                parsed.issue_type,
+            ]
+            process = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await process.communicate()
+            if process.returncode == 0:
+                issue_url = stdout.decode("utf-8", errors="replace").strip()
+                self._record_feedback_event(
+                    "feedback_submitted",
+                    {
+                        "repository": repository,
+                        "issue_url": issue_url,
+                        "authenticated": False,
+                    },
+                )
+                return SubmitFeedbackOutput(
+                    ok=True,
+                    submitted=True,
+                    repository=repository,
+                    repository_visibility="public",
+                    issue_title=issue_title,
+                    issue_body=issue_body,
+                    issue_url=issue_url,
+                    authenticated=False,
+                    warning=warning,
+                    message=(
+                        "Feedback issue submitted via gh CLI. "
+                        "Share issue_url with the user so they can review/delete it if desired."
+                    ),
+                )
+            logger.warning(
+                "gh issue create failed: "
+                + stderr.decode("utf-8", errors="replace").strip()
+            )
+
+        browser_url = f"https://github.com/{repository}/issues/new?" + urlencode(
+            {"title": issue_title, "body": issue_body}
+        )
+        return SubmitFeedbackOutput(
+            ok=True,
+            submitted=False,
+            repository=repository,
+            repository_visibility="public",
+            issue_title=issue_title,
+            issue_body=issue_body,
+            issue_url=browser_url,
+            warning=warning,
+            message=(
+                "Could not auto-submit. Open issue_url to submit manually. "
+                "Share with user so they can edit/remove content before posting."
+            ),
         )
 
     async def update_server(self, input_data: dict[str, Any]) -> UpdateServerOutput:
