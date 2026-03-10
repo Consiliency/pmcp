@@ -265,7 +265,8 @@ class TestMain:
 
                     main()
 
-            mock_dotenv.assert_called_once()
+            # main() loads .env, then two pmcp env stores — 3 calls total
+            assert mock_dotenv.call_count == 3
 
     def test_main_handles_keyboard_interrupt(self) -> None:
         """Test that main handles KeyboardInterrupt gracefully."""

@@ -1639,6 +1639,9 @@ def main() -> None:
     """Main entry point."""
     # Load .env file from current directory or project root
     load_dotenv()
+    # Load PMCP credential stores written by auth_connect (don't override already-set vars)
+    load_dotenv(Path.home() / ".config" / "pmcp" / "pmcp.env", override=False)
+    load_dotenv(Path.cwd() / ".env.pmcp", override=False)
 
     args = parse_args()
 

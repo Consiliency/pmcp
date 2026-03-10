@@ -123,7 +123,8 @@ class TestTemplateSummary:
 
         assert "MCP Gateway:" in summary
         assert "Workflow:" in summary
-        assert "gateway_request_capability" in summary
+        assert "gateway.request_capability" in summary
+        assert "When to use this gateway:" in summary
         assert "playwright" in summary
         assert "context7" in summary
         assert "gateway.catalog_search" in summary
@@ -159,7 +160,7 @@ class TestTemplateSummaryCustomInstructions:
         tools = [make_tool("server", "tool")]
         summary = template_summary(tools, custom_instructions=None)
         assert "Workflow: catalog_search" in summary
-        assert "gateway_request_capability" in summary
+        assert "gateway.request_capability" in summary
 
     def test_no_guidance_when_disabled(self) -> None:
         tools = [make_tool("server", "tool")]
@@ -242,7 +243,7 @@ class TestGetPrebuiltSummary:
         summary = get_prebuilt_summary(tools, cache)
         assert summary is not None
         assert "Workflow:" in summary
-        assert "gateway_request_capability" in summary
+        assert "gateway.request_capability" in summary
         assert "gateway.catalog_search" in summary
 
     def test_returns_none_without_cache(self) -> None:
@@ -257,3 +258,38 @@ class TestGetPrebuiltSummary:
             servers={},
         )
         assert get_prebuilt_summary(tools, cache) is None
+
+
+class TestProvisionableCategories:
+    """Tests for provisionable_categories threading."""
+
+    def test_template_summary_includes_categories(self) -> None:
+        tools = [make_tool("playwright", "navigate", "Navigate to URL")]
+        categories = "Provisionable (2 servers): browser automation (playwright)"
+        summary = template_summary(tools, provisionable_categories=categories)
+        assert categories in summary
+
+    def test_template_summary_no_categories_when_none(self) -> None:
+        tools = [make_tool("playwright", "navigate", "Navigate to URL")]
+        summary = template_summary(tools, provisionable_categories=None)
+        assert "Provisionable" not in summary
+
+    def test_template_summary_categories_suppressed_with_custom_instructions(self) -> None:
+        tools = [make_tool("server", "tool")]
+        categories = "Provisionable (2 servers): browser (playwright)"
+        summary = template_summary(
+            tools,
+            custom_instructions="My custom instructions.",
+            provisionable_categories=categories,
+        )
+        # custom_instructions replaces the default block; categories are not appended
+        assert categories not in summary
+
+    @pytest.mark.asyncio
+    async def test_generate_capability_summary_passes_categories(self) -> None:
+        tools = [make_tool("server", "tool")]
+        categories = "Provisionable (1 servers): test-category (server)"
+        summary = await generate_capability_summary(
+            tools, use_llm=False, provisionable_categories=categories
+        )
+        assert categories in summary

@@ -18,7 +18,7 @@ class GuidanceLayers(BaseModel):
 
     mcp_instructions: bool = Field(
         default=True,
-        description="L0: Philosophy in MCP server instructions (~25-35 tokens)",
+        description="L0: Philosophy in MCP server instructions (~60-90 tokens)",
     )
     code_hints: bool = Field(
         default=True,
@@ -126,7 +126,7 @@ class GuidanceConfig(BaseModel):
         total = 0
 
         if self.include_mcp_instructions:
-            total += 30  # ~25-35 tokens for L0 philosophy
+            total += 80  # ~60-90 tokens for L0 philosophy
 
         if self.include_code_hints:
             total += num_search_results * 10  # ~8-12 tokens per card

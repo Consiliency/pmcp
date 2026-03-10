@@ -489,6 +489,51 @@ class CapabilityResolution(BaseModel):
 
     # For not_available status
     logged_for_discovery: bool = False
+    search_guidance: str | None = None
+
+
+class SearchRegistryResult(BaseModel):
+    """A single result from the MCP registry search."""
+
+    name: str
+    package: str
+    description: str
+    transport: str | None = None
+    env_vars: list[str] = Field(default_factory=list)
+
+
+class SearchRegistryInput(BaseModel):
+    """Input for gateway.search_registry."""
+
+    query: str = Field(min_length=1, description="Natural language capability description")
+    limit: int = Field(default=5, ge=1, le=20)
+
+
+class SearchRegistryOutput(BaseModel):
+    """Output for gateway.search_registry."""
+
+    query: str
+    results: list[SearchRegistryResult]
+    next_step: str
+
+
+class RegisterDiscoveredServerInput(BaseModel):
+    """Input for gateway.register_discovered_server."""
+
+    package: str = Field(min_length=1, description="npm package identifier (e.g. '@modelcontextprotocol/server-github')")
+    server_name: str = Field(min_length=1, description="Logical name for this server (e.g. 'github')")
+    env_vars: list[str] = Field(default_factory=list, description="Required environment variable names")
+    description: str = Field(default="", description="Short description of the server's purpose")
+
+
+class RegisterDiscoveredServerOutput(BaseModel):
+    """Output for gateway.register_discovered_server."""
+
+    ok: bool
+    server_name: str
+    registered: bool
+    message: str
+    next_step: str | None = None
 
 
 class ProvisionInput(BaseModel):
@@ -515,7 +560,7 @@ class ProvisionOutput(BaseModel):
     env_var: str | None = None
     env_instructions: str | None = None
     auth_required: bool = False
-    auth_mode: Literal["api_key", "subscription", "oauth", "unknown"] | None = None
+    auth_mode: Literal["api_key", "unknown"] | None = None
     auth_methods: list[str] | None = None
     alternative_env_vars: list[str] | None = None
     update_warning: str | None = None

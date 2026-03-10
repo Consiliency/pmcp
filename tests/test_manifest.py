@@ -186,6 +186,30 @@ def test_manifest_cli_config():
     assert len(git.keywords) > 0
 
 
+def test_manifest_get_category_summary():
+    """Test get_category_summary returns a useful compact string."""
+    manifest = load_manifest()
+    summary = manifest.get_category_summary()
+
+    assert len(summary) > 0
+    assert "Provisionable" in summary
+    assert "playwright" in summary  # always in manifest
+    # Should mention at least one category label
+    assert any(cat in summary for cat in ["browser automation", "scraping/search", "databases"])
+
+
+def test_manifest_get_category_summary_empty():
+    """Test get_category_summary returns empty string for empty manifest."""
+    from pmcp.manifest.loader import Manifest
+    empty = Manifest(
+        version="1.0",
+        cli_alternatives={},
+        servers={},
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
+    assert empty.get_category_summary() == ""
+
+
 # === Matcher Tests ===
 
 

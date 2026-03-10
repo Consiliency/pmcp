@@ -20,7 +20,7 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 
 **PMCP** acts as a single MCP server that Claude Code connects to. Instead of exposing all downstream tools, it provides:
 
-- **14 stable meta-tools** (not the 50+ underlying tools)
+- **16 stable meta-tools** (not the 50+ underlying tools)
 - **Auto-starts** essential servers (Playwright, Context7) with no configuration
 - **Dynamically provisions** new servers on-demand from a manifest of 25+
 - **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
@@ -184,7 +184,7 @@ Returns: Screenshot of google.com
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                          PMCP                               │
-│  • 14 meta-tools (catalog, invoke, provision, etc.)         │
+│  • 16 meta-tools (catalog, invoke, provision, etc.)         │
 │  • Progressive disclosure (compact cards → full schemas)    │
 │  • Policy enforcement (allow/deny lists)                    │
 └────────────────────────────┬────────────────────────────────┘
@@ -210,7 +210,7 @@ The gateway discovers and manages all other servers.
 
 ## Gateway Tools
 
-The gateway exposes **14 meta-tools** organized into three categories:
+The gateway exposes **16 meta-tools** organized into three categories:
 
 ### Core Tools
 
@@ -233,6 +233,8 @@ The gateway exposes **14 meta-tools** organized into three categories:
 | `gateway.auth_connect` | Store credentials for a server and retry provisioning |
 | `gateway.submit_feedback` | Preview/submit technical PMCP feedback issues to GitHub |
 | `gateway.provision_status` | Check installation progress |
+| `gateway.search_registry` | Search the public MCP Registry for external servers |
+| `gateway.register_discovered_server` | Register a registry result for provisioning |
 
 ### Monitoring Tools
 

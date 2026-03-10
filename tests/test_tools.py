@@ -480,7 +480,9 @@ class TestCapabilityAndProvision:
         assert client_manager.is_server_online("custom-browser") is True
 
     @pytest.mark.asyncio
-    async def test_request_capability_discovers_unknown_server(self, monkeypatch):
+    async def test_request_capability_returns_search_guidance_when_not_found(
+        self, monkeypatch
+    ):
         client_manager = MockClientManager(create_mock_tools())
         policy_manager = PolicyManager()
         gateway_tools = GatewayTools(
@@ -508,24 +510,12 @@ class TestCapabilityAndProvision:
         monkeypatch.setitem(
             sys.modules, "pmcp.baml_client", types.ModuleType("pmcp.baml_client")
         )
-        monkeypatch.setattr(
-            gateway_tools,
-            "_discover_external_servers",
-            lambda query: [
-                CapabilityCandidate(
-                    name="@acme/openbrowser-mcp",
-                    candidate_type="server",
-                    relevance_score=0.8,
-                    reasoning="Discovered from npm",
-                )
-            ],
-        )
 
         result = await gateway_tools.request_capability({"query": "openbrowser mcp"})
 
-        assert result.status == "candidates"
-        assert result.candidates is not None
-        assert result.candidates[0].name == "@acme/openbrowser-mcp"
+        assert result.status == "not_available"
+        assert result.search_guidance is not None
+        assert "gateway.search_registry" in result.search_guidance
 
     @pytest.mark.asyncio
     async def test_provision_reports_auth_metadata_for_missing_key(self, monkeypatch):
@@ -559,6 +549,8 @@ class TestCapabilityAndProvision:
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        # Prevent _check_api_key_available from loading env vars out of pmcp files on disk
+        monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
 
         result = await gateway_tools.provision({"server_name": "browser-use"})
 
@@ -803,3 +795,122 @@ class TestCapabilityAndProvision:
         assert result.ok is False
         assert result.submitted is False
         assert "disabled" in result.message.lower()
+
+
+class TestSearchRegistryAndRegister:
+    """Tests for gateway.search_registry and gateway.register_discovered_server."""
+
+    @pytest.fixture
+    def gateway_tools(self) -> GatewayTools:
+        client_manager = MockClientManager()
+        policy_manager = PolicyManager()
+        return GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+    @pytest.mark.asyncio
+    async def test_search_registry_returns_results_from_mcp_registry(
+        self, gateway_tools: GatewayTools, monkeypatch
+    ) -> None:
+        fake_entries = [
+            {
+                "server": {
+                    "name": "GitHub MCP",
+                    "description": "GitHub integration",
+                    "packages": [
+                        {
+                            "identifier": "@modelcontextprotocol/server-github",
+                            "transport": {"type": "stdio"},
+                            "environmentVariables": [{"name": "GITHUB_TOKEN"}],
+                        }
+                    ],
+                }
+            },
+            # Duplicate package — should be deduplicated
+            {
+                "server": {
+                    "name": "GitHub MCP (duplicate)",
+                    "description": "GitHub integration duplicate",
+                    "packages": [
+                        {
+                            "identifier": "@modelcontextprotocol/server-github",
+                            "transport": {"type": "stdio"},
+                            "environmentVariables": [{"name": "GITHUB_TOKEN"}],
+                        }
+                    ],
+                }
+            },
+        ]
+        monkeypatch.setattr(gateway_tools, "_query_mcp_registry", lambda q, limit=8: fake_entries)
+
+        result = await gateway_tools.search_registry({"query": "github"})
+
+        assert len(result.results) == 1  # duplicate filtered out
+        assert result.results[0].package == "@modelcontextprotocol/server-github"
+        assert result.results[0].env_vars == ["GITHUB_TOKEN"]
+        assert "gateway.register_discovered_server" in result.next_step
+
+    @pytest.mark.asyncio
+    async def test_search_registry_handles_empty_results(
+        self, gateway_tools: GatewayTools, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(gateway_tools, "_query_mcp_registry", lambda q, limit=8: [])
+
+        result = await gateway_tools.search_registry({"query": "nonexistent-xyz-tool"})
+
+        assert result.results == []
+        assert result.query == "nonexistent-xyz-tool"
+
+    @pytest.mark.asyncio
+    async def test_register_discovered_server_stores_config(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        result = await gateway_tools.register_discovered_server(
+            {
+                "package": "@modelcontextprotocol/server-github",
+                "server_name": "github",
+                "env_vars": ["GITHUB_TOKEN"],
+                "description": "GitHub MCP server",
+            }
+        )
+
+        assert result.ok is True
+        assert result.registered is True
+        assert result.server_name == "github"
+        assert "github" in gateway_tools._discovered_server_configs
+        config = gateway_tools._discovered_server_configs["github"]
+        assert config.command == "npx"
+        assert "@modelcontextprotocol/server-github" in config.args
+        assert config.requires_api_key is True
+        assert config.env_var == "GITHUB_TOKEN"
+        assert "gateway.provision" in (result.next_step or "")
+
+    @pytest.mark.asyncio
+    async def test_register_then_provision_flow(
+        self, gateway_tools: GatewayTools, monkeypatch
+    ) -> None:
+        """Full agentic discovery flow: register → provision."""
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={},
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        ))
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+
+        await gateway_tools.register_discovered_server(
+            {
+                "package": "@modelcontextprotocol/server-github",
+                "server_name": "github-ext",
+                "env_vars": ["GITHUB_TOKEN"],
+            }
+        )
+
+        result = await gateway_tools.provision({"server_name": "github-ext"})
+
+        # Should fail because GITHUB_TOKEN is not set
+        assert result.ok is False
+        assert result.needs_api_key is True
+        assert result.env_var == "GITHUB_TOKEN"

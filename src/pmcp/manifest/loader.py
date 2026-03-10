@@ -63,6 +63,42 @@ class Manifest:
         """Get CLI alternative by name."""
         return self.cli_alternatives.get(name)
 
+    def get_category_summary(self) -> str:
+        """Return compact category summary of provisionable servers."""
+        _CATEGORIES: dict[str, list[str]] = {
+            "browser automation": [
+                "playwright", "puppeteer", "browserbase", "browser-use", "chrome-devtools",
+            ],
+            "scraping/search": [
+                "brightdata", "brave-search", "exa", "fetch", "firecrawl", "tavily",
+            ],
+            "APIs": [
+                "github", "gitlab", "slack", "notion", "linear", "google-maps", "coinmarketcap",
+            ],
+            "databases": ["postgres", "sqlite", "supabase", "qdrant"],
+            "developer tools": ["context7", "git", "sequential-thinking", "sentry"],
+            "cloud/storage": ["google-drive", "filesystem", "aws-kb-retrieval", "memory"],
+        }
+
+        total = len(self.servers)
+        if not total:
+            return ""
+
+        parts = []
+        for cat_name, server_names in _CATEGORIES.items():
+            matched = [n for n in server_names if n in self.servers]
+            if not matched:
+                continue
+            if len(matched) <= 2:
+                names_str = ", ".join(matched)
+            else:
+                names_str = ", ".join(matched[:2]) + f" +{len(matched) - 2}"
+            parts.append(f"{cat_name} ({names_str})")
+
+        if not parts:
+            return ""
+        return f"Provisionable ({total} servers): {'; '.join(parts)}"
+
     def search_by_keyword(
         self, keyword: str
     ) -> tuple[list[CLIAlternative], list[ServerConfig]]:

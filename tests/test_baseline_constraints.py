@@ -42,7 +42,7 @@ if TYPE_CHECKING:
 class TestGatewayToolSurface:
     """Verifies the gateway tool API surface remains stable.
 
-    The gateway exposes exactly 14 tools, all prefixed with `gateway.`.
+    The gateway exposes exactly 16 tools, all prefixed with `gateway.`.
     This test class ensures future phases don't accidentally remove or rename tools.
     """
 
@@ -63,14 +63,16 @@ class TestGatewayToolSurface:
             "gateway.provision_status",
             "gateway.list_pending",
             "gateway.cancel",
+            "gateway.search_registry",
+            "gateway.register_discovered_server",
         ]
     )
 
     def test_gateway_tool_count_is_fourteen(self) -> None:
-        """Verify exactly 14 gateway tools are defined."""
+        """Verify exactly 16 gateway tools are defined."""
         tools = get_gateway_tool_definitions()
-        assert len(tools) == 14, (
-            f"Expected 14 gateway tools, got {len(tools)}. "
+        assert len(tools) == 16, (
+            f"Expected 16 gateway tools, got {len(tools)}. "
             f"Tools: {[t.name for t in tools]}"
         )
 

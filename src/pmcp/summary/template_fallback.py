@@ -78,6 +78,7 @@ def template_summary(
     tools: list[ToolInfo],
     include_code_guidance: bool = True,
     custom_instructions: str | None = None,
+    provisionable_categories: str | None = None,
 ) -> str:
     """Generate a simple template-based capability summary.
 
@@ -96,6 +97,7 @@ def template_summary(
         tools: List of tool info from connected servers
         include_code_guidance: If True, include L0 workflow guidance (default: True)
         custom_instructions: If set, replaces default workflow guidance lines
+        provisionable_categories: If set, appended after default L0 trigger patterns
     """
     if not tools:
         return (
@@ -115,9 +117,20 @@ def template_summary(
                 lines.append(line.rstrip())
         else:
             lines.append("Workflow: catalog_search → describe → invoke.")
+            lines.append("")
+            lines.append("When to use this gateway:")
+            lines.append("• Web scraping, search, or data extraction")
+            lines.append("• Browser automation or testing")
+            lines.append("• External APIs (GitHub, Slack, Linear, Notion, etc.)")
+            lines.append("• Database queries (Postgres, SQLite, Qdrant)")
+            lines.append("• Library documentation lookup")
+            lines.append("• Any capability you don't have a local tool for")
+            lines.append("")
             lines.append(
-                "Need a capability not listed? Use gateway_request_capability to find or provision tools."
+                'Use gateway.request_capability("<what you need>") to find or auto-provision the right server.'
             )
+            if provisionable_categories:
+                lines.append(provisionable_categories)
 
     lines.append("")
     lines.append("Available capabilities:")

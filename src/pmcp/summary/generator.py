@@ -21,6 +21,7 @@ def get_prebuilt_summary(
     cache: DescriptionsCache | None = None,
     include_code_guidance: bool = True,
     custom_instructions: str | None = None,
+    provisionable_categories: str | None = None,
 ) -> str | None:
     """Try to build summary from pre-built cache.
 
@@ -61,9 +62,20 @@ def get_prebuilt_summary(
                 lines.append(line.rstrip())
         else:
             lines.append("Workflow: catalog_search → describe → invoke.")
+            lines.append("")
+            lines.append("When to use this gateway:")
+            lines.append("• Web scraping, search, or data extraction")
+            lines.append("• Browser automation or testing")
+            lines.append("• External APIs (GitHub, Slack, Linear, Notion, etc.)")
+            lines.append("• Database queries (Postgres, SQLite, Qdrant)")
+            lines.append("• Library documentation lookup")
+            lines.append("• Any capability you don't have a local tool for")
+            lines.append("")
             lines.append(
-                "Need a capability not listed? Use gateway_request_capability to find or provision tools."
+                'Use gateway.request_capability("<what you need>") to find or auto-provision the right server.'
             )
+            if provisionable_categories:
+                lines.append(provisionable_categories)
 
     lines.append("")
     lines.append("Use gateway.catalog_search to explore tools.")
@@ -76,6 +88,7 @@ async def generate_capability_summary(
     cache: DescriptionsCache | None = None,
     include_code_guidance: bool = True,
     custom_instructions: str | None = None,
+    provisionable_categories: str | None = None,
 ) -> str:
     """Generate a capability summary for MCP tools.
 
@@ -90,6 +103,7 @@ async def generate_capability_summary(
         cache: Pre-built descriptions cache
         include_code_guidance: Whether to include L0 workflow guidance
         custom_instructions: Custom L0 text replacing default workflow guidance
+        provisionable_categories: Compact category string appended after default L0 trigger patterns
 
     Returns:
         Human-readable capability summary for MCP instructions
@@ -107,6 +121,7 @@ async def generate_capability_summary(
             cache,
             include_code_guidance=include_code_guidance,
             custom_instructions=custom_instructions,
+            provisionable_categories=provisionable_categories,
         )
         if prebuilt:
             logger.info("Using pre-built capability summary from cache")
@@ -135,4 +150,5 @@ async def generate_capability_summary(
         tools,
         include_code_guidance=include_code_guidance,
         custom_instructions=custom_instructions,
+        provisionable_categories=provisionable_categories,
     )

@@ -68,8 +68,13 @@ from pmcp.types import (
     ProvisionStatusInput,
     RefreshInput,
     RefreshOutput,
+    RegisterDiscoveredServerInput,
+    RegisterDiscoveredServerOutput,
     RiskHint,
     SchemaCard,
+    SearchRegistryInput,
+    SearchRegistryOutput,
+    SearchRegistryResult,
     ServerHealthInfo,
     SyncEnvironmentInput,
     SyncEnvironmentOutput,
@@ -101,7 +106,9 @@ def get_gateway_tool_definitions() -> list[Tool]:
             description=(
                 "Search for available tools across all connected MCP servers. "
                 "Returns compact capability cards without full schemas. "
-                "Use filters to narrow results by server, tags, or risk level."
+                "Use filters to narrow results by server, tags, or risk level. "
+                "Set include_offline=True to also discover provisionable servers not yet running. "
+                "This is the primary tool discovery entry point."
             ),
             inputSchema={
                 "type": "object",
@@ -241,10 +248,10 @@ def get_gateway_tool_definitions() -> list[Tool]:
         Tool(
             name="gateway.request_capability",
             description=(
-                "Request a capability by describing what you need in natural language. "
-                "The gateway will match your request against installed CLIs and available MCP servers. "
-                "If a matching MCP server exists but isn't running, it will be provisioned automatically. "
-                "Prefers CLIs over MCP servers when the CLI can fully handle the request."
+                "Find and auto-provision the right tool for a task — describe what you need in natural language. "
+                "Examples: 'scrape a website', 'search Slack messages', 'query Postgres', 'browse the web'. "
+                "Matches against installed CLIs and 25+ provisionable MCP servers; starts the server automatically if needed. "
+                "Prefer this over gateway.provision when you don't already know the exact server name."
             ),
             inputSchema={
                 "type": "object",
@@ -291,7 +298,8 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Provision (install and start) a specific MCP server from the manifest. "
                 "Use this after reviewing candidates from gateway.request_capability. "
                 "Returns immediately with a job_id for tracking. "
-                "Poll gateway.provision_status to check progress."
+                "Poll gateway.provision_status to check progress. "
+                "Use gateway.request_capability instead if you don't know the exact server name."
             ),
             inputSchema={
                 "type": "object",
@@ -448,6 +456,62 @@ def get_gateway_tool_definitions() -> list[Tool]:
                     },
                 },
                 "required": ["request_id"],
+            },
+        ),
+        Tool(
+            name="gateway.search_registry",
+            description=(
+                "Search the public MCP Registry for external servers not in the local manifest. "
+                "Use this when gateway.request_capability returns not_available. "
+                "Returns package names and metadata; call gateway.register_discovered_server then gateway.provision to install."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language description of the capability needed",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 20,
+                        "default": 5,
+                        "description": "Maximum number of results to return",
+                    },
+                },
+                "required": ["query"],
+            },
+        ),
+        Tool(
+            name="gateway.register_discovered_server",
+            description=(
+                "Register an externally-discovered MCP server package so it can be provisioned. "
+                "Call this after gateway.search_registry to register the chosen package, "
+                "then call gateway.provision to install and start it."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "package": {
+                        "type": "string",
+                        "description": "npm package identifier (e.g. '@modelcontextprotocol/server-github')",
+                    },
+                    "server_name": {
+                        "type": "string",
+                        "description": "Logical name for this server (e.g. 'github') used with gateway.provision",
+                    },
+                    "env_vars": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Required environment variable names (e.g. ['GITHUB_TOKEN'])",
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Short description of the server's purpose",
+                    },
+                },
+                "required": ["package", "server_name"],
             },
         ),
     ]
@@ -936,9 +1000,9 @@ class GatewayTools:
                         )
                         continue
 
-                    # Skip servers that require API keys if not set
+                    # Skip servers that require API keys if not set (checks all pmcp env stores)
                     if server.requires_api_key and server.env_var:
-                        if not os.environ.get(server.env_var):
+                        if not self._check_api_key_available(server.env_var):
                             logger.info(
                                 f"Skipping auto-start server '{server.name}' - "
                                 f"missing {server.env_var}"
@@ -1005,19 +1069,24 @@ class GatewayTools:
         )
 
     def _check_api_key_available(self, env_var: str | None) -> bool:
-        """Check if an API key is available in environment or .env file."""
+        """Check if an API key is available in environment or any pmcp env store."""
         if not env_var:
             return False
 
-        # Check environment first
+        # Check live environment first (fast path)
         if os.environ.get(env_var):
             return True
 
-        # Check .env file
-        env_path = Path.cwd() / ".env"
-        if env_path.exists():
-            load_dotenv(env_path)
-            return bool(os.environ.get(env_var))
+        # Check all env stores in priority order: project-local .env, then pmcp files
+        for env_path in [
+            Path.cwd() / ".env",
+            Path.cwd() / ".env.pmcp",
+            Path.home() / ".config" / "pmcp" / "pmcp.env",
+        ]:
+            if env_path.exists():
+                load_dotenv(env_path)
+                if os.environ.get(env_var):
+                    return True
 
         return False
 
@@ -1069,70 +1138,23 @@ class GatewayTools:
         """Normalize user query tokens for matching/discovery."""
         return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
-    def _discover_external_servers(self, query: str) -> list[CapabilityCandidate]:
-        """Discover likely MCP servers from npm registry when manifest has no match."""
+    def _query_mcp_registry(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
+        """Query the MCP Registry and return raw server entries."""
         normalized = self._normalize_token(query)
         if not normalized:
             return []
 
         try:
             url = (
-                "https://registry.npmjs.org/-/v1/search?text="
-                f"{quote_plus(normalized + ' mcp server')}&size=8"
+                "https://registry.modelcontextprotocol.io/v0.1/servers"
+                f"?search={quote_plus(normalized)}&limit={limit}"
             )
             with urlopen(url, timeout=5) as resp:  # nosec B310
                 payload = json.loads(resp.read().decode("utf-8"))
         except Exception:
             return []
 
-        objects = payload.get("objects", []) if isinstance(payload, dict) else []
-        candidates: list[CapabilityCandidate] = []
-
-        for obj in objects:
-            if not isinstance(obj, dict):
-                continue
-            pkg = obj.get("package", {})
-            if not isinstance(pkg, dict):
-                continue
-            package_name = str(pkg.get("name", "")).strip()
-            description = str(pkg.get("description", "")).strip()
-            if not package_name:
-                continue
-
-            candidate_text = self._normalize_token(
-                f"{package_name} {description} {' '.join(pkg.get('keywords', []) or [])}"
-            )
-            if (
-                "mcp" not in candidate_text
-                and "model context protocol" not in candidate_text
-            ):
-                continue
-
-            score = 0.35
-            query_terms = set(normalized.split())
-            text_terms = set(candidate_text.split())
-            overlap = len(query_terms.intersection(text_terms))
-            if query_terms:
-                score += min(overlap / len(query_terms), 0.45)
-
-            candidates.append(
-                CapabilityCandidate(
-                    name=package_name,
-                    candidate_type="server",
-                    relevance_score=min(score, 0.9),
-                    reasoning=(
-                        f"Discovered from npm registry: {package_name}. "
-                        "Use gateway.provision with this package name to install via npx."
-                    ),
-                    requires_api_key=False,
-                    api_key_available=False,
-                    is_installed=False,
-                    is_running=False,
-                )
-            )
-
-        candidates.sort(key=lambda c: c.relevance_score, reverse=True)
-        return candidates[:3]
+        return payload.get("servers", []) if isinstance(payload, dict) else []
 
     def _load_configured_servers(self) -> dict[str, ResolvedServerConfig]:
         """Load user/project-configured servers that are allowed by policy."""
@@ -1453,11 +1475,29 @@ class GatewayTools:
             ]
             manifest_summary = ManifestSummary(servers=servers, clis=clis)
 
+            # Build ClientRegistry to route through caller's existing API key
+            # (ANTHROPIC_API_KEY preferred; GROQ_API_KEY as fallback via default BAML config)
+            baml_client = b
+            anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+            if anthropic_key:
+                try:
+                    from baml_py import ClientRegistry
+                    cr = ClientRegistry()
+                    cr.add_llm_client(
+                        "CallerAnthropic",
+                        "anthropic",
+                        {"api_key": anthropic_key, "model": "claude-haiku-4-5-20251001"},
+                    )
+                    cr.set_primary("CallerAnthropic")
+                    baml_client = b.with_options(client_registry=cr)
+                except Exception:
+                    pass  # Fall back to default BAML client
+
             # Call BAML
             import asyncio
 
             async with asyncio.timeout(15):
-                result = await b.MatchCapability(
+                result = await baml_client.MatchCapability(
                     query=parsed.query,
                     manifest=manifest_summary,
                     available_clis=detected_clis,
@@ -1515,6 +1555,11 @@ class GatewayTools:
                     status="not_available",
                     message=f"No matching capability found for: {parsed.query}",
                     logged_for_discovery=True,
+                    search_guidance=(
+                        f'Call gateway.search_registry(query="{parsed.query}") '
+                        "to search the public MCP Registry for external servers. "
+                        "Then call gateway.register_discovered_server and gateway.provision to install."
+                    ),
                 )
 
             # Return candidates for Claude to choose
@@ -1541,46 +1586,6 @@ class GatewayTools:
         )
 
         if not match_result.matched:
-            discovered = self._discover_external_servers(parsed.query)
-            if discovered:
-                for candidate in discovered:
-                    package_name = candidate.name
-                    self._discovered_server_configs[package_name] = ServerConfig(
-                        name=package_name,
-                        description=f"Discovered MCP package: {package_name}",
-                        keywords=["mcp", "discovered", package_name],
-                        install={
-                            "mac": ["npx", "-y", package_name],
-                            "linux": ["npx", "-y", package_name],
-                            "wsl": ["npx", "-y", package_name],
-                            "windows": ["npx", "-y", package_name],
-                        },
-                        command="npx",
-                        args=["-y", package_name],
-                        requires_api_key=False,
-                    )
-                logger.info(
-                    f"No manifest match for '{parsed.query}', returning {len(discovered)} discovered candidates"
-                )
-                self._record_feedback_event(
-                    "capability_discovered_external",
-                    {
-                        "query": parsed.query,
-                        "candidates": [c.name for c in discovered],
-                    },
-                )
-                return CapabilityResolution(
-                    status="candidates",
-                    message=(
-                        f"No manifest match found for '{parsed.query}'. "
-                        "Found discovered MCP packages from registry."
-                    ),
-                    candidates=discovered,
-                    recommendation=(
-                        f"Try provisioning discovered server '{discovered[0].name}'"
-                    ),
-                )
-
             logger.info(f"Unmatched capability request: {parsed.query}")
             self._record_feedback_event(
                 "capability_unmatched", {"query": parsed.query, "path": "fallback"}
@@ -1589,6 +1594,11 @@ class GatewayTools:
                 status="not_available",
                 message=f"No matching capability found for: {parsed.query}",
                 logged_for_discovery=True,
+                search_guidance=(
+                    f'Call gateway.search_registry(query="{parsed.query}") '
+                    "to search the public MCP Registry for external servers. "
+                    "Then call gateway.register_discovered_server and gateway.provision to install."
+                ),
             )
 
         # Build single candidate from keyword match
@@ -2138,6 +2148,113 @@ class GatewayTools:
             refreshed=refresh_result.ok,
             latest_version=latest_version,
             message=message,
+        )
+
+    async def search_registry(self, input_data: dict[str, Any]) -> SearchRegistryOutput:
+        """gateway.search_registry - Search public MCP Registry for external servers."""
+        parsed = SearchRegistryInput.model_validate(input_data)
+        self._record_feedback_event("registry_search", {"query": parsed.query})
+
+        raw_entries = self._query_mcp_registry(parsed.query, limit=parsed.limit * 2)
+
+        results: list[SearchRegistryResult] = []
+        seen_packages: set[str] = set()
+        for entry in raw_entries:
+            if not isinstance(entry, dict):
+                continue
+            server_info = entry.get("server", {})
+            packages = server_info.get("packages", [])
+            if not packages:
+                continue
+            pkg = packages[0]
+            package_name = str(pkg.get("identifier", "")).strip()
+            if not package_name or package_name in seen_packages:
+                continue
+            seen_packages.add(package_name)
+
+            description = str(server_info.get("description", "")).strip()
+            transport = pkg.get("transport", {}).get("type") if isinstance(pkg.get("transport"), dict) else None
+
+            env_var_defs = pkg.get("environmentVariables", []) or []
+            env_vars = [
+                str(ev.get("name", "")).strip()
+                for ev in env_var_defs
+                if isinstance(ev, dict) and ev.get("name")
+            ]
+
+            results.append(
+                SearchRegistryResult(
+                    name=server_info.get("name", package_name),
+                    package=package_name,
+                    description=description,
+                    transport=transport,
+                    env_vars=env_vars,
+                )
+            )
+            if len(results) >= parsed.limit:
+                break
+
+        return SearchRegistryOutput(
+            query=parsed.query,
+            results=results,
+            next_step=(
+                "Call gateway.register_discovered_server(package=<package>, server_name=<name>) "
+                "then gateway.provision(server_name=<name>) to install."
+            ),
+        )
+
+    async def register_discovered_server(
+        self, input_data: dict[str, Any]
+    ) -> RegisterDiscoveredServerOutput:
+        """gateway.register_discovered_server - Register an external server for provisioning."""
+        parsed = RegisterDiscoveredServerInput.model_validate(input_data)
+        server_name = parsed.server_name
+        package = parsed.package
+
+        requires_api_key = len(parsed.env_vars) > 0
+        # Primary env var used for availability checks and auth_connect prompt
+        env_var = parsed.env_vars[0] if parsed.env_vars else None
+        # Build instructions for any additional required env vars
+        extra_vars = parsed.env_vars[1:] if len(parsed.env_vars) > 1 else []
+        env_instructions: str | None = None
+        if extra_vars:
+            vars_list = ", ".join(f"${v}" for v in extra_vars)
+            env_instructions = (
+                f"Also set {vars_list} — call gateway.auth_connect for each, "
+                "or export them before calling gateway.provision."
+            )
+
+        self._discovered_server_configs[server_name] = ServerConfig(
+            name=server_name,
+            description=parsed.description or f"Discovered MCP package: {package}",
+            keywords=["mcp", "discovered", server_name, package],
+            install={
+                "mac": ["npx", "-y", package],
+                "linux": ["npx", "-y", package],
+                "wsl": ["npx", "-y", package],
+                "windows": ["npx", "-y", package],
+            },
+            command="npx",
+            args=["-y", package],
+            requires_api_key=requires_api_key,
+            env_var=env_var,
+            env_instructions=env_instructions,
+        )
+
+        self._record_feedback_event(
+            "server_registered",
+            {"server_name": server_name, "package": package},
+        )
+
+        return RegisterDiscoveredServerOutput(
+            ok=True,
+            server_name=server_name,
+            registered=True,
+            message=(
+                f"Registered '{server_name}' (package: {package}). "
+                "Call gateway.provision to install and start it."
+            ),
+            next_step=f"gateway.provision(server_name='{server_name}')",
         )
 
     async def provision_status(self, input_data: dict[str, Any]) -> ProvisionJobStatus:
