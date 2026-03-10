@@ -15,7 +15,6 @@ from pmcp.errors import GatewayException
 from pmcp.policy.policy import PolicyManager
 from pmcp.tools.handlers import GatewayTools
 from pmcp.types import (
-    CapabilityCandidate,
     LocalMcpServerConfig,
     ResolvedServerConfig,
     RiskHint,
