@@ -1482,11 +1482,15 @@ class GatewayTools:
             if anthropic_key:
                 try:
                     from baml_py import ClientRegistry
+
                     cr = ClientRegistry()
                     cr.add_llm_client(
                         "CallerAnthropic",
                         "anthropic",
-                        {"api_key": anthropic_key, "model": "claude-haiku-4-5-20251001"},
+                        {
+                            "api_key": anthropic_key,
+                            "model": "claude-haiku-4-5-20251001",
+                        },
                     )
                     cr.set_primary("CallerAnthropic")
                     baml_client = b.with_options(client_registry=cr)
@@ -2173,7 +2177,11 @@ class GatewayTools:
             seen_packages.add(package_name)
 
             description = str(server_info.get("description", "")).strip()
-            transport = pkg.get("transport", {}).get("type") if isinstance(pkg.get("transport"), dict) else None
+            transport = (
+                pkg.get("transport", {}).get("type")
+                if isinstance(pkg.get("transport"), dict)
+                else None
+            )
 
             env_var_defs = pkg.get("environmentVariables", []) or []
             env_vars = [

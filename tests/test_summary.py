@@ -274,7 +274,9 @@ class TestProvisionableCategories:
         summary = template_summary(tools, provisionable_categories=None)
         assert "Provisionable" not in summary
 
-    def test_template_summary_categories_suppressed_with_custom_instructions(self) -> None:
+    def test_template_summary_categories_suppressed_with_custom_instructions(
+        self,
+    ) -> None:
         tools = [make_tool("server", "tool")]
         categories = "Provisionable (2 servers): browser (playwright)"
         summary = template_summary(

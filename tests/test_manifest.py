@@ -195,12 +195,15 @@ def test_manifest_get_category_summary():
     assert "Provisionable" in summary
     assert "playwright" in summary  # always in manifest
     # Should mention at least one category label
-    assert any(cat in summary for cat in ["browser automation", "scraping/search", "databases"])
+    assert any(
+        cat in summary for cat in ["browser automation", "scraping/search", "databases"]
+    )
 
 
 def test_manifest_get_category_summary_empty():
     """Test get_category_summary returns empty string for empty manifest."""
     from pmcp.manifest.loader import Manifest
+
     empty = Manifest(
         version="1.0",
         cli_alternatives={},

@@ -150,7 +150,9 @@ class GatewayServer:
                 elif name == "gateway.search_registry":
                     result = await self._gateway_tools.search_registry(arguments)
                 elif name == "gateway.register_discovered_server":
-                    result = await self._gateway_tools.register_discovered_server(arguments)
+                    result = await self._gateway_tools.register_discovered_server(
+                        arguments
+                    )
                 else:
                     raise ValueError(f"Unknown tool: {name}")
 
@@ -427,7 +429,9 @@ class GatewayServer:
             cache=self._descriptions_cache,
             include_code_guidance=self._guidance_config.include_mcp_instructions,
             custom_instructions=self._guidance_config.custom_instructions,
-            provisionable_categories=manifest.get_category_summary() if manifest else None,
+            provisionable_categories=manifest.get_category_summary()
+            if manifest
+            else None,
         )
 
         # If no cache and we have tools, auto-generate cache for next time

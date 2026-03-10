@@ -841,7 +841,9 @@ class TestSearchRegistryAndRegister:
                 }
             },
         ]
-        monkeypatch.setattr(gateway_tools, "_query_mcp_registry", lambda q, limit=8: fake_entries)
+        monkeypatch.setattr(
+            gateway_tools, "_query_mcp_registry", lambda q, limit=8: fake_entries
+        )
 
         result = await gateway_tools.search_registry({"query": "github"})
 
@@ -890,12 +892,15 @@ class TestSearchRegistryAndRegister:
         self, gateway_tools: GatewayTools, monkeypatch
     ) -> None:
         """Full agentic discovery flow: register → provision."""
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: Manifest(
-            version="1.0",
-            cli_alternatives={},
-            servers={},
-            discovery_queue_path=".mcp-gateway/discovery_queue.json",
-        ))
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest",
+            lambda: Manifest(
+                version="1.0",
+                cli_alternatives={},
+                servers={},
+                discovery_queue_path=".mcp-gateway/discovery_queue.json",
+            ),
+        )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
 

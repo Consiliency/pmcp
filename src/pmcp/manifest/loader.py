@@ -67,17 +67,37 @@ class Manifest:
         """Return compact category summary of provisionable servers."""
         _CATEGORIES: dict[str, list[str]] = {
             "browser automation": [
-                "playwright", "puppeteer", "browserbase", "browser-use", "chrome-devtools",
+                "playwright",
+                "puppeteer",
+                "browserbase",
+                "browser-use",
+                "chrome-devtools",
             ],
             "scraping/search": [
-                "brightdata", "brave-search", "exa", "fetch", "firecrawl", "tavily",
+                "brightdata",
+                "brave-search",
+                "exa",
+                "fetch",
+                "firecrawl",
+                "tavily",
             ],
             "APIs": [
-                "github", "gitlab", "slack", "notion", "linear", "google-maps", "coinmarketcap",
+                "github",
+                "gitlab",
+                "slack",
+                "notion",
+                "linear",
+                "google-maps",
+                "coinmarketcap",
             ],
             "databases": ["postgres", "sqlite", "supabase", "qdrant"],
             "developer tools": ["context7", "git", "sequential-thinking", "sentry"],
-            "cloud/storage": ["google-drive", "filesystem", "aws-kb-retrieval", "memory"],
+            "cloud/storage": [
+                "google-drive",
+                "filesystem",
+                "aws-kb-retrieval",
+                "memory",
+            ],
         }
 
         total = len(self.servers)
