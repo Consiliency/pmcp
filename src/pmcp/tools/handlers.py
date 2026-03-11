@@ -1608,9 +1608,11 @@ class GatewayTools:
         name_match: str | None = None
         for window_size in (3, 2, 1):
             for i in range(len(query_words) - window_size + 1):
-                window = "".join(query_words[i : i + window_size]).replace(
-                    "-", ""
-                ).replace("_", "")
+                window = (
+                    "".join(query_words[i : i + window_size])
+                    .replace("-", "")
+                    .replace("_", "")
+                )
                 if window in norm_to_server:
                     name_match = norm_to_server[window]
                     break
@@ -1618,10 +1620,8 @@ class GatewayTools:
                 break
 
         if name_match:
-            requires_api_key, env_var, env_instructions = (
-                self._get_server_env_metadata(
-                    name_match, manifest, configured_servers
-                )
+            requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
+                name_match, manifest, configured_servers
             )
             api_key_available = self._check_api_key_available(env_var)
             candidate = CapabilityCandidate(
@@ -1694,9 +1694,7 @@ class GatewayTools:
             # Build a human-readable message grouping the three tiers
             free = [c for c in all_candidates if not c.requires_api_key]
             key_ready = [
-                c
-                for c in all_candidates
-                if c.requires_api_key and c.api_key_available
+                c for c in all_candidates if c.requires_api_key and c.api_key_available
             ]
             key_missing = [
                 c
@@ -1712,16 +1710,10 @@ class GatewayTools:
                 names = ", ".join(c.name for c in free)
                 parts.append(f"No API key required: {names}.")
             if key_ready:
-                names = ", ".join(
-                    f"{c.name} ({c.env_var} ✓)" for c in key_ready
-                )
-                parts.append(
-                    f"API key already set — ready to provision: {names}."
-                )
+                names = ", ".join(f"{c.name} ({c.env_var} ✓)" for c in key_ready)
+                parts.append(f"API key already set — ready to provision: {names}.")
             if key_missing:
-                names = ", ".join(
-                    f"{c.name} (needs {c.env_var})" for c in key_missing
-                )
+                names = ", ".join(f"{c.name} (needs {c.env_var})" for c in key_missing)
                 parts.append(
                     f"Requires API key (not set): {names}. "
                     "Provide the key or call gateway.auth_connect first."

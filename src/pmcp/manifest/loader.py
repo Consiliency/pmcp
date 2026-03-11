@@ -213,9 +213,7 @@ class Manifest:
             return None
 
         servers = [
-            self.servers[n]
-            for n in _CATEGORY_MAP[best_cat]
-            if n in self.servers
+            self.servers[n] for n in _CATEGORY_MAP[best_cat] if n in self.servers
         ]
         return (best_cat, servers)
 

@@ -41,7 +41,7 @@ def create_http_app(mcp_server: Server) -> Starlette:
     session_manager = StreamableHTTPSessionManager(
         app=mcp_server,
         json_response=False,  # Use SSE stream for responses (standard)
-        stateless=False,       # Maintain session state across requests
+        stateless=False,  # Maintain session state across requests
     )
 
     async def handle_mcp(request: Request) -> Response:
