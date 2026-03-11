@@ -481,7 +481,7 @@ servers:
 
   brightdata:
     description: "Bright Data MCP - search, scraping, and browser automation"
-    keywords: [bright data, brightdata, proxy, scraping, web data, unlocker, browser automation]
+    keywords: [bright data, brightdata, proxy, scraping, web data, web search, search, unlocker, browser automation]
     install:
       mac: ["npx", "-y", "@brightdata/mcp"]
       linux: ["npx", "-y", "@brightdata/mcp"]

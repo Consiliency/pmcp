@@ -70,6 +70,7 @@ function MatchCapability(
     5. If a server requires an API key, still include it but note the requirement
     6. Return 1-3 candidates - fewer if there's a clear winner
     7. If nothing matches well, return empty candidates array
+    8. IMPORTANT: If the query explicitly names a specific server or service (e.g. "Bright Data", "GitHub", "Slack"), that named server is ALWAYS the top candidate with score >= 0.95, regardless of other keyword matches. Explicit name mentions override semantic similarity.
 
     Scoring guide:
     - 0.9-1.0: Perfect match, exactly what user needs
