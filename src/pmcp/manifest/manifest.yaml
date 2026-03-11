@@ -143,12 +143,12 @@ servers:
     description: "HTTP requests - fetch web pages, APIs with robot.txt compliance"
     keywords: [http, fetch, request, api, web, download, curl, get, post]
     install:
-      mac: ["npx", "-y", "@modelcontextprotocol/server-fetch"]
-      linux: ["npx", "-y", "@modelcontextprotocol/server-fetch"]
-      wsl: ["npx", "-y", "@modelcontextprotocol/server-fetch"]
-      windows: ["npx", "-y", "@modelcontextprotocol/server-fetch"]
-    command: "npx"
-    args: ["-y", "@modelcontextprotocol/server-fetch"]
+      mac: ["uvx", "mcp-server-fetch"]
+      linux: ["uvx", "mcp-server-fetch"]
+      wsl: ["uvx", "mcp-server-fetch"]
+      windows: ["uvx", "mcp-server-fetch"]
+    command: "uvx"
+    args: ["mcp-server-fetch"]
     requires_api_key: false
 
   sequential-thinking:

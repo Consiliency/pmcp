@@ -1,64 +1,65 @@
-"""HTTP/SSE transport for MCP Gateway.
+"""HTTP transport for MCP Gateway.
 
-This module provides HTTP transport using Starlette and SSE (Server-Sent Events)
-for the MCP Gateway, allowing multiple clients to connect to a single long-lived
-gateway process.
+Uses the MCP streamable-HTTP transport (introduced in MCP spec 2025-03-26) instead
+of the legacy SSE transport.  Clients connect with a single POST to /mcp; the
+server upgrades to an SSE stream for the response when needed.  No persistent
+GET /sse connection is required, which eliminates the race-condition where tool
+calls arrived before the legacy SSE session completed its initialize handshake.
+
+Claude Code config (.mcp.json):
+    { "mcpServers": { "pmcp": { "type": "http", "url": "http://127.0.0.1:3344/mcp" } } }
 """
 
 from __future__ import annotations
 
+import contextlib
 import logging
+from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
-from mcp.server.sse import SseServerTransport
+from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.requests import Request
 from starlette.responses import Response
-from starlette.routing import Mount, Route
 
 if TYPE_CHECKING:
     from mcp.server import Server
-    from starlette.requests import Request
 
 logger = logging.getLogger(__name__)
 
 
 def create_http_app(mcp_server: Server) -> Starlette:
-    """Create Starlette ASGI app with SSE transport for MCP server.
+    """Create Starlette ASGI app with streamable-HTTP transport for MCP server.
 
     Args:
         mcp_server: The MCP Server instance to run.
 
     Returns:
-        Starlette application with SSE endpoints configured.
+        Starlette application with /mcp endpoint.
     """
-    # Create SSE transport with /messages/ path for POST requests
-    sse_transport = SseServerTransport("/messages/")
+    session_manager = StreamableHTTPSessionManager(
+        app=mcp_server,
+        json_response=False,  # Use SSE stream for responses (standard)
+        stateless=False,       # Maintain session state across requests
+    )
 
-    async def handle_sse(request: Request) -> Response:
-        """Handle SSE connection requests.
-
-        This endpoint establishes a Server-Sent Events connection with the client.
-        The client receives events from the MCP server through this connection.
-        """
-        logger.debug("New SSE connection from %s", request.client)
-
-        async with sse_transport.connect_sse(
+    async def handle_mcp(request: Request) -> Response:
+        """Delegate all MCP traffic to the session manager."""
+        await session_manager.handle_request(
             request.scope, request.receive, request._send
-        ) as streams:
-            await mcp_server.run(
-                streams[0],
-                streams[1],
-                mcp_server.create_initialization_options(),
-            )
-
+        )
         return Response()
 
-    # Define routes:
-    # - GET /sse - SSE connection endpoint
-    # - POST /messages/ - Message endpoint (handled by SseServerTransport)
+    @contextlib.asynccontextmanager
+    async def lifespan(app: Starlette) -> AsyncIterator[None]:
+        async with session_manager.run():
+            logger.info("Streamable-HTTP session manager started")
+            yield
+        logger.info("Streamable-HTTP session manager stopped")
+
     routes = [
-        Route("/sse", endpoint=handle_sse, methods=["GET"]),
-        Mount("/messages", app=sse_transport.handle_post_message),
+        Route("/mcp", endpoint=handle_mcp, methods=["GET", "POST", "DELETE"]),
     ]
 
-    return Starlette(routes=routes)
+    return Starlette(routes=routes, lifespan=lifespan)
