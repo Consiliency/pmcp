@@ -331,16 +331,14 @@ def test_keyword_match_no_match():
 
 @pytest.mark.asyncio
 async def test_match_capability_fallback_to_keyword():
-    """Test that match_capability falls back to keyword when LLM fails."""
+    """Test that match_capability matches by keyword (LLM path removed)."""
     manifest = create_test_manifest()
     detected_clis = {"git"}
 
-    # Disable LLM matching
     result = await match_capability(
         "version control commits",
         manifest,
         detected_clis,
-        use_llm=False,
     )
 
     assert result.matched is True

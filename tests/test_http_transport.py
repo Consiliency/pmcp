@@ -170,8 +170,8 @@ class TestCliHttpArguments:
 class TestHttpTransportRoutes:
     """Test HTTP transport route creation."""
 
-    def test_creates_sse_endpoint(self) -> None:
-        """HTTP app should have /sse endpoint."""
+    def test_creates_mcp_endpoint(self) -> None:
+        """HTTP app should have /mcp endpoint (streamable-HTTP transport)."""
         from pmcp.transport.http import create_http_app
 
         # Create a mock MCP server
@@ -180,12 +180,12 @@ class TestHttpTransportRoutes:
 
         app = create_http_app(mock_server)
 
-        # Check routes
+        # Check routes — new transport uses a single /mcp endpoint
         route_paths = [route.path for route in app.routes]
-        assert "/sse" in route_paths
+        assert "/mcp" in route_paths
 
     def test_creates_messages_endpoint(self) -> None:
-        """HTTP app should have /messages endpoint for POST."""
+        """HTTP app /mcp endpoint handles both GET and POST (streamable-HTTP)."""
         from pmcp.transport.http import create_http_app
 
         mock_server = MagicMock()
@@ -193,13 +193,12 @@ class TestHttpTransportRoutes:
 
         app = create_http_app(mock_server)
 
-        # Check for messages mount
+        # The single /mcp route replaces the old /sse + /messages/ pair
         route_paths = [route.path for route in app.routes]
-        # The messages endpoint is mounted at /messages
-        assert any("/messages" in path for path in route_paths)
+        assert any("/mcp" in path for path in route_paths)
 
     def test_routes_use_correct_methods(self) -> None:
-        """SSE endpoint should accept GET, messages should accept POST."""
+        """/mcp endpoint should accept GET, POST, and DELETE."""
         from pmcp.transport.http import create_http_app
 
         mock_server = MagicMock()
@@ -207,12 +206,12 @@ class TestHttpTransportRoutes:
 
         app = create_http_app(mock_server)
 
-        # Find the /sse route and check it accepts GET
+        # Find the /mcp route and check it accepts GET and POST
         for route in app.routes:
-            if hasattr(route, "path") and route.path == "/sse":
-                # Route is a Starlette Route with methods attribute
+            if hasattr(route, "path") and route.path == "/mcp":
                 if hasattr(route, "methods"):
                     assert "GET" in route.methods
+                    assert "POST" in route.methods
 
 
 class TestHttpTransportIntegration:
