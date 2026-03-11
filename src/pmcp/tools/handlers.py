@@ -540,6 +540,8 @@ class GatewayTools:
         self._discovered_server_configs: dict[str, ServerConfig] = {}
         self._stale_check_cache: dict[str, tuple[float, str | None, str | None]] = {}
         self._stale_check_ttl_seconds = 6 * 60 * 60
+        self._stale_index_interval_seconds = 60 * 60  # Re-index every hour
+        self._stale_index_task: asyncio.Task[None] | None = None
         self._feedback_events: list[dict[str, Any]] = []
         self._provisioned_registry: dict[str, str | None] = (
             self._load_provisioned_registry()
@@ -578,6 +580,66 @@ class GatewayTools:
         """Record a successfully provisioned server in the registry."""
         self._provisioned_registry[server_name] = env_var
         self._save_provisioned_registry()
+
+    # === Stale Version Indexer ===
+
+    def start_stale_indexer(self) -> None:
+        """Start the background stale-version indexing task."""
+        if self._stale_index_task is None or self._stale_index_task.done():
+            self._stale_index_task = asyncio.create_task(self._stale_indexer_loop())
+            logger.info("Started stale-version indexer background task")
+
+    def stop_stale_indexer(self) -> None:
+        """Stop the background stale-version indexing task."""
+        if self._stale_index_task and not self._stale_index_task.done():
+            self._stale_index_task.cancel()
+            self._stale_index_task = None
+            logger.debug("Stopped stale-version indexer background task")
+
+    async def _stale_indexer_loop(self) -> None:
+        """Background loop: precompute stale version checks for all known servers."""
+        while True:
+            try:
+                await self._run_stale_index()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.debug(f"Stale indexer pass failed: {e}")
+            try:
+                await asyncio.sleep(self._stale_index_interval_seconds)
+            except asyncio.CancelledError:
+                break
+
+    async def _run_stale_index(self) -> None:
+        """One pass: fetch latest versions for all servers in the descriptions cache."""
+        if not self._descriptions_cache:
+            return
+        now = time.time()
+        servers = list(self._descriptions_cache.servers.items())
+        for server_name, server_desc in servers:
+            # Skip if cache entry is still fresh
+            cached = self._stale_check_cache.get(server_name)
+            if cached and (now - cached[0]) < self._stale_check_ttl_seconds:
+                continue
+            server_config = self._get_server_config_for_update(server_name)
+            if not server_config or not server_config.command:
+                continue
+            try:
+                latest, _ = await get_package_version(
+                    server_config.command, server_config.args, timeout=5.0
+                )
+                self._stale_check_cache[server_name] = (
+                    now,
+                    server_desc.version,
+                    latest,
+                )
+                if latest and is_version_newer(server_desc.version, latest):
+                    logger.info(
+                        f"Update available for '{server_name}': "
+                        f"{server_desc.version} -> {latest}"
+                    )
+            except Exception as e:
+                logger.debug(f"Stale check failed for '{server_name}': {e}")
 
     async def _ensure_server_for_tool(self, tool_id: str) -> bool:
         """Ensure server is connected for a tool, triggering lazy-start if needed.
@@ -753,10 +815,23 @@ class GatewayTools:
                 )
             )
 
+        # Collect stale-update notices from precomputed cache (no network call)
+        stale_updates: list[str] | None = None
+        if self._stale_check_cache:
+            stale = [
+                f"Update available for '{sn}': {current} -> {latest}. "
+                f"Call gateway.update_server(server_name='{sn}') to update."
+                for sn, (_, current, latest) in self._stale_check_cache.items()
+                if current and latest and is_version_newer(current, latest)
+            ]
+            if stale:
+                stale_updates = stale
+
         return CatalogSearchOutput(
             results=results,
             total_available=total_available,
             truncated=truncated,
+            stale_updates=stale_updates,
         )
 
     async def describe(self, input_data: dict[str, Any]) -> SchemaCard:

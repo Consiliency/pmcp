@@ -201,6 +201,7 @@ class CatalogSearchOutput(BaseModel):
     results: list[CapabilityCard]
     total_available: int
     truncated: bool
+    stale_updates: list[str] | None = None
 
 
 class DescribeInput(BaseModel):

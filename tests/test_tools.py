@@ -918,3 +918,176 @@ class TestSearchRegistryAndRegister:
         assert result.ok is False
         assert result.needs_api_key is True
         assert result.env_var == "GITHUB_TOKEN"
+
+
+class TestStaleIndexer:
+    """Tests for background stale-version indexer and catalog_search stale_updates."""
+
+    def _make_gateway_tools(self, descriptions_cache=None):
+        client_manager = MockClientManager()
+        policy_manager = PolicyManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+            descriptions_cache=descriptions_cache,
+        )
+        return gt
+
+    def _make_manifest_with_playwright(self, monkeypatch):
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "playwright": ServerConfig(
+                    name="playwright",
+                    description="Browser automation",
+                    keywords=["browser"],
+                    install={},
+                    command="npx",
+                    args=["-y", "@playwright/mcp"],
+                    requires_api_key=False,
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        return manifest
+
+    @pytest.mark.asyncio
+    async def test_run_stale_index_populates_cache(self, monkeypatch):
+        """_run_stale_index populates _stale_check_cache without a warm cache."""
+        from pmcp.types import DescriptionsCache, GeneratedServerDescriptions
+
+        cache = DescriptionsCache(
+            generated_at="2024-01-01T00:00:00",
+            gateway_version="1.0.0",
+            servers={
+                "playwright": GeneratedServerDescriptions(
+                    package="@playwright/mcp",
+                    version="0.1.0",
+                    generated_at="2024-01-01T00:00:00",
+                    capability_summary="Browser automation",
+                    tools=[],
+                )
+            },
+        )
+        gt = self._make_gateway_tools(descriptions_cache=cache)
+        self._make_manifest_with_playwright(monkeypatch)
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            return ("0.2.0", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        await gt._run_stale_index()
+
+        assert "playwright" in gt._stale_check_cache
+        _, current, latest = gt._stale_check_cache["playwright"]
+        assert current == "0.1.0"
+        assert latest == "0.2.0"
+
+    @pytest.mark.asyncio
+    async def test_run_stale_index_skips_fresh_cache(self, monkeypatch):
+        """_run_stale_index skips servers whose cache entry is still fresh."""
+        import time
+        from pmcp.types import DescriptionsCache, GeneratedServerDescriptions
+
+        cache = DescriptionsCache(
+            generated_at="2024-01-01T00:00:00",
+            gateway_version="1.0.0",
+            servers={
+                "playwright": GeneratedServerDescriptions(
+                    package="@playwright/mcp",
+                    version="0.1.0",
+                    generated_at="2024-01-01T00:00:00",
+                    capability_summary="Browser automation",
+                    tools=[],
+                )
+            },
+        )
+        gt = self._make_gateway_tools(descriptions_cache=cache)
+        self._make_manifest_with_playwright(monkeypatch)
+
+        # Pre-populate cache as fresh
+        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.1.0")
+
+        network_called = []
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            network_called.append(True)
+            return ("0.2.0", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        await gt._run_stale_index()
+
+        assert not network_called, "Network should not be called when cache is fresh"
+
+    @pytest.mark.asyncio
+    async def test_run_stale_index_no_descriptions_cache(self):
+        """_run_stale_index is a no-op when no descriptions cache is present."""
+        gt = self._make_gateway_tools(descriptions_cache=None)
+        # Should not raise
+        await gt._run_stale_index()
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_includes_stale_updates(self, monkeypatch):
+        """catalog_search returns stale_updates when indexer has detected stale servers."""
+        import time
+
+        tools = [
+            ToolInfo(
+                tool_id="playwright::snapshot",
+                server_name="playwright",
+                tool_name="snapshot",
+                description="Take snapshot",
+                short_description="Take snapshot",
+                input_schema={"type": "object", "properties": {}},
+                tags=["browser"],
+                risk_hint=RiskHint.LOW,
+            )
+        ]
+        client_manager = MockClientManager(tools)
+        client_manager.set_server_online("playwright")
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        # Pre-populate stale check cache with a stale entry
+        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.2.0")
+
+        result = await gt.catalog_search({})
+
+        assert result.stale_updates is not None
+        assert len(result.stale_updates) == 1
+        assert "playwright" in result.stale_updates[0]
+        assert "0.1.0" in result.stale_updates[0]
+        assert "0.2.0" in result.stale_updates[0]
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_no_stale_updates_when_up_to_date(self):
+        """catalog_search returns None for stale_updates when all servers are up to date."""
+        import time
+
+        gt = self._make_gateway_tools()
+        gt._stale_check_cache["playwright"] = (time.time(), "0.2.0", "0.2.0")
+
+        result = await gt.catalog_search({})
+
+        assert result.stale_updates is None
+
+    @pytest.mark.asyncio
+    async def test_start_stop_stale_indexer(self):
+        """start_stale_indexer creates a task; stop_stale_indexer cancels it."""
+        gt = self._make_gateway_tools()
+
+        gt.start_stale_indexer()
+        assert gt._stale_index_task is not None
+        assert not gt._stale_index_task.done()
+        gt.stop_stale_indexer()
+        assert gt._stale_index_task is None
