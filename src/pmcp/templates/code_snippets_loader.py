@@ -93,79 +93,8 @@ class CodeSnippetsLoader:
                 snippet = "\n".join(lines)
             return snippet
 
-        # No static template - try LLM generation if enabled
-        if use_llm_fallback and tool_info:
-            try:
-                return self._generate_snippet_with_llm(tool_info, max_lines)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to generate code snippet for {tool_id} via LLM: {e}"
-                )
-                return None
-
-        # No template and LLM disabled
+        # No static template available
         return None
-
-    def _generate_snippet_with_llm(
-        self, tool_info: ToolInfo, max_lines: int
-    ) -> str | None:
-        """Generate code snippet using BAML/LLM.
-
-        Args:
-            tool_info: Tool information for generation
-            max_lines: Maximum number of lines
-
-        Returns:
-            Generated snippet or None if generation fails
-        """
-        try:
-            # Import BAML client (only when needed to avoid hard dependency)
-            from baml_client.sync_client import b  # type: ignore
-
-            # Prepare tool data for BAML
-            tool_args = []
-            if tool_info.input_schema:
-                properties = tool_info.input_schema.get("properties", {})
-                required = tool_info.input_schema.get("required", [])
-
-                for name, prop in properties.items():
-                    tool_args.append(
-                        {
-                            "name": name,
-                            "type": prop.get("type", "unknown"),
-                            "required": name in required,
-                            "description": prop.get("description", ""),
-                        }
-                    )
-
-            tool_data = {
-                "tool_id": tool_info.tool_id,
-                "tool_name": tool_info.tool_name,
-                "description": tool_info.description,
-                "args": tool_args,
-            }
-
-            # Call BAML function to generate snippet
-            result = b.GenerateCodeSnippet(tool=tool_data)
-
-            if result and result.snippet:
-                # Trim to max lines
-                lines = result.snippet.strip().split("\n")
-                if len(lines) > max_lines:
-                    lines = lines[:max_lines]
-                return "\n".join(lines)
-
-            return None
-
-        except ImportError:
-            # BAML client not generated yet
-            logger.debug(
-                "BAML client not available. Run 'baml generate' to enable LLM-based snippet generation."
-            )
-            return None
-        except Exception as e:
-            logger.warning(f"LLM snippet generation failed: {e}")
-            return None
 
 
 # Global instance (lazy-loaded)

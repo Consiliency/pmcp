@@ -42,6 +42,94 @@ class ServerConfig:
     auto_start: bool = False
 
 
+# Category taxonomy used by Manifest.get_category_summary() and get_servers_in_category()
+_CATEGORY_MAP: dict[str, list[str]] = {
+    "browser automation": [
+        "playwright",
+        "puppeteer",
+        "browserbase",
+        "browser-use",
+        "chrome-devtools",
+        "hyperbrowser",
+    ],
+    "scraping/search": [
+        "brightdata",
+        "brave-search",
+        "exa",
+        "fetch",
+        "firecrawl",
+        "tavily",
+        "perplexity",
+        "apify",
+        "jina",
+    ],
+    "APIs": [
+        "github",
+        "gitlab",
+        "slack",
+        "notion",
+        "linear",
+        "discord",
+        "google-maps",
+        "mapbox",
+        "coinmarketcap",
+    ],
+    "databases": [
+        "postgres",
+        "sqlite",
+        "supabase",
+        "qdrant",
+        "mysql",
+        "mongodb",
+        "clickhouse",
+        "neo4j",
+        "meilisearch",
+    ],
+    "developer tools": [
+        "context7",
+        "git",
+        "sequential-thinking",
+        "sentry",
+        "postman",
+        "eslint",
+        "circleci",
+        "argocd",
+        "kubernetes",
+    ],
+    "cloud/storage": [
+        "google-drive",
+        "filesystem",
+        "aws-kb-retrieval",
+        "memory",
+        "cloudflare",
+        "heroku",
+        "railway",
+        "neon",
+        "azure",
+    ],
+    "CRM & sales": ["hubspot", "salesforce"],
+    "payments": ["stripe", "xero", "paypal"],
+    "project management": [
+        "jira",
+        "confluence",
+        "asana",
+        "clickup",
+        "todoist",
+        "plane",
+    ],
+    "design & media": ["figma", "miro", "mux", "elevenlabs"],
+    "monitoring": ["datadog", "grafana", "dynatrace", "langfuse"],
+    "CMS & content": [
+        "airtable",
+        "contentful",
+        "webflow",
+        "wordpress",
+        "obsidian",
+    ],
+    "communication": ["twilio", "mailgun", "line"],
+}
+
+
 @dataclass
 class Manifest:
     """Parsed manifest with CLI alternatives and MCP servers."""
@@ -65,98 +153,12 @@ class Manifest:
 
     def get_category_summary(self) -> str:
         """Return compact category summary of provisionable servers."""
-        _CATEGORIES: dict[str, list[str]] = {
-            "browser automation": [
-                "playwright",
-                "puppeteer",
-                "browserbase",
-                "browser-use",
-                "chrome-devtools",
-                "hyperbrowser",
-            ],
-            "scraping/search": [
-                "brightdata",
-                "brave-search",
-                "exa",
-                "fetch",
-                "firecrawl",
-                "tavily",
-                "perplexity",
-                "apify",
-                "jina",
-            ],
-            "APIs": [
-                "github",
-                "gitlab",
-                "slack",
-                "notion",
-                "linear",
-                "discord",
-                "google-maps",
-                "mapbox",
-                "coinmarketcap",
-            ],
-            "databases": [
-                "postgres",
-                "sqlite",
-                "supabase",
-                "qdrant",
-                "mysql",
-                "mongodb",
-                "clickhouse",
-                "neo4j",
-                "meilisearch",
-            ],
-            "developer tools": [
-                "context7",
-                "git",
-                "sequential-thinking",
-                "sentry",
-                "postman",
-                "eslint",
-                "circleci",
-                "argocd",
-                "kubernetes",
-            ],
-            "cloud/storage": [
-                "google-drive",
-                "filesystem",
-                "aws-kb-retrieval",
-                "memory",
-                "cloudflare",
-                "heroku",
-                "railway",
-                "neon",
-                "azure",
-            ],
-            "CRM & sales": ["hubspot", "salesforce"],
-            "payments": ["stripe", "xero", "paypal"],
-            "project management": [
-                "jira",
-                "confluence",
-                "asana",
-                "clickup",
-                "todoist",
-                "plane",
-            ],
-            "design & media": ["figma", "miro", "mux", "elevenlabs"],
-            "monitoring": ["datadog", "grafana", "dynatrace", "langfuse"],
-            "CMS & content": [
-                "airtable",
-                "contentful",
-                "webflow",
-                "wordpress",
-                "obsidian",
-            ],
-            "communication": ["twilio", "mailgun", "line"],
-        }
-
         total = len(self.servers)
         if not total:
             return ""
 
         parts = []
-        for cat_name, server_names in _CATEGORIES.items():
+        for cat_name, server_names in _CATEGORY_MAP.items():
             matched = [n for n in server_names if n in self.servers]
             if not matched:
                 continue
@@ -169,6 +171,53 @@ class Manifest:
         if not parts:
             return ""
         return f"Provisionable ({total} servers): {'; '.join(parts)}"
+
+    def get_servers_in_category(
+        self, query: str
+    ) -> tuple[str, list[ServerConfig]] | None:
+        """Find the best-matching category for a query and return its servers.
+
+        Matches against category names and each server's keywords within each
+        category. Returns (category_name, [ServerConfig, ...]) for the first
+        category that has any keyword overlap with the query, or None if no
+        category matches.
+        """
+        query_lower = query.lower()
+        query_words = set(query_lower.replace("-", " ").replace("_", " ").split())
+
+        best_cat: str | None = None
+        best_score = 0
+
+        for cat_name, server_names in _CATEGORY_MAP.items():
+            score = 0
+
+            # Score: category name words that appear in query
+            cat_words = set(cat_name.lower().replace("/", " ").split())
+            score += len(cat_words & query_words) * 2
+
+            # Score: keyword hits across servers in this category
+            for sname in server_names:
+                server = self.servers.get(sname)
+                if not server:
+                    continue
+                for kw in server.keywords:
+                    kw_norm = kw.lower().replace("-", " ").replace("_", " ")
+                    if set(kw_norm.split()).issubset(query_words):
+                        score += 1
+
+            if score > best_score:
+                best_score = score
+                best_cat = cat_name
+
+        if not best_cat or best_score == 0:
+            return None
+
+        servers = [
+            self.servers[n]
+            for n in _CATEGORY_MAP[best_cat]
+            if n in self.servers
+        ]
+        return (best_cat, servers)
 
     def search_by_keyword(
         self, keyword: str

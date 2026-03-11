@@ -331,55 +331,57 @@ class TestHealth:
 
 class TestCapabilityAndProvision:
     @pytest.mark.asyncio
-    async def test_request_capability_includes_configured_server(self, monkeypatch):
+    async def test_request_capability_name_match_returns_single_candidate(
+        self, monkeypatch
+    ):
+        """Tier-1: explicit name in query → single candidate, status='candidates'."""
         client_manager = MockClientManager(create_mock_tools())
-        client_manager.add_lazy_server("custom-browser")
         policy_manager = PolicyManager()
         gateway_tools = GatewayTools(
             client_manager=client_manager,  # type: ignore
             policy_manager=policy_manager,
         )
 
-        configured = [
-            ResolvedServerConfig(
-                name="custom-browser",
-                source="project",
-                config=LocalMcpServerConfig(command="npx", args=["custom-browser-mcp"]),
-            )
-        ]
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+        result = await gateway_tools.request_capability(
+            {"query": "use playwright for browser automation", "available_clis": []}
+        )
+
+        assert result.status == "candidates"
+        assert result.candidates is not None
+        assert len(result.candidates) == 1
+        assert result.candidates[0].name == "playwright"
+        assert result.candidates[0].candidate_type == "server"
+
+    @pytest.mark.asyncio
+    async def test_request_capability_category_match_returns_all_servers(
+        self, monkeypatch
+    ):
+        """Tier-2: category query → pick_from_category with all category servers."""
+        client_manager = MockClientManager(create_mock_tools())
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
 
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
         )
-        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
-
-        async def fake_match_capability(**kwargs):
-            return types.SimpleNamespace(
-                matched=True,
-                entry_name="custom-browser",
-                entry_type="server",
-                confidence=0.82,
-                reasoning="Keyword match for server: custom-browser",
-            )
-
-        monkeypatch.setattr(
-            "pmcp.tools.handlers.match_capability",
-            fake_match_capability,
-        )
-
-        # Force BAML import failure so fallback matcher is used deterministically.
-        monkeypatch.setitem(
-            sys.modules, "pmcp.baml_client", types.ModuleType("pmcp.baml_client")
-        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
         result = await gateway_tools.request_capability(
             {"query": "browser automation", "available_clis": []}
         )
 
-        assert result.status == "candidates"
+        assert result.status == "pick_from_category"
+        assert result.category_name == "browser automation"
         assert result.candidates is not None
-        assert result.candidates[0].name == "custom-browser"
-        assert result.candidates[0].candidate_type == "server"
+        assert len(result.candidates) >= 1
 
     @pytest.mark.asyncio
     async def test_provision_starts_configured_lazy_server(self, monkeypatch):
@@ -419,6 +421,7 @@ class TestCapabilityAndProvision:
 
     @pytest.mark.asyncio
     async def test_request_then_provision_for_configured_server(self, monkeypatch):
+        """Tier-1 name match for a .mcp.json-configured server → provision succeeds."""
         tool = ToolInfo(
             tool_id="custom-browser::snapshot",
             server_name="custom-browser",
@@ -450,24 +453,9 @@ class TestCapabilityAndProvision:
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
 
-        async def fake_match_capability(**kwargs):
-            return types.SimpleNamespace(
-                matched=True,
-                entry_name="custom-browser",
-                entry_type="server",
-                confidence=0.9,
-                reasoning="Keyword match for server: custom-browser",
-            )
-
-        monkeypatch.setattr(
-            "pmcp.tools.handlers.match_capability", fake_match_capability
-        )
-        monkeypatch.setitem(
-            sys.modules, "pmcp.baml_client", types.ModuleType("pmcp.baml_client")
-        )
-
+        # Tier-1 sliding-window name match: "custom-browser" appears verbatim in query
         capability = await gateway_tools.request_capability(
-            {"query": "browser automation", "available_clis": []}
+            {"query": "use custom-browser for automation", "available_clis": []}
         )
         assert capability.status == "candidates"
         assert capability.candidates is not None
@@ -482,6 +470,7 @@ class TestCapabilityAndProvision:
     async def test_request_capability_returns_search_guidance_when_not_found(
         self, monkeypatch
     ):
+        """Tier-3: unknown query → not_available with search_registry guidance."""
         client_manager = MockClientManager(create_mock_tools())
         policy_manager = PolicyManager()
         gateway_tools = GatewayTools(
@@ -493,22 +482,6 @@ class TestCapabilityAndProvision:
             "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
-
-        async def fake_match_capability(**kwargs):
-            return types.SimpleNamespace(
-                matched=False,
-                entry_name="",
-                entry_type="",
-                confidence=0.0,
-                reasoning="No matching capability found in manifest",
-            )
-
-        monkeypatch.setattr(
-            "pmcp.tools.handlers.match_capability", fake_match_capability
-        )
-        monkeypatch.setitem(
-            sys.modules, "pmcp.baml_client", types.ModuleType("pmcp.baml_client")
-        )
 
         result = await gateway_tools.request_capability({"query": "openbrowser mcp"})
 

@@ -34,7 +34,6 @@ from pmcp.manifest.installer import (
     InstallError,
 )
 from pmcp.manifest.loader import load_manifest
-from pmcp.manifest.matcher import match_capability
 from pmcp.manifest.version_checker import (
     detect_package_type,
     get_package_version,
@@ -1595,202 +1594,164 @@ class GatewayTools:
             if s.status.value == "online"
         ]
 
-        # Try BAML matching
-        try:
-            from pmcp.baml_client import b
-            from pmcp.baml_client.types import (
-                ManifestCLI,
-                ManifestServer,
-                ManifestSummary,
+        # --- Tier 1: explicit server name match ---
+        # Match by normalizing server names and query word groups (strips hyphens,
+        # underscores, spaces) so "bright data" → "brightdata", "brave-search" →
+        # "bravesearch", etc. Does NOT use keywords to avoid matching generic
+        # capability words like "browser" or "search".
+        query_lower = parsed.query.lower()
+        query_words = query_lower.split()
+        norm_to_server = {
+            n.lower().replace("-", "").replace("_", "").replace(" ", ""): n
+            for n in merged_manifest.servers
+        }
+        name_match: str | None = None
+        for window_size in (3, 2, 1):
+            for i in range(len(query_words) - window_size + 1):
+                window = "".join(query_words[i : i + window_size]).replace(
+                    "-", ""
+                ).replace("_", "")
+                if window in norm_to_server:
+                    name_match = norm_to_server[window]
+                    break
+            if name_match:
+                break
+
+        if name_match:
+            requires_api_key, env_var, env_instructions = (
+                self._get_server_env_metadata(
+                    name_match, manifest, configured_servers
+                )
+            )
+            api_key_available = self._check_api_key_available(env_var)
+            candidate = CapabilityCandidate(
+                name=name_match,
+                candidate_type="server",
+                relevance_score=1.0,
+                reasoning=f"Explicit name match for '{name_match}' in query.",
+                requires_api_key=requires_api_key,
+                api_key_available=api_key_available,
+                env_var=env_var,
+                env_instructions=env_instructions,
+                is_running=name_match in running_servers,
+            )
+            msg = f"Matched '{name_match}' by name."
+            if requires_api_key:
+                if api_key_available:
+                    msg += f" API key ({env_var}) is already set — ready to provision."
+                else:
+                    msg += (
+                        f" Requires API key ({env_var}). "
+                        f"Set it or call gateway.auth_connect, then gateway.provision."
+                    )
+            else:
+                msg += " No API key required. Call gateway.provision to install."
+            return CapabilityResolution(
+                status="candidates",
+                message=msg,
+                candidates=[candidate],
+                recommendation=f"Call gateway.provision(server_name='{name_match}')",
             )
 
-            # Build manifest summary for BAML
-            servers = [
-                ManifestServer(
-                    name=name,
-                    description=server.description,
-                    keywords=server.keywords,
-                    requires_api_key=server.requires_api_key,
-                    env_var=server.env_var,
-                )
-                for name, server in merged_manifest.servers.items()
-            ]
-            clis = [
-                ManifestCLI(
-                    name=name,
-                    description=cli.description,
-                    keywords=cli.keywords,
-                )
-                for name, cli in manifest.cli_alternatives.items()
-            ]
-            manifest_summary = ManifestSummary(servers=servers, clis=clis)
+        # --- Tier 2: category keyword match ---
+        category_result = manifest.get_servers_in_category(parsed.query)
+        if category_result:
+            cat_name, cat_servers = category_result
 
-            # Build ClientRegistry to route through caller's existing API key
-            # (ANTHROPIC_API_KEY preferred; GROQ_API_KEY as fallback via default BAML config)
-            baml_client = b
-            anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
-            if anthropic_key:
-                try:
-                    from baml_py import ClientRegistry
-
-                    cr = ClientRegistry()
-                    cr.add_llm_client(
-                        "CallerAnthropic",
-                        "anthropic",
-                        {
-                            "api_key": anthropic_key,
-                            "model": "claude-haiku-4-5-20251001",
-                        },
+            # Build enriched candidates for every server in the category
+            all_candidates: list[CapabilityCandidate] = []
+            for scfg in cat_servers:
+                requires_api_key, env_var, env_instructions = (
+                    self._get_server_env_metadata(
+                        scfg.name, manifest, configured_servers
                     )
-                    cr.set_primary("CallerAnthropic")
-                    baml_client = b.with_options(client_registry=cr)
-                except Exception:
-                    pass  # Fall back to default BAML client
-
-            # Call BAML
-            import asyncio
-
-            async with asyncio.timeout(15):
-                result = await baml_client.MatchCapability(
-                    query=parsed.query,
-                    manifest=manifest_summary,
-                    available_clis=detected_clis,
-                    running_servers=running_servers,
                 )
-
-            # Convert BAML result to our types with enriched info
-            candidates: list[CapabilityCandidate] = []
-            for c in result.candidates:
-                # Enrich with runtime info
-                is_installed = (
-                    c.name in detected_clis if c.candidate_type == "cli" else False
-                )
-                is_running = (
-                    c.name in running_servers if c.candidate_type == "server" else False
-                )
-
-                # Get server info for API key details
-                env_var = None
-                env_instructions = None
-                api_key_available = False
-                requires_api_key = c.requires_api_key
-
-                if c.candidate_type == "server":
-                    requires_api_key, env_var, env_instructions = (
-                        self._get_server_env_metadata(
-                            c.name,
-                            manifest,
-                            configured_servers,
-                        )
-                    )
-                    api_key_available = self._check_api_key_available(env_var)
-
-                candidates.append(
+                api_key_available = self._check_api_key_available(env_var)
+                all_candidates.append(
                     CapabilityCandidate(
-                        name=c.name,
-                        candidate_type=cast(Literal["cli", "server"], c.candidate_type),
-                        relevance_score=c.relevance_score,
-                        reasoning=c.reasoning,
+                        name=scfg.name,
+                        candidate_type="server",
+                        relevance_score=1.0,
+                        reasoning=scfg.description,
                         requires_api_key=requires_api_key,
                         api_key_available=api_key_available,
                         env_var=env_var,
                         env_instructions=env_instructions,
-                        is_installed=is_installed,
-                        is_running=is_running,
+                        is_running=scfg.name in running_servers,
                     )
                 )
 
-            if not candidates:
-                logger.info(f"No matches for capability request: {parsed.query}")
-                self._record_feedback_event(
-                    "capability_unmatched", {"query": parsed.query, "path": "baml"}
+            # Sort: no-key-required first, then key-available, then key-missing
+            def _sort_key(c: CapabilityCandidate) -> int:
+                if not c.requires_api_key:
+                    return 0
+                if c.api_key_available:
+                    return 1
+                return 2
+
+            all_candidates.sort(key=_sort_key)
+
+            # Build a human-readable message grouping the three tiers
+            free = [c for c in all_candidates if not c.requires_api_key]
+            key_ready = [
+                c
+                for c in all_candidates
+                if c.requires_api_key and c.api_key_available
+            ]
+            key_missing = [
+                c
+                for c in all_candidates
+                if c.requires_api_key and not c.api_key_available
+            ]
+
+            parts: list[str] = [
+                f"{len(all_candidates)} options in '{cat_name}' category. "
+                "Review and call gateway.provision(server_name='...') with your choice."
+            ]
+            if free:
+                names = ", ".join(c.name for c in free)
+                parts.append(f"No API key required: {names}.")
+            if key_ready:
+                names = ", ".join(
+                    f"{c.name} ({c.env_var} ✓)" for c in key_ready
                 )
-                return CapabilityResolution(
-                    status="not_available",
-                    message=f"No matching capability found for: {parsed.query}",
-                    logged_for_discovery=True,
-                    search_guidance=(
-                        f'Call gateway.search_registry(query="{parsed.query}") '
-                        "to search the public MCP Registry for external servers. "
-                        "Then call gateway.register_discovered_server and gateway.provision to install."
-                    ),
+                parts.append(
+                    f"API key already set — ready to provision: {names}."
+                )
+            if key_missing:
+                names = ", ".join(
+                    f"{c.name} (needs {c.env_var})" for c in key_missing
+                )
+                parts.append(
+                    f"Requires API key (not set): {names}. "
+                    "Provide the key or call gateway.auth_connect first."
                 )
 
-            # Return candidates for Claude to choose
             return CapabilityResolution(
-                status="candidates",
-                message=f"Found {len(candidates)} matching options. Review and call gateway.provision to install your choice.",
-                candidates=candidates,
-                recommendation=result.recommendation,
-            )
-
-        except ImportError:
-            logger.warning("BAML not available, falling back to keyword matching")
-        except Exception as e:
-            logger.warning(
-                f"BAML matching failed: {e}, falling back to keyword matching"
-            )
-
-        # Fallback: use simple keyword matching
-        match_result = await match_capability(
-            query=parsed.query,
-            manifest=merged_manifest,
-            detected_clis=set(detected_clis),
-            use_llm=False,  # Don't use LLM in fallback
-        )
-
-        if not match_result.matched:
-            logger.info(f"Unmatched capability request: {parsed.query}")
-            self._record_feedback_event(
-                "capability_unmatched", {"query": parsed.query, "path": "fallback"}
-            )
-            return CapabilityResolution(
-                status="not_available",
-                message=f"No matching capability found for: {parsed.query}",
-                logged_for_discovery=True,
-                search_guidance=(
-                    f'Call gateway.search_registry(query="{parsed.query}") '
-                    "to search the public MCP Registry for external servers. "
-                    "Then call gateway.register_discovered_server and gateway.provision to install."
+                status="pick_from_category",
+                message=" ".join(parts),
+                candidates=all_candidates,
+                category_name=cat_name,
+                recommendation=(
+                    "Choose based on your needs and API key availability. "
+                    "Call gateway.provision(server_name='<chosen>') to install."
                 ),
             )
 
-        # Build single candidate from keyword match
-        if match_result.entry_type == "cli":
-            candidates = [
-                CapabilityCandidate(
-                    name=match_result.entry_name,
-                    candidate_type="cli",
-                    relevance_score=match_result.confidence,
-                    reasoning=match_result.reasoning,
-                    is_installed=match_result.entry_name in detected_clis,
-                )
-            ]
-        else:
-            requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
-                match_result.entry_name,
-                manifest,
-                configured_servers,
-            )
-            candidates = [
-                CapabilityCandidate(
-                    name=match_result.entry_name,
-                    candidate_type="server",
-                    relevance_score=match_result.confidence,
-                    reasoning=match_result.reasoning,
-                    requires_api_key=requires_api_key,
-                    api_key_available=self._check_api_key_available(env_var),
-                    env_var=env_var,
-                    env_instructions=env_instructions,
-                    is_running=match_result.entry_name in running_servers,
-                )
-            ]
-
+        # --- Tier 3: no match ---
+        logger.info(f"Unmatched capability request: {parsed.query}")
+        self._record_feedback_event(
+            "capability_unmatched", {"query": parsed.query, "path": "no_match"}
+        )
         return CapabilityResolution(
-            status="candidates",
-            message=f"Found {len(candidates)} matching option. Review and call gateway.provision to install.",
-            candidates=candidates,
-            recommendation=f"Use {match_result.entry_name} ({match_result.entry_type})",
+            status="not_available",
+            message=f"No matching capability found for: {parsed.query}",
+            logged_for_discovery=True,
+            search_guidance=(
+                f'Call gateway.search_registry(query="{parsed.query}") '
+                "to search the public MCP Registry for external servers. "
+                "Then call gateway.register_discovered_server and gateway.provision to install."
+            ),
         )
 
     async def provision(self, input_data: dict[str, Any]) -> ProvisionOutput:

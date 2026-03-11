@@ -3,13 +3,12 @@
 This module handles:
 1. Connecting to MCP servers temporarily
 2. Fetching tool definitions
-3. Generating capability summaries via BAML
+3. Generating capability summaries from keyword tags
 4. Caching descriptions to .mcp-gateway/descriptions.yaml
 """
 
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -293,39 +292,10 @@ async def refresh_server(
 async def _generate_capability_summary(
     server_name: str, tools: list[PrebuiltToolInfo]
 ) -> str:
-    """Generate capability summary for a server using BAML or fallback."""
+    """Generate capability summary for a server using keyword tags."""
     if not tools:
         return f"• {server_name} (0 tools): No tools available"
 
-    # Try BAML summarization
-    try:
-        from pmcp.baml_client import b
-        from pmcp.baml_client.types import ToolDescription
-
-        tool_descriptions = [
-            ToolDescription(
-                server_name=server_name,
-                tool_name=t.name,
-                description=t.short_description,
-            )
-            for t in tools
-        ]
-
-        async with asyncio.timeout(30):
-            result = await b.SummarizeCapabilities(tool_descriptions)
-
-        # Format as compact summary
-        lines = []
-        for cat in result.categories:
-            lines.append(f"• {cat.name} ({len(tools)} tools): {cat.summary}")
-        return "\n".join(lines)
-
-    except ImportError:
-        logger.debug("BAML not available, using template fallback")
-    except Exception as e:
-        logger.warning(f"BAML summarization failed: {e}")
-
-    # Fallback: simple template
     capabilities = set()
     for tool in tools:
         for tag in tool.tags:

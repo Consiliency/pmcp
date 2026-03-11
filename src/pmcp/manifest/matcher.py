@@ -1,4 +1,4 @@
-"""Capability matcher - match requests to manifest entries using BAML/Groq."""
+"""Capability matcher - keyword-based matching of requests to manifest entries."""
 
 from __future__ import annotations
 
@@ -56,130 +56,19 @@ async def match_capability(
     query: str,
     manifest: Manifest,
     detected_clis: set[str] | None = None,
-    use_llm: bool = True,
 ) -> MatchResult:
-    """Match a capability request to a CLI or MCP server.
+    """Match a capability request to a CLI or MCP server using keyword matching.
 
     Args:
         query: Natural language capability request
         manifest: Loaded manifest with CLIs and servers
         detected_clis: Set of CLI names detected in the environment
-        use_llm: Whether to use LLM for semantic matching (falls back to keyword)
 
     Returns:
         MatchResult with matched entry or no match
     """
     detected_clis = detected_clis or set()
-
-    # Try LLM-powered matching first
-    if use_llm:
-        try:
-            result = await _llm_match(query, manifest, detected_clis)
-            if result.matched:
-                return result
-        except Exception as e:
-            logger.warning(f"LLM matching failed, falling back to keyword: {e}")
-
-    # Fall back to keyword matching
     return _keyword_match(query, manifest, detected_clis)
-
-
-async def _llm_match(
-    query: str,
-    manifest: Manifest,
-    detected_clis: set[str],
-    running_servers: list[str] | None = None,
-) -> MatchResult:
-    """Use BAML/Groq for semantic matching."""
-    from pmcp.baml_client import b
-    from pmcp.baml_client.types import (
-        ManifestCLI,
-        ManifestServer,
-        ManifestSummary,
-    )
-
-    running_servers = running_servers or []
-
-    # Build ManifestSummary for the LLM
-    servers: list[ManifestServer] = []
-    clis: list[ManifestCLI] = []
-
-    # Add all servers
-    for name, server in manifest.servers.items():
-        servers.append(
-            ManifestServer(
-                name=name,
-                description=server.description,
-                keywords=server.keywords,
-                requires_api_key=server.requires_api_key,
-                env_var=server.env_var,
-            )
-        )
-
-    # Add all CLIs
-    for name, cli in manifest.cli_alternatives.items():
-        clis.append(
-            ManifestCLI(
-                name=name,
-                description=cli.description,
-                keywords=cli.keywords,
-            )
-        )
-
-    manifest_summary = ManifestSummary(servers=servers, clis=clis)
-
-    # Call BAML function with new API
-    result = await b.MatchCapability(
-        query=query,
-        manifest=manifest_summary,
-        available_clis=list(detected_clis),
-        running_servers=running_servers,
-    )
-
-    # Check if we have any viable candidates
-    if not result.candidates:
-        return MatchResult(
-            matched=False,
-            entry_name="",
-            entry_type="",
-            confidence=0.0,
-            reasoning=result.recommendation or "No matching capability found",
-        )
-
-    # Get the best candidate (first one with high enough relevance)
-    best_candidate = result.candidates[0]
-
-    # Threshold for accepting a match
-    if best_candidate.relevance_score < 0.3:
-        return MatchResult(
-            matched=False,
-            entry_name="",
-            entry_type="",
-            confidence=best_candidate.relevance_score,
-            reasoning=f"Best match '{best_candidate.name}' has low relevance: {best_candidate.reasoning}",
-        )
-
-    # Resolve the matched entry
-    cli_config = None
-    server_config = None
-    entry_type: Literal["cli", "server", ""] = ""
-
-    if best_candidate.candidate_type == "cli":
-        cli_config = manifest.get_cli(best_candidate.name)
-        entry_type = "cli"
-    elif best_candidate.candidate_type == "server":
-        server_config = manifest.get_server(best_candidate.name)
-        entry_type = "server"
-
-    return MatchResult(
-        matched=True,
-        entry_name=best_candidate.name,
-        entry_type=entry_type,
-        confidence=best_candidate.relevance_score,
-        reasoning=best_candidate.reasoning,
-        cli_config=cli_config,
-        server_config=server_config,
-    )
 
 
 def _keyword_match(

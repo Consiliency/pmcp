@@ -468,13 +468,15 @@ class CapabilityResolution(BaseModel):
         "provisioned",  # MCP server was installed and started
         "needs_api_key",  # MCP server exists but needs API key
         "not_available",  # No matching capability found
-        "candidates",  # New: returning candidates for Claude to choose
+        "candidates",  # Single explicit match - call gateway.provision
+        "pick_from_category",  # Multiple options in a category - caller should choose
     ]
     message: str
 
-    # For candidates status (new two-phase flow)
+    # For candidates / pick_from_category status
     candidates: list[CapabilityCandidate] | None = None
     recommendation: str | None = None
+    category_name: str | None = None  # Set when status="pick_from_category"
 
     # For use_cli status
     cli: CLIResolution | None = None
