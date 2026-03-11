@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from typing import Any, cast
 import types
-import sys
 from pathlib import Path
 
 import pytest
