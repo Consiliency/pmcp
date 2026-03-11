@@ -541,5 +541,758 @@ servers:
     env_var: "AWS_ACCESS_KEY_ID"
     env_instructions: "Set AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and AWS_REGION"
 
+  # === CRM & Sales ===
+
+  hubspot:
+    description: "HubSpot CRM - contacts, companies, deals, tickets, marketing workflows"
+    keywords: [hubspot, crm, contacts, deals, marketing, sales, customers, pipeline]
+    install:
+      mac: ["npx", "-y", "@hubspot/mcp-server"]
+      linux: ["npx", "-y", "@hubspot/mcp-server"]
+      wsl: ["npx", "-y", "@hubspot/mcp-server"]
+      windows: ["npx", "-y", "@hubspot/mcp-server"]
+    command: "npx"
+    args: ["-y", "@hubspot/mcp-server"]
+    requires_api_key: true
+    env_var: "HUBSPOT_ACCESS_TOKEN"
+    env_instructions: "Create private app token at https://app.hubspot.com/private-apps"
+
+  salesforce:
+    description: "Salesforce CRM - SOQL queries, objects, records, flows, org metadata"
+    keywords: [salesforce, crm, soql, objects, records, apex, enterprise, sfdc]
+    install:
+      mac: ["npx", "-y", "@salesforce/mcp"]
+      linux: ["npx", "-y", "@salesforce/mcp"]
+      wsl: ["npx", "-y", "@salesforce/mcp"]
+      windows: ["npx", "-y", "@salesforce/mcp"]
+    command: "npx"
+    args: ["-y", "@salesforce/mcp"]
+    requires_api_key: true
+    env_var: "SF_ORG_USERNAME"
+    env_instructions: "Set SF_ORG_USERNAME; authenticate org first via Salesforce CLI (sf auth)"
+
+  # === Cloud Platforms ===
+
+  cloudflare:
+    description: "Cloudflare - Workers, KV, R2, D1 databases, Pages, DNS management"
+    keywords: [cloudflare, workers, edge, serverless, cdn, kv, r2, d1, dns, deployment]
+    install:
+      mac: ["npx", "-y", "@cloudflare/mcp-server-cloudflare"]
+      linux: ["npx", "-y", "@cloudflare/mcp-server-cloudflare"]
+      wsl: ["npx", "-y", "@cloudflare/mcp-server-cloudflare"]
+      windows: ["npx", "-y", "@cloudflare/mcp-server-cloudflare"]
+    command: "npx"
+    args: ["-y", "@cloudflare/mcp-server-cloudflare"]
+    requires_api_key: true
+    env_var: "CLOUDFLARE_API_TOKEN"
+    env_instructions: "Set CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID from https://dash.cloudflare.com/profile/api-tokens"
+
+  heroku:
+    description: "Heroku Platform - apps, dynos, add-ons, pipelines, deployments"
+    keywords: [heroku, deployment, apps, dynos, platform, paas, cloud, hosting, addons]
+    install:
+      mac: ["npx", "-y", "@heroku/mcp-server"]
+      linux: ["npx", "-y", "@heroku/mcp-server"]
+      wsl: ["npx", "-y", "@heroku/mcp-server"]
+      windows: ["npx", "-y", "@heroku/mcp-server"]
+    command: "npx"
+    args: ["-y", "@heroku/mcp-server"]
+    requires_api_key: true
+    env_var: "HEROKU_API_KEY"
+    env_instructions: "Get API key at https://dashboard.heroku.com/account"
+
+  railway:
+    description: "Railway - deploy services, manage projects, environments, databases, logs"
+    keywords: [railway, deployment, hosting, services, databases, paas, cloud, devops]
+    install:
+      mac: ["npx", "-y", "@railway/mcp-server"]
+      linux: ["npx", "-y", "@railway/mcp-server"]
+      wsl: ["npx", "-y", "@railway/mcp-server"]
+      windows: ["npx", "-y", "@railway/mcp-server"]
+    command: "npx"
+    args: ["-y", "@railway/mcp-server"]
+    requires_api_key: true
+    env_var: "RAILWAY_API_TOKEN"
+    env_instructions: "Create token at https://railway.app/account/tokens"
+
+  neon:
+    description: "Neon serverless Postgres - create and manage projects, branches, databases, SQL"
+    keywords: [neon, postgres, serverless, database, sql, branching, cloud, postgresql]
+    install:
+      mac: ["npx", "-y", "neonctl@latest", "mcp"]
+      linux: ["npx", "-y", "neonctl@latest", "mcp"]
+      wsl: ["npx", "-y", "neonctl@latest", "mcp"]
+      windows: ["npx", "-y", "neonctl@latest", "mcp"]
+    command: "npx"
+    args: ["-y", "neonctl@latest", "mcp"]
+    requires_api_key: true
+    env_var: "NEON_API_KEY"
+    env_instructions: "Create API key at https://console.neon.tech/app/settings/api-keys"
+
+  azure:
+    description: "Azure cloud services - Storage, Cosmos DB, Resource Manager, Service Bus"
+    keywords: [azure, microsoft, cloud, storage, cosmos-db, resource-manager, serverless, paas, blob]
+    install:
+      mac: ["npx", "-y", "@azure/mcp"]
+      linux: ["npx", "-y", "@azure/mcp"]
+      wsl: ["npx", "-y", "@azure/mcp"]
+      windows: ["npx", "-y", "@azure/mcp"]
+    command: "npx"
+    args: ["-y", "@azure/mcp"]
+    requires_api_key: true
+    env_var: "AZURE_SUBSCRIPTION_ID"
+    env_instructions: "Set AZURE_SUBSCRIPTION_ID, AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET or use az login"
+
+  # === Payments & Finance ===
+
+  stripe:
+    description: "Stripe payments - customers, charges, invoices, subscriptions, refunds"
+    keywords: [stripe, payments, billing, subscriptions, invoices, commerce, fintech, checkout]
+    install:
+      mac: ["npx", "-y", "@stripe/mcp"]
+      linux: ["npx", "-y", "@stripe/mcp"]
+      wsl: ["npx", "-y", "@stripe/mcp"]
+      windows: ["npx", "-y", "@stripe/mcp"]
+    command: "npx"
+    args: ["-y", "@stripe/mcp"]
+    requires_api_key: true
+    env_var: "STRIPE_SECRET_KEY"
+    env_instructions: "Get secret key at https://dashboard.stripe.com/apikeys (starts with sk_)"
+
+  xero:
+    description: "Xero accounting - invoices, contacts, accounts, financial data, tax"
+    keywords: [xero, accounting, invoices, finance, bookkeeping, tax, payments, erp]
+    install:
+      mac: ["npx", "-y", "@xeroapi/xero-mcp-server"]
+      linux: ["npx", "-y", "@xeroapi/xero-mcp-server"]
+      wsl: ["npx", "-y", "@xeroapi/xero-mcp-server"]
+      windows: ["npx", "-y", "@xeroapi/xero-mcp-server"]
+    command: "npx"
+    args: ["-y", "@xeroapi/xero-mcp-server"]
+    requires_api_key: true
+    env_var: "XERO_CLIENT_ID"
+    env_instructions: "Set XERO_CLIENT_ID and XERO_CLIENT_SECRET from https://developer.xero.com/myapps"
+
+  paypal:
+    description: "PayPal payments - orders, subscriptions, invoices, transaction history"
+    keywords: [paypal, payments, transactions, orders, subscriptions, billing, commerce, fintech]
+    install:
+      mac: ["npx", "-y", "@paypal/agent-toolkit"]
+      linux: ["npx", "-y", "@paypal/agent-toolkit"]
+      wsl: ["npx", "-y", "@paypal/agent-toolkit"]
+      windows: ["npx", "-y", "@paypal/agent-toolkit"]
+    command: "npx"
+    args: ["-y", "@paypal/agent-toolkit"]
+    requires_api_key: true
+    env_var: "PAYPAL_CLIENT_ID"
+    env_instructions: "Set PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET from https://developer.paypal.com/dashboard"
+
+  # === Communication ===
+
+  twilio:
+    description: "Twilio communications - SMS, voice calls, phone numbers, messaging services"
+    keywords: [twilio, sms, messaging, voice, calls, phone, communication, whatsapp, api]
+    install:
+      mac: ["npx", "-y", "@twilio-alpha/mcp"]
+      linux: ["npx", "-y", "@twilio-alpha/mcp"]
+      wsl: ["npx", "-y", "@twilio-alpha/mcp"]
+      windows: ["npx", "-y", "@twilio-alpha/mcp"]
+    command: "npx"
+    args: ["-y", "@twilio-alpha/mcp"]
+    requires_api_key: true
+    env_var: "TWILIO_ACCOUNT_SID"
+    env_instructions: "Set TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET from https://console.twilio.com"
+
+  mailgun:
+    description: "Mailgun email API - send emails, manage domains, mailing lists, templates"
+    keywords: [mailgun, email, sending, transactional, smtp, domains, templates, api]
+    install:
+      mac: ["npx", "-y", "@mailgun/mcp-server"]
+      linux: ["npx", "-y", "@mailgun/mcp-server"]
+      wsl: ["npx", "-y", "@mailgun/mcp-server"]
+      windows: ["npx", "-y", "@mailgun/mcp-server"]
+    command: "npx"
+    args: ["-y", "@mailgun/mcp-server"]
+    requires_api_key: true
+    env_var: "MAILGUN_API_KEY"
+    env_instructions: "Get API key at https://app.mailgun.com/settings/api_security"
+
+  line:
+    description: "LINE messaging - send messages, manage channels via LINE Messaging API"
+    keywords: [line, messaging, chatbot, japan, notifications, push-messages, mobile, api]
+    install:
+      mac: ["npx", "-y", "@line/line-bot-mcp-server"]
+      linux: ["npx", "-y", "@line/line-bot-mcp-server"]
+      wsl: ["npx", "-y", "@line/line-bot-mcp-server"]
+      windows: ["npx", "-y", "@line/line-bot-mcp-server"]
+    command: "npx"
+    args: ["-y", "@line/line-bot-mcp-server"]
+    requires_api_key: true
+    env_var: "LINE_CHANNEL_ACCESS_TOKEN"
+    env_instructions: "Set LINE_CHANNEL_ACCESS_TOKEN and LINE_CHANNEL_SECRET from https://developers.line.biz"
+
+  # === Databases ===
+
+  mysql:
+    description: "MySQL database - execute queries, inspect schemas, manage tables and data"
+    keywords: [mysql, database, sql, queries, tables, relational, rdbms, mariadb]
+    install:
+      mac: ["npx", "-y", "@benborla29/mcp-server-mysql"]
+      linux: ["npx", "-y", "@benborla29/mcp-server-mysql"]
+      wsl: ["npx", "-y", "@benborla29/mcp-server-mysql"]
+      windows: ["npx", "-y", "@benborla29/mcp-server-mysql"]
+    command: "npx"
+    args: ["-y", "@benborla29/mcp-server-mysql"]
+    requires_api_key: true
+    env_var: "MYSQL_HOST"
+    env_instructions: "Set MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE"
+
+  mongodb:
+    description: "MongoDB - query collections, manage documents, run aggregations, inspect schemas"
+    keywords: [mongodb, nosql, documents, collections, database, aggregation, atlas, queries]
+    install:
+      mac: ["npx", "-y", "mongodb-lens"]
+      linux: ["npx", "-y", "mongodb-lens"]
+      wsl: ["npx", "-y", "mongodb-lens"]
+      windows: ["npx", "-y", "mongodb-lens"]
+    command: "npx"
+    args: ["-y", "mongodb-lens"]
+    requires_api_key: true
+    env_var: "MONGODB_URI"
+    env_instructions: "Set MONGODB_URI as connection string: mongodb://user:pass@host:27017/db"
+
+  clickhouse:
+    description: "ClickHouse analytical database - SQL queries, schemas, data warehouse analysis"
+    keywords: [clickhouse, analytics, olap, sql, database, time-series, columnar, data-warehouse]
+    install:
+      mac: ["uvx", "mcp-clickhouse"]
+      linux: ["uvx", "mcp-clickhouse"]
+      wsl: ["uvx", "mcp-clickhouse"]
+      windows: ["uvx", "mcp-clickhouse"]
+    command: "uvx"
+    args: ["mcp-clickhouse"]
+    requires_api_key: true
+    env_var: "CLICKHOUSE_HOST"
+    env_instructions: "Set CLICKHOUSE_HOST, CLICKHOUSE_PORT (8443), CLICKHOUSE_USER, CLICKHOUSE_PASSWORD"
+
+  neo4j:
+    description: "Neo4j graph database - Cypher queries, node/relationship traversal, graph schemas"
+    keywords: [neo4j, graph-database, cypher, nodes, relationships, knowledge-graph, network, graph]
+    install:
+      mac: ["uvx", "mcp-neo4j-cypher"]
+      linux: ["uvx", "mcp-neo4j-cypher"]
+      wsl: ["uvx", "mcp-neo4j-cypher"]
+      windows: ["uvx", "mcp-neo4j-cypher"]
+    command: "uvx"
+    args: ["mcp-neo4j-cypher"]
+    requires_api_key: true
+    env_var: "NEO4J_URL"
+    env_instructions: "Set NEO4J_URL (bolt://localhost:7687), NEO4J_USERNAME, NEO4J_PASSWORD"
+
+  meilisearch:
+    description: "Meilisearch - full-text and semantic search, index management, document storage"
+    keywords: [meilisearch, search, full-text, indexing, semantic-search, documents, relevance]
+    install:
+      mac: ["uvx", "meilisearch-mcp"]
+      linux: ["uvx", "meilisearch-mcp"]
+      wsl: ["uvx", "meilisearch-mcp"]
+      windows: ["uvx", "meilisearch-mcp"]
+    command: "uvx"
+    args: ["meilisearch-mcp"]
+    requires_api_key: true
+    env_var: "MEILI_HTTP_ADDR"
+    env_instructions: "Set MEILI_HTTP_ADDR (e.g. http://localhost:7700) and MEILI_MASTER_KEY"
+
+  # === DevOps & CI/CD ===
+
+  circleci:
+    description: "CircleCI CI/CD - trigger pipelines, view logs, diagnose build failures"
+    keywords: [circleci, ci-cd, pipelines, builds, testing, deployment, devops, automation]
+    install:
+      mac: ["npx", "-y", "@circleci/mcp-server-circleci@latest"]
+      linux: ["npx", "-y", "@circleci/mcp-server-circleci@latest"]
+      wsl: ["npx", "-y", "@circleci/mcp-server-circleci@latest"]
+      windows: ["npx", "-y", "@circleci/mcp-server-circleci@latest"]
+    command: "npx"
+    args: ["-y", "@circleci/mcp-server-circleci@latest"]
+    requires_api_key: true
+    env_var: "CIRCLECI_TOKEN"
+    env_instructions: "Create personal API token at https://app.circleci.com/settings/user/tokens"
+
+  argocd:
+    description: "Argo CD GitOps - manage applications, sync operations, rollbacks, deployment status"
+    keywords: [argocd, gitops, kubernetes, continuous-delivery, deployments, helm, devops, cd]
+    install:
+      mac: ["npx", "-y", "argocd-mcp"]
+      linux: ["npx", "-y", "argocd-mcp"]
+      wsl: ["npx", "-y", "argocd-mcp"]
+      windows: ["npx", "-y", "argocd-mcp"]
+    command: "npx"
+    args: ["-y", "argocd-mcp"]
+    requires_api_key: true
+    env_var: "ARGOCD_BASE_URL"
+    env_instructions: "Set ARGOCD_BASE_URL (e.g. https://argocd.example.com) and ARGOCD_API_TOKEN"
+
+  kubernetes:
+    description: "Kubernetes cluster management - pods, deployments, services, namespaces via MCP"
+    keywords: [kubernetes, k8s, pods, deployments, services, containers, orchestration, cluster, helm]
+    install:
+      mac: ["npx", "-y", "mcp-server-kubernetes"]
+      linux: ["npx", "-y", "mcp-server-kubernetes"]
+      wsl: ["npx", "-y", "mcp-server-kubernetes"]
+      windows: ["npx", "-y", "mcp-server-kubernetes"]
+    command: "npx"
+    args: ["-y", "mcp-server-kubernetes"]
+    requires_api_key: false
+    env_instructions: "Uses active kubeconfig (~/.kube/config or KUBECONFIG env var)"
+
+  postman:
+    description: "Postman API platform - collections, environments, execute requests, API testing"
+    keywords: [postman, api, collections, testing, rest, requests, workspace, api-testing, endpoints]
+    install:
+      mac: ["npx", "-y", "@postman/postman-mcp-server"]
+      linux: ["npx", "-y", "@postman/postman-mcp-server"]
+      wsl: ["npx", "-y", "@postman/postman-mcp-server"]
+      windows: ["npx", "-y", "@postman/postman-mcp-server"]
+    command: "npx"
+    args: ["-y", "@postman/postman-mcp-server"]
+    requires_api_key: true
+    env_var: "POSTMAN_API_KEY"
+    env_instructions: "Generate API key at https://postman.co/settings/me/api-keys"
+
+  eslint:
+    description: "ESLint JavaScript/TypeScript linting - lint code, explain rules, suggest fixes"
+    keywords: [eslint, linting, javascript, typescript, code-quality, static-analysis, rules, lint]
+    install:
+      mac: ["npx", "-y", "@eslint/mcp"]
+      linux: ["npx", "-y", "@eslint/mcp"]
+      wsl: ["npx", "-y", "@eslint/mcp"]
+      windows: ["npx", "-y", "@eslint/mcp"]
+    command: "npx"
+    args: ["-y", "@eslint/mcp"]
+    requires_api_key: false
+
+  # === Project Management ===
+
+  jira:
+    description: "Jira issue tracking - list projects, search issues, create and update tickets"
+    keywords: [jira, atlassian, issues, tickets, project-management, sprints, agile, bug-tracking]
+    install:
+      mac: ["npx", "-y", "@aashari/mcp-server-atlassian-jira"]
+      linux: ["npx", "-y", "@aashari/mcp-server-atlassian-jira"]
+      wsl: ["npx", "-y", "@aashari/mcp-server-atlassian-jira"]
+      windows: ["npx", "-y", "@aashari/mcp-server-atlassian-jira"]
+    command: "npx"
+    args: ["-y", "@aashari/mcp-server-atlassian-jira"]
+    requires_api_key: true
+    env_var: "ATLASSIAN_API_TOKEN"
+    env_instructions: "Set ATLASSIAN_SITE_NAME, ATLASSIAN_USER_EMAIL, ATLASSIAN_API_TOKEN from https://id.atlassian.com/manage-profile/security/api-tokens"
+
+  confluence:
+    description: "Confluence wiki - search spaces, read and create pages, manage content"
+    keywords: [confluence, atlassian, wiki, documentation, pages, spaces, knowledge-base]
+    install:
+      mac: ["npx", "-y", "@aashari/mcp-server-atlassian-confluence"]
+      linux: ["npx", "-y", "@aashari/mcp-server-atlassian-confluence"]
+      wsl: ["npx", "-y", "@aashari/mcp-server-atlassian-confluence"]
+      windows: ["npx", "-y", "@aashari/mcp-server-atlassian-confluence"]
+    command: "npx"
+    args: ["-y", "@aashari/mcp-server-atlassian-confluence"]
+    requires_api_key: true
+    env_var: "ATLASSIAN_API_TOKEN"
+    env_instructions: "Set ATLASSIAN_SITE_NAME, ATLASSIAN_USER_EMAIL, ATLASSIAN_API_TOKEN from https://id.atlassian.com/manage-profile/security/api-tokens"
+
+  asana:
+    description: "Asana project management - tasks, projects, teams, workspaces, assignments"
+    keywords: [asana, tasks, projects, teams, productivity, project-management, workflows, deadlines]
+    install:
+      mac: ["npx", "-y", "@roychri/mcp-server-asana"]
+      linux: ["npx", "-y", "@roychri/mcp-server-asana"]
+      wsl: ["npx", "-y", "@roychri/mcp-server-asana"]
+      windows: ["npx", "-y", "@roychri/mcp-server-asana"]
+    command: "npx"
+    args: ["-y", "@roychri/mcp-server-asana"]
+    requires_api_key: true
+    env_var: "ASANA_ACCESS_TOKEN"
+    env_instructions: "Create personal access token at https://app.asana.com/0/my-apps"
+
+  clickup:
+    description: "ClickUp - tasks, documents, spaces, lists, folders, team management"
+    keywords: [clickup, tasks, projects, productivity, workspaces, lists, docs, project-management]
+    install:
+      mac: ["npx", "-y", "@taazkareem/clickup-mcp-server@latest"]
+      linux: ["npx", "-y", "@taazkareem/clickup-mcp-server@latest"]
+      wsl: ["npx", "-y", "@taazkareem/clickup-mcp-server@latest"]
+      windows: ["npx", "-y", "@taazkareem/clickup-mcp-server@latest"]
+    command: "npx"
+    args: ["-y", "@taazkareem/clickup-mcp-server@latest"]
+    requires_api_key: true
+    env_var: "CLICKUP_API_KEY"
+    env_instructions: "Set CLICKUP_API_KEY and CLICKUP_TEAM_ID from https://app.clickup.com/settings/apps"
+
+  todoist:
+    description: "Todoist task manager - create, update, complete tasks, projects, labels"
+    keywords: [todoist, tasks, todo, productivity, projects, reminders, gtd, task-management]
+    install:
+      mac: ["npx", "-y", "mcp-server-todoist"]
+      linux: ["npx", "-y", "mcp-server-todoist"]
+      wsl: ["npx", "-y", "mcp-server-todoist"]
+      windows: ["npx", "-y", "mcp-server-todoist"]
+    command: "npx"
+    args: ["-y", "mcp-server-todoist"]
+    requires_api_key: true
+    env_var: "TODOIST_API_TOKEN"
+    env_instructions: "Get API token at https://app.todoist.com/app/settings/integrations/developer"
+
+  plane:
+    description: "Plane open-source project management - issues, cycles, modules, projects"
+    keywords: [plane, project-management, issues, cycles, sprints, open-source, agile, workspace]
+    install:
+      mac: ["uvx", "plane-mcp-server", "stdio"]
+      linux: ["uvx", "plane-mcp-server", "stdio"]
+      wsl: ["uvx", "plane-mcp-server", "stdio"]
+      windows: ["uvx", "plane-mcp-server", "stdio"]
+    command: "uvx"
+    args: ["plane-mcp-server", "stdio"]
+    requires_api_key: true
+    env_var: "PLANE_API_KEY"
+    env_instructions: "Set PLANE_API_KEY and PLANE_WORKSPACE_SLUG from your Plane workspace settings"
+
+  # === Design & Media ===
+
+  figma:
+    description: "Figma design tool - read design files, inspect components, export assets"
+    keywords: [figma, design, ui, ux, components, assets, prototyping, design-system, svg]
+    install:
+      mac: ["npx", "-y", "figma-mcp"]
+      linux: ["npx", "-y", "figma-mcp"]
+      wsl: ["npx", "-y", "figma-mcp"]
+      windows: ["npx", "-y", "figma-mcp"]
+    command: "npx"
+    args: ["-y", "figma-mcp"]
+    requires_api_key: true
+    env_var: "FIGMA_API_KEY"
+    env_instructions: "Create personal access token at https://www.figma.com/settings under 'Personal access tokens'"
+
+  miro:
+    description: "Miro whiteboard - create boards, sticky notes, frames, shapes, diagrams"
+    keywords: [miro, whiteboard, diagrams, collaboration, brainstorming, sticky-notes, boards, canvas]
+    install:
+      mac: ["npx", "-y", "@k-jarzyna/mcp-miro"]
+      linux: ["npx", "-y", "@k-jarzyna/mcp-miro"]
+      wsl: ["npx", "-y", "@k-jarzyna/mcp-miro"]
+      windows: ["npx", "-y", "@k-jarzyna/mcp-miro"]
+    command: "npx"
+    args: ["-y", "@k-jarzyna/mcp-miro"]
+    requires_api_key: true
+    env_var: "MIRO_ACCESS_TOKEN"
+    env_instructions: "Create app and get access token at https://miro.com/app/settings/user-profile/apps"
+
+  mux:
+    description: "Mux video API - manage video assets, live streams, transcoding, analytics"
+    keywords: [mux, video, streaming, media, transcoding, playback, live-stream, hls, encoding]
+    install:
+      mac: ["npx", "-y", "@mux/mcp"]
+      linux: ["npx", "-y", "@mux/mcp"]
+      wsl: ["npx", "-y", "@mux/mcp"]
+      windows: ["npx", "-y", "@mux/mcp"]
+    command: "npx"
+    args: ["-y", "@mux/mcp"]
+    requires_api_key: true
+    env_var: "MUX_TOKEN_ID"
+    env_instructions: "Set MUX_TOKEN_ID and MUX_TOKEN_SECRET from https://dashboard.mux.com/settings/access-tokens"
+
+  elevenlabs:
+    description: "ElevenLabs text-to-speech - generate audio, clone voices, sound effects"
+    keywords: [elevenlabs, tts, text-to-speech, voice, audio, speech, ai-voice, synthesis, narration]
+    install:
+      mac: ["uvx", "elevenlabs-mcp"]
+      linux: ["uvx", "elevenlabs-mcp"]
+      wsl: ["uvx", "elevenlabs-mcp"]
+      windows: ["uvx", "elevenlabs-mcp"]
+    command: "uvx"
+    args: ["elevenlabs-mcp"]
+    requires_api_key: true
+    env_var: "ELEVENLABS_API_KEY"
+    env_instructions: "Get API key at https://elevenlabs.io/app/settings/api-keys"
+
+  # === Monitoring & Observability ===
+
+  datadog:
+    description: "Datadog observability - metrics, logs, traces, dashboards, monitors, incidents"
+    keywords: [datadog, monitoring, observability, metrics, logs, traces, apm, alerts, dashboards]
+    install:
+      mac: ["npx", "-y", "@winor30/mcp-server-datadog"]
+      linux: ["npx", "-y", "@winor30/mcp-server-datadog"]
+      wsl: ["npx", "-y", "@winor30/mcp-server-datadog"]
+      windows: ["npx", "-y", "@winor30/mcp-server-datadog"]
+    command: "npx"
+    args: ["-y", "@winor30/mcp-server-datadog"]
+    requires_api_key: true
+    env_var: "DATADOG_API_KEY"
+    env_instructions: "Set DATADOG_API_KEY and DATADOG_APP_KEY from https://app.datadoghq.com/organization-settings/api-keys"
+
+  grafana:
+    description: "Grafana dashboards - query metrics, logs, alerts, datasources, annotations"
+    keywords: [grafana, dashboards, metrics, monitoring, visualization, alerts, observability, prometheus]
+    install:
+      mac: ["uvx", "mcp-grafana"]
+      linux: ["uvx", "mcp-grafana"]
+      wsl: ["uvx", "mcp-grafana"]
+      windows: ["uvx", "mcp-grafana"]
+    command: "uvx"
+    args: ["mcp-grafana"]
+    requires_api_key: true
+    env_var: "GRAFANA_URL"
+    env_instructions: "Set GRAFANA_URL (e.g. http://localhost:3000) and GRAFANA_SERVICE_ACCOUNT_TOKEN"
+
+  dynatrace:
+    description: "Dynatrace AIOps - metrics, logs, problems, synthetic tests, topology data"
+    keywords: [dynatrace, observability, monitoring, apm, metrics, problems, aiops, logs, traces]
+    install:
+      mac: ["npx", "-y", "@dynatrace-oss/dynatrace-mcp-server"]
+      linux: ["npx", "-y", "@dynatrace-oss/dynatrace-mcp-server"]
+      wsl: ["npx", "-y", "@dynatrace-oss/dynatrace-mcp-server"]
+      windows: ["npx", "-y", "@dynatrace-oss/dynatrace-mcp-server"]
+    command: "npx"
+    args: ["-y", "@dynatrace-oss/dynatrace-mcp-server"]
+    requires_api_key: true
+    env_var: "DYNATRACE_ENV_URL"
+    env_instructions: "Set DYNATRACE_ENV_URL (https://xxx.live.dynatrace.com) and DYNATRACE_API_TOKEN"
+
+  langfuse:
+    description: "Langfuse LLM observability - prompts, traces, usage analytics, model performance"
+    keywords: [langfuse, llm, observability, prompts, traces, analytics, monitoring, ai, evals]
+    install:
+      mac: ["npx", "-y", "langfuse-mcp"]
+      linux: ["npx", "-y", "langfuse-mcp"]
+      wsl: ["npx", "-y", "langfuse-mcp"]
+      windows: ["npx", "-y", "langfuse-mcp"]
+    command: "npx"
+    args: ["-y", "langfuse-mcp"]
+    requires_api_key: true
+    env_var: "LANGFUSE_PUBLIC_KEY"
+    env_instructions: "Set LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASEURL from https://cloud.langfuse.com/settings"
+
+  # === CMS & Content ===
+
+  airtable:
+    description: "Airtable database/spreadsheet - read, create, update, delete records across bases"
+    keywords: [airtable, database, spreadsheet, records, bases, tables, no-code, data, grid]
+    install:
+      mac: ["npx", "-y", "airtable-mcp-server"]
+      linux: ["npx", "-y", "airtable-mcp-server"]
+      wsl: ["npx", "-y", "airtable-mcp-server"]
+      windows: ["npx", "-y", "airtable-mcp-server"]
+    command: "npx"
+    args: ["-y", "airtable-mcp-server"]
+    requires_api_key: true
+    env_var: "AIRTABLE_API_KEY"
+    env_instructions: "Create personal access token at https://airtable.com/create/tokens"
+
+  contentful:
+    description: "Contentful headless CMS - manage content types, entries, assets, spaces"
+    keywords: [contentful, cms, content, headless, entries, assets, editorial, publishing, api]
+    install:
+      mac: ["npx", "-y", "@ivotoby/contentful-management-mcp-server"]
+      linux: ["npx", "-y", "@ivotoby/contentful-management-mcp-server"]
+      wsl: ["npx", "-y", "@ivotoby/contentful-management-mcp-server"]
+      windows: ["npx", "-y", "@ivotoby/contentful-management-mcp-server"]
+    command: "npx"
+    args: ["-y", "@ivotoby/contentful-management-mcp-server"]
+    requires_api_key: true
+    env_var: "CONTENTFUL_MANAGEMENT_ACCESS_TOKEN"
+    env_instructions: "Create CMA token at https://app.contentful.com/account/profile/cma-tokens"
+
+  webflow:
+    description: "Webflow - manage sites, CMS collections, pages, and content via Webflow API"
+    keywords: [webflow, cms, website, no-code, design, collections, pages, publishing, hosting]
+    install:
+      mac: ["npx", "-y", "webflow-mcp-server@latest"]
+      linux: ["npx", "-y", "webflow-mcp-server@latest"]
+      wsl: ["npx", "-y", "webflow-mcp-server@latest"]
+      windows: ["npx", "-y", "webflow-mcp-server@latest"]
+    command: "npx"
+    args: ["-y", "webflow-mcp-server@latest"]
+    requires_api_key: true
+    env_var: "WEBFLOW_TOKEN"
+    env_instructions: "Create site API token at https://webflow.com/dashboard/account/integrations"
+
+  wordpress:
+    description: "WordPress CMS - publish posts, pages, categories, tags, media management"
+    keywords: [wordpress, cms, blogging, posts, pages, publishing, website, content, wp]
+    install:
+      mac: ["npx", "-y", "wordpress-mcp-server"]
+      linux: ["npx", "-y", "wordpress-mcp-server"]
+      wsl: ["npx", "-y", "wordpress-mcp-server"]
+      windows: ["npx", "-y", "wordpress-mcp-server"]
+    command: "npx"
+    args: ["-y", "wordpress-mcp-server"]
+    requires_api_key: true
+    env_var: "WORDPRESS_SITE_URL"
+    env_instructions: "Set WORDPRESS_SITE_URL, WORDPRESS_USERNAME, WORDPRESS_PASSWORD (or app password)"
+
+  obsidian:
+    description: "Obsidian vault - read, write, search notes with links, tags, and backlinks"
+    keywords: [obsidian, notes, knowledge-base, vault, markdown, personal-knowledge, pkm, zettelkasten]
+    install:
+      mac: ["npx", "-y", "@mauricio.wolff/mcp-obsidian"]
+      linux: ["npx", "-y", "@mauricio.wolff/mcp-obsidian"]
+      wsl: ["npx", "-y", "@mauricio.wolff/mcp-obsidian"]
+      windows: ["npx", "-y", "@mauricio.wolff/mcp-obsidian"]
+    command: "npx"
+    args: ["-y", "@mauricio.wolff/mcp-obsidian"]
+    requires_api_key: true
+    env_var: "OBSIDIAN_API_KEY"
+    env_instructions: "Enable Local REST API plugin in Obsidian; set OBSIDIAN_API_KEY and OBSIDIAN_VAULT_PATH"
+
+  # === Search & Data Enrichment ===
+
+  perplexity:
+    description: "Perplexity AI - real-time web search, research, and reasoning via Sonar API"
+    keywords: [perplexity, search, web-search, research, ai, reasoning, sonar, real-time, news]
+    install:
+      mac: ["npx", "-y", "@perplexity-ai/mcp-server"]
+      linux: ["npx", "-y", "@perplexity-ai/mcp-server"]
+      wsl: ["npx", "-y", "@perplexity-ai/mcp-server"]
+      windows: ["npx", "-y", "@perplexity-ai/mcp-server"]
+    command: "npx"
+    args: ["-y", "@perplexity-ai/mcp-server"]
+    requires_api_key: true
+    env_var: "PERPLEXITY_API_KEY"
+    env_instructions: "Get API key at https://www.perplexity.ai/settings/api"
+
+  apify:
+    description: "Apify cloud scrapers - 3000+ pre-built actors for web scraping and data extraction"
+    keywords: [apify, actors, scraping, automation, web-data, crawling, extraction, cloud, datasets]
+    install:
+      mac: ["npx", "-y", "@apify/actors-mcp-server"]
+      linux: ["npx", "-y", "@apify/actors-mcp-server"]
+      wsl: ["npx", "-y", "@apify/actors-mcp-server"]
+      windows: ["npx", "-y", "@apify/actors-mcp-server"]
+    command: "npx"
+    args: ["-y", "@apify/actors-mcp-server"]
+    requires_api_key: true
+    env_var: "APIFY_TOKEN"
+    env_instructions: "Get API token at https://console.apify.com/account/integrations"
+
+  jina:
+    description: "Jina AI - web reading, URL to markdown conversion, neural document retrieval"
+    keywords: [jina, search, web-reading, neural-search, markdown, documents, retrieval, ai, reader]
+    install:
+      mac: ["npx", "-y", "jina-mcp-tools"]
+      linux: ["npx", "-y", "jina-mcp-tools"]
+      wsl: ["npx", "-y", "jina-mcp-tools"]
+      windows: ["npx", "-y", "jina-mcp-tools"]
+    command: "npx"
+    args: ["-y", "jina-mcp-tools"]
+    requires_api_key: true
+    env_var: "JINA_API_KEY"
+    env_instructions: "Get API key at https://jina.ai/api-dashboard"
+
+  hyperbrowser:
+    description: "Hyperbrowser cloud browser - headless automation, web scraping at scale"
+    keywords: [hyperbrowser, browser, automation, scraping, headless, cloud, web, stealth, scale]
+    install:
+      mac: ["npx", "-y", "hyperbrowser-mcp"]
+      linux: ["npx", "-y", "hyperbrowser-mcp"]
+      wsl: ["npx", "-y", "hyperbrowser-mcp"]
+      windows: ["npx", "-y", "hyperbrowser-mcp"]
+    command: "npx"
+    args: ["-y", "hyperbrowser-mcp"]
+    requires_api_key: true
+    env_var: "HYPERBROWSER_API_KEY"
+    env_instructions: "Get API key at https://app.hyperbrowser.ai/settings"
+
+  # === Maps & Location ===
+
+  mapbox:
+    description: "Mapbox geospatial - geocoding, directions, POI search, isochrones, routing"
+    keywords: [mapbox, maps, geocoding, directions, geospatial, location, poi, routing, gis]
+    install:
+      mac: ["npx", "-y", "@mapbox/mcp-server"]
+      linux: ["npx", "-y", "@mapbox/mcp-server"]
+      wsl: ["npx", "-y", "@mapbox/mcp-server"]
+      windows: ["npx", "-y", "@mapbox/mcp-server"]
+    command: "npx"
+    args: ["-y", "@mapbox/mcp-server"]
+    requires_api_key: true
+    env_var: "MAPBOX_ACCESS_TOKEN"
+    env_instructions: "Create access token at https://account.mapbox.com/access-tokens"
+
+  # === Data Analytics ===
+
+  dbt:
+    description: "dbt data transformation - run dbt commands, query semantic layer, explore models"
+    keywords: [dbt, data-transformation, sql, models, analytics, warehouse, lineage, elt, semantic]
+    install:
+      mac: ["uvx", "dbt-mcp"]
+      linux: ["uvx", "dbt-mcp"]
+      wsl: ["uvx", "dbt-mcp"]
+      windows: ["uvx", "dbt-mcp"]
+    command: "uvx"
+    args: ["dbt-mcp"]
+    requires_api_key: true
+    env_var: "DBT_HOST"
+    env_instructions: "Set DBT_HOST, DBT_TOKEN, DBT_ENVIRONMENT_ID for dbt Cloud connection"
+
+  # === Networking & Infrastructure ===
+
+  tailscale:
+    description: "Tailscale VPN - list devices, manage ACLs, routes, DNS settings, network policies"
+    keywords: [tailscale, vpn, networking, devices, wireguard, zero-trust, network, security, mesh]
+    install:
+      mac: ["npx", "-y", "@hexsleeves/tailscale-mcp-server"]
+      linux: ["npx", "-y", "@hexsleeves/tailscale-mcp-server"]
+      wsl: ["npx", "-y", "@hexsleeves/tailscale-mcp-server"]
+      windows: ["npx", "-y", "@hexsleeves/tailscale-mcp-server"]
+    command: "npx"
+    args: ["-y", "@hexsleeves/tailscale-mcp-server"]
+    requires_api_key: true
+    env_var: "TAILSCALE_API_KEY"
+    env_instructions: "Set TAILSCALE_API_KEY and TAILSCALE_TAILNET from https://login.tailscale.com/admin/settings/keys"
+
+  # === Smart Home ===
+
+  home-assistant:
+    description: "Home Assistant smart home - control entities, automate devices, query states"
+    keywords: [home-assistant, smart-home, iot, automation, devices, hass, lights, sensors, switches]
+    install:
+      mac: ["uvx", "hass-mcp"]
+      linux: ["uvx", "hass-mcp"]
+      wsl: ["uvx", "hass-mcp"]
+      windows: ["uvx", "hass-mcp"]
+    command: "uvx"
+    args: ["hass-mcp"]
+    requires_api_key: true
+    env_var: "HA_TOKEN"
+    env_instructions: "Set HA_URL (http://homeassistant.local:8123) and HA_TOKEN from your Home Assistant profile"
+
+  # === Productivity & Office ===
+
+  excel:
+    description: "Excel spreadsheets - read, write, create, format Excel files, charts, pivot tables"
+    keywords: [excel, spreadsheet, xlsx, data, charts, formulas, office, pivot-tables, workbook]
+    install:
+      mac: ["npx", "-y", "@haris-musa/excel-mcp-server"]
+      linux: ["npx", "-y", "@haris-musa/excel-mcp-server"]
+      wsl: ["npx", "-y", "@haris-musa/excel-mcp-server"]
+      windows: ["npx", "-y", "@haris-musa/excel-mcp-server"]
+    command: "npx"
+    args: ["-y", "@haris-musa/excel-mcp-server"]
+    requires_api_key: false
+
+  airbnb:
+    description: "Airbnb listing search - search properties, view details, check availability"
+    keywords: [airbnb, travel, accommodation, listings, rentals, search, hospitality, vacation]
+    install:
+      mac: ["npx", "-y", "@openbnb/mcp-server-airbnb"]
+      linux: ["npx", "-y", "@openbnb/mcp-server-airbnb"]
+      wsl: ["npx", "-y", "@openbnb/mcp-server-airbnb"]
+      windows: ["npx", "-y", "@openbnb/mcp-server-airbnb"]
+    command: "npx"
+    args: ["-y", "@openbnb/mcp-server-airbnb"]
+    requires_api_key: false
+
 # Discovery queue location
 discovery_queue_path: ".pmcp/discovery_queue.json"

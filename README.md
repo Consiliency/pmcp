@@ -22,7 +22,7 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 
 - **16 stable meta-tools** (not the 50+ underlying tools)
 - **Auto-starts** essential servers (Playwright, Context7) with no configuration
-- **Dynamically provisions** new servers on-demand from a manifest of 25+
+- **Dynamically provisions** new servers on-demand from a manifest of 90+
 - **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
 - **Policy enforcement**: Output size caps and optional secret redaction
 
@@ -193,7 +193,7 @@ Returns: Screenshot of google.com
         ▼                    ▼                    ▼
 ┌───────────────┐  ┌─────────────────┐  ┌─────────────────┐
 │  Auto-Start   │  │    Manifest     │  │  Custom Servers │
-│  (Playwright, │  │   (25+ servers  │  │  (your own MCP  │
+│  (Playwright, │  │   (90+ servers  │  │  (your own MCP  │
 │   Context7)   │  │   on-demand)    │  │  servers)       │
 └───────────────┘  └─────────────────┘  └─────────────────┘
 ```
@@ -326,7 +326,7 @@ pmcp refresh
 
 ## Dynamic Server Provisioning
 
-PMCP can install and start MCP servers on-demand from a curated manifest of 25+ servers.
+PMCP can install and start MCP servers on-demand from a curated manifest of 90+ servers.
 
 ### Example: Adding GitHub Support
 
@@ -372,7 +372,7 @@ These servers start automatically (no configuration required):
 
 ## Available Servers
 
-The manifest includes 25+ servers that can be provisioned on-demand:
+The manifest includes 90+ servers that can be provisioned on-demand:
 
 ### No API Key Required
 
@@ -400,6 +400,16 @@ The manifest includes 25+ servers that can be provisioned on-demand:
 | `brave-search` | Web search | `BRAVE_API_KEY` |
 | `google-drive` | Google Drive files | `GDRIVE_CREDENTIALS` |
 | `sentry` | Error tracking | `SENTRY_AUTH_TOKEN` |
+| `stripe` | Payments and billing | `STRIPE_SECRET_KEY` |
+| `github-actions` | CI/CD workflows | `GITHUB_PERSONAL_ACCESS_TOKEN` |
+| `datadog` | Monitoring and observability | `DATADOG_API_KEY` |
+| `cloudflare` | Edge network and Workers | `CLOUDFLARE_API_TOKEN` |
+| `figma` | Design files and components | `FIGMA_ACCESS_TOKEN` |
+| `jira` | Issue tracking | `JIRA_API_TOKEN` |
+| `airtable` | Spreadsheet database | `AIRTABLE_TOKEN` |
+| `hubspot` | CRM and marketing | `HUBSPOT_ACCESS_TOKEN` |
+| `twilio` | SMS and voice | `TWILIO_ACCOUNT_SID` |
+| `...and 80+ more` | Use `gateway.catalog_search` to explore | — |
 
 See `.env.example` for all supported environment variables.
 
@@ -715,7 +725,7 @@ pmcp/
 │   ├── tools/
 │   │   └── handlers.py       # Gateway tool implementations
 │   ├── manifest/
-│   │   ├── manifest.yaml     # Server manifest (25+ servers)
+│   │   ├── manifest.yaml     # Server manifest (90+ servers)
 │   │   ├── loader.py         # Manifest loading
 │   │   ├── installer.py      # Server provisioning
 │   │   └── environment.py    # Platform/CLI detection
