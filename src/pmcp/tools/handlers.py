@@ -250,7 +250,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
             description=(
                 "Find and auto-provision the right tool for a task — describe what you need in natural language. "
                 "Examples: 'scrape a website', 'search Slack messages', 'query Postgres', 'browse the web'. "
-                "Matches against installed CLIs and 25+ provisionable MCP servers; starts the server automatically if needed. "
+                "Matches against installed CLIs and 90+ provisionable MCP servers; starts the server automatically if needed. "
                 "Prefer this over gateway.provision when you don't already know the exact server name."
             ),
             inputSchema={
@@ -541,6 +541,43 @@ class GatewayTools:
         self._stale_check_cache: dict[str, tuple[float, str | None, str | None]] = {}
         self._stale_check_ttl_seconds = 6 * 60 * 60
         self._feedback_events: list[dict[str, Any]] = []
+        self._provisioned_registry: dict[str, str | None] = (
+            self._load_provisioned_registry()
+        )
+
+    @property
+    def _provisioned_registry_path(self) -> Path:
+        return Path.home() / ".config" / "pmcp" / "provisioned.json"
+
+    def _load_provisioned_registry(self) -> dict[str, str | None]:
+        """Load the persisted provisioned-server registry from disk."""
+        path = self._provisioned_registry_path
+        if not path.exists():
+            return {}
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            return {k: v for k, v in data.items() if isinstance(k, str)}
+        except Exception as e:
+            logger.warning(f"Could not load provisioned registry: {e}")
+            return {}
+
+    def _save_provisioned_registry(self) -> None:
+        """Persist the provisioned-server registry to disk."""
+        path = self._provisioned_registry_path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "w") as f:
+                json.dump(self._provisioned_registry, f)
+        except Exception as e:
+            logger.warning(f"Could not save provisioned registry: {e}")
+
+    def _register_provisioned_server(
+        self, server_name: str, env_var: str | None
+    ) -> None:
+        """Record a successfully provisioned server in the registry."""
+        self._provisioned_registry[server_name] = env_var
+        self._save_provisioned_registry()
 
     async def _ensure_server_for_tool(self, tool_id: str) -> bool:
         """Ensure server is connected for a tool, triggering lazy-start if needed.
@@ -1017,6 +1054,34 @@ class GatewayTools:
             except Exception as e:
                 logger.warning(f"Failed to load manifest auto-start servers: {e}")
 
+            # Re-add previously provisioned servers (issue #45 fix)
+            try:
+                provisioned = self._load_provisioned_registry()
+                for prov_name, prov_env_var in provisioned.items():
+                    if prov_name in seen_servers:
+                        continue
+                    # Skip if required API key is gone
+                    if prov_env_var and not self._check_api_key_available(prov_env_var):
+                        logger.info(
+                            f"Skipping provisioned server '{prov_name}' - missing {prov_env_var}"
+                        )
+                        continue
+                    try:
+                        prov_manifest = load_manifest()
+                        prov_config = prov_manifest.get_server(prov_name)
+                        if prov_config:
+                            configs.append(manifest_server_to_config(prov_config))
+                            seen_servers.add(prov_name)
+                            logger.info(
+                                f"Re-added provisioned server from registry: {prov_name}"
+                            )
+                    except Exception as inner_e:
+                        logger.warning(
+                            f"Could not re-add provisioned server '{prov_name}': {inner_e}"
+                        )
+            except Exception as e:
+                logger.warning(f"Failed to restore provisioned servers: {e}")
+
             # Filter by policy
             allowed_configs = [
                 c for c in configs if self._policy_manager.is_server_allowed(c.name)
@@ -1051,6 +1116,15 @@ class GatewayTools:
         """gateway.health - Get gateway health status."""
         revision_id, last_refresh_ts = self._client_manager.get_registry_meta()
         statuses = self._client_manager.get_all_server_statuses()
+        known_names = {s.name for s in statuses}
+
+        # Include provisioned servers that are not currently tracked (e.g. after restart)
+        provisioned = self._load_provisioned_registry()
+        extra = [
+            ServerHealthInfo(name=prov_name, status="offline", tool_count=0)
+            for prov_name in provisioned
+            if prov_name not in known_names
+        ]
 
         return HealthOutput(
             revision_id=revision_id,
@@ -1064,7 +1138,8 @@ class GatewayTools:
                     else None,
                 )
                 for s in statuses
-            ],
+            ]
+            + extra,
             last_refresh_ts=last_refresh_ts,
         )
 
@@ -2334,6 +2409,10 @@ class GatewayTools:
                     # Mark job complete and clear process reference
                     job.status = "complete"
                     job.process = None
+
+                    # Persist to provisioned registry so refresh() can reconnect it
+                    env_var = server_config.env_var if server_config else None
+                    self._register_provisioned_server(job_server_name, env_var)
 
                     # Get the new tools
                     tools = [
