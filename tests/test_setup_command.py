@@ -42,7 +42,7 @@ def test_parse_args_setup_command() -> None:
 
 
 def test_run_setup_renders_claude_sse_config(capsys) -> None:
-    """run_setup should render Claude SSE config to stdout."""
+    """run_setup should render Claude HTTP config to stdout (mode='sse' maps to http transport)."""
     args = argparse.Namespace(mode="sse", client="claude", write=False)
 
     run_setup(args)
@@ -51,8 +51,8 @@ def test_run_setup_renders_claude_sse_config(capsys) -> None:
     assert output == {
         "mcpServers": {
             "pmcp": {
-                "type": "sse",
-                "url": "http://127.0.0.1:3344/sse",
+                "type": "http",
+                "url": "http://127.0.0.1:3344/mcp",
             }
         }
     }
@@ -87,7 +87,7 @@ def test_run_setup_writes_and_merges_opencode_config(tmp_path: Path) -> None:
     assert "existing" in merged["mcp"]
     assert merged["mcp"]["pmcp"] == {
         "type": "remote",
-        "url": "http://127.0.0.1:3344/sse",
+        "url": "http://127.0.0.1:3344/mcp",
         "enabled": True,
     }
 

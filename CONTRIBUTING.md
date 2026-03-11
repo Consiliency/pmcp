@@ -34,7 +34,7 @@ uv run pytest tests/test_integration.py -v
 
 ## Adding a Server to the Manifest
 
-The manifest (`src/pmcp/manifest/manifest.yaml`) contains 25+ MCP servers
+The manifest (`src/pmcp/manifest/manifest.yaml`) contains 90+ MCP servers
 that can be provisioned on-demand via `gateway.provision`.
 
 ### Steps to Add a New Server

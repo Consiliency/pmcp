@@ -610,7 +610,8 @@ class TestHealthOutputWithLazyServers:
             policy_manager=mock_policy_manager,
         )
 
-        result = await tools.health()
+        with patch.object(tools, "_load_provisioned_registry", return_value={}):
+            result = await tools.health()
 
         assert len(result.servers) == 2
         server_dict = {s.name: s for s in result.servers}

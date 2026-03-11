@@ -40,39 +40,10 @@ uvx pmcp
 # With pip
 pip install pmcp
 
-# With LLM-enhanced features (optional, see below)
-uv pip install pmcp[llm]
 ```
 
-### Advanced LLM Features (Optional)
-
-PMCP can use an LLM for smarter capability matching and summarization. Without an API key, it falls back to keyword matching and templates.
-
-**Features enabled with LLM:**
-
-| Feature | Without API Key | With API Key |
-|---------|-----------------|--------------|
-| Capability matching | Keyword-based | Semantic understanding |
-| Tool summaries | Static templates | LLM-generated descriptions |
-| Code snippets | Static examples | Dynamic, context-aware examples |
-
-**Setup:**
-
-1. Get a free API key from [Groq Console](https://console.groq.com/keys)
-2. Add to your `.env` file:
-
-```bash
-# In your project's .env file (or ~/.env)
-GROQ_API_KEY=gsk_your_groq_api_key_here
-```
-
-3. Install with LLM support:
-
-```bash
-uv pip install pmcp[llm]
-```
-
-PMCP uses [BAML](https://docs.boundaryml.com/) with Groq's fast inference API for sub-second LLM responses. The LLM features are entirely optional - PMCP works fully without them.
+> **Capability matching is built-in** — no API key needed. `gateway.request_capability`
+> uses a three-tier pure-Python router: explicit name match → category match → search guidance.
 
 ### Configure with `pmcp setup`
 
@@ -82,15 +53,15 @@ Use `pmcp setup` to print the generated config:
 
 ```bash
 pmcp setup --client claude --mode stdio    # Claude local stdio
-pmcp setup --client claude --mode sse      # Claude shared-service SSE
+pmcp setup --client claude --mode http     # Claude shared-service HTTP
 pmcp setup --client opencode --mode stdio  # OpenCode local stdio
-pmcp setup --client opencode --mode sse    # OpenCode shared-service SSE
+pmcp setup --client opencode --mode http   # OpenCode shared-service HTTP
 ```
 
 Write directly into your client config with `--write`:
 
 ```bash
-pmcp setup --client claude --mode sse --write
+pmcp setup --client claude --mode http --write
 ```
 
 Without `--write`, `pmcp setup` prints the config so you can paste it into:
@@ -101,14 +72,14 @@ Use SSE mode when running one shared PMCP service for multiple sessions/clients.
 
 ### Shared Service Mode (Manual)
 
-If you prefer manual config, point each client to the shared SSE endpoint:
+If you prefer manual config, point each client to the shared HTTP endpoint:
 
 ```json
 {
   "mcpServers": {
-    "gateway": {
-      "type": "sse",
-      "url": "http://127.0.0.1:3344/sse"
+    "pmcp": {
+      "type": "http",
+      "url": "http://127.0.0.1:3344/mcp"
     }
   }
 }
@@ -120,7 +91,7 @@ Quick verification:
 
 ```bash
 systemctl --user is-active pmcp
-curl -sS -D - http://127.0.0.1:3344/sse -o /dev/null
+curl -sS http://127.0.0.1:3344/mcp
 ```
 
 ### Other MCP Clients
@@ -248,7 +219,7 @@ The gateway exposes **16 meta-tools** organized into three categories:
 - `gateway.update_server` is the phase-1 update path for subordinate MCPs.
 - `pmcp update <server>` and `pmcp update --all` call the same gateway update workflow.
 - `gateway.describe`, `gateway.invoke`, and `gateway.provision` may return `update_warning` when a newer package version is detected.
-- Planned follow-ups: background stale-version indexing, stronger stale prompts in client UX, and expanded package-manager coverage.
+- Background stale-version indexing is active — warnings are zero-latency via hourly pre-population.
 
 ### Feedback Telemetry
 
@@ -625,7 +596,7 @@ Use `pmcp doctor` to diagnose common PMCP startup and connectivity issues. It ch
 
 - `lock`: detects singleton lock state and stale lock collisions at `~/.pmcp/gateway.lock`
 - `mode`: detects local command-mode MCP config conflicts when a shared PMCP system service is running
-- `sse`: probes discovered SSE endpoints in local `.mcp.json` and reports health
+- `http`: probes the `/mcp` endpoint and reports connectivity health
 
 Example:
 
@@ -729,7 +700,7 @@ pmcp/
 │   │   ├── loader.py         # Manifest loading
 │   │   ├── installer.py      # Server provisioning
 │   │   └── environment.py    # Platform/CLI detection
-│   └── baml_client/          # BAML-generated LLM client (optional)
+│   └── baml_client/          # BAML-generated client (used for structured parsing; no outbound LLM calls since v1.8.0)
 ├── tests/                    # 310+ tests
 ├── Dockerfile
 ├── docker-compose.yml

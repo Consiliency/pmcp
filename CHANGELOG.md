@@ -5,6 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-03-11
+
+### Changed
+- **Transport**: Replaced deprecated SSE transport (`/sse`, `type: "sse"`) with MCP
+  streamable-HTTP transport (`/mcp`, `type: "http"`). Eliminates the race condition
+  where tool calls arrived before SSE session initialization completed.
+  Update `~/.mcp.json`: `{"type":"http","url":"http://127.0.0.1:3344/mcp"}`
+- **Capability routing**: Removed all outbound BAML/Groq LLM calls from
+  `gateway.request_capability`. Replaced with three-tier pure-Python router:
+  (1) sliding-window name match → single candidate, (2) category keyword match →
+  all servers sorted by API-key availability, (3) not_available + search guidance.
+  No API key required. New `pick_from_category` status added.
+- `pmcp setup --mode sse` now generates `type: "http"` config (transport migration).
+
+### Added
+- **Background stale-version indexer**: pre-populates version check cache hourly so
+  `catalog_search stale_updates` and `update_warning` fields are zero-latency.
+- `stale_updates` field in `catalog_search` output listing servers with available updates.
+
+### Fixed
+- `fetch` manifest entry corrected: `@modelcontextprotocol/server-fetch` (404 on npm)
+  → `uvx mcp-server-fetch` (PyPI).
+- `pmcp doctor` and `pmcp setup` updated to probe/generate `/mcp` endpoint.
+
+## [1.7.0] - 2026-03-08
+
+### Added
+- Background stale-version indexer task (see 1.8.0 above for details; released together).
+- `stale_updates` field in `CatalogSearchOutput`.
+
+### Changed
+- Removed BAML outbound LLM calls from `request_capability` (see 1.8.0 above).
+
 ## [1.3.0] - 2025-01-23
 
 ### Added

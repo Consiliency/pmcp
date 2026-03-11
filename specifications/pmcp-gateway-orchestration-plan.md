@@ -1,3 +1,6 @@
+> **Status: IMPLEMENTED** — All phases shipped as of v1.8.0. Retained as historical
+> specification. See CHANGELOG.md for release notes.
+
 # PMCP Gateway Orchestration Fix Plan (Specification)
 
 ## Purpose

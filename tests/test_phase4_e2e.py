@@ -10,6 +10,13 @@ import sys
 from pathlib import Path
 
 
+import site as _site
+
+_SRC_DIR = str(Path(__file__).parent.parent / "src")
+# User site-packages may not be loaded when HOME is overridden; pin the absolute path.
+_USER_SITE = _site.getusersitepackages()
+
+
 def _run_pmcp(
     args: list[str],
     *,
@@ -17,6 +24,10 @@ def _run_pmcp(
     cwd: Path,
 ) -> subprocess.CompletedProcess[str]:
     """Run pmcp CLI as a subprocess and capture text output."""
+    env = dict(env)
+    existing = env.get("PYTHONPATH", "")
+    extra = f"{_SRC_DIR}:{_USER_SITE}"
+    env["PYTHONPATH"] = f"{extra}:{existing}" if existing else extra
     return subprocess.run(
         [sys.executable, "-m", "pmcp", *args],
         capture_output=True,
@@ -48,7 +59,7 @@ def test_phase4_setup_writes_opencode_sse_config(tmp_path: Path) -> None:
     parsed = json.loads(config_path.read_text())
     assert parsed["mcp"]["pmcp"] == {
         "type": "remote",
-        "url": "http://127.0.0.1:3344/sse",
+        "url": "http://127.0.0.1:3344/mcp",
         "enabled": True,
     }
 

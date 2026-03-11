@@ -70,8 +70,8 @@ def parse_args() -> argparse.Namespace:
   pmcp
   pmcp --transport http --host 127.0.0.1 --port 3344
   pmcp setup --client claude --mode stdio
-  pmcp setup --client claude --mode sse --write
-  pmcp setup --client opencode --mode sse --write
+  pmcp setup --client claude --mode http --write
+  pmcp setup --client opencode --mode http --write
   pmcp doctor
   pmcp secrets set API_TOKEN my-token --scope user
   pmcp secrets sync --from-scope user --to-scope project --overwrite
@@ -337,9 +337,9 @@ Environment overrides:
     )
     setup_parser.add_argument(
         "--mode",
-        choices=["stdio", "sse"],
-        default="sse",
-        help="Connection mode to configure (default: sse)",
+        choices=["stdio", "sse", "http"],
+        default="http",
+        help="Connection mode to configure (default: http)",
     )
     setup_parser.add_argument(
         "--client",
@@ -585,11 +585,11 @@ async def run_update(args: argparse.Namespace) -> None:
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )
 
-    gateway_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/sse")
+    gateway_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/mcp")
     gateway_config = ResolvedServerConfig(
         name="pmcp-gateway",
         source="custom",
-        config=RemoteMcpServerConfig(type="sse", url=gateway_url),
+        config=RemoteMcpServerConfig(type="http", url=gateway_url),
     )
 
     async def _call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
@@ -671,11 +671,11 @@ async def _query_running_gateway_status(
     probe_manager = ClientManager(
         max_tools_per_server=policy_manager.get_max_tools_per_server()  # type: ignore[attr-defined]
     )
-    probe_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/sse")
+    probe_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/mcp")
     probe_config = ResolvedServerConfig(
         name="pmcp-gateway",
         source="custom",
-        config=RemoteMcpServerConfig(type="sse", url=probe_url),
+        config=RemoteMcpServerConfig(type="http", url=probe_url),
     )
 
     try:
@@ -1095,12 +1095,12 @@ async def run_init(args: argparse.Namespace) -> None:
 def _build_setup_config(mode: str, client: str) -> dict:
     """Build client config snippet for PMCP."""
     if client == "claude":
-        if mode == "sse":
+        if mode in ("sse", "http"):
             return {
                 "mcpServers": {
                     "pmcp": {
-                        "type": "sse",
-                        "url": "http://127.0.0.1:3344/sse",
+                        "type": "http",
+                        "url": "http://127.0.0.1:3344/mcp",
                     }
                 }
             }
@@ -1114,12 +1114,12 @@ def _build_setup_config(mode: str, client: str) -> dict:
         }
 
     # OpenCode
-    if mode == "sse":
+    if mode in ("sse", "http"):
         return {
             "mcp": {
                 "pmcp": {
                     "type": "remote",
-                    "url": "http://127.0.0.1:3344/sse",
+                    "url": "http://127.0.0.1:3344/mcp",
                     "enabled": True,
                 }
             }
@@ -1313,7 +1313,7 @@ async def run_doctor(args: argparse.Namespace) -> None:
             (
                 "mode",
                 "fail",
-                f"Local config {config_path} uses command mode for [{joined}] while system service is active. Use remote URL instead of command (type: sse, url: http://127.0.0.1:3344/sse).",
+                f"Local config {config_path} uses command mode for [{joined}] while system service is active. Use remote URL instead of command (type: http, url: http://127.0.0.1:3344/mcp).",
             )
         )
     elif service_active:
@@ -1519,11 +1519,11 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )
 
-    gateway_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/sse")
+    gateway_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/mcp")
     gateway_config = ResolvedServerConfig(
         name="pmcp-gateway",
         source="custom",
-        config=RemoteMcpServerConfig(type="sse", url=gateway_url),
+        config=RemoteMcpServerConfig(type="http", url=gateway_url),
     )
 
     async def _call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:

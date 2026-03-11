@@ -206,38 +206,3 @@ class TestGatewayServer:
 
         finally:
             await server.shutdown()
-
-
-@skip_no_servers
-class TestBAMLSummarization:
-    """Test BAML LLM summarization (requires GROQ_API_KEY)."""
-
-    @pytest.mark.asyncio
-    async def test_baml_summarization(self) -> None:
-        """Test BAML summarization with real API."""
-        if not os.environ.get("GROQ_API_KEY"):
-            pytest.skip("GROQ_API_KEY not set")
-
-        configs = get_available_servers()
-        policy = PolicyManager()
-
-        allowed = [c for c in configs if policy.is_server_allowed(c.name)]
-        manager = ClientManager()
-
-        try:
-            await manager.connect_all(allowed)
-            tools = manager.get_all_tools()
-
-            if not tools:
-                pytest.skip("No tools available")
-
-            # With use_llm=True, should use BAML
-            summary = await generate_capability_summary(tools, use_llm=True)
-
-            print(f"\nBAML LLM Summary:\n{summary}")
-
-            assert "MCP Gateway capabilities:" in summary
-            assert len(summary) > 50  # Should be a real summary
-
-        finally:
-            await manager.disconnect_all()
