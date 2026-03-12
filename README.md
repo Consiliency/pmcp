@@ -579,9 +579,9 @@ pmcp init
 # Render client setup snippets
 pmcp setup
 pmcp setup --client claude --mode stdio
-pmcp setup --client opencode --mode sse --write
+pmcp setup --client opencode --mode http --write
 
-# Run diagnostics for lock/mode/SSE checks
+# Run diagnostics for lock/mode/http checks
 pmcp doctor
 pmcp doctor --project /path/to/project
 

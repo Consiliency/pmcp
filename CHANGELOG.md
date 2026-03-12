@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.1] - 2026-03-12
+
+### Fixed
+- README: corrected `pmcp setup` example to use `--mode http` (was `--mode sse`)
+  and updated `pmcp doctor` comment to reflect HTTP transport.
+- Test suite: resolved pre-existing failures (health isolation mock, subprocess
+  PYTHONPATH, browser-invoke skip markers, ruff lint/format drift).
+- Removed stale `TestBAMLSummarization` integration test (`generate_capability_summary`
+  no longer makes outbound LLM calls since v1.8.0).
+
 ## [1.8.0] - 2026-03-11
 
 ### Changed
