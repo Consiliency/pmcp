@@ -92,6 +92,7 @@ _CATEGORY_MAP: dict[str, list[str]] = {
         "sentry",
         "postman",
         "eslint",
+        "index-it-mcp",
         "circleci",
         "argocd",
         "kubernetes",

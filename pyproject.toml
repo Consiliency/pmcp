@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pmcp"
-version = "1.8.1"
+version = "1.9.0"
 description = "PMCP - Progressive MCP: Minimal context bloat with on-demand tool discovery"
 readme = "README.md"
 license = "MIT"
@@ -68,6 +68,9 @@ packages = ["src/pmcp"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "live: opt-in live integration tests (require network and package managers)",
+]
 filterwarnings = [
     # Suppress coroutine warnings from test mocks
     "ignore:coroutine .* was never awaited:RuntimeWarning",

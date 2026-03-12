@@ -872,6 +872,18 @@ servers:
     args: ["-y", "@eslint/mcp"]
     requires_api_key: false
 
+  index-it-mcp:
+    description: "Local-first code indexer - symbol lookup, full-text and semantic search across 48 languages, real-time file watching"
+    keywords: [code-search, indexing, symbols, tree-sitter, semantic-search, code-intelligence, repositories, local-first, ctags, code-index, full-text-search, multi-language]
+    install:
+      mac: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "serve"]
+      linux: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "serve"]
+      wsl: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "serve"]
+      windows: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "serve"]
+    command: "uvx"
+    args: ["--from", "index-it-mcp", "index-it-mcp", "serve"]
+    requires_api_key: false
+
   # === Project Management ===
 
   jira:
