@@ -26,6 +26,10 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 - **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
 - **Policy enforcement**: Output size caps and optional secret redaction
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/viperjuice-mcp-gateway).
+
 ## Quick Start
 
 ### Installation
