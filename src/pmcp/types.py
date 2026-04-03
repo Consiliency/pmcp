@@ -619,7 +619,7 @@ class UpdateServerOutput(BaseModel):
 
     ok: bool
     server: str
-    package_type: Literal["npm", "pypi", "unknown"]
+    package_type: Literal["npm", "pypi", "cargo", "docker", "unknown"]
     package_name: str | None = None
     refreshed: bool = False
     latest_version: str | None = None

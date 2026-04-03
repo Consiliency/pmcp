@@ -11,6 +11,8 @@ from pmcp.manifest.version_checker import (
     _version_cache,
     clear_version_cache,
     detect_package_type,
+    get_cargo_version,
+    get_docker_version,
     get_npm_version,
     get_package_version,
     get_pypi_version,
@@ -73,10 +75,62 @@ class TestDetectPackageType:
         assert pkg_name is None
 
     def test_docker_command(self) -> None:
-        """Test docker command returns unknown."""
+        """Test docker command detects image name."""
         pkg_type, pkg_name = detect_package_type("docker", ["run", "myimage"])
-        assert pkg_type == "unknown"
-        assert pkg_name is None
+        assert pkg_type == "docker"
+        assert pkg_name == "myimage"
+
+    def test_docker_run_with_flags(self) -> None:
+        """Test docker run strips flags and finds image."""
+        pkg_type, pkg_name = detect_package_type(
+            "docker", ["run", "-i", "--rm", "mcp/server:latest"]
+        )
+        assert pkg_type == "docker"
+        assert pkg_name == "mcp/server"
+
+    def test_docker_run_with_env_flag(self) -> None:
+        """Test docker run skips -e VALUE and finds image."""
+        pkg_type, pkg_name = detect_package_type(
+            "docker", ["run", "-e", "KEY=val", "--rm", "ghcr.io/org/mcp"]
+        )
+        assert pkg_type == "docker"
+        assert pkg_name == "ghcr.io/org/mcp"
+
+    def test_cargo_run_with_package_flag(self) -> None:
+        """Test cargo run -p package detects package."""
+        pkg_type, pkg_name = detect_package_type(
+            "cargo", ["run", "-p", "my-mcp-server"]
+        )
+        assert pkg_type == "cargo"
+        assert pkg_name == "my-mcp-server"
+
+    def test_cargo_run_with_bin_flag(self) -> None:
+        """Test cargo run --bin binary detects binary name."""
+        pkg_type, pkg_name = detect_package_type(
+            "cargo", ["run", "--bin", "mcp-binary"]
+        )
+        assert pkg_type == "cargo"
+        assert pkg_name == "mcp-binary"
+
+    def test_cargo_install(self) -> None:
+        """Test cargo install package detects package."""
+        pkg_type, pkg_name = detect_package_type("cargo", ["install", "mcp-tool"])
+        assert pkg_type == "cargo"
+        assert pkg_name == "mcp-tool"
+
+    def test_pip_install(self) -> None:
+        """Test pip install detects PyPI package."""
+        pkg_type, pkg_name = detect_package_type("pip", ["install", "mcp-server-git"])
+        assert pkg_type == "pypi"
+        assert pkg_name == "mcp-server-git"
+
+    def test_pip3_install_upgrade(self) -> None:
+        """Test pip3 install --upgrade detects package."""
+        pkg_type, pkg_name = detect_package_type(
+            "pip3", ["install", "--upgrade", "my-mcp-server"]
+        )
+        assert pkg_type == "pypi"
+        assert pkg_name == "my-mcp-server"
 
     def test_empty_args(self) -> None:
         """Test npx with empty args."""
@@ -415,8 +469,8 @@ class TestGetPackageVersion:
 
     @pytest.mark.asyncio
     async def test_unknown_package(self) -> None:
-        """Test unknown package type."""
-        version, pkg_type = await get_package_version("docker", ["run", "image"])
+        """Test unknown package type returns unknown."""
+        version, pkg_type = await get_package_version("python", ["-m", "mymodule"])
         assert version is None
         assert pkg_type == "unknown"
 
@@ -432,12 +486,225 @@ class TestGetPackageVersion:
             assert version is None
             assert pkg_type == "npm"
 
+    @pytest.mark.asyncio
+    async def test_cargo_package(self) -> None:
+        """Test cargo package version lookup."""
+        with patch(
+            "pmcp.manifest.version_checker.get_cargo_version",
+            new_callable=AsyncMock,
+            return_value="1.5.0",
+        ):
+            version, pkg_type = await get_package_version(
+                "cargo", ["run", "-p", "my-crate"]
+            )
+            assert version == "1.5.0"
+            assert pkg_type == "cargo"
+
+    @pytest.mark.asyncio
+    async def test_docker_package(self) -> None:
+        """Test docker image version lookup."""
+        with patch(
+            "pmcp.manifest.version_checker.get_docker_version",
+            new_callable=AsyncMock,
+            return_value="abcdef123456",
+        ):
+            version, pkg_type = await get_package_version(
+                "docker", ["run", "-i", "--rm", "mcp/server:latest"]
+            )
+            assert version == "abcdef123456"
+            assert pkg_type == "docker"
+
+    @pytest.mark.asyncio
+    async def test_pip_package(self) -> None:
+        """Test pip install package uses PyPI lookup."""
+        with patch(
+            "pmcp.manifest.version_checker.get_pypi_version",
+            new_callable=AsyncMock,
+            return_value="3.0.0",
+        ):
+            version, pkg_type = await get_package_version(
+                "pip", ["install", "my-mcp-server"]
+            )
+            assert version == "3.0.0"
+            assert pkg_type == "pypi"
+
+
+class TestGetCargoVersion:
+    """Tests for get_cargo_version function."""
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self) -> None:
+        clear_version_cache()
+
+    @pytest.mark.asyncio
+    async def test_successful_lookup(self) -> None:
+        """Test successful crates.io version lookup."""
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            return_value={"crate": {"newest_version": "1.5.0"}}
+        )
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            version = await get_cargo_version("my-crate")
+            assert version == "1.5.0"
+
+    @pytest.mark.asyncio
+    async def test_correct_url(self) -> None:
+        """Test crates.io URL is correct."""
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            return_value={"crate": {"newest_version": "0.1.0"}}
+        )
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            await get_cargo_version("my-crate")
+            url = mock_session.get.call_args[0][0]
+            assert url == "https://crates.io/api/v1/crates/my-crate"
+
+    @pytest.mark.asyncio
+    async def test_404_response(self) -> None:
+        """Test handling of 404 response."""
+        mock_response = MagicMock()
+        mock_response.status = 404
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            version = await get_cargo_version("nonexistent-crate")
+            assert version is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_error(self) -> None:
+        """Test handling of timeout."""
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(side_effect=asyncio.TimeoutError())
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            version = await get_cargo_version("my-crate")
+            assert version is None
+
+    @pytest.mark.asyncio
+    async def test_cache_hit(self) -> None:
+        """Test cached versions avoid network calls."""
+        _version_cache["cargo:my-crate"] = "2.0.0"
+        version = await get_cargo_version("my-crate")
+        assert version == "2.0.0"
+
+
+class TestGetDockerVersion:
+    """Tests for get_docker_version function."""
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self) -> None:
+        clear_version_cache()
+
+    @pytest.mark.asyncio
+    async def test_successful_lookup_namespaced(self) -> None:
+        """Test successful Docker Hub lookup for namespaced image."""
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            return_value={"digest": "sha256:abcdef1234567890", "name": "latest"}
+        )
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            version = await get_docker_version("mcp/server")
+            assert version == "abcdef123456"  # first 12 hex chars after "sha256:"
+
+    @pytest.mark.asyncio
+    async def test_official_image_uses_library_prefix(self) -> None:
+        """Test official images route through library/ namespace."""
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(
+            return_value={"digest": "sha256:aabbccdd11223344", "name": "latest"}
+        )
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            await get_docker_version("nginx")
+            url = mock_session.get.call_args[0][0]
+            assert "library/nginx" in url
+
+    @pytest.mark.asyncio
+    async def test_404_response(self) -> None:
+        """Test handling of 404 response."""
+        mock_response = MagicMock()
+        mock_response.status = 404
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            version = await get_docker_version("nonexistent/image")
+            assert version is None
+
+    @pytest.mark.asyncio
+    async def test_timeout_error(self) -> None:
+        """Test handling of timeout."""
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(side_effect=asyncio.TimeoutError())
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            version = await get_docker_version("mcp/server")
+            assert version is None
+
+    @pytest.mark.asyncio
+    async def test_cache_hit(self) -> None:
+        """Test cached versions avoid network calls."""
+        _version_cache["docker:mcp/server"] = "abc123def456"
+        version = await get_docker_version("mcp/server")
+        assert version == "abc123def456"
+
 
 class TestClearVersionCache:
     """Tests for clear_version_cache function."""
 
     def test_clears_cache(self) -> None:
         """Test cache is cleared."""
+        clear_version_cache()
         _version_cache["npm:test"] = "1.0.0"
         _version_cache["pypi:test"] = "2.0.0"
         assert len(_version_cache) == 2

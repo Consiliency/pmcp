@@ -2199,12 +2199,16 @@ class GatewayTools:
                 package_type="unknown",
                 message=(
                     f"Could not determine package manager for '{server_name}'. "
-                    "Only npm (npx) and pypi (uvx) servers are supported."
+                    "Supported managers: npm (npx), pypi (uvx/pip), cargo, docker."
                 ),
             )
 
         if package_type == "npm":
             update_cmd = ["npx", "-y", f"{package_name}@latest", "--help"]
+        elif package_type == "cargo":
+            update_cmd = ["cargo", "install", package_name]
+        elif package_type == "docker":
+            update_cmd = ["docker", "pull", f"{package_name}:latest"]
         else:
             update_cmd = ["uvx", "--refresh", package_name, "--help"]
 
