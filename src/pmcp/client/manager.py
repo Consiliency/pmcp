@@ -386,6 +386,12 @@ class ClientManager:
         """Connect to a local stdio MCP server."""
         name = config.name
 
+        # Clean up any existing live connection before spawning a replacement
+        if name in self._clients:
+            existing = self._clients[name]
+            logger.warning(f"[{name}] Existing live connection found; cleaning up before reconnect")
+            await self._cleanup_client(name, existing)
+
         # Initialize status
         status = ServerStatus(
             name=name,
@@ -546,6 +552,12 @@ class ClientManager:
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
             status.last_error = str(e)
+            if managed.read_task and not managed.read_task.done():
+                managed.read_task.cancel()
+                try:
+                    await asyncio.shield(managed.read_task)
+                except (asyncio.CancelledError, Exception):
+                    pass
             if process.returncode is None:
                 process.kill()
             raise
@@ -969,12 +981,42 @@ class ClientManager:
                         await asyncio.wait_for(managed.process.wait(), timeout=5.0)
                     except asyncio.TimeoutError:
                         managed.process.kill()
+                        try:
+                            await asyncio.wait_for(managed.process.wait(), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"[{name}] Process PID={managed.process.pid} did not exit "
+                                f"after SIGKILL (possible D-state / uninterruptible I/O wait)"
+                            )
             except Exception as e:
                 logger.warning(f"Error disconnecting from {name}: {e}")
 
         self._clients.clear()
         self._tools.clear()
         self._servers.clear()
+
+    async def _cleanup_client(self, name: str, managed: ManagedClient) -> None:
+        """Cancel a client's read task, kill its process, and remove it from registries.
+
+        Safe to call on any managed client regardless of state. All exceptions are
+        suppressed so callers always complete successfully.
+        """
+        if managed.read_task and not managed.read_task.done():
+            managed.read_task.cancel()
+            try:
+                await asyncio.shield(managed.read_task)
+            except (asyncio.CancelledError, Exception):
+                pass
+        if managed.process and managed.process.returncode is None:
+            managed.process.kill()
+            try:
+                await asyncio.wait_for(managed.process.wait(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[{name}] Process did not exit after SIGKILL in _cleanup_client"
+                )
+        self._clients.pop(name, None)
+        self._servers.pop(name, None)
 
     async def refresh(self, configs: list[ResolvedServerConfig]) -> list[str]:
         """Refresh connections (disconnect + reconnect)."""
@@ -1081,14 +1123,7 @@ class ClientManager:
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
             status.last_error = str(e)
-            # Clean up on failure
-            if managed.read_task:
-                managed.read_task.cancel()
-            if process.returncode is None:
-                process.kill()
-            # Remove from registries
-            self._clients.pop(name, None)
-            self._servers.pop(name, None)
+            await self._cleanup_client(name, managed)
             raise
 
     async def call_tool(

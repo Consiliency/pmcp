@@ -732,3 +732,154 @@ class TestConnectionRetry:
 
         assert attempts == 1  # No retry
         assert len(errors) == 1
+
+
+class TestCleanupClient:
+    """Tests for _cleanup_client helper."""
+
+    def _make_manager_with_client(
+        self, returncode: int | None = None, task_done: bool = False
+    ) -> tuple[ClientManager, ManagedClient]:
+        manager = ClientManager()
+        mock_process = MagicMock()
+        mock_process.returncode = returncode
+        mock_process.kill = MagicMock()
+        mock_process.wait = AsyncMock(return_value=0)
+
+        mock_task = MagicMock()
+        mock_task.done = MagicMock(return_value=task_done)
+        mock_task.cancel = MagicMock()
+
+        status = ServerStatus(name="test", status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=mock_process, status=status)
+        managed.read_task = mock_task  # type: ignore[assignment]
+
+        manager._clients["test"] = managed
+        manager._servers["test"] = status
+        return manager, managed
+
+    @pytest.mark.asyncio
+    async def test_cleanup_client_cancels_read_task_and_kills_process(self) -> None:
+        """_cleanup_client should cancel the read task and kill a running process."""
+        manager, managed = self._make_manager_with_client(returncode=None, task_done=False)
+
+        await manager._cleanup_client("test", managed)
+
+        managed.read_task.cancel.assert_called_once()  # type: ignore[union-attr]
+        managed.process.kill.assert_called_once()  # type: ignore[union-attr]
+        assert "test" not in manager._clients
+        assert "test" not in manager._servers
+
+    @pytest.mark.asyncio
+    async def test_cleanup_client_skips_cancel_if_task_done(self) -> None:
+        """_cleanup_client should not cancel an already-done read task."""
+        manager, managed = self._make_manager_with_client(returncode=None, task_done=True)
+
+        await manager._cleanup_client("test", managed)
+
+        managed.read_task.cancel.assert_not_called()  # type: ignore[union-attr]
+        managed.process.kill.assert_called_once()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_cleanup_client_skips_kill_if_process_exited(self) -> None:
+        """_cleanup_client should not kill a process that has already exited."""
+        manager, managed = self._make_manager_with_client(returncode=0, task_done=False)
+
+        await manager._cleanup_client("test", managed)
+
+        managed.read_task.cancel.assert_called_once()  # type: ignore[union-attr]
+        managed.process.kill.assert_not_called()  # type: ignore[union-attr]
+
+
+class TestConnectStdioGuard:
+    """Tests for the pre-spawn guard in _connect_stdio."""
+
+    @pytest.mark.asyncio
+    async def test_connect_stdio_calls_cleanup_when_existing_client_present(self) -> None:
+        """If _clients already has an entry for a server, _cleanup_client must be called."""
+        manager = ClientManager()
+
+        existing_status = ServerStatus(
+            name="test", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+        existing_managed = ManagedClient(
+            config=MagicMock(), process=MagicMock(), status=existing_status
+        )
+        manager._clients["test"] = existing_managed
+        manager._servers["test"] = existing_status
+
+        cleanup_mock = AsyncMock()
+        manager._cleanup_client = cleanup_mock  # type: ignore[method-assign]
+
+        # Make _connect_stdio fail fast after the guard so we don't need full MCP wiring
+        with patch("asyncio.create_subprocess_exec", side_effect=RuntimeError("abort")):
+            with pytest.raises(RuntimeError, match="abort"):
+                from pmcp.types import LocalMcpServerConfig
+
+                config = ResolvedServerConfig(
+                    name="test",
+                    source="project",
+                    config=LocalMcpServerConfig(command="fake", args=[]),
+                )
+                await manager._connect_stdio(config)
+
+        cleanup_mock.assert_awaited_once_with("test", existing_managed)
+
+
+class TestDisconnectAllPostKill:
+    """Additional disconnect_all tests for post-SIGKILL wait behaviour."""
+
+    @pytest.mark.asyncio
+    async def test_disconnect_all_waits_after_sigkill_and_logs_on_dstate(self) -> None:
+        """After SIGKILL, disconnect_all should wait up to 3s and warn if still alive."""
+        manager = ClientManager()
+
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.pid = 99999
+        mock_process.terminate = MagicMock()
+        mock_process.kill = MagicMock()
+        # First call (SIGTERM wait) times out; second call (post-SIGKILL wait) also times out
+        mock_process.wait = AsyncMock(side_effect=asyncio.TimeoutError())
+
+        status = ServerStatus(name="slow", status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=mock_process, status=status)
+        managed.read_task = None
+        manager._clients["slow"] = managed
+        manager._servers["slow"] = status
+
+        with patch("pmcp.client.manager.logger") as mock_logger:
+            await manager.disconnect_all()
+
+        mock_process.kill.assert_called_once()
+        # Warning should mention SIGKILL or D-state
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any("SIGKILL" in w or "D-state" in w for w in warning_calls)
+
+    @pytest.mark.asyncio
+    async def test_disconnect_all_second_wait_succeeds_after_sigkill(self) -> None:
+        """After SIGKILL, if the process exits within 3s, no warning should be logged."""
+        manager = ClientManager()
+
+        mock_process = MagicMock()
+        mock_process.returncode = None
+        mock_process.pid = 11111
+        mock_process.terminate = MagicMock()
+        mock_process.kill = MagicMock()
+        # SIGTERM wait times out; post-SIGKILL wait succeeds
+        mock_process.wait = AsyncMock(
+            side_effect=[asyncio.TimeoutError(), 0]
+        )
+
+        status = ServerStatus(name="slow2", status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=mock_process, status=status)
+        managed.read_task = None
+        manager._clients["slow2"] = managed
+        manager._servers["slow2"] = status
+
+        with patch("pmcp.client.manager.logger") as mock_logger:
+            await manager.disconnect_all()
+
+        mock_process.kill.assert_called_once()
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert not any("SIGKILL" in w or "D-state" in w for w in warning_calls)

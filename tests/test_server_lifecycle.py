@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from pmcp.server import GatewayServer
+from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
 
 
 class TestGatewayServerInit:
@@ -133,3 +137,91 @@ class TestGatewayServerIntegration:
 
                         assert server._server is not None
                         assert server._capability_summary == "No tools available"
+
+
+class TestOrphanScan:
+    """Tests for GatewayServer._kill_orphan_processes."""
+
+    def _make_config(self, command: str, args: list[str]) -> ResolvedServerConfig:
+        return ResolvedServerConfig(
+            name="test-server",
+            source="project",
+            config=LocalMcpServerConfig(command=command, args=args),
+        )
+
+    def _write_cmdline(self, proc_dir: Path, pid: int, argv: list[str]) -> None:
+        entry = proc_dir / str(pid)
+        entry.mkdir()
+        (entry / "cmdline").write_bytes(b"\x00".join(a.encode() for a in argv) + b"\x00")
+
+    def test_skips_on_non_linux(self, tmp_path: Path) -> None:
+        """_kill_orphan_processes should do nothing on non-Linux platforms."""
+        server = GatewayServer()
+        config = self._make_config("npx", ["some-mcp-server"])
+        with patch("pmcp.server.sys") as mock_sys, patch("pmcp.server.os.kill") as mock_kill:
+            mock_sys.platform = "darwin"
+            server._kill_orphan_processes([config], _proc_path=tmp_path)
+        mock_kill.assert_not_called()
+
+    def test_kills_matching_pid(self, tmp_path: Path) -> None:
+        """_kill_orphan_processes should SIGKILL a process whose argv matches a config."""
+        proc_dir = tmp_path / "proc"
+        proc_dir.mkdir()
+        self._write_cmdline(proc_dir, 12345, ["npx", "@mcp/server-fs", "/srv"])
+
+        server = GatewayServer()
+        config = self._make_config("npx", ["@mcp/server-fs", "/srv"])
+
+        with patch("pmcp.server.sys") as mock_sys, patch("pmcp.server.os") as mock_os:
+            mock_sys.platform = "linux"
+            mock_os.getpid.return_value = 1  # own pid won't match 12345
+            server._kill_orphan_processes([config], _proc_path=proc_dir)
+            mock_os.kill.assert_called_once_with(12345, signal.SIGKILL)
+
+    def test_skips_own_pid(self, tmp_path: Path) -> None:
+        """_kill_orphan_processes should not kill its own PID."""
+        proc_dir = tmp_path / "proc"
+        proc_dir.mkdir()
+        own_pid = os.getpid()
+        self._write_cmdline(proc_dir, own_pid, ["npx", "@mcp/server-fs", "/srv"])
+
+        server = GatewayServer()
+        config = self._make_config("npx", ["@mcp/server-fs", "/srv"])
+
+        with patch("pmcp.server.sys") as mock_sys, patch("pmcp.server.os.kill") as mock_kill:
+            mock_sys.platform = "linux"
+            server._kill_orphan_processes([config], _proc_path=proc_dir)
+        mock_kill.assert_not_called()
+
+    def test_handles_permission_error_on_kill(self, tmp_path: Path) -> None:
+        """PermissionError on os.kill should be caught and not propagate."""
+        proc_dir = tmp_path / "proc"
+        proc_dir.mkdir()
+        self._write_cmdline(proc_dir, 55555, ["npx", "some-server"])
+
+        server = GatewayServer()
+        config = self._make_config("npx", ["some-server"])
+
+        with patch("pmcp.server.sys") as mock_sys, patch("pmcp.server.os") as mock_os:
+            mock_sys.platform = "linux"
+            mock_os.getpid.return_value = 1
+            mock_os.kill.side_effect = PermissionError("not allowed")
+            # Should not raise
+            server._kill_orphan_processes([config], _proc_path=proc_dir)
+
+    def test_ignores_unreadable_cmdline(self, tmp_path: Path) -> None:
+        """PermissionError when reading cmdline should be silently skipped."""
+        proc_dir = tmp_path / "proc"
+        proc_dir.mkdir()
+        entry = proc_dir / "77777"
+        entry.mkdir()
+        cmdline = entry / "cmdline"
+        cmdline.write_bytes(b"")  # empty — simulates unreadable/zombie process
+
+        server = GatewayServer()
+        config = self._make_config("npx", ["some-server"])
+
+        with patch("pmcp.server.sys") as mock_sys, patch("pmcp.server.os.kill") as mock_kill:
+            mock_sys.platform = "linux"
+            server._kill_orphan_processes([config], _proc_path=proc_dir)
+        mock_kill.assert_not_called()
