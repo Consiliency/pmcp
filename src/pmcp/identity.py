@@ -168,7 +168,15 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
         logger.debug(f"Acquired singleton lock: {_LOCK_FILE}")
         return True
     except (BlockingIOError, OSError) as e:
-        logger.warning(f"Another gateway instance is running (lock: {_LOCK_FILE}): {e}")
+        pid_info = ""
+        try:
+            if _LOCK_FILE and _LOCK_FILE.exists():
+                pid_info = f" PID {_LOCK_FILE.read_text().strip()},"
+        except Exception:
+            pass
+        logger.warning(
+            f"Another gateway instance is running ({pid_info} lock: {_LOCK_FILE}): {e}"
+        )
         if _LOCK_FD:
             _LOCK_FD.close()
             _LOCK_FD = None

@@ -65,6 +65,7 @@ class TestConfigLoading:
             print(f"  Found: {cfg.name} ({cfg.source})")
 
 
+@pytest.mark.live
 @skip_no_servers
 class TestServerConnection:
     """Test connecting to real MCP servers."""
@@ -126,6 +127,7 @@ class TestServerConnection:
             await manager.disconnect_all()
 
 
+@pytest.mark.live
 @skip_no_servers
 class TestSummaryGeneration:
     """Test summary generation with real tools."""
@@ -185,6 +187,7 @@ class TestSummaryGeneration:
             await manager.disconnect_all()
 
 
+@pytest.mark.live
 @skip_no_servers
 class TestGatewayServer:
     """Test full gateway server initialization."""

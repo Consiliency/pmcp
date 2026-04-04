@@ -31,19 +31,37 @@ LOG_DIR = Path(".pmcp/logs")
 LOG_FILE = LOG_DIR / "gateway.log"
 
 
-def setup_logging(level: str, log_to_file: bool = True) -> None:
+class _JsonFormatter(logging.Formatter):
+    """Emit log records as single-line JSON for Datadog/Loki ingestion."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({
+            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        })
+
+
+def setup_logging(level: str, log_to_file: bool = True, log_format: str = "text") -> None:
     """Configure logging with optional file output."""
     log_level = getattr(logging, level.upper(), logging.INFO)
-    log_format = "[%(asctime)s] [%(levelname)s] %(message)s"
+    text_format = "[%(asctime)s] [%(levelname)s] %(message)s"
     date_format = "%Y-%m-%dT%H:%M:%S"
 
+    formatter: logging.Formatter
+    if log_format == "json":
+        formatter = _JsonFormatter()
+    else:
+        formatter = logging.Formatter(text_format, datefmt=date_format)
+
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(formatter)
+
     # Log to stderr to avoid interfering with MCP stdio
-    logging.basicConfig(
-        level=log_level,
-        format=log_format,
-        datefmt=date_format,
-        stream=sys.stderr,
-    )
+    root = logging.getLogger()
+    root.setLevel(log_level)
+    root.addHandler(handler)
 
     # Also log to file for later viewing with 'pmcp logs'
     if log_to_file:
@@ -55,9 +73,7 @@ def setup_logging(level: str, log_to_file: bool = True) -> None:
                 backupCount=5,
             )
             file_handler.setLevel(log_level)
-            file_handler.setFormatter(
-                logging.Formatter(log_format, datefmt=date_format)
-            )
+            file_handler.setFormatter(formatter)
             logging.getLogger().addHandler(file_handler)
         except Exception:
             # If we can't write logs, continue without file logging
@@ -118,6 +134,12 @@ Environment overrides:
         help="Log level (default: info)",
     )
     parser.add_argument(
+        "--log-format",
+        choices=["text", "json"],
+        default="text",
+        help="Log output format: text (default) or json (for Datadog/Loki)",
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging",
@@ -151,6 +173,35 @@ Environment overrides:
         type=Path,
         default=None,
         help="Directory for singleton lock file. Default: ~/.pmcp (global per-user lock)",
+    )
+    parser.add_argument(
+        "--auth-token",
+        type=str,
+        default=None,
+        help="Bearer token required on HTTP transport (ignored for stdio). "
+        "Also read from PMCP_AUTH_TOKEN env var. "
+        "Prefer PMCP_AUTH_TOKEN env var; CLI arg is visible in process list.",
+    )
+    parser.add_argument(
+        "--auth-token-file",
+        type=Path,
+        default=None,
+        help="Path to a file containing the bearer token (alternative to --auth-token). "
+        "File contents are stripped of leading/trailing whitespace.",
+    )
+    parser.add_argument(
+        "--max-concurrent-spawns",
+        type=int,
+        default=8,
+        help="Max simultaneous child MCP server processes to spawn (default: 8). "
+        "Also read from PMCP_MAX_SPAWNS.",
+    )
+    parser.add_argument(
+        "--rate-limit",
+        type=int,
+        default=0,
+        help="HTTP rate limit in requests per minute per client IP on /mcp "
+        "(default: 0 = unlimited). Also read from PMCP_RATE_LIMIT.",
     )
     parser.add_argument(
         "--version",
@@ -1385,6 +1436,36 @@ async def run_server(args: argparse.Namespace) -> None:
         args.host = os.environ["PMCP_HOST"]
     if os.environ.get("PMCP_PORT"):
         args.port = int(os.environ["PMCP_PORT"])
+    # Resolve auth token: --auth-token-file > --auth-token > PMCP_AUTH_TOKEN
+    auth_token_from_cli = bool(args.auth_token)
+    auth_token_file = getattr(args, "auth_token_file", None)
+    if auth_token_file and args.auth_token:
+        logger.error("--auth-token and --auth-token-file are mutually exclusive")
+        sys.exit(1)
+    if auth_token_file:
+        try:
+            args.auth_token = Path(auth_token_file).read_text().strip()
+        except OSError as e:
+            logger.error(f"Cannot read --auth-token-file: {e}")
+            sys.exit(1)
+    elif not args.auth_token and os.environ.get("PMCP_AUTH_TOKEN"):
+        args.auth_token = os.environ["PMCP_AUTH_TOKEN"]
+        auth_token_from_cli = False
+
+    # Warn when secret is visible in the process list
+    if auth_token_from_cli:
+        logger.warning(
+            "--auth-token passed on CLI; token is visible in 'ps aux'. "
+            "Use the PMCP_AUTH_TOKEN environment variable instead."
+        )
+
+    # Env overrides for new flags
+    if not getattr(args, "max_concurrent_spawns", None) or args.max_concurrent_spawns == 8:
+        if os.environ.get("PMCP_MAX_SPAWNS"):
+            args.max_concurrent_spawns = int(os.environ["PMCP_MAX_SPAWNS"])
+    if not getattr(args, "rate_limit", None):
+        if os.environ.get("PMCP_RATE_LIMIT"):
+            args.rate_limit = int(os.environ["PMCP_RATE_LIMIT"])
 
     # Lock directory - CLI flag takes precedence over env var
     lock_dir = getattr(args, "lock_dir", None)
@@ -1399,7 +1480,7 @@ async def run_server(args: argparse.Namespace) -> None:
     else:
         log_level = args.log_level
 
-    setup_logging(log_level)
+    setup_logging(log_level, log_format=getattr(args, "log_format", "text"))
     logger = logging.getLogger(__name__)
 
     logger.info("Starting PMCP...")
@@ -1411,6 +1492,9 @@ async def run_server(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         lock_dir=lock_dir,
+        auth_token=getattr(args, "auth_token", None),
+        max_concurrent_spawns=getattr(args, "max_concurrent_spawns", 8),
+        rate_limit_rpm=getattr(args, "rate_limit", 0),
     )
 
     # Handle graceful shutdown

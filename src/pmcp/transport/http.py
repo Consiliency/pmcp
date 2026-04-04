@@ -13,22 +13,42 @@ Claude Code config (.mcp.json):
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import json
 import logging
+import uuid
 from collections.abc import AsyncIterator
 from typing import TYPE_CHECKING
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
-from starlette.routing import Route
 from starlette.requests import Request
-from starlette.responses import Response, StreamingResponse
+from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.routing import Route
+
+from pmcp import __version__
 
 if TYPE_CHECKING:
     from mcp.server import Server
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# In-process request counters (Prometheus text format fallback)
+# ---------------------------------------------------------------------------
+_metrics: dict[str, int] = {
+    "requests_total": 0,
+    "requests_401": 0,
+    "requests_429": 0,
+    "requests_ok": 0,
+}
+
+# ---------------------------------------------------------------------------
+# Rate-limit state (lazy-initialized to avoid event-loop issues at import time)
+# ---------------------------------------------------------------------------
+_rl_store: dict[str, collections.deque] = {}
+_rl_lock: asyncio.Lock | None = None
 
 
 class _NullResponse(Response):
@@ -44,14 +64,49 @@ class _NullResponse(Response):
         pass  # response was already sent by session_manager.handle_request
 
 
-def create_http_app(mcp_server: Server) -> Starlette:
+async def _check_rate_limit(client_ip: str, max_rpm: int) -> bool:
+    """Return True if the request is allowed, False if rate-limited.
+
+    Uses a sliding 60-second window per client IP.
+    """
+    global _rl_lock
+    if _rl_lock is None:
+        _rl_lock = asyncio.Lock()
+
+    import time
+
+    now = time.monotonic()
+    window = 60.0
+    async with _rl_lock:
+        if client_ip not in _rl_store:
+            _rl_store[client_ip] = collections.deque()
+        q = _rl_store[client_ip]
+        while q and now - q[0] > window:
+            q.popleft()
+        if not q:
+            del _rl_store[client_ip]
+            _rl_store[client_ip] = collections.deque()
+            q = _rl_store[client_ip]
+        if len(q) >= max_rpm:
+            return False
+        q.append(now)
+        return True
+
+
+def create_http_app(
+    mcp_server: Server,
+    auth_token: str | None = None,
+    rate_limit_rpm: int = 0,
+) -> Starlette:
     """Create Starlette ASGI app with streamable-HTTP transport for MCP server.
 
     Args:
         mcp_server: The MCP Server instance to run.
+        auth_token: If set, require ``Authorization: Bearer <token>`` on every /mcp request.
+        rate_limit_rpm: If > 0, limit each client IP to this many requests per minute on /mcp.
 
     Returns:
-        Starlette application with /mcp endpoint.
+        Starlette application with /mcp, /health, and /metrics endpoints.
     """
     session_manager = StreamableHTTPSessionManager(
         app=mcp_server,
@@ -59,16 +114,67 @@ def create_http_app(mcp_server: Server) -> Starlette:
         stateless=False,  # Maintain session state across requests
     )
 
+    async def handle_health(request: Request) -> Response:
+        """Unauthenticated health check — safe for load-balancers and container probes."""
+        return JSONResponse({"ok": True, "version": __version__, "transport": "http"})
+
+    async def handle_metrics(request: Request) -> Response:
+        """Unauthenticated Prometheus-compatible metrics endpoint."""
+        try:
+            import prometheus_client
+
+            output = prometheus_client.generate_latest()
+            return Response(
+                output,
+                media_type="text/plain; version=0.0.4; charset=utf-8",
+            )
+        except ImportError:
+            pass
+
+        # Fallback: render internal counters in Prometheus text format
+        lines: list[str] = []
+        for key, val in _metrics.items():
+            metric_name = f"pmcp_{key}"
+            lines.append(f"# TYPE {metric_name} counter")
+            lines.append(f"{metric_name} {val}")
+        return Response(
+            "\n".join(lines) + "\n",
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
+
     async def handle_mcp(request: Request) -> Response:
         """Delegate all MCP traffic to the session manager."""
+        request_id = uuid.uuid4().hex[:8]
+        _metrics["requests_total"] += 1
+
         session_id_short = (request.headers.get("mcp-session-id") or "")[:8] or "<none>"
         logger.debug(
-            "handle_mcp: %s method=%s session=%s accept=%r",
+            "handle_mcp [%s]: %s method=%s session=%s accept=%r",
+            request_id,
             request.url.path,
             request.method,
             session_id_short,
             request.headers.get("accept", ""),
         )
+
+        # Bearer-token auth guard (optional — only when auth_token is configured)
+        if auth_token is not None:
+            incoming = request.headers.get("authorization", "")
+            if incoming != f"Bearer {auth_token}":
+                _metrics["requests_401"] += 1
+                logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)
+                return Response("Unauthorized", status_code=401)
+
+        # Per-IP rate limiting (optional — only when rate_limit_rpm > 0)
+        if rate_limit_rpm > 0:
+            client_ip = request.client.host if request.client else "unknown"
+            if not await _check_rate_limit(client_ip, rate_limit_rpm):
+                _metrics["requests_429"] += 1
+                logger.debug(
+                    "handle_mcp [%s]: 429 rate limited ip=%s", request_id, client_ip
+                )
+                return Response("Too Many Requests", status_code=429)
+
         # Workaround for rmcp clients (e.g., Codex) that open the GET common
         # stream before completing the initialize handshake (and therefore have
         # no session ID yet). The MCP session manager returns 400 for session-less
@@ -86,7 +192,10 @@ def create_http_app(mcp_server: Server) -> Starlette:
                 except asyncio.CancelledError:
                     pass
 
-            logger.debug("rmcp-compat: serving pre-session GET as keep-alive SSE")
+            logger.debug(
+                "handle_mcp [%s]: rmcp-compat serving pre-session GET as keep-alive SSE",
+                request_id,
+            )
             return StreamingResponse(
                 _keepalive_sse(),
                 media_type="text/event-stream",
@@ -106,7 +215,9 @@ def create_http_app(mcp_server: Server) -> Starlette:
                 body = json.loads(body_bytes)
                 if body.get("method") == "notifications/initialized":
                     logger.debug(
-                        "rmcp-compat: accepted notifications/initialized without session ID"
+                        "handle_mcp [%s]: rmcp-compat accepted notifications/initialized"
+                        " without session ID",
+                        request_id,
                     )
                     return Response(status_code=202)
             except Exception:
@@ -130,6 +241,7 @@ def create_http_app(mcp_server: Server) -> Starlette:
         await session_manager.handle_request(
             request.scope, request.receive, request._send
         )
+        _metrics["requests_ok"] += 1
         return _NullResponse()
 
     @contextlib.asynccontextmanager
@@ -141,6 +253,8 @@ def create_http_app(mcp_server: Server) -> Starlette:
 
     routes = [
         Route("/mcp", endpoint=handle_mcp, methods=["GET", "POST", "DELETE"]),
+        Route("/health", endpoint=handle_health, methods=["GET"]),
+        Route("/metrics", endpoint=handle_metrics, methods=["GET"]),
     ]
 
     return Starlette(routes=routes, lifespan=lifespan)

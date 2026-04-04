@@ -63,12 +63,18 @@ class GatewayServer:
         host: str = "127.0.0.1",
         port: int = 3344,
         lock_dir: Path | str | None = None,
+        auth_token: str | None = None,
+        max_concurrent_spawns: int = 8,
+        rate_limit_rpm: int = 0,
     ) -> None:
         self._project_root = project_root
         self._custom_config_path = custom_config_path
         self._cache_dir = cache_dir or Path(".mcp-gateway")
         self._host = host
         self._port = port
+        self._auth_token = auth_token
+        self._max_concurrent_spawns = max_concurrent_spawns
+        self._rate_limit_rpm = rate_limit_rpm
         # Lock directory - None means use global default (~/.pmcp)
         self._lock_dir: Path | None = Path(lock_dir) if lock_dir else None
 
@@ -83,7 +89,8 @@ class GatewayServer:
 
         # Initialize client manager
         self._client_manager = ClientManager(
-            max_tools_per_server=self._policy_manager.get_max_tools_per_server()
+            max_tools_per_server=self._policy_manager.get_max_tools_per_server(),
+            max_concurrent_spawns=self._max_concurrent_spawns,
         )
 
         # Initialize gateway tools handler
@@ -169,7 +176,7 @@ class GatewayServer:
                 return [
                     TextContent(
                         type="text",
-                        text=json.dumps({"error": True, "message": str(e)}),
+                        text=json.dumps({"error": True, "message": str(e)[:400]}),
                     )
                 ]
 
@@ -577,7 +584,11 @@ class GatewayServer:
             raise RuntimeError("Server not initialized after initialization")
 
         try:
-            app = create_http_app(self._server)
+            app = create_http_app(
+                self._server,
+                auth_token=self._auth_token,
+                rate_limit_rpm=self._rate_limit_rpm,
+            )
             logger.info(
                 f"MCP Gateway server started (http://{self._host}:{self._port})"
             )

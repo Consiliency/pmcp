@@ -22,6 +22,9 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Environment :: Console",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+    "Topic :: Internet :: WWW/HTTP",
 ]
 dependencies = [
     "mcp>=1.0.0",
@@ -54,6 +57,7 @@ http = [
     "starlette>=0.27.0",
     "uvicorn>=0.23.0",
     "sse-starlette>=1.6.0",
+    "prometheus-client>=0.20",
 ]
 all = [
     "pmcp[dev,llm,http]",

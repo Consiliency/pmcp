@@ -546,6 +546,12 @@ class GatewayTools:
             self._load_provisioned_registry()
         )
 
+    @staticmethod
+    def _sanitize_error(e: Exception) -> str:
+        """Return a safe error string: strip absolute paths, truncate to 400 chars."""
+        msg = re.sub(r"(/[^\s:,\"']+)", lambda m: os.path.basename(m.group(1)), str(e))
+        return msg[:400]
+
     @property
     def _provisioned_registry_path(self) -> Path:
         return Path.home() / ".config" / "pmcp" / "provisioned.json"
@@ -984,9 +990,28 @@ class GatewayTools:
                 feedback_hint=self._feedback_hint(),
             )
 
+        # Pre-dispatch: validate required arguments
+        required = (tool_info.input_schema or {}).get("required", [])
+        missing = [f for f in required if f not in (parsed.arguments or {})]
+        if missing:
+            error = make_error(
+                ErrorCode.E304_INVALID_ARGUMENTS,
+                message=f"Missing required arguments: {', '.join(missing)}",
+                tool_id=parsed.tool_id,
+            )
+            return InvokeOutput(
+                tool_id=parsed.tool_id,
+                ok=False,
+                truncated=False,
+                raw_size_estimate=0,
+                errors=[error.model_dump_json()],
+                feedback_hint=self._feedback_hint(),
+            )
+
         update_warning = await self._get_update_warning(tool_info.server_name)
 
         # Call the tool
+        _call_start = time.monotonic()
         timeout_ms = 30000
         if parsed.options:
             timeout_ms = parsed.options.timeout_ms
@@ -1006,6 +1031,10 @@ class GatewayTools:
                 result, redact=redact, max_bytes=max_bytes
             )
 
+            elapsed_ms = round((time.monotonic() - _call_start) * 1000)
+            logger.info(
+                f"tool_call tool={parsed.tool_id} server={tool_info.server_name} ok=True elapsed_ms={elapsed_ms}"
+            )
             return InvokeOutput(
                 tool_id=parsed.tool_id,
                 ok=True,
@@ -1021,6 +1050,10 @@ class GatewayTools:
             self._record_feedback_event(
                 "invoke_failure",
                 {"tool_id": parsed.tool_id, "reason": "timeout"},
+            )
+            elapsed_ms = round((time.monotonic() - _call_start) * 1000)
+            logger.info(
+                f"tool_call tool={parsed.tool_id} server={tool_info.server_name} ok=False elapsed_ms={elapsed_ms} reason=timeout"
             )
             error = make_error(
                 ErrorCode.E303_TOOL_TIMEOUT,
@@ -1043,12 +1076,16 @@ class GatewayTools:
                 {
                     "tool_id": parsed.tool_id,
                     "reason": "connection_error",
-                    "error": str(e),
+                    "error": self._sanitize_error(e),
                 },
+            )
+            elapsed_ms = round((time.monotonic() - _call_start) * 1000)
+            logger.info(
+                f"tool_call tool={parsed.tool_id} server={tool_info.server_name} ok=False elapsed_ms={elapsed_ms} reason=connection_error"
             )
             error = make_error(
                 ErrorCode.E201_SERVER_OFFLINE,
-                message=str(e),
+                message=self._sanitize_error(e),
                 tool_id=parsed.tool_id,
             )
             return InvokeOutput(
@@ -1064,11 +1101,15 @@ class GatewayTools:
         except Exception as e:
             self._record_feedback_event(
                 "invoke_failure",
-                {"tool_id": parsed.tool_id, "reason": "exception", "error": str(e)},
+                {"tool_id": parsed.tool_id, "reason": "exception", "error": self._sanitize_error(e)},
+            )
+            elapsed_ms = round((time.monotonic() - _call_start) * 1000)
+            logger.info(
+                f"tool_call tool={parsed.tool_id} server={tool_info.server_name} ok=False elapsed_ms={elapsed_ms} reason=exception"
             )
             error = make_error(
                 ErrorCode.E302_TOOL_EXECUTION_FAILED,
-                message=str(e),
+                message=self._sanitize_error(e),
                 tool_id=parsed.tool_id,
             )
             return InvokeOutput(
@@ -1917,13 +1958,13 @@ class GatewayTools:
         except InstallError as e:
             self._record_feedback_event(
                 "provision_failure",
-                {"server": server_name, "reason": "install_error", "error": str(e)},
+                {"server": server_name, "reason": "install_error", "error": self._sanitize_error(e)},
             )
             return ProvisionOutput(
                 ok=False,
                 server=server_name,
                 status="failed",
-                message=str(e),
+                message=self._sanitize_error(e),
                 update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
@@ -1932,13 +1973,13 @@ class GatewayTools:
             logger.error(f"Failed to start provisioning {server_name}: {e}")
             self._record_feedback_event(
                 "provision_failure",
-                {"server": server_name, "reason": "exception", "error": str(e)},
+                {"server": server_name, "reason": "exception", "error": self._sanitize_error(e)},
             )
             return ProvisionOutput(
                 ok=False,
                 server=server_name,
                 status="failed",
-                message=f"Failed to start provisioning '{server_name}': {e}",
+                message=f"Failed to start provisioning '{server_name}': {self._sanitize_error(e)}",
                 update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
@@ -2496,10 +2537,10 @@ class GatewayTools:
                         server=job_server_name,
                         status="failed",
                         progress=job_progress,
-                        message=f"Failed to connect to '{job_server_name}': {e}",
+                        message=f"Failed to connect to '{job_server_name}': {self._sanitize_error(e)}",
                         output_tail=job_output_lines[-5:],
                         elapsed_seconds=elapsed,
-                        error=str(e),
+                        error=self._sanitize_error(e),
                     )
 
             # If complete (from non-npx install), trigger refresh to connect the server
@@ -2517,7 +2558,7 @@ class GatewayTools:
                     ]
                 except Exception as e:
                     logger.error(f"Failed to refresh after install: {e}")
-                    refresh_error = str(e)
+                    refresh_error = self._sanitize_error(e)
 
                 message = f"Server '{job_server_name}' installed"
                 if tools:
@@ -2580,8 +2621,8 @@ class GatewayTools:
                 server="unknown",
                 status="failed",
                 progress=0,
-                message=f"Error checking status: {e}",
-                error=str(e),
+                message=f"Error checking status: {self._sanitize_error(e)}",
+                error=self._sanitize_error(e),
             )
 
     async def sync_environment(

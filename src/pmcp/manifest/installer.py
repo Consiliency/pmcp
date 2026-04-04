@@ -118,7 +118,7 @@ class JobManager:
         self._jobs[job_id] = job
 
         logger.info(
-            f"Starting install job {job_id} for {server_config.name}: {' '.join(install_cmd)}"
+            f"Starting install job {job_id} for {server_config.name}: {install_cmd[0]} <args redacted>"
         )
 
         try:
@@ -152,7 +152,7 @@ class JobManager:
 
         except Exception as e:
             job.status = "failed"
-            job.error = str(e)
+            job.error = str(e)[:300]
             logger.error(f"Install job {job_id} failed: {job.error}")
 
         return job_id
@@ -174,8 +174,8 @@ class JobManager:
                 ):
                     try:
                         job.process.kill()
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"task cleanup error: {e}")
         except asyncio.CancelledError:
             # Task was cancelled, not an error
             pass
@@ -210,7 +210,8 @@ class JobManager:
             try:
                 line = await stream.readline()
                 return (name, line)
-            except Exception:
+            except Exception as e:
+                logger.debug(f"stream reader error: {e}")
                 return (name, None)
 
         try:

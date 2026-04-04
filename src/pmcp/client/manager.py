@@ -89,8 +89,8 @@ def _get_memory_usage_mb() -> float:
             for line in f:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) / 1024
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"memory usage parse error: {e}")
     return 0.0
 
 
@@ -107,7 +107,8 @@ def _get_system_memory_pct() -> int:
             available = meminfo.get("MemAvailable", total)
             used_pct = int((total - available) * 100 / total)
             return used_pct
-    except Exception:
+    except Exception as e:
+        logger.debug(f"system memory check error: {e}")
         return 0
 
 
@@ -231,7 +232,7 @@ class ManagedClient:
 class ClientManager:
     """Manages connections to downstream MCP servers."""
 
-    def __init__(self, max_tools_per_server: int = 100) -> None:
+    def __init__(self, max_tools_per_server: int = 100, max_concurrent_spawns: int = 8) -> None:
         self._clients: dict[str, ManagedClient] = {}
         self._tools: dict[str, ToolInfo] = {}
         self._resources: dict[str, ResourceInfo] = {}
@@ -241,6 +242,7 @@ class ClientManager:
         self._revision_id: str = _generate_revision_id()
         self._last_refresh_ts: float = time.time()
         self._max_tools_per_server = max_tools_per_server
+        self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
 
     async def connect_all(
         self, configs: list[ResolvedServerConfig], retry: bool = True
@@ -417,8 +419,9 @@ class ClientManager:
         if local_config.env:
             env.update(local_config.env)
 
-        # Spawn process
-        process = await asyncio.create_subprocess_exec(
+        # Spawn process (semaphore caps concurrent spawns to avoid FD exhaustion)
+        async with self._spawn_semaphore:
+            process = await asyncio.create_subprocess_exec(
             local_config.command,
             *local_config.args,
             stdin=asyncio.subprocess.PIPE,
@@ -715,12 +718,16 @@ class ClientManager:
         """Read stderr from a server process."""
         try:
             while True:
-                line = await stderr.readline()
+                try:
+                    line = await asyncio.wait_for(stderr.readline(), timeout=120.0)
+                except asyncio.TimeoutError:
+                    logger.debug(f"[{name}] stderr readline timed out, continuing")
+                    continue
                 if not line:
                     break
                 logger.debug(f"[{name}] stderr: {line.decode().strip()}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"[{name}] stderr reader error: {e}")
 
     async def _read_stdout(self, name: str, managed: ManagedClient) -> None:
         """Read JSON-RPC messages from stdout."""
@@ -781,6 +788,12 @@ class ClientManager:
                 logger.warning(f"Server {name} disconnected unexpectedly")
                 managed.status.status = ServerStatusEnum.ERROR
                 managed.status.last_error = "Server process exited"
+                # Schedule auto-reconnect if we have the config
+                if managed.config is not None:
+                    asyncio.create_task(
+                        self._reconnect_loop(name, managed.config),
+                        name=f"reconnect-{name}",
+                    )
             else:
                 logger.debug(f"Server {name} disconnected (graceful shutdown)")
             # Cancel any pending requests
@@ -791,6 +804,29 @@ class ClientManager:
                     )
             managed.pending_requests.clear()
             managed.status.pending_request_count = 0
+
+    async def _reconnect_loop(self, name: str, config: ResolvedServerConfig) -> None:
+        """Attempt to reconnect a crashed server with exponential back-off.
+
+        Tries up to 3 times with 5 s / 15 s / 30 s delays. Gives up if another
+        caller has already brought the server back online.
+        """
+        delays = [5.0, 15.0, 30.0]
+        for attempt, delay in enumerate(delays, start=1):
+            await asyncio.sleep(delay)
+            # If someone else already reconnected (e.g. manual refresh), stop.
+            managed = self._clients.get(name)
+            if managed and managed.status.status == ServerStatusEnum.ONLINE:
+                logger.debug(f"[{name}] already online; skipping reconnect attempt {attempt}")
+                return
+            logger.info(f"[{name}] reconnect attempt {attempt}/{len(delays)} ...")
+            try:
+                await self._connect_with_retry(config)
+                logger.info(f"[{name}] reconnected successfully")
+                return
+            except Exception as e:
+                logger.warning(f"[{name}] reconnect attempt {attempt} failed: {e}")
+        logger.error(f"[{name}] all reconnect attempts failed; server remains offline")
 
     async def _read_sse(
         self, name: str, managed: ManagedClient, read_stream: Any

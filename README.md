@@ -94,6 +94,86 @@ systemctl --user is-active pmcp
 curl -sS http://127.0.0.1:3344/mcp
 ```
 
+### Security
+
+**HTTP transport is unauthenticated by default.** For any non-localhost exposure, require a bearer token:
+
+```bash
+# Start with auth token
+pmcp --transport http --auth-token mysecrettoken
+
+# Or via environment variable
+PMCP_AUTH_TOKEN=mysecrettoken pmcp --transport http
+```
+
+Clients must then include `Authorization: Bearer mysecrettoken` in every request.
+
+**Assumptions and trust model:**
+
+- PMCP binds to `127.0.0.1` by default — not safe to expose publicly without `--auth-token`.
+- Config files (`.mcp.json`) are trusted inputs — treat them like code; do not load untrusted configs.
+- Secrets in `.env` files are passed to child MCP server processes; protect the `.env` file with filesystem permissions.
+
+**Production background service (Linux systemd):**
+
+```ini
+# ~/.config/systemd/user/pmcp.service
+[Unit]
+Description=PMCP MCP Gateway
+
+[Service]
+ExecStart=/usr/local/bin/pmcp --transport http --auth-token %i
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+```bash
+systemctl --user enable --now pmcp
+```
+
+Or with nohup:
+
+```bash
+nohup pmcp --transport http --auth-token "$PMCP_AUTH_TOKEN" >> ~/.pmcp/logs/gateway.log 2>&1 &
+```
+
+### TLS / Reverse Proxy
+
+PMCP's HTTP transport is **plaintext**. For any exposure beyond localhost, terminate TLS at a
+reverse proxy and forward to `127.0.0.1:3344`. Keep `--host 127.0.0.1` (the default) so PMCP
+only listens on the loopback interface.
+
+**Nginx** (`/etc/nginx/sites-available/pmcp`):
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name pmcp.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/pmcp.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/pmcp.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:3344;
+        proxy_set_header Authorization $http_authorization;
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+    }
+}
+```
+
+**Caddy** (`Caddyfile`):
+
+```
+pmcp.example.com {
+    reverse_proxy 127.0.0.1:3344
+}
+```
+
+Caddy handles TLS automatically via Let's Encrypt.
+
 ### Other MCP Clients
 
 PMCP works with any MCP-compatible client. Below are configuration examples for popular clients.

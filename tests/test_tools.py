@@ -1063,3 +1063,122 @@ class TestStaleIndexer:
         assert not gt._stale_index_task.done()
         gt.stop_stale_indexer()
         assert gt._stale_index_task is None
+
+
+class TestInvokeErrorPaths:
+    """Tests for gateway.invoke error handling paths."""
+
+    def _make_tool(self, required_fields: list[str] | None = None) -> ToolInfo:
+        return ToolInfo(
+            tool_id="svc::do_thing",
+            server_name="svc",
+            tool_name="do_thing",
+            description="A test tool",
+            short_description="A test tool",
+            input_schema={
+                "type": "object",
+                "properties": {"q": {"type": "string"}},
+                "required": required_fields or [],
+            },
+            tags=[],
+            risk_hint=RiskHint.LOW,
+        )
+
+    def _make_gateway_tools(
+        self, tool: ToolInfo | None = None, call_tool_side_effect: Any = None
+    ) -> GatewayTools:
+        t = tool or self._make_tool()
+        cm = MockClientManager([t])
+        cm.set_server_online("svc")
+        if call_tool_side_effect is not None:
+            async def _raise(*args: Any, **kwargs: Any) -> Any:
+                raise call_tool_side_effect
+            cm.call_tool = _raise  # type: ignore[method-assign]
+        return GatewayTools(
+            client_manager=cm,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_invoke_timeout(self) -> None:
+        gt = self._make_gateway_tools(call_tool_side_effect=TimeoutError())
+        result = await gt.invoke({"tool_id": "svc::do_thing", "arguments": {}})
+        assert result.ok is False
+        assert "E303" in (result.errors or [""])[0]
+
+    @pytest.mark.asyncio
+    async def test_invoke_connection_error(self) -> None:
+        gt = self._make_gateway_tools(call_tool_side_effect=ConnectionError("refused"))
+        result = await gt.invoke({"tool_id": "svc::do_thing", "arguments": {}})
+        assert result.ok is False
+        assert "E201" in (result.errors or [""])[0]
+
+    @pytest.mark.asyncio
+    async def test_invoke_generic_exception(self) -> None:
+        gt = self._make_gateway_tools(call_tool_side_effect=RuntimeError("boom"))
+        result = await gt.invoke({"tool_id": "svc::do_thing", "arguments": {}})
+        assert result.ok is False
+        assert "E302" in (result.errors or [""])[0]
+        # Message must not contain raw traceback — just the short error text
+        assert len((result.errors or [""])[0]) < 2000
+
+    @pytest.mark.asyncio
+    async def test_invoke_missing_required_arg(self) -> None:
+        tool = self._make_tool(required_fields=["q"])
+        gt = self._make_gateway_tools(tool=tool)
+        # call_tool should never be called; the check is pre-dispatch
+        called = False
+
+        async def _should_not_be_called(*args: Any, **kwargs: Any) -> Any:
+            nonlocal called
+            called = True
+            return {}
+
+        gt._client_manager.call_tool = _should_not_be_called  # type: ignore[method-assign]
+        result = await gt.invoke({"tool_id": "svc::do_thing", "arguments": {}})
+        assert result.ok is False
+        assert "E304" in (result.errors or [""])[0]
+        assert not called
+
+    @pytest.mark.asyncio
+    async def test_invoke_policy_denied(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        gt = self._make_gateway_tools()
+        monkeypatch.setattr(gt._policy_manager, "is_tool_allowed", lambda _: False)
+        result = await gt.invoke({"tool_id": "svc::do_thing", "arguments": {}})
+        assert result.ok is False
+        assert "E402" in (result.errors or [""])[0]
+
+
+class TestSanitizeError:
+    """Unit tests for GatewayTools._sanitize_error."""
+
+    def _err(self, msg: str) -> Exception:
+        return Exception(msg)
+
+    def test_strips_absolute_path(self) -> None:
+        e = self._err("/home/user/.local/lib/python3.10/site-packages/pkg/mod.py: no module")
+        result = GatewayTools._sanitize_error(e)
+        assert "/home" not in result
+        assert "mod.py" in result
+
+    def test_truncates_at_400(self) -> None:
+        e = self._err("x" * 500)
+        result = GatewayTools._sanitize_error(e)
+        assert len(result) == 400
+
+    def test_no_path_unchanged_except_truncation(self) -> None:
+        e = self._err("simple error message")
+        result = GatewayTools._sanitize_error(e)
+        assert result == "simple error message"
+
+    def test_multiple_paths_all_stripped(self) -> None:
+        e = self._err("/tmp/foo.py and /var/run/bar.sock failed")
+        result = GatewayTools._sanitize_error(e)
+        assert "/tmp" not in result
+        assert "/var" not in result
+        assert "foo.py" in result
+        assert "bar.sock" in result
+
+    def test_returns_string(self) -> None:
+        result = GatewayTools._sanitize_error(ValueError("boom"))
+        assert isinstance(result, str)
