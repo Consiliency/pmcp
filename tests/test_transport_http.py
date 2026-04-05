@@ -71,24 +71,19 @@ class TestMetricsEndpoint:
         client = _make_app()
         r = client.get("/metrics")
         assert r.status_code == 200
-        # Valid Prometheus text format has TYPE lines regardless of which registry is used
+        # prometheus_client is installed in dev: generate_latest() includes our registered counters
         assert "# TYPE" in r.text
+        assert "pmcp_requests_total" in r.text
 
-    def test_metrics_fallback_without_prometheus_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """When prometheus_client is not installed, fallback renders pmcp_* counters."""
-        import builtins
-        real_import = builtins.__import__
-
-        def mock_import(name: str, *args, **kwargs):  # type: ignore[no-untyped-def]
-            if name == "prometheus_client":
-                raise ImportError("mocked absence")
-            return real_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", mock_import)
+    def test_metrics_fallback_renderer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """When _generate_latest is None (prometheus_client absent), fallback renders pmcp_* counters."""
+        import pmcp.transport.http as http_mod
+        monkeypatch.setattr(http_mod, "_generate_latest", None)
         client = _make_app()
         r = client.get("/metrics")
         assert r.status_code == 200
         assert "pmcp_requests_total" in r.text
+        assert "# TYPE pmcp_requests_total counter" in r.text
 
     def test_metrics_unauthenticated_even_when_auth_configured(self) -> None:
         """Metrics endpoint must not require auth — Prometheus scrapers won't have tokens."""
@@ -359,3 +354,50 @@ class TestSignalHandling:
                 signal_mod.signal(sig, lambda signum, frame: None)
 
         assert loop.add_signal_handler.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# Timing-safe auth token comparison
+# ---------------------------------------------------------------------------
+
+class TestTimingSafeAuth:
+    """hmac.compare_digest must be used instead of plain string equality."""
+
+    def test_correct_token_accepted(self) -> None:
+        client = _make_app(auth_token="secret")
+        r = client.post("/mcp", content=b"{}", headers={"Authorization": "Bearer secret"})
+        assert r.status_code != 401
+
+    def test_wrong_token_rejected(self) -> None:
+        client = _make_app(auth_token="secret")
+        r = client.post("/mcp", content=b"{}", headers={"Authorization": "Bearer wrong"})
+        assert r.status_code == 401
+
+    def test_prefix_only_rejected(self) -> None:
+        """'Bearer ' without the token value must not match."""
+        client = _make_app(auth_token="secret")
+        r = client.post("/mcp", content=b"{}", headers={"Authorization": "Bearer "})
+        assert r.status_code == 401
+
+    def test_empty_header_rejected(self) -> None:
+        client = _make_app(auth_token="secret")
+        r = client.post("/mcp", content=b"{}", headers={"Authorization": ""})
+        assert r.status_code == 401
+
+    def test_compare_digest_is_called(self) -> None:
+        """Verify handle_mcp delegates to hmac.compare_digest, not plain !=."""
+        import hmac as hmac_mod
+        import pmcp.transport.http as http_mod
+
+        calls: list[tuple] = []
+        original = hmac_mod.compare_digest
+
+        def spy(*args: object) -> bool:
+            calls.append(args)
+            return original(*args)  # type: ignore[arg-type]
+
+        with patch.object(http_mod.hmac, "compare_digest", spy):
+            client = _make_app(auth_token="secret")
+            client.post("/mcp", content=b"{}", headers={"Authorization": "Bearer secret"})
+
+        assert len(calls) >= 1, "hmac.compare_digest was not called — timing-safe check missing"

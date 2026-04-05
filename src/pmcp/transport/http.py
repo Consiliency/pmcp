@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import contextlib
+import hmac
 import json
 import logging
 import uuid
@@ -51,6 +52,30 @@ _rl_store: dict[str, collections.deque] = {}
 _rl_lock: asyncio.Lock | None = None
 
 _MAX_BODY_BYTES: int = 10 * 1024 * 1024  # 10 MB
+
+# ---------------------------------------------------------------------------
+# Prometheus counter registration (optional — falls back to _metrics dict)
+# ---------------------------------------------------------------------------
+try:
+    from prometheus_client import Counter as _PCounter
+    from prometheus_client import generate_latest as _generate_latest
+
+    _prom_counters: dict = {
+        "requests_total": _PCounter("pmcp_requests_total", "Total /mcp requests handled"),
+        "requests_401":   _PCounter("pmcp_requests_401",   "Requests rejected 401 Unauthorized"),
+        "requests_429":   _PCounter("pmcp_requests_429",   "Requests rejected 429 Too Many Requests"),
+        "requests_ok":    _PCounter("pmcp_requests_ok",    "Requests completed successfully"),
+    }
+except ImportError:
+    _prom_counters: dict = {}
+    _generate_latest = None
+
+
+def _inc(key: str) -> None:
+    """Increment a metric counter in both the fallback dict and the prometheus registry."""
+    _metrics[key] += 1
+    if c := _prom_counters.get(key):
+        c.inc()
 
 
 class _NullResponse(Response):
@@ -123,18 +148,12 @@ def create_http_app(
 
     async def handle_metrics(request: Request) -> Response:
         """Unauthenticated Prometheus-compatible metrics endpoint."""
-        try:
-            import prometheus_client
-
-            output = prometheus_client.generate_latest()
+        if _generate_latest is not None:
             return Response(
-                output,
+                _generate_latest(),
                 media_type="text/plain; version=0.0.4; charset=utf-8",
             )
-        except ImportError:
-            pass
-
-        # Fallback: render internal counters in Prometheus text format
+        # Fallback: prometheus_client not installed — render _metrics dict
         lines: list[str] = []
         for key, val in _metrics.items():
             metric_name = f"pmcp_{key}"
@@ -148,7 +167,7 @@ def create_http_app(
     async def handle_mcp(request: Request) -> Response:
         """Delegate all MCP traffic to the session manager."""
         request_id = uuid.uuid4().hex[:8]
-        _metrics["requests_total"] += 1
+        _inc("requests_total")
 
         session_id_short = (request.headers.get("mcp-session-id") or "")[:8] or "<none>"
         logger.debug(
@@ -163,8 +182,8 @@ def create_http_app(
         # Bearer-token auth guard (optional — only when auth_token is configured)
         if auth_token is not None:
             incoming = request.headers.get("authorization", "")
-            if incoming != f"Bearer {auth_token}":
-                _metrics["requests_401"] += 1
+            if not hmac.compare_digest(incoming, f"Bearer {auth_token}"):
+                _inc("requests_401")
                 logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)
                 return Response("Unauthorized", status_code=401)
 
@@ -172,7 +191,7 @@ def create_http_app(
         if rate_limit_rpm > 0:
             client_ip = request.client.host if request.client else "unknown"
             if not await _check_rate_limit(client_ip, rate_limit_rpm):
-                _metrics["requests_429"] += 1
+                _inc("requests_429")
                 logger.debug(
                     "handle_mcp [%s]: 429 rate limited ip=%s", request_id, client_ip
                 )
@@ -257,7 +276,7 @@ def create_http_app(
                 "handle_mcp [%s]: request timed out after %ss", request_id, request_timeout
             )
             return Response("Gateway Timeout", status_code=504)
-        _metrics["requests_ok"] += 1
+        _inc("requests_ok")
         return _NullResponse()
 
     @contextlib.asynccontextmanager
