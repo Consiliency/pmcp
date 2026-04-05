@@ -227,6 +227,8 @@ class ManagedClient:
     read_task: asyncio.Task[None] | None = None
     # Health monitoring: rolling window of response times for avg calculation
     response_times: deque[float] = field(default_factory=lambda: deque(maxlen=100))
+    # Reconnect storm guard: True while a _reconnect_loop task is in flight
+    reconnecting: bool = False
 
 
 class ClientManager:
@@ -788,8 +790,9 @@ class ClientManager:
                 logger.warning(f"Server {name} disconnected unexpectedly")
                 managed.status.status = ServerStatusEnum.ERROR
                 managed.status.last_error = "Server process exited"
-                # Schedule auto-reconnect if we have the config
-                if managed.config is not None:
+                # Schedule auto-reconnect if we have the config (storm guard: only one task)
+                if managed.config is not None and not managed.reconnecting:
+                    managed.reconnecting = True
                     asyncio.create_task(
                         self._reconnect_loop(name, managed.config),
                         name=f"reconnect-{name}",
@@ -812,21 +815,25 @@ class ClientManager:
         caller has already brought the server back online.
         """
         delays = [5.0, 15.0, 30.0]
-        for attempt, delay in enumerate(delays, start=1):
-            await asyncio.sleep(delay)
-            # If someone else already reconnected (e.g. manual refresh), stop.
-            managed = self._clients.get(name)
-            if managed and managed.status.status == ServerStatusEnum.ONLINE:
-                logger.debug(f"[{name}] already online; skipping reconnect attempt {attempt}")
-                return
-            logger.info(f"[{name}] reconnect attempt {attempt}/{len(delays)} ...")
-            try:
-                await self._connect_with_retry(config)
-                logger.info(f"[{name}] reconnected successfully")
-                return
-            except Exception as e:
-                logger.warning(f"[{name}] reconnect attempt {attempt} failed: {e}")
-        logger.error(f"[{name}] all reconnect attempts failed; server remains offline")
+        try:
+            for attempt, delay in enumerate(delays, start=1):
+                await asyncio.sleep(delay)
+                # If someone else already reconnected (e.g. manual refresh), stop.
+                managed = self._clients.get(name)
+                if managed and managed.status.status == ServerStatusEnum.ONLINE:
+                    logger.debug(f"[{name}] already online; skipping reconnect attempt {attempt}")
+                    return
+                logger.info(f"[{name}] reconnect attempt {attempt}/{len(delays)} ...")
+                try:
+                    await self._connect_with_retry(config)
+                    logger.info(f"[{name}] reconnected successfully")
+                    return
+                except Exception as e:
+                    logger.warning(f"[{name}] reconnect attempt {attempt} failed: {e}")
+            logger.error(f"[{name}] all reconnect attempts failed; server remains offline")
+        finally:
+            if managed := self._clients.get(name):
+                managed.reconnecting = False
 
     async def _read_sse(
         self, name: str, managed: ManagedClient, read_stream: Any

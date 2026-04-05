@@ -50,6 +50,8 @@ _metrics: dict[str, int] = {
 _rl_store: dict[str, collections.deque] = {}
 _rl_lock: asyncio.Lock | None = None
 
+_MAX_BODY_BYTES: int = 10 * 1024 * 1024  # 10 MB
+
 
 class _NullResponse(Response):
     """Sentinel returned when session_manager.handle_request already sent the response.
@@ -97,6 +99,7 @@ def create_http_app(
     mcp_server: Server,
     auth_token: str | None = None,
     rate_limit_rpm: int = 0,
+    request_timeout: int = 60,
 ) -> Starlette:
     """Create Starlette ASGI app with streamable-HTTP transport for MCP server.
 
@@ -175,6 +178,12 @@ def create_http_app(
                 )
                 return Response("Too Many Requests", status_code=429)
 
+        # Input size guard — reject oversized POST bodies before reading them
+        if request.method == "POST":
+            cl = request.headers.get("content-length")
+            if cl and int(cl) > _MAX_BODY_BYTES:
+                return Response("Payload Too Large", status_code=413)
+
         # Workaround for rmcp clients (e.g., Codex) that open the GET common
         # stream before completing the initialize handshake (and therefore have
         # no session ID yet). The MCP session manager returns 400 for session-less
@@ -238,9 +247,16 @@ def create_http_app(
 
             request._receive = replay_receive  # type: ignore[method-assign]
 
-        await session_manager.handle_request(
-            request.scope, request.receive, request._send
-        )
+        try:
+            await asyncio.wait_for(
+                session_manager.handle_request(request.scope, request.receive, request._send),
+                timeout=request_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "handle_mcp [%s]: request timed out after %ss", request_id, request_timeout
+            )
+            return Response("Gateway Timeout", status_code=504)
         _metrics["requests_ok"] += 1
         return _NullResponse()
 

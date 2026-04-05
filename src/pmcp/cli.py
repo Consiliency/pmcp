@@ -204,6 +204,12 @@ Environment overrides:
         "(default: 0 = unlimited). Also read from PMCP_RATE_LIMIT.",
     )
     parser.add_argument(
+        "--request-timeout",
+        type=int,
+        default=60,
+        help="HTTP request timeout in seconds (default: 60). Also read from PMCP_REQUEST_TIMEOUT.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"pmcp {importlib.metadata.version('pmcp')}",
@@ -1466,6 +1472,9 @@ async def run_server(args: argparse.Namespace) -> None:
     if not getattr(args, "rate_limit", None):
         if os.environ.get("PMCP_RATE_LIMIT"):
             args.rate_limit = int(os.environ["PMCP_RATE_LIMIT"])
+    if getattr(args, "request_timeout", 60) == 60:
+        if os.environ.get("PMCP_REQUEST_TIMEOUT"):
+            args.request_timeout = int(os.environ["PMCP_REQUEST_TIMEOUT"])
 
     # Lock directory - CLI flag takes precedence over env var
     lock_dir = getattr(args, "lock_dir", None)
@@ -1495,6 +1504,7 @@ async def run_server(args: argparse.Namespace) -> None:
         auth_token=getattr(args, "auth_token", None),
         max_concurrent_spawns=getattr(args, "max_concurrent_spawns", 8),
         rate_limit_rpm=getattr(args, "rate_limit", 0),
+        request_timeout=getattr(args, "request_timeout", 60),
     )
 
     # Handle graceful shutdown
@@ -1505,8 +1515,12 @@ async def run_server(args: argparse.Namespace) -> None:
         shutdown_event.set()
 
     loop = asyncio.get_event_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, handle_signal, sig)
+    if sys.platform != "win32":
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, handle_signal, sig)
+    else:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda signum, frame: handle_signal(signal.Signals(signum)))
 
     try:
         # Run server with shutdown handling

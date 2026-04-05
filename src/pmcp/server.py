@@ -66,6 +66,7 @@ class GatewayServer:
         auth_token: str | None = None,
         max_concurrent_spawns: int = 8,
         rate_limit_rpm: int = 0,
+        request_timeout: int = 60,
     ) -> None:
         self._project_root = project_root
         self._custom_config_path = custom_config_path
@@ -75,6 +76,7 @@ class GatewayServer:
         self._auth_token = auth_token
         self._max_concurrent_spawns = max_concurrent_spawns
         self._rate_limit_rpm = rate_limit_rpm
+        self._request_timeout = request_timeout
         # Lock directory - None means use global default (~/.pmcp)
         self._lock_dir: Path | None = Path(lock_dir) if lock_dir else None
 
@@ -588,6 +590,7 @@ class GatewayServer:
                 self._server,
                 auth_token=self._auth_token,
                 rate_limit_rpm=self._rate_limit_rpm,
+                request_timeout=self._request_timeout,
             )
             logger.info(
                 f"MCP Gateway server started (http://{self._host}:{self._port})"
