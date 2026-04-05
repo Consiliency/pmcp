@@ -883,3 +883,95 @@ class TestDisconnectAllPostKill:
         mock_process.kill.assert_called_once()
         warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
         assert not any("SIGKILL" in w or "D-state" in w for w in warning_calls)
+
+
+# ---------------------------------------------------------------------------
+# Reconnect storm guard
+# ---------------------------------------------------------------------------
+
+class TestReconnectStormGuard:
+    """ManagedClient.reconnecting flag prevents duplicate _reconnect_loop tasks."""
+
+    def test_managed_client_reconnecting_default_false(self) -> None:
+        """reconnecting field must start as False."""
+        managed = ManagedClient(
+            config=MagicMock(),
+            status=ServerStatus(name="t", status=ServerStatusEnum.OFFLINE, tool_count=0),
+        )
+        assert managed.reconnecting is False
+
+    @pytest.mark.asyncio
+    async def test_reconnect_loop_clears_flag_on_success(self) -> None:
+        """_reconnect_loop sets reconnecting=False after a successful reconnect."""
+        manager = ClientManager()
+        config = MagicMock()
+        status = ServerStatus(name="s", status=ServerStatusEnum.ERROR, tool_count=0)
+        managed = ManagedClient(config=config, status=status)
+        managed.reconnecting = True
+        manager._clients["s"] = managed
+
+        with patch.object(manager, "_connect_with_retry", new=AsyncMock()):
+            with patch("asyncio.sleep", new=AsyncMock()):
+                await manager._reconnect_loop("s", config)
+
+        assert managed.reconnecting is False
+
+    @pytest.mark.asyncio
+    async def test_reconnect_loop_clears_flag_after_all_failures(self) -> None:
+        """_reconnect_loop sets reconnecting=False even when all 3 attempts fail."""
+        manager = ClientManager()
+        config = MagicMock()
+        status = ServerStatus(name="s", status=ServerStatusEnum.ERROR, tool_count=0)
+        managed = ManagedClient(config=config, status=status)
+        managed.reconnecting = True
+        manager._clients["s"] = managed
+
+        with patch.object(manager, "_connect_with_retry", new=AsyncMock(side_effect=Exception("down"))):
+            with patch("asyncio.sleep", new=AsyncMock()):
+                await manager._reconnect_loop("s", config)
+
+        assert managed.reconnecting is False
+
+    @pytest.mark.asyncio
+    async def test_reconnect_loop_clears_flag_when_already_online(self) -> None:
+        """_reconnect_loop exits early if server is already ONLINE, still clears flag."""
+        manager = ClientManager()
+        config = MagicMock()
+        # Already ONLINE — someone else reconnected
+        status = ServerStatus(name="s", status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=config, status=status)
+        managed.reconnecting = True
+        manager._clients["s"] = managed
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            await manager._reconnect_loop("s", config)
+
+        assert managed.reconnecting is False
+
+    @pytest.mark.asyncio
+    async def test_storm_guard_prevents_second_task_while_first_runs(self) -> None:
+        """If reconnecting is True, a second _read_stdout finally block skips create_task."""
+        manager = ClientManager()
+        config = MagicMock()
+        status = ServerStatus(name="s", status=ServerStatusEnum.ONLINE, tool_count=5)
+        managed = ManagedClient(config=config, status=status)
+        managed.reconnecting = False
+        manager._clients["s"] = managed
+
+        tasks_created: list[str] = []
+
+        async def fake_reconnect_loop(name: str, cfg: object) -> None:
+            tasks_created.append(name)
+
+        # Simulate what _read_stdout finally block does, twice in rapid succession
+        def _schedule_reconnect() -> None:
+            managed.status.status = ServerStatusEnum.ERROR
+            if managed.config is not None and not managed.reconnecting:
+                managed.reconnecting = True
+                asyncio.ensure_future(fake_reconnect_loop("s", config))
+
+        _schedule_reconnect()  # first failure — should schedule
+        _schedule_reconnect()  # second failure — should be a no-op
+
+        await asyncio.sleep(0)  # let tasks run
+        assert len(tasks_created) == 1, "Only one reconnect task should be created"

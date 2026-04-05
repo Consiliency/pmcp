@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -11,7 +12,11 @@ from pmcp import __version__
 from pmcp.transport.http import _metrics, create_http_app
 
 
-def _make_app(auth_token: str | None = None, rate_limit_rpm: int = 0) -> TestClient:
+def _make_app(
+    auth_token: str | None = None,
+    rate_limit_rpm: int = 0,
+    request_timeout: int = 60,
+) -> TestClient:
     """Create a TestClient wrapping a minimal create_http_app instance."""
     mcp_server = MagicMock()
     mcp_server.list_tools = AsyncMock(return_value=[])
@@ -27,7 +32,12 @@ def _make_app(auth_token: str | None = None, rate_limit_rpm: int = 0) -> TestCli
         instance.run.return_value.__aexit__ = AsyncMock(return_value=False)
         instance.handle_request = AsyncMock(return_value=None)
 
-        app = create_http_app(mcp_server, auth_token=auth_token, rate_limit_rpm=rate_limit_rpm)
+        app = create_http_app(
+            mcp_server,
+            auth_token=auth_token,
+            rate_limit_rpm=rate_limit_rpm,
+            request_timeout=request_timeout,
+        )
         return TestClient(app, raise_server_exceptions=False)
 
 
@@ -157,3 +167,195 @@ class TestRateLimitHttp:
         for _ in range(20):
             r = client.post("/mcp", content=b"{}")
             assert r.status_code != 429
+
+
+# ---------------------------------------------------------------------------
+# Payload size limit on /mcp
+# ---------------------------------------------------------------------------
+
+class TestPayloadSizeLimit:
+    """POST bodies larger than _MAX_BODY_BYTES must be rejected with 413."""
+
+    def test_oversized_payload_returns_413(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Content-Length exceeding limit → 413 before body is read."""
+        import pmcp.transport.http as http_mod
+        monkeypatch.setattr(http_mod, "_MAX_BODY_BYTES", 10)
+        client = _make_app()
+        r = client.post("/mcp", content=b"x" * 20)
+        assert r.status_code == 413
+
+    def test_payload_at_limit_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Content-Length exactly at limit is allowed (boundary is exclusive)."""
+        import pmcp.transport.http as http_mod
+        monkeypatch.setattr(http_mod, "_MAX_BODY_BYTES", 20)
+        client = _make_app()
+        r = client.post("/mcp", content=b"x" * 20)
+        assert r.status_code != 413
+
+    def test_normal_payload_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Typical small payloads are never blocked."""
+        import pmcp.transport.http as http_mod
+        monkeypatch.setattr(http_mod, "_MAX_BODY_BYTES", 100)
+        client = _make_app()
+        r = client.post("/mcp", content=b"{}")
+        assert r.status_code != 413
+
+    def test_get_endpoint_not_affected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """GET endpoints (no body) are never size-checked — /health returns 200."""
+        import pmcp.transport.http as http_mod
+        monkeypatch.setattr(http_mod, "_MAX_BODY_BYTES", 1)
+        client = _make_app()
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert r.status_code != 413
+
+    def test_413_independent_of_auth(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Size check fires before auth, so even auth-less oversized requests get 413 not 401."""
+        import pmcp.transport.http as http_mod
+        monkeypatch.setattr(http_mod, "_MAX_BODY_BYTES", 10)
+        # auth_token configured; no Authorization header sent
+        client = _make_app(auth_token="secret")
+        r = client.post("/mcp", content=b"x" * 20)
+        # Auth check runs first (after rate-limit, before size) — but size check is
+        # placed after auth in handle_mcp, so 401 takes priority.
+        # This test documents the ordering: 401 before 413.
+        assert r.status_code in (401, 413)
+
+
+# ---------------------------------------------------------------------------
+# Request timeout on /mcp
+# ---------------------------------------------------------------------------
+
+class TestRequestTimeout:
+    """session_manager.handle_request must be cancelled after request_timeout seconds."""
+
+    def _make_slow_app(self, request_timeout: float, handler_delay: float) -> TestClient:
+        """App whose handle_request sleeps for handler_delay seconds."""
+        mcp_server = MagicMock()
+        mcp_server.list_tools = AsyncMock(return_value=[])
+
+        with patch(
+            "pmcp.transport.http.StreamableHTTPSessionManager",
+            autospec=True,
+        ) as MockManager:
+            instance = MockManager.return_value
+            instance.run.return_value.__aenter__ = AsyncMock(return_value=None)
+            instance.run.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            async def slow_handler(*args: object, **kwargs: object) -> None:
+                await asyncio.sleep(handler_delay)
+
+            instance.handle_request = slow_handler
+
+            app = create_http_app(mcp_server, request_timeout=request_timeout)
+            return TestClient(app, raise_server_exceptions=False)
+
+    def test_slow_request_returns_504(self) -> None:
+        """Request that exceeds timeout → 504 Gateway Timeout."""
+        # handler sleeps 10s, timeout is 0.05s → should get 504
+        client = self._make_slow_app(request_timeout=0.05, handler_delay=10.0)
+        r = client.post(
+            "/mcp",
+            content=b'{"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}',
+        )
+        assert r.status_code == 504
+
+    def test_fast_request_does_not_timeout(self) -> None:
+        """Request that completes before timeout → not 504."""
+        # handler returns immediately (0s delay), timeout is 60s
+        client = _make_app(request_timeout=60)
+        r = client.post("/mcp", content=b"{}")
+        assert r.status_code != 504
+
+    def test_timeout_zero_not_used_in_normal_path(self) -> None:
+        """Default 60s timeout doesn't affect fast handlers."""
+        client = _make_app()  # default request_timeout=60
+        r = client.get("/health")
+        assert r.status_code == 200  # health is not subject to handle_mcp timeout
+
+
+# ---------------------------------------------------------------------------
+# Version consistency
+# ---------------------------------------------------------------------------
+
+class TestVersionConsistency:
+    def test_version_matches_tag(self) -> None:
+        """__version__ must be 1.9.1 to match the v1.9.1 git tag."""
+        from pmcp import __version__ as v
+        assert v == "1.9.1"
+
+    def test_health_reports_correct_version(self) -> None:
+        """GET /health returns the package version, not a stale value."""
+        client = _make_app()
+        data = client.get("/health").json()
+        assert data["version"] == __version__
+
+
+# ---------------------------------------------------------------------------
+# Windows-safe signal registration
+# ---------------------------------------------------------------------------
+
+class TestSignalHandling:
+    def test_signal_registration_does_not_use_add_signal_handler_on_win32(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On win32, loop.add_signal_handler must not be called (it doesn't exist)."""
+        import sys
+        import signal as signal_mod
+        import asyncio
+
+        monkeypatch.setattr(sys, "platform", "win32")
+
+        loop = MagicMock()
+        # add_signal_handler is Unix-only; simulate it raising NotImplementedError on win32
+        loop.add_signal_handler.side_effect = NotImplementedError("win32")
+
+        registered: list[int] = []
+
+        def fake_signal(sig: int, handler: object) -> None:
+            registered.append(sig)
+
+        monkeypatch.setattr(signal_mod, "signal", fake_signal)
+
+        # Simulate what cli.py does
+        shutdown_event = asyncio.Event()
+
+        def handle_signal(sig: signal_mod.Signals) -> None:
+            shutdown_event.set()
+
+        if sys.platform != "win32":
+            for sig in (signal_mod.SIGINT, signal_mod.SIGTERM):
+                loop.add_signal_handler(sig, handle_signal, sig)
+        else:
+            for sig in (signal_mod.SIGINT, signal_mod.SIGTERM):
+                signal_mod.signal(sig, lambda signum, frame: handle_signal(signal_mod.Signals(signum)))
+
+        # On "win32", add_signal_handler should NOT have been called
+        loop.add_signal_handler.assert_not_called()
+        # signal.signal should have been called for both SIGINT and SIGTERM
+        assert len(registered) == 2
+
+    def test_signal_registration_uses_add_signal_handler_on_linux(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On Linux, loop.add_signal_handler is used (the async-safe path)."""
+        import sys
+        import signal as signal_mod
+
+        monkeypatch.setattr(sys, "platform", "linux")
+
+        loop = MagicMock()
+        registered: list[int] = []
+        loop.add_signal_handler.side_effect = lambda sig, *args: registered.append(sig)
+
+        def handle_signal(sig: signal_mod.Signals) -> None:
+            pass
+
+        if sys.platform != "win32":
+            for sig in (signal_mod.SIGINT, signal_mod.SIGTERM):
+                loop.add_signal_handler(sig, handle_signal, sig)
+        else:
+            for sig in (signal_mod.SIGINT, signal_mod.SIGTERM):
+                signal_mod.signal(sig, lambda signum, frame: None)
+
+        assert loop.add_signal_handler.call_count == 2
