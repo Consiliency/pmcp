@@ -123,7 +123,9 @@ async def get_cargo_version(crate_name: str, timeout: float = 10.0) -> str | Non
     url = f"https://crates.io/api/v1/crates/{crate_name}"
 
     try:
-        async with aiohttp.ClientSession(headers={"User-Agent": _USER_AGENT}) as session:
+        async with aiohttp.ClientSession(
+            headers={"User-Agent": _USER_AGENT}
+        ) as session:
             async with session.get(
                 url, timeout=aiohttp.ClientTimeout(total=timeout)
             ) as resp:
@@ -262,10 +264,28 @@ def detect_package_type(
     elif command == "docker":
         # docker run [options] image[:tag] [cmd...]
         _value_flags = {
-            "-e", "--env", "-v", "--volume", "-p", "--publish",
-            "--name", "--network", "-u", "--user", "--entrypoint",
-            "-w", "--workdir", "--label", "-l", "--memory", "-m",
-            "--cpus", "--add-host", "--dns", "--hostname", "-h",
+            "-e",
+            "--env",
+            "-v",
+            "--volume",
+            "-p",
+            "--publish",
+            "--name",
+            "--network",
+            "-u",
+            "--user",
+            "--entrypoint",
+            "-w",
+            "--workdir",
+            "--label",
+            "-l",
+            "--memory",
+            "-m",
+            "--cpus",
+            "--add-host",
+            "--dns",
+            "--hostname",
+            "-h",
         }
         skip_next = False
         for arg in args:

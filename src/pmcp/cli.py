@@ -35,15 +35,19 @@ class _JsonFormatter(logging.Formatter):
     """Emit log records as single-line JSON for Datadog/Loki ingestion."""
 
     def format(self, record: logging.LogRecord) -> str:
-        return json.dumps({
-            "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
-            "level": record.levelname,
-            "logger": record.name,
-            "msg": record.getMessage(),
-        })
+        return json.dumps(
+            {
+                "ts": self.formatTime(record, "%Y-%m-%dT%H:%M:%S"),
+                "level": record.levelname,
+                "logger": record.name,
+                "msg": record.getMessage(),
+            }
+        )
 
 
-def setup_logging(level: str, log_to_file: bool = True, log_format: str = "text") -> None:
+def setup_logging(
+    level: str, log_to_file: bool = True, log_format: str = "text"
+) -> None:
     """Configure logging with optional file output."""
     log_level = getattr(logging, level.upper(), logging.INFO)
     text_format = "[%(asctime)s] [%(levelname)s] %(message)s"
@@ -1446,7 +1450,10 @@ async def run_server(args: argparse.Namespace) -> None:
     auth_token_from_cli = bool(args.auth_token)
     auth_token_file = getattr(args, "auth_token_file", None)
     if auth_token_file and args.auth_token:
-        print("error: --auth-token and --auth-token-file are mutually exclusive", file=sys.stderr)
+        print(
+            "error: --auth-token and --auth-token-file are mutually exclusive",
+            file=sys.stderr,
+        )
         sys.exit(1)
     if auth_token_file:
         try:
@@ -1459,7 +1466,10 @@ async def run_server(args: argparse.Namespace) -> None:
         auth_token_from_cli = False
 
     # Env overrides for new flags
-    if not getattr(args, "max_concurrent_spawns", None) or args.max_concurrent_spawns == 8:
+    if (
+        not getattr(args, "max_concurrent_spawns", None)
+        or args.max_concurrent_spawns == 8
+    ):
         if os.environ.get("PMCP_MAX_SPAWNS"):
             args.max_concurrent_spawns = int(os.environ["PMCP_MAX_SPAWNS"])
     if not getattr(args, "rate_limit", None):
@@ -1519,7 +1529,9 @@ async def run_server(args: argparse.Namespace) -> None:
             loop.add_signal_handler(sig, handle_signal, sig)
     else:
         for sig in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(sig, lambda signum, frame: handle_signal(signal.Signals(signum)))
+            signal.signal(
+                sig, lambda signum, frame: handle_signal(signal.Signals(signum))
+            )
 
     try:
         # Run server with shutdown handling

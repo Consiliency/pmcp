@@ -761,7 +761,9 @@ class TestCleanupClient:
     @pytest.mark.asyncio
     async def test_cleanup_client_cancels_read_task_and_kills_process(self) -> None:
         """_cleanup_client should cancel the read task and kill a running process."""
-        manager, managed = self._make_manager_with_client(returncode=None, task_done=False)
+        manager, managed = self._make_manager_with_client(
+            returncode=None, task_done=False
+        )
 
         await manager._cleanup_client("test", managed)
 
@@ -773,7 +775,9 @@ class TestCleanupClient:
     @pytest.mark.asyncio
     async def test_cleanup_client_skips_cancel_if_task_done(self) -> None:
         """_cleanup_client should not cancel an already-done read task."""
-        manager, managed = self._make_manager_with_client(returncode=None, task_done=True)
+        manager, managed = self._make_manager_with_client(
+            returncode=None, task_done=True
+        )
 
         await manager._cleanup_client("test", managed)
 
@@ -795,7 +799,9 @@ class TestConnectStdioGuard:
     """Tests for the pre-spawn guard in _connect_stdio."""
 
     @pytest.mark.asyncio
-    async def test_connect_stdio_calls_cleanup_when_existing_client_present(self) -> None:
+    async def test_connect_stdio_calls_cleanup_when_existing_client_present(
+        self,
+    ) -> None:
         """If _clients already has an entry for a server, _cleanup_client must be called."""
         manager = ClientManager()
 
@@ -867,11 +873,11 @@ class TestDisconnectAllPostKill:
         mock_process.terminate = MagicMock()
         mock_process.kill = MagicMock()
         # SIGTERM wait times out; post-SIGKILL wait succeeds
-        mock_process.wait = AsyncMock(
-            side_effect=[asyncio.TimeoutError(), 0]
-        )
+        mock_process.wait = AsyncMock(side_effect=[asyncio.TimeoutError(), 0])
 
-        status = ServerStatus(name="slow2", status=ServerStatusEnum.ONLINE, tool_count=0)
+        status = ServerStatus(
+            name="slow2", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
         managed = ManagedClient(config=MagicMock(), process=mock_process, status=status)
         managed.read_task = None
         manager._clients["slow2"] = managed
@@ -889,6 +895,7 @@ class TestDisconnectAllPostKill:
 # Reconnect storm guard
 # ---------------------------------------------------------------------------
 
+
 class TestReconnectStormGuard:
     """ManagedClient.reconnecting flag prevents duplicate _reconnect_loop tasks."""
 
@@ -896,7 +903,9 @@ class TestReconnectStormGuard:
         """reconnecting field must start as False."""
         managed = ManagedClient(
             config=MagicMock(),
-            status=ServerStatus(name="t", status=ServerStatusEnum.OFFLINE, tool_count=0),
+            status=ServerStatus(
+                name="t", status=ServerStatusEnum.OFFLINE, tool_count=0
+            ),
         )
         assert managed.reconnecting is False
 
@@ -926,7 +935,9 @@ class TestReconnectStormGuard:
         managed.reconnecting = True
         manager._clients["s"] = managed
 
-        with patch.object(manager, "_connect_with_retry", new=AsyncMock(side_effect=Exception("down"))):
+        with patch.object(
+            manager, "_connect_with_retry", new=AsyncMock(side_effect=Exception("down"))
+        ):
             with patch("asyncio.sleep", new=AsyncMock()):
                 await manager._reconnect_loop("s", config)
 

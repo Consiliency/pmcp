@@ -64,10 +64,16 @@ try:
     from prometheus_client import generate_latest as _prom_generate_latest
 
     _prom_counters = {
-        "requests_total": _PCounter("pmcp_requests_total", "Total /mcp requests handled"),
-        "requests_401":   _PCounter("pmcp_requests_401",   "Requests rejected 401 Unauthorized"),
-        "requests_429":   _PCounter("pmcp_requests_429",   "Requests rejected 429 Too Many Requests"),
-        "requests_ok":    _PCounter("pmcp_requests_ok",    "Requests completed successfully"),
+        "requests_total": _PCounter(
+            "pmcp_requests_total", "Total /mcp requests handled"
+        ),
+        "requests_401": _PCounter(
+            "pmcp_requests_401", "Requests rejected 401 Unauthorized"
+        ),
+        "requests_429": _PCounter(
+            "pmcp_requests_429", "Requests rejected 429 Too Many Requests"
+        ),
+        "requests_ok": _PCounter("pmcp_requests_ok", "Requests completed successfully"),
     }
     _generate_latest = _prom_generate_latest
 except ImportError:
@@ -264,19 +270,27 @@ def create_http_app(
                 nonlocal body_replayed
                 if not body_replayed:
                     body_replayed = True
-                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                    return {
+                        "type": "http.request",
+                        "body": body_bytes,
+                        "more_body": False,
+                    }
                 return await original_receive()
 
             request._receive = replay_receive  # type: ignore[method-assign]
 
         try:
             await asyncio.wait_for(
-                session_manager.handle_request(request.scope, request.receive, request._send),
+                session_manager.handle_request(
+                    request.scope, request.receive, request._send
+                ),
                 timeout=request_timeout,
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "handle_mcp [%s]: request timed out after %ss", request_id, request_timeout
+                "handle_mcp [%s]: request timed out after %ss",
+                request_id,
+                request_timeout,
             )
             return Response("Gateway Timeout", status_code=504)
         _inc("requests_ok")

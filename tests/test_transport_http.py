@@ -45,6 +45,7 @@ def _make_app(
 # /health
 # ---------------------------------------------------------------------------
 
+
 class TestHealthEndpoint:
     def test_health_returns_200(self) -> None:
         client = _make_app()
@@ -66,6 +67,7 @@ class TestHealthEndpoint:
 # /metrics
 # ---------------------------------------------------------------------------
 
+
 class TestMetricsEndpoint:
     def test_metrics_returns_200(self) -> None:
         client = _make_app()
@@ -78,6 +80,7 @@ class TestMetricsEndpoint:
     def test_metrics_fallback_renderer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When _generate_latest is None (prometheus_client absent), fallback renders pmcp_* counters."""
         import pmcp.transport.http as http_mod
+
         monkeypatch.setattr(http_mod, "_generate_latest", None)
         client = _make_app()
         r = client.get("/metrics")
@@ -101,6 +104,7 @@ class TestMetricsEndpoint:
 # Auth guard on /mcp
 # ---------------------------------------------------------------------------
 
+
 class TestAuthGuardHttp:
     def test_no_token_returns_401(self) -> None:
         client = _make_app(auth_token="mysecret")
@@ -109,7 +113,9 @@ class TestAuthGuardHttp:
 
     def test_wrong_token_returns_401(self) -> None:
         client = _make_app(auth_token="mysecret")
-        r = client.post("/mcp", content=b"{}", headers={"Authorization": "Bearer wrong"})
+        r = client.post(
+            "/mcp", content=b"{}", headers={"Authorization": "Bearer wrong"}
+        )
         assert r.status_code == 401
 
     def test_correct_token_does_not_return_401(self) -> None:
@@ -138,6 +144,7 @@ class TestAuthGuardHttp:
 # Rate limiting on /mcp
 # ---------------------------------------------------------------------------
 
+
 class TestRateLimitHttp:
     def test_rate_limit_allows_under_limit(self) -> None:
         client = _make_app(rate_limit_rpm=10)
@@ -152,9 +159,7 @@ class TestRateLimitHttp:
         http_mod._rl_store.clear()
 
         client = _make_app(rate_limit_rpm=3)
-        statuses = [
-            client.post("/mcp", content=b"{}").status_code for _ in range(5)
-        ]
+        statuses = [client.post("/mcp", content=b"{}").status_code for _ in range(5)]
         assert 429 in statuses
 
     def test_rate_limit_zero_disables(self) -> None:
@@ -168,12 +173,16 @@ class TestRateLimitHttp:
 # Payload size limit on /mcp
 # ---------------------------------------------------------------------------
 
+
 class TestPayloadSizeLimit:
     """POST bodies larger than _MAX_BODY_BYTES must be rejected with 413."""
 
-    def test_oversized_payload_returns_413(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_oversized_payload_returns_413(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """Content-Length exceeding limit → 413 before body is read."""
         import pmcp.transport.http as http_mod
+
         monkeypatch.setattr(http_mod, "_MAX_BODY_BYTES", 10)
         client = _make_app()
         r = client.post("/mcp", content=b"x" * 20)
@@ -182,6 +191,7 @@ class TestPayloadSizeLimit:
     def test_payload_at_limit_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Content-Length exactly at limit is allowed (boundary is exclusive)."""
         import pmcp.transport.http as http_mod
+
         monkeypatch.setattr(http_mod, "_MAX_BODY_BYTES", 20)
         client = _make_app()
         r = client.post("/mcp", content=b"x" * 20)
@@ -190,6 +200,7 @@ class TestPayloadSizeLimit:
     def test_normal_payload_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Typical small payloads are never blocked."""
         import pmcp.transport.http as http_mod
+
         monkeypatch.setattr(http_mod, "_MAX_BODY_BYTES", 100)
         client = _make_app()
         r = client.post("/mcp", content=b"{}")
@@ -198,6 +209,7 @@ class TestPayloadSizeLimit:
     def test_get_endpoint_not_affected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """GET endpoints (no body) are never size-checked — /health returns 200."""
         import pmcp.transport.http as http_mod
+
         monkeypatch.setattr(http_mod, "_MAX_BODY_BYTES", 1)
         client = _make_app()
         r = client.get("/health")
@@ -207,6 +219,7 @@ class TestPayloadSizeLimit:
     def test_413_independent_of_auth(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Size check fires before auth, so even auth-less oversized requests get 413 not 401."""
         import pmcp.transport.http as http_mod
+
         monkeypatch.setattr(http_mod, "_MAX_BODY_BYTES", 10)
         # auth_token configured; no Authorization header sent
         client = _make_app(auth_token="secret")
@@ -221,10 +234,13 @@ class TestPayloadSizeLimit:
 # Request timeout on /mcp
 # ---------------------------------------------------------------------------
 
+
 class TestRequestTimeout:
     """session_manager.handle_request must be cancelled after request_timeout seconds."""
 
-    def _make_slow_app(self, request_timeout: float, handler_delay: float) -> TestClient:
+    def _make_slow_app(
+        self, request_timeout: float, handler_delay: float
+    ) -> TestClient:
         """App whose handle_request sleeps for handler_delay seconds."""
         mcp_server = MagicMock()
         mcp_server.list_tools = AsyncMock(return_value=[])
@@ -273,10 +289,12 @@ class TestRequestTimeout:
 # Version consistency
 # ---------------------------------------------------------------------------
 
+
 class TestVersionConsistency:
     def test_version_matches_tag(self) -> None:
         """__version__ must be 1.9.1 to match the v1.9.1 git tag."""
         from pmcp import __version__ as v
+
         assert v == "1.9.1"
 
     def test_health_reports_correct_version(self) -> None:
@@ -289,6 +307,7 @@ class TestVersionConsistency:
 # ---------------------------------------------------------------------------
 # Windows-safe signal registration
 # ---------------------------------------------------------------------------
+
 
 class TestSignalHandling:
     def test_signal_registration_does_not_use_add_signal_handler_on_win32(
@@ -323,7 +342,9 @@ class TestSignalHandling:
                 loop.add_signal_handler(sig, handle_signal, sig)
         else:
             for sig in (signal_mod.SIGINT, signal_mod.SIGTERM):
-                signal_mod.signal(sig, lambda signum, frame: handle_signal(signal_mod.Signals(signum)))
+                signal_mod.signal(
+                    sig, lambda signum, frame: handle_signal(signal_mod.Signals(signum))
+                )
 
         # On "win32", add_signal_handler should NOT have been called
         loop.add_signal_handler.assert_not_called()
@@ -360,17 +381,22 @@ class TestSignalHandling:
 # Timing-safe auth token comparison
 # ---------------------------------------------------------------------------
 
+
 class TestTimingSafeAuth:
     """hmac.compare_digest must be used instead of plain string equality."""
 
     def test_correct_token_accepted(self) -> None:
         client = _make_app(auth_token="secret")
-        r = client.post("/mcp", content=b"{}", headers={"Authorization": "Bearer secret"})
+        r = client.post(
+            "/mcp", content=b"{}", headers={"Authorization": "Bearer secret"}
+        )
         assert r.status_code != 401
 
     def test_wrong_token_rejected(self) -> None:
         client = _make_app(auth_token="secret")
-        r = client.post("/mcp", content=b"{}", headers={"Authorization": "Bearer wrong"})
+        r = client.post(
+            "/mcp", content=b"{}", headers={"Authorization": "Bearer wrong"}
+        )
         assert r.status_code == 401
 
     def test_prefix_only_rejected(self) -> None:
@@ -398,6 +424,10 @@ class TestTimingSafeAuth:
 
         with patch.object(http_mod.hmac, "compare_digest", spy):
             client = _make_app(auth_token="secret")
-            client.post("/mcp", content=b"{}", headers={"Authorization": "Bearer secret"})
+            client.post(
+                "/mcp", content=b"{}", headers={"Authorization": "Bearer secret"}
+            )
 
-        assert len(calls) >= 1, "hmac.compare_digest was not called — timing-safe check missing"
+        assert len(calls) >= 1, (
+            "hmac.compare_digest was not called — timing-safe check missing"
+        )

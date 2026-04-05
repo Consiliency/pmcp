@@ -1091,8 +1091,10 @@ class TestInvokeErrorPaths:
         cm = MockClientManager([t])
         cm.set_server_online("svc")
         if call_tool_side_effect is not None:
+
             async def _raise(*args: Any, **kwargs: Any) -> Any:
                 raise call_tool_side_effect
+
             cm.call_tool = _raise  # type: ignore[method-assign]
         return GatewayTools(
             client_manager=cm,  # type: ignore
@@ -1156,7 +1158,9 @@ class TestSanitizeError:
         return Exception(msg)
 
     def test_strips_absolute_path(self) -> None:
-        e = self._err("/home/user/.local/lib/python3.10/site-packages/pkg/mod.py: no module")
+        e = self._err(
+            "/home/user/.local/lib/python3.10/site-packages/pkg/mod.py: no module"
+        )
         result = GatewayTools._sanitize_error(e)
         assert "/home" not in result
         assert "mod.py" in result

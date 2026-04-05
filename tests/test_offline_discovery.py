@@ -331,8 +331,8 @@ class TestCacheMergeWithLiveTools:
         mock_client_manager = MagicMock()
         mock_client_manager.get_all_tools.return_value = [mock_live_tool]
         # Only online-server is online
-        mock_client_manager.is_server_online.side_effect = (
-            lambda name: name == "online-server"
+        mock_client_manager.is_server_online.side_effect = lambda name: (
+            name == "online-server"
         )
 
         mock_policy_manager = MagicMock()
@@ -407,8 +407,8 @@ class TestCachePolicyEnforcement:
         mock_policy_manager = MagicMock()
         mock_policy_manager.is_tool_allowed.return_value = True
         # Deny "denied-server"
-        mock_policy_manager.is_server_allowed.side_effect = (
-            lambda name: name != "denied-server"
+        mock_policy_manager.is_server_allowed.side_effect = lambda name: (
+            name != "denied-server"
         )
 
         tools = GatewayTools(
@@ -462,8 +462,8 @@ class TestCachePolicyEnforcement:
         mock_policy_manager = MagicMock()
         mock_policy_manager.is_server_allowed.return_value = True
         # Deny tools with "delete" in the name
-        mock_policy_manager.is_tool_allowed.side_effect = (
-            lambda tool_id: "delete" not in tool_id
+        mock_policy_manager.is_tool_allowed.side_effect = lambda tool_id: (
+            "delete" not in tool_id
         )
 
         tools = GatewayTools(

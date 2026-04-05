@@ -151,13 +151,18 @@ class TestOrphanScan:
     def _write_cmdline(self, proc_dir: Path, pid: int, argv: list[str]) -> None:
         entry = proc_dir / str(pid)
         entry.mkdir()
-        (entry / "cmdline").write_bytes(b"\x00".join(a.encode() for a in argv) + b"\x00")
+        (entry / "cmdline").write_bytes(
+            b"\x00".join(a.encode() for a in argv) + b"\x00"
+        )
 
     def test_skips_on_non_linux(self, tmp_path: Path) -> None:
         """_kill_orphan_processes should do nothing on non-Linux platforms."""
         server = GatewayServer()
         config = self._make_config("npx", ["some-mcp-server"])
-        with patch("pmcp.server.sys") as mock_sys, patch("pmcp.server.os.kill") as mock_kill:
+        with (
+            patch("pmcp.server.sys") as mock_sys,
+            patch("pmcp.server.os.kill") as mock_kill,
+        ):
             mock_sys.platform = "darwin"
             server._kill_orphan_processes([config], _proc_path=tmp_path)
         mock_kill.assert_not_called()
@@ -187,7 +192,10 @@ class TestOrphanScan:
         server = GatewayServer()
         config = self._make_config("npx", ["@mcp/server-fs", "/srv"])
 
-        with patch("pmcp.server.sys") as mock_sys, patch("pmcp.server.os.kill") as mock_kill:
+        with (
+            patch("pmcp.server.sys") as mock_sys,
+            patch("pmcp.server.os.kill") as mock_kill,
+        ):
             mock_sys.platform = "linux"
             server._kill_orphan_processes([config], _proc_path=proc_dir)
         mock_kill.assert_not_called()
@@ -220,7 +228,10 @@ class TestOrphanScan:
         server = GatewayServer()
         config = self._make_config("npx", ["some-server"])
 
-        with patch("pmcp.server.sys") as mock_sys, patch("pmcp.server.os.kill") as mock_kill:
+        with (
+            patch("pmcp.server.sys") as mock_sys,
+            patch("pmcp.server.os.kill") as mock_kill,
+        ):
             mock_sys.platform = "linux"
             server._kill_orphan_processes([config], _proc_path=proc_dir)
         mock_kill.assert_not_called()

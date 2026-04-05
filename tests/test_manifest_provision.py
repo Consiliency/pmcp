@@ -158,9 +158,7 @@ class TestProvisionRoutingAllServers:
 
         result = await tools.provision({"server_name": server.name})
 
-        assert result.ok is True, (
-            f"[{server.name}] provision failed: {result.message}"
-        )
+        assert result.ok is True, f"[{server.name}] provision failed: {result.message}"
         assert result.status == "started", (
             f"[{server.name}] expected status='started', got {result.status!r}"
         )
@@ -174,9 +172,7 @@ class TestProvisionRoutingAllServers:
 
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: _manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
-        monkeypatch.setattr(
-            "pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False
-        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
         # Force all env-var checks to miss
         monkeypatch.setattr(
             tools,

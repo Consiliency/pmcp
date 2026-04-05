@@ -1101,7 +1101,11 @@ class GatewayTools:
         except Exception as e:
             self._record_feedback_event(
                 "invoke_failure",
-                {"tool_id": parsed.tool_id, "reason": "exception", "error": self._sanitize_error(e)},
+                {
+                    "tool_id": parsed.tool_id,
+                    "reason": "exception",
+                    "error": self._sanitize_error(e),
+                },
             )
             elapsed_ms = round((time.monotonic() - _call_start) * 1000)
             logger.info(
@@ -1958,7 +1962,11 @@ class GatewayTools:
         except InstallError as e:
             self._record_feedback_event(
                 "provision_failure",
-                {"server": server_name, "reason": "install_error", "error": self._sanitize_error(e)},
+                {
+                    "server": server_name,
+                    "reason": "install_error",
+                    "error": self._sanitize_error(e),
+                },
             )
             return ProvisionOutput(
                 ok=False,
@@ -1973,7 +1981,11 @@ class GatewayTools:
             logger.error(f"Failed to start provisioning {server_name}: {e}")
             self._record_feedback_event(
                 "provision_failure",
-                {"server": server_name, "reason": "exception", "error": self._sanitize_error(e)},
+                {
+                    "server": server_name,
+                    "reason": "exception",
+                    "error": self._sanitize_error(e),
+                },
             )
             return ProvisionOutput(
                 ok=False,

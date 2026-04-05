@@ -234,7 +234,9 @@ class ManagedClient:
 class ClientManager:
     """Manages connections to downstream MCP servers."""
 
-    def __init__(self, max_tools_per_server: int = 100, max_concurrent_spawns: int = 8) -> None:
+    def __init__(
+        self, max_tools_per_server: int = 100, max_concurrent_spawns: int = 8
+    ) -> None:
         self._clients: dict[str, ManagedClient] = {}
         self._tools: dict[str, ToolInfo] = {}
         self._resources: dict[str, ResourceInfo] = {}
@@ -393,7 +395,9 @@ class ClientManager:
         # Clean up any existing live connection before spawning a replacement
         if name in self._clients:
             existing = self._clients[name]
-            logger.warning(f"[{name}] Existing live connection found; cleaning up before reconnect")
+            logger.warning(
+                f"[{name}] Existing live connection found; cleaning up before reconnect"
+            )
             await self._cleanup_client(name, existing)
 
         # Initialize status
@@ -424,14 +428,14 @@ class ClientManager:
         # Spawn process (semaphore caps concurrent spawns to avoid FD exhaustion)
         async with self._spawn_semaphore:
             process = await asyncio.create_subprocess_exec(
-            local_config.command,
-            *local_config.args,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=local_config.cwd,
-            env=env,
-        )
+                local_config.command,
+                *local_config.args,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=local_config.cwd,
+                env=env,
+            )
 
         managed = ManagedClient(
             config=config,
@@ -821,7 +825,9 @@ class ClientManager:
                 # If someone else already reconnected (e.g. manual refresh), stop.
                 managed = self._clients.get(name)
                 if managed and managed.status.status == ServerStatusEnum.ONLINE:
-                    logger.debug(f"[{name}] already online; skipping reconnect attempt {attempt}")
+                    logger.debug(
+                        f"[{name}] already online; skipping reconnect attempt {attempt}"
+                    )
                     return
                 logger.info(f"[{name}] reconnect attempt {attempt}/{len(delays)} ...")
                 try:
@@ -830,7 +836,9 @@ class ClientManager:
                     return
                 except Exception as e:
                     logger.warning(f"[{name}] reconnect attempt {attempt} failed: {e}")
-            logger.error(f"[{name}] all reconnect attempts failed; server remains offline")
+            logger.error(
+                f"[{name}] all reconnect attempts failed; server remains offline"
+            )
         finally:
             if managed := self._clients.get(name):
                 managed.reconnecting = False
