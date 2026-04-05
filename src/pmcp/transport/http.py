@@ -20,7 +20,7 @@ import json
 import logging
 import uuid
 from collections.abc import AsyncIterator
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
@@ -56,19 +56,22 @@ _MAX_BODY_BYTES: int = 10 * 1024 * 1024  # 10 MB
 # ---------------------------------------------------------------------------
 # Prometheus counter registration (optional — falls back to _metrics dict)
 # ---------------------------------------------------------------------------
+_prom_counters: dict = {}
+_generate_latest: Callable[..., bytes] | None = None
+
 try:
     from prometheus_client import Counter as _PCounter
-    from prometheus_client import generate_latest as _generate_latest
+    from prometheus_client import generate_latest as _prom_generate_latest
 
-    _prom_counters: dict = {
+    _prom_counters = {
         "requests_total": _PCounter("pmcp_requests_total", "Total /mcp requests handled"),
         "requests_401":   _PCounter("pmcp_requests_401",   "Requests rejected 401 Unauthorized"),
         "requests_429":   _PCounter("pmcp_requests_429",   "Requests rejected 429 Too Many Requests"),
         "requests_ok":    _PCounter("pmcp_requests_ok",    "Requests completed successfully"),
     }
+    _generate_latest = _prom_generate_latest
 except ImportError:
-    _prom_counters: dict = {}
-    _generate_latest = None
+    pass
 
 
 def _inc(key: str) -> None:
@@ -257,7 +260,7 @@ def create_http_app(
             original_receive = request._receive
             body_replayed = False
 
-            async def replay_receive() -> dict:
+            async def replay_receive() -> Any:
                 nonlocal body_replayed
                 if not body_replayed:
                     body_replayed = True

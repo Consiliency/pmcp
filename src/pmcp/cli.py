@@ -1446,24 +1446,17 @@ async def run_server(args: argparse.Namespace) -> None:
     auth_token_from_cli = bool(args.auth_token)
     auth_token_file = getattr(args, "auth_token_file", None)
     if auth_token_file and args.auth_token:
-        logger.error("--auth-token and --auth-token-file are mutually exclusive")
+        print("error: --auth-token and --auth-token-file are mutually exclusive", file=sys.stderr)
         sys.exit(1)
     if auth_token_file:
         try:
             args.auth_token = Path(auth_token_file).read_text().strip()
         except OSError as e:
-            logger.error(f"Cannot read --auth-token-file: {e}")
+            print(f"error: Cannot read --auth-token-file: {e}", file=sys.stderr)
             sys.exit(1)
     elif not args.auth_token and os.environ.get("PMCP_AUTH_TOKEN"):
         args.auth_token = os.environ["PMCP_AUTH_TOKEN"]
         auth_token_from_cli = False
-
-    # Warn when secret is visible in the process list
-    if auth_token_from_cli:
-        logger.warning(
-            "--auth-token passed on CLI; token is visible in 'ps aux'. "
-            "Use the PMCP_AUTH_TOKEN environment variable instead."
-        )
 
     # Env overrides for new flags
     if not getattr(args, "max_concurrent_spawns", None) or args.max_concurrent_spawns == 8:
@@ -1491,6 +1484,12 @@ async def run_server(args: argparse.Namespace) -> None:
 
     setup_logging(log_level, log_format=getattr(args, "log_format", "text"))
     logger = logging.getLogger(__name__)
+
+    if auth_token_from_cli:
+        logger.warning(
+            "--auth-token passed on CLI; token is visible in 'ps aux'. "
+            "Use the PMCP_AUTH_TOKEN environment variable instead."
+        )
 
     logger.info("Starting PMCP...")
 
