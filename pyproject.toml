@@ -25,6 +25,10 @@ classifiers = [
     "Environment :: Console",
     "Topic :: Software Development :: Libraries :: Application Frameworks",
     "Topic :: Internet :: WWW/HTTP",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Typing :: Typed",
 ]
 dependencies = [
     "mcp>=1.0.0",
