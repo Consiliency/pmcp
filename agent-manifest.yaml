@@ -1,0 +1,14 @@
+version: v1
+name: pmcp
+type: service
+business_unit: frontier-strategies
+system: fs-toolchain
+upstream: github.com/ViperJuice/pmcp
+description: "Progressive MCP gateway for minimal context bloat with dynamic tool discovery and provisioning"
+specs:
+  active: specs/active/
+  archive: specs/archive/
+prompts:
+  source: baml_src/
+generated:
+  output: generated/

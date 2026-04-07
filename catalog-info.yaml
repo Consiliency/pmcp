@@ -1,0 +1,18 @@
+apiVersion: backstage.io/v1alpha1
+kind: Component
+metadata:
+  name: pmcp
+  description: Progressive MCP gateway — meta-server for minimal context bloat with dynamic tool discovery
+  annotations:
+    github.com/project-slug: ViperJuice/pmcp
+    backstage.io/techdocs-ref: dir:.
+  tags:
+    - mcp
+    - gateway
+    - ai-tooling
+    - python
+spec:
+  type: service
+  lifecycle: production
+  owner: frontier-strategies
+  system: fs-toolchain
