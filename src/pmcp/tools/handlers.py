@@ -1698,8 +1698,23 @@ class GatewayTools:
                 recommendation=f"Call gateway.provision(server_name='{name_match}')",
             )
 
+        # --- Tier 2 pre-check: detect unknown named services (Fix C, issue #56) ---
+        # If the query contains a PascalCase word (not the first word of the sentence)
+        # that is NOT a known server name, the user is likely requesting a specific
+        # external service not in the manifest. Skip category matching and fall
+        # through to not_available so search_registry guidance is surfaced.
+        _pascal_re = re.compile(r"^[A-Z][a-z]{3,}$")
+        _unknown_service = any(
+            _pascal_re.match(w)
+            and w.lower().replace("-", "").replace("_", "") not in norm_to_server
+            for i, w in enumerate(parsed.query.split())
+            if i > 0  # skip first word — always capitalised in English sentences
+        )
+
         # --- Tier 2: category keyword match ---
-        category_result = manifest.get_servers_in_category(parsed.query)
+        category_result = (
+            None if _unknown_service else manifest.get_servers_in_category(parsed.query)
+        )
         if category_result:
             cat_name, cat_servers = category_result
 

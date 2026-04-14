@@ -178,25 +178,52 @@ class Manifest:
     ) -> tuple[str, list[ServerConfig]] | None:
         """Find the best-matching category for a query and return its servers.
 
-        Matches against category names and each server's keywords within each
-        category. Returns (category_name, [ServerConfig, ...]) for the first
-        category that has any keyword overlap with the query, or None if no
-        category matches.
+        Uses category-span IDF discounting: keywords that appear across many
+        distinct categories (e.g. "api" spans communication, APIs, developer tools)
+        get lower weight than category-specific terms (e.g. "dns" only in
+        cloud/storage). A minimum score of 0.5 is required to prevent spurious
+        matches from generic-only keyword overlap.
+
+        Returns (category_name, [ServerConfig, ...]) for the best-scoring category
+        above the threshold, or None if no category qualifies.
         """
         query_lower = query.lower()
         query_words = set(query_lower.replace("-", " ").replace("_", " ").split())
 
+        # Build keyword → set-of-categories map for IDF discounting.
+        # A keyword that appears in servers across many different categories is
+        # considered generic; one confined to a single category is specific.
+        kw_cats: dict[str, set[str]] = {}
+        for cat_name, server_names in _CATEGORY_MAP.items():
+            for sname in server_names:
+                server = self.servers.get(sname)
+                if not server:
+                    continue
+                for kw in server.keywords:
+                    kw_norm = kw.lower().replace("-", " ").replace("_", " ")
+                    kw_cats.setdefault(kw_norm, set()).add(cat_name)
+
+        def _kw_weight(kw_norm: str) -> float:
+            n_cats = len(kw_cats.get(kw_norm, set()))
+            if n_cats >= 4:
+                return 0.1  # Appears across 4+ categories → very generic
+            if n_cats == 3:
+                return 0.3  # Spans three categories → somewhat generic
+            if n_cats == 2:
+                return 0.7  # Two-category overlap — still useful signal
+            return 1.0  # Confined to one category → highly specific
+
         best_cat: str | None = None
-        best_score = 0
+        best_score: float = 0.0
 
         for cat_name, server_names in _CATEGORY_MAP.items():
-            score = 0
+            score: float = 0.0
 
-            # Score: category name words that appear in query
+            # Score: category name words that appear in query (strong signal, ×2)
             cat_words = set(cat_name.lower().replace("/", " ").split())
-            score += len(cat_words & query_words) * 2
+            score += len(cat_words & query_words) * 2.0
 
-            # Score: keyword hits across servers in this category
+            # Score: keyword hits across servers in this category, category-span weighted
             for sname in server_names:
                 server = self.servers.get(sname)
                 if not server:
@@ -204,13 +231,16 @@ class Manifest:
                 for kw in server.keywords:
                     kw_norm = kw.lower().replace("-", " ").replace("_", " ")
                     if set(kw_norm.split()).issubset(query_words):
-                        score += 1
+                        score += _kw_weight(kw_norm)
 
             if score > best_score:
                 best_score = score
                 best_cat = cat_name
 
-        if not best_cat or best_score == 0:
+        # Minimum score prevents spurious matches from generic-keyword-only overlap.
+        # 0.5 requires at least one moderately-specific keyword or a category-name hit.
+        _MIN_SCORE = 0.5
+        if not best_cat or best_score < _MIN_SCORE:
             return None
 
         servers = [
