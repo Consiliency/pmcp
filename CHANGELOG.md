@@ -5,6 +5,67 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.2] - 2026-04-14
+
+### Fixed
+- **`gateway.request_capability` false-positive category matches** (closes #56):
+  - Bug 1 — Generic keywords (e.g. "api") inflated category scores when multiple
+    servers in one category each carried the same generic term. Replaced per-server
+    frequency counting with category-span IDF weighting: a keyword appearing across
+    N distinct categories gets weight 1.0 / 0.7 / 0.3 / 0.1 for N = 1 / 2 / 3 / 4+.
+  - Bug 2 — Any non-zero score returned a category match. Added a minimum score
+    threshold of 0.5 so pure generic-keyword overlap (e.g. three "api" hits × 0.1 = 0.3)
+    falls through to `not_available` + `search_registry` guidance.
+  - Bug 3 — Queries naming a specific unknown service (e.g. "Hostinger") still
+    returned an unrelated category. Added a pre-check in `request_capability`:
+    PascalCase words (non-first position) not matching any manifest server name
+    cause Tier 2 to be skipped entirely, surfacing `not_available` immediately.
+
+## [1.9.1] - 2026-04-13
+
+### Added
+- **`py.typed` marker** (`src/pmcp/py.typed`) — PEP 561 compliance; downstream
+  projects using mypy/pyright now resolve PMCP types without `ignore_missing_imports`.
+- **PyPI classifiers**: added `Operating System :: POSIX :: Linux`,
+  `Operating System :: MacOS`, `Operating System :: Microsoft :: Windows`,
+  and `Typing :: Typed`.
+- **SECURITY.md**: documents threat model, known limitations, responsible disclosure
+  process, and production hardening checklist.
+
+### Fixed
+- **Timing-safe auth token comparison**: replaced `!=` string equality with
+  `hmac.compare_digest` to prevent timing oracle attacks on Bearer tokens.
+- **Prometheus counter registration**: counters now registered at module import;
+  fallback dict renderer kept in sync via `_inc()` helper so metrics are always
+  visible in `generate_latest()` output.
+- **Reconnect storm guard**: added `reconnecting: bool` flag to `ManagedClient`;
+  prevents multiple concurrent `_reconnect_loop` tasks from spawning when a server
+  exits rapidly.
+- **HTTP request timeout**: tool invocations now wrapped in `asyncio.wait_for`
+  (default 60 s, configurable via `--request-timeout` / `PMCP_REQUEST_TIMEOUT`);
+  returns HTTP 504 on timeout.
+- **Payload size limit**: `Content-Length > 10 MB` rejected with HTTP 413 before
+  the body is read.
+- **Windows signal handling**: `loop.add_signal_handler()` (POSIX-only) now
+  guarded by `sys.platform != "win32"`; falls back to `signal.signal()`.
+- CI mypy/ruff failures introduced by hardening changes.
+
+## [1.9.0] - 2026-04-12
+
+### Added
+- **Production hardening**: authentication middleware, structured audit logging,
+  sliding-window rate limiter (per-IP, configurable via env vars), and memory-leak
+  fix for `_rl_store` cleanup.
+- **Backstage catalog**: `catalog-info.yaml` and standard repo layout for
+  Backstage/portal registration.
+- **Consiliency maintenance trigger**: GitHub Actions workflow for scheduled
+  maintenance worker.
+
+### Fixed
+- **rmcp/Codex HTTP transport compatibility** (closes #51): keep-alive SSE for
+  session-less GETs; HTTP 202 for `notifications/initialized` without session ID;
+  `_NullResponse` ASGI double-send guard.
+
 ## [1.8.1] - 2026-03-12
 
 ### Fixed
