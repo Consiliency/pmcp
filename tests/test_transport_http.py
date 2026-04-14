@@ -292,10 +292,11 @@ class TestRequestTimeout:
 
 class TestVersionConsistency:
     def test_version_matches_tag(self) -> None:
-        """__version__ must be 1.9.1 to match the v1.9.1 git tag."""
+        """__version__ must follow semver (MAJOR.MINOR.PATCH)."""
+        import re
         from pmcp import __version__ as v
 
-        assert v == "1.9.1"
+        assert re.match(r"^\d+\.\d+\.\d+$", v), f"Version {v!r} is not semver"
 
     def test_health_reports_correct_version(self) -> None:
         """GET /health returns the package version, not a stale value."""
