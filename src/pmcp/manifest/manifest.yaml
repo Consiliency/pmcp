@@ -1000,6 +1000,16 @@ servers:
     env_var: "MIRO_ACCESS_TOKEN"
     env_instructions: "Create app and get access token at https://miro.com/app/settings/user-profile/apps"
 
+  excalidraw:
+    description: "Excalidraw whiteboard - create and edit hand-drawn diagrams and scenes"
+    keywords: [excalidraw, whiteboard, diagram, drawing, sketch, canvas, scene, shapes, app]
+    install: {}
+    transport: "streamable-http"
+    url: "https://mcp.excalidraw.com"
+    command: ""
+    args: []
+    requires_api_key: false
+
   mux:
     description: "Mux video API - manage video assets, live streams, transcoding, analytics"
     keywords: [mux, video, streaming, media, transcoding, playback, live-stream, hls, encoding]

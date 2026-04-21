@@ -9,8 +9,10 @@ from pathlib import Path
 from pmcp.config.loader import (
     load_configs,
     make_tool_id,
+    manifest_server_to_config,
     parse_tool_id,
 )
+from pmcp.manifest.loader import ServerConfig
 
 
 class TestMakeToolId:
@@ -187,6 +189,25 @@ class TestLoadConfigs:
         assert configs[0].name == "gateway"
         assert configs[0].config.type == "remote"
         assert configs[0].config.url == "https://example.com/mcp"
+
+    def test_converts_remote_manifest_server_to_remote_config(self) -> None:
+        server = ServerConfig(
+            name="excalidraw",
+            description="Excalidraw whiteboard",
+            keywords=["excalidraw"],
+            install={},
+            command="",
+            args=[],
+            transport="streamable-http",
+            url="https://mcp.excalidraw.com",
+        )
+
+        resolved = manifest_server_to_config(server)
+
+        assert resolved.name == "excalidraw"
+        assert resolved.source == "manifest"
+        assert resolved.config.type == "streamable-http"
+        assert resolved.config.url == "https://mcp.excalidraw.com"
 
     def test_merges_manifest_defaults_for_partial_server_config(
         self, tmp_path: Path

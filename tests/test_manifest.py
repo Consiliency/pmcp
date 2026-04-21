@@ -123,6 +123,7 @@ def test_manifest_has_expected_servers():
         "supabase",
         "firecrawl",
         "tavily",
+        "excalidraw",
     ]
     for server in expected_servers:
         assert server in manifest.servers, f"Missing server: {server}"
@@ -172,6 +173,18 @@ def test_manifest_server_config():
     assert playwright.command == "npx"
     assert playwright.requires_api_key is False
     assert playwright.auto_start is True
+
+
+def test_manifest_remote_server_config():
+    """Test remote server config structure."""
+    manifest = load_manifest()
+
+    excalidraw = manifest.get_server("excalidraw")
+    assert excalidraw is not None
+    assert excalidraw.transport == "streamable-http"
+    assert excalidraw.url == "https://mcp.excalidraw.com"
+    assert excalidraw.command == ""
+    assert excalidraw.install == {}
 
 
 def test_manifest_cli_config():

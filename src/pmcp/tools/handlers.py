@@ -1417,6 +1417,15 @@ class GatewayTools:
                 command=command,
                 args=args,
                 requires_api_key=False,
+                transport=config.config.type
+                if isinstance(config.config, RemoteMcpServerConfig)
+                else "local",
+                url=config.config.url
+                if isinstance(config.config, RemoteMcpServerConfig)
+                else None,
+                headers=config.config.headers
+                if isinstance(config.config, RemoteMcpServerConfig)
+                else None,
             )
 
         return Manifest(
@@ -1929,6 +1938,79 @@ class GatewayTools:
                     auth_mode="api_key",
                     auth_methods=self._auth_methods_for_server(server_name),
                     alternative_env_vars=auth_env_options,
+                    update_warning=update_warning,
+                    feedback_hint=self._feedback_hint(),
+                )
+
+        # Remote manifest entries do not install packages; connect them directly.
+        if server_config.url:
+            try:
+                resolved_config = manifest_server_to_config(server_config)
+                errors = await self._client_manager.connect_all([resolved_config])
+                if errors:
+                    message = "; ".join(errors)
+                    self._record_feedback_event(
+                        "provision_failure",
+                        {
+                            "server": server_name,
+                            "reason": "remote_connect_error",
+                            "error": self._sanitize_error(Exception(message)),
+                        },
+                    )
+                    return ProvisionOutput(
+                        ok=False,
+                        server=server_name,
+                        status="failed",
+                        message=message,
+                        update_warning=update_warning,
+                        feedback_hint=self._feedback_hint(),
+                    )
+
+                self._register_provisioned_server(
+                    server_name,
+                    server_config.env_var if server_config else None,
+                )
+                tools = [
+                    t
+                    for t in self._client_manager.get_all_tools()
+                    if t.server_name == server_name
+                ]
+                return ProvisionOutput(
+                    ok=True,
+                    server=server_name,
+                    status="complete",
+                    message=f"Remote server '{server_name}' connected with {len(tools)} tools.",
+                    new_tools=[
+                        CapabilityCard(
+                            tool_id=t.tool_id,
+                            server=t.server_name,
+                            tool_name=t.tool_name,
+                            short_description=t.short_description,
+                            tags=t.tags,
+                            availability="online",
+                            risk_hint=t.risk_hint.value,
+                        )
+                        for t in tools[:10]
+                    ],
+                    update_warning=update_warning,
+                    feedback_hint=None,
+                )
+
+            except Exception as e:
+                logger.error(f"Failed to connect remote server {server_name}: {e}")
+                self._record_feedback_event(
+                    "provision_failure",
+                    {
+                        "server": server_name,
+                        "reason": "remote_connect_exception",
+                        "error": self._sanitize_error(e),
+                    },
+                )
+                return ProvisionOutput(
+                    ok=False,
+                    server=server_name,
+                    status="failed",
+                    message=f"Failed to connect remote server '{server_name}': {self._sanitize_error(e)}",
                     update_warning=update_warning,
                     feedback_hint=self._feedback_hint(),
                 )

@@ -33,6 +33,7 @@ class MockClientManager:
         self._server_statuses: list[ServerStatus] = []
         self._revision_id = "test-rev"
         self._last_refresh_ts = 1234567890.0
+        self.connected_configs: list[Any] = []
 
     def get_all_tools(self) -> list[ToolInfo]:
         return list(self._tools.values())
@@ -77,6 +78,12 @@ class MockClientManager:
         return {"content": [{"type": "text", "text": "result"}]}
 
     async def refresh(self, configs: list[Any]) -> list[str]:
+        return []
+
+    async def connect_all(self, configs: list[Any], retry: bool = True) -> list[str]:
+        self.connected_configs.extend(configs)
+        for config in configs:
+            self._online_servers.add(config.name)
         return []
 
 
@@ -890,6 +897,47 @@ class TestSearchRegistryAndRegister:
         assert result.ok is False
         assert result.needs_api_key is True
         assert result.env_var == "GITHUB_TOKEN"
+
+    @pytest.mark.asyncio
+    async def test_remote_manifest_server_provisions_without_installer(
+        self, gateway_tools: GatewayTools, monkeypatch
+    ) -> None:
+        """Remote manifest servers should connect directly instead of starting jobs."""
+        client_manager = cast(MockClientManager, gateway_tools._client_manager)
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "excalidraw": ServerConfig(
+                    name="excalidraw",
+                    description="Excalidraw whiteboard",
+                    keywords=["excalidraw", "whiteboard"],
+                    install={},
+                    command="",
+                    args=[],
+                    requires_api_key=False,
+                    transport="streamable-http",
+                    url="https://mcp.excalidraw.com",
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        fake_jm = types.SimpleNamespace(start_install=pytest.fail)
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: fake_jm)
+        monkeypatch.setattr(gateway_tools, "_save_provisioned_registry", lambda: None)
+
+        result = await gateway_tools.provision({"server_name": "excalidraw"})
+
+        assert result.ok is True
+        assert result.status == "complete"
+        assert len(client_manager.connected_configs) == 1
+        connected = client_manager.connected_configs[0]
+        assert connected.name == "excalidraw"
+        assert connected.config.type == "streamable-http"
+        assert connected.config.url == "https://mcp.excalidraw.com"
 
 
 class TestStaleIndexer:

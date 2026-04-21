@@ -5,13 +5,14 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import yaml
 
 logger = logging.getLogger(__name__)
 
 Platform = Literal["mac", "wsl", "linux", "windows"]
+ServerTransport = Literal["local", "remote", "sse", "http", "streamable-http"]
 
 
 @dataclass
@@ -40,6 +41,9 @@ class ServerConfig:
     env_var: str | None = None
     env_instructions: str | None = None
     auto_start: bool = False
+    transport: ServerTransport = "local"
+    url: str | None = None
+    headers: dict[str, str] | None = None
 
 
 # Category taxonomy used by Manifest.get_category_summary() and get_servers_in_category()
@@ -118,7 +122,7 @@ _CATEGORY_MAP: dict[str, list[str]] = {
         "todoist",
         "plane",
     ],
-    "design & media": ["figma", "miro", "mux", "elevenlabs"],
+    "design & media": ["figma", "miro", "excalidraw", "mux", "elevenlabs"],
     "monitoring": ["datadog", "grafana", "dynatrace", "langfuse"],
     "CMS & content": [
         "airtable",
@@ -290,6 +294,11 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         if platform in install_data:
             install[platform] = install_data[platform]  # type: ignore
 
+    transport = cast(
+        ServerTransport,
+        data.get("transport", "streamable-http" if data.get("url") else "local"),
+    )
+
     return ServerConfig(
         name=name,
         description=data.get("description", ""),
@@ -301,6 +310,9 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         env_var=data.get("env_var"),
         env_instructions=data.get("env_instructions"),
         auto_start=data.get("auto_start", False),
+        transport=transport,
+        url=data.get("url"),
+        headers=data.get("headers"),
     )
 
 
