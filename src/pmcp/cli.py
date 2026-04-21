@@ -1465,8 +1465,8 @@ async def run_doctor(args: argparse.Namespace) -> None:
                     f"pmcp is installed by BOTH uv tool ({drift.uv_path}) and "
                     f"pip --user ({drift.pip_user_site}). Whichever shim wins PATH "
                     "masks the other; upgrading one leaves the other stale. Remove "
-                    "the inactive copy: 'pip uninstall --user --break-system-packages "
-                    "pmcp' or 'uv tool uninstall pmcp'."
+                    "the inactive copy: 'python -m pip uninstall pmcp' or "
+                    "'uv tool uninstall pmcp'."
                 ),
             )
         )
@@ -1499,9 +1499,7 @@ def _restart_local_pmcp_service() -> None:
             print("No active pmcp systemd user service found — skipping restart.")
             return
         print("Restarting pmcp systemd user service...")
-        subprocess.run(
-            ["systemctl", "--user", "restart", "pmcp.service"], check=False
-        )
+        subprocess.run(["systemctl", "--user", "restart", "pmcp.service"], check=False)
         return
     if sys.platform == "darwin" and shutil.which("launchctl"):
         label = f"gui/{os.getuid()}/com.user.pmcp"

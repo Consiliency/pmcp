@@ -30,7 +30,9 @@ class TestDetectInstallMethod:
         with patch.object(install_mod, "sys") as sys_mock:
             sys_mock.executable = str(exe)
             with patch.object(install_mod, "_uv_tool_dir", return_value=uv_root):
-                with patch.object(install_mod, "_has_pip_user_pmcp", return_value=False):
+                with patch.object(
+                    install_mod, "_has_pip_user_pmcp", return_value=False
+                ):
                     assert detect_install_method() == "uv"
 
     def test_detects_pip_when_user_site_has_pmcp(self, tmp_path: Path) -> None:
@@ -107,9 +109,7 @@ class TestUpgradeCommand:
         assert args.dry_run is True
 
     @pytest.mark.asyncio
-    async def test_dry_run_auto_uv(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    async def test_dry_run_auto_uv(self, capsys: pytest.CaptureFixture[str]) -> None:
         args = argparse.Namespace(
             command="upgrade",
             method="auto",
