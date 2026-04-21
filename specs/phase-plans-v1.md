@@ -88,17 +88,19 @@ Define and test the user-facing startup policy contract without changing gateway
 
 ### Phase 2 — Shared Startup Resolver (RESOLVER)
 
+**Status**: Completed in current working tree.
+
 **Objective**
 
 Create one resolver that computes lazy and eager downstream server sets from user config, manifest catalog entries, provisioned registry, auth availability, and policy allow/deny rules.
 
 **Exit criteria**
 
-- [ ] Resolver returns separate lazy and eager config lists.
-- [ ] Explicit `autoStart` names can refer to configured `.mcp.json` servers or manifest-only servers.
-- [ ] Configured server definitions take precedence over manifest defaults when names collide.
-- [ ] Missing auth skips eager connection with a clear reason while keeping the server available lazily when appropriate.
-- [ ] Unit tests cover configured local servers, configured remote servers, manifest-only servers, unknown names, policy-denied names, and missing-auth names.
+- [x] Resolver returns separate lazy and eager config lists.
+- [x] Explicit `autoStart` names can refer to configured `.mcp.json` servers or manifest-only servers.
+- [x] Configured server definitions take precedence over manifest defaults when names collide.
+- [x] Missing auth skips eager connection with a clear reason while keeping the server available lazily when appropriate.
+- [x] Unit tests cover configured local servers, configured remote servers, manifest-only servers, unknown names, policy-denied names, and missing-auth names.
 
 **Scope notes**
 

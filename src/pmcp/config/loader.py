@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -17,7 +20,6 @@ from pmcp.types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
     from pmcp.manifest.loader import ServerConfig as ManifestServerConfig
 
 logger = logging.getLogger(__name__)
@@ -26,6 +28,34 @@ DEFAULT_USER_CONFIG_PATHS = [
     Path.home() / ".mcp.json",
     Path.home() / ".claude" / ".mcp.json",
 ]
+
+
+class StartupSkipReason(str, Enum):
+    """Reason a server was excluded during startup resolution."""
+
+    POLICY_DENIED = "policy_denied"
+    MISSING_AUTH = "missing_auth"
+    UNKNOWN_AUTO_START = "unknown_auto_start"
+    UNKNOWN_PROVISIONED = "unknown_provisioned"
+
+
+@dataclass(frozen=True)
+class StartupSkip:
+    """A server skipped by startup resolution with machine-readable context."""
+
+    name: str
+    reason: StartupSkipReason
+    source: Literal["configured", "manifest", "auto_start", "provisioned"]
+    env_var: str | None = None
+
+
+@dataclass(frozen=True)
+class StartupResolution:
+    """Resolved lazy/eager startup groups plus skipped entries."""
+
+    lazy_configs: list[ResolvedServerConfig]
+    eager_configs: list[ResolvedServerConfig]
+    skipped: list[StartupSkip]
 
 
 def _coerce_server_entry(config: object) -> dict[str, Any] | None:
@@ -388,15 +418,22 @@ def load_enabled_auto_start(
     return enabled
 
 
-def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerConfig:
-    """Convert a manifest ServerConfig to a ResolvedServerConfig.
+def _coerce_manifest_servers(
+    manifest_servers: Mapping[str, "ManifestServerConfig"]
+    | Iterable["ManifestServerConfig"]
+    | None,
+) -> dict[str, "ManifestServerConfig"]:
+    if manifest_servers is None:
+        return {}
+    if isinstance(manifest_servers, Mapping):
+        return dict(manifest_servers)
+    return {server.name: server for server in manifest_servers}
 
-    Args:
-        server: Server configuration from manifest.yaml
 
-    Returns:
-        ResolvedServerConfig compatible with ClientManager
-    """
+def _manifest_server_to_config(
+    server: "ManifestServerConfig",
+    env_lookup: Callable[[str], str | None],
+) -> ResolvedServerConfig:
     if server.url:
         remote_type = server.transport
         if remote_type == "local":
@@ -417,7 +454,7 @@ def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerC
     # Build env dict if server requires API key
     env: dict[str, str] | None = None
     if server.env_var:
-        env_value = os.environ.get(server.env_var, "")
+        env_value = env_lookup(server.env_var)
         if env_value:
             env = {server.env_var: env_value}
 
@@ -429,4 +466,129 @@ def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerC
             args=server.args,
             env=env,
         ),
+    )
+
+
+def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerConfig:
+    """Convert a manifest ServerConfig to a ResolvedServerConfig.
+
+    Args:
+        server: Server configuration from manifest.yaml
+
+    Returns:
+        ResolvedServerConfig compatible with ClientManager
+    """
+    return _manifest_server_to_config(server, os.environ.get)
+
+
+def resolve_startup_configs(
+    configured_configs: Sequence[ResolvedServerConfig],
+    manifest_servers: Mapping[str, "ManifestServerConfig"]
+    | Iterable["ManifestServerConfig"]
+    | None = None,
+    enabled_auto_start: Collection[str] = (),
+    disabled_auto_start: Collection[str] = (),
+    provisioned_server_names: Collection[str] = (),
+    is_server_allowed: Callable[[str], bool] = lambda _name: True,
+    is_auth_available: Callable[[str], bool] = lambda _env_var: True,
+    legacy_manifest_auto_start: bool = False,
+) -> StartupResolution:
+    """Classify already-loaded server definitions into lazy/eager startup groups."""
+    manifest_by_name = _coerce_manifest_servers(manifest_servers)
+    enabled = set(enabled_auto_start)
+    disabled = set(disabled_auto_start)
+    provisioned = set(provisioned_server_names)
+
+    lazy_configs: list[ResolvedServerConfig] = []
+    eager_configs: list[ResolvedServerConfig] = []
+    skipped: list[StartupSkip] = []
+
+    configured_names: set[str] = set()
+    classified_names: set[str] = set()
+
+    def add_config(
+        config: ResolvedServerConfig,
+        *,
+        eager: bool,
+        source: Literal["configured", "manifest", "provisioned"],
+        manifest_server: "ManifestServerConfig" | None = None,
+    ) -> None:
+        if not is_server_allowed(config.name):
+            skipped.append(
+                StartupSkip(
+                    name=config.name,
+                    reason=StartupSkipReason.POLICY_DENIED,
+                    source=source,
+                )
+            )
+            classified_names.add(config.name)
+            return
+
+        if eager and manifest_server and manifest_server.requires_api_key:
+            env_var = manifest_server.env_var
+            if env_var and not is_auth_available(env_var):
+                skipped.append(
+                    StartupSkip(
+                        name=config.name,
+                        reason=StartupSkipReason.MISSING_AUTH,
+                        source=source,
+                        env_var=env_var,
+                    )
+                )
+                classified_names.add(config.name)
+                return
+
+        if eager:
+            eager_configs.append(config)
+        else:
+            lazy_configs.append(config)
+        classified_names.add(config.name)
+
+    for config in configured_configs:
+        if config.name in configured_names:
+            continue
+        configured_names.add(config.name)
+        add_config(
+            config,
+            eager=config.name in enabled and config.name not in disabled,
+            source="configured",
+        )
+
+    for name, server in manifest_by_name.items():
+        if name in configured_names or name in classified_names:
+            continue
+
+        eager = name in enabled and name not in disabled
+        if legacy_manifest_auto_start and server.auto_start and name not in disabled:
+            eager = True
+
+        config = _manifest_server_to_config(server, lambda _env_var: None)
+        source: Literal["manifest", "provisioned"] = (
+            "provisioned" if name in provisioned else "manifest"
+        )
+        add_config(config, eager=eager, source=source, manifest_server=server)
+
+    known_names = configured_names | set(manifest_by_name)
+    for name in sorted(enabled - known_names):
+        skipped.append(
+            StartupSkip(
+                name=name,
+                reason=StartupSkipReason.UNKNOWN_AUTO_START,
+                source="auto_start",
+            )
+        )
+
+    for name in sorted(provisioned - known_names):
+        skipped.append(
+            StartupSkip(
+                name=name,
+                reason=StartupSkipReason.UNKNOWN_PROVISIONED,
+                source="provisioned",
+            )
+        )
+
+    return StartupResolution(
+        lazy_configs=lazy_configs,
+        eager_configs=eager_configs,
+        skipped=skipped,
     )

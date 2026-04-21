@@ -34,6 +34,7 @@ class MockClientManager:
         self._revision_id = "test-rev"
         self._last_refresh_ts = 1234567890.0
         self.connected_configs: list[Any] = []
+        self.refreshed_configs: list[Any] = []
 
     def get_all_tools(self) -> list[ToolInfo]:
         return list(self._tools.values())
@@ -78,6 +79,7 @@ class MockClientManager:
         return {"content": [{"type": "text", "text": "result"}]}
 
     async def refresh(self, configs: list[Any]) -> list[str]:
+        self.refreshed_configs = list(configs)
         return []
 
     async def connect_all(self, configs: list[Any], retry: bool = True) -> list[str]:
@@ -155,6 +157,78 @@ def create_mock_tools() -> list[ToolInfo]:
             risk_hint=RiskHint.LOW,
         ),
     ]
+
+
+class TestRefreshCompatibility:
+    @pytest.mark.asyncio
+    async def test_refresh_keeps_current_manifest_policy_and_provisioned_behavior(
+        self, monkeypatch
+    ) -> None:
+        client_manager = MockClientManager()
+        policy_manager = PolicyManager()
+        policy_manager.is_server_allowed = lambda name: name != "denied"  # type: ignore[method-assign]
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        configured = [
+            ResolvedServerConfig(
+                name="configured",
+                source="project",
+                config=LocalMcpServerConfig(command="configured-cmd"),
+            ),
+            ResolvedServerConfig(
+                name="denied",
+                source="project",
+                config=LocalMcpServerConfig(command="denied-cmd"),
+            ),
+        ]
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "legacy-auto": ServerConfig(
+                    name="legacy-auto",
+                    description="Legacy auto-start",
+                    keywords=["legacy"],
+                    install={},
+                    command="legacy-cmd",
+                    args=[],
+                    auto_start=True,
+                ),
+                "provisioned": ServerConfig(
+                    name="provisioned",
+                    description="Provisioned",
+                    keywords=["provisioned"],
+                    install={},
+                    command="provisioned-cmd",
+                    args=[],
+                ),
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr(
+            "pmcp.config.loader.load_enabled_auto_start",
+            lambda **_: pytest.fail("refresh should not read autoStart yet"),
+        )
+        monkeypatch.setattr(
+            gateway_tools,
+            "_load_provisioned_registry",
+            lambda: {"provisioned": None},
+        )
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert [config.name for config in client_manager.refreshed_configs] == [
+            "configured",
+            "legacy-auto",
+            "provisioned",
+        ]
 
 
 class TestCatalogSearch:
