@@ -19,7 +19,7 @@ import hmac
 import json
 import logging
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, MutableMapping
 from typing import TYPE_CHECKING, Any, Callable
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -282,7 +282,7 @@ def create_http_app(
         response_started = False
         original_send = request._send
 
-        async def tracking_send(message: dict[str, Any]) -> None:
+        async def tracking_send(message: MutableMapping[str, Any]) -> None:
             nonlocal response_started
             if message.get("type") == "http.response.start":
                 response_started = True
