@@ -353,6 +353,23 @@ def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerC
     Returns:
         ResolvedServerConfig compatible with ClientManager
     """
+    if server.url:
+        remote_type = server.transport
+        if remote_type == "local":
+            remote_type = "streamable-http"
+        return ResolvedServerConfig(
+            name=server.name,
+            source="manifest",
+            config=RemoteMcpServerConfig(
+                type=cast(
+                    Literal["remote", "sse", "http", "streamable-http"],
+                    remote_type,
+                ),
+                url=server.url,
+                headers=server.headers,
+            ),
+        )
+
     # Build env dict if server requires API key
     env: dict[str, str] | None = None
     if server.env_var:

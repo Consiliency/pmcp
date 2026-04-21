@@ -1,7 +1,7 @@
 """Manifest provisioning test suite.
 
 Fast unit tier (~300 parametrized cases, <10s):
-- Schema completeness for all 99 manifest servers
+- Schema completeness for manifest servers
 - Install command consistency (linux[0] == server.command)
 - Mocked provision routing for all servers
 
@@ -29,6 +29,12 @@ _manifest = load_manifest()
 _all_servers = list(_manifest.servers.values())
 _api_key_servers = [s for s in _all_servers if s.requires_api_key]
 _no_key_servers = [s for s in _all_servers if not s.requires_api_key]
+_remote_servers = [s for s in _all_servers if s.url]
+_installable_servers = [s for s in _all_servers if not s.url]
+_no_key_installable_servers = [
+    s for s in _installable_servers if not s.requires_api_key
+]
+_no_key_remote_servers = [s for s in _remote_servers if not s.requires_api_key]
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +69,9 @@ class _MinimalClientManager:
     async def refresh(self, configs):
         return []
 
+    async def connect_all(self, configs, retry=True):
+        return []
+
 
 def _make_gateway_tools() -> GatewayTools:
     return GatewayTools(
@@ -87,17 +96,17 @@ class TestManifestSchemaCompleteness:
     def test_keywords_non_empty(self, server):
         assert isinstance(server.keywords, list) and len(server.keywords) > 0
 
-    @pytest.mark.parametrize("server", _all_servers, ids=lambda s: s.name)
+    @pytest.mark.parametrize("server", _installable_servers, ids=lambda s: s.name)
     def test_install_dict_non_empty(self, server):
         assert isinstance(server.install, dict) and len(server.install) > 0
 
-    @pytest.mark.parametrize("server", _all_servers, ids=lambda s: s.name)
+    @pytest.mark.parametrize("server", _installable_servers, ids=lambda s: s.name)
     def test_linux_platform_present(self, server):
         assert "linux" in server.install, (
             f"Server '{server.name}' missing 'linux' key in install"
         )
 
-    @pytest.mark.parametrize("server", _all_servers, ids=lambda s: s.name)
+    @pytest.mark.parametrize("server", _installable_servers, ids=lambda s: s.name)
     def test_command_non_empty(self, server):
         assert isinstance(server.command, str) and server.command.strip()
 
@@ -117,6 +126,11 @@ class TestManifestSchemaCompleteness:
             f"Server '{server.name}' requires_api_key=True but env_instructions is empty"
         )
 
+    @pytest.mark.parametrize("server", _remote_servers, ids=lambda s: s.name)
+    def test_remote_servers_have_url_and_transport(self, server):
+        assert server.url
+        assert server.transport in {"remote", "sse", "http", "streamable-http"}
+
 
 # ---------------------------------------------------------------------------
 # Class 2 — Install command consistency
@@ -126,7 +140,7 @@ class TestManifestSchemaCompleteness:
 class TestManifestInstallCommandConsistency:
     """server.install['linux'][0] must equal server.command."""
 
-    @pytest.mark.parametrize("server", _all_servers, ids=lambda s: s.name)
+    @pytest.mark.parametrize("server", _installable_servers, ids=lambda s: s.name)
     def test_linux_install_first_token_matches_command(self, server):
         linux_cmd = server.install["linux"]
         assert linux_cmd, f"Server '{server.name}': linux install list is empty"
@@ -144,7 +158,9 @@ class TestManifestInstallCommandConsistency:
 class TestProvisionRoutingAllServers:
     """Provision routing returns correct shape for every server — no I/O."""
 
-    @pytest.mark.parametrize("server", _no_key_servers, ids=lambda s: s.name)
+    @pytest.mark.parametrize(
+        "server", _no_key_installable_servers, ids=lambda s: s.name
+    )
     async def test_provision_no_key_server(self, server, monkeypatch):
         """No-API-key servers should start installation and return status='started'."""
         tools = _make_gateway_tools()
@@ -164,6 +180,27 @@ class TestProvisionRoutingAllServers:
         )
         assert result.job_id == "fake-job-id"
         assert result.server == server.name
+
+    @pytest.mark.parametrize("server", _no_key_remote_servers, ids=lambda s: s.name)
+    async def test_provision_no_key_remote_server(self, server, monkeypatch):
+        """No-API-key remote servers should connect directly without installer jobs."""
+        tools = _make_gateway_tools()
+
+        fake_jm = MagicMock()
+        fake_jm.start_install = AsyncMock(return_value="fake-job-id")
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: _manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: fake_jm)
+        monkeypatch.setattr(tools, "_save_provisioned_registry", lambda: None)
+
+        result = await tools.provision({"server_name": server.name})
+
+        assert result.ok is True, f"[{server.name}] provision failed: {result.message}"
+        assert result.status == "complete"
+        assert result.job_id is None
+        assert result.server == server.name
+        fake_jm.start_install.assert_not_awaited()
 
     @pytest.mark.parametrize("server", _api_key_servers, ids=lambda s: s.name)
     async def test_provision_missing_api_key(self, server, monkeypatch):
@@ -228,7 +265,9 @@ class TestLiveProvisionSmokeTest:
                         pass
         JobManager._instance = None
 
-    @pytest.mark.parametrize("server", _no_key_servers, ids=lambda s: s.name)
+    @pytest.mark.parametrize(
+        "server", _no_key_installable_servers, ids=lambda s: s.name
+    )
     @pytest.mark.timeout(130)
     async def test_live_install(self, server):
         """Start install and wait up to 120 s for server_ready or complete."""
