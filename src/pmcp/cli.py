@@ -399,7 +399,11 @@ Environment overrides:
     setup_parser = subparsers.add_parser(
         "setup",
         help="Render PMCP client config",
-        description="Render PMCP config for Claude/OpenCode; optionally write it.",
+        description=(
+            "Render PMCP config for Claude/OpenCode; optionally write it. "
+            "This config starts only the PMCP gateway; downstream servers remain "
+            "lazy unless explicitly listed in .mcp.json autoStart."
+        ),
     )
     setup_parser.add_argument(
         "--mode",

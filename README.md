@@ -21,7 +21,7 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 **PMCP** acts as a single MCP server that Claude Code connects to. Instead of exposing all downstream tools, it provides:
 
 - **16 stable meta-tools** (not the 50+ underlying tools)
-- **Auto-starts** essential servers (Playwright, Context7) with no configuration
+- **Lazy by default**: downstream servers are available on demand and only eager-start when listed in `autoStart`
 - **Dynamically provisions** new servers on-demand from a manifest of 90+
 - **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
 - **Policy enforcement**: Output size caps and optional secret redaction
@@ -48,6 +48,9 @@ pip install pmcp
 ### Configure with `pmcp setup`
 
 PMCP includes a wizard-style helper that can render ready-to-use MCP client config for Claude and OpenCode.
+The generated config only connects your client to the PMCP gateway. Downstream MCP
+servers stay lazy until first use unless you add them to `autoStart` in your
+`.mcp.json`.
 
 Use `pmcp setup` to print the generated config:
 
@@ -243,9 +246,9 @@ Returns: Screenshot of google.com
         ┌────────────────────┼────────────────────┐
         ▼                    ▼                    ▼
 ┌───────────────┐  ┌─────────────────┐  ┌─────────────────┐
-│  Auto-Start   │  │    Manifest     │  │  Custom Servers │
-│  (Playwright, │  │   (90+ servers  │  │  (your own MCP  │
-│   Context7)   │  │   on-demand)    │  │  servers)       │
+│  Explicit     │  │    Manifest     │  │  Custom Servers │
+│  autoStart    │  │   (90+ servers  │  │  (your own MCP  │
+│  servers      │  │   on-demand)    │  │  servers)       │
 └───────────────┘  └─────────────────┘  └─────────────────┘
 ```
 
@@ -412,9 +415,22 @@ export GITHUB_PERSONAL_ACCESS_TOKEN=ghp_...
 gateway.provision({ server_name: "github" })
 ```
 
-## Auto-Start Servers
+## Optional Eager Startup
 
-These servers start automatically (no configuration required):
+Packaged manifest servers do not start automatically. They are lazy by default:
+PMCP can discover or provision them from the manifest, then connect on first use.
+
+To eagerly start a server every time PMCP starts, list it in top-level
+`autoStart`:
+
+```json
+{
+  "autoStart": ["playwright", "context7"],
+  "mcpServers": {}
+}
+```
+
+Common opt-in choices:
 
 | Server | Description | API Key |
 |--------|-------------|---------|
@@ -546,9 +562,40 @@ For MCP servers not in the manifest, add them to `~/.mcp.json`:
 
 PMCP supports both local command-based and remote URL-based downstream entries from discovered config files. Entries in `mcpServers` make downstream servers available lazily/on demand; they do not by themselves mean the server should be eagerly started.
 
-The top-level `autoStart` list records explicit eager-start intent for the startup policy migration. In the current Phase 1 contract, it is parsed and exposed for policy code but does not yet control runtime eager startup.
+The top-level `autoStart` list controls explicit eager startup. Names can refer to
+servers defined in `mcpServers` or packaged manifest entries such as `playwright`
+and `context7`. Omit a server from `autoStart` to keep it lazy.
 
-The legacy top-level `disableAutoStart` list remains supported for disabling packaged manifest auto-start defaults during the migration.
+The legacy top-level `disableAutoStart` list remains supported for deployments
+that temporarily enable `PMCP_LEGACY_MANIFEST_AUTOSTART=1`, but packaged PMCP
+defaults no longer require it.
+
+Lazy Excalidraw example:
+
+```json
+{
+  "mcpServers": {
+    "excalidraw": {
+      "type": "http",
+      "url": "https://mcp.excalidraw.com/mcp"
+    }
+  }
+}
+```
+
+Eager Excalidraw example:
+
+```json
+{
+  "autoStart": ["excalidraw"],
+  "mcpServers": {
+    "excalidraw": {
+      "type": "http",
+      "url": "https://mcp.excalidraw.com/mcp"
+    }
+  }
+}
+```
 
 #### Remote Downstream Servers
 

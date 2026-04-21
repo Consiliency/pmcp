@@ -133,17 +133,19 @@ Create one resolver that computes lazy and eager downstream server sets from use
 
 ### Phase 3 — Runtime Startup Policy Migration (RUNTIME)
 
+**Status**: Completed in current working tree.
+
 **Objective**
 
 Switch gateway startup and refresh to the shared resolver so explicit user `autoStart` controls eager connections and all other configured/provisioned servers remain lazy.
 
 **Exit criteria**
 
-- [ ] `GatewayServer.initialize()` registers lazy configs before connecting explicit eager configs.
-- [ ] `gateway.refresh` uses the same policy as startup.
-- [ ] Legacy manifest `auto_start` behavior is retained only through a compatibility path or clearly deprecated transition flag.
-- [ ] `gateway.health` and status output remain correct for lazy and online servers.
-- [ ] Existing lazy-start tests pass after being updated for the new source of eager configs.
+- [x] `GatewayServer.initialize()` registers lazy configs before connecting explicit eager configs.
+- [x] `gateway.refresh` uses the same policy as startup.
+- [x] Legacy manifest `auto_start` behavior is retained only through a compatibility path or clearly deprecated transition flag.
+- [x] `gateway.health` and status output remain correct for lazy and online servers.
+- [x] Existing lazy-start tests pass after being updated for the new source of eager configs.
 
 **Scope notes**
 
@@ -175,17 +177,19 @@ Switch gateway startup and refresh to the shared resolver so explicit user `auto
 
 ### Phase 4 — Manifest Defaults Deprecation and Docs (MIGRATION)
 
+**Status**: Completed in current working tree.
+
 **Objective**
 
 Remove or neutralize developer-selected auto-start defaults and document the new user-owned startup model.
 
 **Exit criteria**
 
-- [ ] Packaged manifest no longer causes Playwright, Context7, or any other downstream server to auto-start without user opt-in, unless a compatibility flag is intentionally enabled.
-- [ ] README examples show `autoStart` for eager startup and plain `mcpServers` for lazy availability.
-- [ ] `pmcp setup` output or guidance explains minimal startup versus optional presets.
-- [ ] Tests no longer assert developer-selected manifest auto-start defaults as required behavior.
-- [ ] Release notes clearly describe the migration and how to restore prior behavior.
+- [x] Packaged manifest no longer causes Playwright, Context7, or any other downstream server to auto-start without user opt-in.
+- [x] README examples show `autoStart` for eager startup and plain `mcpServers` for lazy availability.
+- [x] `pmcp setup` output or guidance explains minimal startup versus optional presets.
+- [x] Tests no longer assert developer-selected manifest auto-start defaults as required behavior.
+- [x] Release notes clearly describe the migration and how to restore prior behavior.
 
 **Scope notes**
 

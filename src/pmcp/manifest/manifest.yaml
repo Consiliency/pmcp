@@ -71,7 +71,7 @@ cli_alternatives:
 
 # MCP Servers - verified against official documentation
 servers:
-  # === Default Auto-Start (no API key required) ===
+  # === Recommended Opt-In Servers (no API key required) ===
 
   playwright:
     description: "Browser automation - navigation, clicks, screenshots, DOM inspection"
@@ -95,7 +95,6 @@ servers:
     command: "npx"
     args: ["-y", "@playwright/mcp@latest"]
     requires_api_key: false
-    auto_start: true
 
   context7:
     description: "Library documentation lookup - up-to-date docs for any package"
@@ -110,7 +109,6 @@ servers:
     command_windows: "cmd"
     args_windows: ["/c", "npx", "-y", "@upstash/context7-mcp"]
     requires_api_key: false
-    auto_start: true
     # Optional: CONTEXT7_API_KEY for higher rate limits (60 req/hr without)
 
   # === Reference Servers (from modelcontextprotocol/servers) ===

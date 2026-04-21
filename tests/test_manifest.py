@@ -129,16 +129,13 @@ def test_manifest_has_expected_servers():
         assert server in manifest.servers, f"Missing server: {server}"
 
 
-def test_manifest_auto_start_servers():
-    """Test getting auto-start servers."""
+def test_manifest_has_no_packaged_auto_start_defaults():
+    """The packaged manifest should not eagerly start servers by default."""
     manifest = load_manifest()
 
     auto_start = manifest.get_auto_start_servers()
 
-    # Should include playwright, context7, brightdata-scraper, brightdata-serp
-    auto_start_names = [s.name for s in auto_start]
-    assert "playwright" in auto_start_names
-    assert "context7" in auto_start_names
+    assert auto_start == []
 
 
 def test_manifest_search_by_keyword():
@@ -172,7 +169,7 @@ def test_manifest_server_config():
     assert playwright is not None
     assert playwright.command == "npx"
     assert playwright.requires_api_key is False
-    assert playwright.auto_start is True
+    assert playwright.auto_start is False
 
 
 def test_manifest_remote_server_config():
