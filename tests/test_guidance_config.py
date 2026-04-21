@@ -18,7 +18,7 @@ from pmcp.templates.code_snippets_loader import (
     CodeSnippetsLoader,
     get_code_snippet,
 )
-from pmcp.types import ToolInfo
+from pmcp.types import McpConfigFile, ToolInfo
 
 
 class TestGuidanceConfigDefaults:
@@ -505,24 +505,35 @@ class TestMcpConfigFileExtraFields:
     """Tests for McpConfigFile tolerating extra fields."""
 
     def test_ignores_warning_field(self) -> None:
-        from pmcp.types import McpConfigFile
-
         data = {
             "_WARNING": "Do not add gateway here",
             "mcpServers": {},
         }
         config = McpConfigFile.model_validate(data)
         assert config.mcpServers == {}
+        assert config.autoStart == []
 
     def test_ignores_arbitrary_extra_fields(self) -> None:
-        from pmcp.types import McpConfigFile
-
         data = {
             "_comment": "Some comment",
             "extraField": 42,
             "mcpServers": {"test": {"type": "local", "command": "echo"}},
+            "autoStart": ["context7"],
             "disableAutoStart": ["playwright"],
         }
         config = McpConfigFile.model_validate(data)
         assert "test" in config.mcpServers
+        assert config.autoStart == ["context7"]
         assert config.disableAutoStart == ["playwright"]
+
+    def test_accepts_camel_case_auto_start(self) -> None:
+        config = McpConfigFile.model_validate(
+            {"autoStart": ["context7"], "mcpServers": {}}
+        )
+
+        assert config.autoStart == ["context7"]
+
+    def test_defaults_auto_start_to_empty_list(self) -> None:
+        config = McpConfigFile.model_validate({"mcpServers": {}})
+
+        assert config.autoStart == []

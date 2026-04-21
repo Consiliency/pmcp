@@ -531,6 +531,7 @@ For MCP servers not in the manifest, add them to `~/.mcp.json`:
 
 ```json
 {
+  "autoStart": ["my-custom-server"],
   "mcpServers": {
     "my-custom-server": {
       "command": "node",
@@ -543,7 +544,11 @@ For MCP servers not in the manifest, add them to `~/.mcp.json`:
 }
 ```
 
-PMCP supports both local command-based and remote URL-based downstream entries from discovered config files.
+PMCP supports both local command-based and remote URL-based downstream entries from discovered config files. Entries in `mcpServers` make downstream servers available lazily/on demand; they do not by themselves mean the server should be eagerly started.
+
+The top-level `autoStart` list records explicit eager-start intent for the startup policy migration. In the current Phase 1 contract, it is parsed and exposed for policy code but does not yet control runtime eager startup.
+
+The legacy top-level `disableAutoStart` list remains supported for disabling packaged manifest auto-start defaults during the migration.
 
 #### Remote Downstream Servers
 

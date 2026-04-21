@@ -58,6 +58,7 @@ class McpConfigFile(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     mcpServers: dict[str, McpServerConfig] = Field(default_factory=dict)
+    autoStart: list[str] = Field(default_factory=list)
     disableAutoStart: list[str] = Field(default_factory=list)
 
 

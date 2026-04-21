@@ -7,6 +7,8 @@ from pathlib import Path
 
 
 from pmcp.config.loader import (
+    load_disabled_auto_start,
+    load_enabled_auto_start,
     load_configs,
     make_tool_id,
     manifest_server_to_config,
@@ -256,3 +258,108 @@ class TestLoadConfigs:
         )
 
         assert configs == []
+
+
+class TestLoadAutoStartPolicy:
+    """Tests for startup policy aggregation from config files."""
+
+    def test_loads_enabled_auto_start_from_all_config_sources(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".mcp.json").write_text(
+            json.dumps({"autoStart": ["project-server", "shared-server"]})
+        )
+
+        user_config_path = tmp_path / "user.mcp.json"
+        user_config_path.write_text(
+            json.dumps({"autoStart": ["user-server", "shared-server"]})
+        )
+
+        custom_config_path = tmp_path / "custom.mcp.json"
+        custom_config_path.write_text(
+            json.dumps({"autoStart": ["custom-server", "shared-server"]})
+        )
+
+        enabled = load_enabled_auto_start(
+            project_root=tmp_path,
+            user_config_paths=[user_config_path],
+            custom_config_path=custom_config_path,
+        )
+
+        assert enabled == {
+            "project-server",
+            "user-server",
+            "custom-server",
+            "shared-server",
+        }
+
+    def test_auto_start_policy_lists_are_unioned_not_overridden(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "shared-server": {"command": "project-cmd"},
+                    },
+                    "autoStart": ["project-server"],
+                }
+            )
+        )
+
+        user_config_path = tmp_path / "user.mcp.json"
+        user_config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "shared-server": {"command": "user-cmd"},
+                    },
+                    "autoStart": ["shared-server", "user-server"],
+                }
+            )
+        )
+
+        configs = load_configs(
+            project_root=tmp_path,
+            user_config_paths=[user_config_path],
+        )
+        enabled = load_enabled_auto_start(
+            project_root=tmp_path,
+            user_config_paths=[user_config_path],
+        )
+
+        shared = next(c for c in configs if c.name == "shared-server")
+        assert shared.source == "project"
+        assert shared.config.type == "local"
+        assert shared.config.command == "project-cmd"
+        assert enabled == {"project-server", "shared-server", "user-server"}
+
+    def test_loads_disabled_auto_start_from_all_config_sources(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".mcp.json").write_text(
+            json.dumps({"disableAutoStart": ["project-server", "shared-server"]})
+        )
+
+        user_config_path = tmp_path / "user.mcp.json"
+        user_config_path.write_text(
+            json.dumps({"disableAutoStart": ["user-server", "shared-server"]})
+        )
+
+        custom_config_path = tmp_path / "custom.mcp.json"
+        custom_config_path.write_text(
+            json.dumps({"disableAutoStart": ["custom-server", "shared-server"]})
+        )
+
+        disabled = load_disabled_auto_start(
+            project_root=tmp_path,
+            user_config_paths=[user_config_path],
+            custom_config_path=custom_config_path,
+        )
+
+        assert disabled == {
+            "project-server",
+            "user-server",
+            "custom-server",
+            "shared-server",
+        }
