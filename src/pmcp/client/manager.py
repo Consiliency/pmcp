@@ -18,6 +18,7 @@ from typing import Any
 
 import mcp.types as mcp_types
 from mcp.client.sse import sse_client
+from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.message import SessionMessage
 
 from pmcp.config.loader import make_tool_id
@@ -191,6 +192,15 @@ def _interpolate_header_value(value: str) -> str:
     if not match:
         return value
     return os.environ.get(match.group(1), "")
+
+
+def _remote_headers(config: RemoteMcpServerConfig) -> dict[str, str] | None:
+    """Return remote transport headers with env-var placeholders expanded."""
+    if not config.headers:
+        return None
+    return {
+        key: _interpolate_header_value(value) for key, value in config.headers.items()
+    }
 
 
 @dataclass
@@ -383,7 +393,10 @@ class ClientManager:
     async def _connect_server(self, config: ResolvedServerConfig) -> None:
         """Connect to a single MCP server."""
         if isinstance(config.config, RemoteMcpServerConfig):
-            await self._connect_sse(config)
+            if config.config.type in ("http", "streamable-http"):
+                await self._connect_streamable_http(config)
+            else:
+                await self._connect_sse(config)
             return
 
         await self._connect_stdio(config)
@@ -573,6 +586,38 @@ class ClientManager:
 
     async def _connect_sse(self, config: ResolvedServerConfig) -> None:
         """Connect to a remote SSE MCP server."""
+        if not isinstance(config.config, RemoteMcpServerConfig):
+            raise ValueError(f"Server {config.name} has unsupported remote config type")
+
+        remote_config = config.config
+        headers = _remote_headers(remote_config)
+        await self._connect_remote_stream(
+            config,
+            sse_client(remote_config.url, headers=headers),
+            transport_name="SSE",
+        )
+
+    async def _connect_streamable_http(self, config: ResolvedServerConfig) -> None:
+        """Connect to a remote streamable-HTTP MCP server."""
+        if not isinstance(config.config, RemoteMcpServerConfig):
+            raise ValueError(f"Server {config.name} has unsupported remote config type")
+
+        remote_config = config.config
+        headers = _remote_headers(remote_config)
+        await self._connect_remote_stream(
+            config,
+            streamablehttp_client(remote_config.url, headers=headers),
+            transport_name="streamable HTTP",
+        )
+
+    async def _connect_remote_stream(
+        self,
+        config: ResolvedServerConfig,
+        transport_context: Any,
+        *,
+        transport_name: str,
+    ) -> None:
+        """Connect to a remote MCP server using a read/write stream transport."""
         name = config.name
 
         status = ServerStatus(
@@ -582,29 +627,17 @@ class ClientManager:
         )
         self._servers[name] = status
 
-        if not isinstance(config.config, RemoteMcpServerConfig):
-            raise ValueError(f"Server {name} has unsupported remote config type")
+        logger.info(f"Connecting to remote MCP server via {transport_name}: {name}")
 
-        remote_config = config.config
-        headers = None
-        if remote_config.headers:
-            headers = {
-                key: _interpolate_header_value(value)
-                for key, value in remote_config.headers.items()
-            }
-
-        logger.info(f"Connecting to remote MCP server: {name}")
-
-        sse_stack = AsyncExitStack()
-        read_stream, write_stream = await sse_stack.enter_async_context(
-            sse_client(remote_config.url, headers=headers)
-        )
+        remote_stack = AsyncExitStack()
+        transport = await remote_stack.enter_async_context(transport_context)
+        read_stream, write_stream = transport[:2]
 
         managed = ManagedClient(
             config=config,
             process=None,
             is_remote=True,
-            sse_exit_stack=sse_stack,
+            sse_exit_stack=remote_stack,
             write_stream=write_stream,
             status=status,
         )
@@ -717,7 +750,7 @@ class ClientManager:
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
             status.last_error = str(e)
-            await sse_stack.aclose()
+            await remote_stack.aclose()
             raise
 
     async def _read_stderr(self, name: str, stderr: asyncio.StreamReader) -> None:

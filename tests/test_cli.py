@@ -1056,6 +1056,127 @@ class TestDoctorAndSecretsIntegration:
         mock_update.assert_awaited_once_with(args)
 
 
+class TestGatewayCliRemoteConfig:
+    """Tests for CLI commands that talk to the running PMCP gateway."""
+
+    def test_get_gateway_url_prefers_new_env_var(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PMCP_GATEWAY_URL should override the legacy SSE alias."""
+        from pmcp.cli import _get_gateway_url
+
+        monkeypatch.setenv("PMCP_STATUS_SSE_URL", "http://legacy.example/mcp")
+        monkeypatch.setenv("PMCP_GATEWAY_URL", "http://gateway.example/mcp")
+
+        assert _get_gateway_url() == "http://gateway.example/mcp"
+
+    @pytest.mark.asyncio
+    async def test_run_update_exits_when_gateway_connect_fails(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """run_update should stop before tool calls when the gateway is unreachable."""
+        from pmcp.cli import run_update
+
+        args = argparse.Namespace(
+            command="update",
+            server="context7",
+            all=False,
+            json=False,
+            policy=None,
+            log_level="warn",
+        )
+
+        with patch(
+            "pmcp.client.manager.ClientManager.connect_all",
+            new=AsyncMock(return_value=["Failed to connect to pmcp-gateway: boom"]),
+        ) as mock_connect_all:
+            with patch(
+                "pmcp.client.manager.ClientManager.call_tool", new=AsyncMock()
+            ) as mock_call_tool:
+                with patch(
+                    "pmcp.client.manager.ClientManager.disconnect_all",
+                    new=AsyncMock(),
+                ):
+                    with pytest.raises(SystemExit) as exc_info:
+                        await run_update(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "cannot reach PMCP gateway" in captured.err
+        gateway_config = mock_connect_all.await_args.args[0][0]
+        assert gateway_config.config.type == "streamable-http"
+        mock_call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_query_running_gateway_status_returns_none_on_connect_failure(
+        self,
+    ) -> None:
+        """Live status query failures should preserve static-config fallback."""
+        from pmcp.cli import _query_running_gateway_status
+
+        class Policy:
+            def get_max_tools_per_server(self) -> int:
+                return 100
+
+        args = argparse.Namespace(server=None, pending=False)
+
+        with patch(
+            "pmcp.client.manager.ClientManager.connect_all",
+            new=AsyncMock(return_value=["Failed to connect to pmcp-gateway: boom"]),
+        ) as mock_connect_all:
+            with patch(
+                "pmcp.client.manager.ClientManager.call_tool", new=AsyncMock()
+            ) as mock_call_tool:
+                with patch(
+                    "pmcp.client.manager.ClientManager.disconnect_all",
+                    new=AsyncMock(),
+                ):
+                    result = await _query_running_gateway_status(args, Policy())
+
+        assert result is None
+        gateway_config = mock_connect_all.await_args.args[0][0]
+        assert gateway_config.config.type == "streamable-http"
+        mock_call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_auth_connect_exits_when_gateway_connect_fails(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """auth connect should use streamable HTTP and stop on connect errors."""
+        from pmcp.cli import run_auth_connect
+
+        args = argparse.Namespace(
+            command="auth",
+            auth_command="connect",
+            server_name="browser-use",
+            credential=None,
+            policy=None,
+            log_level="warn",
+            json=False,
+        )
+
+        with patch(
+            "pmcp.client.manager.ClientManager.connect_all",
+            new=AsyncMock(return_value=["Failed to connect to pmcp-gateway: boom"]),
+        ) as mock_connect_all:
+            with patch(
+                "pmcp.client.manager.ClientManager.call_tool", new=AsyncMock()
+            ) as mock_call_tool:
+                with patch(
+                    "pmcp.client.manager.ClientManager.disconnect_all",
+                    new=AsyncMock(),
+                ):
+                    with pytest.raises(SystemExit) as exc_info:
+                        await run_auth_connect(args)
+
+        assert exc_info.value.code == 1
+        captured = capsys.readouterr()
+        assert "cannot reach PMCP gateway" in captured.err
+        gateway_config = mock_connect_all.await_args.args[0][0]
+        assert gateway_config.config.type == "streamable-http"
+        mock_call_tool.assert_not_awaited()
+
+
 class TestRunStatusWithData:
     """Tests for run_status with actual server data."""
 
