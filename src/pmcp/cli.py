@@ -18,6 +18,10 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
+from pmcp.cli_commands.install import (
+    detect_install_drift,
+    detect_install_method,
+)
 from pmcp.cli_commands.secrets import (
     run_secrets_check,
     run_secrets_set,
@@ -93,6 +97,7 @@ def parse_args() -> argparse.Namespace:
   pmcp setup --client claude --mode http --write
   pmcp setup --client opencode --mode http --write
   pmcp doctor
+  pmcp upgrade
   pmcp secrets set API_TOKEN my-token --scope user
   pmcp secrets sync --from-scope user --to-scope project --overwrite
   pmcp status --json
@@ -450,6 +455,40 @@ Environment overrides:
         help="SSE probe timeout in seconds (default: 3.0)",
     )
     doctor_parser.add_argument(
+        "-l",
+        "--log-level",
+        choices=["debug", "info", "warn", "error"],
+        default="warn",
+        help="Log level (default: warn)",
+    )
+
+    # Upgrade command
+    upgrade_parser = subparsers.add_parser(
+        "upgrade",
+        help="Upgrade the pmcp package to the latest release",
+        description=(
+            "Detect how pmcp was installed (uv tool vs pip --user) and "
+            "run the matching upgrade command. Optionally restart the "
+            "local gateway service afterwards."
+        ),
+    )
+    upgrade_parser.add_argument(
+        "--method",
+        choices=["auto", "uv", "pip"],
+        default="auto",
+        help="Override install-method detection (default: auto)",
+    )
+    upgrade_parser.add_argument(
+        "--restart-service",
+        action="store_true",
+        help="Restart the local systemd/launchd pmcp service after upgrade",
+    )
+    upgrade_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print what would run without invoking the upgrade command",
+    )
+    upgrade_parser.add_argument(
         "-l",
         "--log-level",
         choices=["debug", "info", "warn", "error"],
@@ -1416,6 +1455,27 @@ async def run_doctor(args: argparse.Namespace) -> None:
     else:
         checks.append(("remote", "ok", "No remote downstream header issues detected."))
 
+    drift = detect_install_drift()
+    if drift.has_drift:
+        checks.append(
+            (
+                "install",
+                "warn",
+                (
+                    f"pmcp is installed by BOTH uv tool ({drift.uv_path}) and "
+                    f"pip --user ({drift.pip_user_site}). Whichever shim wins PATH "
+                    "masks the other; upgrading one leaves the other stale. Remove "
+                    "the inactive copy: 'pip uninstall --user --break-system-packages "
+                    "pmcp' or 'uv tool uninstall pmcp'."
+                ),
+            )
+        )
+    else:
+        method = detect_install_method()
+        checks.append(
+            ("install", "ok", f"pmcp install method: {method} (no drift detected).")
+        )
+
     status_icon = {"ok": "OK", "warn": "WARN", "fail": "FAIL"}
     print("PMCP Doctor")
     print("===========")
@@ -1425,6 +1485,92 @@ async def run_doctor(args: argparse.Namespace) -> None:
 
     if any(status == "fail" for _, status, _ in checks):
         sys.exit(1)
+
+
+def _restart_local_pmcp_service() -> None:
+    """Best-effort restart of the local pmcp service (systemd user or launchd)."""
+    if shutil.which("systemctl") and Path("/run/systemd/system").exists():
+        probe = subprocess.run(
+            ["systemctl", "--user", "is-active", "pmcp.service"],
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode != 0:
+            print("No active pmcp systemd user service found — skipping restart.")
+            return
+        print("Restarting pmcp systemd user service...")
+        subprocess.run(
+            ["systemctl", "--user", "restart", "pmcp.service"], check=False
+        )
+        return
+    if sys.platform == "darwin" and shutil.which("launchctl"):
+        label = f"gui/{os.getuid()}/com.user.pmcp"
+        print(f"Kickstarting launchd {label}...")
+        subprocess.run(["launchctl", "kickstart", "-k", label], check=False)
+        return
+    print("No supported service manager detected — skipping restart.")
+
+
+async def run_upgrade(args: argparse.Namespace) -> None:
+    """Upgrade the pmcp package using the detected install method."""
+    setup_logging(args.log_level)
+
+    method = args.method
+    if method == "auto":
+        method = detect_install_method()
+        if method == "unknown":
+            print(
+                "error: could not auto-detect install method (neither uv tool nor "
+                "pip --user). Pass --method=uv or --method=pip explicitly, or "
+                "reinstall pmcp from PyPI.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    if method == "uv":
+        cmd = ["uv", "tool", "upgrade", "pmcp"]
+    elif method == "pip":
+        cmd = [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "-U",
+            "--user",
+            "--break-system-packages",
+            "pmcp",
+        ]
+    else:
+        print(f"error: unsupported --method={method}", file=sys.stderr)
+        sys.exit(2)
+
+    if args.dry_run:
+        print(f"[dry-run] would run: {' '.join(cmd)}")
+        return
+
+    print(f"Upgrading pmcp via {method}: {' '.join(cmd)}")
+    try:
+        result = subprocess.run(cmd, check=False)
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+    if result.returncode != 0:
+        print(
+            f"error: upgrade command failed with exit {result.returncode}",
+            file=sys.stderr,
+        )
+        sys.exit(result.returncode)
+
+    drift = detect_install_drift()
+    if drift.has_drift:
+        print(
+            "\nwarning: pmcp is installed by BOTH uv tool and pip --user. The copy "
+            f"that was upgraded is {method}; the other is now stale and will mask "
+            "the upgrade if PATH order changes. Run 'pmcp doctor' for details."
+        )
+
+    if args.restart_service:
+        _restart_local_pmcp_service()
 
 
 async def run_server(args: argparse.Namespace) -> None:
@@ -1711,6 +1857,8 @@ async def async_main(args: argparse.Namespace) -> None:
         run_guidance(args)  # Synchronous command
     elif args.command == "doctor":
         await run_doctor(args)
+    elif args.command == "upgrade":
+        await run_upgrade(args)
     elif args.command == "secrets":
         if args.secrets_command == "set":
             output = await run_secrets_set(args)
