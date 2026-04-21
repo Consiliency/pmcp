@@ -27,9 +27,11 @@ from pydantic import AnyUrl
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
+    is_legacy_manifest_auto_start_enabled,
     load_configs,
     load_disabled_auto_start,
-    manifest_server_to_config,
+    load_enabled_auto_start,
+    resolve_startup_configs,
 )
 from pmcp.identity import (
     filter_self_references,
@@ -348,77 +350,56 @@ class GatewayServer:
         # Filter out the gateway itself to prevent recursive connection
         # Uses command-based detection, not just name matching
         configs = filter_self_references(configs)
-        seen_servers = {c.name for c in configs}
-
-        # These are LAZY configs - from .mcp.json, not auto-start
-        lazy_configs = list(configs)  # Copy for lazy registration
-
-        # Load manifest and get auto-start servers
-        auto_start_configs: list = []
         manifest = None
+        manifest_servers = {}
+        try:
+            manifest = load_manifest()
+            manifest_servers = manifest.servers
+        except Exception as e:
+            logger.warning(f"Failed to load manifest startup configs: {e}")
+
+        enabled_auto_start = load_enabled_auto_start(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        )
         disabled_auto_start = load_disabled_auto_start(
             project_root=self._project_root,
             custom_config_path=self._custom_config_path,
         )
-        try:
-            manifest = load_manifest()
-            auto_start_servers = manifest.get_auto_start_servers()
 
-            for server in auto_start_servers:
-                if server.name in seen_servers:
-                    logger.debug(
-                        f"Skipping manifest server '{server.name}' - already in .mcp.json"
-                    )
-                    continue
-
-                # Check if explicitly disabled in config
-                if server.name in disabled_auto_start:
-                    logger.info(
-                        f"Skipping auto-start server '{server.name}' - disabled in config"
-                    )
-                    continue
-
-                # Skip servers that require API keys if not set
-                if server.requires_api_key and server.env_var:
-                    if not os.environ.get(server.env_var):
-                        logger.info(
-                            f"Skipping auto-start server '{server.name}' - "
-                            f"missing {server.env_var} (set in .env)"
-                        )
-                        continue
-
-                # This is an AUTO-START config (manifest servers)
-                auto_start_configs.append(manifest_server_to_config(server))
-                seen_servers.add(server.name)
-                logger.info(f"Added auto-start server from manifest: {server.name}")
-
-        except Exception as e:
-            logger.warning(f"Failed to load manifest auto-start servers: {e}")
-
-        # Filter by policy (both auto-start and lazy)
-        allowed_auto_start = [
-            c
-            for c in auto_start_configs
-            if self._policy_manager.is_server_allowed(c.name)
-        ]
-        allowed_lazy = [
-            c for c in lazy_configs if self._policy_manager.is_server_allowed(c.name)
-        ]
+        resolution = resolve_startup_configs(
+            configs,
+            manifest_servers=manifest_servers,
+            enabled_auto_start=enabled_auto_start,
+            disabled_auto_start=disabled_auto_start,
+            is_server_allowed=self._policy_manager.is_server_allowed,
+            is_auth_available=lambda env_var: bool(os.environ.get(env_var)),
+            legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
+        )
 
         # Log what we're doing
-        logger.info(f"Auto-start servers: {len(allowed_auto_start)}")
-        logger.info(f"Lazy servers (on-demand): {len(allowed_lazy)}")
+        logger.info(f"Eager startup servers: {len(resolution.eager_configs)}")
+        logger.info(f"Lazy servers (on-demand): {len(resolution.lazy_configs)}")
+        logger.info(f"Skipped startup entries: {len(resolution.skipped)}")
+        for skipped in resolution.skipped:
+            detail = f" ({skipped.env_var})" if skipped.env_var else ""
+            logger.info(
+                f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
+                f"{skipped.reason.value}{detail}"
+            )
 
         # Kill any orphan processes from a previous PMCP crash before registering servers
-        self._kill_orphan_processes(allowed_lazy + allowed_auto_start)
+        self._kill_orphan_processes(
+            resolution.lazy_configs + resolution.eager_configs
+        )
 
         # Register lazy configs FIRST (before connecting auto-start)
-        self._client_manager.register_lazy_configs(allowed_lazy)
+        self._client_manager.register_lazy_configs(resolution.lazy_configs)
 
         # Connect ONLY auto-start servers eagerly
         errors: list[str] = []
-        if allowed_auto_start:
-            errors = await self._client_manager.connect_all(allowed_auto_start)
+        if resolution.eager_configs:
+            errors = await self._client_manager.connect_all(resolution.eager_configs)
             if errors:
                 logger.warning(
                     f"Some auto-start servers failed to connect: {len(errors)} errors"

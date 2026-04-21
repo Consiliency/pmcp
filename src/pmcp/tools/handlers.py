@@ -22,7 +22,14 @@ from pmcp import __version__ as PMCP_VERSION
 
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig
-from pmcp.config.loader import load_configs, manifest_server_to_config
+from pmcp.config.loader import (
+    is_legacy_manifest_auto_start_enabled,
+    load_configs,
+    load_disabled_auto_start,
+    load_enabled_auto_start,
+    manifest_server_to_config,
+    resolve_startup_configs,
+)
 from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.identity import filter_self_references
 from pmcp.manifest.code_patterns_loader import get_code_hint
@@ -1133,7 +1140,6 @@ class GatewayTools:
         logger.info(f"Refresh requested: {parsed.reason or 'manual refresh'}")
 
         try:
-            # Reload configs from .mcp.json files
             configs = load_configs(
                 project_root=self._project_root,
                 custom_config_path=self._custom_config_path,
@@ -1142,79 +1148,64 @@ class GatewayTools:
             # Filter out the gateway itself to prevent recursive connection
             # Uses command-based detection, not just name matching
             configs = filter_self_references(configs)
-            seen_servers = {c.name for c in configs}
 
-            # Load manifest and add auto-start servers (if not already configured)
+            manifest_servers = {}
             try:
                 manifest = load_manifest()
-                auto_start_servers = manifest.get_auto_start_servers()
-
-                for server in auto_start_servers:
-                    if server.name in seen_servers:
-                        logger.debug(
-                            f"Skipping manifest server '{server.name}' - already in .mcp.json"
-                        )
-                        continue
-
-                    # Skip servers that require API keys if not set (checks all pmcp env stores)
-                    if server.requires_api_key and server.env_var:
-                        if not self._check_api_key_available(server.env_var):
-                            logger.info(
-                                f"Skipping auto-start server '{server.name}' - "
-                                f"missing {server.env_var}"
-                            )
-                            continue
-
-                    # Add manifest server to configs
-                    configs.append(manifest_server_to_config(server))
-                    seen_servers.add(server.name)
-                    logger.info(f"Added auto-start server from manifest: {server.name}")
-
+                manifest_servers = manifest.servers
             except Exception as e:
-                logger.warning(f"Failed to load manifest auto-start servers: {e}")
+                logger.warning(f"Failed to load manifest startup configs: {e}")
 
-            # Re-add previously provisioned servers (issue #45 fix)
+            provisioned: dict[str, str | None] = {}
             try:
                 provisioned = self._load_provisioned_registry()
-                for prov_name, prov_env_var in provisioned.items():
-                    if prov_name in seen_servers:
-                        continue
-                    # Skip if required API key is gone
-                    if prov_env_var and not self._check_api_key_available(prov_env_var):
-                        logger.info(
-                            f"Skipping provisioned server '{prov_name}' - missing {prov_env_var}"
-                        )
-                        continue
-                    try:
-                        prov_manifest = load_manifest()
-                        prov_config = prov_manifest.get_server(prov_name)
-                        if prov_config:
-                            configs.append(manifest_server_to_config(prov_config))
-                            seen_servers.add(prov_name)
-                            logger.info(
-                                f"Re-added provisioned server from registry: {prov_name}"
-                            )
-                    except Exception as inner_e:
-                        logger.warning(
-                            f"Could not re-add provisioned server '{prov_name}': {inner_e}"
-                        )
             except Exception as e:
                 logger.warning(f"Failed to restore provisioned servers: {e}")
 
-            # Filter by policy
-            allowed_configs = [
-                c for c in configs if self._policy_manager.is_server_allowed(c.name)
-            ]
+            enabled_auto_start = load_enabled_auto_start(
+                project_root=self._project_root,
+                custom_config_path=self._custom_config_path,
+            )
+            disabled_auto_start = load_disabled_auto_start(
+                project_root=self._project_root,
+                custom_config_path=self._custom_config_path,
+            )
+            resolution = resolve_startup_configs(
+                configs,
+                manifest_servers=manifest_servers,
+                enabled_auto_start=enabled_auto_start,
+                disabled_auto_start=disabled_auto_start,
+                provisioned_server_names=set(provisioned),
+                is_server_allowed=self._policy_manager.is_server_allowed,
+                is_auth_available=self._check_api_key_available,
+                legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
+            )
 
-            # Reconnect
-            errors = await self._client_manager.refresh(allowed_configs)
+            logger.info(f"Refresh eager servers: {len(resolution.eager_configs)}")
+            logger.info(f"Refresh lazy servers: {len(resolution.lazy_configs)}")
+            logger.info(f"Refresh skipped entries: {len(resolution.skipped)}")
+            for skipped in resolution.skipped:
+                detail = f" ({skipped.env_var})" if skipped.env_var else ""
+                logger.info(
+                    f"Skipping refresh entry '{skipped.name}' from {skipped.source}: "
+                    f"{skipped.reason.value}{detail}"
+                )
+
+            await self._client_manager.disconnect_all()
+            self._client_manager.register_lazy_configs(resolution.lazy_configs)
+            errors = await self._client_manager.connect_all(resolution.eager_configs)
 
             revision_id, _ = self._client_manager.get_registry_meta()
             statuses = self._client_manager.get_all_server_statuses()
+            resolved_names = {
+                config.name
+                for config in resolution.lazy_configs + resolution.eager_configs
+            }
+            resolved_names.update(skip.name for skip in resolution.skipped)
 
             return RefreshOutput(
                 ok=len(errors) == 0,
-                servers_seen=len(configs),
+                servers_seen=len(resolved_names),
                 servers_online=sum(1 for s in statuses if s.status.value == "online"),
                 tools_indexed=len(self._client_manager.get_all_tools()),
                 revision_id=revision_id,

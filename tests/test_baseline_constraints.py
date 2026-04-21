@@ -566,11 +566,62 @@ class TestInitializationSequence:
                 mock_filter.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_initialize_connects_servers(self) -> None:
-        """Verify initialize() calls connect_all on client manager."""
-        with patch("pmcp.server.load_configs") as mock_load:
+    async def test_initialize_skips_connect_all_without_eager_servers(self) -> None:
+        """Verify initialize() does not connect when startup policy has no eager servers."""
+        with (
+            patch("pmcp.server.load_configs") as mock_load,
+            patch("pmcp.server.load_manifest") as mock_manifest,
+            patch("pmcp.server.load_enabled_auto_start", return_value=set()),
+            patch("pmcp.server.load_disabled_auto_start", return_value=set()),
+        ):
             mock_load.return_value = []
+            mock_manifest.return_value.servers = {}
 
+            server = GatewayServer()
+
+            with patch.object(
+                server._client_manager, "register_lazy_configs"
+            ) as mock_register:
+                with patch.object(
+                    server._client_manager, "connect_all", new_callable=AsyncMock
+                ) as mock_connect:
+                    mock_connect.return_value = []
+                    with patch.object(server._client_manager, "start_health_monitor"):
+                        with patch.object(
+                            server._client_manager,
+                            "get_all_server_statuses",
+                            return_value=[],
+                        ):
+                            with patch.object(
+                                server._client_manager, "get_all_tools", return_value=[]
+                            ):
+                                with patch(
+                                    "pmcp.server.generate_capability_summary",
+                                    new_callable=AsyncMock,
+                                ) as mock_summary:
+                                    mock_summary.return_value = "test summary"
+                                    await server.initialize()
+
+                mock_register.assert_called_once_with([])
+                mock_connect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_initialize_connects_eager_servers(self) -> None:
+        """Verify initialize() calls connect_all for autoStart servers."""
+        from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+        eager_config = ResolvedServerConfig(
+            name="eager",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        with (
+            patch("pmcp.server.load_configs", return_value=[eager_config]),
+            patch("pmcp.server.load_manifest") as mock_manifest,
+            patch("pmcp.server.load_enabled_auto_start", return_value={"eager"}),
+            patch("pmcp.server.load_disabled_auto_start", return_value=set()),
+        ):
+            mock_manifest.return_value.servers = {}
             server = GatewayServer()
 
             with patch.object(
@@ -594,6 +645,7 @@ class TestInitializationSequence:
                                 await server.initialize()
 
                 mock_connect.assert_called_once()
+                assert mock_connect.call_args.args[0] == [eager_config]
 
     @pytest.mark.asyncio
     async def test_initialize_starts_health_monitor(self) -> None:

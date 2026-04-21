@@ -35,6 +35,8 @@ class MockClientManager:
         self._last_refresh_ts = 1234567890.0
         self.connected_configs: list[Any] = []
         self.refreshed_configs: list[Any] = []
+        self.lazy_configs: list[Any] = []
+        self.disconnected = False
 
     def get_all_tools(self) -> list[ToolInfo]:
         return list(self._tools.values())
@@ -81,6 +83,14 @@ class MockClientManager:
     async def refresh(self, configs: list[Any]) -> list[str]:
         self.refreshed_configs = list(configs)
         return []
+
+    async def disconnect_all(self) -> None:
+        self.disconnected = True
+
+    def register_lazy_configs(self, configs: list[Any]) -> None:
+        self.lazy_configs = list(configs)
+        for config in configs:
+            self._lazy_servers.add(config.name)
 
     async def connect_all(self, configs: list[Any], retry: bool = True) -> list[str]:
         self.connected_configs.extend(configs)
@@ -161,7 +171,7 @@ def create_mock_tools() -> list[ToolInfo]:
 
 class TestRefreshCompatibility:
     @pytest.mark.asyncio
-    async def test_refresh_keeps_current_manifest_policy_and_provisioned_behavior(
+    async def test_refresh_registers_configured_manifest_and_provisioned_lazy_by_default(
         self, monkeypatch
     ) -> None:
         client_manager = MockClientManager()
@@ -212,8 +222,12 @@ class TestRefreshCompatibility:
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
         monkeypatch.setattr(
-            "pmcp.config.loader.load_enabled_auto_start",
-            lambda **_: pytest.fail("refresh should not read autoStart yet"),
+            "pmcp.tools.handlers.load_enabled_auto_start",
+            lambda **_: set(),
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_disabled_auto_start",
+            lambda **_: set(),
         )
         monkeypatch.setattr(
             gateway_tools,
@@ -224,11 +238,159 @@ class TestRefreshCompatibility:
         result = await gateway_tools.refresh({"reason": "test"})
 
         assert result.ok is True
-        assert [config.name for config in client_manager.refreshed_configs] == [
+        assert client_manager.disconnected is True
+        assert client_manager.refreshed_configs == []
+        assert [config.name for config in client_manager.lazy_configs] == [
             "configured",
             "legacy-auto",
             "provisioned",
         ]
+        assert client_manager.connected_configs == []
+        assert result.servers_seen == 4
+
+    @pytest.mark.asyncio
+    async def test_refresh_connects_only_configured_auto_start(
+        self, monkeypatch
+    ) -> None:
+        client_manager = MockClientManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        configured = [
+            ResolvedServerConfig(
+                name="configured",
+                source="project",
+                config=LocalMcpServerConfig(command="configured-cmd"),
+            ),
+            ResolvedServerConfig(
+                name="lazy",
+                source="project",
+                config=LocalMcpServerConfig(command="lazy-cmd"),
+            ),
+        ]
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={},
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_enabled_auto_start",
+            lambda **_: {"configured"},
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_disabled_auto_start",
+            lambda **_: set(),
+        )
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert [config.name for config in client_manager.lazy_configs] == ["lazy"]
+        assert [config.name for config in client_manager.connected_configs] == [
+            "configured"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_refresh_legacy_manifest_auto_start_env_connects_manifest(
+        self, monkeypatch
+    ) -> None:
+        client_manager = MockClientManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "legacy-auto": ServerConfig(
+                    name="legacy-auto",
+                    description="Legacy auto-start",
+                    keywords=["legacy"],
+                    install={},
+                    command="legacy-cmd",
+                    args=[],
+                    auto_start=True,
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+        monkeypatch.setenv("PMCP_LEGACY_MANIFEST_AUTOSTART", "1")
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_enabled_auto_start",
+            lambda **_: set(),
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_disabled_auto_start",
+            lambda **_: set(),
+        )
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert client_manager.lazy_configs == []
+        assert [config.name for config in client_manager.connected_configs] == [
+            "legacy-auto"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_refresh_provisioned_servers_remain_lazy_unless_auto_start(
+        self, monkeypatch
+    ) -> None:
+        client_manager = MockClientManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "provisioned": ServerConfig(
+                    name="provisioned",
+                    description="Provisioned",
+                    keywords=["provisioned"],
+                    install={},
+                    command="provisioned-cmd",
+                    args=[],
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_enabled_auto_start",
+            lambda **_: set(),
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_disabled_auto_start",
+            lambda **_: set(),
+        )
+        monkeypatch.setattr(
+            gateway_tools,
+            "_load_provisioned_registry",
+            lambda: {"provisioned": None},
+        )
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert [config.name for config in client_manager.lazy_configs] == [
+            "provisioned"
+        ]
+        assert client_manager.connected_configs == []
 
 
 class TestCatalogSearch:

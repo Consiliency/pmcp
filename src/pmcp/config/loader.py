@@ -418,6 +418,14 @@ def load_enabled_auto_start(
     return enabled
 
 
+def is_legacy_manifest_auto_start_enabled(
+    env: Mapping[str, str] | None = None,
+) -> bool:
+    """Return true when legacy manifest auto-start compatibility is enabled."""
+    values = env if env is not None else os.environ
+    return values.get("PMCP_LEGACY_MANIFEST_AUTOSTART") == "1"
+
+
 def _coerce_manifest_servers(
     manifest_servers: Mapping[str, "ManifestServerConfig"]
     | Iterable["ManifestServerConfig"]

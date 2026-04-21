@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pmcp.manifest.loader import Manifest, ServerConfig
 from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig, ServerStatusEnum
 
 
@@ -243,6 +244,7 @@ class TestGatewayServerInitializeLazy:
             patch("pmcp.server.load_configs") as mock_load,
             patch("pmcp.server.load_manifest") as mock_manifest,
             patch("pmcp.server.filter_self_references", side_effect=lambda x: x),
+            patch("pmcp.server.load_enabled_auto_start", return_value=set()),
             patch("pmcp.server.load_disabled_auto_start", return_value=set()),
             patch("pmcp.server.load_descriptions_cache", return_value=None),
             patch("pmcp.server.get_cache_path", return_value=None),
@@ -256,7 +258,7 @@ class TestGatewayServerInitializeLazy:
                 )
             ]
             # No manifest auto-start servers
-            mock_manifest.return_value.get_auto_start_servers.return_value = []
+            mock_manifest.return_value.servers = {}
 
             server = GatewayServer()
 
@@ -290,19 +292,19 @@ class TestGatewayServerInitializeLazy:
                 assert lazy_configs[0].name == "config-server"
 
     @pytest.mark.asyncio
-    async def test_initialize_does_not_consume_mcp_json_auto_start_yet(self) -> None:
-        """initialize() should keep .mcp.json autoStart out of eager startup."""
+    async def test_initialize_connects_configured_auto_start(self) -> None:
+        """initialize() should eagerly connect configured servers listed in autoStart."""
         from pmcp.server import GatewayServer
 
         with (
             patch("pmcp.server.load_configs") as mock_load,
             patch("pmcp.server.load_manifest") as mock_manifest,
             patch("pmcp.server.filter_self_references", side_effect=lambda x: x),
-            patch("pmcp.server.load_disabled_auto_start", return_value=set()),
             patch(
-                "pmcp.config.loader.load_enabled_auto_start",
-                side_effect=AssertionError("runtime should not read autoStart yet"),
+                "pmcp.server.load_enabled_auto_start",
+                return_value={"configured-auto"},
             ),
+            patch("pmcp.server.load_disabled_auto_start", return_value=set()),
             patch("pmcp.server.load_descriptions_cache", return_value=None),
             patch("pmcp.server.get_cache_path", return_value=None),
         ):
@@ -313,7 +315,7 @@ class TestGatewayServerInitializeLazy:
                     config=LocalMcpServerConfig(command="echo"),
                 )
             ]
-            mock_manifest.return_value.get_auto_start_servers.return_value = []
+            mock_manifest.return_value.servers = {}
 
             server = GatewayServer()
 
@@ -341,44 +343,52 @@ class TestGatewayServerInitializeLazy:
                 await server.initialize()
 
                 lazy_configs = mock_register.call_args[0][0]
-                assert [config.name for config in lazy_configs] == ["configured-auto"]
-                mock_connect.assert_not_called()
+                assert lazy_configs == []
+                mock_connect.assert_called_once()
+                eager_configs = mock_connect.call_args[0][0]
+                assert [config.name for config in eager_configs] == [
+                    "configured-auto"
+                ]
 
     @pytest.mark.asyncio
-    async def test_connects_manifest_auto_start_servers(self) -> None:
-        """initialize() should eagerly connect manifest auto-start servers."""
+    async def test_manifest_auto_start_servers_are_lazy_by_default(self) -> None:
+        """initialize() should register manifest auto_start servers lazily by default."""
         from pmcp.server import GatewayServer
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "auto-server": ServerConfig(
+                    name="auto-server",
+                    description="Auto server",
+                    keywords=["auto"],
+                    install={},
+                    command="echo",
+                    args=[],
+                    auto_start=True,
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
 
         with (
             patch("pmcp.server.load_configs") as mock_load,
-            patch("pmcp.server.load_manifest") as mock_manifest,
-            patch("pmcp.server.manifest_server_to_config") as mock_convert,
+            patch("pmcp.server.load_manifest", return_value=manifest),
             patch("pmcp.server.filter_self_references", side_effect=lambda x: x),
+            patch("pmcp.server.load_enabled_auto_start", return_value=set()),
             patch("pmcp.server.load_disabled_auto_start", return_value=set()),
             patch("pmcp.server.load_descriptions_cache", return_value=None),
             patch("pmcp.server.get_cache_path", return_value=None),
         ):
             mock_load.return_value = []  # No .mcp.json configs
 
-            # Manifest auto-start server
-            auto_server = MagicMock()
-            auto_server.name = "auto-server"
-            auto_server.requires_api_key = False
-            mock_manifest.return_value.get_auto_start_servers.return_value = [
-                auto_server
-            ]
-
-            auto_config = ResolvedServerConfig(
-                name="auto-server",
-                source="manifest",
-                config=LocalMcpServerConfig(command="echo"),
-            )
-            mock_convert.return_value = auto_config
-
             server = GatewayServer()
 
             with (
-                patch.object(server._client_manager, "register_lazy_configs"),
+                patch.object(
+                    server._client_manager, "register_lazy_configs"
+                ) as mock_register,
                 patch.object(
                     server._client_manager,
                     "connect_all",
@@ -398,11 +408,133 @@ class TestGatewayServerInitializeLazy:
             ):
                 await server.initialize()
 
-                # Auto-start server should be eagerly connected
-                mock_connect.assert_called_once()
-                connected_configs = mock_connect.call_args[0][0]
-                assert len(connected_configs) == 1
-                assert connected_configs[0].name == "auto-server"
+                lazy_configs = mock_register.call_args[0][0]
+                assert [config.name for config in lazy_configs] == ["auto-server"]
+                mock_connect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_legacy_manifest_auto_start_env_connects_manifest_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """PMCP_LEGACY_MANIFEST_AUTOSTART=1 keeps old manifest eager behavior."""
+        from pmcp.server import GatewayServer
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "auto-server": ServerConfig(
+                    name="auto-server",
+                    description="Auto server",
+                    keywords=["auto"],
+                    install={},
+                    command="echo",
+                    args=[],
+                    auto_start=True,
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        monkeypatch.setenv("PMCP_LEGACY_MANIFEST_AUTOSTART", "1")
+
+        with (
+            patch("pmcp.server.load_configs", return_value=[]),
+            patch("pmcp.server.load_manifest", return_value=manifest),
+            patch("pmcp.server.filter_self_references", side_effect=lambda x: x),
+            patch("pmcp.server.load_enabled_auto_start", return_value=set()),
+            patch("pmcp.server.load_disabled_auto_start", return_value=set()),
+            patch("pmcp.server.load_descriptions_cache", return_value=None),
+            patch("pmcp.server.get_cache_path", return_value=None),
+        ):
+            server = GatewayServer()
+
+            with (
+                patch.object(
+                    server._client_manager, "register_lazy_configs"
+                ) as mock_register,
+                patch.object(
+                    server._client_manager,
+                    "connect_all",
+                    new_callable=AsyncMock,
+                    return_value=[],
+                ) as mock_connect,
+                patch.object(server._client_manager, "start_health_monitor"),
+                patch.object(
+                    server._client_manager, "get_all_server_statuses", return_value=[]
+                ),
+                patch.object(server._client_manager, "get_all_tools", return_value=[]),
+                patch(
+                    "pmcp.server.generate_capability_summary",
+                    new_callable=AsyncMock,
+                    return_value="",
+                ),
+            ):
+                await server.initialize()
+
+                assert mock_register.call_args[0][0] == []
+                eager_configs = mock_connect.call_args[0][0]
+                assert [config.name for config in eager_configs] == ["auto-server"]
+
+    @pytest.mark.asyncio
+    async def test_missing_auth_eager_manifest_server_is_skipped(self) -> None:
+        """Missing-auth eager manifest servers should not abort startup."""
+        from pmcp.server import GatewayServer
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "needs-key": ServerConfig(
+                    name="needs-key",
+                    description="Needs key",
+                    keywords=["auth"],
+                    install={},
+                    command="echo",
+                    args=[],
+                    requires_api_key=True,
+                    env_var="PMCP_TEST_MISSING_KEY",
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+        with (
+            patch("pmcp.server.load_configs", return_value=[]),
+            patch("pmcp.server.load_manifest", return_value=manifest),
+            patch("pmcp.server.filter_self_references", side_effect=lambda x: x),
+            patch("pmcp.server.load_enabled_auto_start", return_value={"needs-key"}),
+            patch("pmcp.server.load_disabled_auto_start", return_value=set()),
+            patch("pmcp.server.load_descriptions_cache", return_value=None),
+            patch("pmcp.server.get_cache_path", return_value=None),
+            patch.dict("os.environ", {"PMCP_TEST_MISSING_KEY": ""}, clear=False),
+        ):
+            server = GatewayServer()
+
+            with (
+                patch.object(
+                    server._client_manager, "register_lazy_configs"
+                ) as mock_register,
+                patch.object(
+                    server._client_manager,
+                    "connect_all",
+                    new_callable=AsyncMock,
+                    return_value=[],
+                ) as mock_connect,
+                patch.object(server._client_manager, "start_health_monitor"),
+                patch.object(
+                    server._client_manager, "get_all_server_statuses", return_value=[]
+                ),
+                patch.object(server._client_manager, "get_all_tools", return_value=[]),
+                patch(
+                    "pmcp.server.generate_capability_summary",
+                    new_callable=AsyncMock,
+                    return_value="",
+                ),
+            ):
+                await server.initialize()
+
+                assert mock_register.call_args[0][0] == []
+                mock_connect.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_lazy_configs_registered_before_auto_start_connect(self) -> None:
@@ -414,8 +546,8 @@ class TestGatewayServerInitializeLazy:
         with (
             patch("pmcp.server.load_configs") as mock_load,
             patch("pmcp.server.load_manifest") as mock_manifest,
-            patch("pmcp.server.manifest_server_to_config") as mock_convert,
             patch("pmcp.server.filter_self_references", side_effect=lambda x: x),
+            patch("pmcp.server.load_enabled_auto_start", return_value={"auto-server"}),
             patch("pmcp.server.load_disabled_auto_start", return_value=set()),
             patch("pmcp.server.load_descriptions_cache", return_value=None),
             patch("pmcp.server.get_cache_path", return_value=None),
@@ -429,18 +561,16 @@ class TestGatewayServerInitializeLazy:
                 )
             ]
 
-            auto_server = MagicMock()
-            auto_server.name = "auto-server"
-            auto_server.requires_api_key = False
-            mock_manifest.return_value.get_auto_start_servers.return_value = [
-                auto_server
-            ]
-
-            mock_convert.return_value = ResolvedServerConfig(
-                name="auto-server",
-                source="manifest",
-                config=LocalMcpServerConfig(command="echo"),
-            )
+            mock_manifest.return_value.servers = {
+                "auto-server": ServerConfig(
+                    name="auto-server",
+                    description="Auto server",
+                    keywords=["auto"],
+                    install={},
+                    command="echo",
+                    args=[],
+                )
+            }
 
             server = GatewayServer()
 

@@ -121,21 +121,21 @@ class TestGatewayServerIntegration:
         with patch("pmcp.server.load_configs", return_value=[]):
             with patch("pmcp.server.load_manifest") as mock_manifest:
                 mock_manifest.return_value = MagicMock()
-                mock_manifest.return_value.get_auto_start_servers = MagicMock(
-                    return_value=[]
-                )
+                mock_manifest.return_value.servers = {}
 
-                with patch("pmcp.server.load_descriptions_cache", return_value=None):
-                    with patch(
-                        "pmcp.server.generate_capability_summary"
-                    ) as mock_summary:
-                        mock_summary.return_value = "No tools available"
+                with (
+                    patch("pmcp.server.load_enabled_auto_start", return_value=set()),
+                    patch("pmcp.server.load_disabled_auto_start", return_value=set()),
+                    patch("pmcp.server.load_descriptions_cache", return_value=None),
+                    patch("pmcp.server.generate_capability_summary") as mock_summary,
+                ):
+                    mock_summary.return_value = "No tools available"
 
-                        server = GatewayServer()
-                        await server.initialize()
+                    server = GatewayServer()
+                    await server.initialize()
 
-                        assert server._server is not None
-                        assert server._capability_summary == "No tools available"
+                    assert server._server is not None
+                    assert server._capability_summary == "No tools available"
 
 
 class TestOrphanScan:
