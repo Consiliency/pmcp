@@ -279,10 +279,19 @@ def create_http_app(
 
             request._receive = replay_receive  # type: ignore[method-assign]
 
+        response_started = False
+        original_send = request._send
+
+        async def tracking_send(message: dict[str, Any]) -> None:
+            nonlocal response_started
+            if message.get("type") == "http.response.start":
+                response_started = True
+            await original_send(message)
+
         try:
             await asyncio.wait_for(
                 session_manager.handle_request(
-                    request.scope, request.receive, request._send
+                    request.scope, request.receive, tracking_send
                 ),
                 timeout=request_timeout,
             )
@@ -292,6 +301,8 @@ def create_http_app(
                 request_id,
                 request_timeout,
             )
+            if response_started:
+                return _NullResponse()
             return Response("Gateway Timeout", status_code=504)
         _inc("requests_ok")
         return _NullResponse()

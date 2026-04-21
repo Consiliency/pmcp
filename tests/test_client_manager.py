@@ -359,6 +359,121 @@ class TestRemoteConnectSseHeaders:
 
         await manager.disconnect_all()
 
+    @pytest.mark.asyncio
+    async def test_connect_streamable_http_interpolates_headers_from_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Streamable-HTTP remote configs should use the same header interpolation."""
+        manager = ClientManager()
+        monkeypatch.setenv("PMCP_TEST_TOKEN", "test-token")
+
+        config = ResolvedServerConfig(
+            name="remote-http",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                type="streamable-http",
+                url="https://example.com/mcp",
+                headers={
+                    "Authorization": "${PMCP_TEST_TOKEN}",
+                    "X-Static": "literal-value",
+                    "X-Missing": "${PMCP_MISSING}",
+                },
+            ),
+        )
+
+        captured_headers: dict[str, str] = {}
+
+        class EmptyReadStream:
+            def __aiter__(self) -> "EmptyReadStream":
+                return self
+
+            async def __anext__(self) -> None:
+                raise StopAsyncIteration
+
+        @asynccontextmanager
+        async def mock_streamablehttp_client(
+            url: str, headers: dict[str, str] | None = None
+        ):
+            assert url == "https://example.com/mcp"
+            captured_headers.update(headers or {})
+            yield EmptyReadStream(), MagicMock(), MagicMock(return_value=None)
+
+        manager._send_initialize = AsyncMock()
+
+        async def mock_send_request(*args: object, **kwargs: object) -> dict:
+            method = args[1]
+            if method == "tools/list":
+                return {"tools": []}
+            if method == "resources/list":
+                return {"resources": []}
+            if method == "prompts/list":
+                return {"prompts": []}
+            return {}
+
+        manager._send_request = AsyncMock(side_effect=mock_send_request)
+        manager._read_sse = AsyncMock()
+
+        with patch(
+            "pmcp.client.manager.streamablehttp_client", mock_streamablehttp_client
+        ):
+            await manager._connect_streamable_http(config)
+
+        assert captured_headers == {
+            "Authorization": "test-token",
+            "X-Static": "literal-value",
+            "X-Missing": "",
+        }
+
+        await manager.disconnect_all()
+
+
+class TestRemoteConnectTransportDispatch:
+    """Tests for remote transport dispatch."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("config_type", ["http", "streamable-http"])
+    async def test_http_remote_types_use_streamable_http(
+        self, config_type: str
+    ) -> None:
+        """HTTP-style remote configs should use the streamable-HTTP client."""
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name=f"remote-{config_type}",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                type=cast(Any, config_type),
+                url="https://example.com/mcp",
+            ),
+        )
+        manager._connect_streamable_http = AsyncMock()  # type: ignore[method-assign]
+        manager._connect_sse = AsyncMock()  # type: ignore[method-assign]
+
+        await manager._connect_server(config)
+
+        manager._connect_streamable_http.assert_awaited_once_with(config)  # type: ignore[attr-defined]
+        manager._connect_sse.assert_not_awaited()  # type: ignore[attr-defined]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("config_type", ["sse", "remote"])
+    async def test_legacy_remote_types_use_sse(self, config_type: str) -> None:
+        """SSE and legacy remote configs should keep using the SSE client."""
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name=f"remote-{config_type}",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                type=cast(Any, config_type),
+                url="https://example.com/sse",
+            ),
+        )
+        manager._connect_streamable_http = AsyncMock()  # type: ignore[method-assign]
+        manager._connect_sse = AsyncMock()  # type: ignore[method-assign]
+
+        await manager._connect_server(config)
+
+        manager._connect_sse.assert_awaited_once_with(config)  # type: ignore[attr-defined]
+        manager._connect_streamable_http.assert_not_awaited()  # type: ignore[attr-defined]
+
 
 class TestCallTool:
     """Tests for call_tool method."""

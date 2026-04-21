@@ -271,6 +271,42 @@ class TestRequestTimeout:
         )
         assert r.status_code == 504
 
+    def test_timeout_after_response_start_does_not_double_send(self) -> None:
+        """A timeout after response start should not trigger a second Starlette response."""
+        mcp_server = MagicMock()
+        mcp_server.list_tools = AsyncMock(return_value=[])
+
+        with patch(
+            "pmcp.transport.http.StreamableHTTPSessionManager",
+            autospec=True,
+        ) as MockManager:
+            instance = MockManager.return_value
+            instance.run.return_value.__aenter__ = AsyncMock(return_value=None)
+            instance.run.return_value.__aexit__ = AsyncMock(return_value=False)
+
+            async def started_then_slow_handler(
+                scope: object, receive: object, send: object
+            ) -> None:
+                await send(
+                    {
+                        "type": "http.response.start",
+                        "status": 202,
+                        "headers": [],
+                    }
+                )
+                await asyncio.sleep(10.0)
+
+            instance.handle_request = started_then_slow_handler
+
+            app = create_http_app(mcp_server, request_timeout=0.05)
+            client = TestClient(app, raise_server_exceptions=False)
+
+        r = client.post(
+            "/mcp",
+            content=b'{"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}',
+        )
+        assert r.status_code == 202
+
     def test_fast_request_does_not_timeout(self) -> None:
         """Request that completes before timeout → not 504."""
         # handler returns immediately (0s delay), timeout is 60s

@@ -685,11 +685,11 @@ async def run_update(args: argparse.Namespace) -> None:
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )
 
-    gateway_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/mcp")
+    gateway_url = _get_gateway_url()
     gateway_config = ResolvedServerConfig(
         name="pmcp-gateway",
         source="custom",
-        config=RemoteMcpServerConfig(type="http", url=gateway_url),
+        config=RemoteMcpServerConfig(type="streamable-http", url=gateway_url),
     )
 
     async def _call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
@@ -698,8 +698,11 @@ async def run_update(args: argparse.Namespace) -> None:
         )
         return _extract_tool_payload(raw) or {}
 
-    await client_manager.connect_all([gateway_config])
     try:
+        errors = await client_manager.connect_all([gateway_config])
+        if errors:
+            _exit_gateway_unreachable(errors)
+
         targets: list[str] = []
         if args.all:
             health = await _call("gateway.health", {})
@@ -738,6 +741,21 @@ async def run_update(args: argparse.Namespace) -> None:
         await client_manager.disconnect_all()
 
 
+def _get_gateway_url() -> str:
+    """Return the PMCP gateway MCP endpoint URL."""
+    return os.environ.get(
+        "PMCP_GATEWAY_URL",
+        os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/mcp"),
+    )
+
+
+def _exit_gateway_unreachable(errors: list[str]) -> None:
+    """Exit with a clear direct-gateway connection failure."""
+    detail = "; ".join(errors)
+    print(f"Error: cannot reach PMCP gateway: {detail}", file=sys.stderr)
+    sys.exit(1)
+
+
 def _extract_tool_payload(result: dict[str, object]) -> dict[str, object] | None:
     """Extract JSON payload from MCP tool response content."""
     content = result.get("content")
@@ -762,24 +780,29 @@ def _extract_tool_payload(result: dict[str, object]) -> dict[str, object] | None
 async def _query_running_gateway_status(
     args: argparse.Namespace, policy_manager: object
 ) -> dict[str, object] | None:
-    """Query live gateway status over SSE, return None on failure."""
+    """Query live gateway status over streamable HTTP, return None on failure."""
     import time
 
     from pmcp.client.manager import ClientManager
     from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
 
+    logger = logging.getLogger(__name__)
     probe_manager = ClientManager(
         max_tools_per_server=policy_manager.get_max_tools_per_server()  # type: ignore[attr-defined]
     )
-    probe_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/mcp")
+    probe_url = _get_gateway_url()
     probe_config = ResolvedServerConfig(
         name="pmcp-gateway",
         source="custom",
-        config=RemoteMcpServerConfig(type="http", url=probe_url),
+        config=RemoteMcpServerConfig(type="streamable-http", url=probe_url),
     )
 
     try:
-        await probe_manager.connect_all([probe_config])
+        errors = await probe_manager.connect_all([probe_config])
+        if errors:
+            logger.debug("Live gateway status query failed: %s", "; ".join(errors))
+            return None
+
         health_raw = await probe_manager.call_tool(
             "pmcp-gateway::gateway.health", {}, timeout_ms=3000
         )
@@ -821,6 +844,7 @@ async def _query_running_gateway_status(
 
         return snapshot
     except Exception:
+        logger.debug("Live gateway status query failed", exc_info=True)
         return None
     finally:
         await probe_manager.disconnect_all()
@@ -1772,11 +1796,11 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
         max_tools_per_server=policy_manager.get_max_tools_per_server()
     )
 
-    gateway_url = os.environ.get("PMCP_STATUS_SSE_URL", "http://127.0.0.1:3344/mcp")
+    gateway_url = _get_gateway_url()
     gateway_config = ResolvedServerConfig(
         name="pmcp-gateway",
         source="custom",
-        config=RemoteMcpServerConfig(type="http", url=gateway_url),
+        config=RemoteMcpServerConfig(type="streamable-http", url=gateway_url),
     )
 
     async def _call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
@@ -1786,8 +1810,11 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
         payload = _extract_tool_payload(raw)
         return payload or {}
 
-    await client_manager.connect_all([gateway_config])
     try:
+        errors = await client_manager.connect_all([gateway_config])
+        if errors:
+            _exit_gateway_unreachable(errors)
+
         server_name = args.server_name
         first = await _call("gateway.provision", {"server_name": server_name})
 
