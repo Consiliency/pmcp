@@ -168,8 +168,8 @@ Release gate summary:
 - Full pytest passed: 1595 passed, 12 skipped, 21 deselected.
 - Ruff lint passed for `src/` and `tests/`.
 - Mypy passed for `src/pmcp --exclude baml_client`.
-- `uv build` passed and produced `dist/pmcp-1.9.4.tar.gz` and
-  `dist/pmcp-1.9.4-py3-none-any.whl`.
+- `uv build` passed and produced `dist/pmcp-1.10.0.tar.gz` and
+  `dist/pmcp-1.10.0-py3-none-any.whl`.
 - `pmcp status --json`, `pmcp status --verbose`,
   `pmcp setup --client claude --mode http`, and
   `pmcp setup --client opencode --mode http` passed.

@@ -338,7 +338,7 @@ Release gate results:
 - `uv run ruff check src/ tests/` — passed.
 - `uv run ruff format --check src/ tests/` — passed after cleaning pre-existing formatting drift.
 - `uv run mypy src/pmcp --exclude baml_client` — passed.
-- `uv build` — passed, built `dist/pmcp-1.9.4.tar.gz` and `dist/pmcp-1.9.4-py3-none-any.whl`.
+- `uv build` — passed, built `dist/pmcp-1.10.0.tar.gz` and `dist/pmcp-1.10.0-py3-none-any.whl`.
 - `pmcp status --json` — passed.
 - `pmcp status --verbose` — passed.
 - `pmcp setup --client claude --mode http` — passed.

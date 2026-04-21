@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-04-21
+
 ### Added
 - `gateway.connect_server`, `gateway.disconnect_server`, and
   `gateway.restart_server` provide runtime-only lifecycle controls for known
