@@ -20,7 +20,7 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 
 **PMCP** acts as a single MCP server that Claude Code connects to. Instead of exposing all downstream tools, it provides:
 
-- **16 stable meta-tools** (not the 50+ underlying tools)
+- **19 stable meta-tools** (not the 50+ underlying tools)
 - **Lazy by default**: downstream servers are available on demand and only eager-start when listed in `autoStart`
 - **Dynamically provisions** new servers on-demand from a manifest of 90+
 - **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
@@ -71,7 +71,7 @@ Without `--write`, `pmcp setup` prints the config so you can paste it into:
 - Claude: `~/.mcp.json`
 - OpenCode: `~/.config/opencode/opencode.json`
 
-Use SSE mode when running one shared PMCP service for multiple sessions/clients. Use stdio mode for single-process local testing.
+Use shared-service HTTP mode when running one PMCP service for multiple sessions or clients. Use single-process stdio mode for local testing.
 
 ### Shared Service Mode (Manual)
 
@@ -89,6 +89,13 @@ If you prefer manual config, point each client to the shared HTTP endpoint:
 ```
 
 Why this mode: PMCP uses a singleton lock (`~/.pmcp/gateway.lock`), so multiple local launches can conflict. One shared service avoids lock collisions and keeps tool state consistent.
+
+Shared gateway state:
+
+- All clients connected to one PMCP HTTP gateway share downstream server connections, pending requests, provisioned tools, and live lifecycle state.
+- `gateway.refresh(force=true)`, `gateway.disconnect_server(force=true)`, and `gateway.restart_server(force=true)` can cancel or interrupt downstream work started by another client using the same gateway.
+- `gateway.health` and live `pmcp status --verbose` show startup policy observations for downstream servers without exposing secret values.
+- `--rate-limit` / `PMCP_RATE_LIMIT` applies per observed source IP on `/mcp`; localhost clients and reverse-proxied clients can share one bucket unless the proxy preserves distinct client IPs.
 
 Quick verification:
 
@@ -109,7 +116,10 @@ pmcp --transport http --auth-token mysecrettoken
 PMCP_AUTH_TOKEN=mysecrettoken pmcp --transport http
 ```
 
-Clients must then include `Authorization: Bearer mysecrettoken` in every request.
+Clients must then include `Authorization: Bearer mysecrettoken` on `/mcp` requests.
+`/health` and `/metrics` remain unauthenticated by design; protect them with
+firewall rules, IP allowlists, or reverse-proxy policy before any non-localhost
+exposure.
 
 **Assumptions and trust model:**
 
@@ -238,7 +248,7 @@ Returns: Screenshot of google.com
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                          PMCP                               │
-│  • 16 meta-tools (catalog, invoke, provision, etc.)         │
+│  • 19 meta-tools (catalog, invoke, provision, etc.)         │
 │  • Progressive disclosure (compact cards → full schemas)    │
 │  • Policy enforcement (allow/deny lists)                    │
 └────────────────────────────┬────────────────────────────────┘
@@ -257,14 +267,14 @@ The gateway discovers and manages all other servers.
 
 ### Why Single-Gateway?
 
-1. **No context bloat** - Claude sees 14 tools, not 50+
+1. **No context bloat** - Claude sees 19 tools, not 50+
 2. **No restarts** - Provision new servers without restarting Claude Code
 3. **Consistent interface** - All tools accessed via `gateway.invoke`
 4. **Policy control** - Centralized allow/deny rules
 
 ## Gateway Tools
 
-The gateway exposes **16 meta-tools** organized into three categories:
+The gateway exposes **19 meta-tools** organized into four categories:
 
 ### Core Tools
 
@@ -273,8 +283,16 @@ The gateway exposes **16 meta-tools** organized into three categories:
 | `gateway.catalog_search` | Search available tools, returns compact capability cards |
 | `gateway.describe` | Get detailed schema for a specific tool |
 | `gateway.invoke` | Call a downstream tool with argument validation |
-| `gateway.refresh` | Reload backend configs and reconnect |
+| `gateway.refresh` | Reload backend configs and reconnect; refuses while requests are pending unless `force=true` |
 | `gateway.health` | Get gateway and server health status |
+
+### Lifecycle Tools
+
+| Tool | Purpose |
+|------|---------|
+| `gateway.connect_server` | Connect or start a known configured, manifest/provisioned, or registered discovered server |
+| `gateway.disconnect_server` | Runtime-stop a server without editing `.mcp.json` or changing `autoStart` |
+| `gateway.restart_server` | Runtime-stop then reconnect a server without changing persistent config |
 
 ### Capability Discovery Tools
 
@@ -296,6 +314,20 @@ The gateway exposes **16 meta-tools** organized into three categories:
 |------|---------|
 | `gateway.list_pending` | List pending tool invocations with health status |
 | `gateway.cancel` | Cancel a pending tool invocation |
+
+`gateway.refresh` is intentionally conservative in shared-service mode. If a
+downstream request is in flight, refresh returns `ok=false` without disconnecting
+or reconnecting servers. Use `gateway.list_pending` to inspect active requests,
+then retry with `force=true` only when cancelling that work is acceptable.
+
+`gateway.disconnect_server` and `gateway.restart_server` follow the same
+shared-service disruption policy for the target server: they refuse while that
+server has pending requests unless `force=true`. With `force=true`, only pending
+requests for the named server are cancelled. These controls are runtime-only;
+they free local resources and update live gateway state, but they do not edit
+`.mcp.json`, remove server definitions, or change `autoStart`. In HTTP shared
+service mode, stopping or restarting a downstream server can affect other
+clients using the same PMCP gateway.
 
 ### Subordinate MCP Updates
 
@@ -436,6 +468,35 @@ Common opt-in choices:
 |--------|-------------|---------|
 | `playwright` | Browser automation - navigation, screenshots, DOM inspection | Not required |
 | `context7` | Library documentation lookup - up-to-date docs for any package | Optional (for higher rate limits) |
+
+Startup policy decisions are visible through `gateway.health` and live
+`pmcp status --verbose`. Health rows keep the existing `name`, `status`,
+`tool_count`, and `error` fields, and may also include:
+
+| Field | Meaning |
+|-------|---------|
+| `startup_policy` | `eager`, `lazy`, `skipped`, or `unknown` |
+| `startup_source` | Resolver source such as `project`, `user`, `manifest`, `configured`, or `auto_start` |
+| `startup_skip_reason` | Machine-readable skip reason such as `policy_denied`, `missing_auth`, or `unknown_auto_start` |
+| `startup_env_var` | Required environment variable name for missing-auth skips |
+
+Servers stopped with `gateway.disconnect_server` remain visible in health as
+`offline` or `lazy` when PMCP still knows their configuration, and startup policy
+observation fields are preserved.
+
+Example missing-auth health row:
+
+```json
+{
+  "name": "github",
+  "status": "offline",
+  "tool_count": 0,
+  "startup_policy": "skipped",
+  "startup_source": "manifest",
+  "startup_skip_reason": "missing_auth",
+  "startup_env_var": "GITHUB_PERSONAL_ACCESS_TOKEN"
+}
+```
 
 ## Available Servers
 
@@ -693,6 +754,7 @@ pmcp
 # Check server status
 pmcp status
 pmcp status --json              # JSON output
+pmcp status --verbose           # Include startup policy details when available
 pmcp status --server playwright # Filter by server
 
 # View logs
@@ -728,7 +790,9 @@ Use `pmcp doctor` to diagnose common PMCP startup and connectivity issues. It ch
 
 - `lock`: detects singleton lock state and stale lock collisions at `~/.pmcp/gateway.lock`
 - `mode`: detects local command-mode MCP config conflicts when a shared PMCP system service is running
-- `http`: probes the `/mcp` endpoint and reports connectivity health
+- `http`: probes the unauthenticated `/health` endpoint derived from `PMCP_GATEWAY_URL` or `http://127.0.0.1:3344/mcp`
+- `remote`: detects unresolved remote downstream header environment references
+- `install`: detects conflicting `uv tool` and `pip --user` installs
 
 Example:
 
@@ -868,6 +932,14 @@ gateway.catalog_search({ query: "tool-name" })
 gateway.describe({ tool_id: "server::tool-name" })
 gateway.list_pending()
 ```
+
+If `gateway.refresh` reports pending requests, inspect them with
+`gateway.list_pending()` or retry refresh with `force=true` to cancel them before
+reloading server configuration.
+
+If `gateway.disconnect_server` or `gateway.restart_server` reports pending
+requests, inspect `gateway.list_pending(server="<name>")` or retry with
+`force=true` to cancel only that server's pending work.
 
 ## License
 

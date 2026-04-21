@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -231,6 +232,105 @@ class TestEnsureConnected:
 
         assert result is False
 
+    @pytest.mark.asyncio
+    async def test_concurrent_lazy_start_is_single_flight(self) -> None:
+        """Concurrent ensure_connected calls should trigger one lazy connect."""
+        from pmcp.client.manager import ClientManager
+
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="lazy-server",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        manager.register_lazy_configs([config])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def mock_connect_impl(cfg: ResolvedServerConfig) -> None:
+            started.set()
+            await release.wait()
+            manager._servers[cfg.name].status = ServerStatusEnum.ONLINE
+
+        with patch.object(
+            manager, "_connect_with_retry", new_callable=AsyncMock
+        ) as mock_connect:
+            mock_connect.side_effect = mock_connect_impl
+            calls = [
+                asyncio.create_task(manager.ensure_connected("lazy-server"))
+                for _ in range(5)
+            ]
+            await started.wait()
+            release.set()
+            results = await asyncio.gather(*calls)
+
+        assert results == [True, True, True, True, True]
+        mock_connect.assert_awaited_once_with(config)
+        assert "lazy-server" not in manager._lazy_configs
+
+    @pytest.mark.asyncio
+    async def test_concurrent_lazy_start_failure_is_single_flight(self) -> None:
+        """Concurrent lazy failures should share one failed connection attempt."""
+        from pmcp.client.manager import ClientManager
+
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="lazy-server",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        manager.register_lazy_configs([config])
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def mock_connect_impl(cfg: ResolvedServerConfig) -> None:
+            started.set()
+            await release.wait()
+            raise RuntimeError("Connection failed")
+
+        with patch.object(
+            manager, "_connect_with_retry", new_callable=AsyncMock
+        ) as mock_connect:
+            mock_connect.side_effect = mock_connect_impl
+            calls = [
+                asyncio.create_task(manager.ensure_connected("lazy-server"))
+                for _ in range(3)
+            ]
+            await started.wait()
+            release.set()
+            results = await asyncio.gather(*calls)
+
+        assert results == [False, False, False]
+        mock_connect.assert_awaited_once_with(config)
+        assert manager._servers["lazy-server"].status == ServerStatusEnum.ERROR
+
+    @pytest.mark.asyncio
+    async def test_successful_lazy_start_removes_config_once(self) -> None:
+        """After a successful lazy start, later ensure_connected returns online."""
+        from pmcp.client.manager import ClientManager
+
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="lazy-server",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        manager.register_lazy_configs([config])
+
+        async def mock_connect_impl(cfg: ResolvedServerConfig) -> None:
+            manager._servers[cfg.name].status = ServerStatusEnum.ONLINE
+
+        with patch.object(
+            manager, "_connect_with_retry", new_callable=AsyncMock
+        ) as mock_connect:
+            mock_connect.side_effect = mock_connect_impl
+
+            assert await manager.ensure_connected("lazy-server") is True
+            assert await manager.ensure_connected("lazy-server") is True
+
+        mock_connect.assert_awaited_once_with(config)
+        assert "lazy-server" not in manager._lazy_configs
+
 
 class TestGatewayServerInitializeLazy:
     """Test GatewayServer.initialize() separates auto-start from lazy configs."""
@@ -346,9 +446,7 @@ class TestGatewayServerInitializeLazy:
                 assert lazy_configs == []
                 mock_connect.assert_called_once()
                 eager_configs = mock_connect.call_args[0][0]
-                assert [config.name for config in eager_configs] == [
-                    "configured-auto"
-                ]
+                assert [config.name for config in eager_configs] == ["configured-auto"]
 
     @pytest.mark.asyncio
     async def test_manifest_auto_start_servers_are_lazy_by_default(self) -> None:
@@ -535,6 +633,74 @@ class TestGatewayServerInitializeLazy:
 
                 assert mock_register.call_args[0][0] == []
                 mock_connect.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_initialize_records_startup_observations(self) -> None:
+        """initialize() should preserve resolver outcomes for gateway.health."""
+        from pmcp.server import GatewayServer
+        from pmcp.types import ServerStatus
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={},
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+        with (
+            patch(
+                "pmcp.server.load_configs",
+                return_value=[
+                    ResolvedServerConfig(
+                        name="lazy-server",
+                        source="project",
+                        config=LocalMcpServerConfig(command="echo"),
+                    ),
+                    ResolvedServerConfig(
+                        name="eager-server",
+                        source="project",
+                        config=LocalMcpServerConfig(command="echo"),
+                    ),
+                ],
+            ),
+            patch("pmcp.server.load_manifest", return_value=manifest),
+            patch("pmcp.server.filter_self_references", side_effect=lambda x: x),
+            patch("pmcp.server.load_enabled_auto_start", return_value={"eager-server"}),
+            patch(
+                "pmcp.server.load_disabled_auto_start",
+                return_value=set(),
+            ),
+            patch("pmcp.server.load_descriptions_cache", return_value=None),
+            patch("pmcp.server.get_cache_path", return_value=None),
+        ):
+            server = GatewayServer()
+
+            with (
+                patch.object(
+                    server._client_manager,
+                    "connect_all",
+                    new_callable=AsyncMock,
+                    return_value=[],
+                ),
+                patch.object(server._client_manager, "start_health_monitor"),
+                patch.object(server._client_manager, "get_all_tools", return_value=[]),
+                patch(
+                    "pmcp.server.generate_capability_summary",
+                    new_callable=AsyncMock,
+                    return_value="",
+                ),
+            ):
+                await server.initialize()
+
+        server._client_manager._servers["eager-server"] = ServerStatus(
+            name="eager-server",
+            status=ServerStatusEnum.ONLINE,
+            tool_count=0,
+        )
+        health = await server._gateway_tools.health()
+        by_name = {entry.name: entry for entry in health.servers}
+        assert by_name["lazy-server"].startup_policy == "lazy"
+        assert by_name["eager-server"].startup_policy == "eager"
 
     @pytest.mark.asyncio
     async def test_lazy_configs_registered_before_auto_start_connect(self) -> None:

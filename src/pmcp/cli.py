@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
@@ -444,7 +445,7 @@ Environment overrides:
     doctor_parser = subparsers.add_parser(
         "doctor",
         help="Diagnose PMCP configuration conflicts",
-        description="Detect lock/mode/SSE issues and print remediation steps.",
+        description="Detect lock, mode, HTTP reachability, remote header, and install issues.",
     )
     doctor_parser.add_argument(
         "-p",
@@ -456,7 +457,7 @@ Environment overrides:
         "--timeout",
         type=float,
         default=3.0,
-        help="SSE probe timeout in seconds (default: 3.0)",
+        help="HTTP health probe timeout in seconds (default: 3.0)",
     )
     doctor_parser.add_argument(
         "-l",
@@ -753,6 +754,24 @@ def _get_gateway_url() -> str:
     )
 
 
+def _get_gateway_health_url() -> str:
+    """Return the unauthenticated PMCP gateway health endpoint URL."""
+    parsed = urlsplit(_get_gateway_url())
+    return urlunsplit((parsed.scheme, parsed.netloc, "/health", "", ""))
+
+
+def _redact_url_credentials(url: str) -> str:
+    """Remove URL userinfo before printing diagnostics."""
+    parsed = urlsplit(url)
+    hostname = parsed.hostname or ""
+    netloc = hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunsplit(
+        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
+    )
+
+
 def _exit_gateway_unreachable(errors: list[str]) -> None:
     """Exit with a clear direct-gateway connection failure."""
     detail = "; ".join(errors)
@@ -895,9 +914,12 @@ async def run_status(args: argparse.Namespace) -> None:
 
         print("PMCP Status")
         print("==================\n")
+        print(
+            f"PMCP Gateway: reachable ({_redact_url_credentials(_get_gateway_url())})"
+        )
 
         if servers:
-            print(f"Servers ({online} online, {offline} offline):")
+            print(f"\nDownstream Server State ({online} online, {offline} offline):")
             for s in servers:
                 if not isinstance(s, dict):
                     continue
@@ -908,6 +930,15 @@ async def run_status(args: argparse.Namespace) -> None:
                 else:
                     icon = "\u2717"
                     details = f"({s.get('error') or status})"
+                if args.verbose and s.get("startup_policy"):
+                    policy_parts = [f"policy={s.get('startup_policy')}"]
+                    if s.get("startup_source"):
+                        policy_parts.append(f"source={s.get('startup_source')}")
+                    if s.get("startup_skip_reason"):
+                        policy_parts.append(f"reason={s.get('startup_skip_reason')}")
+                    if s.get("startup_env_var"):
+                        policy_parts.append(f"env={s.get('startup_env_var')}")
+                    details = f"{details}  {' '.join(policy_parts)}"
                 print(f"  {icon} {s.get('name', ''):<16} {status:<10} {details}")
         else:
             print("No servers found.")
@@ -966,13 +997,24 @@ async def run_status(args: argparse.Namespace) -> None:
             print("No MCP servers configured.")
         return
 
-    # Connect to servers
-    logger.info(f"Connecting to {len(allowed_configs)} servers...")
-    await client_manager.connect_all(allowed_configs)
-
     try:
-        statuses = client_manager.get_all_server_statuses()
-        tools = client_manager.get_all_tools()
+        if args.verbose:
+            from pmcp.types import ServerStatus
+
+            statuses = [
+                ServerStatus(
+                    name=config.name,
+                    status=ServerStatusEnum.LAZY,
+                    tool_count=0,
+                )
+                for config in allowed_configs
+            ]
+            tools = []
+        else:
+            logger.info(f"Connecting to {len(allowed_configs)} servers...")
+            await client_manager.connect_all(allowed_configs)
+            statuses = client_manager.get_all_server_statuses()
+            tools = client_manager.get_all_tools()
         revision_id, last_refresh = client_manager.get_registry_meta()
 
         # Filter by server if specified
@@ -1020,9 +1062,12 @@ async def run_status(args: argparse.Namespace) -> None:
 
             print("PMCP Status")
             print("==================\n")
+            print("PMCP Gateway: local fallback (no live gateway snapshot)")
 
             if statuses:
-                print(f"Servers ({online} online, {offline} offline):")
+                print(
+                    f"\nDownstream Server State ({online} online, {offline} offline):"
+                )
                 for s in statuses:
                     if s.status == ServerStatusEnum.ONLINE:
                         icon = "\u2713"  # checkmark
@@ -1411,6 +1456,23 @@ async def _probe_sse_endpoint(url: str, timeout_s: float) -> tuple[bool, str]:
         return False, str(exc)
 
 
+async def _probe_http_health(timeout_s: float) -> tuple[bool, str]:
+    """Probe gateway /health and return (ok, details)."""
+    import httpx
+
+    url = _get_gateway_health_url()
+    safe_url = _redact_url_credentials(url)
+    try:
+        timeout = httpx.Timeout(timeout=timeout_s)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            response = await client.get(url)
+        if response.status_code == 200:
+            return True, f"{safe_url} reachable"
+        return False, f"{safe_url} returned HTTP {response.status_code}"
+    except Exception as exc:
+        return False, f"{safe_url} unreachable ({exc.__class__.__name__})"
+
+
 async def run_doctor(args: argparse.Namespace) -> None:
     """Diagnose local PMCP conflict conditions and suggest fixes."""
     setup_logging(args.log_level)
@@ -1433,7 +1495,7 @@ async def run_doctor(args: argparse.Namespace) -> None:
     config_path, config_data = _load_local_mcp_json(
         args.project if hasattr(args, "project") else None
     )
-    command_servers, sse_endpoints = _extract_mode_signals(config_data)
+    command_servers, _sse_endpoints = _extract_mode_signals(config_data)
 
     if service_active and command_servers:
         joined = ", ".join(sorted(command_servers))
@@ -1455,27 +1517,21 @@ async def run_doctor(args: argparse.Namespace) -> None:
     else:
         checks.append(("mode", "ok", "No active PMCP system service detected."))
 
-    if sse_endpoints:
-        for server_name, sse_url in sse_endpoints:
-            ok, detail = await _probe_sse_endpoint(sse_url, args.timeout)
-            if ok:
-                checks.append(
-                    (
-                        "sse",
-                        "ok",
-                        f"{server_name}: {sse_url} reachable ({detail}).",
-                    )
-                )
-            else:
-                checks.append(
-                    (
-                        "sse",
-                        "fail",
-                        f"{server_name}: {sse_url} probe failed ({detail}). Ensure pmcp service is running and URL is correct.",
-                    )
-                )
+    http_ok, http_detail = await _probe_http_health(args.timeout)
+    if http_ok:
+        checks.append(
+            ("http", "ok", f"Gateway /health reachability OK: {http_detail}.")
+        )
     else:
-        checks.append(("sse", "ok", "No SSE endpoint configured in local .mcp.json."))
+        checks.append(
+            (
+                "http",
+                "warn",
+                "Gateway /health reachability warning: "
+                f"{http_detail}. Start pmcp --transport http or set "
+                "PMCP_GATEWAY_URL if the gateway uses a custom URL.",
+            )
+        )
 
     remote_checks = collect_remote_header_diagnostics(config_data)
     if remote_checks:

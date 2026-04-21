@@ -2,20 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any, cast
 import types
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
 from pmcp.manifest.loader import CLIAlternative, Manifest, ServerConfig
 from pmcp.config.guidance import GuidanceConfig
+from pmcp.config.loader import StartupObservation
 from pmcp.errors import GatewayException
 from pmcp.policy.policy import PolicyManager
-from pmcp.tools.handlers import GatewayTools
+from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
 from pmcp.types import (
     LocalMcpServerConfig,
     ResolvedServerConfig,
+    RequestState,
     RiskHint,
     ServerStatus,
     ServerStatusEnum,
@@ -37,6 +42,9 @@ class MockClientManager:
         self.refreshed_configs: list[Any] = []
         self.lazy_configs: list[Any] = []
         self.disconnected = False
+        self.events: list[str] = []
+        self.ensure_connected_calls: list[str] = []
+        self.pending_requests: list[Any] = []
 
     def get_all_tools(self) -> list[ToolInfo]:
         return list(self._tools.values())
@@ -60,6 +68,9 @@ class MockClientManager:
         self._online_servers.add(name)
 
     async def ensure_connected(self, server_name: str) -> bool:
+        self.ensure_connected_calls.append(server_name)
+        if server_name in self._online_servers:
+            return True
         if server_name in self._lazy_servers:
             self._lazy_servers.remove(server_name)
             self._online_servers.add(server_name)
@@ -68,6 +79,16 @@ class MockClientManager:
 
     def get_all_server_statuses(self) -> list[Any]:
         return self._server_statuses
+
+    def get_server_status(self, name: str) -> ServerStatus | None:
+        for status in self._server_statuses:
+            if status.name == name:
+                return status
+        if name in self._online_servers:
+            return ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+        if name in self._lazy_servers:
+            return ServerStatus(name=name, status=ServerStatusEnum.LAZY, tool_count=0)
+        return None
 
     def set_server_statuses(self, statuses: list[ServerStatus]) -> None:
         self._server_statuses = statuses
@@ -85,18 +106,126 @@ class MockClientManager:
         return []
 
     async def disconnect_all(self) -> None:
+        self.events.append("disconnect")
         self.disconnected = True
 
     def register_lazy_configs(self, configs: list[Any]) -> None:
+        self.events.append("register_lazy")
         self.lazy_configs = list(configs)
         for config in configs:
             self._lazy_servers.add(config.name)
 
     async def connect_all(self, configs: list[Any], retry: bool = True) -> list[str]:
+        self.events.append("connect")
         self.connected_configs.extend(configs)
         for config in configs:
             self._online_servers.add(config.name)
         return []
+
+    async def connect_server(self, config: Any, retry: bool = True) -> list[str]:
+        self.events.append(f"connect_server:{config.name}")
+        self.connected_configs.append(config)
+        if config.name == "fails-connect":
+            return [f"Failed to connect to {config.name}: boom"]
+        self._online_servers.add(config.name)
+        self._lazy_servers.discard(config.name)
+        self._server_statuses = [
+            status for status in self._server_statuses if status.name != config.name
+        ]
+        self._server_statuses.append(
+            ServerStatus(name=config.name, status=ServerStatusEnum.ONLINE, tool_count=0)
+        )
+        return []
+
+    async def disconnect_server(
+        self, name: str, force: bool = False
+    ) -> tuple[bool, int, str | None]:
+        self.events.append(f"disconnect_server:{name}:{force}")
+        pending = self.get_pending_requests(name)
+        if pending and not force:
+            return (
+                False,
+                0,
+                "Disconnect refused because this server has pending requests. "
+                "Use force=true to cancel them.",
+            )
+        cancelled = self.cancel_pending_requests(name) if pending else 0
+        self._online_servers.discard(name)
+        self._lazy_servers.add(name)
+        self._server_statuses = [
+            status for status in self._server_statuses if status.name != name
+        ]
+        self._server_statuses.append(
+            ServerStatus(name=name, status=ServerStatusEnum.LAZY, tool_count=0)
+        )
+        return (True, cancelled, None)
+
+    async def restart_server(
+        self, config: Any, force: bool = False
+    ) -> tuple[bool, int, list[str]]:
+        self.events.append(f"restart_server:{config.name}:{force}")
+        disconnected, cancelled, error = await self.disconnect_server(
+            config.name, force=force
+        )
+        if not disconnected:
+            return (False, cancelled, [error or "Restart refused."])
+        errors = await self.connect_server(config)
+        return (not errors, cancelled, errors)
+
+    def add_pending_request(self, server_name: str = "server") -> Any:
+        request_id = len(self.pending_requests) + 1
+        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        request = types.SimpleNamespace(
+            request_id=request_id,
+            server_name=server_name,
+            tool_id=f"{server_name}::tool",
+            started_at=time.time(),
+            last_heartbeat=time.time(),
+            timeout_ms=30000,
+            future=future,
+        )
+        self.pending_requests.append(request)
+        return request
+
+    def get_pending_requests(self, server: str | None = None) -> list[Any]:
+        if server is None:
+            return list(self.pending_requests)
+        return [
+            request
+            for request in self.pending_requests
+            if request.server_name == server
+        ]
+
+    def get_request_state(self, request: Any) -> RequestState:
+        if request.future.cancelled():
+            return RequestState.CANCELLED
+        if request.future.done():
+            return RequestState.COMPLETED
+        return RequestState.PENDING
+
+    def cancel_all_pending_requests(self) -> int:
+        self.events.append("cancel_all")
+        cancelled = 0
+        for request in list(self.pending_requests):
+            if not request.future.done():
+                request.future.cancel()
+                cancelled += 1
+        self.pending_requests = []
+        return cancelled
+
+    def cancel_pending_requests(self, server: str) -> int:
+        self.events.append(f"cancel_pending:{server}")
+        cancelled = 0
+        remaining = []
+        for request in self.pending_requests:
+            if request.server_name == server:
+                if not request.future.done():
+                    request.future.cancel()
+                    cancelled += 1
+            else:
+                remaining.append(request)
+        self.pending_requests = remaining
+        return cancelled
 
 
 def create_manifest_for_request_tests() -> Manifest:
@@ -167,6 +296,28 @@ def create_mock_tools() -> list[ToolInfo]:
             risk_hint=RiskHint.LOW,
         ),
     ]
+
+
+def patch_refresh_config_sources(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: list[ResolvedServerConfig],
+) -> None:
+    manifest = Manifest(
+        version="1.0",
+        cli_alternatives={},
+        servers={},
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
+    monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_enabled_auto_start",
+        lambda **_: set(),
+    )
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_disabled_auto_start",
+        lambda **_: set(),
+    )
 
 
 class TestRefreshCompatibility:
@@ -247,6 +398,10 @@ class TestRefreshCompatibility:
         ]
         assert client_manager.connected_configs == []
         assert result.servers_seen == 4
+        assert result.pending_requests_seen == 0
+        assert result.pending_requests_cancelled == 0
+        assert result.pending_requests_refused == 0
+        assert result.pending_requests_remaining == 0
 
     @pytest.mark.asyncio
     async def test_refresh_connects_only_configured_auto_start(
@@ -392,6 +547,216 @@ class TestRefreshCompatibility:
         ]
         assert client_manager.connected_configs == []
 
+    @pytest.mark.asyncio
+    async def test_refresh_refuses_pending_requests_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager()
+        client_manager.add_pending_request("active")
+        client_manager.set_server_statuses(
+            [
+                ServerStatus(
+                    name="active",
+                    status=ServerStatusEnum.ONLINE,
+                    tool_count=1,
+                )
+            ]
+        )
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        gateway_tools.set_startup_observations(
+            {
+                "stale": StartupObservation(
+                    name="stale",
+                    startup_policy="skipped",
+                    startup_source="auto_start",
+                )
+            }
+        )
+        patch_refresh_config_sources(
+            monkeypatch,
+            [
+                ResolvedServerConfig(
+                    name="fresh",
+                    source="project",
+                    config=LocalMcpServerConfig(command="fresh-cmd"),
+                )
+            ],
+        )
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is False
+        assert result.pending_requests_seen == 1
+        assert result.pending_requests_refused == 1
+        assert result.pending_requests_remaining == 1
+        assert "force=true" in (result.errors or [""])[0]
+        assert client_manager.disconnected is False
+        assert client_manager.lazy_configs == []
+        assert client_manager.connected_configs == []
+        assert "stale" in gateway_tools._startup_observations
+        assert "fresh" not in gateway_tools._startup_observations
+
+    @pytest.mark.asyncio
+    async def test_refresh_force_cancels_before_disconnect_and_reconnect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager()
+        request = client_manager.add_pending_request("active")
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        configured = [
+            ResolvedServerConfig(
+                name="eager",
+                source="project",
+                config=LocalMcpServerConfig(command="eager-cmd"),
+            )
+        ]
+        patch_refresh_config_sources(monkeypatch, configured)
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_enabled_auto_start",
+            lambda **_: {"eager"},
+        )
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        result = await gateway_tools.refresh({"reason": "test", "force": True})
+
+        assert result.ok is True
+        assert request.future.cancelled()
+        assert result.pending_requests_seen == 1
+        assert result.pending_requests_cancelled == 1
+        assert result.pending_requests_remaining == 0
+        assert client_manager.events == [
+            "cancel_all",
+            "disconnect",
+            "register_lazy",
+            "connect",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_refresh_schema_force_is_optional(self) -> None:
+        refresh_tool = next(
+            tool
+            for tool in get_gateway_tool_definitions()
+            if tool.name == "gateway.refresh"
+        )
+
+        schema = refresh_tool.inputSchema
+        assert "force" in schema["properties"]
+        assert schema["properties"]["force"]["type"] == "boolean"
+        assert schema.get("required", []) == []
+
+    @pytest.mark.asyncio
+    async def test_list_pending_survives_refused_refresh_and_clears_after_force(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager()
+        client_manager.add_pending_request("active")
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        patch_refresh_config_sources(monkeypatch, [])
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        before = await gateway_tools.list_pending({})
+        refused = await gateway_tools.refresh({"reason": "test"})
+        after_refused = await gateway_tools.list_pending({})
+        forced = await gateway_tools.refresh({"reason": "test", "force": True})
+        after_forced = await gateway_tools.list_pending({})
+
+        assert before.total_pending == 1
+        assert refused.ok is False
+        assert after_refused.total_pending == 1
+        assert forced.ok is True
+        assert forced.pending_requests_cancelled == 1
+        assert after_forced.total_pending == 0
+
+    @pytest.mark.asyncio
+    async def test_refresh_refuses_pending_lazy_start_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager()
+        pending = client_manager.add_pending_request("lazy")
+        pending.tool_id = ""
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        patch_refresh_config_sources(monkeypatch, [])
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        refused = await gateway_tools.refresh({"reason": "lazy start race"})
+        forced = await gateway_tools.refresh(
+            {"reason": "lazy start race", "force": True}
+        )
+
+        assert refused.ok is False
+        assert refused.pending_requests_refused == 1
+        assert client_manager.events == [
+            "cancel_all",
+            "disconnect",
+            "register_lazy",
+            "connect",
+        ]
+        assert forced.ok is True
+        assert forced.pending_requests_cancelled == 1
+
+    @pytest.mark.asyncio
+    async def test_soak_health_and_pending_survive_refused_refresh(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager()
+        pending = client_manager.add_pending_request("active")
+        client_manager.set_server_statuses(
+            [
+                ServerStatus(
+                    name="active",
+                    status=ServerStatusEnum.ONLINE,
+                    tool_count=1,
+                    pending_request_count=1,
+                )
+            ]
+        )
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        gateway_tools.set_startup_observations(
+            {
+                "active": StartupObservation(
+                    name="active",
+                    startup_policy="eager",
+                    startup_source="project",
+                )
+            }
+        )
+        patch_refresh_config_sources(monkeypatch, [])
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        before_health = await gateway_tools.health()
+        before_pending = await gateway_tools.list_pending({})
+        refused = await gateway_tools.refresh({"reason": "soak"})
+        after_health = await gateway_tools.health()
+        after_pending = await gateway_tools.list_pending({})
+
+        assert before_health.servers[0].name == "active"
+        assert before_health.servers[0].startup_policy == "eager"
+        assert before_pending.requests[0].request_id == "active::1"
+        assert refused.ok is False
+        assert refused.pending_requests_seen == 1
+        assert refused.pending_requests_refused == 1
+        assert pending.future.cancelled() is False
+        assert after_health.revision_id == "test-rev"
+        assert after_health.servers[0].status == "online"
+        assert after_pending.requests[0].request_id == "active::1"
+        assert client_manager.events == []
+
 
 class TestCatalogSearch:
     """Tests for catalog_search."""
@@ -462,6 +827,251 @@ class TestCatalogSearch:
             assert not hasattr(card, "input_schema")
 
 
+class TestServerLifecycleTools:
+    """Tests for gateway server lifecycle tools."""
+
+    @pytest.fixture
+    def gateway_tools(self, monkeypatch: pytest.MonkeyPatch) -> GatewayTools:
+        client_manager = MockClientManager()
+        policy_manager = PolicyManager()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+        configured = [
+            ResolvedServerConfig(
+                name="configured",
+                source="project",
+                config=LocalMcpServerConfig(command="configured-cmd"),
+            ),
+            ResolvedServerConfig(
+                name="denied",
+                source="project",
+                config=LocalMcpServerConfig(command="denied-cmd"),
+            ),
+            ResolvedServerConfig(
+                name="fails-connect",
+                source="project",
+                config=LocalMcpServerConfig(command="fail-cmd"),
+            ),
+        ]
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "manifest": ServerConfig(
+                    name="manifest",
+                    description="Manifest server",
+                    keywords=["manifest"],
+                    install={},
+                    command="manifest-cmd",
+                    args=[],
+                ),
+                "needs-key": ServerConfig(
+                    name="needs-key",
+                    description="Auth server",
+                    keywords=["auth"],
+                    install={},
+                    command="auth-cmd",
+                    args=[],
+                    requires_api_key=True,
+                    env_var="PMCP_TEST_KEY",
+                ),
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
+        policy_manager.is_server_allowed = lambda name: name != "denied"  # type: ignore[method-assign]
+        return gateway_tools
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_tool_schemas_are_additive(self) -> None:
+        tools = {tool.name: tool for tool in get_gateway_tool_definitions()}
+
+        assert "gateway.connect_server" in tools
+        assert "gateway.disconnect_server" in tools
+        assert "gateway.restart_server" in tools
+        assert tools["gateway.connect_server"].inputSchema["required"] == [
+            "server_name"
+        ]
+        assert "force" not in tools["gateway.connect_server"].inputSchema["properties"]
+        assert (
+            tools["gateway.disconnect_server"].inputSchema["properties"]["force"][
+                "type"
+            ]
+            == "boolean"
+        )
+        assert (
+            tools["gateway.restart_server"].inputSchema["properties"]["force"]["type"]
+            == "boolean"
+        )
+        assert "force" not in tools["gateway.refresh"].inputSchema.get("required", [])
+
+    @pytest.mark.asyncio
+    async def test_connect_server_already_online(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        manager = cast(Any, gateway_tools._client_manager)
+        manager.set_server_online("configured")
+
+        result = await gateway_tools.connect_server({"server_name": "configured"})
+
+        assert result.ok is True
+        assert result.prior_status == "online"
+        assert result.new_status == "online"
+        assert result.cancelled_request_count == 0
+        assert manager.connected_configs == []
+
+    @pytest.mark.asyncio
+    async def test_connect_server_starts_configured_and_manifest(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        configured = await gateway_tools.connect_server({"server_name": "configured"})
+        manifest = await gateway_tools.connect_server({"server_name": "manifest"})
+
+        assert configured.ok is True
+        assert manifest.ok is True
+        connected_names = [
+            config.name
+            for config in cast(Any, gateway_tools._client_manager).connected_configs
+        ]
+        assert connected_names == ["configured", "manifest"]
+
+    @pytest.mark.asyncio
+    async def test_connect_server_reports_unknown_policy_and_missing_auth(
+        self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
+
+        unknown = await gateway_tools.connect_server({"server_name": "unknown"})
+        denied = await gateway_tools.connect_server({"server_name": "denied"})
+        missing_auth = await gateway_tools.connect_server({"server_name": "needs-key"})
+
+        assert unknown.ok is False
+        assert unknown.errors == ["Unknown server: unknown"]
+        assert denied.ok is False
+        assert "blocked by policy" in denied.message
+        assert missing_auth.ok is False
+        assert "PMCP_TEST_KEY" in (missing_auth.errors or [""])[0]
+
+    @pytest.mark.asyncio
+    async def test_connect_server_uses_registered_discovered_server(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        gateway_tools._discovered_server_configs["discovered"] = ServerConfig(
+            name="discovered",
+            description="Discovered",
+            keywords=["discovered"],
+            install={},
+            command="discovered-cmd",
+            args=[],
+        )
+
+        result = await gateway_tools.connect_server({"server_name": "discovered"})
+
+        assert result.ok is True
+        assert cast(Any, gateway_tools._client_manager).connected_configs[-1].name == (
+            "discovered"
+        )
+
+    @pytest.mark.asyncio
+    async def test_disconnect_server_success_and_pending_policy(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        manager = cast(Any, gateway_tools._client_manager)
+        manager.set_server_online("configured")
+        stopped = await gateway_tools.disconnect_server({"server_name": "configured"})
+        manager.set_server_online("configured")
+        request = manager.add_pending_request("configured")
+        refused = await gateway_tools.disconnect_server({"server_name": "configured"})
+        assert request.future.cancelled() is False
+        forced = await gateway_tools.disconnect_server(
+            {"server_name": "configured", "force": True}
+        )
+
+        assert stopped.ok is True
+        assert stopped.new_status == "lazy"
+        assert refused.ok is False
+        assert "force=true" in refused.message
+        assert forced.ok is True
+        assert forced.cancelled_request_count == 1
+        assert request.future.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_restart_server_success_failure_and_pending_policy(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        manager = cast(Any, gateway_tools._client_manager)
+        manager.set_server_online("configured")
+        restarted = await gateway_tools.restart_server({"server_name": "configured"})
+        manager.set_server_online("configured")
+        request = manager.add_pending_request("configured")
+        refused = await gateway_tools.restart_server({"server_name": "configured"})
+        assert request.future.cancelled() is False
+        forced = await gateway_tools.restart_server(
+            {"server_name": "configured", "force": True}
+        )
+        failed = await gateway_tools.restart_server({"server_name": "fails-connect"})
+
+        assert restarted.ok is True
+        assert restarted.new_status == "online"
+        assert refused.ok is False
+        assert forced.ok is True
+        assert forced.cancelled_request_count == 1
+        assert failed.ok is False
+        assert failed.errors == ["Failed to connect to fails-connect: boom"]
+
+    @pytest.mark.asyncio
+    async def test_soak_force_lifecycle_cancels_only_target_server(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        manager = cast(Any, gateway_tools._client_manager)
+        manager.set_server_online("configured")
+        manager.set_server_online("other")
+        target = manager.add_pending_request("configured")
+        other = manager.add_pending_request("other")
+
+        refused = await gateway_tools.disconnect_server({"server_name": "configured"})
+
+        assert refused.ok is False
+        assert target.future.cancelled() is False
+        assert other.future.cancelled() is False
+        forced = await gateway_tools.disconnect_server(
+            {"server_name": "configured", "force": True}
+        )
+
+        assert forced.ok is True
+        assert forced.cancelled_request_count == 1
+        assert target.future.cancelled()
+        assert other.future.cancelled() is False
+        assert [p.request_id for p in manager.get_pending_requests("other")] == [2]
+
+    @pytest.mark.asyncio
+    async def test_health_keeps_runtime_stopped_startup_observation(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        manager = cast(Any, gateway_tools._client_manager)
+        manager.set_server_online("configured")
+        gateway_tools.set_startup_observations(
+            {
+                "configured": StartupObservation(
+                    name="configured",
+                    startup_policy="lazy",
+                    startup_source="project",
+                )
+            }
+        )
+
+        await gateway_tools.disconnect_server({"server_name": "configured"})
+        result = await gateway_tools.health()
+
+        by_name = {server.name: server for server in result.servers}
+        assert by_name["configured"].status == "lazy"
+        assert by_name["configured"].startup_policy == "lazy"
+
+
 class TestDescribe:
     """Tests for describe."""
 
@@ -529,6 +1139,79 @@ class TestInvoke:
         assert result.ok is False
         assert "Tool not found" in (result.errors or [])[0]
 
+    @pytest.mark.asyncio
+    async def test_soak_concurrent_lazy_invokes_share_one_connect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager()
+        client_manager.add_lazy_server("lazy")
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        monkeypatch.setattr(
+            gateway_tools, "_get_update_warning", AsyncMock(return_value=None)
+        )
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        connect_task: asyncio.Task[None] | None = None
+        connect_calls = 0
+        connect_lock = asyncio.Lock()
+
+        async def do_connect() -> None:
+            nonlocal connect_calls
+            connect_calls += 1
+            started.set()
+            await release.wait()
+            client_manager._lazy_servers.discard("lazy")
+            client_manager._online_servers.add("lazy")
+            client_manager._tools["lazy::echo"] = ToolInfo(
+                tool_id="lazy::echo",
+                server_name="lazy",
+                tool_name="echo",
+                description="Echo",
+                short_description="Echo",
+                input_schema={},
+                tags=[],
+                risk_hint=RiskHint.LOW,
+            )
+
+        async def ensure_connected(server_name: str) -> bool:
+            nonlocal connect_task
+            async with connect_lock:
+                if client_manager.is_server_online(server_name):
+                    return True
+                if connect_task is None:
+                    connect_task = asyncio.create_task(do_connect())
+                task = connect_task
+            await task
+            return True
+
+        async def call_tool(
+            tool_id: str, args: dict[str, Any], timeout_ms: int
+        ) -> dict[str, Any]:
+            return {"content": [{"type": "text", "text": tool_id}]}
+
+        client_manager.ensure_connected = ensure_connected  # type: ignore[method-assign]
+        client_manager.call_tool = call_tool  # type: ignore[method-assign]
+
+        first = asyncio.create_task(
+            gateway_tools.invoke({"tool_id": "lazy::echo", "arguments": {}})
+        )
+        second = asyncio.create_task(
+            gateway_tools.invoke({"tool_id": "lazy::echo", "arguments": {}})
+        )
+        await started.wait()
+        assert connect_calls == 1
+        release.set()
+
+        results = await asyncio.gather(first, second)
+
+        assert [result.ok for result in results] == [True, True]
+        assert connect_calls == 1
+        assert client_manager.is_server_online("lazy") is True
+
 
 class TestHealth:
     """Tests for health."""
@@ -569,6 +1252,162 @@ class TestHealth:
 
         assert result.servers[0].status == "error"
         assert result.servers[0].error == "Connection refused"
+
+    @pytest.mark.asyncio
+    async def test_merges_startup_observations_into_health(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        cast(Any, gateway_tools._client_manager).set_server_statuses(
+            [
+                ServerStatus(
+                    name="eager",
+                    status=ServerStatusEnum.ONLINE,
+                    tool_count=2,
+                ),
+                ServerStatus(
+                    name="lazy",
+                    status=ServerStatusEnum.LAZY,
+                    tool_count=0,
+                ),
+            ]
+        )
+        gateway_tools.set_startup_observations(
+            {
+                "eager": StartupObservation(
+                    name="eager",
+                    startup_policy="eager",
+                    startup_source="project",
+                ),
+                "lazy": StartupObservation(
+                    name="lazy",
+                    startup_policy="lazy",
+                    startup_source="manifest",
+                ),
+            }
+        )
+
+        result = await gateway_tools.health()
+
+        by_name = {server.name: server for server in result.servers}
+        assert by_name["eager"].startup_policy == "eager"
+        assert by_name["eager"].startup_source == "project"
+        assert by_name["lazy"].startup_policy == "lazy"
+        assert by_name["lazy"].startup_source == "manifest"
+
+    @pytest.mark.asyncio
+    async def test_health_includes_skipped_startup_entries(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        gateway_tools.set_startup_observations(
+            {
+                "unknown": StartupObservation(
+                    name="unknown",
+                    startup_policy="skipped",
+                    startup_source="auto_start",
+                    startup_skip_reason="unknown_auto_start",
+                ),
+                "denied": StartupObservation(
+                    name="denied",
+                    startup_policy="skipped",
+                    startup_source="configured",
+                    startup_skip_reason="policy_denied",
+                ),
+                "needs-key": StartupObservation(
+                    name="needs-key",
+                    startup_policy="skipped",
+                    startup_source="manifest",
+                    startup_skip_reason="missing_auth",
+                    startup_env_var="PMCP_TEST_KEY",
+                ),
+            }
+        )
+
+        result = await gateway_tools.health()
+
+        by_name = {server.name: server for server in result.servers}
+        assert by_name["unknown"].status == "offline"
+        assert by_name["unknown"].startup_skip_reason == "unknown_auto_start"
+        assert by_name["denied"].startup_skip_reason == "policy_denied"
+        assert by_name["needs-key"].startup_skip_reason == "missing_auth"
+        assert by_name["needs-key"].startup_env_var == "PMCP_TEST_KEY"
+
+    @pytest.mark.asyncio
+    async def test_health_merges_provisioned_startup_observation(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        gateway_tools.set_startup_observations(
+            {
+                "provisioned": StartupObservation(
+                    name="provisioned",
+                    startup_policy="lazy",
+                    startup_source="manifest",
+                )
+            }
+        )
+        gateway_tools._load_provisioned_registry = lambda: {"provisioned": None}  # type: ignore[method-assign]
+
+        result = await gateway_tools.health()
+
+        assert len(result.servers) == 1
+        assert result.servers[0].name == "provisioned"
+        assert result.servers[0].status == "offline"
+        assert result.servers[0].startup_policy == "lazy"
+
+    @pytest.mark.asyncio
+    async def test_refresh_replaces_startup_observations_in_health(
+        self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        configured = [
+            ResolvedServerConfig(
+                name="fresh",
+                source="project",
+                config=LocalMcpServerConfig(command="fresh-cmd"),
+            )
+        ]
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={},
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        gateway_tools.set_startup_observations(
+            {
+                "stale": StartupObservation(
+                    name="stale",
+                    startup_policy="skipped",
+                    startup_source="auto_start",
+                    startup_skip_reason="unknown_auto_start",
+                )
+            }
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_enabled_auto_start",
+            lambda **_: set(),
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_disabled_auto_start",
+            lambda **_: set(),
+        )
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        await gateway_tools.refresh({"reason": "test"})
+        cast(Any, gateway_tools._client_manager).set_server_statuses(
+            [
+                ServerStatus(
+                    name="fresh",
+                    status=ServerStatusEnum.LAZY,
+                    tool_count=0,
+                )
+            ]
+        )
+
+        result = await gateway_tools.health()
+
+        by_name = {server.name: server for server in result.servers}
+        assert "stale" not in by_name
+        assert by_name["fresh"].startup_policy == "lazy"
 
 
 class TestCapabilityAndProvision:
@@ -660,6 +1499,46 @@ class TestCapabilityAndProvision:
         assert result.ok is True
         assert result.status == "complete"
         assert "started from .mcp.json configuration" in result.message
+
+    @pytest.mark.asyncio
+    async def test_concurrent_provision_for_configured_lazy_server_reuses_running(
+        self, monkeypatch
+    ):
+        tool = ToolInfo(
+            tool_id="custom-browser::snapshot",
+            server_name="custom-browser",
+            tool_name="snapshot",
+            description="Take browser snapshot",
+            short_description="Take browser snapshot",
+            input_schema={"type": "object", "properties": {}},
+            tags=["browser"],
+            risk_hint=RiskHint.LOW,
+        )
+        client_manager = MockClientManager([tool])
+        client_manager.add_lazy_server("custom-browser")
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        configured = [
+            ResolvedServerConfig(
+                name="custom-browser",
+                source="project",
+                config=LocalMcpServerConfig(command="npx", args=["custom-browser-mcp"]),
+            )
+        ]
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+
+        first, second = await asyncio.gather(
+            gateway_tools.provision({"server_name": "custom-browser"}),
+            gateway_tools.provision({"server_name": "custom-browser"}),
+        )
+
+        assert first.ok is True
+        assert second.ok is True
+        assert {first.status, second.status} <= {"complete", "already_running"}
+        assert client_manager.is_server_online("custom-browser") is True
 
     @pytest.mark.asyncio
     async def test_request_then_provision_for_configured_server(self, monkeypatch):

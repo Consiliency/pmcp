@@ -425,6 +425,8 @@ class TestRunStatus:
                 await run_status(status_args)
 
         captured = capsys.readouterr()
+        assert "PMCP Gateway: reachable" in captured.out
+        assert "Downstream Server State" in captured.out
         assert "context7" in captured.out
         assert "browser-use" in captured.out
         assert "No MCP servers configured" not in captured.out
@@ -467,6 +469,174 @@ class TestRunStatus:
         output = json.loads(captured.out)
         assert output["revision_id"] == "live-rev"
         assert output["pending_requests"][0]["request_id"] == "context7::1"
+
+    @pytest.mark.asyncio
+    async def test_status_live_snapshot_human_with_pending_and_verbose(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Human status should render live pending and lifecycle visibility."""
+        from pmcp.cli import run_status
+
+        status_args.pending = True
+        status_args.verbose = True
+        live_snapshot = {
+            "revision_id": "live-rev",
+            "last_refresh_ts": 1_700_000_000.0,
+            "servers": [
+                {
+                    "name": "context7",
+                    "status": "online",
+                    "tool_count": 2,
+                    "startup_policy": "eager",
+                    "startup_source": "project",
+                },
+                {
+                    "name": "browser-use",
+                    "status": "lazy",
+                    "tool_count": 0,
+                    "startup_policy": "lazy",
+                    "startup_source": "manifest",
+                },
+            ],
+            "total_tools": 2,
+            "pending_requests": [
+                {
+                    "request_id": "context7::1",
+                    "server_name": "context7",
+                    "tool_id": "context7::search",
+                    "elapsed_seconds": 2.5,
+                    "state": "pending",
+                }
+            ],
+        }
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status",
+            new=AsyncMock(return_value=live_snapshot),
+        ):
+            await run_status(status_args)
+
+        captured = capsys.readouterr()
+        assert "PMCP Gateway: reachable" in captured.out
+        assert "context7" in captured.out
+        assert "browser-use" in captured.out
+        assert "policy=eager" in captured.out
+        assert "policy=lazy" in captured.out
+        assert "Pending Requests (1)" in captured.out
+        assert "context7::search" in captured.out
+        assert "[pending]" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_status_verbose_prints_live_startup_policy(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Verbose live status should show startup policy details."""
+        from pmcp.cli import run_status
+
+        status_args.verbose = True
+        live_snapshot = {
+            "revision_id": "live-rev",
+            "last_refresh_ts": 1_700_000_000.0,
+            "servers": [
+                {
+                    "name": "context7",
+                    "status": "online",
+                    "tool_count": 2,
+                    "startup_policy": "eager",
+                    "startup_source": "project",
+                },
+                {
+                    "name": "needs-key",
+                    "status": "offline",
+                    "tool_count": 0,
+                    "startup_policy": "skipped",
+                    "startup_source": "manifest",
+                    "startup_skip_reason": "missing_auth",
+                    "startup_env_var": "CONTEXT7_API_KEY",
+                },
+            ],
+            "total_tools": 2,
+        }
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status",
+            new=AsyncMock(return_value=live_snapshot),
+        ):
+            await run_status(status_args)
+
+        captured = capsys.readouterr()
+        assert "policy=eager" in captured.out
+        assert "policy=skipped" in captured.out
+        assert "reason=missing_auth" in captured.out
+        assert "env=CONTEXT7_API_KEY" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_status_json_preserves_live_startup_policy(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """JSON live status should pass health fields through unchanged."""
+        import json
+
+        from pmcp.cli import run_status
+
+        status_args.json = True
+        live_snapshot = {
+            "revision_id": "live-rev",
+            "last_refresh_ts": 1_700_000_000.0,
+            "servers": [
+                {
+                    "name": "needs-key",
+                    "status": "offline",
+                    "tool_count": 0,
+                    "startup_policy": "skipped",
+                    "startup_skip_reason": "missing_auth",
+                    "startup_env_var": "CONTEXT7_API_KEY",
+                }
+            ],
+            "total_tools": 0,
+        }
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status",
+            new=AsyncMock(return_value=live_snapshot),
+        ):
+            await run_status(status_args)
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        server = output["servers"][0]
+        assert server["startup_policy"] == "skipped"
+        assert server["startup_skip_reason"] == "missing_auth"
+        assert server["startup_env_var"] == "CONTEXT7_API_KEY"
+
+    @pytest.mark.asyncio
+    async def test_status_verbose_local_fallback_does_not_connect(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Verbose local fallback should not eagerly spawn configured servers."""
+        from pmcp.cli import run_status
+        from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+        status_args.verbose = True
+        config = ResolvedServerConfig(
+            name="configured",
+            source="project",
+            config=LocalMcpServerConfig(command="configured-cmd"),
+        )
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status", new=AsyncMock(return_value=None)
+        ):
+            with patch("pmcp.config.loader.load_configs", return_value=[config]):
+                with patch(
+                    "pmcp.client.manager.ClientManager.connect_all", new=AsyncMock()
+                ) as mock_connect_all:
+                    await run_status(status_args)
+
+        captured = capsys.readouterr()
+        assert "configured" in captured.out
+        assert "lazy" in captured.out
+        mock_connect_all.assert_not_awaited()
 
 
 class TestLogsCommand:
@@ -795,18 +965,27 @@ class TestRunDoctor:
                         {"mcpServers": {"gateway": {"command": "pmcp", "args": []}}},
                     ),
                 ):
-                    with pytest.raises(SystemExit) as exc_info:
-                        await run_doctor(args)
+                    with patch(
+                        "pmcp.cli._probe_http_health",
+                        new=AsyncMock(
+                            return_value=(
+                                True,
+                                "http://127.0.0.1:3344/health reachable",
+                            )
+                        ),
+                    ):
+                        with pytest.raises(SystemExit) as exc_info:
+                            await run_doctor(args)
 
         assert exc_info.value.code == 1
         captured = capsys.readouterr()
         assert "Use remote URL instead of command" in captured.out
 
     @pytest.mark.asyncio
-    async def test_doctor_sse_probe_failure_exits(
+    async def test_doctor_http_probe_reachable_reports_ok(
         self, capsys: pytest.CaptureFixture[str], tmp_path: Path
     ) -> None:
-        """Doctor should fail when configured SSE endpoint is unreachable."""
+        """Doctor should report a named http check when /health is reachable."""
         from pmcp.cli import run_doctor
 
         args = argparse.Namespace(
@@ -817,28 +996,63 @@ class TestRunDoctor:
             with patch("pmcp.cli._is_pmcp_system_service_active", return_value=False):
                 with patch(
                     "pmcp.cli._load_local_mcp_json",
-                    return_value=(
-                        tmp_path / ".mcp.json",
-                        {
-                            "mcpServers": {
-                                "gateway": {
-                                    "type": "sse",
-                                    "url": "http://127.0.0.1:3344/sse",
-                                }
-                            }
-                        },
-                    ),
+                    return_value=(tmp_path / ".mcp.json", {"mcpServers": {}}),
                 ):
                     with patch(
-                        "pmcp.cli._probe_sse_endpoint",
-                        new=AsyncMock(return_value=(False, "connection refused")),
+                        "pmcp.cli._probe_http_health",
+                        new=AsyncMock(
+                            return_value=(
+                                True,
+                                "http://127.0.0.1:3344/health reachable",
+                            )
+                        ),
                     ):
-                        with pytest.raises(SystemExit) as exc_info:
+                        await run_doctor(args)
+
+        captured = capsys.readouterr()
+        assert "[OK] http:" in captured.out
+        assert "/health" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_doctor_http_probe_unreachable_warns_without_secret_leak(
+        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        """Doctor should warn on HTTP reachability without leaking URL credentials."""
+        from pmcp.cli import run_doctor
+
+        args = argparse.Namespace(
+            command="doctor", project=None, timeout=2.0, log_level="warn"
+        )
+
+        with patch.dict(
+            "pmcp.cli.os.environ",
+            {"PMCP_GATEWAY_URL": "http://user:secret-token@127.0.0.1:3344/mcp"},
+        ):
+            with patch("pmcp.cli.Path.home", return_value=tmp_path):
+                with patch(
+                    "pmcp.cli._is_pmcp_system_service_active", return_value=False
+                ):
+                    with patch(
+                        "pmcp.cli._load_local_mcp_json",
+                        return_value=(tmp_path / ".mcp.json", {"mcpServers": {}}),
+                    ):
+                        with patch(
+                            "pmcp.cli._probe_http_health",
+                            new=AsyncMock(
+                                return_value=(
+                                    False,
+                                    "http://127.0.0.1:3344/health "
+                                    "unreachable (ConnectError)",
+                                )
+                            ),
+                        ):
                             await run_doctor(args)
 
-        assert exc_info.value.code == 1
         captured = capsys.readouterr()
-        assert "probe failed" in captured.out
+        assert "[WARN] http:" in captured.out
+        assert "http://127.0.0.1:3344/health" in captured.out
+        assert "secret-token" not in captured.out
+        assert "user:" not in captured.out
 
     @pytest.mark.asyncio
     async def test_doctor_warns_on_missing_remote_header_env(
@@ -875,7 +1089,16 @@ class TestRunDoctor:
                                 },
                             ),
                         ):
-                            await run_doctor(args)
+                            with patch(
+                                "pmcp.cli._probe_http_health",
+                                new=AsyncMock(
+                                    return_value=(
+                                        True,
+                                        "http://127.0.0.1:3344/health reachable",
+                                    )
+                                ),
+                            ):
+                                await run_doctor(args)
 
         captured = capsys.readouterr()
         assert "[WARN] remote:" in captured.out
@@ -920,7 +1143,16 @@ class TestRunDoctor:
                                 },
                             ),
                         ):
-                            await run_doctor(args)
+                            with patch(
+                                "pmcp.cli._probe_http_health",
+                                new=AsyncMock(
+                                    return_value=(
+                                        True,
+                                        "http://127.0.0.1:3344/health reachable",
+                                    )
+                                ),
+                            ):
+                                await run_doctor(args)
 
         captured = capsys.readouterr()
         assert "[WARN] remote:" not in captured.out
@@ -1069,6 +1301,25 @@ class TestGatewayCliRemoteConfig:
         monkeypatch.setenv("PMCP_GATEWAY_URL", "http://gateway.example/mcp")
 
         assert _get_gateway_url() == "http://gateway.example/mcp"
+
+    def test_get_gateway_health_url_derives_health_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """HTTP doctor should probe /health derived from PMCP_GATEWAY_URL."""
+        from pmcp.cli import _get_gateway_health_url
+
+        monkeypatch.setenv("PMCP_GATEWAY_URL", "http://gateway.example:3344/mcp")
+
+        assert _get_gateway_health_url() == "http://gateway.example:3344/health"
+
+    def test_redact_url_credentials_hides_userinfo(self) -> None:
+        """Printed diagnostics should not reveal URL credentials."""
+        from pmcp.cli import _redact_url_credentials
+
+        url = _redact_url_credentials("http://user:secret@gateway.example:3344/health")
+
+        assert url == "http://gateway.example:3344/health"
+        assert "secret" not in url
 
     @pytest.mark.asyncio
     async def test_run_update_exits_when_gateway_connect_fails(

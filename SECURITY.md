@@ -23,7 +23,8 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 
 - Unauthenticated tool invocations via Bearer token guard on `/mcp`
 - Timing oracle attacks on token comparison (`hmac.compare_digest`)
-- Request floods via per-IP sliding-window rate limiting (`--rate-limit`)
+- Request floods via per-source-IP sliding-window rate limiting (`--rate-limit`
+  / `PMCP_RATE_LIMIT`) on `/mcp`
 - Oversized payloads causing OOM (`Content-Length > 10 MB → 413`)
 - Hanging downstream tools consuming connections indefinitely (60 s request timeout)
 - Multiple gateway instances fighting over resources (fcntl singleton lock)
@@ -34,9 +35,14 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 - **No mTLS**: clients are not authenticated by certificate; only Bearer token.
 - **No per-tool ACL on HTTP**: any valid token can invoke any tool. Tool-level policy is
   enforced at the MCP layer, not the HTTP layer.
+- **Rate-limit source IPs may be shared**: localhost clients usually share the
+  same observed source IP, and reverse-proxied clients may share one bucket
+  unless the proxy preserves distinct client IPs for PMCP.
 - **`/health` and `/metrics` are unauthenticated by design**: load balancers and Prometheus
-  scrapers typically cannot present Bearer tokens. Do not expose these endpoints on a public
-  interface without a separate network-layer control (firewall rule, IP allowlist).
+  scrapers typically cannot present Bearer tokens. Bearer auth for `/mcp` does
+  not protect these endpoints. Do not expose them on a public interface without
+  separate network-layer control (firewall rule, IP allowlist, or reverse-proxy
+  policy).
 - **Subprocess spawning**: PMCP forks child processes for downstream MCP servers. A malicious
   MCP server config entry could cause PMCP to spawn arbitrary executables. Only configure
   servers you trust.
@@ -68,7 +74,7 @@ Before exposing PMCP beyond localhost:
 - [ ] Set `PMCP_AUTH_TOKEN` (do not use `--auth-token`; token visible in `ps aux`)
 - [ ] Terminate TLS at your reverse proxy; proxy to `127.0.0.1:3344`
 - [ ] Bind to loopback (`--host 127.0.0.1`, the default)
-- [ ] Set `--rate-limit` appropriate for your traffic (e.g. `60` for 1 req/sec per IP)
+- [ ] Set `--rate-limit` appropriate for your traffic (e.g. `60` for 1 req/sec per observed source IP)
 - [ ] Firewall `/health` and `/metrics` to internal networks only
 - [ ] Run as a non-root user (Docker image already uses `appuser`)
 - [ ] Review downstream MCP server configs — only trust servers you control

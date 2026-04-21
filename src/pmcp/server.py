@@ -27,11 +27,14 @@ from pydantic import AnyUrl
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
+    StartupSkipReason,
+    build_startup_observation_snapshot,
     is_legacy_manifest_auto_start_enabled,
     load_configs,
     load_disabled_auto_start,
     load_enabled_auto_start,
     resolve_startup_configs,
+    summarize_startup_resolution,
 )
 from pmcp.identity import (
     filter_self_references,
@@ -140,6 +143,12 @@ class GatewayServer:
                     result = await self._gateway_tools.invoke(arguments)
                 elif name == "gateway.refresh":
                     result = await self._gateway_tools.refresh(arguments)
+                elif name == "gateway.connect_server":
+                    result = await self._gateway_tools.connect_server(arguments)
+                elif name == "gateway.disconnect_server":
+                    result = await self._gateway_tools.disconnect_server(arguments)
+                elif name == "gateway.restart_server":
+                    result = await self._gateway_tools.restart_server(arguments)
                 elif name == "gateway.health":
                     result = await self._gateway_tools.health()
                 elif name == "gateway.request_capability":
@@ -376,22 +385,37 @@ class GatewayServer:
             is_auth_available=lambda env_var: bool(os.environ.get(env_var)),
             legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
         )
+        self._gateway_tools.set_startup_observations(
+            build_startup_observation_snapshot(resolution)
+        )
 
-        # Log what we're doing
-        logger.info(f"Eager startup servers: {len(resolution.eager_configs)}")
-        logger.info(f"Lazy servers (on-demand): {len(resolution.lazy_configs)}")
-        logger.info(f"Skipped startup entries: {len(resolution.skipped)}")
+        counts = summarize_startup_resolution(resolution)
+        logger.info(
+            "Startup policy summary: "
+            f"eager={counts['eager']}, lazy={counts['lazy']}, "
+            f"skipped={counts['skipped']}, policy_denied={counts['policy_denied']}, "
+            f"missing_auth={counts['missing_auth']}, "
+            f"unknown_auto_start={counts['unknown_auto_start']}"
+        )
         for skipped in resolution.skipped:
-            detail = f" ({skipped.env_var})" if skipped.env_var else ""
-            logger.info(
-                f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
-                f"{skipped.reason.value}{detail}"
-            )
+            if skipped.reason == StartupSkipReason.MISSING_AUTH:
+                logger.info(
+                    f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
+                    f"missing_auth; set {skipped.env_var} to enable eager startup"
+                )
+            elif skipped.reason == StartupSkipReason.UNKNOWN_AUTO_START:
+                logger.info(
+                    f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
+                    "unknown_auto_start; add a matching mcpServers entry or remove it from autoStart"
+                )
+            else:
+                logger.info(
+                    f"Skipping startup entry '{skipped.name}' from {skipped.source}: "
+                    f"{skipped.reason.value}"
+                )
 
         # Kill any orphan processes from a previous PMCP crash before registering servers
-        self._kill_orphan_processes(
-            resolution.lazy_configs + resolution.eager_configs
-        )
+        self._kill_orphan_processes(resolution.lazy_configs + resolution.eager_configs)
 
         # Register lazy configs FIRST (before connecting auto-start)
         self._client_manager.register_lazy_configs(resolution.lazy_configs)

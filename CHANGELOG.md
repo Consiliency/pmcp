@@ -7,13 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- `gateway.connect_server`, `gateway.disconnect_server`, and
+  `gateway.restart_server` provide runtime-only lifecycle controls for known
+  downstream servers with structured status output.
+- `gateway.health` now includes optional startup policy fields for eager, lazy,
+  skipped, policy-denied, missing-auth, and unknown `autoStart` decisions.
+- `pmcp status --verbose` displays live startup policy details when available,
+  including missing-auth environment variable names without exposing secret
+  values.
+- Startup and refresh logs now include concise policy summary counts and
+  actionable messages for unknown `autoStart` and missing-auth skips.
+- `pmcp doctor` now includes a named `http` check that probes gateway `/health`
+  reachability without requiring bearer auth.
+- Bounded multi-client soak coverage now exercises concurrent lazy invokes,
+  same-server single-flight startup, refresh and lifecycle refusal/cancellation,
+  health/list-pending/status visibility, and local HTTP shared-service smoke
+  paths.
+
 ### Changed
+- `gateway.refresh` now refuses by default while downstream requests are pending
+  and reports pending-request counters. Passing `force=true` cancels those
+  requests before refresh proceeds.
+- `gateway.disconnect_server` and `gateway.restart_server` use the same
+  target-server pending-request policy: refuse by default and cancel only that
+  server's pending requests when `force=true`.
 - Packaged manifest entries no longer mark Playwright or Context7 for automatic
   eager startup. Downstream servers remain lazy by default and can be eagerly
   started by adding their names to top-level `.mcp.json` `autoStart`.
 - README and `pmcp setup` guidance now describe the user-owned startup model:
   `mcpServers` provides lazy availability, while `autoStart` opts selected
   servers into eager startup.
+- README and SECURITY now document shared-service HTTP mode, per-source-IP
+  `/mcp` rate-limit buckets, lifecycle disruption behavior, and unauthenticated
+  `/health` and `/metrics` expectations.
 
 ### Migration
 - To restore the previous eager startup behavior for the common browser/docs

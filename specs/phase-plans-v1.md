@@ -223,17 +223,19 @@ Remove or neutralize developer-selected auto-start defaults and document the new
 
 ### Phase 5 — Startup Observability and Polish (OBSERVE)
 
+**Status**: Completed in current working tree.
+
 **Objective**
 
 Improve user visibility into startup policy decisions so users can understand why a server is lazy, eagerly connected, skipped, denied, or failed.
 
 **Exit criteria**
 
-- [ ] `pmcp status --verbose` or gateway health exposes eager/lazy/skipped startup classification.
-- [ ] Logs include concise startup policy summaries.
-- [ ] Unknown `autoStart` entries produce actionable warnings.
-- [ ] Missing-auth eager entries show the env var/auth method without failing gateway startup.
-- [ ] Tests cover status/health output for lazy, eager, skipped, and policy-denied cases.
+- [x] `pmcp status --verbose` or gateway health exposes eager/lazy/skipped startup classification.
+- [x] Logs include concise startup policy summaries.
+- [x] Unknown `autoStart` entries produce actionable warnings.
+- [x] Missing-auth eager entries show the env var/auth method without failing gateway startup.
+- [x] Tests cover status/health output for lazy, eager, skipped, and policy-denied cases.
 
 **Scope notes**
 

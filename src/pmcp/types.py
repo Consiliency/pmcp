@@ -281,6 +281,7 @@ class RefreshInput(BaseModel):
 
     source: Literal["claude_config", "custom"] | None = None
     reason: str | None = None
+    force: bool = False
 
 
 class RefreshOutput(BaseModel):
@@ -292,6 +293,43 @@ class RefreshOutput(BaseModel):
     tools_indexed: int
     revision_id: str
     errors: list[str] | None = None
+    pending_requests_seen: int = 0
+    pending_requests_cancelled: int = 0
+    pending_requests_refused: int = 0
+    pending_requests_remaining: int = 0
+
+
+class ConnectServerInput(BaseModel):
+    """Input for gateway.connect_server."""
+
+    server_name: str = Field(min_length=1, description="Server to connect")
+
+
+class DisconnectServerInput(BaseModel):
+    """Input for gateway.disconnect_server."""
+
+    server_name: str = Field(min_length=1, description="Server to disconnect")
+    force: bool = False
+
+
+class RestartServerInput(BaseModel):
+    """Input for gateway.restart_server."""
+
+    server_name: str = Field(min_length=1, description="Server to restart")
+    force: bool = False
+
+
+class LifecycleServerOutput(BaseModel):
+    """Output for gateway server lifecycle controls."""
+
+    ok: bool
+    server: str
+    action: Literal["connect", "disconnect", "restart"]
+    prior_status: str
+    new_status: str
+    cancelled_request_count: int = 0
+    message: str
+    errors: list[str] | None = None
 
 
 class ServerHealthInfo(BaseModel):
@@ -301,6 +339,10 @@ class ServerHealthInfo(BaseModel):
     status: str
     tool_count: int
     error: str | None = None
+    startup_policy: Literal["eager", "lazy", "skipped", "unknown"] | None = None
+    startup_source: str | None = None
+    startup_skip_reason: str | None = None
+    startup_env_var: str | None = None
 
 
 class HealthOutput(BaseModel):

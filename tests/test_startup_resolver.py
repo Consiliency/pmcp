@@ -112,7 +112,9 @@ def test_configured_server_wins_over_manifest_collision() -> None:
     assert result.eager_configs[0].config.command == "configured-cmd"
 
 
-def test_provisioned_manifest_server_is_lazy_by_default_and_eager_when_enabled() -> None:
+def test_provisioned_manifest_server_is_lazy_by_default_and_eager_when_enabled() -> (
+    None
+):
     manifest = {"playwright": manifest_server("playwright")}
 
     lazy = resolve_startup_configs(

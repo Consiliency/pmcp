@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import pytest
+from mcp.types import CallToolRequest
 
 from pmcp.server import GatewayServer
 from pmcp.types import (
@@ -172,6 +174,48 @@ class TestServerCreation:
 
         with pytest.raises(RuntimeError, match="Server not initialized"):
             server._setup_handlers()
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_tools_are_routed_through_call_tool_handler(self) -> None:
+        """Lifecycle tool names should dispatch through the JSON response path."""
+        server = GatewayServer()
+        server._create_server()
+
+        called: list[str] = []
+
+        async def fake_connect(arguments: dict) -> object:
+            called.append("connect")
+            return {"ok": True, "server": arguments["server_name"]}
+
+        async def fake_disconnect(arguments: dict) -> object:
+            called.append("disconnect")
+            return {"ok": True, "server": arguments["server_name"]}
+
+        async def fake_restart(arguments: dict) -> object:
+            called.append("restart")
+            return {"ok": True, "server": arguments["server_name"]}
+
+        server._gateway_tools.connect_server = fake_connect  # type: ignore[method-assign]
+        server._gateway_tools.disconnect_server = fake_disconnect  # type: ignore[method-assign]
+        server._gateway_tools.restart_server = fake_restart  # type: ignore[method-assign]
+
+        assert server._server is not None
+        handler = server._server.request_handlers[CallToolRequest]
+
+        for tool_name in [
+            "gateway.connect_server",
+            "gateway.disconnect_server",
+            "gateway.restart_server",
+        ]:
+            result = await handler(
+                CallToolRequest(
+                    params={"name": tool_name, "arguments": {"server_name": "test"}}
+                )
+            )
+            payload = json.loads(result.root.content[0].text)
+            assert payload == {"ok": True, "server": "test"}
+
+        assert called == ["connect", "disconnect", "restart"]
 
 
 class TestPolicyIntegration:

@@ -7,9 +7,39 @@ from typing import TYPE_CHECKING, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from starlette.testclient import TestClient
+
+from pmcp import __version__
 
 if TYPE_CHECKING:
     pass
+
+
+def _make_contract_client(
+    auth_token: str | None = None,
+    rate_limit_rpm: int = 0,
+) -> TestClient:
+    """Create a minimal HTTP app client for route contract tests."""
+    from pmcp.transport.http import create_http_app
+
+    mock_server = MagicMock()
+    mock_server.create_initialization_options = MagicMock(return_value={})
+
+    with patch(
+        "pmcp.transport.http.StreamableHTTPSessionManager",
+        autospec=True,
+    ) as mock_manager:
+        instance = mock_manager.return_value
+        instance.run.return_value.__aenter__ = AsyncMock(return_value=None)
+        instance.run.return_value.__aexit__ = AsyncMock(return_value=False)
+        instance.handle_request = AsyncMock(return_value=None)
+
+        app = create_http_app(
+            mock_server,
+            auth_token=auth_token,
+            rate_limit_rpm=rate_limit_rpm,
+        )
+        return TestClient(app, raise_server_exceptions=False)
 
 
 class TestGatewayTransportType:
@@ -212,6 +242,65 @@ class TestHttpTransportRoutes:
                 if hasattr(route, "methods"):
                     assert "GET" in route.methods
                     assert "POST" in route.methods
+
+
+class TestHttpObservabilityContracts:
+    """Operational HTTP route contracts for shared-service mode."""
+
+    def test_health_is_unauthenticated_with_auth_token(self) -> None:
+        client = _make_contract_client(auth_token="secret")
+
+        response = client.get("/health")
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "ok": True,
+            "version": __version__,
+            "transport": "http",
+        }
+
+    def test_metrics_is_unauthenticated_with_auth_token(self) -> None:
+        client = _make_contract_client(auth_token="secret")
+
+        response = client.get("/metrics")
+
+        assert response.status_code == 200
+        assert "pmcp_requests_total" in response.text
+
+    def test_auth_token_applies_to_mcp_only(self) -> None:
+        client = _make_contract_client(auth_token="secret")
+
+        response = client.post("/mcp", content=b"{}")
+
+        assert response.status_code == 401
+
+    def test_smoke_health_metrics_and_authenticated_mcp_initialized(self) -> None:
+        client = _make_contract_client(auth_token="secret")
+        headers = {"Authorization": "Bearer secret"}
+
+        health = client.get("/health")
+        metrics = client.get("/metrics")
+        initialized = client.post(
+            "/mcp",
+            headers=headers,
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        assert health.status_code == 200
+        assert health.json()["ok"] is True
+        assert metrics.status_code == 200
+        assert "pmcp_requests_total" in metrics.text
+        assert initialized.status_code == 202
+
+    def test_rate_limit_uses_one_bucket_for_same_client_ip(self) -> None:
+        from pmcp.transport import http as http_mod
+
+        http_mod._rl_store.clear()
+        client = _make_contract_client(rate_limit_rpm=2)
+
+        statuses = [client.post("/mcp", content=b"{}").status_code for _ in range(3)]
+
+        assert 429 in statuses
 
 
 class TestHttpTransportIntegration:

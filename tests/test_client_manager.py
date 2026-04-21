@@ -19,11 +19,15 @@ from pmcp.client.manager import (
     _truncate_description,
 )
 from pmcp.types import (
+    LocalMcpServerConfig,
+    PromptInfo,
     RemoteMcpServerConfig,
+    ResourceInfo,
     ResolvedServerConfig,
     RiskHint,
     ServerStatus,
     ServerStatusEnum,
+    ToolInfo,
 )
 
 
@@ -256,6 +260,201 @@ class TestDisconnectAll:
         assert manager._clients == {}
         assert manager._servers == {}
         mock_warning.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_disconnect_all_uses_stable_client_snapshot(self) -> None:
+        """disconnect_all should not iterate a live _clients view while awaiting."""
+        manager = ClientManager()
+
+        process = MagicMock()
+        process.returncode = None
+        process.terminate = MagicMock()
+        process.kill = MagicMock()
+
+        async def wait_with_mutation() -> int:
+            manager._clients["late"] = ManagedClient(
+                config=MagicMock(),
+                status=ServerStatus(
+                    name="late", status=ServerStatusEnum.ONLINE, tool_count=0
+                ),
+            )
+            await asyncio.sleep(0)
+            return 0
+
+        process.wait = AsyncMock(side_effect=wait_with_mutation)
+        status = ServerStatus(name="test", status=ServerStatusEnum.ONLINE, tool_count=0)
+        manager._clients["test"] = ManagedClient(
+            config=MagicMock(), process=process, status=status
+        )
+        manager._servers["test"] = status
+
+        await manager.disconnect_all()
+
+        assert manager._clients == {}
+        assert manager._servers == {}
+
+
+class TestTargetServerLifecycle:
+    """Tests for target-server lifecycle helpers."""
+
+    def _add_client(self, manager: ClientManager, name: str) -> ManagedClient:
+        process = MagicMock()
+        process.returncode = None
+        process.terminate = MagicMock()
+        process.kill = MagicMock()
+        process.wait = AsyncMock(return_value=0)
+        status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=1)
+        config = ResolvedServerConfig(
+            name=name,
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        managed = ManagedClient(config=config, process=process, status=status)
+        manager._clients[name] = managed
+        manager._servers[name] = status
+        manager._tools[f"{name}::tool"] = ToolInfo(
+            tool_id=f"{name}::tool",
+            server_name=name,
+            tool_name="tool",
+            description="tool",
+            short_description="tool",
+            input_schema={},
+            tags=[],
+            risk_hint=RiskHint.LOW,
+        )
+        manager._resources[f"{name}::resource"] = ResourceInfo(
+            resource_id=f"{name}::resource",
+            server_name=name,
+            uri=f"{name}:resource",
+        )
+        manager._prompts[f"{name}::prompt"] = PromptInfo(
+            prompt_id=f"{name}::prompt",
+            server_name=name,
+            name="prompt",
+        )
+        return managed
+
+    def _add_pending(
+        self, managed: ManagedClient, request_id: int = 1
+    ) -> asyncio.Future[Any]:
+        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        managed.pending_requests[request_id] = PendingRequest(
+            request_id=request_id,
+            server_name=managed.config.name,
+            tool_id=f"{managed.config.name}::tool",
+            started_at=time.time(),
+            last_heartbeat=time.time(),
+            timeout_ms=30000,
+            future=future,
+        )
+        managed.status.pending_request_count = len(managed.pending_requests)
+        return future
+
+    @pytest.mark.asyncio
+    async def test_disconnect_server_removes_only_target_indexes(self) -> None:
+        manager = ClientManager()
+        target = self._add_client(manager, "target")
+        other = self._add_client(manager, "other")
+
+        disconnected, cancelled, error = await manager.disconnect_server("target")
+
+        assert disconnected is True
+        assert cancelled == 0
+        assert error is None
+        assert target.process is not None
+        target.process.terminate.assert_called_once()
+        assert "target" not in manager._clients
+        assert "other" in manager._clients
+        assert manager._clients["other"] is other
+        assert "target::tool" not in manager._tools
+        assert "target::resource" not in manager._resources
+        assert "target::prompt" not in manager._prompts
+        assert "other::tool" in manager._tools
+        assert "other::resource" in manager._resources
+        assert "other::prompt" in manager._prompts
+
+    @pytest.mark.asyncio
+    async def test_disconnect_server_refuses_pending_without_force(self) -> None:
+        manager = ClientManager()
+        managed = self._add_client(manager, "target")
+        future = self._add_pending(managed)
+
+        disconnected, cancelled, error = await manager.disconnect_server("target")
+
+        assert disconnected is False
+        assert cancelled == 0
+        assert error is not None
+        assert "pending requests" in error
+        assert future.cancelled() is False
+        assert "target" in manager._clients
+
+    @pytest.mark.asyncio
+    async def test_force_disconnect_cancels_only_target_pending_requests(self) -> None:
+        manager = ClientManager()
+        target = self._add_client(manager, "target")
+        other = self._add_client(manager, "other")
+        target_future = self._add_pending(target)
+        other_future = self._add_pending(other)
+
+        disconnected, cancelled, error = await manager.disconnect_server(
+            "target", force=True
+        )
+
+        assert disconnected is True
+        assert error is None
+        assert cancelled == 1
+        assert target_future.cancelled()
+        assert other_future.cancelled() is False
+        assert manager.get_pending_requests("target") == []
+        assert len(manager.get_pending_requests("other")) == 1
+
+    @pytest.mark.asyncio
+    async def test_restart_server_disconnects_before_singleflight_connect(self) -> None:
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="target",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        events: list[str] = []
+
+        async def disconnect(
+            name: str, force: bool = False
+        ) -> tuple[bool, int, str | None]:
+            events.append(f"disconnect:{name}:{force}")
+            return (True, 0, None)
+
+        async def connect(
+            config: ResolvedServerConfig, retry: bool = True
+        ) -> list[str]:
+            events.append(f"connect:{config.name}:{retry}")
+            return []
+
+        manager.disconnect_server = disconnect  # type: ignore[method-assign]
+        manager.connect_server = connect  # type: ignore[method-assign]
+
+        ok, cancelled, errors = await manager.restart_server(config, force=True)
+
+        assert ok is True
+        assert cancelled == 0
+        assert errors == []
+        assert events == ["disconnect:target:True", "connect:target:True"]
+
+    @pytest.mark.asyncio
+    async def test_disconnect_server_preserves_lazy_status_for_known_config(
+        self,
+    ) -> None:
+        manager = ClientManager()
+        self._add_client(manager, "target")
+
+        disconnected, _cancelled, _error = await manager.disconnect_server("target")
+
+        assert disconnected is True
+        assert manager.is_lazy_server("target") is True
+        status = manager.get_server_status("target")
+        assert status is not None
+        assert status.status == ServerStatusEnum.LAZY
+        assert await manager.ensure_connected("target") is False
 
 
 class TestRemoteSendRequest:
@@ -785,6 +984,409 @@ class TestParallelConnections:
         assert len(errors) == 1
         assert "fail" in errors[0]
         assert "Connection failed" in errors[0]
+
+    @pytest.mark.asyncio
+    async def test_connect_all_deduplicates_same_name_configs(self) -> None:
+        """Duplicate server names should share one connection attempt."""
+        manager = ClientManager()
+        calls: list[str] = []
+
+        async def mock_connect(config: ResolvedServerConfig) -> None:
+            calls.append(config.name)
+            await asyncio.sleep(0.05)
+
+        manager._connect_server = mock_connect  # type: ignore[method-assign]
+        same_a = ResolvedServerConfig(
+            name="same",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        same_b = ResolvedServerConfig(
+            name="same",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        other = ResolvedServerConfig(
+            name="other",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+
+        start = time.time()
+        errors = await manager.connect_all([same_a, same_b, other], retry=False)
+
+        assert errors == []
+        assert sorted(calls) == ["other", "same"]
+        assert time.time() - start < 0.09
+
+    @pytest.mark.asyncio
+    async def test_concurrent_connect_all_calls_share_same_server_attempt(self) -> None:
+        """Concurrent callers for one server should observe the same connect task."""
+        manager = ClientManager()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+        config = ResolvedServerConfig(
+            name="shared",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+
+        async def mock_connect(config: ResolvedServerConfig) -> None:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            manager._servers[config.name] = ServerStatus(
+                name=config.name,
+                status=ServerStatusEnum.ONLINE,
+                tool_count=0,
+            )
+
+        manager._connect_server = mock_connect  # type: ignore[method-assign]
+
+        first = asyncio.create_task(manager.connect_all([config], retry=False))
+        second = asyncio.create_task(manager.connect_all([config], retry=False))
+        await started.wait()
+        release.set()
+
+        assert await first == []
+        assert await second == []
+        assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_soak_concurrent_lazy_invokes_share_one_connect_attempt(self) -> None:
+        """Bounded concurrent lazy users should share one downstream startup."""
+        manager = ClientManager()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+        config = ResolvedServerConfig(
+            name="lazy",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        manager.register_lazy_configs([config])
+
+        async def mock_connect(config: ResolvedServerConfig) -> None:
+            nonlocal calls
+            calls += 1
+            started.set()
+            await release.wait()
+            process = MagicMock()
+            process.returncode = None
+            manager._clients[config.name] = ManagedClient(
+                config=config,
+                process=process,
+                status=ServerStatus(
+                    name=config.name,
+                    status=ServerStatusEnum.ONLINE,
+                    tool_count=1,
+                ),
+            )
+            manager._servers[config.name] = manager._clients[config.name].status
+            manager._tools[f"{config.name}::echo"] = ToolInfo(
+                tool_id=f"{config.name}::echo",
+                server_name=config.name,
+                tool_name="echo",
+                description="Echo",
+                short_description="Echo",
+                input_schema={},
+                tags=[],
+                risk_hint=RiskHint.LOW,
+            )
+
+        async def mock_send_request(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            tool_id: str = "",
+            timeout_ms: int = 30000,
+        ) -> dict[str, Any]:
+            return {"content": [{"type": "text", "text": params["name"]}]}
+
+        manager._connect_server = mock_connect  # type: ignore[method-assign]
+        manager._send_request = mock_send_request  # type: ignore[method-assign]
+
+        async def client_call() -> Any:
+            assert await manager.ensure_connected("lazy") is True
+            return await manager.call_tool("lazy::echo", {}, timeout_ms=1000)
+
+        tasks = [asyncio.create_task(client_call()) for _ in range(5)]
+        await started.wait()
+        assert calls == 1
+        release.set()
+
+        results = await asyncio.gather(*tasks)
+
+        assert calls == 1
+        assert len(results) == 5
+        assert manager.is_server_online("lazy") is True
+        assert manager.is_lazy_server("lazy") is False
+
+    @pytest.mark.asyncio
+    async def test_soak_active_tool_call_refuses_default_disconnect(self) -> None:
+        """Pending request visibility should stay stable during refused lifecycle."""
+        manager = ClientManager()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        config = ResolvedServerConfig(
+            name="active",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        process = MagicMock()
+        process.returncode = None
+        status = ServerStatus(
+            name="active", status=ServerStatusEnum.ONLINE, tool_count=1
+        )
+        managed = ManagedClient(config=config, process=process, status=status)
+        manager._clients["active"] = managed
+        manager._servers["active"] = status
+        manager._tools["active::echo"] = ToolInfo(
+            tool_id="active::echo",
+            server_name="active",
+            tool_name="echo",
+            description="Echo",
+            short_description="Echo",
+            input_schema={},
+            tags=[],
+            risk_hint=RiskHint.LOW,
+        )
+
+        async def mock_send_request(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            tool_id: str = "",
+            timeout_ms: int = 30000,
+        ) -> dict[str, Any]:
+            future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+            pending = PendingRequest(
+                request_id=7,
+                server_name="active",
+                tool_id=tool_id,
+                started_at=time.time(),
+                last_heartbeat=time.time(),
+                timeout_ms=timeout_ms,
+                future=future,
+            )
+            managed.pending_requests[7] = pending
+            managed.status.pending_request_count = len(managed.pending_requests)
+            started.set()
+            await release.wait()
+            future.set_result({"ok": True})
+            managed.pending_requests.pop(7, None)
+            managed.status.pending_request_count = len(managed.pending_requests)
+            return {"content": [{"type": "text", "text": "ok"}]}
+
+        manager._send_request = mock_send_request  # type: ignore[method-assign]
+
+        call = asyncio.create_task(
+            manager.call_tool("active::echo", {}, timeout_ms=30000)
+        )
+        await started.wait()
+
+        pending = manager.get_pending_requests("active")
+        assert [p.request_id for p in pending] == [7]
+        disconnected, cancelled, error = await manager.disconnect_server("active")
+
+        assert disconnected is False
+        assert cancelled == 0
+        assert error is not None
+        assert "pending requests" in error
+        assert manager.get_pending_requests("active")[0].request_id == 7
+        assert process.terminate.call_count == 0
+
+        release.set()
+        assert await call == {"content": [{"type": "text", "text": "ok"}]}
+        assert manager.get_pending_requests("active") == []
+
+    @pytest.mark.asyncio
+    async def test_refresh_serializes_disconnect_and_connect_cycles(self) -> None:
+        """Concurrent refresh calls should not interleave lifecycle replacement."""
+        manager = ClientManager()
+        active = 0
+        max_active = 0
+        events: list[str] = []
+
+        async def disconnect() -> None:
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            events.append("disconnect:start")
+            await asyncio.sleep(0.01)
+            events.append("disconnect:end")
+            active -= 1
+
+        async def connect(configs: list[ResolvedServerConfig]) -> list[str]:
+            events.append("connect:start")
+            await asyncio.sleep(0.01)
+            events.append("connect:end")
+            return []
+
+        manager._disconnect_all_unlocked = disconnect  # type: ignore[method-assign]
+        manager.connect_all = connect  # type: ignore[method-assign]
+
+        await asyncio.gather(manager.refresh([]), manager.refresh([]))
+
+        assert max_active == 1
+        assert events == [
+            "disconnect:start",
+            "disconnect:end",
+            "connect:start",
+            "connect:end",
+            "disconnect:start",
+            "disconnect:end",
+            "connect:start",
+            "connect:end",
+        ]
+
+    def test_snapshot_methods_return_new_collection_containers(self) -> None:
+        """Read methods should not expose manager-owned collection containers."""
+        manager = ClientManager()
+        manager._tools["server::tool"] = ToolInfo(
+            tool_id="server::tool",
+            server_name="server",
+            tool_name="tool",
+            description="tool",
+            short_description="tool",
+            input_schema={},
+            tags=[],
+            risk_hint=RiskHint.LOW,
+        )
+        manager._resources["server::resource"] = ResourceInfo(
+            resource_id="server::resource",
+            server_name="server",
+            uri="resource",
+        )
+        manager._prompts["server::prompt"] = PromptInfo(
+            prompt_id="server::prompt",
+            server_name="server",
+            name="prompt",
+        )
+        manager._servers["server"] = ServerStatus(
+            name="server", status=ServerStatusEnum.LAZY, tool_count=0
+        )
+        manager._lazy_configs["server"] = ResolvedServerConfig(
+            name="server",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+
+        manager.get_all_tools().clear()
+        manager.get_all_resources().clear()
+        manager.get_all_prompts().clear()
+        manager.get_all_server_statuses().clear()
+        manager.get_lazy_server_names().clear()
+
+        assert len(manager._tools) == 1
+        assert len(manager._resources) == 1
+        assert len(manager._prompts) == 1
+        assert len(manager._servers) == 1
+        assert len(manager._lazy_configs) == 1
+
+    @pytest.mark.asyncio
+    async def test_get_pending_requests_returns_stable_list_snapshot(self) -> None:
+        """Pending request snapshots should not expose the manager-owned list."""
+        manager = ClientManager()
+        status = ServerStatus(
+            name="server", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+        managed = ManagedClient(config=MagicMock(), status=status)
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        pending = PendingRequest(
+            request_id=1,
+            server_name="server",
+            tool_id="server::tool",
+            started_at=time.time(),
+            last_heartbeat=time.time(),
+            timeout_ms=30000,
+            future=future,
+        )
+        managed.pending_requests[1] = pending
+        manager._clients["server"] = managed
+
+        snapshot = manager.get_pending_requests()
+        snapshot.clear()
+
+        assert len(manager._clients["server"].pending_requests) == 1
+        assert manager.get_pending_requests() == [pending]
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_pending_requests_cancels_and_clears_each_client(
+        self,
+    ) -> None:
+        """Bulk cancellation should clear all client pending registries."""
+        manager = ClientManager()
+        for name in ("one", "two"):
+            status = ServerStatus(
+                name=name, status=ServerStatusEnum.ONLINE, tool_count=0
+            )
+            managed = ManagedClient(config=MagicMock(), status=status)
+            future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+            managed.pending_requests[1] = PendingRequest(
+                request_id=1,
+                server_name=name,
+                tool_id=f"{name}::tool",
+                started_at=time.time(),
+                last_heartbeat=time.time(),
+                timeout_ms=30000,
+                future=future,
+            )
+            managed.status.pending_request_count = 1
+            manager._clients[name] = managed
+
+        cancelled = manager.cancel_all_pending_requests()
+
+        assert cancelled == 2
+        for managed in manager._clients.values():
+            assert managed.pending_requests == {}
+            assert managed.status.pending_request_count == 0
+
+    @pytest.mark.asyncio
+    async def test_cancel_all_pending_requests_removes_completed_without_counting(
+        self,
+    ) -> None:
+        """Completed futures should be removed without inflating cancelled count."""
+        manager = ClientManager()
+        status = ServerStatus(
+            name="server", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+        managed = ManagedClient(config=MagicMock(), status=status)
+        pending_future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        completed_future: asyncio.Future[Any] = (
+            asyncio.get_running_loop().create_future()
+        )
+        completed_future.set_result("done")
+        managed.pending_requests[1] = PendingRequest(
+            request_id=1,
+            server_name="server",
+            tool_id="server::pending",
+            started_at=time.time(),
+            last_heartbeat=time.time(),
+            timeout_ms=30000,
+            future=pending_future,
+        )
+        managed.pending_requests[2] = PendingRequest(
+            request_id=2,
+            server_name="server",
+            tool_id="server::done",
+            started_at=time.time(),
+            last_heartbeat=time.time(),
+            timeout_ms=30000,
+            future=completed_future,
+        )
+        managed.status.pending_request_count = 2
+        manager._clients["server"] = managed
+
+        cancelled = manager.cancel_all_pending_requests()
+
+        assert cancelled == 1
+        assert pending_future.cancelled()
+        assert completed_future.result() == "done"
+        assert managed.pending_requests == {}
+        assert managed.status.pending_request_count == 0
 
 
 class TestConnectionRetry:

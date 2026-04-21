@@ -58,6 +58,72 @@ class StartupResolution:
     skipped: list[StartupSkip]
 
 
+@dataclass(frozen=True)
+class StartupObservation:
+    """Observed startup policy details for health/status output."""
+
+    name: str
+    startup_policy: Literal["eager", "lazy", "skipped", "unknown"]
+    startup_source: str | None = None
+    startup_skip_reason: str | None = None
+    startup_env_var: str | None = None
+
+
+StartupObservationSnapshot = dict[str, StartupObservation]
+
+
+def build_startup_observation_snapshot(
+    resolution: StartupResolution,
+) -> StartupObservationSnapshot:
+    """Convert a startup resolution into a name-keyed observation snapshot."""
+    snapshot: StartupObservationSnapshot = {}
+    for config in resolution.eager_configs:
+        snapshot[config.name] = StartupObservation(
+            name=config.name,
+            startup_policy="eager",
+            startup_source=config.source,
+        )
+    for config in resolution.lazy_configs:
+        snapshot[config.name] = StartupObservation(
+            name=config.name,
+            startup_policy="lazy",
+            startup_source=config.source,
+        )
+    for skipped in resolution.skipped:
+        snapshot[skipped.name] = StartupObservation(
+            name=skipped.name,
+            startup_policy="skipped",
+            startup_source=skipped.source,
+            startup_skip_reason=skipped.reason.value,
+            startup_env_var=skipped.env_var,
+        )
+    return snapshot
+
+
+def summarize_startup_resolution(resolution: StartupResolution) -> dict[str, int]:
+    """Return concise counters for startup/refresh policy logs."""
+    return {
+        "eager": len(resolution.eager_configs),
+        "lazy": len(resolution.lazy_configs),
+        "skipped": len(resolution.skipped),
+        "policy_denied": sum(
+            1
+            for skipped in resolution.skipped
+            if skipped.reason == StartupSkipReason.POLICY_DENIED
+        ),
+        "missing_auth": sum(
+            1
+            for skipped in resolution.skipped
+            if skipped.reason == StartupSkipReason.MISSING_AUTH
+        ),
+        "unknown_auto_start": sum(
+            1
+            for skipped in resolution.skipped
+            if skipped.reason == StartupSkipReason.UNKNOWN_AUTO_START
+        ),
+    }
+
+
 def _coerce_server_entry(config: object) -> dict[str, Any] | None:
     """Coerce legacy MCP server entries into typed local/remote records."""
     if not isinstance(config, dict):

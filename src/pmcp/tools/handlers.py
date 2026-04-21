@@ -23,12 +23,16 @@ from pmcp import __version__ as PMCP_VERSION
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
+    StartupObservationSnapshot,
+    StartupSkipReason,
+    build_startup_observation_snapshot,
     is_legacy_manifest_auto_start_enabled,
     load_configs,
     load_disabled_auto_start,
     load_enabled_auto_start,
     manifest_server_to_config,
     resolve_startup_configs,
+    summarize_startup_resolution,
 )
 from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.identity import filter_self_references
@@ -65,6 +69,10 @@ from pmcp.types import (
     InvokeInput,
     InvokeOutput,
     InvokeTemplate,
+    ConnectServerInput,
+    DisconnectServerInput,
+    RestartServerInput,
+    LifecycleServerOutput,
     ListPendingInput,
     ListPendingOutput,
     PendingRequestInfo,
@@ -223,7 +231,8 @@ def get_gateway_tool_definitions() -> list[Tool]:
             name="gateway.refresh",
             description=(
                 "Reload backend MCP server configurations and reconnect. "
-                "Use this when new MCP servers have been configured or to recover from connection errors."
+                "Use this when new MCP servers have been configured or to recover from connection errors. "
+                "Refuses by default while downstream requests are pending; set force=true to cancel them."
             ),
             inputSchema={
                 "type": "object",
@@ -237,7 +246,73 @@ def get_gateway_tool_definitions() -> list[Tool]:
                         "type": "string",
                         "description": "Reason for refresh (for logging)",
                     },
+                    "force": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Cancel pending downstream requests before refreshing",
+                    },
                 },
+            },
+        ),
+        Tool(
+            name="gateway.connect_server",
+            description=(
+                "Connect or start a known downstream MCP server by name. "
+                "Resolves configured, provisioned manifest, and registered discovered servers."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Name of the server to connect",
+                    },
+                },
+                "required": ["server_name"],
+            },
+        ),
+        Tool(
+            name="gateway.disconnect_server",
+            description=(
+                "Disconnect a running downstream MCP server without changing persistent config. "
+                "Refuses by default when that server has pending requests; set force=true to cancel them."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Name of the server to disconnect",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Cancel this server's pending requests before disconnecting",
+                    },
+                },
+                "required": ["server_name"],
+            },
+        ),
+        Tool(
+            name="gateway.restart_server",
+            description=(
+                "Restart a known downstream MCP server without changing persistent config. "
+                "Refuses by default when that server has pending requests; set force=true to cancel them."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Name of the server to restart",
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Cancel this server's pending requests before restarting",
+                    },
+                },
+                "required": ["server_name"],
             },
         ),
         Tool(
@@ -552,6 +627,13 @@ class GatewayTools:
         self._provisioned_registry: dict[str, str | None] = (
             self._load_provisioned_registry()
         )
+        self._startup_observations: StartupObservationSnapshot = {}
+
+    def set_startup_observations(
+        self, observations: StartupObservationSnapshot
+    ) -> None:
+        """Replace startup policy observations used by gateway.health."""
+        self._startup_observations = dict(observations)
 
     @staticmethod
     def _sanitize_error(e: Exception) -> str:
@@ -1138,6 +1220,8 @@ class GatewayTools:
         parsed = RefreshInput.model_validate(input_data)
 
         logger.info(f"Refresh requested: {parsed.reason or 'manual refresh'}")
+        pending_seen = 0
+        pending_cancelled = 0
 
         try:
             configs = load_configs(
@@ -1181,19 +1265,71 @@ class GatewayTools:
                 legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
             )
 
-            logger.info(f"Refresh eager servers: {len(resolution.eager_configs)}")
-            logger.info(f"Refresh lazy servers: {len(resolution.lazy_configs)}")
-            logger.info(f"Refresh skipped entries: {len(resolution.skipped)}")
+            counts = summarize_startup_resolution(resolution)
+            logger.info(
+                "Refresh policy summary: "
+                f"eager={counts['eager']}, lazy={counts['lazy']}, "
+                f"skipped={counts['skipped']}, "
+                f"policy_denied={counts['policy_denied']}, "
+                f"missing_auth={counts['missing_auth']}, "
+                f"unknown_auto_start={counts['unknown_auto_start']}"
+            )
             for skipped in resolution.skipped:
-                detail = f" ({skipped.env_var})" if skipped.env_var else ""
-                logger.info(
-                    f"Skipping refresh entry '{skipped.name}' from {skipped.source}: "
-                    f"{skipped.reason.value}{detail}"
+                if skipped.reason == StartupSkipReason.MISSING_AUTH:
+                    logger.info(
+                        f"Skipping refresh entry '{skipped.name}' from {skipped.source}: "
+                        f"missing_auth; set {skipped.env_var} to enable eager startup"
+                    )
+                elif skipped.reason == StartupSkipReason.UNKNOWN_AUTO_START:
+                    logger.info(
+                        f"Skipping refresh entry '{skipped.name}' from {skipped.source}: "
+                        "unknown_auto_start; add a matching mcpServers entry or remove it from autoStart"
+                    )
+                else:
+                    logger.info(
+                        f"Skipping refresh entry '{skipped.name}' from {skipped.source}: "
+                        f"{skipped.reason.value}"
+                    )
+
+            pending_requests = self._client_manager.get_pending_requests()
+            pending_seen = len(pending_requests)
+            if pending_seen and not parsed.force:
+                revision_id, _ = self._client_manager.get_registry_meta()
+                statuses = self._client_manager.get_all_server_statuses()
+                logger.warning(
+                    f"Refresh refused with {pending_seen} pending downstream requests"
+                )
+                return RefreshOutput(
+                    ok=False,
+                    servers_seen=len(statuses),
+                    servers_online=sum(
+                        1 for s in statuses if s.status.value == "online"
+                    ),
+                    tools_indexed=len(self._client_manager.get_all_tools()),
+                    revision_id=revision_id,
+                    errors=[
+                        "Refresh refused because downstream requests are pending. "
+                        "Use gateway.list_pending to inspect them or retry with force=true "
+                        "to cancel them before refreshing."
+                    ],
+                    pending_requests_seen=pending_seen,
+                    pending_requests_refused=pending_seen,
+                    pending_requests_remaining=pending_seen,
                 )
 
+            if pending_seen:
+                pending_cancelled = self._client_manager.cancel_all_pending_requests()
+                logger.warning(
+                    f"Forced refresh cancelled {pending_cancelled} pending downstream requests"
+                )
+
+            self.set_startup_observations(
+                build_startup_observation_snapshot(resolution)
+            )
             await self._client_manager.disconnect_all()
             self._client_manager.register_lazy_configs(resolution.lazy_configs)
             errors = await self._client_manager.connect_all(resolution.eager_configs)
+            pending_remaining = len(self._client_manager.get_pending_requests())
 
             revision_id, _ = self._client_manager.get_registry_meta()
             statuses = self._client_manager.get_all_server_statuses()
@@ -1210,6 +1346,9 @@ class GatewayTools:
                 tools_indexed=len(self._client_manager.get_all_tools()),
                 revision_id=revision_id,
                 errors=errors if errors else None,
+                pending_requests_seen=pending_seen,
+                pending_requests_cancelled=pending_cancelled,
+                pending_requests_remaining=pending_remaining,
             )
 
         except Exception as e:
@@ -1220,37 +1359,184 @@ class GatewayTools:
                 tools_indexed=0,
                 revision_id="error",
                 errors=[str(e)],
+                pending_requests_seen=pending_seen,
+                pending_requests_cancelled=pending_cancelled,
             )
 
     async def health(self) -> HealthOutput:
         """gateway.health - Get gateway health status."""
         revision_id, last_refresh_ts = self._client_manager.get_registry_meta()
         statuses = self._client_manager.get_all_server_statuses()
-        known_names = {s.name for s in statuses}
+        servers: list[ServerHealthInfo] = []
+
+        for status in statuses:
+            info = ServerHealthInfo(
+                name=status.name,
+                status=status.status.value,
+                tool_count=status.tool_count,
+                error=status.last_error
+                if status.status.value == "error" and status.last_error
+                else None,
+            )
+            observation = self._startup_observations.get(status.name)
+            if observation:
+                info.startup_policy = observation.startup_policy
+                info.startup_source = observation.startup_source
+                info.startup_skip_reason = observation.startup_skip_reason
+                info.startup_env_var = observation.startup_env_var
+            servers.append(info)
+
+        known_names = {s.name for s in servers}
 
         # Include provisioned servers that are not currently tracked (e.g. after restart)
         provisioned = self._load_provisioned_registry()
-        extra = [
-            ServerHealthInfo(name=prov_name, status="offline", tool_count=0)
-            for prov_name in provisioned
-            if prov_name not in known_names
-        ]
+        for prov_name in provisioned:
+            if prov_name in known_names:
+                continue
+            info = ServerHealthInfo(name=prov_name, status="offline", tool_count=0)
+            observation = self._startup_observations.get(prov_name)
+            if observation:
+                info.startup_policy = observation.startup_policy
+                info.startup_source = observation.startup_source
+                info.startup_skip_reason = observation.startup_skip_reason
+                info.startup_env_var = observation.startup_env_var
+            servers.append(info)
+            known_names.add(prov_name)
+
+        for name, observation in self._startup_observations.items():
+            if name in known_names or observation.startup_policy != "skipped":
+                continue
+            servers.append(
+                ServerHealthInfo(
+                    name=name,
+                    status="offline",
+                    tool_count=0,
+                    startup_policy=observation.startup_policy,
+                    startup_source=observation.startup_source,
+                    startup_skip_reason=observation.startup_skip_reason,
+                    startup_env_var=observation.startup_env_var,
+                )
+            )
 
         return HealthOutput(
             revision_id=revision_id,
-            servers=[
-                ServerHealthInfo(
-                    name=s.name,
-                    status=s.status.value,
-                    tool_count=s.tool_count,
-                    error=s.last_error
-                    if s.status.value == "error" and s.last_error
-                    else None,
-                )
-                for s in statuses
-            ]
-            + extra,
+            servers=servers,
             last_refresh_ts=last_refresh_ts,
+        )
+
+    async def connect_server(self, input_data: dict[str, Any]) -> LifecycleServerOutput:
+        """gateway.connect_server - Connect one known server."""
+        parsed = ConnectServerInput.model_validate(input_data)
+        server_name = parsed.server_name
+        prior_status = self._status_value(server_name)
+
+        config, failure = self._resolve_lifecycle_config(
+            server_name, action="connect", prior_status=prior_status
+        )
+        if failure is not None:
+            return failure
+        if config is None:
+            return self._lifecycle_output(
+                ok=False,
+                server=server_name,
+                action="connect",
+                prior_status=prior_status,
+                message=f"Server '{server_name}' could not be resolved.",
+                errors=[f"Unable to resolve server: {server_name}"],
+            )
+
+        if self._client_manager.is_server_online(server_name):
+            return self._lifecycle_output(
+                ok=True,
+                server=server_name,
+                action="connect",
+                prior_status=prior_status,
+                message=f"Server '{server_name}' is already online.",
+            )
+
+        errors = await self._client_manager.connect_server(config)
+        return self._lifecycle_output(
+            ok=not errors,
+            server=server_name,
+            action="connect",
+            prior_status=prior_status,
+            message=f"Server '{server_name}' connected."
+            if not errors
+            else f"Server '{server_name}' could not be connected.",
+            errors=errors or None,
+        )
+
+    async def disconnect_server(
+        self, input_data: dict[str, Any]
+    ) -> LifecycleServerOutput:
+        """gateway.disconnect_server - Disconnect one known server."""
+        parsed = DisconnectServerInput.model_validate(input_data)
+        server_name = parsed.server_name
+        prior_status = self._status_value(server_name)
+
+        _config, failure = self._resolve_lifecycle_config(
+            server_name, action="disconnect", prior_status=prior_status
+        )
+        if failure is not None:
+            return failure
+
+        disconnected, cancelled, error = await self._client_manager.disconnect_server(
+            server_name, force=parsed.force
+        )
+        if not disconnected:
+            return self._lifecycle_output(
+                ok=False,
+                server=server_name,
+                action="disconnect",
+                prior_status=prior_status,
+                cancelled_request_count=cancelled,
+                message=error or f"Server '{server_name}' could not be disconnected.",
+                errors=[error] if error else None,
+            )
+
+        return self._lifecycle_output(
+            ok=True,
+            server=server_name,
+            action="disconnect",
+            prior_status=prior_status,
+            cancelled_request_count=cancelled,
+            message=f"Server '{server_name}' disconnected.",
+        )
+
+    async def restart_server(self, input_data: dict[str, Any]) -> LifecycleServerOutput:
+        """gateway.restart_server - Restart one known server."""
+        parsed = RestartServerInput.model_validate(input_data)
+        server_name = parsed.server_name
+        prior_status = self._status_value(server_name)
+
+        config, failure = self._resolve_lifecycle_config(
+            server_name, action="restart", prior_status=prior_status
+        )
+        if failure is not None:
+            return failure
+        if config is None:
+            return self._lifecycle_output(
+                ok=False,
+                server=server_name,
+                action="restart",
+                prior_status=prior_status,
+                message=f"Server '{server_name}' could not be resolved.",
+                errors=[f"Unable to resolve server: {server_name}"],
+            )
+
+        ok, cancelled, errors = await self._client_manager.restart_server(
+            config, force=parsed.force
+        )
+        return self._lifecycle_output(
+            ok=ok,
+            server=server_name,
+            action="restart",
+            prior_status=prior_status,
+            cancelled_request_count=cancelled,
+            message=f"Server '{server_name}' restarted."
+            if ok
+            else f"Server '{server_name}' could not be restarted.",
+            errors=errors or None,
         )
 
     def _check_api_key_available(self, env_var: str | None) -> bool:
@@ -1354,6 +1640,135 @@ class GatewayTools:
             if self._policy_manager.is_server_allowed(config.name):
                 configured[config.name] = config
         return configured
+
+    def _load_all_configured_servers(self) -> dict[str, ResolvedServerConfig]:
+        """Load user/project-configured servers before policy filtering."""
+        configs = load_configs(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        )
+        return {config.name: config for config in filter_self_references(configs)}
+
+    def _status_value(self, server_name: str) -> str:
+        """Return a public status string for a server, or unknown."""
+        status = self._client_manager.get_server_status(server_name)
+        if status is None:
+            return "unknown"
+        return status.status.value
+
+    def _lifecycle_output(
+        self,
+        *,
+        ok: bool,
+        server: str,
+        action: Literal["connect", "disconnect", "restart"],
+        prior_status: str,
+        message: str,
+        cancelled_request_count: int = 0,
+        errors: list[str] | None = None,
+    ) -> LifecycleServerOutput:
+        return LifecycleServerOutput(
+            ok=ok,
+            server=server,
+            action=action,
+            prior_status=prior_status,
+            new_status=self._status_value(server),
+            cancelled_request_count=cancelled_request_count,
+            message=message,
+            errors=errors,
+        )
+
+    def _resolve_lifecycle_config(
+        self,
+        server_name: str,
+        *,
+        action: Literal["connect", "disconnect", "restart"],
+        prior_status: str,
+    ) -> tuple[ResolvedServerConfig | None, LifecycleServerOutput | None]:
+        """Resolve a lifecycle target or return a structured failure output."""
+        configured_servers = self._load_all_configured_servers()
+        if server_name in configured_servers:
+            if not self._policy_manager.is_server_allowed(server_name):
+                return (
+                    None,
+                    self._lifecycle_output(
+                        ok=False,
+                        server=server_name,
+                        action=action,
+                        prior_status=prior_status,
+                        message=f"Server '{server_name}' is blocked by policy.",
+                        errors=[f"Server '{server_name}' is blocked by policy."],
+                    ),
+                )
+            return (configured_servers[server_name], None)
+
+        manifest = load_manifest()
+        server_config = manifest.get_server(server_name)
+        if server_config is None:
+            server_config = self._discovered_server_configs.get(server_name)
+
+        if server_config is not None:
+            if not self._policy_manager.is_server_allowed(server_name):
+                return (
+                    None,
+                    self._lifecycle_output(
+                        ok=False,
+                        server=server_name,
+                        action=action,
+                        prior_status=prior_status,
+                        message=f"Server '{server_name}' is blocked by policy.",
+                        errors=[f"Server '{server_name}' is blocked by policy."],
+                    ),
+                )
+
+            if server_config.requires_api_key and server_config.env_var:
+                auth_env_options = self._auth_env_options(
+                    server_name, server_config.env_var
+                )
+                if not self._check_any_api_key_available(auth_env_options):
+                    env_names = ", ".join(auth_env_options)
+                    return (
+                        None,
+                        self._lifecycle_output(
+                            ok=False,
+                            server=server_name,
+                            action=action,
+                            prior_status=prior_status,
+                            message=(
+                                f"Server '{server_name}' requires authentication. "
+                                f"Set one of: {env_names}"
+                            ),
+                            errors=[
+                                f"Missing authentication environment variable for '{server_name}': {env_names}"
+                            ],
+                        ),
+                    )
+
+            return (manifest_server_to_config(server_config), None)
+
+        if action == "disconnect" and self._client_manager.get_server_status(
+            server_name
+        ):
+            return (
+                ResolvedServerConfig(
+                    name=server_name,
+                    source="custom",
+                    config=LocalMcpServerConfig(command=""),
+                ),
+                None,
+            )
+
+        return (
+            None,
+            self._lifecycle_output(
+                ok=False,
+                server=server_name,
+                action=action,
+                prior_status=prior_status,
+                message=f"Server '{server_name}' is not known to PMCP.",
+                errors=[f"Unknown server: {server_name}"],
+            ),
+        )
 
     def _keywords_for_config_server(self, config: ResolvedServerConfig) -> list[str]:
         """Build lightweight keywords for a configured server entry."""

@@ -85,25 +85,18 @@ def test_phase4_doctor_handles_stale_lock_gracefully(tmp_path: Path) -> None:
     assert "[FAIL]" not in result.stdout
 
 
-def test_phase4_doctor_fails_for_unreachable_sse(tmp_path: Path) -> None:
-    """pmcp doctor exits non-zero when configured SSE endpoint is unreachable."""
+def test_phase4_doctor_warns_for_unreachable_http_health(tmp_path: Path) -> None:
+    """pmcp doctor warns when gateway /health is unreachable."""
     home = tmp_path / "home"
     project = tmp_path / "project"
     project.mkdir(parents=True)
     home.mkdir(parents=True)
 
-    mcp_config = {
-        "mcpServers": {
-            "gateway": {
-                "type": "sse",
-                "url": "http://127.0.0.1:9/sse",
-            }
-        }
-    }
-    (project / ".mcp.json").write_text(json.dumps(mcp_config))
+    (project / ".mcp.json").write_text(json.dumps({"mcpServers": {}}))
 
     env = os.environ.copy()
     env["HOME"] = str(home)
+    env["PMCP_GATEWAY_URL"] = "http://127.0.0.1:9/mcp"
 
     result = _run_pmcp(
         ["doctor", "--project", str(project), "--timeout", "0.2"],
@@ -111,9 +104,9 @@ def test_phase4_doctor_fails_for_unreachable_sse(tmp_path: Path) -> None:
         cwd=project,
     )
 
-    assert result.returncode == 1
-    assert "[FAIL] sse:" in result.stdout
-    assert "probe failed" in result.stdout
+    assert result.returncode == 0
+    assert "[WARN] http:" in result.stdout
+    assert "http://127.0.0.1:9/health" in result.stdout
 
 
 def test_phase4_secrets_reports_missing_and_success_paths(tmp_path: Path) -> None:

@@ -257,6 +257,8 @@ class ClientManager:
         self._last_refresh_ts: float = time.time()
         self._max_tools_per_server = max_tools_per_server
         self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
+        self._lifecycle_lock = asyncio.Lock()
+        self._connect_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def connect_all(
         self, configs: list[ResolvedServerConfig], retry: bool = True
@@ -273,11 +275,15 @@ class ClientManager:
         if not configs:
             return []
 
-        # Connect to all servers concurrently (with optional retry)
-        if retry:
-            tasks = [self._connect_with_retry(config) for config in configs]
-        else:
-            tasks = [self._connect_server(config) for config in configs]
+        # Connect to all servers concurrently, sharing work for duplicate names.
+        tasks_by_name: dict[str, asyncio.Task[None]] = {}
+        tasks: list[asyncio.Task[None]] = []
+        for config in configs:
+            task = tasks_by_name.get(config.name)
+            if task is None:
+                task = asyncio.create_task(self._connect_singleflight(config, retry))
+                tasks_by_name[config.name] = task
+            tasks.append(task)
 
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -293,6 +299,29 @@ class ClientManager:
         self._last_refresh_ts = time.time()
 
         return errors
+
+    async def _connect_singleflight(
+        self, config: ResolvedServerConfig, retry: bool = True
+    ) -> None:
+        """Share concurrent connection attempts for the same server name."""
+        name = config.name
+        status = self._servers.get(name)
+        if status is not None and status.status == ServerStatusEnum.ONLINE:
+            return
+
+        task = self._connect_tasks.get(name)
+        if task is None:
+            if retry:
+                task = asyncio.create_task(self._connect_with_retry(config))
+            else:
+                task = asyncio.create_task(self._connect_server(config))
+            self._connect_tasks[name] = task
+
+        try:
+            await task
+        finally:
+            if self._connect_tasks.get(name) is task:
+                self._connect_tasks.pop(name, None)
 
     def register_lazy_configs(self, configs: list[ResolvedServerConfig]) -> None:
         """Register configs for lazy (on-demand) server connections.
@@ -348,9 +377,9 @@ class ClientManager:
         logger.info(f"Lazy-starting server: {server_name}")
 
         try:
-            await self._connect_with_retry(config)
+            await self._connect_singleflight(config)
             # Remove from lazy configs after successful connection
-            del self._lazy_configs[server_name]
+            self._lazy_configs.pop(server_name, None)
             return True
         except Exception as e:
             logger.error(f"Failed to lazy-start {server_name}: {e}")
@@ -359,6 +388,145 @@ class ClientManager:
                 self._servers[server_name].status = ServerStatusEnum.ERROR
                 self._servers[server_name].last_error = str(e)
             return False
+
+    async def connect_server(
+        self, config: ResolvedServerConfig, retry: bool = True
+    ) -> list[str]:
+        """Connect one server through same-server single-flight startup."""
+        try:
+            await self._connect_singleflight(config, retry=retry)
+            if self.is_server_online(config.name):
+                self._lazy_configs.pop(config.name, None)
+            self._revision_id = _generate_revision_id()
+            self._last_refresh_ts = time.time()
+            return []
+        except Exception as e:
+            if config.name in self._servers:
+                self._servers[config.name].status = ServerStatusEnum.ERROR
+                self._servers[config.name].last_error = str(e)
+            return [f"Failed to connect to {config.name}: {e}"]
+
+    def cancel_pending_requests(self, server: str) -> int:
+        """Cancel pending requests for one server and return newly cancelled count."""
+        managed = self._clients.get(server)
+        if not managed:
+            return 0
+
+        cancelled = 0
+        for request_id, pending in list(managed.pending_requests.items()):
+            if not pending.future.done():
+                pending.future.cancel()
+                cancelled += 1
+            managed.pending_requests.pop(request_id, None)
+        managed.status.pending_request_count = len(managed.pending_requests)
+        if cancelled:
+            logger.warning(
+                f"Force-cancelled {cancelled} pending requests for server {server}"
+            )
+        return cancelled
+
+    async def disconnect_server(
+        self, name: str, force: bool = False
+    ) -> tuple[bool, int, str | None]:
+        """Disconnect one server, refusing active requests unless forced."""
+        pending_requests = self.get_pending_requests(name)
+        if pending_requests and not force:
+            return (
+                False,
+                0,
+                "Disconnect refused because this server has pending requests. "
+                "Use gateway.list_pending to inspect them or retry with force=true.",
+            )
+
+        cancelled = self.cancel_pending_requests(name) if pending_requests else 0
+
+        async with self._lifecycle_lock:
+            managed = self._clients.get(name)
+            if not managed:
+                status = self._servers.get(name)
+                if status is not None:
+                    status.status = (
+                        ServerStatusEnum.LAZY
+                        if name in self._lazy_configs
+                        else ServerStatusEnum.OFFLINE
+                    )
+                    status.tool_count = 0
+                    status.resource_count = 0
+                    status.prompt_count = 0
+                    status.pending_request_count = 0
+                return (True, cancelled, None)
+
+            config = managed.config
+            managed.status.status = ServerStatusEnum.OFFLINE
+            managed.status.pending_request_count = 0
+
+            if managed.read_task and not managed.read_task.done():
+                managed.read_task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(managed.read_task), timeout=1.0
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception:
+                    pass
+
+            try:
+                if managed.is_remote:
+                    if managed.sse_exit_stack is not None:
+                        try:
+                            await managed.sse_exit_stack.aclose()
+                        except RuntimeError as e:
+                            if _is_cancel_scope_task_mismatch_error(e):
+                                logger.debug(
+                                    f"[{name}] Ignoring SSE shutdown cancel-scope mismatch: {e}"
+                                )
+                            else:
+                                raise
+                elif managed.process and managed.process.returncode is None:
+                    managed.process.terminate()
+                    try:
+                        await asyncio.wait_for(managed.process.wait(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        managed.process.kill()
+                        try:
+                            await asyncio.wait_for(managed.process.wait(), timeout=3.0)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                f"[{name}] Process PID={managed.process.pid} did not exit "
+                                "after SIGKILL (possible D-state / uninterruptible I/O wait)"
+                            )
+            except Exception as e:
+                logger.warning(f"Error disconnecting from {name}: {e}")
+                return (False, cancelled, str(e))
+
+            self._clients.pop(name, None)
+            self._remove_server_indexes(name)
+            if config is not None and config.source in {"project", "user", "custom"}:
+                self._lazy_configs[name] = config
+            self._servers[name] = ServerStatus(
+                name=name,
+                status=ServerStatusEnum.LAZY
+                if name in self._lazy_configs
+                else ServerStatusEnum.OFFLINE,
+                tool_count=0,
+            )
+            self._revision_id = _generate_revision_id()
+            self._last_refresh_ts = time.time()
+            return (True, cancelled, None)
+
+    async def restart_server(
+        self, config: ResolvedServerConfig, force: bool = False
+    ) -> tuple[bool, int, list[str]]:
+        """Restart one server by disconnecting then connecting the same config."""
+        disconnected, cancelled, error = await self.disconnect_server(
+            config.name, force
+        )
+        if not disconnected:
+            return (False, cancelled, [error or "Restart refused."])
+
+        errors = await self.connect_server(config)
+        return (len(errors) == 0, cancelled, errors)
 
     def is_lazy_server(self, name: str) -> bool:
         """Check if server is registered for lazy start but not yet connected."""
@@ -401,6 +569,18 @@ class ClientManager:
 
         await self._connect_stdio(config)
 
+    def _remove_server_indexes(self, name: str) -> None:
+        """Remove catalog entries owned by one server."""
+        for tool_id, tool in list(self._tools.items()):
+            if tool.server_name == name:
+                self._tools.pop(tool_id, None)
+        for resource_id, resource in list(self._resources.items()):
+            if resource.server_name == name:
+                self._resources.pop(resource_id, None)
+        for prompt_id, prompt in list(self._prompts.items()):
+            if prompt.server_name == name:
+                self._prompts.pop(prompt_id, None)
+
     async def _connect_stdio(self, config: ResolvedServerConfig) -> None:
         """Connect to a local stdio MCP server."""
         name = config.name
@@ -412,6 +592,8 @@ class ClientManager:
                 f"[{name}] Existing live connection found; cleaning up before reconnect"
             )
             await self._cleanup_client(name, existing)
+        else:
+            self._remove_server_indexes(name)
 
         # Initialize status
         status = ServerStatus(
@@ -619,6 +801,15 @@ class ClientManager:
     ) -> None:
         """Connect to a remote MCP server using a read/write stream transport."""
         name = config.name
+
+        if name in self._clients:
+            existing = self._clients[name]
+            logger.warning(
+                f"[{name}] Existing live connection found; cleaning up before reconnect"
+            )
+            await self._cleanup_client(name, existing)
+        else:
+            self._remove_server_indexes(name)
 
         status = ServerStatus(
             name=name,
@@ -864,7 +1055,7 @@ class ClientManager:
                     return
                 logger.info(f"[{name}] reconnect attempt {attempt}/{len(delays)} ...")
                 try:
-                    await self._connect_with_retry(config)
+                    await self._connect_singleflight(config)
                     logger.info(f"[{name}] reconnected successfully")
                     return
                 except Exception as e:
@@ -1019,10 +1210,16 @@ class ClientManager:
 
     async def disconnect_all(self) -> None:
         """Disconnect from all servers."""
+        async with self._lifecycle_lock:
+            await self._disconnect_all_unlocked()
+
+    async def _disconnect_all_unlocked(self) -> None:
+        """Disconnect from all servers while caller owns the lifecycle boundary."""
         # Stop health monitor if running
         self.stop_health_monitor()
 
-        for name, managed in self._clients.items():
+        clients = list(self._clients.items())
+        for name, managed in clients:
             try:
                 logger.info(f"Disconnecting from {name}")
 
@@ -1077,7 +1274,10 @@ class ClientManager:
 
         self._clients.clear()
         self._tools.clear()
+        self._resources.clear()
+        self._prompts.clear()
         self._servers.clear()
+        self._lazy_configs.clear()
 
     async def _cleanup_client(self, name: str, managed: ManagedClient) -> None:
         """Cancel a client's read task, kill its process, and remove it from registries.
@@ -1101,11 +1301,13 @@ class ClientManager:
                 )
         self._clients.pop(name, None)
         self._servers.pop(name, None)
+        self._remove_server_indexes(name)
 
     async def refresh(self, configs: list[ResolvedServerConfig]) -> list[str]:
         """Refresh connections (disconnect + reconnect)."""
-        await self.disconnect_all()
-        return await self.connect_all(configs)
+        async with self._lifecycle_lock:
+            await self._disconnect_all_unlocked()
+            return await self.connect_all(configs)
 
     async def adopt_process(
         self,
@@ -1454,11 +1656,25 @@ class ClientManager:
     def get_pending_requests(self, server: str | None = None) -> list[PendingRequest]:
         """Get all pending requests, optionally filtered by server."""
         result: list[PendingRequest] = []
-        for name, managed in self._clients.items():
+        for name, managed in list(self._clients.items()):
             if server and name != server:
                 continue
-            result.extend(managed.pending_requests.values())
+            result.extend(list(managed.pending_requests.values()))
         return result
+
+    def cancel_all_pending_requests(self) -> int:
+        """Cancel all pending requests and return the number newly cancelled."""
+        cancelled = 0
+        for _, managed in list(self._clients.items()):
+            for request_id, pending in list(managed.pending_requests.items()):
+                if not pending.future.done():
+                    pending.future.cancel()
+                    cancelled += 1
+                managed.pending_requests.pop(request_id, None)
+            managed.status.pending_request_count = len(managed.pending_requests)
+        if cancelled:
+            logger.warning(f"Force-cancelled {cancelled} pending requests")
+        return cancelled
 
     def get_request_state(self, pending: PendingRequest) -> RequestState:
         """Determine current state of a pending request."""
