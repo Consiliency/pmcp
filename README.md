@@ -20,7 +20,7 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 
 **PMCP** acts as a single MCP server that Claude Code connects to. Instead of exposing all downstream tools, it provides:
 
-- **19 stable meta-tools** (not the 50+ underlying tools)
+- **23 stable meta-tools** (not the 50+ underlying tools)
 - **Lazy by default**: downstream servers are available on demand and only eager-start when listed in `autoStart`
 - **Dynamically provisions** new servers on-demand from a manifest of 90+
 - **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
@@ -248,7 +248,7 @@ Returns: Screenshot of google.com
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                          PMCP                               │
-│  • 19 meta-tools (catalog, invoke, provision, etc.)         │
+│  • 23 meta-tools (catalog, invoke, tasks, provision, etc.)  │
 │  • Progressive disclosure (compact cards → full schemas)    │
 │  • Policy enforcement (allow/deny lists)                    │
 └────────────────────────────┬────────────────────────────────┘
@@ -274,16 +274,20 @@ The gateway discovers and manages all other servers.
 
 ## Gateway Tools
 
-The gateway exposes **19 meta-tools** organized into four categories:
+The gateway exposes **23 meta-tools** organized into four categories:
+
+Tool annotations are preserved as untrusted hints only; policy and safety notes
+continue to use PMCP's own risk model. When a tool schema omits `$schema`, PMCP
+reports the JSON Schema dialect as `https://json-schema.org/draft/2020-12/schema`.
 
 ### Core Tools
 
 | Tool | Purpose |
 |------|---------|
-| `gateway.catalog_search` | Search available tools, returns compact capability cards |
-| `gateway.describe` | Get detailed schema for a specific tool |
-| `gateway.invoke` | Call a downstream tool with argument validation |
-| `gateway.refresh` | Reload backend configs and reconnect; refuses while requests are pending unless `force=true` |
+| `gateway.catalog_search` | Search available tools, returns compact capability cards with small metadata such as title, icons, execution hints, and schema dialect |
+| `gateway.describe` | Get detailed schema and richer metadata for a specific tool, including output schema, annotations, execution/task support, icons, and schema dialect |
+| `gateway.invoke` | Call a downstream tool with argument validation, including task-augmented execution for task-capable tools |
+| `gateway.refresh` | Reload backend configs and reconnect; refuses while requests or active MCP tasks are pending unless `force=true` |
 | `gateway.health` | Get gateway and server health status |
 
 ### Lifecycle Tools
@@ -302,7 +306,7 @@ The gateway exposes **19 meta-tools** organized into four categories:
 | `gateway.sync_environment` | Detect platform and available CLIs |
 | `gateway.provision` | Install and start MCP servers on-demand |
 | `gateway.update_server` | Update an MCP server package and reconnect it |
-| `gateway.auth_connect` | Store credentials for a server and retry provisioning |
+| `gateway.auth_connect` | Store API-key credentials or acknowledge URL-mode elicitation and retry provisioning |
 | `gateway.submit_feedback` | Preview/submit technical PMCP feedback issues to GitHub |
 | `gateway.provision_status` | Check installation progress |
 | `gateway.search_registry` | Search the public MCP Registry for external servers |
@@ -314,20 +318,60 @@ The gateway exposes **19 meta-tools** organized into four categories:
 |------|---------|
 | `gateway.list_pending` | List pending tool invocations with health status |
 | `gateway.cancel` | Cancel a pending tool invocation |
+| `gateway.tasks_list` | List brokered downstream MCP tasks by opaque task ID |
+| `gateway.tasks_get` | Get current status for one downstream MCP task |
+| `gateway.tasks_result` | Fetch and process a downstream MCP task result |
+| `gateway.tasks_cancel` | Cancel a downstream MCP task |
 
 `gateway.refresh` is intentionally conservative in shared-service mode. If a
-downstream request is in flight, refresh returns `ok=false` without disconnecting
-or reconnecting servers. Use `gateway.list_pending` to inspect active requests,
-then retry with `force=true` only when cancelling that work is acceptable.
+downstream request or active MCP task is in flight, refresh returns `ok=false`
+without disconnecting or reconnecting servers. Use `gateway.list_pending` to
+inspect active PMCP request IDs and `gateway.tasks_list` to inspect downstream
+MCP task IDs, then retry with `force=true` only when cancelling that work is
+acceptable.
 
 `gateway.disconnect_server` and `gateway.restart_server` follow the same
 shared-service disruption policy for the target server: they refuse while that
-server has pending requests unless `force=true`. With `force=true`, only pending
-requests for the named server are cancelled. These controls are runtime-only;
-they free local resources and update live gateway state, but they do not edit
-`.mcp.json`, remove server definitions, or change `autoStart`. In HTTP shared
-service mode, stopping or restarting a downstream server can affect other
-clients using the same PMCP gateway.
+server has pending requests or active MCP tasks unless `force=true`. With
+`force=true`, only pending requests and active tasks for the named server are
+cancelled. These controls are runtime-only; they free local resources and update
+live gateway state, but they do not edit `.mcp.json`, remove server definitions,
+or change `autoStart`. In HTTP shared service mode, stopping or restarting a
+downstream server can affect other clients using the same PMCP gateway.
+
+MCP task IDs are downstream server identifiers and remain distinct from PMCP
+pending request IDs such as `server::local_id`. Use `gateway.cancel` only for
+PMCP request IDs from `gateway.list_pending`; use `gateway.tasks_cancel` for MCP
+task IDs. Task records are transient in-memory gateway state. PMCP can bind
+visibility to the server and requestor context it observes, but unauthenticated
+local transports cannot provide cross-user authorization isolation.
+
+### Auth And Elicitation
+
+PMCP reports downstream authorization as structured, non-secret state. Gateway
+outputs and health rows may include `auth_state` values of `none`,
+`missing_auth`, `insufficient_scope`, `elicitation_required`, `policy_denied`, or
+`unknown`, plus optional `next_step`, `auth_methods`, scope names, sanitized
+metadata URLs, and URL-mode elicitation summaries.
+
+Supported flows:
+
+- Local API-key servers continue to use env-store credentials. When
+  `gateway.provision` reports `auth_state="missing_auth"` and
+  `auth_mode="api_key"`, call `gateway.auth_connect` with a credential and PMCP
+  stores it in the selected user or project env file.
+- Remote authorization discovery is diagnostic-only. PMCP can preserve and report
+  OAuth Protected Resource Metadata, Authorization Server Metadata, OpenID
+  Connect discovery, Client ID Metadata Document URLs, and declared scopes when a
+  server or `WWW-Authenticate` challenge provides them.
+- URL-mode elicitation is out of band. PMCP returns a sanitized URL and
+  `elicitation_id`; complete that URL flow outside PMCP, then acknowledge it with
+  `gateway.auth_connect(auth_mode="url_elicitation", elicitation_id=..., consent_acknowledged=true)`.
+
+PMCP is not an authorization server and does not implement enterprise SSO,
+Cross-App Access, DPoP, workload identity federation, or third-party refresh
+token storage. Do not paste OAuth codes or third-party credentials into
+URL-mode gateway calls.
 
 ### Subordinate MCP Updates
 
@@ -479,6 +523,31 @@ Startup policy decisions are visible through `gateway.health` and live
 | `startup_source` | Resolver source such as `project`, `user`, `manifest`, `configured`, or `auto_start` |
 | `startup_skip_reason` | Machine-readable skip reason such as `policy_denied`, `missing_auth`, or `unknown_auto_start` |
 | `startup_env_var` | Required environment variable name for missing-auth skips |
+| `auth_state` | Machine-readable downstream auth state such as `missing_auth`, `insufficient_scope`, `elicitation_required`, or `policy_denied` |
+| `next_step` | Non-secret suggested next action when an auth state needs operator action |
+
+PMCP negotiates the current MCP protocol version with downstream servers and
+continues to connect to older supported servers. `gateway.health` and
+`pmcp status --json` can include the negotiated `protocol_version` and declared
+server capabilities when a connected server reports them.
+
+Gateway observability is local and structured. `gateway.invoke` accepts trace
+context through `_meta.traceparent`, `_meta.tracestate`, and `_meta.baggage` and
+preserves those string values on PMCP-owned downstream request metadata. The
+same keys are tolerated on HTTP requests. PMCP does not require or configure an
+OpenTelemetry exporter.
+
+`gateway.health` may include `gateway_diagnostics` and recent `audit_events`.
+Diagnostics report transport/header compatibility, trace support, audit buffer
+readiness, auth metadata presence, and rate-limit configuration without secret
+values. Audit events are bounded in memory and include method/action, server or
+tool identity, protocol version when known, task ID when present, outcome,
+latency, auth state, and redacted error text.
+
+PMCP's Streamable HTTP endpoint remains compatible with existing clients that
+send no draft headers. It also tolerates `MCP-Protocol-Version`, `Mcp-Method`,
+and `Mcp-Name` request headers for clients experimenting with draft MCP
+transport conventions.
 
 Servers stopped with `gateway.disconnect_server` remain visible in health as
 `offline` or `lazy` when PMCP still knows their configuration, and startup policy
@@ -933,13 +1002,14 @@ gateway.describe({ tool_id: "server::tool-name" })
 gateway.list_pending()
 ```
 
-If `gateway.refresh` reports pending requests, inspect them with
-`gateway.list_pending()` or retry refresh with `force=true` to cancel them before
-reloading server configuration.
+If `gateway.refresh` reports pending requests or active MCP tasks, inspect them
+with `gateway.list_pending()` and `gateway.tasks_list()`, or retry refresh with
+`force=true` to cancel them before reloading server configuration.
 
 If `gateway.disconnect_server` or `gateway.restart_server` reports pending
-requests, inspect `gateway.list_pending(server="<name>")` or retry with
-`force=true` to cancel only that server's pending work.
+requests or active MCP tasks, inspect `gateway.list_pending(server="<name>")`
+and `gateway.tasks_list(server_name="<name>")`, or retry with `force=true` to
+cancel only that server's pending work.
 
 ## License
 

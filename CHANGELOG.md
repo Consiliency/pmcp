@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Downstream MCP initialization now prefers protocol version `2025-11-25`,
+  records negotiated protocol versions and server capabilities, and preserves
+  compatibility with older supported protocol versions.
+- Tool, resource, and prompt indexing now preserves modern MCP metadata
+  additively, including titles, icons, output schemas, annotations,
+  execution/task support hints, unknown raw metadata, and JSON Schema dialects.
+- `gateway.invoke` can request downstream MCP task-augmented execution for
+  task-capable tools, and required-task tools are routed through task metadata
+  automatically.
+- Added `gateway.tasks_list`, `gateway.tasks_get`, `gateway.tasks_result`, and
+  `gateway.tasks_cancel` for gateway-safe downstream MCP task brokering.
+- Added structured downstream auth state reporting for missing auth,
+  insufficient scope, policy denial, and URL-mode elicitation, with safe
+  authorization metadata discovery hints.
+- Added additive gateway observability models for trace context, bounded
+  structured audit events, and gateway transport diagnostics.
+- `gateway.health` can now include safe `gateway_diagnostics` and recent
+  redacted `audit_events`; `pmcp status --verbose` renders those diagnostics
+  when a live gateway reports them.
+- Streamable HTTP now reports safe `/health` transport diagnostics and tolerates
+  `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, and trace context headers.
+
+### Changed
+- `gateway.catalog_search`, `gateway.describe`, `gateway.health`, and
+  `pmcp status` can surface negotiated protocol and richer metadata without
+  requiring older servers or clients to provide the new optional fields.
+- Refresh, disconnect, and restart now account for active MCP tasks separately
+  from PMCP pending requests and refuse active work by default.
+- `gateway.auth_connect`, `pmcp status`, `pmcp doctor`, and HTTP 401 responses
+  now share stricter redaction for bearer tokens, API keys, auth codes, URL
+  userinfo, and sensitive query parameters.
+- Tool/resource/prompt/server snapshots, pending requests, task lists, MCP
+  server-facing lists, and catalog tie-breakers now use stable public ordering.
+
 ## [1.10.0] - 2026-04-21
 
 ### Added

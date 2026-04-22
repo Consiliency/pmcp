@@ -70,12 +70,12 @@ Bring PMCP's downstream client and gateway surfaces up to current MCP protocol e
 
 **Exit criteria**
 
-- [ ] PMCP initializes downstream servers with an explicit protocol negotiation strategy instead of hardcoding only `2024-11-05`.
-- [ ] PMCP records negotiated protocol version and exposes it through internal status and appropriate diagnostic views.
-- [ ] Tool metadata preserves and exposes modern fields such as `title`, `icons`, `outputSchema`, `annotations`, `execution.taskSupport`, and JSON Schema dialect information where present.
-- [ ] Resource, resource template, and prompt metadata preserve modern icon/title fields where supported by the SDK or raw payloads.
-- [ ] `gateway.catalog_search` and `gateway.describe` remain backward compatible while surfacing richer metadata additively.
-- [ ] Tests cover old-protocol servers, current-protocol servers, missing optional fields, unknown extra fields, and schema dialect defaults.
+- [x] PMCP initializes downstream servers with an explicit protocol negotiation strategy instead of hardcoding only `2024-11-05`.
+- [x] PMCP records negotiated protocol version and exposes it through internal status and appropriate diagnostic views.
+- [x] Tool metadata preserves and exposes modern fields such as `title`, `icons`, `outputSchema`, `annotations`, `execution.taskSupport`, and JSON Schema dialect information where present.
+- [x] Resource, resource template, and prompt metadata preserve modern icon/title fields where supported by the SDK or raw payloads.
+- [x] `gateway.catalog_search` and `gateway.describe` remain backward compatible while surfacing richer metadata additively.
+- [x] Tests cover old-protocol servers, current-protocol servers, missing optional fields, unknown extra fields, and schema dialect defaults.
 
 **Scope notes**
 
@@ -117,12 +117,12 @@ Support MCP `2025-11-25` task-augmented execution in a way that composes with PM
 
 **Exit criteria**
 
-- [ ] PMCP detects server and tool task support from capabilities and `execution.taskSupport`.
-- [ ] PMCP can invoke optional or required task-supported tools without treating accepted task creation as a completed tool result.
-- [ ] PMCP exposes task state through gateway-visible pending/status surfaces without breaking existing `gateway.list_pending` output.
-- [ ] PMCP can proxy or implement `tasks/list`, `tasks/get`, `tasks/result`, and `tasks/cancel` where supported by downstream servers.
-- [ ] Forced refresh, disconnect, and restart behavior clearly covers active MCP tasks and normal pending requests.
-- [ ] Tests cover working, input-required, completed, failed, cancelled, expired/missing, and required-task tool scenarios.
+- [x] PMCP detects server and tool task support from capabilities and `execution.taskSupport`.
+- [x] PMCP can invoke optional or required task-supported tools without treating accepted task creation as a completed tool result.
+- [x] PMCP exposes task state through gateway-visible pending/status surfaces without breaking existing `gateway.list_pending` output.
+- [x] PMCP can proxy or implement `tasks/list`, `tasks/get`, `tasks/result`, and `tasks/cancel` where supported by downstream servers.
+- [x] Forced refresh, disconnect, and restart behavior clearly covers active MCP tasks and normal pending requests.
+- [x] Tests cover working, input-required, completed, failed, cancelled, expired/missing, and required-task tool scenarios.
 
 **Scope notes**
 
@@ -165,12 +165,12 @@ Align PMCP's auth and credential UX with current MCP authorization and elicitati
 
 **Exit criteria**
 
-- [ ] PMCP recognizes and reports authorization metadata relevant to OIDC discovery, protected resource metadata, and Client ID Metadata Documents where available.
-- [ ] PMCP handles incremental scope consent challenges in a structured way rather than reducing them to opaque connection failures.
-- [ ] `gateway.auth_connect` or successor flows support URL-mode elicitation for secure out-of-band credential collection when a server can provide it.
-- [ ] Missing-auth, insufficient-scope, and policy-denied states are distinct in health/status/doctor output.
-- [ ] Secrets and auth URLs are redacted in logs, status, doctor output, and release diagnostics.
-- [ ] Tests cover missing auth, expired/insufficient scope, URL-mode elicitation, local env-store fallback, and refusal paths.
+- [x] PMCP recognizes and reports authorization metadata relevant to OIDC discovery, protected resource metadata, and Client ID Metadata Documents where available.
+- [x] PMCP handles incremental scope consent challenges in a structured way rather than reducing them to opaque connection failures.
+- [x] `gateway.auth_connect` or successor flows support URL-mode elicitation for secure out-of-band credential collection when a server can provide it.
+- [x] Missing-auth, insufficient-scope, and policy-denied states are distinct in health/status/doctor output.
+- [x] Secrets and auth URLs are redacted in logs, status, doctor output, and release diagnostics.
+- [x] Tests cover missing auth, expired/insufficient scope, URL-mode elicitation, local env-store fallback, and refusal paths.
 
 **Scope notes**
 
@@ -215,12 +215,12 @@ Make PMCP's gateway/proxy behavior auditable and compatible with emerging MCP ob
 
 **Exit criteria**
 
-- [ ] PMCP preserves or emits OpenTelemetry trace context metadata where requests cross gateway boundaries.
-- [ ] Gateway audit events capture method, server, tool/resource/prompt identity, protocol version, lifecycle action, task ID when present, outcome, latency, and redacted error details.
-- [ ] `tools/list` and PMCP catalog outputs are deterministically ordered for caching and prompt stability.
-- [ ] Streamable HTTP requests include or tolerate current/draft MCP method/name header conventions where supported by clients and servers.
-- [ ] Status and doctor commands expose enough gateway/proxy diagnostics to debug session, header, auth, and rate-limit behavior without exposing secrets.
-- [ ] Tests cover deterministic ordering, trace propagation, redaction, HTTP header compatibility, and audit event shape.
+- [x] PMCP preserves or emits OpenTelemetry trace context metadata where requests cross gateway boundaries.
+- [x] Gateway audit events capture method, server, tool/resource/prompt identity, protocol version, lifecycle action, task ID when present, outcome, latency, and redacted error details.
+- [x] `tools/list` and PMCP catalog outputs are deterministically ordered for caching and prompt stability.
+- [x] Streamable HTTP requests include or tolerate current/draft MCP method/name header conventions where supported by clients and servers.
+- [x] Status and doctor commands expose enough gateway/proxy diagnostics to debug session, header, auth, and rate-limit behavior without exposing secrets.
+- [x] Tests cover deterministic ordering, trace propagation, redaction, HTTP header compatibility, and audit event shape.
 
 **Scope notes**
 

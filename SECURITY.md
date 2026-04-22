@@ -43,11 +43,30 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   not protect these endpoints. Do not expose them on a public interface without
   separate network-layer control (firewall rule, IP allowlist, or reverse-proxy
   policy).
+- **Authorization discovery is diagnostic**: PMCP can surface protected-resource,
+  authorization-server, OIDC discovery, Client ID Metadata Document, scope, and
+  URL-mode elicitation hints, but it is not an authorization server and does not
+  store third-party OAuth refresh tokens.
+- **URL-mode elicitation is out of band**: never paste OAuth codes, third-party
+  passwords, or provider refresh tokens into gateway tools. `gateway.auth_connect`
+  accepts API-key credentials only for local env-store flows; URL-mode flows only
+  accept an elicitation identifier and consent acknowledgement.
+- **Redaction is best-effort defense in depth**: PMCP redacts bearer tokens, API
+  keys, common secrets, URL userinfo, authorization codes, and auth-bearing query
+  parameters from gateway outputs, status/doctor diagnostics, feedback payloads,
+  and HTTP diagnostics. Treat all logs as operational data and avoid adding
+  secrets to server names, tool names, or free-form descriptions.
 - **Subprocess spawning**: PMCP forks child processes for downstream MCP servers. A malicious
   MCP server config entry could cause PMCP to spawn arbitrary executables. Only configure
   servers you trust.
 - **No audit log persistence**: the per-call audit log (`tool_call tool=... ok=...`) is
-  written to stderr/stdout only. There is no log rotation or tamper-evident storage.
+  written to stderr/stdout, and structured `gateway.health.audit_events` are
+  bounded in memory. There is no database, log rotation, or tamper-evident
+  storage.
+- **Trace context is metadata, not identity**: PMCP preserves accepted
+  `traceparent`, `tracestate`, and `baggage` strings only through explicit
+  PMCP-owned fields or request metadata. Do not put bearer tokens, API keys,
+  auth codes, user identifiers, or other secrets in trace baggage.
 
 ## Reporting a Vulnerability
 

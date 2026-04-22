@@ -9,7 +9,8 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 from pmcp.config.loader import find_project_root, load_configs
-from pmcp.types import LocalMcpServerConfig
+from pmcp.manifest.loader import load_manifest
+from pmcp.types import LocalMcpServerConfig, RemoteMcpServerConfig
 
 ENV_REF_PATTERN = re.compile(
     r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
@@ -99,13 +100,31 @@ def _mask(value: str) -> str:
 
 def _extract_required_keys(
     project_root: Path,
-) -> tuple[list[str], dict[str, list[str]]]:
+) -> tuple[list[str], dict[str, list[str]], dict[str, dict[str, object]]]:
     """Extract required env keys from discovered MCP server configs."""
     configs = load_configs(project_root=project_root)
 
     per_server: dict[str, set[str]] = {}
     all_keys: set[str] = set()
+    auth_metadata_by_server: dict[str, dict[str, object]] = {}
     for cfg in configs:
+        if isinstance(cfg.config, RemoteMcpServerConfig):
+            remote_metadata: dict[str, object] = {
+                key: value
+                for key, value in {
+                    "protected_resource_metadata_url": cfg.config.protected_resource_metadata_url,
+                    "authorization_server_metadata_url": cfg.config.authorization_server_metadata_url,
+                    "oidc_issuer_url": cfg.config.oidc_issuer_url,
+                    "oidc_discovery_url": cfg.config.oidc_discovery_url,
+                    "client_id_metadata_document_url": cfg.config.client_id_metadata_document_url,
+                    "declared_scopes": cfg.config.declared_scopes,
+                    "supports_url_elicitation": cfg.config.supports_url_elicitation,
+                }.items()
+                if value
+            }
+            if remote_metadata:
+                auth_metadata_by_server[cfg.name] = remote_metadata
+            continue
         if not isinstance(cfg.config, LocalMcpServerConfig):
             continue
 
@@ -124,10 +143,31 @@ def _extract_required_keys(
         if server_keys:
             per_server[cfg.name] = server_keys
 
+    try:
+        manifest = load_manifest()
+        for server in manifest.servers.values():
+            manifest_metadata: dict[str, object] = {
+                key: value
+                for key, value in {
+                    "protected_resource_metadata_url": server.protected_resource_metadata_url,
+                    "authorization_server_metadata_url": server.authorization_server_metadata_url,
+                    "oidc_issuer_url": server.oidc_issuer_url,
+                    "oidc_discovery_url": server.oidc_discovery_url,
+                    "client_id_metadata_document_url": server.client_id_metadata_document_url,
+                    "declared_scopes": server.declared_scopes,
+                    "supports_url_elicitation": server.supports_url_elicitation,
+                }.items()
+                if value
+            }
+            if manifest_metadata:
+                auth_metadata_by_server.setdefault(server.name, manifest_metadata)
+    except Exception:
+        pass
+
     server_required = {
         server_name: sorted(keys) for server_name, keys in per_server.items()
     }
-    return sorted(all_keys), server_required
+    return sorted(all_keys), server_required, auth_metadata_by_server
 
 
 async def run_secrets_set(args: argparse.Namespace) -> dict[str, object]:
@@ -216,7 +256,9 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
     effective = dict(user_values)
     effective.update(project_values)
 
-    required_keys, required_by_server = _extract_required_keys(project_root)
+    required_keys, required_by_server, auth_metadata_by_server = _extract_required_keys(
+        project_root
+    )
     missing_keys = sorted(
         key for key in required_keys if key not in effective or not effective[key]
     )
@@ -237,6 +279,7 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
         },
         "required_keys": required_keys,
         "required_by_server": required_by_server,
+        "auth_metadata_by_server": auth_metadata_by_server,
         "available_keys": sorted(k for k, v in effective.items() if v),
         "missing_keys": missing_keys,
     }

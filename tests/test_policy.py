@@ -207,6 +207,18 @@ class TestSecretRedaction:
         assert "mysecretpassword" not in redacted
         assert "[REDACTED]" in redacted
 
+    def test_redacts_auth_urls_and_authorization_headers(self) -> None:
+        policy = PolicyManager()
+
+        redacted = policy.redact_secrets(
+            "Authorization: Bearer token-value "
+            "https://user:pass@example.test/callback?code=secret-code&state=ok"
+        )
+
+        assert "token-value" not in redacted
+        assert "user:pass" not in redacted
+        assert "secret-code" not in redacted
+
 
 class TestYamlPolicyLoading:
     """Tests for YAML policy loading."""

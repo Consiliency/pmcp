@@ -10,6 +10,7 @@ import asyncio
 import time
 import platform
 import shutil
+from collections import deque
 from pathlib import Path
 from typing import Any, Literal, cast
 from urllib.parse import quote_plus
@@ -19,6 +20,13 @@ from urllib.parse import urlencode
 from dotenv import load_dotenv
 from mcp.types import Tool
 from pmcp import __version__ as PMCP_VERSION
+from pmcp.auth import (
+    normalize_auth_metadata,
+    parse_url_elicitation_error,
+    parse_www_authenticate,
+    redact_auth_url,
+    sanitize_auth_diagnostic,
+)
 
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig
@@ -65,6 +73,8 @@ from pmcp.types import (
     CatalogSearchOutput,
     DescribeInput,
     DescriptionsCache,
+    GatewayAuditEvent,
+    GatewayDiagnosticsInfo,
     HealthOutput,
     InvokeInput,
     InvokeOutput,
@@ -94,12 +104,23 @@ from pmcp.types import (
     SyncEnvironmentOutput,
     SubmitFeedbackInput,
     SubmitFeedbackOutput,
+    TasksCancelInput,
+    TasksCancelOutput,
+    TasksGetInput,
+    TasksGetOutput,
+    TasksListInput,
+    TasksListOutput,
+    TasksResultInput,
+    TasksResultOutput,
     ToolInfo,
+    TraceContextInfo,
     UpdateServerInput,
     UpdateServerOutput,
     LocalMcpServerConfig,
+    McpTaskInfo,
     RemoteMcpServerConfig,
     ResolvedServerConfig,
+    UrlElicitationInfo,
 )
 
 from pmcp.manifest.loader import Manifest, ServerConfig
@@ -110,6 +131,11 @@ FEEDBACK_TOKEN_LIMIT = 4000
 
 # Risk level ordering for filtering
 RISK_ORDER = {"low": 1, "medium": 2, "high": 3, "unknown": 4}
+TRACE_CONTEXT_KEYS = ("traceparent", "tracestate", "baggage")
+TRACE_VALUE_DENY_PATTERN = re.compile(
+    r"(bearer\s+|authorization|api[_-]?key|token|password|secret|sk-[A-Za-z0-9_-]{12,})",
+    re.I,
+)
 
 
 def get_gateway_tool_definitions() -> list[Tool]:
@@ -427,6 +453,25 @@ def get_gateway_tool_definitions() -> list[Tool]:
                         "type": "string",
                         "description": "API key, token, or subscription credential to store",
                     },
+                    "auth_mode": {
+                        "type": "string",
+                        "enum": ["api_key", "url_elicitation"],
+                        "default": "api_key",
+                        "description": "API-key storage or URL-mode elicitation acknowledgement",
+                    },
+                    "elicitation_id": {
+                        "type": "string",
+                        "description": "URL-mode elicitation identifier",
+                    },
+                    "elicitation_url": {
+                        "type": "string",
+                        "description": "Sanitized URL-mode elicitation URL",
+                    },
+                    "consent_acknowledged": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Acknowledge that the out-of-band URL flow was completed",
+                    },
                     "env_var": {
                         "type": "string",
                         "description": "Optional explicit environment variable key",
@@ -438,7 +483,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                         "description": "Where to store the credential",
                     },
                 },
-                "required": ["server_name", "credential"],
+                "required": ["server_name"],
             },
         ),
         Tool(
@@ -540,6 +585,76 @@ def get_gateway_tool_definitions() -> list[Tool]:
             },
         ),
         Tool(
+            name="gateway.tasks_list",
+            description=(
+                "List brokered downstream MCP tasks. "
+                "MCP task IDs are opaque downstream task identifiers, not PMCP request IDs."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_name": {
+                        "type": "string",
+                        "description": "Optional server filter",
+                    },
+                    "cursor": {
+                        "type": "string",
+                        "description": "Optional downstream pagination cursor",
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="gateway.tasks_get",
+            description="Get current status for one downstream MCP task.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_name": {"type": "string"},
+                    "task_id": {"type": "string"},
+                },
+                "required": ["server_name", "task_id"],
+            },
+        ),
+        Tool(
+            name="gateway.tasks_result",
+            description=(
+                "Fetch a downstream MCP task result and apply the same output "
+                "redaction and truncation options as gateway.invoke."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_name": {"type": "string"},
+                    "task_id": {"type": "string"},
+                    "options": {
+                        "type": "object",
+                        "properties": {
+                            "max_output_chars": {"type": "integer"},
+                            "redact_secrets": {"type": "boolean"},
+                        },
+                    },
+                },
+                "required": ["server_name", "task_id"],
+            },
+        ),
+        Tool(
+            name="gateway.tasks_cancel",
+            description=(
+                "Cancel a downstream MCP task by opaque task ID. "
+                "Use gateway.cancel only for PMCP request IDs from gateway.list_pending."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "server_name": {"type": "string"},
+                    "task_id": {"type": "string"},
+                    "force": {"type": "boolean", "default": False},
+                },
+                "required": ["server_name", "task_id"],
+            },
+        ),
+        Tool(
             name="gateway.search_registry",
             description=(
                 "Search the public MCP Registry for external servers not in the local manifest. "
@@ -624,10 +739,15 @@ class GatewayTools:
         self._stale_index_interval_seconds = 60 * 60  # Re-index every hour
         self._stale_index_task: asyncio.Task[None] | None = None
         self._feedback_events: list[dict[str, Any]] = []
+        self._audit_events: deque[GatewayAuditEvent] = deque(maxlen=64)
         self._provisioned_registry: dict[str, str | None] = (
             self._load_provisioned_registry()
         )
         self._startup_observations: StartupObservationSnapshot = {}
+        self._transport_diagnostics = GatewayDiagnosticsInfo(
+            transport="gateway",
+            audit_buffer_size=self._audit_events.maxlen or 0,
+        )
 
     def set_startup_observations(
         self, observations: StartupObservationSnapshot
@@ -635,11 +755,110 @@ class GatewayTools:
         """Replace startup policy observations used by gateway.health."""
         self._startup_observations = dict(observations)
 
+    def set_transport_diagnostics(self, diagnostics: GatewayDiagnosticsInfo) -> None:
+        """Replace safe transport diagnostics surfaced by gateway.health."""
+        self._transport_diagnostics = diagnostics
+
+    def _safe_trace_value(self, value: Any) -> str | None:
+        if not isinstance(value, str) or not value:
+            return None
+        if len(value) > 1024 or TRACE_VALUE_DENY_PATTERN.search(value):
+            return None
+        return value
+
+    def _extract_trace_context(
+        self, input_data: dict[str, Any]
+    ) -> TraceContextInfo | None:
+        values: dict[str, str] = {}
+        for candidate in (
+            input_data.get("_meta"),
+            input_data.get("meta"),
+            input_data.get("trace_context"),
+            input_data.get("traceContext"),
+        ):
+            if not isinstance(candidate, dict):
+                continue
+            for key in TRACE_CONTEXT_KEYS:
+                if key in values:
+                    continue
+                safe_value = self._safe_trace_value(candidate.get(key))
+                if safe_value is not None:
+                    values[key] = safe_value
+        if not values:
+            return None
+        return TraceContextInfo.model_validate(values)
+
+    def _audit(
+        self,
+        *,
+        method: str,
+        action: str,
+        outcome: Literal["success", "failure", "refused"],
+        started_at: float,
+        server_name: str | None = None,
+        tool_id: str | None = None,
+        task_id: str | None = None,
+        protocol_version: str | None = None,
+        auth_state: str = "none",
+        error: str | None = None,
+        trace_context: TraceContextInfo | None = None,
+    ) -> None:
+        safe_error = None
+        if error:
+            safe_error = self._sanitize_error(Exception(error))
+        self._audit_events.append(
+            GatewayAuditEvent(
+                timestamp=time.time(),
+                method=method,
+                action=action,
+                outcome=outcome,
+                latency_ms=round((time.monotonic() - started_at) * 1000),
+                server_name=server_name,
+                tool_id=tool_id,
+                task_id=task_id,
+                protocol_version=protocol_version,
+                auth_state=cast(Any, auth_state),
+                error=safe_error,
+                trace_present=trace_context is not None,
+            )
+        )
+
     @staticmethod
     def _sanitize_error(e: Exception) -> str:
         """Return a safe error string: strip absolute paths, truncate to 400 chars."""
-        msg = re.sub(r"(/[^\s:,\"']+)", lambda m: os.path.basename(m.group(1)), str(e))
+        msg = sanitize_auth_diagnostic(e)
+        msg = re.sub(r"(/[^\s:,\"']+)", lambda m: os.path.basename(m.group(1)), msg)
         return msg[:400]
+
+    def _auth_metadata_for_server(self, server_config: ServerConfig | None):
+        if server_config is None:
+            return None
+        metadata = normalize_auth_metadata(
+            protected_resource_metadata_url=server_config.protected_resource_metadata_url,
+            authorization_server_metadata_url=server_config.authorization_server_metadata_url,
+            oidc_issuer_url=server_config.oidc_issuer_url,
+            oidc_discovery_url=server_config.oidc_discovery_url,
+            client_id_metadata_document_url=server_config.client_id_metadata_document_url,
+            declared_scopes=server_config.declared_scopes,
+        )
+        if not any(
+            [
+                metadata.protected_resource_metadata_url,
+                metadata.authorization_server_metadata_url,
+                metadata.oidc_issuer_url,
+                metadata.oidc_discovery_url,
+                metadata.client_id_metadata_document_url,
+                metadata.declared_scopes,
+            ]
+        ):
+            return None
+        return metadata
+
+    def _auth_challenge_from_message(self, message: str):
+        match = re.search(r"WWW-Authenticate(?:\s*[:=]\s*|\s+)(.+)", message, re.I)
+        if not match:
+            return None
+        return parse_www_authenticate(match.group(1))
 
     @property
     def _provisioned_registry_path(self) -> Path:
@@ -768,7 +987,9 @@ class GatewayTools:
 
         cached_tools: list[ToolInfo] = []
 
-        for server_name, server_desc in self._descriptions_cache.servers.items():
+        for server_name, server_desc in sorted(
+            self._descriptions_cache.servers.items()
+        ):
             # Skip servers that are already online (live tools take precedence)
             if self._client_manager.is_server_online(server_name):
                 continue
@@ -778,7 +999,7 @@ class GatewayTools:
                 continue
 
             # Convert cached PrebuiltToolInfo to ToolInfo
-            for tool in server_desc.tools:
+            for tool in sorted(server_desc.tools, key=lambda item: item.name):
                 tool_id = f"{server_name}::{tool.name}"
 
                 # Check policy allows this tool
@@ -870,14 +1091,19 @@ class GatewayTools:
         if parsed.query:
             query_lower = parsed.query.lower()
 
-            def sort_key(t: Any) -> tuple[int, int, str]:
+            def sort_key(t: Any) -> tuple[int, int, str, str]:
                 exact = t.tool_name.lower() == query_lower
                 starts = t.tool_name.lower().startswith(query_lower)
-                return (0 if exact else 1, 0 if starts else 1, t.tool_name)
+                return (
+                    0 if exact else 1,
+                    0 if starts else 1,
+                    t.server_name,
+                    t.tool_id,
+                )
 
             tools.sort(key=sort_key)
         else:
-            tools.sort(key=lambda t: t.tool_name)
+            tools.sort(key=lambda t: (t.server_name, t.tool_id))
 
         # Apply limit
         truncated = len(tools) > parsed.limit
@@ -899,12 +1125,16 @@ class GatewayTools:
                     tool_id=t.tool_id,
                     server=t.server_name,
                     tool_name=t.tool_name,
+                    title=t.title,
                     short_description=t.short_description,
                     tags=t.tags,
                     availability="online"
                     if self._client_manager.is_server_online(t.server_name)
                     else "offline",
                     risk_hint=t.risk_hint.value,
+                    icons=t.icons,
+                    execution=t.execution,
+                    schema_dialect=t.schema_dialect,
                     code_hint=code_hint,
                 )
             )
@@ -1022,8 +1252,14 @@ class GatewayTools:
         return SchemaCard(
             server=tool_info.server_name,
             tool_name=tool_info.tool_name,
+            title=tool_info.title,
             description=tool_info.description,
+            icons=tool_info.icons,
             args=args,
+            output_schema=tool_info.output_schema,
+            annotations=tool_info.annotations,
+            execution=tool_info.execution,
+            schema_dialect=tool_info.schema_dialect,
             safety_notes=safety_notes if safety_notes else None,
             invoke_template=invoke_template,
             code_snippet=code_snippet,
@@ -1033,6 +1269,8 @@ class GatewayTools:
 
     async def invoke(self, input_data: dict[str, Any]) -> InvokeOutput:
         """gateway.invoke - Call a downstream tool."""
+        audit_started_at = time.monotonic()
+        trace_context = self._extract_trace_context(input_data)
         parsed = InvokeInput.model_validate(input_data)
 
         # Check if tool exists in registry
@@ -1055,6 +1293,15 @@ class GatewayTools:
                     ErrorCode.E301_TOOL_NOT_FOUND,
                     tool_id=parsed.tool_id,
                 )
+                self._audit(
+                    method="gateway.invoke",
+                    action="invoke",
+                    outcome="failure",
+                    started_at=audit_started_at,
+                    tool_id=parsed.tool_id,
+                    error=error.message,
+                    trace_context=trace_context,
+                )
                 return InvokeOutput(
                     tool_id=parsed.tool_id,
                     ok=False,
@@ -1070,12 +1317,25 @@ class GatewayTools:
                 ErrorCode.E402_TOOL_DENIED,
                 tool_id=parsed.tool_id,
             )
+            self._audit(
+                method="gateway.invoke",
+                action="invoke",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=tool_info.server_name,
+                tool_id=parsed.tool_id,
+                protocol_version=self._protocol_version(tool_info.server_name),
+                auth_state="policy_denied",
+                error=error.message,
+                trace_context=trace_context,
+            )
             return InvokeOutput(
                 tool_id=parsed.tool_id,
                 ok=False,
                 truncated=False,
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
+                auth_state="policy_denied",
                 feedback_hint=self._feedback_hint(),
             )
 
@@ -1087,6 +1347,17 @@ class GatewayTools:
                 ErrorCode.E304_INVALID_ARGUMENTS,
                 message=f"Missing required arguments: {', '.join(missing)}",
                 tool_id=parsed.tool_id,
+            )
+            self._audit(
+                method="gateway.invoke",
+                action="invoke",
+                outcome="failure",
+                started_at=audit_started_at,
+                server_name=tool_info.server_name,
+                tool_id=parsed.tool_id,
+                protocol_version=self._protocol_version(tool_info.server_name),
+                error=error.message,
+                trace_context=trace_context,
             )
             return InvokeOutput(
                 tool_id=parsed.tool_id,
@@ -1105,9 +1376,41 @@ class GatewayTools:
         if parsed.options:
             timeout_ms = parsed.options.timeout_ms
         try:
-            result = await self._client_manager.call_tool(
-                parsed.tool_id, parsed.arguments, timeout_ms
-            )
+            if parsed.task is None:
+                if trace_context is None:
+                    result = await self._client_manager.call_tool(
+                        parsed.tool_id, parsed.arguments, timeout_ms
+                    )
+                else:
+                    result = await self._client_manager.call_tool(
+                        parsed.tool_id,
+                        parsed.arguments,
+                        timeout_ms,
+                        trace_context=trace_context,
+                    )
+            else:
+                if trace_context is None:
+                    result = await self._client_manager.call_tool(
+                        parsed.tool_id, parsed.arguments, timeout_ms, task=parsed.task
+                    )
+                else:
+                    result = await self._client_manager.call_tool(
+                        parsed.tool_id,
+                        parsed.arguments,
+                        timeout_ms,
+                        task=parsed.task,
+                        trace_context=trace_context,
+                    )
+
+            task_info = None
+            if isinstance(result, dict):
+                task_payload = result.get("task")
+                if isinstance(task_payload, dict):
+                    task_id = task_payload.get("taskId") or task_payload.get("task_id")
+                    if isinstance(task_id, str):
+                        task_info = self._client_manager.get_task_record(
+                            tool_info.server_name, task_id
+                        )
 
             # Process output (truncate, redact)
             max_bytes = None
@@ -1124,10 +1427,22 @@ class GatewayTools:
             logger.info(
                 f"tool_call tool={parsed.tool_id} server={tool_info.server_name} ok=True elapsed_ms={elapsed_ms}"
             )
+            self._audit(
+                method="gateway.invoke",
+                action="invoke",
+                outcome="success",
+                started_at=audit_started_at,
+                server_name=tool_info.server_name,
+                tool_id=parsed.tool_id,
+                task_id=task_info.task_id if task_info else None,
+                protocol_version=self._protocol_version(tool_info.server_name),
+                trace_context=trace_context,
+            )
             return InvokeOutput(
                 tool_id=parsed.tool_id,
                 ok=True,
-                result=processed["result"],
+                result=None if task_info is not None else processed["result"],
+                task=task_info,
                 truncated=processed["truncated"],
                 summary=processed["summary"],
                 raw_size_estimate=processed["raw_size"],
@@ -1149,6 +1464,17 @@ class GatewayTools:
                 tool_id=parsed.tool_id,
                 timeout_ms=timeout_ms,
             )
+            self._audit(
+                method="gateway.invoke",
+                action="invoke",
+                outcome="failure",
+                started_at=audit_started_at,
+                server_name=tool_info.server_name,
+                tool_id=parsed.tool_id,
+                protocol_version=self._protocol_version(tool_info.server_name),
+                error=error.message,
+                trace_context=trace_context,
+            )
             return InvokeOutput(
                 tool_id=parsed.tool_id,
                 ok=False,
@@ -1160,6 +1486,14 @@ class GatewayTools:
             )
 
         except ConnectionError as e:
+            auth_challenge = self._auth_challenge_from_message(str(e))
+            auth_state = "none"
+            if auth_challenge:
+                auth_state = (
+                    "insufficient_scope"
+                    if auth_challenge.missing_scopes
+                    else "missing_auth"
+                )
             self._record_feedback_event(
                 "invoke_failure",
                 {
@@ -1177,6 +1511,18 @@ class GatewayTools:
                 message=self._sanitize_error(e),
                 tool_id=parsed.tool_id,
             )
+            self._audit(
+                method="gateway.invoke",
+                action="invoke",
+                outcome="failure",
+                started_at=audit_started_at,
+                server_name=tool_info.server_name,
+                tool_id=parsed.tool_id,
+                protocol_version=self._protocol_version(tool_info.server_name),
+                auth_state=auth_state,
+                error=error.message,
+                trace_context=trace_context,
+            )
             return InvokeOutput(
                 tool_id=parsed.tool_id,
                 ok=False,
@@ -1184,10 +1530,53 @@ class GatewayTools:
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
                 update_warning=update_warning,
+                auth_state=cast(Any, auth_state),
+                auth_challenge=auth_challenge,
+                next_step="Resolve remote authorization out of band, then retry gateway.invoke."
+                if auth_challenge
+                else None,
                 feedback_hint=self._feedback_hint(),
             )
 
         except Exception as e:
+            url_elicitations = parse_url_elicitation_error(e)
+            if url_elicitations:
+                self._record_feedback_event(
+                    "invoke_failure",
+                    {"tool_id": parsed.tool_id, "reason": "url_elicitation_required"},
+                )
+                self._audit(
+                    method="gateway.invoke",
+                    action="invoke",
+                    outcome="failure",
+                    started_at=audit_started_at,
+                    server_name=tool_info.server_name,
+                    tool_id=parsed.tool_id,
+                    protocol_version=self._protocol_version(tool_info.server_name),
+                    auth_state="elicitation_required",
+                    error="URL-mode elicitation required.",
+                    trace_context=trace_context,
+                )
+                return InvokeOutput(
+                    tool_id=parsed.tool_id,
+                    ok=False,
+                    truncated=False,
+                    raw_size_estimate=0,
+                    errors=["URL-mode elicitation required."],
+                    update_warning=update_warning,
+                    auth_state="elicitation_required",
+                    url_elicitations=url_elicitations,
+                    next_step=url_elicitations[0].next_step,
+                    feedback_hint=self._feedback_hint(),
+                )
+            auth_challenge = self._auth_challenge_from_message(str(e))
+            auth_state = "none"
+            if auth_challenge:
+                auth_state = (
+                    "insufficient_scope"
+                    if auth_challenge.missing_scopes
+                    else "missing_auth"
+                )
             self._record_feedback_event(
                 "invoke_failure",
                 {
@@ -1205,6 +1594,18 @@ class GatewayTools:
                 message=self._sanitize_error(e),
                 tool_id=parsed.tool_id,
             )
+            self._audit(
+                method="gateway.invoke",
+                action="invoke",
+                outcome="failure",
+                started_at=audit_started_at,
+                server_name=tool_info.server_name,
+                tool_id=parsed.tool_id,
+                protocol_version=self._protocol_version(tool_info.server_name),
+                auth_state=auth_state,
+                error=error.message,
+                trace_context=trace_context,
+            )
             return InvokeOutput(
                 tool_id=parsed.tool_id,
                 ok=False,
@@ -1212,16 +1613,24 @@ class GatewayTools:
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
                 update_warning=update_warning,
+                auth_state=cast(Any, auth_state),
+                auth_challenge=auth_challenge,
+                next_step="Resolve remote authorization out of band, then retry gateway.invoke."
+                if auth_challenge
+                else None,
                 feedback_hint=self._feedback_hint(),
             )
 
     async def refresh(self, input_data: dict[str, Any]) -> RefreshOutput:
         """gateway.refresh - Reload backend configs and reconnect."""
+        audit_started_at = time.monotonic()
         parsed = RefreshInput.model_validate(input_data)
 
         logger.info(f"Refresh requested: {parsed.reason or 'manual refresh'}")
         pending_seen = 0
         pending_cancelled = 0
+        active_tasks_seen = 0
+        active_tasks_cancelled = 0
 
         try:
             configs = load_configs(
@@ -1293,11 +1702,22 @@ class GatewayTools:
 
             pending_requests = self._client_manager.get_pending_requests()
             pending_seen = len(pending_requests)
-            if pending_seen and not parsed.force:
+            active_tasks = self._client_manager.get_active_tasks()
+            active_tasks_seen = len(active_tasks)
+            if (pending_seen or active_tasks_seen) and not parsed.force:
                 revision_id, _ = self._client_manager.get_registry_meta()
                 statuses = self._client_manager.get_all_server_statuses()
                 logger.warning(
-                    f"Refresh refused with {pending_seen} pending downstream requests"
+                    "Refresh refused with "
+                    f"{pending_seen} pending downstream requests and "
+                    f"{active_tasks_seen} active MCP tasks"
+                )
+                self._audit(
+                    method="gateway.refresh",
+                    action="refresh",
+                    outcome="refused",
+                    started_at=audit_started_at,
+                    error="pending requests or active MCP tasks",
                 )
                 return RefreshOutput(
                     ok=False,
@@ -1308,13 +1728,16 @@ class GatewayTools:
                     tools_indexed=len(self._client_manager.get_all_tools()),
                     revision_id=revision_id,
                     errors=[
-                        "Refresh refused because downstream requests are pending. "
+                        "Refresh refused because downstream requests or active MCP tasks are pending. "
                         "Use gateway.list_pending to inspect them or retry with force=true "
                         "to cancel them before refreshing."
                     ],
                     pending_requests_seen=pending_seen,
                     pending_requests_refused=pending_seen,
                     pending_requests_remaining=pending_seen,
+                    mcp_tasks_seen=active_tasks_seen,
+                    mcp_tasks_refused=active_tasks_seen,
+                    mcp_tasks_remaining=active_tasks_seen,
                 )
 
             if pending_seen:
@@ -1322,6 +1745,38 @@ class GatewayTools:
                 logger.warning(
                     f"Forced refresh cancelled {pending_cancelled} pending downstream requests"
                 )
+            if active_tasks_seen:
+                (
+                    active_tasks_cancelled,
+                    task_errors,
+                ) = await self._client_manager.cancel_active_tasks()
+                if task_errors:
+                    revision_id, _ = self._client_manager.get_registry_meta()
+                    statuses = self._client_manager.get_all_server_statuses()
+                    self._audit(
+                        method="gateway.refresh",
+                        action="refresh",
+                        outcome="failure",
+                        started_at=audit_started_at,
+                        error="; ".join(task_errors),
+                    )
+                    return RefreshOutput(
+                        ok=False,
+                        servers_seen=len(statuses),
+                        servers_online=sum(
+                            1 for s in statuses if s.status.value == "online"
+                        ),
+                        tools_indexed=len(self._client_manager.get_all_tools()),
+                        revision_id=revision_id,
+                        errors=task_errors,
+                        pending_requests_seen=pending_seen,
+                        pending_requests_cancelled=pending_cancelled,
+                        mcp_tasks_seen=active_tasks_seen,
+                        mcp_tasks_cancelled=active_tasks_cancelled,
+                        mcp_tasks_remaining=len(
+                            self._client_manager.get_active_tasks()
+                        ),
+                    )
 
             self.set_startup_observations(
                 build_startup_observation_snapshot(resolution)
@@ -1339,7 +1794,7 @@ class GatewayTools:
             }
             resolved_names.update(skip.name for skip in resolution.skipped)
 
-            return RefreshOutput(
+            output = RefreshOutput(
                 ok=len(errors) == 0,
                 servers_seen=len(resolved_names),
                 servers_online=sum(1 for s in statuses if s.status.value == "online"),
@@ -1349,9 +1804,27 @@ class GatewayTools:
                 pending_requests_seen=pending_seen,
                 pending_requests_cancelled=pending_cancelled,
                 pending_requests_remaining=pending_remaining,
+                mcp_tasks_seen=active_tasks_seen,
+                mcp_tasks_cancelled=active_tasks_cancelled,
+                mcp_tasks_remaining=len(self._client_manager.get_active_tasks()),
             )
+            self._audit(
+                method="gateway.refresh",
+                action="refresh",
+                outcome="success" if output.ok else "failure",
+                started_at=audit_started_at,
+                error="; ".join(errors) if errors else None,
+            )
+            return output
 
         except Exception as e:
+            self._audit(
+                method="gateway.refresh",
+                action="refresh",
+                outcome="failure",
+                started_at=audit_started_at,
+                error=str(e),
+            )
             return RefreshOutput(
                 ok=False,
                 servers_seen=0,
@@ -1361,6 +1834,8 @@ class GatewayTools:
                 errors=[str(e)],
                 pending_requests_seen=pending_seen,
                 pending_requests_cancelled=pending_cancelled,
+                mcp_tasks_seen=active_tasks_seen,
+                mcp_tasks_cancelled=active_tasks_cancelled,
             )
 
     async def health(self) -> HealthOutput:
@@ -1374,6 +1849,8 @@ class GatewayTools:
                 name=status.name,
                 status=status.status.value,
                 tool_count=status.tool_count,
+                protocol_version=status.protocol_version,
+                server_capabilities=status.server_capabilities,
                 error=status.last_error
                 if status.status.value == "error" and status.last_error
                 else None,
@@ -1384,6 +1861,29 @@ class GatewayTools:
                 info.startup_source = observation.startup_source
                 info.startup_skip_reason = observation.startup_skip_reason
                 info.startup_env_var = observation.startup_env_var
+                if observation.startup_skip_reason in {
+                    StartupSkipReason.MISSING_AUTH.value,
+                    StartupSkipReason.POLICY_DENIED.value,
+                }:
+                    info.auth_state = cast(Any, observation.startup_skip_reason)
+                    if (
+                        observation.startup_skip_reason
+                        == StartupSkipReason.MISSING_AUTH.value
+                    ):
+                        info.auth_methods = self._auth_methods_for_server(status.name)
+                        info.next_step = (
+                            f"gateway.auth_connect(server_name='{status.name}')"
+                        )
+            if status.last_error:
+                auth_challenge = self._auth_challenge_from_message(status.last_error)
+                if auth_challenge:
+                    info.auth_challenge = auth_challenge
+                    info.auth_state = (
+                        "insufficient_scope"
+                        if auth_challenge.missing_scopes
+                        else "missing_auth"
+                    )
+                    info.next_step = "Resolve remote authorization out of band, then retry connection."
             servers.append(info)
 
         known_names = {s.name for s in servers}
@@ -1400,6 +1900,19 @@ class GatewayTools:
                 info.startup_source = observation.startup_source
                 info.startup_skip_reason = observation.startup_skip_reason
                 info.startup_env_var = observation.startup_env_var
+                if observation.startup_skip_reason in {
+                    StartupSkipReason.MISSING_AUTH.value,
+                    StartupSkipReason.POLICY_DENIED.value,
+                }:
+                    info.auth_state = cast(Any, observation.startup_skip_reason)
+                    if (
+                        observation.startup_skip_reason
+                        == StartupSkipReason.MISSING_AUTH.value
+                    ):
+                        info.auth_methods = self._auth_methods_for_server(prov_name)
+                        info.next_step = (
+                            f"gateway.auth_connect(server_name='{prov_name}')"
+                        )
             servers.append(info)
             known_names.add(prov_name)
 
@@ -1415,13 +1928,44 @@ class GatewayTools:
                     startup_source=observation.startup_source,
                     startup_skip_reason=observation.startup_skip_reason,
                     startup_env_var=observation.startup_env_var,
+                    auth_state=cast(
+                        Any,
+                        observation.startup_skip_reason
+                        if observation.startup_skip_reason
+                        in {
+                            StartupSkipReason.MISSING_AUTH.value,
+                            StartupSkipReason.POLICY_DENIED.value,
+                        }
+                        else "none",
+                    ),
+                    next_step=(
+                        f"gateway.auth_connect(server_name='{name}')"
+                        if observation.startup_skip_reason
+                        == StartupSkipReason.MISSING_AUTH.value
+                        else None
+                    ),
                 )
             )
 
+        diagnostics = self._transport_diagnostics.model_copy()
+        diagnostics.audit_buffer_size = self._audit_events.maxlen or len(
+            self._audit_events
+        )
+        diagnostics.auth_metadata_present = any(
+            server.auth_metadata is not None or server.auth_challenge is not None
+            for server in servers
+        )
+        diagnostics.protocol_version_visible = any(
+            server.protocol_version for server in servers
+        )
+
+        servers.sort(key=lambda server: server.name)
         return HealthOutput(
             revision_id=revision_id,
             servers=servers,
             last_refresh_ts=last_refresh_ts,
+            gateway_diagnostics=diagnostics,
+            audit_events=list(self._audit_events) or None,
         )
 
     async def connect_server(self, input_data: dict[str, Any]) -> LifecycleServerOutput:
@@ -1480,9 +2024,12 @@ class GatewayTools:
         if failure is not None:
             return failure
 
+        active_tasks_before = len(self._client_manager.get_active_tasks(server_name))
         disconnected, cancelled, error = await self._client_manager.disconnect_server(
             server_name, force=parsed.force
         )
+        active_tasks_after = len(self._client_manager.get_active_tasks(server_name))
+        cancelled_tasks = max(active_tasks_before - active_tasks_after, 0)
         if not disconnected:
             return self._lifecycle_output(
                 ok=False,
@@ -1490,6 +2037,8 @@ class GatewayTools:
                 action="disconnect",
                 prior_status=prior_status,
                 cancelled_request_count=cancelled,
+                active_task_count=active_tasks_after,
+                cancelled_task_count=cancelled_tasks,
                 message=error or f"Server '{server_name}' could not be disconnected.",
                 errors=[error] if error else None,
             )
@@ -1500,6 +2049,8 @@ class GatewayTools:
             action="disconnect",
             prior_status=prior_status,
             cancelled_request_count=cancelled,
+            active_task_count=active_tasks_after,
+            cancelled_task_count=cancelled_tasks,
             message=f"Server '{server_name}' disconnected.",
         )
 
@@ -1524,15 +2075,19 @@ class GatewayTools:
                 errors=[f"Unable to resolve server: {server_name}"],
             )
 
+        active_tasks_before = len(self._client_manager.get_active_tasks(server_name))
         ok, cancelled, errors = await self._client_manager.restart_server(
             config, force=parsed.force
         )
+        active_tasks_after = len(self._client_manager.get_active_tasks(server_name))
         return self._lifecycle_output(
             ok=ok,
             server=server_name,
             action="restart",
             prior_status=prior_status,
             cancelled_request_count=cancelled,
+            active_task_count=active_tasks_after,
+            cancelled_task_count=max(active_tasks_before - active_tasks_after, 0),
             message=f"Server '{server_name}' restarted."
             if ok
             else f"Server '{server_name}' could not be restarted.",
@@ -1656,6 +2211,13 @@ class GatewayTools:
             return "unknown"
         return status.status.value
 
+    def _protocol_version(self, server_name: str | None) -> str | None:
+        if server_name is None:
+            return None
+        status = self._client_manager.get_server_status(server_name)
+        protocol_version = getattr(status, "protocol_version", None) if status else None
+        return protocol_version if isinstance(protocol_version, str) else None
+
     def _lifecycle_output(
         self,
         *,
@@ -1665,8 +2227,26 @@ class GatewayTools:
         prior_status: str,
         message: str,
         cancelled_request_count: int = 0,
+        active_task_count: int = 0,
+        cancelled_task_count: int = 0,
         errors: list[str] | None = None,
+        auth_state: str = "none",
+        next_step: str | None = None,
+        auth_methods: list[str] | None = None,
+        auth_metadata: Any | None = None,
+        auth_challenge: Any | None = None,
+        url_elicitations: list[Any] | None = None,
     ) -> LifecycleServerOutput:
+        self._audit(
+            method=f"gateway.{action}_server",
+            action=action,
+            outcome="success" if ok else "refused",
+            started_at=time.monotonic(),
+            server_name=server,
+            protocol_version=self._protocol_version(server),
+            auth_state=auth_state,
+            error="; ".join(errors) if errors else None,
+        )
         return LifecycleServerOutput(
             ok=ok,
             server=server,
@@ -1674,8 +2254,16 @@ class GatewayTools:
             prior_status=prior_status,
             new_status=self._status_value(server),
             cancelled_request_count=cancelled_request_count,
+            active_task_count=active_task_count,
+            cancelled_task_count=cancelled_task_count,
             message=message,
             errors=errors,
+            auth_state=cast(Any, auth_state),
+            next_step=next_step,
+            auth_methods=auth_methods,
+            auth_metadata=auth_metadata,
+            auth_challenge=auth_challenge,
+            url_elicitations=url_elicitations,
         )
 
     def _resolve_lifecycle_config(
@@ -1698,6 +2286,7 @@ class GatewayTools:
                         prior_status=prior_status,
                         message=f"Server '{server_name}' is blocked by policy.",
                         errors=[f"Server '{server_name}' is blocked by policy."],
+                        auth_state="policy_denied",
                     ),
                 )
             return (configured_servers[server_name], None)
@@ -1718,6 +2307,7 @@ class GatewayTools:
                         prior_status=prior_status,
                         message=f"Server '{server_name}' is blocked by policy.",
                         errors=[f"Server '{server_name}' is blocked by policy."],
+                        auth_state="policy_denied",
                     ),
                 )
 
@@ -1741,6 +2331,10 @@ class GatewayTools:
                             errors=[
                                 f"Missing authentication environment variable for '{server_name}': {env_names}"
                             ],
+                            auth_state="missing_auth",
+                            auth_methods=self._auth_methods_for_server(server_name),
+                            auth_metadata=self._auth_metadata_for_server(server_config),
+                            next_step=f"gateway.auth_connect(server_name='{server_name}')",
                         ),
                     )
 
@@ -2023,6 +2617,7 @@ class GatewayTools:
         # Load manifest
         manifest = load_manifest()
         configured_servers = self._load_configured_servers()
+
         merged_manifest = self._build_manifest_with_config_servers(
             manifest, configured_servers
         )
@@ -2230,6 +2825,17 @@ class GatewayTools:
 
         configured_servers = self._load_configured_servers()
 
+        if not self._policy_manager.is_server_allowed(server_name):
+            return ProvisionOutput(
+                ok=False,
+                server=server_name,
+                status="failed",
+                message=f"Server '{server_name}' is blocked by policy.",
+                auth_state="policy_denied",
+                update_warning=update_warning,
+                feedback_hint=self._feedback_hint(),
+            )
+
         # Check if already running
         if self._client_manager.is_server_online(server_name):
             tools = [
@@ -2300,6 +2906,7 @@ class GatewayTools:
                     f"Server '{server_name}' is configured but could not be started. "
                     "Run gateway.refresh and check gateway.health for connection errors."
                 ),
+                auth_state="unknown",
                 update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
@@ -2344,6 +2951,9 @@ class GatewayTools:
                     auth_mode="api_key",
                     auth_methods=self._auth_methods_for_server(server_name),
                     alternative_env_vars=auth_env_options,
+                    auth_state="missing_auth",
+                    auth_metadata=self._auth_metadata_for_server(server_config),
+                    next_step=f"gateway.auth_connect(server_name='{server_name}')",
                     update_warning=update_warning,
                     feedback_hint=self._feedback_hint(),
                 )
@@ -2355,6 +2965,10 @@ class GatewayTools:
                 errors = await self._client_manager.connect_all([resolved_config])
                 if errors:
                     message = "; ".join(errors)
+                    auth_challenge = self._auth_challenge_from_message(message)
+                    auth_state = "missing_auth" if auth_challenge else "unknown"
+                    if auth_challenge and auth_challenge.missing_scopes:
+                        auth_state = "insufficient_scope"
                     self._record_feedback_event(
                         "provision_failure",
                         {
@@ -2367,7 +2981,11 @@ class GatewayTools:
                         ok=False,
                         server=server_name,
                         status="failed",
-                        message=message,
+                        message=self._sanitize_error(Exception(message)),
+                        auth_state=cast(Any, auth_state),
+                        auth_challenge=auth_challenge,
+                        auth_metadata=self._auth_metadata_for_server(server_config),
+                        next_step="Resolve remote authorization out of band, then retry gateway.provision.",
                         update_warning=update_warning,
                         feedback_hint=self._feedback_hint(),
                     )
@@ -2417,6 +3035,8 @@ class GatewayTools:
                     server=server_name,
                     status="failed",
                     message=f"Failed to connect remote server '{server_name}': {self._sanitize_error(e)}",
+                    auth_state="unknown",
+                    auth_metadata=self._auth_metadata_for_server(server_config),
                     update_warning=update_warning,
                     feedback_hint=self._feedback_hint(),
                 )
@@ -2458,6 +3078,9 @@ class GatewayTools:
                 auth_required=True,
                 auth_mode="api_key",
                 auth_methods=self._auth_methods_for_server(server_name),
+                auth_state="missing_auth",
+                next_step=f"gateway.auth_connect(server_name='{server_name}')",
+                auth_metadata=self._auth_metadata_for_server(server_config),
                 update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
@@ -2504,6 +3127,54 @@ class GatewayTools:
         parsed = AuthConnectInput.model_validate(input_data)
         server_name = parsed.server_name
 
+        if parsed.auth_mode == "url_elicitation":
+            if parsed.credential:
+                return AuthConnectOutput(
+                    ok=False,
+                    server=server_name,
+                    message=(
+                        "URL-mode elicitation does not accept credentials, OAuth "
+                        "codes, or third-party secrets through gateway.auth_connect."
+                    ),
+                    auth_state="elicitation_required",
+                )
+            if not parsed.elicitation_id or not parsed.consent_acknowledged:
+                return AuthConnectOutput(
+                    ok=False,
+                    server=server_name,
+                    message=(
+                        "URL-mode elicitation requires elicitation_id and "
+                        "consent_acknowledged=true after completing the URL flow."
+                    ),
+                    auth_state="elicitation_required",
+                )
+            url_elicitation = None
+            if parsed.elicitation_url:
+                url_elicitation = UrlElicitationInfo(
+                    elicitation_id=parsed.elicitation_id,
+                    url=redact_auth_url(parsed.elicitation_url),
+                    next_step=f"Retry gateway.provision(server_name='{server_name}') or gateway.invoke.",
+                )
+            return AuthConnectOutput(
+                ok=True,
+                server=server_name,
+                message=(
+                    f"Recorded URL-mode elicitation acknowledgement for '{server_name}'. "
+                    "PMCP did not store third-party credentials."
+                ),
+                next_step=f"Retry gateway.provision(server_name='{server_name}') or gateway.invoke.",
+                auth_state="elicitation_required",
+                url_elicitation=url_elicitation,
+            )
+
+        if not parsed.credential:
+            return AuthConnectOutput(
+                ok=False,
+                server=server_name,
+                message="API-key auth requires a credential value.",
+                auth_state="missing_auth",
+            )
+
         manifest = load_manifest()
         server_config = manifest.get_server(server_name)
         env_var = parsed.env_var or (server_config.env_var if server_config else None)
@@ -2516,6 +3187,7 @@ class GatewayTools:
                     f"No auth env var is known for server '{server_name}'. "
                     "Pass env_var explicitly or add auth metadata to manifest."
                 ),
+                auth_state="missing_auth",
             )
 
         path = self._write_secret(parsed.scope, env_var, parsed.credential)
@@ -3203,6 +3875,8 @@ class GatewayTools:
                     timeout_ms=req.timeout_ms,
                     state=state.value,
                     last_heartbeat_seconds_ago=now - req.last_heartbeat,
+                    task_id=getattr(req, "task_id", None),
+                    task_status=getattr(req, "task_status", None),
                 )
             )
 
@@ -3211,8 +3885,173 @@ class GatewayTools:
             total_pending=len(requests),
         )
 
+    async def tasks_list(self, input_data: dict[str, Any]) -> TasksListOutput:
+        """gateway.tasks_list - List downstream MCP tasks."""
+        audit_started_at = time.monotonic()
+        parsed = TasksListInput.model_validate(input_data)
+        try:
+            result = await self._client_manager.list_tasks(
+                parsed.server_name, parsed.cursor
+            )
+            tasks: list[McpTaskInfo] = []
+            for task in result.get("tasks", []):
+                if not isinstance(task, dict) or not isinstance(
+                    task.get("task_id"), str
+                ):
+                    continue
+                record = self._client_manager.get_task_record(
+                    task.get("server_name", parsed.server_name or ""),
+                    task["task_id"],
+                )
+                tasks.append(record if record is not None else McpTaskInfo(**task))
+            output = TasksListOutput(
+                ok=True,
+                tasks=tasks,
+                next_cursor=result.get("nextCursor"),
+            )
+            self._audit(
+                method="gateway.tasks_list",
+                action="tasks_list",
+                outcome="success",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+            )
+            return output
+        except Exception as e:
+            self._audit(
+                method="gateway.tasks_list",
+                action="tasks_list",
+                outcome="failure",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                error=str(e),
+            )
+            return TasksListOutput(ok=False, errors=[self._sanitize_error(e)])
+
+    async def tasks_get(self, input_data: dict[str, Any]) -> TasksGetOutput:
+        """gateway.tasks_get - Get a downstream MCP task."""
+        audit_started_at = time.monotonic()
+        parsed = TasksGetInput.model_validate(input_data)
+        try:
+            task = await self._client_manager.get_task(
+                parsed.server_name, parsed.task_id
+            )
+            self._audit(
+                method="gateway.tasks_get",
+                action="tasks_get",
+                outcome="success",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                task_id=parsed.task_id,
+            )
+            return TasksGetOutput(ok=True, task=task)
+        except Exception as e:
+            self._audit(
+                method="gateway.tasks_get",
+                action="tasks_get",
+                outcome="failure",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                task_id=parsed.task_id,
+                error=str(e),
+            )
+            return TasksGetOutput(ok=False, errors=[self._sanitize_error(e)])
+
+    async def tasks_result(self, input_data: dict[str, Any]) -> TasksResultOutput:
+        """gateway.tasks_result - Fetch a downstream MCP task result."""
+        audit_started_at = time.monotonic()
+        parsed = TasksResultInput.model_validate(input_data)
+        try:
+            result = await self._client_manager.get_task_result(
+                parsed.server_name, parsed.task_id
+            )
+            task = self._client_manager.get_task_record(
+                parsed.server_name, parsed.task_id
+            )
+            result_payload = (
+                result.get("result", result) if isinstance(result, dict) else result
+            )
+            max_bytes = None
+            if parsed.options and parsed.options.max_output_chars:
+                max_bytes = parsed.options.max_output_chars * 4
+            redact = parsed.options.redact_secrets if parsed.options else False
+            processed = self._policy_manager.process_output(
+                result_payload, redact=redact, max_bytes=max_bytes
+            )
+            output = TasksResultOutput(
+                ok=True,
+                task=task,
+                result=processed["result"],
+                truncated=processed["truncated"],
+                summary=processed["summary"],
+                raw_size_estimate=processed["raw_size"],
+            )
+            self._audit(
+                method="gateway.tasks_result",
+                action="tasks_result",
+                outcome="success",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                task_id=parsed.task_id,
+            )
+            return output
+        except Exception as e:
+            self._audit(
+                method="gateway.tasks_result",
+                action="tasks_result",
+                outcome="failure",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                task_id=parsed.task_id,
+                error=str(e),
+            )
+            return TasksResultOutput(ok=False, errors=[self._sanitize_error(e)])
+
+    async def tasks_cancel(self, input_data: dict[str, Any]) -> TasksCancelOutput:
+        """gateway.tasks_cancel - Cancel a downstream MCP task."""
+        audit_started_at = time.monotonic()
+        parsed = TasksCancelInput.model_validate(input_data)
+        try:
+            ok, task, message = await self._client_manager.cancel_task(
+                parsed.server_name, parsed.task_id, parsed.force
+            )
+            self._audit(
+                method="gateway.tasks_cancel",
+                action="tasks_cancel",
+                outcome="success" if ok else "refused",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                task_id=parsed.task_id,
+                error=None if ok else message,
+            )
+            return TasksCancelOutput(
+                ok=ok,
+                task=task,
+                status="cancelled" if ok else "not_found",
+                message=message,
+                errors=None if ok else [message],
+            )
+        except Exception as e:
+            message = self._sanitize_error(e)
+            self._audit(
+                method="gateway.tasks_cancel",
+                action="tasks_cancel",
+                outcome="failure",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                task_id=parsed.task_id,
+                error=message,
+            )
+            return TasksCancelOutput(
+                ok=False,
+                status="error",
+                message=message,
+                errors=[message],
+            )
+
     async def cancel(self, input_data: dict[str, Any]) -> CancelOutput:
         """gateway.cancel - Cancel a pending tool invocation."""
+        audit_started_at = time.monotonic()
         parsed = CancelInput.model_validate(input_data)
 
         (
@@ -3221,6 +4060,25 @@ class GatewayTools:
             was_stalled,
             elapsed,
         ) = await self._client_manager.cancel_request(parsed.request_id, parsed.force)
+
+        outcome: Literal["success", "failure", "refused"] = "success"
+        if status in {"cancelled", "already_complete"}:
+            outcome = "success"
+        elif status == "refused":
+            outcome = "refused"
+        else:
+            outcome = "failure"
+        server_name = (
+            parsed.request_id.rsplit("::", 1)[0] if "::" in parsed.request_id else None
+        )
+        self._audit(
+            method="gateway.cancel",
+            action="cancel",
+            outcome=outcome,
+            started_at=audit_started_at,
+            server_name=server_name,
+            error=None if outcome == "success" else message,
+        )
 
         return CancelOutput(
             request_id=parsed.request_id,

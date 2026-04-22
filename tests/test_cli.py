@@ -471,6 +471,42 @@ class TestRunStatus:
         assert output["pending_requests"][0]["request_id"] == "context7::1"
 
     @pytest.mark.asyncio
+    async def test_status_live_snapshot_json_preserves_protocol_fields(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """JSON live status should pass protocol metadata through unchanged."""
+        import json
+
+        from pmcp.cli import run_status
+
+        status_args.json = True
+        live_snapshot = {
+            "revision_id": "live-rev",
+            "last_refresh_ts": 1_700_000_000.0,
+            "servers": [
+                {
+                    "name": "context7",
+                    "status": "online",
+                    "tool_count": 2,
+                    "protocol_version": "2025-11-25",
+                    "server_capabilities": {"tools": {"listChanged": True}},
+                }
+            ],
+            "total_tools": 2,
+        }
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status",
+            new=AsyncMock(return_value=live_snapshot),
+        ):
+            await run_status(status_args)
+
+        captured = capsys.readouterr()
+        server = json.loads(captured.out)["servers"][0]
+        assert server["protocol_version"] == "2025-11-25"
+        assert server["server_capabilities"] == {"tools": {"listChanged": True}}
+
+    @pytest.mark.asyncio
     async def test_status_live_snapshot_human_with_pending_and_verbose(
         self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
     ) -> None:
@@ -553,6 +589,8 @@ class TestRunStatus:
                     "startup_source": "manifest",
                     "startup_skip_reason": "missing_auth",
                     "startup_env_var": "CONTEXT7_API_KEY",
+                    "auth_state": "missing_auth",
+                    "next_step": "gateway.auth_connect(server_name='needs-key')",
                 },
             ],
             "total_tools": 2,
@@ -569,6 +607,39 @@ class TestRunStatus:
         assert "policy=skipped" in captured.out
         assert "reason=missing_auth" in captured.out
         assert "env=CONTEXT7_API_KEY" in captured.out
+        assert "auth=missing_auth" in captured.out
+        assert "gateway.auth_connect" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_status_verbose_prints_live_protocol_version(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Verbose live status should show protocol version when present."""
+        from pmcp.cli import run_status
+
+        status_args.verbose = True
+        live_snapshot = {
+            "revision_id": "live-rev",
+            "last_refresh_ts": 1_700_000_000.0,
+            "servers": [
+                {
+                    "name": "context7",
+                    "status": "online",
+                    "tool_count": 2,
+                    "protocol_version": "2025-11-25",
+                }
+            ],
+            "total_tools": 2,
+        }
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status",
+            new=AsyncMock(return_value=live_snapshot),
+        ):
+            await run_status(status_args)
+
+        captured = capsys.readouterr()
+        assert "protocol=2025-11-25" in captured.out
 
     @pytest.mark.asyncio
     async def test_status_json_preserves_live_startup_policy(
@@ -637,6 +708,48 @@ class TestRunStatus:
         assert "configured" in captured.out
         assert "lazy" in captured.out
         mock_connect_all.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_status_local_fallback_json_includes_protocol_fields(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import json
+
+        from pmcp.cli import run_status
+        from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig, ServerStatus
+        from pmcp.types import ServerStatusEnum
+
+        status_args.json = True
+        config = ResolvedServerConfig(
+            name="configured",
+            source="project",
+            config=LocalMcpServerConfig(command="configured-cmd"),
+        )
+        server_status = ServerStatus(
+            name="configured",
+            status=ServerStatusEnum.ONLINE,
+            tool_count=1,
+            protocol_version="2025-11-25",
+            server_capabilities={"tools": {"listChanged": True}},
+        )
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status", new=AsyncMock(return_value=None)
+        ):
+            with patch("pmcp.config.loader.load_configs", return_value=[config]):
+                with patch(
+                    "pmcp.client.manager.ClientManager.connect_all", new=AsyncMock()
+                ):
+                    with patch(
+                        "pmcp.client.manager.ClientManager.get_all_server_statuses",
+                        return_value=[server_status],
+                    ):
+                        await run_status(status_args)
+
+        captured = capsys.readouterr()
+        server = json.loads(captured.out)["servers"][0]
+        assert server["protocol_version"] == "2025-11-25"
+        assert server["server_capabilities"] == {"tools": {"listChanged": True}}
 
 
 class TestLogsCommand:

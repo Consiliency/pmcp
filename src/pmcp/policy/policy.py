@@ -12,6 +12,7 @@ from typing import Any
 import yaml
 
 from pmcp.types import GatewayPolicy
+from pmcp.auth import sanitize_auth_diagnostic
 
 logger = logging.getLogger(__name__)
 
@@ -192,7 +193,7 @@ class PolicyManager:
 
     def redact_secrets(self, output: str) -> str:
         """Redact secrets from output."""
-        result = output
+        result = sanitize_auth_diagnostic(output)
 
         for regex in self._redaction_regexes:
 

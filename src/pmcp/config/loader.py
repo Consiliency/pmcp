@@ -522,6 +522,13 @@ def _manifest_server_to_config(
                 ),
                 url=server.url,
                 headers=server.headers,
+                protected_resource_metadata_url=server.protected_resource_metadata_url,
+                authorization_server_metadata_url=server.authorization_server_metadata_url,
+                oidc_issuer_url=server.oidc_issuer_url,
+                oidc_discovery_url=server.oidc_discovery_url,
+                client_id_metadata_document_url=server.client_id_metadata_document_url,
+                declared_scopes=server.declared_scopes,
+                supports_url_elicitation=server.supports_url_elicitation,
             ),
         )
 

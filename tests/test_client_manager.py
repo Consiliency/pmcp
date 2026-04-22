@@ -12,8 +12,10 @@ import pytest
 
 from pmcp.client.manager import (
     ClientManager,
+    DEFAULT_SCHEMA_DIALECT,
     ManagedClient,
     PendingRequest,
+    PREFERRED_PROTOCOL_VERSION,
     _extract_tags,
     _infer_risk_hint,
     _truncate_description,
@@ -72,6 +74,27 @@ class TestHelperFunctions:
         assert _truncate_description("") == ""
 
 
+def make_managed_for_protocol_tests() -> tuple[ResolvedServerConfig, ManagedClient]:
+    config = ResolvedServerConfig(
+        name="server",
+        source="custom",
+        config=LocalMcpServerConfig(command="cmd"),
+    )
+    status = ServerStatus(
+        name="server",
+        status=ServerStatusEnum.CONNECTING,
+        tool_count=0,
+    )
+    write_stream = AsyncMock()
+    managed = ManagedClient(
+        config=config,
+        is_remote=True,
+        write_stream=write_stream,
+        status=status,
+    )
+    return config, managed
+
+
 class TestClientManager:
     """Tests for ClientManager class."""
 
@@ -79,6 +102,175 @@ class TestClientManager:
     def manager(self) -> ClientManager:
         """Create a ClientManager instance."""
         return ClientManager(max_tools_per_server=100)
+
+    @pytest.mark.asyncio
+    async def test_send_initialize_prefers_current_protocol_and_records_metadata(
+        self,
+    ) -> None:
+        """Initialize should send the preferred protocol and record server response."""
+        manager = ClientManager()
+        _, managed = make_managed_for_protocol_tests()
+        manager._send_request = AsyncMock(
+            return_value={
+                "protocolVersion": "2025-11-25",
+                "capabilities": {"tools": {"listChanged": True}},
+            }
+        )
+
+        await manager._send_initialize(managed)
+
+        manager._send_request.assert_awaited_once()
+        params = manager._send_request.await_args.args[2]
+        assert params["protocolVersion"] == PREFERRED_PROTOCOL_VERSION
+        assert managed.status.protocol_version == "2025-11-25"
+        assert managed.status.server_capabilities == {"tools": {"listChanged": True}}
+        managed.write_stream.send.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "protocol_version",
+        ["2024-11-05", "2025-03-26", "2025-06-18"],
+    )
+    async def test_send_initialize_records_supported_older_protocol_versions(
+        self, protocol_version: str
+    ) -> None:
+        manager = ClientManager()
+        _, managed = make_managed_for_protocol_tests()
+        manager._send_request = AsyncMock(
+            return_value={"protocolVersion": protocol_version, "capabilities": {}}
+        )
+
+        await manager._send_initialize(managed)
+
+        assert managed.status.protocol_version == protocol_version
+
+    @pytest.mark.asyncio
+    async def test_send_initialize_retries_legacy_on_protocol_error(self) -> None:
+        manager = ClientManager()
+        _, managed = make_managed_for_protocol_tests()
+        manager._send_request = AsyncMock(
+            side_effect=[
+                Exception("initialize unsupported protocol version"),
+                {"protocolVersion": "2024-11-05", "capabilities": {}},
+            ]
+        )
+
+        await manager._send_initialize(managed)
+
+        first_params = manager._send_request.await_args_list[0].args[2]
+        second_params = manager._send_request.await_args_list[1].args[2]
+        assert first_params["protocolVersion"] == "2025-11-25"
+        assert second_params["protocolVersion"] == "2024-11-05"
+        assert managed.status.protocol_version == "2024-11-05"
+
+    def test_index_tools_preserves_modern_metadata_and_schema_dialect(self) -> None:
+        manager = ClientManager()
+
+        count = manager._index_tools(
+            "server",
+            [
+                {
+                    "name": "modern",
+                    "title": "Modern Tool",
+                    "description": "Uses modern metadata",
+                    "inputSchema": {"type": "object"},
+                    "outputSchema": {
+                        "$schema": "https://json-schema.org/draft/2019-09/schema",
+                        "type": "object",
+                    },
+                    "icons": [{"src": "tool.svg", "mimeType": "image/svg+xml"}],
+                    "annotations": {"readOnlyHint": True},
+                    "execution": {"taskSupport": "optional"},
+                    "extraField": {"kept": True},
+                }
+            ],
+        )
+
+        tool = manager.get_tool("server::modern")
+        assert count == 1
+        assert tool is not None
+        assert tool.title == "Modern Tool"
+        assert tool.icons == [{"src": "tool.svg", "mimeType": "image/svg+xml"}]
+        assert tool.output_schema == {
+            "$schema": "https://json-schema.org/draft/2019-09/schema",
+            "type": "object",
+        }
+        assert tool.annotations == {"readOnlyHint": True}
+        assert tool.execution == {"taskSupport": "optional"}
+        assert tool.schema_dialect == "https://json-schema.org/draft/2019-09/schema"
+        assert tool.raw_metadata == {"extraField": {"kept": True}}
+
+    def test_index_tools_defaults_schema_dialect_and_accepts_old_payloads(
+        self,
+    ) -> None:
+        manager = ClientManager()
+
+        manager._index_tools(
+            "server",
+            [{"name": "old", "description": "Old payload", "inputSchema": {}}],
+        )
+
+        tool = manager.get_tool("server::old")
+        assert tool is not None
+        assert tool.title is None
+        assert tool.output_schema is None
+        assert tool.schema_dialect == DEFAULT_SCHEMA_DIALECT
+        assert tool.raw_metadata is None
+
+    def test_index_resources_and_prompts_preserve_metadata(self) -> None:
+        manager = ClientManager()
+
+        resource_count = manager._index_resources(
+            "server",
+            [
+                {
+                    "uri": "file://one",
+                    "name": "one",
+                    "title": "One",
+                    "icons": [{"src": "resource.png"}],
+                    "annotations": {"audience": ["assistant"]},
+                    "extra": "resource-extra",
+                }
+            ],
+        )
+        prompt_count = manager._index_prompts(
+            "server",
+            [
+                {
+                    "name": "summarize",
+                    "title": "Summarize",
+                    "icons": [{"src": "prompt.png"}],
+                    "annotations": {"priority": 1},
+                    "arguments": [
+                        {
+                            "name": "topic",
+                            "title": "Topic",
+                            "required": True,
+                            "extra": "argument-extra",
+                        }
+                    ],
+                    "extra": "prompt-extra",
+                }
+            ],
+        )
+
+        resource = manager.get_resource("server::file://one")
+        prompt = manager.get_prompt_info("server::summarize")
+        assert resource_count == 1
+        assert prompt_count == 1
+        assert resource is not None
+        assert resource.title == "One"
+        assert resource.icons == [{"src": "resource.png"}]
+        assert resource.annotations == {"audience": ["assistant"]}
+        assert resource.raw_metadata == {"extra": "resource-extra"}
+        assert prompt is not None
+        assert prompt.title == "Summarize"
+        assert prompt.icons == [{"src": "prompt.png"}]
+        assert prompt.annotations == {"priority": 1}
+        assert prompt.raw_metadata == {"extra": "prompt-extra"}
+        assert prompt.arguments is not None
+        assert prompt.arguments[0].title == "Topic"
+        assert prompt.arguments[0].raw_metadata == {"extra": "argument-extra"}
 
     def test_init(self, manager: ClientManager) -> None:
         """Test ClientManager initialization."""
@@ -108,6 +300,65 @@ class TestClientManager:
         revision_id, last_refresh_ts = manager.get_registry_meta()
         assert revision_id.startswith("rev-")
         assert last_refresh_ts > 0
+
+    def test_snapshot_getters_are_sorted_by_public_ids(
+        self, manager: ClientManager
+    ) -> None:
+        manager._tools["z::beta"] = ToolInfo(
+            tool_id="z::beta",
+            server_name="z",
+            tool_name="beta",
+            description="Beta",
+            short_description="Beta",
+            input_schema={},
+            tags=[],
+            risk_hint=RiskHint.LOW,
+        )
+        manager._tools["a::alpha"] = ToolInfo(
+            tool_id="a::alpha",
+            server_name="a",
+            tool_name="alpha",
+            description="Alpha",
+            short_description="Alpha",
+            input_schema={},
+            tags=[],
+            risk_hint=RiskHint.LOW,
+        )
+        manager._resources["z::file:///z"] = ResourceInfo(
+            resource_id="z::file:///z", server_name="z", uri="file:///z"
+        )
+        manager._resources["a::file:///a"] = ResourceInfo(
+            resource_id="a::file:///a", server_name="a", uri="file:///a"
+        )
+        manager._prompts["z::beta"] = PromptInfo(
+            prompt_id="z::beta", server_name="z", name="beta"
+        )
+        manager._prompts["a::alpha"] = PromptInfo(
+            prompt_id="a::alpha", server_name="a", name="alpha"
+        )
+        manager._servers["z"] = ServerStatus(
+            name="z", status=ServerStatusEnum.LAZY, tool_count=0
+        )
+        manager._servers["a"] = ServerStatus(
+            name="a", status=ServerStatusEnum.LAZY, tool_count=0
+        )
+
+        assert [tool.tool_id for tool in manager.get_all_tools()] == [
+            "a::alpha",
+            "z::beta",
+        ]
+        assert [resource.resource_id for resource in manager.get_all_resources()] == [
+            "a::file:///a",
+            "z::file:///z",
+        ]
+        assert [prompt.prompt_id for prompt in manager.get_all_prompts()] == [
+            "a::alpha",
+            "z::beta",
+        ]
+        assert [status.name for status in manager.get_all_server_statuses()] == [
+            "a",
+            "z",
+        ]
 
 
 class TestDisconnectAll:
@@ -714,6 +965,165 @@ class TestCallTool:
         """Test call_tool raises when server not connected."""
         with pytest.raises(RuntimeError, match="not connected"):
             await manager_with_tool.call_tool("test::echo", {})
+
+    @pytest.mark.asyncio
+    async def test_call_tool_optional_task_records_downstream_task(
+        self, manager_with_tool: ClientManager
+    ) -> None:
+        tool = manager_with_tool._tools["test::echo"]
+        tool.execution = {"taskSupport": "optional"}
+        managed = ManagedClient(
+            config=ResolvedServerConfig(
+                name="test",
+                source="custom",
+                config=LocalMcpServerConfig(command="test"),
+            ),
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=ServerStatus(
+                name="test",
+                status=ServerStatusEnum.ONLINE,
+                tool_count=1,
+                server_capabilities={"tasks": {}},
+            ),
+        )
+        manager_with_tool._clients["test"] = managed
+        manager_with_tool._send_request = AsyncMock(
+            return_value={"task": {"taskId": "downstream-1", "status": "working"}}
+        )
+
+        result = await manager_with_tool.call_tool(
+            "test::echo", {"x": 1}, task={"metadata": {"kind": "slow"}}
+        )
+
+        assert result["task"]["taskId"] == "downstream-1"
+        manager_with_tool._send_request.assert_awaited_once()
+        params = manager_with_tool._send_request.await_args.args[2]
+        assert params == {
+            "name": "echo",
+            "arguments": {"x": 1},
+            "task": {"metadata": {"kind": "slow"}},
+        }
+        record = manager_with_tool.get_task_record("test", "downstream-1")
+        assert record is not None
+        assert record.status == "working"
+        assert record.tool_id == "test::echo"
+
+    @pytest.mark.asyncio
+    async def test_call_tool_preserves_trace_context_in_meta(
+        self, manager_with_tool: ClientManager
+    ) -> None:
+        managed = ManagedClient(
+            config=ResolvedServerConfig(
+                name="test",
+                source="custom",
+                config=LocalMcpServerConfig(command="test"),
+            ),
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=ServerStatus(
+                name="test",
+                status=ServerStatusEnum.ONLINE,
+                tool_count=1,
+            ),
+        )
+        manager_with_tool._clients["test"] = managed
+        manager_with_tool._send_request = AsyncMock(return_value={"ok": True})
+
+        await manager_with_tool.call_tool(
+            "test::echo",
+            {"x": 1},
+            trace_context={"traceparent": "00-abc-123-01", "baggage": "tenant=dev"},
+        )
+
+        params = manager_with_tool._send_request.await_args.args[2]
+        assert params["_meta"] == {
+            "traceparent": "00-abc-123-01",
+            "baggage": "tenant=dev",
+        }
+
+    @pytest.mark.asyncio
+    async def test_call_tool_required_task_without_server_capability_fails(
+        self, manager_with_tool: ClientManager
+    ) -> None:
+        tool = manager_with_tool._tools["test::echo"]
+        tool.execution = {"taskSupport": "required"}
+        managed = ManagedClient(
+            config=ResolvedServerConfig(
+                name="test",
+                source="custom",
+                config=LocalMcpServerConfig(command="test"),
+            ),
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=ServerStatus(
+                name="test",
+                status=ServerStatusEnum.ONLINE,
+                tool_count=1,
+                server_capabilities={},
+            ),
+        )
+        manager_with_tool._clients["test"] = managed
+
+        with pytest.raises(RuntimeError, match="does not advertise MCP task support"):
+            await manager_with_tool.call_tool("test::echo", {})
+
+    @pytest.mark.asyncio
+    async def test_task_proxy_methods_update_registry(
+        self, manager_with_tool: ClientManager
+    ) -> None:
+        managed = ManagedClient(
+            config=ResolvedServerConfig(
+                name="test",
+                source="custom",
+                config=LocalMcpServerConfig(command="test"),
+            ),
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=ServerStatus(
+                name="test",
+                status=ServerStatusEnum.ONLINE,
+                tool_count=1,
+                server_capabilities={"tasks": {}},
+            ),
+        )
+        manager_with_tool._clients["test"] = managed
+        manager_with_tool._send_request = AsyncMock(
+            side_effect=[
+                {"tasks": [{"taskId": "t1", "status": "input_required"}]},
+                {"task": {"taskId": "t1", "status": "completed"}},
+                {
+                    "result": {"ok": True},
+                    "task": {"taskId": "t1", "status": "completed"},
+                },
+            ]
+        )
+
+        listed = await manager_with_tool.list_tasks("test")
+        got = await manager_with_tool.get_task("test", "t1")
+        result = await manager_with_tool.get_task_result("test", "t1")
+
+        assert listed["tasks"][0]["task_id"] == "t1"
+        assert got.status == "completed"
+        assert result["result"] == {"ok": True}
+        assert manager_with_tool.get_task_record("test", "t1").status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_cancel_task_is_idempotent_for_terminal_tasks(
+        self, manager_with_tool: ClientManager
+    ) -> None:
+        task = manager_with_tool._record_task(
+            "test",
+            manager_with_tool._task_info_from_payload(
+                {"taskId": "done", "status": "completed"}
+            ),
+        )
+
+        ok, returned, message = await manager_with_tool.cancel_task("test", "done")
+
+        assert ok is True
+        assert returned == task
+        assert "already terminal" in message
 
 
 class TestServerHealthTracking:

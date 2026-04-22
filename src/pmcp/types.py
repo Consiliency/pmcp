@@ -11,6 +11,95 @@ from pydantic import BaseModel, ConfigDict, Field
 
 GatewayTransport = Literal["stdio", "http"]
 
+AuthState = Literal[
+    "none",
+    "missing_auth",
+    "insufficient_scope",
+    "elicitation_required",
+    "policy_denied",
+    "unknown",
+]
+
+
+class TraceContextInfo(BaseModel):
+    """OpenTelemetry-style trace context accepted by PMCP-owned surfaces."""
+
+    traceparent: str | None = None
+    tracestate: str | None = None
+    baggage: str | None = None
+
+
+class GatewayAuditEvent(BaseModel):
+    """Redacted structured audit event for gateway action boundaries."""
+
+    timestamp: float
+    method: str
+    action: str
+    outcome: Literal["success", "failure", "refused"]
+    latency_ms: int
+    server_name: str | None = None
+    tool_id: str | None = None
+    resource_id: str | None = None
+    prompt_id: str | None = None
+    task_id: str | None = None
+    protocol_version: str | None = None
+    auth_state: AuthState = "none"
+    error: str | None = None
+    trace_present: bool = False
+
+
+class GatewayDiagnosticsInfo(BaseModel):
+    """Safe gateway/proxy diagnostics for health, status, and doctor output."""
+
+    transport: str = "stdio"
+    audit_enabled: bool = True
+    audit_buffer_size: int = 0
+    trace_context_supported: bool = True
+    trace_context_keys: list[str] = Field(
+        default_factory=lambda: ["traceparent", "tracestate", "baggage"]
+    )
+    protocol_version_visible: bool = True
+    header_compatibility: dict[str, str] = Field(default_factory=dict)
+    session_compatibility: dict[str, str] = Field(default_factory=dict)
+    auth_metadata_present: bool = False
+    rate_limit_enabled: bool = False
+    rate_limit_rpm: int | None = None
+
+
+class AuthMetadataInfo(BaseModel):
+    """Non-secret authorization metadata and discovery hints."""
+
+    protected_resource_metadata_url: str | None = None
+    authorization_server_metadata_url: str | None = None
+    oidc_issuer_url: str | None = None
+    oidc_discovery_url: str | None = None
+    client_id_metadata_document_url: str | None = None
+    declared_scopes: list[str] = Field(default_factory=list)
+    granted_scopes: list[str] = Field(default_factory=list)
+    missing_scopes: list[str] = Field(default_factory=list)
+    diagnostics: list[str] = Field(default_factory=list)
+
+
+class AuthChallengeInfo(BaseModel):
+    """Parsed non-secret details from an authorization challenge."""
+
+    scheme: str | None = None
+    resource_metadata_url: str | None = None
+    scope: str | None = None
+    missing_scopes: list[str] = Field(default_factory=list)
+    error: str | None = None
+    error_description: str | None = None
+
+
+class UrlElicitationInfo(BaseModel):
+    """URL-mode elicitation details safe to display to users."""
+
+    elicitation_id: str
+    url: str
+    message: str | None = None
+    next_step: str | None = None
+
+
 # === Config Types ===
 
 
@@ -44,6 +133,13 @@ class RemoteMcpServerConfig(_DictLikeModel):
     type: Literal["remote", "sse", "http", "streamable-http"] = "remote"
     url: str
     headers: dict[str, str] | None = None
+    protected_resource_metadata_url: str | None = None
+    authorization_server_metadata_url: str | None = None
+    oidc_issuer_url: str | None = None
+    oidc_discovery_url: str | None = None
+    client_id_metadata_document_url: str | None = None
+    declared_scopes: list[str] = Field(default_factory=list)
+    supports_url_elicitation: bool = False
 
 
 McpServerConfig = Annotated[
@@ -103,15 +199,32 @@ class RequestState(str, Enum):
     TIMEOUT = "timeout"  # Hard timeout reached
 
 
+TaskSupportMode = Literal["forbidden", "optional", "required"]
+McpTaskStatus = Literal[
+    "working",
+    "input_required",
+    "completed",
+    "failed",
+    "cancelled",
+]
+
+
 class ToolInfo(BaseModel):
     """Internal tool information."""
 
     tool_id: str  # Normalized: server_name::tool_name
     server_name: str
     tool_name: str
+    title: str | None = None
     description: str
     short_description: str  # Truncated for catalog
     input_schema: dict[str, Any]
+    icons: list[dict[str, Any]] | None = None
+    output_schema: dict[str, Any] | None = None
+    annotations: dict[str, Any] | None = None
+    execution: dict[str, Any] | None = None
+    schema_dialect: str = "https://json-schema.org/draft/2020-12/schema"
+    raw_metadata: dict[str, Any] | None = None
     tags: list[str]
     risk_hint: RiskHint
 
@@ -123,16 +236,22 @@ class ResourceInfo(BaseModel):
     server_name: str
     uri: str
     name: str | None = None
+    title: str | None = None
     description: str | None = None
     mime_type: str | None = None
+    icons: list[dict[str, Any]] | None = None
+    annotations: dict[str, Any] | None = None
+    raw_metadata: dict[str, Any] | None = None
 
 
 class PromptArgumentInfo(BaseModel):
     """Prompt argument information."""
 
     name: str
+    title: str | None = None
     description: str | None = None
     required: bool = False
+    raw_metadata: dict[str, Any] | None = None
 
 
 class PromptInfo(BaseModel):
@@ -141,8 +260,12 @@ class PromptInfo(BaseModel):
     prompt_id: str  # Normalized: server_name::name
     server_name: str
     name: str
+    title: str | None = None
     description: str | None = None
     arguments: list[PromptArgumentInfo] | None = None
+    icons: list[dict[str, Any]] | None = None
+    annotations: dict[str, Any] | None = None
+    raw_metadata: dict[str, Any] | None = None
 
 
 class ServerStatus(BaseModel):
@@ -153,12 +276,115 @@ class ServerStatus(BaseModel):
     tool_count: int
     resource_count: int = 0
     prompt_count: int = 0
+    protocol_version: str | None = None
+    server_capabilities: dict[str, Any] | None = None
     last_error: str | None = None
     last_connected_at: float | None = None
     # Health monitoring fields
     pending_request_count: int = 0  # Number of in-flight requests
     last_activity_at: float | None = None  # Last heartbeat from server
     avg_response_time_ms: float | None = None  # Rolling average response time
+
+
+class McpTaskInfo(BaseModel):
+    """Public view of a downstream MCP task."""
+
+    task_id: str
+    status: McpTaskStatus | str | None = None
+    status_message: str | None = None
+    created_at: float | None = None
+    updated_at: float | None = None
+    ttl: int | None = None
+    poll_interval: float | None = None
+    raw: dict[str, Any] = Field(default_factory=dict)
+
+
+class McpTaskRecord(McpTaskInfo):
+    """Transient task registry record tracked by PMCP."""
+
+    server_name: str
+    tool_id: str | None = None
+    local_request_id: str | None = None
+    requestor_context: dict[str, Any] | None = None
+
+
+class TaskMetadataInput(BaseModel):
+    """Task metadata for task-augmented tool invocation."""
+
+    enabled: bool = True
+    metadata: dict[str, Any] | None = None
+    ttl: int | None = None
+    poll_interval: float | None = None
+    requestor_context: dict[str, Any] | None = None
+
+
+class TasksListInput(BaseModel):
+    """Input for gateway.tasks_list."""
+
+    server_name: str | None = None
+    cursor: str | None = None
+
+
+class TasksListOutput(BaseModel):
+    """Output for gateway.tasks_list."""
+
+    ok: bool
+    tasks: list[McpTaskInfo] = Field(default_factory=list)
+    next_cursor: str | None = None
+    errors: list[str] | None = None
+
+
+class TasksGetInput(BaseModel):
+    """Input for gateway.tasks_get."""
+
+    server_name: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+
+
+class TasksGetOutput(BaseModel):
+    """Output for gateway.tasks_get."""
+
+    ok: bool
+    task: McpTaskInfo | None = None
+    errors: list[str] | None = None
+
+
+class TasksResultInput(BaseModel):
+    """Input for gateway.tasks_result."""
+
+    server_name: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    options: InvokeOptions | None = None
+
+
+class TasksResultOutput(BaseModel):
+    """Output for gateway.tasks_result."""
+
+    ok: bool
+    task: McpTaskInfo | None = None
+    result: Any | None = None
+    truncated: bool = False
+    summary: str | None = None
+    raw_size_estimate: int = 0
+    errors: list[str] | None = None
+
+
+class TasksCancelInput(BaseModel):
+    """Input for gateway.tasks_cancel."""
+
+    server_name: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    force: bool = False
+
+
+class TasksCancelOutput(BaseModel):
+    """Output for gateway.tasks_cancel."""
+
+    ok: bool
+    task: McpTaskInfo | None = None
+    status: str
+    message: str
+    errors: list[str] | None = None
 
 
 # === Gateway Tool Input/Output Types ===
@@ -187,10 +413,14 @@ class CapabilityCard(BaseModel):
     tool_id: str
     server: str
     tool_name: str
+    title: str | None = None
     short_description: str
     tags: list[str]
     availability: Literal["online", "offline"]
     risk_hint: str
+    icons: list[dict[str, Any]] | None = None
+    execution: dict[str, Any] | None = None
+    schema_dialect: str | None = None
     code_hint: str | None = (
         None  # L1: Ultra-terse code pattern hint (e.g., "loop", "filter")
     )
@@ -233,8 +463,14 @@ class SchemaCard(BaseModel):
 
     server: str
     tool_name: str
+    title: str | None = None
     description: str
+    icons: list[dict[str, Any]] | None = None
     args: list[ArgInfo]
+    output_schema: dict[str, Any] | None = None
+    annotations: dict[str, Any] | None = None
+    execution: dict[str, Any] | None = None
+    schema_dialect: str | None = None
     constraints: list[str] | None = None
     safety_notes: list[str] | None = None
     # Direct invocation template
@@ -257,9 +493,14 @@ class InvokeOptions(BaseModel):
 class InvokeInput(BaseModel):
     """Input for gateway.invoke."""
 
+    model_config = ConfigDict(populate_by_name=True)
+
     tool_id: str = Field(min_length=1)
     arguments: dict[str, Any] = Field(default_factory=dict)
+    task: TaskMetadataInput | None = None
     options: InvokeOptions | None = None
+    trace_context: TraceContextInfo | None = None
+    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
 
 
 class InvokeOutput(BaseModel):
@@ -268,12 +509,19 @@ class InvokeOutput(BaseModel):
     tool_id: str
     ok: bool
     result: Any | None = None
+    task: McpTaskInfo | None = None
     truncated: bool
     summary: str | None = None
     raw_size_estimate: int
     errors: list[str] | None = None
     update_warning: str | None = None
     feedback_hint: str | None = None
+    auth_state: AuthState = "none"
+    next_step: str | None = None
+    auth_methods: list[str] | None = None
+    auth_metadata: AuthMetadataInfo | None = None
+    auth_challenge: AuthChallengeInfo | None = None
+    url_elicitations: list[UrlElicitationInfo] | None = None
 
 
 class RefreshInput(BaseModel):
@@ -297,6 +545,10 @@ class RefreshOutput(BaseModel):
     pending_requests_cancelled: int = 0
     pending_requests_refused: int = 0
     pending_requests_remaining: int = 0
+    mcp_tasks_seen: int = 0
+    mcp_tasks_cancelled: int = 0
+    mcp_tasks_refused: int = 0
+    mcp_tasks_remaining: int = 0
 
 
 class ConnectServerInput(BaseModel):
@@ -328,8 +580,16 @@ class LifecycleServerOutput(BaseModel):
     prior_status: str
     new_status: str
     cancelled_request_count: int = 0
+    active_task_count: int = 0
+    cancelled_task_count: int = 0
     message: str
     errors: list[str] | None = None
+    auth_state: AuthState = "none"
+    next_step: str | None = None
+    auth_methods: list[str] | None = None
+    auth_metadata: AuthMetadataInfo | None = None
+    auth_challenge: AuthChallengeInfo | None = None
+    url_elicitations: list[UrlElicitationInfo] | None = None
 
 
 class ServerHealthInfo(BaseModel):
@@ -338,11 +598,19 @@ class ServerHealthInfo(BaseModel):
     name: str
     status: str
     tool_count: int
+    protocol_version: str | None = None
+    server_capabilities: dict[str, Any] | None = None
     error: str | None = None
     startup_policy: Literal["eager", "lazy", "skipped", "unknown"] | None = None
     startup_source: str | None = None
     startup_skip_reason: str | None = None
     startup_env_var: str | None = None
+    auth_state: AuthState = "none"
+    next_step: str | None = None
+    auth_methods: list[str] | None = None
+    auth_metadata: AuthMetadataInfo | None = None
+    auth_challenge: AuthChallengeInfo | None = None
+    url_elicitations: list[UrlElicitationInfo] | None = None
 
 
 class HealthOutput(BaseModel):
@@ -351,6 +619,8 @@ class HealthOutput(BaseModel):
     revision_id: str
     servers: list[ServerHealthInfo]
     last_refresh_ts: float
+    gateway_diagnostics: GatewayDiagnosticsInfo | None = None
+    audit_events: list[GatewayAuditEvent] | None = None
 
 
 # === Pending Request Monitoring Types ===
@@ -373,6 +643,8 @@ class PendingRequestInfo(BaseModel):
     timeout_ms: int
     state: str  # RequestState value
     last_heartbeat_seconds_ago: float
+    task_id: str | None = None
+    task_status: str | None = None
 
 
 class ListPendingOutput(BaseModel):
@@ -620,6 +892,11 @@ class ProvisionOutput(BaseModel):
     auth_mode: Literal["api_key", "unknown"] | None = None
     auth_methods: list[str] | None = None
     alternative_env_vars: list[str] | None = None
+    auth_state: AuthState = "none"
+    next_step: str | None = None
+    auth_metadata: AuthMetadataInfo | None = None
+    auth_challenge: AuthChallengeInfo | None = None
+    url_elicitations: list[UrlElicitationInfo] | None = None
     update_warning: str | None = None
     feedback_hint: str | None = None
 
@@ -675,7 +952,9 @@ class AuthConnectInput(BaseModel):
     server_name: str = Field(
         min_length=1, description="Server requiring authentication"
     )
-    credential: str = Field(min_length=1, description="Secret token/API key to store")
+    credential: str | None = Field(
+        default=None, min_length=1, description="Secret token/API key to store"
+    )
     env_var: str | None = Field(
         default=None,
         description="Override environment variable key to store into",
@@ -683,6 +962,10 @@ class AuthConnectInput(BaseModel):
     scope: Literal["user", "project"] = Field(
         default="user", description="Where to store credentials"
     )
+    auth_mode: Literal["api_key", "url_elicitation"] = "api_key"
+    elicitation_id: str | None = None
+    elicitation_url: str | None = None
+    consent_acknowledged: bool = False
 
 
 class AuthConnectOutput(BaseModel):
@@ -694,6 +977,8 @@ class AuthConnectOutput(BaseModel):
     env_var: str | None = None
     env_path: str | None = None
     next_step: str | None = None
+    auth_state: AuthState = "none"
+    url_elicitation: UrlElicitationInfo | None = None
 
 
 class ProvisionStatusInput(BaseModel):

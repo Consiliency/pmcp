@@ -66,16 +66,20 @@ class TestGatewayToolSurface:
             "gateway.provision_status",
             "gateway.list_pending",
             "gateway.cancel",
+            "gateway.tasks_list",
+            "gateway.tasks_get",
+            "gateway.tasks_result",
+            "gateway.tasks_cancel",
             "gateway.search_registry",
             "gateway.register_discovered_server",
         ]
     )
 
-    def test_gateway_tool_count_is_nineteen(self) -> None:
-        """Verify exactly 19 gateway tools are defined."""
+    def test_gateway_tool_count_is_twenty_three(self) -> None:
+        """Verify exactly 23 gateway tools are defined."""
         tools = get_gateway_tool_definitions()
-        assert len(tools) == 19, (
-            f"Expected 19 gateway tools, got {len(tools)}. "
+        assert len(tools) == 23, (
+            f"Expected 23 gateway tools, got {len(tools)}. "
             f"Tools: {[t.name for t in tools]}"
         )
 

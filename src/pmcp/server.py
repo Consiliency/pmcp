@@ -128,7 +128,7 @@ class GatewayServer:
 
         @self._server.list_tools()
         async def list_tools() -> list[Tool]:
-            return get_gateway_tool_definitions()
+            return sorted(get_gateway_tool_definitions(), key=lambda tool: tool.name)
 
         @self._server.call_tool()
         async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
@@ -169,6 +169,14 @@ class GatewayServer:
                     result = await self._gateway_tools.list_pending(arguments)
                 elif name == "gateway.cancel":
                     result = await self._gateway_tools.cancel(arguments)
+                elif name == "gateway.tasks_list":
+                    result = await self._gateway_tools.tasks_list(arguments)
+                elif name == "gateway.tasks_get":
+                    result = await self._gateway_tools.tasks_get(arguments)
+                elif name == "gateway.tasks_result":
+                    result = await self._gateway_tools.tasks_result(arguments)
+                elif name == "gateway.tasks_cancel":
+                    result = await self._gateway_tools.tasks_cancel(arguments)
                 elif name == "gateway.search_registry":
                     result = await self._gateway_tools.search_registry(arguments)
                 elif name == "gateway.register_discovered_server":
@@ -224,7 +232,7 @@ class GatewayServer:
                     )
                 )
 
-            return resource_list
+            return sorted(resource_list, key=lambda resource: str(resource.uri))
 
         @self._server.read_resource()
         async def read_resource(uri: AnyUrl) -> list[TextResourceContents]:
@@ -289,7 +297,7 @@ class GatewayServer:
                 for p in prompts
                 if self._policy_manager.is_prompt_allowed(p.prompt_id)
             ]
-            return [
+            prompts_list = [
                 Prompt(
                     name=p.prompt_id,  # Use full ID for uniqueness
                     description=p.description,
@@ -306,6 +314,7 @@ class GatewayServer:
                 )
                 for p in allowed_prompts
             ]
+            return sorted(prompts_list, key=lambda prompt: prompt.name)
 
         @self._server.get_prompt()
         async def get_prompt(

@@ -44,6 +44,13 @@ class ServerConfig:
     transport: ServerTransport = "local"
     url: str | None = None
     headers: dict[str, str] | None = None
+    protected_resource_metadata_url: str | None = None
+    authorization_server_metadata_url: str | None = None
+    oidc_issuer_url: str | None = None
+    oidc_discovery_url: str | None = None
+    client_id_metadata_document_url: str | None = None
+    declared_scopes: list[str] = field(default_factory=list)
+    supports_url_elicitation: bool = False
 
 
 # Category taxonomy used by Manifest.get_category_summary() and get_servers_in_category()
@@ -313,6 +320,13 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         transport=transport,
         url=data.get("url"),
         headers=data.get("headers"),
+        protected_resource_metadata_url=data.get("protected_resource_metadata_url"),
+        authorization_server_metadata_url=data.get("authorization_server_metadata_url"),
+        oidc_issuer_url=data.get("oidc_issuer_url"),
+        oidc_discovery_url=data.get("oidc_discovery_url"),
+        client_id_metadata_document_url=data.get("client_id_metadata_document_url"),
+        declared_scopes=data.get("declared_scopes", []),
+        supports_url_elicitation=data.get("supports_url_elicitation", False),
     )
 
 

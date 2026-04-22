@@ -171,6 +171,36 @@ class TestLoadConfigs:
         assert local.config.type == "local"
         assert local.config.command == "node"
 
+    def test_remote_entries_preserve_optional_auth_metadata(
+        self, tmp_path: Path
+    ) -> None:
+        project_config = {
+            "mcpServers": {
+                "remote-auth": {
+                    "type": "remote",
+                    "url": "https://mcp.example/mcp",
+                    "protected_resource_metadata_url": "https://mcp.example/.well-known/oauth-protected-resource",
+                    "authorization_server_metadata_url": "https://auth.example/.well-known/oauth-authorization-server",
+                    "oidc_issuer_url": "https://issuer.example",
+                    "declared_scopes": ["read"],
+                    "supports_url_elicitation": True,
+                    "future_field": "ignored",
+                }
+            }
+        }
+        (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+
+        configs = load_configs(project_root=tmp_path, user_config_paths=[])
+
+        cfg = configs[0].config
+        assert cfg.type == "remote"
+        assert (
+            cfg.protected_resource_metadata_url
+            == "https://mcp.example/.well-known/oauth-protected-resource"
+        )
+        assert cfg.declared_scopes == ["read"]
+        assert cfg.supports_url_elicitation is True
+
     def test_coerces_legacy_url_entry_to_remote(self, tmp_path: Path) -> None:
         project_config = {
             "mcpServers": {

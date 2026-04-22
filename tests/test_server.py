@@ -217,6 +217,72 @@ class TestServerCreation:
 
         assert called == ["connect", "disconnect", "restart"]
 
+    @pytest.mark.asyncio
+    async def test_task_tools_are_routed_through_call_tool_handler(self) -> None:
+        """Task tool names should dispatch through the JSON response path."""
+        server = GatewayServer()
+        server._create_server()
+
+        called: list[str] = []
+
+        async def fake_tasks_list(arguments: dict) -> object:
+            called.append("list")
+            return {"ok": True, "args": arguments}
+
+        async def fake_tasks_get(arguments: dict) -> object:
+            called.append("get")
+            return {"ok": True, "args": arguments}
+
+        async def fake_tasks_result(arguments: dict) -> object:
+            called.append("result")
+            return {"ok": True, "args": arguments}
+
+        async def fake_tasks_cancel(arguments: dict) -> object:
+            called.append("cancel")
+            return {"ok": True, "args": arguments}
+
+        server._gateway_tools.tasks_list = fake_tasks_list  # type: ignore[method-assign]
+        server._gateway_tools.tasks_get = fake_tasks_get  # type: ignore[method-assign]
+        server._gateway_tools.tasks_result = fake_tasks_result  # type: ignore[method-assign]
+        server._gateway_tools.tasks_cancel = fake_tasks_cancel  # type: ignore[method-assign]
+
+        assert server._server is not None
+        handler = server._server.request_handlers[CallToolRequest]
+
+        for tool_name in [
+            "gateway.tasks_list",
+            "gateway.tasks_get",
+            "gateway.tasks_result",
+            "gateway.tasks_cancel",
+        ]:
+            result = await handler(
+                CallToolRequest(
+                    params={
+                        "name": tool_name,
+                        "arguments": {"server_name": "test", "task_id": "task-1"},
+                    }
+                )
+            )
+            payload = json.loads(result.root.content[0].text)
+            assert payload["ok"] is True
+
+        assert called == ["list", "get", "result", "cancel"]
+
+    @pytest.mark.asyncio
+    async def test_unknown_task_tool_uses_unknown_tool_error_path(self) -> None:
+        """Unknown task-ish tool names remain unknown tools."""
+        server = GatewayServer()
+        server._create_server()
+
+        assert server._server is not None
+        handler = server._server.request_handlers[CallToolRequest]
+        result = await handler(
+            CallToolRequest(params={"name": "gateway.tasks_delete", "arguments": {}})
+        )
+        payload = json.loads(result.root.content[0].text)
+        assert payload["error"] is True
+        assert "Unknown tool" in payload["message"]
+
 
 class TestPolicyIntegration:
     """Tests for policy integration with handlers."""

@@ -18,6 +18,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
+from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.install import (
     detect_install_drift,
@@ -762,14 +763,7 @@ def _get_gateway_health_url() -> str:
 
 def _redact_url_credentials(url: str) -> str:
     """Remove URL userinfo before printing diagnostics."""
-    parsed = urlsplit(url)
-    hostname = parsed.hostname or ""
-    netloc = hostname
-    if parsed.port is not None:
-        netloc = f"{netloc}:{parsed.port}"
-    return urlunsplit(
-        (parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment)
-    )
+    return redact_auth_url(url)
 
 
 def _exit_gateway_unreachable(errors: list[str]) -> None:
@@ -853,6 +847,10 @@ async def _query_running_gateway_status(
                 if isinstance(s, dict) and isinstance(s.get("tool_count"), int)
             ),
         }
+        if isinstance(health_payload.get("gateway_diagnostics"), dict):
+            snapshot["gateway_diagnostics"] = health_payload["gateway_diagnostics"]
+        if isinstance(health_payload.get("audit_events"), list):
+            snapshot["audit_events"] = health_payload["audit_events"]
 
         if args.pending:
             pending_raw = await probe_manager.call_tool(
@@ -930,6 +928,19 @@ async def run_status(args: argparse.Namespace) -> None:
                 else:
                     icon = "\u2717"
                     details = f"({s.get('error') or status})"
+                auth_state = s.get("auth_state")
+                if auth_state and auth_state != "none":
+                    auth_detail = f"auth={auth_state}"
+                    missing = (
+                        (s.get("auth_challenge") or {}).get("missing_scopes")
+                        if isinstance(s.get("auth_challenge"), dict)
+                        else None
+                    )
+                    if missing:
+                        auth_detail += f" scopes={','.join(missing)}"
+                    details = f"{details}  {auth_detail}"
+                if args.verbose and s.get("next_step"):
+                    details = f"{details}  next={s.get('next_step')}"
                 if args.verbose and s.get("startup_policy"):
                     policy_parts = [f"policy={s.get('startup_policy')}"]
                     if s.get("startup_source"):
@@ -939,6 +950,8 @@ async def run_status(args: argparse.Namespace) -> None:
                     if s.get("startup_env_var"):
                         policy_parts.append(f"env={s.get('startup_env_var')}")
                     details = f"{details}  {' '.join(policy_parts)}"
+                if args.verbose and s.get("protocol_version"):
+                    details = f"{details}  protocol={s.get('protocol_version')}"
                 print(f"  {icon} {s.get('name', ''):<16} {status:<10} {details}")
         else:
             print("No servers found.")
@@ -970,6 +983,31 @@ async def run_status(args: argparse.Namespace) -> None:
                 print("\nNo pending requests.")
 
         if args.verbose:
+            diagnostics = live_snapshot.get("gateway_diagnostics")
+            if isinstance(diagnostics, dict):
+                print("\nGateway Diagnostics:")
+                transport = diagnostics.get("transport")
+                if transport:
+                    print(f"  Transport: {transport}")
+                header_compat = diagnostics.get("header_compatibility")
+                if isinstance(header_compat, dict) and header_compat:
+                    states = ", ".join(
+                        f"{key}={value}" for key, value in sorted(header_compat.items())
+                    )
+                    print(f"  Headers: {states}")
+                print(
+                    "  Trace: "
+                    f"{'supported' if diagnostics.get('trace_context_supported') else 'disabled'}"
+                )
+                if diagnostics.get("audit_enabled"):
+                    print(
+                        "  Audit: "
+                        f"enabled buffer={diagnostics.get('audit_buffer_size', 0)}"
+                    )
+                if diagnostics.get("rate_limit_enabled"):
+                    print(f"  Rate limit: {diagnostics.get('rate_limit_rpm')} rpm")
+                if diagnostics.get("auth_metadata_present"):
+                    print("  Auth metadata: present")
             print(f"\nRevision: {live_snapshot.get('revision_id', '')}")
 
         return
@@ -1033,6 +1071,10 @@ async def run_status(args: argparse.Namespace) -> None:
                         "name": s.name,
                         "status": s.status.value,
                         "tool_count": s.tool_count,
+                        "resource_count": s.resource_count,
+                        "prompt_count": s.prompt_count,
+                        "protocol_version": s.protocol_version,
+                        "server_capabilities": s.server_capabilities,
                         "last_error": s.last_error,
                         "pending_requests": s.pending_request_count,
                         "avg_response_time_ms": s.avg_response_time_ms,
@@ -1080,6 +1122,8 @@ async def run_status(args: argparse.Namespace) -> None:
                     else:
                         icon = "\u2717"  # x mark
                         details = f"({s.last_error or s.status.value})"
+                    if args.verbose and s.protocol_version:
+                        details = f"{details}  protocol={s.protocol_version}"
 
                     print(f"  {icon} {s.name:<16} {s.status.value:<10} {details}")
             else:
@@ -1453,7 +1497,7 @@ async def _probe_sse_endpoint(url: str, timeout_s: float) -> tuple[bool, str]:
                     return True, "endpoint responded with HTTP 200"
                 return False, f"endpoint returned HTTP {response.status_code}"
     except Exception as exc:
-        return False, str(exc)
+        return False, sanitize_auth_diagnostic(exc)
 
 
 async def _probe_http_health(timeout_s: float) -> tuple[bool, str]:
@@ -1467,7 +1511,25 @@ async def _probe_http_health(timeout_s: float) -> tuple[bool, str]:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
             response = await client.get(url)
         if response.status_code == 200:
-            return True, f"{safe_url} reachable"
+            detail = f"{safe_url} reachable"
+            try:
+                diagnostics = response.json().get("gateway_diagnostics")
+            except Exception:
+                diagnostics = None
+            if isinstance(diagnostics, dict):
+                transport = diagnostics.get("transport")
+                trace = diagnostics.get("trace_context_supported")
+                rate = diagnostics.get("rate_limit_rpm")
+                parts = []
+                if transport:
+                    parts.append(f"transport={transport}")
+                if trace is not None:
+                    parts.append(f"trace={'supported' if trace else 'disabled'}")
+                if rate:
+                    parts.append(f"rate_limit={rate}rpm")
+                if parts:
+                    detail = f"{detail} ({', '.join(parts)})"
+            return True, detail
         return False, f"{safe_url} returned HTTP {response.status_code}"
     except Exception as exc:
         return False, f"{safe_url} unreachable ({exc.__class__.__name__})"
@@ -1879,11 +1941,38 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
         first = await _call("gateway.provision", {"server_name": server_name})
 
         needs_auth = bool(first.get("needs_api_key") or first.get("auth_required"))
+        url_elicitations = first.get("url_elicitations")
         if not needs_auth:
             if args.json:
                 print(json.dumps(first, indent=2))
             else:
                 print(first.get("message", "Provision request completed."))
+            return
+
+        if first.get("auth_state") == "elicitation_required" or url_elicitations:
+            if args.credential:
+                raise RuntimeError(
+                    "URL-mode elicitation does not accept credentials through pmcp auth connect"
+                )
+            elicitation = (
+                url_elicitations[0]
+                if isinstance(url_elicitations, list) and url_elicitations
+                else {}
+            )
+            url_auth_args = {
+                "server_name": server_name,
+                "auth_mode": "url_elicitation",
+                "elicitation_id": elicitation.get("elicitation_id"),
+                "elicitation_url": elicitation.get("url"),
+                "consent_acknowledged": True,
+            }
+            auth_result = await _call("gateway.auth_connect", url_auth_args)
+            if args.json:
+                print(json.dumps({"auth": auth_result, "provision": None}, indent=2))
+            else:
+                print(auth_result.get("message", "URL-mode elicitation recorded."))
+                if elicitation.get("url"):
+                    print(f"URL: {_redact_url_credentials(str(elicitation['url']))}")
             return
 
         credential = args.credential

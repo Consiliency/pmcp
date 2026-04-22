@@ -253,11 +253,17 @@ class TestHttpObservabilityContracts:
         response = client.get("/health")
 
         assert response.status_code == 200
-        assert response.json() == {
-            "ok": True,
-            "version": __version__,
-            "transport": "http",
-        }
+        payload = response.json()
+        assert payload["ok"] is True
+        assert payload["version"] == __version__
+        assert payload["transport"] == "http"
+        assert payload["gateway_diagnostics"]["transport"] == "http"
+        assert (
+            payload["gateway_diagnostics"]["header_compatibility"][
+                "MCP-Protocol-Version"
+            ]
+            == "accepted"
+        )
 
     def test_metrics_is_unauthenticated_with_auth_token(self) -> None:
         client = _make_contract_client(auth_token="secret")

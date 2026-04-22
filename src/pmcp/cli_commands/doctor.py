@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from dotenv import dotenv_values
+from pmcp.auth import redact_auth_url
 
 ENV_INTERPOLATION_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
@@ -65,9 +66,37 @@ def collect_remote_header_diagnostics(
                 (
                     "remote",
                     "fail",
-                    f"{server_name}: remote url '{raw_url}' is invalid. Use an absolute URL (for example https://host/sse).",
+                    f"{server_name}: remote url '{redact_auth_url(raw_url)}' is invalid. Use an absolute URL (for example https://host/sse).",
                 )
             )
+
+        for metadata_key in (
+            "protected_resource_metadata_url",
+            "authorization_server_metadata_url",
+            "oidc_issuer_url",
+            "oidc_discovery_url",
+            "client_id_metadata_document_url",
+        ):
+            metadata_url = server_cfg.get(metadata_key)
+            if not isinstance(metadata_url, str) or not metadata_url:
+                continue
+            metadata_parsed = urlparse(metadata_url)
+            if not metadata_parsed.scheme or not metadata_parsed.netloc:
+                checks.append(
+                    (
+                        "remote",
+                        "warn",
+                        f"{server_name}: {metadata_key} '{redact_auth_url(metadata_url)}' is not an absolute URL.",
+                    )
+                )
+            else:
+                checks.append(
+                    (
+                        "remote",
+                        "ok",
+                        f"{server_name}: {metadata_key} configured at {redact_auth_url(metadata_url)}.",
+                    )
+                )
 
         headers = server_cfg.get("headers")
         if not isinstance(headers, dict):

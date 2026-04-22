@@ -16,6 +16,7 @@ def _make_app(
     auth_token: str | None = None,
     rate_limit_rpm: int = 0,
     request_timeout: int = 60,
+    protected_resource_metadata_url: str | None = None,
 ) -> TestClient:
     """Create a TestClient wrapping a minimal create_http_app instance."""
     mcp_server = MagicMock()
@@ -37,6 +38,13 @@ def _make_app(
             auth_token=auth_token,
             rate_limit_rpm=rate_limit_rpm,
             request_timeout=request_timeout,
+            protected_resource_metadata_url=protected_resource_metadata_url,
+            authorization_server_metadata_url=(
+                "https://auth.example/.well-known/oauth-authorization-server"
+                if protected_resource_metadata_url
+                else None
+            ),
+            declared_scopes=["read"] if protected_resource_metadata_url else None,
         )
         return TestClient(app, raise_server_exceptions=False)
 
@@ -55,6 +63,11 @@ class TestHealthEndpoint:
         assert data["ok"] is True
         assert data["version"] == __version__
         assert data["transport"] == "http"
+        assert (
+            data["gateway_diagnostics"]["header_compatibility"]["MCP-Protocol-Version"]
+            == "accepted"
+        )
+        assert data["gateway_diagnostics"]["trace_context_supported"] is True
 
     def test_health_unauthenticated_even_when_auth_configured(self) -> None:
         """Health endpoint must not require auth — load balancers won't have tokens."""
@@ -111,6 +124,31 @@ class TestAuthGuardHttp:
         r = client.post("/mcp", content=b"{}")
         assert r.status_code == 401
 
+    def test_401_includes_protected_resource_metadata_when_configured(self) -> None:
+        client = _make_app(
+            auth_token="mysecret",
+            protected_resource_metadata_url=(
+                "http://testserver/.well-known/oauth-protected-resource"
+            ),
+        )
+        r = client.post("/mcp", content=b"{}")
+
+        assert r.status_code == 401
+        assert "resource_metadata" in r.headers["www-authenticate"]
+        assert "mysecret" not in r.text
+
+    def test_well_known_protected_resource_metadata_is_public(self) -> None:
+        client = _make_app(
+            auth_token="mysecret",
+            protected_resource_metadata_url=(
+                "http://testserver/.well-known/oauth-protected-resource"
+            ),
+        )
+        r = client.get("/.well-known/oauth-protected-resource")
+
+        assert r.status_code == 200
+        assert r.json()["scopes_supported"] == ["read"]
+
     def test_wrong_token_returns_401(self) -> None:
         client = _make_app(auth_token="mysecret")
         r = client.post(
@@ -130,6 +168,23 @@ class TestAuthGuardHttp:
     def test_no_auth_configured_does_not_return_401(self) -> None:
         client = _make_app()
         r = client.post("/mcp", content=b"{}")
+        assert r.status_code != 401
+
+    def test_accepts_draft_headers_and_trace_headers(self) -> None:
+        client = _make_app()
+        r = client.post(
+            "/mcp",
+            content=b'{"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}',
+            headers={
+                "MCP-Protocol-Version": "2025-11-25",
+                "Mcp-Method": "initialize",
+                "Mcp-Name": "gateway.health",
+                "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+                "tracestate": "vendor=value",
+                "baggage": "tenant=test",
+            },
+        )
+
         assert r.status_code != 401
 
     def test_metrics_counter_increments_on_401(self) -> None:

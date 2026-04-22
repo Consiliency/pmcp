@@ -8,6 +8,22 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from pmcp.client.manager import ClientManager, ManagedClient
+from pmcp.config.loader import make_tool_id
+from pmcp.policy.policy import PolicyManager
+from pmcp.tools.handlers import GatewayTools
+from pmcp.types import (
+    LocalMcpServerConfig,
+    ResolvedServerConfig,
+    RiskHint,
+    ServerStatus,
+    ServerStatusEnum,
+    ToolInfo,
+)
 
 
 import site as _site
@@ -36,6 +52,102 @@ def _run_pmcp(
         cwd=cwd,
         check=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_phase4_task_gateway_smoke() -> None:
+    """Task-aware invocation can be observed and resolved through gateway surfaces."""
+    manager = ClientManager()
+    tool_id = make_tool_id("task-server", "slow")
+    manager._tools[tool_id] = ToolInfo(
+        tool_id=tool_id,
+        server_name="task-server",
+        tool_name="slow",
+        description="Slow task",
+        short_description="Slow task",
+        input_schema={"type": "object"},
+        execution={"taskSupport": "optional"},
+        tags=[],
+        risk_hint=RiskHint.LOW,
+    )
+    manager._clients["task-server"] = ManagedClient(
+        config=ResolvedServerConfig(
+            name="task-server",
+            source="custom",
+            config=LocalMcpServerConfig(command="task-server"),
+        ),
+        is_remote=True,
+        write_stream=MagicMock(),
+        status=ServerStatus(
+            name="task-server",
+            status=ServerStatusEnum.ONLINE,
+            tool_count=1,
+            server_capabilities={"tasks": {}},
+        ),
+    )
+    manager._send_request = AsyncMock(
+        side_effect=[
+            {"task": {"taskId": "task-smoke", "status": "working"}},
+            {"tasks": [{"taskId": "task-smoke", "status": "working"}]},
+            {
+                "result": {"ok": True},
+                "task": {"taskId": "task-smoke", "status": "completed"},
+            },
+        ]
+    )
+    gateway = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
+
+    invoked = await gateway.invoke({"tool_id": tool_id, "arguments": {}, "task": {}})
+    listed = await gateway.tasks_list({"server_name": "task-server"})
+    result = await gateway.tasks_result(
+        {"server_name": "task-server", "task_id": "task-smoke"}
+    )
+
+    assert invoked.ok is True
+    assert invoked.task is not None
+    assert invoked.task.task_id == "task-smoke"
+    assert listed.ok is True
+    assert listed.tasks[0].task_id == "task-smoke"
+    assert result.ok is True
+    assert result.result == {"ok": True}
+    assert result.task is not None
+    assert result.task.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_phase4_lifecycle_refuses_and_forces_active_tasks() -> None:
+    """Default refresh refuses active task work; forced refresh cancels it first."""
+    manager = ClientManager()
+    manager._clients["task-server"] = ManagedClient(
+        config=ResolvedServerConfig(
+            name="task-server",
+            source="custom",
+            config=LocalMcpServerConfig(command="task-server"),
+        ),
+        is_remote=True,
+        write_stream=MagicMock(),
+        status=ServerStatus(
+            name="task-server",
+            status=ServerStatusEnum.ONLINE,
+            tool_count=0,
+            server_capabilities={"tasks": {}},
+        ),
+    )
+    manager._send_request = AsyncMock(
+        return_value={"task": {"taskId": "active", "status": "cancelled"}}
+    )
+    manager._record_task(
+        "task-server",
+        manager._task_info_from_payload({"taskId": "active", "status": "working"}),
+    )
+    gateway = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
+
+    refused = await gateway.refresh({})
+    forced = await gateway.refresh({"force": True})
+
+    assert refused.ok is False
+    assert refused.mcp_tasks_refused == 1
+    assert forced.mcp_tasks_cancelled == 1
 
 
 def test_phase4_setup_writes_opencode_sse_config(tmp_path: Path) -> None:

@@ -21,6 +21,7 @@ import logging
 import uuid
 from collections.abc import AsyncIterator, MutableMapping
 from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import urlparse
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
@@ -29,6 +30,8 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from pmcp import __version__
+from pmcp.auth import normalize_auth_metadata
+from pmcp.types import GatewayDiagnosticsInfo
 
 if TYPE_CHECKING:
     from mcp.server import Server
@@ -134,6 +137,12 @@ def create_http_app(
     auth_token: str | None = None,
     rate_limit_rpm: int = 0,
     request_timeout: int = 60,
+    protected_resource_metadata_url: str | None = None,
+    authorization_server_metadata_url: str | None = None,
+    oidc_issuer_url: str | None = None,
+    oidc_discovery_url: str | None = None,
+    client_id_metadata_document_url: str | None = None,
+    declared_scopes: list[str] | None = None,
 ) -> Starlette:
     """Create Starlette ASGI app with streamable-HTTP transport for MCP server.
 
@@ -150,10 +159,50 @@ def create_http_app(
         json_response=False,  # Use SSE stream for responses (standard)
         stateless=False,  # Maintain session state across requests
     )
+    auth_metadata = normalize_auth_metadata(
+        protected_resource_metadata_url=protected_resource_metadata_url,
+        authorization_server_metadata_url=authorization_server_metadata_url,
+        oidc_issuer_url=oidc_issuer_url,
+        oidc_discovery_url=oidc_discovery_url,
+        client_id_metadata_document_url=client_id_metadata_document_url,
+        declared_scopes=declared_scopes,
+    )
+    diagnostics = GatewayDiagnosticsInfo(
+        transport="http",
+        header_compatibility={
+            "MCP-Protocol-Version": "accepted",
+            "Mcp-Method": "accepted",
+            "Mcp-Name": "accepted",
+        },
+        session_compatibility={
+            "pre_session_get": "rmcp_keepalive",
+            "initialized_without_session": "accepted",
+        },
+        auth_metadata_present=bool(auth_metadata.protected_resource_metadata_url),
+        rate_limit_enabled=rate_limit_rpm > 0,
+        rate_limit_rpm=rate_limit_rpm if rate_limit_rpm > 0 else None,
+    )
+
+    def _auth_headers() -> dict[str, str]:
+        if not auth_metadata.protected_resource_metadata_url:
+            return {}
+        return {
+            "WWW-Authenticate": (
+                'Bearer resource_metadata="'
+                f'{auth_metadata.protected_resource_metadata_url}"'
+            )
+        }
 
     async def handle_health(request: Request) -> Response:
         """Unauthenticated health check — safe for load-balancers and container probes."""
-        return JSONResponse({"ok": True, "version": __version__, "transport": "http"})
+        return JSONResponse(
+            {
+                "ok": True,
+                "version": __version__,
+                "transport": "http",
+                "gateway_diagnostics": diagnostics.model_dump(exclude_none=True),
+            }
+        )
 
     async def handle_metrics(request: Request) -> Response:
         """Unauthenticated Prometheus-compatible metrics endpoint."""
@@ -173,6 +222,25 @@ def create_http_app(
             media_type="text/plain; version=0.0.4; charset=utf-8",
         )
 
+    async def handle_protected_resource_metadata(request: Request) -> Response:
+        """Public OAuth protected-resource metadata for this PMCP endpoint."""
+        payload: dict[str, object] = {
+            "resource": str(request.url_for("mcp")),
+        }
+        if auth_metadata.authorization_server_metadata_url:
+            payload["authorization_servers"] = [
+                auth_metadata.authorization_server_metadata_url
+            ]
+        if auth_metadata.oidc_issuer_url:
+            payload["issuer"] = auth_metadata.oidc_issuer_url
+        if auth_metadata.client_id_metadata_document_url:
+            payload["client_id_metadata_document"] = (
+                auth_metadata.client_id_metadata_document_url
+            )
+        if auth_metadata.declared_scopes:
+            payload["scopes_supported"] = auth_metadata.declared_scopes
+        return JSONResponse(payload)
+
     async def handle_mcp(request: Request) -> Response:
         """Delegate all MCP traffic to the session manager."""
         request_id = uuid.uuid4().hex[:8]
@@ -187,6 +255,16 @@ def create_http_app(
             session_id_short,
             request.headers.get("accept", ""),
         )
+        request.scope["pmcp.trace_context"] = {
+            key: value
+            for key in ("traceparent", "tracestate", "baggage")
+            if (value := request.headers.get(key))
+        }
+        request.scope["pmcp.header_compatibility"] = {
+            key: "present"
+            for key in ("mcp-protocol-version", "mcp-method", "mcp-name")
+            if request.headers.get(key)
+        }
 
         # Bearer-token auth guard (optional — only when auth_token is configured)
         if auth_token is not None:
@@ -194,7 +272,9 @@ def create_http_app(
             if not hmac.compare_digest(incoming, f"Bearer {auth_token}"):
                 _inc("requests_401")
                 logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)
-                return Response("Unauthorized", status_code=401)
+                return Response(
+                    "Unauthorized", status_code=401, headers=_auth_headers()
+                )
 
         # Per-IP rate limiting (optional — only when rate_limit_rpm > 0)
         if rate_limit_rpm > 0:
@@ -315,9 +395,24 @@ def create_http_app(
         logger.info("Streamable-HTTP session manager stopped")
 
     routes = [
-        Route("/mcp", endpoint=handle_mcp, methods=["GET", "POST", "DELETE"]),
+        Route(
+            "/mcp", endpoint=handle_mcp, methods=["GET", "POST", "DELETE"], name="mcp"
+        ),
         Route("/health", endpoint=handle_health, methods=["GET"]),
         Route("/metrics", endpoint=handle_metrics, methods=["GET"]),
     ]
+    if protected_resource_metadata_url:
+        metadata_path = urlparse(protected_resource_metadata_url).path
+        if metadata_path:
+            routes.append(
+                Route(
+                    metadata_path,
+                    endpoint=handle_protected_resource_metadata,
+                    methods=["GET"],
+                    name="protected-resource-metadata",
+                )
+            )
 
-    return Starlette(routes=routes, lifespan=lifespan)
+    app = Starlette(routes=routes, lifespan=lifespan)
+    app.state.gateway_diagnostics = diagnostics
+    return app

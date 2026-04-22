@@ -109,6 +109,30 @@ def test_load_manifest():
     assert len(manifest.servers) > 0
 
 
+def test_manifest_server_auth_metadata_fields_are_optional() -> None:
+    server = ServerConfig(
+        name="remote-auth",
+        description="Remote auth server",
+        keywords=["auth"],
+        install={},
+        command="",
+        args=[],
+        transport="streamable-http",
+        url="https://mcp.example/mcp",
+        protected_resource_metadata_url="https://mcp.example/.well-known/oauth-protected-resource",
+        authorization_server_metadata_url="https://auth.example/.well-known/oauth-authorization-server",
+        oidc_issuer_url="https://issuer.example",
+        oidc_discovery_url="https://issuer.example/.well-known/openid-configuration",
+        client_id_metadata_document_url="https://client.example/metadata.json",
+        declared_scopes=["read", "write"],
+        supports_url_elicitation=True,
+    )
+
+    assert server.requires_api_key is False
+    assert server.declared_scopes == ["read", "write"]
+    assert server.supports_url_elicitation is True
+
+
 def test_manifest_has_expected_servers():
     """Test that manifest has expected servers."""
     manifest = load_manifest()

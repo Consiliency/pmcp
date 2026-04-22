@@ -24,6 +24,8 @@ from mcp.shared.message import SessionMessage
 from pmcp.config.loader import make_tool_id
 from pmcp.types import (
     LocalMcpServerConfig,
+    McpTaskInfo,
+    McpTaskRecord,
     PromptArgumentInfo,
     PromptInfo,
     RemoteMcpServerConfig,
@@ -33,7 +35,10 @@ from pmcp.types import (
     RiskHint,
     ServerStatus,
     ServerStatusEnum,
+    TaskMetadataInput,
+    TaskSupportMode,
     ToolInfo,
+    TraceContextInfo,
 )
 
 resource_module: ModuleType | None
@@ -68,6 +73,14 @@ HEALTH_CHECK_INTERVAL = 30.0  # Background health check every 30s
 # Connection retry settings
 MAX_CONNECTION_RETRIES = 3
 RETRY_DELAYS = [1.0, 2.0, 4.0]  # Exponential backoff delays in seconds
+PREFERRED_PROTOCOL_VERSION = "2025-11-25"
+SUPPORTED_PROTOCOL_VERSIONS = (
+    PREFERRED_PROTOCOL_VERSION,
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+)
+DEFAULT_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 
 # Memory monitoring
 MEMORY_LOG_INTERVAL = 60.0  # Log memory every 60s
@@ -183,6 +196,31 @@ def _truncate_description(description: str, max_length: int = 100) -> str:
     return description[: max_length - 3] + "..."
 
 
+def _raw_metadata(
+    payload: dict[str, Any], known_fields: set[str]
+) -> dict[str, Any] | None:
+    metadata = {key: value for key, value in payload.items() if key not in known_fields}
+    return metadata or None
+
+
+def _schema_dialect(*schemas: dict[str, Any] | None) -> str:
+    for schema in schemas:
+        if schema and isinstance(schema.get("$schema"), str):
+            return schema["$schema"]
+    return DEFAULT_SCHEMA_DIALECT
+
+
+def _is_protocol_version_initialize_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return (
+        "protocol" in message
+        and ("version" in message or PREFERRED_PROTOCOL_VERSION in message)
+        and (
+            "initialize" in message or "unsupported" in message or "invalid" in message
+        )
+    )
+
+
 _ENV_VAR_HEADER_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
 
 
@@ -203,6 +241,19 @@ def _remote_headers(config: RemoteMcpServerConfig) -> dict[str, str] | None:
     }
 
 
+def _trace_context_payload(
+    trace_context: TraceContextInfo | dict[str, Any] | None,
+) -> dict[str, str]:
+    if trace_context is None:
+        return {}
+    parsed = (
+        trace_context
+        if isinstance(trace_context, TraceContextInfo)
+        else TraceContextInfo.model_validate(trace_context)
+    )
+    return parsed.model_dump(exclude_none=True)
+
+
 @dataclass
 class PendingRequest:
     """Metadata for tracking a pending tool invocation."""
@@ -214,6 +265,8 @@ class PendingRequest:
     last_heartbeat: float  # time.time() of last activity
     timeout_ms: int  # Configured timeout
     future: asyncio.Future[Any]
+    task_id: str | None = None
+    task_status: str | None = None
 
 
 @dataclass
@@ -259,6 +312,7 @@ class ClientManager:
         self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
         self._lifecycle_lock = asyncio.Lock()
         self._connect_tasks: dict[str, asyncio.Task[None]] = {}
+        self._tasks: dict[tuple[str, str], McpTaskRecord] = {}
 
     async def connect_all(
         self, configs: list[ResolvedServerConfig], retry: bool = True
@@ -430,15 +484,23 @@ class ClientManager:
     ) -> tuple[bool, int, str | None]:
         """Disconnect one server, refusing active requests unless forced."""
         pending_requests = self.get_pending_requests(name)
-        if pending_requests and not force:
+        active_tasks = self.get_active_tasks(name)
+        if (pending_requests or active_tasks) and not force:
             return (
                 False,
                 0,
-                "Disconnect refused because this server has pending requests. "
+                "Disconnect refused because this server has pending requests or active MCP tasks. "
                 "Use gateway.list_pending to inspect them or retry with force=true.",
             )
 
         cancelled = self.cancel_pending_requests(name) if pending_requests else 0
+        if active_tasks:
+            for task in active_tasks:
+                ok, _task, message = await self.cancel_task(
+                    name, task.task_id, force=True
+                )
+                if not ok:
+                    return (False, cancelled, message)
 
         async with self._lifecycle_lock:
             managed = self._clients.get(name)
@@ -580,6 +642,275 @@ class ClientManager:
         for prompt_id, prompt in list(self._prompts.items()):
             if prompt.server_name == name:
                 self._prompts.pop(prompt_id, None)
+        for key in list(self._tasks):
+            if key[0] == name:
+                self._tasks.pop(key, None)
+
+    def _server_supports_tasks(self, managed: ManagedClient) -> bool:
+        capabilities = managed.status.server_capabilities or {}
+        return "tasks" in capabilities and capabilities.get("tasks") is not False
+
+    def _tool_task_support(self, tool_info: ToolInfo) -> TaskSupportMode:
+        support = (tool_info.execution or {}).get("taskSupport")
+        if support in {"optional", "required"}:
+            return support  # type: ignore[return-value]
+        return "forbidden"
+
+    def _task_wire_metadata(
+        self, task: TaskMetadataInput | dict[str, Any] | None
+    ) -> dict[str, Any]:
+        if task is None:
+            return {}
+        parsed = (
+            task
+            if isinstance(task, TaskMetadataInput)
+            else TaskMetadataInput.model_validate(task)
+        )
+        payload: dict[str, Any] = {}
+        if parsed.metadata:
+            payload["metadata"] = parsed.metadata
+        if parsed.ttl is not None:
+            payload["ttl"] = parsed.ttl
+        if parsed.poll_interval is not None:
+            payload["pollInterval"] = parsed.poll_interval
+        if parsed.requestor_context:
+            payload["requestorContext"] = parsed.requestor_context
+        return payload
+
+    def _extract_task_payload(self, result: dict[str, Any]) -> dict[str, Any] | None:
+        task = result.get("task")
+        if isinstance(task, dict):
+            return task
+        if isinstance(result.get("taskId"), str):
+            return result
+        return None
+
+    def _task_info_from_payload(self, payload: dict[str, Any]) -> McpTaskInfo | None:
+        task_id = payload.get("taskId") or payload.get("task_id")
+        if not isinstance(task_id, str) or not task_id:
+            return None
+        status_message = payload.get("statusMessage", payload.get("status_message"))
+        poll_interval = payload.get("pollInterval", payload.get("poll_interval"))
+        return McpTaskInfo(
+            task_id=task_id,
+            status=payload.get("status"),
+            status_message=status_message if isinstance(status_message, str) else None,
+            created_at=payload.get("createdAt", payload.get("created_at")),
+            updated_at=payload.get("updatedAt", payload.get("updated_at")),
+            ttl=payload.get("ttl"),
+            poll_interval=poll_interval,
+            raw=payload,
+        )
+
+    def _record_task(
+        self,
+        server_name: str,
+        task_info: McpTaskInfo,
+        *,
+        tool_id: str | None = None,
+        requestor_context: dict[str, Any] | None = None,
+    ) -> McpTaskRecord:
+        existing = self._tasks.get((server_name, task_info.task_id))
+        record = McpTaskRecord(
+            task_id=task_info.task_id,
+            status=task_info.status,
+            status_message=task_info.status_message,
+            created_at=task_info.created_at
+            if existing is None
+            else existing.created_at,
+            updated_at=task_info.updated_at or time.time(),
+            ttl=task_info.ttl,
+            poll_interval=task_info.poll_interval,
+            raw=task_info.raw,
+            server_name=server_name,
+            tool_id=tool_id or (existing.tool_id if existing else None),
+            requestor_context=requestor_context
+            or (existing.requestor_context if existing else None),
+        )
+        self._tasks[(server_name, task_info.task_id)] = record
+        return record
+
+    def _terminal_task(self, task: McpTaskRecord) -> bool:
+        return task.status in {"completed", "failed", "cancelled"}
+
+    def get_task_record(self, server_name: str, task_id: str) -> McpTaskRecord | None:
+        return self._tasks.get((server_name, task_id))
+
+    def get_tracked_tasks(self, server_name: str | None = None) -> list[McpTaskRecord]:
+        return sorted(
+            [
+                task
+                for (server, _), task in self._tasks.items()
+                if server_name is None or server == server_name
+            ],
+            key=lambda task: (task.server_name, task.task_id),
+        )
+
+    def get_active_tasks(self, server_name: str | None = None) -> list[McpTaskRecord]:
+        return [
+            task
+            for task in self.get_tracked_tasks(server_name)
+            if not self._terminal_task(task)
+        ]
+
+    async def cancel_active_tasks(
+        self, server_name: str | None = None
+    ) -> tuple[int, list[str]]:
+        cancelled = 0
+        errors: list[str] = []
+        for task in list(self.get_active_tasks(server_name)):
+            ok, _record, message = await self.cancel_task(
+                task.server_name, task.task_id, force=True
+            )
+            if ok:
+                cancelled += 1
+            else:
+                errors.append(message)
+        return cancelled, errors
+
+    def _index_tools(self, name: str, tools: list[dict[str, Any]]) -> int:
+        indexed = 0
+        known_fields = {
+            "name",
+            "title",
+            "description",
+            "inputSchema",
+            "outputSchema",
+            "icons",
+            "annotations",
+            "execution",
+        }
+        for tool in tools:
+            if indexed >= self._max_tools_per_server:
+                logger.warning(
+                    f"Server {name} has more than {self._max_tools_per_server} tools, truncating"
+                )
+                break
+
+            tool_name = tool["name"]
+            tool_id = make_tool_id(name, tool_name)
+            description = tool.get("description", "")
+            input_schema = tool.get("inputSchema", {})
+            output_schema = tool.get("outputSchema")
+
+            tool_info = ToolInfo(
+                tool_id=tool_id,
+                server_name=name,
+                tool_name=tool_name,
+                title=tool.get("title"),
+                description=description,
+                short_description=_truncate_description(description),
+                input_schema=input_schema,
+                icons=tool.get("icons"),
+                output_schema=output_schema,
+                annotations=tool.get("annotations"),
+                execution=tool.get("execution"),
+                schema_dialect=_schema_dialect(input_schema, output_schema),
+                raw_metadata=_raw_metadata(tool, known_fields),
+                tags=_extract_tags(name, tool_name, description),
+                risk_hint=_infer_risk_hint(tool_name, description),
+            )
+
+            self._tools[tool_id] = tool_info
+            indexed += 1
+        return indexed
+
+    def _index_resources(self, name: str, resources: list[dict[str, Any]]) -> int:
+        known_fields = {
+            "uri",
+            "name",
+            "title",
+            "description",
+            "mimeType",
+            "icons",
+            "annotations",
+        }
+        for resource in resources:
+            uri = resource.get("uri", "")
+            resource_id = f"{name}::{uri}"
+            resource_info = ResourceInfo(
+                resource_id=resource_id,
+                server_name=name,
+                uri=uri,
+                name=resource.get("name"),
+                title=resource.get("title"),
+                description=resource.get("description"),
+                mime_type=resource.get("mimeType"),
+                icons=resource.get("icons"),
+                annotations=resource.get("annotations"),
+                raw_metadata=_raw_metadata(resource, known_fields),
+            )
+            self._resources[resource_id] = resource_info
+        return len(resources)
+
+    def _index_prompts(self, name: str, prompts: list[dict[str, Any]]) -> int:
+        known_prompt_fields = {
+            "name",
+            "title",
+            "description",
+            "arguments",
+            "icons",
+            "annotations",
+        }
+        known_arg_fields = {"name", "title", "description", "required"}
+        for prompt in prompts:
+            prompt_name = prompt.get("name", "")
+            prompt_id = f"{name}::{prompt_name}"
+            arguments = None
+            if prompt.get("arguments"):
+                arguments = [
+                    PromptArgumentInfo(
+                        name=arg.get("name", ""),
+                        title=arg.get("title"),
+                        description=arg.get("description"),
+                        required=arg.get("required", False),
+                        raw_metadata=_raw_metadata(arg, known_arg_fields),
+                    )
+                    for arg in prompt["arguments"]
+                ]
+            prompt_info = PromptInfo(
+                prompt_id=prompt_id,
+                server_name=name,
+                name=prompt_name,
+                title=prompt.get("title"),
+                description=prompt.get("description"),
+                arguments=arguments,
+                icons=prompt.get("icons"),
+                annotations=prompt.get("annotations"),
+                raw_metadata=_raw_metadata(prompt, known_prompt_fields),
+            )
+            self._prompts[prompt_id] = prompt_info
+        return len(prompts)
+
+    async def _index_capabilities(self, managed: ManagedClient) -> tuple[int, int, int]:
+        name = managed.config.name
+
+        tools_result = await self._send_request(managed, "tools/list", {})
+        indexed = self._index_tools(name, tools_result.get("tools", []))
+
+        resources_task = self._send_request(managed, "resources/list", {})
+        prompts_task = self._send_request(managed, "prompts/list", {})
+        listing_results = await asyncio.gather(
+            resources_task, prompts_task, return_exceptions=True
+        )
+
+        resource_count = 0
+        resources_result = listing_results[0]
+        if isinstance(resources_result, BaseException):
+            logger.debug(f"Server {name} doesn't support resources: {resources_result}")
+        else:
+            resource_count = self._index_resources(
+                name, resources_result.get("resources", [])
+            )
+
+        prompt_count = 0
+        prompts_result = listing_results[1]
+        if isinstance(prompts_result, BaseException):
+            logger.debug(f"Server {name} doesn't support prompts: {prompts_result}")
+        else:
+            prompt_count = self._index_prompts(name, prompts_result.get("prompts", []))
+
+        return indexed, resource_count, prompt_count
 
     async def _connect_stdio(self, config: ResolvedServerConfig) -> None:
         """Connect to a local stdio MCP server."""
@@ -650,96 +981,9 @@ class ClientManager:
             # Initialize connection
             await self._send_initialize(managed)
 
-            # List tools
-            tools_result = await self._send_request(managed, "tools/list", {})
-            tools = tools_result.get("tools", [])
-
-            # Index tools
-            indexed = 0
-            for tool in tools:
-                if indexed >= self._max_tools_per_server:
-                    logger.warning(
-                        f"Server {name} has more than {self._max_tools_per_server} tools, truncating"
-                    )
-                    break
-
-                tool_id = make_tool_id(name, tool["name"])
-                description = tool.get("description", "")
-
-                tool_info = ToolInfo(
-                    tool_id=tool_id,
-                    server_name=name,
-                    tool_name=tool["name"],
-                    description=description,
-                    short_description=_truncate_description(description),
-                    input_schema=tool.get("inputSchema", {}),
-                    tags=_extract_tags(name, tool["name"], description),
-                    risk_hint=_infer_risk_hint(tool["name"], description),
-                )
-
-                self._tools[tool_id] = tool_info
-                indexed += 1
-
-            # List resources and prompts in parallel (optional - server may not support)
-            resource_count = 0
-            prompt_count = 0
-
-            resources_task = self._send_request(managed, "resources/list", {})
-            prompts_task = self._send_request(managed, "prompts/list", {})
-            listing_results = await asyncio.gather(
-                resources_task, prompts_task, return_exceptions=True
+            indexed, resource_count, prompt_count = await self._index_capabilities(
+                managed
             )
-
-            # Process resources result
-            resources_result = listing_results[0]
-            if isinstance(resources_result, BaseException):
-                logger.debug(
-                    f"Server {name} doesn't support resources: {resources_result}"
-                )
-            else:
-                resources = resources_result.get("resources", [])
-                for resource in resources:
-                    uri = resource.get("uri", "")
-                    resource_id = f"{name}::{uri}"
-                    resource_info = ResourceInfo(
-                        resource_id=resource_id,
-                        server_name=name,
-                        uri=uri,
-                        name=resource.get("name"),
-                        description=resource.get("description"),
-                        mime_type=resource.get("mimeType"),
-                    )
-                    self._resources[resource_id] = resource_info
-                    resource_count += 1
-
-            # Process prompts result
-            prompts_result = listing_results[1]
-            if isinstance(prompts_result, BaseException):
-                logger.debug(f"Server {name} doesn't support prompts: {prompts_result}")
-            else:
-                prompts = prompts_result.get("prompts", [])
-                for prompt in prompts:
-                    prompt_name = prompt.get("name", "")
-                    prompt_id = f"{name}::{prompt_name}"
-                    arguments = None
-                    if prompt.get("arguments"):
-                        arguments = [
-                            PromptArgumentInfo(
-                                name=arg.get("name", ""),
-                                description=arg.get("description"),
-                                required=arg.get("required", False),
-                            )
-                            for arg in prompt["arguments"]
-                        ]
-                    prompt_info = PromptInfo(
-                        prompt_id=prompt_id,
-                        server_name=name,
-                        name=prompt_name,
-                        description=prompt.get("description"),
-                        arguments=arguments,
-                    )
-                    self._prompts[prompt_id] = prompt_info
-                    prompt_count += 1
 
             # Update status
             status.status = ServerStatusEnum.ONLINE
@@ -841,91 +1085,9 @@ class ClientManager:
 
             await self._send_initialize(managed)
 
-            tools_result = await self._send_request(managed, "tools/list", {})
-            tools = tools_result.get("tools", [])
-
-            indexed = 0
-            for tool in tools:
-                if indexed >= self._max_tools_per_server:
-                    logger.warning(
-                        f"Server {name} has more than {self._max_tools_per_server} tools, truncating"
-                    )
-                    break
-
-                tool_id = make_tool_id(name, tool["name"])
-                description = tool.get("description", "")
-
-                tool_info = ToolInfo(
-                    tool_id=tool_id,
-                    server_name=name,
-                    tool_name=tool["name"],
-                    description=description,
-                    short_description=_truncate_description(description),
-                    input_schema=tool.get("inputSchema", {}),
-                    tags=_extract_tags(name, tool["name"], description),
-                    risk_hint=_infer_risk_hint(tool["name"], description),
-                )
-
-                self._tools[tool_id] = tool_info
-                indexed += 1
-
-            resource_count = 0
-            prompt_count = 0
-
-            resources_task = self._send_request(managed, "resources/list", {})
-            prompts_task = self._send_request(managed, "prompts/list", {})
-            listing_results = await asyncio.gather(
-                resources_task, prompts_task, return_exceptions=True
+            indexed, resource_count, prompt_count = await self._index_capabilities(
+                managed
             )
-
-            resources_result = listing_results[0]
-            if isinstance(resources_result, BaseException):
-                logger.debug(
-                    f"Server {name} doesn't support resources: {resources_result}"
-                )
-            else:
-                resources = resources_result.get("resources", [])
-                for resource in resources:
-                    uri = resource.get("uri", "")
-                    resource_id = f"{name}::{uri}"
-                    resource_info = ResourceInfo(
-                        resource_id=resource_id,
-                        server_name=name,
-                        uri=uri,
-                        name=resource.get("name"),
-                        description=resource.get("description"),
-                        mime_type=resource.get("mimeType"),
-                    )
-                    self._resources[resource_id] = resource_info
-                    resource_count += 1
-
-            prompts_result = listing_results[1]
-            if isinstance(prompts_result, BaseException):
-                logger.debug(f"Server {name} doesn't support prompts: {prompts_result}")
-            else:
-                prompts = prompts_result.get("prompts", [])
-                for prompt in prompts:
-                    prompt_name = prompt.get("name", "")
-                    prompt_id = f"{name}::{prompt_name}"
-                    arguments = None
-                    if prompt.get("arguments"):
-                        arguments = [
-                            PromptArgumentInfo(
-                                name=arg.get("name", ""),
-                                description=arg.get("description"),
-                                required=arg.get("required", False),
-                            )
-                            for arg in prompt["arguments"]
-                        ]
-                    prompt_info = PromptInfo(
-                        prompt_id=prompt_id,
-                        server_name=name,
-                        name=prompt_name,
-                        description=prompt.get("description"),
-                        arguments=arguments,
-                    )
-                    self._prompts[prompt_id] = prompt_info
-                    prompt_count += 1
 
             status.status = ServerStatusEnum.ONLINE
             status.tool_count = indexed
@@ -1183,15 +1345,36 @@ class ClientManager:
 
     async def _send_initialize(self, managed: ManagedClient) -> None:
         """Send initialize handshake."""
-        await self._send_request(
-            managed,
-            "initialize",
-            {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {},
-                "clientInfo": {"name": "mcp-gateway", "version": "1.0.0"},
-            },
-        )
+        params = {
+            "protocolVersion": PREFERRED_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": {"name": "mcp-gateway", "version": "1.0.0"},
+        }
+        try:
+            result = await self._send_request(managed, "initialize", params)
+            requested_protocol_version = PREFERRED_PROTOCOL_VERSION
+        except Exception as exc:
+            if not _is_protocol_version_initialize_error(exc):
+                raise
+            legacy_params = {**params, "protocolVersion": "2024-11-05"}
+            result = await self._send_request(managed, "initialize", legacy_params)
+            requested_protocol_version = "2024-11-05"
+
+        protocol_version = result.get("protocolVersion")
+        if isinstance(protocol_version, str):
+            managed.status.protocol_version = protocol_version
+            if protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
+                logger.debug(
+                    "Server %s negotiated unrecognized protocol version %s",
+                    managed.config.name,
+                    protocol_version,
+                )
+        else:
+            managed.status.protocol_version = requested_protocol_version
+
+        capabilities = result.get("capabilities")
+        if isinstance(capabilities, dict):
+            managed.status.server_capabilities = capabilities
 
         # Send initialized notification (no response expected)
         notification = {
@@ -1276,6 +1459,7 @@ class ClientManager:
         self._tools.clear()
         self._resources.clear()
         self._prompts.clear()
+        self._tasks.clear()
         self._servers.clear()
         self._lazy_configs.clear()
 
@@ -1365,39 +1549,15 @@ class ClientManager:
             # Initialize MCP connection
             await self._send_initialize(managed)
 
-            # List tools
-            tools_result = await self._send_request(managed, "tools/list", {})
-            tools = tools_result.get("tools", [])
-
-            # Index tools
-            indexed = 0
-            for tool in tools:
-                if indexed >= self._max_tools_per_server:
-                    logger.warning(
-                        f"Server {name} has more than {self._max_tools_per_server} tools, truncating"
-                    )
-                    break
-
-                tool_id = make_tool_id(name, tool["name"])
-                description = tool.get("description", "")
-
-                tool_info = ToolInfo(
-                    tool_id=tool_id,
-                    server_name=name,
-                    tool_name=tool["name"],
-                    description=description,
-                    short_description=_truncate_description(description),
-                    input_schema=tool.get("inputSchema", {}),
-                    tags=_extract_tags(name, tool["name"], description),
-                    risk_hint=_infer_risk_hint(tool["name"], description),
-                )
-
-                self._tools[tool_id] = tool_info
-                indexed += 1
+            indexed, resource_count, prompt_count = await self._index_capabilities(
+                managed
+            )
 
             # Update status
             status.status = ServerStatusEnum.ONLINE
             status.tool_count = indexed
+            status.resource_count = resource_count
+            status.prompt_count = prompt_count
             status.last_connected_at = time.time()
 
             # Update revision
@@ -1413,7 +1573,13 @@ class ClientManager:
             raise
 
     async def call_tool(
-        self, tool_id: str, args: dict[str, Any], timeout_ms: int = 30000
+        self,
+        tool_id: str,
+        args: dict[str, Any],
+        timeout_ms: int = 30000,
+        *,
+        task: TaskMetadataInput | dict[str, Any] | None = None,
+        trace_context: TraceContextInfo | dict[str, Any] | None = None,
     ) -> Any:
         """Call a tool on a downstream server."""
         tool_info = self._tools.get(tool_id)
@@ -1433,16 +1599,139 @@ class ClientManager:
                 f"Server {tool_info.server_name} is {managed.status.status.value}"
             )
 
+        support = self._tool_task_support(tool_info)
+        task_requested = task is not None
+        if support == "required":
+            task_requested = True
+        if task_requested and support == "forbidden":
+            raise RuntimeError(f"Tool {tool_id} does not support MCP task execution")
+        if task_requested and not self._server_supports_tasks(managed):
+            raise RuntimeError(
+                f"Server {tool_info.server_name} does not advertise MCP task support"
+            )
+
+        params: dict[str, Any] = {"name": tool_info.tool_name, "arguments": args}
+        trace_meta = _trace_context_payload(trace_context)
+        if trace_meta:
+            params["_meta"] = {**params.get("_meta", {}), **trace_meta}
+        requestor_context: dict[str, Any] | None = None
+        if task_requested:
+            parsed_task = (
+                task
+                if isinstance(task, TaskMetadataInput)
+                else TaskMetadataInput.model_validate(task or {})
+            )
+            if not parsed_task.enabled and support != "required":
+                task_requested = False
+            else:
+                params["task"] = self._task_wire_metadata(parsed_task)
+                requestor_context = parsed_task.requestor_context
+
         # Send tool call with metadata for health monitoring
         result = await self._send_request(
             managed,
             "tools/call",
-            {"name": tool_info.tool_name, "arguments": args},
+            params,
             tool_id=tool_id,
             timeout_ms=timeout_ms,
         )
+        if task_requested and isinstance(result, dict):
+            task_payload = self._extract_task_payload(result)
+            if task_payload is not None:
+                task_info = self._task_info_from_payload(task_payload)
+                if task_info is not None:
+                    self._record_task(
+                        tool_info.server_name,
+                        task_info,
+                        tool_id=tool_id,
+                        requestor_context=requestor_context,
+                    )
 
         return result
+
+    def _task_client(self, server_name: str) -> ManagedClient:
+        managed = self._clients.get(server_name)
+        if (
+            not managed
+            or (not managed.is_remote and managed.process is None)
+            or (managed.is_remote and managed.write_stream is None)
+        ):
+            raise RuntimeError(f"Server {server_name} is not connected")
+        if not self._server_supports_tasks(managed):
+            raise RuntimeError(
+                f"Server {server_name} does not advertise MCP task support"
+            )
+        return managed
+
+    async def list_tasks(
+        self, server_name: str | None = None, cursor: str | None = None
+    ) -> dict[str, Any]:
+        """Proxy downstream tasks/list and update the transient task registry."""
+        servers = [server_name] if server_name else sorted(self._clients)
+        all_tasks: list[dict[str, Any]] = []
+        next_cursor: str | None = None
+        for name in servers:
+            managed = self._task_client(name)
+            params: dict[str, Any] = {}
+            if cursor:
+                params["cursor"] = cursor
+            result = await self._send_request(managed, "tasks/list", params)
+            for payload in result.get("tasks", []):
+                if not isinstance(payload, dict):
+                    continue
+                task_info = self._task_info_from_payload(payload)
+                if task_info is None:
+                    continue
+                record = self._record_task(name, task_info)
+                all_tasks.append(record.model_dump())
+            next_cursor = result.get("nextCursor") or result.get("next_cursor")
+        return {"tasks": all_tasks, "nextCursor": next_cursor}
+
+    async def get_task(self, server_name: str, task_id: str) -> McpTaskInfo:
+        """Proxy downstream tasks/get and update the transient task registry."""
+        managed = self._task_client(server_name)
+        result = await self._send_request(managed, "tasks/get", {"taskId": task_id})
+        payload = self._extract_task_payload(result) or result
+        task_info = self._task_info_from_payload(payload)
+        if task_info is None:
+            raise KeyError(f"Task not found: {server_name}::{task_id}")
+        return self._record_task(server_name, task_info)
+
+    async def get_task_result(self, server_name: str, task_id: str) -> dict[str, Any]:
+        """Proxy downstream tasks/result and update task metadata when returned."""
+        managed = self._task_client(server_name)
+        result = await self._send_request(managed, "tasks/result", {"taskId": task_id})
+        task_payload = self._extract_task_payload(result)
+        if task_payload is not None:
+            task_info = self._task_info_from_payload(task_payload)
+            if task_info is not None:
+                self._record_task(server_name, task_info)
+        return result
+
+    async def cancel_task(
+        self, server_name: str, task_id: str, force: bool = False
+    ) -> tuple[bool, McpTaskInfo | None, str]:
+        """Proxy downstream tasks/cancel with idempotent local terminal handling."""
+        record = self.get_task_record(server_name, task_id)
+        if record is not None and self._terminal_task(record):
+            return (True, record, f"Task is already terminal: {record.status}")
+        if record is None:
+            return (False, None, f"Task not found: {server_name}::{task_id}")
+
+        managed = self._task_client(server_name)
+        result = await self._send_request(
+            managed, "tasks/cancel", {"taskId": task_id, "force": force}
+        )
+        payload = self._extract_task_payload(result) or result
+        task_info = self._task_info_from_payload(payload)
+        if task_info is None:
+            task_info = McpTaskInfo(
+                task_id=task_id,
+                status="cancelled",
+                updated_at=time.time(),
+                raw=result,
+            )
+        return (True, self._record_task(server_name, task_info), "Task cancelled")
 
     async def read_resource(self, resource_id: str, timeout_ms: int = 30000) -> Any:
         """Read a resource from a downstream server."""
@@ -1515,7 +1804,7 @@ class ClientManager:
 
     def get_all_tools(self) -> list[ToolInfo]:
         """Get all tools."""
-        return list(self._tools.values())
+        return sorted(self._tools.values(), key=lambda tool: tool.tool_id)
 
     def get_resource(self, resource_id: str) -> ResourceInfo | None:
         """Get resource info by ID."""
@@ -1523,7 +1812,9 @@ class ClientManager:
 
     def get_all_resources(self) -> list[ResourceInfo]:
         """Get all resources."""
-        return list(self._resources.values())
+        return sorted(
+            self._resources.values(), key=lambda resource: resource.resource_id
+        )
 
     def get_prompt_info(self, prompt_id: str) -> PromptInfo | None:
         """Get prompt info by ID."""
@@ -1531,7 +1822,7 @@ class ClientManager:
 
     def get_all_prompts(self) -> list[PromptInfo]:
         """Get all prompts."""
-        return list(self._prompts.values())
+        return sorted(self._prompts.values(), key=lambda prompt: prompt.prompt_id)
 
     def get_server_status(self, name: str) -> ServerStatus | None:
         """Get server status."""
@@ -1539,7 +1830,7 @@ class ClientManager:
 
     def get_all_server_statuses(self) -> list[ServerStatus]:
         """Get all server statuses."""
-        return list(self._servers.values())
+        return sorted(self._servers.values(), key=lambda status: status.name)
 
     def get_registry_meta(self) -> tuple[str, float]:
         """Get registry metadata (revision_id, last_refresh_ts)."""
@@ -1656,11 +1947,13 @@ class ClientManager:
     def get_pending_requests(self, server: str | None = None) -> list[PendingRequest]:
         """Get all pending requests, optionally filtered by server."""
         result: list[PendingRequest] = []
-        for name, managed in list(self._clients.items()):
+        for name, managed in sorted(self._clients.items()):
             if server and name != server:
                 continue
             result.extend(list(managed.pending_requests.values()))
-        return result
+        return sorted(
+            result, key=lambda pending: (pending.server_name, pending.request_id)
+        )
 
     def cancel_all_pending_requests(self) -> int:
         """Cancel all pending requests and return the number newly cancelled."""

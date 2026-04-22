@@ -19,6 +19,7 @@ from pmcp.policy.policy import PolicyManager
 from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
 from pmcp.types import (
     LocalMcpServerConfig,
+    McpTaskRecord,
     ResolvedServerConfig,
     RequestState,
     RiskHint,
@@ -45,6 +46,8 @@ class MockClientManager:
         self.events: list[str] = []
         self.ensure_connected_calls: list[str] = []
         self.pending_requests: list[Any] = []
+        self.tasks: dict[tuple[str, str], Any] = {}
+        self.last_call_trace_context: Any = None
 
     def get_all_tools(self) -> list[ToolInfo]:
         return list(self._tools.values())
@@ -97,9 +100,91 @@ class MockClientManager:
         return (self._revision_id, self._last_refresh_ts)
 
     async def call_tool(
-        self, tool_id: str, args: dict[str, Any], timeout_ms: int
+        self,
+        tool_id: str,
+        args: dict[str, Any],
+        timeout_ms: int,
+        *,
+        task: Any = None,
+        trace_context: Any = None,
     ) -> Any:
+        self.last_call_trace_context = trace_context
+        if task is not None:
+            task_record = McpTaskRecord(
+                task_id="task-1",
+                status="working",
+                status_message=None,
+                created_at=None,
+                updated_at=None,
+                ttl=None,
+                poll_interval=None,
+                raw={"taskId": "task-1", "status": "working"},
+                server_name=tool_id.split("::", 1)[0],
+                tool_id=tool_id,
+            )
+            self.tasks[(task_record.server_name, task_record.task_id)] = task_record
+            return {"task": {"taskId": "task-1", "status": "working"}}
         return {"content": [{"type": "text", "text": "result"}]}
+
+    def get_task_record(self, server_name: str, task_id: str) -> Any:
+        return self.tasks.get((server_name, task_id))
+
+    def get_active_tasks(self, server_name: str | None = None) -> list[Any]:
+        return [
+            task
+            for (server, _), task in self.tasks.items()
+            if (server_name is None or server == server_name)
+            and task.status not in {"completed", "failed", "cancelled"}
+        ]
+
+    async def cancel_active_tasks(
+        self, server_name: str | None = None
+    ) -> tuple[int, list[str]]:
+        active = self.get_active_tasks(server_name)
+        for task in active:
+            task.status = "cancelled"
+        return (len(active), [])
+
+    async def list_tasks(
+        self, server_name: str | None = None, cursor: str | None = None
+    ) -> dict[str, Any]:
+        return {
+            "tasks": [
+                {
+                    "task_id": task.task_id,
+                    "status": task.status,
+                    "server_name": task.server_name,
+                    "raw": task.raw,
+                }
+                for task in self.tasks.values()
+                if server_name is None or task.server_name == server_name
+            ],
+            "nextCursor": cursor,
+        }
+
+    async def get_task(self, server_name: str, task_id: str) -> Any:
+        task = self.tasks.get((server_name, task_id))
+        if task is None:
+            raise KeyError(task_id)
+        return task
+
+    async def get_task_result(self, server_name: str, task_id: str) -> dict[str, Any]:
+        task = self.tasks.get((server_name, task_id))
+        if task is None:
+            raise KeyError(task_id)
+        task.status = "completed"
+        return {"result": "api_key=sk-secret", "task": task.raw}
+
+    async def cancel_task(
+        self, server_name: str, task_id: str, force: bool = False
+    ) -> tuple[bool, Any, str]:
+        task = self.tasks.get((server_name, task_id))
+        if task is None:
+            return (False, None, "Task not found")
+        if task.status in {"completed", "failed", "cancelled"}:
+            return (True, task, f"Task is already terminal: {task.status}")
+        task.status = "cancelled"
+        return (True, task, "Task cancelled")
 
     async def refresh(self, configs: list[Any]) -> list[str]:
         self.refreshed_configs = list(configs)
@@ -826,6 +911,37 @@ class TestCatalogSearch:
             # Should not have full schema
             assert not hasattr(card, "input_schema")
 
+    @pytest.mark.asyncio
+    async def test_catalog_search_includes_compact_modern_metadata(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        tool = gateway_tools._client_manager._tools["github::list_issues"]
+        tool.title = "List Issues"
+        tool.icons = [{"src": "tool.svg"}]
+        tool.execution = {"taskSupport": "optional"}
+        tool.schema_dialect = "https://json-schema.org/draft/2020-12/schema"
+
+        result = await gateway_tools.catalog_search({"query": "list_issues"})
+
+        card = result.results[0]
+        assert card.title == "List Issues"
+        assert card.icons == [{"src": "tool.svg"}]
+        assert card.execution == {"taskSupport": "optional"}
+        assert card.schema_dialect == "https://json-schema.org/draft/2020-12/schema"
+        assert not hasattr(card, "output_schema")
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_old_tool_metadata_is_optional(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        result = await gateway_tools.catalog_search({"query": "search_issues"})
+
+        card = result.results[0]
+        assert card.tool_id == "jira::search_issues"
+        assert card.title is None
+        assert card.icons is None
+        assert card.execution is None
+
 
 class TestServerLifecycleTools:
     """Tests for gateway server lifecycle tools."""
@@ -1097,6 +1213,47 @@ class TestDescribe:
         assert any(a.name == "title" and a.required for a in result.args)
 
     @pytest.mark.asyncio
+    async def test_describe_returns_modern_tool_metadata(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        tool = gateway_tools._client_manager._tools["github::create_issue"]
+        tool.title = "Create Issue"
+        tool.icons = [{"src": "issue.svg"}]
+        tool.output_schema = {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+        }
+        tool.annotations = {"readOnlyHint": True}
+        tool.execution = {"taskSupport": "optional"}
+        tool.schema_dialect = "https://json-schema.org/draft/2020-12/schema"
+
+        result = await gateway_tools.describe({"tool_id": "github::create_issue"})
+
+        assert result.title == "Create Issue"
+        assert result.icons == [{"src": "issue.svg"}]
+        assert result.output_schema == {
+            "type": "object",
+            "properties": {"id": {"type": "string"}},
+        }
+        assert result.annotations == {"readOnlyHint": True}
+        assert result.execution == {"taskSupport": "optional"}
+        assert result.schema_dialect == "https://json-schema.org/draft/2020-12/schema"
+
+    @pytest.mark.asyncio
+    async def test_describe_annotations_do_not_override_risk_safety_notes(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        tool = gateway_tools._client_manager._tools["github::create_issue"]
+        tool.annotations = {"readOnlyHint": True}
+
+        result = await gateway_tools.describe({"tool_id": "github::create_issue"})
+
+        assert result.annotations == {"readOnlyHint": True}
+        assert result.safety_notes == [
+            "This tool may modify data or have side effects."
+        ]
+
+    @pytest.mark.asyncio
     async def test_raises_for_unknown_tool(self, gateway_tools: GatewayTools) -> None:
         with pytest.raises(GatewayException) as exc_info:
             await gateway_tools.describe({"tool_id": "unknown::tool"})
@@ -1129,6 +1286,38 @@ class TestInvoke:
         assert result.tool_id == "github::list_issues"
 
     @pytest.mark.asyncio
+    async def test_invoke_audits_success_and_propagates_trace_context(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        result = await gateway_tools.invoke(
+            {
+                "tool_id": "github::list_issues",
+                "arguments": {},
+                "_meta": {
+                    "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+                    "baggage": "tenant=test",
+                    "authorization": "Bearer secret",
+                },
+            }
+        )
+
+        health = await gateway_tools.health()
+        assert result.ok is True
+        assert (
+            cast(Any, gateway_tools._client_manager).last_call_trace_context is not None
+        )
+        assert cast(
+            Any, gateway_tools._client_manager
+        ).last_call_trace_context.traceparent.startswith("00-")
+        assert health.audit_events is not None
+        event = health.audit_events[-1]
+        assert event.method == "gateway.invoke"
+        assert event.tool_id == "github::list_issues"
+        assert event.outcome == "success"
+        assert event.trace_present is True
+        assert event.error is None
+
+    @pytest.mark.asyncio
     async def test_returns_error_for_unknown_tool(
         self, gateway_tools: GatewayTools
     ) -> None:
@@ -1138,6 +1327,9 @@ class TestInvoke:
 
         assert result.ok is False
         assert "Tool not found" in (result.errors or [])[0]
+        health = await gateway_tools.health()
+        assert health.audit_events is not None
+        assert health.audit_events[-1].outcome == "failure"
 
     @pytest.mark.asyncio
     async def test_soak_concurrent_lazy_invokes_share_one_connect(
@@ -1232,6 +1424,40 @@ class TestHealth:
 
         assert result.revision_id == "test-rev"
         assert isinstance(result.servers, list)
+        assert result.gateway_diagnostics is not None
+        assert result.gateway_diagnostics.audit_enabled is True
+        assert result.gateway_diagnostics.trace_context_supported is True
+
+    @pytest.mark.asyncio
+    async def test_health_includes_protocol_metadata(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        cast(Any, gateway_tools._client_manager).set_server_statuses(
+            [
+                ServerStatus(
+                    name="modern",
+                    status=ServerStatusEnum.ONLINE,
+                    tool_count=1,
+                    protocol_version="2025-11-25",
+                    server_capabilities={"tools": {"listChanged": True}},
+                ),
+                ServerStatus(
+                    name="old",
+                    status=ServerStatusEnum.ONLINE,
+                    tool_count=1,
+                ),
+            ]
+        )
+
+        result = await gateway_tools.health()
+
+        by_name = {server.name: server for server in result.servers}
+        modern = by_name["modern"]
+        old = by_name["old"]
+        assert modern.protocol_version == "2025-11-25"
+        assert modern.server_capabilities == {"tools": {"listChanged": True}}
+        assert old.protocol_version is None
+        assert old.server_capabilities is None
 
     @pytest.mark.asyncio
     async def test_includes_error_details_for_error_servers(
@@ -1250,8 +1476,9 @@ class TestHealth:
 
         result = await gateway_tools.health()
 
-        assert result.servers[0].status == "error"
-        assert result.servers[0].error == "Connection refused"
+        by_name = {server.name: server for server in result.servers}
+        assert by_name["playwright"].status == "error"
+        assert by_name["playwright"].error == "Connection refused"
 
     @pytest.mark.asyncio
     async def test_merges_startup_observations_into_health(
@@ -1651,6 +1878,7 @@ class TestCapabilityAndProvision:
         assert result.needs_api_key is True
         assert result.auth_required is True
         assert result.auth_mode == "api_key"
+        assert result.auth_state == "missing_auth"
         assert result.alternative_env_vars == ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
 
     @pytest.mark.asyncio
@@ -1699,6 +1927,76 @@ class TestCapabilityAndProvision:
         assert result.ok is True
         assert result.env_var == "OPENAI_API_KEY"
         assert "gateway.provision" in (result.next_step or "")
+
+    @pytest.mark.asyncio
+    async def test_auth_connect_url_elicitation_refuses_credential(self) -> None:
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        result = await gateway_tools.auth_connect(
+            {
+                "server_name": "remote-auth",
+                "auth_mode": "url_elicitation",
+                "elicitation_id": "consent-1",
+                "credential": "oauth-code",
+                "consent_acknowledged": True,
+            }
+        )
+
+        assert result.ok is False
+        assert result.auth_state == "elicitation_required"
+        assert "does not accept credentials" in result.message
+
+    @pytest.mark.asyncio
+    async def test_invoke_url_elicitation_error_is_structured(self) -> None:
+        tool = ToolInfo(
+            tool_id="remote-auth::login",
+            server_name="remote-auth",
+            tool_name="login",
+            description="Login",
+            short_description="Login",
+            input_schema={},
+            tags=[],
+            risk_hint=RiskHint.LOW,
+        )
+        client_manager = MockClientManager([tool])
+
+        async def raise_elicitation(*args: Any, **kwargs: Any) -> Any:
+            raise RuntimeError(
+                '{"error":{"code":-32042,"data":{"elicitationId":"consent-1",'
+                '"url":"https://auth.example/consent?code=secret"}}}'
+            )
+
+        client_manager.call_tool = raise_elicitation  # type: ignore[method-assign]
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        result = await gateway_tools.invoke(
+            {"tool_id": "remote-auth::login", "arguments": {}}
+        )
+
+        assert result.ok is False
+        assert result.auth_state == "elicitation_required"
+        assert result.url_elicitations
+        assert "secret" not in result.url_elicitations[0].url
+
+    @pytest.mark.asyncio
+    async def test_provision_policy_denied_has_auth_state(self) -> None:
+        policy_manager = PolicyManager()
+        policy_manager.is_server_allowed = lambda _name: False  # type: ignore[method-assign]
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        result = await gateway_tools.provision({"server_name": "blocked"})
+
+        assert result.ok is False
+        assert result.auth_state == "policy_denied"
 
     @pytest.mark.asyncio
     async def test_provision_uses_discovered_server_config(self, monkeypatch):
@@ -2231,7 +2529,11 @@ class TestStaleIndexer:
 class TestInvokeErrorPaths:
     """Tests for gateway.invoke error handling paths."""
 
-    def _make_tool(self, required_fields: list[str] | None = None) -> ToolInfo:
+    def _make_tool(
+        self,
+        required_fields: list[str] | None = None,
+        execution: dict[str, Any] | None = None,
+    ) -> ToolInfo:
         return ToolInfo(
             tool_id="svc::do_thing",
             server_name="svc",
@@ -2245,6 +2547,7 @@ class TestInvokeErrorPaths:
             },
             tags=[],
             risk_hint=RiskHint.LOW,
+            execution=execution,
         )
 
     def _make_gateway_tools(
@@ -2312,6 +2615,57 @@ class TestInvokeErrorPaths:
         result = await gt.invoke({"tool_id": "svc::do_thing", "arguments": {}})
         assert result.ok is False
         assert "E402" in (result.errors or [""])[0]
+
+    @pytest.mark.asyncio
+    async def test_invoke_optional_task_returns_task_not_result(self) -> None:
+        tool = self._make_tool(execution={"taskSupport": "optional"})
+        gt = self._make_gateway_tools(tool=tool)
+
+        result = await gt.invoke(
+            {
+                "tool_id": "svc::do_thing",
+                "arguments": {},
+                "task": {"metadata": {"reason": "slow"}},
+            }
+        )
+
+        assert result.ok is True
+        assert result.result is None
+        assert result.task is not None
+        assert result.task.task_id == "task-1"
+
+    @pytest.mark.asyncio
+    async def test_tasks_result_applies_output_redaction(self) -> None:
+        gt = self._make_gateway_tools()
+        await gt.invoke(
+            {
+                "tool_id": "svc::do_thing",
+                "arguments": {},
+                "task": {"metadata": {"reason": "slow"}},
+            }
+        )
+
+        result = await gt.tasks_result(
+            {
+                "server_name": "svc",
+                "task_id": "task-1",
+                "options": {"redact_secrets": True, "max_output_chars": 100},
+            }
+        )
+
+        assert result.ok is True
+        assert "sk-secret" not in str(result.result)
+        assert result.task is not None
+        assert result.task.status == "completed"
+
+    @pytest.mark.asyncio
+    async def test_tasks_cancel_reports_missing_task(self) -> None:
+        gt = self._make_gateway_tools()
+
+        result = await gt.tasks_cancel({"server_name": "svc", "task_id": "missing"})
+
+        assert result.ok is False
+        assert result.status == "not_found"
 
 
 class TestSanitizeError:
