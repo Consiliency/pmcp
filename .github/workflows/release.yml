@@ -52,3 +52,56 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         # Uses trusted publishing - no token needed
         # Configure at: https://pypi.org/manage/project/pmcp/settings/publishing/
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+      - name: Extract release notes
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          awk -v version="$version" '
+            $0 ~ "^## \\[" version "\\]([ -]|$)" {
+              in_section = 1
+              next
+            }
+            in_section && /^## \[/ {
+              exit
+            }
+            in_section {
+              print
+            }
+          ' CHANGELOG.md > release-notes.md
+
+          if [ ! -s release-notes.md ]; then
+            printf 'Release %s\n' "$tag" > release-notes.md
+          fi
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release edit "$tag" \
+              --title "$tag" \
+              --notes-file release-notes.md
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --title "$tag" \
+              --notes-file release-notes.md \
+              --verify-tag
+          fi
