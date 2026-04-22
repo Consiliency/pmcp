@@ -917,11 +917,10 @@ class TestMonitorInstall:
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
 
-        # Wait for completion
-        await asyncio.sleep(0.2)
-
         job = manager.get_job(job_id)
         assert job is not None
+        assert job._monitor_task is not None
+        await asyncio.wait_for(job._monitor_task, timeout=2.0)
         assert job.status == "complete"
 
     @pytest.mark.asyncio
@@ -940,11 +939,10 @@ class TestMonitorInstall:
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
 
-        # Wait for completion
-        await asyncio.sleep(0.2)
-
         job = manager.get_job(job_id)
         assert job is not None
+        assert job._monitor_task is not None
+        await asyncio.wait_for(job._monitor_task, timeout=2.0)
         assert job.status == "failed"
 
     @pytest.mark.asyncio
