@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import random
-import re
 import string
 import time
 from collections import deque
@@ -22,6 +21,11 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.message import SessionMessage
 
 from pmcp.config.loader import make_tool_id
+from pmcp.remote_auth import (
+    MissingRemoteHeaderAuthError,
+    build_remote_header_env_lookup,
+    resolve_remote_headers,
+)
 from pmcp.types import (
     LocalMcpServerConfig,
     McpTaskInfo,
@@ -221,24 +225,19 @@ def _is_protocol_version_initialize_error(exc: Exception) -> bool:
     )
 
 
-_ENV_VAR_HEADER_PATTERN = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
-
-
-def _interpolate_header_value(value: str) -> str:
-    """Interpolate header value if it's an env-var placeholder like ${VAR}."""
-    match = _ENV_VAR_HEADER_PATTERN.fullmatch(value)
-    if not match:
-        return value
-    return os.environ.get(match.group(1), "")
-
-
-def _remote_headers(config: RemoteMcpServerConfig) -> dict[str, str] | None:
+def _remote_headers(
+    server_name: str, config: RemoteMcpServerConfig
+) -> dict[str, str] | None:
     """Return remote transport headers with env-var placeholders expanded."""
     if not config.headers:
         return None
-    return {
-        key: _interpolate_header_value(value) for key, value in config.headers.items()
-    }
+    resolution = resolve_remote_headers(
+        config.headers,
+        build_remote_header_env_lookup(),
+    )
+    if resolution.missing_env_vars:
+        raise MissingRemoteHeaderAuthError(server_name, resolution.missing_env_vars)
+    return resolution.resolved_headers
 
 
 def _trace_context_payload(
@@ -1016,7 +1015,7 @@ class ClientManager:
             raise ValueError(f"Server {config.name} has unsupported remote config type")
 
         remote_config = config.config
-        headers = _remote_headers(remote_config)
+        headers = _remote_headers(config.name, remote_config)
         await self._connect_remote_stream(
             config,
             sse_client(remote_config.url, headers=headers),
@@ -1029,7 +1028,7 @@ class ClientManager:
             raise ValueError(f"Server {config.name} has unsupported remote config type")
 
         remote_config = config.config
-        headers = _remote_headers(remote_config)
+        headers = _remote_headers(config.name, remote_config)
         await self._connect_remote_stream(
             config,
             streamablehttp_client(remote_config.url, headers=headers),

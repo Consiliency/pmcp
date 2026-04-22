@@ -18,12 +18,12 @@ gateway behavior unless a caller supplies an explicit project path.
 
 ## Interface Freeze Gates
 
-- [ ] IF-0-STORE-1 — PMCP uses `pmcp.env_store` as the only write path for API-key credential files from gateway and CLI surfaces.
-- [ ] IF-0-STORE-2 — `pmcp.env_store.validate_env_var_name(name)` accepts only shell-compatible env var names matching `^[A-Za-z_][A-Za-z0-9_]*$` before any write.
-- [ ] IF-0-STORE-3 — `pmcp.env_store.write_env_file(path, values)` creates parent directories, writes parseable dotenv content, and chmods the target file to `0600`.
-- [ ] IF-0-STORE-4 — `pmcp.env_store.set_env_value(scope, key, value, project=None)` preserves existing user/project scope paths and returns the written `Path`.
-- [ ] IF-0-STORE-5 — newline-bearing credential values are rejected with a clear validation error; no multiline credential format is introduced in Phase 1.
-- [ ] IF-0-STORE-6 — credentials containing spaces, `#`, quotes, backslashes, and `=` round-trip through the shared reader and cannot inject extra env vars.
+- [x] IF-0-STORE-1 — PMCP uses `pmcp.env_store` as the only write path for API-key credential files from gateway and CLI surfaces.
+- [x] IF-0-STORE-2 — `pmcp.env_store.validate_env_var_name(name)` accepts only shell-compatible env var names matching `^[A-Za-z_][A-Za-z0-9_]*$` before any write.
+- [x] IF-0-STORE-3 — `pmcp.env_store.write_env_file(path, values)` creates parent directories, writes parseable dotenv content, and chmods the target file to `0600`.
+- [x] IF-0-STORE-4 — `pmcp.env_store.set_env_value(scope, key, value, project=None)` preserves existing user/project scope paths and returns the written `Path`.
+- [x] IF-0-STORE-5 — newline-bearing credential values are rejected with a clear validation error; no multiline credential format is introduced in Phase 1.
+- [x] IF-0-STORE-6 — credentials containing spaces, `#`, quotes, backslashes, and `=` round-trip through the shared reader and cannot inject extra env vars.
 
 ## Lane Index & Dependencies
 
@@ -131,11 +131,40 @@ Release-bound broader checks:
 
 ## Acceptance Criteria
 
-- [ ] `gateway.auth_connect` and `pmcp secrets set/sync/check` share the same env-file read/write/format helpers.
-- [ ] Env var names are validated with `^[A-Za-z_][A-Za-z0-9_]*$` before writing from gateway and CLI credential surfaces.
-- [ ] Env files written by PMCP are chmodded to `0600`.
-- [ ] Credentials containing spaces, `#`, quotes, backslashes, and `=` round-trip without corrupting the env file.
-- [ ] Newline-bearing credentials are rejected; no multiline credential format is added in Phase 1.
-- [ ] Tests prove credential content cannot inject additional env vars.
-- [ ] Current user scope `~/.config/pmcp/pmcp.env` and project scope `.env.pmcp` paths remain backward compatible.
-- [ ] Gateway and CLI failure outputs do not include secret credential values when validation fails.
+- [x] `gateway.auth_connect` and `pmcp secrets set/sync/check` share the same env-file read/write/format helpers.
+- [x] Env var names are validated with `^[A-Za-z_][A-Za-z0-9_]*$` before writing from gateway and CLI credential surfaces.
+- [x] Env files written by PMCP are chmodded to `0600`.
+- [x] Credentials containing spaces, `#`, quotes, backslashes, and `=` round-trip without corrupting the env file.
+- [x] Newline-bearing credentials are rejected; no multiline credential format is added in Phase 1.
+- [x] Tests prove credential content cannot inject additional env vars.
+- [x] Current user scope `~/.config/pmcp/pmcp.env` and project scope `.env.pmcp` paths remain backward compatible.
+- [x] Gateway and CLI failure outputs do not include secret credential values when validation fails.
+
+## Execution Notes
+
+- Completed SL-0 through SL-3 on 2026-04-22.
+- Shared credential storage now lives in `src/pmcp/env_store.py`; CLI and gateway API-key writes call `set_env_value(...)`/`write_env_file(...)` instead of maintaining separate env-file writers.
+- `AuthConnectInput` model-level validation was intentionally left unchanged. Env-var and newline validation happen in the shared write path so `gateway.auth_connect` can convert validation failures into its existing structured `AuthConnectOutput(ok=False, auth_state="missing_auth", ...)` shape without exposing credential values.
+- Named coverage added:
+  - `test_env_store_validates_env_var_names`
+  - `test_env_store_round_trips_shell_significant_values`
+  - `test_env_store_rejects_injection_before_write`
+  - `test_run_secrets_set_writes_project_env_0600`
+  - `test_run_secrets_set_round_trips_shell_significant_values`
+  - `test_run_secrets_set_rejects_injection_before_write`
+  - `test_run_secrets_sync_rejects_injection_before_write`
+  - `test_run_secrets_sync_rejects_invalid_keys_before_write`
+  - `test_auth_connect_stores_credential`
+  - `test_auth_connect_rejects_invalid_explicit_env_var`
+  - `test_auth_connect_round_trips_shell_significant_credential`
+  - `test_auth_connect_rejects_newline_credential_without_injection`
+- Verification completed:
+  - `uv run pytest tests/test_auth.py -k "auth_connect or env_store or env_var or credential or injection"` — passed
+  - `uv run pytest tests/test_secrets_command.py -k "secrets or env_var or credential or injection or chmod"` — passed
+  - `uv run pytest tests/test_tools.py -k "auth_connect or credential or env_var or injection or missing_auth"` — passed
+  - `uv run pytest tests/test_auth.py tests/test_tools.py tests/test_secrets_command.py -k "auth or credential or secret or env_var or injection or redact"` — passed
+  - `uv run ruff check src/pmcp/env_store.py src/pmcp/types.py src/pmcp/tools/handlers.py src/pmcp/cli_commands/secrets.py tests/test_auth.py tests/test_tools.py tests/test_secrets_command.py` — passed
+  - `uv run ruff format --check src/pmcp/env_store.py src/pmcp/types.py src/pmcp/tools/handlers.py src/pmcp/cli_commands/secrets.py tests/test_auth.py tests/test_tools.py tests/test_secrets_command.py` — passed
+  - `uv run mypy src/pmcp --exclude baml_client` — passed
+  - `uv run pytest -q` — passed, 1669 passed, 12 skipped, 21 deselected
+  - `uv build` — passed

@@ -6,89 +6,22 @@ import argparse
 import re
 from pathlib import Path
 
-from dotenv import dotenv_values
-
-from pmcp.config.loader import find_project_root, load_configs
+from pmcp.config.loader import load_configs
+from pmcp.env_store import (
+    read_env_file,
+    resolve_project_root,
+    resolve_scope_path,
+    set_env_value,
+    validate_env_var_name,
+    write_env_file,
+)
 from pmcp.manifest.loader import load_manifest
+from pmcp.remote_auth import collect_remote_header_env_vars
 from pmcp.types import LocalMcpServerConfig, RemoteMcpServerConfig
 
 ENV_REF_PATTERN = re.compile(
     r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))"
 )
-
-
-def _get_user_env_path() -> Path:
-    """Return user-scope PMCP env path."""
-    return Path.home() / ".config" / "pmcp" / "pmcp.env"
-
-
-def _resolve_project_root(project: Path | None) -> Path:
-    """Resolve project root for project-scope secrets."""
-    if project:
-        return project.resolve()
-
-    discovered = find_project_root(Path.cwd())
-    if discovered:
-        return discovered
-
-    return Path.cwd().resolve()
-
-
-def _get_project_env_path(project: Path | None) -> Path:
-    """Return project-scope PMCP env path."""
-    return _resolve_project_root(project) / ".env.pmcp"
-
-
-def _resolve_scope_path(scope: str, project: Path | None) -> Path:
-    """Resolve env file path for a secret scope."""
-    if scope == "user":
-        return _get_user_env_path()
-    if scope == "project":
-        return _get_project_env_path(project)
-    raise ValueError(f"Unsupported secret scope: {scope}")
-
-
-def _read_env_file(path: Path) -> dict[str, str]:
-    """Read .env key/value pairs from path."""
-    if not path.exists():
-        return {}
-
-    parsed = dotenv_values(path)
-    values: dict[str, str] = {}
-    for key, value in parsed.items():
-        if value is None:
-            values[key] = ""
-        else:
-            values[key] = value
-    return values
-
-
-def _format_env_value(value: str) -> str:
-    """Format a value for safe .env writing."""
-    if value == "":
-        return '""'
-
-    needs_quotes = any(ch.isspace() for ch in value) or any(
-        ch in value for ch in ["#", '"', "'", "\\"]
-    )
-    if not needs_quotes:
-        return value
-
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'"{escaped}"'
-
-
-def _write_env_file(path: Path, values: dict[str, str]) -> None:
-    """Write key/value pairs to .env file and lock permissions to 0600."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    lines = [f"{key}={_format_env_value(val)}" for key, val in values.items()]
-    content = "\n".join(lines)
-    if content:
-        content += "\n"
-
-    path.write_text(content)
-    path.chmod(0o600)
 
 
 def _mask(value: str) -> str:
@@ -109,6 +42,10 @@ def _extract_required_keys(
     auth_metadata_by_server: dict[str, dict[str, object]] = {}
     for cfg in configs:
         if isinstance(cfg.config, RemoteMcpServerConfig):
+            remote_header_keys = set(collect_remote_header_env_vars(cfg.config.headers))
+            if remote_header_keys:
+                per_server[cfg.name] = remote_header_keys
+                all_keys.update(remote_header_keys)
             remote_metadata: dict[str, object] = {
                 key: value
                 for key, value in {
@@ -161,6 +98,10 @@ def _extract_required_keys(
             }
             if manifest_metadata:
                 auth_metadata_by_server.setdefault(server.name, manifest_metadata)
+            server_keys = set(collect_remote_header_env_vars(server.headers))
+            if server_keys:
+                per_server.setdefault(server.name, set()).update(server_keys)
+                all_keys.update(server_keys)
     except Exception:
         pass
 
@@ -172,14 +113,14 @@ def _extract_required_keys(
 
 async def run_secrets_set(args: argparse.Namespace) -> dict[str, object]:
     """Set one secret in user or project PMCP env file."""
-    path = _resolve_scope_path(args.scope, getattr(args, "project", None))
-    values = _read_env_file(path)
+    project = getattr(args, "project", None)
+    path = resolve_scope_path(args.scope, project)
+    values = read_env_file(path)
 
     existing_value = values.get(args.key)
     changed = existing_value != args.value
-    values[args.key] = args.value
 
-    _write_env_file(path, values)
+    path = set_env_value(args.scope, args.key, args.value, project)
 
     return {
         "ok": True,
@@ -207,11 +148,15 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
             "to_scope": to_scope,
         }
 
-    source_path = _resolve_scope_path(from_scope, project)
-    target_path = _resolve_scope_path(to_scope, project)
+    source_path = resolve_scope_path(from_scope, project)
+    target_path = resolve_scope_path(to_scope, project)
 
-    source_values = _read_env_file(source_path)
-    target_values = _read_env_file(target_path)
+    source_values = read_env_file(source_path)
+    target_values = read_env_file(target_path)
+    for key in source_values:
+        validate_env_var_name(key)
+    for key in target_values:
+        validate_env_var_name(key)
 
     added: list[str] = []
     updated: list[str] = []
@@ -227,7 +172,7 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
         else:
             skipped.append(key)
 
-    _write_env_file(target_path, target_values)
+    write_env_file(target_path, target_values)
 
     return {
         "ok": True,
@@ -246,12 +191,12 @@ async def run_secrets_sync(args: argparse.Namespace) -> dict[str, object]:
 
 async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
     """Check available and missing secrets for discovered config requirements."""
-    project_root = _resolve_project_root(getattr(args, "project", None))
-    user_path = _get_user_env_path()
-    project_path = _get_project_env_path(project_root)
+    project_root = resolve_project_root(getattr(args, "project", None))
+    user_path = resolve_scope_path("user")
+    project_path = resolve_scope_path("project", project_root)
 
-    user_values = _read_env_file(user_path)
-    project_values = _read_env_file(project_path)
+    user_values = read_env_file(user_path)
+    project_values = read_env_file(project_path)
 
     effective = dict(user_values)
     effective.update(project_values)

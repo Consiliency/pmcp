@@ -24,8 +24,8 @@ from pmcp.auth import (
     normalize_auth_metadata,
     parse_url_elicitation_error,
     parse_www_authenticate,
-    redact_auth_url,
     sanitize_auth_diagnostic,
+    sanitize_url_elicitation_url,
 )
 
 from pmcp.client.manager import ClientManager
@@ -46,6 +46,7 @@ from pmcp.config.loader import (
     summarize_startup_resolution,
 )
 from pmcp.errors import ErrorCode, GatewayException, make_error
+from pmcp.env_store import set_env_value
 from pmcp.identity import filter_self_references
 from pmcp.manifest.code_patterns_loader import get_code_hint
 from pmcp.manifest.environment import detect_platform, probe_clis
@@ -62,6 +63,11 @@ from pmcp.manifest.version_checker import (
     is_version_newer,
 )
 from pmcp.policy.policy import PolicyManager
+from pmcp.remote_auth import (
+    MissingRemoteHeaderAuthError,
+    build_remote_header_env_lookup,
+    resolve_remote_headers,
+)
 from pmcp.types import (
     ArgInfo,
     AuthConnectInput,
@@ -1721,6 +1727,7 @@ class GatewayTools:
                 is_server_allowed=self._policy_manager.is_server_allowed,
                 is_auth_available=self._check_api_key_available,
                 legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
+                project_root=self._project_root,
             )
 
             counts = summarize_startup_resolution(resolution)
@@ -1910,6 +1917,7 @@ class GatewayTools:
                 info.startup_source = observation.startup_source
                 info.startup_skip_reason = observation.startup_skip_reason
                 info.startup_env_var = observation.startup_env_var
+                info.missing_env_vars = observation.missing_env_vars or []
                 if observation.startup_skip_reason in {
                     StartupSkipReason.MISSING_AUTH.value,
                     StartupSkipReason.POLICY_DENIED.value,
@@ -1949,6 +1957,7 @@ class GatewayTools:
                 info.startup_source = observation.startup_source
                 info.startup_skip_reason = observation.startup_skip_reason
                 info.startup_env_var = observation.startup_env_var
+                info.missing_env_vars = observation.missing_env_vars or []
                 if observation.startup_skip_reason in {
                     StartupSkipReason.MISSING_AUTH.value,
                     StartupSkipReason.POLICY_DENIED.value,
@@ -1977,6 +1986,7 @@ class GatewayTools:
                     startup_source=observation.startup_source,
                     startup_skip_reason=observation.startup_skip_reason,
                     startup_env_var=observation.startup_env_var,
+                    missing_env_vars=observation.missing_env_vars or [],
                     auth_state=cast(
                         Any,
                         observation.startup_skip_reason
@@ -2055,6 +2065,7 @@ class GatewayTools:
             is_server_allowed=self._policy_manager.is_server_allowed,
             is_auth_available=lambda env_var: bool(os.environ.get(env_var)),
             legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
+            project_root=self._project_root,
         )
         observations = build_startup_observation_snapshot(resolution)
         source_paths = self._config_source_paths_by_server()
@@ -2084,6 +2095,9 @@ class GatewayTools:
             startup_source = observation.startup_source if observation else None
             skip_reason = observation.startup_skip_reason if observation else None
             env_var = observation.startup_env_var if observation else None
+            missing_env_vars = (
+                observation.missing_env_vars if observation else []
+            ) or []
             if skip_reason:
                 diagnostics.append(skip_reason)
             if name in enabled and name in disabled:
@@ -2098,6 +2112,7 @@ class GatewayTools:
                     source_path=source_path,
                     startup_skip_reason=skip_reason,
                     startup_env_var=env_var,
+                    missing_env_vars=missing_env_vars,
                     auth_state=auth_state,
                     configured=any(config.name == name for config in configured),
                     manifest=name in manifest,
@@ -2173,6 +2188,19 @@ class GatewayTools:
             )
 
         errors = await self._client_manager.connect_server(config)
+        url_elicitations = parse_url_elicitation_error("; ".join(errors))
+        if url_elicitations:
+            return self._lifecycle_output(
+                ok=False,
+                server=server_name,
+                action="connect",
+                prior_status=prior_status,
+                message="URL-mode elicitation required.",
+                errors=["URL-mode elicitation required."],
+                auth_state="elicitation_required",
+                next_step=url_elicitations[0].next_step,
+                url_elicitations=url_elicitations,
+            )
         return self._lifecycle_output(
             ok=not errors,
             server=server_name,
@@ -2314,25 +2342,7 @@ class GatewayTools:
 
     def _write_secret(self, scope: str, key: str, value: str) -> Path:
         """Persist a secret in PMCP env storage."""
-        if scope == "project":
-            path = Path.cwd() / ".env.pmcp"
-        else:
-            path = Path.home() / ".config" / "pmcp" / "pmcp.env"
-
-        path.parent.mkdir(parents=True, exist_ok=True)
-
-        values: dict[str, str] = {}
-        if path.exists():
-            for line in path.read_text().splitlines():
-                if "=" not in line:
-                    continue
-                k, v = line.split("=", 1)
-                values[k.strip()] = v.strip().strip('"')
-
-        values[key] = value
-        body = "\n".join(f"{k}={v}" for k, v in sorted(values.items())) + "\n"
-        path.write_text(body)
-        return path
+        return set_env_value(scope, key, value)
 
     def _normalize_token(self, value: str) -> str:
         """Normalize user query tokens for matching/discovery."""
@@ -2404,6 +2414,7 @@ class GatewayTools:
         active_task_count: int = 0,
         cancelled_task_count: int = 0,
         errors: list[str] | None = None,
+        missing_env_vars: list[str] | None = None,
         auth_state: str = "none",
         next_step: str | None = None,
         auth_methods: list[str] | None = None,
@@ -2432,12 +2443,52 @@ class GatewayTools:
             cancelled_task_count=cancelled_task_count,
             message=message,
             errors=errors,
+            missing_env_vars=missing_env_vars or [],
             auth_state=cast(Any, auth_state),
             next_step=next_step,
             auth_methods=auth_methods,
             auth_metadata=auth_metadata,
             auth_challenge=auth_challenge,
             url_elicitations=url_elicitations,
+        )
+
+    def _missing_remote_header_env_vars(
+        self,
+        config: ResolvedServerConfig,
+    ) -> list[str]:
+        if not isinstance(config.config, RemoteMcpServerConfig):
+            return []
+        resolution = resolve_remote_headers(
+            config.config.headers,
+            build_remote_header_env_lookup(self._project_root),
+        )
+        return resolution.missing_env_vars
+
+    def _remote_header_missing_lifecycle_output(
+        self,
+        config: ResolvedServerConfig,
+        *,
+        action: Literal["connect", "disconnect", "restart"],
+        prior_status: str,
+        missing_env_vars: list[str],
+    ) -> LifecycleServerOutput:
+        env_names = ", ".join(missing_env_vars)
+        return self._lifecycle_output(
+            ok=False,
+            server=config.name,
+            action=action,
+            prior_status=prior_status,
+            message=(
+                f"Server '{config.name}' requires remote header authentication. "
+                f"Set missing environment variable(s): {env_names}"
+            ),
+            errors=[
+                f"Missing remote header environment variable(s) for '{config.name}': {env_names}"
+            ],
+            missing_env_vars=missing_env_vars,
+            auth_state="missing_auth",
+            auth_methods=self._auth_methods_for_server(config.name),
+            next_step=f"gateway.auth_connect(server_name='{config.name}')",
         )
 
     def _resolve_lifecycle_config(
@@ -2463,7 +2514,19 @@ class GatewayTools:
                         auth_state="policy_denied",
                     ),
                 )
-            return (configured_servers[server_name], None)
+            configured = configured_servers[server_name]
+            missing_env_vars = self._missing_remote_header_env_vars(configured)
+            if missing_env_vars:
+                return (
+                    None,
+                    self._remote_header_missing_lifecycle_output(
+                        configured,
+                        action=action,
+                        prior_status=prior_status,
+                        missing_env_vars=missing_env_vars,
+                    ),
+                )
+            return (configured, None)
 
         manifest = load_manifest()
         server_config = manifest.get_server(server_name)
@@ -2512,7 +2575,20 @@ class GatewayTools:
                         ),
                     )
 
-            return (manifest_server_to_config(server_config), None)
+            resolved = manifest_server_to_config(server_config)
+            missing_env_vars = self._missing_remote_header_env_vars(resolved)
+            if missing_env_vars:
+                return (
+                    None,
+                    self._remote_header_missing_lifecycle_output(
+                        resolved,
+                        action=action,
+                        prior_status=prior_status,
+                        missing_env_vars=missing_env_vars,
+                    ),
+                )
+
+            return (resolved, None)
 
         if action == "disconnect" and self._client_manager.get_server_status(
             server_name
@@ -2706,10 +2782,20 @@ class GatewayTools:
 
     def _record_feedback_event(self, event_type: str, details: dict[str, Any]) -> None:
         """Record compact event history for feedback telemetry context."""
+
+        def sanitize_value(value: Any) -> Any:
+            if isinstance(value, str):
+                return sanitize_auth_diagnostic(value)
+            if isinstance(value, dict):
+                return {str(k): sanitize_value(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [sanitize_value(v) for v in value]
+            return value
+
         event = {
             "ts": int(time.time()),
             "event_type": event_type,
-            "details": details,
+            "details": sanitize_value(details),
         }
         self._feedback_events.append(event)
         if len(self._feedback_events) > 12:
@@ -2731,11 +2817,15 @@ class GatewayTools:
             (r"sk-[A-Za-z0-9_-]{20,}", "[REDACTED_API_KEY]"),
             (r"github_pat_[A-Za-z0-9_]{20,}", "[REDACTED_GITHUB_TOKEN]"),
             (r"ghp_[A-Za-z0-9]{20,}", "[REDACTED_GITHUB_TOKEN]"),
-            (r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}", "[REDACTED_EMAIL]"),
         ]
         for pattern, replacement in patterns:
             scrubbed = re.sub(pattern, replacement, scrubbed)
-        return scrubbed
+        scrubbed = sanitize_auth_diagnostic(scrubbed)
+        return re.sub(
+            r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+            "[REDACTED_EMAIL]",
+            scrubbed,
+        )
 
     def _build_feedback_issue(
         self,
@@ -3040,10 +3130,47 @@ class GatewayTools:
 
         # User/project configured servers are lazy-started via ClientManager.
         if server_name in configured_servers:
+            configured = configured_servers[server_name]
+            missing_env_vars = self._missing_remote_header_env_vars(configured)
+            if missing_env_vars:
+                env_names = ", ".join(missing_env_vars)
+                return ProvisionOutput(
+                    ok=False,
+                    server=server_name,
+                    status="failed",
+                    message=(
+                        f"Server '{server_name}' requires remote header authentication. "
+                        f"Set missing environment variable(s): {env_names}"
+                    ),
+                    missing_env_vars=missing_env_vars,
+                    auth_state="missing_auth",
+                    auth_methods=self._auth_methods_for_server(server_name),
+                    next_step=f"gateway.auth_connect(server_name='{server_name}')",
+                    update_warning=update_warning,
+                    feedback_hint=self._feedback_hint(),
+                )
             try:
                 connected = await self._client_manager.ensure_connected(server_name)
             except ValueError:
                 connected = False
+            except Exception as e:
+                url_elicitations = parse_url_elicitation_error(e)
+                if url_elicitations:
+                    return ProvisionOutput(
+                        ok=False,
+                        server=server_name,
+                        status="failed",
+                        message="URL-mode elicitation required.",
+                        auth_required=True,
+                        auth_mode="url_elicitation",
+                        auth_methods=self._auth_methods_for_server(server_name),
+                        auth_state="elicitation_required",
+                        next_step=url_elicitations[0].next_step,
+                        url_elicitations=url_elicitations,
+                        update_warning=update_warning,
+                        feedback_hint=self._feedback_hint(),
+                    )
+                raise
 
             if connected:
                 tools = [
@@ -3136,9 +3263,52 @@ class GatewayTools:
         if server_config.url:
             try:
                 resolved_config = manifest_server_to_config(server_config)
+                missing_env_vars = self._missing_remote_header_env_vars(resolved_config)
+                if missing_env_vars:
+                    env_names = ", ".join(missing_env_vars)
+                    return ProvisionOutput(
+                        ok=False,
+                        server=server_name,
+                        status="failed",
+                        message=(
+                            f"Server '{server_name}' requires remote header authentication. "
+                            f"Set missing environment variable(s): {env_names}"
+                        ),
+                        missing_env_vars=missing_env_vars,
+                        auth_state="missing_auth",
+                        auth_methods=self._auth_methods_for_server(server_name),
+                        auth_metadata=self._auth_metadata_for_server(server_config),
+                        next_step=f"gateway.auth_connect(server_name='{server_name}')",
+                        update_warning=update_warning,
+                        feedback_hint=self._feedback_hint(),
+                    )
                 errors = await self._client_manager.connect_all([resolved_config])
                 if errors:
                     message = "; ".join(errors)
+                    url_elicitations = parse_url_elicitation_error(message)
+                    if url_elicitations:
+                        self._record_feedback_event(
+                            "provision_failure",
+                            {
+                                "server": server_name,
+                                "reason": "url_elicitation_required",
+                            },
+                        )
+                        return ProvisionOutput(
+                            ok=False,
+                            server=server_name,
+                            status="failed",
+                            message="URL-mode elicitation required.",
+                            auth_required=True,
+                            auth_mode="url_elicitation",
+                            auth_methods=self._auth_methods_for_server(server_name),
+                            auth_state="elicitation_required",
+                            auth_metadata=self._auth_metadata_for_server(server_config),
+                            next_step=url_elicitations[0].next_step,
+                            url_elicitations=url_elicitations,
+                            update_warning=update_warning,
+                            feedback_hint=self._feedback_hint(),
+                        )
                     auth_challenge = self._auth_challenge_from_message(message)
                     auth_state = "missing_auth" if auth_challenge else "unknown"
                     if auth_challenge and auth_challenge.missing_scopes:
@@ -3194,7 +3364,42 @@ class GatewayTools:
                     feedback_hint=None,
                 )
 
+            except MissingRemoteHeaderAuthError as e:
+                env_names = ", ".join(e.missing_env_vars)
+                return ProvisionOutput(
+                    ok=False,
+                    server=server_name,
+                    status="failed",
+                    message=(
+                        f"Server '{server_name}' requires remote header authentication. "
+                        f"Set missing environment variable(s): {env_names}"
+                    ),
+                    missing_env_vars=e.missing_env_vars,
+                    auth_state="missing_auth",
+                    auth_metadata=self._auth_metadata_for_server(server_config),
+                    next_step=f"gateway.auth_connect(server_name='{server_name}')",
+                    update_warning=update_warning,
+                    feedback_hint=self._feedback_hint(),
+                )
+
             except Exception as e:
+                url_elicitations = parse_url_elicitation_error(e)
+                if url_elicitations:
+                    return ProvisionOutput(
+                        ok=False,
+                        server=server_name,
+                        status="failed",
+                        message="URL-mode elicitation required.",
+                        auth_required=True,
+                        auth_mode="url_elicitation",
+                        auth_methods=self._auth_methods_for_server(server_name),
+                        auth_state="elicitation_required",
+                        auth_metadata=self._auth_metadata_for_server(server_config),
+                        next_step=url_elicitations[0].next_step,
+                        url_elicitations=url_elicitations,
+                        update_warning=update_warning,
+                        feedback_hint=self._feedback_hint(),
+                    )
                 logger.error(f"Failed to connect remote server {server_name}: {e}")
                 self._record_feedback_event(
                     "provision_failure",
@@ -3321,12 +3526,26 @@ class GatewayTools:
                         "consent_acknowledged=true after completing the URL flow."
                     ),
                     auth_state="elicitation_required",
+                    next_step=(
+                        "Complete the provider URL flow, then call "
+                        "gateway.auth_connect with auth_mode='url_elicitation', "
+                        "elicitation_id, and consent_acknowledged=true."
+                    ),
                 )
             url_elicitation = None
             if parsed.elicitation_url:
+                try:
+                    safe_url = sanitize_url_elicitation_url(parsed.elicitation_url)
+                except ValueError as e:
+                    return AuthConnectOutput(
+                        ok=False,
+                        server=server_name,
+                        message=str(e),
+                        auth_state="elicitation_required",
+                    )
                 url_elicitation = UrlElicitationInfo(
                     elicitation_id=parsed.elicitation_id,
-                    url=redact_auth_url(parsed.elicitation_url),
+                    url=safe_url,
                     next_step=f"Retry gateway.provision(server_name='{server_name}') or gateway.invoke.",
                 )
             return AuthConnectOutput(
@@ -3364,7 +3583,16 @@ class GatewayTools:
                 auth_state="missing_auth",
             )
 
-        path = self._write_secret(parsed.scope, env_var, parsed.credential)
+        try:
+            path = set_env_value(parsed.scope, env_var, parsed.credential)
+        except ValueError as exc:
+            return AuthConnectOutput(
+                ok=False,
+                server=server_name,
+                message=str(exc),
+                auth_state="missing_auth",
+                env_var=env_var,
+            )
         os.environ[env_var] = parsed.credential
 
         return AuthConnectOutput(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -665,6 +666,7 @@ class TestRunStatus:
                     "startup_source": "manifest",
                     "startup_skip_reason": "missing_auth",
                     "startup_env_var": "CONTEXT7_API_KEY",
+                    "missing_env_vars": ["CONTEXT7_API_KEY"],
                     "auth_state": "missing_auth",
                     "next_step": "gateway.auth_connect(server_name='needs-key')",
                 },
@@ -683,6 +685,7 @@ class TestRunStatus:
         assert "policy=skipped" in captured.out
         assert "reason=missing_auth" in captured.out
         assert "env=CONTEXT7_API_KEY" in captured.out
+        assert "missing_env=CONTEXT7_API_KEY" in captured.out
         assert "auth=missing_auth" in captured.out
         assert "gateway.auth_connect" in captured.out
 
@@ -738,6 +741,7 @@ class TestRunStatus:
                     "startup_policy": "skipped",
                     "startup_skip_reason": "missing_auth",
                     "startup_env_var": "CONTEXT7_API_KEY",
+                    "missing_env_vars": ["CONTEXT7_API_KEY"],
                 }
             ],
             "total_tools": 0,
@@ -755,6 +759,7 @@ class TestRunStatus:
         assert server["startup_policy"] == "skipped"
         assert server["startup_skip_reason"] == "missing_auth"
         assert server["startup_env_var"] == "CONTEXT7_API_KEY"
+        assert server["missing_env_vars"] == ["CONTEXT7_API_KEY"]
 
     @pytest.mark.asyncio
     async def test_status_verbose_local_fallback_does_not_connect(
@@ -826,6 +831,54 @@ class TestRunStatus:
         server = json.loads(captured.out)["servers"][0]
         assert server["protocol_version"] == "2025-11-25"
         assert server["server_capabilities"] == {"tools": {"listChanged": True}}
+
+    @pytest.mark.asyncio
+    async def test_status_local_fallback_json_includes_missing_remote_header_vars(
+        self,
+        status_args: argparse.Namespace,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import json
+
+        from pmcp.cli import run_status
+        from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig, ServerStatus
+        from pmcp.types import ServerStatusEnum
+
+        status_args.json = True
+        monkeypatch.delenv("REMOTE_API_TOKEN", raising=False)
+        config = ResolvedServerConfig(
+            name="remote-api",
+            source="project",
+            config=RemoteMcpServerConfig(
+                url="https://example.com/sse",
+                headers={"Authorization": "Bearer ${REMOTE_API_TOKEN}"},
+            ),
+        )
+        server_status = ServerStatus(
+            name="remote-api",
+            status=ServerStatusEnum.ERROR,
+            tool_count=0,
+        )
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status", new=AsyncMock(return_value=None)
+        ):
+            with patch("pmcp.config.loader.load_configs", return_value=[config]):
+                with patch(
+                    "pmcp.client.manager.ClientManager.connect_all",
+                    new=AsyncMock(),
+                ):
+                    with patch(
+                        "pmcp.client.manager.ClientManager.get_all_server_statuses",
+                        return_value=[server_status],
+                    ):
+                        await run_status(status_args)
+
+        captured = capsys.readouterr()
+        server = json.loads(captured.out)["servers"][0]
+        assert server["auth_state"] == "missing_auth"
+        assert server["missing_env_vars"] == ["REMOTE_API_TOKEN"]
 
 
 class TestLogsCommand:
@@ -1244,8 +1297,14 @@ class TestRunDoctor:
         assert "user:" not in captured.out
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "remote_type", ["remote", "sse", "http", "streamable-http"]
+    )
     async def test_doctor_warns_on_missing_remote_header_env(
-        self, capsys: pytest.CaptureFixture[str], tmp_path: Path
+        self,
+        capsys: pytest.CaptureFixture[str],
+        tmp_path: Path,
+        remote_type: str,
     ) -> None:
         """Doctor should warn when remote header interpolation is unresolved."""
         from pmcp.cli import run_doctor
@@ -1254,7 +1313,7 @@ class TestRunDoctor:
             command="doctor", project=None, timeout=2.0, log_level="warn"
         )
 
-        with patch.dict("pmcp.cli_commands.doctor.os.environ", {}, clear=True):
+        with patch.dict("os.environ", {}, clear=True):
             with patch("pmcp.cli.Path.home", return_value=tmp_path):
                 with patch("pmcp.cli_commands.doctor.Path.home", return_value=tmp_path):
                     with patch(
@@ -1268,7 +1327,7 @@ class TestRunDoctor:
                                 {
                                     "mcpServers": {
                                         "remote-api": {
-                                            "type": "remote",
+                                            "type": remote_type,
                                             "url": "https://example.com/sse",
                                             "headers": {
                                                 "Authorization": "Bearer ${REMOTE_API_TOKEN}"
@@ -1308,7 +1367,7 @@ class TestRunDoctor:
             command="doctor", project=None, timeout=2.0, log_level="warn"
         )
 
-        with patch.dict("pmcp.cli_commands.doctor.os.environ", {}, clear=True):
+        with patch.dict("os.environ", {}, clear=True):
             with patch("pmcp.cli.Path.home", return_value=tmp_path):
                 with patch("pmcp.cli_commands.doctor.Path.home", return_value=tmp_path):
                     with patch(
@@ -1348,6 +1407,36 @@ class TestRunDoctor:
         assert (
             "[OK] remote: No remote downstream header issues detected." in captured.out
         )
+
+    def test_doctor_metadata_url_diagnostics_use_public_auth_validation(
+        self,
+    ) -> None:
+        from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
+
+        checks = collect_remote_header_diagnostics(
+            {
+                "mcpServers": {
+                    "remote-api": {
+                        "type": "remote",
+                        "url": "https://example.com/sse",
+                        "protected_resource_metadata_url": (
+                            "http://auth.example/pr?session=secret-session"
+                        ),
+                        "authorization_server_metadata_url": (
+                            "https://auth.example/as?ticket=secret-ticket"
+                        ),
+                    }
+                }
+            }
+        )
+        rendered = "\n".join(message for _, _, message in checks)
+
+        assert "protected_resource_metadata_url" in rendered
+        assert "authorization_server_metadata_url" in rendered
+        assert "secret-session" not in rendered
+        assert "secret-ticket" not in rendered
+        assert "http://auth.example" in rendered
+        assert "%5BREDACTED%5D" in rendered
 
 
 class TestDoctorAndSecretsIntegration:
@@ -1428,6 +1517,48 @@ class TestDoctorAndSecretsIntegration:
         assert args.no_provision is True
         assert args.json is True
 
+    def test_parse_auth_acknowledge_options(self) -> None:
+        """Auth acknowledge parser should bind URL elicitation options."""
+        with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):
+            with patch(
+                "sys.argv",
+                [
+                    "pmcp",
+                    "auth",
+                    "acknowledge",
+                    "remote-auth",
+                    "--elicitation-id",
+                    "consent-1",
+                    "--json",
+                ],
+            ):
+                args = parse_args()
+
+        assert args.command == "auth"
+        assert args.auth_command == "acknowledge"
+        assert args.server_name == "remote-auth"
+        assert args.elicitation_id == "consent-1"
+        assert args.json is True
+
+    def test_parse_auth_acknowledge_rejects_credential(self) -> None:
+        """URL-mode acknowledgement should not accept credential input."""
+        with patch("pmcp.cli.importlib.metadata.version", return_value="0.0.0"):
+            with patch(
+                "sys.argv",
+                [
+                    "pmcp",
+                    "auth",
+                    "acknowledge",
+                    "remote-auth",
+                    "--elicitation-id",
+                    "consent-1",
+                    "--credential",
+                    "oauth-code-secret",
+                ],
+            ):
+                with pytest.raises(SystemExit):
+                    parse_args()
+
     @pytest.mark.asyncio
     async def test_async_main_dispatches_doctor(self) -> None:
         """async_main should invoke doctor runner for doctor command."""
@@ -1462,6 +1593,16 @@ class TestDoctorAndSecretsIntegration:
         args = argparse.Namespace(command="auth", auth_command="connect")
 
         with patch("pmcp.cli.run_auth_connect", new=AsyncMock()) as mock_auth:
+            await async_main(args)
+
+        mock_auth.assert_awaited_once_with(args)
+
+    @pytest.mark.asyncio
+    async def test_async_main_dispatches_auth_acknowledge(self) -> None:
+        """async_main should invoke auth acknowledge runner."""
+        args = argparse.Namespace(command="auth", auth_command="acknowledge")
+
+        with patch("pmcp.cli.run_auth_acknowledge", new=AsyncMock()) as mock_auth:
             await async_main(args)
 
         mock_auth.assert_awaited_once_with(args)
@@ -1509,6 +1650,41 @@ class TestGatewayCliRemoteConfig:
 
         assert url == "http://gateway.example:3344/health"
         assert "secret" not in url
+
+    def test_redact_url_credentials_hides_auth_query_keys(self) -> None:
+        """Printed diagnostics should not reveal URL-mode auth query values."""
+        from pmcp.cli import _redact_url_credentials
+
+        url = _redact_url_credentials(
+            "https://auth.example/cb?session=s1&sid=s2&jwt=j1"
+            "&assertion=a1&saml=saml1&ticket=t1#frag"
+        )
+
+        for leaked in ["s1", "s2", "j1", "a1", "saml1", "t1", "frag"]:
+            assert leaked not in url
+
+    def test_sanitize_cli_payload_redacts_live_status_strings(self) -> None:
+        from pmcp.cli import _sanitize_cli_payload
+
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.N2QwODhmM2I4OTc1"
+
+        payload = _sanitize_cli_payload(
+            {
+                "servers": [
+                    {
+                        "error": (
+                            "Authorization: Bearer bearer-secret "
+                            "https://user:pass@example.test/cb?ticket=ticket-secret "
+                            f"{jwt}"
+                        )
+                    }
+                ]
+            }
+        )
+        rendered = json.dumps(payload)
+
+        for leaked in ["bearer-secret", "user:pass", "ticket-secret", jwt]:
+            assert leaked not in rendered
 
     @pytest.mark.asyncio
     async def test_run_update_exits_when_gateway_connect_fails(
@@ -1615,6 +1791,209 @@ class TestGatewayCliRemoteConfig:
         gateway_config = mock_connect_all.await_args.args[0][0]
         assert gateway_config.config.type == "streamable-http"
         mock_call_tool.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_run_auth_connect_url_elicitation_prints_without_acknowledging(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from pmcp.cli import run_auth_connect
+
+        args = argparse.Namespace(
+            command="auth",
+            auth_command="connect",
+            server_name="remote-auth",
+            credential=None,
+            env_var=None,
+            scope="user",
+            no_provision=False,
+            policy=None,
+            log_level="warn",
+            json=False,
+        )
+        provision_payload = {
+            "ok": False,
+            "server": "remote-auth",
+            "message": "URL-mode elicitation required.",
+            "auth_required": True,
+            "auth_state": "elicitation_required",
+            "url_elicitations": [
+                {
+                    "elicitation_id": "consent-1",
+                    "url": "https://auth.example/consent?code=%5BREDACTED%5D",
+                    "next_step": "call gateway.auth_connect consent_acknowledged=true",
+                }
+            ],
+        }
+        call_tool = AsyncMock(
+            return_value={
+                "content": [{"type": "text", "text": json.dumps(provision_payload)}]
+            }
+        )
+
+        with patch(
+            "pmcp.client.manager.ClientManager.connect_all",
+            new=AsyncMock(return_value=[]),
+        ):
+            with patch("pmcp.client.manager.ClientManager.call_tool", new=call_tool):
+                with patch(
+                    "pmcp.client.manager.ClientManager.disconnect_all",
+                    new=AsyncMock(),
+                ):
+                    await run_auth_connect(args)
+
+        captured = capsys.readouterr()
+        assert "https://auth.example/consent" in captured.out
+        assert "consent-1" in captured.out
+        assert "consent_acknowledged=true" in captured.out
+        assert call_tool.await_count == 1
+        assert call_tool.await_args.args[0] == "pmcp-gateway::gateway.provision"
+
+    @pytest.mark.asyncio
+    async def test_run_auth_connect_url_elicitation_json_has_no_auth_result(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from pmcp.cli import run_auth_connect
+
+        args = argparse.Namespace(
+            command="auth",
+            auth_command="connect",
+            server_name="remote-auth",
+            credential=None,
+            env_var=None,
+            scope="user",
+            no_provision=False,
+            policy=None,
+            log_level="warn",
+            json=True,
+        )
+        provision_payload = {
+            "ok": False,
+            "server": "remote-auth",
+            "auth_required": True,
+            "auth_state": "elicitation_required",
+            "url_elicitations": [
+                {
+                    "elicitation_id": "consent-1",
+                    "url": "https://auth.example/consent?code=%5BREDACTED%5D",
+                }
+            ],
+        }
+        call_tool = AsyncMock(
+            return_value={
+                "content": [{"type": "text", "text": json.dumps(provision_payload)}]
+            }
+        )
+
+        with patch(
+            "pmcp.client.manager.ClientManager.connect_all",
+            new=AsyncMock(return_value=[]),
+        ):
+            with patch("pmcp.client.manager.ClientManager.call_tool", new=call_tool):
+                with patch(
+                    "pmcp.client.manager.ClientManager.disconnect_all",
+                    new=AsyncMock(),
+                ):
+                    await run_auth_connect(args)
+
+        payload = json.loads(capsys.readouterr().out)
+        assert (
+            payload["provision"]["url_elicitations"][0]["elicitation_id"] == "consent-1"
+        )
+        assert "auth" not in payload
+        assert call_tool.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_run_auth_acknowledge_calls_gateway_auth_connect_text(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from pmcp.cli import run_auth_acknowledge
+
+        args = argparse.Namespace(
+            command="auth",
+            auth_command="acknowledge",
+            server_name="remote-auth",
+            elicitation_id="consent-1",
+            elicitation_url="https://auth.example/consent?code=%5BREDACTED%5D",
+            policy=None,
+            log_level="warn",
+            json=False,
+        )
+        auth_payload = {
+            "ok": True,
+            "server": "remote-auth",
+            "message": "Recorded URL-mode elicitation acknowledgement.",
+            "next_step": "Retry gateway.provision(server_name='remote-auth')",
+            "url_elicitation": {
+                "elicitation_id": "consent-1",
+                "url": "https://auth.example/consent?code=%5BREDACTED%5D",
+            },
+        }
+        call_tool = AsyncMock(
+            return_value={
+                "content": [{"type": "text", "text": json.dumps(auth_payload)}]
+            }
+        )
+
+        with patch(
+            "pmcp.client.manager.ClientManager.connect_all",
+            new=AsyncMock(return_value=[]),
+        ):
+            with patch("pmcp.client.manager.ClientManager.call_tool", new=call_tool):
+                with patch(
+                    "pmcp.client.manager.ClientManager.disconnect_all",
+                    new=AsyncMock(),
+                ):
+                    await run_auth_acknowledge(args)
+
+        call_args = call_tool.await_args.args
+        assert call_args[0] == "pmcp-gateway::gateway.auth_connect"
+        assert call_args[1]["auth_mode"] == "url_elicitation"
+        assert call_args[1]["elicitation_id"] == "consent-1"
+        assert call_args[1]["consent_acknowledged"] is True
+        captured = capsys.readouterr()
+        assert "acknowledgement" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_run_auth_acknowledge_json_outputs_auth_result(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from pmcp.cli import run_auth_acknowledge
+
+        args = argparse.Namespace(
+            command="auth",
+            auth_command="acknowledge",
+            server_name="remote-auth",
+            elicitation_id="consent-1",
+            elicitation_url=None,
+            policy=None,
+            log_level="warn",
+            json=True,
+        )
+        auth_payload = {
+            "ok": False,
+            "server": "remote-auth",
+            "message": "consent_acknowledged=true required",
+            "auth_state": "elicitation_required",
+        }
+        call_tool = AsyncMock(
+            return_value={
+                "content": [{"type": "text", "text": json.dumps(auth_payload)}]
+            }
+        )
+
+        with patch(
+            "pmcp.client.manager.ClientManager.connect_all",
+            new=AsyncMock(return_value=[]),
+        ):
+            with patch("pmcp.client.manager.ClientManager.call_tool", new=call_tool):
+                with patch(
+                    "pmcp.client.manager.ClientManager.disconnect_all",
+                    new=AsyncMock(),
+                ):
+                    await run_auth_acknowledge(args)
+
+        payload = json.loads(capsys.readouterr().out)
+        assert payload["auth"]["auth_state"] == "elicitation_required"
 
 
 class TestRunStatusWithData:

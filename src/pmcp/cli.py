@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
@@ -655,6 +656,27 @@ Environment overrides:
         action="store_true",
         help="Emit JSON output",
     )
+    auth_ack_parser = auth_subparsers.add_parser(
+        "acknowledge",
+        help="Acknowledge completed URL-mode elicitation",
+    )
+    auth_ack_parser.add_argument(
+        "server_name", type=str, help="Server name requiring acknowledgement"
+    )
+    auth_ack_parser.add_argument(
+        "--elicitation-id",
+        required=True,
+        help="URL-mode elicitation identifier",
+    )
+    auth_ack_parser.add_argument(
+        "--elicitation-url",
+        help="Sanitized URL-mode elicitation URL",
+    )
+    auth_ack_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit JSON output",
+    )
 
     return parser.parse_args()
 
@@ -807,6 +829,17 @@ def _redact_url_credentials(url: str) -> str:
     return redact_auth_url(url)
 
 
+def _sanitize_cli_payload(value: Any) -> Any:
+    """Recursively sanitize strings in CLI-visible payloads."""
+    if isinstance(value, str):
+        return sanitize_auth_diagnostic(value)
+    if isinstance(value, dict):
+        return {str(k): _sanitize_cli_payload(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_cli_payload(v) for v in value]
+    return value
+
+
 def _exit_gateway_unreachable(errors: list[str]) -> None:
     """Exit with a clear direct-gateway connection failure."""
     detail = "; ".join(errors)
@@ -922,7 +955,8 @@ async def run_status(args: argparse.Namespace) -> None:
     from pmcp.config.loader import load_configs
     from pmcp.identity import filter_self_references
     from pmcp.policy.policy import PolicyManager
-    from pmcp.types import ServerStatusEnum
+    from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
+    from pmcp.types import RemoteMcpServerConfig, ServerStatusEnum
 
     setup_logging(args.log_level)
     logger = logging.getLogger(__name__)
@@ -936,6 +970,7 @@ async def run_status(args: argparse.Namespace) -> None:
 
     live_snapshot = await _query_running_gateway_status(args, policy_manager)
     if live_snapshot is not None:
+        live_snapshot = _sanitize_cli_payload(live_snapshot)
         servers = live_snapshot.get("servers", [])
         if not isinstance(servers, list):
             servers = []
@@ -968,10 +1003,11 @@ async def run_status(args: argparse.Namespace) -> None:
                     details = f"{s.get('tool_count', 0):>3} tools"
                 else:
                     icon = "\u2717"
-                    details = f"({s.get('error') or status})"
+                    details = f"({sanitize_auth_diagnostic(s.get('error') or status)})"
                 auth_state = s.get("auth_state")
                 if auth_state and auth_state != "none":
                     auth_detail = f"auth={auth_state}"
+                    missing_env_vars = s.get("missing_env_vars")
                     missing = (
                         (s.get("auth_challenge") or {}).get("missing_scopes")
                         if isinstance(s.get("auth_challenge"), dict)
@@ -979,9 +1015,13 @@ async def run_status(args: argparse.Namespace) -> None:
                     )
                     if missing:
                         auth_detail += f" scopes={','.join(missing)}"
+                    if isinstance(missing_env_vars, list) and missing_env_vars:
+                        auth_detail += (
+                            f" env={','.join(str(v) for v in missing_env_vars)}"
+                        )
                     details = f"{details}  {auth_detail}"
                 if args.verbose and s.get("next_step"):
-                    details = f"{details}  next={s.get('next_step')}"
+                    details = f"{details}  next={sanitize_auth_diagnostic(s.get('next_step'))}"
                 if args.verbose and s.get("startup_policy"):
                     policy_parts = [f"policy={s.get('startup_policy')}"]
                     if s.get("startup_source"):
@@ -990,6 +1030,15 @@ async def run_status(args: argparse.Namespace) -> None:
                         policy_parts.append(f"reason={s.get('startup_skip_reason')}")
                     if s.get("startup_env_var"):
                         policy_parts.append(f"env={s.get('startup_env_var')}")
+                    policy_missing_env_vars = s.get("missing_env_vars")
+                    if (
+                        isinstance(policy_missing_env_vars, list)
+                        and policy_missing_env_vars
+                    ):
+                        policy_parts.append(
+                            "missing_env="
+                            + ",".join(str(v) for v in policy_missing_env_vars)
+                        )
                     details = f"{details}  {' '.join(policy_parts)}"
                 if args.verbose and s.get("protocol_version"):
                     details = f"{details}  protocol={s.get('protocol_version')}"
@@ -1064,6 +1113,13 @@ async def run_status(args: argparse.Namespace) -> None:
 
     # Filter by policy
     allowed_configs = [c for c in configs if policy_manager.is_server_allowed(c.name)]
+    env_lookup = build_remote_header_env_lookup(project_root)
+    missing_env_vars_by_server: dict[str, list[str]] = {}
+    for config in allowed_configs:
+        if isinstance(config.config, RemoteMcpServerConfig):
+            resolution = resolve_remote_headers(config.config.headers, env_lookup)
+            if resolution.missing_env_vars:
+                missing_env_vars_by_server[config.name] = resolution.missing_env_vars
 
     if not allowed_configs:
         if args.json:
@@ -1116,7 +1172,13 @@ async def run_status(args: argparse.Namespace) -> None:
                         "prompt_count": s.prompt_count,
                         "protocol_version": s.protocol_version,
                         "server_capabilities": s.server_capabilities,
-                        "last_error": s.last_error,
+                        "last_error": sanitize_auth_diagnostic(s.last_error)
+                        if s.last_error
+                        else None,
+                        "missing_env_vars": missing_env_vars_by_server.get(s.name, []),
+                        "auth_state": "missing_auth"
+                        if missing_env_vars_by_server.get(s.name)
+                        else "none",
                         "pending_requests": s.pending_request_count,
                         "avg_response_time_ms": s.avg_response_time_ms,
                     }
@@ -1162,9 +1224,15 @@ async def run_status(args: argparse.Namespace) -> None:
                         details = f"{s.tool_count:>3} tools   {avg_time} avg"
                     else:
                         icon = "\u2717"  # x mark
-                        details = f"({s.last_error or s.status.value})"
+                        details = f"({sanitize_auth_diagnostic(s.last_error or s.status.value)})"
                     if args.verbose and s.protocol_version:
                         details = f"{details}  protocol={s.protocol_version}"
+                    missing_env_vars = missing_env_vars_by_server.get(s.name, [])
+                    if args.verbose and missing_env_vars:
+                        details = (
+                            f"{details}  auth=missing_auth "
+                            f"missing_env={','.join(missing_env_vars)}"
+                        )
 
                     print(f"  {icon} {s.name:<16} {s.status.value:<10} {details}")
             else:
@@ -1674,7 +1742,9 @@ async def _probe_http_health(timeout_s: float) -> tuple[bool, str]:
             return True, detail
         return False, f"{safe_url} returned HTTP {response.status_code}"
     except Exception as exc:
-        return False, f"{safe_url} unreachable ({exc.__class__.__name__})"
+        return False, sanitize_auth_diagnostic(
+            f"{safe_url} unreachable ({exc.__class__.__name__}: {exc})"
+        )
 
 
 async def run_doctor(args: argparse.Namespace) -> None:
@@ -2044,10 +2114,7 @@ def run_guidance(args: argparse.Namespace) -> None:
     print("  Or set level: off | minimal | standard")
 
 
-async def run_auth_connect(args: argparse.Namespace) -> None:
-    """Connect auth for a server and optionally provision it."""
-    import getpass
-
+def _build_gateway_auth_client(args: argparse.Namespace) -> tuple[Any, Any]:
     from pmcp.client.manager import ClientManager
     from pmcp.policy.policy import PolicyManager
     from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
@@ -2066,13 +2133,24 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
         source="custom",
         config=RemoteMcpServerConfig(type="streamable-http", url=gateway_url),
     )
+    return client_manager, gateway_config
 
-    async def _call(tool_name: str, arguments: dict[str, object]) -> dict[str, object]:
-        raw = await client_manager.call_tool(
-            f"pmcp-gateway::{tool_name}", arguments, timeout_ms=30000
-        )
-        payload = _extract_tool_payload(raw)
-        return payload or {}
+
+async def _call_gateway_tool(
+    client_manager: Any, tool_name: str, arguments: dict[str, object]
+) -> dict[str, object]:
+    raw = await client_manager.call_tool(
+        f"pmcp-gateway::{tool_name}", arguments, timeout_ms=30000
+    )
+    payload = _extract_tool_payload(raw)
+    return payload or {}
+
+
+async def run_auth_connect(args: argparse.Namespace) -> None:
+    """Connect auth for a server and optionally provision it."""
+    import getpass
+
+    client_manager, gateway_config = _build_gateway_auth_client(args)
 
     try:
         errors = await client_manager.connect_all([gateway_config])
@@ -2080,17 +2158,12 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
             _exit_gateway_unreachable(errors)
 
         server_name = args.server_name
-        first = await _call("gateway.provision", {"server_name": server_name})
+        first = await _call_gateway_tool(
+            client_manager, "gateway.provision", {"server_name": server_name}
+        )
 
         needs_auth = bool(first.get("needs_api_key") or first.get("auth_required"))
         url_elicitations = first.get("url_elicitations")
-        if not needs_auth:
-            if args.json:
-                print(json.dumps(first, indent=2))
-            else:
-                print(first.get("message", "Provision request completed."))
-            return
-
         if first.get("auth_state") == "elicitation_required" or url_elicitations:
             if args.credential:
                 raise RuntimeError(
@@ -2101,20 +2174,24 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
                 if isinstance(url_elicitations, list) and url_elicitations
                 else {}
             )
-            url_auth_args = {
-                "server_name": server_name,
-                "auth_mode": "url_elicitation",
-                "elicitation_id": elicitation.get("elicitation_id"),
-                "elicitation_url": elicitation.get("url"),
-                "consent_acknowledged": True,
-            }
-            auth_result = await _call("gateway.auth_connect", url_auth_args)
             if args.json:
-                print(json.dumps({"auth": auth_result, "provision": None}, indent=2))
+                print(json.dumps({"provision": first}, indent=2))
             else:
-                print(auth_result.get("message", "URL-mode elicitation recorded."))
+                print(first.get("message", "URL-mode elicitation required."))
                 if elicitation.get("url"):
                     print(f"URL: {_redact_url_credentials(str(elicitation['url']))}")
+                if elicitation.get("elicitation_id"):
+                    print(f"Elicitation ID: {elicitation['elicitation_id']}")
+                next_step = elicitation.get("next_step") or first.get("next_step")
+                if next_step:
+                    print(f"Next step: {next_step}")
+            return
+
+        if not needs_auth:
+            if args.json:
+                print(json.dumps(first, indent=2))
+            else:
+                print(first.get("message", "Provision request completed."))
             return
 
         credential = args.credential
@@ -2132,7 +2209,9 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
         if args.env_var:
             auth_args["env_var"] = args.env_var
 
-        auth_result = await _call("gateway.auth_connect", auth_args)
+        auth_result = await _call_gateway_tool(
+            client_manager, "gateway.auth_connect", auth_args
+        )
 
         output: dict[str, object] = {
             "auth": auth_result,
@@ -2140,7 +2219,9 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
         }
 
         if not args.no_provision:
-            second = await _call("gateway.provision", {"server_name": server_name})
+            second = await _call_gateway_tool(
+                client_manager, "gateway.provision", {"server_name": server_name}
+            )
             output["provision"] = second
 
         if args.json:
@@ -2151,6 +2232,45 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
                 provision = output["provision"]
                 if isinstance(provision, dict):
                     print(provision.get("message", "Provision retried."))
+    finally:
+        await client_manager.disconnect_all()
+
+
+async def run_auth_acknowledge(args: argparse.Namespace) -> None:
+    """Acknowledge completed URL-mode elicitation for a server."""
+    client_manager, gateway_config = _build_gateway_auth_client(args)
+
+    if getattr(args, "credential", None):
+        raise RuntimeError(
+            "URL-mode elicitation acknowledgement does not accept credentials"
+        )
+
+    try:
+        errors = await client_manager.connect_all([gateway_config])
+        if errors:
+            _exit_gateway_unreachable(errors)
+
+        auth_args: dict[str, object] = {
+            "server_name": args.server_name,
+            "auth_mode": "url_elicitation",
+            "elicitation_id": args.elicitation_id,
+            "consent_acknowledged": True,
+        }
+        if args.elicitation_url:
+            auth_args["elicitation_url"] = args.elicitation_url
+
+        auth_result = await _call_gateway_tool(
+            client_manager, "gateway.auth_connect", auth_args
+        )
+        if args.json:
+            print(json.dumps({"auth": auth_result}, indent=2))
+        else:
+            print(auth_result.get("message", "URL-mode elicitation acknowledged."))
+            url_elicitation = auth_result.get("url_elicitation")
+            if isinstance(url_elicitation, dict) and url_elicitation.get("url"):
+                print(f"URL: {_redact_url_credentials(str(url_elicitation['url']))}")
+            if auth_result.get("next_step"):
+                print(f"Next step: {auth_result['next_step']}")
     finally:
         await client_manager.disconnect_all()
 
@@ -2194,6 +2314,8 @@ async def async_main(args: argparse.Namespace) -> None:
     elif args.command == "auth":
         if args.auth_command == "connect":
             await run_auth_connect(args)
+        elif args.auth_command == "acknowledge":
+            await run_auth_acknowledge(args)
         else:
             print(
                 json.dumps(

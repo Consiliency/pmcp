@@ -219,6 +219,31 @@ class TestSecretRedaction:
         assert "user:pass" not in redacted
         assert "secret-code" not in redacted
 
+    def test_redacts_shared_auth_samples_and_custom_policy_patterns(
+        self, tmp_path: Path
+    ) -> None:
+        policy_path = tmp_path / "policy.json"
+        policy_path.write_text(
+            json.dumps({"redaction": {"patterns": [r"custom_secret=[^\s]+"]}})
+        )
+        policy = PolicyManager(policy_path)
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.N2QwODhmM2I4OTc1"
+
+        redacted = policy.redact_secrets(
+            "Bearer bearer-token custom_secret=private "
+            f"https://user:pass@example.test/cb?ticket=ticket-secret {jwt}"
+        )
+
+        for leaked in [
+            "bearer-token",
+            "private",
+            "user:pass",
+            "ticket-secret",
+            jwt,
+        ]:
+            assert leaked not in redacted
+        assert "[REDACTED]" in redacted
+
 
 class TestYamlPolicyLoading:
     """Tests for YAML policy loading."""

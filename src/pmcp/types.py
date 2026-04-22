@@ -183,6 +183,7 @@ class EffectiveConfigEntry(BaseModel):
     source_path: str | None = None
     startup_skip_reason: str | None = None
     startup_env_var: str | None = None
+    missing_env_vars: list[str] = Field(default_factory=list)
     auth_state: AuthState = "none"
     configured: bool = False
     manifest: bool = False
@@ -679,6 +680,7 @@ class LifecycleServerOutput(BaseModel):
     cancelled_task_count: int = 0
     message: str
     errors: list[str] | None = None
+    missing_env_vars: list[str] = Field(default_factory=list)
     auth_state: AuthState = "none"
     next_step: str | None = None
     auth_methods: list[str] | None = None
@@ -700,6 +702,7 @@ class ServerHealthInfo(BaseModel):
     startup_source: str | None = None
     startup_skip_reason: str | None = None
     startup_env_var: str | None = None
+    missing_env_vars: list[str] = Field(default_factory=list)
     auth_state: AuthState = "none"
     next_step: str | None = None
     auth_methods: list[str] | None = None
@@ -987,9 +990,10 @@ class ProvisionOutput(BaseModel):
     env_var: str | None = None
     env_instructions: str | None = None
     auth_required: bool = False
-    auth_mode: Literal["api_key", "unknown"] | None = None
+    auth_mode: Literal["api_key", "url_elicitation", "unknown"] | None = None
     auth_methods: list[str] | None = None
     alternative_env_vars: list[str] | None = None
+    missing_env_vars: list[str] = Field(default_factory=list)
     auth_state: AuthState = "none"
     next_step: str | None = None
     auth_metadata: AuthMetadataInfo | None = None

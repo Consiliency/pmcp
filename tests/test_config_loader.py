@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 
 from pmcp.config.loader import (
+    build_startup_observation_snapshot,
     get_startup_policy,
     load_disabled_auto_start,
     load_enabled_auto_start,
@@ -15,10 +17,15 @@ from pmcp.config.loader import (
     make_tool_id,
     manifest_server_to_config,
     parse_tool_id,
+    resolve_startup_configs,
     set_startup_policy,
 )
 from pmcp.manifest.loader import ServerConfig
-from pmcp.types import StartupPolicyOperation
+from pmcp.types import (
+    RemoteMcpServerConfig,
+    ResolvedServerConfig,
+    StartupPolicyOperation,
+)
 
 
 class TestMakeToolId:
@@ -296,6 +303,87 @@ class TestLoadConfigs:
 
 class TestLoadAutoStartPolicy:
     """Tests for startup policy aggregation from config files."""
+
+    def test_eager_remote_with_missing_header_placeholder_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("REMOTE_API_TOKEN", raising=False)
+        config = ResolvedServerConfig(
+            name="remote-api",
+            source="project",
+            config=RemoteMcpServerConfig(
+                type="remote",
+                url="https://example.com/sse",
+                headers={"Authorization": "Bearer ${REMOTE_API_TOKEN}"},
+            ),
+        )
+
+        resolution = resolve_startup_configs(
+            [config],
+            enabled_auto_start={"remote-api"},
+        )
+        observation = build_startup_observation_snapshot(resolution)["remote-api"]
+
+        assert resolution.eager_configs == []
+        assert resolution.skipped[0].reason.value == "missing_auth"
+        assert resolution.skipped[0].env_var == "REMOTE_API_TOKEN"
+        assert resolution.skipped[0].missing_env_vars == ["REMOTE_API_TOKEN"]
+        assert observation.startup_env_var == "REMOTE_API_TOKEN"
+        assert observation.missing_env_vars == ["REMOTE_API_TOKEN"]
+
+    @pytest.mark.parametrize("remote_type", ["sse", "http", "streamable-http"])
+    def test_eager_remote_header_detection_covers_remote_types(
+        self, remote_type: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("REMOTE_API_TOKEN", raising=False)
+        config = ResolvedServerConfig(
+            name=f"remote-{remote_type}",
+            source="project",
+            config=RemoteMcpServerConfig(
+                type=remote_type,  # type: ignore[arg-type]
+                url="https://example.com/mcp",
+                headers={"Authorization": "Bearer ${REMOTE_API_TOKEN}"},
+            ),
+        )
+
+        resolution = resolve_startup_configs(
+            [config],
+            enabled_auto_start={config.name},
+        )
+
+        assert resolution.skipped[0].missing_env_vars == ["REMOTE_API_TOKEN"]
+
+    def test_literal_and_present_remote_headers_remain_eager(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("REMOTE_API_TOKEN", "secret-token")
+        literal = ResolvedServerConfig(
+            name="literal",
+            source="project",
+            config=RemoteMcpServerConfig(
+                url="https://example.com/sse",
+                headers={"X-Static": "literal"},
+            ),
+        )
+        present = ResolvedServerConfig(
+            name="present",
+            source="project",
+            config=RemoteMcpServerConfig(
+                url="https://example.com/sse",
+                headers={"Authorization": "Bearer ${REMOTE_API_TOKEN}"},
+            ),
+        )
+
+        resolution = resolve_startup_configs(
+            [literal, present],
+            enabled_auto_start={"literal", "present"},
+        )
+
+        assert [config.name for config in resolution.eager_configs] == [
+            "literal",
+            "present",
+        ]
+        assert resolution.skipped == []
 
     def test_loads_enabled_auto_start_from_all_config_sources(
         self, tmp_path: Path

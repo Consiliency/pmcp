@@ -26,6 +26,7 @@ from pmcp.types import (
     StartupPolicyPreview,
     StartupPolicySource,
 )
+from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
 
 if TYPE_CHECKING:
     from pmcp.manifest.loader import ServerConfig as ManifestServerConfig
@@ -55,6 +56,7 @@ class StartupSkip:
     reason: StartupSkipReason
     source: Literal["configured", "manifest", "auto_start", "provisioned"]
     env_var: str | None = None
+    missing_env_vars: list[str] | None = None
 
 
 @dataclass(frozen=True)
@@ -75,6 +77,7 @@ class StartupObservation:
     startup_source: str | None = None
     startup_skip_reason: str | None = None
     startup_env_var: str | None = None
+    missing_env_vars: list[str] | None = None
 
 
 StartupObservationSnapshot = dict[str, StartupObservation]
@@ -124,6 +127,7 @@ def build_startup_observation_snapshot(
             startup_source=skipped.source,
             startup_skip_reason=skipped.reason.value,
             startup_env_var=skipped.env_var,
+            missing_env_vars=skipped.missing_env_vars or [],
         )
     return snapshot
 
@@ -881,6 +885,7 @@ def resolve_startup_configs(
     is_server_allowed: Callable[[str], bool] = lambda _name: True,
     is_auth_available: Callable[[str], bool] = lambda _env_var: True,
     legacy_manifest_auto_start: bool = False,
+    project_root: Path | None = None,
 ) -> StartupResolution:
     """Classify already-loaded server definitions into lazy/eager startup groups."""
     manifest_by_name = _coerce_manifest_servers(manifest_servers)
@@ -894,6 +899,7 @@ def resolve_startup_configs(
 
     configured_names: set[str] = set()
     classified_names: set[str] = set()
+    remote_header_env_lookup = build_remote_header_env_lookup(project_root)
 
     def add_config(
         config: ResolvedServerConfig,
@@ -922,6 +928,24 @@ def resolve_startup_configs(
                         reason=StartupSkipReason.MISSING_AUTH,
                         source=source,
                         env_var=env_var,
+                    )
+                )
+                classified_names.add(config.name)
+                return
+
+        if eager and isinstance(config.config, RemoteMcpServerConfig):
+            resolution = resolve_remote_headers(
+                config.config.headers,
+                remote_header_env_lookup,
+            )
+            if resolution.missing_env_vars:
+                skipped.append(
+                    StartupSkip(
+                        name=config.name,
+                        reason=StartupSkipReason.MISSING_AUTH,
+                        source=source,
+                        env_var=resolution.missing_env_vars[0],
+                        missing_env_vars=resolution.missing_env_vars,
                     )
                 )
                 classified_names.add(config.name)

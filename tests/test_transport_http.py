@@ -128,26 +128,45 @@ class TestAuthGuardHttp:
         client = _make_app(
             auth_token="mysecret",
             protected_resource_metadata_url=(
-                "http://testserver/.well-known/oauth-protected-resource"
+                "https://testserver/.well-known/oauth-protected-resource?ticket=secret"
             ),
         )
         r = client.post("/mcp", content=b"{}")
 
         assert r.status_code == 401
         assert "resource_metadata" in r.headers["www-authenticate"]
+        assert "secret" not in r.headers["www-authenticate"]
         assert "mysecret" not in r.text
 
     def test_well_known_protected_resource_metadata_is_public(self) -> None:
         client = _make_app(
             auth_token="mysecret",
             protected_resource_metadata_url=(
-                "http://testserver/.well-known/oauth-protected-resource"
+                "https://testserver/.well-known/oauth-protected-resource?token=secret"
             ),
         )
         r = client.get("/.well-known/oauth-protected-resource")
 
         assert r.status_code == 200
         assert r.json()["scopes_supported"] == ["read"]
+        assert "secret" not in r.text
+
+    def test_invalid_metadata_url_does_not_create_route_or_challenge_header(
+        self,
+    ) -> None:
+        client = _make_app(
+            auth_token="mysecret",
+            protected_resource_metadata_url=(
+                "http://auth.example/.well-known/oauth-protected-resource?token=secret"
+            ),
+        )
+
+        unauth = client.post("/mcp", content=b"{}")
+        metadata = client.get("/.well-known/oauth-protected-resource")
+
+        assert unauth.status_code == 401
+        assert "www-authenticate" not in unauth.headers
+        assert metadata.status_code == 404
 
     def test_wrong_token_returns_401(self) -> None:
         client = _make_app(auth_token="mysecret")

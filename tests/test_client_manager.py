@@ -20,6 +20,7 @@ from pmcp.client.manager import (
     _infer_risk_hint,
     _truncate_description,
 )
+from pmcp.remote_auth import MissingRemoteHeaderAuthError
 from pmcp.types import (
     LocalMcpServerConfig,
     PromptInfo,
@@ -879,9 +880,8 @@ class TestRemoteConnectSseHeaders:
             config=RemoteMcpServerConfig(
                 url="https://example.com/sse",
                 headers={
-                    "Authorization": "${PMCP_TEST_TOKEN}",
+                    "Authorization": "Bearer ${PMCP_TEST_TOKEN}",
                     "X-Static": "literal-value",
-                    "X-Missing": "${PMCP_MISSING}",
                 },
             ),
         )
@@ -920,9 +920,8 @@ class TestRemoteConnectSseHeaders:
             await manager._connect_sse(config)
 
         assert captured_headers == {
-            "Authorization": "test-token",
+            "Authorization": "Bearer test-token",
             "X-Static": "literal-value",
-            "X-Missing": "",
         }
 
         await manager.disconnect_all()
@@ -942,9 +941,8 @@ class TestRemoteConnectSseHeaders:
                 type="streamable-http",
                 url="https://example.com/mcp",
                 headers={
-                    "Authorization": "${PMCP_TEST_TOKEN}",
+                    "Authorization": "Bearer ${PMCP_TEST_TOKEN}",
                     "X-Static": "literal-value",
-                    "X-Missing": "${PMCP_MISSING}",
                 },
             ),
         )
@@ -987,12 +985,69 @@ class TestRemoteConnectSseHeaders:
             await manager._connect_streamable_http(config)
 
         assert captured_headers == {
-            "Authorization": "test-token",
+            "Authorization": "Bearer test-token",
             "X-Static": "literal-value",
-            "X-Missing": "",
         }
 
         await manager.disconnect_all()
+
+    @pytest.mark.asyncio
+    async def test_connect_sse_missing_placeholder_does_not_open_transport(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing SSE header placeholders should fail before sse_client is called."""
+        manager = ClientManager()
+        monkeypatch.delenv("PMCP_TEST_TOKEN", raising=False)
+        config = ResolvedServerConfig(
+            name="remote",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                url="https://example.com/sse",
+                headers={"Authorization": "Bearer ${PMCP_TEST_TOKEN}"},
+            ),
+        )
+
+        mock_sse_client = MagicMock()
+        with patch("pmcp.client.manager.sse_client", mock_sse_client):
+            with pytest.raises(MissingRemoteHeaderAuthError) as exc_info:
+                await manager._connect_sse(config)
+
+        assert exc_info.value.missing_env_vars == ["PMCP_TEST_TOKEN"]
+        mock_sse_client.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_connect_streamable_http_missing_placeholders_are_deduped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Missing streamable HTTP header placeholders should be sorted and deduped."""
+        manager = ClientManager()
+        monkeypatch.delenv("PMCP_TEST_TOKEN", raising=False)
+        monkeypatch.delenv("PMCP_OTHER_TOKEN", raising=False)
+        config = ResolvedServerConfig(
+            name="remote-http",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                type="streamable-http",
+                url="https://example.com/mcp",
+                headers={
+                    "Authorization": "Bearer ${PMCP_TEST_TOKEN}",
+                    "X-Api-Key": "${PMCP_TEST_TOKEN}:${PMCP_OTHER_TOKEN}",
+                },
+            ),
+        )
+
+        mock_streamablehttp_client = MagicMock()
+        with patch(
+            "pmcp.client.manager.streamablehttp_client", mock_streamablehttp_client
+        ):
+            with pytest.raises(MissingRemoteHeaderAuthError) as exc_info:
+                await manager._connect_streamable_http(config)
+
+        assert exc_info.value.missing_env_vars == [
+            "PMCP_OTHER_TOKEN",
+            "PMCP_TEST_TOKEN",
+        ]
+        mock_streamablehttp_client.assert_not_called()
 
 
 class TestRemoteConnectTransportDispatch:

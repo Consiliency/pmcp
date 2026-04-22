@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 from typing import Any, cast
 import types
@@ -12,6 +13,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from pmcp.env_store import read_env_file
 from pmcp.manifest.loader import CLIAlternative, Manifest, ServerConfig
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import StartupObservation
@@ -21,6 +23,7 @@ from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
 from pmcp.types import (
     LocalMcpServerConfig,
     McpTaskRecord,
+    RemoteMcpServerConfig,
     ResolvedServerConfig,
     RequestState,
     RiskHint,
@@ -1124,6 +1127,65 @@ class TestServerLifecycleTools:
         assert "PMCP_TEST_KEY" in (missing_auth.errors or [""])[0]
 
     @pytest.mark.asyncio
+    async def test_connect_server_reports_missing_remote_header_auth(
+        self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("REMOTE_API_TOKEN", raising=False)
+        configured = [
+            ResolvedServerConfig(
+                name="remote-api",
+                source="project",
+                config=RemoteMcpServerConfig(
+                    url="https://example.com/sse",
+                    headers={"Authorization": "Bearer ${REMOTE_API_TOKEN}"},
+                ),
+            )
+        ]
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+
+        result = await gateway_tools.connect_server({"server_name": "remote-api"})
+
+        assert result.ok is False
+        assert result.auth_state == "missing_auth"
+        assert result.missing_env_vars == ["REMOTE_API_TOKEN"]
+        assert cast(Any, gateway_tools._client_manager).connected_configs == []
+
+    @pytest.mark.asyncio
+    async def test_provision_reports_missing_remote_manifest_header_auth(
+        self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("REMOTE_API_TOKEN", raising=False)
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "remote-api": ServerConfig(
+                    name="remote-api",
+                    description="Remote API",
+                    keywords=["remote"],
+                    install={},
+                    command="",
+                    args=[],
+                    transport="streamable-http",
+                    url="https://example.com/mcp",
+                    headers={"Authorization": "Bearer ${REMOTE_API_TOKEN}"},
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        fake_jm = types.SimpleNamespace(start_install=pytest.fail)
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: fake_jm)
+
+        result = await gateway_tools.provision({"server_name": "remote-api"})
+
+        assert result.ok is False
+        assert result.auth_state == "missing_auth"
+        assert result.missing_env_vars == ["REMOTE_API_TOKEN"]
+        assert cast(Any, gateway_tools._client_manager).connected_configs == []
+
+    @pytest.mark.asyncio
     async def test_connect_server_uses_registered_discovered_server(
         self, gateway_tools: GatewayTools
     ) -> None:
@@ -1781,6 +1843,28 @@ class TestHealth:
         assert by_name["needs-key"].startup_env_var == "PMCP_TEST_KEY"
 
     @pytest.mark.asyncio
+    async def test_health_includes_remote_header_missing_vars(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        gateway_tools.set_startup_observations(
+            {
+                "remote-api": StartupObservation(
+                    name="remote-api",
+                    startup_policy="skipped",
+                    startup_source="configured",
+                    startup_skip_reason="missing_auth",
+                    startup_env_var="REMOTE_API_TOKEN",
+                    missing_env_vars=["REMOTE_API_TOKEN"],
+                )
+            }
+        )
+
+        health = await gateway_tools.health()
+
+        by_name = {server.name: server for server in health.servers}
+        assert by_name["remote-api"].missing_env_vars == ["REMOTE_API_TOKEN"]
+
+    @pytest.mark.asyncio
     async def test_health_merges_provisioned_startup_observation(
         self, gateway_tools: GatewayTools
     ) -> None:
@@ -2104,7 +2188,8 @@ class TestCapabilityAndProvision:
         assert result.alternative_env_vars == ["OPENAI_API_KEY", "ANTHROPIC_API_KEY"]
 
     @pytest.mark.asyncio
-    async def test_auth_connect_stores_credential(self, monkeypatch):
+    async def test_auth_connect_stores_credential(self, tmp_path: Path, monkeypatch):
+        home = tmp_path / "home"
         client_manager = MockClientManager(create_mock_tools())
         policy_manager = PolicyManager()
         gateway_tools = GatewayTools(
@@ -2132,11 +2217,8 @@ class TestCapabilityAndProvision:
         )
 
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
-        monkeypatch.setattr(
-            gateway_tools,
-            "_write_secret",
-            lambda scope, key, value: Path("/tmp/pmcp-test.env"),
-        )
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
 
         result = await gateway_tools.auth_connect(
             {
@@ -2149,9 +2231,96 @@ class TestCapabilityAndProvision:
         assert result.ok is True
         assert result.env_var == "OPENAI_API_KEY"
         assert "gateway.provision" in (result.next_step or "")
+        assert result.env_path == str(home / ".config" / "pmcp" / "pmcp.env")
+        assert read_env_file(Path(result.env_path or "")) == {
+            "OPENAI_API_KEY": "test-token"
+        }
+        assert os.environ["OPENAI_API_KEY"] == "test-token"
 
     @pytest.mark.asyncio
-    async def test_auth_connect_url_elicitation_refuses_credential(self) -> None:
+    async def test_auth_connect_rejects_invalid_explicit_env_var(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        monkeypatch.chdir(tmp_path)
+
+        result = await gateway_tools.auth_connect(
+            {
+                "server_name": "custom",
+                "env_var": "BAD-NAME",
+                "credential": "test-token",
+                "scope": "project",
+            }
+        )
+
+        assert result.ok is False
+        assert result.auth_state == "missing_auth"
+        assert result.env_var == "BAD-NAME"
+        assert "test-token" not in result.message
+        assert not (tmp_path / ".env.pmcp").exists()
+
+    @pytest.mark.asyncio
+    async def test_auth_connect_round_trips_shell_significant_credential(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        credential = r'token with spaces # "quotes" and \ slash = value'
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        result = await gateway_tools.auth_connect(
+            {
+                "server_name": "custom",
+                "env_var": "OPENAI_API_KEY",
+                "credential": credential,
+                "scope": "project",
+            }
+        )
+
+        assert result.ok is True
+        assert read_env_file(tmp_path / ".env.pmcp")["OPENAI_API_KEY"] == credential
+        assert os.environ["OPENAI_API_KEY"] == credential
+
+    @pytest.mark.asyncio
+    async def test_auth_connect_rejects_newline_credential_without_injection(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("INJECTED", raising=False)
+
+        result = await gateway_tools.auth_connect(
+            {
+                "server_name": "custom",
+                "env_var": "OPENAI_API_KEY",
+                "credential": "first\nINJECTED=second",
+                "scope": "project",
+            }
+        )
+
+        assert result.ok is False
+        assert result.auth_state == "missing_auth"
+        assert "first" not in result.message
+        assert "INJECTED" not in os.environ
+        assert not (tmp_path / ".env.pmcp").exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "credential",
+        ["oauth-code-123", "password-secret", "Bearer token-secret", "refresh-secret"],
+    )
+    async def test_auth_connect_url_elicitation_refuses_credential(
+        self, credential: str
+    ) -> None:
         gateway_tools = GatewayTools(
             client_manager=MockClientManager(),  # type: ignore
             policy_manager=PolicyManager(),
@@ -2162,7 +2331,7 @@ class TestCapabilityAndProvision:
                 "server_name": "remote-auth",
                 "auth_mode": "url_elicitation",
                 "elicitation_id": "consent-1",
-                "credential": "oauth-code",
+                "credential": credential,
                 "consent_acknowledged": True,
             }
         )
@@ -2170,6 +2339,79 @@ class TestCapabilityAndProvision:
         assert result.ok is False
         assert result.auth_state == "elicitation_required"
         assert "does not accept credentials" in result.message
+        assert credential not in result.message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "input_data",
+        [
+            {"server_name": "remote-auth", "auth_mode": "url_elicitation"},
+            {
+                "server_name": "remote-auth",
+                "auth_mode": "url_elicitation",
+                "elicitation_id": "consent-1",
+            },
+        ],
+    )
+    async def test_auth_connect_url_elicitation_requires_post_consent_ack(
+        self, input_data: dict[str, object]
+    ) -> None:
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        result = await gateway_tools.auth_connect(input_data)
+
+        assert result.ok is False
+        assert result.auth_state == "elicitation_required"
+        assert "consent_acknowledged=true" in result.message
+        assert result.next_step
+        assert "auth_mode='url_elicitation'" in result.next_step
+
+    @pytest.mark.asyncio
+    async def test_auth_connect_url_elicitation_redacts_optional_url(self) -> None:
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        result = await gateway_tools.auth_connect(
+            {
+                "server_name": "remote-auth",
+                "auth_mode": "url_elicitation",
+                "elicitation_id": "consent-1",
+                "elicitation_url": "https://auth.example/consent?code=secret",
+                "consent_acknowledged": True,
+            }
+        )
+
+        assert result.ok is True
+        assert result.url_elicitation
+        assert "secret" not in result.url_elicitation.url
+
+    @pytest.mark.asyncio
+    async def test_auth_connect_url_elicitation_rejects_non_loopback_http_url(
+        self,
+    ) -> None:
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        result = await gateway_tools.auth_connect(
+            {
+                "server_name": "remote-auth",
+                "auth_mode": "url_elicitation",
+                "elicitation_id": "consent-1",
+                "elicitation_url": "http://auth.example/consent?code=secret",
+                "consent_acknowledged": True,
+            }
+        )
+
+        assert result.ok is False
+        assert result.auth_state == "elicitation_required"
+        assert "secret" not in result.message
 
     @pytest.mark.asyncio
     async def test_invoke_url_elicitation_error_is_structured(self) -> None:
@@ -2205,6 +2447,89 @@ class TestCapabilityAndProvision:
         assert result.auth_state == "elicitation_required"
         assert result.url_elicitations
         assert "secret" not in result.url_elicitations[0].url
+
+    @pytest.mark.asyncio
+    async def test_provision_url_elicitation_error_is_structured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager()
+
+        async def connect_all(*args: Any, **kwargs: Any) -> list[str]:
+            return [
+                '{"error":{"code":-32042,"data":{"elicitationId":"consent-1",'
+                '"url":"https://auth.example/consent?code=secret"}}}'
+            ]
+
+        client_manager.connect_all = connect_all  # type: ignore[method-assign]
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "remote-auth": ServerConfig(
+                    name="remote-auth",
+                    description="Remote auth",
+                    keywords=["remote"],
+                    install={},
+                    command="",
+                    args=[],
+                    requires_api_key=False,
+                    transport="streamable-http",
+                    url="https://mcp.example",
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+        result = await gateway_tools.provision({"server_name": "remote-auth"})
+
+        assert result.ok is False
+        assert result.auth_state == "elicitation_required"
+        assert result.auth_mode == "url_elicitation"
+        assert result.url_elicitations
+        assert "secret" not in result.url_elicitations[0].url
+        assert result.next_step
+        assert "consent_acknowledged=true" in result.next_step
+
+    @pytest.mark.asyncio
+    async def test_connect_server_url_elicitation_error_is_structured(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager()
+
+        async def connect_server(*args: Any, **kwargs: Any) -> list[str]:
+            return [
+                '{"error":{"code":-32042,"data":{"elicitationId":"consent-1",'
+                '"url":"https://auth.example/consent?refresh_token=secret"}}}'
+            ]
+
+        client_manager.connect_server = connect_server  # type: ignore[method-assign]
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        configured = [
+            ResolvedServerConfig(
+                name="remote-auth",
+                source="project",
+                config=RemoteMcpServerConfig(url="https://mcp.example"),
+            )
+        ]
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: configured)
+
+        result = await gateway_tools.connect_server({"server_name": "remote-auth"})
+
+        assert result.ok is False
+        assert result.auth_state == "elicitation_required"
+        assert result.url_elicitations
+        assert "secret" not in result.url_elicitations[0].url
+        assert result.next_step
+        assert "consent_acknowledged=true" in result.next_step
 
     @pytest.mark.asyncio
     async def test_provision_policy_denied_has_auth_state(self) -> None:
@@ -2965,3 +3290,42 @@ class TestSanitizeError:
     def test_returns_string(self) -> None:
         result = GatewayTools._sanitize_error(ValueError("boom"))
         assert isinstance(result, str)
+
+    def test_redacts_auth_challenge_secrets(self) -> None:
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.N2QwODhmM2I4OTc1"
+        result = GatewayTools._sanitize_error(
+            ValueError(
+                'WWW-Authenticate: Bearer resource_metadata="'
+                'https://auth.example/pr?ticket=secret-ticket", '
+                f'error_description="token {jwt}"'
+            )
+        )
+
+        assert "secret-ticket" not in result
+        assert jwt not in result
+        assert "%5BREDACTED%5D" in result or "[REDACTED]" in result
+
+    def test_feedback_scrubbing_uses_shared_auth_sanitizer(self) -> None:
+        tools = GatewayTools(MockClientManager(), PolicyManager())
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.N2QwODhmM2I4OTc1"
+
+        scrubbed = tools._scrub_sensitive_text(
+            "operator@example.test saw "
+            f"https://user:pass@example.test/cb?session=secret-session {jwt}"
+        )
+
+        assert "operator@example.test" not in scrubbed
+        assert "user:pass" not in scrubbed
+        assert "secret-session" not in scrubbed
+        assert jwt not in scrubbed
+
+    def test_feedback_events_are_sanitized_before_preview(self) -> None:
+        tools = GatewayTools(MockClientManager(), PolicyManager())
+
+        tools._record_feedback_event(
+            "invoke_error",
+            {"error": "https://user:pass@example.test/cb?jwt=secret-jwt"},
+        )
+
+        assert "user:pass" not in json.dumps(tools._feedback_events)
+        assert "secret-jwt" not in json.dumps(tools._feedback_events)

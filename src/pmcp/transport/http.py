@@ -401,8 +401,8 @@ def create_http_app(
         Route("/health", endpoint=handle_health, methods=["GET"]),
         Route("/metrics", endpoint=handle_metrics, methods=["GET"]),
     ]
-    if protected_resource_metadata_url:
-        metadata_path = urlparse(protected_resource_metadata_url).path
+    if auth_metadata.protected_resource_metadata_url:
+        metadata_path = urlparse(auth_metadata.protected_resource_metadata_url).path
         if metadata_path:
             routes.append(
                 Route(

@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import os
-import re
 from pathlib import Path
 from urllib.parse import urlparse
 
-from dotenv import dotenv_values
-from pmcp.auth import redact_auth_url
-
-ENV_INTERPOLATION_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+from pmcp.auth import (
+    redact_auth_url,
+    sanitize_auth_diagnostic,
+    sanitize_public_auth_url,
+)
+from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
 
 
 def _read_user_pmcp_env() -> dict[str, str]:
@@ -19,13 +19,9 @@ def _read_user_pmcp_env() -> dict[str, str]:
     if not path.exists():
         return {}
 
-    parsed = dotenv_values(path)
-    values: dict[str, str] = {}
-    for key, value in parsed.items():
-        if key is None:
-            continue
-        values[key] = "" if value is None else value
-    return values
+    from pmcp.env_store import read_env_file
+
+    return read_env_file(path)
 
 
 def collect_remote_header_diagnostics(
@@ -41,12 +37,12 @@ def collect_remote_header_diagnostics(
     if not isinstance(servers, dict):
         return checks
 
-    pmcp_env = _read_user_pmcp_env()
+    env_lookup = build_remote_header_env_lookup()
 
     for server_name, server_cfg in servers.items():
         if not isinstance(server_cfg, dict):
             continue
-        if server_cfg.get("type") != "remote":
+        if server_cfg.get("type") not in {"remote", "sse", "http", "streamable-http"}:
             continue
 
         raw_url = server_cfg.get("url")
@@ -66,7 +62,7 @@ def collect_remote_header_diagnostics(
                 (
                     "remote",
                     "fail",
-                    f"{server_name}: remote url '{redact_auth_url(raw_url)}' is invalid. Use an absolute URL (for example https://host/sse).",
+                    f"{server_name}: remote url '{sanitize_auth_diagnostic(raw_url)}' is invalid. Use an absolute URL (for example https://host/sse).",
                 )
             )
 
@@ -80,13 +76,14 @@ def collect_remote_header_diagnostics(
             metadata_url = server_cfg.get(metadata_key)
             if not isinstance(metadata_url, str) or not metadata_url:
                 continue
-            metadata_parsed = urlparse(metadata_url)
-            if not metadata_parsed.scheme or not metadata_parsed.netloc:
+            try:
+                safe_metadata_url = sanitize_public_auth_url(metadata_url)
+            except ValueError as exc:
                 checks.append(
                     (
                         "remote",
                         "warn",
-                        f"{server_name}: {metadata_key} '{redact_auth_url(metadata_url)}' is not an absolute URL.",
+                        f"{server_name}: {metadata_key} '{redact_auth_url(metadata_url)}' is invalid: {sanitize_auth_diagnostic(exc)}",
                     )
                 )
             else:
@@ -94,7 +91,7 @@ def collect_remote_header_diagnostics(
                     (
                         "remote",
                         "ok",
-                        f"{server_name}: {metadata_key} configured at {redact_auth_url(metadata_url)}.",
+                        f"{server_name}: {metadata_key} configured at {safe_metadata_url}.",
                     )
                 )
 
@@ -102,20 +99,23 @@ def collect_remote_header_diagnostics(
         if not isinstance(headers, dict):
             continue
 
-        for header_name, header_value in headers.items():
-            if not isinstance(header_name, str) or not isinstance(header_value, str):
-                continue
-
-            referenced_vars = set(ENV_INTERPOLATION_PATTERN.findall(header_value))
-            for var_name in sorted(referenced_vars):
-                if var_name in os.environ or var_name in pmcp_env:
+        string_headers = {
+            key: value
+            for key, value in headers.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+        resolution = resolve_remote_headers(string_headers, env_lookup)
+        for header_name, referenced_vars in sorted(
+            resolution.referenced_env_vars_by_header.items()
+        ):
+            for var_name in referenced_vars:
+                if var_name not in resolution.missing_env_vars:
                     continue
-
                 checks.append(
                     (
                         "remote",
                         "warn",
-                        f"{server_name}: header '{header_name}' references ${{{var_name}}}, but {var_name} is not set in the local environment or ~/.config/pmcp/pmcp.env.",
+                        f"{server_name}: header '{header_name}' references ${{{var_name}}}, but {var_name} is not set in the local environment or PMCP env stores.",
                     )
                 )
 
