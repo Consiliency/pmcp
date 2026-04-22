@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-04-22
+
 ### Added
 - Downstream MCP initialization now prefers protocol version `2025-11-25`,
   records negotiated protocol versions and server capabilities, and preserves
