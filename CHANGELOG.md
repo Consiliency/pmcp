@@ -51,6 +51,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Tool/resource/prompt/server snapshots, pending requests, task lists, MCP
   server-facing lists, and catalog tie-breakers now use stable public ordering.
 
+### Release Verification
+- CONFORM release-gate coverage now exercises old-protocol fake payloads and
+  current-protocol fake payloads across `2024-11-05`, `2025-03-26`,
+  `2025-06-18`, and `2025-11-25` protocol responses.
+- Local conformance tests cover modern tool/resource/prompt metadata
+  preservation, task brokering, required-task capability refusal, structured
+  auth and URL-mode elicitation states, trace context, audit events,
+  startup-policy preview/apply behavior, and deterministic gateway/server
+  ordering.
+- Streamable HTTP smoke verifies `/mcp`, unauthenticated `/health` and
+  `/metrics`, bearer auth, draft header tolerance, trace headers, rate-limit
+  diagnostics, and existing rmcp/Codex compatibility paths with local
+  Starlette/TestClient utilities only.
+- Full release evidence for this gate passed locally: targeted conformance
+  tests, whole phase regression, broader shared-service regression, full
+  `pytest`, `ruff check`, `ruff format --check`, `mypy`, `uv build`, and local
+  `pmcp status`, `pmcp doctor`, and `pmcp setup --profile ...` smoke commands.
+
 ## [1.10.0] - 2026-04-21
 
 ### Added

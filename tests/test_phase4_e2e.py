@@ -1,4 +1,4 @@
-"""Phase 4 end-to-end tests for setup, doctor, and secrets commands."""
+"""Phase 4 and v3 release-gate end-to-end smoke tests."""
 
 from __future__ import annotations
 
@@ -112,6 +112,87 @@ async def test_phase4_task_gateway_smoke() -> None:
     assert result.result == {"ok": True}
     assert result.task is not None
     assert result.task.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_conformance_release_gate_gateway_smoke() -> None:
+    """Protocol, task, trace, auth, and startup state surface together."""
+    manager = ClientManager()
+    tool_id = make_tool_id("current-server", "slow")
+    manager._tools[tool_id] = ToolInfo(
+        tool_id=tool_id,
+        server_name="current-server",
+        tool_name="slow",
+        title="Slow Tool",
+        description="Slow current-protocol tool",
+        short_description="Slow current-protocol tool",
+        input_schema={"type": "object"},
+        output_schema={"type": "object"},
+        annotations={"readOnlyHint": True},
+        execution={"taskSupport": "optional"},
+        schema_dialect="https://json-schema.org/draft/2020-12/schema",
+        raw_metadata={"x-release": "kept"},
+        tags=[],
+        risk_hint=RiskHint.LOW,
+    )
+    current_status = ServerStatus(
+        name="current-server",
+        status=ServerStatusEnum.ONLINE,
+        tool_count=1,
+        protocol_version="2025-11-25",
+        server_capabilities={"tasks": {}, "tools": {"listChanged": True}},
+    )
+    manager._clients["current-server"] = ManagedClient(
+        config=ResolvedServerConfig(
+            name="current-server",
+            source="custom",
+            config=LocalMcpServerConfig(command="current-server"),
+        ),
+        is_remote=True,
+        write_stream=MagicMock(),
+        status=current_status,
+    )
+    manager._servers["current-server"] = current_status
+    manager._send_request = AsyncMock(
+        side_effect=[
+            {"task": {"taskId": "release-task", "status": "working"}},
+            {
+                "result": {"ok": True},
+                "task": {"taskId": "release-task", "status": "completed"},
+            },
+        ]
+    )
+    gateway = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
+
+    invoked = await gateway.invoke(
+        {
+            "tool_id": tool_id,
+            "arguments": {},
+            "task": {"metadata": {"release": "conform"}},
+            "_meta": {
+                "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+            },
+        }
+    )
+    described = await gateway.describe({"tool_id": tool_id})
+    result = await gateway.tasks_result(
+        {"server_name": "current-server", "task_id": "release-task"}
+    )
+    health = await gateway.health()
+
+    assert invoked.ok is True
+    assert invoked.task is not None
+    assert invoked.task.task_id == "release-task"
+    assert described.title == "Slow Tool"
+    assert described.execution == {"taskSupport": "optional"}
+    assert described.schema_dialect == "https://json-schema.org/draft/2020-12/schema"
+    assert result.result == {"ok": True}
+    current_health = next(
+        server for server in health.servers if server.name == "current-server"
+    )
+    assert current_health.protocol_version == "2025-11-25"
+    assert health.audit_events is not None
+    assert health.audit_events[-1].task_id == "release-task"
 
 
 @pytest.mark.asyncio

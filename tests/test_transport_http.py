@@ -194,6 +194,43 @@ class TestAuthGuardHttp:
         client.post("/mcp", content=b"{}")  # no auth → 401
         assert _metrics["requests_401"] > before
 
+    def test_conformance_shared_service_auth_headers_and_diagnostics(self) -> None:
+        client = _make_app(auth_token="secret", rate_limit_rpm=4)
+
+        unauth = client.post("/mcp", content=b"{}")
+        health = client.get("/health")
+        metrics = client.get("/metrics")
+        without_draft_headers = client.post(
+            "/mcp",
+            content=b'{"jsonrpc":"2.0","method":"initialize","id":1,"params":{}}',
+            headers={"Authorization": "Bearer secret"},
+        )
+        with_draft_headers = client.post(
+            "/mcp",
+            content=b'{"jsonrpc":"2.0","method":"initialize","id":2,"params":{}}',
+            headers={
+                "Authorization": "Bearer secret",
+                "MCP-Protocol-Version": "2025-11-25",
+                "Mcp-Method": "initialize",
+                "Mcp-Name": "gateway.health",
+                "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+                "tracestate": "vendor=value",
+                "baggage": "tenant=test",
+            },
+        )
+
+        assert unauth.status_code == 401
+        assert "secret" not in unauth.text
+        assert health.status_code == 200
+        assert metrics.status_code == 200
+        assert without_draft_headers.status_code != 401
+        assert with_draft_headers.status_code != 401
+        diagnostics = health.json()["gateway_diagnostics"]
+        assert diagnostics["header_compatibility"]["MCP-Protocol-Version"] == "accepted"
+        assert diagnostics["trace_context_supported"] is True
+        assert diagnostics["rate_limit_enabled"] is True
+        assert diagnostics["rate_limit_rpm"] == 4
+
 
 # ---------------------------------------------------------------------------
 # Rate limiting on /mcp

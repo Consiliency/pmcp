@@ -6,7 +6,7 @@ from pathlib import Path
 import json
 
 import pytest
-from mcp.types import CallToolRequest
+from mcp.types import CallToolRequest, ListToolsRequest
 
 from pmcp.server import GatewayServer
 from pmcp.types import (
@@ -282,6 +282,76 @@ class TestServerCreation:
         payload = json.loads(result.root.content[0].text)
         assert payload["error"] is True
         assert "Unknown tool" in payload["message"]
+
+    @pytest.mark.asyncio
+    async def test_conformance_tool_listing_is_deterministic_and_includes_admin_routes(
+        self,
+    ) -> None:
+        server = GatewayServer()
+        server._create_server()
+
+        assert server._server is not None
+        handler = server._server.request_handlers[ListToolsRequest]
+        result = await handler(ListToolsRequest(params={}))
+        names = [tool.name for tool in result.root.tools]
+
+        assert names == sorted(names)
+        assert {
+            "gateway.config_status",
+            "gateway.get_startup_policy",
+            "gateway.set_startup_policy",
+            "gateway.tasks_list",
+            "gateway.tasks_get",
+            "gateway.tasks_result",
+            "gateway.tasks_cancel",
+            "gateway.connect_server",
+            "gateway.disconnect_server",
+            "gateway.restart_server",
+        } <= set(names)
+
+    @pytest.mark.asyncio
+    async def test_conformance_config_and_lifecycle_tools_route_json(self) -> None:
+        server = GatewayServer()
+        server._create_server()
+
+        async def fake_config_status() -> object:
+            return {"ok": True, "surface": "config_status"}
+
+        async def fake_get_startup_policy() -> object:
+            return {"ok": True, "surface": "get_startup_policy"}
+
+        async def fake_set_startup_policy(arguments: dict) -> object:
+            return {"ok": True, "surface": "set_startup_policy", "args": arguments}
+
+        server._gateway_tools.config_status = fake_config_status  # type: ignore[method-assign]
+        server._gateway_tools.get_startup_policy = fake_get_startup_policy  # type: ignore[method-assign]
+        server._gateway_tools.set_startup_policy = fake_set_startup_policy  # type: ignore[method-assign]
+
+        assert server._server is not None
+        handler = server._server.request_handlers[CallToolRequest]
+        routed: dict[str, str] = {}
+        for tool_name in [
+            "gateway.config_status",
+            "gateway.get_startup_policy",
+            "gateway.set_startup_policy",
+        ]:
+            result = await handler(
+                CallToolRequest(
+                    params={
+                        "name": tool_name,
+                        "arguments": {"operation": "add", "names": ["svc"]},
+                    }
+                )
+            )
+            payload = json.loads(result.root.content[0].text)
+            routed[tool_name] = payload["surface"]
+            assert payload["ok"] is True
+
+        assert routed == {
+            "gateway.config_status": "config_status",
+            "gateway.get_startup_policy": "get_startup_policy",
+            "gateway.set_startup_policy": "set_startup_policy",
+        }
 
 
 class TestPolicyIntegration:

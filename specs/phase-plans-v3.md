@@ -318,12 +318,12 @@ Validate PMCP against mixed old/current MCP servers and the new gateway/admin co
 
 **Exit criteria**
 
-- [ ] Tests cover at least one old-protocol stdio-style fake server and one current-protocol fake server.
-- [ ] Tests cover tool metadata preservation, task-supported tools, auth/elicitation states, deterministic ordering, trace/header behavior, and startup-policy mutation.
-- [ ] HTTP smoke covers shared-service gateway behavior without external network access.
+- [x] Tests cover at least one old-protocol stdio-style fake server and one current-protocol fake server.
+- [x] Tests cover tool metadata preservation, task-supported tools, auth/elicitation states, deterministic ordering, trace/header behavior, and startup-policy mutation.
+- [x] HTTP smoke covers shared-service gateway behavior without external network access.
 - [x] CLI smoke covers status, doctor, setup profiles, and config status.
-- [ ] Release notes document supported MCP protocol versions, task support limitations, auth limitations, and any draft-feature compatibility flags.
-- [ ] Full test suite, lint, format check, mypy, build, and local smoke commands pass.
+- [x] Release notes document supported MCP protocol versions, task support limitations, auth limitations, and any draft-feature compatibility flags.
+- [x] Full test suite, lint, format check, mypy, build, and local smoke commands pass.
 
 **Scope notes**
 

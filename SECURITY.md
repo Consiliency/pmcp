@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.9.x   | ✅ Active  |
+| 1.10.x  | ✅ Active  |
+| 1.9.x   | ✅ Maintenance |
 | < 1.9   | ❌ No longer supported |
 
 ## Threat Model
@@ -67,6 +68,13 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   `traceparent`, `tracestate`, and `baggage` strings only through explicit
   PMCP-owned fields or request metadata. Do not put bearer tokens, API keys,
   auth codes, user identifiers, or other secrets in trace baggage.
+- **MCP task records are transient**: task IDs are downstream server identifiers
+  held in gateway memory for visibility and cancellation. They are not durable
+  audit records and do not provide cross-user authorization isolation on
+  unauthenticated local transports.
+- **Draft protocol compatibility is additive**: PMCP tolerates current/draft MCP
+  protocol and Streamable HTTP header metadata where documented, but unsupported
+  draft extensions remain out of scope until PMCP explicitly claims them.
 
 ## Reporting a Vulnerability
 

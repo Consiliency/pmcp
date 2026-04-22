@@ -559,9 +559,18 @@ legacy `disableAutoStart` conflicts, policy-denied rows, and missing-auth rows
 without printing secret values.
 
 PMCP negotiates the current MCP protocol version with downstream servers and
-continues to connect to older supported servers. `gateway.health` and
-`pmcp status --json` can include the negotiated `protocol_version` and declared
-server capabilities when a connected server reports them.
+continues to connect to older supported servers. The local conformance matrix
+covers negotiated status handling for `2024-11-05`, `2025-03-26`,
+`2025-06-18`, and `2025-11-25`, with `2025-11-25` preferred for new
+initialization attempts. `gateway.health` and `pmcp status --json` can include
+the negotiated `protocol_version` and declared server capabilities when a
+connected server reports them.
+
+Modern MCP task support is conservative. PMCP forwards task-augmented tool calls
+only when a tool advertises `execution.taskSupport` and the downstream server
+advertises task capability. Required-task tools fail before dispatch if the
+server does not advertise task support. Task records are transient gateway state,
+not durable PMCP storage.
 
 Gateway observability is local and structured. `gateway.invoke` accepts trace
 context through `_meta.traceparent`, `_meta.tracestate`, and `_meta.baggage` and
@@ -579,7 +588,8 @@ latency, auth state, and redacted error text.
 PMCP's Streamable HTTP endpoint remains compatible with existing clients that
 send no draft headers. It also tolerates `MCP-Protocol-Version`, `Mcp-Method`,
 and `Mcp-Name` request headers for clients experimenting with draft MCP
-transport conventions.
+transport conventions. These headers are compatibility inputs, not a promise
+that PMCP implements every draft MCP extension.
 
 Servers stopped with `gateway.disconnect_server` remain visible in health as
 `offline` or `lazy` when PMCP still knows their configuration, and startup policy

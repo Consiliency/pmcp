@@ -79,6 +79,7 @@ testpaths = ["tests"]
 addopts = "-m 'not live'"
 markers = [
     "live: opt-in live integration tests (require network and package managers)",
+    "timeout(seconds): expected maximum runtime for slow opt-in tests",
 ]
 filterwarnings = [
     # Suppress coroutine warnings from test mocks

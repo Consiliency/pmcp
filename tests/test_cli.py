@@ -507,6 +507,82 @@ class TestRunStatus:
         assert server["server_capabilities"] == {"tools": {"listChanged": True}}
 
     @pytest.mark.asyncio
+    async def test_conformance_status_json_preserves_release_gate_fields(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        import json
+
+        from pmcp.cli import run_status
+
+        status_args.json = True
+        status_args.pending = True
+        live_snapshot = {
+            "revision_id": "live-rev",
+            "last_refresh_ts": 1_700_000_000.0,
+            "servers": [
+                {
+                    "name": "current",
+                    "status": "online",
+                    "tool_count": 2,
+                    "protocol_version": "2025-11-25",
+                    "server_capabilities": {
+                        "tasks": {},
+                        "tools": {"listChanged": True},
+                    },
+                    "startup_policy": "eager",
+                    "startup_source": "project",
+                    "auth_state": "none",
+                },
+                {
+                    "name": "needs-key",
+                    "status": "offline",
+                    "tool_count": 0,
+                    "startup_policy": "skipped",
+                    "startup_source": "manifest",
+                    "startup_skip_reason": "missing_auth",
+                    "startup_env_var": "PMCP_TEST_KEY",
+                    "auth_state": "missing_auth",
+                    "next_step": "gateway.auth_connect(server_name='needs-key')",
+                },
+            ],
+            "total_tools": 2,
+            "pending_requests": [
+                {
+                    "request_id": "current::1",
+                    "server_name": "current",
+                    "tool_id": "current::slow",
+                    "elapsed_seconds": 1.5,
+                    "state": "pending",
+                    "task_id": "task-1",
+                    "task_status": "working",
+                }
+            ],
+            "gateway_diagnostics": {
+                "audit_enabled": True,
+                "trace_context_supported": True,
+                "protocol_version_visible": True,
+                "header_compatibility": {"MCP-Protocol-Version": "accepted"},
+            },
+        }
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status",
+            new=AsyncMock(return_value=live_snapshot),
+        ):
+            await run_status(status_args)
+
+        captured = capsys.readouterr()
+        output = json.loads(captured.out)
+        by_name = {server["name"]: server for server in output["servers"]}
+        assert by_name["current"]["protocol_version"] == "2025-11-25"
+        assert by_name["current"]["server_capabilities"]["tasks"] == {}
+        assert by_name["current"]["startup_policy"] == "eager"
+        assert by_name["needs-key"]["auth_state"] == "missing_auth"
+        assert by_name["needs-key"]["startup_skip_reason"] == "missing_auth"
+        assert output["pending_requests"][0]["task_id"] == "task-1"
+        assert output["gateway_diagnostics"]["trace_context_supported"] is True
+
+    @pytest.mark.asyncio
     async def test_status_live_snapshot_human_with_pending_and_verbose(
         self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
     ) -> None:

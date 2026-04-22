@@ -163,6 +163,124 @@ class TestClientManager:
         assert second_params["protocolVersion"] == "2024-11-05"
         assert managed.status.protocol_version == "2024-11-05"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "protocol_version",
+        ["2024-11-05", "2025-03-26", "2025-06-18", "2025-11-25"],
+    )
+    async def test_conformance_initialize_supported_protocol_versions(
+        self, protocol_version: str
+    ) -> None:
+        manager = ClientManager()
+        _, managed = make_managed_for_protocol_tests()
+        capabilities = {"tools": {"listChanged": True}}
+        manager._send_request = AsyncMock(
+            return_value={
+                "protocolVersion": protocol_version,
+                "capabilities": capabilities,
+            }
+        )
+
+        await manager._send_initialize(managed)
+
+        params = manager._send_request.await_args.args[2]
+        assert params["protocolVersion"] == PREFERRED_PROTOCOL_VERSION
+        assert managed.status.protocol_version == protocol_version
+        assert managed.status.server_capabilities == capabilities
+
+    def test_conformance_old_and_current_fake_payload_metadata(self) -> None:
+        manager = ClientManager()
+
+        old_tool_count = manager._index_tools(
+            "old-stdio",
+            [{"name": "ping", "description": "Ping", "inputSchema": {}}],
+        )
+        old_resource_count = manager._index_resources(
+            "old-stdio",
+            [{"uri": "file:///old.txt", "name": "old"}],
+        )
+        old_prompt_count = manager._index_prompts(
+            "old-stdio",
+            [{"name": "old_prompt", "description": "Old prompt"}],
+        )
+        current_tool_count = manager._index_tools(
+            "current",
+            [
+                {
+                    "name": "render",
+                    "title": "Render",
+                    "description": "Render with modern metadata",
+                    "inputSchema": {
+                        "$schema": "https://json-schema.org/draft/2020-12/schema",
+                        "type": "object",
+                    },
+                    "outputSchema": {"type": "object", "properties": {}},
+                    "icons": [{"src": "render.svg"}],
+                    "annotations": {"readOnlyHint": False},
+                    "execution": {"taskSupport": "optional"},
+                    "x-additive": {"preserved": True},
+                }
+            ],
+        )
+        current_resource_count = manager._index_resources(
+            "current",
+            [
+                {
+                    "uri": "file:///current.txt",
+                    "name": "current",
+                    "title": "Current Resource",
+                    "icons": [{"src": "resource.svg"}],
+                    "annotations": {"audience": ["assistant"]},
+                    "x-resource": "kept",
+                }
+            ],
+        )
+        current_prompt_count = manager._index_prompts(
+            "current",
+            [
+                {
+                    "name": "current_prompt",
+                    "title": "Current Prompt",
+                    "icons": [{"src": "prompt.svg"}],
+                    "annotations": {"priority": 1},
+                    "arguments": [{"name": "topic", "x-arg": "kept"}],
+                    "x-prompt": "kept",
+                }
+            ],
+        )
+
+        old_tool = manager.get_tool("old-stdio::ping")
+        current_tool = manager.get_tool("current::render")
+        current_resource = manager.get_resource("current::file:///current.txt")
+        current_prompt = manager.get_prompt_info("current::current_prompt")
+
+        assert (old_tool_count, old_resource_count, old_prompt_count) == (1, 1, 1)
+        assert (current_tool_count, current_resource_count, current_prompt_count) == (
+            1,
+            1,
+            1,
+        )
+        assert old_tool is not None
+        assert old_tool.title is None
+        assert old_tool.schema_dialect == DEFAULT_SCHEMA_DIALECT
+        assert old_tool.raw_metadata is None
+        assert current_tool is not None
+        assert current_tool.title == "Render"
+        assert current_tool.icons == [{"src": "render.svg"}]
+        assert current_tool.output_schema == {"type": "object", "properties": {}}
+        assert current_tool.annotations == {"readOnlyHint": False}
+        assert current_tool.execution == {"taskSupport": "optional"}
+        assert current_tool.schema_dialect == (
+            "https://json-schema.org/draft/2020-12/schema"
+        )
+        assert current_tool.raw_metadata == {"x-additive": {"preserved": True}}
+        assert current_resource is not None
+        assert current_resource.raw_metadata == {"x-resource": "kept"}
+        assert current_prompt is not None
+        assert current_prompt.raw_metadata == {"x-prompt": "kept"}
+        assert current_prompt.arguments is not None
+        assert current_prompt.arguments[0].raw_metadata == {"x-arg": "kept"}
+
     def test_index_tools_preserves_modern_metadata_and_schema_dialect(self) -> None:
         manager = ClientManager()
 

@@ -943,6 +943,56 @@ class TestCatalogSearch:
         assert card.icons is None
         assert card.execution is None
 
+    @pytest.mark.asyncio
+    async def test_conformance_catalog_order_without_relevance_ranking(self) -> None:
+        tools = [
+            ToolInfo(
+                tool_id="zeta::beta",
+                server_name="zeta",
+                tool_name="beta",
+                description="Beta",
+                short_description="Beta",
+                input_schema={},
+                tags=[],
+                risk_hint=RiskHint.LOW,
+            ),
+            ToolInfo(
+                tool_id="alpha::gamma",
+                server_name="alpha",
+                tool_name="gamma",
+                description="Gamma",
+                short_description="Gamma",
+                input_schema={},
+                tags=[],
+                risk_hint=RiskHint.LOW,
+            ),
+            ToolInfo(
+                tool_id="alpha::alpha",
+                server_name="alpha",
+                tool_name="alpha",
+                description="Alpha",
+                short_description="Alpha",
+                input_schema={},
+                tags=[],
+                risk_hint=RiskHint.LOW,
+            ),
+        ]
+        client_manager = MockClientManager(tools)
+        client_manager.set_server_online("zeta")
+        client_manager.set_server_online("alpha")
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        result = await gateway_tools.catalog_search({})
+
+        assert [card.tool_id for card in result.results] == [
+            "alpha::alpha",
+            "alpha::gamma",
+            "zeta::beta",
+        ]
+
 
 class TestServerLifecycleTools:
     """Tests for gateway server lifecycle tools."""
@@ -1462,6 +1512,87 @@ class TestHealth:
         assert any(source.path == str(config_path) for source in policy.sources)
 
     @pytest.mark.asyncio
+    async def test_conformance_config_status_and_startup_policy_admin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        config_path = tmp_path / ".mcp.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "configured": {"command": "configured-cmd"},
+                    },
+                    "autoStart": ["configured", "needs-key"],
+                }
+            )
+        )
+        monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest",
+            lambda: Manifest(
+                version="1.0",
+                cli_alternatives={},
+                servers={
+                    "needs-key": ServerConfig(
+                        name="needs-key",
+                        description="Needs key",
+                        keywords=["auth"],
+                        install={},
+                        command="needs-key-cmd",
+                        args=[],
+                        requires_api_key=True,
+                        env_var="PMCP_TEST_KEY",
+                    )
+                },
+                discovery_queue_path=".mcp-gateway/discovery_queue.json",
+            ),
+        )
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(create_mock_tools()),  # type: ignore
+            policy_manager=PolicyManager(),
+            project_root=tmp_path,
+        )
+
+        status = await gateway_tools.config_status()
+        preview = await gateway_tools.set_startup_policy(
+            {
+                "operation": "add",
+                "names": ["preview-only"],
+                "path": str(config_path),
+            }
+        )
+        no_op_apply = await gateway_tools.set_startup_policy(
+            {
+                "operation": "add",
+                "names": ["configured"],
+                "path": str(config_path),
+                "apply": True,
+                "dry_run": False,
+            }
+        )
+        policy = await gateway_tools.get_startup_policy()
+
+        entries = {entry.name: entry for entry in status.entries}
+        assert entries["configured"].startup_policy == "eager"
+        assert entries["needs-key"].startup_policy == "skipped"
+        assert entries["needs-key"].startup_skip_reason == "missing_auth"
+        assert "missing_auth" in entries["needs-key"].diagnostics
+        assert preview.changed is True
+        assert preview.dry_run is True
+        assert preview.after_autoStart == ["configured", "needs-key", "preview-only"]
+        assert json.loads(config_path.read_text())["autoStart"] == [
+            "configured",
+            "needs-key",
+        ]
+        assert no_op_apply.ok is True
+        assert no_op_apply.changed is False
+        assert [
+            source.autoStart
+            for source in policy.sources
+            if source.path == str(config_path)
+        ] == [["configured", "needs-key"]]
+
+    @pytest.mark.asyncio
     async def test_health_includes_protocol_metadata(
         self, gateway_tools: GatewayTools
     ) -> None:
@@ -1491,6 +1622,64 @@ class TestHealth:
         assert modern.server_capabilities == {"tools": {"listChanged": True}}
         assert old.protocol_version is None
         assert old.server_capabilities is None
+
+    @pytest.mark.asyncio
+    async def test_conformance_health_order_auth_states_and_audit(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        cast(Any, gateway_tools._client_manager).set_server_statuses(
+            [
+                ServerStatus(
+                    name="zeta",
+                    status=ServerStatusEnum.ERROR,
+                    tool_count=0,
+                    last_error=(
+                        'WWW-Authenticate: Bearer resource_metadata="'
+                        'https://auth.example/resource", scope="read write", '
+                        'error="insufficient_scope"'
+                    ),
+                ),
+                ServerStatus(
+                    name="alpha",
+                    status=ServerStatusEnum.ONLINE,
+                    tool_count=1,
+                    protocol_version="2025-11-25",
+                    server_capabilities={"tasks": {}},
+                ),
+            ]
+        )
+        await gateway_tools.invoke(
+            {
+                "tool_id": "github::list_issues",
+                "arguments": {},
+                "_meta": {
+                    "traceparent": (
+                        "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+                    ),
+                    "baggage": "authorization=Bearer secret",
+                },
+            }
+        )
+
+        result = await gateway_tools.health()
+
+        by_name = {server.name: server for server in result.servers}
+        tested_names = [
+            server.name for server in result.servers if server.name in {"alpha", "zeta"}
+        ]
+        assert tested_names == ["alpha", "zeta"]
+        assert by_name["alpha"].protocol_version == "2025-11-25"
+        assert by_name["zeta"].auth_state == "insufficient_scope"
+        assert by_name["zeta"].auth_challenge is not None
+        assert by_name["zeta"].auth_challenge.missing_scopes == ["read", "write"]
+        assert result.audit_events is not None
+        event = result.audit_events[-1]
+        assert event.method == "gateway.invoke"
+        assert event.action == "invoke"
+        assert event.tool_id == "github::list_issues"
+        assert event.outcome == "success"
+        assert event.latency_ms >= 0
+        assert event.trace_present is True
 
     @pytest.mark.asyncio
     async def test_includes_error_details_for_error_servers(
@@ -2699,6 +2888,46 @@ class TestInvokeErrorPaths:
 
         assert result.ok is False
         assert result.status == "not_found"
+
+    @pytest.mark.asyncio
+    async def test_conformance_task_gateway_route_and_audit(self) -> None:
+        tool = self._make_tool(execution={"taskSupport": "optional"})
+        gt = self._make_gateway_tools(tool=tool)
+
+        invoked = await gt.invoke(
+            {
+                "tool_id": "svc::do_thing",
+                "arguments": {},
+                "task": {"metadata": {"reason": "slow"}},
+            }
+        )
+        listed = await gt.tasks_list({"server_name": "svc"})
+        got = await gt.tasks_get({"server_name": "svc", "task_id": "task-1"})
+        result = await gt.tasks_result({"server_name": "svc", "task_id": "task-1"})
+        cancelled = await gt.tasks_cancel({"server_name": "svc", "task_id": "task-1"})
+        health = await gt.health()
+
+        assert invoked.ok is True
+        assert invoked.task is not None
+        assert invoked.task.task_id == "task-1"
+        assert [task.task_id for task in listed.tasks] == ["task-1"]
+        assert got.task is not None
+        assert got.task.task_id == "task-1"
+        assert result.task is not None
+        assert result.task.status == "completed"
+        assert cancelled.ok is True
+        assert cancelled.task is not None
+        assert cancelled.task.status == "completed"
+        assert health.audit_events is not None
+        methods = [event.method for event in health.audit_events[-5:]]
+        assert methods == [
+            "gateway.invoke",
+            "gateway.tasks_list",
+            "gateway.tasks_get",
+            "gateway.tasks_result",
+            "gateway.tasks_cancel",
+        ]
+        assert health.audit_events[-1].task_id == "task-1"
 
 
 class TestSanitizeError:
