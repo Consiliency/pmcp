@@ -7,14 +7,18 @@ from pathlib import Path
 
 
 from pmcp.config.loader import (
+    get_startup_policy,
     load_disabled_auto_start,
     load_enabled_auto_start,
+    load_config_sources,
     load_configs,
     make_tool_id,
     manifest_server_to_config,
     parse_tool_id,
+    set_startup_policy,
 )
 from pmcp.manifest.loader import ServerConfig
+from pmcp.types import StartupPolicyOperation
 
 
 class TestMakeToolId:
@@ -393,3 +397,76 @@ class TestLoadAutoStartPolicy:
             "custom-server",
             "shared-server",
         }
+
+    def test_source_aware_policy_reports_paths_and_conflicts(
+        self, tmp_path: Path
+    ) -> None:
+        (tmp_path / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"known": {"command": "node"}},
+                    "autoStart": ["known", "stale", "conflict"],
+                    "disableAutoStart": ["conflict"],
+                }
+            )
+        )
+
+        sources = load_config_sources(project_root=tmp_path, user_config_paths=[])
+        policy = get_startup_policy(
+            project_root=tmp_path,
+            user_config_paths=[],
+            known_server_names={"known"},
+        )
+
+        assert sources[0].source == "project"
+        assert sources[0].path == tmp_path / ".mcp.json"
+        assert policy.sources[0].autoStart == ["known", "stale", "conflict"]
+        assert {diagnostic.code for diagnostic in policy.diagnostics} == {
+            "auto_start_disabled_conflict",
+            "stale_auto_start",
+            "stale_disable_auto_start",
+        }
+
+    def test_startup_policy_preview_and_apply_preserves_unrelated_keys(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / ".mcp.json"
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {"existing": {"command": "node"}},
+                    "autoStart": ["existing"],
+                    "unrelated": {"keep": True},
+                }
+            )
+        )
+
+        preview = set_startup_policy(
+            StartupPolicyOperation(
+                operation="add",
+                names=["new", "existing"],
+                source="project",
+            ),
+            project_root=tmp_path,
+            user_config_paths=[],
+        )
+        assert preview.changed is True
+        assert preview.after_autoStart == ["existing", "new"]
+        assert json.loads(config_path.read_text())["autoStart"] == ["existing"]
+
+        applied = set_startup_policy(
+            StartupPolicyOperation(
+                operation="add",
+                names=["new", "existing"],
+                source="project",
+                dry_run=False,
+                apply=True,
+            ),
+            project_root=tmp_path,
+            user_config_paths=[],
+        )
+
+        written = json.loads(config_path.read_text())
+        assert applied.changed is True
+        assert written["autoStart"] == ["existing", "new"]
+        assert written["unrelated"] == {"keep": True}

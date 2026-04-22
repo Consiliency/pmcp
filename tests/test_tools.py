@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from typing import Any, cast
 import types
@@ -1427,6 +1428,38 @@ class TestHealth:
         assert result.gateway_diagnostics is not None
         assert result.gateway_diagnostics.audit_enabled is True
         assert result.gateway_diagnostics.trace_context_supported is True
+
+    @pytest.mark.asyncio
+    async def test_config_admin_tools_preview_startup_policy(
+        self, tmp_path: Path
+    ) -> None:
+        config_path = tmp_path / ".mcp.json"
+        config_path.write_text(json.dumps({"autoStart": ["existing"]}))
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(create_mock_tools()),  # type: ignore
+            policy_manager=PolicyManager(),
+            project_root=tmp_path,
+        )
+
+        definitions = {tool.name for tool in get_gateway_tool_definitions()}
+        preview = await gateway_tools.set_startup_policy(
+            {
+                "operation": "add",
+                "names": ["new"],
+                "path": str(config_path),
+            }
+        )
+        policy = await gateway_tools.get_startup_policy()
+
+        assert {
+            "gateway.config_status",
+            "gateway.get_startup_policy",
+            "gateway.set_startup_policy",
+        } <= definitions
+        assert preview.changed is True
+        assert preview.after_autoStart == ["existing", "new"]
+        assert json.loads(config_path.read_text())["autoStart"] == ["existing"]
+        assert any(source.path == str(config_path) for source in policy.sources)
 
     @pytest.mark.asyncio
     async def test_health_includes_protocol_metadata(

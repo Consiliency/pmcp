@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -130,6 +131,39 @@ def test_manifest_server_auth_metadata_fields_are_optional() -> None:
 
     assert server.requires_api_key is False
     assert server.declared_scopes == ["read", "write"]
+
+
+def test_manifest_parses_read_only_discovery_metadata(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        """
+version: "1.0"
+cli_alternatives: {}
+servers:
+  discovered:
+    description: "Discovered server"
+    keywords: ["discovery"]
+    install: {}
+    command: "npx"
+    args: ["-y", "@example/mcp"]
+    package: "@example/mcp"
+    server_card_url: "https://example.com/server-card.json"
+    declared_capabilities: ["tools"]
+    supports_url_elicitation: true
+    discovery_diagnostics: ["registry_metadata_read_only"]
+    discovery_metadata:
+      draftField: "kept-as-raw"
+"""
+    )
+
+    manifest = load_manifest(manifest_path)
+    server = manifest.servers["discovered"]
+
+    assert server.package == "@example/mcp"
+    assert server.server_card_url == "https://example.com/server-card.json"
+    assert server.declared_capabilities == ["tools"]
+    assert server.discovery_diagnostics == ["registry_metadata_read_only"]
+    assert server.raw_discovery_metadata == {"draftField": "kept-as-raw"}
     assert server.supports_url_elicitation is True
 
 

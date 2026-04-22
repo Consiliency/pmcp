@@ -29,6 +29,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when a live gateway reports them.
 - Streamable HTTP now reports safe `/health` transport diagnostics and tolerates
   `MCP-Protocol-Version`, `Mcp-Method`, `Mcp-Name`, and trace context headers.
+- Added CONFIG administration: `gateway.config_status`,
+  `gateway.get_startup_policy`, and `gateway.set_startup_policy` expose
+  source-attributed startup policy/status, preview-only default `autoStart`
+  edits, explicit atomic apply, and non-secret stale/conflict diagnostics.
+- `pmcp setup` now supports named profiles: `local-stdio`,
+  `shared-local-http`, `authenticated-shared-http`, and `ci`.
+- Registry and manifest discovery metadata can carry read-only package,
+  server-card, capability, and diagnostic hints without changing provisioning
+  semantics.
 
 ### Changed
 - `gateway.catalog_search`, `gateway.describe`, `gateway.health`, and

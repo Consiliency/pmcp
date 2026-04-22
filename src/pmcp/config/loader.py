@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from enum import Enum
@@ -12,11 +13,18 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pmcp.types import (
+    ConfigSourceInfo,
+    ConfigSourceName,
     LocalMcpServerConfig,
     McpConfigFile,
     McpServerConfig,
     RemoteMcpServerConfig,
     ResolvedServerConfig,
+    StartupPolicyDiagnostic,
+    StartupPolicyOperation,
+    StartupPolicyOutput,
+    StartupPolicyPreview,
+    StartupPolicySource,
 )
 
 if TYPE_CHECKING:
@@ -70,6 +78,26 @@ class StartupObservation:
 
 
 StartupObservationSnapshot = dict[str, StartupObservation]
+
+
+@dataclass(frozen=True)
+class LoadedConfigSource:
+    """Parsed config plus source/path metadata."""
+
+    source: ConfigSourceName
+    path: Path
+    exists: bool
+    config: McpConfigFile | None = None
+    raw_data: dict[str, Any] | None = None
+    error: str | None = None
+
+    def info(self) -> ConfigSourceInfo:
+        return ConfigSourceInfo(
+            source=self.source,
+            path=str(self.path),
+            exists=self.exists,
+            error=self.error,
+        )
 
 
 def build_startup_observation_snapshot(
@@ -216,6 +244,286 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
     except Exception as e:
         logger.warning(f"Failed to parse config file {file_path}: {e}")
         return None
+
+
+def _iter_config_source_paths(
+    project_root: Path | None = None,
+    user_config_paths: Sequence[Path] | None = None,
+    custom_config_path: Path | None = None,
+) -> list[tuple[ConfigSourceName, Path]]:
+    paths: list[tuple[ConfigSourceName, Path]] = []
+    resolved_project_root = project_root or find_project_root(Path.cwd())
+    if resolved_project_root:
+        paths.append(("project", resolved_project_root / ".mcp.json"))
+
+    user_paths = (
+        list(user_config_paths)
+        if user_config_paths is not None
+        else DEFAULT_USER_CONFIG_PATHS
+    )
+    paths.extend(("user", path) for path in user_paths)
+
+    resolved_custom_path = custom_config_path
+    if not resolved_custom_path:
+        env_path = os.environ.get("PMCP_CONFIG")
+        if env_path:
+            resolved_custom_path = Path(env_path)
+    if resolved_custom_path:
+        paths.append(("custom", resolved_custom_path))
+
+    return paths
+
+
+def _read_config_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    if not path.exists():
+        return None, None
+    try:
+        data = json.loads(path.read_text())
+    except Exception as exc:
+        return None, f"invalid_json: {exc}"
+    if not isinstance(data, dict):
+        return None, "config_root_not_object"
+    return data, None
+
+
+def load_config_sources(
+    project_root: Path | None = None,
+    user_config_paths: Sequence[Path] | None = None,
+    custom_config_path: Path | None = None,
+) -> list[LoadedConfigSource]:
+    """Load MCP config files with source/path attribution."""
+    sources: list[LoadedConfigSource] = []
+    for source, path in _iter_config_source_paths(
+        project_root=project_root,
+        user_config_paths=user_config_paths,
+        custom_config_path=custom_config_path,
+    ):
+        raw_data, error = _read_config_object(path)
+        config = None
+        if raw_data is not None:
+            config = parse_json_file(path)
+            if config is None:
+                error = error or "invalid_mcp_config"
+        sources.append(
+            LoadedConfigSource(
+                source=source,
+                path=path,
+                exists=path.exists(),
+                config=config,
+                raw_data=raw_data,
+                error=error,
+            )
+        )
+    return sources
+
+
+def get_startup_policy(
+    project_root: Path | None = None,
+    user_config_paths: Sequence[Path] | None = None,
+    custom_config_path: Path | None = None,
+    known_server_names: Collection[str] = (),
+) -> StartupPolicyOutput:
+    """Return persisted autoStart/disableAutoStart entries by source."""
+    sources = load_config_sources(project_root, user_config_paths, custom_config_path)
+    known = set(known_server_names)
+    output_sources: list[StartupPolicySource] = []
+    diagnostics: list[StartupPolicyDiagnostic] = []
+
+    for source in sources:
+        auto_start = list(source.config.autoStart) if source.config else []
+        disabled = list(source.config.disableAutoStart) if source.config else []
+        output_sources.append(
+            StartupPolicySource(
+                source=source.source,
+                path=str(source.path),
+                exists=source.exists,
+                autoStart=auto_start,
+                disableAutoStart=disabled,
+                error=source.error,
+            )
+        )
+        if source.error:
+            diagnostics.append(
+                StartupPolicyDiagnostic(
+                    code="invalid_source",
+                    message=source.error,
+                    source=source.source,
+                    path=str(source.path),
+                )
+            )
+        for name in sorted(set(auto_start) & set(disabled)):
+            diagnostics.append(
+                StartupPolicyDiagnostic(
+                    code="auto_start_disabled_conflict",
+                    message=f"{name} is listed in both autoStart and disableAutoStart",
+                    source=source.source,
+                    path=str(source.path),
+                    server_name=name,
+                )
+            )
+        if known:
+            for name in sorted(set(auto_start) - known):
+                diagnostics.append(
+                    StartupPolicyDiagnostic(
+                        code="stale_auto_start",
+                        message=f"{name} is listed in autoStart but no server definition was found",
+                        source=source.source,
+                        path=str(source.path),
+                        server_name=name,
+                    )
+                )
+            for name in sorted(set(disabled) - known):
+                diagnostics.append(
+                    StartupPolicyDiagnostic(
+                        code="stale_disable_auto_start",
+                        message=f"{name} is listed in disableAutoStart but no server definition was found",
+                        source=source.source,
+                        path=str(source.path),
+                        server_name=name,
+                    )
+                )
+    return StartupPolicyOutput(sources=output_sources, diagnostics=diagnostics)
+
+
+def _select_policy_source(
+    operation: StartupPolicyOperation,
+    sources: Sequence[LoadedConfigSource],
+) -> LoadedConfigSource | None:
+    if operation.path:
+        target = Path(operation.path).expanduser()
+        for source in sources:
+            if source.path == target:
+                return source
+        return LoadedConfigSource(
+            source=operation.source or "custom",
+            path=target,
+            exists=target.exists(),
+            config=None,
+            raw_data=None,
+        )
+    if not operation.source:
+        return None
+    candidates = [source for source in sources if source.source == operation.source]
+    existing = [source for source in candidates if source.exists]
+    if len(existing) == 1:
+        return existing[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w", dir=path.parent, delete=False, encoding="utf-8"
+    ) as tmp_file:
+        json.dump(data, tmp_file, indent=2)
+        tmp_file.write("\n")
+        tmp_path = Path(tmp_file.name)
+    tmp_path.replace(path)
+
+
+def set_startup_policy(
+    operation: StartupPolicyOperation,
+    project_root: Path | None = None,
+    user_config_paths: Sequence[Path] | None = None,
+    custom_config_path: Path | None = None,
+) -> StartupPolicyPreview:
+    """Preview or apply a source-scoped autoStart mutation."""
+    sources = load_config_sources(project_root, user_config_paths, custom_config_path)
+    target = _select_policy_source(operation, sources)
+    if target is None:
+        return StartupPolicyPreview(
+            ok=False,
+            dry_run=operation.dry_run,
+            diagnostics=[
+                StartupPolicyDiagnostic(
+                    code="ambiguous_source",
+                    message="Select exactly one startup policy source or path",
+                    source=operation.source,
+                    path=operation.path,
+                )
+            ],
+            message="No startup policy change was applied.",
+        )
+
+    raw_data, error = _read_config_object(target.path)
+    if error:
+        return StartupPolicyPreview(
+            ok=False,
+            source=target.source,
+            path=str(target.path),
+            dry_run=operation.dry_run,
+            diagnostics=[
+                StartupPolicyDiagnostic(
+                    code="invalid_source",
+                    message=error,
+                    source=target.source,
+                    path=str(target.path),
+                )
+            ],
+            message="No startup policy change was applied.",
+        )
+    data = raw_data if raw_data is not None else {}
+
+    names = sorted({name for name in operation.names if name})
+    before = data.get("autoStart", [])
+    if before is None:
+        before = []
+    if not isinstance(before, list) or not all(
+        isinstance(name, str) for name in before
+    ):
+        return StartupPolicyPreview(
+            ok=False,
+            source=target.source,
+            path=str(target.path),
+            dry_run=operation.dry_run,
+            diagnostics=[
+                StartupPolicyDiagnostic(
+                    code="invalid_auto_start",
+                    message="autoStart must be a list of strings",
+                    source=target.source,
+                    path=str(target.path),
+                )
+            ],
+            message="No startup policy change was applied.",
+        )
+
+    current = set(before)
+    if operation.operation == "add":
+        updated = current | set(names)
+    elif operation.operation == "remove":
+        updated = current - set(names)
+    else:
+        updated = set(names)
+    after = sorted(updated)
+    changed = sorted(current) != after
+    should_write = operation.apply and not operation.dry_run and changed
+    if should_write:
+        data["autoStart"] = after
+        _atomic_write_json(target.path, data)
+
+    message = "Startup policy preview generated."
+    if operation.apply and operation.dry_run:
+        message = "Dry run only; set dry_run=false with apply=true to write."
+    elif operation.apply and changed:
+        message = "Startup policy updated."
+    elif not changed:
+        message = "No startup policy change needed."
+
+    return StartupPolicyPreview(
+        ok=True,
+        source=target.source,
+        path=str(target.path),
+        changed=changed,
+        dry_run=not should_write,
+        before_autoStart=sorted(current),
+        after_autoStart=after,
+        message=message,
+        next_step='gateway.refresh(reason="startup_policy_changed")'
+        if should_write
+        else None,
+    )
 
 
 def _merge_manifest_defaults(

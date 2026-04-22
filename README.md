@@ -20,7 +20,7 @@ Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a k
 
 **PMCP** acts as a single MCP server that Claude Code connects to. Instead of exposing all downstream tools, it provides:
 
-- **23 stable meta-tools** (not the 50+ underlying tools)
+- **26 stable meta-tools** (not the 50+ underlying tools)
 - **Lazy by default**: downstream servers are available on demand and only eager-start when listed in `autoStart`
 - **Dynamically provisions** new servers on-demand from a manifest of 90+
 - **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
@@ -59,6 +59,15 @@ pmcp setup --client claude --mode stdio    # Claude local stdio
 pmcp setup --client claude --mode http     # Claude shared-service HTTP
 pmcp setup --client opencode --mode stdio  # OpenCode local stdio
 pmcp setup --client opencode --mode http   # OpenCode shared-service HTTP
+```
+
+Named profiles cover the common modes:
+
+```bash
+pmcp setup --profile local-stdio
+pmcp setup --profile shared-local-http
+pmcp setup --profile authenticated-shared-http
+pmcp setup --profile ci
 ```
 
 Write directly into your client config with `--write`:
@@ -248,7 +257,7 @@ Returns: Screenshot of google.com
                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                          PMCP                               │
-│  • 23 meta-tools (catalog, invoke, tasks, provision, etc.)  │
+│  • 26 meta-tools (catalog, invoke, tasks, config, etc.)     │
 │  • Progressive disclosure (compact cards → full schemas)    │
 │  • Policy enforcement (allow/deny lists)                    │
 └────────────────────────────┬────────────────────────────────┘
@@ -267,14 +276,14 @@ The gateway discovers and manages all other servers.
 
 ### Why Single-Gateway?
 
-1. **No context bloat** - Claude sees 19 tools, not 50+
+1. **No context bloat** - Claude sees 26 tools, not 50+
 2. **No restarts** - Provision new servers without restarting Claude Code
 3. **Consistent interface** - All tools accessed via `gateway.invoke`
 4. **Policy control** - Centralized allow/deny rules
 
 ## Gateway Tools
 
-The gateway exposes **23 meta-tools** organized into four categories:
+The gateway exposes **26 meta-tools** organized into four categories:
 
 Tool annotations are preserved as untrusted hints only; policy and safety notes
 continue to use PMCP's own risk model. When a tool schema omits `$schema`, PMCP
@@ -289,6 +298,9 @@ reports the JSON Schema dialect as `https://json-schema.org/draft/2020-12/schema
 | `gateway.invoke` | Call a downstream tool with argument validation, including task-augmented execution for task-capable tools |
 | `gateway.refresh` | Reload backend configs and reconnect; refuses while requests or active MCP tasks are pending unless `force=true` |
 | `gateway.health` | Get gateway and server health status |
+| `gateway.config_status` | Read effective config and startup/auth status with source attribution |
+| `gateway.get_startup_policy` | Read persisted `autoStart` and legacy `disableAutoStart` entries by source |
+| `gateway.set_startup_policy` | Preview or explicitly apply `autoStart` add/remove/set operations against one selected source |
 
 ### Lifecycle Tools
 
@@ -526,6 +538,26 @@ Startup policy decisions are visible through `gateway.health` and live
 | `auth_state` | Machine-readable downstream auth state such as `missing_auth`, `insufficient_scope`, `elicitation_required`, or `policy_denied` |
 | `next_step` | Non-secret suggested next action when an auth state needs operator action |
 
+For persistent administration, use the config tools:
+
+```json
+gateway.config_status({})
+gateway.get_startup_policy({})
+gateway.set_startup_policy({
+  "operation": "add",
+  "names": ["playwright"],
+  "source": "project"
+})
+```
+
+`gateway.set_startup_policy` is preview-only by default. To write, select exactly
+one `source` or `path` and pass both `"apply": true` and `"dry_run": false`.
+The writer updates only top-level `autoStart`, preserves unrelated `.mcp.json`
+keys and server definitions, writes atomically, and returns a refresh next step
+instead of silently reconnecting servers. Diagnostics report stale `autoStart`,
+legacy `disableAutoStart` conflicts, policy-denied rows, and missing-auth rows
+without printing secret values.
+
 PMCP negotiates the current MCP protocol version with downstream servers and
 continues to connect to older supported servers. `gateway.health` and
 `pmcp status --json` can include the negotiated `protocol_version` and declared
@@ -699,6 +731,17 @@ and `context7`. Omit a server from `autoStart` to keep it lazy.
 The legacy top-level `disableAutoStart` list remains supported for deployments
 that temporarily enable `PMCP_LEGACY_MANIFEST_AUTOSTART=1`, but packaged PMCP
 defaults no longer require it.
+
+The same policy is available locally from the CLI:
+
+```bash
+pmcp config status --json
+pmcp config startup-policy
+pmcp config set-startup-policy add playwright --source project
+pmcp config set-startup-policy add playwright --source project --apply
+```
+
+CLI mutation previews by default. `--apply` is required before writing.
 
 Lazy Excalidraw example:
 

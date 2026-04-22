@@ -151,6 +151,12 @@ class GatewayServer:
                     result = await self._gateway_tools.restart_server(arguments)
                 elif name == "gateway.health":
                     result = await self._gateway_tools.health()
+                elif name == "gateway.config_status":
+                    result = await self._gateway_tools.config_status()
+                elif name == "gateway.get_startup_policy":
+                    result = await self._gateway_tools.get_startup_policy()
+                elif name == "gateway.set_startup_policy":
+                    result = await self._gateway_tools.set_startup_policy(arguments)
                 elif name == "gateway.request_capability":
                     result = await self._gateway_tools.request_capability(arguments)
                 elif name == "gateway.sync_environment":

@@ -51,6 +51,11 @@ class ServerConfig:
     client_id_metadata_document_url: str | None = None
     declared_scopes: list[str] = field(default_factory=list)
     supports_url_elicitation: bool = False
+    package: str | None = None
+    server_card_url: str | None = None
+    declared_capabilities: list[str] = field(default_factory=list)
+    discovery_diagnostics: list[str] = field(default_factory=list)
+    raw_discovery_metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # Category taxonomy used by Manifest.get_category_summary() and get_servers_in_category()
@@ -306,6 +311,13 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         data.get("transport", "streamable-http" if data.get("url") else "local"),
     )
 
+    raw_discovery_metadata = data.get("discovery_metadata", {})
+    if not isinstance(raw_discovery_metadata, dict):
+        raw_discovery_metadata = {}
+    discovery_diagnostics = data.get("discovery_diagnostics", [])
+    if not isinstance(discovery_diagnostics, list):
+        discovery_diagnostics = ["invalid_discovery_diagnostics"]
+
     return ServerConfig(
         name=name,
         description=data.get("description", ""),
@@ -327,6 +339,11 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         client_id_metadata_document_url=data.get("client_id_metadata_document_url"),
         declared_scopes=data.get("declared_scopes", []),
         supports_url_elicitation=data.get("supports_url_elicitation", False),
+        package=data.get("package"),
+        server_card_url=data.get("server_card_url"),
+        declared_capabilities=data.get("declared_capabilities", []),
+        discovery_diagnostics=discovery_diagnostics,
+        raw_discovery_metadata=raw_discovery_metadata,
     )
 
 

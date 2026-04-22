@@ -29,6 +29,13 @@ from pmcp.cli_commands.secrets import (
     run_secrets_set,
     run_secrets_sync,
 )
+from pmcp.config.loader import (
+    get_startup_policy,
+    load_configs,
+    set_startup_policy,
+)
+from pmcp.manifest.loader import load_manifest
+from pmcp.types import StartupPolicyOperation
 
 
 from logging.handlers import RotatingFileHandler
@@ -424,6 +431,40 @@ Environment overrides:
         action="store_true",
         help="Write merged config to the client config file",
     )
+    setup_parser.add_argument(
+        "--profile",
+        choices=[
+            "local-stdio",
+            "shared-local-http",
+            "authenticated-shared-http",
+            "ci",
+        ],
+        help="Named setup profile; preserves --client/--mode defaults when omitted",
+    )
+
+    # Config administration command
+    config_parser = subparsers.add_parser(
+        "config",
+        help="Inspect and edit PMCP configuration policy",
+    )
+    config_subparsers = config_parser.add_subparsers(dest="config_command")
+    config_status_parser = config_subparsers.add_parser(
+        "status", help="Show effective local configuration status"
+    )
+    config_status_parser.add_argument("--json", action="store_true")
+    config_policy_parser = config_subparsers.add_parser(
+        "startup-policy", help="Show persisted startup policy"
+    )
+    config_policy_parser.add_argument("--json", action="store_true")
+    config_set_parser = config_subparsers.add_parser(
+        "set-startup-policy", help="Preview or apply an autoStart mutation"
+    )
+    config_set_parser.add_argument("operation", choices=["add", "remove", "set"])
+    config_set_parser.add_argument("names", nargs="*")
+    config_set_parser.add_argument("--source", choices=["project", "user", "custom"])
+    config_set_parser.add_argument("--path")
+    config_set_parser.add_argument("--apply", action="store_true")
+    config_set_parser.add_argument("--json", action="store_true")
 
     # Guidance command
     guidance_parser = subparsers.add_parser(
@@ -1309,47 +1350,74 @@ async def run_init(args: argparse.Namespace) -> None:
     print("\nRun 'pmcp' to start the gateway.")
 
 
-def _build_setup_config(mode: str, client: str) -> dict:
+SETUP_PROFILES: dict[str, dict[str, str]] = {
+    "local-stdio": {"mode": "stdio"},
+    "shared-local-http": {"mode": "http"},
+    "authenticated-shared-http": {"mode": "http", "authenticated": "1"},
+    "ci": {"mode": "stdio", "ci": "1"},
+}
+
+
+def _build_setup_config(
+    mode: str, client: str, *, authenticated: bool = False, ci: bool = False
+) -> dict:
     """Build client config snippet for PMCP."""
     if client == "claude":
         if mode in ("sse", "http"):
+            server: dict[str, object] = {
+                "type": "http",
+                "url": "http://127.0.0.1:3344/mcp",
+            }
+            if authenticated:
+                server["headers"] = {"Authorization": "Bearer ${PMCP_AUTH_TOKEN}"}
             return {
                 "mcpServers": {
-                    "pmcp": {
-                        "type": "http",
-                        "url": "http://127.0.0.1:3344/mcp",
-                    }
+                    "pmcp": server,
                 }
             }
+        env = {"PMCP_LOG_LEVEL": "error"} if ci else None
+        server = {"command": "pmcp", "args": []}
+        if env:
+            server["env"] = env
         return {
             "mcpServers": {
-                "pmcp": {
-                    "command": "pmcp",
-                    "args": [],
-                }
+                "pmcp": server,
             }
         }
 
     # OpenCode
     if mode in ("sse", "http"):
+        server = {
+            "type": "remote",
+            "url": "http://127.0.0.1:3344/mcp",
+            "enabled": True,
+        }
+        if authenticated:
+            server["headers"] = {"Authorization": "Bearer ${PMCP_AUTH_TOKEN}"}
         return {
             "mcp": {
-                "pmcp": {
-                    "type": "remote",
-                    "url": "http://127.0.0.1:3344/mcp",
-                    "enabled": True,
-                }
+                "pmcp": server,
             }
         }
+    server = {"type": "local", "command": "pmcp", "enabled": True}
+    if ci:
+        server["environment"] = {"PMCP_LOG_LEVEL": "error"}
     return {
         "mcp": {
-            "pmcp": {
-                "type": "local",
-                "command": "pmcp",
-                "enabled": True,
-            }
+            "pmcp": server,
         }
     }
+
+
+def _setup_profile_options(args: argparse.Namespace) -> tuple[str, bool, bool]:
+    if not getattr(args, "profile", None):
+        return args.mode, False, False
+    profile = SETUP_PROFILES[args.profile]
+    return (
+        profile.get("mode", args.mode),
+        profile.get("authenticated") == "1",
+        profile.get("ci") == "1",
+    )
 
 
 def _get_setup_target_path(client: str) -> Path:
@@ -1389,7 +1457,13 @@ def _atomic_write_json(path: Path, data: dict) -> None:
 
 def run_setup(args: argparse.Namespace) -> None:
     """Render or write PMCP config for a supported client."""
-    config = _build_setup_config(mode=args.mode, client=args.client)
+    mode, authenticated, ci = _setup_profile_options(args)
+    config = _build_setup_config(
+        mode=mode,
+        client=args.client,
+        authenticated=authenticated,
+        ci=ci,
+    )
 
     if not args.write:
         print(json.dumps(config, indent=2))
@@ -1414,6 +1488,74 @@ def run_setup(args: argparse.Namespace) -> None:
     merged = _merge_setup_config(existing, config)
     _atomic_write_json(target_path, merged)
     print(f"Wrote PMCP setup to: {target_path}")
+
+
+def run_config(args: argparse.Namespace) -> None:
+    """Run local config administration commands."""
+    command = getattr(args, "config_command", None)
+    configs = load_configs()
+    manifest = load_manifest().servers
+    known_names = {config.name for config in configs} | set(manifest)
+    if command == "startup-policy":
+        policy_output = get_startup_policy(known_server_names=known_names)
+        if args.json:
+            print(policy_output.model_dump_json(indent=2))
+            return
+        for source in policy_output.sources:
+            print(f"{source.source}: {source.path}")
+            print(f"  autoStart: {', '.join(source.autoStart) or '-'}")
+            print(f"  disableAutoStart: {', '.join(source.disableAutoStart) or '-'}")
+        for diagnostic in policy_output.diagnostics:
+            print(f"WARN {diagnostic.code}: {diagnostic.message}")
+        return
+    if command == "set-startup-policy":
+        preview_output = set_startup_policy(
+            StartupPolicyOperation(
+                operation=args.operation,
+                names=args.names,
+                source=args.source,
+                path=args.path,
+                apply=args.apply,
+                dry_run=not args.apply,
+            )
+        )
+        if args.json:
+            print(preview_output.model_dump_json(indent=2))
+            return
+        print(preview_output.message)
+        if preview_output.path:
+            print(f"Source: {preview_output.path}")
+        print(f"Before: {', '.join(preview_output.before_autoStart) or '-'}")
+        print(f"After: {', '.join(preview_output.after_autoStart) or '-'}")
+        for diagnostic in preview_output.diagnostics:
+            print(f"WARN {diagnostic.code}: {diagnostic.message}")
+        return
+    if command == "status":
+        policy = get_startup_policy(known_server_names=known_names)
+        rows = [
+            {
+                "name": config.name,
+                "source": config.source,
+                "startup_policy": "eager"
+                if any(config.name in source.autoStart for source in policy.sources)
+                else "lazy",
+            }
+            for config in configs
+        ]
+        status_output = {
+            "servers": rows,
+            "diagnostics": [d.model_dump() for d in policy.diagnostics],
+        }
+        if args.json:
+            print(json.dumps(status_output, indent=2))
+            return
+        for row in rows:
+            print(f"{row['name']}: {row['startup_policy']} ({row['source']})")
+        for diagnostic in policy.diagnostics:
+            print(f"WARN {diagnostic.code}: {diagnostic.message}")
+        return
+    print("Error: config subcommand required", file=sys.stderr)
+    sys.exit(2)
 
 
 def _is_pmcp_system_service_active() -> bool | None:
@@ -2027,6 +2169,8 @@ async def async_main(args: argparse.Namespace) -> None:
         await run_init(args)
     elif args.command == "setup":
         run_setup(args)  # Synchronous command
+    elif args.command == "config":
+        run_config(args)  # Synchronous command
     elif args.command == "guidance":
         run_guidance(args)  # Synchronous command
     elif args.command == "doctor":

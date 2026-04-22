@@ -109,6 +109,23 @@ def test_run_setup_renders_claude_stdio_config(capsys) -> None:
     }
 
 
+def test_run_setup_renders_named_profiles(capsys) -> None:
+    """Named profiles should map to explicit setup snippets without writing."""
+    args = argparse.Namespace(
+        mode="http",
+        client="claude",
+        write=False,
+        profile="authenticated-shared-http",
+    )
+
+    run_setup(args)
+
+    output = json.loads(capsys.readouterr().out)
+    server = output["mcpServers"]["pmcp"]
+    assert server["type"] == "http"
+    assert server["headers"] == {"Authorization": "Bearer ${PMCP_AUTH_TOKEN}"}
+
+
 @pytest.mark.asyncio
 async def test_setup_command_dispatches_with_opencode_sse_write() -> None:
     """async_main should dispatch setup command with parsed OpenCode SSE args."""

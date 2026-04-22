@@ -34,12 +34,15 @@ from pmcp.config.loader import (
     StartupObservationSnapshot,
     StartupSkipReason,
     build_startup_observation_snapshot,
+    get_startup_policy,
     is_legacy_manifest_auto_start_enabled,
+    load_config_sources,
     load_configs,
     load_disabled_auto_start,
     load_enabled_auto_start,
     manifest_server_to_config,
     resolve_startup_configs,
+    set_startup_policy,
     summarize_startup_resolution,
 )
 from pmcp.errors import ErrorCode, GatewayException, make_error
@@ -71,8 +74,10 @@ from pmcp.types import (
     CapabilityResolution,
     CatalogSearchInput,
     CatalogSearchOutput,
+    ConfigStatusOutput,
     DescribeInput,
     DescriptionsCache,
+    EffectiveConfigEntry,
     GatewayAuditEvent,
     GatewayDiagnosticsInfo,
     HealthOutput,
@@ -100,6 +105,9 @@ from pmcp.types import (
     SearchRegistryOutput,
     SearchRegistryResult,
     ServerHealthInfo,
+    StartupPolicyOperation,
+    StartupPolicyOutput,
+    StartupPolicyPreview,
     SyncEnvironmentInput,
     SyncEnvironmentOutput,
     SubmitFeedbackInput,
@@ -350,6 +358,47 @@ def get_gateway_tool_definitions() -> list[Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {},
+            },
+        ),
+        Tool(
+            name="gateway.config_status",
+            description=(
+                "Show read-only effective configuration and startup policy status "
+                "with source attribution and non-secret diagnostics."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="gateway.get_startup_policy",
+            description=(
+                "Return persisted autoStart and legacy disableAutoStart entries "
+                "grouped by config source."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
+            name="gateway.set_startup_policy",
+            description=(
+                "Preview or explicitly apply an autoStart add/remove/set operation "
+                "against one selected config source or path."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "operation": {
+                        "type": "string",
+                        "enum": ["add", "remove", "set"],
+                    },
+                    "names": {"type": "array", "items": {"type": "string"}},
+                    "source": {
+                        "type": "string",
+                        "enum": ["project", "user", "custom"],
+                    },
+                    "path": {"type": "string"},
+                    "dry_run": {"type": "boolean", "default": True},
+                    "apply": {"type": "boolean", "default": False},
+                },
+                "required": ["operation"],
             },
         ),
         Tool(
@@ -1968,6 +2017,131 @@ class GatewayTools:
             audit_events=list(self._audit_events) or None,
         )
 
+    def _config_source_paths_by_server(self) -> dict[str, tuple[str, str]]:
+        paths: dict[str, tuple[str, str]] = {}
+        for source in load_config_sources(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        ):
+            if not source.config:
+                continue
+            for name in source.config.mcpServers:
+                paths.setdefault(name, (source.source, str(source.path)))
+        return paths
+
+    async def config_status(self) -> ConfigStatusOutput:
+        """gateway.config_status - Read-only effective config administration."""
+        configured = load_configs(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        )
+        manifest = load_manifest().servers
+        provisioned = self._load_provisioned_registry()
+        discovered = self._discovered_server_configs
+        enabled = load_enabled_auto_start(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        )
+        disabled = load_disabled_auto_start(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        )
+        resolution = resolve_startup_configs(
+            configured,
+            manifest_servers={**manifest, **discovered},
+            enabled_auto_start=enabled,
+            disabled_auto_start=disabled,
+            provisioned_server_names=provisioned,
+            is_server_allowed=self._policy_manager.is_server_allowed,
+            is_auth_available=lambda env_var: bool(os.environ.get(env_var)),
+            legacy_manifest_auto_start=is_legacy_manifest_auto_start_enabled(),
+        )
+        observations = build_startup_observation_snapshot(resolution)
+        source_paths = self._config_source_paths_by_server()
+        health_by_name = {
+            server.name: server for server in (await self.health()).servers
+        }
+        config_sources = load_config_sources(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        )
+        known_names = (
+            {config.name for config in configured}
+            | set(manifest)
+            | set(provisioned)
+            | set(discovered)
+            | set(observations)
+        )
+        entries: list[EffectiveConfigEntry] = []
+        for name in sorted(known_names):
+            observation = observations.get(name)
+            health = health_by_name.get(name)
+            source_name, source_path = source_paths.get(name, (None, None))
+            diagnostics: list[str] = []
+            auth_state = health.auth_state if health else "none"
+            status = health.status if health else "offline"
+            startup_policy = observation.startup_policy if observation else "unknown"
+            startup_source = observation.startup_source if observation else None
+            skip_reason = observation.startup_skip_reason if observation else None
+            env_var = observation.startup_env_var if observation else None
+            if skip_reason:
+                diagnostics.append(skip_reason)
+            if name in enabled and name in disabled:
+                diagnostics.append("auto_start_disabled_conflict")
+            entries.append(
+                EffectiveConfigEntry(
+                    name=name,
+                    status=status,
+                    startup_policy=startup_policy,
+                    startup_source=startup_source,
+                    source=cast(Any, source_name or startup_source),
+                    source_path=source_path,
+                    startup_skip_reason=skip_reason,
+                    startup_env_var=env_var,
+                    auth_state=auth_state,
+                    configured=any(config.name == name for config in configured),
+                    manifest=name in manifest,
+                    provisioned=name in provisioned,
+                    discovered=name in discovered,
+                    diagnostics=diagnostics,
+                )
+            )
+        policy = get_startup_policy(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+            known_server_names=known_names,
+        )
+        return ConfigStatusOutput(
+            entries=entries,
+            sources=[source.info() for source in config_sources],
+            diagnostics=[diagnostic.message for diagnostic in policy.diagnostics],
+        )
+
+    async def get_startup_policy(self) -> StartupPolicyOutput:
+        """gateway.get_startup_policy - Read persisted startup policy."""
+        configured = load_configs(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        )
+        manifest = load_manifest().servers
+        known_names = {config.name for config in configured} | set(manifest)
+        return get_startup_policy(
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+            known_server_names=known_names,
+        )
+
+    async def set_startup_policy(
+        self, input_data: dict[str, Any]
+    ) -> StartupPolicyPreview:
+        """gateway.set_startup_policy - Preview/apply an autoStart mutation."""
+        operation = StartupPolicyOperation.model_validate(input_data)
+        return set_startup_policy(
+            operation,
+            project_root=self._project_root,
+            custom_config_path=self._custom_config_path,
+        )
+
     async def connect_server(self, input_data: dict[str, Any]) -> LifecycleServerOutput:
         """gateway.connect_server - Connect one known server."""
         parsed = ConnectServerInput.model_validate(input_data)
@@ -3532,6 +3706,16 @@ class GatewayTools:
                     description=description,
                     transport=transport,
                     env_vars=env_vars,
+                    server_card_url=server_info.get("serverCardUrl")
+                    or server_info.get("server_card_url"),
+                    declared_capabilities=[
+                        str(cap)
+                        for cap in server_info.get("capabilities", [])
+                        if isinstance(cap, str)
+                    ],
+                    diagnostics=[
+                        "registry_metadata_read_only",
+                    ],
                 )
             )
             if len(results) >= parsed.limit:
@@ -3582,6 +3766,11 @@ class GatewayTools:
             requires_api_key=requires_api_key,
             env_var=env_var,
             env_instructions=env_instructions,
+            package=package,
+            declared_capabilities=["discovered"],
+            discovery_diagnostics=[
+                "registered_discovery_metadata_is_read_only_until_provisioned"
+            ],
         )
 
         self._record_feedback_event(

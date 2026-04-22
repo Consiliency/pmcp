@@ -266,12 +266,12 @@ Add structured persistent administration for startup policy, setup profiles, and
 
 **Exit criteria**
 
-- [ ] PMCP exposes read-only effective configuration/status explaining eager, lazy, skipped, policy-denied, missing-auth, and provisioned states with source attribution.
-- [ ] PMCP provides structured startup-policy mutation that can preview and apply `autoStart` changes while preserving unrelated `.mcp.json` content.
-- [ ] PMCP detects stale `autoStart`, legacy `disableAutoStart`, unknown server names, missing auth, and policy conflicts.
-- [ ] `pmcp setup` supports named profiles for common modes such as local stdio, shared-local HTTP, authenticated shared HTTP, and CI.
-- [ ] Registry/server-card-aware discovery is evaluated and integrated where stable enough to improve PMCP's manifest/provisioning flow.
-- [ ] Tests cover atomic config edits, no-op edits, conflict detection, profile output, and backward compatibility with existing config files.
+- [x] PMCP exposes read-only effective configuration/status explaining eager, lazy, skipped, policy-denied, missing-auth, and provisioned states with source attribution.
+- [x] PMCP provides structured startup-policy mutation that can preview and apply `autoStart` changes while preserving unrelated `.mcp.json` content.
+- [x] PMCP detects stale `autoStart`, legacy `disableAutoStart`, unknown server names, missing auth, and policy conflicts.
+- [x] `pmcp setup` supports named profiles for common modes such as local stdio, shared-local HTTP, authenticated shared HTTP, and CI.
+- [x] Registry/server-card-aware discovery is evaluated and integrated where stable enough to improve PMCP's manifest/provisioning flow.
+- [x] Tests cover atomic config edits, no-op edits, conflict detection, profile output, and backward compatibility with existing config files.
 
 **Scope notes**
 
@@ -321,7 +321,7 @@ Validate PMCP against mixed old/current MCP servers and the new gateway/admin co
 - [ ] Tests cover at least one old-protocol stdio-style fake server and one current-protocol fake server.
 - [ ] Tests cover tool metadata preservation, task-supported tools, auth/elicitation states, deterministic ordering, trace/header behavior, and startup-policy mutation.
 - [ ] HTTP smoke covers shared-service gateway behavior without external network access.
-- [ ] CLI smoke covers status, doctor, setup profiles, and config status.
+- [x] CLI smoke covers status, doctor, setup profiles, and config status.
 - [ ] Release notes document supported MCP protocol versions, task support limitations, auth limitations, and any draft-feature compatibility flags.
 - [ ] Full test suite, lint, format check, mypy, build, and local smoke commands pass.
 

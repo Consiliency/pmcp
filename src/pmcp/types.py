@@ -158,6 +158,101 @@ class McpConfigFile(BaseModel):
     disableAutoStart: list[str] = Field(default_factory=list)
 
 
+ConfigSourceName = Literal["project", "user", "custom"]
+
+
+class ConfigSourceInfo(BaseModel):
+    """Source metadata for a discovered MCP config file."""
+
+    source: ConfigSourceName
+    path: str
+    exists: bool = False
+    error: str | None = None
+
+
+class EffectiveConfigEntry(BaseModel):
+    """Effective per-server configuration and startup status."""
+
+    name: str
+    status: str
+    startup_policy: Literal["eager", "lazy", "skipped", "unknown"]
+    startup_source: str | None = None
+    source: (
+        ConfigSourceName | Literal["manifest", "provisioned", "discovered"] | None
+    ) = None
+    source_path: str | None = None
+    startup_skip_reason: str | None = None
+    startup_env_var: str | None = None
+    auth_state: AuthState = "none"
+    configured: bool = False
+    manifest: bool = False
+    provisioned: bool = False
+    discovered: bool = False
+    diagnostics: list[str] = Field(default_factory=list)
+
+
+class ConfigStatusOutput(BaseModel):
+    """Output for effective configuration administration status."""
+
+    entries: list[EffectiveConfigEntry]
+    sources: list[ConfigSourceInfo] = Field(default_factory=list)
+    diagnostics: list[str] = Field(default_factory=list)
+
+
+class StartupPolicyDiagnostic(BaseModel):
+    """Non-secret diagnostic for startup policy administration."""
+
+    code: str
+    message: str
+    source: ConfigSourceName | None = None
+    path: str | None = None
+    server_name: str | None = None
+
+
+class StartupPolicySource(BaseModel):
+    """Persisted startup policy lists from one config source."""
+
+    source: ConfigSourceName
+    path: str
+    exists: bool
+    autoStart: list[str] = Field(default_factory=list)
+    disableAutoStart: list[str] = Field(default_factory=list)
+    error: str | None = None
+
+
+class StartupPolicyOperation(BaseModel):
+    """Input for previewing or applying autoStart mutations."""
+
+    operation: Literal["add", "remove", "set"]
+    names: list[str] = Field(default_factory=list)
+    source: ConfigSourceName | None = None
+    path: str | None = None
+    dry_run: bool = True
+    apply: bool = False
+
+
+class StartupPolicyPreview(BaseModel):
+    """Preview/apply result for a startup policy mutation."""
+
+    ok: bool
+    source: ConfigSourceName | None = None
+    path: str | None = None
+    changed: bool = False
+    dry_run: bool = True
+    before_autoStart: list[str] = Field(default_factory=list)
+    after_autoStart: list[str] = Field(default_factory=list)
+    diagnostics: list[StartupPolicyDiagnostic] = Field(default_factory=list)
+    message: str
+    next_step: str | None = None
+
+
+class StartupPolicyOutput(BaseModel):
+    """Read-only persisted startup policy output."""
+
+    sources: list[StartupPolicySource]
+    diagnostics: list[StartupPolicyDiagnostic] = Field(default_factory=list)
+
+
 class ResolvedServerConfig(BaseModel):
     """A server config resolved from a config file."""
 
@@ -818,6 +913,9 @@ class SearchRegistryResult(BaseModel):
     description: str
     transport: str | None = None
     env_vars: list[str] = Field(default_factory=list)
+    server_card_url: str | None = None
+    declared_capabilities: list[str] = Field(default_factory=list)
+    diagnostics: list[str] = Field(default_factory=list)
 
 
 class SearchRegistryInput(BaseModel):
