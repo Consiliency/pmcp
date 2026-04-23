@@ -72,13 +72,13 @@ def get_prebuilt_summary(
             lines.append("• Any capability you don't have a local tool for")
             lines.append("")
             lines.append(
-                'Use gateway.request_capability("<what you need>") to find or auto-provision the right server.'
+                'Use gateway.request_capability("<what you need>") first; PMCP may return direct CLI guidance for a local tool or an MCP server candidate to provision.'
             )
             if provisionable_categories:
                 lines.append(provisionable_categories)
 
     lines.append("")
-    lines.append("Use gateway.catalog_search to explore tools.")
+    lines.append("Use gateway.catalog_search to explore MCP tools and matching CLI hints.")
     return "\n".join(lines)
 
 

@@ -91,7 +91,7 @@ def template_summary(
     • server_name (N tools): capability1, capability2, capability3
     • other_server (M tools): capability1, capability2
 
-    Use gateway.catalog_search to explore available tools.
+    Use gateway.catalog_search to explore MCP tools and matching CLI hints.
 
     Args:
         tools: List of tool info from connected servers
@@ -127,7 +127,7 @@ def template_summary(
             lines.append("• Any capability you don't have a local tool for")
             lines.append("")
             lines.append(
-                'Use gateway.request_capability("<what you need>") to find or auto-provision the right server.'
+                'Use gateway.request_capability("<what you need>") first; PMCP may return direct CLI guidance for a local tool or an MCP server candidate to provision.'
             )
             if provisionable_categories:
                 lines.append(provisionable_categories)
@@ -141,6 +141,6 @@ def template_summary(
         lines.append(f"• {server_name} ({len(server_tools)} tools): {cap_str}")
 
     lines.append("")
-    lines.append("Use gateway.catalog_search to explore available tools.")
+    lines.append("Use gateway.catalog_search to explore MCP tools and matching CLI hints.")
 
     return "\n".join(lines)

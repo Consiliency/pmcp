@@ -43,7 +43,8 @@ pip install pmcp
 ```
 
 > **Capability matching is built-in** — no API key needed. `gateway.request_capability`
-> uses a three-tier pure-Python router: explicit name match → category match → search guidance.
+> uses a pure-Python matcher that can return direct CLI guidance for installed
+> native tools, MCP server candidates, or registry search guidance.
 
 ### Configure with `pmcp setup`
 
@@ -314,7 +315,7 @@ reports the JSON Schema dialect as `https://json-schema.org/draft/2020-12/schema
 
 | Tool | Purpose |
 |------|---------|
-| `gateway.request_capability` | Natural language capability matching with CLI preference |
+| `gateway.request_capability` | Natural language capability matching that can return direct CLI guidance or MCP server candidates |
 | `gateway.sync_environment` | Detect platform and available CLIs |
 | `gateway.provision` | Install and start MCP servers on-demand |
 | `gateway.update_server` | Update an MCP server package and reconnect it |

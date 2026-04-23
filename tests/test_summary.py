@@ -124,10 +124,12 @@ class TestTemplateSummary:
         assert "MCP Gateway:" in summary
         assert "Workflow:" in summary
         assert "gateway.request_capability" in summary
+        assert "direct CLI guidance" in summary
         assert "When to use this gateway:" in summary
         assert "playwright" in summary
         assert "context7" in summary
         assert "gateway.catalog_search" in summary
+        assert "matching CLI hints" in summary
 
     def test_handles_empty_tools(self) -> None:
         summary = template_summary([])
@@ -245,6 +247,7 @@ class TestGetPrebuiltSummary:
         assert "Workflow:" in summary
         assert "gateway.request_capability" in summary
         assert "gateway.catalog_search" in summary
+        assert "direct CLI guidance" in summary
 
     def test_returns_none_without_cache(self) -> None:
         tools = [make_tool("server", "tool")]

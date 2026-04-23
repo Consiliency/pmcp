@@ -103,8 +103,9 @@
 "gateway::catalog_search":
   snippet: |
     # Search and filter
-    results = mcp.call_tool("gateway.catalog_search", {"query": "browser"})
-    online_tools = [r for r in results if r["availability"] == "online"]
+    search = mcp.call_tool("gateway.catalog_search", {"query": "browser"})
+    online_tools = [r for r in search["results"] if r["availability"] == "online"]
+    cli_hints = search.get("cli_hints", [])
 
 "gateway::describe":
   snippet: |
