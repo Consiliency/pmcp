@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pmcp.env_store import read_env_file
+from pmcp.manifest.environment import CLIInfo
 from pmcp.manifest.loader import CLIAlternative, Manifest, ServerConfig
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import StartupObservation
@@ -21,6 +22,9 @@ from pmcp.errors import GatewayException
 from pmcp.policy.policy import PolicyManager
 from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
 from pmcp.types import (
+    CLIHint,
+    CLIResolution,
+    CatalogSearchOutput,
     LocalMcpServerConfig,
     McpTaskRecord,
     RemoteMcpServerConfig,
@@ -31,6 +35,57 @@ from pmcp.types import (
     ServerStatusEnum,
     ToolInfo,
 )
+
+
+def test_cli_hint_serializes_compact_contract() -> None:
+    hint = CLIHint(
+        name="git",
+        description="Git version control CLI",
+        available=True,
+        path="/usr/bin/git",
+        check_command=["git", "--version"],
+        help_command=["git", "--help"],
+        examples=["git status --short", "git log --oneline -5"],
+        prefer_mcp_for=["github issues"],
+        reason="Available on PATH",
+    )
+
+    dumped = hint.model_dump(exclude_none=True)
+
+    assert dumped == {
+        "name": "git",
+        "description": "Git version control CLI",
+        "available": True,
+        "path": "/usr/bin/git",
+        "check_command": ["git", "--version"],
+        "help_command": ["git", "--help"],
+        "examples": ["git status --short", "git log --oneline -5"],
+        "prefer_mcp_for": ["github issues"],
+        "reason": "Available on PATH",
+    }
+    assert "help_output" not in dumped
+
+
+def test_cli_resolution_legacy_shape_remains_valid() -> None:
+    resolution = CLIResolution(
+        name="git",
+        path="/usr/bin/git",
+        help_output="usage: git ...",
+        examples=["git status --short"],
+    )
+
+    assert resolution.model_dump() == {
+        "name": "git",
+        "path": "/usr/bin/git",
+        "description": None,
+        "available": None,
+        "check_command": None,
+        "help_command": None,
+        "help_output": "usage: git ...",
+        "examples": ["git status --short"],
+        "prefer_mcp_for": None,
+        "reason": None,
+    }
 
 
 class MockClientManager:
@@ -327,6 +382,8 @@ def create_manifest_for_request_tests() -> Manifest:
                 check_command=["git", "--version"],
                 help_command=["git", "--help"],
                 description="Git CLI",
+                examples=["git status --short", "git log --oneline -5"],
+                prefer_mcp_for=["github issues", "pull requests"],
             )
         },
         servers={
@@ -342,6 +399,35 @@ def create_manifest_for_request_tests() -> Manifest:
         },
         discovery_queue_path=".mcp-gateway/discovery_queue.json",
     )
+
+
+def create_git_collision_manifest() -> Manifest:
+    manifest = create_manifest_for_request_tests()
+    manifest.servers["git"] = ServerConfig(
+        name="git",
+        description="Git MCP server",
+        keywords=["git", "commits", "repository"],
+        install={},
+        command="npx",
+        args=["@cyanheads/git-mcp-server"],
+        requires_api_key=False,
+    )
+    return manifest
+
+
+def create_git_and_github_manifest() -> Manifest:
+    manifest = create_manifest_for_request_tests()
+    manifest.servers["github"] = ServerConfig(
+        name="github",
+        description="GitHub issues and pull request management",
+        keywords=["github", "issues", "pull requests"],
+        install={},
+        command="npx",
+        args=["@modelcontextprotocol/server-github"],
+        requires_api_key=True,
+        env_var="GITHUB_PERSONAL_ACCESS_TOKEN",
+    )
+    return manifest
 
 
 def create_mock_tools() -> list[ToolInfo]:
@@ -872,6 +958,29 @@ class TestCatalogSearch:
         assert len(result.results) == 3
         assert result.total_available == 3
         assert result.truncated is False
+        assert result.cli_hints == []
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_queryless_does_not_probe_cli_hints(
+        self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        async def fail_probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
+            raise AssertionError("queryless catalog_search should not probe CLIs")
+
+        monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fail_probe_clis)
+
+        result = await gateway_tools.catalog_search({})
+
+        assert result.cli_hints == []
+
+    def test_catalog_search_output_defaults_cli_hints_to_empty_list(self) -> None:
+        output = CatalogSearchOutput(
+            results=[],
+            total_available=0,
+            truncated=False,
+        )
+
+        assert output.cli_hints == []
 
     @pytest.mark.asyncio
     async def test_filters_by_server_name(self, gateway_tools: GatewayTools) -> None:
@@ -889,6 +998,62 @@ class TestCatalogSearch:
             "search" in r.tool_name.lower() or "search" in r.tags
             for r in result.results
         )
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_returns_cli_hints_for_matching_available_cli(
+        self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        gateway_tools._detected_cli_infos = {
+            "git": CLIInfo(name="git", path="/usr/bin/git")
+        }
+
+        result = await gateway_tools.catalog_search({"query": "git"})
+
+        assert len(result.cli_hints) == 1
+        hint = result.cli_hints[0]
+        assert hint.name == "git"
+        assert hint.available is True
+        assert hint.path == "/usr/bin/git"
+        assert hint.help_command == ["git", "--help"]
+        assert hint.examples == ["git status --short", "git log --oneline -5"]
+        assert not hasattr(hint, "help_output")
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_keeps_cli_hints_separate_from_capability_cards(
+        self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        gateway_tools._detected_cli_infos = {
+            "git": CLIInfo(name="git", path="/usr/bin/git")
+        }
+
+        result = await gateway_tools.catalog_search({"query": "git"})
+
+        assert result.cli_hints[0].name == "git"
+        assert result.results
+        assert all("::" in card.tool_id for card in result.results)
+        assert all(card.server in {"github", "jira"} for card in result.results)
+        assert all(not card.tool_id.startswith("git::") for card in result.results)
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_non_matching_query_omits_cli_hints(
+        self, gateway_tools: GatewayTools, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        gateway_tools._detected_cli_infos = {
+            "git": CLIInfo(name="git", path="/usr/bin/git")
+        }
+
+        result = await gateway_tools.catalog_search({"query": "browser"})
+
+        assert result.cli_hints == []
 
     @pytest.mark.asyncio
     async def test_filters_by_risk_level(self, gateway_tools: GatewayTools) -> None:
@@ -2145,6 +2310,256 @@ class TestCapabilityAndProvision:
         assert "gateway.search_registry" in result.search_guidance
 
     @pytest.mark.asyncio
+    async def test_request_capability_returns_use_cli_for_available_cli(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+        result = await gateway_tools.request_capability(
+            {"query": "git commits", "available_clis": ["git"]}
+        )
+
+        assert result.status == "use_cli"
+        assert result.cli is not None
+        assert result.cli.name == "git"
+        assert result.cli.description == "Git CLI"
+        assert result.cli.help_command == ["git", "--help"]
+        assert result.cli.examples == ["git status --short", "git log --oneline -5"]
+        assert result.cli.help_output is None
+        assert "Bash/direct CLI" in result.message
+        assert "not executing" in result.message
+
+    @pytest.mark.asyncio
+    async def test_request_capability_git_commits_prefers_cli_over_same_named_git_server(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_git_collision_manifest
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+        result = await gateway_tools.request_capability(
+            {"query": "git commits", "available_clis": ["git"]}
+        )
+
+        assert result.status == "use_cli"
+        assert result.cli is not None
+        assert result.cli.name == "git"
+
+    @pytest.mark.asyncio
+    async def test_request_capability_explicit_git_mcp_server_request_returns_candidate(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_git_collision_manifest
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+        result = await gateway_tools.request_capability(
+            {"query": "use git mcp server", "available_clis": ["git"]}
+        )
+
+        assert result.status == "candidates"
+        assert result.candidates is not None
+        assert result.candidates[0].name == "git"
+        assert result.candidates[0].candidate_type == "server"
+
+    @pytest.mark.asyncio
+    async def test_sync_environment_caches_cli_probe_infos_with_paths(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        async def fake_probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
+            return {"git": CLIInfo(name="git", path="/usr/bin/git")}
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fake_probe_clis)
+
+        result = await gateway_tools.sync_environment({"platform": "linux"})
+
+        assert result.detected_clis == ["git"]
+        assert gateway_tools._detected_cli_infos["git"].path == "/usr/bin/git"
+
+    @pytest.mark.asyncio
+    async def test_request_capability_reuses_cached_cli_probe_infos_without_reprobing(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        probe_calls = 0
+
+        async def fake_probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
+            nonlocal probe_calls
+            probe_calls += 1
+            return {"git": CLIInfo(name="git", path="/usr/bin/git")}
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fake_probe_clis)
+
+        await gateway_tools.sync_environment({"platform": "linux"})
+        result = await gateway_tools.request_capability({"query": "browser automation"})
+
+        assert probe_calls == 1
+        assert result.status == "pick_from_category"
+
+    @pytest.mark.asyncio
+    async def test_request_capability_use_cli_preserves_cached_sync_environment_path(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        async def fake_probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
+            return {"git": CLIInfo(name="git", path="/usr/bin/git")}
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fake_probe_clis)
+
+        await gateway_tools.sync_environment({"platform": "linux"})
+        result = await gateway_tools.request_capability({"query": "git commits"})
+
+        assert result.status == "use_cli"
+        assert result.cli is not None
+        assert result.cli.path == "/usr/bin/git"
+
+    @pytest.mark.asyncio
+    async def test_request_capability_probe_fallback_returns_use_cli_when_detected(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        async def fake_probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
+            return {"git": CLIInfo(name="git", path="/usr/bin/git")}
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fake_probe_clis)
+
+        result = await gateway_tools.request_capability({"query": "git commits"})
+
+        assert result.status == "use_cli"
+        assert result.cli is not None
+        assert result.cli.path == "/usr/bin/git"
+
+    @pytest.mark.asyncio
+    async def test_request_capability_available_clis_do_not_overwrite_cached_probe_paths(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        gateway_tools._detected_cli_infos = {
+            "git": CLIInfo(name="git", path="/usr/bin/git")
+        }
+
+        async def fake_probe_clis(cli_configs: dict[str, dict]) -> dict[str, CLIInfo]:
+            raise AssertionError("request_capability should not probe explicit CLIs")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.setattr("pmcp.tools.handlers.probe_clis", fake_probe_clis)
+
+        await gateway_tools.request_capability(
+            {"query": "browser automation", "available_clis": ["docker"]}
+        )
+
+        assert gateway_tools._detected_cli_infos["git"].path == "/usr/bin/git"
+
+    @pytest.mark.asyncio
+    async def test_request_capability_prefer_mcp_for_github_issues_suppresses_git_cli(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_git_and_github_manifest
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+        result = await gateway_tools.request_capability(
+            {"query": "github issues", "available_clis": ["git"]}
+        )
+
+        assert result.status == "candidates"
+        assert result.candidates is not None
+        assert result.candidates[0].name == "github"
+
+    @pytest.mark.asyncio
+    async def test_request_capability_prefer_mcp_for_pull_requests_suppresses_git_cli(
+        self, monkeypatch
+    ):
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_git_and_github_manifest
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+        result = await gateway_tools.request_capability(
+            {"query": "pull requests", "available_clis": ["git"]}
+        )
+
+        assert result.status != "use_cli"
+
+    @pytest.mark.asyncio
     async def test_provision_reports_auth_metadata_for_missing_key(self, monkeypatch):
         client_manager = MockClientManager(create_mock_tools())
         policy_manager = PolicyManager()
@@ -3203,6 +3618,44 @@ class TestStaleIndexer:
         assert "playwright" in result.stale_updates[0]
         assert "0.1.0" in result.stale_updates[0]
         assert "0.2.0" in result.stale_updates[0]
+        assert result.cli_hints == []
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_stale_updates_coexist_with_cli_hints(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """catalog_search serializes stale_updates independently from cli_hints."""
+        import time
+
+        tools = [
+            ToolInfo(
+                tool_id="playwright::snapshot",
+                server_name="playwright",
+                tool_name="snapshot",
+                description="Take snapshot",
+                short_description="Take snapshot",
+                input_schema={"type": "object", "properties": {}},
+                tags=["browser"],
+                risk_hint=RiskHint.LOW,
+            )
+        ]
+        client_manager = MockClientManager(tools)
+        client_manager.set_server_online("playwright")
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        gt._detected_cli_infos = {"git": CLIInfo(name="git", path="/usr/bin/git")}
+        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.2.0")
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+
+        result = await gt.catalog_search({"query": "git"})
+
+        assert result.stale_updates is not None
+        assert "playwright" in result.stale_updates[0]
+        assert result.cli_hints[0].name == "git"
 
     @pytest.mark.asyncio
     async def test_catalog_search_no_stale_updates_when_up_to_date(self):

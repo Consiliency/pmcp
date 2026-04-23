@@ -15,7 +15,8 @@ import pytest
 from pmcp.client.manager import ClientManager, ManagedClient
 from pmcp.config.loader import StartupObservation, make_tool_id
 from pmcp.env_store import read_env_file
-from pmcp.manifest.loader import Manifest, ServerConfig
+from pmcp.manifest.environment import CLIInfo
+from pmcp.manifest.loader import CLIAlternative, Manifest, ServerConfig
 from pmcp.policy.policy import PolicyManager
 from pmcp.tools.handlers import GatewayTools
 from pmcp.types import (
@@ -54,6 +55,133 @@ def _run_pmcp(
         cwd=cwd,
         check=False,
     )
+
+
+@pytest.mark.asyncio
+async def test_clisoak_request_capability_one_call_returns_direct_cli_guidance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One capability request should return compact direct-CLI guidance."""
+    manifest = Manifest(
+        version="1.0",
+        cli_alternatives={
+            "git": CLIAlternative(
+                name="git",
+                keywords=["git", "version control", "commits"],
+                check_command=["git", "--version"],
+                help_command=["git", "--help"],
+                description="Git version control CLI",
+                examples=["git status --short", "git log --oneline -5"],
+            )
+        },
+        servers={},
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
+
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+    gateway = GatewayTools(
+        client_manager=ClientManager(),
+        policy_manager=PolicyManager(),
+    )
+
+    result = await gateway.request_capability(
+        {"query": "git commits", "available_clis": ["git"]}
+    )
+
+    assert result.status == "use_cli"
+    assert result.cli is not None
+    assert result.cli.name == "git"
+    assert result.cli.description == "Git version control CLI"
+    assert result.cli.available is True
+    assert result.cli.help_command == ["git", "--help"]
+    assert result.cli.examples == ["git status --short", "git log --oneline -5"]
+    assert result.cli.help_output is None
+    assert "Bash/direct CLI" in result.message
+    assert "not executing the command" in result.message
+    assert "provisioning an MCP server" in result.message
+
+    dumped = json.dumps(result.model_dump(exclude_none=True))
+    assert "help_output" not in dumped
+    assert "usage:" not in dumped
+
+
+@pytest.mark.asyncio
+async def test_clisoak_catalog_search_one_call_returns_direct_cli_hint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One catalog search should return compact CLI hints separate from MCP cards."""
+    manifest = Manifest(
+        version="1.0",
+        cli_alternatives={
+            "git": CLIAlternative(
+                name="git",
+                keywords=["git", "version control", "commits"],
+                check_command=["git", "--version"],
+                help_command=["git", "--help"],
+                description="Git version control CLI",
+                examples=["git status --short", "git log --oneline -5"],
+            )
+        },
+        servers={},
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
+    manager = ClientManager()
+    tool_id = make_tool_id("github", "list_issues")
+    manager._tools[tool_id] = ToolInfo(
+        tool_id=tool_id,
+        server_name="github",
+        tool_name="list_issues",
+        description="List issues in a repository",
+        short_description="List issues in a repository",
+        input_schema={"type": "object"},
+        tags=["github", "git", "search"],
+        risk_hint=RiskHint.LOW,
+    )
+    github_status = ServerStatus(
+        name="github",
+        status=ServerStatusEnum.ONLINE,
+        tool_count=1,
+    )
+    manager._clients["github"] = ManagedClient(
+        config=ResolvedServerConfig(
+            name="github",
+            source="custom",
+            config=LocalMcpServerConfig(command="github"),
+        ),
+        is_remote=True,
+        write_stream=MagicMock(),
+        status=github_status,
+    )
+    manager._servers["github"] = github_status
+
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+
+    gateway = GatewayTools(
+        client_manager=manager,
+        policy_manager=PolicyManager(),
+    )
+    gateway._detected_cli_infos = {"git": CLIInfo(name="git", path="/usr/bin/git")}
+
+    result = await gateway.catalog_search({"query": "git"})
+
+    assert result.results
+    assert result.results[0].tool_id == "github::list_issues"
+    assert all("::" in card.tool_id for card in result.results)
+    assert all(not card.tool_id.startswith("git::") for card in result.results)
+    assert result.cli_hints
+    hint = result.cli_hints[0]
+    assert hint.name == "git"
+    assert hint.available is True
+    assert hint.path == "/usr/bin/git"
+    assert hint.help_command == ["git", "--help"]
+    assert hint.examples == ["git status --short", "git log --oneline -5"]
+    assert hint.reason is not None
+
+    dumped = json.dumps(result.model_dump(exclude_none=True))
+    assert "help_output" not in dumped
+    assert "usage:" not in dumped
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- PMCP discovery now exposes compact native CLI guidance for installed CLIs
+  through `gateway.request_capability` (`status="use_cli"`) and
+  `gateway.catalog_search` (`cli_hints`) so the model can switch to
+  Bash/direct CLI without a second PMCP discovery step.
+
+### Changed
+- Clarified the CLI-first discovery contract in docs and tests: PMCP provides
+  help commands and curated examples, does not execute the recommended shell
+  command, and does not add a general `pmcp invoke` transport for native CLIs.
+
 ## [1.12.0] - 2026-04-23
 
 ### Added

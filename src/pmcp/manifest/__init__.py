@@ -6,7 +6,7 @@ from pmcp.manifest.environment import (
     probe_clis,
     EnvironmentInfo,
 )
-from pmcp.manifest.matcher import match_capability
+from pmcp.manifest.matcher import CLIHintMatch, match_capability, rank_cli_hints
 from pmcp.manifest.installer import install_server
 
 __all__ = [
@@ -15,6 +15,8 @@ __all__ = [
     "detect_platform",
     "probe_clis",
     "EnvironmentInfo",
+    "CLIHintMatch",
     "match_capability",
+    "rank_cli_hints",
     "install_server",
 ]

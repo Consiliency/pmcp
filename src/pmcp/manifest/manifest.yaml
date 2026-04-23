@@ -7,6 +7,10 @@ cli_alternatives:
     check_command: ["git", "--version"]
     help_command: ["git", "--help"]
     description: "Git version control CLI"
+    examples:
+      - "git status --short"
+      - "git log --oneline -5"
+      - "git branch --show-current"
     prefer_mcp_for: [github issues, pull requests, github actions, github api]
 
   docker:
@@ -14,60 +18,100 @@ cli_alternatives:
     check_command: ["docker", "--version"]
     help_command: ["docker", "--help"]
     description: "Docker container CLI"
+    examples:
+      - "docker ps"
+      - "docker images"
+      - "docker compose ps"
 
   kubectl:
     keywords: [kubernetes, k8s, pods, deployments, services, helm]
     check_command: ["kubectl", "version", "--client"]
     help_command: ["kubectl", "--help"]
     description: "Kubernetes CLI"
+    examples:
+      - "kubectl get pods"
+      - "kubectl get services"
+      - "kubectl config current-context"
 
   node:
     keywords: [node, nodejs, npm, javascript, js, npx]
     check_command: ["node", "--version"]
     help_command: ["node", "--help"]
     description: "Node.js runtime"
+    examples:
+      - "node --version"
+      - "npm --version"
+      - "npx --yes envinfo --version"
 
   python:
     keywords: [python, pip, python3, py]
     check_command: ["python3", "--version"]
     help_command: ["python3", "--help"]
     description: "Python interpreter"
+    examples:
+      - "python3 --version"
+      - "python3 -m pip --version"
+      - "python3 -m pytest --version"
 
   aws:
     keywords: [aws, amazon, s3, ec2, lambda, cloudformation, iam]
     check_command: ["aws", "--version"]
     help_command: ["aws", "help"]
     description: "AWS CLI"
+    examples:
+      - "aws configure list"
+      - "aws sts get-caller-identity"
+      - "aws s3 ls"
 
   gcloud:
     keywords: [gcp, google cloud, gcloud, bigquery, gcs]
     check_command: ["gcloud", "--version"]
     help_command: ["gcloud", "--help"]
     description: "Google Cloud CLI"
+    examples:
+      - "gcloud config list"
+      - "gcloud projects list"
+      - "gcloud auth list"
 
   az:
     keywords: [azure, az, microsoft cloud]
     check_command: ["az", "--version"]
     help_command: ["az", "--help"]
     description: "Azure CLI"
+    examples:
+      - "az --version"
+      - "az account show"
+      - "az group list"
 
   terraform:
     keywords: [terraform, infrastructure, iac, tf]
     check_command: ["terraform", "--version"]
     help_command: ["terraform", "--help"]
     description: "Terraform infrastructure as code"
+    examples:
+      - "terraform validate"
+      - "terraform fmt -check"
+      - "terraform providers"
 
   curl:
     keywords: [curl, http, request, api, download]
     check_command: ["curl", "--version"]
     help_command: ["curl", "--help"]
     description: "HTTP request CLI"
+    examples:
+      - "curl -I https://example.com"
+      - "curl --version"
+      - "curl https://example.com"
 
   jq:
     keywords: [jq, json, parse, query]
     check_command: ["jq", "--version"]
     help_command: ["jq", "--help"]
     description: "JSON processor CLI"
+    examples:
+      - "jq '.items[]' file.json"
+      - "jq '.name' package.json"
+      - "jq --version"
 
 # MCP Servers - verified against official documentation
 servers:

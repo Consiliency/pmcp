@@ -24,6 +24,7 @@ class CLIAlternative:
     check_command: list[str]
     help_command: list[str]
     description: str
+    examples: list[str] = field(default_factory=list)
     prefer_mcp_for: list[str] = field(default_factory=list)
 
 
@@ -293,6 +294,7 @@ def _parse_cli_alternative(name: str, data: dict[str, Any]) -> CLIAlternative:
         check_command=data.get("check_command", [name, "--version"]),
         help_command=data.get("help_command", [name, "--help"]),
         description=data.get("description", ""),
+        examples=data.get("examples", []),
         prefer_mcp_for=data.get("prefer_mcp_for", []),
     )
 

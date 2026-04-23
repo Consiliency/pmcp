@@ -49,7 +49,7 @@ from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.env_store import set_env_value
 from pmcp.identity import filter_self_references
 from pmcp.manifest.code_patterns_loader import get_code_hint
-from pmcp.manifest.environment import detect_platform, probe_clis
+from pmcp.manifest.environment import CLIInfo, detect_platform, probe_clis
 from pmcp.templates.code_snippets_loader import get_code_snippet
 from pmcp.manifest.installer import (
     MissingApiKeyError,
@@ -57,6 +57,7 @@ from pmcp.manifest.installer import (
     InstallError,
 )
 from pmcp.manifest.loader import load_manifest
+from pmcp.manifest.matcher import rank_cli_hints
 from pmcp.manifest.version_checker import (
     detect_package_type,
     get_package_version,
@@ -81,6 +82,7 @@ from pmcp.types import (
     CapabilityResolution,
     CatalogSearchInput,
     CatalogSearchOutput,
+    CLIResolution,
     ConfigStatusOutput,
     DescribeInput,
     DescriptionsCache,
@@ -788,6 +790,7 @@ class GatewayTools:
         self._guidance_config = guidance_config
         self._descriptions_cache = descriptions_cache
         self._detected_clis: set[str] | None = None
+        self._detected_cli_infos: dict[str, CLIInfo] = {}
         self._platform: str | None = None
         self._discovered_server_configs: dict[str, ServerConfig] = {}
         self._stale_check_cache: dict[str, tuple[float, str | None, str | None]] = {}
@@ -804,6 +807,46 @@ class GatewayTools:
             transport="gateway",
             audit_buffer_size=self._audit_events.maxlen or 0,
         )
+
+    def _build_cli_probe_configs(self, manifest: Manifest) -> dict[str, dict[str, Any]]:
+        return {
+            name: {
+                "check_command": cli.check_command,
+                "help_command": cli.help_command,
+            }
+            for name, cli in manifest.cli_alternatives.items()
+        }
+
+    async def _resolve_cli_availability(
+        self,
+        manifest: Manifest,
+        *,
+        explicit_available_clis: list[str] | None = None,
+    ) -> tuple[set[str], dict[str, CLIInfo]]:
+        detected_cli_infos = dict(self._detected_cli_infos)
+
+        if explicit_available_clis is not None:
+            detected_clis = set(explicit_available_clis)
+            detected_clis.update(detected_cli_infos)
+            if self._detected_clis is not None:
+                detected_clis.update(self._detected_clis)
+            return detected_clis, detected_cli_infos
+
+        if detected_cli_infos:
+            detected_clis = set(detected_cli_infos)
+            self._detected_clis = detected_clis
+            return detected_clis, detected_cli_infos
+
+        if self._detected_clis is not None:
+            return set(self._detected_clis), detected_cli_infos
+
+        platform = detect_platform()
+        detected_cli_infos = await probe_clis(self._build_cli_probe_configs(manifest))
+        detected_clis = set(detected_cli_infos)
+        self._detected_cli_infos = detected_cli_infos
+        self._detected_clis = detected_clis
+        self._platform = platform
+        return detected_clis, detected_cli_infos
 
     def set_startup_observations(
         self, observations: StartupObservationSnapshot
@@ -1111,6 +1154,22 @@ class GatewayTools:
     async def catalog_search(self, input_data: dict[str, Any]) -> CatalogSearchOutput:
         """gateway.catalog_search - Search for available tools."""
         parsed = CatalogSearchInput.model_validate(input_data)
+        cli_hints = []
+        query = parsed.query.strip() if parsed.query else ""
+        if query:
+            manifest = load_manifest()
+            detected_clis, detected_cli_infos = await self._resolve_cli_availability(
+                manifest
+            )
+            cli_hints = [
+                match.hint
+                for match in rank_cli_hints(
+                    query,
+                    manifest,
+                    available_clis=detected_clis,
+                    detected_cli_infos=detected_cli_infos,
+                )
+            ]
 
         tools = self._client_manager.get_all_tools()
 
@@ -1233,6 +1292,7 @@ class GatewayTools:
             results=results,
             total_available=total_available,
             truncated=truncated,
+            cli_hints=cli_hints,
             stale_updates=stale_updates,
         )
 
@@ -2980,25 +3040,26 @@ class GatewayTools:
             manifest, configured_servers
         )
 
-        # Get detected CLIs (from input or probe)
-        if parsed.available_clis:
-            detected_clis = list(parsed.available_clis)
-        elif self._detected_clis is not None:
-            detected_clis = list(self._detected_clis)
-        else:
-            # Probe environment if not yet done
-            platform = detect_platform()
-            cli_configs = {
-                name: {
-                    "check_command": cli.check_command,
-                    "help_command": cli.help_command,
-                }
-                for name, cli in manifest.cli_alternatives.items()
-            }
-            detected_cli_infos = await probe_clis(cli_configs)
-            detected_clis = list(detected_cli_infos.keys())
-            self._detected_clis = set(detected_clis)
-            self._platform = platform
+        # Get detected CLIs (from input, cached probe metadata, or a bounded probe).
+        detected_clis, detected_cli_infos = await self._resolve_cli_availability(
+            manifest,
+            explicit_available_clis=parsed.available_clis,
+        )
+        cli_hint_matches = rank_cli_hints(
+            parsed.query,
+            manifest,
+            available_clis=detected_clis,
+            detected_cli_infos=detected_cli_infos,
+        )
+        if cli_hint_matches:
+            logger.debug(
+                "Matched CLI hints for future response plumbing: %s",
+                ", ".join(match.hint.name for match in cli_hint_matches[:3]),
+            )
+        cli_hint_match = next(
+            (match for match in cli_hint_matches if match.hint.available),
+            None,
+        )
 
         # Get running servers
         running_servers = [
@@ -3032,7 +3093,15 @@ class GatewayTools:
             if name_match:
                 break
 
-        if name_match:
+        explicit_mcp_intent = any(
+            word in query_words
+            for word in ("mcp", "server", "servers", "provision", "install", "start")
+        )
+        name_match_collides_with_cli = (
+            cli_hint_match is not None and cli_hint_match.hint.name == name_match
+        )
+
+        if name_match and (explicit_mcp_intent or not name_match_collides_with_cli):
             requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
                 name_match, manifest, configured_servers
             )
@@ -3064,6 +3133,32 @@ class GatewayTools:
                 message=msg,
                 candidates=[candidate],
                 recommendation=f"Call gateway.provision(server_name='{name_match}')",
+            )
+
+        if cli_hint_match is not None:
+            hint = cli_hint_match.hint
+            return CapabilityResolution(
+                status="use_cli",
+                message=(
+                    f"Use Bash/direct CLI with '{hint.name}'. PMCP is recommending "
+                    "the native command here; it is not executing the command or "
+                    "provisioning an MCP server for this path."
+                ),
+                cli=CLIResolution(
+                    name=hint.name,
+                    path=hint.path,
+                    description=hint.description,
+                    available=hint.available,
+                    check_command=hint.check_command,
+                    help_command=hint.help_command,
+                    examples=hint.examples,
+                    prefer_mcp_for=hint.prefer_mcp_for,
+                    reason=hint.reason,
+                ),
+                recommendation=(
+                    f"Run '{hint.name}' directly via Bash/direct CLI. "
+                    "Use gateway.request_capability again only if you need an MCP server."
+                ),
             )
 
         # --- Tier 2 pre-check: detect unknown named services (Fix C, issue #56) ---
@@ -4416,25 +4511,26 @@ class GatewayTools:
         else:
             platform = detect_platform()
 
+        manifest = load_manifest()
+
         # Use provided or probe CLIs
         if parsed.detected_clis:
             detected_clis = set(parsed.detected_clis)
-        else:
-            manifest = load_manifest()
-            # Build CLI configs dict for probing
-            cli_configs = {
-                name: {
-                    "check_command": cli.check_command,
-                    "help_command": cli.help_command,
-                }
-                for name, cli in manifest.cli_alternatives.items()
+            detected_cli_infos = {
+                name: info
+                for name, info in self._detected_cli_infos.items()
+                if name in detected_clis
             }
-            detected_cli_infos = await probe_clis(cli_configs)
+        else:
+            detected_cli_infos = await probe_clis(
+                self._build_cli_probe_configs(manifest)
+            )
             detected_clis = set(detected_cli_infos.keys())
 
         # Store for future use
         self._platform = platform
         self._detected_clis = detected_clis
+        self._detected_cli_infos = detected_cli_infos
 
         return SyncEnvironmentOutput(
             platform=platform,

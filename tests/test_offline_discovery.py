@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from pmcp.manifest.environment import CLIInfo
 from pmcp.tools.handlers import GatewayTools
 from pmcp.types import (
     DescriptionsCache,
@@ -161,6 +162,29 @@ class TestCatalogSearchOfflineDiscovery:
         assert any("offline_tool_2" in tid for tid in tool_ids), (
             f"Should include offline_tool_2 from cache, got {tool_ids}"
         )
+        assert result.cli_hints == []
+
+    @pytest.mark.asyncio
+    async def test_include_offline_cli_hints_do_not_count_as_available_tools(
+        self, gateway_tools_with_cache: GatewayTools
+    ) -> None:
+        """include_offline MCP cards can coexist with separate CLI hints."""
+        gateway_tools_with_cache._detected_cli_infos = {
+            "git": CLIInfo(name="git", path="/usr/bin/git")
+        }
+
+        result = await gateway_tools_with_cache.catalog_search(
+            {
+                "query": "git test",
+                "include_offline": True,
+            }
+        )
+
+        assert result.cli_hints
+        assert result.cli_hints[0].name == "git"
+        assert result.total_available == 2
+        assert len(result.results) == 2
+        assert all("::" in card.tool_id for card in result.results)
 
     @pytest.mark.asyncio
     async def test_default_excludes_cached_tools(

@@ -578,12 +578,27 @@ class CapabilityCard(BaseModel):
     )
 
 
+class CLIHint(BaseModel):
+    """Compact CLI discovery hint."""
+
+    name: str
+    description: str
+    available: bool
+    path: str | None = None
+    check_command: list[str] = Field(default_factory=list)
+    help_command: list[str] = Field(default_factory=list)
+    examples: list[str] = Field(default_factory=list)
+    prefer_mcp_for: list[str] = Field(default_factory=list)
+    reason: str | None = None
+
+
 class CatalogSearchOutput(BaseModel):
     """Output for gateway.catalog_search."""
 
     results: list[CapabilityCard]
     total_available: int
     truncated: bool
+    cli_hints: list[CLIHint] = Field(default_factory=list)
     stale_updates: list[str] | None = None
 
 
@@ -900,8 +915,14 @@ class CLIResolution(BaseModel):
 
     name: str
     path: str | None = None
+    description: str | None = None
+    available: bool | None = None
+    check_command: list[str] | None = None
+    help_command: list[str] | None = None
     help_output: str | None = None
     examples: list[str] | None = None
+    prefer_mcp_for: list[str] | None = None
+    reason: str | None = None
 
 
 class CapabilityCandidate(BaseModel):

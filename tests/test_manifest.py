@@ -10,6 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from pmcp.manifest.environment import (
+    CLIInfo,
     detect_platform,
     probe_clis,
 )
@@ -31,6 +32,7 @@ from pmcp.manifest.loader import (
 from pmcp.manifest.matcher import (
     _keyword_match,
     match_capability,
+    rank_cli_hints,
 )
 
 
@@ -254,6 +256,67 @@ def test_manifest_cli_config():
     assert len(git.keywords) > 0
 
 
+def test_manifest_parses_cli_examples(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        """
+version: "1.0"
+cli_alternatives:
+  git:
+    keywords: ["git"]
+    check_command: ["git", "--version"]
+    help_command: ["git", "--help"]
+    description: "Git CLI"
+    examples:
+      - "git status --short"
+      - "git log --oneline -5"
+servers: {}
+"""
+    )
+
+    manifest = load_manifest(manifest_path)
+    git = manifest.get_cli("git")
+
+    assert git is not None
+    assert git.examples == ["git status --short", "git log --oneline -5"]
+
+
+def test_manifest_cli_examples_default_to_empty(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        """
+version: "1.0"
+cli_alternatives:
+  git:
+    keywords: ["git"]
+    check_command: ["git", "--version"]
+    help_command: ["git", "--help"]
+    description: "Git CLI"
+servers: {}
+"""
+    )
+
+    manifest = load_manifest(manifest_path)
+    git = manifest.get_cli("git")
+
+    assert git is not None
+    assert git.examples == []
+
+
+def test_packaged_cli_alternatives_have_compact_examples() -> None:
+    manifest = load_manifest()
+    blocked_terms = ("rm", "delete", "destroy", "force")
+
+    for cli in manifest.cli_alternatives.values():
+        assert 2 <= len(cli.examples) <= 4, cli.name
+        for example in cli.examples:
+            assert isinstance(example, str), cli.name
+            assert example.strip() == example
+            assert 0 < len(example) <= 80, f"{cli.name}: {example}"
+            words = set(example.lower().replace("-", " ").split())
+            assert not (words & set(blocked_terms)), f"{cli.name}: {example}"
+
+
 def test_manifest_get_category_summary():
     """Test get_category_summary returns a useful compact string."""
     manifest = load_manifest()
@@ -410,6 +473,8 @@ def create_test_manifest() -> Manifest:
                 check_command=["git", "--version"],
                 help_command=["git", "--help"],
                 description="Git version control",
+                examples=["git log --oneline -5"],
+                prefer_mcp_for=["github issues", "pull requests"],
             ),
             "docker": CLIAlternative(
                 name="docker",
@@ -442,6 +507,79 @@ def create_test_manifest() -> Manifest:
         },
         discovery_queue_path=".mcp-gateway/discovery_queue.json",
     )
+
+
+def test_rank_cli_hints_prefers_available_cli_for_local_task() -> None:
+    manifest = create_test_manifest()
+
+    matches = rank_cli_hints("git commits", manifest, available_clis={"git"})
+
+    assert matches
+    assert matches[0].hint.name == "git"
+    assert matches[0].hint.available is True
+
+
+def test_rank_cli_hints_uses_name_description_keywords_and_examples() -> None:
+    manifest = create_test_manifest()
+
+    name_match = rank_cli_hints("docker", manifest, available_clis={"docker"})
+    description_match = rank_cli_hints(
+        "containers", manifest, available_clis={"docker"}
+    )
+    keyword_match = rank_cli_hints("commits", manifest, available_clis={"git"})
+    example_match = rank_cli_hints("git log oneline", manifest, available_clis={"git"})
+
+    assert name_match[0].hint.name == "docker"
+    assert description_match[0].hint.name == "docker"
+    assert keyword_match[0].hint.name == "git"
+    assert example_match[0].hint.name == "git"
+
+
+def test_rank_cli_hints_preserves_probe_path() -> None:
+    manifest = create_test_manifest()
+    detected_cli_infos = {"git": CLIInfo(name="git", path="/usr/bin/git")}
+
+    matches = rank_cli_hints(
+        "git commits", manifest, detected_cli_infos=detected_cli_infos
+    )
+
+    assert matches[0].hint.name == "git"
+    assert matches[0].hint.available is True
+    assert matches[0].hint.path == "/usr/bin/git"
+
+
+def test_rank_cli_hints_available_clis_have_no_path_when_unprobed() -> None:
+    manifest = create_test_manifest()
+
+    matches = rank_cli_hints("git commits", manifest, available_clis={"git"})
+
+    assert matches[0].hint.available is True
+    assert matches[0].hint.path is None
+
+
+def test_rank_cli_hints_suppresses_prefer_mcp_phrase_by_default() -> None:
+    manifest = create_test_manifest()
+
+    matches = rank_cli_hints("github issues", manifest, available_clis={"git"})
+
+    assert matches == []
+
+
+def test_rank_cli_hints_can_return_suppressed_prefer_mcp_match() -> None:
+    manifest = create_test_manifest()
+
+    matches = rank_cli_hints(
+        "github issues",
+        manifest,
+        available_clis={"git"},
+        include_suppressed=True,
+    )
+
+    assert matches[0].hint.name == "git"
+    assert matches[0].suppressed_by_prefer_mcp is True
+    assert matches[0].matched_prefer_mcp_phrase == "github issues"
+    assert matches[0].hint.reason is not None
+    assert "MCP server preferred" in matches[0].hint.reason
 
 
 def test_keyword_match_cli():

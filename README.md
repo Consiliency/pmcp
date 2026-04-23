@@ -293,7 +293,7 @@ reports the JSON Schema dialect as `https://json-schema.org/draft/2020-12/schema
 
 | Tool | Purpose |
 |------|---------|
-| `gateway.catalog_search` | Search available tools, returns compact capability cards with small metadata such as title, icons, execution hints, and schema dialect |
+| `gateway.catalog_search` | Search available tools, returns compact capability cards with small metadata such as title, icons, execution hints, and schema dialect, plus additive compact CLI hints for matching installed CLIs |
 | `gateway.describe` | Get detailed schema and richer metadata for a specific tool, including output schema, annotations, execution/task support, icons, and schema dialect |
 | `gateway.invoke` | Call a downstream tool with argument validation, including task-augmented execution for task-capable tools |
 | `gateway.refresh` | Reload backend configs and reconnect; refuses while requests or active MCP tasks are pending unless `force=true` |
@@ -418,6 +418,35 @@ You: "I need to look up library documentation"
 gateway.request_capability({ query: "library documentation" })
 ```
 
+For local work where an installed native CLI is the right surface, PMCP returns
+compact CLI guidance and does not execute the command:
+
+```
+gateway.request_capability({ query: "git commits", available_clis: ["git"] })
+```
+
+Returns:
+```json
+{
+  "status": "use_cli",
+  "message": "Use Bash/direct CLI with 'git'. PMCP is recommending the native command here; it is not executing the command or provisioning an MCP server for this path.",
+  "cli": {
+    "name": "git",
+    "description": "Git version control CLI",
+    "available": true,
+    "help_command": ["git", "--help"],
+    "examples": ["git status --short", "git log --oneline -5"],
+    "reason": "Matched query against CLI keywords and examples."
+  },
+  "recommendation": "Run 'git' directly via Bash/direct CLI. Use gateway.request_capability again only if you need an MCP server."
+}
+```
+
+After `status: "use_cli"`, use Bash/direct CLI. PMCP stops at guidance here:
+it does not execute the command and does not fetch full native help output for
+the normal compact path. If PMCP returns server candidates instead, continue
+with MCP provisioning, `gateway.describe`, and `gateway.invoke`.
+
 Returns:
 ```json
 {
@@ -438,6 +467,45 @@ Returns:
 ```
 gateway.catalog_search({ query: "documentation" })
 ```
+
+CLI recommendations are returned separately from MCP tool cards:
+
+```json
+gateway.catalog_search({ "query": "git" })
+```
+
+Returns:
+```json
+{
+  "results": [{
+    "tool_id": "github::list_issues",
+    "server": "github",
+    "tool_name": "list_issues",
+    "short_description": "List issues in a repository",
+    "tags": ["github", "git", "search"],
+    "availability": "online",
+    "risk_hint": "low"
+  }],
+  "total_available": 3,
+  "truncated": false,
+  "cli_hints": [{
+    "name": "git",
+    "description": "Git version control CLI",
+    "available": true,
+    "path": "/usr/bin/git",
+    "help_command": ["git", "--help"],
+    "examples": ["git status --short", "git log --oneline -5"],
+    "reason": "Matched query against CLI name."
+  }]
+}
+```
+
+Use `cli_hints` as recommendations for Bash/direct CLI commands. They are not
+MCP tools, do not appear in `results`, and cannot be passed to
+`gateway.describe` or `gateway.invoke`. Start with either
+`gateway.request_capability` or `gateway.catalog_search`; when PMCP returns
+`use_cli` or matching `cli_hints`, that is enough context to switch to
+Bash/direct CLI. Otherwise stay on the MCP path.
 
 ### Step 3: Get Tool Details
 
