@@ -24,12 +24,12 @@ clean. This generated plan artifact is new and will be untracked until staged.
 
 ## Interface Freeze Gates
 
-- [ ] IF-0-AUTHOBS-1 - `src/pmcp/types.py` defines `AuthStateSemanticsInfo` and a default semantics map covering every `AuthState` value with `meaning`, `primary_next_action`, and `evidence_fields`; `GatewayDiagnosticsInfo.auth_state_semantics` exposes that map in `gateway.health`.
-- [ ] IF-0-AUTHOBS-2 - `src/pmcp/types.py` defines `AuthEventKind = Literal["missing_credential", "credential_stored", "remote_auth_challenge", "insufficient_scope", "url_elicitation_required", "url_elicitation_acknowledged", "policy_denied"]`, and `GatewayAuditEvent.auth_event: AuthEventKind | None = None` is additive and redacted.
-- [ ] IF-0-AUTHOBS-3 - Env/header-based missing-auth outputs use `auth_state="missing_auth"` plus sorted, de-duplicated `missing_env_vars` on `ProvisionOutput`, `LifecycleServerOutput`, `ServerHealthInfo`, `EffectiveConfigEntry`, and `InvokeOutput` where applicable; legacy single `env_var` fields remain backward compatible.
-- [ ] IF-0-AUTHOBS-4 - `gateway.health` server rows, gateway diagnostics, and recent audit events expose only non-secret auth evidence: `auth_state`, `auth_event`, `next_step`, `missing_env_vars`, `auth_methods`, `auth_metadata`, `auth_challenge.missing_scopes`, and URL elicitation IDs/sanitized URLs.
-- [ ] IF-0-AUTHOBS-5 - `pmcp status --verbose`, `pmcp doctor`, and `gateway.submit_feedback` previews consume the same structured auth evidence and shared sanitizers, not auth prose parsing, when rendering operator diagnostics.
-- [ ] IF-0-AUTHOBS-6 - Tests cover all auth states, all AUTHOBS auth event kinds, and common secret samples across gateway outputs, health/audit, CLI status, doctor, and feedback previews.
+- [x] IF-0-AUTHOBS-1 - `src/pmcp/types.py` defines `AuthStateSemanticsInfo` and a default semantics map covering every `AuthState` value with `meaning`, `primary_next_action`, and `evidence_fields`; `GatewayDiagnosticsInfo.auth_state_semantics` exposes that map in `gateway.health`.
+- [x] IF-0-AUTHOBS-2 - `src/pmcp/types.py` defines `AuthEventKind = Literal["missing_credential", "credential_stored", "remote_auth_challenge", "insufficient_scope", "url_elicitation_required", "url_elicitation_acknowledged", "policy_denied"]`, and `GatewayAuditEvent.auth_event: AuthEventKind | None = None` is additive and redacted.
+- [x] IF-0-AUTHOBS-3 - Env/header-based missing-auth outputs use `auth_state="missing_auth"` plus sorted, de-duplicated `missing_env_vars` on `ProvisionOutput`, `LifecycleServerOutput`, `ServerHealthInfo`, `EffectiveConfigEntry`, and `InvokeOutput` where applicable; legacy single `env_var` fields remain backward compatible.
+- [x] IF-0-AUTHOBS-4 - `gateway.health` server rows, gateway diagnostics, and recent audit events expose only non-secret auth evidence: `auth_state`, `auth_event`, `next_step`, `missing_env_vars`, `auth_methods`, `auth_metadata`, `auth_challenge.missing_scopes`, and URL elicitation IDs/sanitized URLs.
+- [x] IF-0-AUTHOBS-5 - `pmcp status --verbose`, `pmcp doctor`, and `gateway.submit_feedback` previews consume the same structured auth evidence and shared sanitizers, not auth prose parsing, when rendering operator diagnostics.
+- [x] IF-0-AUTHOBS-6 - Tests cover all auth states, all AUTHOBS auth event kinds, and common secret samples across gateway outputs, health/audit, CLI status, doctor, and feedback previews.
 
 ## Lane Index & Dependencies
 
@@ -158,10 +158,31 @@ Release-bound broader checks:
 
 ## Acceptance Criteria
 
-- [ ] Each `AuthState` has documented machine-readable semantics and exactly one primary next action in gateway health diagnostics.
-- [ ] Gateway outputs include structured `missing_env_vars` where missing auth is caused by env/header placeholders, without exposing values.
-- [ ] Audit events distinguish `missing_credential`, `credential_stored`, `remote_auth_challenge`, `insufficient_scope`, `url_elicitation_required`, and `url_elicitation_acknowledged`.
-- [ ] `gateway.health`, `pmcp status --verbose`, `pmcp doctor`, and feedback payload previews expose consistent non-secret auth evidence.
-- [ ] Tests assert bearer tokens, API keys, auth codes, JWT-looking strings, URL userinfo, and secret query values do not appear in auth-related outputs.
-- [ ] Existing API-key credential storage, remote-header missing-auth detection, URL-mode elicitation acknowledgement, and SAFEURL sanitization behavior remain backward compatible.
-- [ ] AUTHOBS does not add durable audit storage, per-user authorization isolation, OAuth token exchange, or live third-party provider requirements.
+- [x] Each `AuthState` has documented machine-readable semantics and exactly one primary next action in gateway health diagnostics.
+- [x] Gateway outputs include structured `missing_env_vars` where missing auth is caused by env/header placeholders, without exposing values.
+- [x] Audit events distinguish `missing_credential`, `credential_stored`, `remote_auth_challenge`, `insufficient_scope`, `url_elicitation_required`, and `url_elicitation_acknowledged`.
+- [x] `gateway.health`, `pmcp status --verbose`, `pmcp doctor`, and feedback payload previews expose consistent non-secret auth evidence.
+- [x] Tests assert bearer tokens, API keys, auth codes, JWT-looking strings, URL userinfo, and secret query values do not appear in auth-related outputs.
+- [x] Existing API-key credential storage, remote-header missing-auth detection, URL-mode elicitation acknowledgement, and SAFEURL sanitization behavior remain backward compatible.
+- [x] AUTHOBS does not add durable audit storage, per-user authorization isolation, OAuth token exchange, or live third-party provider requirements.
+
+## Closeout Notes
+
+- Completed SL-0 through SL-4 in this worktree.
+- Added `AuthStateSemanticsInfo`, `DEFAULT_AUTH_STATE_SEMANTICS`, `AuthEventKind`, `GatewayAuditEvent.auth_event`, and `InvokeOutput.missing_env_vars` as additive public model fields.
+- Gateway auth boundaries now categorize missing credentials, stored credentials, remote challenges, insufficient scopes, URL elicitation requirements, URL elicitation acknowledgement, and policy denial in audit events.
+- `pmcp status --verbose`, `pmcp doctor`, and `gateway.submit_feedback` previews render structured, sanitized auth evidence rather than parsing auth prose.
+- No README, SECURITY, or CHANGELOG update was required for this phase; release documentation remains Phase 6.
+
+Verification completed:
+
+- `uv run pytest tests/test_auth.py -k "auth_state or auth_event or semantics or missing_env"` - passed.
+- `uv run pytest tests/test_tools.py -k "auth_event or auth_state or missing_env or audit or feedback or elicitation or scope or credential"` - passed.
+- `uv run pytest tests/test_cli.py -k "status or doctor or auth_state or auth_event or missing_env or secret"` - passed.
+- `uv run pytest tests/test_phase4_e2e.py -k "auth or status or doctor or feedback or secret"` - passed.
+- `uv run pytest tests/test_auth.py tests/test_tools.py tests/test_cli.py tests/test_phase4_e2e.py -k "auth_state or auth_event or authobs or missing_env or audit or feedback or status or doctor or elicitation or scope or secret"` - passed.
+- `uv run ruff check src/pmcp/types.py src/pmcp/tools/handlers.py src/pmcp/cli.py src/pmcp/cli_commands/doctor.py tests/test_auth.py tests/test_tools.py tests/test_cli.py tests/test_phase4_e2e.py` - passed.
+- `uv run ruff format --check src/pmcp/types.py src/pmcp/tools/handlers.py src/pmcp/cli.py src/pmcp/cli_commands/doctor.py tests/test_auth.py tests/test_tools.py tests/test_cli.py tests/test_phase4_e2e.py` - passed after formatting `src/pmcp/cli.py`.
+- `uv run mypy src/pmcp --exclude baml_client` - passed.
+- `uv run pytest -q` - passed (`1731 passed, 12 skipped, 21 deselected`).
+- `uv build` - passed.

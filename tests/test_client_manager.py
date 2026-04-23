@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from pathlib import Path
 import time
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -20,6 +21,7 @@ from pmcp.client.manager import (
     _infer_risk_hint,
     _truncate_description,
 )
+from pmcp.env_store import write_env_file
 from pmcp.remote_auth import MissingRemoteHeaderAuthError
 from pmcp.types import (
     LocalMcpServerConfig,
@@ -989,6 +991,54 @@ class TestRemoteConnectSseHeaders:
             "X-Static": "literal-value",
         }
 
+        await manager.disconnect_all()
+
+    @pytest.mark.asyncio
+    async def test_connect_streamable_http_interpolates_headers_from_project_store(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager = ClientManager()
+        credential = r'token with spaces # "quotes" and \ slash = value'
+        write_env_file(tmp_path / ".env.pmcp", {"PMCP_TEST_TOKEN": credential})
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("PMCP_TEST_TOKEN", raising=False)
+
+        config = ResolvedServerConfig(
+            name="remote-http",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                type="streamable-http",
+                url="https://example.com/mcp",
+                headers={"Authorization": "Bearer ${PMCP_TEST_TOKEN}"},
+            ),
+        )
+        captured_headers: dict[str, str] = {}
+
+        class EmptyReadStream:
+            def __aiter__(self) -> "EmptyReadStream":
+                return self
+
+            async def __anext__(self) -> None:
+                raise StopAsyncIteration
+
+        @asynccontextmanager
+        async def mock_streamablehttp_client(
+            url: str, headers: dict[str, str] | None = None
+        ):
+            assert url == "https://example.com/mcp"
+            captured_headers.update(headers or {})
+            yield EmptyReadStream(), MagicMock(), MagicMock(return_value=None)
+
+        manager._send_initialize = AsyncMock()
+        manager._send_request = AsyncMock(return_value={"tools": []})
+        manager._read_sse = AsyncMock()
+
+        with patch(
+            "pmcp.client.manager.streamablehttp_client", mock_streamablehttp_client
+        ):
+            await manager._connect_streamable_http(config)
+
+        assert captured_headers == {"Authorization": f"Bearer {credential}"}
         await manager.disconnect_all()
 
     @pytest.mark.asyncio

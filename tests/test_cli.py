@@ -543,6 +543,7 @@ class TestRunStatus:
                     "startup_skip_reason": "missing_auth",
                     "startup_env_var": "PMCP_TEST_KEY",
                     "auth_state": "missing_auth",
+                    "auth_event": "missing_credential",
                     "next_step": "gateway.auth_connect(server_name='needs-key')",
                 },
             ],
@@ -563,6 +564,13 @@ class TestRunStatus:
                 "trace_context_supported": True,
                 "protocol_version_visible": True,
                 "header_compatibility": {"MCP-Protocol-Version": "accepted"},
+                "auth_state_semantics": {
+                    "missing_auth": {
+                        "meaning": "credential missing",
+                        "primary_next_action": "call gateway.auth_connect",
+                        "evidence_fields": ["missing_env_vars"],
+                    }
+                },
             },
         }
 
@@ -579,9 +587,86 @@ class TestRunStatus:
         assert by_name["current"]["server_capabilities"]["tasks"] == {}
         assert by_name["current"]["startup_policy"] == "eager"
         assert by_name["needs-key"]["auth_state"] == "missing_auth"
+        assert by_name["needs-key"]["auth_event"] == "missing_credential"
         assert by_name["needs-key"]["startup_skip_reason"] == "missing_auth"
         assert output["pending_requests"][0]["task_id"] == "task-1"
         assert output["gateway_diagnostics"]["trace_context_supported"] is True
+        assert "auth_state_semantics" in output["gateway_diagnostics"]
+
+    @pytest.mark.asyncio
+    async def test_auth_soak_status_json_preserves_remote_auth_matrix_fields(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from pmcp.cli import run_status
+
+        status_args.json = True
+        live_snapshot = {
+            "revision_id": "live-rev",
+            "last_refresh_ts": 1_700_000_000.0,
+            "servers": [
+                {
+                    "name": "remote-header",
+                    "status": "offline",
+                    "tool_count": 0,
+                    "auth_state": "missing_auth",
+                    "auth_event": "missing_credential",
+                    "missing_env_vars": ["REMOTE_API_TOKEN"],
+                    "next_step": "gateway.auth_connect(server_name='remote-header')",
+                },
+                {
+                    "name": "remote-scope",
+                    "status": "offline",
+                    "tool_count": 0,
+                    "auth_state": "insufficient_scope",
+                    "auth_event": "insufficient_scope",
+                    "auth_challenge": {
+                        "scheme": "Bearer",
+                        "missing_scopes": ["read", "write"],
+                        "error": "insufficient_scope",
+                    },
+                    "auth_metadata": {
+                        "protected_resource_metadata_url": (
+                            "https://auth.example/pr?token=%5BREDACTED%5D"
+                        ),
+                        "missing_scopes": ["read", "write"],
+                    },
+                },
+                {
+                    "name": "remote-url",
+                    "status": "offline",
+                    "tool_count": 0,
+                    "auth_state": "elicitation_required",
+                    "auth_event": "url_elicitation_required",
+                    "url_elicitations": [
+                        {
+                            "elicitation_id": "consent-1",
+                            "url": ("https://auth.example/consent?code=%5BREDACTED%5D"),
+                            "next_step": "acknowledge consent",
+                        }
+                    ],
+                    "next_step": "acknowledge consent",
+                },
+            ],
+            "total_tools": 0,
+        }
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status",
+            new=AsyncMock(return_value=live_snapshot),
+        ):
+            await run_status(status_args)
+
+        output = json.loads(capsys.readouterr().out)
+        by_name = {server["name"]: server for server in output["servers"]}
+        assert by_name["remote-header"]["missing_env_vars"] == ["REMOTE_API_TOKEN"]
+        assert by_name["remote-scope"]["auth_challenge"]["missing_scopes"] == [
+            "read",
+            "write",
+        ]
+        assert by_name["remote-url"]["url_elicitations"][0]["elicitation_id"] == (
+            "consent-1"
+        )
+        assert "secret" not in json.dumps(output)
 
     @pytest.mark.asyncio
     async def test_status_live_snapshot_human_with_pending_and_verbose(
@@ -688,6 +773,49 @@ class TestRunStatus:
         assert "missing_env=CONTEXT7_API_KEY" in captured.out
         assert "auth=missing_auth" in captured.out
         assert "gateway.auth_connect" in captured.out
+
+    @pytest.mark.asyncio
+    async def test_status_verbose_uses_auth_semantics_next_action(
+        self, status_args: argparse.Namespace, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        from pmcp.cli import run_status
+
+        status_args.verbose = True
+        live_snapshot = {
+            "revision_id": "live-rev",
+            "last_refresh_ts": 1_700_000_000.0,
+            "servers": [
+                {
+                    "name": "needs-key",
+                    "status": "offline",
+                    "tool_count": 0,
+                    "missing_env_vars": ["CONTEXT7_API_KEY"],
+                    "auth_state": "missing_auth",
+                    "auth_event": "missing_credential",
+                },
+            ],
+            "total_tools": 0,
+            "gateway_diagnostics": {
+                "auth_state_semantics": {
+                    "missing_auth": {
+                        "meaning": "credential missing",
+                        "primary_next_action": "call gateway.auth_connect",
+                        "evidence_fields": ["missing_env_vars"],
+                    }
+                }
+            },
+        }
+
+        with patch(
+            "pmcp.cli._query_running_gateway_status",
+            new=AsyncMock(return_value=live_snapshot),
+        ):
+            await run_status(status_args)
+
+        captured = capsys.readouterr()
+        assert "event=missing_credential" in captured.out
+        assert "missing_env=CONTEXT7_API_KEY" in captured.out
+        assert "next=call gateway.auth_connect" in captured.out
 
     @pytest.mark.asyncio
     async def test_status_verbose_prints_live_protocol_version(
@@ -1350,6 +1478,8 @@ class TestRunDoctor:
 
         captured = capsys.readouterr()
         assert "[WARN] remote:" in captured.out
+        assert "auth=missing_auth" in captured.out
+        assert "next=gateway.auth_connect(server_name='remote-api')" in captured.out
         assert "REMOTE_API_TOKEN" in captured.out
 
     @pytest.mark.asyncio
@@ -1436,6 +1566,34 @@ class TestRunDoctor:
         assert "secret-session" not in rendered
         assert "secret-ticket" not in rendered
         assert "http://auth.example" in rendered
+        assert "%5BREDACTED%5D" in rendered
+
+    def test_doctor_remote_auth_diagnostics_do_not_print_header_values(self) -> None:
+        from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
+
+        checks = collect_remote_header_diagnostics(
+            {
+                "mcpServers": {
+                    "remote-api": {
+                        "type": "streamable-http",
+                        "url": "https://example.com/mcp",
+                        "headers": {
+                            "Authorization": "Bearer ${REMOTE_API_TOKEN}",
+                            "X-Api-Key": "literal-secret-value",
+                        },
+                        "protected_resource_metadata_url": (
+                            "https://auth.example/pr?ticket=secret-ticket"
+                        ),
+                    }
+                }
+            }
+        )
+
+        rendered = "\n".join(message for _, _, message in checks)
+        assert "auth=missing_auth" in rendered
+        assert "REMOTE_API_TOKEN" in rendered
+        assert "literal-secret-value" not in rendered
+        assert "secret-ticket" not in rendered
         assert "%5BREDACTED%5D" in rendered
 
 

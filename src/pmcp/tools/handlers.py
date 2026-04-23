@@ -72,6 +72,7 @@ from pmcp.types import (
     ArgInfo,
     AuthConnectInput,
     AuthConnectOutput,
+    AuthEventKind,
     CancelInput,
     CancelOutput,
     CapabilityCandidate,
@@ -855,12 +856,15 @@ class GatewayTools:
         task_id: str | None = None,
         protocol_version: str | None = None,
         auth_state: str = "none",
+        auth_event: AuthEventKind | None = None,
         error: str | None = None,
         trace_context: TraceContextInfo | None = None,
     ) -> None:
         safe_error = None
         if error:
             safe_error = self._sanitize_error(Exception(error))
+        if auth_event is None:
+            auth_event = self._auth_event_for_state(auth_state)
         self._audit_events.append(
             GatewayAuditEvent(
                 timestamp=time.time(),
@@ -873,6 +877,7 @@ class GatewayTools:
                 task_id=task_id,
                 protocol_version=protocol_version,
                 auth_state=cast(Any, auth_state),
+                auth_event=auth_event,
                 error=safe_error,
                 trace_present=trace_context is not None,
             )
@@ -914,6 +919,24 @@ class GatewayTools:
         if not match:
             return None
         return parse_www_authenticate(match.group(1))
+
+    @staticmethod
+    def _auth_event_for_state(auth_state: str) -> AuthEventKind | None:
+        if auth_state == "insufficient_scope":
+            return "insufficient_scope"
+        if auth_state == "elicitation_required":
+            return "url_elicitation_required"
+        if auth_state == "policy_denied":
+            return "policy_denied"
+        return None
+
+    @staticmethod
+    def _auth_event_for_challenge(auth_challenge: Any | None) -> AuthEventKind | None:
+        if auth_challenge is None:
+            return None
+        if getattr(auth_challenge, "missing_scopes", None):
+            return "insufficient_scope"
+        return "remote_auth_challenge"
 
     @property
     def _provisioned_registry_path(self) -> Path:
@@ -1338,7 +1361,44 @@ class GatewayTools:
                 server_name = parsed.tool_id.split("::")[0]
                 if self._client_manager.is_lazy_server(server_name):
                     # Try to connect the lazy server first
-                    connected = await self._ensure_server_for_tool(parsed.tool_id)
+                    try:
+                        connected = await self._ensure_server_for_tool(parsed.tool_id)
+                    except MissingRemoteHeaderAuthError as e:
+                        env_names = ", ".join(e.missing_env_vars)
+                        error = make_error(
+                            ErrorCode.E201_SERVER_OFFLINE,
+                            message=(
+                                "Missing remote header environment variable(s) "
+                                f"for '{server_name}': {env_names}"
+                            ),
+                            tool_id=parsed.tool_id,
+                        )
+                        self._audit(
+                            method="gateway.invoke",
+                            action="invoke",
+                            outcome="failure",
+                            started_at=audit_started_at,
+                            server_name=server_name,
+                            tool_id=parsed.tool_id,
+                            auth_state="missing_auth",
+                            auth_event="missing_credential",
+                            error=error.message,
+                            trace_context=trace_context,
+                        )
+                        return InvokeOutput(
+                            tool_id=parsed.tool_id,
+                            ok=False,
+                            truncated=False,
+                            raw_size_estimate=0,
+                            errors=[error.model_dump_json()],
+                            missing_env_vars=e.missing_env_vars,
+                            auth_state="missing_auth",
+                            auth_methods=self._auth_methods_for_server(server_name),
+                            next_step=(
+                                f"gateway.auth_connect(server_name='{server_name}')"
+                            ),
+                            feedback_hint=self._feedback_hint(),
+                        )
                     if connected:
                         # Re-check for tool after connection
                         tool_info = self._client_manager.get_tool(parsed.tool_id)
@@ -1381,6 +1441,7 @@ class GatewayTools:
                 tool_id=parsed.tool_id,
                 protocol_version=self._protocol_version(tool_info.server_name),
                 auth_state="policy_denied",
+                auth_event="policy_denied",
                 error=error.message,
                 trace_context=trace_context,
             )
@@ -1575,6 +1636,7 @@ class GatewayTools:
                 tool_id=parsed.tool_id,
                 protocol_version=self._protocol_version(tool_info.server_name),
                 auth_state=auth_state,
+                auth_event=self._auth_event_for_challenge(auth_challenge),
                 error=error.message,
                 trace_context=trace_context,
             )
@@ -1609,6 +1671,7 @@ class GatewayTools:
                     tool_id=parsed.tool_id,
                     protocol_version=self._protocol_version(tool_info.server_name),
                     auth_state="elicitation_required",
+                    auth_event="url_elicitation_required",
                     error="URL-mode elicitation required.",
                     trace_context=trace_context,
                 )
@@ -1658,6 +1721,7 @@ class GatewayTools:
                 tool_id=parsed.tool_id,
                 protocol_version=self._protocol_version(tool_info.server_name),
                 auth_state=auth_state,
+                auth_event=self._auth_event_for_challenge(auth_challenge),
                 error=error.message,
                 trace_context=trace_context,
             )
@@ -2201,6 +2265,14 @@ class GatewayTools:
                 next_step=url_elicitations[0].next_step,
                 url_elicitations=url_elicitations,
             )
+        auth_challenge = self._auth_challenge_from_message("; ".join(errors))
+        auth_state = "none"
+        if auth_challenge:
+            auth_state = (
+                "insufficient_scope"
+                if auth_challenge.missing_scopes
+                else "missing_auth"
+            )
         return self._lifecycle_output(
             ok=not errors,
             server=server_name,
@@ -2210,6 +2282,14 @@ class GatewayTools:
             if not errors
             else f"Server '{server_name}' could not be connected.",
             errors=errors or None,
+            auth_state=auth_state,
+            auth_event=self._auth_event_for_challenge(auth_challenge),
+            auth_challenge=auth_challenge,
+            next_step=(
+                "Resolve remote authorization out of band, then retry connection."
+                if auth_challenge
+                else None
+            ),
         )
 
     async def disconnect_server(
@@ -2416,6 +2496,7 @@ class GatewayTools:
         errors: list[str] | None = None,
         missing_env_vars: list[str] | None = None,
         auth_state: str = "none",
+        auth_event: AuthEventKind | None = None,
         next_step: str | None = None,
         auth_methods: list[str] | None = None,
         auth_metadata: Any | None = None,
@@ -2430,6 +2511,7 @@ class GatewayTools:
             server_name=server,
             protocol_version=self._protocol_version(server),
             auth_state=auth_state,
+            auth_event=auth_event,
             error="; ".join(errors) if errors else None,
         )
         return LifecycleServerOutput(
@@ -2487,6 +2569,7 @@ class GatewayTools:
             ],
             missing_env_vars=missing_env_vars,
             auth_state="missing_auth",
+            auth_event="missing_credential",
             auth_methods=self._auth_methods_for_server(config.name),
             next_step=f"gateway.auth_connect(server_name='{config.name}')",
         )
@@ -2568,7 +2651,9 @@ class GatewayTools:
                             errors=[
                                 f"Missing authentication environment variable for '{server_name}': {env_names}"
                             ],
+                            missing_env_vars=auth_env_options,
                             auth_state="missing_auth",
+                            auth_event="missing_credential",
                             auth_methods=self._auth_methods_for_server(server_name),
                             auth_metadata=self._auth_metadata_for_server(server_config),
                             next_step=f"gateway.auth_connect(server_name='{server_name}')",
@@ -2836,7 +2921,16 @@ class GatewayTools:
         safe_description = self._truncate_token_text(
             self._scrub_sensitive_text(parsed.description)
         )
-        events_json = json.dumps(self._feedback_events[-6:], indent=2)
+        events_json = json.dumps(
+            {
+                "feedback_events": self._feedback_events[-6:],
+                "audit_events": [
+                    event.model_dump(mode="json", exclude_none=True)
+                    for event in list(self._audit_events)[-6:]
+                ],
+            },
+            indent=2,
+        )
         subordinate = parsed.subordinate_server or "unknown"
         failed_call = parsed.failed_tool_call or "unknown"
 
@@ -3252,6 +3346,7 @@ class GatewayTools:
                     auth_mode="api_key",
                     auth_methods=self._auth_methods_for_server(server_name),
                     alternative_env_vars=auth_env_options,
+                    missing_env_vars=auth_env_options,
                     auth_state="missing_auth",
                     auth_metadata=self._auth_metadata_for_server(server_config),
                     next_step=f"gateway.auth_connect(server_name='{server_name}')",
@@ -3453,6 +3548,7 @@ class GatewayTools:
                 message=f"Server '{server_name}' requires API key.",
                 needs_api_key=True,
                 env_var=e.env_var,
+                missing_env_vars=[e.env_var],
                 env_instructions=e.env_instructions,
                 auth_required=True,
                 auth_mode="api_key",
@@ -3503,11 +3599,22 @@ class GatewayTools:
 
     async def auth_connect(self, input_data: dict[str, Any]) -> AuthConnectOutput:
         """gateway.auth_connect - Store auth credentials for a server."""
+        audit_started_at = time.monotonic()
         parsed = AuthConnectInput.model_validate(input_data)
         server_name = parsed.server_name
 
         if parsed.auth_mode == "url_elicitation":
             if parsed.credential:
+                self._audit(
+                    method="gateway.auth_connect",
+                    action="auth_connect",
+                    outcome="refused",
+                    started_at=audit_started_at,
+                    server_name=server_name,
+                    auth_state="elicitation_required",
+                    auth_event="url_elicitation_required",
+                    error="URL-mode elicitation does not accept credentials.",
+                )
                 return AuthConnectOutput(
                     ok=False,
                     server=server_name,
@@ -3518,6 +3625,16 @@ class GatewayTools:
                     auth_state="elicitation_required",
                 )
             if not parsed.elicitation_id or not parsed.consent_acknowledged:
+                self._audit(
+                    method="gateway.auth_connect",
+                    action="auth_connect",
+                    outcome="refused",
+                    started_at=audit_started_at,
+                    server_name=server_name,
+                    auth_state="elicitation_required",
+                    auth_event="url_elicitation_required",
+                    error="URL-mode elicitation acknowledgement is incomplete.",
+                )
                 return AuthConnectOutput(
                     ok=False,
                     server=server_name,
@@ -3537,6 +3654,16 @@ class GatewayTools:
                 try:
                     safe_url = sanitize_url_elicitation_url(parsed.elicitation_url)
                 except ValueError as e:
+                    self._audit(
+                        method="gateway.auth_connect",
+                        action="auth_connect",
+                        outcome="refused",
+                        started_at=audit_started_at,
+                        server_name=server_name,
+                        auth_state="elicitation_required",
+                        auth_event="url_elicitation_required",
+                        error=str(e),
+                    )
                     return AuthConnectOutput(
                         ok=False,
                         server=server_name,
@@ -3548,6 +3675,15 @@ class GatewayTools:
                     url=safe_url,
                     next_step=f"Retry gateway.provision(server_name='{server_name}') or gateway.invoke.",
                 )
+            self._audit(
+                method="gateway.auth_connect",
+                action="auth_connect",
+                outcome="success",
+                started_at=audit_started_at,
+                server_name=server_name,
+                auth_state="elicitation_required",
+                auth_event="url_elicitation_acknowledged",
+            )
             return AuthConnectOutput(
                 ok=True,
                 server=server_name,
@@ -3561,6 +3697,16 @@ class GatewayTools:
             )
 
         if not parsed.credential:
+            self._audit(
+                method="gateway.auth_connect",
+                action="auth_connect",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=server_name,
+                auth_state="missing_auth",
+                auth_event="missing_credential",
+                error="API-key auth requires a credential value.",
+            )
             return AuthConnectOutput(
                 ok=False,
                 server=server_name,
@@ -3573,6 +3719,16 @@ class GatewayTools:
         env_var = parsed.env_var or (server_config.env_var if server_config else None)
 
         if not env_var:
+            self._audit(
+                method="gateway.auth_connect",
+                action="auth_connect",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=server_name,
+                auth_state="missing_auth",
+                auth_event="missing_credential",
+                error="No auth env var is known.",
+            )
             return AuthConnectOutput(
                 ok=False,
                 server=server_name,
@@ -3586,6 +3742,16 @@ class GatewayTools:
         try:
             path = set_env_value(parsed.scope, env_var, parsed.credential)
         except ValueError as exc:
+            self._audit(
+                method="gateway.auth_connect",
+                action="auth_connect",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=server_name,
+                auth_state="missing_auth",
+                auth_event="missing_credential",
+                error=str(exc),
+            )
             return AuthConnectOutput(
                 ok=False,
                 server=server_name,
@@ -3595,6 +3761,15 @@ class GatewayTools:
             )
         os.environ[env_var] = parsed.credential
 
+        self._audit(
+            method="gateway.auth_connect",
+            action="auth_connect",
+            outcome="success",
+            started_at=audit_started_at,
+            server_name=server_name,
+            auth_state="none",
+            auth_event="credential_stored",
+        )
         return AuthConnectOutput(
             ok=True,
             server=server_name,

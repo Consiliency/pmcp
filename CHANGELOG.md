@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-04-23
+
+### Added
+- Added an offline AUTHSOAK release-gate matrix for local API-key auth,
+  remote bearer-header placeholders, remote auth challenges, insufficient
+  scopes, URL-mode elicitation, malicious auth URLs, and non-secret
+  status/doctor/feedback evidence.
+
+### Changed
+- Tightened operator auth documentation for env-store scope selection, remote
+  header placeholders, URL-mode non-goals, redaction limits, and HTTP endpoint
+  exposure expectations.
+
+### Fixed
+- Redacted `bearer=` query parameter values anywhere auth URLs are sanitized or
+  rendered in diagnostics.
+
 ## [1.11.0] - 2026-04-22
 
 ### Added

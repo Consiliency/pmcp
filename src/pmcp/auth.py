@@ -18,6 +18,7 @@ AUTH_SECRET_QUERY_KEYS = {
     "auth",
     "auth_code",
     "authorization",
+    "bearer",
     "client_secret",
     "code",
     "id_token",

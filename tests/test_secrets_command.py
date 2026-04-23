@@ -275,3 +275,43 @@ class TestSecretsHandlers:
         assert "REMOTE_API_TOKEN" in output["required_keys"]
         assert output["required_by_server"]["remote-api"] == ["REMOTE_API_TOKEN"]
         assert "REMOTE_API_TOKEN" in output["missing_keys"]
+
+    @pytest.mark.asyncio
+    async def test_run_secrets_check_combines_local_and_remote_auth_requirements(
+        self, tmp_path: Path
+    ) -> None:
+        home = tmp_path / "home"
+        project = tmp_path / "project"
+        user_env = home / ".config" / "pmcp" / "pmcp.env"
+        config_path = project / ".mcp.json"
+
+        user_env.parent.mkdir(parents=True, exist_ok=True)
+        project.mkdir(parents=True, exist_ok=True)
+        user_env.write_text("LOCAL_API_KEY=stored-local\n")
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "local-api": {
+                            "command": "local-api",
+                            "env": {"LOCAL_API_KEY": "${LOCAL_API_KEY}"},
+                        },
+                        "remote-api": {
+                            "type": "streamable-http",
+                            "url": "https://example.com/mcp",
+                            "headers": {"Authorization": "Bearer ${REMOTE_API_TOKEN}"},
+                        },
+                    }
+                }
+            )
+        )
+
+        with patch.dict("os.environ", {"HOME": str(home)}, clear=True):
+            output = await run_secrets_check(argparse.Namespace(project=project))
+
+        assert output["required_by_server"]["local-api"] == ["LOCAL_API_KEY"]
+        assert output["required_by_server"]["remote-api"] == ["REMOTE_API_TOKEN"]
+        assert output["required_keys"] == ["LOCAL_API_KEY", "REMOTE_API_TOKEN"]
+        assert output["available_keys"] == ["LOCAL_API_KEY"]
+        assert output["missing_keys"] == ["REMOTE_API_TOKEN"]
+        assert "stored-local" not in json.dumps(output)

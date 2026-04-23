@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import stat
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
@@ -24,19 +25,76 @@ from pmcp.remote_auth import (
     build_remote_header_env_lookup,
     resolve_remote_headers,
 )
-from pmcp.types import AuthConnectInput, ProvisionOutput, ServerHealthInfo
+from pmcp.types import (
+    DEFAULT_AUTH_STATE_SEMANTICS,
+    AuthConnectInput,
+    GatewayAuditEvent,
+    GatewayDiagnosticsInfo,
+    InvokeOutput,
+    ProvisionOutput,
+    ServerHealthInfo,
+)
+from pmcp.types import AuthState
 
 
 def test_legacy_auth_models_validate_without_new_fields() -> None:
     provision = ProvisionOutput(ok=False, server="x", message="needs key")
     health = ServerHealthInfo(name="x", status="offline", tool_count=0)
+    invoke = InvokeOutput(
+        tool_id="x::tool",
+        ok=False,
+        truncated=False,
+        raw_size_estimate=0,
+    )
     auth_input = AuthConnectInput(server_name="x", credential="secret")
 
     assert provision.auth_state == "none"
     assert provision.missing_env_vars == []
     assert health.auth_state == "none"
     assert health.missing_env_vars == []
+    assert invoke.auth_state == "none"
+    assert invoke.missing_env_vars == []
     assert auth_input.auth_mode == "api_key"
+
+
+def test_auth_state_semantics_cover_every_state_with_operator_action() -> None:
+    assert set(DEFAULT_AUTH_STATE_SEMANTICS) == set(get_args(AuthState))
+    for info in DEFAULT_AUTH_STATE_SEMANTICS.values():
+        assert info.meaning
+        assert info.primary_next_action
+        assert isinstance(info.evidence_fields, list)
+
+
+def test_gateway_diagnostics_includes_auth_semantics_by_default() -> None:
+    diagnostics = GatewayDiagnosticsInfo()
+
+    assert set(diagnostics.auth_state_semantics) == set(get_args(AuthState))
+    assert (
+        diagnostics.auth_state_semantics["missing_auth"].primary_next_action
+        == DEFAULT_AUTH_STATE_SEMANTICS["missing_auth"].primary_next_action
+    )
+
+
+def test_gateway_audit_event_auth_event_is_additive() -> None:
+    minimal = GatewayAuditEvent(
+        timestamp=1.0,
+        method="gateway.health",
+        action="health",
+        outcome="success",
+        latency_ms=0,
+    )
+    categorized = GatewayAuditEvent(
+        timestamp=1.0,
+        method="gateway.invoke",
+        action="invoke",
+        outcome="failure",
+        latency_ms=0,
+        auth_state="missing_auth",
+        auth_event="missing_credential",
+    )
+
+    assert minimal.auth_event is None
+    assert categorized.auth_event == "missing_credential"
 
 
 def test_remote_header_resolves_embedded_placeholders_without_metadata_leaks() -> None:
@@ -254,6 +312,55 @@ def test_auth_redaction_covers_roadmap_query_keys_fragments_and_jwts() -> None:
     ]:
         assert leaked not in redacted
         assert leaked not in safe_url
+
+
+@pytest.mark.parametrize(
+    ("raw_url", "secret_fragments"),
+    [
+        (
+            "https://user:pass@auth.example/cb?code=oauth-code&state=ok",
+            ["user:pass", "oauth-code"],
+        ),
+        (
+            "https://auth.example/cb?bearer=secret-bearer&token=access-token",
+            ["secret-bearer", "access-token"],
+        ),
+        (
+            "https://auth.example/cb?jwt=eyJhbGciOiJIUzI1NiJ9.payload.sig",
+            ["eyJhbGciOiJIUzI1NiJ9.payload.sig"],
+        ),
+        (
+            "https://auth.example/cb?assertion=saml-secret&ticket=ticket-secret",
+            ["saml-secret", "ticket-secret"],
+        ),
+    ],
+)
+def test_auth_url_matrix_redacts_secret_inputs_across_surfaces(
+    raw_url: str, secret_fragments: list[str]
+) -> None:
+    metadata = normalize_auth_metadata(
+        {"scopes_supported": ["read"]},
+        protected_resource_metadata_url=raw_url,
+        diagnostics=[f"provider returned {raw_url}"],
+    )
+    challenge = parse_www_authenticate(
+        f'Bearer resource_metadata="{raw_url}", error="insufficient_scope", '
+        'scope="read write", error_description="token secret-bearer failed"'
+    )
+    elicitation_url = sanitize_url_elicitation_url(raw_url)
+
+    combined = " ".join(
+        [
+            metadata.model_dump_json(),
+            challenge.model_dump_json() if challenge else "",
+            elicitation_url,
+        ]
+    )
+    for fragment in secret_fragments + ["secret-bearer"]:
+        assert fragment not in combined
+    assert metadata.declared_scopes == ["read"]
+    assert challenge is not None
+    assert challenge.missing_scopes == ["read", "write"]
 
 
 def test_sanitize_public_auth_url_rejects_invalid_and_non_public_urls() -> None:

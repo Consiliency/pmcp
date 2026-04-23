@@ -115,7 +115,10 @@ def collect_remote_header_diagnostics(
                     (
                         "remote",
                         "warn",
-                        f"{server_name}: header '{header_name}' references ${{{var_name}}}, but {var_name} is not set in the local environment or PMCP env stores.",
+                        f"{server_name}: auth=missing_auth missing_env={var_name} "
+                        f"next=gateway.auth_connect(server_name='{server_name}'); "
+                        f"header '{header_name}' references ${{{var_name}}}, but "
+                        f"{var_name} is not set in the local environment or PMCP env stores.",
                     )
                 )
 

@@ -250,6 +250,45 @@ class TestAuthGuardHttp:
         assert diagnostics["rate_limit_enabled"] is True
         assert diagnostics["rate_limit_rpm"] == 4
 
+    def test_auth_soak_public_endpoints_and_metadata_never_echo_tokens(self) -> None:
+        client = _make_app(
+            auth_token="pmcp-secret-token",
+            protected_resource_metadata_url=(
+                "https://testserver/.well-known/oauth-protected-resource"
+                "?token=metadata-secret"
+            ),
+        )
+
+        health = client.get(
+            "/health", headers={"Authorization": "Bearer caller-secret"}
+        )
+        metrics = client.get(
+            "/metrics", headers={"Authorization": "Bearer caller-secret"}
+        )
+        unauthorized = client.post(
+            "/mcp", content=b"{}", headers={"Authorization": "Bearer wrong-secret"}
+        )
+        metadata = client.get(
+            "/.well-known/oauth-protected-resource",
+            headers={"Authorization": "Bearer caller-secret"},
+        )
+
+        assert health.status_code == 200
+        assert metrics.status_code == 200
+        assert unauthorized.status_code == 401
+        assert metadata.status_code == 200
+        rendered = "\n".join(
+            [health.text, metrics.text, unauthorized.text, metadata.text]
+        )
+        for secret in [
+            "pmcp-secret-token",
+            "caller-secret",
+            "wrong-secret",
+            "metadata-secret",
+        ]:
+            assert secret not in rendered
+        assert "metadata-secret" not in unauthorized.headers.get("www-authenticate", "")
+
 
 # ---------------------------------------------------------------------------
 # Rate limiting on /mcp

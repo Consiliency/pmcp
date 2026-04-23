@@ -20,6 +20,58 @@ AuthState = Literal[
     "unknown",
 ]
 
+AuthEventKind = Literal[
+    "missing_credential",
+    "credential_stored",
+    "remote_auth_challenge",
+    "insufficient_scope",
+    "url_elicitation_required",
+    "url_elicitation_acknowledged",
+    "policy_denied",
+]
+
+
+class AuthStateSemanticsInfo(BaseModel):
+    """Machine-readable operator semantics for an auth state."""
+
+    meaning: str
+    primary_next_action: str
+    evidence_fields: list[str] = Field(default_factory=list)
+
+
+DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
+    "none": AuthStateSemanticsInfo(
+        meaning="No auth action is currently required.",
+        primary_next_action="No operator auth action is required.",
+        evidence_fields=[],
+    ),
+    "missing_auth": AuthStateSemanticsInfo(
+        meaning="A required credential or credential-backed header is unavailable.",
+        primary_next_action="Provide the missing credential with gateway.auth_connect or configure the named environment variable.",
+        evidence_fields=["missing_env_vars", "auth_methods", "auth_metadata"],
+    ),
+    "insufficient_scope": AuthStateSemanticsInfo(
+        meaning="A credential was present but lacks one or more required scopes.",
+        primary_next_action="Grant the missing scopes with the upstream provider, then retry.",
+        evidence_fields=["auth_challenge.missing_scopes", "auth_metadata"],
+    ),
+    "elicitation_required": AuthStateSemanticsInfo(
+        meaning="The remote server requires an out-of-band URL consent flow.",
+        primary_next_action="Open the sanitized URL, complete consent, then acknowledge the elicitation with gateway.auth_connect.",
+        evidence_fields=["url_elicitations", "url_elicitation"],
+    ),
+    "policy_denied": AuthStateSemanticsInfo(
+        meaning="PMCP policy refused the requested auth-sensitive action.",
+        primary_next_action="Review PMCP policy configuration before retrying.",
+        evidence_fields=["next_step"],
+    ),
+    "unknown": AuthStateSemanticsInfo(
+        meaning="PMCP could not classify the auth condition.",
+        primary_next_action="Inspect sanitized diagnostics and retry after resolving the reported condition.",
+        evidence_fields=["error", "next_step"],
+    ),
+}
+
 
 class TraceContextInfo(BaseModel):
     """OpenTelemetry-style trace context accepted by PMCP-owned surfaces."""
@@ -44,6 +96,7 @@ class GatewayAuditEvent(BaseModel):
     task_id: str | None = None
     protocol_version: str | None = None
     auth_state: AuthState = "none"
+    auth_event: AuthEventKind | None = None
     error: str | None = None
     trace_present: bool = False
 
@@ -64,6 +117,9 @@ class GatewayDiagnosticsInfo(BaseModel):
     auth_metadata_present: bool = False
     rate_limit_enabled: bool = False
     rate_limit_rpm: int | None = None
+    auth_state_semantics: dict[AuthState, AuthStateSemanticsInfo] = Field(
+        default_factory=lambda: DEFAULT_AUTH_STATE_SEMANTICS.copy()
+    )
 
 
 class AuthMetadataInfo(BaseModel):
@@ -612,6 +668,7 @@ class InvokeOutput(BaseModel):
     errors: list[str] | None = None
     update_warning: str | None = None
     feedback_hint: str | None = None
+    missing_env_vars: list[str] = Field(default_factory=list)
     auth_state: AuthState = "none"
     next_step: str | None = None
     auth_methods: list[str] | None = None

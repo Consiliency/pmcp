@@ -98,16 +98,16 @@ used by both `gateway.auth_connect` and `pmcp secrets`.
 
 **Exit criteria**
 
-- [ ] `gateway.auth_connect` and `pmcp secrets set/sync` share the same env-file
+- [x] `gateway.auth_connect` and `pmcp secrets set/sync` share the same env-file
   read/write/format helpers.
-- [ ] Env var names are validated with a strict shell-compatible pattern before
+- [x] Env var names are validated with a strict shell-compatible pattern before
   writing.
-- [ ] Env files written by PMCP are chmodded to `0600`.
-- [ ] Credentials containing spaces, `#`, quotes, backslashes, and `=` round-trip
+- [x] Env files written by PMCP are chmodded to `0600`.
+- [x] Credentials containing spaces, `#`, quotes, backslashes, and `=` round-trip
   without corrupting the env file.
-- [ ] Newline-bearing credentials are rejected unless a deliberately documented
+- [x] Newline-bearing credentials are rejected unless a deliberately documented
   multiline format is added.
-- [ ] Tests prove credential content cannot inject additional env vars.
+- [x] Tests prove credential content cannot inject additional env vars.
 
 **Scope notes**
 
@@ -152,15 +152,15 @@ Streamable HTTP connections.
 
 **Exit criteria**
 
-- [ ] `${ENV_VAR}` placeholders in remote `headers` are resolved through a helper
+- [x] `${ENV_VAR}` placeholders in remote `headers` are resolved through a helper
   that also reports missing variables.
-- [ ] Missing placeholder variables return `auth_state="missing_auth"` and a
+- [x] Missing placeholder variables return `auth_state="missing_auth"` and a
   structured list of missing env vars from `gateway.provision` and
   `gateway.connect_server`.
-- [ ] PMCP does not send empty `Authorization` headers caused by missing env vars.
-- [ ] `pmcp doctor`, `pmcp secrets check`, and `pmcp status` can surface missing
+- [x] PMCP does not send empty `Authorization` headers caused by missing env vars.
+- [x] `pmcp doctor`, `pmcp secrets check`, and `pmcp status` can surface missing
   remote header credentials without printing values.
-- [ ] SSE and Streamable HTTP remote paths have coverage for present and missing
+- [x] SSE and Streamable HTTP remote paths have coverage for present and missing
   credential placeholders.
 
 **Scope notes**
@@ -208,15 +208,15 @@ records acknowledgement only after the user explicitly confirms completion.
 
 **Exit criteria**
 
-- [ ] `pmcp auth connect` no longer auto-acknowledges URL-mode elicitation before
+- [x] `pmcp auth connect` no longer auto-acknowledges URL-mode elicitation before
   the user completes the provider flow.
-- [ ] A clear CLI acknowledgement path exists for URL-mode elicitation, with JSON
+- [x] A clear CLI acknowledgement path exists for URL-mode elicitation, with JSON
   and text output.
-- [ ] `gateway.auth_connect(auth_mode="url_elicitation")` continues to reject
+- [x] `gateway.auth_connect(auth_mode="url_elicitation")` continues to reject
   credentials, OAuth codes, passwords, and refresh-token material.
-- [ ] URL-mode output includes sanitized URL, `elicitation_id`, and next step
+- [x] URL-mode output includes sanitized URL, `elicitation_id`, and next step
   without secret-bearing query values.
-- [ ] Non-loopback `http://` elicitation URLs are rejected; loopback HTTP remains
+- [x] Non-loopback `http://` elicitation URLs are rejected; loopback HTTP remains
   allowed for local development if needed.
 
 **Scope notes**
@@ -261,16 +261,16 @@ parsing, and diagnostic redaction.
 
 **Exit criteria**
 
-- [ ] Redaction covers bearer tokens, API keys, auth codes, JWT-looking strings,
+- [x] Redaction covers bearer tokens, API keys, auth codes, JWT-looking strings,
   URL userinfo, and common auth-bearing query keys including `session`, `sid`,
   `jwt`, `assertion`, `saml`, and `ticket`.
-- [ ] Public metadata fetches do not forward credentials, cookies, or caller auth
+- [x] Public metadata fetches do not forward credentials, cookies, or caller auth
   headers.
-- [ ] Metadata and elicitation URL validation rejects invalid, relative, or
+- [x] Metadata and elicitation URL validation rejects invalid, relative, or
   non-HTTPS non-loopback URLs.
-- [ ] `WWW-Authenticate` parsing handles quoted values, missing scopes,
+- [x] `WWW-Authenticate` parsing handles quoted values, missing scopes,
   insufficient scope, resource metadata URLs, and sanitized error descriptions.
-- [ ] Gateway errors, feedback hints, audit events, status, doctor, and HTTP
+- [x] Gateway errors, feedback hints, audit events, status, doctor, and HTTP
   diagnostics share the same auth sanitizer.
 
 **Scope notes**
@@ -318,15 +318,15 @@ humans to act without parsing prose or seeing secrets.
 
 **Exit criteria**
 
-- [ ] Each auth state has documented semantics and one primary next action.
-- [ ] Gateway outputs include structured `missing_env_vars` or equivalent
+- [x] Each auth state has documented semantics and one primary next action.
+- [x] Gateway outputs include structured `missing_env_vars` or equivalent
   non-secret fields where missing auth is env/header-based.
-- [ ] Audit events distinguish missing credential, credential stored, remote auth
+- [x] Audit events distinguish missing credential, credential stored, remote auth
   challenge, insufficient scope, URL elicitation required, and URL elicitation
   acknowledged.
-- [ ] `gateway.health`, `pmcp status --verbose`, `pmcp doctor`, and feedback
+- [x] `gateway.health`, `pmcp status --verbose`, `pmcp doctor`, and feedback
   payload previews expose non-secret auth evidence consistently.
-- [ ] Tests assert common secret samples do not appear in auth-related outputs.
+- [x] Tests assert common secret samples do not appear in auth-related outputs.
 
 **Scope notes**
 
@@ -372,18 +372,31 @@ available.
 
 **Exit criteria**
 
-- [ ] Local fake downstream coverage models missing API key, present API key,
+- [x] Local fake downstream coverage models missing API key, present API key,
   missing remote bearer header, remote `WWW-Authenticate`, insufficient scope,
   URL elicitation required, and malicious auth URLs.
-- [ ] End-to-end smoke covers provision -> auth connect -> retry for local API-key
+- [x] End-to-end smoke covers provision -> auth connect -> retry for local API-key
   flows without leaking the credential.
-- [ ] End-to-end smoke covers remote header missing-auth and remote challenge
+- [x] End-to-end smoke covers remote header missing-auth and remote challenge
   states through gateway and CLI/status surfaces.
-- [ ] README and SECURITY document supported auth modes, non-goals, URL-mode
+- [x] README and SECURITY document supported auth modes, non-goals, URL-mode
   expectations, env-store scope guidance, redaction limits, and HTTP exposure
   expectations.
-- [ ] CHANGELOG records production auth hardening when release-bound.
-- [ ] Full release verification passes before version bump or publish.
+- [x] CHANGELOG records production auth hardening when release-bound.
+- [x] Full release verification passes before version bump or publish.
+
+**Release evidence**
+
+- 2026-04-23 AUTHSOAK local matrix passed: 163 targeted auth/status/doctor
+  tests across helper, gateway, client, CLI, secrets, HTTP transport, and E2E
+  surfaces.
+- 2026-04-23 full release gate passed: `ruff check src/ tests/`, `ruff format
+  --check src/ tests/`, `mypy src/pmcp --exclude baml_client`, `pytest -q`
+  (1742 passed, 12 skipped, 21 deselected), and `uv build`.
+- The soak matrix found and fixed one contract-preserving redaction gap:
+  `bearer=` query values are now classified as auth-bearing query secrets. No
+  OAuth provider, refresh-token store, identity broker, public tool, CLI command,
+  model field, or auth semantic was added.
 
 **Scope notes**
 

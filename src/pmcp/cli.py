@@ -840,6 +840,53 @@ def _sanitize_cli_payload(value: Any) -> Any:
     return value
 
 
+def _format_auth_evidence(
+    payload: dict[str, Any],
+    *,
+    verbose: bool = False,
+    semantics: dict[str, Any] | None = None,
+) -> str | None:
+    """Render structured auth evidence without parsing prose diagnostics."""
+    auth_state = payload.get("auth_state")
+    if not auth_state or auth_state == "none":
+        return None
+
+    parts = [f"auth={sanitize_auth_diagnostic(auth_state)}"]
+    auth_event = payload.get("auth_event")
+    if auth_event:
+        parts.append(f"event={sanitize_auth_diagnostic(auth_event)}")
+
+    missing_env_vars = payload.get("missing_env_vars")
+    if isinstance(missing_env_vars, list) and missing_env_vars:
+        parts.append("missing_env=" + ",".join(str(v) for v in missing_env_vars))
+
+    auth_challenge = payload.get("auth_challenge")
+    if isinstance(auth_challenge, dict):
+        missing_scopes = auth_challenge.get("missing_scopes")
+        if isinstance(missing_scopes, list) and missing_scopes:
+            parts.append("scopes=" + ",".join(str(v) for v in missing_scopes))
+
+    url_elicitations = payload.get("url_elicitations")
+    if isinstance(url_elicitations, list) and url_elicitations:
+        ids = [
+            str(item.get("elicitation_id"))
+            for item in url_elicitations
+            if isinstance(item, dict) and item.get("elicitation_id")
+        ]
+        if ids:
+            parts.append("elicitations=" + ",".join(ids))
+
+    next_step = payload.get("next_step")
+    if not next_step and semantics:
+        info = semantics.get(str(auth_state))
+        if isinstance(info, dict):
+            next_step = info.get("primary_next_action")
+    if verbose and next_step:
+        parts.append(f"next={sanitize_auth_diagnostic(str(next_step))}")
+
+    return " ".join(parts)
+
+
 def _exit_gateway_unreachable(errors: list[str]) -> None:
     """Exit with a clear direct-gateway connection failure."""
     detail = "; ".join(errors)
@@ -991,6 +1038,12 @@ async def run_status(args: argparse.Namespace) -> None:
         print(
             f"PMCP Gateway: reachable ({_redact_url_credentials(_get_gateway_url())})"
         )
+        diagnostics = live_snapshot.get("gateway_diagnostics")
+        auth_semantics = (
+            diagnostics.get("auth_state_semantics")
+            if isinstance(diagnostics, dict)
+            else None
+        )
 
         if servers:
             print(f"\nDownstream Server State ({online} online, {offline} offline):")
@@ -1004,24 +1057,15 @@ async def run_status(args: argparse.Namespace) -> None:
                 else:
                     icon = "\u2717"
                     details = f"({sanitize_auth_diagnostic(s.get('error') or status)})"
-                auth_state = s.get("auth_state")
-                if auth_state and auth_state != "none":
-                    auth_detail = f"auth={auth_state}"
-                    missing_env_vars = s.get("missing_env_vars")
-                    missing = (
-                        (s.get("auth_challenge") or {}).get("missing_scopes")
-                        if isinstance(s.get("auth_challenge"), dict)
-                        else None
-                    )
-                    if missing:
-                        auth_detail += f" scopes={','.join(missing)}"
-                    if isinstance(missing_env_vars, list) and missing_env_vars:
-                        auth_detail += (
-                            f" env={','.join(str(v) for v in missing_env_vars)}"
-                        )
+                auth_detail = _format_auth_evidence(
+                    s,
+                    verbose=args.verbose,
+                    semantics=auth_semantics
+                    if isinstance(auth_semantics, dict)
+                    else None,
+                )
+                if auth_detail:
                     details = f"{details}  {auth_detail}"
-                if args.verbose and s.get("next_step"):
-                    details = f"{details}  next={sanitize_auth_diagnostic(s.get('next_step'))}"
                 if args.verbose and s.get("startup_policy"):
                     policy_parts = [f"policy={s.get('startup_policy')}"]
                     if s.get("startup_source"):
@@ -1228,11 +1272,20 @@ async def run_status(args: argparse.Namespace) -> None:
                     if args.verbose and s.protocol_version:
                         details = f"{details}  protocol={s.protocol_version}"
                     missing_env_vars = missing_env_vars_by_server.get(s.name, [])
-                    if args.verbose and missing_env_vars:
-                        details = (
-                            f"{details}  auth=missing_auth "
-                            f"missing_env={','.join(missing_env_vars)}"
-                        )
+                    auth_detail = _format_auth_evidence(
+                        {
+                            "auth_state": "missing_auth"
+                            if missing_env_vars
+                            else "none",
+                            "missing_env_vars": missing_env_vars,
+                            "next_step": f"gateway.auth_connect(server_name='{s.name}')"
+                            if missing_env_vars
+                            else None,
+                        },
+                        verbose=args.verbose,
+                    )
+                    if auth_detail:
+                        details = f"{details}  {auth_detail}"
 
                     print(f"  {icon} {s.name:<16} {s.status.value:<10} {details}")
             else:
@@ -1723,8 +1776,10 @@ async def _probe_http_health(timeout_s: float) -> tuple[bool, str]:
         if response.status_code == 200:
             detail = f"{safe_url} reachable"
             try:
-                diagnostics = response.json().get("gateway_diagnostics")
+                payload = response.json()
+                diagnostics = payload.get("gateway_diagnostics")
             except Exception:
+                payload = {}
                 diagnostics = None
             if isinstance(diagnostics, dict):
                 transport = diagnostics.get("transport")
@@ -1737,6 +1792,13 @@ async def _probe_http_health(timeout_s: float) -> tuple[bool, str]:
                     parts.append(f"trace={'supported' if trace else 'disabled'}")
                 if rate:
                     parts.append(f"rate_limit={rate}rpm")
+                if diagnostics.get("auth_state_semantics"):
+                    parts.append("auth_semantics=available")
+                if diagnostics.get("auth_metadata_present"):
+                    parts.append("auth_metadata=present")
+                audit_events = payload.get("audit_events")
+                if isinstance(audit_events, list):
+                    parts.append(f"audit_events={len(audit_events)}")
                 if parts:
                     detail = f"{detail} ({', '.join(parts)})"
             return True, detail

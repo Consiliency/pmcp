@@ -13,7 +13,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pmcp.client.manager import ClientManager, ManagedClient
-from pmcp.config.loader import make_tool_id
+from pmcp.config.loader import StartupObservation, make_tool_id
+from pmcp.env_store import read_env_file
+from pmcp.manifest.loader import Manifest, ServerConfig
 from pmcp.policy.policy import PolicyManager
 from pmcp.tools.handlers import GatewayTools
 from pmcp.types import (
@@ -193,6 +195,136 @@ async def test_conformance_release_gate_gateway_smoke() -> None:
     assert current_health.protocol_version == "2025-11-25"
     assert health.audit_events is not None
     assert health.audit_events[-1].task_id == "release-task"
+
+
+@pytest.mark.asyncio
+async def test_authobs_gateway_health_and_feedback_smoke(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """AUTHOBS evidence is structured, redacted, and shared across surfaces."""
+    manager = ClientManager()
+    gateway = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
+    gateway.set_startup_observations(
+        {
+            "remote-api": StartupObservation(
+                name="remote-api",
+                startup_policy="skipped",
+                startup_source="project",
+                startup_skip_reason="missing_auth",
+                startup_env_var="REMOTE_API_TOKEN",
+                missing_env_vars=["REMOTE_API_TOKEN"],
+            )
+        }
+    )
+    monkeypatch.chdir(tmp_path)
+    await gateway.auth_connect(
+        {
+            "server_name": "custom",
+            "env_var": "OPENAI_API_KEY",
+            "credential": "sk-authobs-secret-token-1234567890",
+            "scope": "project",
+        }
+    )
+
+    health = await gateway.health()
+    feedback = await gateway.submit_feedback(
+        {
+            "title": "AUTHOBS smoke",
+            "description": "URL https://user:pass@example.test/cb?code=secret-code",
+        }
+    )
+
+    remote = next(server for server in health.servers if server.name == "remote-api")
+    assert remote.auth_state == "missing_auth"
+    assert remote.missing_env_vars == ["REMOTE_API_TOKEN"]
+    assert health.gateway_diagnostics is not None
+    assert "missing_auth" in health.gateway_diagnostics.auth_state_semantics
+    assert health.audit_events is not None
+    assert health.audit_events[-1].auth_event == "credential_stored"
+    assert "credential_stored" in feedback.issue_body
+    assert "sk-authobs-secret-token-1234567890" not in feedback.issue_body
+    assert "secret-code" not in feedback.issue_body
+
+
+@pytest.mark.asyncio
+async def test_auth_soak_local_api_key_provision_connect_retry_smoke(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Local fake API-key auth reaches provision, env-store, health, and feedback."""
+    project = tmp_path / "project"
+    home = tmp_path / "home"
+    project.mkdir()
+    credential = "sk-authsoak-secret-token-1234567890"
+    manifest = Manifest(
+        version="1.0",
+        cli_alternatives={},
+        servers={
+            "needs-key": ServerConfig(
+                name="needs-key",
+                description="Needs key",
+                keywords=["auth"],
+                install={},
+                command="needs-key",
+                args=[],
+                requires_api_key=True,
+                env_var="PMCP_TEST_KEY",
+            )
+        },
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
+
+    class FakeJobManager:
+        async def start_install(self, *args: object, **kwargs: object) -> str:
+            return "job-auth-soak"
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(project)
+    monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+    monkeypatch.setattr("pmcp.tools.handlers.get_job_manager", lambda: FakeJobManager())
+    monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
+    gateway = GatewayTools(
+        client_manager=ClientManager(),
+        policy_manager=PolicyManager(),
+        project_root=project,
+    )
+
+    missing = await gateway.provision({"server_name": "needs-key"})
+    connected = await gateway.auth_connect(
+        {
+            "server_name": "needs-key",
+            "credential": credential,
+            "scope": "project",
+        }
+    )
+    retry = await gateway.provision({"server_name": "needs-key"})
+    health = await gateway.health()
+    feedback = await gateway.submit_feedback(
+        {
+            "title": "Auth soak smoke",
+            "description": "https://user:pass@example.test/cb?code=secret-code",
+        }
+    )
+
+    assert missing.auth_state == "missing_auth"
+    assert connected.ok is True
+    assert read_env_file(project / ".env.pmcp") == {"PMCP_TEST_KEY": credential}
+    assert retry.ok is True
+    assert retry.job_id == "job-auth-soak"
+    assert health.audit_events is not None
+    assert health.audit_events[-1].auth_event == "credential_stored"
+    rendered = "\n".join(
+        [
+            missing.model_dump_json(),
+            connected.model_dump_json(),
+            retry.model_dump_json(),
+            health.model_dump_json(),
+            feedback.model_dump_json(),
+        ]
+    )
+    assert credential not in rendered
+    assert "secret-code" not in rendered
 
 
 @pytest.mark.asyncio

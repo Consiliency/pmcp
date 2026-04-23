@@ -57,6 +57,11 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   parameters from gateway outputs, status/doctor diagnostics, feedback payloads,
   and HTTP diagnostics. Treat all logs as operational data and avoid adding
   secrets to server names, tool names, or free-form descriptions.
+- **No per-user credential isolation**: user-scope env-store files are owned by
+  the local OS account, project-scope env-store files are owned by the project
+  directory, and remote header placeholders resolve from those stores plus
+  process environment. PMCP does not provide a multi-tenant authorization layer
+  or cross-user credential separation inside one running gateway.
 - **Subprocess spawning**: PMCP forks child processes for downstream MCP servers. A malicious
   MCP server config entry could cause PMCP to spawn arbitrary executables. Only configure
   servers you trust.

@@ -371,7 +371,15 @@ Supported flows:
 - Local API-key servers continue to use env-store credentials. When
   `gateway.provision` reports `auth_state="missing_auth"` and
   `auth_mode="api_key"`, call `gateway.auth_connect` with a credential and PMCP
-  stores it in the selected user or project env file.
+  stores it in the selected user or project env file. User scope writes
+  `~/.config/pmcp/pmcp.env`; project scope writes `<project>/.env.pmcp`. Project
+  scope is useful for local development and CI workspaces, while user scope is
+  better for credentials that should follow one operator across projects.
+- Remote bearer headers use env placeholders such as
+  `Authorization: Bearer ${REMOTE_API_TOKEN}`. PMCP resolves placeholders from
+  process env, project env-store, and user env-store values, but status, doctor,
+  health, and feedback output only show required or missing env var names, not
+  the resolved header value.
 - Remote authorization discovery is diagnostic-only. PMCP can preserve and report
   OAuth Protected Resource Metadata, Authorization Server Metadata, OpenID
   Connect discovery, Client ID Metadata Document URLs, and declared scopes when a
