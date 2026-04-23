@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-04-23
+
 ### Added
 - PMCP discovery now exposes compact native CLI guidance for installed CLIs
   through `gateway.request_capability` (`status="use_cli"`) and
