@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 import os
 import time
@@ -110,6 +111,7 @@ class MockClientManager:
         self.pending_requests: list[Any] = []
         self.tasks: dict[tuple[str, str], Any] = {}
         self.list_task_calls: list[str | None] = []
+        self.task_request_contexts: list[dict[str, Any] | None] = []
         self.last_call_task: Any = None
         self.last_call_trace_context: Any = None
 
@@ -178,12 +180,21 @@ class MockClientManager:
             task_record = McpTaskRecord(
                 task_id="task-1",
                 status="working",
-                status_message=None,
-                created_at=None,
-                updated_at=None,
-                ttl=None,
-                poll_interval=None,
-                raw={"taskId": "task-1", "status": "working"},
+                status_message="queued by SDK host",
+                created_at="2026-01-02T03:04:05Z",
+                updated_at="2026-01-02T03:04:06Z",
+                ttl=300,
+                poll_interval=2.5,
+                raw={
+                    "taskId": "task-1",
+                    "status": "working",
+                    "statusMessage": "queued by SDK host",
+                    "createdAt": "2026-01-02T03:04:05Z",
+                    "lastUpdatedAt": "2026-01-02T03:04:06Z",
+                    "ttl": 300,
+                    "pollInterval": 2.5,
+                    "metadata": {"unknown": "kept"},
+                },
                 server_name=tool_id.split("::", 1)[0],
                 tool_id=tool_id,
             )
@@ -211,14 +222,24 @@ class MockClientManager:
         return (len(active), [])
 
     async def list_tasks(
-        self, server_name: str | None = None, cursor: str | None = None
+        self,
+        server_name: str | None = None,
+        cursor: str | None = None,
+        *,
+        requestor_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         self.list_task_calls.append(server_name)
+        self.task_request_contexts.append(requestor_context)
         return {
             "tasks": [
                 {
                     "task_id": task.task_id,
                     "status": task.status,
+                    "status_message": task.status_message,
+                    "created_at": task.created_at,
+                    "updated_at": task.updated_at,
+                    "ttl": task.ttl,
+                    "poll_interval": task.poll_interval,
                     "server_name": task.server_name,
                     "raw": task.raw,
                 }
@@ -228,13 +249,27 @@ class MockClientManager:
             "nextCursor": cursor,
         }
 
-    async def get_task(self, server_name: str, task_id: str) -> Any:
+    async def get_task(
+        self,
+        server_name: str,
+        task_id: str,
+        *,
+        requestor_context: dict[str, Any] | None = None,
+    ) -> Any:
+        self.task_request_contexts.append(requestor_context)
         task = self.tasks.get((server_name, task_id))
         if task is None:
             raise KeyError(task_id)
         return task
 
-    async def get_task_result(self, server_name: str, task_id: str) -> dict[str, Any]:
+    async def get_task_result(
+        self,
+        server_name: str,
+        task_id: str,
+        *,
+        requestor_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.task_request_contexts.append(requestor_context)
         task = self.tasks.get((server_name, task_id))
         if task is None:
             raise KeyError(task_id)
@@ -242,8 +277,14 @@ class MockClientManager:
         return {"result": "api_key=sk-secret", "task": task.raw}
 
     async def cancel_task(
-        self, server_name: str, task_id: str, force: bool = False
+        self,
+        server_name: str,
+        task_id: str,
+        force: bool = False,
+        *,
+        requestor_context: dict[str, Any] | None = None,
     ) -> tuple[bool, Any, str]:
+        self.task_request_contexts.append(requestor_context)
         task = self.tasks.get((server_name, task_id))
         if task is None:
             return (False, None, "Task not found")
@@ -4231,6 +4272,97 @@ class TestInvokeErrorPaths:
             "gateway.tasks_cancel",
         ]
         assert health.audit_events[-1].task_id == "task-1"
+
+    @pytest.mark.asyncio
+    async def test_gateway_task_surfaces_preserve_sdk_metadata(self) -> None:
+        tool = self._make_tool(execution={"taskSupport": "optional"})
+        gt = self._make_gateway_tools(tool=tool)
+
+        invoked = await gt.invoke(
+            {
+                "tool_id": "svc::do_thing",
+                "arguments": {},
+                "task": {"metadata": {"reason": "slow"}},
+            }
+        )
+        listed = await gt.tasks_list({"server_name": "svc"})
+        got = await gt.tasks_get({"server_name": "svc", "task_id": "task-1"})
+        result = await gt.tasks_result(
+            {
+                "server_name": "svc",
+                "task_id": "task-1",
+                "options": {"redact_secrets": True},
+            }
+        )
+        health = await gt.health()
+
+        assert invoked.task is not None
+        assert invoked.task.status_message == "queued by SDK host"
+        assert invoked.task.created_at == pytest.approx(
+            datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc).timestamp()
+        )
+        assert invoked.task.updated_at == pytest.approx(
+            datetime(2026, 1, 2, 3, 4, 6, tzinfo=timezone.utc).timestamp()
+        )
+        assert invoked.task.ttl == 300
+        assert invoked.task.poll_interval == 2.5
+        assert invoked.task.raw["metadata"] == {"unknown": "kept"}
+        assert listed.tasks[0].raw["lastUpdatedAt"] == "2026-01-02T03:04:06Z"
+        assert got.task is not None
+        assert got.task.task_id == "task-1"
+        assert result.task is not None
+        assert result.task.status == "completed"
+        assert "sk-secret" not in str(result.result)
+        assert health.audit_events is not None
+        assert [event.task_id for event in health.audit_events[-3:]] == [
+            None,
+            "task-1",
+            "task-1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_gateway_task_surfaces_forward_requestor_context(self) -> None:
+        tool = self._make_tool(execution={"taskSupport": "optional"})
+        gt = self._make_gateway_tools(tool=tool)
+        context = {
+            "tenantId": "tenant_test",
+            "actorId": "actor_test",
+            "authScopes": ["run:create"],
+            "testTenant": True,
+        }
+
+        await gt.invoke(
+            {
+                "tool_id": "svc::do_thing",
+                "arguments": {},
+                "task": {"requestor_context": context},
+            }
+        )
+        await gt.tasks_list({"server_name": "svc", "requestor_context": context})
+        await gt.tasks_get(
+            {
+                "server_name": "svc",
+                "task_id": "task-1",
+                "requestor_context": context,
+            }
+        )
+        await gt.tasks_result(
+            {
+                "server_name": "svc",
+                "task_id": "task-1",
+                "requestor_context": context,
+            }
+        )
+        await gt.tasks_cancel(
+            {
+                "server_name": "svc",
+                "task_id": "task-1",
+                "requestor_context": context,
+            }
+        )
+
+        manager = cast(Any, gt._client_manager)
+        assert manager.task_request_contexts == [context, context, context, context]
 
     @pytest.mark.asyncio
     async def test_tenant_code_mode_task_lifecycle_uses_downstream_task_ids(

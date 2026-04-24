@@ -676,6 +676,22 @@ class ClientManager:
             payload["requestorContext"] = parsed.requestor_context
         return payload
 
+    def _task_request_params(
+        self,
+        *,
+        task_id: str | None = None,
+        cursor: str | None = None,
+        requestor_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        if task_id is not None:
+            payload["taskId"] = task_id
+        if cursor:
+            payload["cursor"] = cursor
+        if requestor_context:
+            payload["task"] = {"requestorContext": requestor_context}
+        return payload
+
     def _extract_task_payload(self, result: dict[str, Any]) -> dict[str, Any] | None:
         task = result.get("task")
         if isinstance(task, dict):
@@ -695,7 +711,13 @@ class ClientManager:
             status=payload.get("status"),
             status_message=status_message if isinstance(status_message, str) else None,
             created_at=payload.get("createdAt", payload.get("created_at")),
-            updated_at=payload.get("updatedAt", payload.get("updated_at")),
+            updated_at=payload.get(
+                "updatedAt",
+                payload.get(
+                    "updated_at",
+                    payload.get("lastUpdatedAt", payload.get("last_updated_at")),
+                ),
+            ),
             ttl=payload.get("ttl"),
             poll_interval=poll_interval,
             raw=payload,
@@ -1663,7 +1685,11 @@ class ClientManager:
         return managed
 
     async def list_tasks(
-        self, server_name: str | None = None, cursor: str | None = None
+        self,
+        server_name: str | None = None,
+        cursor: str | None = None,
+        *,
+        requestor_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Proxy downstream tasks/list and update the transient task registry."""
         servers = [server_name] if server_name else sorted(self._clients)
@@ -1671,9 +1697,10 @@ class ClientManager:
         next_cursor: str | None = None
         for name in servers:
             managed = self._task_client(name)
-            params: dict[str, Any] = {}
-            if cursor:
-                params["cursor"] = cursor
+            params = self._task_request_params(
+                cursor=cursor,
+                requestor_context=requestor_context,
+            )
             result = await self._send_request(managed, "tasks/list", params)
             for payload in result.get("tasks", []):
                 if not isinstance(payload, dict):
@@ -1686,29 +1713,71 @@ class ClientManager:
             next_cursor = result.get("nextCursor") or result.get("next_cursor")
         return {"tasks": all_tasks, "nextCursor": next_cursor}
 
-    async def get_task(self, server_name: str, task_id: str) -> McpTaskInfo:
+    async def get_task(
+        self,
+        server_name: str,
+        task_id: str,
+        *,
+        requestor_context: dict[str, Any] | None = None,
+    ) -> McpTaskInfo:
         """Proxy downstream tasks/get and update the transient task registry."""
         managed = self._task_client(server_name)
-        result = await self._send_request(managed, "tasks/get", {"taskId": task_id})
+        record = self.get_task_record(server_name, task_id)
+        result = await self._send_request(
+            managed,
+            "tasks/get",
+            self._task_request_params(
+                task_id=task_id,
+                requestor_context=requestor_context
+                or (record.requestor_context if record is not None else None),
+            ),
+        )
         payload = self._extract_task_payload(result) or result
         task_info = self._task_info_from_payload(payload)
         if task_info is None:
             raise KeyError(f"Task not found: {server_name}::{task_id}")
         return self._record_task(server_name, task_info)
 
-    async def get_task_result(self, server_name: str, task_id: str) -> dict[str, Any]:
+    async def get_task_result(
+        self,
+        server_name: str,
+        task_id: str,
+        *,
+        requestor_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Proxy downstream tasks/result and update task metadata when returned."""
         managed = self._task_client(server_name)
-        result = await self._send_request(managed, "tasks/result", {"taskId": task_id})
+        record = self.get_task_record(server_name, task_id)
+        result = await self._send_request(
+            managed,
+            "tasks/result",
+            self._task_request_params(
+                task_id=task_id,
+                requestor_context=requestor_context
+                or (record.requestor_context if record is not None else None),
+            ),
+        )
         task_payload = self._extract_task_payload(result)
         if task_payload is not None:
             task_info = self._task_info_from_payload(task_payload)
             if task_info is not None:
                 self._record_task(server_name, task_info)
+        else:
+            await self.get_task(
+                server_name,
+                task_id,
+                requestor_context=requestor_context
+                or (record.requestor_context if record is not None else None),
+            )
         return result
 
     async def cancel_task(
-        self, server_name: str, task_id: str, force: bool = False
+        self,
+        server_name: str,
+        task_id: str,
+        force: bool = False,
+        *,
+        requestor_context: dict[str, Any] | None = None,
     ) -> tuple[bool, McpTaskInfo | None, str]:
         """Proxy downstream tasks/cancel with idempotent local terminal handling."""
         record = self.get_task_record(server_name, task_id)
@@ -1718,9 +1787,12 @@ class ClientManager:
             return (False, None, f"Task not found: {server_name}::{task_id}")
 
         managed = self._task_client(server_name)
-        result = await self._send_request(
-            managed, "tasks/cancel", {"taskId": task_id, "force": force}
+        params = self._task_request_params(
+            task_id=task_id,
+            requestor_context=requestor_context or record.requestor_context,
         )
+        params["force"] = force
+        result = await self._send_request(managed, "tasks/cancel", params)
         payload = self._extract_task_payload(result) or result
         task_info = self._task_info_from_payload(payload)
         if task_info is None:

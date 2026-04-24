@@ -4709,7 +4709,9 @@ class GatewayTools:
             next_cursor = None
             for server_name in server_names:
                 result = await self._client_manager.list_tasks(
-                    server_name, parsed.cursor
+                    server_name,
+                    parsed.cursor,
+                    requestor_context=parsed.requestor_context,
                 )
                 next_cursor = result.get("nextCursor") or next_cursor
                 for task in result.get("tasks", []):
@@ -4770,7 +4772,9 @@ class GatewayTools:
             return TasksGetOutput(ok=False, errors=[message])
         try:
             task = await self._client_manager.get_task(
-                parsed.server_name, parsed.task_id
+                parsed.server_name,
+                parsed.task_id,
+                requestor_context=parsed.requestor_context,
             )
             self._audit(
                 method="gateway.tasks_get",
@@ -4812,7 +4816,9 @@ class GatewayTools:
             return TasksResultOutput(ok=False, errors=[message])
         try:
             result = await self._client_manager.get_task_result(
-                parsed.server_name, parsed.task_id
+                parsed.server_name,
+                parsed.task_id,
+                requestor_context=parsed.requestor_context,
             )
             task = self._client_manager.get_task_record(
                 parsed.server_name, parsed.task_id
@@ -4820,6 +4826,15 @@ class GatewayTools:
             result_payload = (
                 result.get("result", result) if isinstance(result, dict) else result
             )
+            if isinstance(result_payload, str):
+                for _ in range(2):
+                    try:
+                        decoded = json.loads(result_payload)
+                    except json.JSONDecodeError:
+                        break
+                    result_payload = decoded
+                    if not isinstance(result_payload, str):
+                        break
             max_bytes = None
             if parsed.options and parsed.options.max_output_chars:
                 max_bytes = parsed.options.max_output_chars * 4
@@ -4880,7 +4895,10 @@ class GatewayTools:
             )
         try:
             ok, task, message = await self._client_manager.cancel_task(
-                parsed.server_name, parsed.task_id, parsed.force
+                parsed.server_name,
+                parsed.task_id,
+                parsed.force,
+                requestor_context=parsed.requestor_context,
             )
             self._audit(
                 method="gateway.tasks_cancel",

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 # === Transport Types ===
 
@@ -450,6 +451,28 @@ class McpTaskInfo(BaseModel):
     poll_interval: float | None = None
     raw: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("created_at", "updated_at", mode="before")
+    @classmethod
+    def _normalize_task_timestamp(cls, value: Any) -> float | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value.timestamp()
+        if isinstance(value, int | float):
+            return float(value)
+        if isinstance(value, str):
+            candidate = value.strip()
+            if not candidate:
+                return None
+            try:
+                return float(candidate)
+            except ValueError:
+                pass
+            if candidate.endswith("Z"):
+                candidate = f"{candidate[:-1]}+00:00"
+            return datetime.fromisoformat(candidate).timestamp()
+        return value
+
 
 class McpTaskRecord(McpTaskInfo):
     """Transient task registry record tracked by PMCP."""
@@ -475,6 +498,7 @@ class TasksListInput(BaseModel):
 
     server_name: str | None = None
     cursor: str | None = None
+    requestor_context: dict[str, Any] | None = None
 
 
 class TasksListOutput(BaseModel):
@@ -491,6 +515,7 @@ class TasksGetInput(BaseModel):
 
     server_name: str = Field(min_length=1)
     task_id: str = Field(min_length=1)
+    requestor_context: dict[str, Any] | None = None
 
 
 class TasksGetOutput(BaseModel):
@@ -507,6 +532,7 @@ class TasksResultInput(BaseModel):
     server_name: str = Field(min_length=1)
     task_id: str = Field(min_length=1)
     options: InvokeOptions | None = None
+    requestor_context: dict[str, Any] | None = None
 
 
 class TasksResultOutput(BaseModel):
@@ -527,6 +553,7 @@ class TasksCancelInput(BaseModel):
     server_name: str = Field(min_length=1)
     task_id: str = Field(min_length=1)
     force: bool = False
+    requestor_context: dict[str, Any] | None = None
 
 
 class TasksCancelOutput(BaseModel):

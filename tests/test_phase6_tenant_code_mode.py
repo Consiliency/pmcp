@@ -130,6 +130,9 @@ def _tenant_gateway(policy_manager: PolicyManager | None = None) -> GatewayTools
                 "statusMessage": "waiting for approval"
                 if status_value == "input_required"
                 else "queued",
+                "createdAt": "2026-01-02T03:04:05Z",
+                "lastUpdatedAt": "2026-01-02T03:04:06Z",
+                "ttl": 300,
                 "pollInterval": 0.1,
             }
             return {"task": tasks[task_id]}
@@ -143,6 +146,7 @@ def _tenant_gateway(policy_manager: PolicyManager | None = None) -> GatewayTools
                 **tasks[task_id],
                 "status": "completed",
                 "statusMessage": "completed",
+                "lastUpdatedAt": "2026-01-02T03:04:07Z",
             }
             return {
                 "task": tasks[task_id],
@@ -157,6 +161,7 @@ def _tenant_gateway(policy_manager: PolicyManager | None = None) -> GatewayTools
                 **tasks[task_id],
                 "status": "cancelled",
                 "statusMessage": "cancelled by client",
+                "lastUpdatedAt": "2026-01-02T03:04:08Z",
             }
             return {"task": tasks[task_id]}
         raise AssertionError(f"unexpected method {method}")

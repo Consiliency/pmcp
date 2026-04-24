@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 import time
 from typing import Any, cast
@@ -25,6 +26,7 @@ from pmcp.env_store import write_env_file
 from pmcp.remote_auth import MissingRemoteHeaderAuthError
 from pmcp.types import (
     LocalMcpServerConfig,
+    McpTaskInfo,
     PromptInfo,
     RemoteMcpServerConfig,
     ResourceInfo,
@@ -1399,11 +1401,50 @@ class TestCallTool:
         manager_with_tool._clients["test"] = managed
         manager_with_tool._send_request = AsyncMock(
             side_effect=[
-                {"tasks": [{"taskId": "t1", "status": "input_required"}]},
-                {"task": {"taskId": "t1", "status": "completed"}},
+                {
+                    "tasks": [
+                        {
+                            "taskId": "t1",
+                            "status": "input_required",
+                            "statusMessage": "needs approval",
+                            "createdAt": "2026-01-02T03:04:05Z",
+                            "lastUpdatedAt": "2026-01-02T03:04:06Z",
+                            "ttl": 300,
+                            "pollInterval": 2,
+                            "metadata": {"unknown": "kept"},
+                        },
+                        {
+                            "taskId": "opaque/downstream#2",
+                            "status": "host_custom_waiting",
+                            "created_at": 1760000000,
+                            "last_updated_at": 1760000001.5,
+                            "ttl": 120,
+                            "poll_interval": 0.5,
+                        },
+                    ]
+                },
+                {
+                    "task": {
+                        "taskId": "t1",
+                        "status": "completed",
+                        "updatedAt": "2026-01-02T03:04:07Z",
+                    }
+                },
                 {
                     "result": {"ok": True},
-                    "task": {"taskId": "t1", "status": "completed"},
+                    "task": {
+                        "taskId": "t1",
+                        "status": "completed",
+                        "lastUpdatedAt": "2026-01-02T03:04:08Z",
+                    },
+                },
+                {
+                    "task": {
+                        "taskId": "opaque/downstream#2",
+                        "status": "cancelled",
+                        "statusMessage": "cancelled by client",
+                        "lastUpdatedAt": "2026-01-02T03:04:09Z",
+                    }
                 },
             ]
         )
@@ -1411,11 +1452,46 @@ class TestCallTool:
         listed = await manager_with_tool.list_tasks("test")
         got = await manager_with_tool.get_task("test", "t1")
         result = await manager_with_tool.get_task_result("test", "t1")
+        ok, cancelled, message = await manager_with_tool.cancel_task(
+            "test", "opaque/downstream#2"
+        )
 
         assert listed["tasks"][0]["task_id"] == "t1"
+        assert listed["tasks"][0]["status_message"] == "needs approval"
+        assert listed["tasks"][0]["created_at"] == pytest.approx(
+            datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc).timestamp()
+        )
+        assert listed["tasks"][0]["updated_at"] == pytest.approx(
+            datetime(2026, 1, 2, 3, 4, 6, tzinfo=timezone.utc).timestamp()
+        )
+        assert listed["tasks"][0]["ttl"] == 300
+        assert listed["tasks"][0]["poll_interval"] == 2
+        assert listed["tasks"][0]["raw"]["metadata"] == {"unknown": "kept"}
+        assert listed["tasks"][1]["task_id"] == "opaque/downstream#2"
+        assert listed["tasks"][1]["status"] == "host_custom_waiting"
+        assert listed["tasks"][1]["updated_at"] == 1760000001.5
         assert got.status == "completed"
         assert result["result"] == {"ok": True}
         assert manager_with_tool.get_task_record("test", "t1").status == "completed"
+        assert ok is True
+        assert cancelled is not None
+        assert cancelled.task_id == "opaque/downstream#2"
+        assert cancelled.status == "cancelled"
+        assert cancelled.status_message == "cancelled by client"
+        assert message == "Task cancelled"
+
+    def test_task_info_normalizes_sdk_timestamp_inputs(self) -> None:
+        created = datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+        parsed = McpTaskInfo(
+            task_id="t1",
+            created_at=created,
+            updated_at="2026-01-02T03:04:06+00:00",
+        )
+
+        assert parsed.created_at == pytest.approx(created.timestamp())
+        assert parsed.updated_at == pytest.approx(
+            datetime(2026, 1, 2, 3, 4, 6, tzinfo=timezone.utc).timestamp()
+        )
 
     @pytest.mark.asyncio
     async def test_cancel_task_is_idempotent_for_terminal_tasks(
