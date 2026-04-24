@@ -133,6 +133,52 @@ def test_remote_header_missing_vars_are_sorted_deduped_and_non_secret() -> None:
     assert "secret-token" not in str(error)
 
 
+def test_tenant_code_mode_remote_headers_resolve_without_diagnostic_leaks() -> None:
+    resolution = resolve_remote_headers(
+        {
+            "Authorization": "Bearer ${TENANT_CODE_MODE_MCP_TOKEN}",
+            "X-Tenant-ID": "${TENANT_CODE_MODE_TENANT_ID}",
+        },
+        lambda name: {
+            "TENANT_CODE_MODE_MCP_TOKEN": "tenant-secret-token",
+            "TENANT_CODE_MODE_TENANT_ID": "tenant-id-123",
+        }.get(name),
+    )
+
+    assert resolution.resolved_headers == {
+        "Authorization": "Bearer tenant-secret-token",
+        "X-Tenant-ID": "tenant-id-123",
+    }
+    assert resolution.referenced_env_vars_by_header == {
+        "Authorization": ["TENANT_CODE_MODE_MCP_TOKEN"],
+        "X-Tenant-ID": ["TENANT_CODE_MODE_TENANT_ID"],
+    }
+    assert resolution.missing_env_vars == []
+
+
+def test_tenant_code_mode_missing_remote_headers_are_non_secret() -> None:
+    resolution = resolve_remote_headers(
+        {
+            "Authorization": "Bearer ${TENANT_CODE_MODE_MCP_TOKEN}",
+            "X-Tenant-ID": "${TENANT_CODE_MODE_TENANT_ID}",
+        },
+        lambda _name: None,
+    )
+    error = MissingRemoteHeaderAuthError(
+        "tenant-code-mode",
+        resolution.missing_env_vars + ["TENANT_CODE_MODE_MCP_TOKEN"],
+    )
+
+    assert resolution.missing_env_vars == [
+        "TENANT_CODE_MODE_MCP_TOKEN",
+        "TENANT_CODE_MODE_TENANT_ID",
+    ]
+    assert "tenant-code-mode" in str(error)
+    assert "TENANT_CODE_MODE_MCP_TOKEN" in str(error)
+    assert "TENANT_CODE_MODE_TENANT_ID" in str(error)
+    assert "tenant-secret-token" not in str(error)
+
+
 def test_remote_header_env_lookup_reads_process_project_and_user_stores(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -151,6 +197,33 @@ def test_remote_header_env_lookup_reads_process_project_and_user_stores(
     assert lookup("PROJECT_TOKEN") == "project-secret"
     assert lookup("USER_TOKEN") == "user-secret"
     assert lookup("MISSING_TOKEN") is None
+
+
+def test_tenant_code_mode_env_lookup_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    project = tmp_path / "project"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("TENANT_CODE_MODE_MCP_TOKEN", "process-secret")
+    write_env_file(
+        home / ".config" / "pmcp" / "pmcp.env",
+        {
+            "TENANT_CODE_MODE_MCP_TOKEN": "user-secret",
+            "TENANT_CODE_MODE_TENANT_ID": "user-tenant",
+        },
+    )
+    write_env_file(
+        project / ".env.pmcp",
+        {
+            "TENANT_CODE_MODE_TENANT_ID": "project-tenant",
+        },
+    )
+
+    lookup = build_remote_header_env_lookup(project)
+
+    assert lookup("TENANT_CODE_MODE_MCP_TOKEN") == "process-secret"
+    assert lookup("TENANT_CODE_MODE_TENANT_ID") == "project-tenant"
 
 
 def test_parse_www_authenticate_resource_metadata_and_scopes() -> None:
@@ -312,6 +385,31 @@ def test_auth_redaction_covers_roadmap_query_keys_fragments_and_jwts() -> None:
     ]:
         assert leaked not in redacted
         assert leaked not in safe_url
+
+
+def test_tenant_code_mode_auth_redaction_covers_callbacks_and_artifacts() -> None:
+    jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZW5hbnQifQ.N2QwODhmM2I4OTc1"
+    raw = (
+        "Authorization: Bearer tenant-secret "
+        f"https://tenant.example/callback?code=oauth-code&id_token={jwt} "
+        "https://tenant.example/artifacts/run-1?token=artifact-token "
+        "TENANT_CODE_MODE_MCP_TOKEN=stored-token "
+        "TENANT_CODE_MODE_TENANT_ID=tenant-123"
+    )
+
+    redacted = sanitize_auth_diagnostic(raw)
+
+    for leaked in [
+        "tenant-secret",
+        "oauth-code",
+        jwt,
+        "artifact-token",
+        "stored-token",
+        "tenant-123",
+    ]:
+        assert leaked not in redacted
+    assert "TENANT_CODE_MODE_MCP_TOKEN" in redacted
+    assert "TENANT_CODE_MODE_TENANT_ID" in redacted
 
 
 @pytest.mark.parametrize(

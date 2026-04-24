@@ -78,7 +78,9 @@ def get_prebuilt_summary(
                 lines.append(provisionable_categories)
 
     lines.append("")
-    lines.append("Use gateway.catalog_search to explore MCP tools and matching CLI hints.")
+    lines.append(
+        "Use gateway.catalog_search to explore MCP tools and matching CLI hints."
+    )
     return "\n".join(lines)
 
 

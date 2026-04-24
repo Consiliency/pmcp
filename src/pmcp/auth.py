@@ -120,7 +120,7 @@ def sanitize_auth_diagnostic(value: object) -> str:
         text,
     )
     text = re.sub(
-        r"(?i)(bearer|token|api[_-]?key|apikey|secret|password|code)"
+        r"(?i)(bearer|token|api[_-]?key|apikey|secret|password|code|tenant[_-]?id)"
         r"([\s:=]+)([A-Za-z0-9._~+/=-]{6,})",
         r"\1\2[REDACTED]",
         text,

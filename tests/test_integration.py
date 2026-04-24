@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import pytest
+from typing import Any
 
 from pmcp.config.loader import load_configs, manifest_server_to_config
 from pmcp.client.manager import ClientManager
@@ -16,6 +17,8 @@ from pmcp.policy.policy import PolicyManager
 from pmcp.summary import generate_capability_summary
 from pmcp.summary.template_fallback import template_summary
 from pmcp.server import GatewayServer
+from pmcp.tools.handlers import GatewayTools
+from pmcp.types import McpTaskRecord, RiskHint, ServerStatus, ServerStatusEnum, ToolInfo
 
 
 def get_available_servers() -> list:
@@ -49,6 +52,145 @@ def has_mcp_servers() -> bool:
 skip_no_servers = pytest.mark.skipif(
     not has_mcp_servers(), reason="No MCP servers available (config or manifest)"
 )
+
+
+class DeterministicTenantTaskManager:
+    def __init__(self) -> None:
+        self.tasks: dict[tuple[str, str], McpTaskRecord] = {}
+        self._tools = {
+            "tenant-code-mode::run_script": ToolInfo(
+                tool_id="tenant-code-mode::run_script",
+                server_name="tenant-code-mode",
+                tool_name="run_script",
+                description="Submit sandbox code for execution",
+                short_description="Run sandbox code",
+                input_schema={"type": "object", "properties": {}},
+                tags=["tenant", "sandbox"],
+                risk_hint=RiskHint.MEDIUM,
+                execution={"taskSupport": "optional"},
+            )
+        }
+
+    def get_tool(self, tool_id: str) -> ToolInfo | None:
+        return self._tools.get(tool_id)
+
+    def is_lazy_server(self, name: str) -> bool:
+        return False
+
+    def get_server_status(self, name: str) -> ServerStatus | None:
+        if name == "tenant-code-mode":
+            return ServerStatus(
+                name=name,
+                status=ServerStatusEnum.ONLINE,
+                tool_count=1,
+                server_capabilities={"tasks": {}},
+            )
+        return None
+
+    async def call_tool(
+        self,
+        tool_id: str,
+        args: dict[str, Any],
+        timeout_ms: int,
+        *,
+        task: Any = None,
+        trace_context: Any = None,
+    ) -> dict[str, Any]:
+        record = McpTaskRecord(
+            task_id="tenant-run-1",
+            status="working",
+            status_message="queued",
+            raw={"taskId": "tenant-run-1", "status": "working"},
+            server_name="tenant-code-mode",
+            tool_id=tool_id,
+            requestor_context=getattr(task, "requestor_context", None),
+        )
+        self.tasks[("tenant-code-mode", "tenant-run-1")] = record
+        return {"task": {"taskId": "tenant-run-1", "status": "working"}}
+
+    def get_task_record(self, server_name: str, task_id: str) -> McpTaskRecord | None:
+        return self.tasks.get((server_name, task_id))
+
+    async def list_tasks(
+        self, server_name: str | None = None, cursor: str | None = None
+    ) -> dict[str, Any]:
+        record = self.tasks[("tenant-code-mode", "tenant-run-1")]
+        record.status = "input_required"
+        record.raw = {"taskId": record.task_id, "status": "input_required"}
+        return {"tasks": [record.model_dump()], "nextCursor": None}
+
+    async def get_task(self, server_name: str, task_id: str) -> McpTaskRecord:
+        record = self.tasks[(server_name, task_id)]
+        record.status = "completed"
+        record.raw = {"taskId": record.task_id, "status": "completed"}
+        return record
+
+    async def get_task_result(self, server_name: str, task_id: str) -> dict[str, Any]:
+        record = self.tasks[(server_name, task_id)]
+        record.status = "completed"
+        record.raw = {"taskId": record.task_id, "status": "completed"}
+        return {
+            "task": record.raw,
+            "result": {
+                "summary": "completed",
+                "diagnostics": "stdout: ok\nsecret=sk-integration-secret",
+            },
+        }
+
+    async def cancel_task(
+        self, server_name: str, task_id: str, force: bool = False
+    ) -> tuple[bool, McpTaskRecord | None, str]:
+        record = self.tasks.get((server_name, task_id))
+        if record is None:
+            return (False, None, "Task not found")
+        record.status = "cancelled"
+        record.raw = {"taskId": record.task_id, "status": "cancelled"}
+        return (True, record, "Task cancelled")
+
+
+@pytest.mark.asyncio
+async def test_tenant_code_mode_task_lifecycle_is_deterministic() -> None:
+    manager = DeterministicTenantTaskManager()
+    gateway = GatewayTools(
+        client_manager=manager,  # type: ignore[arg-type]
+        policy_manager=PolicyManager(),
+    )
+
+    invoked = await gateway.invoke(
+        {
+            "tool_id": "tenant-code-mode::run_script",
+            "arguments": {"language": "python"},
+            "task": {"metadata": {"run_kind": "integration"}},
+        }
+    )
+    assert invoked.task is not None
+    invoked_status = invoked.task.status
+    listed = await gateway.tasks_list({"server_name": "tenant-code-mode"})
+    listed_status = listed.tasks[0].status
+    got = await gateway.tasks_get(
+        {"server_name": "tenant-code-mode", "task_id": "tenant-run-1"}
+    )
+    assert got.task is not None
+    got_status = got.task.status
+    result = await gateway.tasks_result(
+        {
+            "server_name": "tenant-code-mode",
+            "task_id": "tenant-run-1",
+            "options": {"redact_secrets": True, "max_output_chars": 100},
+        }
+    )
+    cancelled = await gateway.tasks_cancel(
+        {"server_name": "tenant-code-mode", "task_id": "tenant-run-1"}
+    )
+
+    assert invoked_status == "working"
+    assert listed_status == "input_required"
+    assert got_status == "completed"
+    assert result.ok is True
+    assert "sk-integration-secret" not in str(result.result)
+    assert cancelled.ok is True
+    assert cancelled.task is not None
+    assert cancelled.task.status == "cancelled"
 
 
 class TestConfigLoading:

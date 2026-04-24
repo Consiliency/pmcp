@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Added HOSTSOAK release-gate coverage and docs for tenant code-mode host
+  integration. PMCP brokers discovery, invocation, downstream task lifecycle,
+  policy, redaction, and operator guidance for a companion tenant code-mode MCP
+  server, but does not run scripts itself.
+
 ## [1.13.0] - 2026-04-23
 
 ### Added

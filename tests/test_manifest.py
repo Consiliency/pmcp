@@ -244,6 +244,74 @@ def test_manifest_remote_server_config():
     assert excalidraw.install == {}
 
 
+def test_tenant_code_mode_packaged_manifest_entry_is_absent_or_real() -> None:
+    """Do not ship an installable placeholder for the companion tenant server."""
+    manifest = load_manifest()
+    tenant = manifest.get_server("tenant-code-mode")
+
+    if tenant is None:
+        return
+
+    assert tenant.auto_start is False
+    assert tenant.url or tenant.command
+    if not tenant.url:
+        assert tenant.command != ""
+    expected_keywords = {
+        "code execution",
+        "sandbox execution",
+        "mobile code mode",
+        "task runs",
+        "logs",
+        "artifacts",
+    }
+    assert expected_keywords <= set(tenant.keywords)
+    for value in (tenant.headers or {}).values():
+        assert "${" in value and "}" in value
+
+
+def test_tenant_code_mode_remote_fixture_parses_as_lazy_streamable_http(
+    tmp_path: Path,
+) -> None:
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        """
+version: "1.0"
+cli_alternatives: {}
+servers:
+  tenant-code-mode:
+    description: "Tenant code-mode sandbox execution"
+    keywords:
+      - "code execution"
+      - "sandbox execution"
+      - "mobile code mode"
+      - "task runs"
+      - "logs"
+      - "artifacts"
+    install: {}
+    command: ""
+    args: []
+    transport: "streamable-http"
+    url: "https://tenant.example/mcp"
+    headers:
+      Authorization: "Bearer ${TENANT_CODE_MODE_MCP_TOKEN}"
+      X-Tenant-ID: "${TENANT_CODE_MODE_TENANT_ID}"
+"""
+    )
+
+    manifest = load_manifest(manifest_path)
+    tenant = manifest.get_server("tenant-code-mode")
+
+    assert tenant is not None
+    assert tenant.transport == "streamable-http"
+    assert tenant.url == "https://tenant.example/mcp"
+    assert tenant.command == ""
+    assert tenant.auto_start is False
+    assert tenant.headers == {
+        "Authorization": "Bearer ${TENANT_CODE_MODE_MCP_TOKEN}",
+        "X-Tenant-ID": "${TENANT_CODE_MODE_TENANT_ID}",
+    }
+
+
 def test_manifest_cli_config():
     """Test CLI config structure."""
     manifest = load_manifest()
@@ -533,6 +601,40 @@ def test_rank_cli_hints_uses_name_description_keywords_and_examples() -> None:
     assert description_match[0].hint.name == "docker"
     assert keyword_match[0].hint.name == "git"
     assert example_match[0].hint.name == "git"
+
+
+def test_tenant_code_mode_keywords_match_server_without_displacing_cli() -> None:
+    manifest = create_test_manifest()
+    manifest.servers["tenant-code-mode"] = ServerConfig(
+        name="tenant-code-mode",
+        description="Tenant code-mode sandbox execution",
+        keywords=[
+            "code execution",
+            "sandbox execution",
+            "mobile code mode",
+            "task runs",
+            "logs",
+            "artifacts",
+        ],
+        install={},
+        command="",
+        args=[],
+        transport="streamable-http",
+        url="https://tenant.example/mcp",
+        headers={"Authorization": "Bearer ${TENANT_CODE_MODE_MCP_TOKEN}"},
+    )
+
+    server_match = _keyword_match(
+        "hosted sandbox code execution", manifest, detected_clis=set()
+    )
+    cli_match = _keyword_match("git commits", manifest, detected_clis={"git"})
+
+    assert server_match.matched is True
+    assert server_match.entry_name == "tenant-code-mode"
+    assert server_match.entry_type == "server"
+    assert cli_match.matched is True
+    assert cli_match.entry_name == "git"
+    assert cli_match.entry_type == "cli"
 
 
 def test_rank_cli_hints_preserves_probe_path() -> None:

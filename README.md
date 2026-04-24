@@ -649,6 +649,11 @@ advertises task capability. Required-task tools fail before dispatch if the
 server does not advertise task support. Task records are transient gateway state,
 not durable PMCP storage.
 
+The tenant code-mode host contract in
+`specs/tenant-code-mode-host-contract.md` freezes the PMCP/companion-server
+boundary for future hosted sandbox execution. PMCP remains the broker; the
+companion tenant server remains the execution authority.
+
 Gateway observability is local and structured. `gateway.invoke` accepts trace
 context through `_meta.traceparent`, `_meta.tracestate`, and `_meta.baggage` and
 preserves those string values on PMCP-owned downstream request metadata. The
@@ -890,6 +895,63 @@ You can also configure downstream MCP servers over HTTP/SSE directly in `.mcp.js
 **Important**: Don't add `pmcp` itself to this file. PMCP is configured
 in your MCP client config, not in the downstream server list.
 
+#### Tenant Code-Mode Server Registration
+
+PMCP can broker a separate tenant code-mode MCP server as a normal downstream
+server. The contract in `specs/tenant-code-mode-host-contract.md` defines the
+boundary: PMCP discovers, invokes, monitors, truncates, and redacts through
+gateway surfaces; the companion tenant server owns sandbox execution, tenant
+authorization, logs, and artifacts. PMCP does not run scripts itself.
+
+Register the hosted server in `.mcp.json` with the configured name
+`tenant-code-mode`:
+
+```json
+{
+  "mcpServers": {
+    "tenant-code-mode": {
+      "type": "streamable-http",
+      "url": "https://tenant.example.com/mcp",
+      "headers": {
+        "Authorization": "Bearer ${TENANT_CODE_MODE_MCP_TOKEN}",
+        "X-Tenant-ID": "${TENANT_CODE_MODE_TENANT_ID}"
+      }
+    }
+  }
+}
+```
+
+For local companion-server development, use a replaceable stdio command from
+that server's checkout:
+
+```json
+{
+  "mcpServers": {
+    "tenant-code-mode": {
+      "command": "/path/to/tenant-code-mode-server",
+      "args": ["serve", "--transport", "stdio"]
+    }
+  }
+}
+```
+
+The registration is lazy by default. Add `tenant-code-mode` to top-level
+`autoStart` only when the operator wants PMCP to connect during startup.
+Discovery and startup use the existing `gateway.request_capability`,
+`gateway.catalog_search` with `include_offline: true`, `gateway.provision`, and
+`gateway.invoke` flow.
+
+Tenant runs use the existing task broker. Submit long-running work with
+`gateway.invoke` and non-secret `task.metadata`, `task.ttl`,
+`task.poll_interval`, `task.requestor_context`, and trace keys such as
+`_meta.traceparent`; PMCP forwards those fields to the downstream server only
+when the server and tool advertise task support. The returned downstream MCP
+task ID is then used with `gateway.tasks_list`, `gateway.tasks_get`,
+`gateway.tasks_result`, and `gateway.tasks_cancel`. Do not use PMCP request IDs
+from `gateway.list_pending` or `gateway.cancel` for tenant task operations.
+`gateway.tasks_result` continues to apply host-side truncation and optional
+secret redaction to sandbox-shaped logs and diagnostics.
+
 ### Credential Scope Management (`pmcp secrets`)
 
 PMCP stores secrets in environment files by scope:
@@ -943,6 +1005,49 @@ redaction:
     - "(api[_-]?key)[\\s]*[:=][\\s]*[\"']?([^\\s\"']+)"
     - "(password|secret)[\\s]*[:=][\\s]*[\"']?([^\\s\"']+)"
 ```
+
+Tenant code-mode hosting uses the same policy fields. This example allows only
+the tenant server, blocks a high-risk submission tool, bounds output, and adds a
+tenant artifact redaction pattern without granting access to unrelated MCP
+servers:
+
+```yaml
+servers:
+  allowlist:
+    - tenant-code-mode
+
+tools:
+  denylist:
+    - "tenant-code-mode::run_script"
+  allowlist:
+    - "tenant-code-mode::get_*"
+    - "tenant-code-mode::cancel_*"
+
+limits:
+  max_output_bytes: 50000
+  max_output_tokens: 4000
+
+redaction:
+  patterns:
+    - "TENANT_CODE_MODE_[A-Z_]+=[^\\s]+"
+    - "artifact_token=[^\\s]+"
+```
+
+For hosted tenant auth, keep credentials in PMCP env storage or the process
+environment and reference only placeholders from config:
+`${TENANT_CODE_MODE_MCP_TOKEN}` and `${TENANT_CODE_MODE_TENANT_ID}`. Use
+`pmcp secrets set ... --scope project` or `gateway.auth_connect` to populate
+env-store values. PMCP diagnostics report missing field or env-var names such as
+`TENANT_CODE_MODE_MCP_TOKEN`; they must not print token values.
+
+Hosted operators should require Bearer auth on `/mcp`, tune `--rate-limit` or
+`PMCP_RATE_LIMIT` for the deployment, and keep `/health` and `/metrics` behind
+network controls. `gateway.refresh`, `gateway.disconnect_server`, and
+`gateway.restart_server` can disrupt in-flight downstream work unless forced by
+policy; use downstream task IDs with `gateway.tasks_cancel` for tenant run
+cancellation. PMCP task records are transient. Durable sandbox logs, artifacts,
+tenant authorization, and artifact retention remain responsibilities of the
+companion tenant server and its deployment controls.
 
 ### CLI Commands
 

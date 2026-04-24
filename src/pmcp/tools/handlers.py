@@ -1174,7 +1174,12 @@ class GatewayTools:
         tools = self._client_manager.get_all_tools()
 
         # Filter by policy
-        tools = [t for t in tools if self._policy_manager.is_tool_allowed(t.tool_id)]
+        tools = [
+            t
+            for t in tools
+            if self._policy_manager.is_server_allowed(t.server_name)
+            and self._policy_manager.is_tool_allowed(t.tool_id)
+        ]
 
         # Filter by server online status OR merge cached tools
         if parsed.include_offline:
@@ -2762,6 +2767,22 @@ class GatewayTools:
     def _keywords_for_config_server(self, config: ResolvedServerConfig) -> list[str]:
         """Build lightweight keywords for a configured server entry."""
         keywords: list[str] = [config.name, "mcp", "server"]
+        name_words = config.name.replace("-", " ").replace("_", " ").split()
+        keywords.extend(name_words)
+        if name_words:
+            keywords.append(" ".join(name_words))
+        if " ".join(name_words).lower() == "tenant code mode":
+            keywords.extend(
+                [
+                    "code execution",
+                    "sandbox execution",
+                    "mobile code mode",
+                    "task runs",
+                    "logs",
+                    "artifacts",
+                    "hosted sandbox",
+                ]
+            )
         if isinstance(config.config, LocalMcpServerConfig):
             if config.config.command:
                 keywords.append(config.config.command)
@@ -3101,7 +3122,11 @@ class GatewayTools:
             cli_hint_match is not None and cli_hint_match.hint.name == name_match
         )
 
-        if name_match and (explicit_mcp_intent or not name_match_collides_with_cli):
+        if (
+            name_match
+            and self._policy_manager.is_server_allowed(name_match)
+            and (explicit_mcp_intent or not name_match_collides_with_cli)
+        ):
             requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
                 name_match, manifest, configured_servers
             )
@@ -3178,12 +3203,14 @@ class GatewayTools:
         category_result = (
             None if _unknown_service else manifest.get_servers_in_category(parsed.query)
         )
+        all_candidates: list[CapabilityCandidate] = []
         if category_result:
             cat_name, cat_servers = category_result
 
             # Build enriched candidates for every server in the category
-            all_candidates: list[CapabilityCandidate] = []
             for scfg in cat_servers:
+                if not self._policy_manager.is_server_allowed(scfg.name):
+                    continue
                 requires_api_key, env_var, env_instructions = (
                     self._get_server_env_metadata(
                         scfg.name, manifest, configured_servers
@@ -3203,6 +3230,12 @@ class GatewayTools:
                         is_running=scfg.name in running_servers,
                     )
                 )
+
+            if not all_candidates:
+                category_result = None
+
+        if category_result and all_candidates:
+            cat_name, _cat_servers = category_result
 
             # Sort: no-key-required first, then key-available, then key-missing
             def _sort_key(c: CapabilityCandidate) -> int:
@@ -3251,6 +3284,69 @@ class GatewayTools:
                     "Choose based on your needs and API key availability. "
                     "Call gateway.provision(server_name='<chosen>') to install."
                 ),
+            )
+
+        query_norm = parsed.query.lower().replace("-", " ").replace("_", " ")
+        configured_query_words = set(query_norm.split())
+        generic_config_keywords = {"mcp", "server", "remote", "sse", "http", "api"}
+        configured_keyword_matches: list[tuple[str, ServerConfig, list[str]]] = []
+        for server_name in configured_servers:
+            if not self._policy_manager.is_server_allowed(server_name):
+                continue
+            server_config = merged_manifest.servers.get(server_name)
+            if not server_config:
+                continue
+            matched_keywords = []
+            for keyword in server_config.keywords:
+                keyword_norm = keyword.lower().replace("-", " ").replace("_", " ")
+                keyword_words = set(keyword_norm.split())
+                if (
+                    keyword_norm in generic_config_keywords
+                    or keyword_norm.startswith("http")
+                    or not keyword_words
+                ):
+                    continue
+                if keyword_norm in query_norm or keyword_words.issubset(
+                    configured_query_words
+                ):
+                    matched_keywords.append(keyword)
+            if matched_keywords:
+                configured_keyword_matches.append(
+                    (server_name, server_config, matched_keywords)
+                )
+
+        if configured_keyword_matches:
+            configured_keyword_matches.sort(key=lambda item: (-len(item[2]), item[0]))
+            server_name, _server_config, matched_keywords = configured_keyword_matches[
+                0
+            ]
+            requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
+                server_name, manifest, configured_servers
+            )
+            api_key_available = self._check_api_key_available(env_var)
+            return CapabilityResolution(
+                status="candidates",
+                message=(
+                    f"Matched configured MCP server '{server_name}' by keywords. "
+                    "Call gateway.provision to start it when needed."
+                ),
+                candidates=[
+                    CapabilityCandidate(
+                        name=server_name,
+                        candidate_type="server",
+                        relevance_score=min(1.0, len(matched_keywords) / 3),
+                        reasoning=(
+                            "Keyword match for configured server: "
+                            f"{', '.join(matched_keywords[:3])}"
+                        ),
+                        requires_api_key=requires_api_key,
+                        api_key_available=api_key_available,
+                        env_var=env_var,
+                        env_instructions=env_instructions,
+                        is_running=server_name in running_servers,
+                    )
+                ],
+                recommendation=f"Call gateway.provision(server_name='{server_name}')",
             )
 
         # --- Tier 3: no match ---
@@ -4577,25 +4673,64 @@ class GatewayTools:
         """gateway.tasks_list - List downstream MCP tasks."""
         audit_started_at = time.monotonic()
         parsed = TasksListInput.model_validate(input_data)
-        try:
-            result = await self._client_manager.list_tasks(
-                parsed.server_name, parsed.cursor
+        if parsed.server_name and not self._policy_manager.is_server_allowed(
+            parsed.server_name
+        ):
+            message = f"Server '{parsed.server_name}' is blocked by policy."
+            self._audit(
+                method="gateway.tasks_list",
+                action="tasks_list",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                auth_state="policy_denied",
+                error=message,
             )
-            tasks: list[McpTaskInfo] = []
-            for task in result.get("tasks", []):
-                if not isinstance(task, dict) or not isinstance(
-                    task.get("task_id"), str
-                ):
-                    continue
-                record = self._client_manager.get_task_record(
-                    task.get("server_name", parsed.server_name or ""),
-                    task["task_id"],
+            return TasksListOutput(ok=False, errors=[message])
+        try:
+            server_names: list[str | None]
+            if parsed.server_name:
+                server_names = [parsed.server_name]
+            else:
+                discovered_servers = {
+                    status.name
+                    for status in self._client_manager.get_all_server_statuses()
+                }
+                discovered_servers.update(
+                    tool.server_name for tool in self._client_manager.get_all_tools()
                 )
-                tasks.append(record if record is not None else McpTaskInfo(**task))
+                server_names = [
+                    server_name
+                    for server_name in sorted(discovered_servers)
+                    if self._policy_manager.is_server_allowed(server_name)
+                ]
+
+            tasks: list[McpTaskInfo] = []
+            next_cursor = None
+            for server_name in server_names:
+                result = await self._client_manager.list_tasks(
+                    server_name, parsed.cursor
+                )
+                next_cursor = result.get("nextCursor") or next_cursor
+                for task in result.get("tasks", []):
+                    if not isinstance(task, dict) or not isinstance(
+                        task.get("task_id"), str
+                    ):
+                        continue
+                    task_server = task.get("server_name", server_name or "")
+                    if not isinstance(task_server, str):
+                        continue
+                    if not self._policy_manager.is_server_allowed(task_server):
+                        continue
+                    record = self._client_manager.get_task_record(
+                        task_server,
+                        task["task_id"],
+                    )
+                    tasks.append(record if record is not None else McpTaskInfo(**task))
             output = TasksListOutput(
                 ok=True,
                 tasks=tasks,
-                next_cursor=result.get("nextCursor"),
+                next_cursor=next_cursor,
             )
             self._audit(
                 method="gateway.tasks_list",
@@ -4620,6 +4755,19 @@ class GatewayTools:
         """gateway.tasks_get - Get a downstream MCP task."""
         audit_started_at = time.monotonic()
         parsed = TasksGetInput.model_validate(input_data)
+        if not self._policy_manager.is_server_allowed(parsed.server_name):
+            message = f"Server '{parsed.server_name}' is blocked by policy."
+            self._audit(
+                method="gateway.tasks_get",
+                action="tasks_get",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                task_id=parsed.task_id,
+                auth_state="policy_denied",
+                error=message,
+            )
+            return TasksGetOutput(ok=False, errors=[message])
         try:
             task = await self._client_manager.get_task(
                 parsed.server_name, parsed.task_id
@@ -4649,6 +4797,19 @@ class GatewayTools:
         """gateway.tasks_result - Fetch a downstream MCP task result."""
         audit_started_at = time.monotonic()
         parsed = TasksResultInput.model_validate(input_data)
+        if not self._policy_manager.is_server_allowed(parsed.server_name):
+            message = f"Server '{parsed.server_name}' is blocked by policy."
+            self._audit(
+                method="gateway.tasks_result",
+                action="tasks_result",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                task_id=parsed.task_id,
+                auth_state="policy_denied",
+                error=message,
+            )
+            return TasksResultOutput(ok=False, errors=[message])
         try:
             result = await self._client_manager.get_task_result(
                 parsed.server_name, parsed.task_id
@@ -4699,6 +4860,24 @@ class GatewayTools:
         """gateway.tasks_cancel - Cancel a downstream MCP task."""
         audit_started_at = time.monotonic()
         parsed = TasksCancelInput.model_validate(input_data)
+        if not self._policy_manager.is_server_allowed(parsed.server_name):
+            message = f"Server '{parsed.server_name}' is blocked by policy."
+            self._audit(
+                method="gateway.tasks_cancel",
+                action="tasks_cancel",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=parsed.server_name,
+                task_id=parsed.task_id,
+                auth_state="policy_denied",
+                error=message,
+            )
+            return TasksCancelOutput(
+                ok=False,
+                status="policy_denied",
+                message=message,
+                errors=[message],
+            )
         try:
             ok, task, message = await self._client_manager.cancel_task(
                 parsed.server_name, parsed.task_id, parsed.force

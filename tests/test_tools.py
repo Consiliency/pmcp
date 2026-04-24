@@ -25,8 +25,11 @@ from pmcp.types import (
     CLIHint,
     CLIResolution,
     CatalogSearchOutput,
+    DescriptionsCache,
+    GeneratedServerDescriptions,
     LocalMcpServerConfig,
     McpTaskRecord,
+    PrebuiltToolInfo,
     RemoteMcpServerConfig,
     ResolvedServerConfig,
     RequestState,
@@ -106,6 +109,8 @@ class MockClientManager:
         self.ensure_connected_calls: list[str] = []
         self.pending_requests: list[Any] = []
         self.tasks: dict[tuple[str, str], Any] = {}
+        self.list_task_calls: list[str | None] = []
+        self.last_call_task: Any = None
         self.last_call_trace_context: Any = None
 
     def get_all_tools(self) -> list[ToolInfo]:
@@ -167,6 +172,7 @@ class MockClientManager:
         task: Any = None,
         trace_context: Any = None,
     ) -> Any:
+        self.last_call_task = task
         self.last_call_trace_context = trace_context
         if task is not None:
             task_record = McpTaskRecord(
@@ -207,6 +213,7 @@ class MockClientManager:
     async def list_tasks(
         self, server_name: str | None = None, cursor: str | None = None
     ) -> dict[str, Any]:
+        self.list_task_calls.append(server_name)
         return {
             "tasks": [
                 {
@@ -428,6 +435,18 @@ def create_git_and_github_manifest() -> Manifest:
         env_var="GITHUB_PERSONAL_ACCESS_TOKEN",
     )
     return manifest
+
+
+def tenant_code_mode_config() -> ResolvedServerConfig:
+    return ResolvedServerConfig(
+        name="tenant-code-mode",
+        source="project",
+        config=RemoteMcpServerConfig(
+            type="streamable-http",
+            url="https://tenant.example/mcp",
+            headers={"Authorization": "Bearer ${TENANT_CODE_MODE_MCP_TOKEN}"},
+        ),
+    )
 
 
 def create_mock_tools() -> list[ToolInfo]:
@@ -1161,6 +1180,138 @@ class TestCatalogSearch:
             "zeta::beta",
         ]
 
+    @pytest.mark.asyncio
+    async def test_catalog_search_includes_offline_tenant_code_mode_cards(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager([])
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=DescriptionsCache(
+                generated_at="2026-04-23T00:00:00Z",
+                gateway_version="1.0.0",
+                servers={
+                    "tenant-code-mode": GeneratedServerDescriptions(
+                        package="tenant-code-mode",
+                        version="0.0.0",
+                        generated_at="2026-04-23T00:00:00Z",
+                        capability_summary="Tenant sandbox code-mode execution",
+                        tools=[
+                            PrebuiltToolInfo(
+                                name="run_script",
+                                description="Submit sandbox code for execution",
+                                short_description="Run sandbox code",
+                                tags=["sandbox", "code-mode", "artifacts"],
+                                risk_hint="medium",
+                            ),
+                            PrebuiltToolInfo(
+                                name="get_result",
+                                description="Fetch sandbox execution result",
+                                short_description="Fetch run result",
+                                tags=["sandbox", "logs"],
+                                risk_hint="low",
+                            ),
+                            PrebuiltToolInfo(
+                                name="cancel_run",
+                                description="Cancel sandbox execution",
+                                short_description="Cancel run",
+                                tags=["sandbox", "task"],
+                                risk_hint="medium",
+                            ),
+                        ],
+                    )
+                },
+            ),
+        )
+        gateway_tools._detected_cli_infos = {
+            "git": CLIInfo(name="git", path="/usr/bin/git")
+        }
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+
+        result = await gateway_tools.catalog_search(
+            {"query": "sandbox", "include_offline": True}
+        )
+
+        assert {card.tool_id for card in result.results} == {
+            "tenant-code-mode::cancel_run",
+            "tenant-code-mode::get_result",
+            "tenant-code-mode::run_script",
+        }
+        assert result.cli_hints == []
+        assert client_manager.ensure_connected_calls == []
+        assert client_manager.connected_configs == []
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_omits_policy_denied_tenant_code_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager(
+            [
+                ToolInfo(
+                    tool_id="tenant-code-mode::run_script",
+                    server_name="tenant-code-mode",
+                    tool_name="run_script",
+                    description="Submit sandbox code",
+                    short_description="Submit sandbox code",
+                    input_schema={"type": "object", "properties": {}},
+                    tags=["sandbox"],
+                    risk_hint=RiskHint.MEDIUM,
+                )
+            ]
+        )
+        client_manager.set_server_online("tenant-code-mode")
+        policy_manager = PolicyManager()
+        policy_manager.is_server_allowed = (  # type: ignore[method-assign]
+            lambda name: name != "tenant-code-mode"
+        )
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+            descriptions_cache=DescriptionsCache(
+                generated_at="2026-04-23T00:00:00Z",
+                gateway_version="1.0.0",
+                servers={
+                    "tenant-code-mode": GeneratedServerDescriptions(
+                        package="tenant-code-mode",
+                        version="0.0.0",
+                        generated_at="2026-04-23T00:00:00Z",
+                        capability_summary="Tenant sandbox code-mode execution",
+                        tools=[
+                            PrebuiltToolInfo(
+                                name="run_script",
+                                description="Submit sandbox code",
+                                short_description="Submit sandbox code",
+                                tags=["sandbox"],
+                                risk_hint="medium",
+                            )
+                        ],
+                    )
+                },
+            ),
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest",
+            lambda: Manifest(
+                version="1.0",
+                cli_alternatives={},
+                servers={},
+                discovery_queue_path=".mcp-gateway/discovery_queue.json",
+            ),
+        )
+
+        result = await gateway_tools.catalog_search(
+            {"query": "sandbox", "include_offline": True}
+        )
+
+        assert result.results == []
+        assert client_manager.ensure_connected_calls == []
+        assert client_manager.connected_configs == []
+
 
 class TestServerLifecycleTools:
     """Tests for gateway server lifecycle tools."""
@@ -1608,6 +1759,72 @@ class TestInvoke:
         health = await gateway_tools.health()
         assert health.audit_events is not None
         assert health.audit_events[-1].outcome == "failure"
+
+    @pytest.mark.asyncio
+    async def test_tenant_code_mode_invoke_sanitizes_trace_and_forwards_task(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        tenant_tool = ToolInfo(
+            tool_id="tenant-code-mode::run_script",
+            server_name="tenant-code-mode",
+            tool_name="run_script",
+            description="Submit sandbox code for execution",
+            short_description="Run sandbox code",
+            input_schema={"type": "object", "properties": {}},
+            tags=["tenant", "sandbox"],
+            risk_hint=RiskHint.MEDIUM,
+            execution={"taskSupport": "optional"},
+        )
+        manager = cast(Any, gateway_tools._client_manager)
+        manager._tools[tenant_tool.tool_id] = tenant_tool
+        manager.set_server_online("tenant-code-mode")
+
+        result = await gateway_tools.invoke(
+            {
+                "tool_id": "tenant-code-mode::run_script",
+                "arguments": {"language": "python"},
+                "_meta": {
+                    "traceparent": (
+                        "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01"
+                    ),
+                    "tracestate": "tenant=dev",
+                    "baggage": "request=hostmeta",
+                    "authorization": "Bearer secret",
+                },
+                "trace_context": {
+                    "traceparent": "Bearer should-not-win",
+                    "baggage": "x" * 2048,
+                },
+                "task": {
+                    "metadata": {"run_kind": "smoke"},
+                    "ttl": 300,
+                    "poll_interval": 2.5,
+                    "requestor_context": {"client": "mobile"},
+                },
+            }
+        )
+
+        assert result.ok is True
+        assert result.result is None
+        assert result.task is not None
+        assert result.task.task_id == "task-1"
+        assert manager.last_call_task.metadata == {"run_kind": "smoke"}
+        assert manager.last_call_task.ttl == 300
+        assert manager.last_call_task.poll_interval == 2.5
+        assert manager.last_call_task.requestor_context == {"client": "mobile"}
+        assert manager.last_call_trace_context.traceparent.startswith("00-")
+        assert manager.last_call_trace_context.tracestate == "tenant=dev"
+        assert manager.last_call_trace_context.baggage == "request=hostmeta"
+
+        health = await gateway_tools.health()
+        assert health.audit_events is not None
+        event = health.audit_events[-1]
+        assert event.method == "gateway.invoke"
+        assert event.server_name == "tenant-code-mode"
+        assert event.tool_id == "tenant-code-mode::run_script"
+        assert event.task_id == "task-1"
+        assert event.trace_present is True
+        assert "secret" not in str(event)
 
     @pytest.mark.asyncio
     async def test_soak_concurrent_lazy_invokes_share_one_connect(
@@ -2384,6 +2601,121 @@ class TestCapabilityAndProvision:
         assert result.candidates is not None
         assert result.candidates[0].name == "git"
         assert result.candidates[0].candidate_type == "server"
+
+    @pytest.mark.asyncio
+    async def test_request_capability_recommends_registered_tenant_code_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_configs", lambda **_: [tenant_code_mode_config()]
+        )
+
+        result = await gateway_tools.request_capability(
+            {"query": "hosted sandbox code execution", "available_clis": []}
+        )
+
+        assert result.status == "candidates"
+        assert result.candidates is not None
+        assert result.candidates[0].name == "tenant-code-mode"
+        assert result.candidates[0].candidate_type == "server"
+        assert client_manager.ensure_connected_calls == []
+        assert client_manager.connected_configs == []
+
+    @pytest.mark.asyncio
+    async def test_request_capability_omits_policy_denied_tenant_code_mode(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager(create_mock_tools())
+        policy_manager = PolicyManager()
+        policy_manager.is_server_allowed = (  # type: ignore[method-assign]
+            lambda name: name != "tenant-code-mode"
+        )
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=policy_manager,
+        )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_configs", lambda **_: [tenant_code_mode_config()]
+        )
+
+        result = await gateway_tools.request_capability(
+            {"query": "hosted sandbox code execution", "available_clis": []}
+        )
+
+        assert result.status == "not_available"
+        assert client_manager.ensure_connected_calls == []
+        assert client_manager.connected_configs == []
+
+    @pytest.mark.asyncio
+    async def test_request_capability_tenant_code_mode_preserves_cli_first(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_configs", lambda **_: [tenant_code_mode_config()]
+        )
+
+        result = await gateway_tools.request_capability(
+            {"query": "git commits", "available_clis": ["git"]}
+        )
+
+        assert result.status == "use_cli"
+        assert result.cli is not None
+        assert result.cli.name == "git"
+        assert client_manager.ensure_connected_calls == []
+        assert client_manager.connected_configs == []
+
+    @pytest.mark.asyncio
+    async def test_request_capability_explicit_tenant_mcp_intent_wins_over_cli(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_configs", lambda **_: [tenant_code_mode_config()]
+        )
+
+        result = await gateway_tools.request_capability(
+            {
+                "query": "tenant code mode mcp server for node scripts",
+                "available_clis": ["git"],
+            }
+        )
+
+        assert result.status == "candidates"
+        assert result.candidates is not None
+        assert result.candidates[0].name == "tenant-code-mode"
+        assert result.candidates[0].candidate_type == "server"
+        assert client_manager.ensure_connected_calls == []
+        assert client_manager.connected_configs == []
 
     @pytest.mark.asyncio
     async def test_sync_environment_caches_cli_probe_infos_with_paths(
@@ -3772,6 +4104,43 @@ class TestInvokeErrorPaths:
         assert "E402" in (result.errors or [""])[0]
 
     @pytest.mark.asyncio
+    async def test_tenant_code_mode_invoke_policy_denied_audit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tool = ToolInfo(
+            tool_id="tenant-code-mode::run_script",
+            server_name="tenant-code-mode",
+            tool_name="run_script",
+            description="Submit sandbox code",
+            short_description="Submit sandbox code",
+            input_schema={"type": "object", "properties": {}},
+            tags=["tenant", "sandbox"],
+            risk_hint=RiskHint.MEDIUM,
+        )
+        gt = self._make_gateway_tools(tool=tool)
+        cast(Any, gt._client_manager).set_server_online("tenant-code-mode")
+        monkeypatch.setattr(gt._policy_manager, "is_tool_allowed", lambda _: False)
+
+        result = await gt.invoke(
+            {
+                "tool_id": "tenant-code-mode::run_script",
+                "arguments": {},
+                "trace_context": {"authorization": "Bearer should-not-log"},
+            }
+        )
+        health = await gt.health()
+
+        assert result.ok is False
+        assert result.auth_state == "policy_denied"
+        assert "E402" in (result.errors or [""])[0]
+        assert health.audit_events is not None
+        event = health.audit_events[-1]
+        assert event.server_name == "tenant-code-mode"
+        assert event.tool_id == "tenant-code-mode::run_script"
+        assert event.auth_state == "policy_denied"
+        assert "should-not-log" not in str(event)
+
+    @pytest.mark.asyncio
     async def test_invoke_optional_task_returns_task_not_result(self) -> None:
         tool = self._make_tool(execution={"taskSupport": "optional"})
         gt = self._make_gateway_tools(tool=tool)
@@ -3812,6 +4181,7 @@ class TestInvokeErrorPaths:
         assert "sk-secret" not in str(result.result)
         assert result.task is not None
         assert result.task.status == "completed"
+        assert result.raw_size_estimate > 0
 
     @pytest.mark.asyncio
     async def test_tasks_cancel_reports_missing_task(self) -> None:
@@ -3861,6 +4231,157 @@ class TestInvokeErrorPaths:
             "gateway.tasks_cancel",
         ]
         assert health.audit_events[-1].task_id == "task-1"
+
+    @pytest.mark.asyncio
+    async def test_tenant_code_mode_task_lifecycle_uses_downstream_task_ids(
+        self,
+    ) -> None:
+        tool = ToolInfo(
+            tool_id="tenant-code-mode::run_script",
+            server_name="tenant-code-mode",
+            tool_name="run_script",
+            description="Submit sandbox code for execution",
+            short_description="Run sandbox code",
+            input_schema={"type": "object", "properties": {}},
+            tags=["tenant", "sandbox"],
+            risk_hint=RiskHint.MEDIUM,
+            execution={"taskSupport": "optional"},
+        )
+        gt = self._make_gateway_tools(tool=tool)
+        cast(Any, gt._client_manager).set_server_online("tenant-code-mode")
+
+        invoked = await gt.invoke(
+            {
+                "tool_id": "tenant-code-mode::run_script",
+                "arguments": {"language": "python"},
+                "task": {"metadata": {"run_kind": "smoke"}},
+            }
+        )
+        listed = await gt.tasks_list({"server_name": "tenant-code-mode"})
+        got = await gt.tasks_get(
+            {"server_name": "tenant-code-mode", "task_id": "task-1"}
+        )
+        result = await gt.tasks_result(
+            {
+                "server_name": "tenant-code-mode",
+                "task_id": "task-1",
+                "options": {"redact_secrets": True, "max_output_chars": 100},
+            }
+        )
+        cancelled = await gt.tasks_cancel(
+            {"server_name": "tenant-code-mode", "task_id": "task-1"}
+        )
+        missing = await gt.tasks_cancel(
+            {"server_name": "tenant-code-mode", "task_id": "tenant-code-mode::local-1"}
+        )
+        health = await gt.health()
+
+        assert invoked.task is not None
+        assert invoked.task.task_id == "task-1"
+        assert [task.task_id for task in listed.tasks] == ["task-1"]
+        assert got.task is not None
+        assert got.task.task_id == "task-1"
+        assert result.ok is True
+        assert "sk-secret" not in str(result.result)
+        assert cancelled.ok is True
+        assert missing.ok is False
+        assert missing.status == "not_found"
+        assert health.audit_events is not None
+        task_events = [
+            event
+            for event in health.audit_events
+            if event.server_name == "tenant-code-mode"
+        ]
+        assert [event.task_id for event in task_events[-4:]] == [
+            "task-1",
+            "task-1",
+            "task-1",
+            "tenant-code-mode::local-1",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_tenant_code_mode_policy_denied_blocks_task_surfaces(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tool = ToolInfo(
+            tool_id="tenant-code-mode::run_script",
+            server_name="tenant-code-mode",
+            tool_name="run_script",
+            description="Submit sandbox code",
+            short_description="Submit sandbox code",
+            input_schema={"type": "object", "properties": {}},
+            tags=["tenant", "sandbox"],
+            risk_hint=RiskHint.MEDIUM,
+            execution={"taskSupport": "optional"},
+        )
+        gt = self._make_gateway_tools(tool=tool)
+        monkeypatch.setattr(
+            gt._policy_manager,
+            "is_server_allowed",
+            lambda name: name != "tenant-code-mode",
+        )
+
+        listed = await gt.tasks_list({"server_name": "tenant-code-mode"})
+        got = await gt.tasks_get(
+            {"server_name": "tenant-code-mode", "task_id": "task-1"}
+        )
+        result = await gt.tasks_result(
+            {"server_name": "tenant-code-mode", "task_id": "task-1"}
+        )
+        cancelled = await gt.tasks_cancel(
+            {"server_name": "tenant-code-mode", "task_id": "task-1"}
+        )
+        health = await gt.health()
+
+        assert listed.ok is False
+        assert got.ok is False
+        assert result.ok is False
+        assert cancelled.ok is False
+        assert cancelled.status == "policy_denied"
+        assert health.audit_events is not None
+        assert [event.auth_state for event in health.audit_events[-4:]] == [
+            "policy_denied",
+            "policy_denied",
+            "policy_denied",
+            "policy_denied",
+        ]
+        assert "secret" not in str(health.audit_events[-4:])
+
+    @pytest.mark.asyncio
+    async def test_tenant_code_mode_policy_denied_is_omitted_from_unscoped_task_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        tool = ToolInfo(
+            tool_id="tenant-code-mode::run_script",
+            server_name="tenant-code-mode",
+            tool_name="run_script",
+            description="Submit sandbox code",
+            short_description="Submit sandbox code",
+            input_schema={"type": "object", "properties": {}},
+            tags=["tenant", "sandbox"],
+            risk_hint=RiskHint.MEDIUM,
+            execution={"taskSupport": "optional"},
+        )
+        gt = self._make_gateway_tools(tool=tool)
+        manager = cast(Any, gt._client_manager)
+        manager.tasks[("tenant-code-mode", "task-1")] = McpTaskRecord(
+            task_id="task-1",
+            status="working",
+            raw={"taskId": "task-1", "status": "working"},
+            server_name="tenant-code-mode",
+            tool_id="tenant-code-mode::run_script",
+        )
+        monkeypatch.setattr(
+            gt._policy_manager,
+            "is_server_allowed",
+            lambda name: name != "tenant-code-mode",
+        )
+
+        listed = await gt.tasks_list({})
+
+        assert listed.ok is True
+        assert listed.tasks == []
+        assert manager.list_task_calls == []
 
 
 class TestSanitizeError:

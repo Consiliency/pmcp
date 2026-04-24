@@ -1233,6 +1233,92 @@ class TestCallTool:
         assert record.tool_id == "test::echo"
 
     @pytest.mark.asyncio
+    async def test_tenant_code_mode_call_forwards_task_and_trace_metadata(
+        self, manager_with_tool: ClientManager
+    ) -> None:
+        manager_with_tool._tools["tenant-code-mode::run_script"] = ToolInfo(
+            tool_id="tenant-code-mode::run_script",
+            server_name="tenant-code-mode",
+            tool_name="run_script",
+            description="Submit sandbox code for execution",
+            short_description="Run sandbox code",
+            input_schema={"type": "object", "properties": {}},
+            tags=["tenant", "sandbox"],
+            risk_hint=RiskHint.MEDIUM,
+            execution={"taskSupport": "optional"},
+        )
+        managed = ManagedClient(
+            config=ResolvedServerConfig(
+                name="tenant-code-mode",
+                source="custom",
+                config=RemoteMcpServerConfig(
+                    type="streamable-http", url="https://tenant.example/mcp"
+                ),
+            ),
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=ServerStatus(
+                name="tenant-code-mode",
+                status=ServerStatusEnum.ONLINE,
+                tool_count=1,
+                server_capabilities={"tasks": {}},
+            ),
+        )
+        manager_with_tool._clients["tenant-code-mode"] = managed
+        manager_with_tool._send_request = AsyncMock(
+            return_value={
+                "task": {
+                    "task_id": "tenant-run-1",
+                    "status": "working",
+                    "ttl": 300,
+                    "poll_interval": 2.5,
+                    "diagnostics": {"summary": "queued"},
+                }
+            }
+        )
+
+        result = await manager_with_tool.call_tool(
+            "tenant-code-mode::run_script",
+            {"language": "python"},
+            task={
+                "metadata": {"run_kind": "smoke"},
+                "ttl": 300,
+                "poll_interval": 2.5,
+                "requestor_context": {"client": "mobile"},
+            },
+            trace_context={
+                "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+                "tracestate": "tenant=dev",
+                "baggage": "request=hostmeta",
+            },
+        )
+
+        assert result["task"]["task_id"] == "tenant-run-1"
+        params = manager_with_tool._send_request.await_args.args[2]
+        assert params == {
+            "name": "run_script",
+            "arguments": {"language": "python"},
+            "_meta": {
+                "traceparent": "00-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbbbbbbbbbbbbbb-01",
+                "tracestate": "tenant=dev",
+                "baggage": "request=hostmeta",
+            },
+            "task": {
+                "metadata": {"run_kind": "smoke"},
+                "ttl": 300,
+                "pollInterval": 2.5,
+                "requestorContext": {"client": "mobile"},
+            },
+        }
+        record = manager_with_tool.get_task_record("tenant-code-mode", "tenant-run-1")
+        assert record is not None
+        assert record.tool_id == "tenant-code-mode::run_script"
+        assert record.requestor_context == {"client": "mobile"}
+        assert record.ttl == 300
+        assert record.poll_interval == 2.5
+        assert record.raw["diagnostics"] == {"summary": "queued"}
+
+    @pytest.mark.asyncio
     async def test_call_tool_preserves_trace_context_in_meta(
         self, manager_with_tool: ClientManager
     ) -> None:

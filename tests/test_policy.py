@@ -52,6 +52,35 @@ class TestServerAllowDeny:
         assert policy.is_server_allowed("jira") is True
         assert policy.is_server_allowed("slack") is False
 
+    def test_tenant_code_mode_server_policy_isolated(self, tmp_path: Path) -> None:
+        policy_path = tmp_path / "policy.json"
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "servers": {
+                        "allowlist": ["tenant-code-mode"],
+                    }
+                }
+            )
+        )
+
+        policy = PolicyManager(policy_path)
+        assert policy.is_server_allowed("tenant-code-mode") is True
+        assert policy.is_server_allowed("github") is False
+
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "servers": {
+                        "denylist": ["tenant-code-mode"],
+                    }
+                }
+            )
+        )
+        denied_policy = PolicyManager(policy_path)
+        assert denied_policy.is_server_allowed("tenant-code-mode") is False
+        assert denied_policy.is_server_allowed("github") is True
+
 
 class TestToolAllowDeny:
     """Tests for tool allow/deny lists."""
@@ -77,6 +106,39 @@ class TestToolAllowDeny:
         assert policy.is_tool_allowed("jira::delete_issue") is False
         assert policy.is_tool_allowed("dangerous::anything") is False
         assert policy.is_tool_allowed("github::create_issue") is True
+
+    def test_tenant_code_mode_tool_policy_patterns_are_narrow(
+        self, tmp_path: Path
+    ) -> None:
+        policy_path = tmp_path / "policy.json"
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "tools": {
+                        "allowlist": ["tenant-code-mode::get_*"],
+                        "denylist": ["tenant-code-mode::run_script"],
+                    }
+                }
+            )
+        )
+
+        policy = PolicyManager(policy_path)
+        assert policy.is_tool_allowed("tenant-code-mode::get_result") is True
+        assert policy.is_tool_allowed("tenant-code-mode::run_script") is False
+        assert policy.is_tool_allowed("github::get_issue") is False
+
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "tools": {
+                        "denylist": ["tenant-code-mode::*"],
+                    }
+                }
+            )
+        )
+        denied_policy = PolicyManager(policy_path)
+        assert denied_policy.is_tool_allowed("tenant-code-mode::get_result") is False
+        assert denied_policy.is_tool_allowed("github::get_issue") is True
 
 
 class TestResourceAllowDeny:
@@ -243,6 +305,72 @@ class TestSecretRedaction:
         ]:
             assert leaked not in redacted
         assert "[REDACTED]" in redacted
+
+    def test_redacts_tenant_code_mode_sandbox_outputs(self, tmp_path: Path) -> None:
+        policy_path = tmp_path / "policy.json"
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "redaction": {
+                        "patterns": [
+                            r"TENANT_CODE_MODE_[A-Z_]+=[^\s]+",
+                            r"artifact_token=[^\s]+",
+                        ]
+                    }
+                }
+            )
+        )
+        policy = PolicyManager(policy_path)
+        jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZW5hbnQifQ.N2QwODhmM2I4OTc1"
+
+        redacted = policy.redact_secrets(
+            "Authorization: Bearer tenant-bearer "
+            "api_key=sk-tenant "
+            f"jwt={jwt} "
+            "https://tenant.example/artifacts/run-1?token=artifact-secret "
+            "TENANT_CODE_MODE_MCP_TOKEN=stored-secret "
+            "artifact_token=artifact-value"
+        )
+
+        for leaked in [
+            "tenant-bearer",
+            "sk-tenant",
+            jwt,
+            "artifact-secret",
+            "stored-secret",
+            "artifact-value",
+        ]:
+            assert leaked not in redacted
+
+    def test_process_output_redacts_and_truncates_sandbox_logs(
+        self, tmp_path: Path
+    ) -> None:
+        policy_path = tmp_path / "policy.json"
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "redaction": {
+                        "patterns": [
+                            r"TENANT_CODE_MODE_MCP_TOKEN=[^\s]+",
+                        ]
+                    }
+                }
+            )
+        )
+        policy = PolicyManager(policy_path)
+        output = (
+            "run summary\n"
+            "TENANT_CODE_MODE_MCP_TOKEN=tenant-secret\n"
+            "Authorization: Bearer hidden-token\n" + ("sandbox log line\n" * 40)
+        )
+
+        processed = policy.process_output(output, redact=True, max_bytes=220)
+
+        assert processed["truncated"] is True
+        assert processed["raw_size"] > 220
+        assert "tenant-secret" not in processed["result"]
+        assert "hidden-token" not in processed["result"]
+        assert "OUTPUT TRUNCATED" in processed["result"]
 
 
 class TestYamlPolicyLoading:

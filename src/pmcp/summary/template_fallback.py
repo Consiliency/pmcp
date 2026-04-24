@@ -141,6 +141,8 @@ def template_summary(
         lines.append(f"• {server_name} ({len(server_tools)} tools): {cap_str}")
 
     lines.append("")
-    lines.append("Use gateway.catalog_search to explore MCP tools and matching CLI hints.")
+    lines.append(
+        "Use gateway.catalog_search to explore MCP tools and matching CLI hints."
+    )
 
     return "\n".join(lines)

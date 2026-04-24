@@ -62,6 +62,14 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   directory, and remote header placeholders resolve from those stores plus
   process environment. PMCP does not provide a multi-tenant authorization layer
   or cross-user credential separation inside one running gateway.
+- **Tenant code-mode hosting keeps execution outside PMCP**: the host contract
+  in `specs/tenant-code-mode-host-contract.md` treats PMCP as the broker and
+  the companion tenant server as the sandbox execution authority. The contract
+  does not add PMCP-owned sandbox isolation, tenant auth, or durable execution
+  logs. PMCP policy can allow or deny `tenant-code-mode` and
+  `tenant-code-mode::*`, apply output caps, and redact returned diagnostics, but
+  production multi-tenant isolation still requires companion-server and
+  deployment controls.
 - **Subprocess spawning**: PMCP forks child processes for downstream MCP servers. A malicious
   MCP server config entry could cause PMCP to spawn arbitrary executables. Only configure
   servers you trust.
@@ -110,3 +118,9 @@ Before exposing PMCP beyond localhost:
 - [ ] Firewall `/health` and `/metrics` to internal networks only
 - [ ] Run as a non-root user (Docker image already uses `appuser`)
 - [ ] Review downstream MCP server configs — only trust servers you control
+- [ ] For `tenant-code-mode`, keep `${TENANT_CODE_MODE_MCP_TOKEN}` and
+      `${TENANT_CODE_MODE_TENANT_ID}` in env stores or process environment, not
+      config files or logs
+- [ ] For hosted tenant runs, use `gateway.tasks_cancel` with downstream task
+      IDs and keep durable logs, artifacts, artifact retention, tenant auth,
+      SSO/RBAC, and billing outside PMCP
