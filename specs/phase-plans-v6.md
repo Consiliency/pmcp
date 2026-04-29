@@ -101,19 +101,19 @@ manifest, handler, or docs integration depends on it.
 
 **Exit criteria**
 
-- [ ] A PMCP-host contract spec describes expected tenant server tools such as
+- [x] A PMCP-host contract spec describes expected tenant server tools such as
   `run_script`, `get_run`, `get_result`, `cancel_run`, and artifact/resource
   access without requiring those exact names if the companion repo chooses a
   better final shape.
-- [ ] The contract defines required MCP task behavior, including advertised
+- [x] The contract defines required MCP task behavior, including advertised
   server task capability, tool `execution.taskSupport`, task IDs, status values,
   cancellation semantics, polling hints, and result retrieval.
-- [ ] The contract defines PMCP metadata forwarding expectations for
+- [x] The contract defines PMCP metadata forwarding expectations for
   `traceparent`, `tracestate`, `baggage`, and task `requestor_context`.
-- [ ] The contract defines safe output rules: summaries first, redacted logs,
+- [x] The contract defines safe output rules: summaries first, redacted logs,
   bounded raw output, artifact references instead of large payloads, and no
   secret-bearing telemetry.
-- [ ] The contract names compatibility assumptions for streamable HTTP, local
+- [x] The contract names compatibility assumptions for streamable HTTP, local
   stdio development, and lazy downstream configuration.
 
 **Scope notes**
@@ -160,17 +160,17 @@ it eagerly or pretending it is a local CLI.
 
 **Exit criteria**
 
-- [ ] PMCP has a manifest or documented registration entry for the tenant
+- [x] PMCP has a manifest or documented registration entry for the tenant
   code-mode MCP server with keywords for code execution, sandbox execution,
   mobile code mode, task runs, logs, and artifacts.
-- [ ] `gateway.request_capability` can recommend the tenant code-mode MCP server
+- [x] `gateway.request_capability` can recommend the tenant code-mode MCP server
   for hosted sandbox/code-mode requests while preserving CLI-first behavior for
   local installed CLIs.
-- [ ] `gateway.catalog_search(include_offline=true)` can surface cached or
+- [x] `gateway.catalog_search(include_offline=true)` can surface cached or
   configured tenant code-mode tool cards once a compatible server is registered.
-- [ ] Remote streamable HTTP configuration examples show tenant header
+- [x] Remote streamable HTTP configuration examples show tenant header
   placeholders without printing secret values.
-- [ ] Tests prove tenant code-mode discovery does not execute code, start an
+- [x] Tests prove tenant code-mode discovery does not execute code, start an
   unrelated local process, or mix the sandbox server with CLI hints.
 
 **Scope notes**
@@ -216,16 +216,16 @@ result processing against a mock task-capable server.
 
 **Exit criteria**
 
-- [ ] Mock-server tests prove `gateway.invoke(..., task=...)` forwards task
+- [x] Mock-server tests prove `gateway.invoke(..., task=...)` forwards task
   metadata and records returned tenant run task IDs.
-- [ ] Trace metadata is accepted through `_meta` or `trace_context`, sanitized by
+- [x] Trace metadata is accepted through `_meta` or `trace_context`, sanitized by
   existing safeguards, and forwarded to the downstream tenant server.
-- [ ] `gateway.tasks_list`, `gateway.tasks_get`, `gateway.tasks_result`, and
+- [x] `gateway.tasks_list`, `gateway.tasks_get`, `gateway.tasks_result`, and
   `gateway.tasks_cancel` expose tenant run state without confusing PMCP request
   IDs with downstream task IDs.
-- [ ] Result processing continues to apply truncation and optional redaction to
+- [x] Result processing continues to apply truncation and optional redaction to
   sandbox logs, diagnostics, and result payloads.
-- [ ] Health/audit events include enough non-secret task and tool identity to
+- [x] Health/audit events include enough non-secret task and tool identity to
   debug tenant code-mode failures from PMCP.
 
 **Scope notes**
@@ -272,16 +272,16 @@ operator diagnostics.
 
 **Exit criteria**
 
-- [ ] README and SECURITY clearly distinguish PMCP host responsibility from the
+- [x] README and SECURITY clearly distinguish PMCP host responsibility from the
   companion sandbox server's tenant isolation responsibility.
-- [ ] Policy examples show how to allow or deny the tenant server and its tools
+- [x] Policy examples show how to allow or deny the tenant server and its tools
   without exposing unrelated downstream MCP servers.
-- [ ] Auth examples use env placeholders and `gateway.auth_connect`/env-store
+- [x] Auth examples use env placeholders and `gateway.auth_connect`/env-store
   guidance without printing tenant tokens.
-- [ ] Operator docs explain rate limits, `/health` and `/metrics` exposure,
+- [x] Operator docs explain rate limits, `/health` and `/metrics` exposure,
   task cancellation, artifact retention boundaries, and residual risks for
   hosted deployments.
-- [ ] Tests cover policy-denied tenant server/tool paths and redaction of
+- [x] Tests cover policy-denied tenant server/tool paths and redaction of
   sandbox-like secret strings in result processing.
 
 **Scope notes**
@@ -396,8 +396,7 @@ HOSTREG ------> HOSTPOLICY
   `src/pmcp/summary/generator.py` and
   `src/pmcp/summary/template_fallback.py`; `uv run ruff format --check src/ tests/`
   now passes.
-- Suggested first next command:
-  `codex-plan-phase specs/phase-plans-v6.md HOSTCONTRACT`
+- Next command: none - v6 roadmap complete.
 
 ## Verification
 

@@ -119,12 +119,12 @@ curl -sS http://127.0.0.1:3344/mcp
 **HTTP transport is unauthenticated by default.** For any non-localhost exposure, require a bearer token:
 
 ```bash
-# Start with auth token
-pmcp --transport http --auth-token mysecrettoken
-
-# Or via environment variable
+# Start with bearer auth from the environment
 PMCP_AUTH_TOKEN=mysecrettoken pmcp --transport http
 ```
+
+Avoid passing production tokens with `--auth-token`; command-line arguments can
+be visible in process listings on shared hosts.
 
 Clients must then include `Authorization: Bearer mysecrettoken` on `/mcp` requests.
 `/health` and `/metrics` remain unauthenticated by design; protect them with
@@ -133,7 +133,8 @@ exposure.
 
 **Assumptions and trust model:**
 
-- PMCP binds to `127.0.0.1` by default — not safe to expose publicly without `--auth-token`.
+- PMCP binds to `127.0.0.1` by default — not safe to expose publicly without
+  `PMCP_AUTH_TOKEN`.
 - Config files (`.mcp.json`) are trusted inputs — treat them like code; do not load untrusted configs.
 - Secrets in `.env` files are passed to child MCP server processes; protect the `.env` file with filesystem permissions.
 
@@ -145,7 +146,8 @@ exposure.
 Description=PMCP MCP Gateway
 
 [Service]
-ExecStart=/usr/local/bin/pmcp --transport http --auth-token %i
+Environment=PMCP_AUTH_TOKEN=replace-with-secret-token
+ExecStart=/usr/local/bin/pmcp --transport http
 Restart=on-failure
 
 [Install]
@@ -159,7 +161,7 @@ systemctl --user enable --now pmcp
 Or with nohup:
 
 ```bash
-nohup pmcp --transport http --auth-token "$PMCP_AUTH_TOKEN" >> ~/.pmcp/logs/gateway.log 2>&1 &
+PMCP_AUTH_TOKEN=replace-with-secret-token nohup pmcp --transport http >> ~/.pmcp/logs/gateway.log 2>&1 &
 ```
 
 ### TLS / Reverse Proxy
