@@ -112,20 +112,25 @@ class DeterministicTenantTaskManager:
         return self.tasks.get((server_name, task_id))
 
     async def list_tasks(
-        self, server_name: str | None = None, cursor: str | None = None
+        self,
+        server_name: str | None = None,
+        cursor: str | None = None,
+        **_: Any,
     ) -> dict[str, Any]:
         record = self.tasks[("tenant-code-mode", "tenant-run-1")]
         record.status = "input_required"
         record.raw = {"taskId": record.task_id, "status": "input_required"}
         return {"tasks": [record.model_dump()], "nextCursor": None}
 
-    async def get_task(self, server_name: str, task_id: str) -> McpTaskRecord:
+    async def get_task(self, server_name: str, task_id: str, **_: Any) -> McpTaskRecord:
         record = self.tasks[(server_name, task_id)]
         record.status = "completed"
         record.raw = {"taskId": record.task_id, "status": "completed"}
         return record
 
-    async def get_task_result(self, server_name: str, task_id: str) -> dict[str, Any]:
+    async def get_task_result(
+        self, server_name: str, task_id: str, **_: Any
+    ) -> dict[str, Any]:
         record = self.tasks[(server_name, task_id)]
         record.status = "completed"
         record.raw = {"taskId": record.task_id, "status": "completed"}
@@ -138,7 +143,11 @@ class DeterministicTenantTaskManager:
         }
 
     async def cancel_task(
-        self, server_name: str, task_id: str, force: bool = False
+        self,
+        server_name: str,
+        task_id: str,
+        force: bool = False,
+        **_: Any,
     ) -> tuple[bool, McpTaskRecord | None, str]:
         record = self.tasks.get((server_name, task_id))
         if record is None:

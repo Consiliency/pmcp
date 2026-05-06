@@ -2566,7 +2566,9 @@ class TestReadStdoutFailureSurfacing:
         # Build a fake StreamReader that raises LimitOverrunError on first readline.
         fake_stdout = AsyncMock()
         fake_stdout.readline = AsyncMock(
-            side_effect=asyncio.LimitOverrunError("Separator is found, but chunk is longer than limit", 65536)
+            side_effect=asyncio.LimitOverrunError(
+                "Separator is found, but chunk is longer than limit", 65536
+            )
         )
         fake_process = MagicMock()
         fake_process.stdout = fake_stdout
