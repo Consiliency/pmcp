@@ -2498,3 +2498,109 @@ class TestReconnectStormGuard:
 
         await asyncio.sleep(0)  # let tasks run
         assert len(tasks_created) == 1, "Only one reconnect task should be created"
+
+
+class TestStdioReadLimit:
+    """Regression tests for the stdout-line-too-long flake (was: 64 KiB asyncio default)."""
+
+    def test_default_limit_is_10mb(self) -> None:
+        """The shipped default must comfortably exceed real-world MCP responses."""
+        from pmcp.client.manager import DEFAULT_STDIO_READ_LIMIT, _stdio_read_limit
+
+        assert DEFAULT_STDIO_READ_LIMIT == 10 * 1024 * 1024
+        # When env is unset (clear it for the duration of the test), the resolver
+        # must return the default constant.
+        with patch.dict("os.environ", {}, clear=False):
+            import os as _os
+
+            _os.environ.pop("PMCP_STDIO_READ_LIMIT", None)
+            assert _stdio_read_limit() == DEFAULT_STDIO_READ_LIMIT
+
+    def test_env_override_accepts_positive_int(self) -> None:
+        from pmcp.client.manager import _stdio_read_limit
+
+        with patch.dict("os.environ", {"PMCP_STDIO_READ_LIMIT": "1234567"}):
+            assert _stdio_read_limit() == 1234567
+
+    def test_env_override_falls_back_when_invalid(self) -> None:
+        from pmcp.client.manager import DEFAULT_STDIO_READ_LIMIT, _stdio_read_limit
+
+        with patch.dict("os.environ", {"PMCP_STDIO_READ_LIMIT": "not-a-number"}):
+            assert _stdio_read_limit() == DEFAULT_STDIO_READ_LIMIT
+        with patch.dict("os.environ", {"PMCP_STDIO_READ_LIMIT": "-1"}):
+            assert _stdio_read_limit() == DEFAULT_STDIO_READ_LIMIT
+        with patch.dict("os.environ", {"PMCP_STDIO_READ_LIMIT": "0"}):
+            assert _stdio_read_limit() == DEFAULT_STDIO_READ_LIMIT
+
+    @pytest.mark.asyncio
+    async def test_connect_stdio_passes_limit_kwarg(self) -> None:
+        """_connect_stdio must forward limit= so large lines do not LimitOverrun."""
+        manager = ClientManager()
+        captured: dict[str, Any] = {}
+
+        async def fake_create(*args: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            raise RuntimeError("stop here, we only care about the kwargs")
+
+        config = ResolvedServerConfig(
+            name="x",
+            source="project",
+            config=LocalMcpServerConfig(command="fake", args=[]),
+        )
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create):
+            with pytest.raises(RuntimeError, match="stop here"):
+                await manager._connect_stdio(config)
+
+        assert "limit" in captured, "create_subprocess_exec must be called with limit="
+        assert captured["limit"] == 10 * 1024 * 1024
+
+
+class TestReadStdoutFailureSurfacing:
+    """A LimitOverrunError or other read failure must surface its cause, not the
+    misleading generic 'Server process exited' message."""
+
+    @pytest.mark.asyncio
+    async def test_limit_overrun_sets_descriptive_last_error(self) -> None:
+        manager = ClientManager()
+
+        # Build a fake StreamReader that raises LimitOverrunError on first readline.
+        fake_stdout = AsyncMock()
+        fake_stdout.readline = AsyncMock(
+            side_effect=asyncio.LimitOverrunError("Separator is found, but chunk is longer than limit", 65536)
+        )
+        fake_process = MagicMock()
+        fake_process.stdout = fake_stdout
+        fake_process.returncode = None
+
+        status = ServerStatus(name="big", status=ServerStatusEnum.ONLINE, tool_count=1)
+        managed = ManagedClient(config=MagicMock(), process=fake_process, status=status)
+        managed.config = None  # disable the auto-reconnect path for this unit test
+        manager._clients["big"] = managed
+
+        await manager._read_stdout("big", managed)
+
+        assert status.status == ServerStatusEnum.ERROR
+        assert status.last_error is not None
+        assert "read limit" in status.last_error
+        assert "PMCP_STDIO_READ_LIMIT" in status.last_error
+
+    @pytest.mark.asyncio
+    async def test_generic_read_error_surfaces_in_last_error(self) -> None:
+        manager = ClientManager()
+
+        fake_stdout = AsyncMock()
+        fake_stdout.readline = AsyncMock(side_effect=ConnectionResetError("pipe gone"))
+        fake_process = MagicMock()
+        fake_process.stdout = fake_stdout
+        fake_process.returncode = None
+
+        status = ServerStatus(name="dead", status=ServerStatusEnum.ONLINE, tool_count=1)
+        managed = ManagedClient(config=MagicMock(), process=fake_process, status=status)
+        managed.config = None
+        manager._clients["dead"] = managed
+
+        await manager._read_stdout("dead", managed)
+
+        assert status.status == ServerStatusEnum.ERROR
+        assert status.last_error is not None
+        assert "pipe gone" in status.last_error

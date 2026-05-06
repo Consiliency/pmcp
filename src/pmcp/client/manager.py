@@ -90,6 +90,36 @@ DEFAULT_SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 MEMORY_LOG_INTERVAL = 60.0  # Log memory every 60s
 MEMORY_WARN_THRESHOLD_MB = 1024  # Warn if process uses > 1GB
 
+# Stdio read limit for downstream MCP server stdout (bytes per JSON-RPC line).
+# asyncio's StreamReader default is 64 KiB, which truncates real-world tool
+# responses (page scrapes, screenshots, large file reads) into an opaque
+# "disconnected unexpectedly". 10 MiB covers realistic responses; override via
+# PMCP_STDIO_READ_LIMIT for hosts that need larger or smaller caps.
+DEFAULT_STDIO_READ_LIMIT = 10 * 1024 * 1024
+
+
+def _stdio_read_limit() -> int:
+    raw = os.environ.get("PMCP_STDIO_READ_LIMIT")
+    if not raw:
+        return DEFAULT_STDIO_READ_LIMIT
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "PMCP_STDIO_READ_LIMIT=%r is not an integer; using default %d",
+            raw,
+            DEFAULT_STDIO_READ_LIMIT,
+        )
+        return DEFAULT_STDIO_READ_LIMIT
+    if value <= 0:
+        logger.warning(
+            "PMCP_STDIO_READ_LIMIT=%d must be positive; using default %d",
+            value,
+            DEFAULT_STDIO_READ_LIMIT,
+        )
+        return DEFAULT_STDIO_READ_LIMIT
+    return value
+
 
 def _get_memory_usage_mb() -> float:
     """Get current process memory usage in MB."""
@@ -982,6 +1012,7 @@ class ClientManager:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=local_config.cwd,
                 env=env,
+                limit=_stdio_read_limit(),
             )
 
         managed = ManagedClient(
@@ -1147,6 +1178,7 @@ class ClientManager:
         if not managed.process or not managed.process.stdout:
             return
 
+        read_failure_reason: str | None = None
         try:
             while True:
                 line = await managed.process.stdout.readline()
@@ -1191,16 +1223,27 @@ class ClientManager:
                     for req in managed.pending_requests.values():
                         req.last_heartbeat = now
                     logger.debug(f"[{name}] Non-JSON output: {line.decode().strip()}")
+        except asyncio.LimitOverrunError as e:
+            limit = _stdio_read_limit()
+            read_failure_reason = (
+                f"stdout line exceeded {limit}-byte read limit "
+                f"(set PMCP_STDIO_READ_LIMIT to raise)"
+            )
+            logger.warning(f"[{name}] {read_failure_reason}: {e}")
         except Exception as e:
-            logger.debug(f"[{name}] Read error: {e}")
+            read_failure_reason = f"stdout read error: {e}"
+            logger.warning(f"[{name}] {read_failure_reason}")
         finally:
             # Mark server as offline when stdout closes
             # Only warn if status was ONLINE (unexpected disconnect)
             # If status is already OFFLINE, it's a graceful shutdown
             if managed.status.status == ServerStatusEnum.ONLINE:
-                logger.warning(f"Server {name} disconnected unexpectedly")
+                detail = read_failure_reason or "process exited"
+                logger.warning(f"Server {name} disconnected unexpectedly: {detail}")
                 managed.status.status = ServerStatusEnum.ERROR
-                managed.status.last_error = "Server process exited"
+                managed.status.last_error = (
+                    read_failure_reason or "Server process exited"
+                )
                 # Schedule auto-reconnect if we have the config (storm guard: only one task)
                 if managed.config is not None and not managed.reconnecting:
                     managed.reconnecting = True

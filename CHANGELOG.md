@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   policy, redaction, and operator guidance for a companion tenant code-mode MCP
   server, but does not run scripts itself.
 
+## [1.13.1] - 2026-05-06
+
+### Fixed
+- Stdio downstream MCP servers no longer surface a misleading "disconnected
+  unexpectedly" warning when a tool response exceeds asyncio's default 64 KiB
+  per-line read limit. PMCP now spawns child processes with a 10 MiB stdout
+  read limit (overridable via `PMCP_STDIO_READ_LIMIT`) so realistic responses
+  from `brightdata::scrape_batch`, large `playwright` screenshots/DOM dumps,
+  `fetch` on long pages, and similar tools are returned to the caller intact
+  instead of triggering a phantom reconnect cycle.
+- The stdout reader now distinguishes `LimitOverrunError` and other read
+  failures from normal process exit, logs the cause at WARNING, and propagates
+  it into `ServerStatus.last_error` so `gateway.health` and `pmcp status`
+  report the actual failure mode instead of "Server process exited".
+
 ## [1.13.0] - 2026-04-23
 
 ### Added
