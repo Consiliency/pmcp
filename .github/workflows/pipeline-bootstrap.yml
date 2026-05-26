@@ -1,219 +1,40 @@
-name: Pipeline Bootstrap
+name: Governed Pipeline Bootstrap
 
 on:
   repository_dispatch:
-    types: [portal-pipeline-bootstrap]
+    types:
+      - ratification.passed
   workflow_dispatch:
     inputs:
-      bootstrap_job_id:
-        description: Bootstrap job UUID
-        required: true
-      pipeline_id:
-        description: Agent pipeline UUID
-        required: true
-      run_id:
-        description: Agent run UUID
-        required: true
-      repository_full_name:
-        description: "Target repository (e.g. Consiliency/my-repo)"
-        required: true
-      target_branch:
-        description: Target branch to clone and bootstrap
-        required: true
-        default: main
-      policy_mode:
-        description: Bootstrap policy mode
-        required: true
-        default: observe
-      install_mode:
-        description: Portal install mode
-        required: true
-        default: dispatch_existing_workflow
-      requested_mode:
-        description: Portal requested bootstrap mode
+      pipeline_branch:
+        description: "Branch the pipeline should operate against. Empty = default branch (legacy)."
         required: false
-        default: brownfield
-      spec_source_kind:
-        description: Metadata-only spec source kind
-        required: false
+        type: string
         default: ""
-      spec_source_value:
-        description: Metadata-only spec source value
-        required: false
-        default: ""
-      adoption_mode:
-        description: Optional governed-pipeline adoption mode
-        required: false
-        default: ""
-      triggered_by_user_id:
-        description: User ID that triggered the bootstrap
-        required: false
-        default: manual
-      supabase_url:
-        description: Supabase project URL for event emission
-        required: false
-      ingest_endpoint:
-        description: Portal ingest endpoint URL
-        required: false
-      hmac_key_id:
-        description: HMAC key ID for signing the terminal bundle
-        required: false
-        default: v1
-      dry_run:
-        description: Skip live pipeline-init and emit the canned synthesis bundle
-        required: false
-        default: "false"
-
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   bootstrap:
-    name: "bootstrap"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
-    permissions:
-      id-token: write
-      contents: write
-
+    env:
+      BRANCHGOV_ENABLE: ${{ vars.BRANCHGOV_ENABLE || 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.pipeline_branch || github.event.repository.default_branch }}
 
-      - uses: ./.github/actions/pipeline-bootstrap-setup
-
-      - name: Install governed-pipeline CLI
-        if: ${{ inputs.dry_run != 'true' }}
-        env:
-          GOVERNED_PIPELINE_REPOSITORY: Consiliency/governed-pipeline
-          GOVERNED_PIPELINE_REF: main
-          GOVERNED_PIPELINE_TOKEN: ${{ secrets.GOVERNED_PIPELINE_READ_TOKEN || secrets.BOOTSTRAP_CLONE_TOKEN }}
+      - name: Handle BranchGov merge-back
+        if: ${{ github.event_name == 'repository_dispatch' && github.event.action == 'ratification.passed' }}
         run: |
-          if [ -z "$GOVERNED_PIPELINE_TOKEN" ]; then
-            echo "::error::GOVERNED_PIPELINE_READ_TOKEN or BOOTSTRAP_CLONE_TOKEN is required to install pipeline-init from the private governed-pipeline repo"
-            exit 1
-          fi
+          npm exec --package @consiliency/pipeline-runtime@0.1.0 -- node --input-type=module <<'NODE'
+          import { readFile } from 'node:fs/promises';
+          import { handleRatificationPassed } from '@consiliency/pipeline-runtime/workflow/branchgov-mergeback';
 
-          gp_dir="$RUNNER_TEMP/governed-pipeline"
-          repo_url="https://x-access-token:${GOVERNED_PIPELINE_TOKEN}@github.com/${GOVERNED_PIPELINE_REPOSITORY}.git"
+          const event = JSON.parse(await readFile(process.env.GITHUB_EVENT_PATH, 'utf8'));
+          const result = await handleRatificationPassed(event.client_payload ?? {}, process.env);
+          console.log(JSON.stringify(result));
+          NODE
 
-          git clone --depth 1 --branch "$GOVERNED_PIPELINE_REF" "$repo_url" "$gp_dir" || {
-            git clone --depth 1 "$repo_url" "$gp_dir"
-            git -C "$gp_dir" checkout "$GOVERNED_PIPELINE_REF"
-          }
-
-          npm install --ignore-scripts --prefix "$gp_dir"
-          echo "GOVERNED_PIPELINE_NODE_MODULES=$gp_dir/node_modules" >> "$GITHUB_ENV"
-
-          mkdir -p "$RUNNER_TEMP/pipeline-bin"
-          cat > "$RUNNER_TEMP/pipeline-bin/pipeline-init" <<EOF
-          #!/usr/bin/env node
-          import { runInit } from "$gp_dir/packages/pipeline-cli/src/init.mjs";
-          runInit().then((code) => process.exit(code)).catch((error) => {
-            console.error(error?.stack ?? error?.message ?? error);
-            process.exit(1);
-          });
-          EOF
-          chmod +x "$RUNNER_TEMP/pipeline-bin/pipeline-init"
-          echo "$RUNNER_TEMP/pipeline-bin" >> "$GITHUB_PATH"
-
-      - name: Install Codex CLI
-        if: ${{ inputs.dry_run != 'true' }}
-        run: npm install -g @openai/codex@0.125.0
-
-      - name: Install Claude CLI
-        if: ${{ inputs.dry_run != 'true' }}
-        run: npm install -g @anthropic-ai/claude-code@2.1.119
-
-      # Build BOOTSTRAP_PAYLOAD from repository_dispatch client_payload or workflow_dispatch inputs.
-      # All untrusted values are read from env vars inside the node -e script — never inlined.
-      - name: Build payload
-        id: payload
-        env:
-          RD_PAYLOAD: ${{ toJson(github.event.client_payload) }}
-          WD_JOB_ID: ${{ inputs.bootstrap_job_id }}
-          WD_PIPELINE_ID: ${{ inputs.pipeline_id }}
-          WD_RUN_ID: ${{ inputs.run_id }}
-          WD_REPO: ${{ inputs.repository_full_name }}
-          WD_TARGET_BRANCH: ${{ inputs.target_branch }}
-          WD_POLICY_MODE: ${{ inputs.policy_mode }}
-          WD_INSTALL_MODE: ${{ inputs.install_mode }}
-          WD_REQUESTED_MODE: ${{ inputs.requested_mode }}
-          WD_SPEC_SOURCE_KIND: ${{ inputs.spec_source_kind }}
-          WD_SPEC_SOURCE_VALUE: ${{ inputs.spec_source_value }}
-          WD_ADOPTION_MODE: ${{ inputs.adoption_mode }}
-          WD_USER: ${{ inputs.triggered_by_user_id }}
-          WD_SUPA_URL: ${{ inputs.supabase_url }}
-          WD_INGEST: ${{ inputs.ingest_endpoint }}
-          WD_KEY_ID: ${{ inputs.hmac_key_id }}
-        run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            # GITHUB_OUTPUT requires heredoc-delimiter syntax for multi-line
-            # values; toJson(github.event.client_payload) is multi-line.
-            # RD_PAYLOAD env var holds the value safely; we never inline it.
-            {
-              echo 'payload<<PAYLOAD_EOF_BOOTSTRAP'
-              echo "$RD_PAYLOAD"
-              echo 'PAYLOAD_EOF_BOOTSTRAP'
-            } >> "$GITHUB_OUTPUT"
-          else
-            PAYLOAD=$(node -e "
-              const payload = {
-                bootstrap_job_id: process.env.WD_JOB_ID,
-                pipeline_id: process.env.WD_PIPELINE_ID,
-                run_id: process.env.WD_RUN_ID,
-                repository_full_name: process.env.WD_REPO,
-                target_branch: process.env.WD_TARGET_BRANCH || 'main',
-                policy_mode: process.env.WD_POLICY_MODE || 'observe',
-                install_mode: process.env.WD_INSTALL_MODE || 'dispatch_existing_workflow',
-                requested_mode: process.env.WD_REQUESTED_MODE || 'brownfield',
-                triggered_by_user_id: process.env.WD_USER || 'manual',
-                callback: {
-                  supabase_url: process.env.WD_SUPA_URL || '',
-                  ingest_endpoint: process.env.WD_INGEST || '',
-                  hmac_key_id: process.env.WD_KEY_ID || 'v1',
-                },
-                schema_version: 2,
-              };
-              if (process.env.WD_SPEC_SOURCE_KIND && process.env.WD_SPEC_SOURCE_VALUE) {
-                payload.spec_source = {
-                  kind: process.env.WD_SPEC_SOURCE_KIND,
-                  value: process.env.WD_SPEC_SOURCE_VALUE,
-                };
-              }
-              if (process.env.WD_ADOPTION_MODE) {
-                payload.adoption_mode = process.env.WD_ADOPTION_MODE;
-              }
-              process.stdout.write(JSON.stringify(payload));
-            ")
-            {
-              echo 'payload<<PAYLOAD_EOF_BOOTSTRAP'
-              echo "$PAYLOAD"
-              echo 'PAYLOAD_EOF_BOOTSTRAP'
-            } >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Run pipeline bootstrap
-        env:
-          BOOTSTRAP_PAYLOAD: ${{ steps.payload.outputs.payload }}
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-          BOOTSTRAP_HMAC_SECRET: ${{ secrets.BOOTSTRAP_HMAC_SECRET }}
-          # BOOTSTRAP_CLONE_TOKEN is used for cross-repo clones. GITHUB_TOKEN only
-          # has permissions for this repo; a PAT or App installation token with
-          # repo:read on the target must be stored as BOOTSTRAP_CLONE_TOKEN.
-          # See docs/ops/pilot-repo-workflow-install.md for setup instructions.
-          BOOTSTRAP_CLONE_TOKEN: ${{ secrets.BOOTSTRAP_CLONE_TOKEN }}
-          GITHUB_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ github.token }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
-          PIPELINE_NONINTERACTIVE: "1"
-          BOOTSTRAP_DRY_RUN: ${{ inputs.dry_run }}
-        run: |
-          args=()
-          if [ "$BOOTSTRAP_DRY_RUN" = "true" ]; then
-            args+=(--dry-run)
-          fi
-          node scripts/pipeline-bootstrap/run.mjs "${args[@]}"
+      - name: Run pipeline init
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        run: npx pipeline-init --yes
