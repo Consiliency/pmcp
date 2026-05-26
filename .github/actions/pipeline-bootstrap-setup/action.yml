@@ -1,0 +1,13 @@
+name: Pipeline Bootstrap Setup
+description: Install Node 24 and bootstrap-script dependencies for the pipeline-bootstrap workflow
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 24
+
+    - name: Install bootstrap-script dependencies
+      shell: bash
+      run: npm ci --prefix scripts/pipeline-bootstrap

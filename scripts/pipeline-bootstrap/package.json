@@ -1,0 +1,12 @@
+{
+  "name": "@consiliency/pipeline-bootstrap-scripts",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test __tests__/*.test.mjs"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.101.1"
+  }
+}
