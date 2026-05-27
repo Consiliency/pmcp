@@ -1,0 +1,7 @@
+#!/usr/bin/env node
+import { runWorkerShim } from "./lib/worker-shim.mjs";
+
+process.exitCode = await runWorkerShim({
+  harness: "gemini",
+  argv: process.argv.slice(2),
+});
