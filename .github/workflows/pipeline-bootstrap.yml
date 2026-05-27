@@ -208,6 +208,12 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           WORKER_BASE_URL: ${{ secrets.WORKER_BASE_URL }}
           WORKER_API_KEY: ${{ secrets.WORKER_API_KEY }}
+          # v37 hot-fix: pipeline-init preflights ANTHROPIC_API_KEY/OPENAI_API_KEY
+          # presence directly. Shims ignore these and route through workers via
+          # WORKER_BASE_URL+WORKER_API_KEY. Aliasing here satisfies preflight
+          # without leaking real LLM keys.
+          OPENAI_API_KEY: ${{ secrets.WORKER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.WORKER_API_KEY }}
           VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
           PIPELINE_NONINTERACTIVE: "1"
           BOOTSTRAP_DRY_RUN: ${{ inputs.dry_run }}
