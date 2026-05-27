@@ -4,8 +4,8 @@
  *   dispatch → clone → install → init → discovery → synthesis → ingest → complete
  *
  * Designed to run as a plain `node scripts/pipeline-bootstrap/run.mjs` step in
- * GitHub Actions. Does NOT use claude-code-action; ANTHROPIC_API_KEY is
- * consumed internally by `pipeline-init --brownfield`.
+ * GitHub Actions. Does NOT use claude-code-action; agent CLIs are routed
+ * through worker shims installed on PATH by the bootstrap workflow.
  *
  * Flags:
  *   --fixture <path>   Use path as working dir (skip git clone).
@@ -17,7 +17,7 @@
 import { createHash, createHmac } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, mkdtemp, readdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, stat, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { emitEvent } from "./emit-event.mjs";
@@ -309,7 +309,7 @@ export async function run(deps = {}) {
       try {
         await execFn("npm", ["install", "--ignore-scripts"], { cwd: workDir });
       } catch {
-        // Some repos may use pnpm or yarn — best-effort; pipeline-init handles its own install
+        // Some repos may use pnpm or yarn; pipeline-init handles its own install.
         await emit("install", "npm install skipped or failed — continuing");
       }
     }
@@ -326,7 +326,8 @@ export async function run(deps = {}) {
     await emit("init", `Running pipeline-init ${pipelineInitArgs[0]}`);
     if (!args.dryRun) {
       await linkGovernedPipelineInternals(workDir);
-      await prepareCodexApiKeyAuth(workDir);
+      const workerPreflight = await preflightWorkerRelay({ fetchFn });
+      await emit("init", "Worker relay preflight passed", workerPreflight);
       const initResult = await execFn(pipelineInitBin, pipelineInitArgs, {
         cwd: workDir,
         env: {
@@ -438,17 +439,50 @@ async function bootstrapTempParent() {
   return parent;
 }
 
-async function prepareCodexApiKeyAuth(workDir) {
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) return false;
-  const codexHome = path.join(workDir, ".pipeline", "codex");
-  await mkdir(codexHome, { recursive: true });
-  await writeFile(
-    path.join(codexHome, "auth.json"),
-    `${JSON.stringify({ OPENAI_API_KEY: apiKey, auth_mode: "apikey" })}\n`,
-    { encoding: "utf8", mode: 0o600 }
-  );
-  return true;
+function workerEndpoint(baseUrl) {
+  return `${baseUrl.replace(/\/+$/, "")}/jobs/agent-invoke`;
+}
+
+async function preflightWorkerRelay({ fetchFn }) {
+  const baseUrl = process.env.WORKER_BASE_URL?.trim();
+  const apiKey = process.env.WORKER_API_KEY?.trim();
+  if (!baseUrl) {
+    throw Object.assign(new Error("WORKER_BASE_URL is required for worker relay preflight"), { _phase: "init" });
+  }
+  if (!apiKey) {
+    throw Object.assign(new Error("WORKER_API_KEY is required for worker relay preflight"), { _phase: "init" });
+  }
+
+  let endpoint;
+  try {
+    endpoint = workerEndpoint(new URL(baseUrl).toString());
+  } catch {
+    throw Object.assign(new Error("WORKER_BASE_URL must be an absolute URL for worker relay preflight"), { _phase: "init" });
+  }
+
+  let response;
+  try {
+    response = await fetchFn(endpoint, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+      },
+      body: JSON.stringify({
+        harness: "codex",
+        prompt: "bootstrap worker relay preflight",
+        args: [],
+      }),
+    });
+  } catch {
+    throw Object.assign(new Error("worker relay preflight failed: network error"), { _phase: "init" });
+  }
+
+  if (!response.ok) {
+    throw Object.assign(new Error(`worker relay preflight failed: HTTP ${response.status}`), { _phase: "init" });
+  }
+  return { endpoint: "/jobs/agent-invoke", harness: "codex", status: response.status };
 }
 
 function summarizeProcessError(error) {
