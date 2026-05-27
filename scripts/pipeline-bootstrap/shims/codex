@@ -1,0 +1,16 @@
+#!/usr/bin/env node
+import { runWorkerShim } from "./lib/worker-shim.mjs";
+
+async function readStdinWhenRequested(argv) {
+  if (!argv.includes("-")) return "";
+  const chunks = [];
+  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+const argv = process.argv.slice(2);
+process.exitCode = await runWorkerShim({
+  harness: "codex",
+  argv,
+  stdin: await readStdinWhenRequested(argv),
+});
