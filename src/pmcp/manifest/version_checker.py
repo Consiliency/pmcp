@@ -9,12 +9,26 @@ from typing import Literal
 
 import aiohttp
 
+from pmcp import __version__
+
 logger = logging.getLogger(__name__)
 
 # Cache for version lookups (avoid repeated network calls)
 _version_cache: dict[str, str] = {}
 
-_USER_AGENT = "pmcp/1.9.0 (github.com/ViperJuice/pmcp)"
+_USER_AGENT = f"pmcp/{__version__} (github.com/ViperJuice/pmcp)"
+
+
+def _strip_npm_tag(package: str) -> str:
+    if package.startswith("@"):
+        scope, sep, remainder = package.partition("/")
+        if not sep:
+            return package
+        name, tag_sep, _tag = remainder.rpartition("@")
+        return f"{scope}/{name}" if tag_sep and name else package
+
+    name, tag_sep, _tag = package.rpartition("@")
+    return name if tag_sep and name else package
 
 
 async def get_npm_version(package_name: str, timeout: float = 10.0) -> str | None:
@@ -223,8 +237,8 @@ def detect_package_type(
             # Skip flags
             if arg.startswith("-"):
                 continue
-            # Found package name (might have @version suffix)
-            pkg = arg.split("@latest")[0] if "@latest" in arg else arg
+            # Found package name (might have @version or @dist-tag suffix)
+            pkg = _strip_npm_tag(arg)
             # Handle scoped packages like @playwright/mcp
             if pkg.startswith("@") or not pkg.startswith("-"):
                 return ("npm", pkg)

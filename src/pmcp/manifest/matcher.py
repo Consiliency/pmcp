@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Literal
 
 from pmcp.manifest.environment import CLIInfo
@@ -56,30 +56,51 @@ def _text_match_score(query_norm: str, query_words: set[str], value: str) -> flo
     return min(overlap / len(value_words), 0.8)
 
 
-def _keyword_match_score(query: str, keywords: list[str]) -> float:
-    """Simple keyword matching fallback."""
+def _keyword_matches_query(
+    query_lower: str, query_norm: str, query_words: set[str], keyword: str
+) -> bool:
+    keyword_lower = keyword.lower()
+    keyword_norm = keyword_lower.replace("-", " ").replace("_", " ")
+    keyword_words = set(keyword_norm.split())
+    return (
+        keyword_lower in query_lower
+        or keyword_norm in query_norm
+        or keyword_lower in query_words
+        or keyword_norm in query_words
+        or (bool(keyword_words) and keyword_words.issubset(query_words))
+    )
+
+
+def _keyword_match_score(
+    query: str, keywords: list[str], keyword_weights: Mapping[str, float] | None = None
+) -> float:
+    """Score by absolute matched keyword evidence."""
     query_lower = query.lower()
     query_norm = query_lower.replace("-", " ").replace("_", " ")
     query_words = set(query_norm.split())
 
-    matches = 0
+    matched_weight = 0.0
     for keyword in keywords:
-        keyword_lower = keyword.lower()
-        keyword_norm = keyword_lower.replace("-", " ").replace("_", " ")
-        keyword_words = set(keyword_norm.split())
-        if (
-            keyword_lower in query_lower
-            or keyword_norm in query_norm
-            or keyword_lower in query_words
-            or keyword_norm in query_words
-            or (keyword_words and keyword_words.issubset(query_words))
-        ):
-            matches += 1
+        if _keyword_matches_query(query_lower, query_norm, query_words, keyword):
+            keyword_norm = keyword.lower().replace("-", " ").replace("_", " ")
+            matched_weight += (
+                keyword_weights.get(keyword_norm, 1.0) if keyword_weights else 1.0
+            )
 
     if not keywords:
         return 0.0
 
-    return min(matches / len(keywords), 1.0)
+    return min(matched_weight / 3.0, 1.0)
+
+
+def _manifest_keyword_weights(manifest: Manifest) -> dict[str, float]:
+    frequencies: dict[str, int] = {}
+    for server in manifest.servers.values():
+        for keyword in set(server.keywords):
+            keyword_norm = keyword.lower().replace("-", " ").replace("_", " ")
+            frequencies[keyword_norm] = frequencies.get(keyword_norm, 0) + 1
+
+    return {keyword: 1.0 / frequency for keyword, frequency in frequencies.items()}
 
 
 def rank_cli_hints(
@@ -206,8 +227,9 @@ def _keyword_match(
             )
 
     # Check servers
+    keyword_weights = _manifest_keyword_weights(manifest)
     for name, server in manifest.servers.items():
-        score = _keyword_match_score(query, server.keywords)
+        score = _keyword_match_score(query, server.keywords, keyword_weights)
         # Slight preference for CLIs, so server needs higher score
         adjusted_score = score * 0.9
         if adjusted_score > best_score:

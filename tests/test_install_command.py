@@ -15,6 +15,33 @@ from pmcp.cli_commands.install import (
     detect_install_drift,
     detect_install_method,
 )
+from pmcp.manifest.installer import MissingApiKeyError, check_api_key
+from pmcp.manifest.loader import ServerConfig
+
+
+class TestInstallApiKeyDiagnostics:
+    @pytest.mark.asyncio
+    async def test_missing_api_key_error_names_project_pmcp_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
+        server = ServerConfig(
+            name="needs-key",
+            description="Needs a key",
+            keywords=[],
+            install={},
+            command="npx",
+            args=["needs-key"],
+            requires_api_key=True,
+            env_var="PMCP_TEST_KEY",
+        )
+
+        with pytest.raises(MissingApiKeyError) as exc_info:
+            await check_api_key(server)
+
+        assert exc_info.value.env_path.name == ".env.pmcp"
+        assert ".env.pmcp" in str(exc_info.value)
 
 
 class TestDetectInstallMethod:

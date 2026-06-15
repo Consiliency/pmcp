@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from pmcp.manifest.environment import (
     CLIInfo,
@@ -31,6 +32,7 @@ from pmcp.manifest.loader import (
 )
 from pmcp.manifest.matcher import (
     _keyword_match,
+    _keyword_match_score,
     match_capability,
     rank_cli_hints,
 )
@@ -211,6 +213,34 @@ def test_manifest_search_by_keyword():
     assert len(results) > 0
 
 
+def test_archived_reference_server_entries_are_explicitly_labeled() -> None:
+    manifest_path = Path("src/pmcp/manifest/manifest.yaml")
+    data = yaml.safe_load(manifest_path.read_text())
+    audited_entries = {
+        "github": "@modelcontextprotocol/server-github",
+        "brave-search": "@modelcontextprotocol/server-brave-search",
+        "linear": "@modelcontextprotocol/server-linear",
+        "sentry": "@modelcontextprotocol/server-sentry",
+        "filesystem": "@modelcontextprotocol/server-filesystem",
+        "memory": "@modelcontextprotocol/server-memory",
+        "sequential-thinking": "@modelcontextprotocol/server-sequential-thinking",
+        "postgres": "@modelcontextprotocol/server-postgres",
+        "puppeteer": "@modelcontextprotocol/server-puppeteer",
+        "gitlab": "@modelcontextprotocol/server-gitlab",
+        "slack": "@modelcontextprotocol/server-slack",
+        "google-drive": "@modelcontextprotocol/server-gdrive",
+        "google-maps": "@modelcontextprotocol/server-google-maps",
+        "everart": "@modelcontextprotocol/server-everart",
+        "aws-kb-retrieval": "@modelcontextprotocol/server-aws-kb-retrieval",
+    }
+
+    for name, package in audited_entries.items():
+        entry = data["servers"][name]
+        assert entry["status"] == "archived_reference_package"
+        assert entry["transport"] == "local"
+        assert package in entry["args"]
+
+
 def test_keyword_match_browser_use_server():
     """Keyword matcher should resolve browser-use capability requests."""
     manifest = load_manifest()
@@ -219,6 +249,16 @@ def test_keyword_match_browser_use_server():
     assert result.matched is True
     assert result.entry_name == "browser-use"
     assert result.entry_type == "server"
+
+
+def test_keyword_score_uses_absolute_matched_evidence() -> None:
+    assert _keyword_match_score(
+        "github pull request workflows",
+        ["github", "pull request", "workflows", "actions", "issues", "repo"],
+    ) > _keyword_match_score(
+        "github pull request workflows",
+        ["github"],
+    )
 
 
 def test_manifest_server_config():
@@ -635,6 +675,68 @@ def test_tenant_code_mode_keywords_match_server_without_displacing_cli() -> None
     assert cli_match.matched is True
     assert cli_match.entry_name == "git"
     assert cli_match.entry_type == "cli"
+
+
+def test_keyword_match_prefers_specific_multi_keyword_server() -> None:
+    manifest = Manifest(
+        version="1.0",
+        cli_alternatives={},
+        servers={
+            "sparse": ServerConfig(
+                name="sparse",
+                description="Sparse generic server",
+                keywords=["github"],
+                install={},
+                command="npx",
+                args=["sparse"],
+            ),
+            "specific": ServerConfig(
+                name="specific",
+                description="Specific GitHub workflow server",
+                keywords=[
+                    "github",
+                    "pull request",
+                    "workflows",
+                    "actions",
+                    "code review",
+                    "issues",
+                ],
+                install={},
+                command="npx",
+                args=["specific"],
+            ),
+        },
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
+
+    result = _keyword_match("github pull request workflows", manifest, set())
+
+    assert result.matched is True
+    assert result.entry_name == "specific"
+    assert result.confidence >= 0.2
+
+
+def test_keyword_match_generic_api_alone_stays_below_threshold() -> None:
+    manifest = Manifest(
+        version="1.0",
+        cli_alternatives={},
+        servers={
+            f"server-{i}": ServerConfig(
+                name=f"server-{i}",
+                description="Generic API server",
+                keywords=["api"],
+                install={},
+                command="npx",
+                args=[f"server-{i}"],
+            )
+            for i in range(4)
+        },
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
+
+    result = _keyword_match("api", manifest, set())
+
+    assert result.matched is False
 
 
 def test_rank_cli_hints_preserves_probe_path() -> None:

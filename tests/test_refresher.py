@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import tempfile
+import asyncio
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+import yaml
 
+from pmcp.manifest.loader import Manifest, ServerConfig
 from pmcp.manifest.refresher import (
     GATEWAY_VERSION,
     _escape_yaml_string,
@@ -17,6 +20,7 @@ from pmcp.manifest.refresher import (
     check_staleness,
     get_cache_path,
     load_descriptions_cache,
+    refresh_all,
     save_descriptions_cache,
 )
 from pmcp.types import (
@@ -348,6 +352,44 @@ class TestSaveDescriptionsCache:
         loaded = load_descriptions_cache(cache_path)
         assert loaded is not None
 
+    def test_save_hostile_values_cannot_inject_yaml_keys(self, temp_dir: Path) -> None:
+        cache_path = temp_dir / "descriptions.yaml"
+        hostile_server = "server:\n  injected-server"
+        hostile_tool = 'tool":\n      risk_hint: high\n      - name: injected'
+
+        cache = DescriptionsCache(
+            generated_at="2025-01-01T00:00:00Z",
+            gateway_version="1.0.0",
+            servers={
+                hostile_server: GeneratedServerDescriptions(
+                    package='@scope/pkg": "value',
+                    version="1.0.0",
+                    generated_at="2025-01-01T00:00:00Z",
+                    capability_summary="Summary:\n  risk_hint: high",
+                    tools=[
+                        PrebuiltToolInfo(
+                            name=hostile_tool,
+                            description='desc":\n  injected: true',
+                            short_description="short: value\nother: no",
+                            tags=["tag: value", "servers:\n  fake"],
+                            risk_hint="low:\n  injected: high",
+                        )
+                    ],
+                )
+            },
+        )
+
+        save_descriptions_cache(cache, cache_path)
+        raw = yaml.safe_load(cache_path.read_text())
+        loaded = load_descriptions_cache(cache_path)
+
+        assert set(raw["servers"]) == {hostile_server}
+        assert loaded is not None
+        loaded_desc = loaded.servers[hostile_server]
+        assert loaded_desc.tools[0].name == hostile_tool
+        assert loaded_desc.tools[0].risk_hint == "low:\n  injected: high"
+        assert "injected-server" not in loaded.servers
+
     def test_save_multiple_servers(self, temp_dir: Path) -> None:
         """Test saving multiple servers."""
         cache_path = temp_dir / "descriptions.yaml"
@@ -532,6 +574,61 @@ class TestCheckStaleness:
                     result = await check_staleness()
                     # No error, but server not flagged as stale
                     assert "server1" not in result
+
+
+class TestRefreshAll:
+    @pytest.mark.asyncio
+    async def test_refresh_all_uses_bounded_concurrency_for_version_checks(
+        self, temp_dir: Path
+    ) -> None:
+        active = 0
+        peak_active = 0
+        calls: list[str] = []
+
+        async def fake_refresh(
+            server_config: ServerConfig,
+            existing_cache: GeneratedServerDescriptions | None = None,
+            force: bool = False,
+        ) -> GeneratedServerDescriptions:
+            nonlocal active, peak_active
+            active += 1
+            peak_active = max(peak_active, active)
+            calls.append(server_config.name)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return GeneratedServerDescriptions(
+                package=server_config.name,
+                version="1.0.0",
+                generated_at="2025-01-01T00:00:00Z",
+                capability_summary=server_config.name,
+                tools=[],
+            )
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                f"server-{i}": ServerConfig(
+                    name=f"server-{i}",
+                    description="",
+                    keywords=[],
+                    install={},
+                    command="npx",
+                    args=[f"server-{i}"],
+                )
+                for i in range(4)
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+        with patch("pmcp.manifest.refresher.refresh_server", side_effect=fake_refresh):
+            cache = await refresh_all(
+                manifest=manifest, cache_path=temp_dir / "cache.yaml"
+            )
+
+        assert peak_active > 1
+        assert calls == ["server-0", "server-1", "server-2", "server-3"]
+        assert list(cache.servers) == calls
 
 
 class TestGeneratedDescriptionsTypes:

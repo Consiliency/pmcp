@@ -158,6 +158,8 @@ servers:
   # === Reference Servers (from modelcontextprotocol/servers) ===
 
   filesystem:
+    status: "archived_reference_package"
+    transport: "local"
     description: "File system operations - read, write, search, list files"
     keywords: [file, filesystem, read, write, directory, folder, fs, path]
     install:
@@ -170,6 +172,8 @@ servers:
     requires_api_key: false
 
   memory:
+    status: "archived_reference_package"
+    transport: "local"
     description: "Persistent memory - store and retrieve information using knowledge graph"
     keywords: [memory, remember, store, persist, recall, notes, save, knowledge graph]
     install:
@@ -194,6 +198,8 @@ servers:
     requires_api_key: false
 
   sequential-thinking:
+    status: "archived_reference_package"
+    transport: "local"
     description: "Dynamic problem-solving through thought sequences with revision and branching"
     keywords: [thinking, reasoning, problem solving, sequential, thoughts, analysis]
     install:
@@ -246,6 +252,8 @@ servers:
   # === Databases ===
 
   postgres:
+    status: "archived_reference_package"
+    transport: "local"
     description: "PostgreSQL database operations - queries, tables, schemas"
     keywords: [postgres, postgresql, database, sql, query, pg]
     install:
@@ -290,6 +298,8 @@ servers:
   # === Browser Automation ===
 
   puppeteer:
+    status: "archived_reference_package"
+    transport: "local"
     description: "Headless Chrome automation via Puppeteer"
     keywords: [puppeteer, chrome, headless, browser, scraping, automation]
     install:
@@ -344,6 +354,8 @@ servers:
   # === Developer Tools ===
 
   github:
+    status: "archived_reference_package"
+    transport: "local"
     description: "GitHub API - issues, PRs, repos, actions, code search, reviews"
     keywords: [github, issues, pull request, pr, repository, actions, workflows, code review, commits]
     install:
@@ -358,6 +370,8 @@ servers:
     env_instructions: "Create at https://github.com/settings/tokens with repo scope"
 
   gitlab:
+    status: "archived_reference_package"
+    transport: "local"
     description: "GitLab API - projects, merge requests, issues, pipelines"
     keywords: [gitlab, merge request, mr, repository, pipelines, ci, issues]
     install:
@@ -372,6 +386,8 @@ servers:
     env_instructions: "Create at https://gitlab.com/-/profile/personal_access_tokens"
 
   sentry:
+    status: "archived_reference_package"
+    transport: "local"
     description: "Sentry error tracking - issues, events, releases, debugging"
     keywords: [sentry, errors, monitoring, debugging, exceptions, crashes, logs]
     install:
@@ -388,6 +404,8 @@ servers:
   # === Communication ===
 
   slack:
+    status: "archived_reference_package"
+    transport: "local"
     description: "Slack messaging - channels, DMs, search, notifications"
     keywords: [slack, messaging, chat, channels, dm, notifications, team]
     install:
@@ -404,6 +422,8 @@ servers:
   # === Project Management ===
 
   linear:
+    status: "archived_reference_package"
+    transport: "local"
     description: "Linear issue tracking - issues, projects, cycles, teams"
     keywords: [linear, issues, project management, tickets, bugs, tasks, sprint]
     install:
@@ -436,6 +456,8 @@ servers:
   # === Cloud Storage ===
 
   google-drive:
+    status: "archived_reference_package"
+    transport: "local"
     description: "Google Drive - files, folders, search, sharing, docs, sheets"
     keywords: [google drive, gdrive, docs, sheets, files, cloud storage, google]
     install:
@@ -450,6 +472,8 @@ servers:
     env_instructions: "OAuth flow required - see https://github.com/modelcontextprotocol/servers/tree/main/src/gdrive"
 
   google-maps:
+    status: "archived_reference_package"
+    transport: "local"
     description: "Google Maps API - geocoding, directions, places, search"
     keywords: [google maps, maps, geocoding, directions, places, location, gps]
     install:
@@ -466,6 +490,8 @@ servers:
   # === Search & Data ===
 
   brave-search:
+    status: "archived_reference_package"
+    transport: "local"
     description: "Brave Search API - web search, local search, news"
     keywords: [brave, search, web search, news, local search]
     install:
@@ -538,6 +564,8 @@ servers:
   # === AI & LLM ===
 
   everart:
+    status: "archived_reference_package"
+    transport: "local"
     description: "AI image generation via EverArt"
     keywords: [image, ai, generation, art, everart, picture, create]
     install:
@@ -570,6 +598,8 @@ servers:
   # === AWS ===
 
   aws-kb-retrieval:
+    status: "archived_reference_package"
+    transport: "local"
     description: "AWS Bedrock Knowledge Bases - RAG with AWS managed vector stores"
     keywords: [aws, bedrock, knowledge base, rag, retrieval, amazon]
     install:

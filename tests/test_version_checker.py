@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pmcp.manifest.version_checker import (
+    _USER_AGENT,
     _version_cache,
     clear_version_cache,
     detect_package_type,
@@ -18,6 +19,7 @@ from pmcp.manifest.version_checker import (
     get_pypi_version,
     is_version_newer,
 )
+from pmcp import __version__
 
 
 class TestDetectPackageType:
@@ -40,6 +42,23 @@ class TestDetectPackageType:
         pkg_type, pkg_name = detect_package_type("npx", ["-y", "some-package@latest"])
         assert pkg_type == "npm"
         assert pkg_name == "some-package"
+
+    @pytest.mark.parametrize(
+        ("arg", "expected"),
+        [
+            ("some-package@beta", "some-package"),
+            ("some-package@1.2.3", "some-package"),
+            ("@org/pkg@beta", "@org/pkg"),
+            ("@org/pkg@1.2.3", "@org/pkg"),
+            ("@org/pkg", "@org/pkg"),
+        ],
+    )
+    def test_npx_package_strips_arbitrary_tag_or_version(
+        self, arg: str, expected: str
+    ) -> None:
+        pkg_type, pkg_name = detect_package_type("npx", ["-y", arg])
+        assert pkg_type == "npm"
+        assert pkg_name == expected
 
     def test_npx_without_y_flag(self) -> None:
         """Test detection works without -y flag."""
@@ -216,6 +235,9 @@ class TestGetNpmVersion:
     def clear_cache(self) -> None:
         """Clear version cache before each test."""
         clear_version_cache()
+
+    def test_user_agent_uses_pmcp_version(self) -> None:
+        assert _USER_AGENT == f"pmcp/{__version__} (github.com/ViperJuice/pmcp)"
 
     @pytest.mark.asyncio
     async def test_successful_lookup(self) -> None:

@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from pmcp.env_store import resolve_scope_path
 from pmcp.manifest.environment import Platform
 from pmcp.manifest.loader import ServerConfig
 
@@ -36,7 +37,9 @@ class MissingApiKeyError(Exception):
         self.env_var = env_var
         self.env_instructions = env_instructions
         self.env_path = env_path
-        super().__init__(f"Missing required environment variable: {env_var}")
+        super().__init__(
+            f"Missing required environment variable: {env_var}. Add it to {env_path}."
+        )
 
 
 @dataclass
@@ -516,10 +519,11 @@ async def check_api_key(server_config: ServerConfig) -> None:
         return
 
     if not os.environ.get(env_var):
-        env_path = Path.cwd() / ".env"
+        env_path = resolve_scope_path("project")
         raise MissingApiKeyError(
             env_var=env_var,
-            env_instructions=server_config.env_instructions or f"Set {env_var} in .env",
+            env_instructions=server_config.env_instructions
+            or f"Set {env_var} in {env_path}",
             env_path=env_path,
         )
 
