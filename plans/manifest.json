@@ -193,6 +193,45 @@
     },
     {
       "acceptance_criteria_count": null,
+      "created_at": "2026-06-15T19:33:22Z",
+      "file": "plans/phase-plan-v8-AUTHFIX.md",
+      "handoff_ref": ".dev-skills/handoffs/codex-plan-phase/20260615T193322Z-authfix-plan.md",
+      "if_gates_produced": [
+        "IF-0-AUTHFIX-1"
+      ],
+      "lanes": [
+        "SL-0",
+        "SL-1",
+        "SL-2"
+      ],
+      "lifecycle": [
+        {
+          "at": "2026-06-15T19:33:22Z",
+          "by": "codex-plan-phase",
+          "metadata": {
+            "artifact_state": "staged",
+            "roadmap_sha256": "3e07c3a7e8ca6399747a99b81f7575b58dc48ed79af11ef428715a78784342b7"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "codex-plan-phase",
+      "phase_alias": "AUTHFIX",
+      "reflection_ref": "/home/viperjuice/.codex/skills/codex-plan-phase/reflections/f7b19d9e9b16fb85/main/20260615T193322Z-authfix-plan.md",
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v8.md",
+        "slug": "phase-plans-v8",
+        "status": "committed",
+        "type": "roadmap"
+      },
+      "slug": "phase-plan-v8-AUTHFIX",
+      "status": "committed",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-06-15T19:33:22Z"
+    },
+    {
+      "acceptance_criteria_count": null,
       "created_at": "2026-06-15T19:15:49Z",
       "file": "plans/phase-plan-v8-COMPLETE.md",
       "handoff_ref": ".dev-skills/handoffs/codex-plan-phase/20260615T191549Z-complete-plan.md",
@@ -414,6 +453,35 @@
       "task_summary": null,
       "type": "phase",
       "updated_at": "2026-06-15T08:43:22Z"
+    },
+    {
+      "acceptance_criteria_count": null,
+      "created_at": "2026-06-15T19:32:45Z",
+      "file": "plans/phase-plan-v8-AUTHFIX.md",
+      "handoff_ref": null,
+      "if_gates_produced": [
+        "IF-0-AUTHFIX-1"
+      ],
+      "lanes": [
+        "SL-0",
+        "SL-1",
+        "SL-2"
+      ],
+      "lifecycle": [],
+      "owner_skill": "codex-plan-phase",
+      "phase_alias": "AUTHFIX",
+      "reflection_ref": null,
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v8.md",
+        "slug": "phase-plans-v8",
+        "status": "imported",
+        "type": "phase"
+      },
+      "slug": "v8-AUTHFIX",
+      "status": "imported",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-06-15T19:32:45Z"
     },
     {
       "acceptance_criteria_count": null,
