@@ -322,7 +322,7 @@ reports the JSON Schema dialect as `https://json-schema.org/draft/2020-12/schema
 
 | Tool | Purpose |
 |------|---------|
-| `gateway.catalog_search` | Search available tools, returns compact capability cards with small metadata such as title, icons, execution hints, and schema dialect, plus additive compact CLI hints for matching installed CLIs |
+| `gateway.catalog_search` | Search available tools, returns compact capability cards with small metadata such as title, icons, execution hints, and schema dialect, plus additive compact CLI hints and registry candidates when relevant |
 | `gateway.describe` | Get detailed schema and richer metadata for a specific tool, including output schema, annotations, execution/task support, icons, and schema dialect |
 | `gateway.invoke` | Call a downstream tool with argument validation, including task-augmented execution for task-capable tools |
 | `gateway.refresh` | Reload backend configs and reconnect; refuses while requests or active MCP tasks are pending unless `force=true` |
@@ -350,7 +350,7 @@ reports the JSON Schema dialect as `https://json-schema.org/draft/2020-12/schema
 | `gateway.auth_connect` | Store API-key credentials or acknowledge URL-mode elicitation and retry provisioning |
 | `gateway.submit_feedback` | Preview/submit technical PMCP feedback issues to GitHub |
 | `gateway.provision_status` | Check installation progress |
-| `gateway.search_registry` | Search the public MCP Registry for external servers |
+| `gateway.search_registry` | Search the cached public MCP Registry metadata for external servers |
 | `gateway.register_discovered_server` | Register a registry result for provisioning |
 
 ### Monitoring Tools
@@ -539,6 +539,15 @@ MCP tools, do not appear in `results`, and cannot be passed to
 `use_cli` or matching `cli_hints`, that is enough context to switch to
 Bash/direct CLI. Otherwise stay on the MCP path.
 
+Registry-backed matches can appear as `registry_candidates` in
+`gateway.catalog_search` or as `status="candidates"` from
+`gateway.request_capability`. They are read-only discovery metadata from the
+MCP Registry cache and may include package identifiers, transport, server-card
+URLs, protected-resource metadata URLs, authorization-server metadata URLs,
+declared scopes, and placeholder header names. PMCP does not install, connect,
+or pass credentials for a registry result until you explicitly register and
+provision the selected server.
+
 ### Step 3: Get Tool Details
 
 ```
@@ -573,6 +582,10 @@ pmcp refresh
 ```
 
 **Note**: Cached tools show metadata only. Full schemas are available after the server starts (use `gateway.describe` to trigger lazy start).
+
+The MCP Registry cache is stored separately under `.mcp-gateway`; PMCP uses the
+cache when the public registry is unavailable. Registry candidates can coexist
+with cached offline tool cards without changing `total_available`.
 
 ## Dynamic Server Provisioning
 

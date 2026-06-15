@@ -58,6 +58,12 @@ from pmcp.manifest.installer import (
 )
 from pmcp.manifest.loader import load_manifest
 from pmcp.manifest.matcher import rank_cli_hints
+from pmcp.manifest.registry import (
+    RegistryCache,
+    RegistryServerEntry,
+    fetch_registry_servers,
+    load_registry_cache,
+)
 from pmcp.manifest.version_checker import (
     detect_package_type,
     get_package_version,
@@ -1248,6 +1254,12 @@ class GatewayTools:
             tools.sort(key=lambda t: (t.server_name, t.tool_id))
 
         # Apply limit
+        registry_candidates: list[CapabilityCandidate] = []
+        if parsed.query:
+            registry_candidates = self._registry_candidates_for_query(
+                parsed.query, limit=min(5, parsed.limit)
+            )
+
         truncated = len(tools) > parsed.limit
         tools = tools[: parsed.limit]
 
@@ -1298,6 +1310,7 @@ class GatewayTools:
             total_available=total_available,
             truncated=truncated,
             cli_hints=cli_hints,
+            registry_candidates=registry_candidates,
             stale_updates=stale_updates,
         )
 
@@ -2498,8 +2511,91 @@ class GatewayTools:
         """Normalize user query tokens for matching/discovery."""
         return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
+    def _load_registry_candidates(self) -> RegistryCache:
+        """Load the registry cache, falling back to a bounded live fetch."""
+        cached = load_registry_cache()
+        if cached is not None and cached.servers:
+            return cached
+        fetched = fetch_registry_servers()
+        if fetched.servers:
+            return fetched
+        return cached or fetched
+
+    def _registry_matches(
+        self, query: str, *, limit: int = 8
+    ) -> list[RegistryServerEntry]:
+        normalized = self._normalize_token(query)
+        if not normalized:
+            return []
+        query_words = set(normalized.split())
+        scored: list[tuple[int, str, RegistryServerEntry]] = []
+        for entry in self._load_registry_candidates().servers:
+            package_text = " ".join(pkg.identifier for pkg in entry.packages)
+            haystack = self._normalize_token(
+                " ".join(
+                    [
+                        entry.name,
+                        entry.description,
+                        package_text,
+                        " ".join(entry.declared_capabilities),
+                    ]
+                )
+            )
+            hay_words = set(haystack.split())
+            score = len(query_words & hay_words)
+            if normalized in haystack:
+                score += 3
+            if score:
+                scored.append((score, entry.name, entry))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        return [entry for _, _, entry in scored[:limit]]
+
     def _query_mcp_registry(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
-        """Query the MCP Registry and return raw server entries."""
+        """Query the MCP Registry using the shared parser/cache path."""
+        return [entry.raw for entry in self._registry_matches(query, limit=limit)]
+
+    def _registry_candidate_for_entry(
+        self, entry: RegistryServerEntry, *, score: float = 0.7
+    ) -> CapabilityCandidate | None:
+        package = entry.packages[0] if entry.packages else None
+        if package is None:
+            return None
+        if not self._policy_manager.is_server_allowed(entry.name):
+            return None
+        env_var = package.env_vars[0] if package.env_vars else None
+        return CapabilityCandidate(
+            name=entry.name,
+            candidate_type="server",
+            relevance_score=score,
+            reasoning=entry.description or "MCP Registry candidate",
+            requires_api_key=bool(package.env_vars),
+            api_key_available=self._check_any_api_key_available(package.env_vars),
+            env_var=env_var,
+            is_running=False,
+            source="registry",
+            transport=package.transport,
+            package=package.identifier,
+            server_card_url=entry.server_card_url,
+            protected_resource_metadata_url=entry.protected_resource_metadata_url,
+            authorization_server_metadata_url=entry.authorization_server_metadata_url,
+            declared_scopes=entry.declared_scopes,
+            declared_capabilities=entry.declared_capabilities,
+        )
+
+    def _registry_candidates_for_query(
+        self, query: str, *, limit: int = 5
+    ) -> list[CapabilityCandidate]:
+        candidates: list[CapabilityCandidate] = []
+        for entry in self._registry_matches(query, limit=limit):
+            candidate = self._registry_candidate_for_entry(entry)
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
+
+    def _legacy_query_mcp_registry(
+        self, query: str, limit: int = 8
+    ) -> list[dict[str, Any]]:
+        """Deprecated direct registry query retained for local debugging only."""
         normalized = self._normalize_token(query)
         if not normalized:
             return []
@@ -3192,8 +3288,7 @@ class GatewayTools:
         _unknown_service = any(
             _pascal_re.match(w)
             and w.lower().replace("-", "").replace("_", "") not in norm_to_server
-            for i, w in enumerate(parsed.query.split())
-            if i > 0  # skip first word — always capitalised in English sentences
+            for w in parsed.query.split()
         )
 
         # --- Tier 2: category keyword match ---
@@ -3344,6 +3439,25 @@ class GatewayTools:
                     )
                 ],
                 recommendation=f"Call gateway.provision(server_name='{server_name}')",
+            )
+
+        registry_candidates = (
+            self._registry_candidates_for_query(parsed.query)
+            if _unknown_service
+            else []
+        )
+        if registry_candidates:
+            return CapabilityResolution(
+                status="candidates",
+                message=(
+                    "Found MCP Registry candidates. PMCP will not install or connect "
+                    "them until you explicitly choose and register one."
+                ),
+                candidates=registry_candidates,
+                recommendation=(
+                    "Review the registry metadata, then call "
+                    "gateway.register_discovered_server for the selected package."
+                ),
             )
 
         # --- Tier 3: no match ---
@@ -4259,30 +4373,30 @@ class GatewayTools:
         parsed = SearchRegistryInput.model_validate(input_data)
         self._record_feedback_event("registry_search", {"query": parsed.query})
 
-        raw_entries = self._query_mcp_registry(parsed.query, limit=parsed.limit * 2)
-
         results: list[SearchRegistryResult] = []
         seen_packages: set[str] = set()
+        raw_entries = self._query_mcp_registry(parsed.query, limit=parsed.limit * 2)
         for entry in raw_entries:
             if not isinstance(entry, dict):
                 continue
-            server_info = entry.get("server", {})
+            server_info = entry.get("server", entry)
+            if not isinstance(server_info, dict):
+                continue
             packages = server_info.get("packages", [])
             if not packages:
                 continue
             pkg = packages[0]
+            if not isinstance(pkg, dict):
+                continue
             package_name = str(pkg.get("identifier", "")).strip()
             if not package_name or package_name in seen_packages:
                 continue
             seen_packages.add(package_name)
-
-            description = str(server_info.get("description", "")).strip()
             transport = (
                 pkg.get("transport", {}).get("type")
                 if isinstance(pkg.get("transport"), dict)
-                else None
+                else pkg.get("transport")
             )
-
             env_var_defs = pkg.get("environmentVariables", []) or []
             env_vars = [
                 str(ev.get("name", "")).strip()
@@ -4292,21 +4406,37 @@ class GatewayTools:
 
             results.append(
                 SearchRegistryResult(
-                    name=server_info.get("name", package_name),
+                    name=str(server_info.get("name", package_name)),
                     package=package_name,
-                    description=description,
+                    description=str(server_info.get("description", "")).strip(),
                     transport=transport,
                     env_vars=env_vars,
+                    url=pkg.get("url"),
                     server_card_url=server_info.get("serverCardUrl")
                     or server_info.get("server_card_url"),
+                    protected_resource_metadata_url=server_info.get(
+                        "protectedResourceMetadataUrl"
+                    )
+                    or server_info.get("protected_resource_metadata_url"),
+                    authorization_server_metadata_url=server_info.get(
+                        "authorizationServerMetadataUrl"
+                    )
+                    or server_info.get("authorization_server_metadata_url"),
+                    declared_scopes=[
+                        str(scope)
+                        for scope in (
+                            server_info.get("scopes")
+                            or server_info.get("declared_scopes")
+                            or []
+                        )
+                        if isinstance(scope, str)
+                    ],
                     declared_capabilities=[
                         str(cap)
                         for cap in server_info.get("capabilities", [])
                         if isinstance(cap, str)
                     ],
-                    diagnostics=[
-                        "registry_metadata_read_only",
-                    ],
+                    diagnostics=["registry_metadata_read_only"],
                 )
             )
             if len(results) >= parsed.limit:

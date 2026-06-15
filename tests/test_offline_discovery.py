@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from pmcp.manifest.environment import CLIInfo
+from pmcp.manifest.registry import RegistryCache, RegistryPackage, RegistryServerEntry
 from pmcp.tools.handlers import GatewayTools
 from pmcp.types import (
     DescriptionsCache,
@@ -185,6 +186,40 @@ class TestCatalogSearchOfflineDiscovery:
         assert result.total_available == 2
         assert len(result.results) == 2
         assert all("::" in card.tool_id for card in result.results)
+
+    @pytest.mark.asyncio
+    async def test_cached_tools_and_registry_candidates_coexist(
+        self, gateway_tools_with_cache: GatewayTools, monkeypatch
+    ) -> None:
+        cache = RegistryCache(
+            schema_version="registry-cache.v1",
+            source_endpoint="https://registry.example/v0/servers",
+            fetched_at="2026-06-15T00:00:00Z",
+            servers=[
+                RegistryServerEntry(
+                    name="offline-registry",
+                    description="Offline registry candidate",
+                    packages=[
+                        RegistryPackage(
+                            identifier="@example/offline-registry",
+                            transport="stdio",
+                        )
+                    ],
+                )
+            ],
+        )
+        monkeypatch.setattr(
+            gateway_tools_with_cache, "_load_registry_candidates", lambda: cache
+        )
+
+        result = await gateway_tools_with_cache.catalog_search(
+            {"query": "offline registry", "include_offline": True}
+        )
+
+        assert result.total_available == 2
+        assert len(result.results) == 2
+        assert len(result.registry_candidates) == 1
+        assert result.registry_candidates[0].source == "registry"
 
     @pytest.mark.asyncio
     async def test_default_excludes_cached_tools(

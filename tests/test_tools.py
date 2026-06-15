@@ -17,6 +17,7 @@ import pytest
 from pmcp.env_store import read_env_file
 from pmcp.manifest.environment import CLIInfo
 from pmcp.manifest.loader import CLIAlternative, Manifest, ServerConfig
+from pmcp.manifest.registry import RegistryCache, RegistryPackage, RegistryServerEntry
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import StartupObservation
 from pmcp.errors import GatewayException
@@ -3767,6 +3768,51 @@ class TestSearchRegistryAndRegister:
         assert result.results[0].package == "@modelcontextprotocol/server-github"
         assert result.results[0].env_vars == ["GITHUB_TOKEN"]
         assert "gateway.register_discovered_server" in result.next_step
+
+    @pytest.mark.asyncio
+    async def test_request_capability_returns_registry_candidates(
+        self, gateway_tools: GatewayTools, monkeypatch
+    ) -> None:
+        cache = RegistryCache(
+            schema_version="registry-cache.v1",
+            source_endpoint="https://registry.example/v0/servers",
+            fetched_at="2026-06-15T00:00:00Z",
+            servers=[
+                RegistryServerEntry(
+                    name="acme-remote",
+                    description="Acme incident management",
+                    packages=[
+                        RegistryPackage(
+                            identifier="@acme/mcp",
+                            transport="streamable-http",
+                            env_vars=["ACME_TOKEN"],
+                            url="https://mcp.acme.example/mcp",
+                        )
+                    ],
+                    server_card_url="https://acme.example/card.json",
+                    protected_resource_metadata_url="https://acme.example/prm",
+                    authorization_server_metadata_url="https://auth.acme.example/as",
+                    declared_scopes=["incidents:read"],
+                    declared_capabilities=["tools"],
+                )
+            ],
+        )
+        monkeypatch.setattr(gateway_tools, "_load_registry_candidates", lambda: cache)
+
+        result = await gateway_tools.request_capability(
+            {"query": "Acme incident management"}
+        )
+
+        assert result.status == "candidates"
+        assert result.candidates is not None
+        candidate = result.candidates[0]
+        assert candidate.source == "registry"
+        assert candidate.package == "@acme/mcp"
+        assert candidate.transport == "streamable-http"
+        assert candidate.protected_resource_metadata_url == "https://acme.example/prm"
+        assert candidate.authorization_server_metadata_url == "https://auth.acme.example/as"
+        assert candidate.declared_scopes == ["incidents:read"]
+        assert candidate.env_var == "ACME_TOKEN"
 
     @pytest.mark.asyncio
     async def test_search_registry_handles_empty_results(

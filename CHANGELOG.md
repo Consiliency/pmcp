@@ -12,6 +12,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   integration. PMCP brokers discovery, invocation, downstream task lifecycle,
   policy, redaction, and operator guidance for a companion tenant code-mode MCP
   server, but does not run scripts itself.
+- Added MCP Registry-backed discovery metadata and a deterministic local cache.
+  `gateway.request_capability`, `gateway.catalog_search`, and
+  `gateway.search_registry` can surface registry candidates with transport,
+  package, server-card, and remote auth metadata while preserving the explicit
+  `gateway.register_discovered_server` and `gateway.provision` boundary.
+- Added curated registry-backed vendor entries for GitHub, Atlassian Rovo,
+  Cloudflare, Sentry, Vercel, and Hugging Face using placeholder header names
+  only.
 
 ## [1.13.1] - 2026-05-06
 

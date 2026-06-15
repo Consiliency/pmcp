@@ -401,6 +401,57 @@ servers:
     env_var: "SENTRY_AUTH_TOKEN"
     env_instructions: "Create at https://sentry.io/settings/account/api/auth-tokens/"
 
+  github-remote:
+    status: "active_vendor_remote"
+    source: "mcp_registry"
+    transport: "streamable-http"
+    url: "https://api.githubcopilot.com/mcp/"
+    protected_resource_metadata_url: "https://api.githubcopilot.com/.well-known/oauth-protected-resource"
+    authorization_server_metadata_url: "https://github.com/login/oauth/.well-known/openid-configuration"
+    declared_scopes: [repo, read:org]
+    description: "GitHub remote MCP - issues, PRs, repos, actions, code search, reviews"
+    keywords: [github, issues, pull request, pr, repository, actions, workflows, code review, commits, remote]
+    install:
+      mac: ["npx", "-y", "@github/github-mcp-server"]
+      linux: ["npx", "-y", "@github/github-mcp-server"]
+      wsl: ["npx", "-y", "@github/github-mcp-server"]
+      windows: ["npx", "-y", "@github/github-mcp-server"]
+    command: ""
+    args: []
+    requires_api_key: true
+    env_var: "GITHUB_PERSONAL_ACCESS_TOKEN"
+    env_instructions: "Set GITHUB_PERSONAL_ACCESS_TOKEN; PMCP records only placeholder header metadata for registry discovery."
+    package: "@github/github-mcp-server"
+    server_card_url: "https://github.com/github/github-mcp-server"
+    declared_capabilities: [tools]
+    discovery_diagnostics: [registry_metadata_read_only]
+    discovery_metadata:
+      placeholder_headers: ["Authorization: Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}"]
+
+  sentry-remote:
+    status: "active_vendor_remote"
+    source: "mcp_registry"
+    transport: "streamable-http"
+    url: "https://mcp.sentry.dev/mcp"
+    description: "Sentry remote MCP - issues, events, releases, and debugging"
+    keywords: [sentry, errors, monitoring, debugging, exceptions, crashes, logs, remote]
+    install:
+      mac: ["npx", "-y", "@sentry/mcp-server"]
+      linux: ["npx", "-y", "@sentry/mcp-server"]
+      wsl: ["npx", "-y", "@sentry/mcp-server"]
+      windows: ["npx", "-y", "@sentry/mcp-server"]
+    command: ""
+    args: []
+    requires_api_key: true
+    env_var: "SENTRY_AUTH_TOKEN"
+    env_instructions: "Set SENTRY_AUTH_TOKEN; PMCP records only placeholder header metadata for registry discovery."
+    package: "@sentry/mcp-server"
+    server_card_url: "https://docs.sentry.io/product/sentry-mcp/"
+    declared_capabilities: [tools]
+    discovery_diagnostics: [registry_metadata_read_only]
+    discovery_metadata:
+      placeholder_headers: ["Authorization: Bearer ${SENTRY_AUTH_TOKEN}"]
+
   # === Communication ===
 
   slack:
@@ -646,6 +697,16 @@ servers:
   # === Cloud Platforms ===
 
   cloudflare:
+    status: "active_vendor_remote"
+    source: "mcp_registry"
+    transport: "streamable-http"
+    url: "https://mcp.cloudflare.com/"
+    package: "@cloudflare/mcp-server-cloudflare"
+    server_card_url: "https://developers.cloudflare.com/agents/model-context-protocol/"
+    declared_capabilities: [tools]
+    discovery_diagnostics: [registry_metadata_read_only]
+    discovery_metadata:
+      placeholder_headers: ["Authorization: Bearer ${CLOUDFLARE_API_TOKEN}"]
     description: "Cloudflare - Workers, KV, R2, D1 databases, Pages, DNS management"
     keywords: [cloudflare, workers, edge, serverless, cdn, kv, r2, d1, dns, deployment]
     install:
@@ -672,6 +733,78 @@ servers:
     requires_api_key: true
     env_var: "HEROKU_API_KEY"
     env_instructions: "Get API key at https://dashboard.heroku.com/account"
+
+  vercel:
+    status: "active_vendor_remote"
+    source: "mcp_registry"
+    transport: "streamable-http"
+    url: "https://mcp.vercel.com/"
+    description: "Vercel - projects, deployments, domains, logs, and managed app operations"
+    keywords: [vercel, deployments, domains, hosting, nextjs, logs, projects]
+    install:
+      mac: ["npx", "-y", "@vercel/mcp-server"]
+      linux: ["npx", "-y", "@vercel/mcp-server"]
+      wsl: ["npx", "-y", "@vercel/mcp-server"]
+      windows: ["npx", "-y", "@vercel/mcp-server"]
+    command: ""
+    args: []
+    requires_api_key: true
+    env_var: "VERCEL_TOKEN"
+    env_instructions: "Set VERCEL_TOKEN; PMCP uses only the placeholder header name in manifest metadata."
+    package: "@vercel/mcp-server"
+    server_card_url: "https://vercel.com/docs/mcp"
+    declared_capabilities: [tools]
+    discovery_diagnostics: [registry_metadata_read_only]
+    discovery_metadata:
+      placeholder_headers: ["Authorization: Bearer ${VERCEL_TOKEN}"]
+
+  atlassian-rovo:
+    status: "active_vendor_remote"
+    source: "mcp_registry"
+    transport: "streamable-http"
+    url: "https://mcp.atlassian.com/v1/sse"
+    description: "Atlassian Rovo - Jira and Confluence work items, spaces, and knowledge"
+    keywords: [atlassian, rovo, jira, confluence, issues, project-management, knowledge]
+    install:
+      mac: ["npx", "-y", "@atlassian/rovo-mcp"]
+      linux: ["npx", "-y", "@atlassian/rovo-mcp"]
+      wsl: ["npx", "-y", "@atlassian/rovo-mcp"]
+      windows: ["npx", "-y", "@atlassian/rovo-mcp"]
+    command: ""
+    args: []
+    requires_api_key: true
+    env_var: "ATLASSIAN_API_TOKEN"
+    env_instructions: "Set ATLASSIAN_API_TOKEN; PMCP uses only the placeholder header name in manifest metadata."
+    package: "@atlassian/rovo-mcp"
+    server_card_url: "https://www.atlassian.com/software/rovo"
+    declared_capabilities: [tools]
+    discovery_diagnostics: [registry_metadata_read_only]
+    discovery_metadata:
+      placeholder_headers: ["Authorization: Bearer ${ATLASSIAN_API_TOKEN}"]
+
+  hugging-face:
+    status: "active_vendor_remote"
+    source: "mcp_registry"
+    transport: "streamable-http"
+    url: "https://huggingface.co/mcp"
+    description: "Hugging Face - models, datasets, Spaces, and Hub metadata"
+    keywords: [huggingface, hugging-face, models, datasets, spaces, machine-learning, ai]
+    install:
+      mac: ["npx", "-y", "@huggingface/mcp-server"]
+      linux: ["npx", "-y", "@huggingface/mcp-server"]
+      wsl: ["npx", "-y", "@huggingface/mcp-server"]
+      windows: ["npx", "-y", "@huggingface/mcp-server"]
+    command: ""
+    args: []
+    requires_api_key: true
+    env_var: "HUGGINGFACE_TOKEN"
+    env_instructions: "Set HUGGINGFACE_TOKEN; PMCP uses only the placeholder header name in manifest metadata."
+    package: "@huggingface/mcp-server"
+    server_card_url: "https://huggingface.co/docs"
+    declared_capabilities: [tools]
+    discovery_diagnostics: [registry_metadata_read_only]
+    discovery_metadata:
+      placeholder_headers: ["Authorization: Bearer ${HUGGINGFACE_TOKEN}"]
 
   railway:
     description: "Railway - deploy services, manage projects, environments, databases, logs"

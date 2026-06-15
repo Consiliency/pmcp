@@ -626,6 +626,7 @@ class CatalogSearchOutput(BaseModel):
     total_available: int
     truncated: bool
     cli_hints: list[CLIHint] = Field(default_factory=list)
+    registry_candidates: list[CapabilityCandidate] = Field(default_factory=list)
     stale_updates: list[str] | None = None
 
 
@@ -966,6 +967,14 @@ class CapabilityCandidate(BaseModel):
     # Status hints
     is_installed: bool = False  # True if CLI is installed or server is running
     is_running: bool = False  # True if server is already connected
+    source: Literal["manifest", "configured", "registry"] | None = None
+    transport: str | None = None
+    package: str | None = None
+    server_card_url: str | None = None
+    protected_resource_metadata_url: str | None = None
+    authorization_server_metadata_url: str | None = None
+    declared_scopes: list[str] = Field(default_factory=list)
+    declared_capabilities: list[str] = Field(default_factory=list)
 
 
 class CapabilityMatchResponse(BaseModel):
@@ -1021,7 +1030,11 @@ class SearchRegistryResult(BaseModel):
     description: str
     transport: str | None = None
     env_vars: list[str] = Field(default_factory=list)
+    url: str | None = None
     server_card_url: str | None = None
+    protected_resource_metadata_url: str | None = None
+    authorization_server_metadata_url: str | None = None
+    declared_scopes: list[str] = Field(default_factory=list)
     declared_capabilities: list[str] = Field(default_factory=list)
     diagnostics: list[str] = Field(default_factory=list)
 

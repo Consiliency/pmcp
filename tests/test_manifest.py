@@ -36,6 +36,8 @@ from pmcp.manifest.matcher import (
     match_capability,
     rank_cli_hints,
 )
+from pmcp.manifest.registry import RegistryCache, RegistryPackage, RegistryServerEntry
+from pmcp.manifest.sync import sync_registry_to_manifest
 
 
 # === Environment Detection Tests ===
@@ -169,6 +171,125 @@ servers:
     assert server.discovery_diagnostics == ["registry_metadata_read_only"]
     assert server.raw_discovery_metadata == {"draftField": "kept-as-raw"}
     assert server.supports_url_elicitation is True
+
+
+def test_manifest_parses_registry_status_source_and_replacement(tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.yaml"
+    manifest_path.write_text(
+        """
+version: "1.0"
+cli_alternatives: {}
+servers:
+  old-github:
+    status: "archived_reference_package"
+    source: "mcp_registry"
+    replacement: "github"
+    description: "Old GitHub server"
+    keywords: ["github"]
+    install: {}
+    command: "npx"
+    args: ["-y", "@old/github"]
+"""
+    )
+
+    server = load_manifest(manifest_path).servers["old-github"]
+
+    assert server.status == "archived_reference_package"
+    assert server.source == "mcp_registry"
+    assert server.replacement == "github"
+
+
+def test_registry_sync_classifies_without_mutating_manifest() -> None:
+    manifest = Manifest(
+        version="1.0",
+        cli_alternatives={},
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        servers={
+            "github": ServerConfig(
+                name="github",
+                description="GitHub",
+                keywords=["github"],
+                install={},
+                command="",
+                args=[],
+                package="@github/github-mcp-server",
+            ),
+            "legacy": ServerConfig(
+                name="legacy",
+                description="Legacy",
+                keywords=["legacy"],
+                install={},
+                command="",
+                args=[],
+                status="archived_reference_package",
+            ),
+            "old-name": ServerConfig(
+                name="old-name",
+                description="Old name",
+                keywords=["renamed"],
+                install={},
+                command="",
+                args=[],
+                package="@example/renamed",
+            ),
+        },
+    )
+    registry = RegistryCache(
+        schema_version="registry-cache.v1",
+        source_endpoint="https://registry.example/v0/servers",
+        fetched_at="2026-06-15T00:00:00Z",
+        servers=[
+            RegistryServerEntry(
+                name="github",
+                description="GitHub",
+                packages=[RegistryPackage(identifier="@github/github-mcp-server")],
+            ),
+            RegistryServerEntry(
+                name="legacy",
+                description="Legacy",
+                packages=[RegistryPackage(identifier="@example/legacy")],
+            ),
+            RegistryServerEntry(
+                name="new-name",
+                description="Renamed",
+                packages=[RegistryPackage(identifier="@example/renamed")],
+            ),
+            RegistryServerEntry(
+                name="added",
+                description="Added",
+                packages=[RegistryPackage(identifier="@example/added")],
+            ),
+        ],
+    )
+
+    result = sync_registry_to_manifest(manifest, registry)
+
+    assert [entry.name for entry in result.unchanged] == ["github"]
+    assert result.archived == ["legacy"]
+    assert [entry.name for entry in result.renamed] == ["new-name"]
+    assert [entry.name for entry in result.added] == ["added"]
+    assert "added" not in manifest.servers
+
+
+def test_manifest_contains_registry_curated_remote_entries() -> None:
+    manifest = load_manifest()
+    for name, env_var in {
+        "github-remote": "GITHUB_PERSONAL_ACCESS_TOKEN",
+        "sentry-remote": "SENTRY_AUTH_TOKEN",
+        "cloudflare": "CLOUDFLARE_API_TOKEN",
+        "vercel": "VERCEL_TOKEN",
+        "atlassian-rovo": "ATLASSIAN_API_TOKEN",
+        "hugging-face": "HUGGINGFACE_TOKEN",
+    }.items():
+        server = manifest.servers[name]
+        assert server.source == "mcp_registry"
+        assert server.transport in {"streamable-http", "http", "sse"}
+        assert server.headers is None
+        assert server.raw_discovery_metadata["placeholder_headers"] == [
+            f"Authorization: Bearer ${{{env_var}}}"
+        ]
+        assert server.package
+        assert "registry_metadata_read_only" in server.discovery_diagnostics
 
 
 def test_manifest_has_expected_servers():

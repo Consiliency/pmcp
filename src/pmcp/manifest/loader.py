@@ -57,6 +57,9 @@ class ServerConfig:
     declared_capabilities: list[str] = field(default_factory=list)
     discovery_diagnostics: list[str] = field(default_factory=list)
     raw_discovery_metadata: dict[str, Any] = field(default_factory=dict)
+    status: str | None = None
+    source: str | None = None
+    replacement: str | None = None
 
 
 # Category taxonomy used by Manifest.get_category_summary() and get_servers_in_category()
@@ -346,6 +349,9 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         declared_capabilities=data.get("declared_capabilities", []),
         discovery_diagnostics=discovery_diagnostics,
         raw_discovery_metadata=raw_discovery_metadata,
+        status=data.get("status"),
+        source=data.get("source"),
+        replacement=data.get("replacement"),
     )
 
 
