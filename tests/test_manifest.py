@@ -860,6 +860,66 @@ def test_keyword_match_generic_api_alone_stays_below_threshold() -> None:
     assert result.matched is False
 
 
+@pytest.mark.parametrize(
+    ("query", "expected_server"),
+    [
+        ("database sql", "sqlite"),
+        ("sql query", "sqlite"),
+        ("postgres database", "postgres"),
+        ("headless browser", "puppeteer"),
+        ("chrome automation", "puppeteer"),
+        ("browser scraping", "puppeteer"),
+    ],
+)
+def test_real_manifest_keyword_match_table(
+    query: str, expected_server: str
+) -> None:
+    manifest = load_manifest(Path("src/pmcp/manifest/manifest.yaml"))
+
+    result = _keyword_match(query, manifest, detected_clis=set())
+
+    assert result.matched is True
+    assert result.entry_name == expected_server
+    assert result.entry_type == "server"
+    assert result.confidence >= 0.25
+
+
+def test_keyword_match_duplicate_server_keywords_do_not_dilute_threshold() -> None:
+    manifest = Manifest(
+        version="1.0",
+        cli_alternatives={},
+        servers={
+            "sqlite": ServerConfig(
+                name="sqlite",
+                description="SQLite database",
+                keywords=["sqlite", "database", "sql", "query", "db", "table"],
+                install={},
+                command="uvx",
+                args=["mcp-server-sqlite"],
+            ),
+            **{
+                f"sqlite-copy-{i}": ServerConfig(
+                    name=f"sqlite-copy-{i}",
+                    description="Duplicate-like SQL database server",
+                    keywords=["database", "sql", "query", "db", "table"],
+                    install={},
+                    command="uvx",
+                    args=[f"mcp-server-sqlite-copy-{i}"],
+                )
+                for i in range(8)
+            },
+        },
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
+
+    result = _keyword_match("database sql", manifest, detected_clis=set())
+
+    assert result.matched is True
+    assert result.entry_name == "sqlite"
+    assert result.entry_type == "server"
+    assert result.confidence >= 0.25
+
+
 def test_rank_cli_hints_preserves_probe_path() -> None:
     manifest = create_test_manifest()
     detected_cli_infos = {"git": CLIInfo(name="git", path="/usr/bin/git")}

@@ -59,16 +59,10 @@ def _text_match_score(query_norm: str, query_words: set[str], value: str) -> flo
 def _keyword_matches_query(
     query_lower: str, query_norm: str, query_words: set[str], keyword: str
 ) -> bool:
-    keyword_lower = keyword.lower()
-    keyword_norm = keyword_lower.replace("-", " ").replace("_", " ")
+    del query_lower, query_norm
+    keyword_norm = keyword.lower().replace("-", " ").replace("_", " ")
     keyword_words = set(keyword_norm.split())
-    return (
-        keyword_lower in query_lower
-        or keyword_norm in query_norm
-        or keyword_lower in query_words
-        or keyword_norm in query_words
-        or (bool(keyword_words) and keyword_words.issubset(query_words))
-    )
+    return bool(keyword_words) and keyword_words.issubset(query_words)
 
 
 def _keyword_match_score(
@@ -100,7 +94,7 @@ def _manifest_keyword_weights(manifest: Manifest) -> dict[str, float]:
             keyword_norm = keyword.lower().replace("-", " ").replace("_", " ")
             frequencies[keyword_norm] = frequencies.get(keyword_norm, 0) + 1
 
-    return {keyword: 1.0 / frequency for keyword, frequency in frequencies.items()}
+    return {keyword: max(1.0 / frequency, 0.5) for keyword, frequency in frequencies.items()}
 
 
 def rank_cli_hints(
