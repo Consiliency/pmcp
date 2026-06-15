@@ -4,9 +4,9 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.10.x  | ✅ Active  |
-| 1.9.x   | ✅ Maintenance |
-| < 1.9   | ❌ No longer supported |
+| 1.14.x  | ✅ Active  |
+| 1.13.x  | ✅ Maintenance |
+| < 1.13  | ❌ No longer supported |
 
 ## Threat Model
 
@@ -24,7 +24,15 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 
 - Unauthenticated tool invocations via Bearer token guard on `/mcp`
 - AS-issued access tokens in `resource-server` mode via JWKS signature,
-  issuer, expiry, not-before, and audience validation
+  issuer, expiry, not-before, and audience validation. The audience is bound to
+  the operator-configured canonical resource URI (`resource_server_audience`,
+  per RFC 8707) and is never derived from the request Host header. Signatures
+  are only accepted for the operator-configured algorithm allowlist (default
+  `RS256`/`ES256`); the token's own `alg` header is never trusted. The mode
+  fails closed at startup without an issuer, JWKS URL, and audience, and the
+  JWKS URL must be `https` on a public host. JWKS is fetched asynchronously and
+  cached so validation never blocks the event loop; an unreachable JWKS endpoint
+  returns `503` while an invalid or wrong-audience token returns `401`.
 - Timing oracle attacks on token comparison (`hmac.compare_digest`)
 - Request floods via per-source-IP sliding-window rate limiting (`--rate-limit`
   / `PMCP_RATE_LIMIT`) on `/mcp`
@@ -59,9 +67,13 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   accepts API-key credentials only for local env-store flows; URL-mode flows only
   accept an elicitation identifier and consent acknowledgement.
 - **Redaction is best-effort defense in depth**: PMCP redacts bearer tokens, API
-  keys, common secrets, URL userinfo, authorization codes, and auth-bearing query
-  parameters from gateway outputs, status/doctor diagnostics, feedback payloads,
-  and HTTP diagnostics. Treat all logs as operational data and avoid adding
+  keys, bare provider tokens (`sk-`, `ghp_`, `github_pat_`), common secrets, URL
+  userinfo, authorization codes, and auth-bearing query parameters from gateway
+  outputs, status/doctor diagnostics, feedback payloads, and HTTP diagnostics.
+  Redaction is applied across every task-emitting surface — `gateway.invoke`,
+  `gateway.tasks_result`, `gateway.tasks_list`, and `gateway.tasks_get`, including
+  task `status_message` and raw fields — and truncation summaries are built from
+  post-redaction text. Treat all logs as operational data and avoid adding
   secrets to server names, tool names, or free-form descriptions.
 - **Credential isolation is scoped, not identity-complete**: user-scope env-store files are owned by
   the local OS account, project-scope env-store files are owned by the project
