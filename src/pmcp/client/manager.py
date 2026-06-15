@@ -20,6 +20,7 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.shared.message import SessionMessage
 
+from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
@@ -1285,7 +1286,10 @@ class ClientManager:
                     logger.info(f"[{name}] reconnected successfully")
                     return
                 except Exception as e:
-                    logger.warning(f"[{name}] reconnect attempt {attempt} failed: {e}")
+                    safe_error = sanitize_auth_diagnostic(e)
+                    logger.warning(
+                        f"[{name}] reconnect attempt {attempt} failed: {safe_error}"
+                    )
             logger.error(
                 f"[{name}] all reconnect attempts failed; server remains offline"
             )

@@ -387,6 +387,32 @@ def test_auth_redaction_covers_roadmap_query_keys_fragments_and_jwts() -> None:
         assert leaked not in safe_url
 
 
+def test_auth_diagnostic_redacts_roadmap_keyword_values_in_free_text() -> None:
+    raw = (
+        "session=sess-123 sid: sid-123 cookie=chocolate "
+        "set-cookie: pmcp=secret-cookie refresh_token=refresh-123 "
+        "client_secret: client-123 access_token=access-123 "
+        "id_token=id-123 jwt=jwt-123 assertion=assert-123 saml=saml-123"
+    )
+
+    redacted = sanitize_auth_diagnostic(raw)
+
+    for leaked in [
+        "sess-123",
+        "sid-123",
+        "chocolate",
+        "secret-cookie",
+        "refresh-123",
+        "client-123",
+        "access-123",
+        "id-123",
+        "jwt-123",
+        "assert-123",
+        "saml-123",
+    ]:
+        assert leaked not in redacted
+
+
 def test_tenant_code_mode_auth_redaction_covers_callbacks_and_artifacts() -> None:
     jwt = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZW5hbnQifQ.N2QwODhmM2I4OTc1"
     raw = (

@@ -306,6 +306,42 @@ class TestSecretRedaction:
             assert leaked not in redacted
         assert "[REDACTED]" in redacted
 
+    def test_redacts_bare_provider_tokens(self) -> None:
+        policy = PolicyManager()
+        raw = (
+            "tokens: sk-abcdef123456 ghp_1234567890abcdef "
+            "github_pat_1234567890abcdef"
+        )
+
+        redacted = policy.redact_secrets(raw)
+
+        assert "sk-abcdef123456" not in redacted
+        assert "ghp_1234567890abcdef" not in redacted
+        assert "github_pat_1234567890abcdef" not in redacted
+
+    def test_process_output_redacts_truncated_summary(self) -> None:
+        policy = PolicyManager()
+        secret = "sk-abcdef123456"
+        output = f"first line {secret}\n" + ("filler\n" * 80)
+
+        processed = policy.process_output(output, redact=True, max_bytes=180)
+
+        assert processed["truncated"] is True
+        assert processed["raw_size"] == len(output.encode("utf-8"))
+        assert secret not in processed["result"]
+        assert processed["summary"] is not None
+        assert secret not in processed["summary"]
+
+    def test_redaction_does_not_cap_output_without_max_bytes(self) -> None:
+        policy = PolicyManager()
+        output = "prefix " + ("x" * 800) + " sk-abcdef123456"
+
+        processed = policy.process_output(output, redact=True)
+
+        assert processed["truncated"] is False
+        assert len(processed["result"]) > 700
+        assert "sk-abcdef123456" not in processed["result"]
+
     def test_redacts_tenant_code_mode_sandbox_outputs(self, tmp_path: Path) -> None:
         policy_path = tmp_path / "policy.json"
         policy_path.write_text(

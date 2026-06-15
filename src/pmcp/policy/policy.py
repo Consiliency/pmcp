@@ -22,6 +22,9 @@ DEFAULT_REDACTION_PATTERNS = [
     r"(secret|password|passwd|pwd)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
     r"(bearer|token)[\s]+[a-zA-Z0-9._-]+",
     r"(aws_secret|aws_access)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
+    r"\bsk-[A-Za-z0-9_-]{6,}\b",
+    r"\bghp_[A-Za-z0-9_]{10,}\b",
+    r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
 ]
 
 DEFAULT_POLICY_PATHS = [
@@ -193,7 +196,7 @@ class PolicyManager:
 
     def redact_secrets(self, output: str) -> str:
         """Redact secrets from output."""
-        result = sanitize_auth_diagnostic(output)
+        result = sanitize_auth_diagnostic(output, max_length=None)
 
         for regex in self._redaction_regexes:
 
@@ -239,7 +242,8 @@ class PolicyManager:
         summary: str | None = None
         if truncated:
             lines = output_str.count("\n") + 1
-            first_line = output_str.split("\n")[0][:100] if output_str else ""
+            summary_source = final_str if redact else output_str
+            first_line = summary_source.split("\n")[0][:100] if summary_source else ""
             summary = f'Output was {raw_size} bytes ({lines} lines). First line: "{first_line}..."'
 
         # Try to parse back to object if original was not string

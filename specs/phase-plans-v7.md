@@ -186,7 +186,7 @@ field routes through, closing the confirmed leak paths (C1, C2, H1, H2, H3, M1, 
 - [ ] `redact_secrets` defaults to ON for task/code-mode result paths. [M1]
 - [ ] The free-text diagnostic redactor covers `session|sid|cookie|set-cookie|refresh_token|`
   `client_secret|access_token|id_token|jwt|assertion|saml`. [M2]
-- [ ] `ruff`, `mypy`, full `pytest` (TMPDIR outside `/tmp`) green.
+- [ ] `ruff`, CI mypy baseline (`uv run mypy src/pmcp --exclude baml_client`), and full `pytest` (TMPDIR outside `/tmp`) green.
 
 **Scope notes**
 - Decompose into ≥3 lanes with disjoint ownership: (a) `policy/policy.py` — unify the

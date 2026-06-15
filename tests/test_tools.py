@@ -3653,7 +3653,8 @@ class TestCapabilityAndProvision:
         assert "subordinate_server: context7" in result.issue_body
         assert "failed_tool_call: context7::resolve-library-id" in result.issue_body
         assert "pmcp_version" in result.issue_body
-        assert "REDACTED_API_KEY" in result.issue_body
+        assert "sk-abcdef12345678901234567890" not in result.issue_body
+        assert "[REDACTED]" in result.issue_body
         assert "consent" in result.message.lower()
 
     @pytest.mark.asyncio
@@ -4223,6 +4224,75 @@ class TestInvokeErrorPaths:
         assert result.task is not None
         assert result.task.status == "completed"
         assert result.raw_size_estimate > 0
+
+    @pytest.mark.asyncio
+    async def test_invoke_task_metadata_redacts_by_default(self) -> None:
+        tool = self._make_tool(execution={"taskSupport": "optional"})
+        gt = self._make_gateway_tools(tool=tool)
+        cm = cast(Any, gt._client_manager)
+
+        async def call_tool(
+            tool_id: str,
+            args: dict[str, Any],
+            timeout_ms: int,
+            *,
+            task: Any = None,
+            trace_context: Any = None,
+        ) -> dict[str, Any]:
+            task_record = McpTaskRecord(
+                task_id="task-secret",
+                status="working",
+                status_message="queued with sk-abcdef123456",
+                raw={
+                    "statusMessage": "queued with ghp_1234567890abcdef",
+                    "metadata": {"token": "github_pat_1234567890abcdef"},
+                },
+                server_name="svc",
+                tool_id=tool_id,
+            )
+            cm.tasks[("svc", "task-secret")] = task_record
+            return {"task": {"taskId": "task-secret", "status": "working"}}
+
+        cm.call_tool = call_tool
+
+        result = await gt.invoke(
+            {
+                "tool_id": "svc::do_thing",
+                "arguments": {},
+                "task": {"metadata": {"reason": "slow"}},
+            }
+        )
+
+        assert result.task is not None
+        serialized = result.model_dump_json()
+        assert "sk-abcdef123456" not in serialized
+        assert "ghp_1234567890abcdef" not in serialized
+        assert "github_pat_1234567890abcdef" not in serialized
+
+    @pytest.mark.asyncio
+    async def test_tasks_result_redacts_result_and_task_metadata_by_default(self) -> None:
+        gt = self._make_gateway_tools()
+        await gt.invoke(
+            {
+                "tool_id": "svc::do_thing",
+                "arguments": {},
+                "task": {"metadata": {"reason": "slow"}},
+            }
+        )
+        cm = cast(Any, gt._client_manager)
+        task = cm.tasks[("svc", "task-1")]
+        task.status_message = "complete with sk-abcdef123456"
+        task.raw["statusMessage"] = "complete with ghp_1234567890abcdef"
+        task.raw["metadata"] = {"token": "github_pat_1234567890abcdef"}
+
+        result = await gt.tasks_result({"server_name": "svc", "task_id": "task-1"})
+
+        assert result.ok is True
+        serialized = result.model_dump_json()
+        assert "sk-secret" not in serialized
+        assert "sk-abcdef123456" not in serialized
+        assert "ghp_1234567890abcdef" not in serialized
+        assert "github_pat_1234567890abcdef" not in serialized
 
     @pytest.mark.asyncio
     async def test_tasks_cancel_reports_missing_task(self) -> None:

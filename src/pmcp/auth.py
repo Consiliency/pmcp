@@ -35,6 +35,28 @@ AUTH_SECRET_QUERY_KEYS = {
     "jwt",
 }
 
+AUTH_DIAGNOSTIC_SECRET_KEYS = {
+    "access_token",
+    "api_key",
+    "apikey",
+    "assertion",
+    "client_secret",
+    "code",
+    "cookie",
+    "id_token",
+    "jwt",
+    "password",
+    "refresh_token",
+    "saml",
+    "secret",
+    "session",
+    "set-cookie",
+    "sid",
+    "tenant-id",
+    "tenant_id",
+    "token",
+}
+
 _JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])"
     r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
@@ -101,7 +123,7 @@ def sanitize_url_elicitation_url(url: str) -> str:
         raise ValueError("Invalid URL-mode elicitation URL.") from exc
 
 
-def sanitize_auth_diagnostic(value: object) -> str:
+def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
     """Return a display-safe diagnostic string for auth failures."""
     text = str(value)
 
@@ -119,14 +141,21 @@ def sanitize_auth_diagnostic(value: object) -> str:
         r"\1[REDACTED]",
         text,
     )
+    text = re.sub(r"(?i)(\bbearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
+    secret_keys = "|".join(
+        [
+            *[re.escape(key) for key in AUTH_DIAGNOSTIC_SECRET_KEYS],
+            r"api[_-]?key",
+        ]
+    )
     text = re.sub(
-        r"(?i)(bearer|token|api[_-]?key|apikey|secret|password|code|tenant[_-]?id)"
-        r"([\s:=]+)([A-Za-z0-9._~+/=-]{6,})",
+        rf"(?i)\b([A-Za-z0-9_-]*(?:{secret_keys})[A-Za-z0-9_-]*)"
+        r"([\s:=]+)([A-Za-z0-9._~+/=-]{3,})",
         r"\1\2[REDACTED]",
         text,
     )
     text = _JWT_RE.sub("[REDACTED]", text)
-    return text[:400]
+    return text if max_length is None else text[:max_length]
 
 
 def _parse_www_auth_params(raw: str) -> dict[str, str]:

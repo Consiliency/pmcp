@@ -1598,10 +1598,15 @@ class GatewayTools:
             if parsed.options and parsed.options.max_output_chars:
                 max_bytes = parsed.options.max_output_chars * 4  # Rough bytes estimate
 
-            redact = parsed.options.redact_secrets if parsed.options else False
+            redact = parsed.options.redact_secrets if parsed.options else task_info is not None
 
             processed = self._policy_manager.process_output(
                 result, redact=redact, max_bytes=max_bytes
+            )
+            public_task = (
+                self._sanitize_task_for_output(task_info)
+                if task_info is not None
+                else None
             )
 
             elapsed_ms = round((time.monotonic() - _call_start) * 1000)
@@ -1623,7 +1628,7 @@ class GatewayTools:
                 tool_id=parsed.tool_id,
                 ok=True,
                 result=None if task_info is not None else processed["result"],
-                task=task_info,
+                task=public_task,
                 truncated=processed["truncated"],
                 summary=processed["summary"],
                 raw_size_estimate=processed["raw_size"],
@@ -2487,7 +2492,7 @@ class GatewayTools:
 
     def _write_secret(self, scope: str, key: str, value: str) -> Path:
         """Persist a secret in PMCP env storage."""
-        return set_env_value(scope, key, value)
+        return set_env_value(scope, key, value, self._project_root)
 
     def _normalize_token(self, value: str) -> str:
         """Normalize user query tokens for matching/discovery."""
@@ -2978,15 +2983,7 @@ class GatewayTools:
 
     def _scrub_sensitive_text(self, text: str) -> str:
         """Remove obvious secrets and personal identifiers from feedback text."""
-        scrubbed = text
-        patterns = [
-            (r"sk-[A-Za-z0-9_-]{20,}", "[REDACTED_API_KEY]"),
-            (r"github_pat_[A-Za-z0-9_]{20,}", "[REDACTED_GITHUB_TOKEN]"),
-            (r"ghp_[A-Za-z0-9]{20,}", "[REDACTED_GITHUB_TOKEN]"),
-        ]
-        for pattern, replacement in patterns:
-            scrubbed = re.sub(pattern, replacement, scrubbed)
-        scrubbed = sanitize_auth_diagnostic(scrubbed)
+        scrubbed = self._policy_manager.redact_secrets(text)
         return re.sub(
             r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
             "[REDACTED_EMAIL]",
@@ -3931,7 +3928,7 @@ class GatewayTools:
             )
 
         try:
-            path = set_env_value(parsed.scope, env_var, parsed.credential)
+            path = self._write_secret(parsed.scope, env_var, parsed.credential)
         except ValueError as exc:
             self._audit(
                 method="gateway.auth_connect",
@@ -4838,13 +4835,13 @@ class GatewayTools:
             max_bytes = None
             if parsed.options and parsed.options.max_output_chars:
                 max_bytes = parsed.options.max_output_chars * 4
-            redact = parsed.options.redact_secrets if parsed.options else False
+            redact = parsed.options.redact_secrets if parsed.options else True
             processed = self._policy_manager.process_output(
                 result_payload, redact=redact, max_bytes=max_bytes
             )
             output = TasksResultOutput(
                 ok=True,
-                task=task,
+                task=self._sanitize_task_for_output(task) if task is not None else None,
                 result=processed["result"],
                 truncated=processed["truncated"],
                 summary=processed["summary"],
@@ -4870,6 +4867,24 @@ class GatewayTools:
                 error=str(e),
             )
             return TasksResultOutput(ok=False, errors=[self._sanitize_error(e)])
+
+    def _sanitize_task_for_output(self, task: McpTaskInfo) -> McpTaskInfo:
+        task_data = task.model_dump(mode="json")
+        if isinstance(task_data.get("status_message"), str):
+            task_data["status_message"] = self._policy_manager.redact_secrets(
+                task_data["status_message"]
+            )
+        task_data["raw"] = self._sanitize_task_raw(task_data.get("raw", {}))
+        return McpTaskInfo.model_validate(task_data)
+
+    def _sanitize_task_raw(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._policy_manager.redact_secrets(value)
+        if isinstance(value, dict):
+            return {key: self._sanitize_task_raw(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._sanitize_task_raw(item) for item in value]
+        return value
 
     async def tasks_cancel(self, input_data: dict[str, Any]) -> TasksCancelOutput:
         """gateway.tasks_cancel - Cancel a downstream MCP task."""
