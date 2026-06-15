@@ -271,6 +271,46 @@
     },
     {
       "acceptance_criteria_count": null,
+      "created_at": "2026-06-15T19:56:01Z",
+      "file": "plans/phase-plan-v8-REGFIX.md",
+      "handoff_ref": ".dev-skills/handoffs/codex-plan-phase/20260615T195601Z-regfix-plan.md",
+      "if_gates_produced": [
+        "IF-0-REGFIX-1"
+      ],
+      "lanes": [
+        "SL-0",
+        "SL-1",
+        "SL-2",
+        "SL-3"
+      ],
+      "lifecycle": [
+        {
+          "at": "2026-06-15T19:56:01Z",
+          "by": "codex-plan-phase",
+          "metadata": {
+            "artifact_state": "staged",
+            "roadmap_sha256": "3e07c3a7e8ca6399747a99b81f7575b58dc48ed79af11ef428715a78784342b7"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "codex-plan-phase",
+      "phase_alias": "REGFIX",
+      "reflection_ref": "/home/viperjuice/.codex/skills/codex-plan-phase/reflections/f7b19d9e9b16fb85/main/20260615T195601Z-regfix-plan.md",
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v8.md",
+        "slug": "phase-plans-v8",
+        "status": "committed",
+        "type": "roadmap"
+      },
+      "slug": "phase-plan-v8-REGFIX",
+      "status": "committed",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-06-15T19:56:01Z"
+    },
+    {
+      "acceptance_criteria_count": null,
       "created_at": "2026-06-15T08:25:19Z",
       "file": "plans/phase-plan-v7-AUTHRS.md",
       "handoff_ref": null,
@@ -541,6 +581,36 @@
       "task_summary": null,
       "type": "phase",
       "updated_at": "2026-06-15T19:44:51Z"
+    },
+    {
+      "acceptance_criteria_count": null,
+      "created_at": "2026-06-15T19:55:24Z",
+      "file": "plans/phase-plan-v8-REGFIX.md",
+      "handoff_ref": null,
+      "if_gates_produced": [
+        "IF-0-REGFIX-1"
+      ],
+      "lanes": [
+        "SL-0",
+        "SL-1",
+        "SL-2",
+        "SL-3"
+      ],
+      "lifecycle": [],
+      "owner_skill": "codex-plan-phase",
+      "phase_alias": "REGFIX",
+      "reflection_ref": null,
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v8.md",
+        "slug": "phase-plans-v8",
+        "status": "imported",
+        "type": "phase"
+      },
+      "slug": "v8-REGFIX",
+      "status": "imported",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-06-15T19:55:24Z"
     }
   ],
   "schema_version": 1
