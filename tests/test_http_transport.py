@@ -328,10 +328,13 @@ class TestHttpObservabilityContracts:
         claims = SimpleNamespace(
             issuer="https://issuer.example",
             subject="subject-1",
-            audience=["http://testserver/mcp"],
+            audience=["https://pmcp.example/mcp"],
             scopes=["read"],
         )
         with patch(
+            "pmcp.transport.http.AsyncJWKS.get_for_token",
+            new=AsyncMock(return_value={"keys": [{"kid": "test-key"}]}),
+        ), patch(
             "pmcp.transport.http.validate_resource_server_token",
             return_value=claims,
         ) as validate:
@@ -339,35 +342,52 @@ class TestHttpObservabilityContracts:
                 auth_mode="resource-server",
                 resource_server_issuer="https://issuer.example",
                 resource_server_jwks_url="https://issuer.example/jwks.json",
+                resource_server_audience="https://pmcp.example/mcp",
             )
             response = client.post(
                 "/mcp",
-                headers={"Authorization": "Bearer signed-token"},
+                headers={
+                    "Authorization": "Bearer signed-token",
+                    "Host": "spoofed.example",
+                },
                 json={"jsonrpc": "2.0", "method": "notifications/initialized"},
             )
 
         assert response.status_code == 202
         validate.assert_called_once()
-        assert validate.call_args.kwargs["audience"] == "http://testserver/mcp"
+        assert validate.call_args.kwargs["audience"] == "https://pmcp.example/mcp"
+
+    def test_resource_server_requires_configured_canonical_audience(self) -> None:
+        with pytest.raises(ValueError, match="audience"):
+            _make_contract_client(
+                auth_mode="resource-server",
+                resource_server_issuer="https://issuer.example",
+                resource_server_jwks_url="https://issuer.example/jwks.json",
+            )
 
     def test_resource_server_missing_bearer_gets_challenge(self) -> None:
         client = _make_contract_client(
             auth_mode="resource-server",
             resource_server_issuer="https://issuer.example",
             resource_server_jwks_url="https://issuer.example/jwks.json",
+            resource_server_audience="https://pmcp.example/mcp",
         )
 
         response = client.post("/mcp", content=b"{}")
 
         assert response.status_code == 401
         assert (
-            'resource="http://testserver/mcp"' in response.headers["www-authenticate"]
+            'resource="https://pmcp.example/mcp"'
+            in response.headers["www-authenticate"]
         )
 
     def test_resource_server_insufficient_scope_gets_403_challenge(self) -> None:
         from pmcp.auth import ResourceServerAuthError
 
         with patch(
+            "pmcp.transport.http.AsyncJWKS.get_for_token",
+            new=AsyncMock(return_value={"keys": [{"kid": "test-key"}]}),
+        ), patch(
             "pmcp.transport.http.validate_resource_server_token",
             side_effect=ResourceServerAuthError(
                 "insufficient_scope", "Missing required scope(s): write"
@@ -377,6 +397,7 @@ class TestHttpObservabilityContracts:
                 auth_mode="resource-server",
                 resource_server_issuer="https://issuer.example",
                 resource_server_jwks_url="https://issuer.example/jwks.json",
+                resource_server_audience="https://pmcp.example/mcp",
                 required_scopes=["write"],
             )
             response = client.post(
@@ -388,6 +409,52 @@ class TestHttpObservabilityContracts:
         assert response.status_code == 403
         assert 'error="insufficient_scope"' in response.headers["www-authenticate"]
         assert 'scope="write"' in response.headers["www-authenticate"]
+
+    @pytest.mark.parametrize(
+        "jwks_url",
+        [
+            "http://issuer.example/jwks.json",
+            "https://127.0.0.1/jwks.json",
+            "https://10.0.0.1/jwks.json",
+            "https://169.254.1.1/jwks.json",
+            "https://224.0.0.1/jwks.json",
+            "https://0.0.0.0/jwks.json",
+            "not-a-url",
+        ],
+    )
+    def test_resource_server_rejects_non_public_jwks_urls(self, jwks_url: str) -> None:
+        with pytest.raises(ValueError):
+            _make_contract_client(
+                auth_mode="resource-server",
+                resource_server_issuer="https://issuer.example",
+                resource_server_jwks_url=jwks_url,
+                resource_server_audience="https://pmcp.example/mcp",
+            )
+
+    def test_resource_server_jwks_failure_gets_503_challenge(self) -> None:
+        from pmcp.auth import ResourceServerJWKSUnavailable
+
+        with patch(
+            "pmcp.transport.http.AsyncJWKS.get_for_token",
+            side_effect=ResourceServerJWKSUnavailable(
+                "JWKS fetch failed for https://issuer.example/jwks.json?token=secret."
+            ),
+        ):
+            client = _make_contract_client(
+                auth_mode="resource-server",
+                resource_server_issuer="https://issuer.example",
+                resource_server_jwks_url="https://issuer.example/jwks.json?token=secret",
+                resource_server_audience="https://pmcp.example/mcp",
+            )
+            response = client.post(
+                "/mcp",
+                headers={"Authorization": "Bearer signed-token"},
+                content=b"{}",
+            )
+
+        assert response.status_code == 503
+        assert "secret" not in response.text
+        assert "secret" not in response.headers["www-authenticate"]
 
     def test_allowed_origins_rejects_invalid_origin_before_mcp_handler(self) -> None:
         client = _make_contract_client(allowed_origins=["https://app.example"])

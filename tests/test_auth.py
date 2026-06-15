@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import stat
 import time
+import asyncio
 from pathlib import Path
 from typing import get_args
 
@@ -12,7 +13,9 @@ import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
 
 from pmcp.auth import (
+    AsyncJWKS,
     ResourceServerAuthError,
+    ResourceServerJWKSUnavailable,
     fetch_json_metadata,
     normalize_auth_metadata,
     parse_url_elicitation_error,
@@ -315,6 +318,114 @@ def test_validate_resource_server_token_accepts_signed_jwks_token() -> None:
     assert claims.subject == "subject-1"
     assert claims.audience == ["https://pmcp.example/mcp"]
     assert claims.scopes == ["read", "write"]
+
+
+def test_validate_resource_server_token_rejects_header_alg_outside_allowlist() -> None:
+    token, jwks = _signed_token_fixture()
+
+    with pytest.raises(ResourceServerAuthError) as exc_info:
+        validate_resource_server_token(
+            token,
+            issuer="https://issuer.example",
+            audience="https://pmcp.example/mcp",
+            jwks=jwks,
+            allowed_algorithms=("ES256",),
+        )
+
+    assert exc_info.value.error == "invalid_token"
+
+
+@pytest.mark.parametrize(
+    "token_audience",
+    [
+        ["https://pmcp.example/mcp", "https://other.example/mcp"],
+        "https://other.example/mcp",
+    ],
+)
+def test_validate_resource_server_token_uses_configured_canonical_audience(
+    token_audience: str | list[str],
+) -> None:
+    token, jwks = _signed_token_fixture(audience=token_audience)
+
+    if token_audience == "https://other.example/mcp":
+        with pytest.raises(ResourceServerAuthError) as exc_info:
+            validate_resource_server_token(
+                token,
+                issuer="https://issuer.example",
+                audience="https://pmcp.example/mcp",
+                jwks=jwks,
+            )
+        assert exc_info.value.error == "invalid_token"
+    else:
+        claims = validate_resource_server_token(
+            token,
+            issuer="https://issuer.example",
+            audience="https://pmcp.example/mcp",
+            jwks=jwks,
+        )
+        assert "https://pmcp.example/mcp" in claims.audience
+
+
+@pytest.mark.asyncio
+async def test_async_jwks_caches_and_coalesces_fetches(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jwks = AsyncJWKS("https://issuer.example/jwks.json", ttl_seconds=30)
+    calls = 0
+
+    async def fake_fetch() -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        await asyncio.sleep(0)
+        return {"keys": [{"kid": "test-key"}]}
+
+    monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+
+    first, second = await asyncio.gather(jwks.get(), jwks.get())
+    cached = await jwks.get()
+
+    assert first == second == cached == {"keys": [{"kid": "test-key"}]}
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_async_jwks_unknown_kid_forces_one_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token, _ = _signed_token_fixture()
+    jwks = AsyncJWKS("https://issuer.example/jwks.json", ttl_seconds=30)
+    calls = 0
+
+    async def fake_fetch() -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"keys": [{"kid": "other-key"}]}
+
+    monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+
+    await jwks.get_for_token(token)
+
+    assert calls == 2
+
+
+@pytest.mark.asyncio
+async def test_async_jwks_fetch_failures_are_sanitized(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jwks = AsyncJWKS("https://issuer.example/jwks.json?token=secret")
+
+    async def fake_fetch() -> dict[str, object]:
+        raise ResourceServerJWKSUnavailable(
+            "JWKS fetch failed for https://issuer.example/jwks.json?token=secret."
+        )
+
+    monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+
+    with pytest.raises(ResourceServerJWKSUnavailable) as exc_info:
+        await jwks.get(force_refresh=True)
+
+    assert "secret" not in str(exc_info.value)
+    assert "REDACTED" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

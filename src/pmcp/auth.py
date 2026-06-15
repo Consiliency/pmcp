@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import time
+import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
 from ipaddress import ip_address
@@ -11,8 +13,9 @@ from typing import Any
 from urllib.parse import parse_qsl, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
 
+import aiohttp
 import jwt
-from jwt import PyJWKClient, PyJWKSet
+from jwt import PyJWKSet
 
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
@@ -161,6 +164,88 @@ class ResourceServerAuthError(Exception):
         super().__init__(self.description)
 
 
+class ResourceServerJWKSUnavailable(ResourceServerAuthError):
+    """Raised when Resource Server JWKS cannot be fetched."""
+
+    def __init__(self, description: str) -> None:
+        super().__init__("temporarily_unavailable", description)
+
+
+class AsyncJWKS:
+    """Async TTL-cached JWKS fetcher for Resource Server token validation."""
+
+    def __init__(
+        self,
+        url: str,
+        *,
+        ttl_seconds: float = 300,
+        max_bytes: int = 512 * 1024,
+    ) -> None:
+        self.url = sanitize_public_auth_url(url)
+        self._raw_url = url
+        self._ttl_seconds = ttl_seconds
+        self._max_bytes = max_bytes
+        self._lock: asyncio.Lock | None = None
+        self._jwks: Mapping[str, Any] | None = None
+        self._expires_at = 0.0
+
+    @property
+    def _refresh_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def get(self, *, force_refresh: bool = False) -> Mapping[str, Any]:
+        now = time.monotonic()
+        if not force_refresh and self._jwks is not None and now < self._expires_at:
+            return self._jwks
+        async with self._refresh_lock:
+            now = time.monotonic()
+            if not force_refresh and self._jwks is not None and now < self._expires_at:
+                return self._jwks
+            jwks = await self._fetch()
+            self._jwks = jwks
+            self._expires_at = time.monotonic() + self._ttl_seconds
+            return jwks
+
+    async def get_for_token(self, token: str) -> Mapping[str, Any]:
+        jwks = await self.get()
+        try:
+            kid = jwt.get_unverified_header(token).get("kid")
+        except jwt.InvalidTokenError:
+            return jwks
+        if isinstance(kid, str) and not _jwks_has_kid(jwks, kid):
+            jwks = await self.get(force_refresh=True)
+        return jwks
+
+    async def _fetch(self) -> Mapping[str, Any]:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self._raw_url) as response:
+                    response.raise_for_status()
+                    content = await response.content.read(self._max_bytes + 1)
+        except Exception as exc:
+            raise ResourceServerJWKSUnavailable(
+                f"JWKS fetch failed for {self.url}."
+            ) from exc
+        if len(content) > self._max_bytes:
+            raise ResourceServerJWKSUnavailable(f"JWKS response too large for {self.url}.")
+        try:
+            jwks = json.loads(content.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ResourceServerJWKSUnavailable(f"Invalid JWKS JSON from {self.url}.") from exc
+        if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
+            raise ResourceServerJWKSUnavailable(f"Invalid JWKS object from {self.url}.")
+        return jwks
+
+
+def _jwks_has_kid(jwks: Mapping[str, Any], kid: str) -> bool:
+    keys = jwks.get("keys")
+    if not isinstance(keys, list):
+        return False
+    return any(isinstance(key, Mapping) and key.get("kid") == kid for key in keys)
+
+
 def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
     header = jwt.get_unverified_header(token)
     kid = header.get("kid")
@@ -190,10 +275,10 @@ def validate_resource_server_token(
     token: str,
     *,
     issuer: str,
-    jwks_url: str | None = None,
     audience: str,
     required_scopes: list[str] | None = None,
     jwks: Mapping[str, Any] | None = None,
+    allowed_algorithms: tuple[str, ...] = ("RS256", "ES256"),
 ) -> ResourceServerTokenClaims:
     """Validate an AS-issued JWT for PMCP Resource Server mode."""
     if not token:
@@ -205,16 +290,13 @@ def validate_resource_server_token(
             raise ResourceServerAuthError(
                 "invalid_token", "Unsupported token algorithm."
             )
-        if jwks is not None:
-            signing_key = _select_jwk_key(token, jwks)
-        elif jwks_url:
-            signing_key = PyJWKClient(jwks_url).get_signing_key_from_jwt(token).key
-        else:
+        if jwks is None:
             raise ResourceServerAuthError("invalid_token", "JWKS URL is required.")
+        signing_key = _select_jwk_key(token, jwks)
         claims = jwt.decode(
             token,
             signing_key,
-            algorithms=[algorithm],
+            algorithms=list(allowed_algorithms),
             audience=audience,
             issuer=issuer,
             options={"require": ["iss", "exp", "nbf", "aud"]},

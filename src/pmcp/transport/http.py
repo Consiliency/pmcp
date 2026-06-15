@@ -31,8 +31,11 @@ from starlette.routing import Route
 
 from pmcp import __version__
 from pmcp.auth import (
+    AsyncJWKS,
     ResourceServerAuthError,
+    ResourceServerJWKSUnavailable,
     normalize_auth_metadata,
+    sanitize_public_auth_url,
     validate_resource_server_token,
 )
 from pmcp.types import GatewayDiagnosticsInfo
@@ -49,6 +52,7 @@ _metrics: dict[str, int] = {
     "requests_total": 0,
     "requests_401": 0,
     "requests_403": 0,
+    "requests_503": 0,
     "requests_429": 0,
     "requests_ok": 0,
 }
@@ -80,6 +84,9 @@ try:
         ),
         "requests_403": _PCounter(
             "pmcp_requests_403", "Requests rejected 403 Forbidden"
+        ),
+        "requests_503": _PCounter(
+            "pmcp_requests_503", "Requests rejected 503 Service Unavailable"
         ),
         "requests_429": _PCounter(
             "pmcp_requests_429", "Requests rejected 429 Too Many Requests"
@@ -155,6 +162,7 @@ def create_http_app(
     resource_server_issuer: str | None = None,
     resource_server_jwks_url: str | None = None,
     resource_server_audience: str | None = None,
+    resource_server_allowed_algorithms: tuple[str, ...] = ("RS256", "ES256"),
     required_scopes: list[str] | None = None,
     allowed_origins: list[str] | None = None,
 ) -> Starlette:
@@ -188,9 +196,18 @@ def create_http_app(
         raise ValueError("Unsupported auth mode.")
     if effective_auth_mode == "shared-secret" and auth_token is None:
         raise ValueError("shared-secret auth mode requires auth_token.")
+    resource_jwks: AsyncJWKS | None = None
     if effective_auth_mode == "resource-server":
-        if not resource_server_issuer or not resource_server_jwks_url:
-            raise ValueError("resource-server auth mode requires issuer and JWKS URL.")
+        if (
+            not resource_server_issuer
+            or not resource_server_jwks_url
+            or not resource_server_audience
+        ):
+            raise ValueError(
+                "resource-server auth mode requires issuer, JWKS URL, and audience."
+            )
+        sanitize_public_auth_url(resource_server_jwks_url)
+        resource_jwks = AsyncJWKS(resource_server_jwks_url)
     diagnostics = GatewayDiagnosticsInfo(
         transport="http",
         header_compatibility={
@@ -207,8 +224,8 @@ def create_http_app(
         rate_limit_rpm=rate_limit_rpm if rate_limit_rpm > 0 else None,
     )
 
-    def _resource_audience(request: Request) -> str:
-        return resource_server_audience or str(request.url_for("mcp"))
+    def _resource_audience() -> str:
+        return resource_server_audience or ""
 
     def _auth_headers(
         request: Request | None = None,
@@ -219,7 +236,7 @@ def create_http_app(
         parts: list[str] = []
         if not auth_metadata.protected_resource_metadata_url:
             if request is not None and effective_auth_mode == "resource-server":
-                parts.append(f'resource="{_resource_audience(request)}"')
+                parts.append(f'resource="{_resource_audience()}"')
         else:
             parts.append(
                 f'resource_metadata="{auth_metadata.protected_resource_metadata_url}"'
@@ -333,12 +350,18 @@ def create_http_app(
                 logger.debug("handle_mcp [%s]: 401 missing bearer", request_id)
                 return _reject(401, "Unauthorized", _auth_headers(request))
             try:
+                if resource_jwks is None:
+                    raise ResourceServerAuthError(
+                        "invalid_token", "Resource Server JWKS is not configured."
+                    )
+                jwks = await resource_jwks.get_for_token(token)
                 claims = validate_resource_server_token(
                     token,
                     issuer=resource_server_issuer or "",
-                    jwks_url=resource_server_jwks_url,
-                    audience=_resource_audience(request),
+                    jwks=jwks,
+                    audience=_resource_audience(),
                     required_scopes=required_scopes,
+                    allowed_algorithms=resource_server_allowed_algorithms,
                 )
                 request.scope["pmcp.auth"] = {
                     "issuer": claims.issuer,
@@ -346,6 +369,13 @@ def create_http_app(
                     "audience": claims.audience,
                     "scopes": claims.scopes,
                 }
+            except ResourceServerJWKSUnavailable as exc:
+                logger.debug("handle_mcp [%s]: 503 jwks unavailable", request_id)
+                return _reject(
+                    503,
+                    "Service Unavailable",
+                    _auth_headers(request, error=exc.error),
+                )
             except ResourceServerAuthError as exc:
                 if exc.error == "insufficient_scope":
                     scope = " ".join(required_scopes or [])
