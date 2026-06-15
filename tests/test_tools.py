@@ -3113,6 +3113,39 @@ class TestCapabilityAndProvision:
         assert "credential_stored" in combined
 
     @pytest.mark.asyncio
+    async def test_auth_connect_project_scope_ignores_unrelated_temp_ancestor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        ancestor = tmp_path / "ancestor"
+        project = ancestor / "project"
+        child = project / "child"
+        child.mkdir(parents=True)
+        (ancestor / ".git").mkdir()
+        monkeypatch.setattr(
+            "pmcp.config.loader.tempfile.gettempdir", lambda: str(ancestor)
+        )
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        monkeypatch.chdir(child)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        result = await gateway_tools.auth_connect(
+            {
+                "server_name": "custom",
+                "env_var": "OPENAI_API_KEY",
+                "credential": "test-token",
+                "scope": "project",
+            }
+        )
+
+        assert result.ok is True
+        assert result.env_path == str(child / ".env.pmcp")
+        assert not (ancestor / ".env.pmcp").exists()
+        assert read_env_file(child / ".env.pmcp")["OPENAI_API_KEY"] == "test-token"
+
+    @pytest.mark.asyncio
     async def test_auth_connect_rejects_invalid_explicit_env_var(
         self, tmp_path: Path, monkeypatch
     ) -> None:

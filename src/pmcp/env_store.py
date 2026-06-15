@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -79,15 +80,17 @@ def _format_env_value(value: str) -> str:
 def write_env_file(path: Path, values: dict[str, str]) -> None:
     """Write key/value pairs to .env file and lock permissions to 0600."""
     _validate_env_values(values)
-    path.parent.mkdir(parents=True, exist_ok=True)
 
     lines = [f"{key}={_format_env_value(val)}" for key, val in values.items()]
     content = "\n".join(lines)
     if content:
         content += "\n"
 
-    path.write_text(content)
-    path.chmod(0o600)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as env_file:
+        env_file.write(content)
 
 
 def set_env_value(

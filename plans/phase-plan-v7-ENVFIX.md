@@ -64,7 +64,7 @@ Current code already has the relevant seams: `write_env_file(...)`, `set_env_val
 
 - **Scope**: Run the ENVFIX verification set, confirm IF-0-ENVFIX-1 is fully produced, and prepare runner closeout evidence without owning additional source files.
 - **Owned files**: none
-- **Interfaces provided**: ENVFIX verification evidence; IF-0-ENVFIX-1 completion checklist; phase-owned dirty-path inventory for `src/pmcp/env_store.py`, `tests/test_secrets_command.py`, `src/pmcp/config/loader.py`, `tests/test_config_loader.py`, and `tests/test_tools.py`
+- **Interfaces provided**: ENVFIX verification evidence; IF-0-ENVFIX-1 completion checklist; phase-owned dirty-path inventory for the SL-0 and SL-1 owned-file sets
 - **Interfaces consumed**: IF-0-ENVFIX-1, SL-0 atomic-write results, SL-1 bounded-resolver results, roadmap ENVFIX exit criteria
 - **Parallel-safe**: no
 - **Tasks**:

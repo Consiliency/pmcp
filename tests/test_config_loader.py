@@ -9,6 +9,7 @@ import pytest
 
 from pmcp.config.loader import (
     build_startup_observation_snapshot,
+    find_project_root,
     get_startup_policy,
     load_disabled_auto_start,
     load_enabled_auto_start,
@@ -51,6 +52,30 @@ class TestParseToolId:
 
 class TestLoadConfigs:
     """Tests for load_configs."""
+
+    def test_find_project_root_finds_nested_project_marker(
+        self, tmp_path: Path
+    ) -> None:
+        project = tmp_path / "project"
+        nested = project / "a" / "b"
+        nested.mkdir(parents=True)
+        (project / "pyproject.toml").write_text("[project]\nname = 'example'\n")
+
+        assert find_project_root(nested) == project
+
+    def test_find_project_root_ignores_unrelated_temp_ancestor_marker(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        parent = tmp_path / "ancestor"
+        project = parent / "project"
+        nested = project / "child"
+        nested.mkdir(parents=True)
+        (parent / ".git").mkdir()
+        monkeypatch.setattr(
+            "pmcp.config.loader.tempfile.gettempdir", lambda: str(parent)
+        )
+
+        assert find_project_root(nested) is None
 
     def test_loads_project_config(self, tmp_path: Path) -> None:
         # Create project config

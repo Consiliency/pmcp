@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import stat
 from pathlib import Path
 from unittest.mock import patch
@@ -16,7 +17,7 @@ from pmcp.cli_commands.secrets import (
     run_secrets_set,
     run_secrets_sync,
 )
-from pmcp.env_store import read_env_file
+from pmcp.env_store import read_env_file, write_env_file
 
 
 class TestSecretsParseArgs:
@@ -63,6 +64,33 @@ class TestSecretsHandlers:
         assert output["value"] == "*******"
         assert env_path.exists()
         assert read_env_file(env_path)["OPENAI_API_KEY"] == "sk-test"
+        assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+
+    def test_write_env_file_creates_with_os_open_mode_0600(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """write_env_file creates new env files through a restrictive descriptor."""
+        env_path = tmp_path / ".env.pmcp"
+        opened: list[tuple[Path, int, int]] = []
+        real_open = os.open
+
+        def open_spy(
+            path: os.PathLike[str] | str,
+            flags: int,
+            mode: int = 0o777,
+            *args: object,
+            **kwargs: object,
+        ) -> int:
+            opened.append((Path(path), flags, mode))
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr("pmcp.env_store.os.open", open_spy)
+
+        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
+
+        assert opened == [
+            (env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        ]
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
 
     @pytest.mark.asyncio

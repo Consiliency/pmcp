@@ -202,8 +202,11 @@ def _coerce_server_entry(config: object) -> dict[str, Any] | None:
 def find_project_root(start_dir: Path) -> Path | None:
     """Find project root by looking for .mcp.json or common project markers."""
     current = start_dir.resolve()
+    temp_root = Path(tempfile.gettempdir()).resolve()
 
     while current != current.parent:
+        if current == temp_root:
+            return None
         # Check for .mcp.json
         if (current / ".mcp.json").exists():
             return current
