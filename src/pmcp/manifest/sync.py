@@ -32,7 +32,9 @@ def sync_registry_to_manifest(
     install, auto-connect, or mutate the input manifest.
     """
     result = RegistrySyncResult()
-    manifest_by_name = {_norm(name): server for name, server in manifest.servers.items()}
+    manifest_by_name = {
+        _norm(name): server for name, server in manifest.servers.items()
+    }
     manifest_by_package = {
         server.package: server
         for server in manifest.servers.values()
@@ -43,7 +45,11 @@ def sync_registry_to_manifest(
         normalized_name = _norm(entry.name)
         packages = [pkg.identifier for pkg in entry.packages]
         package_match = next(
-            (manifest_by_package[pkg] for pkg in packages if pkg in manifest_by_package),
+            (
+                manifest_by_package[pkg]
+                for pkg in packages
+                if pkg in manifest_by_package
+            ),
             None,
         )
         name_match = manifest_by_name.get(normalized_name)

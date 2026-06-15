@@ -360,9 +360,9 @@ class TestHttpObservabilityContracts:
         response = client.post("/mcp", content=b"{}")
 
         assert response.status_code == 401
-        assert 'resource="http://testserver/mcp"' in response.headers[
-            "www-authenticate"
-        ]
+        assert (
+            'resource="http://testserver/mcp"' in response.headers["www-authenticate"]
+        )
 
     def test_resource_server_insufficient_scope_gets_403_challenge(self) -> None:
         from pmcp.auth import ResourceServerAuthError

@@ -202,7 +202,9 @@ def validate_resource_server_token(
         header = jwt.get_unverified_header(token)
         algorithm = header.get("alg")
         if not isinstance(algorithm, str) or algorithm.lower() == "none":
-            raise ResourceServerAuthError("invalid_token", "Unsupported token algorithm.")
+            raise ResourceServerAuthError(
+                "invalid_token", "Unsupported token algorithm."
+            )
         if jwks is not None:
             signing_key = _select_jwk_key(token, jwks)
         elif jwks_url:

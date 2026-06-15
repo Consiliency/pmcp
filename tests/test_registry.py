@@ -79,7 +79,9 @@ def test_fetch_registry_servers_parses_preview_schema(monkeypatch) -> None:
     assert cache.servers[0].packages[0].env_vars == ["GITHUB_TOKEN"]
     assert cache.servers[0].packages[0].raw["unknownPreviewField"] == {"kept": True}
     assert cache.servers[0].raw["server"]["unknownServerField"] == "kept"
-    assert all("TOKEN" not in diag for server in cache.servers for diag in server.diagnostics)
+    assert all(
+        "TOKEN" not in diag for server in cache.servers for diag in server.diagnostics
+    )
 
 
 def test_fetch_registry_servers_timeout_returns_diagnostic(monkeypatch) -> None:

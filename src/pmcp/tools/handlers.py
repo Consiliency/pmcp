@@ -1611,7 +1611,11 @@ class GatewayTools:
             if parsed.options and parsed.options.max_output_chars:
                 max_bytes = parsed.options.max_output_chars * 4  # Rough bytes estimate
 
-            redact = parsed.options.redact_secrets if parsed.options else task_info is not None
+            redact = (
+                parsed.options.redact_secrets
+                if parsed.options
+                else task_info is not None
+            )
 
             processed = self._policy_manager.process_output(
                 result, redact=redact, max_bytes=max_bytes

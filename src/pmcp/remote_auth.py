@@ -104,10 +104,18 @@ def build_remote_header_env_lookup(
 
 def _tenant_env_path(project_root: Path | None, tenant_id: str) -> Path:
     if not TENANT_ID_PATTERN.fullmatch(tenant_id):
-        raise ValueError("Tenant id may only contain letters, numbers, dot, underscore, or dash.")
+        raise ValueError(
+            "Tenant id may only contain letters, numbers, dot, underscore, or dash."
+        )
     from pmcp.env_store import resolve_project_root
 
-    return resolve_project_root(project_root) / ".pmcp" / "tenants" / tenant_id / "pmcp.env"
+    return (
+        resolve_project_root(project_root)
+        / ".pmcp"
+        / "tenants"
+        / tenant_id
+        / "pmcp.env"
+    )
 
 
 def resolve_remote_headers_for_tenant(
@@ -120,7 +128,9 @@ def resolve_remote_headers_for_tenant(
 ) -> RemoteHeaderAuthResolution:
     """Resolve remote headers using tenant-isolated credentials when tenant_id is set."""
     if tenant_id is None:
-        return resolve_remote_headers(headers, build_remote_header_env_lookup(project_root))
+        return resolve_remote_headers(
+            headers, build_remote_header_env_lookup(project_root)
+        )
 
     from pmcp.env_store import read_env_file
 

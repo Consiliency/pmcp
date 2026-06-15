@@ -237,7 +237,9 @@ def create_http_app(
             return None
         return token
 
-    def _reject(status_code: int, body: str, headers: dict[str, str] | None = None) -> Response:
+    def _reject(
+        status_code: int, body: str, headers: dict[str, str] | None = None
+    ) -> Response:
         _inc(f"requests_{status_code}")
         return Response(body, status_code=status_code, headers=headers or {})
 

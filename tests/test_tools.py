@@ -3810,7 +3810,10 @@ class TestSearchRegistryAndRegister:
         assert candidate.package == "@acme/mcp"
         assert candidate.transport == "streamable-http"
         assert candidate.protected_resource_metadata_url == "https://acme.example/prm"
-        assert candidate.authorization_server_metadata_url == "https://auth.acme.example/as"
+        assert (
+            candidate.authorization_server_metadata_url
+            == "https://auth.acme.example/as"
+        )
         assert candidate.declared_scopes == ["incidents:read"]
         assert candidate.env_var == "ACME_TOKEN"
 
@@ -4349,7 +4352,9 @@ class TestInvokeErrorPaths:
         assert "github_pat_1234567890abcdef" not in serialized
 
     @pytest.mark.asyncio
-    async def test_tasks_result_redacts_result_and_task_metadata_by_default(self) -> None:
+    async def test_tasks_result_redacts_result_and_task_metadata_by_default(
+        self,
+    ) -> None:
         gt = self._make_gateway_tools()
         await gt.invoke(
             {

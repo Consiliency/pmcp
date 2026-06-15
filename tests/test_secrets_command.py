@@ -88,9 +88,7 @@ class TestSecretsHandlers:
 
         write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
 
-        assert opened == [
-            (env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        ]
+        assert opened == [(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)]
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
 
     @pytest.mark.asyncio

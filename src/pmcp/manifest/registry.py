@@ -239,9 +239,7 @@ def load_registry_cache(cache_path: Path | None = None) -> RegistryCache | None:
     return cache
 
 
-def save_registry_cache(
-    cache: RegistryCache, cache_path: Path | None = None
-) -> None:
+def save_registry_cache(cache: RegistryCache, cache_path: Path | None = None) -> None:
     """Save registry cache JSON with stable ordering."""
     path = _cache_path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)

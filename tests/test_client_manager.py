@@ -1114,9 +1114,7 @@ class TestRemoteConnectSseHeaders:
             headers={"Authorization": "Bearer ${PMCP_TEST_TOKEN}"},
         )
 
-        with patch(
-            "pmcp.client.manager.resolve_remote_headers_for_tenant"
-        ) as resolver:
+        with patch("pmcp.client.manager.resolve_remote_headers_for_tenant") as resolver:
             resolver.return_value.resolved_headers = {
                 "Authorization": "Bearer tenant-secret"
             }
@@ -2127,7 +2125,9 @@ class TestParallelConnections:
         assert calls == 1
 
     @pytest.mark.asyncio
-    async def test_shutdown_disconnect_all_awaits_background_task_registry(self) -> None:
+    async def test_shutdown_disconnect_all_awaits_background_task_registry(
+        self,
+    ) -> None:
         manager = ClientManager()
         cancelled = asyncio.Event()
 

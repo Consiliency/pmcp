@@ -308,10 +308,7 @@ class TestSecretRedaction:
 
     def test_redacts_bare_provider_tokens(self) -> None:
         policy = PolicyManager()
-        raw = (
-            "tokens: sk-abcdef123456 ghp_1234567890abcdef "
-            "github_pat_1234567890abcdef"
-        )
+        raw = "tokens: sk-abcdef123456 ghp_1234567890abcdef github_pat_1234567890abcdef"
 
         redacted = policy.redact_secrets(raw)
 
