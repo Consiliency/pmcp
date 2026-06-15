@@ -5,9 +5,14 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from ipaddress import ip_address
+from typing import Any
 from urllib.parse import parse_qsl, quote, urlparse, urlunparse
 from urllib.request import Request, urlopen
+
+import jwt
+from jwt import PyJWKClient, PyJWKSet
 
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
@@ -95,6 +100,22 @@ def _is_loopback_host(hostname: str) -> bool:
         return False
 
 
+def _is_public_auth_host(hostname: str) -> bool:
+    if hostname.lower() == "localhost":
+        return False
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        return True
+    return not (
+        address.is_private
+        or address.is_loopback
+        or address.is_link_local
+        or address.is_multicast
+        or address.is_unspecified
+    )
+
+
 def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> str:
     """Validate and redact a public absolute auth metadata or elicitation URL."""
     try:
@@ -111,8 +132,114 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> 
         not allow_loopback_http or not _is_loopback_host(hostname)
     ):
         raise ValueError("Public auth URL only allows http:// URLs for loopback hosts.")
+    if not (
+        allow_loopback_http and parsed.scheme == "http" and _is_loopback_host(hostname)
+    ):
+        if not _is_public_auth_host(hostname):
+            raise ValueError("Public auth URL host must be public.")
 
     return redact_auth_url(url)
+
+
+@dataclass(frozen=True)
+class ResourceServerTokenClaims:
+    """Validated non-secret Resource Server token claims."""
+
+    issuer: str
+    subject: str | None
+    audience: list[str]
+    scopes: list[str]
+    claims: Mapping[str, Any]
+
+
+class ResourceServerAuthError(Exception):
+    """Raised for failed Resource Server token validation."""
+
+    def __init__(self, error: str, description: str) -> None:
+        self.error = error
+        self.description = sanitize_auth_diagnostic(description)
+        super().__init__(self.description)
+
+
+def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
+    header = jwt.get_unverified_header(token)
+    kid = header.get("kid")
+    key_set = PyJWKSet.from_dict(dict(jwks))
+    keys = key_set.keys
+    if kid:
+        for key in keys:
+            if key.key_id == kid:
+                return key.key
+    if len(keys) == 1:
+        return keys[0].key
+    raise ResourceServerAuthError("invalid_token", "No matching JWK found.")
+
+
+def _claim_scopes(claims: Mapping[str, Any]) -> list[str]:
+    raw_scope = claims.get("scope")
+    scopes: set[str] = set()
+    if isinstance(raw_scope, str):
+        scopes.update(part for part in raw_scope.split() if part)
+    raw_scp = claims.get("scp")
+    if isinstance(raw_scp, list):
+        scopes.update(part for part in raw_scp if isinstance(part, str) and part)
+    return sorted(scopes)
+
+
+def validate_resource_server_token(
+    token: str,
+    *,
+    issuer: str,
+    jwks_url: str | None = None,
+    audience: str,
+    required_scopes: list[str] | None = None,
+    jwks: Mapping[str, Any] | None = None,
+) -> ResourceServerTokenClaims:
+    """Validate an AS-issued JWT for PMCP Resource Server mode."""
+    if not token:
+        raise ResourceServerAuthError("invalid_token", "Missing bearer token.")
+    try:
+        header = jwt.get_unverified_header(token)
+        algorithm = header.get("alg")
+        if not isinstance(algorithm, str) or algorithm.lower() == "none":
+            raise ResourceServerAuthError("invalid_token", "Unsupported token algorithm.")
+        if jwks is not None:
+            signing_key = _select_jwk_key(token, jwks)
+        elif jwks_url:
+            signing_key = PyJWKClient(jwks_url).get_signing_key_from_jwt(token).key
+        else:
+            raise ResourceServerAuthError("invalid_token", "JWKS URL is required.")
+        claims = jwt.decode(
+            token,
+            signing_key,
+            algorithms=[algorithm],
+            audience=audience,
+            issuer=issuer,
+            options={"require": ["iss", "exp", "nbf", "aud"]},
+        )
+    except ResourceServerAuthError:
+        raise
+    except jwt.InvalidAudienceError as exc:
+        raise ResourceServerAuthError("invalid_token", "Invalid audience.") from exc
+    except jwt.InvalidTokenError as exc:
+        raise ResourceServerAuthError("invalid_token", str(exc)) from exc
+
+    scopes = _claim_scopes(claims)
+    missing_scopes = sorted(set(required_scopes or []) - set(scopes))
+    if missing_scopes:
+        raise ResourceServerAuthError(
+            "insufficient_scope",
+            "Missing required scope(s): " + " ".join(missing_scopes),
+        )
+    raw_audience = claims.get("aud")
+    audiences = raw_audience if isinstance(raw_audience, list) else [raw_audience]
+    return ResourceServerTokenClaims(
+        issuer=str(claims.get("iss", "")),
+        subject=claims.get("sub") if isinstance(claims.get("sub"), str) else None,
+        audience=[str(value) for value in audiences if value],
+        scopes=scopes,
+        claims=claims,
+    )
 
 
 def sanitize_url_elicitation_url(url: str) -> str:

@@ -20,7 +20,7 @@ import json
 import logging
 import uuid
 from collections.abc import AsyncIterator, MutableMapping
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Literal
 from urllib.parse import urlparse
 
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
@@ -30,7 +30,11 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 from pmcp import __version__
-from pmcp.auth import normalize_auth_metadata
+from pmcp.auth import (
+    ResourceServerAuthError,
+    normalize_auth_metadata,
+    validate_resource_server_token,
+)
 from pmcp.types import GatewayDiagnosticsInfo
 
 if TYPE_CHECKING:
@@ -44,6 +48,7 @@ logger = logging.getLogger(__name__)
 _metrics: dict[str, int] = {
     "requests_total": 0,
     "requests_401": 0,
+    "requests_403": 0,
     "requests_429": 0,
     "requests_ok": 0,
 }
@@ -72,6 +77,9 @@ try:
         ),
         "requests_401": _PCounter(
             "pmcp_requests_401", "Requests rejected 401 Unauthorized"
+        ),
+        "requests_403": _PCounter(
+            "pmcp_requests_403", "Requests rejected 403 Forbidden"
         ),
         "requests_429": _PCounter(
             "pmcp_requests_429", "Requests rejected 429 Too Many Requests"
@@ -135,6 +143,7 @@ async def _check_rate_limit(client_ip: str, max_rpm: int) -> bool:
 def create_http_app(
     mcp_server: Server,
     auth_token: str | None = None,
+    auth_mode: Literal["none", "shared-secret", "resource-server"] | None = None,
     rate_limit_rpm: int = 0,
     request_timeout: int = 60,
     protected_resource_metadata_url: str | None = None,
@@ -143,6 +152,11 @@ def create_http_app(
     oidc_discovery_url: str | None = None,
     client_id_metadata_document_url: str | None = None,
     declared_scopes: list[str] | None = None,
+    resource_server_issuer: str | None = None,
+    resource_server_jwks_url: str | None = None,
+    resource_server_audience: str | None = None,
+    required_scopes: list[str] | None = None,
+    allowed_origins: list[str] | None = None,
 ) -> Starlette:
     """Create Starlette ASGI app with streamable-HTTP transport for MCP server.
 
@@ -167,6 +181,16 @@ def create_http_app(
         client_id_metadata_document_url=client_id_metadata_document_url,
         declared_scopes=declared_scopes,
     )
+    effective_auth_mode = auth_mode
+    if effective_auth_mode is None:
+        effective_auth_mode = "shared-secret" if auth_token is not None else "none"
+    if effective_auth_mode not in {"none", "shared-secret", "resource-server"}:
+        raise ValueError("Unsupported auth mode.")
+    if effective_auth_mode == "shared-secret" and auth_token is None:
+        raise ValueError("shared-secret auth mode requires auth_token.")
+    if effective_auth_mode == "resource-server":
+        if not resource_server_issuer or not resource_server_jwks_url:
+            raise ValueError("resource-server auth mode requires issuer and JWKS URL.")
     diagnostics = GatewayDiagnosticsInfo(
         transport="http",
         header_compatibility={
@@ -183,15 +207,39 @@ def create_http_app(
         rate_limit_rpm=rate_limit_rpm if rate_limit_rpm > 0 else None,
     )
 
-    def _auth_headers() -> dict[str, str]:
+    def _resource_audience(request: Request) -> str:
+        return resource_server_audience or str(request.url_for("mcp"))
+
+    def _auth_headers(
+        request: Request | None = None,
+        *,
+        error: str | None = None,
+        scope: str | None = None,
+    ) -> dict[str, str]:
+        parts: list[str] = []
         if not auth_metadata.protected_resource_metadata_url:
-            return {}
-        return {
-            "WWW-Authenticate": (
-                'Bearer resource_metadata="'
-                f'{auth_metadata.protected_resource_metadata_url}"'
+            if request is not None and effective_auth_mode == "resource-server":
+                parts.append(f'resource="{_resource_audience(request)}"')
+        else:
+            parts.append(
+                f'resource_metadata="{auth_metadata.protected_resource_metadata_url}"'
             )
-        }
+        if error:
+            parts.append(f'error="{error}"')
+        if scope:
+            parts.append(f'scope="{scope}"')
+        return {"WWW-Authenticate": "Bearer " + ", ".join(parts)} if parts else {}
+
+    def _bearer_token(request: Request) -> str | None:
+        value = request.headers.get("authorization", "")
+        scheme, _, token = value.partition(" ")
+        if scheme.lower() != "bearer" or not token:
+            return None
+        return token
+
+    def _reject(status_code: int, body: str, headers: dict[str, str] | None = None) -> Response:
+        _inc(f"requests_{status_code}")
+        return Response(body, status_code=status_code, headers=headers or {})
 
     async def handle_health(request: Request) -> Response:
         """Unauthenticated health check — safe for load-balancers and container probes."""
@@ -266,14 +314,50 @@ def create_http_app(
             if request.headers.get(key)
         }
 
-        # Bearer-token auth guard (optional — only when auth_token is configured)
-        if auth_token is not None:
+        if allowed_origins is not None:
+            origin = request.headers.get("origin")
+            if origin is not None and origin not in allowed_origins:
+                logger.debug("handle_mcp [%s]: 403 invalid origin", request_id)
+                return _reject(403, "Forbidden")
+
+        if effective_auth_mode == "shared-secret":
             incoming = request.headers.get("authorization", "")
             if not hmac.compare_digest(incoming, f"Bearer {auth_token}"):
-                _inc("requests_401")
                 logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)
-                return Response(
-                    "Unauthorized", status_code=401, headers=_auth_headers()
+                return _reject(401, "Unauthorized", _auth_headers(request))
+        elif effective_auth_mode == "resource-server":
+            token = _bearer_token(request)
+            if token is None:
+                logger.debug("handle_mcp [%s]: 401 missing bearer", request_id)
+                return _reject(401, "Unauthorized", _auth_headers(request))
+            try:
+                claims = validate_resource_server_token(
+                    token,
+                    issuer=resource_server_issuer or "",
+                    jwks_url=resource_server_jwks_url,
+                    audience=_resource_audience(request),
+                    required_scopes=required_scopes,
+                )
+                request.scope["pmcp.auth"] = {
+                    "issuer": claims.issuer,
+                    "subject": claims.subject,
+                    "audience": claims.audience,
+                    "scopes": claims.scopes,
+                }
+            except ResourceServerAuthError as exc:
+                if exc.error == "insufficient_scope":
+                    scope = " ".join(required_scopes or [])
+                    logger.debug("handle_mcp [%s]: 403 insufficient scope", request_id)
+                    return _reject(
+                        403,
+                        "Forbidden",
+                        _auth_headers(request, error=exc.error, scope=scope),
+                    )
+                logger.debug("handle_mcp [%s]: 401 invalid token", request_id)
+                return _reject(
+                    401,
+                    "Unauthorized",
+                    _auth_headers(request, error=exc.error),
                 )
 
         # Per-IP rate limiting (optional — only when rate_limit_rpm > 0)

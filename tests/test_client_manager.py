@@ -20,6 +20,7 @@ from pmcp.client.manager import (
     PREFERRED_PROTOCOL_VERSION,
     _extract_tags,
     _infer_risk_hint,
+    _remote_headers,
     _truncate_description,
 )
 from pmcp.env_store import write_env_file
@@ -1105,6 +1106,29 @@ class TestRemoteConnectSseHeaders:
             "PMCP_TEST_TOKEN",
         ]
         mock_streamablehttp_client.assert_not_called()
+
+    def test_remote_headers_passes_tenant_context_to_resolver(self) -> None:
+        config = RemoteMcpServerConfig(
+            type="streamable-http",
+            url="https://example.com/mcp",
+            headers={"Authorization": "Bearer ${PMCP_TEST_TOKEN}"},
+        )
+
+        with patch(
+            "pmcp.client.manager.resolve_remote_headers_for_tenant"
+        ) as resolver:
+            resolver.return_value.resolved_headers = {
+                "Authorization": "Bearer tenant-secret"
+            }
+            resolver.return_value.missing_env_vars = []
+            headers = _remote_headers("remote-http", config, tenant_id="tenant-a")
+
+        assert headers == {"Authorization": "Bearer tenant-secret"}
+        resolver.assert_called_once_with(
+            config.headers,
+            server_name="remote-http",
+            tenant_id="tenant-a",
+        )
 
 
 class TestRemoteConnectTransportDispatch:

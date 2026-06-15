@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, get_args
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 def _make_contract_client(
     auth_token: str | None = None,
     rate_limit_rpm: int = 0,
+    **kwargs: object,
 ) -> TestClient:
     """Create a minimal HTTP app client for route contract tests."""
     from pmcp.transport.http import create_http_app
@@ -38,6 +40,7 @@ def _make_contract_client(
             mock_server,
             auth_token=auth_token,
             rate_limit_rpm=rate_limit_rpm,
+            **kwargs,
         )
         return TestClient(app, raise_server_exceptions=False)
 
@@ -307,6 +310,95 @@ class TestHttpObservabilityContracts:
         statuses = [client.post("/mcp", content=b"{}").status_code for _ in range(3)]
 
         assert 429 in statuses
+
+    def test_shared_secret_auth_mode_preserves_static_bearer_behavior(self) -> None:
+        client = _make_contract_client(auth_token="secret", auth_mode="shared-secret")
+
+        rejected = client.post("/mcp", content=b"{}")
+        accepted = client.post(
+            "/mcp",
+            headers={"Authorization": "Bearer secret"},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        assert rejected.status_code == 401
+        assert accepted.status_code == 202
+
+    def test_resource_server_valid_token_reaches_mcp_handler(self) -> None:
+        claims = SimpleNamespace(
+            issuer="https://issuer.example",
+            subject="subject-1",
+            audience=["http://testserver/mcp"],
+            scopes=["read"],
+        )
+        with patch(
+            "pmcp.transport.http.validate_resource_server_token",
+            return_value=claims,
+        ) as validate:
+            client = _make_contract_client(
+                auth_mode="resource-server",
+                resource_server_issuer="https://issuer.example",
+                resource_server_jwks_url="https://issuer.example/jwks.json",
+            )
+            response = client.post(
+                "/mcp",
+                headers={"Authorization": "Bearer signed-token"},
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            )
+
+        assert response.status_code == 202
+        validate.assert_called_once()
+        assert validate.call_args.kwargs["audience"] == "http://testserver/mcp"
+
+    def test_resource_server_missing_bearer_gets_challenge(self) -> None:
+        client = _make_contract_client(
+            auth_mode="resource-server",
+            resource_server_issuer="https://issuer.example",
+            resource_server_jwks_url="https://issuer.example/jwks.json",
+        )
+
+        response = client.post("/mcp", content=b"{}")
+
+        assert response.status_code == 401
+        assert 'resource="http://testserver/mcp"' in response.headers[
+            "www-authenticate"
+        ]
+
+    def test_resource_server_insufficient_scope_gets_403_challenge(self) -> None:
+        from pmcp.auth import ResourceServerAuthError
+
+        with patch(
+            "pmcp.transport.http.validate_resource_server_token",
+            side_effect=ResourceServerAuthError(
+                "insufficient_scope", "Missing required scope(s): write"
+            ),
+        ):
+            client = _make_contract_client(
+                auth_mode="resource-server",
+                resource_server_issuer="https://issuer.example",
+                resource_server_jwks_url="https://issuer.example/jwks.json",
+                required_scopes=["write"],
+            )
+            response = client.post(
+                "/mcp",
+                headers={"Authorization": "Bearer signed-token"},
+                content=b"{}",
+            )
+
+        assert response.status_code == 403
+        assert 'error="insufficient_scope"' in response.headers["www-authenticate"]
+        assert 'scope="write"' in response.headers["www-authenticate"]
+
+    def test_allowed_origins_rejects_invalid_origin_before_mcp_handler(self) -> None:
+        client = _make_contract_client(allowed_origins=["https://app.example"])
+
+        response = client.post(
+            "/mcp",
+            headers={"Origin": "https://evil.example"},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        assert response.status_code == 403
 
 
 class TestHttpTransportIntegration:

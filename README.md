@@ -116,7 +116,11 @@ curl -sS http://127.0.0.1:3344/mcp
 
 ### Security
 
-**HTTP transport is unauthenticated by default.** For any non-localhost exposure, require a bearer token:
+**HTTP transport is unauthenticated by default.** For any non-localhost exposure,
+choose an HTTP auth mode and terminate TLS in front of PMCP.
+
+`shared-secret` mode is the backward-compatible single-tenant guard. It accepts
+one static bearer value on `/mcp`:
 
 ```bash
 # Start with bearer auth from the environment
@@ -130,6 +134,28 @@ Clients must then include `Authorization: Bearer mysecrettoken` on `/mcp` reques
 `/health` and `/metrics` remain unauthenticated by design; protect them with
 firewall rules, IP allowlists, or reverse-proxy policy before any non-localhost
 exposure.
+
+`resource-server` mode makes PMCP validate Authorization Server issued access
+tokens as an OAuth 2.1 Resource Server. Configure the HTTP app with a public
+issuer, JWKS URL, resource audience, required scopes, and exact allowed origins:
+
+```python
+create_http_app(
+    mcp_server,
+    auth_mode="resource-server",
+    resource_server_issuer="https://issuer.example",
+    resource_server_jwks_url="https://issuer.example/.well-known/jwks.json",
+    resource_server_audience="https://pmcp.example/mcp",
+    required_scopes=["pmcp.invoke"],
+    allowed_origins=["https://app.example"],
+)
+```
+
+PMCP validates token signature, issuer, expiry, not-before, and audience. It
+rejects private, link-local, loopback, multicast, and unspecified hosts in
+public auth metadata URLs. PMCP is still not an Authorization Server and does
+not provide dynamic client registration, SSO, RBAC, billing, or a complete
+multi-tenant identity service.
 
 **Assumptions and trust model:**
 
@@ -383,6 +409,9 @@ Supported flows:
   process env, project env-store, and user env-store values, but status, doctor,
   health, and feedback output only show required or missing env var names, not
   the resolved header value.
+- Tenant-aware remote header resolution uses a tenant-scoped credential file
+  under the resolved project root. Tenant mode reads only that tenant's values
+  and reports missing env var names without printing header values.
 - Remote authorization discovery is diagnostic-only. PMCP can preserve and report
   OAuth Protected Resource Metadata, Authorization Server Metadata, OpenID
   Connect discovery, Client ID Metadata Document URLs, and declared scopes when a
@@ -1035,11 +1064,13 @@ redaction:
     - "artifact_token=[^\\s]+"
 ```
 
-For hosted tenant auth, keep credentials in PMCP env storage or the process
-environment and reference only placeholders from config:
+For hosted tenant auth, keep credentials in PMCP env storage or tenant-scoped
+project storage and reference only placeholders from config:
 `${TENANT_CODE_MODE_MCP_TOKEN}` and `${TENANT_CODE_MODE_TENANT_ID}`. Use
 `pmcp secrets set ... --scope project` or `gateway.auth_connect` to populate
-env-store values. PMCP diagnostics report missing field or env-var names such as
+env-store values for non-tenant mode; tenant mode uses isolated per-tenant env
+files derived from the resolved project root. PMCP diagnostics report missing
+field or env-var names such as
 `TENANT_CODE_MODE_MCP_TOKEN`; they must not print token values.
 
 Hosted operators should require Bearer auth on `/mcp`, tune `--rate-limit` or

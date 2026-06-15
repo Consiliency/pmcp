@@ -24,8 +24,7 @@ from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
-    build_remote_header_env_lookup,
-    resolve_remote_headers,
+    resolve_remote_headers_for_tenant,
 )
 from pmcp.types import (
     LocalMcpServerConfig,
@@ -258,14 +257,18 @@ def _is_protocol_version_initialize_error(exc: Exception) -> bool:
 
 
 def _remote_headers(
-    server_name: str, config: RemoteMcpServerConfig
+    server_name: str,
+    config: RemoteMcpServerConfig,
+    *,
+    tenant_id: str | None = None,
 ) -> dict[str, str] | None:
     """Return remote transport headers with env-var placeholders expanded."""
     if not config.headers:
         return None
-    resolution = resolve_remote_headers(
+    resolution = resolve_remote_headers_for_tenant(
         config.headers,
-        build_remote_header_env_lookup(),
+        server_name=server_name,
+        tenant_id=tenant_id,
     )
     if resolution.missing_env_vars:
         raise MissingRemoteHeaderAuthError(server_name, resolution.missing_env_vars)

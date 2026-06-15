@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import stat
+import time
 from pathlib import Path
 from typing import get_args
 
+import jwt
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 from pmcp.auth import (
+    ResourceServerAuthError,
     fetch_json_metadata,
     normalize_auth_metadata,
     parse_url_elicitation_error,
@@ -18,12 +22,14 @@ from pmcp.auth import (
     sanitize_auth_diagnostic,
     sanitize_public_auth_url,
     sanitize_url_elicitation_url,
+    validate_resource_server_token,
 )
 from pmcp.env_store import read_env_file, validate_env_var_name, write_env_file
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     build_remote_header_env_lookup,
     resolve_remote_headers,
+    resolve_remote_headers_for_tenant,
 )
 from pmcp.types import (
     DEFAULT_AUTH_STATE_SEMANTICS,
@@ -226,6 +232,136 @@ def test_tenant_code_mode_env_lookup_precedence(
     assert lookup("TENANT_CODE_MODE_TENANT_ID") == "project-tenant"
 
 
+def test_remote_headers_for_tenant_reads_only_tenant_scope(tmp_path: Path) -> None:
+    tenant_a = tmp_path / ".pmcp" / "tenants" / "tenant-a" / "pmcp.env"
+    tenant_b = tmp_path / ".pmcp" / "tenants" / "tenant-b" / "pmcp.env"
+    write_env_file(tenant_a, {"REMOTE_TOKEN": "tenant-a-secret"})
+    write_env_file(tenant_b, {"REMOTE_TOKEN": "tenant-b-secret"})
+
+    resolution = resolve_remote_headers_for_tenant(
+        {"Authorization": "Bearer ${REMOTE_TOKEN}"},
+        server_name="remote",
+        tenant_id="tenant-a",
+        project_root=tmp_path,
+        include_process_env=False,
+    )
+
+    assert resolution.resolved_headers == {"Authorization": "Bearer tenant-a-secret"}
+    assert resolution.missing_env_vars == []
+
+
+def test_remote_headers_for_tenant_missing_does_not_fallback_to_other_tenant(
+    tmp_path: Path,
+) -> None:
+    write_env_file(
+        tmp_path / ".pmcp" / "tenants" / "tenant-b" / "pmcp.env",
+        {"REMOTE_TOKEN": "tenant-b-secret"},
+    )
+
+    resolution = resolve_remote_headers_for_tenant(
+        {"Authorization": "Bearer ${REMOTE_TOKEN}"},
+        server_name="remote",
+        tenant_id="tenant-a",
+        project_root=tmp_path,
+        include_process_env=False,
+    )
+
+    assert resolution.missing_env_vars == ["REMOTE_TOKEN"]
+    assert "tenant-b-secret" not in str(
+        MissingRemoteHeaderAuthError("remote", resolution.missing_env_vars)
+    )
+
+
+def _signed_token_fixture(
+    *,
+    issuer: str = "https://issuer.example",
+    audience: str | list[str] = "https://pmcp.example/mcp",
+    expires_delta: int = 300,
+    not_before_delta: int = -10,
+) -> tuple[str, dict[str, object]]:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    jwk = jwt.algorithms.RSAAlgorithm.to_jwk(key.public_key(), as_dict=True)
+    jwk["kid"] = "test-key"
+    jwks = {"keys": [jwk]}
+    now = int(time.time())
+    token = jwt.encode(
+        {
+            "iss": issuer,
+            "sub": "subject-1",
+            "aud": audience,
+            "scope": "read write",
+            "exp": now + expires_delta,
+            "nbf": now + not_before_delta,
+        },
+        key,
+        algorithm="RS256",
+        headers={"kid": "test-key"},
+    )
+    return token, jwks
+
+
+def test_validate_resource_server_token_accepts_signed_jwks_token() -> None:
+    token, jwks = _signed_token_fixture()
+
+    claims = validate_resource_server_token(
+        token,
+        issuer="https://issuer.example",
+        audience="https://pmcp.example/mcp",
+        required_scopes=["read"],
+        jwks=jwks,
+    )
+
+    assert claims.issuer == "https://issuer.example"
+    assert claims.subject == "subject-1"
+    assert claims.audience == ["https://pmcp.example/mcp"]
+    assert claims.scopes == ["read", "write"]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        ({"audience": "https://other.example/mcp"}, "Invalid audience"),
+        ({"issuer": "https://other.example"}, "Invalid issuer"),
+        ({"expires_delta": -10}, "expired"),
+        ({"not_before_delta": 300}, "not yet valid"),
+    ],
+)
+def test_validate_resource_server_token_rejects_invalid_claims(
+    kwargs: dict[str, object], expected: str
+) -> None:
+    fixture_kwargs = {
+        key: value
+        for key, value in kwargs.items()
+        if key in {"expires_delta", "not_before_delta"}
+    }
+    token, jwks = _signed_token_fixture(**fixture_kwargs)
+
+    with pytest.raises(ResourceServerAuthError) as exc_info:
+        validate_resource_server_token(
+            token,
+            issuer=str(kwargs.get("issuer", "https://issuer.example")),
+            audience=str(kwargs.get("audience", "https://pmcp.example/mcp")),
+            jwks=jwks,
+        )
+
+    assert expected in str(exc_info.value)
+
+
+def test_validate_resource_server_token_rejects_missing_required_scope() -> None:
+    token, jwks = _signed_token_fixture()
+
+    with pytest.raises(ResourceServerAuthError) as exc_info:
+        validate_resource_server_token(
+            token,
+            issuer="https://issuer.example",
+            audience="https://pmcp.example/mcp",
+            required_scopes=["admin"],
+            jwks=jwks,
+        )
+
+    assert exc_info.value.error == "insufficient_scope"
+
+
 def test_parse_www_authenticate_resource_metadata_and_scopes() -> None:
     challenge = (
         'Bearer resource_metadata="https://auth.example/.well-known/pr", '
@@ -298,6 +434,7 @@ def test_sanitize_url_elicitation_url_allows_loopback_http() -> None:
         "/relative/path",
         "ftp://auth.example/consent",
         "http://auth.example/consent",
+        "https://127.0.0.1/consent",
         "https://[::1",
     ],
 )
@@ -503,6 +640,11 @@ def test_sanitize_public_auth_url_rejects_invalid_and_non_public_urls() -> None:
     for url in [
         "/relative",
         "https://[::1",
+        "https://127.0.0.1/meta",
+        "https://10.0.0.1/meta",
+        "https://169.254.169.254/meta",
+        "https://224.0.0.1/meta",
+        "https://0.0.0.0/meta",
         "ftp://auth.example/meta",
         "http://auth.example/meta",
     ]:

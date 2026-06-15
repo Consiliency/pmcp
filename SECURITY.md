@@ -16,13 +16,15 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   networks unless you explicitly bind to `0.0.0.0` or place it behind a reverse proxy.
 - **Trust boundary**: processes running on the same host as PMCP are trusted. Remote clients
   (via reverse proxy) are untrusted and must present a valid Bearer token when
-  `--auth-token` / `PMCP_AUTH_TOKEN` is configured.
+  `shared-secret` or `resource-server` auth is configured.
 - **TLS**: PMCP does not terminate TLS. For any network exposure, terminate TLS at a reverse
   proxy (nginx, Caddy) and proxy to `127.0.0.1:3344`. See the README for example configs.
 
 ### What PMCP protects against (when correctly configured)
 
 - Unauthenticated tool invocations via Bearer token guard on `/mcp`
+- AS-issued access tokens in `resource-server` mode via JWKS signature,
+  issuer, expiry, not-before, and audience validation
 - Timing oracle attacks on token comparison (`hmac.compare_digest`)
 - Request floods via per-source-IP sliding-window rate limiting (`--rate-limit`
   / `PMCP_RATE_LIMIT`) on `/mcp`
@@ -44,10 +46,14 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   not protect these endpoints. Do not expose them on a public interface without
   separate network-layer control (firewall rule, IP allowlist, or reverse-proxy
   policy).
+- **Resource Server, not Authorization Server**: PMCP can validate
+  Authorization Server issued access tokens in `resource-server` mode, but it
+  does not provide an Authorization Server, DCR, SSO, RBAC, billing, or a
+  complete multi-tenant identity service.
 - **Authorization discovery is diagnostic**: PMCP can surface protected-resource,
   authorization-server, OIDC discovery, Client ID Metadata Document, scope, and
-  URL-mode elicitation hints, but it is not an authorization server and does not
-  store third-party OAuth refresh tokens.
+  URL-mode elicitation hints, but it does not store third-party OAuth refresh
+  tokens.
 - **URL-mode elicitation is out of band**: never paste OAuth codes, third-party
   passwords, or provider refresh tokens into gateway tools. `gateway.auth_connect`
   accepts API-key credentials only for local env-store flows; URL-mode flows only
@@ -57,11 +63,13 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   parameters from gateway outputs, status/doctor diagnostics, feedback payloads,
   and HTTP diagnostics. Treat all logs as operational data and avoid adding
   secrets to server names, tool names, or free-form descriptions.
-- **No per-user credential isolation**: user-scope env-store files are owned by
+- **Credential isolation is scoped, not identity-complete**: user-scope env-store files are owned by
   the local OS account, project-scope env-store files are owned by the project
   directory, and remote header placeholders resolve from those stores plus
-  process environment. PMCP does not provide a multi-tenant authorization layer
-  or cross-user credential separation inside one running gateway.
+  process environment in non-tenant mode. Tenant remote-header mode reads
+  tenant-scoped files derived from the resolved project root and must not read
+  another tenant's file, but PMCP still does not provide cross-user identity or
+  authorization isolation by itself.
 - **Tenant code-mode hosting keeps execution outside PMCP**: the host contract
   in `specs/tenant-code-mode-host-contract.md` treats PMCP as the broker and
   the companion tenant server as the sandbox execution authority. The contract
