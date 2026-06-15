@@ -883,9 +883,7 @@ def test_keyword_match_generic_api_alone_stays_below_threshold() -> None:
         ("browser scraping", "puppeteer"),
     ],
 )
-def test_real_manifest_keyword_match_table(
-    query: str, expected_server: str
-) -> None:
+def test_real_manifest_keyword_match_table(query: str, expected_server: str) -> None:
     manifest = load_manifest(Path("src/pmcp/manifest/manifest.yaml"))
 
     result = _keyword_match(query, manifest, detected_clis=set())

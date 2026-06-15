@@ -208,6 +208,7 @@ class TestCatalogSearchOfflineDiscovery:
                 )
             ],
         )
+
         async def fake_load_registry_candidates() -> RegistryCache:
             return cache
 

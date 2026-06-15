@@ -375,11 +375,15 @@ async def _fetch_registry_servers_uncached(
                 cache = _parse_cache_payload(payload, endpoint)
                 servers.extend(cache.servers)
                 diagnostics.extend(cache.diagnostics)
-                metadata = payload.get("metadata") if isinstance(payload, dict) else None
+                metadata = (
+                    payload.get("metadata") if isinstance(payload, dict) else None
+                )
                 next_value = (
                     metadata.get("nextCursor") if isinstance(metadata, dict) else None
                 )
-                next_cursor = next_value if isinstance(next_value, str) and next_value else None
+                next_cursor = (
+                    next_value if isinstance(next_value, str) and next_value else None
+                )
                 if not next_cursor:
                     break
             else:

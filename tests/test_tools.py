@@ -3796,7 +3796,9 @@ class TestSearchRegistryAndRegister:
             ),
         ]
 
-        async def fake_matches(query: str, *, limit: int = 8) -> list[RegistryServerEntry]:
+        async def fake_matches(
+            query: str, *, limit: int = 8
+        ) -> list[RegistryServerEntry]:
             return fake_entries[:limit]
 
         monkeypatch.setattr(
@@ -3842,6 +3844,7 @@ class TestSearchRegistryAndRegister:
                 )
             ],
         )
+
         async def fake_load_registry_candidates() -> RegistryCache:
             return cache
 

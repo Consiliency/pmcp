@@ -147,9 +147,7 @@ async def test_fetch_registry_servers_timeout_returns_diagnostic(monkeypatch) ->
     def failing_session(**_: object) -> _FailingSession:
         return _FailingSession()
 
-    monkeypatch.setattr(
-        "pmcp.manifest.registry.aiohttp.ClientSession", failing_session
-    )
+    monkeypatch.setattr("pmcp.manifest.registry.aiohttp.ClientSession", failing_session)
 
     cache = await fetch_registry_servers(
         "https://registry.example/v0/servers",
@@ -163,8 +161,12 @@ async def test_fetch_registry_servers_timeout_returns_diagnostic(monkeypatch) ->
 
 async def test_fetch_registry_servers_paginates_and_deduplicates(monkeypatch) -> None:
     calls: list[str] = []
-    page1 = json.loads(Path("tests/fixtures/registry/v0_servers_page1.json").read_text())
-    page2 = json.loads(Path("tests/fixtures/registry/v0_servers_page2.json").read_text())
+    page1 = json.loads(
+        Path("tests/fixtures/registry/v0_servers_page1.json").read_text()
+    )
+    page2 = json.loads(
+        Path("tests/fixtures/registry/v0_servers_page2.json").read_text()
+    )
 
     monkeypatch.setattr(
         "pmcp.manifest.registry.aiohttp.ClientSession",

@@ -1396,10 +1396,7 @@ class ClientManager:
                 try:
                     async with self._lifecycle_lock:
                         managed = self._clients.get(name)
-                        if (
-                            managed
-                            and managed.status.status == ServerStatusEnum.ONLINE
-                        ):
+                        if managed and managed.status.status == ServerStatusEnum.ONLINE:
                             logger.debug(
                                 f"[{name}] already online; skipping reconnect attempt {attempt}"
                             )

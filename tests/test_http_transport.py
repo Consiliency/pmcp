@@ -331,13 +331,16 @@ class TestHttpObservabilityContracts:
             audience=["https://pmcp.example/mcp"],
             scopes=["read"],
         )
-        with patch(
-            "pmcp.transport.http.AsyncJWKS.get_for_token",
-            new=AsyncMock(return_value={"keys": [{"kid": "test-key"}]}),
-        ), patch(
-            "pmcp.transport.http.validate_resource_server_token",
-            return_value=claims,
-        ) as validate:
+        with (
+            patch(
+                "pmcp.transport.http.AsyncJWKS.get_for_token",
+                new=AsyncMock(return_value={"keys": [{"kid": "test-key"}]}),
+            ),
+            patch(
+                "pmcp.transport.http.validate_resource_server_token",
+                return_value=claims,
+            ) as validate,
+        ):
             client = _make_contract_client(
                 auth_mode="resource-server",
                 resource_server_issuer="https://issuer.example",
@@ -384,13 +387,16 @@ class TestHttpObservabilityContracts:
     def test_resource_server_insufficient_scope_gets_403_challenge(self) -> None:
         from pmcp.auth import ResourceServerAuthError
 
-        with patch(
-            "pmcp.transport.http.AsyncJWKS.get_for_token",
-            new=AsyncMock(return_value={"keys": [{"kid": "test-key"}]}),
-        ), patch(
-            "pmcp.transport.http.validate_resource_server_token",
-            side_effect=ResourceServerAuthError(
-                "insufficient_scope", "Missing required scope(s): write"
+        with (
+            patch(
+                "pmcp.transport.http.AsyncJWKS.get_for_token",
+                new=AsyncMock(return_value={"keys": [{"kid": "test-key"}]}),
+            ),
+            patch(
+                "pmcp.transport.http.validate_resource_server_token",
+                side_effect=ResourceServerAuthError(
+                    "insufficient_scope", "Missing required scope(s): write"
+                ),
             ),
         ):
             client = _make_contract_client(

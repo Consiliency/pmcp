@@ -229,11 +229,15 @@ class AsyncJWKS:
                 f"JWKS fetch failed for {self.url}."
             ) from exc
         if len(content) > self._max_bytes:
-            raise ResourceServerJWKSUnavailable(f"JWKS response too large for {self.url}.")
+            raise ResourceServerJWKSUnavailable(
+                f"JWKS response too large for {self.url}."
+            )
         try:
             jwks = json.loads(content.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ResourceServerJWKSUnavailable(f"Invalid JWKS JSON from {self.url}.") from exc
+            raise ResourceServerJWKSUnavailable(
+                f"Invalid JWKS JSON from {self.url}."
+            ) from exc
         if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
             raise ResourceServerJWKSUnavailable(f"Invalid JWKS object from {self.url}.")
         return jwks

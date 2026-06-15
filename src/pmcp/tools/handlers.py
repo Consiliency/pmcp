@@ -3286,8 +3286,7 @@ class GatewayTools:
         _pascal_re = re.compile(r"^[A-Z][a-z]{3,}$")
         _unknown_service = any(
             idx > 0
-            and
-            _pascal_re.match(w)
+            and _pascal_re.match(w)
             and w.lower().replace("-", "").replace("_", "") not in norm_to_server
             for idx, w in enumerate(parsed.query.split())
         )

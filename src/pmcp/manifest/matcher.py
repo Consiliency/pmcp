@@ -94,7 +94,9 @@ def _manifest_keyword_weights(manifest: Manifest) -> dict[str, float]:
             keyword_norm = keyword.lower().replace("-", " ").replace("_", " ")
             frequencies[keyword_norm] = frequencies.get(keyword_norm, 0) + 1
 
-    return {keyword: max(1.0 / frequency, 0.5) for keyword, frequency in frequencies.items()}
+    return {
+        keyword: max(1.0 / frequency, 0.5) for keyword, frequency in frequencies.items()
+    }
 
 
 def rank_cli_hints(
