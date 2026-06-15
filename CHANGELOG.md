@@ -7,19 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-06-15
+
 ### Added
-- Added HOSTSOAK release-gate coverage and docs for tenant code-mode host
-  integration. PMCP brokers discovery, invocation, downstream task lifecycle,
-  policy, redaction, and operator guidance for a companion tenant code-mode MCP
-  server, but does not run scripts itself.
-- Added MCP Registry-backed discovery metadata and a deterministic local cache.
+- Tenant code-mode host integration (v7 HOSTSOAK). PMCP brokers discovery,
+  invocation, downstream task lifecycle, policy, redaction, and operator
+  guidance for a companion tenant code-mode MCP server, but does not run
+  scripts itself.
+- OAuth 2.1 Resource Server auth mode (opt-in, fail-closed). When configured,
+  PMCP validates access-token signatures against an async, TTL-cached JWKS and
+  binds the `aud` claim to an explicitly-configured canonical resource URI
+  (RFC 8707). The legacy static bearer remains the default single-tenant mode.
+- MCP Registry-backed discovery metadata with a deterministic local cache.
   `gateway.request_capability`, `gateway.catalog_search`, and
-  `gateway.search_registry` can surface registry candidates with transport,
-  package, server-card, and remote auth metadata while preserving the explicit
-  `gateway.register_discovered_server` and `gateway.provision` boundary.
-- Added curated registry-backed vendor entries for GitHub, Atlassian Rovo,
+  `gateway.search_registry` surface registry candidates — including remote
+  (streamable-http/sse) servers — with transport, package, and remote auth
+  metadata, while preserving the explicit `gateway.register_discovered_server`
+  and `gateway.provision` boundary.
+- Curated registry-backed vendor entries for GitHub, Atlassian Rovo,
   Cloudflare, Sentry, Vercel, and Hugging Face using placeholder header names
   only.
+
+### Fixed
+- Secret redaction now covers every task-emitting gateway surface. `gateway.invoke`,
+  `gateway.tasks_result`, `gateway.tasks_list`, and `gateway.tasks_get` route
+  returned task `status_message`/`raw` through the canonical redactor; truncation
+  summaries are built from post-redaction text; bare `sk-`/`ghp_`/`github_pat_`
+  tokens are redacted; and redaction is decoupled from the 400-char diagnostic cap
+  so large results are no longer silently truncated. Redaction defaults on for
+  task/code-mode results.
+- Shared-gateway concurrency hardening. The downstream connect/reconnect paths now
+  acquire the lifecycle lock (no longer racing `refresh`/`disconnect` into orphaned
+  subprocesses or a torn tool catalog), background tasks are tracked and cancelled
+  on teardown, request IDs carry a per-connection epoch so a stale `gateway.cancel`
+  cannot hit a new request, and the lock is no longer held across reconnect backoff.
+- Resource-server auth no longer derives the token audience from the client Host
+  header, fetches JWKS via a blocking call on the event loop, or returns HTTP 500
+  for JWKS/algorithm errors; algorithms are restricted to an operator allowlist and
+  `jwks_url` must be https on a public host.
+- Capability matcher scoring no longer drops common queries (`database sql`,
+  `headless browser`, `postgres database`) below the match threshold against the
+  shipped manifest.
+- Registry client now models remote servers, deduplicates to the latest version,
+  paginates, bounds the response size, fetches asynchronously, and uses a stable
+  cache path; project-scope credential writes and downstream header reads resolve
+  the same project root.
 
 ## [1.13.1] - 2026-05-06
 
