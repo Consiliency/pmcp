@@ -821,6 +821,11 @@ class TestTargetServerLifecycle:
         manager = ClientManager()
         self._add_client(manager, "target")
 
+        async def fail_connect(config: ResolvedServerConfig) -> None:
+            raise RuntimeError("connection failed")
+
+        manager._connect_server = fail_connect  # type: ignore[method-assign]
+
         disconnected, _cancelled, _error = await manager.disconnect_server("target")
 
         assert disconnected is True
@@ -2014,14 +2019,16 @@ class TestParallelConnections:
             events.append("disconnect:end")
             active -= 1
 
-        async def connect(configs: list[ResolvedServerConfig]) -> list[str]:
+        async def connect(
+            configs: list[ResolvedServerConfig], retry: bool = True
+        ) -> list[str]:
             events.append("connect:start")
             await asyncio.sleep(0.01)
             events.append("connect:end")
             return []
 
         manager._disconnect_all_unlocked = disconnect  # type: ignore[method-assign]
-        manager.connect_all = connect  # type: ignore[method-assign]
+        manager._connect_all_unlocked = connect  # type: ignore[method-assign]
 
         await asyncio.gather(manager.refresh([]), manager.refresh([]))
 
@@ -2036,6 +2043,219 @@ class TestParallelConnections:
             "connect:start",
             "connect:end",
         ]
+
+    @pytest.mark.asyncio
+    async def test_refresh_does_not_deadlock_when_reconnecting_inside_lock(
+        self,
+    ) -> None:
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="lazy",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        calls = 0
+
+        async def connect_server(cfg: ResolvedServerConfig) -> None:
+            nonlocal calls
+            calls += 1
+
+        manager._connect_server = connect_server  # type: ignore[method-assign]
+
+        await asyncio.wait_for(manager.refresh([config]), timeout=1.0)
+
+        assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_connect_all_serializes_duplicate_server_starts(
+        self,
+    ) -> None:
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="same",
+            source="project",
+            config=LocalMcpServerConfig(command="echo"),
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = 0
+
+        async def connect_server(cfg: ResolvedServerConfig) -> None:
+            nonlocal calls
+            calls += 1
+            entered.set()
+            await release.wait()
+            manager._servers[cfg.name] = ServerStatus(
+                name=cfg.name,
+                status=ServerStatusEnum.ONLINE,
+                tool_count=0,
+            )
+
+        manager._connect_server = connect_server  # type: ignore[method-assign]
+
+        first = asyncio.create_task(manager.connect_all([config]))
+        await entered.wait()
+        second = asyncio.create_task(manager.connect_all([config]))
+        await asyncio.sleep(0)
+        release.set()
+
+        assert await asyncio.gather(first, second) == [[], []]
+        assert calls == 1
+
+    @pytest.mark.asyncio
+    async def test_shutdown_disconnect_all_awaits_background_task_registry(self) -> None:
+        manager = ClientManager()
+        cancelled = asyncio.Event()
+
+        async def background() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        task = manager._track_background_task(asyncio.create_task(background()), "test")
+        await asyncio.sleep(0)
+
+        await manager.disconnect_all()
+
+        assert task.done()
+        assert cancelled.is_set()
+        assert manager._background_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_request_ids_are_monotonic_across_reconnects(self) -> None:
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="srv",
+            source="project",
+            config=LocalMcpServerConfig(command="test"),
+        )
+
+        async def send_and_leave_pending(managed: ManagedClient) -> int:
+            task = asyncio.create_task(
+                manager._send_request(managed, "tools/list", {}, timeout_ms=1000)
+            )
+            await asyncio.sleep(0)
+            request_id = next(iter(managed.pending_requests))
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            return request_id
+
+        first = ManagedClient(
+            config=config,
+            is_remote=True,
+            write_stream=MagicMock(send=AsyncMock()),
+            status=ServerStatus(
+                name="srv", status=ServerStatusEnum.ONLINE, tool_count=0
+            ),
+        )
+        assert await send_and_leave_pending(first) == 1
+
+        second = ManagedClient(
+            config=config,
+            is_remote=True,
+            write_stream=MagicMock(send=AsyncMock()),
+            status=ServerStatus(
+                name="srv", status=ServerStatusEnum.ONLINE, tool_count=0
+            ),
+        )
+        assert await send_and_leave_pending(second) == 2
+
+    @pytest.mark.asyncio
+    async def test_stale_cancel_does_not_cancel_replacement_request(self) -> None:
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="srv",
+            source="project",
+            config=LocalMcpServerConfig(command="test"),
+        )
+        old_future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        old = ManagedClient(
+            config=config,
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=ServerStatus(
+                name="srv", status=ServerStatusEnum.ONLINE, tool_count=0
+            ),
+        )
+        old.pending_requests[1] = PendingRequest(
+            request_id=1,
+            server_name="srv",
+            tool_id="srv::tool",
+            started_at=time.time() - 120,
+            last_heartbeat=time.time() - 120,
+            timeout_ms=30000,
+            future=old_future,
+        )
+        manager._request_counters["srv"] = 1
+
+        new_future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        new = ManagedClient(
+            config=config,
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=ServerStatus(
+                name="srv", status=ServerStatusEnum.ONLINE, tool_count=0
+            ),
+        )
+        new.pending_requests[2] = PendingRequest(
+            request_id=2,
+            server_name="srv",
+            tool_id="srv::tool",
+            started_at=time.time() - 120,
+            last_heartbeat=time.time() - 120,
+            timeout_ms=30000,
+            future=new_future,
+        )
+        manager._clients["srv"] = new
+
+        status, _message, _was_stalled, _elapsed = await manager.cancel_request(
+            "srv::1", force=True
+        )
+
+        assert status == "not_found"
+        assert new_future.cancelled() is False
+        assert 2 in new.pending_requests
+
+    @pytest.mark.asyncio
+    async def test_reconnect_guard_survives_managed_client_replacement(self) -> None:
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="srv",
+            source="project",
+            config=LocalMcpServerConfig(command="test"),
+        )
+        created = 0
+        original_create_task = asyncio.create_task
+
+        def fake_create_task(coro: Any, *args: Any, **kwargs: Any) -> asyncio.Task[Any]:
+            nonlocal created
+            created += 1
+            coro.close()
+            task: asyncio.Task[Any] = original_create_task(asyncio.sleep(3600))
+            return task
+
+        with patch("asyncio.create_task", side_effect=fake_create_task):
+            first = ManagedClient(
+                config=config,
+                status=ServerStatus(
+                    name="srv", status=ServerStatusEnum.ONLINE, tool_count=0
+                ),
+            )
+            second = ManagedClient(
+                config=config,
+                status=ServerStatus(
+                    name="srv", status=ServerStatusEnum.ONLINE, tool_count=0
+                ),
+            )
+            manager._schedule_reconnect("srv", first.config)
+            manager._clients["srv"] = second
+            manager._schedule_reconnect("srv", second.config)
+
+        await manager.disconnect_all()
+
+        assert created == 1
 
     def test_snapshot_methods_return_new_collection_containers(self) -> None:
         """Read methods should not expose manager-owned collection containers."""

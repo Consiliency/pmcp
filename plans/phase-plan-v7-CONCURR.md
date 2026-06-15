@@ -33,7 +33,7 @@ Current code already has same-server singleflight (`_connect_tasks`) and a lifec
 - **Scope**: Add failing-first manager tests for lifecycle-lock coverage, background-task cleanup, stale cancel refusal, and manager-level reconnect storm guarding.
 - **Owned files**: `tests/test_client_manager.py`
 - **Interfaces provided**: failing-first coverage for IF-0-CONCURR-1 manager invariants; test helpers for controlled connect/refresh/disconnect interleavings; regression cases for monotonic request IDs and reconnect task deduplication
-- **Interfaces consumed**: existing `ClientManager`, `ManagedClient`, `PendingRequest`, `ServerStatus`, `ServerStatusEnum`, `ResolvedServerConfig`, `LocalMcpServerConfig`, current `server::local_id` pending-request display contract
+- **Interfaces consumed**: existing `ClientManager`, `ManagedClient`, `PendingRequest`, `ServerStatus`, `ServerStatusEnum`, `ResolvedServerConfig`, `LocalMcpServerConfig`, current pending-request display contract
 - **Parallel-safe**: no
 - **Tasks**:
   - test: Add a regression where one task begins lazy `ensure_connected(...)` or `connect_server(...)`, a concurrent `refresh(...)` or `disconnect_all(...)` starts before the connect finishes, and the test asserts lifecycle mutations do not interleave, no old process/client survives, and the final catalog/status state is coherent.

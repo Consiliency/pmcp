@@ -61,6 +61,26 @@ class TestGatewayServerShutdown:
         server._client_manager.disconnect_all.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_shutdown_releases_singleton_after_manager_cleanup(self) -> None:
+        """Shutdown should release the singleton lock after manager cleanup returns."""
+        server = GatewayServer()
+        events: list[str] = []
+
+        async def disconnect_all() -> None:
+            events.append("disconnect:start")
+            await asyncio.sleep(0)
+            events.append("disconnect:end")
+
+        server._client_manager = MagicMock()
+        server._client_manager.disconnect_all = disconnect_all
+
+        with patch("pmcp.server.release_singleton_lock") as release_lock:
+            release_lock.side_effect = lambda: events.append("release")
+            await server.shutdown()
+
+        assert events == ["disconnect:start", "disconnect:end", "release"]
+
+    @pytest.mark.asyncio
     async def test_shutdown_handles_timeout(self) -> None:
         """Test that shutdown handles timeout gracefully."""
         server = GatewayServer()

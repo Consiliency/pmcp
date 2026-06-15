@@ -13,7 +13,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any
+from typing import Any, TypeVar
 
 import mcp.types as mcp_types
 from mcp.client.sse import sse_client
@@ -57,6 +57,7 @@ except ImportError:
     HAS_RESOURCE = False
 
 logger = logging.getLogger(__name__)
+_TaskT = TypeVar("_TaskT", bound=asyncio.Task[Any])
 
 
 def _is_cancel_scope_task_mismatch_error(exc: BaseException) -> bool:
@@ -342,6 +343,10 @@ class ClientManager:
         self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
         self._lifecycle_lock = asyncio.Lock()
         self._connect_tasks: dict[str, asyncio.Task[None]] = {}
+        self._background_tasks: set[asyncio.Task[Any]] = set()
+        self._background_task_servers: dict[asyncio.Task[Any], str | None] = {}
+        self._reconnect_tasks: dict[str, asyncio.Task[None]] = {}
+        self._request_counters: dict[str, int] = {}
         self._tasks: dict[tuple[str, str], McpTaskRecord] = {}
 
     async def connect_all(
@@ -359,13 +364,26 @@ class ClientManager:
         if not configs:
             return []
 
+        async with self._lifecycle_lock:
+            return await self._connect_all_unlocked(configs, retry=retry)
+
+    async def _connect_all_unlocked(
+        self, configs: list[ResolvedServerConfig], retry: bool = True
+    ) -> list[str]:
+        """Connect to all configured servers while caller owns lifecycle lock."""
+        if not configs:
+            return []
+
         # Connect to all servers concurrently, sharing work for duplicate names.
         tasks_by_name: dict[str, asyncio.Task[None]] = {}
         tasks: list[asyncio.Task[None]] = []
         for config in configs:
             task = tasks_by_name.get(config.name)
             if task is None:
-                task = asyncio.create_task(self._connect_singleflight(config, retry))
+                task = self._track_background_task(
+                    asyncio.create_task(self._connect_singleflight(config, retry)),
+                    config.name,
+                )
                 tasks_by_name[config.name] = task
             tasks.append(task)
 
@@ -399,6 +417,7 @@ class ClientManager:
                 task = asyncio.create_task(self._connect_with_retry(config))
             else:
                 task = asyncio.create_task(self._connect_server(config))
+            task = self._track_background_task(task, name)
             self._connect_tasks[name] = task
 
         try:
@@ -406,6 +425,48 @@ class ClientManager:
         finally:
             if self._connect_tasks.get(name) is task:
                 self._connect_tasks.pop(name, None)
+
+    def _track_background_task(
+        self, task: _TaskT, server_name: str | None = None
+    ) -> _TaskT:
+        self._background_tasks.add(task)
+        self._background_task_servers[task] = server_name
+        task.add_done_callback(self._background_tasks.discard)
+        task.add_done_callback(self._background_task_servers.pop)
+        return task
+
+    async def _cancel_background_tasks(
+        self,
+        *,
+        server_name: str | None = None,
+        exclude: set[asyncio.Task[Any]] | None = None,
+    ) -> None:
+        exclude = exclude or set()
+        tasks = [
+            task
+            for task in self._background_tasks
+            if task not in exclude
+            and not task.done()
+            and (
+                server_name is None
+                or self._background_task_servers.get(task) == server_name
+                or task is self._reconnect_tasks.get(server_name)
+                or task is self._connect_tasks.get(server_name)
+            )
+        ]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.difference_update(task for task in tasks if task.done())
+        for task in tasks:
+            if task.done():
+                self._background_task_servers.pop(task, None)
+
+    def _next_request_id(self, server_name: str) -> int:
+        request_id = self._request_counters.get(server_name, 0) + 1
+        self._request_counters[server_name] = request_id
+        return request_id
 
     def register_lazy_configs(self, configs: list[ResolvedServerConfig]) -> None:
         """Register configs for lazy (on-demand) server connections.
@@ -444,51 +505,63 @@ class ClientManager:
         Raises:
             ValueError: If server is not registered (neither connected nor lazy)
         """
-        # Already connected and online?
-        if self.is_server_online(server_name):
-            return True
+        async with self._lifecycle_lock:
+            if self.is_server_online(server_name):
+                return True
 
-        # Check if it's a lazy server we can connect
-        if server_name not in self._lazy_configs:
-            # Not a lazy server - check if it exists at all
-            if server_name not in self._servers:
-                raise ValueError(f"Unknown server: {server_name}")
-            # Server exists but is offline/error - can't auto-reconnect
-            return False
+            if server_name not in self._lazy_configs:
+                if server_name not in self._servers:
+                    raise ValueError(f"Unknown server: {server_name}")
+                return False
 
-        # Trigger lazy connection
-        config = self._lazy_configs[server_name]
-        logger.info(f"Lazy-starting server: {server_name}")
+            config = self._lazy_configs[server_name]
+            logger.info(f"Lazy-starting server: {server_name}")
+            task = self._connect_tasks.get(server_name)
+            if task is None:
+                task = self._track_background_task(
+                    asyncio.create_task(self._connect_with_lifecycle_lock(config)),
+                    server_name,
+                )
+                self._connect_tasks[server_name] = task
 
         try:
-            await self._connect_singleflight(config)
-            # Remove from lazy configs after successful connection
-            self._lazy_configs.pop(server_name, None)
+            await task
+            async with self._lifecycle_lock:
+                self._lazy_configs.pop(server_name, None)
             return True
         except Exception as e:
             logger.error(f"Failed to lazy-start {server_name}: {e}")
-            # Update status to ERROR
-            if server_name in self._servers:
-                self._servers[server_name].status = ServerStatusEnum.ERROR
-                self._servers[server_name].last_error = str(e)
+            async with self._lifecycle_lock:
+                if server_name in self._servers:
+                    self._servers[server_name].status = ServerStatusEnum.ERROR
+                    self._servers[server_name].last_error = str(e)
             return False
+        finally:
+            async with self._lifecycle_lock:
+                if self._connect_tasks.get(server_name) is task:
+                    self._connect_tasks.pop(server_name, None)
+
+    async def _connect_with_lifecycle_lock(self, config: ResolvedServerConfig) -> None:
+        async with self._lifecycle_lock:
+            await self._connect_with_retry(config)
 
     async def connect_server(
         self, config: ResolvedServerConfig, retry: bool = True
     ) -> list[str]:
         """Connect one server through same-server single-flight startup."""
-        try:
-            await self._connect_singleflight(config, retry=retry)
-            if self.is_server_online(config.name):
-                self._lazy_configs.pop(config.name, None)
-            self._revision_id = _generate_revision_id()
-            self._last_refresh_ts = time.time()
-            return []
-        except Exception as e:
-            if config.name in self._servers:
-                self._servers[config.name].status = ServerStatusEnum.ERROR
-                self._servers[config.name].last_error = str(e)
-            return [f"Failed to connect to {config.name}: {e}"]
+        async with self._lifecycle_lock:
+            try:
+                await self._connect_singleflight(config, retry=retry)
+                if self.is_server_online(config.name):
+                    self._lazy_configs.pop(config.name, None)
+                self._revision_id = _generate_revision_id()
+                self._last_refresh_ts = time.time()
+                return []
+            except Exception as e:
+                if config.name in self._servers:
+                    self._servers[config.name].status = ServerStatusEnum.ERROR
+                    self._servers[config.name].last_error = str(e)
+                return [f"Failed to connect to {config.name}: {e}"]
 
     def cancel_pending_requests(self, server: str) -> int:
         """Cancel pending requests for one server and return newly cancelled count."""
@@ -592,6 +665,9 @@ class ClientManager:
                 logger.warning(f"Error disconnecting from {name}: {e}")
                 return (False, cancelled, str(e))
 
+            await self._cancel_background_tasks(server_name=name)
+            self._connect_tasks.pop(name, None)
+            self._reconnect_tasks.pop(name, None)
             self._clients.pop(name, None)
             self._remove_server_indexes(name)
             if config is not None and config.source in {"project", "user", "custom"}:
@@ -1025,11 +1101,17 @@ class ClientManager:
 
         # Start reading stderr in background
         if process.stderr:
-            asyncio.create_task(self._read_stderr(name, process.stderr))
+            self._track_background_task(
+                asyncio.create_task(self._read_stderr(name, process.stderr)),
+                name,
+            )
 
         try:
             # Start reading stdout
-            managed.read_task = asyncio.create_task(self._read_stdout(name, managed))
+            managed.read_task = self._track_background_task(
+                asyncio.create_task(self._read_stdout(name, managed)),
+                name,
+            )
 
             # Initialize connection
             await self._send_initialize(managed)
@@ -1132,8 +1214,9 @@ class ClientManager:
         self._clients[name] = managed
 
         try:
-            managed.read_task = asyncio.create_task(
-                self._read_sse(name, managed, read_stream)
+            managed.read_task = self._track_background_task(
+                asyncio.create_task(self._read_sse(name, managed, read_stream)),
+                name,
             )
 
             await self._send_initialize(managed)
@@ -1248,10 +1331,7 @@ class ClientManager:
                 # Schedule auto-reconnect if we have the config (storm guard: only one task)
                 if managed.config is not None and not managed.reconnecting:
                     managed.reconnecting = True
-                    asyncio.create_task(
-                        self._reconnect_loop(name, managed.config),
-                        name=f"reconnect-{name}",
-                    )
+                    self._schedule_reconnect(name, managed.config)
             else:
                 logger.debug(f"Server {name} disconnected (graceful shutdown)")
             # Cancel any pending requests
@@ -1262,6 +1342,24 @@ class ClientManager:
                     )
             managed.pending_requests.clear()
             managed.status.pending_request_count = 0
+
+    def _schedule_reconnect(self, name: str, config: ResolvedServerConfig) -> None:
+        """Schedule one reconnect task per server across client replacement."""
+        task = self._reconnect_tasks.get(name)
+        if task is not None and not task.done():
+            return
+        task = asyncio.create_task(
+            self._reconnect_loop(name, config),
+            name=f"reconnect-{name}",
+        )
+        self._reconnect_tasks[name] = task
+        self._track_background_task(task, name)
+
+        def clear_reconnect(done: asyncio.Task[None]) -> None:
+            if self._reconnect_tasks.get(name) is done:
+                self._reconnect_tasks.pop(name, None)
+
+        task.add_done_callback(clear_reconnect)
 
     async def _reconnect_loop(self, name: str, config: ResolvedServerConfig) -> None:
         """Attempt to reconnect a crashed server with exponential back-off.
@@ -1294,6 +1392,7 @@ class ClientManager:
                 f"[{name}] all reconnect attempts failed; server remains offline"
             )
         finally:
+            self._reconnect_tasks.pop(name, None)
             if managed := self._clients.get(name):
                 managed.reconnecting = False
 
@@ -1363,8 +1462,8 @@ class ClientManager:
         timeout_ms: int = 30000,
     ) -> dict[str, Any]:
         """Send a JSON-RPC request and wait for response."""
-        managed.request_id += 1
-        request_id = managed.request_id
+        request_id = self._next_request_id(managed.config.name)
+        managed.request_id = request_id
         now = time.time()
 
         request = {
@@ -1523,6 +1622,11 @@ class ClientManager:
             except Exception as e:
                 logger.warning(f"Error disconnecting from {name}: {e}")
 
+        current = asyncio.current_task()
+        exclude = {current} if current is not None else set()
+        await self._cancel_background_tasks(exclude=exclude)
+        self._connect_tasks.clear()
+        self._reconnect_tasks.clear()
         self._clients.clear()
         self._tools.clear()
         self._resources.clear()
@@ -1543,6 +1647,7 @@ class ClientManager:
                 await asyncio.shield(managed.read_task)
             except (asyncio.CancelledError, Exception):
                 pass
+        await self._cancel_background_tasks(server_name=name)
         if managed.process and managed.process.returncode is None:
             managed.process.kill()
             try:
@@ -1559,7 +1664,7 @@ class ClientManager:
         """Refresh connections (disconnect + reconnect)."""
         async with self._lifecycle_lock:
             await self._disconnect_all_unlocked()
-            return await self.connect_all(configs)
+            return await self._connect_all_unlocked(configs)
 
     async def adopt_process(
         self,
@@ -1608,11 +1713,17 @@ class ClientManager:
 
         # Start reading stderr in background (if available)
         if process.stderr:
-            asyncio.create_task(self._read_stderr(name, process.stderr))
+            self._track_background_task(
+                asyncio.create_task(self._read_stderr(name, process.stderr)),
+                name,
+            )
 
         try:
             # Start reading stdout for JSON-RPC responses
-            managed.read_task = asyncio.create_task(self._read_stdout(name, managed))
+            managed.read_task = self._track_background_task(
+                asyncio.create_task(self._read_stdout(name, managed)),
+                name,
+            )
 
             # Initialize MCP connection
             await self._send_initialize(managed)
@@ -1964,8 +2075,8 @@ class ClientManager:
     def start_health_monitor(self) -> None:
         """Start the background health monitoring task."""
         if not hasattr(self, "_health_task") or self._health_task is None:
-            self._health_task: asyncio.Task[None] | None = asyncio.create_task(
-                self._health_monitor_loop()
+            self._health_task: asyncio.Task[None] | None = self._track_background_task(
+                asyncio.create_task(self._health_monitor_loop())
             )
             logger.info("Started health monitor background task")
 
