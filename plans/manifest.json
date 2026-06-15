@@ -193,6 +193,39 @@
     },
     {
       "acceptance_criteria_count": null,
+      "created_at": "2026-06-15T08:25:19Z",
+      "file": "plans/phase-plan-v7-AUTHRS.md",
+      "handoff_ref": null,
+      "if_gates_produced": [
+        "IF-0-ENVFIX-1",
+        "IF-0-AUTHRS-1",
+        "IF-0-AUTHRS-2"
+      ],
+      "lanes": [
+        "SL-0",
+        "SL-1",
+        "SL-2",
+        "SL-3",
+        "SL-4"
+      ],
+      "lifecycle": [],
+      "owner_skill": "codex-plan-phase",
+      "phase_alias": "AUTHRS",
+      "reflection_ref": null,
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v7.md",
+        "slug": "phase-plans-v7",
+        "status": "imported",
+        "type": "phase"
+      },
+      "slug": "v7-AUTHRS",
+      "status": "imported",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-06-15T08:25:19Z"
+    },
+    {
+      "acceptance_criteria_count": null,
       "created_at": "2026-06-15T07:28:17Z",
       "file": "plans/phase-plan-v7-CONCURR.md",
       "handoff_ref": null,
