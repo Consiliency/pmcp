@@ -146,13 +146,23 @@ create_http_app(
     resource_server_issuer="https://issuer.example",
     resource_server_jwks_url="https://issuer.example/.well-known/jwks.json",
     resource_server_audience="https://pmcp.example/mcp",
+    resource_server_allowed_algorithms=("RS256", "ES256"),
     required_scopes=["pmcp.invoke"],
     allowed_origins=["https://app.example"],
 )
 ```
 
-PMCP validates token signature, issuer, expiry, not-before, and audience. It
-rejects private, link-local, loopback, multicast, and unspecified hosts in
+PMCP validates token signature, issuer, expiry, not-before, and audience. The
+audience is bound to the configured `resource_server_audience` (the server's
+canonical resource URI, per RFC 8707); it is never derived from the request
+Host header. `resource-server` mode fails closed at startup if the issuer,
+JWKS URL, or audience is missing, and `resource_server_jwks_url` must be an
+`https` URL on a public host. Token signatures are only accepted for the
+operator-configured `resource_server_allowed_algorithms` allowlist (default
+`RS256`/`ES256`); the token's own `alg` header is never trusted. JWKS is fetched
+asynchronously and cached, so validation never blocks the event loop; an
+unreachable JWKS endpoint returns `503` while an invalid token returns `401`.
+It rejects private, link-local, loopback, multicast, and unspecified hosts in
 public auth metadata URLs. PMCP is still not an Authorization Server and does
 not provide dynamic client registration, SSO, RBAC, billing, or a complete
 multi-tenant identity service.
@@ -542,11 +552,13 @@ Bash/direct CLI. Otherwise stay on the MCP path.
 Registry-backed matches can appear as `registry_candidates` in
 `gateway.catalog_search` or as `status="candidates"` from
 `gateway.request_capability`. They are read-only discovery metadata from the
-MCP Registry cache and may include package identifiers, transport, server-card
-URLs, protected-resource metadata URLs, authorization-server metadata URLs,
-declared scopes, and placeholder header names. PMCP does not install, connect,
-or pass credentials for a registry result until you explicitly register and
-provision the selected server.
+MCP Registry cache and may include package identifiers, transport, remote
+(streamable-http/sse) endpoints for hosted servers, server-card URLs,
+protected-resource metadata URLs, authorization-server metadata URLs,
+declared scopes, and placeholder header names. Candidates are deduplicated to
+the latest published version. PMCP does not install, connect, or pass
+credentials for a registry result until you explicitly register and provision
+the selected server.
 
 ### Step 3: Get Tool Details
 
