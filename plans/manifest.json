@@ -1,6 +1,46 @@
 {
   "plans": [
     {
+      "acceptance_criteria_count": 6,
+      "created_at": "2026-06-15T07:28:43Z",
+      "file": "plans/phase-plan-v7-CONCURR.md",
+      "handoff_ref": ".dev-skills/handoffs/codex-plan-phase/20260615T072843Z-concurr-plan.md",
+      "if_gates_produced": [
+        "IF-0-CONCURR-1"
+      ],
+      "lanes": [
+        "SL-0",
+        "SL-1",
+        "SL-2",
+        "SL-3"
+      ],
+      "lifecycle": [
+        {
+          "at": "2026-06-15T07:28:43Z",
+          "by": "codex-plan-phase",
+          "metadata": {
+            "artifact_state": "staged",
+            "roadmap_sha256": "f91921d76188ed0617760861380a48ee907bd53db51fe25f8d6c71ad91dff4d5"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "codex-plan-phase",
+      "phase_alias": "CONCURR",
+      "reflection_ref": "/home/viperjuice/.codex/skills/codex-plan-phase/reflections/f7b19d9e9b16fb85/main/20260615T072843Z-concurr-plan.md",
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v7.md",
+        "slug": "phase-plans-v7",
+        "status": "committed",
+        "type": "roadmap"
+      },
+      "slug": "phase-plan-v7-CONCURR",
+      "status": "committed",
+      "task_summary": "Plan CONCURR concurrency and lifecycle hardening from specs/phase-plans-v7.md.",
+      "type": "phase",
+      "updated_at": "2026-06-15T07:28:43Z"
+    },
+    {
       "acceptance_criteria_count": 9,
       "created_at": "2026-06-15T06:47:32Z",
       "file": "plans/phase-plan-v7-REDACT.md",
@@ -110,6 +150,36 @@
       "task_summary": "Plan REDACT redaction hardening from specs/phase-plans-v7.md.",
       "type": "phase",
       "updated_at": "2026-06-15T07:14:34Z"
+    },
+    {
+      "acceptance_criteria_count": null,
+      "created_at": "2026-06-15T07:28:17Z",
+      "file": "plans/phase-plan-v7-CONCURR.md",
+      "handoff_ref": null,
+      "if_gates_produced": [
+        "IF-0-CONCURR-1"
+      ],
+      "lanes": [
+        "SL-0",
+        "SL-1",
+        "SL-2",
+        "SL-3"
+      ],
+      "lifecycle": [],
+      "owner_skill": "codex-plan-phase",
+      "phase_alias": "CONCURR",
+      "reflection_ref": null,
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v7.md",
+        "slug": "phase-plans-v7",
+        "status": "imported",
+        "type": "phase"
+      },
+      "slug": "v7-CONCURR",
+      "status": "imported",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-06-15T07:28:17Z"
     },
     {
       "acceptance_criteria_count": null,
