@@ -1383,7 +1383,17 @@ class ClientManager:
                     return
                 logger.info(f"[{name}] reconnect attempt {attempt}/{len(delays)} ...")
                 try:
-                    await self._connect_singleflight(config)
+                    async with self._lifecycle_lock:
+                        managed = self._clients.get(name)
+                        if (
+                            managed
+                            and managed.status.status == ServerStatusEnum.ONLINE
+                        ):
+                            logger.debug(
+                                f"[{name}] already online; skipping reconnect attempt {attempt}"
+                            )
+                            return
+                        await self._connect_singleflight(config)
                     logger.info(f"[{name}] reconnected successfully")
                     return
                 except Exception as e:

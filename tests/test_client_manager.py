@@ -2673,6 +2673,7 @@ class TestReconnectStormGuard:
         status = ServerStatus(name="s", status=ServerStatusEnum.ERROR, tool_count=0)
         managed = ManagedClient(config=config, status=status)
         managed.reconnecting = True
+        manager._servers["s"] = status
         manager._clients["s"] = managed
 
         with patch.object(manager, "_connect_with_retry", new=AsyncMock()):
@@ -2712,6 +2713,84 @@ class TestReconnectStormGuard:
 
         with patch("asyncio.sleep", new=AsyncMock()):
             await manager._reconnect_loop("s", config)
+
+        assert managed.reconnecting is False
+
+    @pytest.mark.asyncio
+    async def test_reconnect_loop_serializes_connect_attempt_with_refresh(
+        self,
+    ) -> None:
+        manager = ClientManager()
+        config = MagicMock()
+        status = ServerStatus(name="s", status=ServerStatusEnum.ERROR, tool_count=0)
+        managed = ManagedClient(config=config, status=status)
+        managed.reconnecting = True
+        manager._clients["s"] = managed
+        events: list[str] = []
+        connect_entered = asyncio.Event()
+        release_connect = asyncio.Event()
+
+        async def connect(cfg: object, retry: bool = True) -> None:
+            events.append("reconnect:start")
+            connect_entered.set()
+            await release_connect.wait()
+            events.append("reconnect:end")
+
+        async def refresh_during_reconnect() -> list[str]:
+            await connect_entered.wait()
+            events.append("refresh:waiting")
+            result = await manager.refresh([])
+            events.append("refresh:done")
+            return result
+
+        manager._connect_singleflight = connect  # type: ignore[method-assign]
+
+        with patch("asyncio.sleep", new=AsyncMock()):
+            reconnect_task = asyncio.create_task(manager._reconnect_loop("s", config))
+            refresh_task = asyncio.create_task(refresh_during_reconnect())
+            await connect_entered.wait()
+            await asyncio.sleep(0)
+            assert events == ["reconnect:start", "refresh:waiting"]
+            release_connect.set()
+            await asyncio.gather(reconnect_task, refresh_task)
+
+        assert events == [
+            "reconnect:start",
+            "refresh:waiting",
+            "reconnect:end",
+            "refresh:done",
+        ]
+        assert managed.reconnecting is False
+
+    @pytest.mark.asyncio
+    async def test_reconnect_loop_does_not_hold_lifecycle_lock_during_backoff(
+        self,
+    ) -> None:
+        manager = ClientManager()
+        config = MagicMock()
+        status = ServerStatus(name="s", status=ServerStatusEnum.ERROR, tool_count=0)
+        managed = ManagedClient(config=config, status=status)
+        managed.reconnecting = True
+        manager._servers["s"] = status
+        manager._clients["s"] = managed
+        sleep_entered = asyncio.Event()
+        release_sleep = asyncio.Event()
+
+        async def sleep(delay: float) -> None:
+            sleep_entered.set()
+            await release_sleep.wait()
+
+        async def connect(cfg: object, retry: bool = True) -> None:
+            managed.status.status = ServerStatusEnum.ONLINE
+
+        manager._connect_singleflight = connect  # type: ignore[method-assign]
+
+        with patch("asyncio.sleep", new=sleep):
+            reconnect_task = asyncio.create_task(manager._reconnect_loop("s", config))
+            await sleep_entered.wait()
+            await asyncio.wait_for(manager.ensure_connected("s"), timeout=1.0)
+            release_sleep.set()
+            await reconnect_task
 
         assert managed.reconnecting is False
 

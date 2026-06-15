@@ -4859,7 +4859,8 @@ class GatewayTools:
                         task_server,
                         task["task_id"],
                     )
-                    tasks.append(record if record is not None else McpTaskInfo(**task))
+                    task_info = record if record is not None else McpTaskInfo(**task)
+                    tasks.append(self._sanitize_task_for_output(task_info))
             output = TasksListOutput(
                 ok=True,
                 tasks=tasks,
@@ -4915,7 +4916,7 @@ class GatewayTools:
                 server_name=parsed.server_name,
                 task_id=parsed.task_id,
             )
-            return TasksGetOutput(ok=True, task=task)
+            return TasksGetOutput(ok=True, task=self._sanitize_task_for_output(task))
         except Exception as e:
             self._audit(
                 method="gateway.tasks_get",
