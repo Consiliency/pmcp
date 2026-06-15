@@ -36,7 +36,12 @@ from pmcp.manifest.matcher import (
     match_capability,
     rank_cli_hints,
 )
-from pmcp.manifest.registry import RegistryCache, RegistryPackage, RegistryServerEntry
+from pmcp.manifest.registry import (
+    RegistryCache,
+    RegistryPackage,
+    RegistryRemote,
+    RegistryServerEntry,
+)
 from pmcp.manifest.sync import sync_registry_to_manifest
 
 
@@ -258,6 +263,13 @@ def test_registry_sync_classifies_without_mutating_manifest() -> None:
                 name="added",
                 description="Added",
                 packages=[RegistryPackage(identifier="@example/added")],
+                remotes=[
+                    RegistryRemote(
+                        transport="streamable-http",
+                        url="https://added.example/mcp",
+                        headers=["ADDED_TOKEN"],
+                    )
+                ],
             ),
         ],
     )

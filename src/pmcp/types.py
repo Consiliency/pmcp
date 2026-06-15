@@ -969,6 +969,8 @@ class CapabilityCandidate(BaseModel):
     is_running: bool = False  # True if server is already connected
     source: Literal["manifest", "configured", "registry"] | None = None
     transport: str | None = None
+    url: str | None = None
+    remote_headers: list[str] = Field(default_factory=list)
     package: str | None = None
     server_card_url: str | None = None
     protected_resource_metadata_url: str | None = None
@@ -1031,6 +1033,10 @@ class SearchRegistryResult(BaseModel):
     transport: str | None = None
     env_vars: list[str] = Field(default_factory=list)
     url: str | None = None
+    remotes: list[dict[str, Any]] = Field(default_factory=list)
+    remote_headers: list[str] = Field(default_factory=list)
+    registry_status: str | None = None
+    is_latest: bool | None = None
     server_card_url: str | None = None
     protected_resource_metadata_url: str | None = None
     authorization_server_metadata_url: str | None = None

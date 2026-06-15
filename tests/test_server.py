@@ -38,6 +38,8 @@ class TestGatewayServerInit:
             policy_path=policy_file,
         )
         assert server._project_root == tmp_path
+        assert server._gateway_tools._project_root == tmp_path
+        assert server._client_manager._project_root == tmp_path
 
 
 class TestResourceHandlers:

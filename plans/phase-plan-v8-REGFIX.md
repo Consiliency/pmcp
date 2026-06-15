@@ -32,7 +32,7 @@ Current code has the target seams described by the roadmap: `RegistryServerEntry
 
 - **Scope**: Update the manifest-layer registry contract so remote registry entries, outer metadata, pagination, latest filtering, deduplication, stable cache paths, and offline-safe fetch failures are represented once and tested with recorded registry fixtures.
 - **Owned files**: `src/pmcp/manifest/registry.py`, `src/pmcp/manifest/sync.py`, `src/pmcp/types.py`, `tests/test_registry.py`, `tests/test_manifest.py`, `tests/fixtures/registry/v0_servers_page1.json`, `tests/fixtures/registry/v0_servers_page2.json`
-- **Interfaces provided**: IF-0-REGFIX-1 registry model/fetch/cache surface; `RegistryRemote` metadata for streamable-http and sse registry remotes; `RegistryServerMeta` outer status and isLatest metadata; async `fetch_registry_servers(...)`; stable registry cache path helper; deduplicated latest registry cache semantics; typed registry data available to handler lanes
+- **Interfaces provided**: IF-0-REGFIX-1 registry model/fetch/cache surface; additive `RegistryServerEntry` remote/metadata fields; `RegistryRemote` metadata for streamable-http and sse registry remotes; `RegistryServerMeta` outer status and isLatest metadata; async `fetch_registry_servers(...)`; stable registry cache path helper; deduplicated latest registry cache semantics; typed registry data available to handler lanes
 - **Interfaces consumed**: pre-existing `RegistryServerEntry`, `RegistryPackage`, `RegistryCache`, `sync_registry_to_manifest(...)`, `SearchRegistryResult`, `CapabilityCandidate`, aiohttp client APIs already available in the project, MCP Registry `/v0/servers` response shape with `servers[]` and `metadata.nextCursor`
 - **Parallel-safe**: yes
 - **Tasks**:

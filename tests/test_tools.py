@@ -17,7 +17,12 @@ import pytest
 from pmcp.env_store import read_env_file
 from pmcp.manifest.environment import CLIInfo
 from pmcp.manifest.loader import CLIAlternative, Manifest, ServerConfig
-from pmcp.manifest.registry import RegistryCache, RegistryPackage, RegistryServerEntry
+from pmcp.manifest.registry import (
+    RegistryCache,
+    RegistryPackage,
+    RegistryRemote,
+    RegistryServerEntry,
+)
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import StartupObservation
 from pmcp.errors import GatewayException
@@ -3147,6 +3152,36 @@ class TestCapabilityAndProvision:
         assert read_env_file(child / ".env.pmcp")["OPENAI_API_KEY"] == "test-token"
 
     @pytest.mark.asyncio
+    async def test_auth_connect_project_scope_uses_explicit_project_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project = tmp_path / "project"
+        other = tmp_path / "other"
+        project.mkdir()
+        other.mkdir()
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            project_root=project,
+        )
+        monkeypatch.chdir(other)
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+        result = await gateway_tools.auth_connect(
+            {
+                "server_name": "custom",
+                "env_var": "OPENAI_API_KEY",
+                "credential": "test-token",
+                "scope": "project",
+            }
+        )
+
+        assert result.ok is True
+        assert result.env_path == str(project / ".env.pmcp")
+        assert read_env_file(project / ".env.pmcp")["OPENAI_API_KEY"] == "test-token"
+        assert not (other / ".env.pmcp").exists()
+
+    @pytest.mark.asyncio
     async def test_auth_connect_rejects_invalid_explicit_env_var(
         self, tmp_path: Path, monkeypatch
     ) -> None:
@@ -3730,36 +3765,44 @@ class TestSearchRegistryAndRegister:
         self, gateway_tools: GatewayTools, monkeypatch
     ) -> None:
         fake_entries = [
-            {
-                "server": {
-                    "name": "GitHub MCP",
-                    "description": "GitHub integration",
-                    "packages": [
-                        {
-                            "identifier": "@modelcontextprotocol/server-github",
-                            "transport": {"type": "stdio"},
-                            "environmentVariables": [{"name": "GITHUB_TOKEN"}],
-                        }
-                    ],
-                }
-            },
-            # Duplicate package — should be deduplicated
-            {
-                "server": {
-                    "name": "GitHub MCP (duplicate)",
-                    "description": "GitHub integration duplicate",
-                    "packages": [
-                        {
-                            "identifier": "@modelcontextprotocol/server-github",
-                            "transport": {"type": "stdio"},
-                            "environmentVariables": [{"name": "GITHUB_TOKEN"}],
-                        }
-                    ],
-                }
-            },
+            RegistryServerEntry(
+                name="GitHub MCP",
+                description="GitHub integration",
+                packages=[
+                    RegistryPackage(
+                        identifier="@modelcontextprotocol/server-github",
+                        transport="stdio",
+                        env_vars=["GITHUB_TOKEN"],
+                    )
+                ],
+                remotes=[
+                    RegistryRemote(
+                        transport="streamable-http",
+                        url="https://github.example/mcp",
+                        headers=["GITHUB_TOKEN"],
+                    )
+                ],
+            ),
+            RegistryServerEntry(
+                name="GitHub MCP (duplicate)",
+                description="GitHub integration duplicate",
+                packages=[
+                    RegistryPackage(
+                        identifier="@modelcontextprotocol/server-github",
+                        transport="stdio",
+                        env_vars=["GITHUB_TOKEN"],
+                    )
+                ],
+            ),
         ]
+
+        async def fake_matches(query: str, *, limit: int = 8) -> list[RegistryServerEntry]:
+            return fake_entries[:limit]
+
         monkeypatch.setattr(
-            gateway_tools, "_query_mcp_registry", lambda q, limit=8: fake_entries
+            gateway_tools,
+            "_registry_matches",
+            fake_matches,
         )
 
         result = await gateway_tools.search_registry({"query": "github"})
@@ -3767,6 +3810,8 @@ class TestSearchRegistryAndRegister:
         assert len(result.results) == 1  # duplicate filtered out
         assert result.results[0].package == "@modelcontextprotocol/server-github"
         assert result.results[0].env_vars == ["GITHUB_TOKEN"]
+        assert result.results[0].remote_headers == ["GITHUB_TOKEN"]
+        assert result.results[0].url == "https://github.example/mcp"
         assert "gateway.register_discovered_server" in result.next_step
 
     @pytest.mark.asyncio
@@ -3797,10 +3842,15 @@ class TestSearchRegistryAndRegister:
                 )
             ],
         )
-        monkeypatch.setattr(gateway_tools, "_load_registry_candidates", lambda: cache)
+        async def fake_load_registry_candidates() -> RegistryCache:
+            return cache
+
+        monkeypatch.setattr(
+            gateway_tools, "_load_registry_candidates", fake_load_registry_candidates
+        )
 
         result = await gateway_tools.request_capability(
-            {"query": "Acme incident management"}
+            {"query": "Find Acme incident management"}
         )
 
         assert result.status == "candidates"
@@ -3821,7 +3871,12 @@ class TestSearchRegistryAndRegister:
     async def test_search_registry_handles_empty_results(
         self, gateway_tools: GatewayTools, monkeypatch
     ) -> None:
-        monkeypatch.setattr(gateway_tools, "_query_mcp_registry", lambda q, limit=8: [])
+        async def fake_matches(
+            query: str, *, limit: int = 8
+        ) -> list[RegistryServerEntry]:
+            return []
+
+        monkeypatch.setattr(gateway_tools, "_registry_matches", fake_matches)
 
         result = await gateway_tools.search_registry({"query": "nonexistent-xyz-tool"})
 

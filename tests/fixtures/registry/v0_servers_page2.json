@@ -1,0 +1,23 @@
+{
+  "servers": [
+    {
+      "_meta": {
+        "official": {
+          "isLatest": true
+        },
+        "status": "active"
+      },
+      "server": {
+        "name": "Second Page",
+        "description": "Second page server",
+        "packages": [
+          {
+            "identifier": "@example/second-page",
+            "transport": "stdio"
+          }
+        ]
+      }
+    }
+  ],
+  "metadata": {}
+}

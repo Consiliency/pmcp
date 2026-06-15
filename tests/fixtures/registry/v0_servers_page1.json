@@ -1,0 +1,60 @@
+{
+  "servers": [
+    {
+      "_meta": {
+        "official": {
+          "isLatest": true
+        },
+        "status": "active"
+      },
+      "server": {
+        "name": "Remote Search",
+        "description": "Search the web",
+        "capabilities": [
+          "tools"
+        ],
+        "packages": [
+          {
+            "identifier": "@example/remote-search",
+            "transport": "stdio"
+          }
+        ],
+        "remotes": [
+          {
+            "transport": "streamable-http",
+            "url": "https://search.example/mcp",
+            "headers": [
+              {
+                "name": "SEARCH_API_KEY"
+              }
+            ],
+            "preview": {
+              "kept": true
+            }
+          }
+        ]
+      }
+    },
+    {
+      "_meta": {
+        "official": {
+          "isLatest": false
+        },
+        "status": "active"
+      },
+      "server": {
+        "name": "Remote Search Old",
+        "description": "Old search server",
+        "packages": [
+          {
+            "identifier": "@example/remote-search",
+            "transport": "stdio"
+          }
+        ]
+      }
+    }
+  ],
+  "metadata": {
+    "nextCursor": "page-2"
+  }
+}

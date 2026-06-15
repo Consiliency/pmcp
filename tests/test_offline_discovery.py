@@ -208,8 +208,13 @@ class TestCatalogSearchOfflineDiscovery:
                 )
             ],
         )
+        async def fake_load_registry_candidates() -> RegistryCache:
+            return cache
+
         monkeypatch.setattr(
-            gateway_tools_with_cache, "_load_registry_candidates", lambda: cache
+            gateway_tools_with_cache,
+            "_load_registry_candidates",
+            fake_load_registry_candidates,
         )
 
         result = await gateway_tools_with_cache.catalog_search(

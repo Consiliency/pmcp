@@ -98,6 +98,7 @@ class GatewayServer:
         self._client_manager = ClientManager(
             max_tools_per_server=self._policy_manager.get_max_tools_per_server(),
             max_concurrent_spawns=self._max_concurrent_spawns,
+            project_root=project_root,
         )
 
         # Initialize gateway tools handler

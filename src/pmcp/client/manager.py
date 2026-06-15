@@ -7,6 +7,7 @@ from contextlib import AsyncExitStack
 import json
 import logging
 import os
+from pathlib import Path
 import random
 import string
 import time
@@ -261,6 +262,7 @@ def _remote_headers(
     config: RemoteMcpServerConfig,
     *,
     tenant_id: str | None = None,
+    project_root: Path | None = None,
 ) -> dict[str, str] | None:
     """Return remote transport headers with env-var placeholders expanded."""
     if not config.headers:
@@ -269,6 +271,7 @@ def _remote_headers(
         config.headers,
         server_name=server_name,
         tenant_id=tenant_id,
+        project_root=project_root,
     )
     if resolution.missing_env_vars:
         raise MissingRemoteHeaderAuthError(server_name, resolution.missing_env_vars)
@@ -332,7 +335,10 @@ class ClientManager:
     """Manages connections to downstream MCP servers."""
 
     def __init__(
-        self, max_tools_per_server: int = 100, max_concurrent_spawns: int = 8
+        self,
+        max_tools_per_server: int = 100,
+        max_concurrent_spawns: int = 8,
+        project_root: Path | None = None,
     ) -> None:
         self._clients: dict[str, ManagedClient] = {}
         self._tools: dict[str, ToolInfo] = {}
@@ -343,6 +349,7 @@ class ClientManager:
         self._revision_id: str = _generate_revision_id()
         self._last_refresh_ts: float = time.time()
         self._max_tools_per_server = max_tools_per_server
+        self._project_root = project_root
         self._spawn_semaphore = asyncio.Semaphore(max_concurrent_spawns)
         self._lifecycle_lock = asyncio.Lock()
         self._connect_tasks: dict[str, asyncio.Task[None]] = {}
@@ -1154,7 +1161,9 @@ class ClientManager:
             raise ValueError(f"Server {config.name} has unsupported remote config type")
 
         remote_config = config.config
-        headers = _remote_headers(config.name, remote_config)
+        headers = _remote_headers(
+            config.name, remote_config, project_root=self._project_root
+        )
         await self._connect_remote_stream(
             config,
             sse_client(remote_config.url, headers=headers),
@@ -1167,7 +1176,9 @@ class ClientManager:
             raise ValueError(f"Server {config.name} has unsupported remote config type")
 
         remote_config = config.config
-        headers = _remote_headers(config.name, remote_config)
+        headers = _remote_headers(
+            config.name, remote_config, project_root=self._project_root
+        )
         await self._connect_remote_stream(
             config,
             streamablehttp_client(remote_config.url, headers=headers),

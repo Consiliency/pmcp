@@ -79,6 +79,47 @@ class TestHelperFunctions:
 
         assert _truncate_description("") == ""
 
+    def test_remote_headers_reads_explicit_project_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        project = tmp_path / "project"
+        other = tmp_path / "other"
+        project.mkdir()
+        other.mkdir()
+        write_env_file(project / ".env.pmcp", {"REMOTE_TOKEN": "project-token"})
+        monkeypatch.chdir(other)
+        monkeypatch.delenv("REMOTE_TOKEN", raising=False)
+
+        headers = _remote_headers(
+            "remote",
+            RemoteMcpServerConfig(
+                type="streamable-http",
+                url="https://remote.example/mcp",
+                headers={"Authorization": "Bearer ${REMOTE_TOKEN}"},
+            ),
+            project_root=project,
+        )
+
+        assert headers == {"Authorization": "Bearer project-token"}
+
+    def test_remote_headers_process_env_precedence_with_project_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        write_env_file(tmp_path / ".env.pmcp", {"REMOTE_TOKEN": "project-token"})
+        monkeypatch.setenv("REMOTE_TOKEN", "process-token")
+
+        headers = _remote_headers(
+            "remote",
+            RemoteMcpServerConfig(
+                type="sse",
+                url="https://remote.example/sse",
+                headers={"Authorization": "Bearer ${REMOTE_TOKEN}"},
+            ),
+            project_root=tmp_path,
+        )
+
+        assert headers == {"Authorization": "Bearer process-token"}
+
 
 def make_managed_for_protocol_tests() -> tuple[ResolvedServerConfig, ManagedClient]:
     config = ResolvedServerConfig(
@@ -1126,6 +1167,7 @@ class TestRemoteConnectSseHeaders:
             config.headers,
             server_name="remote-http",
             tenant_id="tenant-a",
+            project_root=None,
         )
 
 

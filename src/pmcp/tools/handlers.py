@@ -13,7 +13,6 @@ import shutil
 from collections import deque
 from pathlib import Path
 from typing import Any, Literal, cast
-from urllib.parse import quote_plus
 from urllib.request import urlopen
 from urllib.parse import urlencode
 
@@ -1256,7 +1255,7 @@ class GatewayTools:
         # Apply limit
         registry_candidates: list[CapabilityCandidate] = []
         if parsed.query:
-            registry_candidates = self._registry_candidates_for_query(
+            registry_candidates = await self._registry_candidates_for_query(
                 parsed.query, limit=min(5, parsed.limit)
             )
 
@@ -2515,17 +2514,17 @@ class GatewayTools:
         """Normalize user query tokens for matching/discovery."""
         return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
 
-    def _load_registry_candidates(self) -> RegistryCache:
+    async def _load_registry_candidates(self) -> RegistryCache:
         """Load the registry cache, falling back to a bounded live fetch."""
         cached = load_registry_cache()
         if cached is not None and cached.servers:
             return cached
-        fetched = fetch_registry_servers()
+        fetched = await fetch_registry_servers()
         if fetched.servers:
             return fetched
         return cached or fetched
 
-    def _registry_matches(
+    async def _registry_matches(
         self, query: str, *, limit: int = 8
     ) -> list[RegistryServerEntry]:
         normalized = self._normalize_token(query)
@@ -2533,14 +2532,16 @@ class GatewayTools:
             return []
         query_words = set(normalized.split())
         scored: list[tuple[int, str, RegistryServerEntry]] = []
-        for entry in self._load_registry_candidates().servers:
+        for entry in (await self._load_registry_candidates()).servers:
             package_text = " ".join(pkg.identifier for pkg in entry.packages)
+            remote_text = " ".join(remote.url or "" for remote in entry.remotes)
             haystack = self._normalize_token(
                 " ".join(
                     [
                         entry.name,
                         entry.description,
                         package_text,
+                        remote_text,
                         " ".join(entry.declared_capabilities),
                     ]
                 )
@@ -2554,31 +2555,45 @@ class GatewayTools:
         scored.sort(key=lambda item: (-item[0], item[1]))
         return [entry for _, _, entry in scored[:limit]]
 
-    def _query_mcp_registry(self, query: str, limit: int = 8) -> list[dict[str, Any]]:
-        """Query the MCP Registry using the shared parser/cache path."""
-        return [entry.raw for entry in self._registry_matches(query, limit=limit)]
-
     def _registry_candidate_for_entry(
         self, entry: RegistryServerEntry, *, score: float = 0.7
     ) -> CapabilityCandidate | None:
         package = entry.packages[0] if entry.packages else None
-        if package is None:
+        remote = entry.remotes[0] if entry.remotes else None
+        if package is None and remote is None:
             return None
         if not self._policy_manager.is_server_allowed(entry.name):
             return None
-        env_var = package.env_vars[0] if package.env_vars else None
+        env_vars = package.env_vars if package is not None else []
+        remote_headers = remote.headers if remote is not None else []
+        auth_vars = env_vars or remote_headers
+        env_var = auth_vars[0] if auth_vars else None
         return CapabilityCandidate(
             name=entry.name,
             candidate_type="server",
             relevance_score=score,
             reasoning=entry.description or "MCP Registry candidate",
-            requires_api_key=bool(package.env_vars),
-            api_key_available=self._check_any_api_key_available(package.env_vars),
+            requires_api_key=bool(auth_vars),
+            api_key_available=self._check_any_api_key_available(auth_vars),
             env_var=env_var,
             is_running=False,
             source="registry",
-            transport=package.transport,
-            package=package.identifier,
+            transport=(
+                remote.transport
+                if remote is not None
+                else package.transport
+                if package is not None
+                else None
+            ),
+            url=(
+                remote.url
+                if remote is not None
+                else package.url
+                if package is not None
+                else None
+            ),
+            remote_headers=remote_headers,
+            package=package.identifier if package is not None else None,
             server_card_url=entry.server_card_url,
             protected_resource_metadata_url=entry.protected_resource_metadata_url,
             authorization_server_metadata_url=entry.authorization_server_metadata_url,
@@ -2586,35 +2601,15 @@ class GatewayTools:
             declared_capabilities=entry.declared_capabilities,
         )
 
-    def _registry_candidates_for_query(
+    async def _registry_candidates_for_query(
         self, query: str, *, limit: int = 5
     ) -> list[CapabilityCandidate]:
         candidates: list[CapabilityCandidate] = []
-        for entry in self._registry_matches(query, limit=limit):
+        for entry in await self._registry_matches(query, limit=limit):
             candidate = self._registry_candidate_for_entry(entry)
             if candidate is not None:
                 candidates.append(candidate)
         return candidates
-
-    def _legacy_query_mcp_registry(
-        self, query: str, limit: int = 8
-    ) -> list[dict[str, Any]]:
-        """Deprecated direct registry query retained for local debugging only."""
-        normalized = self._normalize_token(query)
-        if not normalized:
-            return []
-
-        try:
-            url = (
-                "https://registry.modelcontextprotocol.io/v0.1/servers"
-                f"?search={quote_plus(normalized)}&limit={limit}"
-            )
-            with urlopen(url, timeout=5) as resp:  # nosec B310
-                payload = json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            return []
-
-        return payload.get("servers", []) if isinstance(payload, dict) else []
 
     def _load_configured_servers(self) -> dict[str, ResolvedServerConfig]:
         """Load user/project-configured servers that are allowed by policy."""
@@ -3290,9 +3285,11 @@ class GatewayTools:
         # through to not_available so search_registry guidance is surfaced.
         _pascal_re = re.compile(r"^[A-Z][a-z]{3,}$")
         _unknown_service = any(
+            idx > 0
+            and
             _pascal_re.match(w)
             and w.lower().replace("-", "").replace("_", "") not in norm_to_server
-            for w in parsed.query.split()
+            for idx, w in enumerate(parsed.query.split())
         )
 
         # --- Tier 2: category keyword match ---
@@ -3446,7 +3443,7 @@ class GatewayTools:
             )
 
         registry_candidates = (
-            self._registry_candidates_for_query(parsed.query)
+            await self._registry_candidates_for_query(parsed.query)
             if _unknown_service
             else []
         )
@@ -4378,69 +4375,53 @@ class GatewayTools:
         self._record_feedback_event("registry_search", {"query": parsed.query})
 
         results: list[SearchRegistryResult] = []
-        seen_packages: set[str] = set()
-        raw_entries = self._query_mcp_registry(parsed.query, limit=parsed.limit * 2)
-        for entry in raw_entries:
-            if not isinstance(entry, dict):
-                continue
-            server_info = entry.get("server", entry)
-            if not isinstance(server_info, dict):
-                continue
-            packages = server_info.get("packages", [])
-            if not packages:
-                continue
-            pkg = packages[0]
-            if not isinstance(pkg, dict):
-                continue
-            package_name = str(pkg.get("identifier", "")).strip()
-            if not package_name or package_name in seen_packages:
-                continue
-            seen_packages.add(package_name)
-            transport = (
-                pkg.get("transport", {}).get("type")
-                if isinstance(pkg.get("transport"), dict)
-                else pkg.get("transport")
+        seen_identities: set[str] = set()
+        entries = await self._registry_matches(parsed.query, limit=parsed.limit * 2)
+        for entry in entries:
+            package = entry.packages[0] if entry.packages else None
+            remote = entry.remotes[0] if entry.remotes else None
+            identity = (
+                package.identifier
+                if package is not None
+                else remote.url
+                if remote is not None and remote.url is not None
+                else entry.name
             )
-            env_var_defs = pkg.get("environmentVariables", []) or []
-            env_vars = [
-                str(ev.get("name", "")).strip()
-                for ev in env_var_defs
-                if isinstance(ev, dict) and ev.get("name")
-            ]
-
+            if not identity or identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            env_vars = package.env_vars if package is not None else []
+            remote_headers = remote.headers if remote is not None else []
             results.append(
                 SearchRegistryResult(
-                    name=str(server_info.get("name", package_name)),
-                    package=package_name,
-                    description=str(server_info.get("description", "")).strip(),
-                    transport=transport,
+                    name=entry.name,
+                    package=identity,
+                    description=entry.description,
+                    transport=(
+                        remote.transport
+                        if remote is not None
+                        else package.transport
+                        if package is not None
+                        else None
+                    ),
                     env_vars=env_vars,
-                    url=pkg.get("url"),
-                    server_card_url=server_info.get("serverCardUrl")
-                    or server_info.get("server_card_url"),
-                    protected_resource_metadata_url=server_info.get(
-                        "protectedResourceMetadataUrl"
-                    )
-                    or server_info.get("protected_resource_metadata_url"),
-                    authorization_server_metadata_url=server_info.get(
-                        "authorizationServerMetadataUrl"
-                    )
-                    or server_info.get("authorization_server_metadata_url"),
-                    declared_scopes=[
-                        str(scope)
-                        for scope in (
-                            server_info.get("scopes")
-                            or server_info.get("declared_scopes")
-                            or []
-                        )
-                        if isinstance(scope, str)
-                    ],
-                    declared_capabilities=[
-                        str(cap)
-                        for cap in server_info.get("capabilities", [])
-                        if isinstance(cap, str)
-                    ],
-                    diagnostics=["registry_metadata_read_only"],
+                    url=(
+                        remote.url
+                        if remote is not None
+                        else package.url
+                        if package is not None
+                        else None
+                    ),
+                    remotes=[remote.raw for remote in entry.remotes],
+                    remote_headers=remote_headers,
+                    registry_status=entry.registry_meta.status,
+                    is_latest=entry.registry_meta.is_latest,
+                    server_card_url=entry.server_card_url,
+                    protected_resource_metadata_url=entry.protected_resource_metadata_url,
+                    authorization_server_metadata_url=entry.authorization_server_metadata_url,
+                    declared_scopes=entry.declared_scopes,
+                    declared_capabilities=entry.declared_capabilities,
+                    diagnostics=entry.diagnostics,
                 )
             )
             if len(results) >= parsed.limit:
