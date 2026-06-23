@@ -4,6 +4,6 @@
 generator target {
   output_type python/pydantic
   output_dir "../src/pmcp"
-  version "0.219.0"
+  version "0.222.0"
   default_client_mode async
 }

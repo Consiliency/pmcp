@@ -298,3 +298,33 @@ class TestProvisionableCategories:
             tools, use_llm=False, provisionable_categories=categories
         )
         assert categories in summary
+
+
+class TestBamlClientCompatibility:
+    """Guard the generated baml_client against runtime version drift.
+
+    The LLM summarizer (`summary/generator.py`) catches a baml import failure and
+    silently falls back to template summaries. That meant a `baml_client`/`baml-py`
+    version mismatch could disable LLM summarization with no test failure. This
+    test makes such drift fail loudly: the generated client must import cleanly
+    under the pinned baml-py runtime, and its declared generator version must
+    match the installed baml-py.
+    """
+
+    def test_baml_client_imports_under_pinned_runtime(self) -> None:
+        # Raises ResourceServer-style version-incompatibility error if the
+        # generated client was built for a different baml-py than is installed.
+        from pmcp.baml_client import b
+
+        assert b is not None
+
+    def test_generated_client_version_matches_installed_baml_py(self) -> None:
+        from importlib.metadata import version
+
+        from pmcp.baml_client import __version__ as generated_version
+
+        assert generated_version == version("baml-py"), (
+            f"baml_client was generated for {generated_version} but baml-py "
+            f"{version('baml-py')} is installed. Run `baml-cli generate` after "
+            "bumping baml-py and update baml_src/generators.baml."
+        )
