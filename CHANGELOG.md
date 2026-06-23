@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.1] - 2026-06-23
+
+### Fixed
+- Regenerated the vendored `baml_client` against the pinned `baml-py` (0.222.0).
+  The client had been generated for 0.219.0 and raised a version-incompatibility
+  error under the shipped runtime, so the LLM capability summarizer silently fell
+  back to template summaries since 1.13.x. It now loads BAML correctly, and guard
+  tests assert the generated client matches the installed `baml-py` so the drift
+  cannot recur unnoticed.
+
+### Changed
+- Bumped `baml-py` to 0.222.0 and CI `actions/checkout` to v7 (dependabot #63, #75).
+
 ## [1.14.0] - 2026-06-15
 
 ### Added
