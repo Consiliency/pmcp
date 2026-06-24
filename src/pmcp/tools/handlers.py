@@ -1391,12 +1391,11 @@ class GatewayTools:
         # Get code snippet if guidance enabled
         code_snippet = None
         if self._guidance_config and self._guidance_config.include_code_snippets:
-            # Try static template first, fallback to LLM generation for dynamic tools
+            # Static code-snippet template lookup (None when no template exists)
             code_snippet = get_code_snippet(
                 tool_info.tool_id,
                 max_lines=self._guidance_config.max_snippet_lines,
                 tool_info=tool_info,
-                use_llm_fallback=True,  # Enable LLM generation for tools without templates
             )
 
         self._record_feedback_event(

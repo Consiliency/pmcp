@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 import yaml
 
 from pmcp.config.guidance import (
@@ -278,11 +277,9 @@ class TestCodeSnippetLoading:
             lines = snippet.split("\n")
             assert len(lines) <= 2
 
-    def test_returns_none_for_unknown_tools_without_llm(self) -> None:
-        snippet = get_code_snippet(
-            "unknown::unknown_tool", max_lines=4, use_llm_fallback=False
-        )
-        # Should return None without LLM fallback
+    def test_returns_none_for_unknown_tools(self) -> None:
+        snippet = get_code_snippet("unknown::unknown_tool", max_lines=4)
+        # Should return None when no static template exists
         assert snippet is None
 
     def test_loader_with_custom_templates_file(self, tmp_path: Path) -> None:
@@ -310,46 +307,8 @@ class TestCodeSnippetLoading:
         # Should return None
         assert snippet is None
 
-    def test_llm_fallback_with_tool_info(self, mocker) -> None:
-        # Mock BAML client - need to mock the import inside the function
-        try:
-            # Try importing BAML to see if it's available
-            from baml_client.sync_client import b  # type: ignore
-
-            # If import succeeds, mock it
-            mock_result = mocker.MagicMock()
-            mock_result.snippet = (
-                "mcp.call_tool('gateway.invoke', ...)\nresult = response"
-            )
-            mocker.patch.object(b, "GenerateCodeSnippet", return_value=mock_result)
-
-            tool_info = ToolInfo(
-                tool_id="custom::new_tool",
-                server_name="custom",
-                tool_name="new_tool",
-                description="A new tool",
-                short_description="A new tool",
-                input_schema={"type": "object", "properties": {}},
-                tags=["custom"],
-                risk_hint="low",
-            )
-
-            snippet = get_code_snippet(
-                "custom::new_tool",
-                max_lines=4,
-                tool_info=tool_info,
-                use_llm_fallback=True,
-            )
-
-            # Should get generated snippet
-            assert snippet is not None
-            assert "gateway.invoke" in snippet
-        except ImportError:
-            # BAML not available, skip test
-            pytest.skip("BAML client not available")
-
-    def test_graceful_failure_when_baml_unavailable(self) -> None:
-        # Test when BAML not installed
+    def test_snippet_lookup_with_tool_info_is_static_only(self) -> None:
+        # tool_info is accepted but unused; a tool with no static template -> None
         tool_info = ToolInfo(
             tool_id="custom::new_tool",
             server_name="custom",
@@ -360,18 +319,8 @@ class TestCodeSnippetLoading:
             tags=["custom"],
             risk_hint="low",
         )
-
-        # Should not crash, just return None or a snippet
-        try:
-            snippet = get_code_snippet(
-                "nonexistent::tool", tool_info=tool_info, use_llm_fallback=True
-            )
-            # May be None or may succeed if BAML is available
-            # Just ensure no exception raised
-            assert snippet is None or isinstance(snippet, str)
-        except ImportError:
-            # Expected if BAML not available
-            pass
+        snippet = get_code_snippet("custom::new_tool", tool_info=tool_info)
+        assert snippet is None
 
 
 class TestGuidanceConfigProperties:

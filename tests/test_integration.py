@@ -327,7 +327,7 @@ class TestSummaryGeneration:
                 pytest.skip("No tools available")
 
             # With use_llm=False, should use template
-            summary = await generate_capability_summary(tools, use_llm=False)
+            summary = await generate_capability_summary(tools)
 
             print(f"\nFallback Summary:\n{summary}")
 

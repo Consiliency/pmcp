@@ -179,20 +179,20 @@ class TestGenerateCapabilitySummary:
     @pytest.mark.asyncio
     async def test_uses_template_when_llm_disabled(self) -> None:
         tools = [make_tool("server", "tool")]
-        summary = await generate_capability_summary(tools, use_llm=False)
+        summary = await generate_capability_summary(tools)
         # Format changed with L0 guidance
         assert "MCP Gateway:" in summary
 
     @pytest.mark.asyncio
     async def test_handles_empty_tools(self) -> None:
-        summary = await generate_capability_summary([], use_llm=False)
+        summary = await generate_capability_summary([])
         assert "No tools" in summary
 
     @pytest.mark.asyncio
     async def test_falls_back_to_template_if_llm_unavailable(self) -> None:
         # When claude-agent-sdk is not installed, should fall back to template
         tools = [make_tool("server", "tool")]
-        summary = await generate_capability_summary(tools, use_llm=True)
+        summary = await generate_capability_summary(tools)
         # Should still generate something (either LLM or template fallback)
         assert len(summary) > 0
 
@@ -200,17 +200,13 @@ class TestGenerateCapabilitySummary:
     async def test_passes_custom_instructions_to_template(self) -> None:
         tools = [make_tool("server", "tool")]
         custom = "My custom instructions."
-        summary = await generate_capability_summary(
-            tools, use_llm=False, custom_instructions=custom
-        )
+        summary = await generate_capability_summary(tools, custom_instructions=custom)
         assert "My custom instructions." in summary
 
     @pytest.mark.asyncio
     async def test_disables_guidance_when_flag_false(self) -> None:
         tools = [make_tool("server", "tool")]
-        summary = await generate_capability_summary(
-            tools, use_llm=False, include_code_guidance=False
-        )
+        summary = await generate_capability_summary(tools, include_code_guidance=False)
         assert "Workflow:" not in summary
 
 
@@ -295,36 +291,6 @@ class TestProvisionableCategories:
         tools = [make_tool("server", "tool")]
         categories = "Provisionable (1 servers): test-category (server)"
         summary = await generate_capability_summary(
-            tools, use_llm=False, provisionable_categories=categories
+            tools, provisionable_categories=categories
         )
         assert categories in summary
-
-
-class TestBamlClientCompatibility:
-    """Guard the generated baml_client against runtime version drift.
-
-    The LLM summarizer (`summary/generator.py`) catches a baml import failure and
-    silently falls back to template summaries. That meant a `baml_client`/`baml-py`
-    version mismatch could disable LLM summarization with no test failure. This
-    test makes such drift fail loudly: the generated client must import cleanly
-    under the pinned baml-py runtime, and its declared generator version must
-    match the installed baml-py.
-    """
-
-    def test_baml_client_imports_under_pinned_runtime(self) -> None:
-        # Raises ResourceServer-style version-incompatibility error if the
-        # generated client was built for a different baml-py than is installed.
-        from pmcp.baml_client import b
-
-        assert b is not None
-
-    def test_generated_client_version_matches_installed_baml_py(self) -> None:
-        from importlib.metadata import version
-
-        from pmcp.baml_client import __version__ as generated_version
-
-        assert generated_version == version("baml-py"), (
-            f"baml_client was generated for {generated_version} but baml-py "
-            f"{version('baml-py')} is installed. Run `baml-cli generate` after "
-            "bumping baml-py and update baml_src/generators.baml."
-        )

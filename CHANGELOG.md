@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.14.2] - 2026-06-24
+
+### Removed
+- Removed the unused BAML/LLM machinery entirely. Outbound LLM calls were retired
+  long ago in favor of a pure-Python capability router, leaving the `baml-py`
+  dependency, the generated `baml_client`, `baml_src/`, the retired
+  `llm_summarizer` stub, and the dead `use_llm` / `use_llm_fallback` code paths as
+  vestigial. Dropping them removes a heavy dependency (no more native binary) and
+  the per-release client-regeneration burden. Capability summaries and code
+  snippets are unchanged: cache → template for summaries, static templates for
+  snippets. The `llm` optional-dependency extra is gone.
+
 ## [1.14.1] - 2026-06-23
 
 ### Fixed

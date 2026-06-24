@@ -1,7 +1,7 @@
 """Code snippet template loader.
 
 This module loads code snippet templates from YAML for L2 guidance.
-Falls back to BAML-based LLM generation for tools without static templates.
+Returns a static template for the tool, or None when none exists.
 """
 
 from __future__ import annotations
@@ -69,15 +69,13 @@ class CodeSnippetsLoader:
         tool_id: str,
         max_lines: int = 4,
         tool_info: ToolInfo | None = None,
-        use_llm_fallback: bool = False,
     ) -> str | None:
         """Get code snippet for a tool.
 
         Args:
             tool_id: Full tool ID (e.g., "playwright::browser_navigate")
             max_lines: Maximum number of lines to return
-            tool_info: Optional ToolInfo for LLM generation fallback
-            use_llm_fallback: Whether to use BAML/LLM generation if no static template
+            tool_info: Optional ToolInfo (reserved; unused by static templates)
 
         Returns:
             Code snippet string or None if no template exists
@@ -113,18 +111,16 @@ def get_code_snippet(
     tool_id: str,
     max_lines: int = 4,
     tool_info: ToolInfo | None = None,
-    use_llm_fallback: bool = False,
 ) -> str | None:
     """Get code snippet for a tool (convenience function).
 
     Args:
         tool_id: Full tool ID (e.g., "playwright::browser_navigate")
         max_lines: Maximum number of lines to return
-        tool_info: Optional ToolInfo for LLM generation fallback
-        use_llm_fallback: Whether to use BAML/LLM generation if no static template
+        tool_info: Optional ToolInfo (reserved; unused by static templates)
 
     Returns:
         Code snippet string or None if no template exists
     """
     loader = get_code_snippets_loader()
-    return loader.get_snippet_for_tool(tool_id, max_lines, tool_info, use_llm_fallback)
+    return loader.get_snippet_for_tool(tool_id, max_lines, tool_info)

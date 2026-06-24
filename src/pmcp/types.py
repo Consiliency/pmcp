@@ -954,7 +954,7 @@ class CLIResolution(BaseModel):
 
 
 class CapabilityCandidate(BaseModel):
-    """A single capability candidate from BAML matching."""
+    """A single capability candidate from the capability matcher."""
 
     name: str
     candidate_type: Literal["cli", "server"]
