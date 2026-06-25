@@ -601,6 +601,22 @@ The MCP Registry cache is stored separately under `.mcp-gateway`; PMCP uses the
 cache when the public registry is unavailable. Registry candidates can coexist
 with cached offline tool cards without changing `total_available`.
 
+#### Private registry (debugging, opt-in)
+
+By default PMCP discovers only from the public MCP Registry and surfaces
+GA-shaped, latest-version entries. Developers debugging their own **private** MCP
+servers can opt in with an environment flag (default **off**):
+
+```bash
+export PMCP_REGISTRY_ALLOW_PRIVATE=1
+export PMCP_REGISTRY_PRIVATE_ENDPOINT=https://registry.internal.example/v0/servers
+```
+
+When enabled, PMCP fetches from the configured private endpoint and tolerates
+draft/non-GA `server.json` schema fields, surfacing all versions (including
+non-latest entries) for inspection. This is a debugging aid, **not for
+production discovery**; with the flag off, behavior is unchanged.
+
 ## Dynamic Server Provisioning
 
 PMCP can install and start MCP servers on-demand from a curated manifest of 90+ servers.

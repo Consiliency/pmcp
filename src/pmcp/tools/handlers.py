@@ -60,8 +60,10 @@ from pmcp.manifest.matcher import rank_cli_hints
 from pmcp.manifest.registry import (
     RegistryCache,
     RegistryServerEntry,
+    effective_registry_endpoint,
     fetch_registry_servers,
     load_registry_cache,
+    registry_private_enabled,
 )
 from pmcp.manifest.version_checker import (
     detect_package_type,
@@ -2518,7 +2520,10 @@ class GatewayTools:
         cached = load_registry_cache()
         if cached is not None and cached.servers:
             return cached
-        fetched = await fetch_registry_servers()
+        fetched = await fetch_registry_servers(
+            effective_registry_endpoint(),
+            allow_draft_schema=registry_private_enabled(),
+        )
         if fetched.servers:
             return fetched
         return cached or fetched

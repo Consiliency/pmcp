@@ -18,6 +18,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_REGISTRY_ENDPOINT = "https://registry.modelcontextprotocol.io/v0/servers"
 REGISTRY_CACHE_TTL_SECONDS = 300.0
+REGISTRY_ALLOW_PRIVATE_ENV = "PMCP_REGISTRY_ALLOW_PRIVATE"
+REGISTRY_PRIVATE_ENDPOINT_ENV = "PMCP_REGISTRY_PRIVATE_ENDPOINT"
 _IN_PROCESS_CACHE: dict[tuple[Any, ...], tuple[float, "RegistryCache"]] = {}
 _IN_PROCESS_TASKS: dict[tuple[Any, ...], "asyncio.Task[RegistryCache]"] = {}
 
@@ -107,6 +109,33 @@ def default_registry_cache_path() -> Path:
     cache_home = os.environ.get("XDG_CACHE_HOME")
     base = Path(cache_home).expanduser() if cache_home else Path.home() / ".cache"
     return base / "pmcp" / "registry-cache.json"
+
+
+def registry_private_enabled() -> bool:
+    """Opt-in flag (default OFF) for private registries + draft-schema tolerance.
+
+    Aimed at developers debugging their own private MCP servers against PMCP.
+    With it off, PMCP uses only the public registry and the GA-shaped behavior.
+    """
+    return os.environ.get(REGISTRY_ALLOW_PRIVATE_ENV, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def effective_registry_endpoint(default: str = DEFAULT_REGISTRY_ENDPOINT) -> str:
+    """Return the configured private registry endpoint only when opt-in is on.
+
+    Flag off (default): the configured private endpoint is ignored and the
+    public registry endpoint is used.
+    """
+    if registry_private_enabled():
+        private = os.environ.get(REGISTRY_PRIVATE_ENDPOINT_ENV, "").strip()
+        if private:
+            return private
+    return default
 
 
 def _first_str(mapping: dict[str, Any], *keys: str) -> str | None:
@@ -354,6 +383,7 @@ async def _fetch_registry_servers_uncached(
     max_pages: int,
     max_response_bytes: int,
     updated_since: str | None = None,
+    allow_draft_schema: bool = False,
 ) -> RegistryCache:
     diagnostics: list[str] = []
     servers: list[RegistryServerEntry] = []
@@ -401,9 +431,14 @@ async def _fetch_registry_servers_uncached(
             fetched_at=_now_iso(),
             diagnostics=[f"registry_fetch_failed:{type(exc).__name__}"],
         )
-    latest_servers = [
-        entry for entry in servers if entry.registry_meta.is_latest is not False
-    ]
+    if allow_draft_schema:
+        # Debugging mode: surface all versions, including draft/non-latest entries.
+        latest_servers = list(servers)
+        diagnostics.append("registry_draft_schema_allowed")
+    else:
+        latest_servers = [
+            entry for entry in servers if entry.registry_meta.is_latest is not False
+        ]
     return RegistryCache(
         schema_version="registry-cache.v1",
         source_endpoint=endpoint,
@@ -427,6 +462,7 @@ async def _fetch_with_fallback(
     max_response_bytes: int,
     updated_since: str | None,
     fallback_cache: RegistryCache | None,
+    allow_draft_schema: bool = False,
 ) -> RegistryCache:
     """Try an incremental fetch, fall back to full, then to the prior cache."""
     cache = await _fetch_registry_servers_uncached(
@@ -435,6 +471,7 @@ async def _fetch_with_fallback(
         max_pages=max_pages,
         max_response_bytes=max_response_bytes,
         updated_since=updated_since,
+        allow_draft_schema=allow_draft_schema,
     )
     if updated_since and _fetch_failed(cache):
         # Incremental attempt failed; degrade to a full fetch.
@@ -443,6 +480,7 @@ async def _fetch_with_fallback(
             timeout=timeout,
             max_pages=max_pages,
             max_response_bytes=max_response_bytes,
+            allow_draft_schema=allow_draft_schema,
         )
     if _fetch_failed(cache) and fallback_cache is not None:
         # Full fetch also failed; keep the previously-cached servers.
@@ -462,6 +500,7 @@ async def fetch_registry_servers(
     use_in_process_cache: bool = True,
     updated_since: str | None = None,
     fallback_cache: RegistryCache | None = None,
+    allow_draft_schema: bool = False,
 ) -> RegistryCache:
     """Fetch and parse the MCP Registry without leaking network errors.
 
@@ -469,8 +508,18 @@ async def fetch_registry_servers(
     ``updated_since`` alongside ``version=latest`` for an incremental delta
     fetch. A failed incremental attempt degrades to a full fetch, and a failed
     full fetch degrades to ``fallback_cache`` rather than crashing.
+
+    ``allow_draft_schema`` (opt-in debugging mode) surfaces all versions,
+    including draft/non-latest entries, instead of filtering to the latest.
     """
-    key = (endpoint, timeout, max_pages, max_response_bytes, updated_since)
+    key = (
+        endpoint,
+        timeout,
+        max_pages,
+        max_response_bytes,
+        updated_since,
+        allow_draft_schema,
+    )
     now = time.monotonic()
     if use_in_process_cache:
         cached = _IN_PROCESS_CACHE.get(key)
@@ -487,6 +536,7 @@ async def fetch_registry_servers(
                 max_response_bytes=max_response_bytes,
                 updated_since=updated_since,
                 fallback_cache=fallback_cache,
+                allow_draft_schema=allow_draft_schema,
             )
         )
         _IN_PROCESS_TASKS[key] = task
@@ -503,6 +553,7 @@ async def fetch_registry_servers(
         max_response_bytes=max_response_bytes,
         updated_since=updated_since,
         fallback_cache=fallback_cache,
+        allow_draft_schema=allow_draft_schema,
     )
 
 

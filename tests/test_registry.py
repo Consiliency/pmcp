@@ -363,3 +363,80 @@ def test_merge_registry_delta_merges_and_dedupes() -> None:
     assert by_id["@x/a"].description == "new"  # delta replaced base
     assert by_id["@x/b"].description == "keep"  # base preserved
     assert merged.last_synced_at == "2026-06-25T00:00:00Z"
+
+
+def test_registry_private_flag_defaults_off(monkeypatch) -> None:
+    from pmcp.manifest.registry import (
+        DEFAULT_REGISTRY_ENDPOINT,
+        effective_registry_endpoint,
+        registry_private_enabled,
+    )
+
+    monkeypatch.delenv("PMCP_REGISTRY_ALLOW_PRIVATE", raising=False)
+    monkeypatch.setenv(
+        "PMCP_REGISTRY_PRIVATE_ENDPOINT", "https://private.example/v0/servers"
+    )
+    # Flag off: private endpoint is ignored, public endpoint used.
+    assert registry_private_enabled() is False
+    assert effective_registry_endpoint() == DEFAULT_REGISTRY_ENDPOINT
+
+
+def test_registry_private_flag_on_uses_private_endpoint(monkeypatch) -> None:
+    from pmcp.manifest.registry import (
+        effective_registry_endpoint,
+        registry_private_enabled,
+    )
+
+    monkeypatch.setenv("PMCP_REGISTRY_ALLOW_PRIVATE", "1")
+    monkeypatch.setenv(
+        "PMCP_REGISTRY_PRIVATE_ENDPOINT", "https://private.example/v0/servers"
+    )
+    assert registry_private_enabled() is True
+    assert effective_registry_endpoint() == "https://private.example/v0/servers"
+
+
+async def test_allow_draft_schema_includes_non_latest(monkeypatch) -> None:
+    calls: list[str] = []
+    payload: dict[str, object] = {
+        "servers": [
+            {
+                "_meta": {"official": {"isLatest": True}},
+                "server": {
+                    "name": "Latest",
+                    "description": "d",
+                    "packages": [{"identifier": "@x/latest", "transport": "stdio"}],
+                },
+            },
+            {
+                "_meta": {"official": {"isLatest": False}},
+                "server": {
+                    "name": "Draft",
+                    "description": "d",
+                    "packages": [{"identifier": "@x/draft", "transport": "stdio"}],
+                },
+            },
+        ]
+    }
+    monkeypatch.setattr(
+        "pmcp.manifest.registry.aiohttp.ClientSession",
+        lambda **_: _Session(calls, [payload]),
+    )
+    # Flag off (default): the draft (isLatest false) entry is filtered out.
+    off = await fetch_registry_servers(
+        "https://r.example/v0/servers", use_in_process_cache=False
+    )
+    assert {s.name for s in off.servers} == {"Latest"}
+    assert "registry_draft_schema_allowed" not in off.diagnostics
+
+    # allow_draft_schema on: draft entry included + posture diagnostic.
+    monkeypatch.setattr(
+        "pmcp.manifest.registry.aiohttp.ClientSession",
+        lambda **_: _Session(calls, [payload]),
+    )
+    on = await fetch_registry_servers(
+        "https://r.example/v0/servers",
+        use_in_process_cache=False,
+        allow_draft_schema=True,
+    )
+    assert {s.name for s in on.servers} == {"Latest", "Draft"}
+    assert "registry_draft_schema_allowed" in on.diagnostics
