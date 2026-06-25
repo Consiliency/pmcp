@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-06-25
+
+### Added
+- `SPEC_COMPLIANCE.md` tracks PMCP against the current stable MCP revision
+  (`2025-11-25`) with a per-requirement compliance table, a draft-revision
+  migration assessment (stateless transport, the `io.modelcontextprotocol/tasks`
+  extension, `server/discover`, `CacheableResult`, DCR→Client ID Metadata
+  Documents, SSE resumability), and a next-stable tracking checklist. PMCP is
+  confirmed compliant with the folded-in current-stable items (403 on invalid
+  `Origin` per PR #1439, `insufficient_scope` 403 step-up per SEP-835,
+  input-validation as tool-execution errors per SEP-1303, JSON Schema 2020-12
+  default dialect per SEP-1613, tool/resource/prompt icon passthrough per
+  SEP-973).
+- MCP Registry incremental sync. The registry client persists `last_synced_at`
+  and accepts `updated_since` to fetch only changed servers
+  (`?version=latest&updated_since=…` with cursor pagination), merging deltas into
+  the cache via `merge_registry_delta`. A failed incremental attempt degrades to
+  a full fetch, and a failed full fetch degrades to the prior cache. Default
+  full-fetch callers are unchanged.
+- Opt-in private-registry support (`PMCP_REGISTRY_ALLOW_PRIVATE`, default off).
+  When enabled with `PMCP_REGISTRY_PRIVATE_ENDPOINT`, PMCP discovers from a
+  private/custom registry and tolerates draft/non-GA `server.json` schema fields,
+  surfacing all versions — a debugging aid for developers building their own
+  private MCP servers, not for production discovery. With the flag off,
+  discovery behavior is unchanged.
+
 ## [1.14.2] - 2026-06-24
 
 ### Removed
