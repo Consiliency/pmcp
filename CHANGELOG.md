@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-06-25
+
 ### Added
 - Manifest: 2026 vendor-official servers — Okta (identity/IAM), Zapier
   (automation meta-connector), Shopify Dev and Square (commerce), Snowflake
