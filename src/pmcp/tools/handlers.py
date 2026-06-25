@@ -58,12 +58,12 @@ from pmcp.manifest.installer import (
 from pmcp.manifest.loader import load_manifest
 from pmcp.manifest.matcher import rank_cli_hints
 from pmcp.manifest.registry import (
+    DEFAULT_REGISTRY_ENDPOINT,
     RegistryCache,
     RegistryServerEntry,
     effective_registry_endpoint,
     fetch_registry_servers,
     load_registry_cache,
-    registry_private_enabled,
 )
 from pmcp.manifest.version_checker import (
     detect_package_type,
@@ -2520,9 +2520,12 @@ class GatewayTools:
         cached = load_registry_cache()
         if cached is not None and cached.servers:
             return cached
+        endpoint = effective_registry_endpoint()
+        # Draft-schema tolerance applies only when actually using a private
+        # endpoint, so enabling the flag never changes public-registry results.
         fetched = await fetch_registry_servers(
-            effective_registry_endpoint(),
-            allow_draft_schema=registry_private_enabled(),
+            endpoint,
+            allow_draft_schema=endpoint != DEFAULT_REGISTRY_ENDPOINT,
         )
         if fetched.servers:
             return fetched

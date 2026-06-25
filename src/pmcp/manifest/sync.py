@@ -8,7 +8,6 @@ from pmcp.manifest.loader import Manifest
 from pmcp.manifest.registry import (
     RegistryCache,
     RegistryServerEntry,
-    _dedupe_latest,
     _server_identity,
 )
 
@@ -40,13 +39,21 @@ def merge_registry_delta(base: RegistryCache, delta: RegistryCache) -> RegistryC
         _server_identity(entry): entry for entry in base.servers
     }
     for entry in delta.servers:
-        merged_by_identity[_server_identity(entry)] = entry
-    merged = _dedupe_latest(list(merged_by_identity.values()))
+        key = _server_identity(entry)
+        existing = merged_by_identity.get(key)
+        # Apply the delta entry unless it would downgrade a known-latest base
+        # entry to a non-latest one.
+        if (
+            existing is None
+            or entry.registry_meta.is_latest
+            or not existing.registry_meta.is_latest
+        ):
+            merged_by_identity[key] = entry
     return RegistryCache(
         schema_version=base.schema_version,
         source_endpoint=delta.source_endpoint or base.source_endpoint,
         fetched_at=delta.fetched_at,
-        servers=merged,
+        servers=list(merged_by_identity.values()),
         diagnostics=list(delta.diagnostics),
         last_synced_at=delta.last_synced_at or base.last_synced_at,
     )

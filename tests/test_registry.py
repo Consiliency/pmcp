@@ -328,8 +328,13 @@ async def test_incremental_failure_degrades_to_fallback_cache(monkeypatch) -> No
         use_in_process_cache=False,
     )
 
-    assert cache is fallback
+    # Returns a copy of the fallback with a degraded marker, preserving the
+    # cached servers — and must NOT mutate the caller-owned fallback object.
+    assert cache is not fallback
+    assert cache.servers == fallback.servers
+    assert cache.last_synced_at == fallback.last_synced_at
     assert "registry_fetch_degraded_to_cache" in cache.diagnostics
+    assert "registry_fetch_degraded_to_cache" not in fallback.diagnostics
 
 
 def test_merge_registry_delta_merges_and_dedupes() -> None:

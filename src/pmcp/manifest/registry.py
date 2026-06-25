@@ -7,7 +7,7 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -443,7 +443,10 @@ async def _fetch_registry_servers_uncached(
         schema_version="registry-cache.v1",
         source_endpoint=endpoint,
         fetched_at=_now_iso(),
-        servers=_dedupe_latest(latest_servers),
+        # In draft mode, surface every version; otherwise dedupe to the latest.
+        servers=latest_servers
+        if allow_draft_schema
+        else _dedupe_latest(latest_servers),
         diagnostics=diagnostics,
         last_synced_at=_now_iso(),
     )
@@ -483,11 +486,13 @@ async def _fetch_with_fallback(
             allow_draft_schema=allow_draft_schema,
         )
     if _fetch_failed(cache) and fallback_cache is not None:
-        # Full fetch also failed; keep the previously-cached servers.
-        fallback_cache.diagnostics = list(fallback_cache.diagnostics) + [
-            "registry_fetch_degraded_to_cache"
-        ]
-        return fallback_cache
+        # Full fetch also failed; keep the previously-cached servers. Return a
+        # copy so the caller-owned fallback object is never mutated.
+        return replace(
+            fallback_cache,
+            diagnostics=list(fallback_cache.diagnostics)
+            + ["registry_fetch_degraded_to_cache"],
+        )
     return cache
 
 
@@ -544,7 +549,11 @@ async def fetch_registry_servers(
             cache = await task
         finally:
             _IN_PROCESS_TASKS.pop(key, None)
-        _IN_PROCESS_CACHE[key] = (time.monotonic(), cache)
+        # Don't cache a failed/degraded fetch — a transient blip must not block
+        # recovery for the full TTL window.
+        degraded = "registry_fetch_degraded_to_cache" in cache.diagnostics
+        if not _fetch_failed(cache) and not degraded:
+            _IN_PROCESS_CACHE[key] = (time.monotonic(), cache)
         return cache
     return await _fetch_with_fallback(
         endpoint,
