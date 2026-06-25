@@ -239,3 +239,127 @@ def test_registry_cache_round_trip_is_deterministic(tmp_path: Path) -> None:
     assert loaded is not None
     assert loaded.schema_version == "registry-cache.v1"
     assert path.read_text().endswith("\n")
+
+
+def _delta_page(name: str, identifier: str, cursor: str | None) -> dict[str, object]:
+    page: dict[str, object] = {
+        "servers": [
+            {
+                "_meta": {"official": {"isLatest": True, "status": "active"}},
+                "server": {
+                    "name": name,
+                    "description": f"{name} desc",
+                    "packages": [{"identifier": identifier, "transport": "stdio"}],
+                },
+            }
+        ]
+    }
+    if cursor:
+        page["metadata"] = {"nextCursor": cursor}
+    return page
+
+
+async def test_fetch_registry_incremental_uses_updated_since(monkeypatch) -> None:
+    calls: list[str] = []
+    page1 = _delta_page("Updated Server", "@example/updated", "delta-2")
+    page2 = _delta_page("New Server", "@example/new", None)
+    monkeypatch.setattr(
+        "pmcp.manifest.registry.aiohttp.ClientSession",
+        lambda **_: _Session(calls, [page1, page2]),
+    )
+
+    cache = await fetch_registry_servers(
+        "https://registry.example/v0/servers",
+        updated_since="2026-06-25T00:00:00Z",
+        use_in_process_cache=False,
+    )
+
+    assert calls == [
+        "https://registry.example/v0/servers?version=latest"
+        "&updated_since=2026-06-25T00%3A00%3A00Z",
+        "https://registry.example/v0/servers?version=latest"
+        "&updated_since=2026-06-25T00%3A00%3A00Z&cursor=delta-2",
+    ]
+    assert {s.name for s in cache.servers} == {"Updated Server", "New Server"}
+    assert cache.last_synced_at is not None
+
+
+def test_registry_cache_round_trips_last_synced_at(tmp_path: Path) -> None:
+    path = tmp_path / "registry-cache.json"
+    cache = RegistryCache(
+        schema_version="registry-cache.v1",
+        source_endpoint="https://registry.example/v0/servers",
+        fetched_at="2026-06-25T00:00:00Z",
+        last_synced_at="2026-06-25T00:00:00Z",
+    )
+    save_registry_cache(cache, path)
+    loaded = load_registry_cache(path)
+    assert loaded is not None
+    assert loaded.last_synced_at == "2026-06-25T00:00:00Z"
+
+    # Old cache JSON without the field loads with last_synced_at == None.
+    legacy = json.loads(path.read_text())
+    legacy.pop("last_synced_at", None)
+    path.write_text(json.dumps(legacy))
+    loaded_legacy = load_registry_cache(path)
+    assert loaded_legacy is not None
+    assert loaded_legacy.last_synced_at is None
+
+
+async def test_incremental_failure_degrades_to_fallback_cache(monkeypatch) -> None:
+    def _raising_session(**_: object) -> object:
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(
+        "pmcp.manifest.registry.aiohttp.ClientSession", _raising_session
+    )
+    fallback = RegistryCache(
+        schema_version="registry-cache.v1",
+        source_endpoint="https://registry.example/v0/servers",
+        fetched_at="2026-06-24T00:00:00Z",
+        servers=[],
+        last_synced_at="2026-06-24T00:00:00Z",
+    )
+
+    cache = await fetch_registry_servers(
+        "https://registry.example/v0/servers",
+        updated_since="2026-06-25T00:00:00Z",
+        fallback_cache=fallback,
+        use_in_process_cache=False,
+    )
+
+    assert cache is fallback
+    assert "registry_fetch_degraded_to_cache" in cache.diagnostics
+
+
+def test_merge_registry_delta_merges_and_dedupes() -> None:
+    from pmcp.manifest.registry import RegistryPackage, RegistryServerEntry
+    from pmcp.manifest.sync import merge_registry_delta
+
+    def entry(name: str, identifier: str, desc: str) -> RegistryServerEntry:
+        return RegistryServerEntry(
+            name=name,
+            description=desc,
+            packages=[RegistryPackage(identifier=identifier)],
+        )
+
+    base = RegistryCache(
+        schema_version="registry-cache.v1",
+        source_endpoint="https://registry.example/v0/servers",
+        fetched_at="2026-06-24T00:00:00Z",
+        servers=[entry("A", "@x/a", "old"), entry("B", "@x/b", "keep")],
+    )
+    delta = RegistryCache(
+        schema_version="registry-cache.v1",
+        source_endpoint="https://registry.example/v0/servers",
+        fetched_at="2026-06-25T00:00:00Z",
+        servers=[entry("A", "@x/a", "new"), entry("C", "@x/c", "added")],
+        last_synced_at="2026-06-25T00:00:00Z",
+    )
+
+    merged = merge_registry_delta(base, delta)
+    by_id = {p.packages[0].identifier: p for p in merged.servers}
+    assert set(by_id) == {"@x/a", "@x/b", "@x/c"}
+    assert by_id["@x/a"].description == "new"  # delta replaced base
+    assert by_id["@x/b"].description == "keep"  # base preserved
+    assert merged.last_synced_at == "2026-06-25T00:00:00Z"

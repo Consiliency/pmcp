@@ -82,6 +82,7 @@ class RegistryCache:
     servers: list[RegistryServerEntry] = field(default_factory=list)
     diagnostics: list[str] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
+    last_synced_at: str | None = None
 
 
 def _now_iso() -> str:
@@ -352,11 +353,15 @@ async def _fetch_registry_servers_uncached(
     timeout: float,
     max_pages: int,
     max_response_bytes: int,
+    updated_since: str | None = None,
 ) -> RegistryCache:
     diagnostics: list[str] = []
     servers: list[RegistryServerEntry] = []
     next_cursor: str | None = None
-    current_endpoint = _with_query(endpoint, {"version": "latest"})
+    query_params = {"version": "latest"}
+    if updated_since:
+        query_params["updated_since"] = updated_since
+    current_endpoint = _with_query(endpoint, query_params)
     try:
         timeout_config = aiohttp.ClientTimeout(total=timeout)
         async with aiohttp.ClientSession(timeout=timeout_config) as session:
@@ -405,7 +410,47 @@ async def _fetch_registry_servers_uncached(
         fetched_at=_now_iso(),
         servers=_dedupe_latest(latest_servers),
         diagnostics=diagnostics,
+        last_synced_at=_now_iso(),
     )
+
+
+def _fetch_failed(cache: RegistryCache) -> bool:
+    """A fetch failed if it surfaced a fetch-failure diagnostic."""
+    return any(d.startswith("registry_fetch_failed") for d in cache.diagnostics)
+
+
+async def _fetch_with_fallback(
+    endpoint: str,
+    *,
+    timeout: float,
+    max_pages: int,
+    max_response_bytes: int,
+    updated_since: str | None,
+    fallback_cache: RegistryCache | None,
+) -> RegistryCache:
+    """Try an incremental fetch, fall back to full, then to the prior cache."""
+    cache = await _fetch_registry_servers_uncached(
+        endpoint,
+        timeout=timeout,
+        max_pages=max_pages,
+        max_response_bytes=max_response_bytes,
+        updated_since=updated_since,
+    )
+    if updated_since and _fetch_failed(cache):
+        # Incremental attempt failed; degrade to a full fetch.
+        cache = await _fetch_registry_servers_uncached(
+            endpoint,
+            timeout=timeout,
+            max_pages=max_pages,
+            max_response_bytes=max_response_bytes,
+        )
+    if _fetch_failed(cache) and fallback_cache is not None:
+        # Full fetch also failed; keep the previously-cached servers.
+        fallback_cache.diagnostics = list(fallback_cache.diagnostics) + [
+            "registry_fetch_degraded_to_cache"
+        ]
+        return fallback_cache
+    return cache
 
 
 async def fetch_registry_servers(
@@ -415,9 +460,17 @@ async def fetch_registry_servers(
     max_pages: int = 5,
     max_response_bytes: int = 2_000_000,
     use_in_process_cache: bool = True,
+    updated_since: str | None = None,
+    fallback_cache: RegistryCache | None = None,
 ) -> RegistryCache:
-    """Fetch and parse the MCP Registry without leaking network errors."""
-    key = (endpoint, timeout, max_pages, max_response_bytes)
+    """Fetch and parse the MCP Registry without leaking network errors.
+
+    With ``updated_since`` (an RFC3339 timestamp) the request adds
+    ``updated_since`` alongside ``version=latest`` for an incremental delta
+    fetch. A failed incremental attempt degrades to a full fetch, and a failed
+    full fetch degrades to ``fallback_cache`` rather than crashing.
+    """
+    key = (endpoint, timeout, max_pages, max_response_bytes, updated_since)
     now = time.monotonic()
     if use_in_process_cache:
         cached = _IN_PROCESS_CACHE.get(key)
@@ -427,11 +480,13 @@ async def fetch_registry_servers(
         if task is not None:
             return await task
         task = asyncio.create_task(
-            _fetch_registry_servers_uncached(
+            _fetch_with_fallback(
                 endpoint,
                 timeout=timeout,
                 max_pages=max_pages,
                 max_response_bytes=max_response_bytes,
+                updated_since=updated_since,
+                fallback_cache=fallback_cache,
             )
         )
         _IN_PROCESS_TASKS[key] = task
@@ -441,11 +496,13 @@ async def fetch_registry_servers(
             _IN_PROCESS_TASKS.pop(key, None)
         _IN_PROCESS_CACHE[key] = (time.monotonic(), cache)
         return cache
-    return await _fetch_registry_servers_uncached(
+    return await _fetch_with_fallback(
         endpoint,
         timeout=timeout,
         max_pages=max_pages,
         max_response_bytes=max_response_bytes,
+        updated_since=updated_since,
+        fallback_cache=fallback_cache,
     )
 
 
@@ -466,6 +523,8 @@ def load_registry_cache(cache_path: Path | None = None) -> RegistryCache | None:
     cache.schema_version = str(payload.get("schema_version", "registry-cache.v1"))
     cache.fetched_at = str(payload.get("fetched_at", cache.fetched_at))
     cache.diagnostics = _string_list(payload.get("diagnostics")) + cache.diagnostics
+    last_synced = payload.get("last_synced_at")
+    cache.last_synced_at = last_synced if isinstance(last_synced, str) else None
     return cache
 
 

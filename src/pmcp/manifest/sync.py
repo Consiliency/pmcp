@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from pmcp.manifest.loader import Manifest
-from pmcp.manifest.registry import RegistryCache, RegistryServerEntry
+from pmcp.manifest.registry import (
+    RegistryCache,
+    RegistryServerEntry,
+    _dedupe_latest,
+    _server_identity,
+)
 
 
 @dataclass
@@ -21,6 +26,30 @@ class RegistrySyncResult:
 
 def _norm(value: str) -> str:
     return value.lower().replace("_", "-").replace(" ", "-")
+
+
+def merge_registry_delta(base: RegistryCache, delta: RegistryCache) -> RegistryCache:
+    """Merge an incremental registry delta into a base cache.
+
+    Delta entries add new servers and replace existing ones matched by server
+    identity; base servers not present in the delta are preserved. The merged
+    set is deduplicated to the latest published version. Returns a new
+    ``RegistryCache``; neither input is mutated.
+    """
+    merged_by_identity: dict[str, RegistryServerEntry] = {
+        _server_identity(entry): entry for entry in base.servers
+    }
+    for entry in delta.servers:
+        merged_by_identity[_server_identity(entry)] = entry
+    merged = _dedupe_latest(list(merged_by_identity.values()))
+    return RegistryCache(
+        schema_version=base.schema_version,
+        source_endpoint=delta.source_endpoint or base.source_endpoint,
+        fetched_at=delta.fetched_at,
+        servers=merged,
+        diagnostics=list(delta.diagnostics),
+        last_synced_at=delta.last_synced_at or base.last_synced_at,
+    )
 
 
 def sync_registry_to_manifest(
