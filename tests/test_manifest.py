@@ -1784,3 +1784,73 @@ class TestVerifyInstallation:
 
         result = await verify_installation(server_config)
         assert result is False
+
+
+class TestVendorAdditions2026:
+    """Guards the 2026 vendor-official manifest additions (Tier-1) + refreshes."""
+
+    NEW_SERVERS = {
+        # name: (transport, requires_api_key)
+        "okta": ("local", True),
+        "zapier": ("streamable-http", True),
+        "shopify-dev": ("local", False),
+        "square": ("local", True),
+        "snowflake": ("local", True),
+        "pinecone": ("local", True),
+        "azure-devops": ("local", True),
+        "gitlab-duo": ("streamable-http", True),
+        # Tier 2
+        "elasticsearch": ("local", True),
+        "chroma": ("local", False),
+        "redis": ("local", True),
+        "databricks": ("streamable-http", True),
+        "storybook": ("local", False),
+        "cloudinary": ("local", True),
+    }
+
+    def test_new_vendor_servers_present_and_well_formed(self) -> None:
+        from pmcp.manifest.loader import load_manifest
+
+        manifest = load_manifest()
+        for name, (transport, needs_key) in self.NEW_SERVERS.items():
+            server = manifest.servers.get(name)
+            assert server is not None, f"missing manifest entry: {name}"
+            # transport defaults to local when unset
+            assert (getattr(server, "transport", None) or "local") == transport, name
+            assert server.requires_api_key is needs_key, name
+            assert server.keywords, f"{name} has no keywords"
+            if needs_key:
+                assert server.env_var, f"{name} requires a key but has no env_var"
+
+    def test_mongodb_uses_official_server(self) -> None:
+        from pmcp.manifest.loader import load_manifest
+
+        manifest = load_manifest()
+        mongodb = manifest.servers["mongodb"]
+        assert "mongodb-mcp-server" in mongodb.args
+        assert "mongodb-lens" not in mongodb.args
+
+    @pytest.mark.asyncio
+    async def test_new_servers_match_their_queries(self) -> None:
+        from pmcp.manifest.loader import load_manifest
+        from pmcp.manifest.matcher import match_capability
+
+        manifest = load_manifest()
+        cases = {
+            "pinecone embeddings index": "pinecone",
+            "okta identity access management": "okta",
+            "snowflake data warehouse cortex": "snowflake",
+            "zapier automation integrations": "zapier",
+            "azure devops boards and pipelines": "azure-devops",
+            "elasticsearch full text search": "elasticsearch",
+            "redis cache key value store": "redis",
+            "storybook ui components": "storybook",
+            "cloudinary media images cdn": "cloudinary",
+            "databricks unity catalog": "databricks",
+        }
+        for query, expected in cases.items():
+            result = await match_capability(query, manifest)
+            assert result.matched, f"no match for {query!r}"
+            assert result.entry_name == expected, (
+                f"{query!r} matched {result.entry_name}, expected {expected}"
+            )

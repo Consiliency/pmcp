@@ -953,18 +953,19 @@ servers:
     env_instructions: "Set MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE"
 
   mongodb:
-    description: "MongoDB - query collections, manage documents, run aggregations, inspect schemas"
+    description: "MongoDB (official) - query collections, run aggregations, and manage Atlas clusters"
     keywords: [mongodb, nosql, documents, collections, database, aggregation, atlas, queries]
     install:
-      mac: ["npx", "-y", "mongodb-lens"]
-      linux: ["npx", "-y", "mongodb-lens"]
-      wsl: ["npx", "-y", "mongodb-lens"]
-      windows: ["npx", "-y", "mongodb-lens"]
+      mac: ["npx", "-y", "mongodb-mcp-server"]
+      linux: ["npx", "-y", "mongodb-mcp-server"]
+      wsl: ["npx", "-y", "mongodb-mcp-server"]
+      windows: ["npx", "-y", "mongodb-mcp-server"]
     command: "npx"
-    args: ["-y", "mongodb-lens"]
+    args: ["-y", "mongodb-mcp-server"]
     requires_api_key: true
-    env_var: "MONGODB_URI"
-    env_instructions: "Set MONGODB_URI as connection string: mongodb://user:pass@host:27017/db"
+    env_var: "MDB_MCP_CONNECTION_STRING"
+    env_instructions: "Set MDB_MCP_CONNECTION_STRING (mongodb+srv://...) or MDB_MCP_API_CLIENT_ID/SECRET for Atlas admin"
+    package: "mongodb-mcp-server"
 
   clickhouse:
     description: "ClickHouse analytical database - SQL queries, schemas, data warehouse analysis"
@@ -1520,6 +1521,235 @@ servers:
     command: "npx"
     args: ["-y", "@openbnb/mcp-server-airbnb"]
     requires_api_key: false
+
+  # === Identity & Access ===
+
+  okta:
+    transport: "local"
+    description: "Okta identity & access - manage users, groups, apps, and policies"
+    keywords: [okta, identity, iam, users, groups, sso, authentication, provisioning, access management]
+    install:
+      mac: ["npx", "-y", "okta-mcp-server"]
+      linux: ["npx", "-y", "okta-mcp-server"]
+      wsl: ["npx", "-y", "okta-mcp-server"]
+      windows: ["npx", "-y", "okta-mcp-server"]
+    command: "npx"
+    args: ["-y", "okta-mcp-server"]
+    requires_api_key: true
+    env_var: "OKTA_API_TOKEN"
+    env_instructions: "Set OKTA_API_TOKEN and OKTA_ORG_URL (https://your-org.okta.com); create a token at Security > API > Tokens"
+    package: "okta-mcp-server"
+
+  # === Automation & Integration ===
+
+  zapier:
+    status: "active_vendor_remote"
+    source: "mcp_registry"
+    transport: "streamable-http"
+    url: "${ZAPIER_MCP_URL}"
+    description: "Zapier - meta-connector exposing 8,000+ SaaS apps as dynamic MCP tools"
+    keywords: [zapier, automation, integrations, apps, workflows, zaps, no-code, connectors, saas]
+    requires_api_key: true
+    env_var: "ZAPIER_MCP_URL"
+    env_instructions: "Generate your per-account MCP endpoint at https://mcp.zapier.com and set ZAPIER_MCP_URL to that URL"
+    package: "zapier-mcp"
+    server_card_url: "https://mcp.zapier.com"
+    declared_capabilities: [tools]
+
+  # === E-commerce ===
+
+  shopify-dev:
+    transport: "local"
+    description: "Shopify Dev - search Shopify dev docs and validate GraphQL against live Admin/Storefront schemas"
+    keywords: [shopify, ecommerce, storefront, admin api, graphql, app development, liquid, dev docs]
+    install:
+      mac: ["npx", "-y", "@shopify/dev-mcp"]
+      linux: ["npx", "-y", "@shopify/dev-mcp"]
+      wsl: ["npx", "-y", "@shopify/dev-mcp"]
+      windows: ["npx", "-y", "@shopify/dev-mcp"]
+    command: "npx"
+    args: ["-y", "@shopify/dev-mcp"]
+    requires_api_key: false
+    package: "@shopify/dev-mcp"
+
+  square:
+    transport: "local"
+    description: "Square - payments, orders, inventory, catalog, and customers"
+    keywords: [square, payments, orders, inventory, catalog, customers, pos, commerce]
+    install:
+      mac: ["npx", "-y", "square-mcp-server"]
+      linux: ["npx", "-y", "square-mcp-server"]
+      wsl: ["npx", "-y", "square-mcp-server"]
+      windows: ["npx", "-y", "square-mcp-server"]
+    command: "npx"
+    args: ["-y", "square-mcp-server"]
+    requires_api_key: true
+    env_var: "SQUARE_ACCESS_TOKEN"
+    env_instructions: "Create an access token in the Square Developer Dashboard (https://developer.squareup.com)"
+    package: "square-mcp-server"
+
+  # === Data Platform & Vector ===
+
+  snowflake:
+    transport: "local"
+    description: "Snowflake Cortex - SQL, Cortex agents, semantic views, and data operations"
+    keywords: [snowflake, data warehouse, sql, cortex, analytics, semantic, lakehouse, queries]
+    install:
+      mac: ["uvx", "snowflake-labs-mcp"]
+      linux: ["uvx", "snowflake-labs-mcp"]
+      wsl: ["uvx", "snowflake-labs-mcp"]
+      windows: ["uvx", "snowflake-labs-mcp"]
+    command: "uvx"
+    args: ["snowflake-labs-mcp"]
+    requires_api_key: true
+    env_var: "SNOWFLAKE_PAT"
+    env_instructions: "Configure SNOWFLAKE_ACCOUNT, SNOWFLAKE_USER, and SNOWFLAKE_PAT; see github.com/Snowflake-Labs/mcp"
+    package: "snowflake-labs-mcp"
+
+  pinecone:
+    transport: "local"
+    description: "Pinecone vector database - index management, vector search, and RAG"
+    keywords: [pinecone, vector database, embeddings, rag, semantic search, similarity, indexes]
+    install:
+      mac: ["npx", "-y", "@pinecone-database/mcp"]
+      linux: ["npx", "-y", "@pinecone-database/mcp"]
+      wsl: ["npx", "-y", "@pinecone-database/mcp"]
+      windows: ["npx", "-y", "@pinecone-database/mcp"]
+    command: "npx"
+    args: ["-y", "@pinecone-database/mcp"]
+    requires_api_key: true
+    env_var: "PINECONE_API_KEY"
+    env_instructions: "Create an API key at https://app.pinecone.io"
+    package: "@pinecone-database/mcp"
+
+  # === DevOps & CI/CD (2026 vendor) ===
+
+  azure-devops:
+    transport: "local"
+    description: "Azure DevOps - work items, boards, pull requests, pipelines, repos, and test plans"
+    keywords: [azure devops, ado, work items, boards, pipelines, repos, pull requests, builds, test plans]
+    install:
+      mac: ["npx", "-y", "@azure-devops/mcp"]
+      linux: ["npx", "-y", "@azure-devops/mcp"]
+      wsl: ["npx", "-y", "@azure-devops/mcp"]
+      windows: ["npx", "-y", "@azure-devops/mcp"]
+    command: "npx"
+    args: ["-y", "@azure-devops/mcp"]
+    requires_api_key: true
+    env_var: "AZURE_DEVOPS_PAT"
+    env_instructions: "Set AZURE_DEVOPS_PAT and your organization; create a PAT in Azure DevOps > User Settings > Personal Access Tokens"
+    package: "@azure-devops/mcp"
+
+  gitlab-duo:
+    status: "active_vendor_remote"
+    source: "mcp_registry"
+    transport: "streamable-http"
+    url: "https://gitlab.com/api/v4/mcp"
+    description: "GitLab Duo remote MCP - issues, merge requests, pipelines, and CI (gitlab.com; self-managed override via URL)"
+    keywords: [gitlab, duo, merge requests, issues, pipelines, ci, devops, remote]
+    requires_api_key: true
+    env_var: "GITLAB_TOKEN"
+    env_instructions: "Set GITLAB_TOKEN (PAT with the 'mcp' scope); for self-managed, point the URL at https://<your-gitlab>/api/v4/mcp"
+    package: "gitlab-duo-mcp"
+    server_card_url: "https://docs.gitlab.com/user/gitlab_duo/model_context_protocol/mcp_server/"
+    declared_capabilities: [tools]
+
+  # === Search & Vector (2026 vendor) ===
+
+  elasticsearch:
+    transport: "local"
+    description: "Elasticsearch - query indices, search, and inspect mappings"
+    keywords: [elasticsearch, elastic, search, full text, indices, queries, observability, logs]
+    install:
+      mac: ["npx", "-y", "@elastic/mcp-server-elasticsearch"]
+      linux: ["npx", "-y", "@elastic/mcp-server-elasticsearch"]
+      wsl: ["npx", "-y", "@elastic/mcp-server-elasticsearch"]
+      windows: ["npx", "-y", "@elastic/mcp-server-elasticsearch"]
+    command: "npx"
+    args: ["-y", "@elastic/mcp-server-elasticsearch"]
+    requires_api_key: true
+    env_var: "ES_API_KEY"
+    env_instructions: "Set ES_URL and ES_API_KEY (or ES_USERNAME/ES_PASSWORD); see github.com/elastic/mcp-server-elasticsearch"
+    package: "@elastic/mcp-server-elasticsearch"
+
+  chroma:
+    transport: "local"
+    description: "Chroma vector database - collections, document ops, and vector search"
+    keywords: [chroma, vector database, embeddings, rag, semantic search, collections, similarity]
+    install:
+      mac: ["uvx", "chroma-mcp"]
+      linux: ["uvx", "chroma-mcp"]
+      wsl: ["uvx", "chroma-mcp"]
+      windows: ["uvx", "chroma-mcp"]
+    command: "uvx"
+    args: ["chroma-mcp"]
+    requires_api_key: false
+    env_instructions: "Runs against a local/persistent Chroma by default; for Chroma Cloud set CHROMA_API_KEY, CHROMA_TENANT, CHROMA_DATABASE"
+    package: "chroma-mcp"
+
+  redis:
+    transport: "local"
+    description: "Redis - data operations, search, and vector storage"
+    keywords: [redis, cache, key value, data store, vector, search, pubsub, streams]
+    install:
+      mac: ["uvx", "redis-mcp-server"]
+      linux: ["uvx", "redis-mcp-server"]
+      wsl: ["uvx", "redis-mcp-server"]
+      windows: ["uvx", "redis-mcp-server"]
+    command: "uvx"
+    args: ["redis-mcp-server"]
+    requires_api_key: true
+    env_var: "REDIS_URL"
+    env_instructions: "Set REDIS_URL (redis://[:password@]host:port/db); see github.com/redis/mcp-redis"
+    package: "redis-mcp-server"
+
+  # === Data Platform (managed remote) ===
+
+  databricks:
+    status: "active_vendor_remote"
+    source: "mcp_registry"
+    transport: "streamable-http"
+    url: "${DATABRICKS_MCP_URL}"
+    description: "Databricks managed MCP - Unity Catalog data, AI Search, Genie spaces, and functions"
+    keywords: [databricks, lakehouse, unity catalog, sql, genie, ai search, data, analytics]
+    requires_api_key: true
+    env_var: "DATABRICKS_MCP_URL"
+    env_instructions: "Set DATABRICKS_MCP_URL to your workspace managed-MCP endpoint (https://<workspace>.cloud.databricks.com/api/2.0/mcp/...) and a Databricks token"
+    package: "databricks-managed-mcp"
+    server_card_url: "https://docs.databricks.com/aws/en/generative-ai/mcp/managed-mcp"
+    declared_capabilities: [tools]
+
+  # === Frontend & Media (2026 vendor) ===
+
+  storybook:
+    transport: "local"
+    description: "Storybook - generate and test stories for UI components"
+    keywords: [storybook, ui, components, frontend, stories, testing, design system, react]
+    install:
+      mac: ["npx", "-y", "@storybook/mcp"]
+      linux: ["npx", "-y", "@storybook/mcp"]
+      wsl: ["npx", "-y", "@storybook/mcp"]
+      windows: ["npx", "-y", "@storybook/mcp"]
+    command: "npx"
+    args: ["-y", "@storybook/mcp"]
+    requires_api_key: false
+    package: "@storybook/mcp"
+
+  cloudinary:
+    transport: "local"
+    description: "Cloudinary - media asset management, transformation, and upload"
+    keywords: [cloudinary, media, images, video, cdn, assets, transformation, upload]
+    install:
+      mac: ["npx", "-y", "cloudinary-mcp-server"]
+      linux: ["npx", "-y", "cloudinary-mcp-server"]
+      wsl: ["npx", "-y", "cloudinary-mcp-server"]
+      windows: ["npx", "-y", "cloudinary-mcp-server"]
+    command: "npx"
+    args: ["-y", "cloudinary-mcp-server"]
+    requires_api_key: true
+    env_var: "CLOUDINARY_URL"
+    env_instructions: "Set CLOUDINARY_URL (cloudinary://<api_key>:<api_secret>@<cloud_name>)"
+    package: "cloudinary-mcp-server"
 
 # Discovery queue location
 discovery_queue_path: ".pmcp/discovery_queue.json"
