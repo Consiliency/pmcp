@@ -18,7 +18,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, patch
+import inspect
 
+from mcp.server import Server
+from mcp.types import Implementation
 import pytest
 
 from pmcp.tools.handlers import get_gateway_tool_definitions
@@ -167,7 +170,6 @@ class TestTransportConstraints:
 
     def test_server_name_is_mcp_gateway(self) -> None:
         """Verify server is created with name 'mcp-gateway'."""
-        import inspect
         from pmcp.server import GatewayServer
 
         # Check the _create_server method source
@@ -176,6 +178,11 @@ class TestTransportConstraints:
         assert '"mcp-gateway"' in source, (
             "Server must be created with name 'mcp-gateway'"
         )
+
+    def test_mcp_sdk_implementation_description_surface_is_documented(self) -> None:
+        """Installed SDK has no Implementation.description field for PMCP to set."""
+        assert "description" not in inspect.signature(Server).parameters
+        assert "description" not in Implementation.model_fields
 
 
 # === Test Class 3: Singleton Lock Constraints ===

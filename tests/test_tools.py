@@ -1166,6 +1166,20 @@ class TestCatalogSearch:
         assert not hasattr(card, "output_schema")
 
     @pytest.mark.asyncio
+    async def test_catalog_search_uses_default_schema_dialect_when_schema_omits_marker(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        tool = gateway_tools._client_manager._tools["github::list_issues"]
+        tool.input_schema = {"type": "object", "properties": {}}
+
+        result = await gateway_tools.catalog_search({"query": "list_issues"})
+
+        assert (
+            result.results[0].schema_dialect
+            == "https://json-schema.org/draft/2020-12/schema"
+        )
+
+    @pytest.mark.asyncio
     async def test_catalog_search_old_tool_metadata_is_optional(
         self, gateway_tools: GatewayTools
     ) -> None:
@@ -1713,6 +1727,17 @@ class TestDescribe:
         }
         assert result.annotations == {"readOnlyHint": True}
         assert result.execution == {"taskSupport": "optional"}
+        assert result.schema_dialect == "https://json-schema.org/draft/2020-12/schema"
+
+    @pytest.mark.asyncio
+    async def test_describe_uses_default_schema_dialect_when_schema_omits_marker(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        tool = gateway_tools._client_manager._tools["github::create_issue"]
+        tool.input_schema = {"type": "object", "properties": {}}
+
+        result = await gateway_tools.describe({"tool_id": "github::create_issue"})
+
         assert result.schema_dialect == "https://json-schema.org/draft/2020-12/schema"
 
     @pytest.mark.asyncio

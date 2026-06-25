@@ -327,6 +327,8 @@ The gateway exposes **26 meta-tools** organized into four categories:
 Tool annotations are preserved as untrusted hints only; policy and safety notes
 continue to use PMCP's own risk model. When a tool schema omits `$schema`, PMCP
 reports the JSON Schema dialect as `https://json-schema.org/draft/2020-12/schema`.
+See [SPEC_COMPLIANCE.md](SPEC_COMPLIANCE.md) for the current MCP specification
+compliance matrix and next-revision tracking checklist.
 
 ### Core Tools
 
