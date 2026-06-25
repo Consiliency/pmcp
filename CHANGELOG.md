@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Cortex (data platform), Pinecone (vector DB), Azure DevOps, and the GitLab Duo
   remote MCP. Adds Identity, Automation, E-commerce, and Data-Platform discovery
   coverage.
+- Manifest (Tier 2): Elasticsearch, Chroma, Redis, Databricks (managed remote),
+  Storybook, and Cloudinary — rounding out search/vector, data-platform,
+  frontend, and media coverage.
 
 ### Changed
 - Manifest: `mongodb` now points at the official `mongodb-mcp-server`

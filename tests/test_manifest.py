@@ -1799,6 +1799,13 @@ class TestVendorAdditions2026:
         "pinecone": ("local", True),
         "azure-devops": ("local", True),
         "gitlab-duo": ("streamable-http", True),
+        # Tier 2
+        "elasticsearch": ("local", True),
+        "chroma": ("local", False),
+        "redis": ("local", True),
+        "databricks": ("streamable-http", True),
+        "storybook": ("local", False),
+        "cloudinary": ("local", True),
     }
 
     def test_new_vendor_servers_present_and_well_formed(self) -> None:
@@ -1835,6 +1842,11 @@ class TestVendorAdditions2026:
             "snowflake data warehouse cortex": "snowflake",
             "zapier automation integrations": "zapier",
             "azure devops boards and pipelines": "azure-devops",
+            "elasticsearch full text search": "elasticsearch",
+            "redis cache key value store": "redis",
+            "storybook ui components": "storybook",
+            "cloudinary media images cdn": "cloudinary",
+            "databricks unity catalog": "databricks",
         }
         for query, expected in cases.items():
             result = await match_capability(query, manifest)
