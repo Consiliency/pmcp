@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Manifest: 2026 vendor-official servers — Okta (identity/IAM), Zapier
+  (automation meta-connector), Shopify Dev and Square (commerce), Snowflake
+  Cortex (data platform), Pinecone (vector DB), Azure DevOps, and the GitLab Duo
+  remote MCP. Adds Identity, Automation, E-commerce, and Data-Platform discovery
+  coverage.
+
+### Changed
+- Manifest: `mongodb` now points at the official `mongodb-mcp-server`
+  (mongodb-js) instead of the community `mongodb-lens`, covering Atlas admin in
+  addition to queries.
+
 ## [1.15.0] - 2026-06-25
 
 ### Added
