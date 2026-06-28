@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-06-28
+
 ### Fixed
 - A single downstream stdout line larger than the read limit (default 10 MiB,
   `PMCP_STDIO_READ_LIMIT`) no longer disconnects the whole server (issue #79,
