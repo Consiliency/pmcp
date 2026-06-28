@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- A single downstream stdout line larger than the read limit (default 10 MiB,
+  `PMCP_STDIO_READ_LIMIT`) no longer disconnects the whole server (issue #79,
+  symptom 1b). The stdout reader now reads in chunks and splits on newlines
+  itself: an oversized line is dropped — failing only the request it belongs to,
+  with an actionable "output too large" message — while the connection and other
+  pending requests stay alive, so the *next* call no longer fails. Large browser
+  responses (full-page snapshots, screenshots) were a common trigger of the
+  reported "session expired"/instability. A reproduction harness lives in
+  `diagnostics/issue-79-1b/`.
 - Downstream tool calls are no longer killed by a fixed wall-clock deadline
   (issue #79, symptom 1a). `timeout_ms` is now an **inactivity (idle) timeout**:
   a call survives as long as the downstream MCP server keeps producing output
