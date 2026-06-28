@@ -203,6 +203,12 @@ MEMORY_WARN_THRESHOLD_MB = 1024  # Warn if process uses > 1GB
 # PMCP_STDIO_READ_LIMIT for hosts that need larger or smaller caps.
 DEFAULT_STDIO_READ_LIMIT = 10 * 1024 * 1024
 
+# Chunk size for draining downstream stdout. We read in chunks and split on
+# newlines ourselves (rather than StreamReader.readline) so a single oversized
+# line can be dropped — failing only its request — instead of raising and tearing
+# down the whole server connection (issue #79/1b).
+_STDIO_CHUNK_SIZE = 64 * 1024
+
 
 def _stdio_read_limit() -> int:
     raw = os.environ.get("PMCP_STDIO_READ_LIMIT")
@@ -1421,16 +1427,86 @@ class ClientManager:
         except Exception as e:
             logger.debug(f"[{name}] stderr reader error: {e}")
 
+    def _handle_stdout_line(
+        self, name: str, managed: ManagedClient, line: bytes, now: float
+    ) -> None:
+        """Dispatch one complete JSON-RPC line from a downstream server's stdout."""
+        try:
+            message = json.loads(line.decode())
+            msg_id = message.get("id")
+            if msg_id is not None and msg_id in managed.pending_requests:
+                pending = managed.pending_requests.pop(msg_id)
+
+                # Track response time
+                elapsed_ms = (now - pending.started_at) * 1000
+                managed.response_times.append(elapsed_ms)
+                if managed.response_times:
+                    managed.status.avg_response_time_ms = sum(
+                        managed.response_times
+                    ) / len(managed.response_times)
+
+                # Update pending count
+                managed.status.pending_request_count = len(managed.pending_requests)
+
+                if "error" in message:
+                    pending.future.set_exception(
+                        Exception(message["error"].get("message", "Unknown error"))
+                    )
+                else:
+                    pending.future.set_result(message.get("result", {}))
+        except json.JSONDecodeError:
+            # Non-JSON output already counted as a heartbeat by the caller.
+            logger.debug(
+                f"[{name}] Non-JSON output: {line.decode(errors='replace').strip()}"
+            )
+
+    def _fail_oversized_line(
+        self, name: str, managed: ManagedClient, limit: int
+    ) -> None:
+        """Drop an oversized stdout line: fail the in-flight request it most likely
+        belongs to (the oldest pending) but keep the server connected.
+
+        A huge single response (e.g. a browser page snapshot exceeding the read
+        limit) used to disconnect the whole server and break the next call until
+        reconnect (issue #79/1b). Instead we discard just that line and fail one
+        request with an actionable message, leaving the connection and other
+        pending requests intact.
+        """
+        msg = (
+            f"Downstream response exceeded the {limit}-byte stdout line limit and "
+            f"was dropped; the server stays connected. Raise PMCP_STDIO_READ_LIMIT "
+            f"or reduce the tool's output size."
+        )
+        logger.warning(f"[{name}] {msg}")
+        for req_id, pending in list(managed.pending_requests.items()):
+            if not pending.future.done():
+                pending.future.set_exception(Exception(msg))
+            managed.pending_requests.pop(req_id, None)
+            managed.status.pending_request_count = len(managed.pending_requests)
+            break
+
     async def _read_stdout(self, name: str, managed: ManagedClient) -> None:
-        """Read JSON-RPC messages from stdout."""
+        """Read JSON-RPC messages from stdout.
+
+        Reads in chunks and splits on newlines ourselves (rather than
+        StreamReader.readline) so a single line larger than the read limit is
+        dropped — failing only its request — instead of tearing down the whole
+        server connection (issue #79/1b).
+        """
         if not managed.process or not managed.process.stdout:
             return
 
+        stream = managed.process.stdout
+        limit = _stdio_read_limit()
         read_failure_reason: str | None = None
+        buf = bytearray()
+        # True while discarding the tail of an oversized line, staying byte-aligned
+        # to the next newline so following messages are not corrupted.
+        skipping = False
         try:
             while True:
-                line = await managed.process.stdout.readline()
-                if not line:
+                chunk = await stream.read(_STDIO_CHUNK_SIZE)
+                if not chunk:
                     # EOF - server process has exited
                     break
 
@@ -1442,43 +1518,26 @@ class ClientManager:
                 for req in managed.pending_requests.values():
                     req.last_heartbeat = now
 
-                try:
-                    message = json.loads(line.decode())
-                    msg_id = message.get("id")
-                    if msg_id is not None and msg_id in managed.pending_requests:
-                        pending = managed.pending_requests.pop(msg_id)
-
-                        # Track response time
-                        elapsed_ms = (now - pending.started_at) * 1000
-                        managed.response_times.append(elapsed_ms)
-                        if managed.response_times:
-                            managed.status.avg_response_time_ms = sum(
-                                managed.response_times
-                            ) / len(managed.response_times)
-
-                        # Update pending count
-                        managed.status.pending_request_count = len(
-                            managed.pending_requests
-                        )
-
-                        if "error" in message:
-                            pending.future.set_exception(
-                                Exception(
-                                    message["error"].get("message", "Unknown error")
-                                )
-                            )
-                        else:
-                            pending.future.set_result(message.get("result", {}))
-                except json.JSONDecodeError:
-                    # Non-JSON output already counted as a heartbeat above.
-                    logger.debug(f"[{name}] Non-JSON output: {line.decode().strip()}")
-        except asyncio.LimitOverrunError as e:
-            limit = _stdio_read_limit()
-            read_failure_reason = (
-                f"stdout line exceeded {limit}-byte read limit "
-                f"(set PMCP_STDIO_READ_LIMIT to raise)"
-            )
-            logger.warning(f"[{name}] {read_failure_reason}: {e}")
+                buf.extend(chunk)
+                while True:
+                    nl = buf.find(b"\n")
+                    if nl == -1:
+                        # No complete line yet. If the in-progress line already
+                        # exceeds the limit, drop it (fail its request) and skip to
+                        # the next newline instead of disconnecting the server.
+                        if len(buf) > limit:
+                            if not skipping:
+                                self._fail_oversized_line(name, managed, limit)
+                                skipping = True
+                            buf.clear()
+                        break
+                    raw = bytes(buf[:nl])
+                    del buf[: nl + 1]
+                    if skipping:
+                        # This newline ends the oversized line we were discarding.
+                        skipping = False
+                        continue
+                    self._handle_stdout_line(name, managed, raw, now)
         except Exception as e:
             read_failure_reason = f"stdout read error: {e}"
             logger.warning(f"[{name}] {read_failure_reason}")

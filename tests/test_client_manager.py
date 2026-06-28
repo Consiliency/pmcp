@@ -1603,7 +1603,7 @@ class TestServerHealthTracking:
 
         # Create mock process with empty stdout (EOF)
         mock_stdout = AsyncMock()
-        mock_stdout.readline = AsyncMock(return_value=b"")
+        mock_stdout.read = AsyncMock(return_value=b"")
 
         mock_process = MagicMock()
         mock_process.stdout = mock_stdout
@@ -1633,7 +1633,7 @@ class TestServerHealthTracking:
         )
 
         mock_stdout = AsyncMock()
-        mock_stdout.readline = AsyncMock(return_value=b"")
+        mock_stdout.read = AsyncMock(return_value=b"")
 
         mock_process = MagicMock()
         mock_process.stdout = mock_stdout
@@ -3006,7 +3006,7 @@ class TestIdleTimeout:
             )
             + "\n"
         )
-        cast(Any, managed.process).stdout.readline = AsyncMock(
+        cast(Any, managed.process).stdout.read = AsyncMock(
             side_effect=[notif.encode(), b""]
         )
 
@@ -3345,19 +3345,25 @@ class TestTerminateProcessTree:
 
 
 class TestReadStdoutFailureSurfacing:
-    """A LimitOverrunError or other read failure must surface its cause, not the
-    misleading generic 'Server process exited' message."""
+    """An oversized line must be dropped (failing only its request) without tearing
+    down the server (issue #79/1b); a real read error must surface its cause."""
 
     @pytest.mark.asyncio
-    async def test_limit_overrun_sets_descriptive_last_error(self) -> None:
+    async def test_oversized_line_recovers_without_disconnect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A stdout line over the read limit fails the oldest in-flight request with
+        an actionable message, and the server keeps processing later lines — it is
+        NOT disconnected mid-stream (issue #79/1b)."""
+        monkeypatch.setenv("PMCP_STDIO_READ_LIMIT", "50")
         manager = ClientManager()
 
-        # Build a fake StreamReader that raises LimitOverrunError on first readline.
+        # Sequence: an oversized chunk with no newline (overflow), then the newline
+        # ending that line, then a valid response to a DIFFERENT request, then EOF.
+        resp2 = json.dumps({"jsonrpc": "2.0", "id": 2, "result": {"ok": True}}) + "\n"
         fake_stdout = AsyncMock()
-        fake_stdout.readline = AsyncMock(
-            side_effect=asyncio.LimitOverrunError(
-                "Separator is found, but chunk is longer than limit", 65536
-            )
+        fake_stdout.read = AsyncMock(
+            side_effect=[b"X" * 200, b"junk-tail\n", resp2.encode(), b""]
         )
         fake_process = MagicMock()
         fake_process.stdout = fake_stdout
@@ -3365,22 +3371,49 @@ class TestReadStdoutFailureSurfacing:
 
         status = ServerStatus(name="big", status=ServerStatusEnum.ONLINE, tool_count=1)
         managed = ManagedClient(config=MagicMock(), process=fake_process, status=status)
-        managed.config = None  # disable the auto-reconnect path for this unit test
+        managed.config = None  # disable auto-reconnect for this unit test
+
+        f1: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        f2: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[1] = PendingRequest(
+            request_id=1,
+            server_name="big",
+            tool_id="t::big",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=f1,
+        )
+        managed.pending_requests[2] = PendingRequest(
+            request_id=2,
+            server_name="big",
+            tool_id="t::ok",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=f2,
+        )
         manager._clients["big"] = managed
 
         await manager._read_stdout("big", managed)
 
-        assert status.status == ServerStatusEnum.ERROR
-        assert status.last_error is not None
-        assert "read limit" in status.last_error
-        assert "PMCP_STDIO_READ_LIMIT" in status.last_error
+        # Request 1 (oldest, the overflow) failed with the actionable limit message,
+        # NOT a "disconnected" ConnectionError.
+        assert f1.done()
+        err = f1.exception()
+        assert err is not None and "stdout line limit" in str(err)
+        assert not isinstance(err, ConnectionError)
+        # Request 2 arrived AFTER the oversized line and was processed normally —
+        # proving the stream stayed aligned and the server was not torn down.
+        assert f2.done() and f2.result() == {"ok": True}
 
     @pytest.mark.asyncio
     async def test_generic_read_error_surfaces_in_last_error(self) -> None:
         manager = ClientManager()
 
         fake_stdout = AsyncMock()
-        fake_stdout.readline = AsyncMock(side_effect=ConnectionResetError("pipe gone"))
+        fake_stdout.read = AsyncMock(side_effect=ConnectionResetError("pipe gone"))
         fake_process = MagicMock()
         fake_process.stdout = fake_stdout
         fake_process.returncode = None
