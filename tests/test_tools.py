@@ -1113,6 +1113,7 @@ class TestRefreshCompatibility:
                 headers={"Authorization": "Bearer ${TOKEN}"},
             ),
         )
+
         # Env store now resolves TOKEN to "new-secret".
         def lookup(var: str) -> str | None:
             return "new-secret" if var == "TOKEN" else None

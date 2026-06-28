@@ -1685,9 +1685,7 @@ class ClientManager:
         # can't stall startup/refresh/connect_all for the full ceiling.
         idle_timeout_s = timeout_ms / 1000.0
         ceiling_s = (
-            _request_ceiling_ms() / 1000.0
-            if method == "tools/call"
-            else idle_timeout_s
+            _request_ceiling_ms() / 1000.0 if method == "tools/call" else idle_timeout_s
         )
         try:
             result = await self._await_with_idle_timeout(
@@ -1726,9 +1724,7 @@ class ClientManager:
         slice_s = min(idle_timeout_s, 1.0)
         while True:
             try:
-                return await asyncio.wait_for(
-                    asyncio.shield(future), timeout=slice_s
-                )
+                return await asyncio.wait_for(asyncio.shield(future), timeout=slice_s)
             except asyncio.TimeoutError:
                 if future.done():
                     return future.result()
