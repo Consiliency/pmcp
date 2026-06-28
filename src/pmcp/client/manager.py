@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 import random
+import signal
 import string
 import time
 from collections import deque
@@ -69,6 +70,65 @@ def _is_cancel_scope_task_mismatch_error(exc: BaseException) -> bool:
         and "entered" in msg
         and "exit" in msg
     )
+
+
+async def _terminate_process_tree(
+    process: asyncio.subprocess.Process | None, name: str
+) -> None:
+    """Terminate a downstream process and its whole process group.
+
+    stdio servers are spawned with ``start_new_session=True``, so the child is a
+    process-group leader; signalling the group also reaps grandchildren (e.g. the
+    Chrome that ``@playwright/mcp`` launches) that would otherwise orphan to init
+    and keep the browser profile's SingletonLock, breaking the next launch.
+
+    Falls back to single-process signals when the process is not a group leader
+    (e.g. an adopted install-time process) or the group is already gone, so this
+    never accidentally signals an unrelated group such as the gateway's own.
+    """
+    if process is None or process.returncode is not None:
+        return
+
+    def _signal(sig: int) -> None:
+        pid = process.pid
+        pgid: int | None = None
+        if isinstance(pid, int):
+            try:
+                pgid = os.getpgid(pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                pgid = None
+        # Only signal the group if this process leads it; otherwise signalling
+        # its group could hit unrelated processes (including the gateway, for an
+        # adopted process that was not given its own session).
+        if pgid is not None and pgid == pid:
+            try:
+                os.killpg(pgid, sig)
+                return
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            if sig == signal.SIGKILL:
+                process.kill()
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
+
+    _signal(signal.SIGTERM)
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    _signal(signal.SIGKILL)
+    try:
+        await asyncio.wait_for(process.wait(), timeout=3.0)
+    except asyncio.TimeoutError:
+        logger.warning(
+            f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
+            "(possible D-state / uninterruptible I/O wait)"
+        )
 
 
 # Heartbeat thresholds for health monitoring
@@ -688,19 +748,8 @@ class ClientManager:
                                 )
                             else:
                                 raise
-                elif managed.process and managed.process.returncode is None:
-                    managed.process.terminate()
-                    try:
-                        await asyncio.wait_for(managed.process.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        managed.process.kill()
-                        try:
-                            await asyncio.wait_for(managed.process.wait(), timeout=3.0)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                f"[{name}] Process PID={managed.process.pid} did not exit "
-                                "after SIGKILL (possible D-state / uninterruptible I/O wait)"
-                            )
+                else:
+                    await _terminate_process_tree(managed.process, name)
             except Exception as e:
                 logger.warning(f"Error disconnecting from {name}: {e}")
                 return (False, cancelled, str(e))
@@ -1130,6 +1179,9 @@ class ClientManager:
                 cwd=local_config.cwd,
                 env=env,
                 limit=_stdio_read_limit(),
+                # New session/process group so we can reap the whole tree
+                # (e.g. browsers launched by the server) on disconnect.
+                start_new_session=True,
             )
 
         managed = ManagedClient(
@@ -1181,8 +1233,7 @@ class ClientManager:
                     await asyncio.shield(managed.read_task)
                 except (asyncio.CancelledError, Exception):
                     pass
-            if process.returncode is None:
-                process.kill()
+            await _terminate_process_tree(process, name)
             raise
 
     async def _connect_sse(self, config: ResolvedServerConfig) -> None:
@@ -1709,19 +1760,8 @@ class ClientManager:
                                 )
                             else:
                                 raise
-                elif managed.process and managed.process.returncode is None:
-                    managed.process.terminate()
-                    try:
-                        await asyncio.wait_for(managed.process.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        managed.process.kill()
-                        try:
-                            await asyncio.wait_for(managed.process.wait(), timeout=3.0)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                f"[{name}] Process PID={managed.process.pid} did not exit "
-                                f"after SIGKILL (possible D-state / uninterruptible I/O wait)"
-                            )
+                else:
+                    await _terminate_process_tree(managed.process, name)
             except Exception as e:
                 logger.warning(f"Error disconnecting from {name}: {e}")
 
@@ -1751,14 +1791,7 @@ class ClientManager:
             except (asyncio.CancelledError, Exception):
                 pass
         await self._cancel_background_tasks(server_name=name)
-        if managed.process and managed.process.returncode is None:
-            managed.process.kill()
-            try:
-                await asyncio.wait_for(managed.process.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[{name}] Process did not exit after SIGKILL in _cleanup_client"
-                )
+        await _terminate_process_tree(managed.process, name)
         self._clients.pop(name, None)
         self._servers.pop(name, None)
         self._remove_server_indexes(name)
@@ -2163,6 +2196,14 @@ class ClientManager:
     def get_all_server_statuses(self) -> list[ServerStatus]:
         """Get all server statuses."""
         return sorted(self._servers.values(), key=lambda status: status.name)
+
+    def get_connected_configs(self) -> dict[str, ResolvedServerConfig]:
+        """Return resolved configs for currently-connected servers, keyed by name.
+
+        Used by gateway.refresh to diff the running set against a freshly
+        resolved config set so unchanged servers are left running.
+        """
+        return {name: managed.config for name, managed in self._clients.items()}
 
     def get_registry_meta(self) -> tuple[str, float]:
         """Get registry metadata (revision_id, last_refresh_ts)."""

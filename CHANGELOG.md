@@ -17,6 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configurable via `PMCP_REQUEST_CEILING_MS` (default 600000ms / 10 min). This
   unblocks legitimately long browser/automation operations driven through the
   gateway.
+- Stdio servers are now spawned in their own session/process group
+  (`start_new_session=True`) and reaped as a whole tree on disconnect (issue
+  #79, symptom 1c). Previously, killing a stdio server (e.g. `@playwright/mcp`)
+  left the browser it launched orphaned to init, holding the profile's
+  SingletonLock and breaking the next launch. A new group-aware
+  `_terminate_process_tree` helper (SIGTERM the group, wait, then SIGKILL, with
+  a single-process fallback when the process is not a group leader) now backs
+  all four downstream shutdown paths.
+- `gateway.refresh` is now diff-based and non-destructive (issue #79, symptom
+  2). Servers whose resolved config is unchanged are left connected and
+  running; only servers that were removed or whose config changed are
+  disconnected, and only newly-added eager servers are connected. Previously
+  refresh tore down **every** server and reconnected only the eager set, which
+  dropped previously-running lazy/provisioned servers to offline (the reported
+  "105 seen, 0 online") and needlessly respawned unchanged processes (e.g. a
+  live browser) on every refresh.
 
 ### Added
 - `gateway.catalog_search` with `include_offline=true` now surfaces

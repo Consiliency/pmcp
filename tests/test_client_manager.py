@@ -23,6 +23,7 @@ from pmcp.client.manager import (
     _extract_tags,
     _infer_risk_hint,
     _remote_headers,
+    _terminate_process_tree,
     _truncate_description,
 )
 from pmcp.env_store import write_env_file
@@ -2568,7 +2569,9 @@ class TestCleanupClient:
         await manager._cleanup_client("test", managed)
 
         managed.read_task.cancel.assert_called_once()  # type: ignore[union-attr]
-        managed.process.kill.assert_called_once()  # type: ignore[union-attr]
+        # _terminate_process_tree gracefully SIGTERMs first (the process exits
+        # within the wait window, so SIGKILL is never needed).
+        managed.process.terminate.assert_called_once()  # type: ignore[union-attr]
         assert "test" not in manager._clients
         assert "test" not in manager._servers
 
@@ -2582,7 +2585,7 @@ class TestCleanupClient:
         await manager._cleanup_client("test", managed)
 
         managed.read_task.cancel.assert_not_called()  # type: ignore[union-attr]
-        managed.process.kill.assert_called_once()  # type: ignore[union-attr]
+        managed.process.terminate.assert_called_once()  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
     async def test_cleanup_client_skips_kill_if_process_exited(self) -> None:
@@ -2654,7 +2657,12 @@ class TestDisconnectAllPostKill:
         manager._clients["slow"] = managed
         manager._servers["slow"] = status
 
-        with patch("pmcp.client.manager.logger") as mock_logger:
+        with (
+            patch("pmcp.client.manager.logger") as mock_logger,
+            patch(
+                "pmcp.client.manager.os.getpgid", side_effect=ProcessLookupError
+            ),
+        ):
             await manager.disconnect_all()
 
         mock_process.kill.assert_called_once()
@@ -2683,7 +2691,12 @@ class TestDisconnectAllPostKill:
         manager._clients["slow2"] = managed
         manager._servers["slow2"] = status
 
-        with patch("pmcp.client.manager.logger") as mock_logger:
+        with (
+            patch("pmcp.client.manager.logger") as mock_logger,
+            patch(
+                "pmcp.client.manager.os.getpgid", side_effect=ProcessLookupError
+            ),
+        ):
             await manager.disconnect_all()
 
         mock_process.kill.assert_called_once()
@@ -3118,6 +3131,83 @@ class TestStdioReadLimit:
 
         assert "limit" in captured, "create_subprocess_exec must be called with limit="
         assert captured["limit"] == 10 * 1024 * 1024
+
+    @pytest.mark.asyncio
+    async def test_connect_stdio_starts_new_session(self) -> None:
+        """_connect_stdio must spawn with start_new_session=True so the whole
+        process tree (e.g. browsers) can be reaped on disconnect (issue #79)."""
+        manager = ClientManager()
+        captured: dict[str, Any] = {}
+
+        async def fake_create(*args: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            raise RuntimeError("stop here")
+
+        config = ResolvedServerConfig(
+            name="x",
+            source="project",
+            config=LocalMcpServerConfig(command="fake", args=[]),
+        )
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create):
+            with pytest.raises(RuntimeError, match="stop here"):
+                await manager._connect_stdio(config)
+
+        assert captured.get("start_new_session") is True
+
+
+class TestTerminateProcessTree:
+    """Tests for the group-aware _terminate_process_tree helper (issue #79)."""
+
+    @pytest.mark.asyncio
+    async def test_terminates_whole_process_group(self) -> None:
+        """When the process leads its group, SIGTERM goes to the group."""
+        import signal
+
+        process = MagicMock()
+        process.pid = 4321
+        process.returncode = None
+        process.wait = AsyncMock(return_value=0)
+
+        with (
+            patch("pmcp.client.manager.os.getpgid", return_value=4321),
+            patch("pmcp.client.manager.os.killpg") as mock_killpg,
+        ):
+            await _terminate_process_tree(process, "browser")
+
+        mock_killpg.assert_called_once_with(4321, signal.SIGTERM)
+        # Group signal succeeded, so we never fall back to single-process kill.
+        process.terminate.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_single_process_on_process_lookup_error(self) -> None:
+        """If killpg raises ProcessLookupError, fall back to process.terminate()."""
+        process = MagicMock()
+        process.pid = 4321
+        process.returncode = None
+        process.wait = AsyncMock(return_value=0)
+
+        with (
+            patch("pmcp.client.manager.os.getpgid", return_value=4321),
+            patch(
+                "pmcp.client.manager.os.killpg", side_effect=ProcessLookupError
+            ),
+        ):
+            await _terminate_process_tree(process, "browser")
+
+        process.terminate.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_process_already_exited(self) -> None:
+        """A process that already exited must not be signalled."""
+        process = MagicMock()
+        process.pid = 4321
+        process.returncode = 0
+
+        with patch("pmcp.client.manager.os.killpg") as mock_killpg:
+            await _terminate_process_tree(process, "browser")
+
+        mock_killpg.assert_not_called()
+        process.terminate.assert_not_called()
 
 
 class TestReadStdoutFailureSurfacing:

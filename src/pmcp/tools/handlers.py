@@ -157,6 +157,66 @@ logger = logging.getLogger(__name__)
 
 FEEDBACK_TOKEN_LIMIT = 4000
 
+
+def _refresh_config_unchanged(
+    old: ResolvedServerConfig, new: ResolvedServerConfig
+) -> bool:
+    """Return True if two resolved configs describe the same downstream process.
+
+    Used by gateway.refresh's diff so unchanged servers are left running.
+
+    We compare only the fields that actually affect the spawned process
+    (command/args/cwd/env for local, url/headers/transport for remote) rather
+    than using full-model equality, for two reasons:
+
+    * ``env`` is compared by its *effective* override only — entries that
+      actually differ from ``os.environ``. The same logical server can be stored
+      with different env representations depending on how it entered the manager:
+      an adopted/provisioned server keeps env resolved from ``os.environ``
+      (``manifest_server_to_config``), while the loader resolves the identical
+      server with ``env=None`` (``_manifest_server_to_config(..., lambda: None)``).
+      Both spawn identically because ``_connect_stdio`` seeds ``os.environ.copy()``
+      first, so an override that merely mirrors ``os.environ`` is a no-op. Naively
+      comparing ``env`` would spuriously tear down running provisioned servers on
+      every refresh (issue #79); comparing only the genuine override still
+      detects a real env change.
+    * ``source`` is excluded (e.g. ``manifest`` vs the configured source for the
+      same effective server).
+    """
+    if old.name != new.name:
+        return False
+    old_cfg, new_cfg = old.config, new.config
+    if type(old_cfg) is not type(new_cfg):
+        return False
+    if isinstance(old_cfg, LocalMcpServerConfig) and isinstance(
+        new_cfg, LocalMcpServerConfig
+    ):
+
+        def _effective_env(env: dict[str, str] | None) -> dict[str, str]:
+            # Only overrides that actually change the spawned environment.
+            return {
+                key: value
+                for key, value in (env or {}).items()
+                if os.environ.get(key) != value
+            }
+
+        return (
+            old_cfg.command == new_cfg.command
+            and old_cfg.args == new_cfg.args
+            and old_cfg.cwd == new_cfg.cwd
+            and _effective_env(old_cfg.env) == _effective_env(new_cfg.env)
+        )
+    if isinstance(old_cfg, RemoteMcpServerConfig) and isinstance(
+        new_cfg, RemoteMcpServerConfig
+    ):
+        return (
+            old_cfg.url == new_cfg.url
+            and old_cfg.headers == new_cfg.headers
+            and old_cfg.type == new_cfg.type
+        )
+    return False
+
+
 # Risk level ordering for filtering
 RISK_ORDER = {"low": 1, "medium": 2, "high": 3, "unknown": 4}
 TRACE_CONTEXT_KEYS = ("traceparent", "tracestate", "baggage")
@@ -2095,9 +2155,59 @@ class GatewayTools:
             self.set_startup_observations(
                 build_startup_observation_snapshot(resolution)
             )
-            await self._client_manager.disconnect_all()
+
+            # Diff-based refresh: leave servers whose resolved config is
+            # unchanged connected and running. Only disconnect servers that were
+            # removed (or are no longer in the resolved set at all, e.g. now
+            # policy-denied/missing-auth) or whose config changed, and only
+            # eagerly connect newly-added/changed eager servers. This avoids
+            # dropping previously-running lazy/provisioned servers to offline
+            # and avoids needlessly respawning unchanged processes (e.g. a live
+            # browser) on every refresh.
+            #
+            # Equality uses _refresh_config_unchanged, which compares the fields
+            # that affect the spawned process (command/args/cwd for local,
+            # url/headers/transport for remote). The keep-set is the union of
+            # eager AND lazy: a lazily-started server (e.g. a provisioned browser
+            # put into _clients by ensure_connected) resolves as lazy here, and
+            # must NOT be torn down.
+            current_configs = self._client_manager.get_connected_configs()
+            eager_by_name = {
+                config.name: config for config in resolution.eager_configs
+            }
+            keep_by_name = {
+                config.name: config
+                for config in resolution.eager_configs + resolution.lazy_configs
+            }
+            to_disconnect = [
+                name
+                for name, current in current_configs.items()
+                if name not in keep_by_name
+                or not _refresh_config_unchanged(current, keep_by_name[name])
+            ]
+            to_connect = [
+                config
+                for name, config in eager_by_name.items()
+                if name not in current_configs
+                or not _refresh_config_unchanged(current_configs[name], config)
+            ]
+
+            for name in to_disconnect:
+                # Pending/active work was already gated (and force-cancelled)
+                # above, so force the per-server disconnect here.
+                await self._client_manager.disconnect_server(name, force=True)
+
+            # Lazy configs are still (re)registered as today. We intentionally do
+            # not aggressively prune _lazy_configs for servers that vanished: a
+            # removed-but-connected server is disconnected above, and any stale
+            # on-demand entry is harmless (it only matters if later explicitly
+            # ensure_connected'd). This keeps the change minimal and avoids
+            # touching disconnect_server's existing lazy-retention semantics.
             self._client_manager.register_lazy_configs(resolution.lazy_configs)
-            errors = await self._client_manager.connect_all(resolution.eager_configs)
+
+            errors: list[str] = []
+            if to_connect:
+                errors = await self._client_manager.connect_all(to_connect)
             pending_remaining = len(self._client_manager.get_pending_requests())
 
             revision_id, _ = self._client_manager.get_registry_meta()

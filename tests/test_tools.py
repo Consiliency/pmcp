@@ -24,10 +24,14 @@ from pmcp.manifest.registry import (
     RegistryServerEntry,
 )
 from pmcp.config.guidance import GuidanceConfig
-from pmcp.config.loader import StartupObservation
+from pmcp.config.loader import StartupObservation, manifest_server_to_config
 from pmcp.errors import GatewayException
 from pmcp.policy.policy import PolicyManager
-from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
+from pmcp.tools.handlers import (
+    GatewayTools,
+    _refresh_config_unchanged,
+    get_gateway_tool_definitions,
+)
 from pmcp.types import (
     CLIHint,
     CLIResolution,
@@ -109,6 +113,7 @@ class MockClientManager:
         self._revision_id = "test-rev"
         self._last_refresh_ts = 1234567890.0
         self.connected_configs: list[Any] = []
+        self.connected_config_map: dict[str, Any] = {}
         self.refreshed_configs: list[Any] = []
         self.lazy_configs: list[Any] = []
         self.disconnected = False
@@ -303,9 +308,26 @@ class MockClientManager:
         self.refreshed_configs = list(configs)
         return []
 
+    def get_connected_configs(self) -> dict[str, Any]:
+        return dict(self.connected_config_map)
+
+    def add_connected_server(self, config: Any) -> None:
+        """Pre-populate an already-connected, online server (test helper)."""
+        self.connected_config_map[config.name] = config
+        self._online_servers.add(config.name)
+        self._server_statuses = [
+            status for status in self._server_statuses if status.name != config.name
+        ]
+        self._server_statuses.append(
+            ServerStatus(
+                name=config.name, status=ServerStatusEnum.ONLINE, tool_count=0
+            )
+        )
+
     async def disconnect_all(self) -> None:
         self.events.append("disconnect")
         self.disconnected = True
+        self.connected_config_map.clear()
 
     def register_lazy_configs(self, configs: list[Any]) -> None:
         self.events.append("register_lazy")
@@ -318,6 +340,7 @@ class MockClientManager:
         self.connected_configs.extend(configs)
         for config in configs:
             self._online_servers.add(config.name)
+            self.connected_config_map[config.name] = config
         return []
 
     async def connect_server(self, config: Any, retry: bool = True) -> list[str]:
@@ -326,6 +349,7 @@ class MockClientManager:
         if config.name == "fails-connect":
             return [f"Failed to connect to {config.name}: boom"]
         self._online_servers.add(config.name)
+        self.connected_config_map[config.name] = config
         self._lazy_servers.discard(config.name)
         self._server_statuses = [
             status for status in self._server_statuses if status.name != config.name
@@ -349,6 +373,7 @@ class MockClientManager:
             )
         cancelled = self.cancel_pending_requests(name) if pending else 0
         self._online_servers.discard(name)
+        self.connected_config_map.pop(name, None)
         self._lazy_servers.add(name)
         self._server_statuses = [
             status for status in self._server_statuses if status.name != name
@@ -630,7 +655,9 @@ class TestRefreshCompatibility:
         result = await gateway_tools.refresh({"reason": "test"})
 
         assert result.ok is True
-        assert client_manager.disconnected is True
+        # Diff-based refresh no longer tears everything down; nothing was
+        # connected and the resolution is all-lazy, so no disconnect happens.
+        assert client_manager.disconnected is False
         assert client_manager.refreshed_configs == []
         assert [config.name for config in client_manager.lazy_configs] == [
             "configured",
@@ -789,6 +816,195 @@ class TestRefreshCompatibility:
         assert client_manager.connected_configs == []
 
     @pytest.mark.asyncio
+    async def test_refresh_keeps_unchanged_lazy_server_online(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A connected server that resolves as lazy must stay online (issue #79).
+
+        This is the discriminating case: a lazily-started server (e.g. a
+        provisioned browser put into _clients by ensure_connected) resolves as
+        lazy on refresh. The diff must keep it, not tear it down.
+        """
+        client_manager = MockClientManager()
+        config = ResolvedServerConfig(
+            name="browser",
+            source="project",
+            config=LocalMcpServerConfig(command="browser-cmd"),
+        )
+        client_manager.add_connected_server(config)
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        # No auto_start -> "browser" resolves as lazy on this refresh.
+        patch_refresh_config_sources(monkeypatch, [config])
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert "disconnect_server:browser:True" not in client_manager.events
+        assert "connect" not in client_manager.events
+        assert client_manager.is_server_online("browser") is True
+        assert result.servers_online == 1
+        assert [c.name for c in client_manager.lazy_configs] == ["browser"]
+
+    @pytest.mark.asyncio
+    async def test_refresh_keeps_adopted_provisioned_server_online(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A runtime-adopted provisioned server must survive refresh (issue #79).
+
+        This is the scenario that produced "105 seen, 0 online": the adopted
+        config stores env resolved from os.environ
+        (manifest_server_to_config), while the loader resolves the same server
+        with env=None. Full-model equality would differ and tear it down; the
+        diff must treat them as the same process and keep it.
+        """
+        monkeypatch.setenv("PROV_KEY", "secret-value")
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "prov": ServerConfig(
+                    name="prov",
+                    description="Provisioned w/ api key",
+                    keywords=["prov"],
+                    install={},
+                    command="prov-cmd",
+                    args=[],
+                    requires_api_key=True,
+                    env_var="PROV_KEY",
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        client_manager = MockClientManager()
+        # Connected config carries env resolved from os.environ (adopt path).
+        adopted = manifest_server_to_config(manifest.servers["prov"])
+        assert adopted.config.env == {"PROV_KEY": "secret-value"}
+        client_manager.add_connected_server(adopted)
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_enabled_auto_start", lambda **_: set()
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_disabled_auto_start", lambda **_: set()
+        )
+        monkeypatch.setattr(
+            gateway_tools,
+            "_load_provisioned_registry",
+            lambda: {"prov": "PROV_KEY"},
+        )
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert "disconnect_server:prov:True" not in client_manager.events
+        assert "connect" not in client_manager.events
+        assert client_manager.is_server_online("prov") is True
+        assert result.servers_online == 1
+
+    @pytest.mark.asyncio
+    async def test_refresh_keeps_unchanged_eager_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unchanged eager server is left running, not respawned."""
+        client_manager = MockClientManager()
+        config = ResolvedServerConfig(
+            name="eager",
+            source="project",
+            config=LocalMcpServerConfig(command="eager-cmd"),
+        )
+        client_manager.add_connected_server(config)
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        patch_refresh_config_sources(monkeypatch, [config])
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_enabled_auto_start",
+            lambda **_: {"eager"},
+        )
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert "disconnect_server:eager:True" not in client_manager.events
+        assert "connect" not in client_manager.events
+        assert client_manager.is_server_online("eager") is True
+        assert result.servers_online == 1
+
+    @pytest.mark.asyncio
+    async def test_refresh_disconnects_removed_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A server removed from config is disconnected on refresh."""
+        client_manager = MockClientManager()
+        client_manager.add_connected_server(
+            ResolvedServerConfig(
+                name="gone",
+                source="project",
+                config=LocalMcpServerConfig(command="gone-cmd"),
+            )
+        )
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        patch_refresh_config_sources(monkeypatch, [])
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert "disconnect_server:gone:True" in client_manager.events
+        assert client_manager.is_server_online("gone") is False
+
+    @pytest.mark.asyncio
+    async def test_refresh_reconnects_changed_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A server whose config changed is disconnected and reconnected."""
+        client_manager = MockClientManager()
+        client_manager.add_connected_server(
+            ResolvedServerConfig(
+                name="srv",
+                source="project",
+                config=LocalMcpServerConfig(command="old-cmd"),
+            )
+        )
+        new_config = ResolvedServerConfig(
+            name="srv",
+            source="project",
+            config=LocalMcpServerConfig(command="new-cmd"),
+        )
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        patch_refresh_config_sources(monkeypatch, [new_config])
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_enabled_auto_start",
+            lambda **_: {"srv"},
+        )
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert "disconnect_server:srv:True" in client_manager.events
+        assert [c.name for c in client_manager.connected_configs] == ["srv"]
+        assert client_manager.connected_config_map["srv"].config.command == "new-cmd"
+        assert client_manager.is_server_online("srv") is True
+
+    @pytest.mark.asyncio
     async def test_refresh_refuses_pending_requests_by_default(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -872,9 +1088,11 @@ class TestRefreshCompatibility:
         assert result.pending_requests_seen == 1
         assert result.pending_requests_cancelled == 1
         assert result.pending_requests_remaining == 0
+        # Diff-based refresh: force still cancels pending first, then (nothing
+        # was connected so no per-server disconnect) registers lazy and connects
+        # the newly-eager server.
         assert client_manager.events == [
             "cancel_all",
-            "disconnect",
             "register_lazy",
             "connect",
         ]
@@ -939,11 +1157,12 @@ class TestRefreshCompatibility:
 
         assert refused.ok is False
         assert refused.pending_requests_refused == 1
+        # Diff-based refresh with no configured/eager servers: the forced refresh
+        # cancels pending then only re-registers lazy configs (nothing to
+        # disconnect or connect).
         assert client_manager.events == [
             "cancel_all",
-            "disconnect",
             "register_lazy",
-            "connect",
         ]
         assert forced.ok is True
         assert forced.pending_requests_cancelled == 1
@@ -997,6 +1216,58 @@ class TestRefreshCompatibility:
         assert after_health.servers[0].status == "online"
         assert after_pending.requests[0].request_id == "active::1"
         assert client_manager.events == []
+
+
+class TestRefreshConfigUnchanged:
+    """Unit tests for the gateway.refresh config-equality helper (issue #79)."""
+
+    def _local(self, **kwargs: Any) -> ResolvedServerConfig:
+        return ResolvedServerConfig(
+            name=kwargs.pop("name", "srv"),
+            source=kwargs.pop("source", "project"),
+            config=LocalMcpServerConfig(**kwargs),
+        )
+
+    def test_same_process_is_unchanged(self) -> None:
+        a = self._local(command="c", args=["x"])
+        b = self._local(command="c", args=["x"])
+        assert _refresh_config_unchanged(a, b) is True
+
+    def test_command_change_detected(self) -> None:
+        a = self._local(command="old")
+        b = self._local(command="new")
+        assert _refresh_config_unchanged(a, b) is False
+
+    def test_source_difference_ignored(self) -> None:
+        a = self._local(command="c", source="manifest")
+        b = self._local(command="c", source="project")
+        assert _refresh_config_unchanged(a, b) is True
+
+    def test_env_mirroring_environ_is_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Adopt path stores env resolved from os.environ; loader stores None.
+        monkeypatch.setenv("KEY", "val")
+        adopted = self._local(command="c", env={"KEY": "val"})
+        loader = self._local(command="c", env=None)
+        assert _refresh_config_unchanged(adopted, loader) is True
+
+    def test_genuine_env_override_change_detected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OVERRIDE", raising=False)
+        a = self._local(command="c", env={"OVERRIDE": "old"})
+        b = self._local(command="c", env={"OVERRIDE": "new"})
+        assert _refresh_config_unchanged(a, b) is False
+
+    def test_type_mismatch_detected(self) -> None:
+        local = self._local(command="c")
+        remote = ResolvedServerConfig(
+            name="srv",
+            source="project",
+            config=RemoteMcpServerConfig(url="https://x"),
+        )
+        assert _refresh_config_unchanged(local, remote) is False
 
 
 class TestCatalogSearch:
