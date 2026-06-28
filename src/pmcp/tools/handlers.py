@@ -12,6 +12,7 @@ import platform
 import shutil
 from collections import deque
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Literal, cast
 from urllib.request import urlopen
 from urllib.parse import urlencode
@@ -159,7 +160,11 @@ FEEDBACK_TOKEN_LIMIT = 4000
 
 
 def _refresh_config_unchanged(
-    old: ResolvedServerConfig, new: ResolvedServerConfig
+    old: ResolvedServerConfig,
+    new: ResolvedServerConfig,
+    *,
+    header_env_lookup: Callable[[str], str | None] | None = None,
+    old_resolved_headers: dict[str, str] | None = None,
 ) -> bool:
     """Return True if two resolved configs describe the same downstream process.
 
@@ -179,9 +184,19 @@ def _refresh_config_unchanged(
       first, so an override that merely mirrors ``os.environ`` is a no-op. Naively
       comparing ``env`` would spuriously tear down running provisioned servers on
       every refresh (issue #79); comparing only the genuine override still
-      detects a real env change.
+      detects a real env change. (Known limitation: rotation of an *ambient*
+      secret that is not an explicit override cannot be detected here without a
+      spawn-time env snapshot.)
     * ``source`` is excluded (e.g. ``manifest`` vs the configured source for the
       same effective server).
+
+    Remote ``headers`` are compared *after* resolving ``${VAR}`` placeholders.
+    The raw config keeps the same placeholder across a token rotation, so the
+    only way to detect rotation is to compare the value the server was actually
+    connected with — ``old_resolved_headers`` (captured at connect time) — against
+    the freshly-resolved ``new`` headers (via ``header_env_lookup``). Without that
+    the remote connection would silently keep stale/revoked auth across a refresh.
+    When neither is supplied (e.g. unit tests), the raw headers are compared.
     """
     if old.name != new.name:
         return False
@@ -209,9 +224,27 @@ def _refresh_config_unchanged(
     if isinstance(old_cfg, RemoteMcpServerConfig) and isinstance(
         new_cfg, RemoteMcpServerConfig
     ):
+        old_headers: dict[str, str] | None
+        new_headers: dict[str, str] | None
+        if header_env_lookup is not None:
+            new_headers = resolve_remote_headers(
+                new_cfg.headers, header_env_lookup
+            ).resolved_headers
+        else:
+            new_headers = new_cfg.headers
+        if old_resolved_headers is not None:
+            # The value the running server was actually connected with — this is
+            # what reveals an env-store token rotation.
+            old_headers = old_resolved_headers
+        elif header_env_lookup is not None:
+            old_headers = resolve_remote_headers(
+                old_cfg.headers, header_env_lookup
+            ).resolved_headers
+        else:
+            old_headers = old_cfg.headers
         return (
             old_cfg.url == new_cfg.url
-            and old_cfg.headers == new_cfg.headers
+            and old_headers == new_headers
             and old_cfg.type == new_cfg.type
         )
     return False
@@ -2172,6 +2205,7 @@ class GatewayTools:
             # put into _clients by ensure_connected) resolves as lazy here, and
             # must NOT be torn down.
             current_configs = self._client_manager.get_connected_configs()
+            header_env_lookup = build_remote_header_env_lookup(self._project_root)
             eager_by_name = {
                 config.name: config for config in resolution.eager_configs
             }
@@ -2179,17 +2213,45 @@ class GatewayTools:
                 config.name: config
                 for config in resolution.eager_configs + resolution.lazy_configs
             }
+
+            def _live_keep(name: str) -> bool:
+                # Keep a server connected only if it is actually ONLINE, still in
+                # the resolved keep-set, and its (resolved) config is unchanged.
+                # A present-but-not-ONLINE entry (e.g. a crashed eager server left
+                # in _clients with status ERROR after its reconnect attempts
+                # exhausted) is NOT a live keep — it is torn down here and, if
+                # eager, reconnected below, so `gateway.refresh` heals it again.
+                return (
+                    name in keep_by_name
+                    and self._client_manager.is_server_online(name)
+                    and _refresh_config_unchanged(
+                        current_configs[name],
+                        keep_by_name[name],
+                        header_env_lookup=header_env_lookup,
+                        old_resolved_headers=(
+                            self._client_manager.get_connected_resolved_headers(name)
+                        ),
+                    )
+                )
+
             to_disconnect = [
-                name
-                for name, current in current_configs.items()
-                if name not in keep_by_name
-                or not _refresh_config_unchanged(current, keep_by_name[name])
+                name for name in current_configs if not _live_keep(name)
             ]
             to_connect = [
                 config
                 for name, config in eager_by_name.items()
-                if name not in current_configs
-                or not _refresh_config_unchanged(current_configs[name], config)
+                if not (
+                    name in current_configs
+                    and self._client_manager.is_server_online(name)
+                    and _refresh_config_unchanged(
+                        current_configs[name],
+                        config,
+                        header_env_lookup=header_env_lookup,
+                        old_resolved_headers=(
+                            self._client_manager.get_connected_resolved_headers(name)
+                        ),
+                    )
+                )
             ]
 
             for name in to_disconnect:
@@ -2197,13 +2259,13 @@ class GatewayTools:
                 # above, so force the per-server disconnect here.
                 await self._client_manager.disconnect_server(name, force=True)
 
-            # Lazy configs are still (re)registered as today. We intentionally do
-            # not aggressively prune _lazy_configs for servers that vanished: a
-            # removed-but-connected server is disconnected above, and any stale
-            # on-demand entry is harmless (it only matters if later explicitly
-            # ensure_connected'd). This keeps the change minimal and avoids
-            # touching disconnect_server's existing lazy-retention semantics.
             self._client_manager.register_lazy_configs(resolution.lazy_configs)
+            # Reconcile the lazy set to the resolved keep-set: drop on-demand
+            # entries for servers that are now removed / policy-denied /
+            # missing-auth (and undo disconnect_server's re-registration of the
+            # ones we just tore down) so they can no longer be lazily started via
+            # ensure_connected().
+            self._client_manager.prune_lazy_configs(set(keep_by_name))
 
             errors: list[str] = []
             if to_connect:

@@ -3163,7 +3163,14 @@ class TestTerminateProcessTree:
 
     @pytest.mark.asyncio
     async def test_terminates_whole_process_group(self) -> None:
-        """When the process leads its group, SIGTERM goes to the group."""
+        """When the process leads its group, SIGTERM goes to the group; once the
+        group is gone (probe raises) no SIGKILL escalation happens."""
+
+        def killpg_side(pgid: int, sig: int) -> None:
+            if sig == 0:  # liveness probe: report the group already gone
+                raise ProcessLookupError
+            return None
+
         process = MagicMock()
         process.pid = 4321
         process.returncode = None
@@ -3171,13 +3178,23 @@ class TestTerminateProcessTree:
 
         with (
             patch("pmcp.client.manager.os.getpgid", return_value=4321),
-            patch("pmcp.client.manager.os.killpg") as mock_killpg,
+            patch(
+                "pmcp.client.manager.os.killpg", side_effect=killpg_side
+            ) as mock_killpg,
         ):
             await _terminate_process_tree(process, "browser")
 
-        mock_killpg.assert_called_once_with(4321, signal.SIGTERM)
+        # SIGTERM was delivered to the group...
+        assert any(
+            c.args == (4321, signal.SIGTERM) for c in mock_killpg.call_args_list
+        )
+        # ...and since the group probe reported it gone, no SIGKILL escalation.
+        assert not any(
+            c.args == (4321, signal.SIGKILL) for c in mock_killpg.call_args_list
+        )
         # Group signal succeeded, so we never fall back to single-process kill.
         process.terminate.assert_not_called()
+        process.kill.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_falls_back_to_single_process_on_process_lookup_error(self) -> None:
@@ -3257,6 +3274,60 @@ class TestTerminateProcessTree:
 
         assert await _gone(parent_pid), "parent process was not reaped"
         assert await _gone(child_pid), "grandchild process was orphaned, not reaped"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not hasattr(os, "killpg"), reason="process-group reaping is POSIX-only"
+    )
+    async def test_sigterm_ignoring_grandchild_is_group_sigkilled(self) -> None:
+        """A grandchild that ignores SIGTERM and outlives the leader must still be
+        reaped via the group SIGKILL escalation (issue #79/1c — codex finding).
+
+        The parent dies on SIGTERM (default disposition); the grandchild installs
+        SIG_IGN for SIGTERM, so it survives the SIGTERM phase. The helper must
+        then SIGKILL the surviving group rather than returning once the leader is
+        gone.
+        """
+        child_code = (
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        parent_code = (
+            "import subprocess, sys, time\n"
+            f"c = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            "print(c.pid, flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            parent_code,
+            stdout=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        child_pid = int((await asyncio.wait_for(process.stdout.readline(), 10.0)).strip())
+        parent_pid = process.pid
+        os.kill(parent_pid, 0)
+        os.kill(child_pid, 0)
+
+        await _terminate_process_tree(process, "ignore")
+
+        async def _gone(pid: int) -> bool:
+            for _ in range(30):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                await asyncio.sleep(0.1)
+            return False
+
+        assert await _gone(parent_pid), "parent was not reaped"
+        assert await _gone(
+            child_pid
+        ), "SIGTERM-ignoring grandchild was not group-SIGKILLed"
 
     @pytest.mark.asyncio
     async def test_windows_falls_back_without_killpg(

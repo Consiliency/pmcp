@@ -117,21 +117,62 @@ async def _terminate_process_tree(
         except ProcessLookupError:
             pass
 
+    # Cache the process group up front: once the leader exits, os.getpgid(pid)
+    # fails, so we could no longer find the group to escalate against. Only set
+    # when this process leads its own group (POSIX, start_new_session=True).
+    group_pgid: int | None = None
+    pid = process.pid
+    if isinstance(pid, int) and hasattr(os, "getpgid") and hasattr(os, "killpg"):
+        try:
+            if os.getpgid(pid) == pid:
+                group_pgid = pid
+        except (ProcessLookupError, PermissionError, OSError):
+            group_pgid = None
+
+    def _group_alive() -> bool:
+        if group_pgid is None:
+            return False
+        try:
+            os.killpg(group_pgid, 0)  # signal 0 == liveness probe
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
     _signal(kill=False)
     try:
         await asyncio.wait_for(process.wait(), timeout=5.0)
-        return
+        leader_exited = True
     except asyncio.TimeoutError:
-        pass
+        leader_exited = False
 
-    _signal(kill=True)
-    try:
-        await asyncio.wait_for(process.wait(), timeout=3.0)
-    except asyncio.TimeoutError:
-        logger.warning(
-            f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
-            "(possible D-state / uninterruptible I/O wait)"
-        )
+    # If the leader is still alive, SIGKILL it (and, when it leads a group, the
+    # whole group). The leader exiting is NOT sufficient: a grandchild (e.g. a
+    # SIGTERM-ignoring browser) can outlive the leader inside the group and keep
+    # the profile SingletonLock — so we still escalate to a group SIGKILL below.
+    if not leader_exited:
+        _signal(kill=True)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
+                "(possible D-state / uninterruptible I/O wait)"
+            )
+
+    if _group_alive():
+        try:
+            os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        for _ in range(30):  # up to ~3s for the OS to reap the group
+            if not _group_alive():
+                break
+            await asyncio.sleep(0.1)
+        else:
+            logger.warning(
+                f"[{name}] process group {group_pgid} survived SIGKILL "
+                "(possible orphaned grandchild / D-state)"
+            )
 
 
 # Heartbeat thresholds for health monitoring
@@ -418,6 +459,10 @@ class ManagedClient:
     request_id: int = 0
     pending_requests: dict[int, PendingRequest] = field(default_factory=dict)
     read_task: asyncio.Task[None] | None = None
+    # Remote auth headers as RESOLVED at connect time (placeholders expanded).
+    # gateway.refresh compares these against freshly-resolved headers to detect
+    # token rotation in the env store, which leaves the raw config unchanged.
+    resolved_remote_headers: dict[str, str] | None = None
     # Health monitoring: rolling window of response times for avg calculation
     response_times: deque[float] = field(default_factory=lambda: deque(maxlen=100))
     # Reconnect storm guard: True while a _reconnect_loop task is in flight
@@ -595,6 +640,23 @@ class ClientManager:
                 tool_count=0,
             )
             logger.info(f"Registered lazy server: {name}")
+
+    def prune_lazy_configs(self, keep_names: set[str]) -> None:
+        """Drop on-demand (lazy) configs whose name is not in ``keep_names``.
+
+        Used by ``gateway.refresh`` to reconcile the lazy set to the freshly
+        resolved keep-set so a server that is now removed / policy-denied /
+        missing-auth can no longer be lazily started via ``ensure_connected()``.
+        Also clears its lingering ``LAZY`` status entry. Connected servers are
+        untouched (they are reconciled by the refresh diff, not here).
+        """
+        for name in list(self._lazy_configs):
+            if name in keep_names:
+                continue
+            self._lazy_configs.pop(name, None)
+            status = self._servers.get(name)
+            if status is not None and status.status == ServerStatusEnum.LAZY:
+                self._servers.pop(name, None)
 
     async def ensure_connected(self, server_name: str) -> bool:
         """Ensure a server is connected, triggering lazy-start if needed.
@@ -1252,6 +1314,7 @@ class ClientManager:
             config,
             sse_client(remote_config.url, headers=headers),
             transport_name="SSE",
+            resolved_headers=headers,
         )
 
     async def _connect_streamable_http(self, config: ResolvedServerConfig) -> None:
@@ -1267,6 +1330,7 @@ class ClientManager:
             config,
             streamablehttp_client(remote_config.url, headers=headers),
             transport_name="streamable HTTP",
+            resolved_headers=headers,
         )
 
     async def _connect_remote_stream(
@@ -1275,6 +1339,7 @@ class ClientManager:
         transport_context: Any,
         *,
         transport_name: str,
+        resolved_headers: dict[str, str] | None = None,
     ) -> None:
         """Connect to a remote MCP server using a read/write stream transport."""
         name = config.name
@@ -1308,6 +1373,7 @@ class ClientManager:
             sse_exit_stack=remote_stack,
             write_stream=write_stream,
             status=status,
+            resolved_remote_headers=resolved_headers,
         )
         self._clients[name] = managed
 
@@ -1737,8 +1803,7 @@ class ClientManager:
         # Stop health monitor if running
         self.stop_health_monitor()
 
-        clients = list(self._clients.items())
-        for name, managed in clients:
+        async def _shutdown_one(name: str, managed: ManagedClient) -> None:
             try:
                 logger.info(f"Disconnecting from {name}")
 
@@ -1779,6 +1844,19 @@ class ClientManager:
                     await _terminate_process_tree(managed.process, name)
             except Exception as e:
                 logger.warning(f"Error disconnecting from {name}: {e}")
+
+        # Reap servers concurrently: each _terminate_process_tree can cost up to
+        # ~8s for a hung stdio server, and disconnect_all() runs under a bounded
+        # shutdown budget (server.py wraps it in wait_for). A sequential loop
+        # would let two+ hung servers blow that budget and leave later groups
+        # unsignalled — orphaning browsers (issue #79/1c) at shutdown. Concurrent
+        # reaping makes total time ≈ the slowest single server.
+        clients = list(self._clients.items())
+        if clients:
+            await asyncio.gather(
+                *(_shutdown_one(name, managed) for name, managed in clients),
+                return_exceptions=True,
+            )
 
         current = asyncio.current_task()
         exclude = {current} if current is not None else set()
@@ -2219,6 +2297,18 @@ class ClientManager:
         resolved config set so unchanged servers are left running.
         """
         return {name: managed.config for name, managed in self._clients.items()}
+
+    def get_connected_resolved_headers(self, name: str) -> dict[str, str] | None:
+        """Return the remote auth headers a connected server was actually
+        connected with (placeholders resolved at connect time), or None.
+
+        Used by gateway.refresh to detect token rotation in the env store: the
+        raw config keeps the same ``${VAR}`` placeholder, so only comparing the
+        connect-time resolved value against a freshly-resolved value reveals the
+        change.
+        """
+        managed = self._clients.get(name)
+        return managed.resolved_remote_headers if managed is not None else None
 
     def get_registry_meta(self) -> tuple[str, float]:
         """Get registry metadata (revision_id, last_refresh_ts)."""

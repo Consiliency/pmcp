@@ -35,7 +35,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refresh tore down **every** server and reconnected only the eager set, which
   dropped previously-running lazy/provisioned servers to offline (the reported
   "105 seen, 0 online") and needlessly respawned unchanged processes (e.g. a
-  live browser) on every refresh.
+  live browser) on every refresh. The diff keeps only servers that are actually
+  ONLINE — a crashed eager server is reconnected (recovery path preserved);
+  reconciles the lazy registry to the resolved keep-set so removed/policy-denied
+  servers can no longer be lazily started; and reconnects a remote server when
+  its `${VAR}` auth token has rotated in the env store (compared against the
+  connect-time resolved headers), instead of keeping stale/revoked auth.
+- Process-tree reaping now escalates to a group `SIGKILL` when the leader exits
+  but a grandchild (e.g. a `SIGTERM`-ignoring browser) survives the `SIGTERM`
+  grace period, and reaps servers concurrently at shutdown so multiple hung
+  servers can't exceed the shutdown budget and orphan browsers (issue #79/1c).
 
 ### Added
 - `gateway.catalog_search` with `include_offline=true` now surfaces

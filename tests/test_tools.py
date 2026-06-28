@@ -114,6 +114,7 @@ class MockClientManager:
         self._last_refresh_ts = 1234567890.0
         self.connected_configs: list[Any] = []
         self.connected_config_map: dict[str, Any] = {}
+        self.connected_resolved_headers: dict[str, dict[str, str]] = {}
         self.refreshed_configs: list[Any] = []
         self.lazy_configs: list[Any] = []
         self.disconnected = False
@@ -311,18 +312,43 @@ class MockClientManager:
     def get_connected_configs(self) -> dict[str, Any]:
         return dict(self.connected_config_map)
 
-    def add_connected_server(self, config: Any) -> None:
-        """Pre-populate an already-connected, online server (test helper)."""
+    def get_connected_resolved_headers(self, name: str) -> dict[str, str] | None:
+        return self.connected_resolved_headers.get(name)
+
+    def add_connected_server(
+        self,
+        config: Any,
+        *,
+        online: bool = True,
+        resolved_headers: dict[str, str] | None = None,
+    ) -> None:
+        """Pre-populate an already-connected server (test helper).
+
+        ``online=False`` models a crashed server still present in ``_clients``
+        with ERROR status (its reconnect attempts exhausted) — it appears in
+        get_connected_configs() but is NOT ONLINE. ``resolved_headers`` records
+        the auth headers the server was connected with (placeholders resolved).
+        """
         self.connected_config_map[config.name] = config
-        self._online_servers.add(config.name)
+        if resolved_headers is not None:
+            self.connected_resolved_headers[config.name] = resolved_headers
         self._server_statuses = [
             status for status in self._server_statuses if status.name != config.name
         ]
-        self._server_statuses.append(
-            ServerStatus(
-                name=config.name, status=ServerStatusEnum.ONLINE, tool_count=0
+        if online:
+            self._online_servers.add(config.name)
+            self._server_statuses.append(
+                ServerStatus(
+                    name=config.name, status=ServerStatusEnum.ONLINE, tool_count=0
+                )
             )
-        )
+        else:
+            self._online_servers.discard(config.name)
+            self._server_statuses.append(
+                ServerStatus(
+                    name=config.name, status=ServerStatusEnum.ERROR, tool_count=0
+                )
+            )
 
     async def disconnect_all(self) -> None:
         self.events.append("disconnect")
@@ -334,6 +360,18 @@ class MockClientManager:
         self.lazy_configs = list(configs)
         for config in configs:
             self._lazy_servers.add(config.name)
+
+    def prune_lazy_configs(self, keep_names: set[str]) -> None:
+        self.events.append("prune_lazy")
+        self.lazy_configs = [c for c in self.lazy_configs if c.name in keep_names]
+        for name in list(self._lazy_servers):
+            if name not in keep_names:
+                self._lazy_servers.discard(name)
+                self._server_statuses = [
+                    s
+                    for s in self._server_statuses
+                    if not (s.name == name and s.status == ServerStatusEnum.LAZY)
+                ]
 
     async def connect_all(self, configs: list[Any], retry: bool = True) -> list[str]:
         self.events.append("connect")
@@ -1005,6 +1043,102 @@ class TestRefreshCompatibility:
         assert client_manager.is_server_online("srv") is True
 
     @pytest.mark.asyncio
+    async def test_refresh_heals_crashed_eager_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A present-but-not-ONLINE eager server (crashed, reconnect exhausted) is
+        torn down and reconnected by refresh — the recovery path must not regress."""
+        client_manager = MockClientManager()
+        config = ResolvedServerConfig(
+            name="eager",
+            source="project",
+            config=LocalMcpServerConfig(command="eager-cmd"),
+        )
+        # In _clients with ERROR status (crashed), NOT online.
+        client_manager.add_connected_server(config, online=False)
+        assert client_manager.is_server_online("eager") is False
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        patch_refresh_config_sources(monkeypatch, [config])
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_enabled_auto_start",
+            lambda **_: {"eager"},
+        )
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        # Stale entry cleared, then reconnected.
+        assert "disconnect_server:eager:True" in client_manager.events
+        assert "eager" in [c.name for c in client_manager.connected_configs]
+        assert client_manager.is_server_online("eager") is True
+
+    @pytest.mark.asyncio
+    async def test_refresh_prunes_removed_lazy_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A previously-lazy server that is no longer in the resolved set is pruned
+        from the lazy registry so it can't be lazily started after refresh."""
+        client_manager = MockClientManager()
+        client_manager.add_lazy_server("stale")
+        assert "stale" in client_manager.get_lazy_server_names()
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        patch_refresh_config_sources(monkeypatch, [])
+        monkeypatch.setattr(gateway_tools, "_load_provisioned_registry", lambda: {})
+
+        result = await gateway_tools.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert "stale" not in client_manager.get_lazy_server_names()
+
+    def test_refresh_config_unchanged_detects_remote_token_rotation(self) -> None:
+        """_refresh_config_unchanged compares the connect-time RESOLVED headers
+        against a fresh resolution, so a rotated env-store token (raw config
+        unchanged) is detected as CHANGED — guarding against stale/revoked auth
+        surviving a refresh (issue #79, codex+gemini finding)."""
+        from pmcp.tools.handlers import _refresh_config_unchanged
+
+        cfg = ResolvedServerConfig(
+            name="remote",
+            source="project",
+            config=RemoteMcpServerConfig(
+                type="streamable-http",
+                url="https://example/mcp",
+                headers={"Authorization": "Bearer ${TOKEN}"},
+            ),
+        )
+        # Env store now resolves TOKEN to "new-secret".
+        def lookup(var: str) -> str | None:
+            return "new-secret" if var == "TOKEN" else None
+
+        # Connected with the OLD secret -> rotation must read as CHANGED.
+        assert (
+            _refresh_config_unchanged(
+                cfg,
+                cfg,
+                header_env_lookup=lookup,
+                old_resolved_headers={"Authorization": "Bearer old-secret"},
+            )
+            is False
+        )
+        # Same secret as connect time -> unchanged, keep connected.
+        assert (
+            _refresh_config_unchanged(
+                cfg,
+                cfg,
+                header_env_lookup=lookup,
+                old_resolved_headers={"Authorization": "Bearer new-secret"},
+            )
+            is True
+        )
+
+    @pytest.mark.asyncio
     async def test_refresh_refuses_pending_requests_by_default(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1094,6 +1228,7 @@ class TestRefreshCompatibility:
         assert client_manager.events == [
             "cancel_all",
             "register_lazy",
+            "prune_lazy",
             "connect",
         ]
 
@@ -1158,11 +1293,12 @@ class TestRefreshCompatibility:
         assert refused.ok is False
         assert refused.pending_requests_refused == 1
         # Diff-based refresh with no configured/eager servers: the forced refresh
-        # cancels pending then only re-registers lazy configs (nothing to
+        # cancels pending then re-registers and prunes lazy configs (nothing to
         # disconnect or connect).
         assert client_manager.events == [
             "cancel_all",
             "register_lazy",
+            "prune_lazy",
         ]
         assert forced.ok is True
         assert forced.pending_requests_cancelled == 1
