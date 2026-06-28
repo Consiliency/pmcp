@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 import random
+import signal
 import string
 import time
 from collections import deque
@@ -71,6 +72,109 @@ def _is_cancel_scope_task_mismatch_error(exc: BaseException) -> bool:
     )
 
 
+async def _terminate_process_tree(
+    process: asyncio.subprocess.Process | None, name: str
+) -> None:
+    """Terminate a downstream process and its whole process group.
+
+    stdio servers are spawned with ``start_new_session=True``, so the child is a
+    process-group leader; signalling the group also reaps grandchildren (e.g. the
+    Chrome that ``@playwright/mcp`` launches) that would otherwise orphan to init
+    and keep the browser profile's SingletonLock, breaking the next launch.
+
+    Falls back to single-process signals when the process is not a group leader
+    (e.g. an adopted install-time process) or the group is already gone, so this
+    never accidentally signals an unrelated group such as the gateway's own.
+    """
+    if process is None or process.returncode is not None:
+        return
+
+    def _signal(kill: bool) -> None:
+        # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
+        # (and signal.SIGKILL) don't exist, so fall back to the cross-platform
+        # process.terminate()/kill() — preserving the pre-process-group behavior.
+        pid = process.pid
+        pgid: int | None = None
+        if isinstance(pid, int) and hasattr(os, "getpgid"):
+            try:
+                pgid = os.getpgid(pid)
+            except (ProcessLookupError, PermissionError, OSError):
+                pgid = None
+        # Only signal the group if this process leads it; otherwise signalling
+        # its group could hit unrelated processes (including the gateway, for an
+        # adopted process that was not given its own session).
+        if pgid is not None and pgid == pid and hasattr(os, "killpg"):
+            try:
+                os.killpg(pgid, signal.SIGKILL if kill else signal.SIGTERM)
+                return
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            if kill:
+                process.kill()
+            else:
+                process.terminate()
+        except ProcessLookupError:
+            pass
+
+    # Cache the process group up front: once the leader exits, os.getpgid(pid)
+    # fails, so we could no longer find the group to escalate against. Only set
+    # when this process leads its own group (POSIX, start_new_session=True).
+    group_pgid: int | None = None
+    pid = process.pid
+    if isinstance(pid, int) and hasattr(os, "getpgid") and hasattr(os, "killpg"):
+        try:
+            if os.getpgid(pid) == pid:
+                group_pgid = pid
+        except (ProcessLookupError, PermissionError, OSError):
+            group_pgid = None
+
+    def _group_alive() -> bool:
+        if group_pgid is None:
+            return False
+        try:
+            os.killpg(group_pgid, 0)  # signal 0 == liveness probe
+            return True
+        except (ProcessLookupError, PermissionError, OSError):
+            return False
+
+    _signal(kill=False)
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5.0)
+        leader_exited = True
+    except asyncio.TimeoutError:
+        leader_exited = False
+
+    # If the leader is still alive, SIGKILL it (and, when it leads a group, the
+    # whole group). The leader exiting is NOT sufficient: a grandchild (e.g. a
+    # SIGTERM-ignoring browser) can outlive the leader inside the group and keep
+    # the profile SingletonLock — so we still escalate to a group SIGKILL below.
+    if not leader_exited:
+        _signal(kill=True)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[{name}] Process PID={process.pid} did not exit after SIGKILL "
+                "(possible D-state / uninterruptible I/O wait)"
+            )
+
+    if _group_alive():
+        try:
+            os.killpg(group_pgid, signal.SIGKILL)  # type: ignore[arg-type]
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+        for _ in range(30):  # up to ~3s for the OS to reap the group
+            if not _group_alive():
+                break
+            await asyncio.sleep(0.1)
+        else:
+            logger.warning(
+                f"[{name}] process group {group_pgid} survived SIGKILL "
+                "(possible orphaned grandchild / D-state)"
+            )
+
+
 # Heartbeat thresholds for health monitoring
 HEARTBEAT_WARN_THRESHOLD = 60.0  # Warn if no activity for 60s
 HEARTBEAT_STALL_THRESHOLD = 120.0  # Mark as stalled after 120s
@@ -120,6 +224,36 @@ def _stdio_read_limit() -> int:
             DEFAULT_STDIO_READ_LIMIT,
         )
         return DEFAULT_STDIO_READ_LIMIT
+    return value
+
+
+# Absolute backstop for a single downstream request. ``timeout_ms`` is now an
+# inactivity (idle) timeout: a call survives as long as the downstream keeps
+# producing output. This ceiling caps the total wall-clock time so a chatty but
+# never-completing call cannot hang forever. Override via PMCP_REQUEST_CEILING_MS.
+DEFAULT_REQUEST_CEILING_MS = 600000  # 10 minutes
+
+
+def _request_ceiling_ms() -> int:
+    raw = os.environ.get("PMCP_REQUEST_CEILING_MS")
+    if not raw:
+        return DEFAULT_REQUEST_CEILING_MS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "PMCP_REQUEST_CEILING_MS=%r is not an integer; using default %d",
+            raw,
+            DEFAULT_REQUEST_CEILING_MS,
+        )
+        return DEFAULT_REQUEST_CEILING_MS
+    if value <= 0:
+        logger.warning(
+            "PMCP_REQUEST_CEILING_MS=%d must be positive; using default %d",
+            value,
+            DEFAULT_REQUEST_CEILING_MS,
+        )
+        return DEFAULT_REQUEST_CEILING_MS
     return value
 
 
@@ -325,6 +459,10 @@ class ManagedClient:
     request_id: int = 0
     pending_requests: dict[int, PendingRequest] = field(default_factory=dict)
     read_task: asyncio.Task[None] | None = None
+    # Remote auth headers as RESOLVED at connect time (placeholders expanded).
+    # gateway.refresh compares these against freshly-resolved headers to detect
+    # token rotation in the env store, which leaves the raw config unchanged.
+    resolved_remote_headers: dict[str, str] | None = None
     # Health monitoring: rolling window of response times for avg calculation
     response_times: deque[float] = field(default_factory=lambda: deque(maxlen=100))
     # Reconnect storm guard: True while a _reconnect_loop task is in flight
@@ -503,6 +641,23 @@ class ClientManager:
             )
             logger.info(f"Registered lazy server: {name}")
 
+    def prune_lazy_configs(self, keep_names: set[str]) -> None:
+        """Drop on-demand (lazy) configs whose name is not in ``keep_names``.
+
+        Used by ``gateway.refresh`` to reconcile the lazy set to the freshly
+        resolved keep-set so a server that is now removed / policy-denied /
+        missing-auth can no longer be lazily started via ``ensure_connected()``.
+        Also clears its lingering ``LAZY`` status entry. Connected servers are
+        untouched (they are reconciled by the refresh diff, not here).
+        """
+        for name in list(self._lazy_configs):
+            if name in keep_names:
+                continue
+            self._lazy_configs.pop(name, None)
+            status = self._servers.get(name)
+            if status is not None and status.status == ServerStatusEnum.LAZY:
+                self._servers.pop(name, None)
+
     async def ensure_connected(self, server_name: str) -> bool:
         """Ensure a server is connected, triggering lazy-start if needed.
 
@@ -658,19 +813,8 @@ class ClientManager:
                                 )
                             else:
                                 raise
-                elif managed.process and managed.process.returncode is None:
-                    managed.process.terminate()
-                    try:
-                        await asyncio.wait_for(managed.process.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        managed.process.kill()
-                        try:
-                            await asyncio.wait_for(managed.process.wait(), timeout=3.0)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                f"[{name}] Process PID={managed.process.pid} did not exit "
-                                "after SIGKILL (possible D-state / uninterruptible I/O wait)"
-                            )
+                else:
+                    await _terminate_process_tree(managed.process, name)
             except Exception as e:
                 logger.warning(f"Error disconnecting from {name}: {e}")
                 return (False, cancelled, str(e))
@@ -1100,6 +1244,9 @@ class ClientManager:
                 cwd=local_config.cwd,
                 env=env,
                 limit=_stdio_read_limit(),
+                # New session/process group so we can reap the whole tree
+                # (e.g. browsers launched by the server) on disconnect.
+                start_new_session=True,
             )
 
         managed = ManagedClient(
@@ -1151,8 +1298,7 @@ class ClientManager:
                     await asyncio.shield(managed.read_task)
                 except (asyncio.CancelledError, Exception):
                     pass
-            if process.returncode is None:
-                process.kill()
+            await _terminate_process_tree(process, name)
             raise
 
     async def _connect_sse(self, config: ResolvedServerConfig) -> None:
@@ -1168,6 +1314,7 @@ class ClientManager:
             config,
             sse_client(remote_config.url, headers=headers),
             transport_name="SSE",
+            resolved_headers=headers,
         )
 
     async def _connect_streamable_http(self, config: ResolvedServerConfig) -> None:
@@ -1183,6 +1330,7 @@ class ClientManager:
             config,
             streamablehttp_client(remote_config.url, headers=headers),
             transport_name="streamable HTTP",
+            resolved_headers=headers,
         )
 
     async def _connect_remote_stream(
@@ -1191,6 +1339,7 @@ class ClientManager:
         transport_context: Any,
         *,
         transport_name: str,
+        resolved_headers: dict[str, str] | None = None,
     ) -> None:
         """Connect to a remote MCP server using a read/write stream transport."""
         name = config.name
@@ -1224,6 +1373,7 @@ class ClientManager:
             sse_exit_stack=remote_stack,
             write_stream=write_stream,
             status=status,
+            resolved_remote_headers=resolved_headers,
         )
         self._clients[name] = managed
 
@@ -1284,16 +1434,19 @@ class ClientManager:
                     # EOF - server process has exited
                     break
 
-                # UPDATE heartbeat on ANY output from server
+                # UPDATE heartbeat on ANY output from server. This includes JSON
+                # progress notifications (id: null) that don't resolve a request,
+                # so per-request liveness drives the idle timeout in _send_request.
                 now = time.time()
                 managed.status.last_activity_at = now
+                for req in managed.pending_requests.values():
+                    req.last_heartbeat = now
 
                 try:
                     message = json.loads(line.decode())
                     msg_id = message.get("id")
                     if msg_id is not None and msg_id in managed.pending_requests:
                         pending = managed.pending_requests.pop(msg_id)
-                        pending.last_heartbeat = now  # Update request heartbeat
 
                         # Track response time
                         elapsed_ms = (now - pending.started_at) * 1000
@@ -1317,9 +1470,7 @@ class ClientManager:
                         else:
                             pending.future.set_result(message.get("result", {}))
                 except json.JSONDecodeError:
-                    # Non-JSON output still counts as heartbeat for all pending
-                    for req in managed.pending_requests.values():
-                        req.last_heartbeat = now
+                    # Non-JSON output already counted as a heartbeat above.
                     logger.debug(f"[{name}] Non-JSON output: {line.decode().strip()}")
         except asyncio.LimitOverrunError as e:
             limit = _stdio_read_limit()
@@ -1423,12 +1574,14 @@ class ClientManager:
         """Read JSON-RPC messages from an SSE stream."""
         try:
             async for message in read_stream:
+                # Any output counts as per-request liveness, including progress
+                # notifications (id: null), so the idle timeout sees the keepalive.
                 now = time.time()
                 managed.status.last_activity_at = now
+                for req in managed.pending_requests.values():
+                    req.last_heartbeat = now
 
                 if isinstance(message, Exception):
-                    for req in managed.pending_requests.values():
-                        req.last_heartbeat = now
                     raise message
 
                 payload = message.message.model_dump(
@@ -1439,7 +1592,6 @@ class ClientManager:
                 msg_id = payload.get("id")
                 if msg_id is not None and msg_id in managed.pending_requests:
                     pending = managed.pending_requests.pop(msg_id)
-                    pending.last_heartbeat = now
 
                     elapsed_ms = (now - pending.started_at) * 1000
                     managed.response_times.append(elapsed_ms)
@@ -1522,14 +1674,76 @@ class ClientManager:
             managed.process.stdin.write(data.encode())
             await managed.process.stdin.drain()
 
-        # Wait for response with timeout
+        # Wait for response with an inactivity (idle) timeout: the call survives
+        # as long as the downstream keeps producing output (per-request
+        # last_heartbeat), bounded by an absolute ceiling backstop.
+        #
+        # The generous absolute ceiling applies only to tool invocations, which
+        # can legitimately run long (e.g. browser automation). Control-plane
+        # requests (initialize, tools/list, resources/list, tasks/*) keep the
+        # tighter idle deadline as their ceiling, so one chatty-but-stuck server
+        # can't stall startup/refresh/connect_all for the full ceiling.
+        idle_timeout_s = timeout_ms / 1000.0
+        ceiling_s = (
+            _request_ceiling_ms() / 1000.0
+            if method == "tools/call"
+            else idle_timeout_s
+        )
         try:
-            result = await asyncio.wait_for(future, timeout=timeout_ms / 1000.0)
+            result = await self._await_with_idle_timeout(
+                managed,
+                request_id,
+                pending,
+                future,
+                idle_timeout_s=idle_timeout_s,
+                ceiling_s=ceiling_s,
+            )
             return result
         except asyncio.TimeoutError:
             managed.pending_requests.pop(request_id, None)
             managed.status.pending_request_count = len(managed.pending_requests)
             raise TimeoutError(f"Request {method} timed out")
+
+    async def _await_with_idle_timeout(
+        self,
+        managed: ManagedClient,
+        request_id: int,
+        pending: PendingRequest,
+        future: asyncio.Future[Any],
+        idle_timeout_s: float,
+        ceiling_s: float,
+    ) -> Any:
+        """Await ``future`` until it resolves, the downstream goes idle, or the
+        absolute ceiling is hit.
+
+        Waits in short slices so per-request liveness (``pending.last_heartbeat``,
+        bumped by the stdout/SSE readers on any downstream output) can extend the
+        deadline. ``asyncio.shield`` ensures a slice timeout never cancels the real
+        future, so a response arriving mid-slice is returned rather than dropped.
+        Raises ``asyncio.TimeoutError`` on idle/ceiling so the caller maps it to the
+        usual ``TimeoutError``.
+        """
+        slice_s = min(idle_timeout_s, 1.0)
+        while True:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(future), timeout=slice_s
+                )
+            except asyncio.TimeoutError:
+                if future.done():
+                    return future.result()
+                now = time.time()
+                if now - pending.started_at >= ceiling_s:
+                    logger.warning(
+                        "[%s] request %d hit absolute ceiling (%.1fs)",
+                        managed.config.name,
+                        request_id,
+                        ceiling_s,
+                    )
+                    raise
+                if now - pending.last_heartbeat >= idle_timeout_s:
+                    raise
+                # Downstream is still active; keep waiting.
 
     async def _send_initialize(self, managed: ManagedClient) -> None:
         """Send initialize handshake."""
@@ -1589,8 +1803,7 @@ class ClientManager:
         # Stop health monitor if running
         self.stop_health_monitor()
 
-        clients = list(self._clients.items())
-        for name, managed in clients:
+        async def _shutdown_one(name: str, managed: ManagedClient) -> None:
             try:
                 logger.info(f"Disconnecting from {name}")
 
@@ -1627,21 +1840,23 @@ class ClientManager:
                                 )
                             else:
                                 raise
-                elif managed.process and managed.process.returncode is None:
-                    managed.process.terminate()
-                    try:
-                        await asyncio.wait_for(managed.process.wait(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        managed.process.kill()
-                        try:
-                            await asyncio.wait_for(managed.process.wait(), timeout=3.0)
-                        except asyncio.TimeoutError:
-                            logger.warning(
-                                f"[{name}] Process PID={managed.process.pid} did not exit "
-                                f"after SIGKILL (possible D-state / uninterruptible I/O wait)"
-                            )
+                else:
+                    await _terminate_process_tree(managed.process, name)
             except Exception as e:
                 logger.warning(f"Error disconnecting from {name}: {e}")
+
+        # Reap servers concurrently: each _terminate_process_tree can cost up to
+        # ~8s for a hung stdio server, and disconnect_all() runs under a bounded
+        # shutdown budget (server.py wraps it in wait_for). A sequential loop
+        # would let two+ hung servers blow that budget and leave later groups
+        # unsignalled — orphaning browsers (issue #79/1c) at shutdown. Concurrent
+        # reaping makes total time ≈ the slowest single server.
+        clients = list(self._clients.items())
+        if clients:
+            await asyncio.gather(
+                *(_shutdown_one(name, managed) for name, managed in clients),
+                return_exceptions=True,
+            )
 
         current = asyncio.current_task()
         exclude = {current} if current is not None else set()
@@ -1669,14 +1884,7 @@ class ClientManager:
             except (asyncio.CancelledError, Exception):
                 pass
         await self._cancel_background_tasks(server_name=name)
-        if managed.process and managed.process.returncode is None:
-            managed.process.kill()
-            try:
-                await asyncio.wait_for(managed.process.wait(), timeout=3.0)
-            except asyncio.TimeoutError:
-                logger.warning(
-                    f"[{name}] Process did not exit after SIGKILL in _cleanup_client"
-                )
+        await _terminate_process_tree(managed.process, name)
         self._clients.pop(name, None)
         self._servers.pop(name, None)
         self._remove_server_indexes(name)
@@ -2081,6 +2289,26 @@ class ClientManager:
     def get_all_server_statuses(self) -> list[ServerStatus]:
         """Get all server statuses."""
         return sorted(self._servers.values(), key=lambda status: status.name)
+
+    def get_connected_configs(self) -> dict[str, ResolvedServerConfig]:
+        """Return resolved configs for currently-connected servers, keyed by name.
+
+        Used by gateway.refresh to diff the running set against a freshly
+        resolved config set so unchanged servers are left running.
+        """
+        return {name: managed.config for name, managed in self._clients.items()}
+
+    def get_connected_resolved_headers(self, name: str) -> dict[str, str] | None:
+        """Return the remote auth headers a connected server was actually
+        connected with (placeholders resolved at connect time), or None.
+
+        Used by gateway.refresh to detect token rotation in the env store: the
+        raw config keeps the same ``${VAR}`` placeholder, so only comparing the
+        connect-time resolved value against a freshly-resolved value reveals the
+        change.
+        """
+        managed = self._clients.get(name)
+        return managed.resolved_remote_headers if managed is not None else None
 
     def get_registry_meta(self) -> tuple[str, float]:
         """Get registry metadata (revision_id, last_refresh_ts)."""

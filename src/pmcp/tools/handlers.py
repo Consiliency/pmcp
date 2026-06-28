@@ -12,6 +12,7 @@ import platform
 import shutil
 from collections import deque
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any, Literal, cast
 from urllib.request import urlopen
 from urllib.parse import urlencode
@@ -56,7 +57,11 @@ from pmcp.manifest.installer import (
     InstallError,
 )
 from pmcp.manifest.loader import load_manifest
-from pmcp.manifest.matcher import rank_cli_hints
+from pmcp.manifest.matcher import (
+    _keyword_match_score,
+    _manifest_keyword_weights,
+    rank_cli_hints,
+)
 from pmcp.manifest.registry import (
     DEFAULT_REGISTRY_ENDPOINT,
     RegistryCache,
@@ -152,6 +157,98 @@ from pmcp.manifest.loader import Manifest, ServerConfig
 logger = logging.getLogger(__name__)
 
 FEEDBACK_TOKEN_LIMIT = 4000
+
+
+def _refresh_config_unchanged(
+    old: ResolvedServerConfig,
+    new: ResolvedServerConfig,
+    *,
+    header_env_lookup: Callable[[str], str | None] | None = None,
+    old_resolved_headers: dict[str, str] | None = None,
+) -> bool:
+    """Return True if two resolved configs describe the same downstream process.
+
+    Used by gateway.refresh's diff so unchanged servers are left running.
+
+    We compare only the fields that actually affect the spawned process
+    (command/args/cwd/env for local, url/headers/transport for remote) rather
+    than using full-model equality, for two reasons:
+
+    * ``env`` is compared by its *effective* override only — entries that
+      actually differ from ``os.environ``. The same logical server can be stored
+      with different env representations depending on how it entered the manager:
+      an adopted/provisioned server keeps env resolved from ``os.environ``
+      (``manifest_server_to_config``), while the loader resolves the identical
+      server with ``env=None`` (``_manifest_server_to_config(..., lambda: None)``).
+      Both spawn identically because ``_connect_stdio`` seeds ``os.environ.copy()``
+      first, so an override that merely mirrors ``os.environ`` is a no-op. Naively
+      comparing ``env`` would spuriously tear down running provisioned servers on
+      every refresh (issue #79); comparing only the genuine override still
+      detects a real env change. (Known limitation: rotation of an *ambient*
+      secret that is not an explicit override cannot be detected here without a
+      spawn-time env snapshot.)
+    * ``source`` is excluded (e.g. ``manifest`` vs the configured source for the
+      same effective server).
+
+    Remote ``headers`` are compared *after* resolving ``${VAR}`` placeholders.
+    The raw config keeps the same placeholder across a token rotation, so the
+    only way to detect rotation is to compare the value the server was actually
+    connected with — ``old_resolved_headers`` (captured at connect time) — against
+    the freshly-resolved ``new`` headers (via ``header_env_lookup``). Without that
+    the remote connection would silently keep stale/revoked auth across a refresh.
+    When neither is supplied (e.g. unit tests), the raw headers are compared.
+    """
+    if old.name != new.name:
+        return False
+    old_cfg, new_cfg = old.config, new.config
+    if type(old_cfg) is not type(new_cfg):
+        return False
+    if isinstance(old_cfg, LocalMcpServerConfig) and isinstance(
+        new_cfg, LocalMcpServerConfig
+    ):
+
+        def _effective_env(env: dict[str, str] | None) -> dict[str, str]:
+            # Only overrides that actually change the spawned environment.
+            return {
+                key: value
+                for key, value in (env or {}).items()
+                if os.environ.get(key) != value
+            }
+
+        return (
+            old_cfg.command == new_cfg.command
+            and old_cfg.args == new_cfg.args
+            and old_cfg.cwd == new_cfg.cwd
+            and _effective_env(old_cfg.env) == _effective_env(new_cfg.env)
+        )
+    if isinstance(old_cfg, RemoteMcpServerConfig) and isinstance(
+        new_cfg, RemoteMcpServerConfig
+    ):
+        old_headers: dict[str, str] | None
+        new_headers: dict[str, str] | None
+        if header_env_lookup is not None:
+            new_headers = resolve_remote_headers(
+                new_cfg.headers, header_env_lookup
+            ).resolved_headers
+        else:
+            new_headers = new_cfg.headers
+        if old_resolved_headers is not None:
+            # The value the running server was actually connected with — this is
+            # what reveals an env-store token rotation.
+            old_headers = old_resolved_headers
+        elif header_env_lookup is not None:
+            old_headers = resolve_remote_headers(
+                old_cfg.headers, header_env_lookup
+            ).resolved_headers
+        else:
+            old_headers = old_cfg.headers
+        return (
+            old_cfg.url == new_cfg.url
+            and old_headers == new_headers
+            and old_cfg.type == new_cfg.type
+        )
+    return False
+
 
 # Risk level ordering for filtering
 RISK_ORDER = {"low": 1, "medium": 2, "high": 3, "unknown": 4}
@@ -420,9 +517,10 @@ def get_gateway_tool_definitions() -> list[Tool]:
         Tool(
             name="gateway.request_capability",
             description=(
-                "Find and auto-provision the right tool for a task — describe what you need in natural language. "
+                "Recommend the right tool for a task — describe what you need in natural language. "
                 "Examples: 'scrape a website', 'search Slack messages', 'query Postgres', 'browse the web'. "
-                "Matches against installed CLIs and 90+ provisionable MCP servers; starts the server automatically if needed. "
+                "Matches against installed CLIs and 90+ provisionable MCP servers and returns ranked candidates; "
+                "it does NOT start anything — call gateway.provision to actually install/start the recommended server. "
                 "Prefer this over gateway.provision when you don't already know the exact server name."
             ),
             inputSchema={
@@ -1158,6 +1256,90 @@ class GatewayTools:
 
         return cached_tools
 
+    def _manifest_candidates_for_query(
+        self,
+        query: str,
+        *,
+        manifest: Manifest,
+        configured_servers: dict[str, ResolvedServerConfig],
+        exclude_servers: set[str],
+        limit: int = 5,
+    ) -> list[CapabilityCandidate]:
+        """Match a query against manifest servers and emit provision candidates.
+
+        Surfaces manifest-only servers (never started, so no cached tools are
+        represented in catalog_search) so an agent can provision the exact
+        server instead of falling back to a plain web search (issue #78).
+        Scoring reuses the manifest keyword matcher; a normalized name match is
+        also accepted so servers that don't list their own name still surface.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+
+        query_words = query.lower().replace("-", " ").replace("_", " ").split()
+        keyword_weights = _manifest_keyword_weights(manifest)
+
+        scored: list[tuple[float, str, ServerConfig]] = []
+        for name, server in manifest.servers.items():
+            if name in exclude_servers:
+                continue
+            if not self._policy_manager.is_server_allowed(name):
+                continue
+
+            score = _keyword_match_score(query, server.keywords, keyword_weights)
+
+            # Normalized name match (e.g. "bright data" -> "brightdata").
+            norm_name = name.lower().replace("-", "").replace("_", "")
+            for window_size in (3, 2, 1):
+                for i in range(len(query_words) - window_size + 1):
+                    window = "".join(query_words[i : i + window_size])
+                    if window == norm_name:
+                        score = max(score, 1.0)
+                        break
+
+            if score >= 0.2:  # Same minimum threshold as the matcher
+                scored.append((score, name, server))
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+
+        running_servers = {
+            s.name
+            for s in self._client_manager.get_all_server_statuses()
+            if s.status.value == "online"
+        }
+
+        candidates: list[CapabilityCandidate] = []
+        for score, name, server in scored[:limit]:
+            requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
+                name, manifest, configured_servers
+            )
+            candidates.append(
+                CapabilityCandidate(
+                    name=name,
+                    candidate_type="server",
+                    relevance_score=min(1.0, score),
+                    reasoning=server.description,
+                    requires_api_key=requires_api_key,
+                    api_key_available=self._check_api_key_available(env_var),
+                    env_var=env_var,
+                    env_instructions=env_instructions,
+                    is_running=name in running_servers,
+                    source="manifest",
+                    transport=server.transport,
+                    url=server.url,
+                    package=server.package,
+                    server_card_url=server.server_card_url,
+                    declared_scopes=server.declared_scopes,
+                    declared_capabilities=server.declared_capabilities,
+                    provisionable=True,
+                    provision_tool="gateway.provision",
+                    request_capability_tool="gateway.request_capability",
+                    auth_tool="gateway.auth_connect",
+                )
+            )
+        return candidates
+
     async def catalog_search(self, input_data: dict[str, Any]) -> CatalogSearchOutput:
         """gateway.catalog_search - Search for available tools."""
         parsed = CatalogSearchInput.model_validate(input_data)
@@ -1205,6 +1387,11 @@ class GatewayTools:
             ]
 
         total_available = len(tools)
+
+        # Capture servers already represented by online/cached tools BEFORE any
+        # narrowing filters, so manifest candidates only cover "never started"
+        # servers (no cached tools at all) rather than ones merely filtered out.
+        represented_servers = {t.server_name for t in tools}
 
         # Filter by server name
         if parsed.filters and parsed.filters.server:
@@ -1261,6 +1448,18 @@ class GatewayTools:
                 parsed.query, limit=min(5, parsed.limit)
             )
 
+        # Surface manifest-provisionable servers that have never been started
+        # (no cached tools) so agents can provision them directly (#78).
+        manifest_candidates: list[CapabilityCandidate] = []
+        if parsed.include_offline and parsed.query:
+            manifest_candidates = self._manifest_candidates_for_query(
+                parsed.query,
+                manifest=load_manifest(),
+                configured_servers=self._load_configured_servers(),
+                exclude_servers=represented_servers,
+                limit=min(5, parsed.limit),
+            )
+
         truncated = len(tools) > parsed.limit
         tools = tools[: parsed.limit]
 
@@ -1312,6 +1511,7 @@ class GatewayTools:
             truncated=truncated,
             cli_hints=cli_hints,
             registry_candidates=registry_candidates,
+            manifest_candidates=manifest_candidates,
             stale_updates=stale_updates,
         )
 
@@ -1988,9 +2188,88 @@ class GatewayTools:
             self.set_startup_observations(
                 build_startup_observation_snapshot(resolution)
             )
-            await self._client_manager.disconnect_all()
+
+            # Diff-based refresh: leave servers whose resolved config is
+            # unchanged connected and running. Only disconnect servers that were
+            # removed (or are no longer in the resolved set at all, e.g. now
+            # policy-denied/missing-auth) or whose config changed, and only
+            # eagerly connect newly-added/changed eager servers. This avoids
+            # dropping previously-running lazy/provisioned servers to offline
+            # and avoids needlessly respawning unchanged processes (e.g. a live
+            # browser) on every refresh.
+            #
+            # Equality uses _refresh_config_unchanged, which compares the fields
+            # that affect the spawned process (command/args/cwd for local,
+            # url/headers/transport for remote). The keep-set is the union of
+            # eager AND lazy: a lazily-started server (e.g. a provisioned browser
+            # put into _clients by ensure_connected) resolves as lazy here, and
+            # must NOT be torn down.
+            current_configs = self._client_manager.get_connected_configs()
+            header_env_lookup = build_remote_header_env_lookup(self._project_root)
+            eager_by_name = {
+                config.name: config for config in resolution.eager_configs
+            }
+            keep_by_name = {
+                config.name: config
+                for config in resolution.eager_configs + resolution.lazy_configs
+            }
+
+            def _live_keep(name: str) -> bool:
+                # Keep a server connected only if it is actually ONLINE, still in
+                # the resolved keep-set, and its (resolved) config is unchanged.
+                # A present-but-not-ONLINE entry (e.g. a crashed eager server left
+                # in _clients with status ERROR after its reconnect attempts
+                # exhausted) is NOT a live keep — it is torn down here and, if
+                # eager, reconnected below, so `gateway.refresh` heals it again.
+                return (
+                    name in keep_by_name
+                    and self._client_manager.is_server_online(name)
+                    and _refresh_config_unchanged(
+                        current_configs[name],
+                        keep_by_name[name],
+                        header_env_lookup=header_env_lookup,
+                        old_resolved_headers=(
+                            self._client_manager.get_connected_resolved_headers(name)
+                        ),
+                    )
+                )
+
+            to_disconnect = [
+                name for name in current_configs if not _live_keep(name)
+            ]
+            to_connect = [
+                config
+                for name, config in eager_by_name.items()
+                if not (
+                    name in current_configs
+                    and self._client_manager.is_server_online(name)
+                    and _refresh_config_unchanged(
+                        current_configs[name],
+                        config,
+                        header_env_lookup=header_env_lookup,
+                        old_resolved_headers=(
+                            self._client_manager.get_connected_resolved_headers(name)
+                        ),
+                    )
+                )
+            ]
+
+            for name in to_disconnect:
+                # Pending/active work was already gated (and force-cancelled)
+                # above, so force the per-server disconnect here.
+                await self._client_manager.disconnect_server(name, force=True)
+
             self._client_manager.register_lazy_configs(resolution.lazy_configs)
-            errors = await self._client_manager.connect_all(resolution.eager_configs)
+            # Reconcile the lazy set to the resolved keep-set: drop on-demand
+            # entries for servers that are now removed / policy-denied /
+            # missing-auth (and undo disconnect_server's re-registration of the
+            # ones we just tore down) so they can no longer be lazily started via
+            # ensure_connected().
+            self._client_manager.prune_lazy_configs(set(keep_by_name))
+
+            errors: list[str] = []
+            if to_connect:
+                errors = await self._client_manager.connect_all(to_connect)
             pending_remaining = len(self._client_manager.get_pending_requests())
 
             revision_id, _ = self._client_manager.get_registry_meta()

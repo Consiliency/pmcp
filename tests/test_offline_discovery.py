@@ -580,3 +580,75 @@ class TestNoCacheScenario:
         # Should return only live tools
         assert len(result.results) == 1
         assert result.results[0].tool_id == "live-server::live_tool"
+
+
+class TestManifestCandidatesDiscovery:
+    """Verify catalog_search surfaces manifest-provisionable servers (#78)."""
+
+    @pytest.fixture
+    def gateway_tools_no_cache(self) -> GatewayTools:
+        """GatewayTools with no live tools and no cache (manifest-only world)."""
+        mock_client_manager = MagicMock()
+        mock_client_manager.get_all_tools.return_value = []
+        mock_client_manager.is_server_online.return_value = False
+        mock_client_manager.get_all_server_statuses.return_value = []
+
+        mock_policy_manager = MagicMock()
+        mock_policy_manager.is_tool_allowed.return_value = True
+        mock_policy_manager.is_server_allowed.return_value = True
+
+        return GatewayTools(
+            client_manager=mock_client_manager,
+            policy_manager=mock_policy_manager,
+            descriptions_cache=None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_manifest_only_server_surfaced_as_candidate(
+        self, gateway_tools_no_cache: GatewayTools
+    ) -> None:
+        """A query matching a manifest-only server returns it as a candidate."""
+        result = await gateway_tools_no_cache.catalog_search(
+            {"query": "bright data web research", "include_offline": True}
+        )
+
+        names = [c.name for c in result.manifest_candidates]
+        assert "brightdata" in names, (
+            f"brightdata should surface as a manifest candidate, got {names}"
+        )
+
+        candidate = next(
+            c for c in result.manifest_candidates if c.name == "brightdata"
+        )
+        # API-key metadata is populated from the manifest (deterministic).
+        assert candidate.requires_api_key is True
+        assert candidate.env_var == "API_TOKEN"
+        # Machine-readable next-action metadata for agents to act on.
+        assert candidate.provisionable is True
+        assert candidate.source == "manifest"
+        assert candidate.provision_tool == "gateway.provision"
+        assert candidate.request_capability_tool == "gateway.request_capability"
+        assert candidate.auth_tool == "gateway.auth_connect"
+
+    @pytest.mark.asyncio
+    async def test_enriched_research_keyword_matches_brightdata(
+        self, gateway_tools_no_cache: GatewayTools
+    ) -> None:
+        """The newly added 'web research' keyword surfaces brightdata."""
+        result = await gateway_tools_no_cache.catalog_search(
+            {"query": "web research", "include_offline": True}
+        )
+
+        assert any(
+            c.name == "brightdata" for c in result.manifest_candidates
+        ), "enriched 'web research' keyword should surface brightdata"
+
+    @pytest.mark.asyncio
+    async def test_manifest_candidates_require_include_offline(
+        self, gateway_tools_no_cache: GatewayTools
+    ) -> None:
+        """Manifest candidates are gated on include_offline=True."""
+        result = await gateway_tools_no_cache.catalog_search(
+            {"query": "bright data web research"}
+        )
+        assert result.manifest_candidates == []

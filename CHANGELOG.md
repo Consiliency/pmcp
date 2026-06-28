@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Downstream tool calls are no longer killed by a fixed wall-clock deadline
+  (issue #79, symptom 1a). `timeout_ms` is now an **inactivity (idle) timeout**:
+  a call survives as long as the downstream MCP server keeps producing output
+  (including JSON progress notifications, which now count toward per-request
+  liveness in both the stdio and SSE readers). An absolute backstop caps total
+  wall-clock time so a chatty-but-never-completing call cannot hang forever —
+  configurable via `PMCP_REQUEST_CEILING_MS` (default 600000ms / 10 min). The
+  long ceiling applies only to tool invocations; control-plane requests
+  (initialize, list calls) keep the tighter idle deadline so one stuck server
+  can't stall startup/refresh. This unblocks legitimately long browser/
+  automation operations driven through the gateway.
+- Stdio servers are now spawned in their own session/process group
+  (`start_new_session=True`) and reaped as a whole tree on disconnect (issue
+  #79, symptom 1c). Previously, killing a stdio server (e.g. `@playwright/mcp`)
+  left the browser it launched orphaned to init, holding the profile's
+  SingletonLock and breaking the next launch. A new group-aware
+  `_terminate_process_tree` helper (SIGTERM the group, wait, then SIGKILL, with
+  a single-process fallback when the process is not a group leader, or on
+  Windows where process groups are unavailable) now backs all four downstream
+  shutdown paths.
+- `gateway.refresh` is now diff-based and non-destructive (issue #79, symptom
+  2). Servers whose resolved config is unchanged are left connected and
+  running; only servers that were removed or whose config changed are
+  disconnected, and only newly-added eager servers are connected. Previously
+  refresh tore down **every** server and reconnected only the eager set, which
+  dropped previously-running lazy/provisioned servers to offline (the reported
+  "105 seen, 0 online") and needlessly respawned unchanged processes (e.g. a
+  live browser) on every refresh. The diff keeps only servers that are actually
+  ONLINE — a crashed eager server is reconnected (recovery path preserved);
+  reconciles the lazy registry to the resolved keep-set so removed/policy-denied
+  servers can no longer be lazily started; and reconnects a remote server when
+  its `${VAR}` auth token has rotated in the env store (compared against the
+  connect-time resolved headers), instead of keeping stale/revoked auth.
+- Process-tree reaping now escalates to a group `SIGKILL` when the leader exits
+  but a grandchild (e.g. a `SIGTERM`-ignoring browser) survives the `SIGTERM`
+  grace period, and reaps servers concurrently at shutdown so multiple hung
+  servers can't exceed the shutdown budget and orphan browsers (issue #79/1c).
+
+### Added
+- `gateway.catalog_search` with `include_offline=true` now surfaces
+  manifest-only provisionable servers in a dedicated `manifest_candidates` field
+  when the query matches a manifest server by name or keyword but no cached
+  tools exist yet (issue #78). Candidates carry machine-readable next-action
+  metadata (`provisionable`, `provision_tool`, `request_capability_tool`,
+  `auth_tool`, `requires_api_key`, `api_key_available`, `env_var`) so an agent
+  can provision the exact server instead of falling back to a plain web search.
+- Manifest: `brightdata` keywords extended with `web research`, `current web`,
+  `page fetch`, and `external research` so research-oriented prompts match
+  without the exact brand name.
+
+### Changed
+- `gateway.request_capability` tool description now states it **recommends** a
+  server to provision (and that `gateway.provision` does the actual install/
+  start), matching the implementation — it previously claimed to auto-provision
+  (issue #78).
+
 ## [1.16.0] - 2026-06-25
 
 ### Added

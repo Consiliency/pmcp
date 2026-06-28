@@ -711,6 +711,28 @@
       "task_summary": null,
       "type": "phase",
       "updated_at": "2026-06-25T02:26:25Z"
+    },
+    {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-06-28T06:46:00Z",
+      "file": "plans/detailed-idle-timeout-downstream-calls-20260628-0646.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/20260628T0646Z-idle-timeout.md",
+      "lifecycle": [
+        {
+          "at": "2026-06-28T06:46:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "artifact_state": "staged"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "slug": "detailed-idle-timeout-downstream-calls",
+      "status": "staged",
+      "task_summary": "Convert downstream-call timeout to inactivity (idle) timeout with absolute ceiling (#79 symptom 1a)",
+      "type": "detailed",
+      "updated_at": "2026-06-28T06:46:00Z"
     }
   ],
   "schema_version": 1

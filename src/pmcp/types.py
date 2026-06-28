@@ -627,6 +627,10 @@ class CatalogSearchOutput(BaseModel):
     truncated: bool
     cli_hints: list[CLIHint] = Field(default_factory=list)
     registry_candidates: list[CapabilityCandidate] = Field(default_factory=list)
+    # Manifest-provisionable servers that match the query but have never been
+    # started (no cached tools). Surfaced when include_offline=True so agents can
+    # provision the exact server instead of falling back to web search (#78).
+    manifest_candidates: list[CapabilityCandidate] = Field(default_factory=list)
     stale_updates: list[str] | None = None
 
 
@@ -977,6 +981,13 @@ class CapabilityCandidate(BaseModel):
     authorization_server_metadata_url: str | None = None
     declared_scopes: list[str] = Field(default_factory=list)
     declared_capabilities: list[str] = Field(default_factory=list)
+    # Machine-readable next-action metadata (issue #78). Lets an agent act on a
+    # candidate without knowing the gateway's magic tool names. Defaults keep
+    # existing consumers (e.g. registry/category candidates) unchanged.
+    provisionable: bool = False  # True if gateway.provision can install/start it
+    provision_tool: str | None = None  # e.g. "gateway.provision"
+    request_capability_tool: str | None = None  # e.g. "gateway.request_capability"
+    auth_tool: str | None = None  # e.g. "gateway.auth_connect"
 
 
 class CapabilityMatchResponse(BaseModel):

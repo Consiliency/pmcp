@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
+import os
 from pathlib import Path
+import signal
+import sys
 import time
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,6 +26,7 @@ from pmcp.client.manager import (
     _extract_tags,
     _infer_risk_hint,
     _remote_headers,
+    _terminate_process_tree,
     _truncate_description,
 )
 from pmcp.env_store import write_env_file
@@ -2566,7 +2572,9 @@ class TestCleanupClient:
         await manager._cleanup_client("test", managed)
 
         managed.read_task.cancel.assert_called_once()  # type: ignore[union-attr]
-        managed.process.kill.assert_called_once()  # type: ignore[union-attr]
+        # _terminate_process_tree gracefully SIGTERMs first (the process exits
+        # within the wait window, so SIGKILL is never needed).
+        managed.process.terminate.assert_called_once()  # type: ignore[union-attr]
         assert "test" not in manager._clients
         assert "test" not in manager._servers
 
@@ -2580,7 +2588,7 @@ class TestCleanupClient:
         await manager._cleanup_client("test", managed)
 
         managed.read_task.cancel.assert_not_called()  # type: ignore[union-attr]
-        managed.process.kill.assert_called_once()  # type: ignore[union-attr]
+        managed.process.terminate.assert_called_once()  # type: ignore[union-attr]
 
     @pytest.mark.asyncio
     async def test_cleanup_client_skips_kill_if_process_exited(self) -> None:
@@ -2652,7 +2660,12 @@ class TestDisconnectAllPostKill:
         manager._clients["slow"] = managed
         manager._servers["slow"] = status
 
-        with patch("pmcp.client.manager.logger") as mock_logger:
+        with (
+            patch("pmcp.client.manager.logger") as mock_logger,
+            patch(
+                "pmcp.client.manager.os.getpgid", side_effect=ProcessLookupError
+            ),
+        ):
             await manager.disconnect_all()
 
         mock_process.kill.assert_called_once()
@@ -2681,7 +2694,12 @@ class TestDisconnectAllPostKill:
         manager._clients["slow2"] = managed
         manager._servers["slow2"] = status
 
-        with patch("pmcp.client.manager.logger") as mock_logger:
+        with (
+            patch("pmcp.client.manager.logger") as mock_logger,
+            patch(
+                "pmcp.client.manager.os.getpgid", side_effect=ProcessLookupError
+            ),
+        ):
             await manager.disconnect_all()
 
         mock_process.kill.assert_called_once()
@@ -2865,6 +2883,204 @@ class TestReconnectStormGuard:
         assert len(tasks_created) == 1, "Only one reconnect task should be created"
 
 
+class TestIdleTimeout:
+    """Tests for the inactivity (idle) timeout on downstream requests (#79/1a)."""
+
+    @staticmethod
+    def _managed(remote: bool = False) -> ManagedClient:
+        """Build a ManagedClient with a mock process suitable for _send_request."""
+        config = MagicMock()
+        config.name = "test"
+        status = ServerStatus(
+            name="test", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.stdin.write = MagicMock()
+        process.stdin.drain = AsyncMock()
+        process.stdout = MagicMock()
+        return ManagedClient(
+            config=config, process=process, status=status, is_remote=remote
+        )
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_survives_periodic_output(self) -> None:
+        """A call that keeps producing output past the idle window completes."""
+        manager = ClientManager()
+        managed = self._managed()
+        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        pending = PendingRequest(
+            request_id=1,
+            server_name="test",
+            tool_id="t::x",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=300,
+            future=future,
+        )
+        managed.pending_requests[1] = pending
+
+        async def keepalive() -> None:
+            # Bump well past the 0.3s idle window, then resolve.
+            for _ in range(5):
+                await asyncio.sleep(0.1)
+                pending.last_heartbeat = time.time()
+            future.set_result({"ok": True})
+
+        task = asyncio.create_task(keepalive())
+        result = await manager._await_with_idle_timeout(
+            managed, 1, pending, future, idle_timeout_s=0.3, ceiling_s=100.0
+        )
+        await task
+        assert result == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_fires_when_silent(self) -> None:
+        """A silent downstream times out at the idle threshold and is removed."""
+        manager = ClientManager()
+        managed = self._managed()
+
+        with pytest.raises(TimeoutError):
+            await manager._send_request(
+                managed, "tools/call", {}, tool_id="t::x", timeout_ms=200
+            )
+
+        assert managed.pending_requests == {}
+        assert managed.status.pending_request_count == 0
+
+    @pytest.mark.asyncio
+    async def test_absolute_ceiling_fires_for_chatty_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A continuously-heartbeating call that never resolves hits the ceiling."""
+        monkeypatch.setenv("PMCP_REQUEST_CEILING_MS", "200")
+        manager = ClientManager()
+        managed = self._managed()
+
+        async def chatty() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(0.05)
+                    for req in managed.pending_requests.values():
+                        req.last_heartbeat = time.time()
+            except asyncio.CancelledError:
+                pass
+
+        task = asyncio.create_task(chatty())
+        try:
+            with pytest.raises(TimeoutError):
+                # idle window (400ms) never elapses thanks to chatty bumps, so the
+                # 200ms ceiling is what fires.
+                await manager._send_request(
+                    managed, "tools/call", {}, tool_id="t::x", timeout_ms=400
+                )
+        finally:
+            task.cancel()
+            await task
+
+        assert managed.pending_requests == {}
+
+    @pytest.mark.asyncio
+    async def test_progress_notification_bumps_pending_heartbeat_stdout(self) -> None:
+        """An id:null JSON notification advances in-flight last_heartbeat (stdio)."""
+        manager = ClientManager()
+        managed = self._managed()
+        # Graceful branch in finally; avoid scheduling a reconnect task.
+        managed.status.status = ServerStatusEnum.OFFLINE
+        stale = time.time() - 10
+        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        pending = PendingRequest(
+            request_id=1,
+            server_name="test",
+            tool_id="t::x",
+            started_at=stale,
+            last_heartbeat=stale,
+            timeout_ms=30000,
+            future=future,
+        )
+        managed.pending_requests[1] = pending
+
+        notif = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progress": 1},
+                }
+            )
+            + "\n"
+        )
+        cast(Any, managed.process).stdout.readline = AsyncMock(
+            side_effect=[notif.encode(), b""]
+        )
+
+        await manager._read_stdout("test", managed)
+
+        assert pending.last_heartbeat > stale
+        # Retrieve the ConnectionError set by the EOF finally so it is not logged.
+        with contextlib.suppress(Exception):
+            pending.future.exception()
+
+    @pytest.mark.asyncio
+    async def test_progress_notification_bumps_pending_heartbeat_sse(self) -> None:
+        """An id:null JSON notification advances in-flight last_heartbeat (SSE)."""
+        manager = ClientManager()
+        managed = self._managed(remote=True)
+        managed.status.status = ServerStatusEnum.OFFLINE
+        stale = time.time() - 10
+        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        pending = PendingRequest(
+            request_id=1,
+            server_name="test",
+            tool_id="t::x",
+            started_at=stale,
+            last_heartbeat=stale,
+            timeout_ms=30000,
+            future=future,
+        )
+        managed.pending_requests[1] = pending
+
+        msg = MagicMock()
+        msg.message.model_dump.return_value = {
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {},
+        }
+
+        async def stream() -> Any:
+            yield msg
+
+        await manager._read_sse("test", managed, stream())
+
+        assert pending.last_heartbeat > stale
+        with contextlib.suppress(Exception):
+            pending.future.exception()
+
+    def test_request_ceiling_ms_env_parsing(self) -> None:
+        """_request_ceiling_ms parses valid values and falls back on bad ones."""
+        from pmcp.client.manager import (
+            DEFAULT_REQUEST_CEILING_MS,
+            _request_ceiling_ms,
+        )
+
+        assert DEFAULT_REQUEST_CEILING_MS == 600000
+
+        import os as _os
+
+        with patch.dict("os.environ", {}, clear=False):
+            _os.environ.pop("PMCP_REQUEST_CEILING_MS", None)
+            assert _request_ceiling_ms() == DEFAULT_REQUEST_CEILING_MS
+
+        with patch.dict("os.environ", {"PMCP_REQUEST_CEILING_MS": "1234"}):
+            assert _request_ceiling_ms() == 1234
+
+        for bad in ("not-a-number", "-1", "0"):
+            with patch.dict("os.environ", {"PMCP_REQUEST_CEILING_MS": bad}):
+                assert _request_ceiling_ms() == DEFAULT_REQUEST_CEILING_MS
+
+
 class TestStdioReadLimit:
     """Regression tests for the stdout-line-too-long flake (was: 64 KiB asyncio default)."""
 
@@ -2918,6 +3134,220 @@ class TestStdioReadLimit:
 
         assert "limit" in captured, "create_subprocess_exec must be called with limit="
         assert captured["limit"] == 10 * 1024 * 1024
+
+    @pytest.mark.asyncio
+    async def test_connect_stdio_starts_new_session(self) -> None:
+        """_connect_stdio must spawn with start_new_session=True so the whole
+        process tree (e.g. browsers) can be reaped on disconnect (issue #79)."""
+        manager = ClientManager()
+        captured: dict[str, Any] = {}
+
+        async def fake_create(*args: Any, **kwargs: Any) -> Any:
+            captured.update(kwargs)
+            raise RuntimeError("stop here")
+
+        config = ResolvedServerConfig(
+            name="x",
+            source="project",
+            config=LocalMcpServerConfig(command="fake", args=[]),
+        )
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_create):
+            with pytest.raises(RuntimeError, match="stop here"):
+                await manager._connect_stdio(config)
+
+        assert captured.get("start_new_session") is True
+
+
+class TestTerminateProcessTree:
+    """Tests for the group-aware _terminate_process_tree helper (issue #79)."""
+
+    @pytest.mark.asyncio
+    async def test_terminates_whole_process_group(self) -> None:
+        """When the process leads its group, SIGTERM goes to the group; once the
+        group is gone (probe raises) no SIGKILL escalation happens."""
+
+        def killpg_side(pgid: int, sig: int) -> None:
+            if sig == 0:  # liveness probe: report the group already gone
+                raise ProcessLookupError
+            return None
+
+        process = MagicMock()
+        process.pid = 4321
+        process.returncode = None
+        process.wait = AsyncMock(return_value=0)
+
+        with (
+            patch("pmcp.client.manager.os.getpgid", return_value=4321),
+            patch(
+                "pmcp.client.manager.os.killpg", side_effect=killpg_side
+            ) as mock_killpg,
+        ):
+            await _terminate_process_tree(process, "browser")
+
+        # SIGTERM was delivered to the group...
+        assert any(
+            c.args == (4321, signal.SIGTERM) for c in mock_killpg.call_args_list
+        )
+        # ...and since the group probe reported it gone, no SIGKILL escalation.
+        assert not any(
+            c.args == (4321, signal.SIGKILL) for c in mock_killpg.call_args_list
+        )
+        # Group signal succeeded, so we never fall back to single-process kill.
+        process.terminate.assert_not_called()
+        process.kill.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_single_process_on_process_lookup_error(self) -> None:
+        """If killpg raises ProcessLookupError, fall back to process.terminate()."""
+        process = MagicMock()
+        process.pid = 4321
+        process.returncode = None
+        process.wait = AsyncMock(return_value=0)
+
+        with (
+            patch("pmcp.client.manager.os.getpgid", return_value=4321),
+            patch(
+                "pmcp.client.manager.os.killpg", side_effect=ProcessLookupError
+            ),
+        ):
+            await _terminate_process_tree(process, "browser")
+
+        process.terminate.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_noop_when_process_already_exited(self) -> None:
+        """A process that already exited must not be signalled."""
+        process = MagicMock()
+        process.pid = 4321
+        process.returncode = 0
+
+        with patch("pmcp.client.manager.os.killpg") as mock_killpg:
+            await _terminate_process_tree(process, "browser")
+
+        mock_killpg.assert_not_called()
+        process.terminate.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not hasattr(os, "killpg"), reason="process-group reaping is POSIX-only"
+    )
+    async def test_real_process_tree_is_reaped(self) -> None:
+        """End-to-end: a grandchild spawned by the downstream process is killed.
+
+        The mocked tests above only prove killpg is *called*; this proves the
+        whole tree actually dies — the regression guard for orphaned Chrome
+        holding the browser profile's SingletonLock (issue #79, symptom 1c).
+        """
+        # Parent (its own session, like _connect_stdio) spawns a child; the
+        # parent prints the child PID then both sleep.
+        script = (
+            "import subprocess, time;"
+            "c = subprocess.Popen(['sleep', '30']);"
+            "print(c.pid, flush=True);"
+            "time.sleep(30)"
+        )
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdout=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        child_pid = int((await asyncio.wait_for(process.stdout.readline(), 10.0)).strip())
+        parent_pid = process.pid
+
+        # Both are alive before reaping.
+        os.kill(parent_pid, 0)
+        os.kill(child_pid, 0)
+
+        await _terminate_process_tree(process, "real")
+
+        async def _gone(pid: int) -> bool:
+            for _ in range(30):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                await asyncio.sleep(0.1)
+            return False
+
+        assert await _gone(parent_pid), "parent process was not reaped"
+        assert await _gone(child_pid), "grandchild process was orphaned, not reaped"
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not hasattr(os, "killpg"), reason="process-group reaping is POSIX-only"
+    )
+    async def test_sigterm_ignoring_grandchild_is_group_sigkilled(self) -> None:
+        """A grandchild that ignores SIGTERM and outlives the leader must still be
+        reaped via the group SIGKILL escalation (issue #79/1c — codex finding).
+
+        The parent dies on SIGTERM (default disposition); the grandchild installs
+        SIG_IGN for SIGTERM, so it survives the SIGTERM phase. The helper must
+        then SIGKILL the surviving group rather than returning once the leader is
+        gone.
+        """
+        child_code = (
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "print('ready', flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        parent_code = (
+            "import subprocess, sys, time\n"
+            f"c = subprocess.Popen([sys.executable, '-c', {child_code!r}])\n"
+            "print(c.pid, flush=True)\n"
+            "time.sleep(60)\n"
+        )
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            parent_code,
+            stdout=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        child_pid = int((await asyncio.wait_for(process.stdout.readline(), 10.0)).strip())
+        parent_pid = process.pid
+        os.kill(parent_pid, 0)
+        os.kill(child_pid, 0)
+
+        await _terminate_process_tree(process, "ignore")
+
+        async def _gone(pid: int) -> bool:
+            for _ in range(30):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                await asyncio.sleep(0.1)
+            return False
+
+        assert await _gone(parent_pid), "parent was not reaped"
+        assert await _gone(
+            child_pid
+        ), "SIGTERM-ignoring grandchild was not group-SIGKILLed"
+
+    @pytest.mark.asyncio
+    async def test_windows_falls_back_without_killpg(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On platforms without os.killpg/os.getpgid (Windows), the helper must
+        fall back to process.terminate()/kill() instead of raising AttributeError."""
+        import pmcp.client.manager as mgr
+
+        monkeypatch.delattr(mgr.os, "killpg", raising=False)
+        monkeypatch.delattr(mgr.os, "getpgid", raising=False)
+
+        process = MagicMock()
+        process.pid = 4321
+        process.returncode = None
+        process.wait = AsyncMock(return_value=0)
+
+        # Must not raise; must use the cross-platform single-process path.
+        await _terminate_process_tree(process, "browser")
+        process.terminate.assert_called_once()
 
 
 class TestReadStdoutFailureSurfacing:
