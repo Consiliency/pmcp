@@ -639,9 +639,9 @@ class TestManifestCandidatesDiscovery:
             {"query": "web research", "include_offline": True}
         )
 
-        assert any(
-            c.name == "brightdata" for c in result.manifest_candidates
-        ), "enriched 'web research' keyword should surface brightdata"
+        assert any(c.name == "brightdata" for c in result.manifest_candidates), (
+            "enriched 'web research' keyword should surface brightdata"
+        )
 
     @pytest.mark.asyncio
     async def test_manifest_candidates_require_include_offline(

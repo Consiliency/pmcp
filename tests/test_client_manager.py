@@ -2662,9 +2662,7 @@ class TestDisconnectAllPostKill:
 
         with (
             patch("pmcp.client.manager.logger") as mock_logger,
-            patch(
-                "pmcp.client.manager.os.getpgid", side_effect=ProcessLookupError
-            ),
+            patch("pmcp.client.manager.os.getpgid", side_effect=ProcessLookupError),
         ):
             await manager.disconnect_all()
 
@@ -2696,9 +2694,7 @@ class TestDisconnectAllPostKill:
 
         with (
             patch("pmcp.client.manager.logger") as mock_logger,
-            patch(
-                "pmcp.client.manager.os.getpgid", side_effect=ProcessLookupError
-            ),
+            patch("pmcp.client.manager.os.getpgid", side_effect=ProcessLookupError),
         ):
             await manager.disconnect_all()
 
@@ -2891,9 +2887,7 @@ class TestIdleTimeout:
         """Build a ManagedClient with a mock process suitable for _send_request."""
         config = MagicMock()
         config.name = "test"
-        status = ServerStatus(
-            name="test", status=ServerStatusEnum.ONLINE, tool_count=0
-        )
+        status = ServerStatus(name="test", status=ServerStatusEnum.ONLINE, tool_count=0)
         process = MagicMock()
         process.returncode = None
         process.stdin = MagicMock()
@@ -3185,9 +3179,7 @@ class TestTerminateProcessTree:
             await _terminate_process_tree(process, "browser")
 
         # SIGTERM was delivered to the group...
-        assert any(
-            c.args == (4321, signal.SIGTERM) for c in mock_killpg.call_args_list
-        )
+        assert any(c.args == (4321, signal.SIGTERM) for c in mock_killpg.call_args_list)
         # ...and since the group probe reported it gone, no SIGKILL escalation.
         assert not any(
             c.args == (4321, signal.SIGKILL) for c in mock_killpg.call_args_list
@@ -3206,9 +3198,7 @@ class TestTerminateProcessTree:
 
         with (
             patch("pmcp.client.manager.os.getpgid", return_value=4321),
-            patch(
-                "pmcp.client.manager.os.killpg", side_effect=ProcessLookupError
-            ),
+            patch("pmcp.client.manager.os.killpg", side_effect=ProcessLookupError),
         ):
             await _terminate_process_tree(process, "browser")
 
@@ -3254,7 +3244,9 @@ class TestTerminateProcessTree:
             start_new_session=True,
         )
         assert process.stdout is not None
-        child_pid = int((await asyncio.wait_for(process.stdout.readline(), 10.0)).strip())
+        child_pid = int(
+            (await asyncio.wait_for(process.stdout.readline(), 10.0)).strip()
+        )
         parent_pid = process.pid
 
         # Both are alive before reaping.
@@ -3308,7 +3300,9 @@ class TestTerminateProcessTree:
             start_new_session=True,
         )
         assert process.stdout is not None
-        child_pid = int((await asyncio.wait_for(process.stdout.readline(), 10.0)).strip())
+        child_pid = int(
+            (await asyncio.wait_for(process.stdout.readline(), 10.0)).strip()
+        )
         parent_pid = process.pid
         os.kill(parent_pid, 0)
         os.kill(child_pid, 0)
@@ -3325,9 +3319,9 @@ class TestTerminateProcessTree:
             return False
 
         assert await _gone(parent_pid), "parent was not reaped"
-        assert await _gone(
-            child_pid
-        ), "SIGTERM-ignoring grandchild was not group-SIGKILLed"
+        assert await _gone(child_pid), (
+            "SIGTERM-ignoring grandchild was not group-SIGKILLed"
+        )
 
     @pytest.mark.asyncio
     async def test_windows_falls_back_without_killpg(

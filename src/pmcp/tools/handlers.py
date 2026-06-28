@@ -2206,9 +2206,7 @@ class GatewayTools:
             # must NOT be torn down.
             current_configs = self._client_manager.get_connected_configs()
             header_env_lookup = build_remote_header_env_lookup(self._project_root)
-            eager_by_name = {
-                config.name: config for config in resolution.eager_configs
-            }
+            eager_by_name = {config.name: config for config in resolution.eager_configs}
             keep_by_name = {
                 config.name: config
                 for config in resolution.eager_configs + resolution.lazy_configs
@@ -2234,9 +2232,7 @@ class GatewayTools:
                     )
                 )
 
-            to_disconnect = [
-                name for name in current_configs if not _live_keep(name)
-            ]
+            to_disconnect = [name for name in current_configs if not _live_keep(name)]
             to_connect = [
                 config
                 for name, config in eager_by_name.items()
