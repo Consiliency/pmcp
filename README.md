@@ -334,7 +334,7 @@ compliance matrix and next-revision tracking checklist.
 
 | Tool | Purpose |
 |------|---------|
-| `gateway.catalog_search` | Search available tools, returns compact capability cards with small metadata such as title, icons, execution hints, and schema dialect, plus additive compact CLI hints and registry candidates when relevant |
+| `gateway.catalog_search` | Search available tools, returns compact capability cards with small metadata such as title, icons, execution hints, and schema dialect, plus additive compact CLI hints, registry candidates, and (with `include_offline=true`) manifest provision candidates (`manifest_candidates`) carrying `provisionable`/`provision_tool`/`requires_api_key`/`api_key_available`/`env_var` so an agent can provision the exact server |
 | `gateway.describe` | Get detailed schema and richer metadata for a specific tool, including output schema, annotations, execution/task support, icons, and schema dialect |
 | `gateway.invoke` | Call a downstream tool with argument validation, including task-augmented execution for task-capable tools |
 | `gateway.refresh` | Reload backend configs and reconnect; refuses while requests or active MCP tasks are pending unless `force=true` |
@@ -1201,6 +1201,21 @@ pmcp
 
 ```bash
 pmcp --lock-dir ./.mcp-gateway
+```
+
+### Downstream call tunables
+
+```bash
+# Per-line stdout read limit for downstream stdio servers (default 10 MiB).
+# A single response line larger than this is dropped (failing only that call,
+# with the server kept connected) rather than disconnecting the server.
+export PMCP_STDIO_READ_LIMIT=$((20 * 1024 * 1024))
+
+# Absolute backstop for a single downstream tool call (default 600000ms / 10 min).
+# `timeout_ms` is an INACTIVITY timeout — a call survives as long as the server
+# keeps producing output; this ceiling caps total wall-clock time for tool calls
+# so a chatty-but-never-completing call cannot hang forever.
+export PMCP_REQUEST_CEILING_MS=600000
 ```
 
 ## Deprecations
