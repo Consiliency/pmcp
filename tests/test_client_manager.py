@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 import time
 from typing import Any, cast
@@ -2863,6 +2865,204 @@ class TestReconnectStormGuard:
 
         await asyncio.sleep(0)  # let tasks run
         assert len(tasks_created) == 1, "Only one reconnect task should be created"
+
+
+class TestIdleTimeout:
+    """Tests for the inactivity (idle) timeout on downstream requests (#79/1a)."""
+
+    @staticmethod
+    def _managed(remote: bool = False) -> ManagedClient:
+        """Build a ManagedClient with a mock process suitable for _send_request."""
+        config = MagicMock()
+        config.name = "test"
+        status = ServerStatus(
+            name="test", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.stdin.write = MagicMock()
+        process.stdin.drain = AsyncMock()
+        process.stdout = MagicMock()
+        return ManagedClient(
+            config=config, process=process, status=status, is_remote=remote
+        )
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_survives_periodic_output(self) -> None:
+        """A call that keeps producing output past the idle window completes."""
+        manager = ClientManager()
+        managed = self._managed()
+        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        pending = PendingRequest(
+            request_id=1,
+            server_name="test",
+            tool_id="t::x",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=300,
+            future=future,
+        )
+        managed.pending_requests[1] = pending
+
+        async def keepalive() -> None:
+            # Bump well past the 0.3s idle window, then resolve.
+            for _ in range(5):
+                await asyncio.sleep(0.1)
+                pending.last_heartbeat = time.time()
+            future.set_result({"ok": True})
+
+        task = asyncio.create_task(keepalive())
+        result = await manager._await_with_idle_timeout(
+            managed, 1, pending, future, idle_timeout_s=0.3, ceiling_s=100.0
+        )
+        await task
+        assert result == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_fires_when_silent(self) -> None:
+        """A silent downstream times out at the idle threshold and is removed."""
+        manager = ClientManager()
+        managed = self._managed()
+
+        with pytest.raises(TimeoutError):
+            await manager._send_request(
+                managed, "tools/call", {}, tool_id="t::x", timeout_ms=200
+            )
+
+        assert managed.pending_requests == {}
+        assert managed.status.pending_request_count == 0
+
+    @pytest.mark.asyncio
+    async def test_absolute_ceiling_fires_for_chatty_call(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A continuously-heartbeating call that never resolves hits the ceiling."""
+        monkeypatch.setenv("PMCP_REQUEST_CEILING_MS", "200")
+        manager = ClientManager()
+        managed = self._managed()
+
+        async def chatty() -> None:
+            try:
+                while True:
+                    await asyncio.sleep(0.05)
+                    for req in managed.pending_requests.values():
+                        req.last_heartbeat = time.time()
+            except asyncio.CancelledError:
+                pass
+
+        task = asyncio.create_task(chatty())
+        try:
+            with pytest.raises(TimeoutError):
+                # idle window (400ms) never elapses thanks to chatty bumps, so the
+                # 200ms ceiling is what fires.
+                await manager._send_request(
+                    managed, "tools/call", {}, tool_id="t::x", timeout_ms=400
+                )
+        finally:
+            task.cancel()
+            await task
+
+        assert managed.pending_requests == {}
+
+    @pytest.mark.asyncio
+    async def test_progress_notification_bumps_pending_heartbeat_stdout(self) -> None:
+        """An id:null JSON notification advances in-flight last_heartbeat (stdio)."""
+        manager = ClientManager()
+        managed = self._managed()
+        # Graceful branch in finally; avoid scheduling a reconnect task.
+        managed.status.status = ServerStatusEnum.OFFLINE
+        stale = time.time() - 10
+        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        pending = PendingRequest(
+            request_id=1,
+            server_name="test",
+            tool_id="t::x",
+            started_at=stale,
+            last_heartbeat=stale,
+            timeout_ms=30000,
+            future=future,
+        )
+        managed.pending_requests[1] = pending
+
+        notif = (
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/progress",
+                    "params": {"progress": 1},
+                }
+            )
+            + "\n"
+        )
+        cast(Any, managed.process).stdout.readline = AsyncMock(
+            side_effect=[notif.encode(), b""]
+        )
+
+        await manager._read_stdout("test", managed)
+
+        assert pending.last_heartbeat > stale
+        # Retrieve the ConnectionError set by the EOF finally so it is not logged.
+        with contextlib.suppress(Exception):
+            pending.future.exception()
+
+    @pytest.mark.asyncio
+    async def test_progress_notification_bumps_pending_heartbeat_sse(self) -> None:
+        """An id:null JSON notification advances in-flight last_heartbeat (SSE)."""
+        manager = ClientManager()
+        managed = self._managed(remote=True)
+        managed.status.status = ServerStatusEnum.OFFLINE
+        stale = time.time() - 10
+        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        pending = PendingRequest(
+            request_id=1,
+            server_name="test",
+            tool_id="t::x",
+            started_at=stale,
+            last_heartbeat=stale,
+            timeout_ms=30000,
+            future=future,
+        )
+        managed.pending_requests[1] = pending
+
+        msg = MagicMock()
+        msg.message.model_dump.return_value = {
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": {},
+        }
+
+        async def stream() -> Any:
+            yield msg
+
+        await manager._read_sse("test", managed, stream())
+
+        assert pending.last_heartbeat > stale
+        with contextlib.suppress(Exception):
+            pending.future.exception()
+
+    def test_request_ceiling_ms_env_parsing(self) -> None:
+        """_request_ceiling_ms parses valid values and falls back on bad ones."""
+        from pmcp.client.manager import (
+            DEFAULT_REQUEST_CEILING_MS,
+            _request_ceiling_ms,
+        )
+
+        assert DEFAULT_REQUEST_CEILING_MS == 600000
+
+        import os as _os
+
+        with patch.dict("os.environ", {}, clear=False):
+            _os.environ.pop("PMCP_REQUEST_CEILING_MS", None)
+            assert _request_ceiling_ms() == DEFAULT_REQUEST_CEILING_MS
+
+        with patch.dict("os.environ", {"PMCP_REQUEST_CEILING_MS": "1234"}):
+            assert _request_ceiling_ms() == 1234
+
+        for bad in ("not-a-number", "-1", "0"):
+            with patch.dict("os.environ", {"PMCP_REQUEST_CEILING_MS": bad}):
+                assert _request_ceiling_ms() == DEFAULT_REQUEST_CEILING_MS
 
 
 class TestStdioReadLimit:

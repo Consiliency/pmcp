@@ -123,6 +123,36 @@ def _stdio_read_limit() -> int:
     return value
 
 
+# Absolute backstop for a single downstream request. ``timeout_ms`` is now an
+# inactivity (idle) timeout: a call survives as long as the downstream keeps
+# producing output. This ceiling caps the total wall-clock time so a chatty but
+# never-completing call cannot hang forever. Override via PMCP_REQUEST_CEILING_MS.
+DEFAULT_REQUEST_CEILING_MS = 600000  # 10 minutes
+
+
+def _request_ceiling_ms() -> int:
+    raw = os.environ.get("PMCP_REQUEST_CEILING_MS")
+    if not raw:
+        return DEFAULT_REQUEST_CEILING_MS
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "PMCP_REQUEST_CEILING_MS=%r is not an integer; using default %d",
+            raw,
+            DEFAULT_REQUEST_CEILING_MS,
+        )
+        return DEFAULT_REQUEST_CEILING_MS
+    if value <= 0:
+        logger.warning(
+            "PMCP_REQUEST_CEILING_MS=%d must be positive; using default %d",
+            value,
+            DEFAULT_REQUEST_CEILING_MS,
+        )
+        return DEFAULT_REQUEST_CEILING_MS
+    return value
+
+
 def _get_memory_usage_mb() -> float:
     """Get current process memory usage in MB."""
     try:
@@ -1284,16 +1314,19 @@ class ClientManager:
                     # EOF - server process has exited
                     break
 
-                # UPDATE heartbeat on ANY output from server
+                # UPDATE heartbeat on ANY output from server. This includes JSON
+                # progress notifications (id: null) that don't resolve a request,
+                # so per-request liveness drives the idle timeout in _send_request.
                 now = time.time()
                 managed.status.last_activity_at = now
+                for req in managed.pending_requests.values():
+                    req.last_heartbeat = now
 
                 try:
                     message = json.loads(line.decode())
                     msg_id = message.get("id")
                     if msg_id is not None and msg_id in managed.pending_requests:
                         pending = managed.pending_requests.pop(msg_id)
-                        pending.last_heartbeat = now  # Update request heartbeat
 
                         # Track response time
                         elapsed_ms = (now - pending.started_at) * 1000
@@ -1317,9 +1350,7 @@ class ClientManager:
                         else:
                             pending.future.set_result(message.get("result", {}))
                 except json.JSONDecodeError:
-                    # Non-JSON output still counts as heartbeat for all pending
-                    for req in managed.pending_requests.values():
-                        req.last_heartbeat = now
+                    # Non-JSON output already counted as a heartbeat above.
                     logger.debug(f"[{name}] Non-JSON output: {line.decode().strip()}")
         except asyncio.LimitOverrunError as e:
             limit = _stdio_read_limit()
@@ -1423,12 +1454,14 @@ class ClientManager:
         """Read JSON-RPC messages from an SSE stream."""
         try:
             async for message in read_stream:
+                # Any output counts as per-request liveness, including progress
+                # notifications (id: null), so the idle timeout sees the keepalive.
                 now = time.time()
                 managed.status.last_activity_at = now
+                for req in managed.pending_requests.values():
+                    req.last_heartbeat = now
 
                 if isinstance(message, Exception):
-                    for req in managed.pending_requests.values():
-                        req.last_heartbeat = now
                     raise message
 
                 payload = message.message.model_dump(
@@ -1439,7 +1472,6 @@ class ClientManager:
                 msg_id = payload.get("id")
                 if msg_id is not None and msg_id in managed.pending_requests:
                     pending = managed.pending_requests.pop(msg_id)
-                    pending.last_heartbeat = now
 
                     elapsed_ms = (now - pending.started_at) * 1000
                     managed.response_times.append(elapsed_ms)
@@ -1522,14 +1554,64 @@ class ClientManager:
             managed.process.stdin.write(data.encode())
             await managed.process.stdin.drain()
 
-        # Wait for response with timeout
+        # Wait for response with an inactivity (idle) timeout: the call survives
+        # as long as the downstream keeps producing output (per-request
+        # last_heartbeat), bounded by an absolute ceiling backstop.
         try:
-            result = await asyncio.wait_for(future, timeout=timeout_ms / 1000.0)
+            result = await self._await_with_idle_timeout(
+                managed,
+                request_id,
+                pending,
+                future,
+                idle_timeout_s=timeout_ms / 1000.0,
+                ceiling_s=_request_ceiling_ms() / 1000.0,
+            )
             return result
         except asyncio.TimeoutError:
             managed.pending_requests.pop(request_id, None)
             managed.status.pending_request_count = len(managed.pending_requests)
             raise TimeoutError(f"Request {method} timed out")
+
+    async def _await_with_idle_timeout(
+        self,
+        managed: ManagedClient,
+        request_id: int,
+        pending: PendingRequest,
+        future: asyncio.Future[Any],
+        idle_timeout_s: float,
+        ceiling_s: float,
+    ) -> Any:
+        """Await ``future`` until it resolves, the downstream goes idle, or the
+        absolute ceiling is hit.
+
+        Waits in short slices so per-request liveness (``pending.last_heartbeat``,
+        bumped by the stdout/SSE readers on any downstream output) can extend the
+        deadline. ``asyncio.shield`` ensures a slice timeout never cancels the real
+        future, so a response arriving mid-slice is returned rather than dropped.
+        Raises ``asyncio.TimeoutError`` on idle/ceiling so the caller maps it to the
+        usual ``TimeoutError``.
+        """
+        slice_s = min(idle_timeout_s, 1.0)
+        while True:
+            try:
+                return await asyncio.wait_for(
+                    asyncio.shield(future), timeout=slice_s
+                )
+            except asyncio.TimeoutError:
+                if future.done():
+                    return future.result()
+                now = time.time()
+                if now - pending.started_at >= ceiling_s:
+                    logger.warning(
+                        "[%s] request %d hit absolute ceiling (%.1fs)",
+                        managed.config.name,
+                        request_id,
+                        ceiling_s,
+                    )
+                    raise
+                if now - pending.last_heartbeat >= idle_timeout_s:
+                    raise
+                # Downstream is still active; keep waiting.
 
     async def _send_initialize(self, managed: ManagedClient) -> None:
         """Send initialize handshake."""
