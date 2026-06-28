@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Downstream tool calls are no longer killed by a fixed wall-clock deadline
+  (issue #79, symptom 1a). `timeout_ms` is now an **inactivity (idle) timeout**:
+  a call survives as long as the downstream MCP server keeps producing output
+  (including JSON progress notifications, which now count toward per-request
+  liveness in both the stdio and SSE readers). An absolute backstop caps total
+  wall-clock time so a chatty-but-never-completing call cannot hang forever —
+  configurable via `PMCP_REQUEST_CEILING_MS` (default 600000ms / 10 min). This
+  unblocks legitimately long browser/automation operations driven through the
+  gateway.
+
+### Added
+- `gateway.catalog_search` with `include_offline=true` now surfaces
+  manifest-only provisionable servers in a dedicated `manifest_candidates` field
+  when the query matches a manifest server by name or keyword but no cached
+  tools exist yet (issue #78). Candidates carry machine-readable next-action
+  metadata (`provisionable`, `provision_tool`, `request_capability_tool`,
+  `auth_tool`, `requires_api_key`, `api_key_available`, `env_var`) so an agent
+  can provision the exact server instead of falling back to a plain web search.
+- Manifest: `brightdata` keywords extended with `web research`, `current web`,
+  `page fetch`, and `external research` so research-oriented prompts match
+  without the exact brand name.
+
+### Changed
+- `gateway.request_capability` tool description now states it **recommends** a
+  server to provision (and that `gateway.provision` does the actual install/
+  start), matching the implementation — it previously claimed to auto-provision
+  (issue #78).
+
 ## [1.16.0] - 2026-06-25
 
 ### Added
