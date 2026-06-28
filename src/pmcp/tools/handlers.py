@@ -56,7 +56,11 @@ from pmcp.manifest.installer import (
     InstallError,
 )
 from pmcp.manifest.loader import load_manifest
-from pmcp.manifest.matcher import rank_cli_hints
+from pmcp.manifest.matcher import (
+    _keyword_match_score,
+    _manifest_keyword_weights,
+    rank_cli_hints,
+)
 from pmcp.manifest.registry import (
     DEFAULT_REGISTRY_ENDPOINT,
     RegistryCache,
@@ -420,9 +424,10 @@ def get_gateway_tool_definitions() -> list[Tool]:
         Tool(
             name="gateway.request_capability",
             description=(
-                "Find and auto-provision the right tool for a task — describe what you need in natural language. "
+                "Recommend the right tool for a task — describe what you need in natural language. "
                 "Examples: 'scrape a website', 'search Slack messages', 'query Postgres', 'browse the web'. "
-                "Matches against installed CLIs and 90+ provisionable MCP servers; starts the server automatically if needed. "
+                "Matches against installed CLIs and 90+ provisionable MCP servers and returns ranked candidates; "
+                "it does NOT start anything — call gateway.provision to actually install/start the recommended server. "
                 "Prefer this over gateway.provision when you don't already know the exact server name."
             ),
             inputSchema={
@@ -1158,6 +1163,90 @@ class GatewayTools:
 
         return cached_tools
 
+    def _manifest_candidates_for_query(
+        self,
+        query: str,
+        *,
+        manifest: Manifest,
+        configured_servers: dict[str, ResolvedServerConfig],
+        exclude_servers: set[str],
+        limit: int = 5,
+    ) -> list[CapabilityCandidate]:
+        """Match a query against manifest servers and emit provision candidates.
+
+        Surfaces manifest-only servers (never started, so no cached tools are
+        represented in catalog_search) so an agent can provision the exact
+        server instead of falling back to a plain web search (issue #78).
+        Scoring reuses the manifest keyword matcher; a normalized name match is
+        also accepted so servers that don't list their own name still surface.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+
+        query_words = query.lower().replace("-", " ").replace("_", " ").split()
+        keyword_weights = _manifest_keyword_weights(manifest)
+
+        scored: list[tuple[float, str, ServerConfig]] = []
+        for name, server in manifest.servers.items():
+            if name in exclude_servers:
+                continue
+            if not self._policy_manager.is_server_allowed(name):
+                continue
+
+            score = _keyword_match_score(query, server.keywords, keyword_weights)
+
+            # Normalized name match (e.g. "bright data" -> "brightdata").
+            norm_name = name.lower().replace("-", "").replace("_", "")
+            for window_size in (3, 2, 1):
+                for i in range(len(query_words) - window_size + 1):
+                    window = "".join(query_words[i : i + window_size])
+                    if window == norm_name:
+                        score = max(score, 1.0)
+                        break
+
+            if score >= 0.2:  # Same minimum threshold as the matcher
+                scored.append((score, name, server))
+
+        scored.sort(key=lambda item: (-item[0], item[1]))
+
+        running_servers = {
+            s.name
+            for s in self._client_manager.get_all_server_statuses()
+            if s.status.value == "online"
+        }
+
+        candidates: list[CapabilityCandidate] = []
+        for score, name, server in scored[:limit]:
+            requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
+                name, manifest, configured_servers
+            )
+            candidates.append(
+                CapabilityCandidate(
+                    name=name,
+                    candidate_type="server",
+                    relevance_score=min(1.0, score),
+                    reasoning=server.description,
+                    requires_api_key=requires_api_key,
+                    api_key_available=self._check_api_key_available(env_var),
+                    env_var=env_var,
+                    env_instructions=env_instructions,
+                    is_running=name in running_servers,
+                    source="manifest",
+                    transport=server.transport,
+                    url=server.url,
+                    package=server.package,
+                    server_card_url=server.server_card_url,
+                    declared_scopes=server.declared_scopes,
+                    declared_capabilities=server.declared_capabilities,
+                    provisionable=True,
+                    provision_tool="gateway.provision",
+                    request_capability_tool="gateway.request_capability",
+                    auth_tool="gateway.auth_connect",
+                )
+            )
+        return candidates
+
     async def catalog_search(self, input_data: dict[str, Any]) -> CatalogSearchOutput:
         """gateway.catalog_search - Search for available tools."""
         parsed = CatalogSearchInput.model_validate(input_data)
@@ -1205,6 +1294,11 @@ class GatewayTools:
             ]
 
         total_available = len(tools)
+
+        # Capture servers already represented by online/cached tools BEFORE any
+        # narrowing filters, so manifest candidates only cover "never started"
+        # servers (no cached tools at all) rather than ones merely filtered out.
+        represented_servers = {t.server_name for t in tools}
 
         # Filter by server name
         if parsed.filters and parsed.filters.server:
@@ -1261,6 +1355,18 @@ class GatewayTools:
                 parsed.query, limit=min(5, parsed.limit)
             )
 
+        # Surface manifest-provisionable servers that have never been started
+        # (no cached tools) so agents can provision them directly (#78).
+        manifest_candidates: list[CapabilityCandidate] = []
+        if parsed.include_offline and parsed.query:
+            manifest_candidates = self._manifest_candidates_for_query(
+                parsed.query,
+                manifest=load_manifest(),
+                configured_servers=self._load_configured_servers(),
+                exclude_servers=represented_servers,
+                limit=min(5, parsed.limit),
+            )
+
         truncated = len(tools) > parsed.limit
         tools = tools[: parsed.limit]
 
@@ -1312,6 +1418,7 @@ class GatewayTools:
             truncated=truncated,
             cli_hints=cli_hints,
             registry_candidates=registry_candidates,
+            manifest_candidates=manifest_candidates,
             stale_updates=stale_updates,
         )
 
