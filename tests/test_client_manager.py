@@ -7,7 +7,10 @@ import contextlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import signal
+import sys
 import time
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -3161,8 +3164,6 @@ class TestTerminateProcessTree:
     @pytest.mark.asyncio
     async def test_terminates_whole_process_group(self) -> None:
         """When the process leads its group, SIGTERM goes to the group."""
-        import signal
-
         process = MagicMock()
         process.pid = 4321
         process.returncode = None
@@ -3208,6 +3209,74 @@ class TestTerminateProcessTree:
 
         mock_killpg.assert_not_called()
         process.terminate.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        not hasattr(os, "killpg"), reason="process-group reaping is POSIX-only"
+    )
+    async def test_real_process_tree_is_reaped(self) -> None:
+        """End-to-end: a grandchild spawned by the downstream process is killed.
+
+        The mocked tests above only prove killpg is *called*; this proves the
+        whole tree actually dies — the regression guard for orphaned Chrome
+        holding the browser profile's SingletonLock (issue #79, symptom 1c).
+        """
+        # Parent (its own session, like _connect_stdio) spawns a child; the
+        # parent prints the child PID then both sleep.
+        script = (
+            "import subprocess, time;"
+            "c = subprocess.Popen(['sleep', '30']);"
+            "print(c.pid, flush=True);"
+            "time.sleep(30)"
+        )
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            script,
+            stdout=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        assert process.stdout is not None
+        child_pid = int((await asyncio.wait_for(process.stdout.readline(), 10.0)).strip())
+        parent_pid = process.pid
+
+        # Both are alive before reaping.
+        os.kill(parent_pid, 0)
+        os.kill(child_pid, 0)
+
+        await _terminate_process_tree(process, "real")
+
+        async def _gone(pid: int) -> bool:
+            for _ in range(30):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    return True
+                await asyncio.sleep(0.1)
+            return False
+
+        assert await _gone(parent_pid), "parent process was not reaped"
+        assert await _gone(child_pid), "grandchild process was orphaned, not reaped"
+
+    @pytest.mark.asyncio
+    async def test_windows_falls_back_without_killpg(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On platforms without os.killpg/os.getpgid (Windows), the helper must
+        fall back to process.terminate()/kill() instead of raising AttributeError."""
+        import pmcp.client.manager as mgr
+
+        monkeypatch.delattr(mgr.os, "killpg", raising=False)
+        monkeypatch.delattr(mgr.os, "getpgid", raising=False)
+
+        process = MagicMock()
+        process.pid = 4321
+        process.returncode = None
+        process.wait = AsyncMock(return_value=0)
+
+        # Must not raise; must use the cross-platform single-process path.
+        await _terminate_process_tree(process, "browser")
+        process.terminate.assert_called_once()
 
 
 class TestReadStdoutFailureSurfacing:

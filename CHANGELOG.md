@@ -14,17 +14,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (including JSON progress notifications, which now count toward per-request
   liveness in both the stdio and SSE readers). An absolute backstop caps total
   wall-clock time so a chatty-but-never-completing call cannot hang forever —
-  configurable via `PMCP_REQUEST_CEILING_MS` (default 600000ms / 10 min). This
-  unblocks legitimately long browser/automation operations driven through the
-  gateway.
+  configurable via `PMCP_REQUEST_CEILING_MS` (default 600000ms / 10 min). The
+  long ceiling applies only to tool invocations; control-plane requests
+  (initialize, list calls) keep the tighter idle deadline so one stuck server
+  can't stall startup/refresh. This unblocks legitimately long browser/
+  automation operations driven through the gateway.
 - Stdio servers are now spawned in their own session/process group
   (`start_new_session=True`) and reaped as a whole tree on disconnect (issue
   #79, symptom 1c). Previously, killing a stdio server (e.g. `@playwright/mcp`)
   left the browser it launched orphaned to init, holding the profile's
   SingletonLock and breaking the next launch. A new group-aware
   `_terminate_process_tree` helper (SIGTERM the group, wait, then SIGKILL, with
-  a single-process fallback when the process is not a group leader) now backs
-  all four downstream shutdown paths.
+  a single-process fallback when the process is not a group leader, or on
+  Windows where process groups are unavailable) now backs all four downstream
+  shutdown paths.
 - `gateway.refresh` is now diff-based and non-destructive (issue #79, symptom
   2). Servers whose resolved config is unchanged are left connected and
   running; only servers that were removed or whose config changed are

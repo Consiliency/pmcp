@@ -89,10 +89,13 @@ async def _terminate_process_tree(
     if process is None or process.returncode is not None:
         return
 
-    def _signal(sig: int) -> None:
+    def _signal(kill: bool) -> None:
+        # Process-group signalling is POSIX-only. On Windows os.getpgid/os.killpg
+        # (and signal.SIGKILL) don't exist, so fall back to the cross-platform
+        # process.terminate()/kill() — preserving the pre-process-group behavior.
         pid = process.pid
         pgid: int | None = None
-        if isinstance(pid, int):
+        if isinstance(pid, int) and hasattr(os, "getpgid"):
             try:
                 pgid = os.getpgid(pid)
             except (ProcessLookupError, PermissionError, OSError):
@@ -100,28 +103,28 @@ async def _terminate_process_tree(
         # Only signal the group if this process leads it; otherwise signalling
         # its group could hit unrelated processes (including the gateway, for an
         # adopted process that was not given its own session).
-        if pgid is not None and pgid == pid:
+        if pgid is not None and pgid == pid and hasattr(os, "killpg"):
             try:
-                os.killpg(pgid, sig)
+                os.killpg(pgid, signal.SIGKILL if kill else signal.SIGTERM)
                 return
             except (ProcessLookupError, PermissionError):
                 pass
         try:
-            if sig == signal.SIGKILL:
+            if kill:
                 process.kill()
             else:
                 process.terminate()
         except ProcessLookupError:
             pass
 
-    _signal(signal.SIGTERM)
+    _signal(kill=False)
     try:
         await asyncio.wait_for(process.wait(), timeout=5.0)
         return
     except asyncio.TimeoutError:
         pass
 
-    _signal(signal.SIGKILL)
+    _signal(kill=True)
     try:
         await asyncio.wait_for(process.wait(), timeout=3.0)
     except asyncio.TimeoutError:
@@ -1608,14 +1611,26 @@ class ClientManager:
         # Wait for response with an inactivity (idle) timeout: the call survives
         # as long as the downstream keeps producing output (per-request
         # last_heartbeat), bounded by an absolute ceiling backstop.
+        #
+        # The generous absolute ceiling applies only to tool invocations, which
+        # can legitimately run long (e.g. browser automation). Control-plane
+        # requests (initialize, tools/list, resources/list, tasks/*) keep the
+        # tighter idle deadline as their ceiling, so one chatty-but-stuck server
+        # can't stall startup/refresh/connect_all for the full ceiling.
+        idle_timeout_s = timeout_ms / 1000.0
+        ceiling_s = (
+            _request_ceiling_ms() / 1000.0
+            if method == "tools/call"
+            else idle_timeout_s
+        )
         try:
             result = await self._await_with_idle_timeout(
                 managed,
                 request_id,
                 pending,
                 future,
-                idle_timeout_s=timeout_ms / 1000.0,
-                ceiling_s=_request_ceiling_ms() / 1000.0,
+                idle_timeout_s=idle_timeout_s,
+                ceiling_s=ceiling_s,
             )
             return result
         except asyncio.TimeoutError:
