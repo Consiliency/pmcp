@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.18.0] - 2026-06-29
+
 ### Added
 - Private/custom manifest overlay: define your own provisionable MCP servers in
   `~/.pmcp/manifest.yaml` (user), `<project>/.pmcp/manifest.yaml` (project), or a
