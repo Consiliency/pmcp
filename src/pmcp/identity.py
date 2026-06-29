@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pmcp.types import LocalMcpServerConfig
 
@@ -133,6 +133,46 @@ _LOCK_FILE: Path | None = None
 _LOCK_FD = None
 
 
+def _lock_fd_exclusive(fd: Any) -> None:
+    """Take a non-blocking exclusive advisory lock on an open file.
+
+    Raises ``OSError``/``BlockingIOError`` if another process holds the lock.
+    Cross-platform: ``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows —
+    PMCP supports native Windows, where importing ``fcntl`` would fail (#84).
+    The literal ``sys.platform`` check (not a module-level alias) lets type
+    checkers narrow the platform-only ``msvcrt``/``fcntl`` imports.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        fd.seek(0)
+        msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_fd(fd: Any) -> None:
+    """Release a lock taken by :func:`_lock_fd_exclusive` (best-effort).
+
+    Closing the descriptor also releases the lock on both platforms, so failures
+    here are non-fatal.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        try:
+            fd.seek(0)
+            msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     """Ensure only one gateway instance runs per user.
 
@@ -143,8 +183,6 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
         True if lock acquired, False if another instance is running
     """
     global _LOCK_FILE, _LOCK_FD
-
-    import fcntl
 
     # Already holding a lock
     if _LOCK_FD is not None:
@@ -161,7 +199,7 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
 
     try:
         fd = open(_LOCK_FILE, "w")
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _lock_fd_exclusive(fd)
         _LOCK_FD = fd
         _LOCK_FD.write(str(os.getpid()))
         _LOCK_FD.flush()
@@ -187,11 +225,9 @@ def release_singleton_lock() -> None:
     """Release the singleton lock."""
     global _LOCK_FD
 
-    import fcntl
-
     if _LOCK_FD:
         try:
-            fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
+            _unlock_fd(_LOCK_FD)
             _LOCK_FD.close()
         except Exception:
             pass
