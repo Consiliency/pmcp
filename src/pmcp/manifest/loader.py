@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -13,6 +15,12 @@ logger = logging.getLogger(__name__)
 
 Platform = Literal["mac", "wsl", "linux", "windows"]
 ServerTransport = Literal["local", "remote", "sse", "http", "streamable-http"]
+
+# Private/custom manifest overlay locations (mirrors config.loader's
+# DEFAULT_USER_CONFIG_PATHS). The user path is recomputed from Path.home() at
+# call time in _overlay_manifest_paths() so HOME monkeypatching works in tests;
+# this constant documents the default location.
+DEFAULT_USER_MANIFEST_PATHS = [Path.home() / ".pmcp" / "manifest.yaml"]
 
 
 @dataclass
@@ -355,8 +363,124 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
     )
 
 
+def _find_project_manifest() -> Path | None:
+    """Walk up from cwd for the nearest ancestor containing .pmcp/manifest.yaml.
+
+    Replicates config.loader.find_project_root's marker-based walk locally to
+    avoid a circular import (config/loader imports load_manifest). Stops at the
+    filesystem root and at the temp directory so test fixtures under tempdir do
+    not accidentally pick up an unrelated overlay.
+    """
+    try:
+        current = Path.cwd().resolve()
+    except OSError:
+        return None
+    temp_root = Path(tempfile.gettempdir()).resolve()
+
+    while current != current.parent:
+        if current == temp_root:
+            return None
+        candidate = current / ".pmcp" / "manifest.yaml"
+        if candidate.exists():
+            return candidate
+        current = current.parent
+
+    return None
+
+
+def _overlay_manifest_paths() -> list[tuple[str, Path]]:
+    """Return existing overlay manifest paths in precedence order (low → high).
+
+    Order: user (``~/.pmcp/manifest.yaml``), then project
+    (``<project>/.pmcp/manifest.yaml``), then ``$PMCP_MANIFEST_PATH``. Later
+    entries override earlier ones, so the env path wins over project, which wins
+    over user, which wins over the shipped manifest. Only files that exist are
+    returned. The user path is computed from ``Path.home()`` here (not the frozen
+    module constant) so HOME isolation in tests takes effect.
+    """
+    paths: list[tuple[str, Path]] = []
+
+    user_path = Path.home() / ".pmcp" / "manifest.yaml"
+    if user_path.exists():
+        paths.append(("user", user_path))
+
+    project_path = _find_project_manifest()
+    if project_path is not None:
+        paths.append(("project", project_path))
+
+    env_value = os.environ.get("PMCP_MANIFEST_PATH")
+    if env_value:
+        env_path = Path(env_value).expanduser()
+        if env_path.exists():
+            paths.append(("env", env_path))
+
+    return paths
+
+
+def _load_overlay_file(
+    path: Path,
+) -> tuple[dict[str, ServerConfig], dict[str, CLIAlternative]]:
+    """Parse an overlay manifest file, fail-soft.
+
+    Returns ``(servers, cli_alternatives)`` parsed from ``path``. A missing file,
+    OSError, YAML error, or non-mapping top-level document logs a warning naming
+    the file and returns empty dicts. Each server/CLI entry is parsed in its own
+    try/except so one malformed entry is skipped without dropping its siblings.
+    """
+    try:
+        with open(path, "r") as f:
+            data = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
+        return {}, {}
+
+    if not isinstance(data, dict):
+        logger.warning(
+            f"Skipping manifest overlay {path}: top-level document is not a mapping"
+        )
+        return {}, {}
+
+    servers: dict[str, ServerConfig] = {}
+    raw_servers = data.get("servers", {})
+    if isinstance(raw_servers, dict):
+        for name, server_data in raw_servers.items():
+            try:
+                servers[name] = _parse_server_config(name, server_data)
+            except Exception as exc:
+                logger.warning(
+                    f"Skipping invalid server entry '{name}' in overlay {path}: {exc}"
+                )
+    elif raw_servers:
+        logger.warning(f"Skipping 'servers' in overlay {path}: not a mapping")
+
+    cli_alternatives: dict[str, CLIAlternative] = {}
+    raw_clis = data.get("cli_alternatives", {})
+    if isinstance(raw_clis, dict):
+        for name, cli_data in raw_clis.items():
+            try:
+                cli_alternatives[name] = _parse_cli_alternative(name, cli_data)
+            except Exception as exc:
+                logger.warning(
+                    f"Skipping invalid cli_alternative '{name}' in overlay "
+                    f"{path}: {exc}"
+                )
+    elif raw_clis:
+        logger.warning(f"Skipping 'cli_alternatives' in overlay {path}: not a mapping")
+
+    return servers, cli_alternatives
+
+
 def load_manifest(manifest_path: Path | None = None) -> Manifest:
-    """Load and parse the manifest.yaml file."""
+    """Load and parse the manifest.yaml file.
+
+    When called with no ``manifest_path`` (all internal callers), private/custom
+    overlay manifests are merged over the shipped manifest: user
+    (``~/.pmcp/manifest.yaml``) < project (``<project>/.pmcp/manifest.yaml``) <
+    ``$PMCP_MANIFEST_PATH``, each overriding the shipped entry of the same name
+    (whole-entry replace). An explicit ``manifest_path`` loads only that file
+    and applies no overlays. Overlay parsing is fail-soft and never raises.
+    """
+    apply_overlays = manifest_path is None
     if manifest_path is None:
         # Default to manifest.yaml in the same directory as this module
         manifest_path = Path(__file__).parent / "manifest.yaml"
@@ -375,6 +499,19 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
     servers: dict[str, ServerConfig] = {}
     for name, server_data in data.get("servers", {}).items():
         servers[name] = _parse_server_config(name, server_data)
+
+    # Merge private/custom overlays over the shipped manifest (default path only).
+    if apply_overlays:
+        for label, overlay_path in _overlay_manifest_paths():
+            overlay_servers, overlay_clis = _load_overlay_file(overlay_path)
+            if overlay_servers or overlay_clis:
+                logger.info(
+                    f"Applying manifest overlay ({label}) from {overlay_path}: "
+                    f"{len(overlay_servers)} servers, "
+                    f"{len(overlay_clis)} CLI alternatives"
+                )
+            servers.update(overlay_servers)
+            cli_alternatives.update(overlay_clis)
 
     manifest = Manifest(
         version=data.get("version", "1.0"),

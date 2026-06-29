@@ -869,6 +869,53 @@ PMCP discovers MCP servers from:
 2. **User config**: `~/.mcp.json` or `~/.claude/.mcp.json`
 3. **Custom config**: Via `--config` flag or `PMCP_CONFIG` env var
 
+### Private manifest overlay
+
+If you built your own MCP servers (or want private provisionable definitions),
+you can add manifest entries **without editing the shipped manifest**. PMCP
+merges these overlay files over the built-in manifest, so your servers get
+first-class treatment in `gateway.request_capability` keyword matching,
+`gateway.catalog_search` offline discovery, `gateway.provision`, and startup
+resolution — answering "can I add my own private manifest items?" with yes.
+
+Overlay locations, lowest → highest precedence (later overrides earlier, by
+server name; a same-named entry is replaced whole, not deep-merged):
+
+1. **Shipped manifest** (base)
+2. **User**: `~/.pmcp/manifest.yaml`
+3. **Project**: `<project>/.pmcp/manifest.yaml` (nearest ancestor of the cwd)
+4. **Explicit**: `PMCP_MANIFEST_PATH` env var (wins over all)
+
+Overlays use the same entry schema as the shipped manifest. Example
+`~/.pmcp/manifest.yaml`:
+
+```yaml
+servers:
+  # Local (stdio) server provisioned via a command
+  my-private:
+    description: "My private internal server"
+    keywords: [myprivate, internal widget]
+    command: "npx"
+    args: ["-y", "@me/my-mcp"]
+    requires_api_key: true
+    env_var: MY_TOKEN
+  # Remote server reached over streamable HTTP
+  my-remote:
+    description: "My private remote server"
+    keywords: [myremote, internal api]
+    url: "https://mcp.internal.example.com/sse"
+    headers:
+      Authorization: "Bearer ${MY_REMOTE_TOKEN}"
+```
+
+Overlay loading is **fail-soft**: a missing file is skipped silently, and a
+malformed file or a single bad entry logs a warning and is skipped without
+crashing the gateway — the shipped manifest always still loads.
+
+> **Security:** a manifest entry can specify an arbitrary `command`/`args` to
+> run when provisioned — treat an overlay file with the same trust as your own
+> `.mcp.json`. Policy still applies (denied servers stay denied).
+
 ### Adding Custom Servers
 
 For MCP servers not in the manifest, add them to `~/.mcp.json`:

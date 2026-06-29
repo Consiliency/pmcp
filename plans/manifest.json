@@ -733,6 +733,28 @@
       "task_summary": "Convert downstream-call timeout to inactivity (idle) timeout with absolute ceiling (#79 symptom 1a)",
       "type": "detailed",
       "updated_at": "2026-06-28T06:46:00Z"
+    },
+    {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-06-29T08:41:00Z",
+      "file": "plans/detailed-private-manifest-overlay-20260629-0841.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/20260629T0841Z-private-manifest-overlay.md",
+      "lifecycle": [
+        {
+          "at": "2026-06-29T08:41:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "artifact_state": "staged"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "slug": "detailed-private-manifest-overlay",
+      "status": "staged",
+      "task_summary": "Private/custom MCP manifest overlay merged in load_manifest (user/project/PMCP_MANIFEST_PATH); ship v1.18.0",
+      "type": "detailed",
+      "updated_at": "2026-06-29T08:41:00Z"
     }
   ],
   "schema_version": 1
