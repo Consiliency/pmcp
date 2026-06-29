@@ -10,7 +10,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TextIO
 
 from pmcp.types import LocalMcpServerConfig
 
@@ -133,6 +133,46 @@ _LOCK_FILE: Path | None = None
 _LOCK_FD = None
 
 
+def _lock_fd_exclusive(fd: TextIO) -> None:
+    """Take a non-blocking exclusive advisory lock on an open file.
+
+    Raises ``OSError``/``BlockingIOError`` if another process holds the lock.
+    Cross-platform: ``fcntl.flock`` on POSIX, ``msvcrt.locking`` on Windows —
+    PMCP supports native Windows, where importing ``fcntl`` would fail (#84).
+    The literal ``sys.platform`` check (not a module-level alias) lets type
+    checkers narrow the platform-only ``msvcrt``/``fcntl`` imports.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        fd.seek(0)
+        msvcrt.locking(fd.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock_fd(fd: TextIO) -> None:
+    """Release a lock taken by :func:`_lock_fd_exclusive` (best-effort).
+
+    Closing the descriptor also releases the lock on both platforms, so failures
+    here are non-fatal.
+    """
+    if sys.platform == "win32":
+        import msvcrt
+
+        try:
+            fd.seek(0)
+            msvcrt.locking(fd.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    else:
+        import fcntl
+
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     """Ensure only one gateway instance runs per user.
 
@@ -143,8 +183,6 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
         True if lock acquired, False if another instance is running
     """
     global _LOCK_FILE, _LOCK_FD
-
-    import fcntl
 
     # Already holding a lock
     if _LOCK_FD is not None:
@@ -159,39 +197,67 @@ def acquire_singleton_lock(lock_dir: Path | str | None = None) -> bool:
     lock_dir.mkdir(parents=True, exist_ok=True)
     _LOCK_FILE = lock_dir / "gateway.lock"
 
+    # Open WITHOUT truncating ("r+" on an ensured-existing file) so a losing
+    # second instance cannot wipe the holder's PID before its lock attempt
+    # fails. We truncate + write our own PID only after we win the lock.
     try:
-        fd = open(_LOCK_FILE, "w")
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        _LOCK_FD = fd
-        _LOCK_FD.write(str(os.getpid()))
-        _LOCK_FD.flush()
-        logger.debug(f"Acquired singleton lock: {_LOCK_FILE}")
-        return True
+        _LOCK_FILE.touch(exist_ok=True)
+        fd = open(_LOCK_FILE, "r+")
+    except OSError as e:
+        logger.warning(f"Could not open singleton lock file {_LOCK_FILE}: {e}")
+        return False
+
+    try:
+        _lock_fd_exclusive(fd)
     except (BlockingIOError, OSError) as e:
         pid_info = ""
         try:
-            if _LOCK_FILE and _LOCK_FILE.exists():
-                pid_info = f" PID {_LOCK_FILE.read_text().strip()},"
+            fd.seek(0)
+            existing = fd.read().strip()
+            if existing:
+                pid_info = f" PID {existing},"
         except Exception:
             pass
         logger.warning(
             f"Another gateway instance is running ({pid_info} lock: {_LOCK_FILE}): {e}"
         )
-        if _LOCK_FD:
-            _LOCK_FD.close()
-            _LOCK_FD = None
+        fd.close()
         return False
+    except ImportError as e:
+        # No platform locking primitive available (e.g. an exotic Windows build
+        # without msvcrt). Don't crash startup — proceed without single-instance
+        # protection rather than re-introducing the #84 import-crash class.
+        logger.warning(
+            f"Singleton lock primitive unavailable ({e}); proceeding without "
+            "single-instance protection."
+        )
+        fd.close()
+        return True
+
+    _LOCK_FD = fd
+    try:
+        _LOCK_FD.seek(0)
+        _LOCK_FD.truncate(0)
+        _LOCK_FD.write(str(os.getpid()))
+        _LOCK_FD.flush()
+    except Exception:
+        pass
+    logger.debug(f"Acquired singleton lock: {_LOCK_FILE}")
+    return True
 
 
 def release_singleton_lock() -> None:
     """Release the singleton lock."""
     global _LOCK_FD
 
-    import fcntl
-
     if _LOCK_FD:
+        # Unlock and close independently so a failing unlock cannot skip close()
+        # (closing the fd releases the OS lock regardless).
         try:
-            fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
+            _unlock_fd(_LOCK_FD)
+        except Exception:
+            pass
+        try:
             _LOCK_FD.close()
         except Exception:
             pass

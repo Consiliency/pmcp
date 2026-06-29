@@ -189,3 +189,48 @@ class TestLockDirDocumentation:
         assert "--lock-dir" in readme_content, (
             "README should document --lock-dir CLI option"
         )
+
+
+class TestWindowsLockPath:
+    """On native Windows the singleton lock must use msvcrt, never the Unix-only
+    fcntl module whose import crashed gateway startup (issue #84)."""
+
+    def setup_method(self) -> None:
+        release_singleton_lock()
+
+    def teardown_method(self) -> None:
+        release_singleton_lock()
+
+    def test_windows_uses_msvcrt_and_never_imports_fcntl(
+        self, tmp_path: Path, monkeypatch
+    ) -> None:
+        import types
+
+        import pmcp.identity as identity
+
+        calls: list[int] = []
+
+        fake_msvcrt = types.ModuleType("msvcrt")
+        fake_msvcrt.LK_NBLCK = 2  # type: ignore[attr-defined]
+        fake_msvcrt.LK_UNLCK = 0  # type: ignore[attr-defined]
+
+        def _locking(fileno: int, mode: int, nbytes: int) -> None:
+            calls.append(mode)
+
+        fake_msvcrt.locking = _locking  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+
+        # Force the Windows branch, and make `import fcntl` raise — so if the code
+        # ever falls back to fcntl on Windows the test fails (the #84 regression).
+        monkeypatch.setattr(identity.sys, "platform", "win32")
+        monkeypatch.setitem(sys.modules, "fcntl", None)
+
+        lock_dir = tmp_path / "locks"
+        assert acquire_singleton_lock(lock_dir) is True
+        assert (lock_dir / "gateway.lock").exists()
+        # Took a non-blocking exclusive lock via msvcrt.
+        assert fake_msvcrt.LK_NBLCK in calls  # type: ignore[attr-defined]
+
+        release_singleton_lock()
+        # Released via msvcrt as well.
+        assert fake_msvcrt.LK_UNLCK in calls  # type: ignore[attr-defined]

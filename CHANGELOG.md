@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.17.1] - 2026-06-29
+
+### Fixed
+- Native Windows gateway startup no longer crashes with `No module named 'fcntl'`
+  (issue #84). `acquire_singleton_lock`/`release_singleton_lock` imported the
+  Unix-only `fcntl` unconditionally; they now take the per-user single-instance
+  lock via `msvcrt.locking` on Windows and `fcntl.flock` on POSIX (selected by a
+  literal `sys.platform` check so type checkers narrow the platform-only
+  imports). WSL is unaffected. (`resource` was already import-guarded.)
+
 ## [1.17.0] - 2026-06-28
 
 ### Fixed
