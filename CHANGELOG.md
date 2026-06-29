@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Private/custom manifest overlay: define your own provisionable MCP servers in
+  `~/.pmcp/manifest.yaml` (user), `<project>/.pmcp/manifest.yaml` (project), or a
+  file pointed to by `PMCP_MANIFEST_PATH`, merged over the shipped manifest
+  without editing it. Precedence is shipped < user < project < `PMCP_MANIFEST_PATH`
+  (same-named entries are replaced whole). Overlay parsing is fail-soft — a
+  missing file is skipped, and a malformed file or a single bad entry logs a
+  warning and is skipped without crashing the gateway. Merged servers
+  participate identically in `gateway.request_capability`, `gateway.catalog_search`,
+  `gateway.provision`, and startup `refresh` resolution, gated by the same
+  policy/auth checks.
+
 ## [1.17.1] - 2026-06-29
 
 ### Fixed
