@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import stat
@@ -341,3 +342,84 @@ class TestSecretsHandlers:
         assert output["available_keys"] == ["LOCAL_API_KEY"]
         assert output["missing_keys"] == ["REMOTE_API_TOKEN"]
         assert "stored-local" not in json.dumps(output)
+
+
+class TestSecretDirectoryPermissions:
+    """write_env_file must create PMCP-owned secret dirs privately (0700)."""
+
+    def test_write_env_file_creates_secret_dir_0700(self, tmp_path: Path) -> None:
+        """A freshly created secret directory is locked to 0700, file to 0600."""
+        secret_dir = tmp_path / ".config" / "pmcp"
+        env_path = secret_dir / "pmcp.env"
+
+        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
+
+        assert stat.S_IMODE(secret_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+
+    def test_write_env_file_leaves_existing_parent_untouched(
+        self, tmp_path: Path
+    ) -> None:
+        """A pre-existing parent (e.g. a project root) is never chmod-ed."""
+        os.chmod(tmp_path, 0o755)
+        env_path = tmp_path / ".env.pmcp"
+
+        write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
+
+        assert stat.S_IMODE(tmp_path.stat().st_mode) == 0o755
+        assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
+
+
+class TestSecretsSetValueResolution:
+    """`secrets set` must not require the value on argv."""
+
+    def test_parse_secrets_set_value_optional(self) -> None:
+        """The positional value is optional (no argv exposure required)."""
+        with patch("sys.argv", ["pmcp", "secrets", "set", "OPENAI_API_KEY"]):
+            with patch("importlib.metadata.version", return_value="0.0.0"):
+                args = parse_args()
+
+        assert args.value is None
+        assert args.stdin is False
+
+    def test_parse_secrets_set_stdin_flag(self) -> None:
+        """--stdin parses and leaves the positional value unset."""
+        with patch("sys.argv", ["pmcp", "secrets", "set", "OPENAI_API_KEY", "--stdin"]):
+            with patch("importlib.metadata.version", return_value="0.0.0"):
+                args = parse_args()
+
+        assert args.stdin is True
+        assert args.value is None
+
+    def test_resolve_value_from_stdin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A value omitted from argv is read from stdin with --stdin."""
+        from pmcp.cli import _resolve_secret_set_value
+
+        monkeypatch.setattr("sys.stdin", io.StringIO("sk-piped\n"))
+        args = argparse.Namespace(key="OPENAI_API_KEY", value=None, stdin=True)
+
+        assert _resolve_secret_set_value(args) == "sk-piped"
+
+    def test_resolve_value_from_getpass(self) -> None:
+        """With no value and no --stdin, the value is read interactively."""
+        from pmcp.cli import _resolve_secret_set_value
+
+        args = argparse.Namespace(key="OPENAI_API_KEY", value=None, stdin=False)
+        with patch("getpass.getpass", return_value="sk-prompted") as mock_getpass:
+            assert _resolve_secret_set_value(args) == "sk-prompted"
+
+        mock_getpass.assert_called_once()
+
+    def test_resolve_positional_value_warns_to_stderr(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Passing the value on argv still works but warns on stderr."""
+        from pmcp.cli import _resolve_secret_set_value
+
+        args = argparse.Namespace(key="OPENAI_API_KEY", value="sk-inline", stdin=False)
+
+        assert _resolve_secret_set_value(args) == "sk-inline"
+
+        captured = capsys.readouterr()
+        assert captured.out == ""  # warning must not corrupt JSON stdout
+        assert "visible in" in captured.err

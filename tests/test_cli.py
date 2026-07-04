@@ -929,6 +929,9 @@ class TestRunStatus:
         from pmcp.types import ServerStatusEnum
 
         status_args.json = True
+        # P4: status is lazy by default; --probe opts into active connection,
+        # which is what surfaces live protocol fields from server statuses.
+        status_args.probe = True
         config = ResolvedServerConfig(
             name="configured",
             source="project",

@@ -81,6 +81,29 @@ class TestServerAllowDeny:
         assert denied_policy.is_server_allowed("tenant-code-mode") is False
         assert denied_policy.is_server_allowed("github") is True
 
+    def test_allow_deny_matching_is_case_sensitive(self, tmp_path: Path) -> None:
+        """Policy globs match case-sensitively; server IDs are case-sensitive.
+
+        Pins the decision that a deny of ``Secret*`` does NOT match
+        ``secretserver`` (different case), only the exact-case ID.
+        """
+        policy_path = tmp_path / "policy.json"
+        policy_path.write_text(
+            json.dumps(
+                {
+                    "servers": {
+                        "denylist": ["Secret*"],
+                    }
+                }
+            )
+        )
+
+        policy = PolicyManager(policy_path)
+        # Different-case ID is not denied by an upper-case pattern.
+        assert policy.is_server_allowed("secretserver") is True
+        # Exact-case ID is denied.
+        assert policy.is_server_allowed("SecretServer") is False
+
 
 class TestToolAllowDeny:
     """Tests for tool allow/deny lists."""
