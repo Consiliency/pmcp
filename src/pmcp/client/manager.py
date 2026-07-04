@@ -465,6 +465,9 @@ class ManagedClient:
     request_id: int = 0
     pending_requests: dict[int, PendingRequest] = field(default_factory=dict)
     read_task: asyncio.Task[None] | None = None
+    # stderr reader task for stdio servers; tracked so a failed/replaced connect
+    # can cancel it directly instead of relying on server-name-scoped cancellation.
+    stderr_task: asyncio.Task[None] | None = None
     # Remote auth headers as RESOLVED at connect time (placeholders expanded).
     # gateway.refresh compares these against freshly-resolved headers to detect
     # token rotation in the env store, which leaves the raw config unchanged.
@@ -595,7 +598,14 @@ class ClientManager:
         server_name: str | None = None,
         exclude: set[asyncio.Task[Any]] | None = None,
     ) -> None:
-        exclude = exclude or set()
+        # Copy so we never mutate a caller's set, and always exclude the running
+        # task: a connect/reconnect task scoped to this server name must never
+        # cancel a gather() containing itself (that self-cancel recurses until
+        # RecursionError and leaves the server stuck in ERROR).
+        exclude = set(exclude) if exclude else set()
+        current = asyncio.current_task()
+        if current is not None:
+            exclude.add(current)
         tasks = [
             task
             for task in self._background_tasks
@@ -1264,7 +1274,7 @@ class ClientManager:
 
         # Start reading stderr in background
         if process.stderr:
-            self._track_background_task(
+            managed.stderr_task = self._track_background_task(
                 asyncio.create_task(self._read_stderr(name, process.stderr)),
                 name,
             )
@@ -1298,13 +1308,18 @@ class ClientManager:
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
             status.last_error = str(e)
-            if managed.read_task and not managed.read_task.done():
-                managed.read_task.cancel()
-                try:
-                    await asyncio.shield(managed.read_task)
-                except (asyncio.CancelledError, Exception):
-                    pass
+            for task in (managed.read_task, managed.stderr_task):
+                if task and not task.done():
+                    task.cancel()
+                    try:
+                        await asyncio.shield(task)
+                    except (asyncio.CancelledError, Exception):
+                        pass
             await _terminate_process_tree(process, name)
+            # Drop the stale ERROR client so it can't be found as a live
+            # connection on the next connect attempt (issue: stale entry + leak).
+            if self._clients.get(name) is managed:
+                self._clients.pop(name, None)
             raise
 
     async def _connect_sse(self, config: ResolvedServerConfig) -> None:
@@ -1409,7 +1424,17 @@ class ClientManager:
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
             status.last_error = str(e)
+            if managed.read_task and not managed.read_task.done():
+                managed.read_task.cancel()
+                try:
+                    await asyncio.shield(managed.read_task)
+                except (asyncio.CancelledError, Exception):
+                    pass
             await remote_stack.aclose()
+            # Drop the stale ERROR client so it can't be found as a live
+            # connection on the next connect attempt.
+            if self._clients.get(name) is managed:
+                self._clients.pop(name, None)
             raise
 
     async def _read_stderr(self, name: str, stderr: asyncio.StreamReader) -> None:
@@ -1674,6 +1699,10 @@ class ClientManager:
                 logger.warning(f"Server {name} disconnected unexpectedly")
                 managed.status.status = ServerStatusEnum.ERROR
                 managed.status.last_error = "SSE connection closed"
+                # Schedule auto-reconnect if we have the config (storm guard: only one task)
+                if managed.config is not None and not managed.reconnecting:
+                    managed.reconnecting = True
+                    self._schedule_reconnect(name, managed.config)
             else:
                 logger.debug(f"Server {name} disconnected (graceful shutdown)")
 
@@ -1931,14 +1960,20 @@ class ClientManager:
 
         Safe to call on any managed client regardless of state. All exceptions are
         suppressed so callers always complete successfully.
+
+        Cancels only *this* client's own read/stderr tasks — not every background
+        task scoped to the server name. A reconnect runs its connect inside a task
+        that is itself scoped to the name; a server-name-wide cancel here would
+        cancel the in-flight reconnect (cascading into the running connect task)
+        and abort the very recovery that called us.
         """
-        if managed.read_task and not managed.read_task.done():
-            managed.read_task.cancel()
-            try:
-                await asyncio.shield(managed.read_task)
-            except (asyncio.CancelledError, Exception):
-                pass
-        await self._cancel_background_tasks(server_name=name)
+        for task in (managed.read_task, managed.stderr_task):
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.shield(task)
+                except (asyncio.CancelledError, Exception):
+                    pass
         await _terminate_process_tree(managed.process, name)
         self._clients.pop(name, None)
         self._servers.pop(name, None)
@@ -1997,7 +2032,7 @@ class ClientManager:
 
         # Start reading stderr in background (if available)
         if process.stderr:
-            self._track_background_task(
+            managed.stderr_task = self._track_background_task(
                 asyncio.create_task(self._read_stderr(name, process.stderr)),
                 name,
             )
