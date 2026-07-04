@@ -6,11 +6,14 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -125,16 +128,60 @@ def registry_private_enabled() -> bool:
     }
 
 
+def _is_loopback_endpoint_host(hostname: str) -> bool:
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        return ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _private_endpoint_allowed(endpoint: str) -> bool:
+    """Validate a private registry endpoint before trusting it.
+
+    Requires ``https://`` (``http://`` only for loopback dev hosts) and rejects
+    link-local / metadata hosts such as 169.254.169.254 even over TLS.
+    """
+    try:
+        parsed = urlparse(endpoint)
+        hostname = parsed.hostname
+    except ValueError:
+        return False
+    if not parsed.scheme or not parsed.netloc or not hostname:
+        return False
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None and (
+        address.is_link_local or address.is_multicast or address.is_unspecified
+    ):
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.scheme == "http" and _is_loopback_endpoint_host(hostname)
+
+
 def effective_registry_endpoint(default: str = DEFAULT_REGISTRY_ENDPOINT) -> str:
     """Return the configured private registry endpoint only when opt-in is on.
 
     Flag off (default): the configured private endpoint is ignored and the
-    public registry endpoint is used.
+    public registry endpoint is used. When on, the endpoint must be a valid
+    https:// (or loopback http://) URL that does not target a link-local or
+    metadata host; otherwise it is rejected and the public endpoint is used.
     """
     if registry_private_enabled():
         private = os.environ.get(REGISTRY_PRIVATE_ENDPOINT_ENV, "").strip()
         if private:
-            return private
+            if _private_endpoint_allowed(private):
+                return private
+            logger.warning(
+                "Ignoring %s: private registry endpoint must be https:// "
+                "(or http://localhost) and must not target a link-local or "
+                "metadata host.",
+                REGISTRY_PRIVATE_ENDPOINT_ENV,
+            )
     return default
 
 
@@ -367,6 +414,27 @@ def _dedupe_latest(servers: list[RegistryServerEntry]) -> list[RegistryServerEnt
     return list(deduped.values())
 
 
+async def _read_body_capped(
+    resp: aiohttp.ClientResponse, max_bytes: int
+) -> bytes | None:
+    """Read a response body while enforcing ``max_bytes`` during the read.
+
+    Returns None (without ever buffering the whole body) when the advertised
+    or streamed size exceeds the cap, so a multi-GB response cannot OOM us.
+    """
+    content_length = resp.content_length
+    if content_length is not None and content_length > max_bytes:
+        return None
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(65536):
+        total += len(chunk)
+        if total > max_bytes:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 def _with_query(endpoint: str, params: dict[str, str]) -> str:
     from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -402,8 +470,8 @@ async def _fetch_registry_servers_uncached(
                     else current_endpoint
                 )
                 async with session.get(url) as resp:
-                    body = await resp.read()
-                if len(body) > max_response_bytes:
+                    body = await _read_body_capped(resp, max_response_bytes)
+                if body is None:
                     diagnostics.append("registry_response_size_cap")
                     break
                 payload = json.loads(body.decode("utf-8"))
@@ -589,7 +657,25 @@ def load_registry_cache(cache_path: Path | None = None) -> RegistryCache | None:
 
 
 def save_registry_cache(cache: RegistryCache, cache_path: Path | None = None) -> None:
-    """Save registry cache JSON with stable ordering."""
+    """Save registry cache JSON atomically with owner-only (0600) permissions.
+
+    The payload is written to a temp file in the same directory then atomically
+    ``os.replace``d into place, so a crash mid-write cannot corrupt the cache.
+    """
     path = _cache_path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(asdict(cache), indent=2, sort_keys=True) + "\n")
+    payload = json.dumps(asdict(cache), indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        os.chmod(tmp_name, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
