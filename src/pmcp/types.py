@@ -8,6 +8,8 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from pmcp.validation import is_valid_package_name
+
 # === Transport Types ===
 
 GatewayTransport = Literal["stdio", "http"]
@@ -1090,6 +1092,17 @@ class RegisterDiscoveredServerInput(BaseModel):
         default="", description="Short description of the server's purpose"
     )
 
+    @field_validator("package")
+    @classmethod
+    def _validate_package(cls, value: str) -> str:
+        if not is_valid_package_name(value):
+            raise ValueError(
+                "package must be a valid npm/pypi identifier "
+                "(no leading dash, whitespace, path separators, or shell "
+                "metacharacters)"
+            )
+        return value
+
 
 class RegisterDiscoveredServerOutput(BaseModel):
     """Output for gateway.register_discovered_server."""
@@ -1098,6 +1111,9 @@ class RegisterDiscoveredServerOutput(BaseModel):
     server_name: str
     registered: bool
     message: str
+    # Exact list-argv install command that gateway.provision will execute, so
+    # the caller can confirm it before provisioning runs.
+    install_command: list[str] | None = None
     next_step: str | None = None
 
 
