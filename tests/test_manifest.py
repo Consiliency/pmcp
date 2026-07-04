@@ -1399,11 +1399,12 @@ class TestMonitorInstall:
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
 
-        # Wait for completion
-        await asyncio.sleep(0.3)
-
+        # Wait deterministically for the monitor to drain output and finish,
+        # rather than racing a fixed wall-clock sleep against the subprocess.
         job = manager.get_job(job_id)
         assert job is not None
+        assert job._monitor_task is not None
+        await asyncio.wait_for(job._monitor_task, timeout=5.0)
         # Check stderr was captured
         stderr_found = any("stderr_message" in line for line in job.output_lines)
         assert stderr_found, f"Expected stderr in output: {job.output_lines}"
@@ -1427,11 +1428,12 @@ class TestMonitorInstall:
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
 
-        # Wait for completion
-        await asyncio.sleep(0.5)
-
+        # Wait deterministically for the monitor to finish instead of racing a
+        # fixed wall-clock sleep against the subprocess generating 30 lines.
         job = manager.get_job(job_id)
         assert job is not None
+        assert job._monitor_task is not None
+        await asyncio.wait_for(job._monitor_task, timeout=5.0)
         assert len(job.output_lines) <= 20
 
     @pytest.mark.asyncio

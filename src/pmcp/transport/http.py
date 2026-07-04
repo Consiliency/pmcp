@@ -16,8 +16,10 @@ import asyncio
 import collections
 import contextlib
 import hmac
+import ipaddress
 import json
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator, MutableMapping
 from typing import TYPE_CHECKING, Any, Callable, Literal
@@ -64,6 +66,74 @@ _rl_store: dict[str, collections.deque] = {}
 _rl_lock: asyncio.Lock | None = None
 
 _MAX_BODY_BYTES: int = 10 * 1024 * 1024  # 10 MB
+
+# ---------------------------------------------------------------------------
+# Transport DoS guards for unauthenticated pre-session traffic
+# ---------------------------------------------------------------------------
+# The pre-session keepalive SSE stream (rmcp compatibility, see handle_mcp) is
+# infinite by design. Without bounds an unauthenticated client can open an
+# unlimited number of long-lived connections and exhaust the server
+# (connection-exhaustion DoS). We cap both the number of concurrent streams and
+# each stream's absolute lifetime. Both are env-tunable for operators.
+_DEFAULT_MAX_KEEPALIVE_STREAMS: int = 64
+_DEFAULT_KEEPALIVE_MAX_SECONDS: float = 300.0
+_KEEPALIVE_HEARTBEAT_SECONDS: float = 30.0
+
+# Live count of open pre-session keepalive streams. Mutated only from the event
+# loop thread; check-then-increment in handle_mcp has no await in between and is
+# therefore atomic. Held in a dict so nested closures can mutate without a
+# module-level ``global`` declaration (mirrors the _rl_store pattern).
+_keepalive_active: dict[str, int] = {"count": 0}
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    """Read a positive int from the environment, clamped to ``minimum``."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    """Read a positive float from the environment, clamped to ``minimum``."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, float(raw))
+    except ValueError:
+        return default
+
+
+async def _read_body_capped(
+    receive: Callable[[], Any], max_bytes: int
+) -> tuple[bytes, bool]:
+    """Read the full ASGI request body, enforcing ``max_bytes`` as chunks arrive.
+
+    Returns ``(body, exceeded)``. Counting bytes during the read (rather than
+    trusting the advertised Content-Length) means a chunked or mislabeled
+    request cannot bypass the size cap. Once the cap is exceeded the read stops
+    immediately and any buffered data is dropped.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    more_body = True
+    while more_body:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            break
+        chunk = message.get("body", b"")
+        if chunk:
+            total += len(chunk)
+            if total > max_bytes:
+                return b"", True
+            chunks.append(chunk)
+        more_body = message.get("more_body", False)
+    return b"".join(chunks), False
+
 
 # ---------------------------------------------------------------------------
 # Prometheus counter registration (optional — falls back to _metrics dict)
@@ -147,6 +217,46 @@ async def _check_rate_limit(client_ip: str, max_rpm: int) -> bool:
         return True
 
 
+def _is_loopback_host(hostname: str) -> bool:
+    """Return True for loopback host names (localhost, 127.0.0.0/8, ::1)."""
+    if not hostname:
+        return False
+    hostname = hostname.strip("[]")
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _split_host_port(value: str, default_port: str) -> tuple[str, str]:
+    """Split a ``host[:port]`` authority into (hostname, port).
+
+    Handles bracketed IPv6 literals (``[::1]:3344``). ``default_port`` is
+    returned when no explicit port is present.
+    """
+    value = value.strip()
+    if value.startswith("["):
+        host, sep, rest = value[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else default_port
+        return host, (port or default_port)
+    if value.count(":") == 1:
+        host, _, port = value.partition(":")
+        return host, (port or default_port)
+    return value, default_port
+
+
+def _origin_host_port(origin: str) -> tuple[str, str] | None:
+    """Return (hostname, port) for an Origin header value, or None if unparseable."""
+    parsed = urlparse(origin)
+    if not parsed.scheme or not parsed.hostname:
+        return None
+    default_port = "443" if parsed.scheme == "https" else "80"
+    port = str(parsed.port) if parsed.port is not None else default_port
+    return parsed.hostname, port
+
+
 def create_http_app(
     mcp_server: Server,
     auth_token: str | None = None,
@@ -223,6 +333,65 @@ def create_http_app(
         rate_limit_enabled=rate_limit_rpm > 0,
         rate_limit_rpm=rate_limit_rpm if rate_limit_rpm > 0 else None,
     )
+
+    # Host allowlist for DNS-rebinding defense. Enforced only when the operator
+    # opts in by configuring allowed_origins; the set is derived from the origins
+    # plus the gateway's own canonical resource host (audience / metadata URL) so
+    # a reverse proxy forwarding the public Host is not rejected.
+    _allowed_host_names: set[str] = set()
+    if allowed_origins is not None:
+        for _origin in allowed_origins:
+            parsed = _origin_host_port(_origin)
+            if parsed is not None:
+                _allowed_host_names.add(parsed[0])
+        for _url in (resource_server_audience, protected_resource_metadata_url):
+            if _url:
+                parsed_url = urlparse(_url)
+                if parsed_url.hostname:
+                    _allowed_host_names.add(parsed_url.hostname)
+
+    def _origin_rejected(request: Request) -> bool:
+        """Return True if a browser Origin header should be rejected (403).
+
+        Runs by default (even without a configured allowlist) as DNS-rebinding
+        defense: a non-loopback, non-same-origin Origin that is not explicitly
+        allow-listed is rejected. Requests with no Origin (normal MCP clients)
+        always pass.
+        """
+        origin = request.headers.get("origin")
+        if origin is None:
+            return False
+        parsed = _origin_host_port(origin)
+        if parsed is None:
+            return True
+        origin_host, origin_port = parsed
+        if _is_loopback_host(origin_host):
+            return False
+        if allowed_origins is not None and origin in allowed_origins:
+            return False
+        # Same-origin: Origin host:port matches the request Host header.
+        default_port = "443" if request.url.scheme == "https" else "80"
+        host_header = request.headers.get("host", "")
+        host_name, host_port = _split_host_port(host_header, default_port)
+        if origin_host == host_name and origin_port == host_port:
+            return False
+        return True
+
+    def _host_rejected(request: Request) -> bool:
+        """Return True if the request Host header is not allow-listed (403).
+
+        Enforced only when allowed_origins is configured; loopback Hosts are
+        always accepted so local clients keep working.
+        """
+        if allowed_origins is None:
+            return False
+        host_header = request.headers.get("host", "")
+        if not host_header:
+            return False
+        host_name, _ = _split_host_port(host_header, "")
+        if _is_loopback_host(host_name):
+            return False
+        return host_name not in _allowed_host_names
 
     def _resource_audience() -> str:
         return resource_server_audience or ""
@@ -333,11 +502,13 @@ def create_http_app(
             if request.headers.get(key)
         }
 
-        if allowed_origins is not None:
-            origin = request.headers.get("origin")
-            if origin is not None and origin not in allowed_origins:
-                logger.debug("handle_mcp [%s]: 403 invalid origin", request_id)
-                return _reject(403, "Forbidden")
+        if _origin_rejected(request):
+            logger.debug("handle_mcp [%s]: 403 invalid origin", request_id)
+            return _reject(403, "Forbidden")
+
+        if _host_rejected(request):
+            logger.debug("handle_mcp [%s]: 403 invalid host", request_id)
+            return _reject(403, "Forbidden")
 
         if effective_auth_mode == "shared-secret":
             incoming = request.headers.get("authorization", "")
@@ -402,11 +573,22 @@ def create_http_app(
                 )
                 return Response("Too Many Requests", status_code=429)
 
-        # Input size guard — reject oversized POST bodies before reading them
+        # Input size guard — fast-path reject when the advertised Content-Length
+        # already exceeds the cap. This is only a hint: a chunked or mislabeled
+        # request has no (or a false) Content-Length, so the body is additionally
+        # counted while reading below (see _read_body_capped).
         if request.method == "POST":
             cl = request.headers.get("content-length")
-            if cl and int(cl) > _MAX_BODY_BYTES:
-                return Response("Payload Too Large", status_code=413)
+            if cl:
+                try:
+                    declared = int(cl)
+                except ValueError:
+                    declared = 0
+                if declared > _MAX_BODY_BYTES:
+                    logger.debug(
+                        "handle_mcp [%s]: 413 Content-Length over cap", request_id
+                    )
+                    return Response("Payload Too Large", status_code=413)
 
         # Workaround for rmcp clients (e.g., Codex) that open the GET common
         # stream before completing the initialize handshake (and therefore have
@@ -416,18 +598,53 @@ def create_http_app(
         # channel are lost. Return a minimal keep-alive SSE stream instead; rmcp
         # will re-open the GET with a real session ID once it has one.
         if request.method == "GET" and not request.headers.get("mcp-session-id"):
+            # DoS guard: cap concurrent pre-session streams and give each an
+            # absolute lifetime so an unauthenticated client cannot open an
+            # unbounded number of infinite connections.
+            max_streams = _env_int(
+                "PMCP_MAX_KEEPALIVE_STREAMS",
+                _DEFAULT_MAX_KEEPALIVE_STREAMS,
+                minimum=1,
+            )
+            if _keepalive_active["count"] >= max_streams:
+                logger.debug(
+                    "handle_mcp [%s]: 503 keepalive stream cap reached (%d)",
+                    request_id,
+                    max_streams,
+                )
+                return _reject(503, "Service Unavailable")
+            # No await between the check above and this increment: atomic on the
+            # event loop. The finally in the generator releases the slot.
+            _keepalive_active["count"] += 1
+            max_seconds = _env_float(
+                "PMCP_KEEPALIVE_MAX_SECONDS",
+                _DEFAULT_KEEPALIVE_MAX_SECONDS,
+                minimum=0.1,
+            )
 
             async def _keepalive_sse() -> AsyncIterator[bytes]:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + max_seconds
                 try:
-                    while True:
+                    while loop.time() < deadline:
                         yield b": keep-alive\n\n"
-                        await asyncio.sleep(30)
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            break
+                        await asyncio.sleep(
+                            min(_KEEPALIVE_HEARTBEAT_SECONDS, remaining)
+                        )
                 except asyncio.CancelledError:
                     pass
+                finally:
+                    _keepalive_active["count"] -= 1
 
             logger.debug(
-                "handle_mcp [%s]: rmcp-compat serving pre-session GET as keep-alive SSE",
+                "handle_mcp [%s]: rmcp-compat serving pre-session GET as keep-alive"
+                " SSE (deadline=%ss, active=%d)",
                 request_id,
+                max_seconds,
+                _keepalive_active["count"],
             )
             return StreamingResponse(
                 _keepalive_sse(),
@@ -435,31 +652,55 @@ def create_http_app(
                 headers={"Cache-Control": "no-cache"},
             )
 
-        # Workaround for rmcp clients (e.g., Codex) that send the
-        # notifications/initialized message without the mcp-session-id header.
-        # The MCP initialize response includes the session ID, but rmcp does not
-        # propagate it to the immediately-following initialized notification.
-        # PMCP normally returns 400 for session-less POSTs that aren't initialize,
-        # which causes the rmcp worker to abort. Accept this specific notification
-        # as a no-op when no session ID is present.
-        if request.method == "POST" and not request.headers.get("mcp-session-id"):
-            body_bytes = await request.body()
-            try:
-                body = json.loads(body_bytes)
-                if body.get("method") == "notifications/initialized":
-                    logger.debug(
-                        "handle_mcp [%s]: rmcp-compat accepted notifications/initialized"
-                        " without session ID",
-                        request_id,
-                    )
-                    return Response(status_code=202)
-            except Exception:
-                pass
-
-            # For other session-less POSTs (e.g., the initialize request itself),
-            # replay the already-consumed body through the receive callable so
-            # the session manager can still read it.
+        # Read the POST body up front, counting bytes against _MAX_BODY_BYTES so
+        # a chunked / mislabeled request cannot bypass the header-only cap above.
+        # Bound the read by request_timeout so a slow-trickle client cannot pin a
+        # connection open (slow-read DoS) — the session manager would otherwise
+        # read the body inside the wait_for wrapper further down, but we now read
+        # it here for every POST, so we reproduce that bound.
+        if request.method == "POST":
             original_receive = request._receive
+            try:
+                body_bytes, body_too_large = await asyncio.wait_for(
+                    _read_body_capped(original_receive, _MAX_BODY_BYTES),
+                    timeout=request_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "handle_mcp [%s]: body read timed out after %ss",
+                    request_id,
+                    request_timeout,
+                )
+                return Response("Gateway Timeout", status_code=504)
+            if body_too_large:
+                logger.debug(
+                    "handle_mcp [%s]: 413 body exceeded cap during read", request_id
+                )
+                return Response("Payload Too Large", status_code=413)
+
+            # Workaround for rmcp clients (e.g., Codex) that send the
+            # notifications/initialized message without the mcp-session-id header.
+            # The MCP initialize response includes the session ID, but rmcp does
+            # not propagate it to the immediately-following initialized
+            # notification. PMCP normally returns 400 for session-less POSTs that
+            # aren't initialize, which causes the rmcp worker to abort. Accept
+            # this specific notification as a no-op when no session ID is present.
+            if not request.headers.get("mcp-session-id"):
+                try:
+                    body = json.loads(body_bytes)
+                    if body.get("method") == "notifications/initialized":
+                        logger.debug(
+                            "handle_mcp [%s]: rmcp-compat accepted"
+                            " notifications/initialized without session ID",
+                            request_id,
+                        )
+                        return Response(status_code=202)
+                except Exception:
+                    pass
+
+            # Replay the already-consumed body through the receive callable so the
+            # session manager can still read it (for both session-bearing POSTs
+            # and session-less ones such as the initialize request itself).
             body_replayed = False
 
             async def replay_receive() -> Any:

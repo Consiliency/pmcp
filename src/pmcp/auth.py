@@ -10,14 +10,35 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from ipaddress import ip_address
 from typing import Any
+from urllib.error import HTTPError
 from urllib.parse import parse_qsl, quote, urlparse, urlunparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import aiohttp
 import jwt
 from jwt import PyJWKSet
 
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    """Refuse HTTP redirects so a public URL cannot 3xx to an internal host."""
+
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request | None:
+        raise HTTPError(newurl, code, "Redirects are not allowed.", headers, fp)
+
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler)
+# Metadata fetches go through a no-redirect opener; tests patch this name.
+urlopen = _NO_REDIRECT_OPENER.open
 
 AUTH_SECRET_QUERY_KEYS = {
     "access_token",
@@ -221,9 +242,18 @@ class AsyncJWKS:
     async def _fetch(self) -> Mapping[str, Any]:
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(self._raw_url) as response:
+                async with session.get(
+                    self._raw_url, allow_redirects=False
+                ) as response:
+                    if 300 <= response.status < 400:
+                        raise ResourceServerJWKSUnavailable(
+                            f"JWKS endpoint returned a redirect for {self.url}; "
+                            "refusing to follow."
+                        )
                     response.raise_for_status()
                     content = await response.content.read(self._max_bytes + 1)
+        except ResourceServerJWKSUnavailable:
+            raise
         except Exception as exc:
             raise ResourceServerJWKSUnavailable(
                 f"JWKS fetch failed for {self.url}."

@@ -83,8 +83,15 @@ class PolicyManager:
                 logger.warning(f"Invalid redaction pattern '{pattern}': {e}")
 
     def _matches_any(self, value: str, patterns: list[str]) -> bool:
-        """Check if value matches any glob pattern."""
-        return any(fnmatch.fnmatch(value.lower(), p.lower()) for p in patterns)
+        """Check if value matches any glob pattern.
+
+        Matching is case-SENSITIVE: server/tool/resource/prompt IDs are treated
+        as case-sensitive everywhere else in the gateway, so an allow/deny glob
+        must match the exact case (e.g. a deny of ``Secret*`` does not match
+        ``secretserver``). ``fnmatchcase`` is used instead of ``fnmatch`` so the
+        behavior is stable across case-insensitive host filesystems.
+        """
+        return any(fnmatch.fnmatchcase(value, p) for p in patterns)
 
     def is_server_allowed(self, server_name: str) -> bool:
         """Check if server is allowed by policy."""

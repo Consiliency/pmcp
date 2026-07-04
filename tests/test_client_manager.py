@@ -1585,6 +1585,36 @@ class TestCallTool:
         assert returned == task
         assert "already terminal" in message
 
+    def test_terminal_task_records_are_evicted_past_cap(self) -> None:
+        """Terminal task records are pruned past the cap; active ones survive."""
+        manager = ClientManager()
+        manager._max_terminal_tasks = 5
+
+        # An active (non-terminal) record must never be evicted.
+        manager._record_task(
+            "srv",
+            McpTaskInfo(task_id="active", status="working", updated_at=0.0),
+        )
+
+        # Record many terminal tasks with increasing updated_at timestamps.
+        for i in range(20):
+            manager._record_task(
+                "srv",
+                McpTaskInfo(
+                    task_id=f"done-{i}", status="completed", updated_at=float(i + 1)
+                ),
+            )
+
+        terminal = [
+            t for t in manager.get_tracked_tasks("srv") if manager._terminal_task(t)
+        ]
+        assert len(terminal) == 5
+        # Oldest terminal records were dropped; newest survive.
+        surviving = {t.task_id for t in terminal}
+        assert surviving == {f"done-{i}" for i in range(15, 20)}
+        # The active task is untouched.
+        assert manager.get_task_record("srv", "active") is not None
+
 
 class TestServerHealthTracking:
     """Tests for server health tracking."""

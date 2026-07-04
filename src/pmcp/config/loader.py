@@ -203,9 +203,14 @@ def find_project_root(start_dir: Path) -> Path | None:
     """Find project root by looking for .mcp.json or common project markers."""
     current = start_dir.resolve()
     temp_root = Path(tempfile.gettempdir()).resolve()
+    home_root = Path.home().resolve()
 
     while current != current.parent:
         if current == temp_root:
+            return None
+        # $HOME is already covered by the user config source; treating it as a
+        # project root would double-attribute ~/.mcp.json (project + user).
+        if current == home_root:
             return None
         # Check for .mcp.json
         if (current / ".mcp.json").exists():
@@ -291,6 +296,27 @@ def _read_config_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     if not isinstance(data, dict):
         return None, "config_root_not_object"
     return data, None
+
+
+def _parse_config_or_warn(path: Path) -> McpConfigFile | None:
+    """Parse a config file, surfacing a WARNING when it exists but is malformed.
+
+    ``parse_json_file`` returns ``None`` both for a missing file and for a
+    malformed one, so on the hot ``load_configs`` path a broken ``.mcp.json``
+    would silently disable all of its servers. This wrapper keeps startup
+    fail-soft while logging the path and reason at WARNING so ``pmcp status``
+    and operators can see that the file's servers were dropped.
+    """
+    if not path.exists():
+        return None
+    config = parse_json_file(path)
+    if config is None:
+        _raw, error = _read_config_object(path)
+        logger.warning(
+            f"Ignoring malformed config {path} "
+            f"({error or 'invalid_mcp_config'}); its servers are disabled"
+        )
+    return config
 
 
 def load_config_sources(
@@ -638,7 +664,7 @@ def load_configs(
     resolved_project_root = project_root or find_project_root(Path.cwd())
     if resolved_project_root:
         project_config_path = resolved_project_root / ".mcp.json"
-        project_config = parse_json_file(project_config_path)
+        project_config = _parse_config_or_warn(project_config_path)
 
         if project_config and project_config.mcpServers:
             logger.info(f"Loaded project config from {project_config_path}")
@@ -661,7 +687,7 @@ def load_configs(
         else DEFAULT_USER_CONFIG_PATHS
     )
     for user_path in user_paths:
-        user_config = parse_json_file(user_path)
+        user_config = _parse_config_or_warn(user_path)
 
         if user_config and user_config.mcpServers:
             logger.info(f"Loaded user config from {user_path}")
@@ -689,7 +715,7 @@ def load_configs(
             resolved_custom_path = Path(env_path)
 
     if resolved_custom_path:
-        custom_config = parse_json_file(resolved_custom_path)
+        custom_config = _parse_config_or_warn(resolved_custom_path)
 
         if custom_config and custom_config.mcpServers:
             logger.info(f"Loaded custom config from {resolved_custom_path}")

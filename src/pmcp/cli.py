@@ -211,22 +211,68 @@ Environment overrides:
     parser.add_argument(
         "--max-concurrent-spawns",
         type=int,
-        default=8,
+        default=None,
         help="Max simultaneous child MCP server processes to spawn (default: 8). "
         "Also read from PMCP_MAX_SPAWNS.",
     )
     parser.add_argument(
         "--rate-limit",
         type=int,
-        default=0,
+        default=None,
         help="HTTP rate limit in requests per minute per client IP on /mcp "
         "(default: 0 = unlimited). Also read from PMCP_RATE_LIMIT.",
     )
     parser.add_argument(
         "--request-timeout",
         type=int,
-        default=60,
+        default=None,
         help="HTTP request timeout in seconds (default: 60). Also read from PMCP_REQUEST_TIMEOUT.",
+    )
+    parser.add_argument(
+        "--auth-mode",
+        choices=["none", "shared-secret", "resource-server"],
+        default=None,
+        help="HTTP auth mode (default: inferred — shared-secret if a token is set, "
+        "else none). Also read from PMCP_AUTH_MODE.",
+    )
+    parser.add_argument(
+        "--oauth-issuer",
+        type=str,
+        default=None,
+        help="OAuth Authorization Server issuer for resource-server mode. "
+        "Also read from PMCP_OAUTH_ISSUER.",
+    )
+    parser.add_argument(
+        "--oauth-jwks-url",
+        type=str,
+        default=None,
+        help="Public https JWKS URL for resource-server mode. "
+        "Also read from PMCP_OAUTH_JWKS_URL.",
+    )
+    parser.add_argument(
+        "--oauth-audience",
+        type=str,
+        default=None,
+        help="Canonical resource audience (RFC 8707) for resource-server mode. "
+        "Also read from PMCP_OAUTH_AUDIENCE.",
+    )
+    parser.add_argument(
+        "--required-scope",
+        action="append",
+        default=None,
+        dest="required_scopes",
+        metavar="SCOPE",
+        help="Required OAuth scope for resource-server mode (repeatable). "
+        "Also read from PMCP_REQUIRED_SCOPES (comma-separated).",
+    )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=None,
+        dest="allowed_origins",
+        metavar="ORIGIN",
+        help="Allowed browser Origin for /mcp (repeatable). Also enables Host "
+        "header validation. Also read from PMCP_ALLOWED_ORIGINS (comma-separated).",
     )
     parser.add_argument(
         "--version",
@@ -323,6 +369,12 @@ Environment overrides:
         "--pending",
         action="store_true",
         help="Show pending requests",
+    )
+    status_parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="Actively connect to each configured server (default: lazy, "
+        "report servers without connecting)",
     )
     status_parser.add_argument(
         "-v",
@@ -561,7 +613,19 @@ Environment overrides:
         help="Set a secret value in PMCP env file",
     )
     secrets_set_parser.add_argument("key", type=str, help="Secret key name")
-    secrets_set_parser.add_argument("value", type=str, help="Secret value")
+    secrets_set_parser.add_argument(
+        "value",
+        type=str,
+        nargs="?",
+        default=None,
+        help="Secret value. Omit to read it from --stdin or an interactive "
+        "prompt; passing it here exposes it in 'ps aux' and shell history.",
+    )
+    secrets_set_parser.add_argument(
+        "--stdin",
+        action="store_true",
+        help="Read the secret value from stdin instead of passing it on argv",
+    )
     secrets_set_parser.add_argument(
         "--scope",
         choices=["user", "project"],
@@ -1177,7 +1241,15 @@ async def run_status(args: argparse.Namespace) -> None:
         return
 
     try:
-        if args.verbose:
+        if getattr(args, "probe", False):
+            logger.info(f"Connecting to {len(allowed_configs)} servers...")
+            await client_manager.connect_all(allowed_configs)
+            statuses = client_manager.get_all_server_statuses()
+            tools = client_manager.get_all_tools()
+        else:
+            # Default: lazy view. `status` is a read-only command, so it must not
+            # spawn/connect every configured server as a side effect. Use --probe
+            # to opt into active connection.
             from pmcp.types import ServerStatus
 
             statuses = [
@@ -1189,11 +1261,6 @@ async def run_status(args: argparse.Namespace) -> None:
                 for config in allowed_configs
             ]
             tools = []
-        else:
-            logger.info(f"Connecting to {len(allowed_configs)} servers...")
-            await client_manager.connect_all(allowed_configs)
-            statuses = client_manager.get_all_server_statuses()
-            tools = client_manager.get_all_tools()
         revision_id, last_refresh = client_manager.get_registry_meta()
 
         # Filter by server if specified
@@ -1763,8 +1830,12 @@ async def _probe_sse_endpoint(url: str, timeout_s: float) -> tuple[bool, str]:
         return False, sanitize_auth_diagnostic(exc)
 
 
-async def _probe_http_health(timeout_s: float) -> tuple[bool, str]:
-    """Probe gateway /health and return (ok, details)."""
+async def _probe_http_health(timeout_s: float) -> tuple[bool, str, int | None]:
+    """Probe gateway /health and return (ok, details, status_code).
+
+    status_code is the HTTP status when the gateway responded (even on an error
+    status like 401/403), or None when the gateway was unreachable.
+    """
     import httpx
 
     url = _get_gateway_health_url()
@@ -1801,11 +1872,19 @@ async def _probe_http_health(timeout_s: float) -> tuple[bool, str]:
                     parts.append(f"audit_events={len(audit_events)}")
                 if parts:
                     detail = f"{detail} ({', '.join(parts)})"
-            return True, detail
-        return False, f"{safe_url} returned HTTP {response.status_code}"
+            return True, detail, 200
+        return (
+            False,
+            f"{safe_url} returned HTTP {response.status_code}",
+            response.status_code,
+        )
     except Exception as exc:
-        return False, sanitize_auth_diagnostic(
-            f"{safe_url} unreachable ({exc.__class__.__name__}: {exc})"
+        return (
+            False,
+            sanitize_auth_diagnostic(
+                f"{safe_url} unreachable ({exc.__class__.__name__}: {exc})"
+            ),
+            None,
         )
 
 
@@ -1853,10 +1932,23 @@ async def run_doctor(args: argparse.Namespace) -> None:
     else:
         checks.append(("mode", "ok", "No active PMCP system service detected."))
 
-    http_ok, http_detail = await _probe_http_health(args.timeout)
+    probe_result = await _probe_http_health(args.timeout)
+    http_ok, http_detail = probe_result[0], probe_result[1]
+    http_status = probe_result[2] if len(probe_result) > 2 else None
     if http_ok:
         checks.append(
             ("http", "ok", f"Gateway /health reachability OK: {http_detail}.")
+        )
+    elif http_status in (401, 403):
+        checks.append(
+            (
+                "http",
+                "warn",
+                "Gateway is up but /health requires authentication "
+                f"(HTTP {http_status}): {http_detail}. The gateway is reachable; "
+                "supply credentials (PMCP_AUTH_TOKEN or the configured auth mode) "
+                "rather than restarting it.",
+            )
         )
     else:
         checks.append(
@@ -2029,19 +2121,50 @@ async def run_server(args: argparse.Namespace) -> None:
         args.auth_token = os.environ["PMCP_AUTH_TOKEN"]
         auth_token_from_cli = False
 
-    # Env overrides for new flags
-    if (
-        not getattr(args, "max_concurrent_spawns", None)
-        or args.max_concurrent_spawns == 8
+    # Resolve tunables with a clear precedence: an explicitly-passed CLI flag
+    # (default=None sentinel) wins, then the environment variable, then the
+    # built-in default. Using a None sentinel instead of comparing against the
+    # default value means an explicit flag equal to the default (e.g.
+    # --request-timeout 60) still wins over the environment.
+    if getattr(args, "max_concurrent_spawns", None) is None:
+        env_spawns = os.environ.get("PMCP_MAX_SPAWNS")
+        args.max_concurrent_spawns = int(env_spawns) if env_spawns else 8
+    if getattr(args, "rate_limit", None) is None:
+        env_rate = os.environ.get("PMCP_RATE_LIMIT")
+        args.rate_limit = int(env_rate) if env_rate else 0
+    if getattr(args, "request_timeout", None) is None:
+        env_timeout = os.environ.get("PMCP_REQUEST_TIMEOUT")
+        args.request_timeout = int(env_timeout) if env_timeout else 60
+
+    # Auth / Origin env fallbacks (CLI flags take precedence).
+    if not getattr(args, "auth_mode", None) and os.environ.get("PMCP_AUTH_MODE"):
+        args.auth_mode = os.environ["PMCP_AUTH_MODE"]
+    if not getattr(args, "oauth_issuer", None) and os.environ.get("PMCP_OAUTH_ISSUER"):
+        args.oauth_issuer = os.environ["PMCP_OAUTH_ISSUER"]
+    if not getattr(args, "oauth_jwks_url", None) and os.environ.get(
+        "PMCP_OAUTH_JWKS_URL"
     ):
-        if os.environ.get("PMCP_MAX_SPAWNS"):
-            args.max_concurrent_spawns = int(os.environ["PMCP_MAX_SPAWNS"])
-    if not getattr(args, "rate_limit", None):
-        if os.environ.get("PMCP_RATE_LIMIT"):
-            args.rate_limit = int(os.environ["PMCP_RATE_LIMIT"])
-    if getattr(args, "request_timeout", 60) == 60:
-        if os.environ.get("PMCP_REQUEST_TIMEOUT"):
-            args.request_timeout = int(os.environ["PMCP_REQUEST_TIMEOUT"])
+        args.oauth_jwks_url = os.environ["PMCP_OAUTH_JWKS_URL"]
+    if not getattr(args, "oauth_audience", None) and os.environ.get(
+        "PMCP_OAUTH_AUDIENCE"
+    ):
+        args.oauth_audience = os.environ["PMCP_OAUTH_AUDIENCE"]
+    if not getattr(args, "required_scopes", None) and os.environ.get(
+        "PMCP_REQUIRED_SCOPES"
+    ):
+        args.required_scopes = [
+            s.strip()
+            for s in os.environ["PMCP_REQUIRED_SCOPES"].split(",")
+            if s.strip()
+        ]
+    if not getattr(args, "allowed_origins", None) and os.environ.get(
+        "PMCP_ALLOWED_ORIGINS"
+    ):
+        args.allowed_origins = [
+            o.strip()
+            for o in os.environ["PMCP_ALLOWED_ORIGINS"].split(",")
+            if o.strip()
+        ]
 
     # Lock directory - CLI flag takes precedence over env var
     lock_dir = getattr(args, "lock_dir", None)
@@ -2078,6 +2201,12 @@ async def run_server(args: argparse.Namespace) -> None:
         max_concurrent_spawns=getattr(args, "max_concurrent_spawns", 8),
         rate_limit_rpm=getattr(args, "rate_limit", 0),
         request_timeout=getattr(args, "request_timeout", 60),
+        auth_mode=getattr(args, "auth_mode", None),
+        resource_server_issuer=getattr(args, "oauth_issuer", None),
+        resource_server_jwks_url=getattr(args, "oauth_jwks_url", None),
+        resource_server_audience=getattr(args, "oauth_audience", None),
+        required_scopes=getattr(args, "required_scopes", None),
+        allowed_origins=getattr(args, "allowed_origins", None),
     )
 
     # Handle graceful shutdown
@@ -2206,6 +2335,32 @@ async def _call_gateway_tool(
     )
     payload = _extract_tool_payload(raw)
     return payload or {}
+
+
+def _resolve_secret_set_value(args: argparse.Namespace) -> str:
+    """Resolve the value for `secrets set` without exposing it on argv.
+
+    Precedence: an explicit positional value (with a warning, since it is
+    visible in ``ps aux`` and shell history) > ``--stdin`` > interactive
+    getpass prompt. Mirrors how `auth connect` reads credentials.
+    """
+    import getpass
+
+    value = getattr(args, "value", None)
+    if value is not None:
+        print(
+            "warning: secret value passed on the command line is visible in "
+            "'ps aux' and shell history; pipe it via --stdin or omit it to be "
+            "prompted.",
+            file=sys.stderr,
+        )
+        return value
+
+    if getattr(args, "stdin", False):
+        line = sys.stdin.readline()
+        return line.rstrip("\r\n")
+
+    return getpass.getpass(f"Enter value for {args.key}: ")
 
 
 async def run_auth_connect(args: argparse.Namespace) -> None:
@@ -2403,6 +2558,14 @@ def main() -> None:
     load_dotenv(Path.cwd() / ".env.pmcp", override=False)
 
     args = parse_args()
+
+    # Resolve the `secrets set` value here (not in async_main) so it is never
+    # required on argv, while async_main stays a pure dispatcher over args.
+    if (
+        getattr(args, "command", None) == "secrets"
+        and getattr(args, "secrets_command", None) == "set"
+    ):
+        args.value = _resolve_secret_set_value(args)
 
     try:
         asyncio.run(async_main(args))

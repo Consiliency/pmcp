@@ -6,6 +6,7 @@ import asyncio
 import logging
 import re
 from typing import Literal
+from urllib.parse import quote
 
 import aiohttp
 
@@ -46,11 +47,9 @@ async def get_npm_version(package_name: str, timeout: float = 10.0) -> str | Non
     if cache_key in _version_cache:
         return _version_cache[cache_key]
 
-    # Handle scoped packages (@org/pkg)
-    if package_name.startswith("@"):
-        url = f"https://registry.npmjs.org/{package_name.replace('@', '%40').replace('/', '%2F')}"
-    else:
-        url = f"https://registry.npmjs.org/{package_name}"
+    # Handle scoped packages (@org/pkg): escape the whole name segment
+    # (@ -> %40, / -> %2F) so it is a single path component.
+    url = f"https://registry.npmjs.org/{quote(package_name, safe='')}"
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -92,7 +91,7 @@ async def get_pypi_version(package_name: str, timeout: float = 10.0) -> str | No
     if cache_key in _version_cache:
         return _version_cache[cache_key]
 
-    url = f"https://pypi.org/pypi/{package_name}/json"
+    url = f"https://pypi.org/pypi/{quote(package_name, safe='')}/json"
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -134,7 +133,7 @@ async def get_cargo_version(crate_name: str, timeout: float = 10.0) -> str | Non
     if cache_key in _version_cache:
         return _version_cache[cache_key]
 
-    url = f"https://crates.io/api/v1/crates/{crate_name}"
+    url = f"https://crates.io/api/v1/crates/{quote(crate_name, safe='')}"
 
     try:
         async with aiohttp.ClientSession(
@@ -184,7 +183,8 @@ async def get_docker_version(image_name: str, timeout: float = 10.0) -> str | No
     else:
         repo_path = f"library/{image_name}"
 
-    url = f"https://hub.docker.com/v2/repositories/{repo_path}/tags/latest"
+    # Keep "/" unescaped: org/name is a two-segment path on Docker Hub.
+    url = f"https://hub.docker.com/v2/repositories/{quote(repo_path, safe='/')}/tags/latest"
 
     try:
         async with aiohttp.ClientSession() as session:

@@ -47,6 +47,7 @@ from pmcp.config.loader import (
 )
 from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.env_store import set_env_value
+from pmcp.validation import env_var_allowed, is_valid_package_name
 from pmcp.identity import filter_self_references
 from pmcp.manifest.code_patterns_loader import get_code_hint
 from pmcp.manifest.environment import CLIInfo, detect_platform, probe_clis
@@ -898,6 +899,11 @@ class GatewayTools:
         self._detected_cli_infos: dict[str, CLIInfo] = {}
         self._platform: str | None = None
         self._discovered_server_configs: dict[str, ServerConfig] = {}
+        # provision_status finalization is one-shot per job: the per-job lock
+        # serializes the server_ready→adopt handoff (and the complete→refresh)
+        # so concurrent polls cannot double-adopt or re-refresh a finished job.
+        self._provision_finalize_locks: dict[str, asyncio.Lock] = {}
+        self._provision_finalized: set[str] = set()
         self._stale_check_cache: dict[str, tuple[float, str | None, str | None]] = {}
         self._stale_check_ttl_seconds = 6 * 60 * 60
         self._stale_index_interval_seconds = 60 * 60  # Re-index every hour
@@ -3386,13 +3392,25 @@ class GatewayTools:
             },
             indent=2,
         )
-        subordinate = parsed.subordinate_server or "unknown"
-        failed_call = parsed.failed_tool_call or "unknown"
+        # All caller-supplied fields land in a potentially public GitHub issue,
+        # so scrub each the same way as the description — not just description.
+        subordinate = (
+            self._scrub_sensitive_text(parsed.subordinate_server)
+            if parsed.subordinate_server
+            else "unknown"
+        )
+        failed_call = (
+            self._scrub_sensitive_text(parsed.failed_tool_call)
+            if parsed.failed_tool_call
+            else "unknown"
+        )
 
         title_prefix = (
             "[Feedback][Bug]" if parsed.issue_type == "bug" else "[Feedback][Feature]"
         )
-        issue_title = f"{title_prefix} {parsed.title.strip()}"
+        issue_title = (
+            f"{title_prefix} {self._scrub_sensitive_text(parsed.title.strip())}"
+        )
         issue_title = issue_title[:160]
 
         body = (
@@ -4300,7 +4318,17 @@ class GatewayTools:
 
         manifest = load_manifest()
         server_config = manifest.get_server(server_name)
-        env_var = parsed.env_var or (server_config.env_var if server_config else None)
+        # Resolve the server's declared credential variable from both the
+        # manifest and the discovered-server registry: discovered servers
+        # (register_discovered_server) never land in the manifest, so relying on
+        # manifest.get_server alone would break their register→auth→provision
+        # flow.
+        declared_env_var = server_config.env_var if server_config else None
+        if declared_env_var is None:
+            discovered = self._discovered_server_configs.get(server_name)
+            if discovered is not None:
+                declared_env_var = discovered.env_var
+        env_var = parsed.env_var or declared_env_var
 
         if not env_var:
             self._audit(
@@ -4321,6 +4349,34 @@ class GatewayTools:
                     "Pass env_var explicitly or add auth metadata to manifest."
                 ),
                 auth_state="missing_auth",
+            )
+
+        # A caller-chosen env var is written into process env and the persistent
+        # .env, then inherited by the next provisioned subprocess. Only the
+        # server's declared credential variable (or a credential-shaped name when
+        # none is declared) is permitted; loader-influencing variables such as
+        # LD_PRELOAD / NODE_OPTIONS / PATH / PYTHON* are refused outright.
+        if not env_var_allowed(env_var, declared_env_var):
+            self._audit(
+                method="gateway.auth_connect",
+                action="auth_connect",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=server_name,
+                auth_state="missing_auth",
+                auth_event="policy_denied",
+                error=f"Env var '{env_var}' is not permitted for this server.",
+            )
+            expected = f" Expected '{declared_env_var}'." if declared_env_var else ""
+            return AuthConnectOutput(
+                ok=False,
+                server=server_name,
+                message=(
+                    f"Env var '{env_var}' is not permitted for server "
+                    f"'{server_name}'.{expected} Refusing to store it."
+                ),
+                auth_state="missing_auth",
+                env_var=env_var,
             )
 
         try:
@@ -4725,6 +4781,22 @@ class GatewayTools:
         server_name = parsed.server_name
         package = parsed.package
 
+        # Defense in depth: the pydantic field validator already rejects unsafe
+        # identifiers, but re-check here before the package is baked into an
+        # install command that gateway.provision will exec as list-argv.
+        if not is_valid_package_name(package):
+            return RegisterDiscoveredServerOutput(
+                ok=False,
+                server_name=server_name,
+                registered=False,
+                message=(
+                    f"Refused to register '{server_name}': "
+                    f"unsafe package identifier {package!r}."
+                ),
+            )
+
+        install_command = ["npx", "-y", package]
+
         requires_api_key = len(parsed.env_vars) > 0
         # Primary env var used for availability checks and auth_connect prompt
         env_var = parsed.env_vars[0] if parsed.env_vars else None
@@ -4743,10 +4815,10 @@ class GatewayTools:
             description=parsed.description or f"Discovered MCP package: {package}",
             keywords=["mcp", "discovered", server_name, package],
             install={
-                "mac": ["npx", "-y", package],
-                "linux": ["npx", "-y", package],
-                "wsl": ["npx", "-y", package],
-                "windows": ["npx", "-y", package],
+                "mac": list(install_command),
+                "linux": list(install_command),
+                "wsl": list(install_command),
+                "windows": list(install_command),
             },
             command="npx",
             args=["-y", package],
@@ -4771,8 +4843,10 @@ class GatewayTools:
             registered=True,
             message=(
                 f"Registered '{server_name}' (package: {package}). "
+                f"gateway.provision will run: {' '.join(install_command)}. "
                 "Call gateway.provision to install and start it."
             ),
+            install_command=install_command,
             next_step=f"gateway.provision(server_name='{server_name}')",
         )
 
@@ -4808,153 +4882,27 @@ class GatewayTools:
                 f"provision_status: job={job_id} status={job_status} progress={job_progress}"
             )
 
-            # If server_ready, perform handoff to ClientManager
-            if job_status == "server_ready":
-                process = job.process
-                if not process or process.returncode is not None:
-                    # Process died before handoff
-                    job.status = "failed"
-                    job.error = "Server process exited before handoff"
-                    return ProvisionJobStatus(
-                        job_id=job_id,
-                        server=job_server_name,
-                        status="failed",
-                        progress=job_progress,
-                        message=f"Server process for '{job_server_name}' exited unexpectedly",
-                        output_tail=job_output_lines[-5:],
-                        elapsed_seconds=elapsed,
-                        error="Process exited before handoff",
-                    )
-
-                try:
-                    # Build config from manifest
-                    manifest = load_manifest()
-                    server_config = manifest.get_server(job_server_name)
-                    if not server_config:
-                        raise ValueError(
-                            f"Server '{job_server_name}' not found in manifest"
-                        )
-
-                    resolved_config = manifest_server_to_config(server_config)
-
-                    # Adopt the process into ClientManager
-                    await self._client_manager.adopt_process(
-                        job_server_name, process, resolved_config
-                    )
-
-                    # Mark job complete and clear process reference
-                    job.status = "complete"
-                    job.process = None
-
-                    # Persist to provisioned registry so refresh() can reconnect it
-                    env_var = server_config.env_var if server_config else None
-                    self._register_provisioned_server(job_server_name, env_var)
-
-                    # Get the new tools
-                    tools = [
-                        t
-                        for t in self._client_manager.get_all_tools()
-                        if t.server_name == job_server_name
-                    ]
-
-                    return ProvisionJobStatus(
-                        job_id=job_id,
-                        server=job_server_name,
-                        status="complete",
-                        progress=100,
-                        message=f"Server '{job_server_name}' installed and connected with {len(tools)} tools.",
-                        output_tail=job_output_lines[-5:],
-                        elapsed_seconds=elapsed,
-                        new_tools=[
-                            CapabilityCard(
-                                tool_id=t.tool_id,
-                                server=t.server_name,
-                                tool_name=t.tool_name,
-                                short_description=t.short_description,
-                                tags=t.tags,
-                                availability="online",
-                                risk_hint=t.risk_hint.value,
-                            )
-                            for t in tools[:10]
-                        ]
-                        if tools
-                        else None,
-                    )
-
-                except Exception as e:
-                    logger.error(
-                        f"Handoff failed for {job_server_name}: {e}", exc_info=True
-                    )
-                    job.status = "failed"
-                    job.error = f"Handoff failed: {e}"
-                    # Kill the orphaned process
-                    if process and process.returncode is None:
-                        try:
-                            process.kill()
-                        except Exception:
-                            pass
-                    job.process = None
-
-                    return ProvisionJobStatus(
-                        job_id=job_id,
-                        server=job_server_name,
-                        status="failed",
-                        progress=job_progress,
-                        message=f"Failed to connect to '{job_server_name}': {self._sanitize_error(e)}",
-                        output_tail=job_output_lines[-5:],
-                        elapsed_seconds=elapsed,
-                        error=self._sanitize_error(e),
-                    )
-
-            # If complete (from non-npx install), trigger refresh to connect the server
-            if job_status == "complete":
-                tools = []
-                refresh_error = None
-
-                try:
-                    await self.refresh({"reason": f"Provisioned {job_server_name}"})
-                    # Get the new tools
-                    tools = [
-                        t
-                        for t in self._client_manager.get_all_tools()
-                        if t.server_name == job_server_name
-                    ]
-                except Exception as e:
-                    logger.error(f"Failed to refresh after install: {e}")
-                    refresh_error = self._sanitize_error(e)
-
-                message = f"Server '{job_server_name}' installed"
-                if tools:
-                    message += f" and connected with {len(tools)} tools."
-                elif refresh_error:
-                    message += f" but refresh failed: {refresh_error}"
-                else:
-                    message += " but no tools found. Try gateway.refresh manually."
-
-                return ProvisionJobStatus(
-                    job_id=job_id,
-                    server=job_server_name,
-                    status="complete",
-                    progress=100,
-                    message=message,
-                    output_tail=job_output_lines[-5:],
-                    elapsed_seconds=elapsed,
-                    new_tools=[
-                        CapabilityCard(
-                            tool_id=t.tool_id,
-                            server=t.server_name,
-                            tool_name=t.tool_name,
-                            short_description=t.short_description,
-                            tags=t.tags,
-                            availability="online",
-                            risk_hint=t.risk_hint.value,
-                        )
-                        for t in tools[:10]
-                    ]
-                    if tools
-                    else None,
-                    error=refresh_error,
+            # server_ready → adopt the process; complete (non-npx) → refresh.
+            # Both are one-shot per job: serialize on a per-job lock and re-read
+            # the live status inside it so two concurrent polls cannot
+            # double-adopt or re-refresh a job another poll already finalized.
+            if job_status in ("server_ready", "complete"):
+                finalize_lock = self._provision_finalize_locks.setdefault(
+                    job_id, asyncio.Lock()
                 )
+                async with finalize_lock:
+                    if job_id in self._provision_finalized:
+                        return self._build_finalized_status(job, job_id, elapsed)
+                    live_status = job.status
+                    if live_status == "server_ready":
+                        return await self._finalize_server_ready(job, job_id, elapsed)
+                    if live_status == "complete":
+                        return await self._finalize_complete(job, job_id, elapsed)
+                    # Live status changed under us (e.g. failed); fall through
+                    # and report it below using refreshed snapshots.
+                    job_status = live_status
+                    job_progress = job.progress
+                    job_error = job.error
 
             # For other statuses, return current state
             status_messages = {
@@ -4987,6 +4935,209 @@ class GatewayTools:
                 message=f"Error checking status: {self._sanitize_error(e)}",
                 error=self._sanitize_error(e),
             )
+
+    async def _finalize_server_ready(
+        self, job: Any, job_id: str, elapsed: float
+    ) -> ProvisionJobStatus:
+        """Adopt a server_ready job's process into ClientManager exactly once.
+
+        The caller must hold the job's finalize lock and have confirmed the job
+        is not already finalized.
+        """
+        job_server_name = job.server_name
+        job_progress = job.progress
+        job_output_lines = list(job.output_lines)
+
+        process = job.process
+        if not process or process.returncode is not None:
+            # Process died before handoff
+            job.status = "failed"
+            job.error = "Server process exited before handoff"
+            return ProvisionJobStatus(
+                job_id=job_id,
+                server=job_server_name,
+                status="failed",
+                progress=job_progress,
+                message=f"Server process for '{job_server_name}' exited unexpectedly",
+                output_tail=job_output_lines[-5:],
+                elapsed_seconds=elapsed,
+                error="Process exited before handoff",
+            )
+
+        try:
+            # Build config from manifest
+            manifest = load_manifest()
+            server_config = manifest.get_server(job_server_name)
+            if not server_config:
+                raise ValueError(f"Server '{job_server_name}' not found in manifest")
+
+            resolved_config = manifest_server_to_config(server_config)
+
+            # Adopt the process into ClientManager
+            await self._client_manager.adopt_process(
+                job_server_name, process, resolved_config
+            )
+
+            # Mark job complete and clear process reference
+            job.status = "complete"
+            job.process = None
+            self._provision_finalized.add(job_id)
+
+            # Persist to provisioned registry so refresh() can reconnect it
+            env_var = server_config.env_var if server_config else None
+            self._register_provisioned_server(job_server_name, env_var)
+
+            # Get the new tools
+            tools = [
+                t
+                for t in self._client_manager.get_all_tools()
+                if t.server_name == job_server_name
+            ]
+
+            return ProvisionJobStatus(
+                job_id=job_id,
+                server=job_server_name,
+                status="complete",
+                progress=100,
+                message=f"Server '{job_server_name}' installed and connected with {len(tools)} tools.",
+                output_tail=job_output_lines[-5:],
+                elapsed_seconds=elapsed,
+                new_tools=[
+                    CapabilityCard(
+                        tool_id=t.tool_id,
+                        server=t.server_name,
+                        tool_name=t.tool_name,
+                        short_description=t.short_description,
+                        tags=t.tags,
+                        availability="online",
+                        risk_hint=t.risk_hint.value,
+                    )
+                    for t in tools[:10]
+                ]
+                if tools
+                else None,
+            )
+
+        except Exception as e:
+            logger.error(f"Handoff failed for {job_server_name}: {e}", exc_info=True)
+            job.status = "failed"
+            job.error = f"Handoff failed: {e}"
+            # Kill the orphaned process
+            if process and process.returncode is None:
+                try:
+                    process.kill()
+                except Exception:
+                    pass
+            job.process = None
+
+            return ProvisionJobStatus(
+                job_id=job_id,
+                server=job_server_name,
+                status="failed",
+                progress=job_progress,
+                message=f"Failed to connect to '{job_server_name}': {self._sanitize_error(e)}",
+                output_tail=job_output_lines[-5:],
+                elapsed_seconds=elapsed,
+                error=self._sanitize_error(e),
+            )
+
+    async def _finalize_complete(
+        self, job: Any, job_id: str, elapsed: float
+    ) -> ProvisionJobStatus:
+        """Refresh once for a completed (non-npx) install job.
+
+        The caller must hold the job's finalize lock and have confirmed the job
+        is not already finalized. Marks the job finalized before refreshing so a
+        racing poll cannot trigger a second full refresh.
+        """
+        job_server_name = job.server_name
+        job_output_lines = list(job.output_lines)
+        self._provision_finalized.add(job_id)
+
+        tools = []
+        refresh_error = None
+        try:
+            await self.refresh({"reason": f"Provisioned {job_server_name}"})
+            # Get the new tools
+            tools = [
+                t
+                for t in self._client_manager.get_all_tools()
+                if t.server_name == job_server_name
+            ]
+        except Exception as e:
+            logger.error(f"Failed to refresh after install: {e}")
+            refresh_error = self._sanitize_error(e)
+
+        message = f"Server '{job_server_name}' installed"
+        if tools:
+            message += f" and connected with {len(tools)} tools."
+        elif refresh_error:
+            message += f" but refresh failed: {refresh_error}"
+        else:
+            message += " but no tools found. Try gateway.refresh manually."
+
+        return ProvisionJobStatus(
+            job_id=job_id,
+            server=job_server_name,
+            status="complete",
+            progress=100,
+            message=message,
+            output_tail=job_output_lines[-5:],
+            elapsed_seconds=elapsed,
+            new_tools=[
+                CapabilityCard(
+                    tool_id=t.tool_id,
+                    server=t.server_name,
+                    tool_name=t.tool_name,
+                    short_description=t.short_description,
+                    tags=t.tags,
+                    availability="online",
+                    risk_hint=t.risk_hint.value,
+                )
+                for t in tools[:10]
+            ]
+            if tools
+            else None,
+            error=refresh_error,
+        )
+
+    def _build_finalized_status(
+        self, job: Any, job_id: str, elapsed: float
+    ) -> ProvisionJobStatus:
+        """Read-only terminal status for a job already finalized by another poll.
+
+        Reports the connected tools without re-adopting or re-refreshing.
+        """
+        job_server_name = job.server_name
+        job_output_lines = list(job.output_lines)
+        tools = [
+            t
+            for t in self._client_manager.get_all_tools()
+            if t.server_name == job_server_name
+        ]
+        return ProvisionJobStatus(
+            job_id=job_id,
+            server=job_server_name,
+            status="complete",
+            progress=100,
+            message=f"Server '{job_server_name}' installed and connected with {len(tools)} tools.",
+            output_tail=job_output_lines[-5:],
+            elapsed_seconds=elapsed,
+            new_tools=[
+                CapabilityCard(
+                    tool_id=t.tool_id,
+                    server=t.server_name,
+                    tool_name=t.tool_name,
+                    short_description=t.short_description,
+                    tags=t.tags,
+                    availability="online",
+                    risk_hint=t.risk_hint.value,
+                )
+                for t in tools[:10]
+            ]
+            if tools
+            else None,
+        )
 
     async def sync_environment(
         self, input_data: dict[str, Any]

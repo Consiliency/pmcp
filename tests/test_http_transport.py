@@ -42,7 +42,11 @@ def _make_contract_client(
             rate_limit_rpm=rate_limit_rpm,
             **kwargs,
         )
-        return TestClient(app, raise_server_exceptions=False)
+        # Loopback base URL so the request Host header is always allow-listed;
+        # keeps Origin/Host tests deterministic regardless of TestClient defaults.
+        return TestClient(
+            app, base_url="http://127.0.0.1", raise_server_exceptions=False
+        )
 
 
 class TestGatewayTransportType:
@@ -472,6 +476,71 @@ class TestHttpObservabilityContracts:
         )
 
         assert response.status_code == 403
+
+    def test_cross_origin_rejected_by_default_without_allowlist(self) -> None:
+        """DNS-rebinding defense runs even when allowed_origins is unset."""
+        client = _make_contract_client()
+
+        foreign = client.post(
+            "/mcp",
+            headers={"Origin": "https://evil.example"},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        assert foreign.status_code == 403
+
+    def test_no_origin_and_loopback_and_same_origin_pass_by_default(self) -> None:
+        """Normal MCP clients (no Origin) and loopback/same-origin browsers pass."""
+        client = _make_contract_client()
+
+        no_origin = client.post(
+            "/mcp",
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        loopback = client.post(
+            "/mcp",
+            headers={"Origin": "http://localhost:8080"},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        same_origin = client.post(
+            "/mcp",
+            headers={"Origin": "http://127.0.0.1"},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        assert no_origin.status_code == 202
+        assert loopback.status_code == 202
+        assert same_origin.status_code == 202
+
+    def test_host_validation_enforced_only_when_origins_configured(self) -> None:
+        """A foreign Host is rejected once allowed_origins opts Host checking in."""
+        client = _make_contract_client(allowed_origins=["https://app.example"])
+
+        foreign_host = client.post(
+            "/mcp",
+            headers={"Host": "evil.example"},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+        allowlisted_host = client.post(
+            "/mcp",
+            headers={"Host": "app.example"},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        assert foreign_host.status_code == 403
+        assert allowlisted_host.status_code == 202
+
+    def test_host_not_validated_without_allowlist(self) -> None:
+        """Without allowed_origins, an arbitrary Host still works (proxy-friendly)."""
+        client = _make_contract_client()
+
+        response = client.post(
+            "/mcp",
+            headers={"Host": "pmcp.public.example"},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        assert response.status_code == 202
 
 
 class TestHttpTransportIntegration:

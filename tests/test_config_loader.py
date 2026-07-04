@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,33 @@ class TestLoadConfigs:
             user_config_paths=[],
         )
         assert len(configs) == 0
+
+    def test_malformed_config_is_surfaced_but_startup_proceeds(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Malformed project config: its servers are silently dropped today.
+        (tmp_path / ".mcp.json").write_text("invalid json {{{")
+        # A valid user config that must still load despite the broken project file.
+        user_path = tmp_path / "user.mcp.json"
+        user_path.write_text(
+            json.dumps({"mcpServers": {"good": {"command": "echo", "args": ["hi"]}}})
+        )
+
+        with caplog.at_level(logging.WARNING, logger="pmcp.config.loader"):
+            configs = load_configs(
+                project_root=tmp_path,
+                user_config_paths=[user_path],
+            )
+
+        # Startup still proceeds: the valid user server loads.
+        assert [c.name for c in configs] == ["good"]
+        # The malformed file's failure is surfaced (path + disabled note).
+        assert any(
+            "malformed config" in record.message.lower()
+            and str(tmp_path / ".mcp.json") in record.message
+            for record in caplog.records
+            if record.levelno >= logging.WARNING
+        )
 
     def test_normalizes_relative_paths(self, tmp_path: Path) -> None:
         project_config = {

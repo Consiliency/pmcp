@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import AsyncIterator
 from pathlib import Path
 
 from pmcp.manifest.registry import (
@@ -73,9 +74,24 @@ RECORDED_PAYLOAD = {
 }
 
 
+class _Content:
+    def __init__(self, body: bytes) -> None:
+        self._body = body
+
+    async def iter_chunked(self, size: int) -> AsyncIterator[bytes]:
+        for start in range(0, len(self._body), size):
+            yield self._body[start : start + size]
+
+
 class _Response:
     def __init__(self, payload: dict[str, object]) -> None:
         self._payload = payload
+        self._body = json.dumps(payload).encode()
+        self.content = _Content(self._body)
+
+    @property
+    def content_length(self) -> int:
+        return len(self._body)
 
     async def __aenter__(self) -> _Response:
         return self
@@ -84,7 +100,7 @@ class _Response:
         return None
 
     async def read(self) -> bytes:
-        return json.dumps(self._payload).encode()
+        return self._body
 
 
 class _Session:

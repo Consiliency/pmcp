@@ -86,7 +86,17 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
     if content:
         content += "\n"
 
-    path.parent.mkdir(parents=True, exist_ok=True)
+    # Tighten only directories PMCP itself creates (e.g. ~/.config/pmcp for
+    # user-scope secrets) to 0700. Never chmod a pre-existing directory such as
+    # a project root, which for project-scope secrets is path.parent.
+    parent = path.parent
+    parent_created = not parent.exists()
+    parent.mkdir(parents=True, exist_ok=True)
+    if parent_created:
+        try:
+            os.chmod(parent, 0o700)
+        except OSError:
+            pass
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as env_file:

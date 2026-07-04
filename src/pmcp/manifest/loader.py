@@ -382,7 +382,15 @@ def _find_project_manifest() -> Path | None:
             return None
         candidate = current / ".pmcp" / "manifest.yaml"
         if candidate.exists():
-            return candidate
+            # Don't follow an overlay that a symlink points outside this tree:
+            # resolve the candidate and require it to stay within the ancestor
+            # directory that contains it.
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                resolved = None
+            if resolved is not None and resolved.is_relative_to(current):
+                return candidate
         current = current.parent
 
     return None
@@ -510,6 +518,12 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
                     f"{len(overlay_servers)} servers, "
                     f"{len(overlay_clis)} CLI alternatives"
                 )
+            for name in overlay_servers:
+                if name in servers:
+                    logger.warning(
+                        f"Manifest overlay ({label}) from {overlay_path} overrides "
+                        f"existing server '{name}'"
+                    )
             servers.update(overlay_servers)
             cli_alternatives.update(overlay_clis)
 
