@@ -462,7 +462,6 @@ class ManagedClient:
             tool_count=0,
         )
     )
-    request_id: int = 0
     pending_requests: dict[int, PendingRequest] = field(default_factory=dict)
     read_task: asyncio.Task[None] | None = None
     # stderr reader task for stdio servers; tracked so a failed/replaced connect
@@ -505,6 +504,11 @@ class ClientManager:
         self._reconnect_tasks: dict[str, asyncio.Task[None]] = {}
         self._request_counters: dict[str, int] = {}
         self._tasks: dict[tuple[str, str], McpTaskRecord] = {}
+        # Cap on retained terminal (completed/failed/cancelled) task records.
+        # Active records are never evicted; only terminal ones are pruned oldest
+        # first once this many accumulate, so the registry can't grow unbounded
+        # between full teardowns.
+        self._max_terminal_tasks = 100
 
     async def connect_all(
         self, configs: list[ResolvedServerConfig], retry: bool = True
@@ -589,7 +593,7 @@ class ClientManager:
         self._background_tasks.add(task)
         self._background_task_servers[task] = server_name
         task.add_done_callback(self._background_tasks.discard)
-        task.add_done_callback(self._background_task_servers.pop)
+        task.add_done_callback(lambda t: self._background_task_servers.pop(t, None))
         return task
 
     async def _cancel_background_tasks(
@@ -788,6 +792,11 @@ class ClientManager:
 
         async with self._lifecycle_lock:
             managed = self._clients.get(name)
+            # Re-cancel inside the lock: requests may have been queued in the
+            # window between the pre-lock inspection above and acquiring the
+            # lock, which would otherwise leave orphaned pending futures.
+            if managed is not None and managed.pending_requests:
+                cancelled += self.cancel_pending_requests(name)
             if not managed:
                 status = self._servers.get(name)
                 if status is not None:
@@ -1026,7 +1035,27 @@ class ClientManager:
             or (existing.requestor_context if existing else None),
         )
         self._tasks[(server_name, task_info.task_id)] = record
+        self._evict_terminal_tasks()
         return record
+
+    def _evict_terminal_tasks(self) -> None:
+        """Prune oldest terminal task records past the retention cap.
+
+        Only completed/failed/cancelled records are candidates; active tasks are
+        left untouched. Eviction targets the oldest records by ``updated_at`` so
+        recently-finished tasks remain queryable.
+        """
+        terminal = [
+            (key, record)
+            for key, record in self._tasks.items()
+            if self._terminal_task(record)
+        ]
+        excess = len(terminal) - self._max_terminal_tasks
+        if excess <= 0:
+            return
+        terminal.sort(key=lambda item: (item[1].updated_at or 0.0, item[0]))
+        for key, _record in terminal[:excess]:
+            self._tasks.pop(key, None)
 
     def _terminal_task(self, task: McpTaskRecord) -> bool:
         return task.status in {"completed", "failed", "cancelled"}
@@ -1724,7 +1753,6 @@ class ClientManager:
     ) -> dict[str, Any]:
         """Send a JSON-RPC request and wait for response."""
         request_id = self._next_request_id(managed.config.name)
-        managed.request_id = request_id
         now = time.time()
 
         request = {

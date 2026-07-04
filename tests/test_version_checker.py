@@ -733,3 +733,53 @@ class TestClearVersionCache:
 
         clear_version_cache()
         assert len(_version_cache) == 0
+
+
+class TestVersionCheckUrlEscaping:
+    """Version-check URLs escape the package-name segment for all registries."""
+
+    @pytest.fixture(autouse=True)
+    def clear_cache(self) -> None:
+        clear_version_cache()
+
+    @staticmethod
+    async def _capture_url(getter, name: str, payload: dict) -> str:
+        mock_response = MagicMock()
+        mock_response.status = 200
+        mock_response.json = AsyncMock(return_value=payload)
+        mock_response.__aenter__ = AsyncMock(return_value=mock_response)
+        mock_response.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.get = MagicMock(return_value=mock_response)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session):
+            await getter(name)
+        return mock_session.get.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_pypi_name_is_quoted(self) -> None:
+        url = await self._capture_url(
+            get_pypi_version, "pkg name", {"info": {"version": "1.0.0"}}
+        )
+        assert "pkg%20name" in url
+        assert "pkg name" not in url
+
+    @pytest.mark.asyncio
+    async def test_cargo_name_is_quoted(self) -> None:
+        url = await self._capture_url(
+            get_cargo_version, "crate name", {"crate": {"newest_version": "1.0.0"}}
+        )
+        assert "crate%20name" in url
+        assert "crate name" not in url
+
+    @pytest.mark.asyncio
+    async def test_docker_name_is_quoted_but_slash_preserved(self) -> None:
+        # org/name stays a two-segment path; the space in the name is escaped.
+        url = await self._capture_url(
+            get_docker_version, "org/img name", {"digest": "sha256:abcdef012345"}
+        )
+        assert "org/img%20name" in url
+        assert "img name" not in url

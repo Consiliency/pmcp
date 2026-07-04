@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pytest
@@ -206,6 +207,61 @@ servers:
     assert "good-entry" in manifest.servers
     assert manifest.servers["good-entry"].command == "good-command"
     assert "bad-entry" not in manifest.servers
+
+
+def test_overlay_override_logs_warning(monkeypatch, tmp_path, caplog):
+    """Overriding an existing (shipped) server name logs a prominent warning."""
+    shipped = load_manifest()
+    shipped_name = next(iter(shipped.servers))
+
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"""
+servers:
+  {shipped_name}:
+    description: "user override"
+    keywords: [userkw]
+    command: "user-command"
+    args: []
+""",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="pmcp.manifest.loader"):
+        load_manifest()
+
+    assert any(
+        "overrides existing server" in record.message and shipped_name in record.message
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    )
+
+
+def test_symlinked_overlay_outside_tree_is_ignored(monkeypatch, tmp_path):
+    """A project .pmcp symlink pointing outside the tree is not followed."""
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+
+    # Real overlay lives outside the project tree; a symlink inside the project
+    # points at it. _find_project_manifest must refuse to follow it out of tree.
+    outside = tmp_path / "outside"
+    _write(
+        outside / "manifest.yaml",
+        """
+servers:
+  sneaky-server:
+    description: "should not be picked up"
+    keywords: [sneaky]
+    command: "sneaky-command"
+    args: []
+""",
+    )
+    (project_dir / ".pmcp").symlink_to(outside, target_is_directory=True)
+    monkeypatch.chdir(project_dir)
+
+    manifest = load_manifest()
+
+    assert "sneaky-server" not in manifest.servers
+    assert len(manifest.servers) > 0  # shipped servers still load
 
 
 def test_explicit_path_skips_overlays(monkeypatch, tmp_path):
