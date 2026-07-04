@@ -19,6 +19,7 @@ import hmac
 import ipaddress
 import json
 import logging
+import os
 import uuid
 from collections.abc import AsyncIterator, MutableMapping
 from typing import TYPE_CHECKING, Any, Callable, Literal
@@ -65,6 +66,74 @@ _rl_store: dict[str, collections.deque] = {}
 _rl_lock: asyncio.Lock | None = None
 
 _MAX_BODY_BYTES: int = 10 * 1024 * 1024  # 10 MB
+
+# ---------------------------------------------------------------------------
+# Transport DoS guards for unauthenticated pre-session traffic
+# ---------------------------------------------------------------------------
+# The pre-session keepalive SSE stream (rmcp compatibility, see handle_mcp) is
+# infinite by design. Without bounds an unauthenticated client can open an
+# unlimited number of long-lived connections and exhaust the server
+# (connection-exhaustion DoS). We cap both the number of concurrent streams and
+# each stream's absolute lifetime. Both are env-tunable for operators.
+_DEFAULT_MAX_KEEPALIVE_STREAMS: int = 64
+_DEFAULT_KEEPALIVE_MAX_SECONDS: float = 300.0
+_KEEPALIVE_HEARTBEAT_SECONDS: float = 30.0
+
+# Live count of open pre-session keepalive streams. Mutated only from the event
+# loop thread; check-then-increment in handle_mcp has no await in between and is
+# therefore atomic. Held in a dict so nested closures can mutate without a
+# module-level ``global`` declaration (mirrors the _rl_store pattern).
+_keepalive_active: dict[str, int] = {"count": 0}
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    """Read a positive int from the environment, clamped to ``minimum``."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float, *, minimum: float) -> float:
+    """Read a positive float from the environment, clamped to ``minimum``."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, float(raw))
+    except ValueError:
+        return default
+
+
+async def _read_body_capped(
+    receive: Callable[[], Any], max_bytes: int
+) -> tuple[bytes, bool]:
+    """Read the full ASGI request body, enforcing ``max_bytes`` as chunks arrive.
+
+    Returns ``(body, exceeded)``. Counting bytes during the read (rather than
+    trusting the advertised Content-Length) means a chunked or mislabeled
+    request cannot bypass the size cap. Once the cap is exceeded the read stops
+    immediately and any buffered data is dropped.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    more_body = True
+    while more_body:
+        message = await receive()
+        if message["type"] == "http.disconnect":
+            break
+        chunk = message.get("body", b"")
+        if chunk:
+            total += len(chunk)
+            if total > max_bytes:
+                return b"", True
+            chunks.append(chunk)
+        more_body = message.get("more_body", False)
+    return b"".join(chunks), False
+
 
 # ---------------------------------------------------------------------------
 # Prometheus counter registration (optional — falls back to _metrics dict)
@@ -504,11 +573,22 @@ def create_http_app(
                 )
                 return Response("Too Many Requests", status_code=429)
 
-        # Input size guard — reject oversized POST bodies before reading them
+        # Input size guard — fast-path reject when the advertised Content-Length
+        # already exceeds the cap. This is only a hint: a chunked or mislabeled
+        # request has no (or a false) Content-Length, so the body is additionally
+        # counted while reading below (see _read_body_capped).
         if request.method == "POST":
             cl = request.headers.get("content-length")
-            if cl and int(cl) > _MAX_BODY_BYTES:
-                return Response("Payload Too Large", status_code=413)
+            if cl:
+                try:
+                    declared = int(cl)
+                except ValueError:
+                    declared = 0
+                if declared > _MAX_BODY_BYTES:
+                    logger.debug(
+                        "handle_mcp [%s]: 413 Content-Length over cap", request_id
+                    )
+                    return Response("Payload Too Large", status_code=413)
 
         # Workaround for rmcp clients (e.g., Codex) that open the GET common
         # stream before completing the initialize handshake (and therefore have
@@ -518,18 +598,53 @@ def create_http_app(
         # channel are lost. Return a minimal keep-alive SSE stream instead; rmcp
         # will re-open the GET with a real session ID once it has one.
         if request.method == "GET" and not request.headers.get("mcp-session-id"):
+            # DoS guard: cap concurrent pre-session streams and give each an
+            # absolute lifetime so an unauthenticated client cannot open an
+            # unbounded number of infinite connections.
+            max_streams = _env_int(
+                "PMCP_MAX_KEEPALIVE_STREAMS",
+                _DEFAULT_MAX_KEEPALIVE_STREAMS,
+                minimum=1,
+            )
+            if _keepalive_active["count"] >= max_streams:
+                logger.debug(
+                    "handle_mcp [%s]: 503 keepalive stream cap reached (%d)",
+                    request_id,
+                    max_streams,
+                )
+                return _reject(503, "Service Unavailable")
+            # No await between the check above and this increment: atomic on the
+            # event loop. The finally in the generator releases the slot.
+            _keepalive_active["count"] += 1
+            max_seconds = _env_float(
+                "PMCP_KEEPALIVE_MAX_SECONDS",
+                _DEFAULT_KEEPALIVE_MAX_SECONDS,
+                minimum=0.1,
+            )
 
             async def _keepalive_sse() -> AsyncIterator[bytes]:
+                loop = asyncio.get_running_loop()
+                deadline = loop.time() + max_seconds
                 try:
-                    while True:
+                    while loop.time() < deadline:
                         yield b": keep-alive\n\n"
-                        await asyncio.sleep(30)
+                        remaining = deadline - loop.time()
+                        if remaining <= 0:
+                            break
+                        await asyncio.sleep(
+                            min(_KEEPALIVE_HEARTBEAT_SECONDS, remaining)
+                        )
                 except asyncio.CancelledError:
                     pass
+                finally:
+                    _keepalive_active["count"] -= 1
 
             logger.debug(
-                "handle_mcp [%s]: rmcp-compat serving pre-session GET as keep-alive SSE",
+                "handle_mcp [%s]: rmcp-compat serving pre-session GET as keep-alive"
+                " SSE (deadline=%ss, active=%d)",
                 request_id,
+                max_seconds,
+                _keepalive_active["count"],
             )
             return StreamingResponse(
                 _keepalive_sse(),
@@ -537,31 +652,55 @@ def create_http_app(
                 headers={"Cache-Control": "no-cache"},
             )
 
-        # Workaround for rmcp clients (e.g., Codex) that send the
-        # notifications/initialized message without the mcp-session-id header.
-        # The MCP initialize response includes the session ID, but rmcp does not
-        # propagate it to the immediately-following initialized notification.
-        # PMCP normally returns 400 for session-less POSTs that aren't initialize,
-        # which causes the rmcp worker to abort. Accept this specific notification
-        # as a no-op when no session ID is present.
-        if request.method == "POST" and not request.headers.get("mcp-session-id"):
-            body_bytes = await request.body()
-            try:
-                body = json.loads(body_bytes)
-                if body.get("method") == "notifications/initialized":
-                    logger.debug(
-                        "handle_mcp [%s]: rmcp-compat accepted notifications/initialized"
-                        " without session ID",
-                        request_id,
-                    )
-                    return Response(status_code=202)
-            except Exception:
-                pass
-
-            # For other session-less POSTs (e.g., the initialize request itself),
-            # replay the already-consumed body through the receive callable so
-            # the session manager can still read it.
+        # Read the POST body up front, counting bytes against _MAX_BODY_BYTES so
+        # a chunked / mislabeled request cannot bypass the header-only cap above.
+        # Bound the read by request_timeout so a slow-trickle client cannot pin a
+        # connection open (slow-read DoS) — the session manager would otherwise
+        # read the body inside the wait_for wrapper further down, but we now read
+        # it here for every POST, so we reproduce that bound.
+        if request.method == "POST":
             original_receive = request._receive
+            try:
+                body_bytes, body_too_large = await asyncio.wait_for(
+                    _read_body_capped(original_receive, _MAX_BODY_BYTES),
+                    timeout=request_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "handle_mcp [%s]: body read timed out after %ss",
+                    request_id,
+                    request_timeout,
+                )
+                return Response("Gateway Timeout", status_code=504)
+            if body_too_large:
+                logger.debug(
+                    "handle_mcp [%s]: 413 body exceeded cap during read", request_id
+                )
+                return Response("Payload Too Large", status_code=413)
+
+            # Workaround for rmcp clients (e.g., Codex) that send the
+            # notifications/initialized message without the mcp-session-id header.
+            # The MCP initialize response includes the session ID, but rmcp does
+            # not propagate it to the immediately-following initialized
+            # notification. PMCP normally returns 400 for session-less POSTs that
+            # aren't initialize, which causes the rmcp worker to abort. Accept
+            # this specific notification as a no-op when no session ID is present.
+            if not request.headers.get("mcp-session-id"):
+                try:
+                    body = json.loads(body_bytes)
+                    if body.get("method") == "notifications/initialized":
+                        logger.debug(
+                            "handle_mcp [%s]: rmcp-compat accepted"
+                            " notifications/initialized without session ID",
+                            request_id,
+                        )
+                        return Response(status_code=202)
+                except Exception:
+                    pass
+
+            # Replay the already-consumed body through the receive callable so the
+            # session manager can still read it (for both session-bearing POSTs
+            # and session-less ones such as the initialize request itself).
             body_replayed = False
 
             async def replay_receive() -> Any:
