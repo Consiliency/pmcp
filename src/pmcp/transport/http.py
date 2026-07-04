@@ -16,6 +16,7 @@ import asyncio
 import collections
 import contextlib
 import hmac
+import ipaddress
 import json
 import logging
 import uuid
@@ -147,6 +148,46 @@ async def _check_rate_limit(client_ip: str, max_rpm: int) -> bool:
         return True
 
 
+def _is_loopback_host(hostname: str) -> bool:
+    """Return True for loopback host names (localhost, 127.0.0.0/8, ::1)."""
+    if not hostname:
+        return False
+    hostname = hostname.strip("[]")
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def _split_host_port(value: str, default_port: str) -> tuple[str, str]:
+    """Split a ``host[:port]`` authority into (hostname, port).
+
+    Handles bracketed IPv6 literals (``[::1]:3344``). ``default_port`` is
+    returned when no explicit port is present.
+    """
+    value = value.strip()
+    if value.startswith("["):
+        host, sep, rest = value[1:].partition("]")
+        port = rest[1:] if rest.startswith(":") else default_port
+        return host, (port or default_port)
+    if value.count(":") == 1:
+        host, _, port = value.partition(":")
+        return host, (port or default_port)
+    return value, default_port
+
+
+def _origin_host_port(origin: str) -> tuple[str, str] | None:
+    """Return (hostname, port) for an Origin header value, or None if unparseable."""
+    parsed = urlparse(origin)
+    if not parsed.scheme or not parsed.hostname:
+        return None
+    default_port = "443" if parsed.scheme == "https" else "80"
+    port = str(parsed.port) if parsed.port is not None else default_port
+    return parsed.hostname, port
+
+
 def create_http_app(
     mcp_server: Server,
     auth_token: str | None = None,
@@ -223,6 +264,65 @@ def create_http_app(
         rate_limit_enabled=rate_limit_rpm > 0,
         rate_limit_rpm=rate_limit_rpm if rate_limit_rpm > 0 else None,
     )
+
+    # Host allowlist for DNS-rebinding defense. Enforced only when the operator
+    # opts in by configuring allowed_origins; the set is derived from the origins
+    # plus the gateway's own canonical resource host (audience / metadata URL) so
+    # a reverse proxy forwarding the public Host is not rejected.
+    _allowed_host_names: set[str] = set()
+    if allowed_origins is not None:
+        for _origin in allowed_origins:
+            parsed = _origin_host_port(_origin)
+            if parsed is not None:
+                _allowed_host_names.add(parsed[0])
+        for _url in (resource_server_audience, protected_resource_metadata_url):
+            if _url:
+                parsed_url = urlparse(_url)
+                if parsed_url.hostname:
+                    _allowed_host_names.add(parsed_url.hostname)
+
+    def _origin_rejected(request: Request) -> bool:
+        """Return True if a browser Origin header should be rejected (403).
+
+        Runs by default (even without a configured allowlist) as DNS-rebinding
+        defense: a non-loopback, non-same-origin Origin that is not explicitly
+        allow-listed is rejected. Requests with no Origin (normal MCP clients)
+        always pass.
+        """
+        origin = request.headers.get("origin")
+        if origin is None:
+            return False
+        parsed = _origin_host_port(origin)
+        if parsed is None:
+            return True
+        origin_host, origin_port = parsed
+        if _is_loopback_host(origin_host):
+            return False
+        if allowed_origins is not None and origin in allowed_origins:
+            return False
+        # Same-origin: Origin host:port matches the request Host header.
+        default_port = "443" if request.url.scheme == "https" else "80"
+        host_header = request.headers.get("host", "")
+        host_name, host_port = _split_host_port(host_header, default_port)
+        if origin_host == host_name and origin_port == host_port:
+            return False
+        return True
+
+    def _host_rejected(request: Request) -> bool:
+        """Return True if the request Host header is not allow-listed (403).
+
+        Enforced only when allowed_origins is configured; loopback Hosts are
+        always accepted so local clients keep working.
+        """
+        if allowed_origins is None:
+            return False
+        host_header = request.headers.get("host", "")
+        if not host_header:
+            return False
+        host_name, _ = _split_host_port(host_header, "")
+        if _is_loopback_host(host_name):
+            return False
+        return host_name not in _allowed_host_names
 
     def _resource_audience() -> str:
         return resource_server_audience or ""
@@ -333,11 +433,13 @@ def create_http_app(
             if request.headers.get(key)
         }
 
-        if allowed_origins is not None:
-            origin = request.headers.get("origin")
-            if origin is not None and origin not in allowed_origins:
-                logger.debug("handle_mcp [%s]: 403 invalid origin", request_id)
-                return _reject(403, "Forbidden")
+        if _origin_rejected(request):
+            logger.debug("handle_mcp [%s]: 403 invalid origin", request_id)
+            return _reject(403, "Forbidden")
+
+        if _host_rejected(request):
+            logger.debug("handle_mcp [%s]: 403 invalid host", request_id)
+            return _reject(403, "Forbidden")
 
         if effective_auth_mode == "shared-secret":
             incoming = request.headers.get("authorization", "")

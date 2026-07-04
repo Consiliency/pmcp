@@ -229,6 +229,52 @@ Environment overrides:
         help="HTTP request timeout in seconds (default: 60). Also read from PMCP_REQUEST_TIMEOUT.",
     )
     parser.add_argument(
+        "--auth-mode",
+        choices=["none", "shared-secret", "resource-server"],
+        default=None,
+        help="HTTP auth mode (default: inferred — shared-secret if a token is set, "
+        "else none). Also read from PMCP_AUTH_MODE.",
+    )
+    parser.add_argument(
+        "--oauth-issuer",
+        type=str,
+        default=None,
+        help="OAuth Authorization Server issuer for resource-server mode. "
+        "Also read from PMCP_OAUTH_ISSUER.",
+    )
+    parser.add_argument(
+        "--oauth-jwks-url",
+        type=str,
+        default=None,
+        help="Public https JWKS URL for resource-server mode. "
+        "Also read from PMCP_OAUTH_JWKS_URL.",
+    )
+    parser.add_argument(
+        "--oauth-audience",
+        type=str,
+        default=None,
+        help="Canonical resource audience (RFC 8707) for resource-server mode. "
+        "Also read from PMCP_OAUTH_AUDIENCE.",
+    )
+    parser.add_argument(
+        "--required-scope",
+        action="append",
+        default=None,
+        dest="required_scopes",
+        metavar="SCOPE",
+        help="Required OAuth scope for resource-server mode (repeatable). "
+        "Also read from PMCP_REQUIRED_SCOPES (comma-separated).",
+    )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=None,
+        dest="allowed_origins",
+        metavar="ORIGIN",
+        help="Allowed browser Origin for /mcp (repeatable). Also enables Host "
+        "header validation. Also read from PMCP_ALLOWED_ORIGINS (comma-separated).",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"pmcp {importlib.metadata.version('pmcp')}",
@@ -2043,6 +2089,36 @@ async def run_server(args: argparse.Namespace) -> None:
         if os.environ.get("PMCP_REQUEST_TIMEOUT"):
             args.request_timeout = int(os.environ["PMCP_REQUEST_TIMEOUT"])
 
+    # Auth / Origin env fallbacks (CLI flags take precedence).
+    if not getattr(args, "auth_mode", None) and os.environ.get("PMCP_AUTH_MODE"):
+        args.auth_mode = os.environ["PMCP_AUTH_MODE"]
+    if not getattr(args, "oauth_issuer", None) and os.environ.get("PMCP_OAUTH_ISSUER"):
+        args.oauth_issuer = os.environ["PMCP_OAUTH_ISSUER"]
+    if not getattr(args, "oauth_jwks_url", None) and os.environ.get(
+        "PMCP_OAUTH_JWKS_URL"
+    ):
+        args.oauth_jwks_url = os.environ["PMCP_OAUTH_JWKS_URL"]
+    if not getattr(args, "oauth_audience", None) and os.environ.get(
+        "PMCP_OAUTH_AUDIENCE"
+    ):
+        args.oauth_audience = os.environ["PMCP_OAUTH_AUDIENCE"]
+    if not getattr(args, "required_scopes", None) and os.environ.get(
+        "PMCP_REQUIRED_SCOPES"
+    ):
+        args.required_scopes = [
+            s.strip()
+            for s in os.environ["PMCP_REQUIRED_SCOPES"].split(",")
+            if s.strip()
+        ]
+    if not getattr(args, "allowed_origins", None) and os.environ.get(
+        "PMCP_ALLOWED_ORIGINS"
+    ):
+        args.allowed_origins = [
+            o.strip()
+            for o in os.environ["PMCP_ALLOWED_ORIGINS"].split(",")
+            if o.strip()
+        ]
+
     # Lock directory - CLI flag takes precedence over env var
     lock_dir = getattr(args, "lock_dir", None)
     if not lock_dir and os.environ.get("PMCP_LOCK_DIR"):
@@ -2078,6 +2154,12 @@ async def run_server(args: argparse.Namespace) -> None:
         max_concurrent_spawns=getattr(args, "max_concurrent_spawns", 8),
         rate_limit_rpm=getattr(args, "rate_limit", 0),
         request_timeout=getattr(args, "request_timeout", 60),
+        auth_mode=getattr(args, "auth_mode", None),
+        resource_server_issuer=getattr(args, "oauth_issuer", None),
+        resource_server_jwks_url=getattr(args, "oauth_jwks_url", None),
+        resource_server_audience=getattr(args, "oauth_audience", None),
+        required_scopes=getattr(args, "required_scopes", None),
+        allowed_origins=getattr(args, "allowed_origins", None),
     )
 
     # Handle graceful shutdown

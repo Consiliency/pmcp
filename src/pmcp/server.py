@@ -9,7 +9,7 @@ import os
 import signal
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from mcp.server import Server
 from mcp.types import (
@@ -72,6 +72,12 @@ class GatewayServer:
         max_concurrent_spawns: int = 8,
         rate_limit_rpm: int = 0,
         request_timeout: int = 60,
+        auth_mode: Literal["none", "shared-secret", "resource-server"] | None = None,
+        resource_server_issuer: str | None = None,
+        resource_server_jwks_url: str | None = None,
+        resource_server_audience: str | None = None,
+        required_scopes: list[str] | None = None,
+        allowed_origins: list[str] | None = None,
     ) -> None:
         self._project_root = project_root
         self._custom_config_path = custom_config_path
@@ -82,6 +88,12 @@ class GatewayServer:
         self._max_concurrent_spawns = max_concurrent_spawns
         self._rate_limit_rpm = rate_limit_rpm
         self._request_timeout = request_timeout
+        self._auth_mode = auth_mode
+        self._resource_server_issuer = resource_server_issuer
+        self._resource_server_jwks_url = resource_server_jwks_url
+        self._resource_server_audience = resource_server_audience
+        self._required_scopes = required_scopes
+        self._allowed_origins = allowed_origins
         # Lock directory - None means use global default (~/.pmcp)
         self._lock_dir: Path | None = Path(lock_dir) if lock_dir else None
 
@@ -610,8 +622,14 @@ class GatewayServer:
             app = create_http_app(
                 self._server,
                 auth_token=self._auth_token,
+                auth_mode=self._auth_mode,
                 rate_limit_rpm=self._rate_limit_rpm,
                 request_timeout=self._request_timeout,
+                resource_server_issuer=self._resource_server_issuer,
+                resource_server_jwks_url=self._resource_server_jwks_url,
+                resource_server_audience=self._resource_server_audience,
+                required_scopes=self._required_scopes,
+                allowed_origins=self._allowed_origins,
             )
             logger.info(
                 f"MCP Gateway server started (http://{self._host}:{self._port})"

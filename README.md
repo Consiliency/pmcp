@@ -167,6 +167,34 @@ public auth metadata URLs. PMCP is still not an Authorization Server and does
 not provide dynamic client registration, SSO, RBAC, billing, or a complete
 multi-tenant identity service.
 
+Auth mode and OAuth resource-server parameters are configurable from the CLI or
+environment (CLI flags take precedence; env values are read only when the flag
+is unset):
+
+| Flag | Env var | Purpose |
+| --- | --- | --- |
+| `--auth-mode {none,shared-secret,resource-server}` | `PMCP_AUTH_MODE` | Select the HTTP auth mode. When unset, PMCP infers `shared-secret` if a token is present, otherwise `none`. |
+| `--oauth-issuer` | `PMCP_OAUTH_ISSUER` | Authorization Server issuer (resource-server mode). |
+| `--oauth-jwks-url` | `PMCP_OAUTH_JWKS_URL` | Public `https` JWKS URL (resource-server mode). |
+| `--oauth-audience` | `PMCP_OAUTH_AUDIENCE` | Canonical resource audience, RFC 8707 (resource-server mode). |
+| `--required-scope` (repeatable) | `PMCP_REQUIRED_SCOPES` (comma-separated) | Scopes every token must present. |
+| `--allowed-origin` (repeatable) | `PMCP_ALLOWED_ORIGINS` (comma-separated) | Browser Origins permitted on `/mcp`; also enables Host-header validation. |
+
+**Origin and Host posture (DNS-rebinding defense).** The `Origin` check runs by
+default in every auth mode, even when no `--allowed-origin` is configured: a
+request carrying a browser `Origin` header is rejected with `403` unless the
+origin is loopback, same-origin with the request `Host`, or explicitly
+allow-listed. Requests with no `Origin` header — the normal case for
+non-browser MCP clients — always pass. Configuring `--allowed-origin` (or
+`PMCP_ALLOWED_ORIGINS`) additionally turns on `Host`-header validation: the
+request `Host` must be loopback or one of the hosts derived from the configured
+origins and the gateway's own canonical resource host (`--oauth-audience` /
+protected-resource metadata URL); other Hosts get `403`. Host validation stays
+off by default so that reverse-proxy deployments that forward an arbitrary
+public `Host` keep working; if you enable it behind a proxy, make sure your
+gateway's public hostname is reachable through the configured origins or
+audience so the proxied `Host` is accepted.
+
 **Assumptions and trust model:**
 
 - PMCP binds to `127.0.0.1` by default — not safe to expose publicly without
