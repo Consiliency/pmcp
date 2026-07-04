@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.0] - 2026-07-04
+
+Remediation of the v1.18.0 code review (roadmap `specs/phase-plans-v10.md`).
+
+### Fixed
+- **Downstream servers now actually recover from failure.** A crashed stdio
+  server never came back: `_cleanup_client` cancelled the very connect task
+  driving the reconnect (a `gather()` cancelling itself → `RecursionError`).
+  `_cancel_background_tasks` now excludes the current task and `_cleanup_client`
+  cancels only the client's own read/stderr tasks. Remote (SSE/HTTP) servers now
+  auto-reconnect on an unexpected drop (parity with stdio). Failed connects no
+  longer leave a stale ERROR client or a leaked stderr reader task. Proven by a
+  real-subprocess integration test.
+- Transport DoS bounds: pre-session keepalive SSE streams are capped
+  (`PMCP_MAX_KEEPALIVE_STREAMS`, default 64) with an absolute lifetime
+  (`PMCP_KEEPALIVE_MAX_SECONDS`, default 300); POST bodies are enforced against
+  the size cap **during read** so chunked/unadvertised-length bodies can't bypass
+  it (413), with a request timeout closing slow-trickle connections.
+- Robustness: terminal task records are evicted past a cap (was unbounded);
+  `disconnect_server` re-cancels pending requests under the lifecycle lock
+  (orphaned-future window); malformed `.mcp.json` is surfaced (path + reason)
+  instead of silently disabling its servers; `find_project_root` no longer
+  resolves to `$HOME`; version-check URLs are `quote()`-escaped; the two flaky
+  monitor tests are now deterministic.
+
+### Security
+- **OAuth 2.1 resource-server auth mode and Origin/DNS-rebinding validation are
+  now reachable.** They were fully implemented and tested but never passed to the
+  running server. New CLI flags/env (`--auth-mode`, `--oauth-issuer`,
+  `--oauth-jwks-url`, `--oauth-audience`, `--required-scope`, `--allowed-origin`;
+  `PMCP_AUTH_MODE`/`PMCP_OAUTH_*`/`PMCP_ALLOWED_ORIGINS`) thread them through
+  `GatewayServer`. The Origin check now runs by default: a cross-origin browser
+  `Origin` is rejected (loopback/same-origin/allowlisted pass; no-Origin clients
+  unaffected). Host validation is opt-in when origins are configured.
+- Provisioning input validation: a discovered/registered package name is now
+  validated (rejects leading-dash flag injection, path separators, shell/URL
+  metachars) before it can reach `npx -y <name>`, and the resolved install
+  command is echoed for confirmation. `auth_connect` refuses to persist/export an
+  env var that isn't the target server's declared credential variable (hard
+  denylist for `LD_*`/`DYLD_*`/`NODE_OPTIONS`/`PATH`/`PYTHON*`), closing an
+  `LD_PRELOAD`-into-subprocess code-exec path.
+- Outbound-fetch hardening: JWKS and auth-metadata fetches no longer follow
+  redirects to internal hosts; the registry response is size-capped during a
+  streamed read (no OOM); the private registry endpoint requires `https` and
+  rejects link-local/metadata hosts; the registry cache is written atomically at
+  `0600`.
+- Local credentials: `pmcp secrets set` reads the value via prompt/`--stdin`
+  (never argv/shell history); the secret directory is created `0700`;
+  `submit_feedback` scrubs the title and all fields (not just the description)
+  before posting to a public issue.
+
+### Changed
+- Policy allow/deny matching is now **case-sensitive** (matching server-ID
+  semantics elsewhere in the gateway).
+- `pmcp status` no longer eagerly connects every server as a side effect of a
+  read-only query — it reports the lazy view by default; use `--probe` to connect.
+- Explicit `--max-concurrent-spawns` / `--rate-limit` / `--request-timeout` flags
+  now take precedence over the matching env var (previously a flag equal to the
+  default was silently overridden).
+
 ## [1.18.0] - 2026-06-29
 
 ### Added
