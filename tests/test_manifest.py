@@ -121,6 +121,19 @@ def test_load_manifest():
     assert len(manifest.servers) > 0
 
 
+def test_index_it_mcp_uses_stdio_transport() -> None:
+    """index-it-mcp must launch the stdio MCP child, not the serve surface (#89)."""
+    server = load_manifest().get_server("index-it-mcp")
+
+    assert server is not None
+    assert server.args[-1] == "stdio"
+    assert "serve" not in server.args
+
+    for platform, argv in server.install.items():
+        assert argv[-1] == "stdio", f"{platform} install must end in stdio"
+        assert "serve" not in argv, f"{platform} install still references serve"
+
+
 def test_manifest_server_auth_metadata_fields_are_optional() -> None:
     server = ServerConfig(
         name="remote-auth",

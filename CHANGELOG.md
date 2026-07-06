@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.1] - 2026-07-06
+
+### Fixed
+- **`gateway.describe` now exposes nested array/object item schemas.** Array and
+  object arguments were collapsed to a bare `"array"`/`"object"` type, hiding
+  item shape and required item fields, so agents wasted calls guessing at the
+  payload (e.g. `brightdata::search_engine_batch` needs
+  `{"queries": [{"query": "..."}]}`). `ArgInfo` gains an optional `item_schema`
+  with a compact one-level summary, and the `invoke_template` placeholder now
+  shows the nested shape (e.g. `[{"query": "<string>"}]`). Scalar-arg output is
+  unchanged. (issue #87)
+- **`index-it-mcp` manifest entry now launches the `stdio` transport.** The
+  shipped entry ran `serve` (the HTTP/admin surface) where PMCP's local process
+  path needs a stdio MCP child; `command`/`args` and all four install platforms
+  now end in `stdio`. (issue #89)
+
+### Docs
+- README pilot config for provisioning `index-it-mcp` via `.mcp.json` with a
+  pinned version and the operational env block, noting that per-entry `env` is
+  honored only from `.mcp.json` (the manifest/overlay schema has no `env:`).
+
 ## [1.19.0] - 2026-07-04
 
 Remediation of the v1.18.0 code review (roadmap `specs/phase-plans-v10.md`).

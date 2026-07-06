@@ -65,3 +65,6 @@ code_index.db
 # Local screenshot artifacts
 /*.png
 /.dev-skills/
+
+# index-it-mcp local index cache
+.mcp-index/

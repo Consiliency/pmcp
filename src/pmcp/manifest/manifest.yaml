@@ -1082,12 +1082,12 @@ servers:
     description: "Local-first code indexer - symbol lookup, full-text and semantic search across 48 languages, real-time file watching"
     keywords: [code-search, indexing, symbols, tree-sitter, semantic-search, code-intelligence, repositories, local-first, ctags, code-index, full-text-search, multi-language]
     install:
-      mac: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "serve"]
-      linux: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "serve"]
-      wsl: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "serve"]
-      windows: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "serve"]
+      mac: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "stdio"]
+      linux: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "stdio"]
+      wsl: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "stdio"]
+      windows: ["uvx", "--from", "index-it-mcp", "index-it-mcp", "stdio"]
     command: "uvx"
-    args: ["--from", "index-it-mcp", "index-it-mcp", "serve"]
+    args: ["--from", "index-it-mcp", "index-it-mcp", "stdio"]
     requires_api_key: false
 
   # === Project Management ===

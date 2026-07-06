@@ -877,6 +877,68 @@ def get_gateway_tool_definitions() -> list[Tool]:
     ]
 
 
+def _summarize_arg_schema(
+    prop: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None, str]:
+    """Summarize one argument's JSON Schema, one level deep.
+
+    Returns ``(type_str, item_schema, placeholder)`` where ``item_schema`` is a
+    compact nested summary (or None for scalars) and ``placeholder`` is a JSON
+    example string. For array-of-objects the placeholder shows the nested item
+    shape (e.g. ``[{"query": "<string>"}]``) so agents can invoke correctly on
+    the first try instead of guessing at the bare ``array`` type.
+    """
+    prop_type = str(prop.get("type", "unknown"))
+
+    def _prop_type(p: dict[str, Any]) -> str:
+        return str(p.get("type", "unknown"))
+
+    if prop_type == "array":
+        items = prop.get("items")
+        if isinstance(items, dict):
+            item_type = _prop_type(items)
+            if item_type == "object":
+                item_props = items.get("properties", {})
+                item_required = items.get("required", [])
+                properties = {
+                    key: _prop_type(value) if isinstance(value, dict) else "unknown"
+                    for key, value in item_props.items()
+                }
+                item_schema: dict[str, Any] = {
+                    "type": "object",
+                    "required": list(item_required),
+                    "properties": properties,
+                }
+                # Prefer required item fields for the example; fall back to all.
+                example_keys = list(item_required) or list(properties)
+                example = {
+                    key: f"<{properties.get(key, 'unknown')}>" for key in example_keys
+                }
+                return prop_type, item_schema, json.dumps([example])
+            # Array of scalars: record item type only.
+            return prop_type, {"type": item_type}, json.dumps([f"<{item_type}>"])
+        return prop_type, None, "<required: array>"
+
+    if prop_type == "object":
+        obj_props = prop.get("properties")
+        if isinstance(obj_props, dict):
+            obj_required = prop.get("required", [])
+            properties = {
+                key: _prop_type(value) if isinstance(value, dict) else "unknown"
+                for key, value in obj_props.items()
+            }
+            item_schema = {
+                "required": list(obj_required),
+                "properties": properties,
+            }
+            example = {key: f"<{value}>" for key, value in properties.items()}
+            return prop_type, item_schema, json.dumps(example)
+        return prop_type, None, "<required: object>"
+
+    # Scalar: no nested schema, caller keeps the existing placeholder form.
+    return prop_type, None, ""
+
+
 class GatewayTools:
     """Gateway tool handler implementations."""
 
@@ -1564,17 +1626,21 @@ class GatewayTools:
         properties = schema.get("properties", {})
         required = schema.get("required", [])
 
+        nested_placeholders: dict[str, str] = {}
         for name, prop in properties.items():
-            prop_type = prop.get("type", "unknown")
             description = prop.get("description", "")
+            type_str, item_schema, placeholder = _summarize_arg_schema(prop)
+            if item_schema is not None:
+                nested_placeholders[name] = placeholder
 
             args.append(
                 ArgInfo(
                     name=name,
-                    type=str(prop_type),
+                    type=type_str,
                     required=name in required,
                     short_description=description[:200] if description else "",
                     examples=prop.get("examples"),
+                    item_schema=item_schema,
                 )
             )
 
@@ -1586,7 +1652,9 @@ class GatewayTools:
         # Build invoke template for direct invocation
         arg_placeholders: dict[str, str] = {}
         for arg in args:
-            if arg.required:
+            if arg.item_schema is not None:
+                arg_placeholders[arg.name] = nested_placeholders[arg.name]
+            elif arg.required:
                 arg_placeholders[arg.name] = f"<required: {arg.type}>"
             else:
                 arg_placeholders[arg.name] = f"<optional: {arg.type}>"

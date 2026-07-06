@@ -2111,6 +2111,84 @@ class TestDescribe:
         assert any(a.name == "title" and a.required for a in result.args)
 
     @pytest.mark.asyncio
+    async def test_describe_exposes_nested_array_item_schema(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        # Mirror brightdata::search_engine_batch: an array of objects with a
+        # required item field, plus a scalar arg (regression) and an
+        # array-of-scalars / no-required-field edge case.
+        tool = gateway_tools._client_manager._tools["github::create_issue"]
+        tool.input_schema = {
+            "type": "object",
+            "properties": {
+                "queries": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+                "tags": {"type": "array", "items": {"type": "string"}},
+                "filters": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {"field": {"type": "string"}},
+                    },
+                },
+                "metadata": {
+                    "type": "object",
+                    "properties": {"owner": {"type": "string"}},
+                    "required": ["owner"],
+                },
+                "name": {"type": "string"},
+            },
+            "required": ["queries", "name"],
+        }
+
+        result = await gateway_tools.describe({"tool_id": "github::create_issue"})
+        by_name = {arg.name: arg for arg in result.args}
+
+        # Array-of-objects: item schema exposes item type + required field name/type.
+        queries = by_name["queries"]
+        assert queries.type == "array"
+        assert queries.item_schema == {
+            "type": "object",
+            "required": ["query"],
+            "properties": {"query": "string"},
+        }
+
+        # Array-of-scalars: item type recorded only.
+        assert by_name["tags"].item_schema == {"type": "string"}
+
+        # Array-of-objects with no required fields: falls back to all item props.
+        assert by_name["filters"].item_schema == {
+            "type": "object",
+            "required": [],
+            "properties": {"field": "string"},
+        }
+
+        # Top-level object property: summarized (no "type" key, object is implied).
+        assert by_name["metadata"].item_schema == {
+            "required": ["owner"],
+            "properties": {"owner": "string"},
+        }
+
+        # Scalar arg unchanged.
+        assert by_name["name"].type == "string"
+        assert by_name["name"].item_schema is None
+
+        placeholders = result.invoke_template.arguments
+        # Nested array placeholder shows the {"query": ...} shape, not <required: array>.
+        assert placeholders["queries"] == '[{"query": "<string>"}]'
+        assert placeholders["tags"] == '["<string>"]'
+        assert placeholders["filters"] == '[{"field": "<string>"}]'
+        assert placeholders["metadata"] == '{"owner": "<string>"}'
+        # Scalar placeholder is byte-identical to today's form.
+        assert placeholders["name"] == "<required: string>"
+
+    @pytest.mark.asyncio
     async def test_describe_returns_modern_tool_metadata(
         self, gateway_tools: GatewayTools
     ) -> None:
