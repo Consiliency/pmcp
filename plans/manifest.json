@@ -755,6 +755,28 @@
       "task_summary": "Private/custom MCP manifest overlay merged in load_manifest (user/project/PMCP_MANIFEST_PATH); ship v1.18.0",
       "type": "detailed",
       "updated_at": "2026-06-29T08:41:00Z"
+    },
+    {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-07-06T09:20:00Z",
+      "file": "plans/detailed-describe-nested-schema-and-indexit-stdio-20260706-0920.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/20260706T0920Z-describe-nested-schema-indexit-stdio.md",
+      "lifecycle": [
+        {
+          "at": "2026-07-06T09:20:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "artifact_state": "staged"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "slug": "detailed-describe-nested-schema-indexit-stdio",
+      "status": "staged",
+      "task_summary": "gateway.describe nested-schema fidelity (#87) + index-it-mcp stdio transport & pilot docs (#89); ship v1.19.1",
+      "type": "detailed",
+      "updated_at": "2026-07-06T09:20:00Z"
     }
   ],
   "schema_version": 1
