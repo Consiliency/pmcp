@@ -33,10 +33,23 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Documents the default user config locations. Do NOT read this frozen list at
+# runtime — it captures Path.home() at import time, so a changed/monkeypatched
+# HOME (e.g. in tests, or a re-homed process) would be ignored. Use
+# default_user_config_paths() instead, which resolves Path.home() at call time
+# (mirrors manifest/loader.py's overlay path handling).
 DEFAULT_USER_CONFIG_PATHS = [
     Path.home() / ".mcp.json",
     Path.home() / ".claude" / ".mcp.json",
 ]
+
+
+def default_user_config_paths() -> list[Path]:
+    """User-level config paths, resolved from Path.home() at call time."""
+    return [
+        Path.home() / ".mcp.json",
+        Path.home() / ".claude" / ".mcp.json",
+    ]
 
 
 class StartupSkipReason(str, Enum):
@@ -271,7 +284,7 @@ def _iter_config_source_paths(
     user_paths = (
         list(user_config_paths)
         if user_config_paths is not None
-        else DEFAULT_USER_CONFIG_PATHS
+        else default_user_config_paths()
     )
     paths.extend(("user", path) for path in user_paths)
 
@@ -684,7 +697,7 @@ def load_configs(
     user_paths = (
         list(user_config_paths)
         if user_config_paths is not None
-        else DEFAULT_USER_CONFIG_PATHS
+        else default_user_config_paths()
     )
     for user_path in user_paths:
         user_config = _parse_config_or_warn(user_path)
@@ -756,7 +769,7 @@ def load_disabled_auto_start(
     user_paths = (
         list(user_config_paths)
         if user_config_paths is not None
-        else DEFAULT_USER_CONFIG_PATHS
+        else default_user_config_paths()
     )
     for user_path in user_paths:
         user_config = parse_json_file(user_path)
@@ -800,7 +813,7 @@ def load_enabled_auto_start(
     user_paths = (
         list(user_config_paths)
         if user_config_paths is not None
-        else DEFAULT_USER_CONFIG_PATHS
+        else default_user_config_paths()
     )
     for user_path in user_paths:
         user_config = parse_json_file(user_path)
