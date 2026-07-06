@@ -2667,6 +2667,37 @@ class TestConnectStdioGuard:
 
         cleanup_mock.assert_awaited_once_with("test", existing_managed)
 
+    @pytest.mark.asyncio
+    async def test_local_config_env_reaches_subprocess(self) -> None:
+        """A local server config's env dict is merged over os.environ and passed
+        to the spawned subprocess (#89 AC3)."""
+        manager = ClientManager()
+
+        config = ResolvedServerConfig(
+            name="index-it-mcp",
+            source="project",
+            config=LocalMcpServerConfig(
+                command="fake",
+                args=["stdio"],
+                env={"MCP_ALLOWED_ROOTS": "/repo", "QDRANT_URL": "http://q"},
+            ),
+        )
+
+        # Fail fast after the spawn call so we don't need full MCP wiring; the
+        # env kwarg is captured from call_args.
+        spawn = AsyncMock(side_effect=RuntimeError("abort"))
+        with patch("asyncio.create_subprocess_exec", spawn):
+            with pytest.raises(RuntimeError, match="abort"):
+                await manager._connect_stdio(config)
+
+        _, kwargs = spawn.call_args
+        passed_env = kwargs["env"]
+        # Custom keys present with their values...
+        assert passed_env["MCP_ALLOWED_ROOTS"] == "/repo"
+        assert passed_env["QDRANT_URL"] == "http://q"
+        # ...merged OVER os.environ (a pre-existing key survives → not a replace).
+        assert passed_env["PATH"] == os.environ["PATH"]
+
 
 class TestDisconnectAllPostKill:
     """Additional disconnect_all tests for post-SIGKILL wait behaviour."""

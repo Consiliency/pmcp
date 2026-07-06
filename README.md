@@ -965,6 +965,46 @@ For MCP servers not in the manifest, add them to `~/.mcp.json`:
 
 PMCP supports both local command-based and remote URL-based downstream entries from discovered config files. Entries in `mcpServers` make downstream servers available lazily/on demand; they do not by themselves mean the server should be eagerly started.
 
+#### `index-it-mcp` code-index pilot
+
+For a fleet pilot of the local-first code indexer, add `index-it-mcp` to your
+`.mcp.json` with a **pinned** version and its operational env. PMCP spawns it
+over stdio and passes the `env` block **verbatim** into the child process
+(`_connect_stdio` does `env = os.environ.copy(); env.update(config.env)`), so
+this is the supported channel for the server's configuration:
+
+```json
+{
+  "mcpServers": {
+    "index-it-mcp": {
+      "command": "uvx",
+      "args": ["--from", "index-it-mcp==<approved-version>", "index-it-mcp", "stdio"],
+      "env": {
+        "MCP_ALLOWED_ROOTS": "/path/to/repo",
+        "SEMANTIC_SEARCH_ENABLED": "true",
+        "SEMANTIC_DEFAULT_PROFILE": "code",
+        "SEMANTIC_EMBEDDING_BASE_URL": "http://localhost:8000/v1",
+        "QDRANT_URL": "http://localhost:6333",
+        "OPENAI_API_KEY": "local-vllm-placeholder"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- **Pin the version** (`index-it-mcp==<approved-version>`) so a PyPI release-line
+  change can't silently swap the indexer under a running fleet. Replace
+  `<approved-version>` with the operator-approved pin.
+- **`OPENAI_API_KEY`** is only the token the server presents to a local
+  OpenAI-compatible endpoint (e.g. a vLLM embedding server at
+  `SEMANTIC_EMBEDDING_BASE_URL`); it is not an api.openai.com secret.
+- **Env must go via `.mcp.json`.** The shipped-manifest and private-overlay
+  entry schema has **no `env:` block** — putting `env:` in a manifest overlay
+  will be ignored. Per-entry environment is only honored from `.mcp.json`
+  `mcpServers` entries.
+
 The top-level `autoStart` list controls explicit eager startup. Names can refer to
 servers defined in `mcpServers` or packaged manifest entries such as `playwright`
 and `context7`. Omit a server from `autoStart` to keep it lazy.

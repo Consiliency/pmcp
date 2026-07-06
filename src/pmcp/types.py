@@ -650,6 +650,12 @@ class ArgInfo(BaseModel):
     required: bool
     short_description: str
     examples: list[Any] | None = None
+    # Compact one-level summary of a nested array item / object shape, when the
+    # arg is an array or object (None for scalars). For an array-of-objects:
+    # {"type": "object", "required": [...], "properties": {name: type, ...}};
+    # for an object: {"required": [...], "properties": {name: type, ...}};
+    # for an array-of-scalars: {"type": "<item type>"}. Not full JSON Schema.
+    item_schema: dict[str, Any] | None = None
 
 
 class InvokeTemplate(BaseModel):
