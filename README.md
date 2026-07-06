@@ -1004,6 +1004,36 @@ Notes:
   entry schema has **no `env:` block** — putting `env:` in a manifest overlay
   will be ignored. Per-entry environment is only honored from `.mcp.json`
   `mcpServers` entries.
+- **Pin the Python interpreter** with `"args": ["--python", "3.12", "--from", …]`.
+  `index-it-mcp==1.2.0` depends on `tree-sitter-languages`, which has no wheel for
+  CPython 3.13; without the pin, `uvx` may pick 3.13 and fail to launch.
+
+**Repository registration must use the same storage env as the config.** Before
+agents get indexed results, each repo must be registered *and* the gateway-spawned
+server must read the registry the registration wrote. The registry location is
+resolved from `MCP_INDEX_STORAGE_PATH` / `MCP_REPO_REGISTRY`. If you set those in
+the `.mcp.json` `env` above but run `index-it-mcp repository register` **without**
+them, the CLI writes to the default `~/.mcp/repository_registry.json` while the
+PMCP-spawned server reads `$MCP_INDEX_STORAGE_PATH/repository_registry.json` — so
+the server reports `repositories: []` and every query falls back to native search
+(`unregistered_repository`). Register with the **same** env the config uses:
+
+```bash
+export MCP_INDEX_STORAGE_PATH=/path/to/shared/.indexes
+export MCP_REPO_REGISTRY="$MCP_INDEX_STORAGE_PATH/repository_registry.json"
+for repo in /path/to/repo-a /path/to/repo-b; do
+  uvx --python 3.12 --from index-it-mcp==1.2.0 index-it-mcp repository register "$repo"
+done
+# Verify the server-side view before trusting results:
+uvx --python 3.12 --from index-it-mcp==1.2.0 index-it-mcp repository list   # expect your repos
+uvx --python 3.12 --from index-it-mcp==1.2.0 index-it-mcp preflight         # readiness check
+```
+
+**Check readiness before trusting indexed answers.** The server's status/query
+tools report a readiness state (`ready`, `unregistered_repository`,
+`missing_index`, `stale_commit`, …) and, when not ready, `safe_fallback:
+"native_search"`. Agents should treat any non-`ready` state as non-authoritative
+and fall back to native search rather than reporting stale/empty index results.
 
 The top-level `autoStart` list controls explicit eager startup. Names can refer to
 servers defined in `mcpServers` or packaged manifest entries such as `playwright`
