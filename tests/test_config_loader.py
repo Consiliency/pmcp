@@ -103,6 +103,30 @@ class TestLoadConfigs:
         assert cfg.command == "node"
         assert cfg.args == ["server.js"]
 
+    def test_load_configs_honors_runtime_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Default user config paths must resolve HOME at call time, not import
+        time — so a patched/changed HOME is honored and a test never leaks the
+        developer's real ~/.mcp.json into the loaded config set."""
+        from pmcp.config.loader import default_user_config_paths
+
+        fake_home = tmp_path / "home"
+        (fake_home).mkdir()
+        (fake_home / ".mcp.json").write_text(
+            json.dumps({"mcpServers": {"home-server": {"command": "home-cmd"}}})
+        )
+        monkeypatch.setattr(Path, "home", classmethod(lambda cls: fake_home))
+
+        # The call-time helper reflects the patched HOME...
+        assert default_user_config_paths()[0] == fake_home / ".mcp.json"
+        # ...and load_configs (no explicit user_config_paths) picks up ONLY that
+        # user config, not any real ~/.mcp.json.
+        empty_project = tmp_path / "proj"
+        empty_project.mkdir()
+        names = {c.name for c in load_configs(project_root=empty_project)}
+        assert names == {"home-server"}
+
     def test_merges_configs_with_precedence(self, tmp_path: Path) -> None:
         # Create project config
         project_config = {
