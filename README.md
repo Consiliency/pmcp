@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/viperjuice-pmcp-badge.png)](https://mseep.ai/app/viperjuice-pmcp)
+
 # PMCP - Progressive MCP
 
 <!-- mcp-name: io.github.ViperJuice/pmcp -->
