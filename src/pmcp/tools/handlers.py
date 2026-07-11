@@ -181,18 +181,20 @@ def _refresh_config_unchanged(
     than using full-model equality, for two reasons:
 
     * ``env`` is compared by its *effective* override only — entries that
-      actually differ from ``os.environ``. The same logical server can be stored
-      with different env representations depending on how it entered the manager:
-      an adopted/provisioned server keeps env resolved from ``os.environ``
-      (``manifest_server_to_config``), while the loader resolves the identical
-      server with ``env=None`` (``_manifest_server_to_config(..., lambda: None)``).
-      Both spawn identically because ``_connect_stdio`` seeds ``os.environ.copy()``
-      first, so an override that merely mirrors ``os.environ`` is a no-op. Naively
-      comparing ``env`` would spuriously tear down running provisioned servers on
-      every refresh (issue #79); comparing only the genuine override still
-      detects a real env change. (Known limitation: rotation of an *ambient*
-      secret that is not an explicit override cannot be detected here without a
-      spawn-time env snapshot.)
+      actually differ from ``os.environ``. Both the loader and the connect path
+      now resolve a manifest server's credential the same way
+      (``_manifest_server_to_config(..., os.environ.get)``), so the same logical
+      server yields an identical ``env`` regardless of how it entered the manager
+      and the effective-override comparison matches. (Before per-server secret
+      namespacing, the loader used ``env=None`` and relied on ``_connect_stdio``
+      seeding ``os.environ.copy()`` to supply the runtime credential; that broke
+      once the credential moved to a namespaced storage key, so the loader now
+      injects the resolved runtime ``env_var`` explicitly — do not revert it to
+      ``lambda: None``.) Naively comparing full ``env`` would spuriously tear
+      down running provisioned servers on every refresh (issue #79); comparing
+      only the genuine override still detects a real env change. (Known
+      limitation: rotation of an *ambient* secret that is not an explicit
+      override cannot be detected here without a spawn-time env snapshot.)
     * ``source`` is excluded (e.g. ``manifest`` vs the configured source for the
       same effective server).
 
