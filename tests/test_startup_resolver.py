@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import os
+
+import pytest
+
 from pmcp.config.loader import (
     StartupSkipReason,
     resolve_startup_configs,
@@ -213,6 +217,39 @@ def test_eager_manifest_server_started_when_namespaced_key_available() -> None:
 
     assert result.skipped == []
     assert names(result.eager_configs) == ["brightdata"]
+
+
+def test_eager_manifest_server_env_resolves_namespaced_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The eager startup config must INJECT the runtime env_var, resolved from
+    the namespaced storage key — not merely pass classification. Regression:
+    the config previously carried env=None, so an eager namespaced server spawned
+    without its credential (os.environ holds the storage key, not the runtime
+    env_var)."""
+    monkeypatch.delenv("API_TOKEN", raising=False)
+    monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "bd-secret")
+
+    manifest = {
+        "brightdata": manifest_server(
+            "brightdata",
+            requires_api_key=True,
+            env_var="API_TOKEN",
+            secret_key="BRIGHTDATA_API_TOKEN",
+        )
+    }
+
+    result = resolve_startup_configs(
+        [],
+        manifest_servers=manifest,
+        enabled_auto_start={"brightdata"},
+        is_auth_available=lambda key: bool(os.environ.get(key)),
+    )
+
+    assert names(result.eager_configs) == ["brightdata"]
+    # The runtime env_var is injected with the value stored under the namespaced
+    # key, so _connect_stdio spawns @brightdata/mcp with API_TOKEN present.
+    assert result.eager_configs[0].config.env == {"API_TOKEN": "bd-secret"}
 
 
 def test_eager_manifest_server_skipped_when_no_lookup_key_available() -> None:

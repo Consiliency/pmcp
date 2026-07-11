@@ -1031,7 +1031,16 @@ def resolve_startup_configs(
         if legacy_manifest_auto_start and server.auto_start and name not in disabled:
             eager = True
 
-        config = _manifest_server_to_config(server, lambda _env_var: None)
+        # Resolve the credential from os.environ (namespaced storage key first,
+        # legacy env_var fallback) so the startup config injects the runtime
+        # env_var into the spawned subprocess. Previously this used a lambda that
+        # discarded env, relying on _connect_stdio seeding os.environ.copy() to
+        # supply the credential — but after namespacing os.environ holds the
+        # storage key (BRIGHTDATA_API_TOKEN), not the runtime env_var (API_TOKEN),
+        # so eager/lazy/refresh spawns would launch without the credential.
+        # Resolving here keeps both this path and the connect path symmetric, so
+        # the refresh diff (issue #79) still sees no spurious env change.
+        config = _manifest_server_to_config(server, os.environ.get)
         source: Literal["manifest", "provisioned"] = (
             "provisioned" if name in provisioned else "manifest"
         )
