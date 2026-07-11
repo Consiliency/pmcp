@@ -129,6 +129,25 @@ class TestConfiguredEntryCredentialInheritance:
         assert merged is not None
         assert merged.env == {"API_TOKEN": "bd-secret"}
 
+    def test_configured_entry_resolves_braceless_placeholder(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A bare $VAR reference (no braces) is also a dead literal for local
+        stdio env and must be resolved, matching PMCP's ENV_REF_PATTERN which
+        recognizes both ${VAR} and $VAR forms."""
+        monkeypatch.delenv("API_TOKEN", raising=False)
+        monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "bd-secret")
+        config = LocalMcpServerConfig(
+            command="npx",
+            args=["-y", "@brightdata/mcp"],
+            env={"API_TOKEN": "$API_TOKEN"},
+        )
+
+        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+
+        assert merged is not None
+        assert merged.env == {"API_TOKEN": "bd-secret"}
+
 
 class TestMakeToolId:
     """Tests for make_tool_id."""

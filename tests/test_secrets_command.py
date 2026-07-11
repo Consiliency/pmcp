@@ -268,6 +268,52 @@ class TestSecretsHandlers:
         assert "GITHUB_TOKEN" in output["missing_keys"]
 
     @pytest.mark.asyncio
+    async def test_run_secrets_check_accepts_namespaced_storage_key(
+        self, tmp_path: Path
+    ) -> None:
+        """A configured server matching a manifest api-key server with a
+        secret_key is satisfied by the namespaced storage key — not falsely
+        reported missing because the runtime env_var (API_TOKEN) is absent."""
+        home = tmp_path / "home"
+        project = tmp_path / "project"
+        user_env = home / ".config" / "pmcp" / "pmcp.env"
+        project_env = project / ".env.pmcp"
+        config_path = project / ".mcp.json"
+
+        user_env.parent.mkdir(parents=True, exist_ok=True)
+        project.mkdir(parents=True, exist_ok=True)
+        user_env.write_text("BRIGHTDATA_API_TOKEN=bd-secret\n")
+        project_env.write_text("")
+        # Configured entry with no env — resolution/requirements come from the
+        # matching manifest server (brightdata declares secret_key).
+        config_path.write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "brightdata": {
+                            "command": "npx",
+                            "args": ["-y", "@brightdata/mcp"],
+                        }
+                    }
+                }
+            )
+        )
+
+        with patch.dict(
+            "os.environ",
+            {"HOME": str(home), "BRIGHTDATA_API_TOKEN": "bd-secret"},
+            clear=False,
+        ):
+            os.environ.pop("API_TOKEN", None)
+            output = await run_secrets_check(argparse.Namespace(project=project))
+
+        # Requirement is the namespaced storage key, and it is satisfied.
+        assert "BRIGHTDATA_API_TOKEN" in output["required_keys"]
+        assert "API_TOKEN" not in output["required_keys"]
+        assert output["missing_keys"] == []
+        assert output["ok"] is True
+
+    @pytest.mark.asyncio
     async def test_run_secrets_check_includes_remote_header_placeholders(
         self, tmp_path: Path
     ) -> None:

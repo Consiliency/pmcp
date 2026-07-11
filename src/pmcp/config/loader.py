@@ -573,6 +573,14 @@ def set_startup_policy(
     )
 
 
+# A configured-env value that is ENTIRELY a single ${VAR} or $VAR reference.
+# Local stdio env is passed verbatim (no expansion), so such a value is a dead
+# literal for the runtime credential slot and must be resolved, not preserved.
+_LOCAL_ENV_PLACEHOLDER_RE = re.compile(
+    r"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
 def _merge_manifest_defaults(
     name: str,
     config: LocalMcpServerConfig,
@@ -611,14 +619,14 @@ def _merge_manifest_defaults(
 
         env_var = manifest_server.env_var
         existing = (merged.env or {}).get(env_var)
-        # A local stdio server's env is passed verbatim — ${VAR} placeholders are
-        # NOT expanded (only remote headers are). So a pmcp-init-style
-        # {"API_TOKEN": "${API_TOKEN}"} is a non-functional literal that merely
-        # clobbers the inherited value; treat such an unexpanded placeholder as
-        # unset and resolve the real credential. A concrete value is a genuine
-        # user override and is preserved.
+        # A local stdio server's env is passed verbatim — ${VAR}/$VAR placeholders
+        # are NOT expanded (only remote headers are). So a pmcp-init-style
+        # {"API_TOKEN": "${API_TOKEN}"} (or a hand-authored "$API_TOKEN") is a
+        # non-functional literal that merely clobbers the inherited value; treat
+        # such an unexpanded placeholder as unset and resolve the real credential.
+        # A concrete value is a genuine user override and is preserved.
         is_placeholder = bool(
-            existing and re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", existing)
+            existing and re.fullmatch(_LOCAL_ENV_PLACEHOLDER_RE, existing)
         )
         if not existing or is_placeholder:
             for lookup_key in credential_lookup_keys(manifest_server):

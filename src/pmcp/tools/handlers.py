@@ -2942,13 +2942,20 @@ class GatewayTools:
         remote_headers = remote.headers if remote is not None else []
         auth_vars = env_vars or remote_headers
         env_var = auth_vars[0] if auth_vars else None
+        # Include the server's namespaced storage key (when the registry entry
+        # name matches a manifest server declaring a secret_key) so a credential
+        # stored under the namespaced key reads as available, not "api key needed".
+        availability_keys = list(auth_vars)
+        for key in self._auth_env_options(entry.name, env_var):
+            if key not in availability_keys:
+                availability_keys.append(key)
         return CapabilityCandidate(
             name=entry.name,
             candidate_type="server",
             relevance_score=score,
             reasoning=entry.description or "MCP Registry candidate",
             requires_api_key=bool(auth_vars),
-            api_key_available=self._check_any_api_key_available(auth_vars),
+            api_key_available=self._check_any_api_key_available(availability_keys),
             env_var=env_var,
             is_running=False,
             source="registry",
