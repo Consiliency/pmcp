@@ -109,6 +109,26 @@ class TestConfiguredEntryCredentialInheritance:
         assert merged is not None
         assert not (merged.env or {}).get("API_TOKEN")
 
+    def test_configured_entry_resolves_unexpanded_placeholder(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """pmcp init writes {"API_TOKEN": "${API_TOKEN}"}, but local stdio env is
+        passed verbatim (no ${VAR} expansion), so the placeholder is a dead
+        literal. It must be resolved to the real (namespaced) credential, not
+        preserved as an override."""
+        monkeypatch.delenv("API_TOKEN", raising=False)
+        monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "bd-secret")
+        config = LocalMcpServerConfig(
+            command="npx",
+            args=["-y", "@brightdata/mcp"],
+            env={"API_TOKEN": "${API_TOKEN}"},
+        )
+
+        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+
+        assert merged is not None
+        assert merged.env == {"API_TOKEN": "bd-secret"}
+
 
 class TestMakeToolId:
     """Tests for make_tool_id."""

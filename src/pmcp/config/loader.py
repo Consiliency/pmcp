@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -609,7 +610,17 @@ def _merge_manifest_defaults(
         from pmcp.manifest.loader import credential_lookup_keys
 
         env_var = manifest_server.env_var
-        if not (merged.env or {}).get(env_var):
+        existing = (merged.env or {}).get(env_var)
+        # A local stdio server's env is passed verbatim — ${VAR} placeholders are
+        # NOT expanded (only remote headers are). So a pmcp-init-style
+        # {"API_TOKEN": "${API_TOKEN}"} is a non-functional literal that merely
+        # clobbers the inherited value; treat such an unexpanded placeholder as
+        # unset and resolve the real credential. A concrete value is a genuine
+        # user override and is preserved.
+        is_placeholder = bool(
+            existing and re.fullmatch(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", existing)
+        )
+        if not existing or is_placeholder:
             for lookup_key in credential_lookup_keys(manifest_server):
                 value = os.environ.get(lookup_key)
                 if value:
