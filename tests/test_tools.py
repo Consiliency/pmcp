@@ -3547,6 +3547,61 @@ class TestCapabilityAndProvision:
         assert "test-token" not in events[-1].model_dump_json()
 
     @pytest.mark.asyncio
+    async def test_auth_connect_stores_credential_under_namespaced_secret_key(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A server with a namespaced secret_key persists under it, not the
+        generic runtime env_var, avoiding collisions in the flat secret store."""
+        home = tmp_path / "home"
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(create_mock_tools()),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "brightdata": ServerConfig(
+                    name="brightdata",
+                    description="Bright Data",
+                    keywords=["brightdata"],
+                    install={},
+                    command="npx",
+                    args=["-y", "@brightdata/mcp"],
+                    requires_api_key=True,
+                    env_var="API_TOKEN",
+                    secret_key="BRIGHTDATA_API_TOKEN",
+                    env_instructions="Set API_TOKEN",
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("API_TOKEN", raising=False)
+        monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
+
+        result = await gateway_tools.auth_connect(
+            {
+                "server_name": "brightdata",
+                "credential": "bd-token",
+                "scope": "user",
+            }
+        )
+
+        assert result.ok is True
+        # Persisted + reported under the namespaced storage key, never the
+        # generic API_TOKEN.
+        assert result.env_var == "BRIGHTDATA_API_TOKEN"
+        assert read_env_file(Path(result.env_path or "")) == {
+            "BRIGHTDATA_API_TOKEN": "bd-token"
+        }
+        assert os.environ["BRIGHTDATA_API_TOKEN"] == "bd-token"
+        assert "API_TOKEN" not in os.environ
+
+    @pytest.mark.asyncio
     async def test_auth_soak_local_api_key_connect_retry_and_feedback_redaction(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

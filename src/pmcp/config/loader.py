@@ -886,12 +886,19 @@ def _manifest_server_to_config(
             ),
         )
 
-    # Build env dict if server requires API key
+    # Build env dict if server requires API key. The credential is looked up
+    # under its (optionally namespaced) storage key, with the runtime env_var as
+    # a legacy fallback, but is always injected into the subprocess under the
+    # runtime env_var the downstream server actually reads.
     env: dict[str, str] | None = None
     if server.env_var:
-        env_value = env_lookup(server.env_var)
-        if env_value:
-            env = {server.env_var: env_value}
+        from pmcp.manifest.loader import credential_lookup_keys
+
+        for lookup_key in credential_lookup_keys(server):
+            env_value = env_lookup(lookup_key)
+            if env_value:
+                env = {server.env_var: env_value}
+                break
 
     return ResolvedServerConfig(
         name=server.name,

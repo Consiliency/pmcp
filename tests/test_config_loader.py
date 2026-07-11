@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from pmcp.config.loader import (
+    _manifest_server_to_config,
     build_startup_observation_snapshot,
     find_project_root,
     get_startup_policy,
@@ -22,7 +23,11 @@ from pmcp.config.loader import (
     resolve_startup_configs,
     set_startup_policy,
 )
-from pmcp.manifest.loader import ServerConfig
+from pmcp.manifest.loader import (
+    ServerConfig,
+    credential_lookup_keys,
+    credential_storage_key,
+)
 from pmcp.types import (
     RemoteMcpServerConfig,
     ResolvedServerConfig,
@@ -328,6 +333,58 @@ class TestLoadConfigs:
         assert resolved.source == "manifest"
         assert resolved.config.type == "streamable-http"
         assert resolved.config.url == "https://mcp.excalidraw.com"
+
+    def _local_server(self, **overrides: object) -> ServerConfig:
+        base: dict[str, object] = dict(
+            name="brightdata",
+            description="Bright Data",
+            keywords=["brightdata"],
+            install={},
+            command="npx",
+            args=["-y", "@brightdata/mcp"],
+            requires_api_key=True,
+            env_var="API_TOKEN",
+        )
+        base.update(overrides)
+        return ServerConfig(**base)  # type: ignore[arg-type]
+
+    def test_credential_keys_prefer_namespaced_secret_key(self) -> None:
+        server = self._local_server(secret_key="BRIGHTDATA_API_TOKEN")
+        assert credential_storage_key(server) == "BRIGHTDATA_API_TOKEN"
+        # storage key first, then the runtime env_var as a legacy fallback
+        assert credential_lookup_keys(server) == ["BRIGHTDATA_API_TOKEN", "API_TOKEN"]
+
+    def test_credential_keys_default_to_env_var(self) -> None:
+        server = self._local_server()
+        assert credential_storage_key(server) == "API_TOKEN"
+        assert credential_lookup_keys(server) == ["API_TOKEN"]
+
+    def test_injects_credential_from_namespaced_storage_key(self) -> None:
+        server = self._local_server(secret_key="BRIGHTDATA_API_TOKEN")
+        store = {"BRIGHTDATA_API_TOKEN": "tok-namespaced"}
+
+        resolved = _manifest_server_to_config(server, store.get)
+
+        # Resolved from the namespaced key but injected under the runtime env_var
+        # the downstream @brightdata/mcp process actually reads.
+        assert resolved.config.env == {"API_TOKEN": "tok-namespaced"}
+
+    def test_injects_credential_falls_back_to_legacy_env_var(self) -> None:
+        server = self._local_server(secret_key="BRIGHTDATA_API_TOKEN")
+        # Pre-upgrade install: credential still stored under the legacy env_var.
+        store = {"API_TOKEN": "tok-legacy"}
+
+        resolved = _manifest_server_to_config(server, store.get)
+
+        assert resolved.config.env == {"API_TOKEN": "tok-legacy"}
+
+    def test_namespaced_key_wins_over_legacy_when_both_present(self) -> None:
+        server = self._local_server(secret_key="BRIGHTDATA_API_TOKEN")
+        store = {"BRIGHTDATA_API_TOKEN": "tok-new", "API_TOKEN": "tok-old"}
+
+        resolved = _manifest_server_to_config(server, store.get)
+
+        assert resolved.config.env == {"API_TOKEN": "tok-new"}
 
     def test_merges_manifest_defaults_for_partial_server_config(
         self, tmp_path: Path

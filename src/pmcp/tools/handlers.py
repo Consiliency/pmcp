@@ -153,7 +153,12 @@ from pmcp.types import (
     UrlElicitationInfo,
 )
 
-from pmcp.manifest.loader import Manifest, ServerConfig
+from pmcp.manifest.loader import (
+    Manifest,
+    ServerConfig,
+    credential_lookup_keys,
+    credential_storage_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1389,7 +1394,9 @@ class GatewayTools:
                     relevance_score=min(1.0, score),
                     reasoning=server.description,
                     requires_api_key=requires_api_key,
-                    api_key_available=self._check_api_key_available(env_var),
+                    api_key_available=self._check_any_api_key_available(
+                        self._auth_env_options(name, env_var)
+                    ),
                     env_var=env_var,
                     env_instructions=env_instructions,
                     is_running=name in running_servers,
@@ -2839,9 +2846,18 @@ class GatewayTools:
         return any(self._check_api_key_available(env_var) for env_var in env_vars)
 
     def _auth_env_options(self, server_name: str, env_var: str | None) -> list[str]:
-        """Return acceptable auth env vars for a server."""
+        """Return acceptable secret-store keys for a server.
+
+        Includes the server's namespaced storage key (``secret_key``) ahead of
+        the runtime ``env_var`` legacy fallback so availability checks stay
+        correct after a credential is migrated to the namespaced key.
+        """
         options: list[str] = []
-        if env_var:
+        manifest_server = load_manifest().get_server(server_name)
+        for key in credential_lookup_keys(manifest_server):
+            if key not in options:
+                options.append(key)
+        if env_var and env_var not in options:
             options.append(env_var)
         # Browser Use supports either OpenAI or Anthropic provider credentials.
         if server_name == "browser-use":
@@ -3590,7 +3606,9 @@ class GatewayTools:
             requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
                 name_match, manifest, configured_servers
             )
-            api_key_available = self._check_api_key_available(env_var)
+            api_key_available = self._check_any_api_key_available(
+                self._auth_env_options(name_match, env_var)
+            )
             candidate = CapabilityCandidate(
                 name=name_match,
                 candidate_type="server",
@@ -4392,11 +4410,18 @@ class GatewayTools:
         # manifest.get_server alone would break their register→auth→provision
         # flow.
         declared_env_var = server_config.env_var if server_config else None
+        declared_storage_key = (
+            credential_storage_key(server_config) if server_config else None
+        )
         if declared_env_var is None:
             discovered = self._discovered_server_configs.get(server_name)
             if discovered is not None:
                 declared_env_var = discovered.env_var
-        env_var = parsed.env_var or declared_env_var
+                declared_storage_key = credential_storage_key(discovered)
+        # Persist under the (optionally namespaced) storage key so generic runtime
+        # names like API_TOKEN do not collide in the flat secret store. An explicit
+        # caller override still takes precedence for discovered/advanced flows.
+        env_var = parsed.env_var or declared_storage_key or declared_env_var
 
         if not env_var:
             self._audit(
@@ -4419,12 +4444,12 @@ class GatewayTools:
                 auth_state="missing_auth",
             )
 
-        # A caller-chosen env var is written into process env and the persistent
-        # .env, then inherited by the next provisioned subprocess. Only the
-        # server's declared credential variable (or a credential-shaped name when
-        # none is declared) is permitted; loader-influencing variables such as
+        # A caller-chosen key is written into process env and the persistent
+        # .env, then read back when the subprocess is provisioned. Only the
+        # server's declared storage key (or a credential-shaped name when none is
+        # declared) is permitted; loader-influencing variables such as
         # LD_PRELOAD / NODE_OPTIONS / PATH / PYTHON* are refused outright.
-        if not env_var_allowed(env_var, declared_env_var):
+        if not env_var_allowed(env_var, declared_storage_key):
             self._audit(
                 method="gateway.auth_connect",
                 action="auth_connect",
@@ -4435,7 +4460,9 @@ class GatewayTools:
                 auth_event="policy_denied",
                 error=f"Env var '{env_var}' is not permitted for this server.",
             )
-            expected = f" Expected '{declared_env_var}'." if declared_env_var else ""
+            expected = (
+                f" Expected '{declared_storage_key}'." if declared_storage_key else ""
+            )
             return AuthConnectOutput(
                 ok=False,
                 server=server_name,

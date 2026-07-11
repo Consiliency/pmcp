@@ -610,6 +610,10 @@ servers:
     args: ["-y", "@brightdata/mcp"]
     requires_api_key: true
     env_var: "API_TOKEN"
+    # @brightdata/mcp reads API_TOKEN at runtime, but that generic name would
+    # collide with any other server using API_TOKEN in the flat secret store, so
+    # PMCP persists/looks up the credential under a namespaced storage key.
+    secret_key: "BRIGHTDATA_API_TOKEN"
     env_instructions: "Set API_TOKEN to your Bright Data API key (optional: WEB_UNLOCKER_ZONE, BROWSER_ZONE, PRO_MODE, GROUPS, TOOLS)"
 
   # === AI & LLM ===
