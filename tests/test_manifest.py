@@ -1134,6 +1134,82 @@ async def test_check_api_key_not_required():
 
 
 @pytest.mark.asyncio
+async def test_check_api_key_satisfied_by_namespaced_storage_key(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The provision gate must accept a credential stored under a namespaced
+    secret_key even though the runtime env_var is absent (regression: previously
+    raised MissingApiKeyError on the auth_connect -> provision path)."""
+    server_config = ServerConfig(
+        name="brightdata",
+        description="Bright Data",
+        keywords=["brightdata"],
+        install={"mac": ["echo", "install"]},
+        command="npx",
+        args=["-y", "@brightdata/mcp"],
+        requires_api_key=True,
+        env_var="API_TOKEN",
+        secret_key="BRIGHTDATA_API_TOKEN",
+        env_instructions="Set API_TOKEN",
+    )
+    monkeypatch.delenv("API_TOKEN", raising=False)
+    monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "bd-token")
+
+    # Should not raise — credential is present under the namespaced key.
+    await check_api_key(server_config)
+
+
+@pytest.mark.asyncio
+async def test_check_api_key_missing_with_namespaced_key_still_raises(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """When neither the namespaced key nor the legacy env_var is set, the gate
+    still raises, reporting the runtime env_var."""
+    server_config = ServerConfig(
+        name="brightdata",
+        description="Bright Data",
+        keywords=["brightdata"],
+        install={"mac": ["echo", "install"]},
+        command="npx",
+        args=["-y", "@brightdata/mcp"],
+        requires_api_key=True,
+        env_var="API_TOKEN",
+        secret_key="BRIGHTDATA_API_TOKEN",
+        env_instructions="Set API_TOKEN",
+    )
+    monkeypatch.delenv("API_TOKEN", raising=False)
+    monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
+
+    with pytest.raises(MissingApiKeyError) as exc_info:
+        await check_api_key(server_config)
+    assert exc_info.value.env_var == "API_TOKEN"
+
+
+@pytest.mark.asyncio
+async def test_check_api_key_legacy_env_var_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A pre-migration install storing the credential under the legacy runtime
+    env_var still satisfies the gate via the fallback lookup key."""
+    server_config = ServerConfig(
+        name="brightdata",
+        description="Bright Data",
+        keywords=["brightdata"],
+        install={"mac": ["echo", "install"]},
+        command="npx",
+        args=["-y", "@brightdata/mcp"],
+        requires_api_key=True,
+        env_var="API_TOKEN",
+        secret_key="BRIGHTDATA_API_TOKEN",
+    )
+    monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
+    monkeypatch.setenv("API_TOKEN", "legacy-token")
+
+    # Should not raise — legacy env_var fallback.
+    await check_api_key(server_config)
+
+
+@pytest.mark.asyncio
 async def test_install_server_no_platform_command():
     """Test install fails when no command for platform."""
     server_config = ServerConfig(

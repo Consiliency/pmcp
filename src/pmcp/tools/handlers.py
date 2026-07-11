@@ -3694,7 +3694,9 @@ class GatewayTools:
                         scfg.name, manifest, configured_servers
                     )
                 )
-                api_key_available = self._check_api_key_available(env_var)
+                api_key_available = self._check_any_api_key_available(
+                    self._auth_env_options(scfg.name, env_var)
+                )
                 all_candidates.append(
                     CapabilityCandidate(
                         name=scfg.name,
@@ -3801,7 +3803,9 @@ class GatewayTools:
             requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
                 server_name, manifest, configured_servers
             )
-            api_key_available = self._check_api_key_available(env_var)
+            api_key_available = self._check_any_api_key_available(
+                self._auth_env_options(server_name, env_var)
+            )
             return CapabilityResolution(
                 status="candidates",
                 message=(
@@ -4420,8 +4424,22 @@ class GatewayTools:
                 declared_storage_key = credential_storage_key(discovered)
         # Persist under the (optionally namespaced) storage key so generic runtime
         # names like API_TOKEN do not collide in the flat secret store. An explicit
-        # caller override still takes precedence for discovered/advanced flows.
-        env_var = parsed.env_var or declared_storage_key or declared_env_var
+        # override that names the runtime env_var (following env_instructions like
+        # "Set API_TOKEN") is normalized to the storage key so it still lands
+        # namespaced; any other override is honored for discovered/advanced flows.
+        env_var: str | None
+        if (
+            parsed.env_var
+            and declared_storage_key is not None
+            and parsed.env_var
+            in {
+                declared_env_var,
+                declared_storage_key,
+            }
+        ):
+            env_var = declared_storage_key
+        else:
+            env_var = parsed.env_var or declared_storage_key or declared_env_var
 
         if not env_var:
             self._audit(

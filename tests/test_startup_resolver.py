@@ -42,6 +42,7 @@ def manifest_server(
     auto_start: bool = False,
     requires_api_key: bool = False,
     env_var: str | None = None,
+    secret_key: str | None = None,
 ) -> ServerConfig:
     return ServerConfig(
         name=name,
@@ -53,6 +54,7 @@ def manifest_server(
         auto_start=auto_start,
         requires_api_key=requires_api_key,
         env_var=env_var,
+        secret_key=secret_key,
     )
 
 
@@ -186,6 +188,56 @@ def test_missing_auth_eager_manifest_server_is_skipped() -> None:
     assert result.skipped[0].name == "needs-key"
     assert result.skipped[0].reason == StartupSkipReason.MISSING_AUTH
     assert result.skipped[0].env_var == "NEEDS_KEY"
+
+
+def test_eager_manifest_server_started_when_namespaced_key_available() -> None:
+    """Eager gating must resolve through the server's lookup keys: a credential
+    present only under the namespaced storage key must NOT skip the server as
+    MISSING_AUTH."""
+    manifest = {
+        "brightdata": manifest_server(
+            "brightdata",
+            requires_api_key=True,
+            env_var="API_TOKEN",
+            secret_key="BRIGHTDATA_API_TOKEN",
+        )
+    }
+
+    # Auth resolver reports availability only for the namespaced storage key.
+    result = resolve_startup_configs(
+        [],
+        manifest_servers=manifest,
+        enabled_auto_start={"brightdata"},
+        is_auth_available=lambda key: key == "BRIGHTDATA_API_TOKEN",
+    )
+
+    assert result.skipped == []
+    assert names(result.eager_configs) == ["brightdata"]
+
+
+def test_eager_manifest_server_skipped_when_no_lookup_key_available() -> None:
+    """When neither the namespaced key nor the legacy env_var is available, the
+    eager server is still skipped as MISSING_AUTH."""
+    manifest = {
+        "brightdata": manifest_server(
+            "brightdata",
+            requires_api_key=True,
+            env_var="API_TOKEN",
+            secret_key="BRIGHTDATA_API_TOKEN",
+        )
+    }
+
+    result = resolve_startup_configs(
+        [],
+        manifest_servers=manifest,
+        enabled_auto_start={"brightdata"},
+        is_auth_available=lambda _key: False,
+    )
+
+    assert names(result.eager_configs) == []
+    assert len(result.skipped) == 1
+    assert result.skipped[0].reason == StartupSkipReason.MISSING_AUTH
+    assert result.skipped[0].env_var == "API_TOKEN"
 
 
 def test_missing_auth_lazy_manifest_server_remains_lazy() -> None:

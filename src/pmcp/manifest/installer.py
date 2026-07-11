@@ -13,7 +13,7 @@ from typing import Literal
 
 from pmcp.env_store import resolve_scope_path
 from pmcp.manifest.environment import Platform
-from pmcp.manifest.loader import ServerConfig
+from pmcp.manifest.loader import ServerConfig, credential_lookup_keys
 
 logger = logging.getLogger(__name__)
 
@@ -518,7 +518,12 @@ async def check_api_key(server_config: ServerConfig) -> None:
     if not env_var:
         return
 
-    if not os.environ.get(env_var):
+    # Resolve through the server's credential lookup keys (namespaced storage
+    # key first, runtime env_var as legacy fallback) so a credential stored under
+    # a namespaced secret_key satisfies the provision gate. Checking only the raw
+    # runtime env_var would wrongly raise for namespaced-only credentials.
+    lookup_keys = credential_lookup_keys(server_config) or [env_var]
+    if not any(os.environ.get(key) for key in lookup_keys):
         env_path = resolve_scope_path("project")
         raise MissingApiKeyError(
             env_var=env_var,

@@ -969,8 +969,15 @@ def resolve_startup_configs(
             return
 
         if eager and manifest_server and manifest_server.requires_api_key:
+            from pmcp.manifest.loader import credential_lookup_keys
+
             env_var = manifest_server.env_var
-            if env_var and not is_auth_available(env_var):
+            # Auth is available if the credential is present under any of the
+            # server's lookup keys (namespaced storage key or legacy env_var);
+            # checking only the runtime env_var would skip a namespaced-only
+            # credential as MISSING_AUTH.
+            lookup_keys = credential_lookup_keys(manifest_server)
+            if lookup_keys and not any(is_auth_available(key) for key in lookup_keys):
                 skipped.append(
                     StartupSkip(
                         name=config.name,
