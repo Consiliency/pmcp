@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.2] - 2026-07-11
+
+### Fixed
+- **Per-server credential storage-key namespacing.** A server can now store its
+  credential under a namespaced key (manifest `secret_key`, e.g. Bright Data's
+  `BRIGHTDATA_API_TOKEN`) while the downstream process still receives the generic
+  runtime `env_var` it reads (`API_TOKEN`). This removes the collision risk of
+  two servers sharing a generic name like `API_TOKEN` in the flat secret store.
+  Every credential path resolves through `credential_lookup_keys` (namespaced key
+  first, legacy `env_var` as a backward-compatible fallback — no migration
+  required): the `auth_connect` write path, the provision auth gate
+  (`check_api_key`), manifest/configured/eager/lazy/refresh startup-config
+  resolution, the install-and-run subprocess environment (adopted `npx` servers),
+  and the connect/describe availability checks. Configured `.mcp.json` entries
+  that match a manifest api-key server inherit the resolved credential (including
+  dead `${VAR}`/`$VAR` placeholders that local stdio env never expands), and the
+  `pmcp secrets check` / `pmcp init` diagnostics are namespace-aware. (#95)
+
 ## [1.19.1] - 2026-07-06
 
 ### Fixed
