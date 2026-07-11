@@ -314,6 +314,41 @@ class TestSecretsHandlers:
         assert output["ok"] is True
 
     @pytest.mark.asyncio
+    async def test_run_secrets_check_reports_missing_namespaced_credential(
+        self, tmp_path: Path
+    ) -> None:
+        """The credential requirement is intrinsic to a configured api-key server
+        and must be reported missing when nothing is stored — even though the
+        configured entry has no env block (init no longer emits a placeholder)."""
+        home = tmp_path / "home"
+        project = tmp_path / "project"
+        (home / ".config" / "pmcp").mkdir(parents=True, exist_ok=True)
+        project.mkdir(parents=True, exist_ok=True)
+        (home / ".config" / "pmcp" / "pmcp.env").write_text("")
+        (project / ".env.pmcp").write_text("")
+        (project / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "brightdata": {
+                            "command": "npx",
+                            "args": ["-y", "@brightdata/mcp"],
+                        }
+                    }
+                }
+            )
+        )
+
+        with patch.dict("os.environ", {"HOME": str(home)}, clear=False):
+            os.environ.pop("API_TOKEN", None)
+            os.environ.pop("BRIGHTDATA_API_TOKEN", None)
+            output = await run_secrets_check(argparse.Namespace(project=project))
+
+        assert "BRIGHTDATA_API_TOKEN" in output["required_keys"]
+        assert "BRIGHTDATA_API_TOKEN" in output["missing_keys"]
+        assert output["ok"] is False
+
+    @pytest.mark.asyncio
     async def test_run_secrets_check_includes_remote_header_placeholders(
         self, tmp_path: Path
     ) -> None:

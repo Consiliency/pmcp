@@ -15,7 +15,7 @@ from pmcp.env_store import (
     validate_env_var_name,
     write_env_file,
 )
-from pmcp.manifest.loader import load_manifest
+from pmcp.manifest.loader import credential_storage_key, load_manifest
 from pmcp.remote_auth import collect_remote_header_env_vars
 from pmcp.types import LocalMcpServerConfig, RemoteMcpServerConfig
 
@@ -82,21 +82,36 @@ def _extract_required_keys(
         manifest_server = manifest_by_name.get(cfg.name)
         env_map = cfg.config.env or {}
         server_keys: set[str] = set()
+
+        # The credential requirement is INTRINSIC to a configured server that
+        # matches a manifest api-key server — it holds whether or not a credential
+        # is currently resolved into env_map. (A fresh configured entry has no env
+        # until the credential is stored; deriving the requirement only from the
+        # env map would falsely report "ok" for a missing credential.) Require the
+        # namespaced storage key with the legacy runtime env_var as a fallback.
+        credential_var: str | None = None
+        if (
+            manifest_server
+            and manifest_server.requires_api_key
+            and manifest_server.env_var
+        ):
+            credential_var = manifest_server.env_var
+            storage_key = credential_storage_key(manifest_server) or credential_var
+            server_keys.add(storage_key)
+            all_keys.add(storage_key)
+            if storage_key != credential_var:
+                credential_fallbacks[storage_key] = credential_var
+
         for env_key, env_value in env_map.items():
-            # A credentialed server that stores under a namespaced secret_key is
-            # satisfied by the storage key; require that (not the runtime env_var)
-            # with the legacy env_var as an accepted fallback.
-            secret_key = manifest_server.secret_key if manifest_server else None
-            required_key = env_key
-            if manifest_server and manifest_server.env_var == env_key and secret_key:
-                required_key = secret_key
-                credential_fallbacks[required_key] = env_key
-            server_keys.add(required_key)
-            all_keys.add(required_key)
+            # The credential var is required via the manifest above; don't re-add
+            # its bare runtime name (which would bypass the storage-key mapping).
+            if env_key != credential_var:
+                server_keys.add(env_key)
+                all_keys.add(env_key)
 
             for pattern_match in ENV_REF_PATTERN.finditer(env_value):
                 var_name = pattern_match.group(1) or pattern_match.group(2)
-                if var_name:
+                if var_name and var_name != credential_var:
                     server_keys.add(var_name)
                     all_keys.add(var_name)
 
