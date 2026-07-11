@@ -10,6 +10,7 @@ import pytest
 
 from pmcp.config.loader import (
     _manifest_server_to_config,
+    _merge_manifest_defaults,
     build_startup_observation_snapshot,
     find_project_root,
     get_startup_policy,
@@ -29,10 +30,84 @@ from pmcp.manifest.loader import (
     credential_storage_key,
 )
 from pmcp.types import (
+    LocalMcpServerConfig,
     RemoteMcpServerConfig,
     ResolvedServerConfig,
     StartupPolicyOperation,
 )
+
+
+class TestConfiguredEntryCredentialInheritance:
+    """A configured .mcp.json entry that matches a manifest api-key server must
+    inherit the namespaced credential resolved into its runtime env_var, or it
+    would start the downstream server unauthenticated post-migration (os.environ
+    holds only the storage key)."""
+
+    def _manifest(self) -> dict[str, ServerConfig]:
+        return {
+            "brightdata": ServerConfig(
+                name="brightdata",
+                description="Bright Data",
+                keywords=["brightdata"],
+                install={},
+                command="npx",
+                args=["-y", "@brightdata/mcp"],
+                requires_api_key=True,
+                env_var="API_TOKEN",
+                secret_key="BRIGHTDATA_API_TOKEN",
+            )
+        }
+
+    def test_configured_entry_inherits_namespaced_credential(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("API_TOKEN", raising=False)
+        monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "bd-secret")
+        config = LocalMcpServerConfig(command="npx", args=["-y", "@brightdata/mcp"])
+
+        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+
+        assert merged is not None
+        assert merged.env == {"API_TOKEN": "bd-secret"}
+
+    def test_configured_entry_legacy_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
+        monkeypatch.setenv("API_TOKEN", "legacy-secret")
+        config = LocalMcpServerConfig(command="npx", args=["-y", "@brightdata/mcp"])
+
+        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+
+        assert merged is not None
+        assert merged.env == {"API_TOKEN": "legacy-secret"}
+
+    def test_configured_entry_user_env_override_preserved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "bd-secret")
+        config = LocalMcpServerConfig(
+            command="npx",
+            args=["-y", "@brightdata/mcp"],
+            env={"API_TOKEN": "user-set"},
+        )
+
+        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+
+        assert merged is not None
+        assert merged.env == {"API_TOKEN": "user-set"}
+
+    def test_configured_entry_no_credential_available_leaves_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("API_TOKEN", raising=False)
+        monkeypatch.delenv("BRIGHTDATA_API_TOKEN", raising=False)
+        config = LocalMcpServerConfig(command="npx", args=["-y", "@brightdata/mcp"])
+
+        merged = _merge_manifest_defaults("brightdata", config, self._manifest())
+
+        assert merged is not None
+        assert not (merged.env or {}).get("API_TOKEN")
 
 
 class TestMakeToolId:

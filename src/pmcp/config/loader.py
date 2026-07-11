@@ -577,26 +577,47 @@ def _merge_manifest_defaults(
     config: LocalMcpServerConfig,
     manifest_servers: dict[str, "ManifestServerConfig"] | None,
 ) -> LocalMcpServerConfig | None:
-    """Merge a partial config with manifest defaults when possible."""
+    """Merge a partial config with manifest defaults when possible.
+
+    Also injects the credential for a configured local server that matches a
+    manifest api-key server: without this, a ``.mcp.json`` entry (or one that
+    ``pmcp init`` generates) that duplicates a manifest server with a namespaced
+    ``secret_key`` would inherit only the storage key from ``os.environ`` and
+    start the downstream server without its runtime ``env_var``. A credential
+    the config already sets for that var is preserved (genuine user override).
+    """
+    manifest_server = manifest_servers.get(name) if manifest_servers else None
+
     if config.command:
-        return config
+        merged = config
+    else:
+        if not manifest_servers:
+            logger.warning(
+                f"Skipping server '{name}' - command missing and manifest unavailable"
+            )
+            return None
+        if not manifest_server:
+            logger.warning(
+                f"Skipping server '{name}' - command missing and no manifest default found"
+            )
+            return None
+        merged = config.model_copy(deep=True)
+        merged.command = manifest_server.command
+        merged.args = [*manifest_server.args, *config.args]
 
-    if not manifest_servers:
-        logger.warning(
-            f"Skipping server '{name}' - command missing and manifest unavailable"
-        )
-        return None
+    if manifest_server and manifest_server.env_var:
+        from pmcp.manifest.loader import credential_lookup_keys
 
-    manifest_server = manifest_servers.get(name)
-    if not manifest_server:
-        logger.warning(
-            f"Skipping server '{name}' - command missing and no manifest default found"
-        )
-        return None
+        env_var = manifest_server.env_var
+        if not (merged.env or {}).get(env_var):
+            for lookup_key in credential_lookup_keys(manifest_server):
+                value = os.environ.get(lookup_key)
+                if value:
+                    if merged is config:
+                        merged = config.model_copy(deep=True)
+                    merged.env = {**(merged.env or {}), env_var: value}
+                    break
 
-    merged = config.model_copy(deep=True)
-    merged.command = manifest_server.command
-    merged.args = [*manifest_server.args, *config.args]
     return merged
 
 
