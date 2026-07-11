@@ -133,6 +133,7 @@ class JobManager:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                env=build_install_child_env(server_config),
             )
             job.process = process
             job.status = "installing"
@@ -505,6 +506,29 @@ def get_job_manager() -> JobManager:
     return JobManager.get_instance()
 
 
+def build_install_child_env(server_config: ServerConfig) -> dict[str, str]:
+    """Build the subprocess environment for a server's install/run command.
+
+    Injects the server's runtime ``env_var`` with the credential resolved from
+    its (optionally namespaced) storage key — namespaced ``secret_key`` first,
+    then the legacy ``env_var`` as a fallback. This matters for install-and-run
+    servers whose install command IS the server (e.g. ``npx @brightdata/mcp``):
+    the spawned process is adopted as the live connection, so if it does not
+    receive its ``env_var`` at spawn time it starts without its credential. The
+    gateway's own ``os.environ`` only holds the namespaced storage key after
+    ``auth_connect``, so a bare inherited environment would omit the runtime var.
+    """
+    child_env = os.environ.copy()
+    env_var = server_config.env_var
+    if env_var:
+        for key in credential_lookup_keys(server_config):
+            value = os.environ.get(key)
+            if value:
+                child_env[env_var] = value
+                break
+    return child_env
+
+
 async def check_api_key(server_config: ServerConfig) -> None:
     """Check if required API key is set.
 
@@ -573,6 +597,7 @@ async def install_server(
             *install_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=build_install_child_env(server_config),
         )
 
         stdout, stderr = await asyncio.wait_for(
