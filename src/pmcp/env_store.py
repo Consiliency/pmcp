@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -101,6 +102,45 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as env_file:
         env_file.write(content)
+
+
+def managed_secret_keys(project: Path | None = None) -> set[str]:
+    """Env-var keys of credentials PMCP manages in its user/project secret stores.
+
+    These are the keys ``auth_connect`` / ``pmcp secrets set`` write (and that the
+    gateway loads into its own ``os.environ`` at startup). Used to avoid bleeding
+    one server's PMCP-stored credentials into another server's subprocess env.
+    Only PMCP-managed keys are enumerated — not secrets that reached ``os.environ``
+    from the operator's shell or a plain ``.env``.
+    """
+    keys: set[str] = set(read_env_file(resolve_scope_path("user")))
+    try:
+        keys.update(read_env_file(resolve_scope_path("project", project)))
+    except (OSError, ValueError):
+        pass
+    return keys
+
+
+def sanitized_subprocess_env(
+    own_env: Mapping[str, str] | None = None, project: Path | None = None
+) -> dict[str, str]:
+    """Build the environment for a downstream server subprocess.
+
+    Inherits the gateway's environment MINUS PMCP-managed credentials — so a
+    server never receives ANOTHER server's PMCP-stored secrets — then applies the
+    server's OWN resolved credentials (``own_env``), which win over the strip
+    (e.g. a server whose runtime env_var equals a managed key gets its own value
+    back). Non-secret ambient vars (PATH/HOME/NODE_*/proxy/locale) are preserved.
+
+    Note: this removes only PMCP-managed keys; secrets the operator exported into
+    the shell or a plain ``.env`` are not sanitized here.
+    """
+    env = os.environ.copy()
+    for key in managed_secret_keys(project):
+        env.pop(key, None)
+    if own_env:
+        env.update(own_env)
+    return env
 
 
 def set_env_value(
