@@ -1507,14 +1507,30 @@ async def run_init(args: argparse.Namespace) -> None:
                 "args": server.args,
             }
 
-            # Check for API key
+            # Check for API key. Resolve availability through the server's
+            # (optionally namespaced) storage key so a credential stored under a
+            # secret_key like BRIGHTDATA_API_TOKEN is recognized. Do NOT write a
+            # {env_var: "${env_var}"} placeholder: local stdio env is passed
+            # verbatim (no ${VAR} expansion), so it would be a dead literal — PMCP
+            # resolves the credential from the store at load time instead.
             if server.env_var:
-                env_value = os.environ.get(server.env_var)
-                if env_value:
-                    print(f"    Found {server.env_var} in environment")
+                from pmcp.manifest.loader import (
+                    credential_lookup_keys,
+                    credential_storage_key,
+                )
+
+                found_key = next(
+                    (k for k in credential_lookup_keys(server) if os.environ.get(k)),
+                    None,
+                )
+                storage_key = credential_storage_key(server) or server.env_var
+                if found_key:
+                    print(f"    Found {found_key} in environment")
                 else:
-                    print(f"    Note: Set {server.env_var} in .env for this server")
-                config["env"] = {server.env_var: f"${{{server.env_var}}}"}
+                    print(
+                        f"    Note: store the credential with "
+                        f"`pmcp secrets set {storage_key} <value>`"
+                    )
 
             selected_servers[name] = config
             print(f"    Added {name}")

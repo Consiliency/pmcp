@@ -15,7 +15,7 @@ from pmcp.env_store import (
     validate_env_var_name,
     write_env_file,
 )
-from pmcp.manifest.loader import load_manifest
+from pmcp.manifest.loader import credential_storage_key, load_manifest
 from pmcp.remote_auth import collect_remote_header_env_vars
 from pmcp.types import LocalMcpServerConfig, RemoteMcpServerConfig
 
@@ -33,13 +33,27 @@ def _mask(value: str) -> str:
 
 def _extract_required_keys(
     project_root: Path,
-) -> tuple[list[str], dict[str, list[str]], dict[str, dict[str, object]]]:
-    """Extract required env keys from discovered MCP server configs."""
+) -> tuple[
+    list[str], dict[str, list[str]], dict[str, dict[str, object]], dict[str, str]
+]:
+    """Extract required env keys from discovered MCP server configs.
+
+    Returns (all_keys, per_server, auth_metadata, credential_fallbacks) where
+    credential_fallbacks maps a required namespaced storage key to the legacy
+    runtime env_var that also satisfies it — so `pmcp secrets check` accepts a
+    credential stored under either the namespaced secret_key or the legacy key.
+    """
     configs = load_configs(project_root=project_root)
+
+    try:
+        manifest_by_name = load_manifest().servers
+    except Exception:
+        manifest_by_name = {}
 
     per_server: dict[str, set[str]] = {}
     all_keys: set[str] = set()
     auth_metadata_by_server: dict[str, dict[str, object]] = {}
+    credential_fallbacks: dict[str, str] = {}
     for cfg in configs:
         if isinstance(cfg.config, RemoteMcpServerConfig):
             remote_header_keys = set(collect_remote_header_env_vars(cfg.config.headers))
@@ -65,15 +79,39 @@ def _extract_required_keys(
         if not isinstance(cfg.config, LocalMcpServerConfig):
             continue
 
+        manifest_server = manifest_by_name.get(cfg.name)
         env_map = cfg.config.env or {}
         server_keys: set[str] = set()
+
+        # The credential requirement is INTRINSIC to a configured server that
+        # matches a manifest api-key server — it holds whether or not a credential
+        # is currently resolved into env_map. (A fresh configured entry has no env
+        # until the credential is stored; deriving the requirement only from the
+        # env map would falsely report "ok" for a missing credential.) Require the
+        # namespaced storage key with the legacy runtime env_var as a fallback.
+        credential_var: str | None = None
+        if (
+            manifest_server
+            and manifest_server.requires_api_key
+            and manifest_server.env_var
+        ):
+            credential_var = manifest_server.env_var
+            storage_key = credential_storage_key(manifest_server) or credential_var
+            server_keys.add(storage_key)
+            all_keys.add(storage_key)
+            if storage_key != credential_var:
+                credential_fallbacks[storage_key] = credential_var
+
         for env_key, env_value in env_map.items():
-            server_keys.add(env_key)
-            all_keys.add(env_key)
+            # The credential var is required via the manifest above; don't re-add
+            # its bare runtime name (which would bypass the storage-key mapping).
+            if env_key != credential_var:
+                server_keys.add(env_key)
+                all_keys.add(env_key)
 
             for pattern_match in ENV_REF_PATTERN.finditer(env_value):
                 var_name = pattern_match.group(1) or pattern_match.group(2)
-                if var_name:
+                if var_name and var_name != credential_var:
                     server_keys.add(var_name)
                     all_keys.add(var_name)
 
@@ -108,7 +146,12 @@ def _extract_required_keys(
     server_required = {
         server_name: sorted(keys) for server_name, keys in per_server.items()
     }
-    return sorted(all_keys), server_required, auth_metadata_by_server
+    return (
+        sorted(all_keys),
+        server_required,
+        auth_metadata_by_server,
+        credential_fallbacks,
+    )
 
 
 async def run_secrets_set(args: argparse.Namespace) -> dict[str, object]:
@@ -201,12 +244,20 @@ async def run_secrets_check(args: argparse.Namespace) -> dict[str, object]:
     effective = dict(user_values)
     effective.update(project_values)
 
-    required_keys, required_by_server, auth_metadata_by_server = _extract_required_keys(
-        project_root
-    )
-    missing_keys = sorted(
-        key for key in required_keys if key not in effective or not effective[key]
-    )
+    (
+        required_keys,
+        required_by_server,
+        auth_metadata_by_server,
+        credential_fallbacks,
+    ) = _extract_required_keys(project_root)
+
+    def _satisfied(key: str) -> bool:
+        if effective.get(key):
+            return True
+        fallback = credential_fallbacks.get(key)
+        return bool(fallback and effective.get(fallback))
+
+    missing_keys = sorted(key for key in required_keys if not _satisfied(key))
 
     return {
         "ok": len(missing_keys) == 0,

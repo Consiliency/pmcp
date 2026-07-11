@@ -153,7 +153,12 @@ from pmcp.types import (
     UrlElicitationInfo,
 )
 
-from pmcp.manifest.loader import Manifest, ServerConfig
+from pmcp.manifest.loader import (
+    Manifest,
+    ServerConfig,
+    credential_lookup_keys,
+    credential_storage_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,18 +181,20 @@ def _refresh_config_unchanged(
     than using full-model equality, for two reasons:
 
     * ``env`` is compared by its *effective* override only — entries that
-      actually differ from ``os.environ``. The same logical server can be stored
-      with different env representations depending on how it entered the manager:
-      an adopted/provisioned server keeps env resolved from ``os.environ``
-      (``manifest_server_to_config``), while the loader resolves the identical
-      server with ``env=None`` (``_manifest_server_to_config(..., lambda: None)``).
-      Both spawn identically because ``_connect_stdio`` seeds ``os.environ.copy()``
-      first, so an override that merely mirrors ``os.environ`` is a no-op. Naively
-      comparing ``env`` would spuriously tear down running provisioned servers on
-      every refresh (issue #79); comparing only the genuine override still
-      detects a real env change. (Known limitation: rotation of an *ambient*
-      secret that is not an explicit override cannot be detected here without a
-      spawn-time env snapshot.)
+      actually differ from ``os.environ``. Both the loader and the connect path
+      now resolve a manifest server's credential the same way
+      (``_manifest_server_to_config(..., os.environ.get)``), so the same logical
+      server yields an identical ``env`` regardless of how it entered the manager
+      and the effective-override comparison matches. (Before per-server secret
+      namespacing, the loader used ``env=None`` and relied on ``_connect_stdio``
+      seeding ``os.environ.copy()`` to supply the runtime credential; that broke
+      once the credential moved to a namespaced storage key, so the loader now
+      injects the resolved runtime ``env_var`` explicitly — do not revert it to
+      ``lambda: None``.) Naively comparing full ``env`` would spuriously tear
+      down running provisioned servers on every refresh (issue #79); comparing
+      only the genuine override still detects a real env change. (Known
+      limitation: rotation of an *ambient* secret that is not an explicit
+      override cannot be detected here without a spawn-time env snapshot.)
     * ``source`` is excluded (e.g. ``manifest`` vs the configured source for the
       same effective server).
 
@@ -1389,7 +1396,9 @@ class GatewayTools:
                     relevance_score=min(1.0, score),
                     reasoning=server.description,
                     requires_api_key=requires_api_key,
-                    api_key_available=self._check_api_key_available(env_var),
+                    api_key_available=self._check_any_api_key_available(
+                        self._auth_env_options(name, env_var)
+                    ),
                     env_var=env_var,
                     env_instructions=env_instructions,
                     is_running=name in running_servers,
@@ -2839,9 +2848,18 @@ class GatewayTools:
         return any(self._check_api_key_available(env_var) for env_var in env_vars)
 
     def _auth_env_options(self, server_name: str, env_var: str | None) -> list[str]:
-        """Return acceptable auth env vars for a server."""
+        """Return acceptable secret-store keys for a server.
+
+        Includes the server's namespaced storage key (``secret_key``) ahead of
+        the runtime ``env_var`` legacy fallback so availability checks stay
+        correct after a credential is migrated to the namespaced key.
+        """
         options: list[str] = []
-        if env_var:
+        manifest_server = load_manifest().get_server(server_name)
+        for key in credential_lookup_keys(manifest_server):
+            if key not in options:
+                options.append(key)
+        if env_var and env_var not in options:
             options.append(env_var)
         # Browser Use supports either OpenAI or Anthropic provider credentials.
         if server_name == "browser-use":
@@ -2924,13 +2942,20 @@ class GatewayTools:
         remote_headers = remote.headers if remote is not None else []
         auth_vars = env_vars or remote_headers
         env_var = auth_vars[0] if auth_vars else None
+        # Include the server's namespaced storage key (when the registry entry
+        # name matches a manifest server declaring a secret_key) so a credential
+        # stored under the namespaced key reads as available, not "api key needed".
+        availability_keys = list(auth_vars)
+        for key in self._auth_env_options(entry.name, env_var):
+            if key not in availability_keys:
+                availability_keys.append(key)
         return CapabilityCandidate(
             name=entry.name,
             candidate_type="server",
             relevance_score=score,
             reasoning=entry.description or "MCP Registry candidate",
             requires_api_key=bool(auth_vars),
-            api_key_available=self._check_any_api_key_available(auth_vars),
+            api_key_available=self._check_any_api_key_available(availability_keys),
             env_var=env_var,
             is_running=False,
             source="registry",
@@ -3590,7 +3615,9 @@ class GatewayTools:
             requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
                 name_match, manifest, configured_servers
             )
-            api_key_available = self._check_api_key_available(env_var)
+            api_key_available = self._check_any_api_key_available(
+                self._auth_env_options(name_match, env_var)
+            )
             candidate = CapabilityCandidate(
                 name=name_match,
                 candidate_type="server",
@@ -3676,7 +3703,9 @@ class GatewayTools:
                         scfg.name, manifest, configured_servers
                     )
                 )
-                api_key_available = self._check_api_key_available(env_var)
+                api_key_available = self._check_any_api_key_available(
+                    self._auth_env_options(scfg.name, env_var)
+                )
                 all_candidates.append(
                     CapabilityCandidate(
                         name=scfg.name,
@@ -3783,7 +3812,9 @@ class GatewayTools:
             requires_api_key, env_var, env_instructions = self._get_server_env_metadata(
                 server_name, manifest, configured_servers
             )
-            api_key_available = self._check_api_key_available(env_var)
+            api_key_available = self._check_any_api_key_available(
+                self._auth_env_options(server_name, env_var)
+            )
             return CapabilityResolution(
                 status="candidates",
                 message=(
@@ -4392,11 +4423,32 @@ class GatewayTools:
         # manifest.get_server alone would break their register→auth→provision
         # flow.
         declared_env_var = server_config.env_var if server_config else None
+        declared_storage_key = (
+            credential_storage_key(server_config) if server_config else None
+        )
         if declared_env_var is None:
             discovered = self._discovered_server_configs.get(server_name)
             if discovered is not None:
                 declared_env_var = discovered.env_var
-        env_var = parsed.env_var or declared_env_var
+                declared_storage_key = credential_storage_key(discovered)
+        # Persist under the (optionally namespaced) storage key so generic runtime
+        # names like API_TOKEN do not collide in the flat secret store. An explicit
+        # override that names the runtime env_var (following env_instructions like
+        # "Set API_TOKEN") is normalized to the storage key so it still lands
+        # namespaced; any other override is honored for discovered/advanced flows.
+        env_var: str | None
+        if (
+            parsed.env_var
+            and declared_storage_key is not None
+            and parsed.env_var
+            in {
+                declared_env_var,
+                declared_storage_key,
+            }
+        ):
+            env_var = declared_storage_key
+        else:
+            env_var = parsed.env_var or declared_storage_key or declared_env_var
 
         if not env_var:
             self._audit(
@@ -4419,12 +4471,12 @@ class GatewayTools:
                 auth_state="missing_auth",
             )
 
-        # A caller-chosen env var is written into process env and the persistent
-        # .env, then inherited by the next provisioned subprocess. Only the
-        # server's declared credential variable (or a credential-shaped name when
-        # none is declared) is permitted; loader-influencing variables such as
+        # A caller-chosen key is written into process env and the persistent
+        # .env, then read back when the subprocess is provisioned. Only the
+        # server's declared storage key (or a credential-shaped name when none is
+        # declared) is permitted; loader-influencing variables such as
         # LD_PRELOAD / NODE_OPTIONS / PATH / PYTHON* are refused outright.
-        if not env_var_allowed(env_var, declared_env_var):
+        if not env_var_allowed(env_var, declared_storage_key):
             self._audit(
                 method="gateway.auth_connect",
                 action="auth_connect",
@@ -4435,7 +4487,9 @@ class GatewayTools:
                 auth_event="policy_denied",
                 error=f"Env var '{env_var}' is not permitted for this server.",
             )
-            expected = f" Expected '{declared_env_var}'." if declared_env_var else ""
+            expected = (
+                f" Expected '{declared_storage_key}'." if declared_storage_key else ""
+            )
             return AuthConnectOutput(
                 ok=False,
                 server=server_name,

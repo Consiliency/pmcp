@@ -48,6 +48,11 @@ class ServerConfig:
     args: list[str]
     requires_api_key: bool = False
     env_var: str | None = None
+    # Env-store key under which this server's credential is persisted. Defaults
+    # to env_var when unset. Declare a namespaced value (e.g. BRIGHTDATA_API_TOKEN)
+    # for servers whose runtime env_var is a generic name like API_TOKEN, so two
+    # servers sharing that runtime name do not collide in the flat secret store.
+    secret_key: str | None = None
     env_instructions: str | None = None
     auto_start: bool = False
     transport: ServerTransport = "local"
@@ -68,6 +73,38 @@ class ServerConfig:
     status: str | None = None
     source: str | None = None
     replacement: str | None = None
+
+
+def credential_storage_key(server: Any) -> str | None:
+    """Env-store key under which *server*'s credential is persisted.
+
+    Uses the namespaced ``secret_key`` when the server declares one, otherwise
+    the runtime ``env_var``. Accepts any object exposing those attributes
+    (manifest ``ServerConfig`` or a discovered-server config), returning
+    ``None`` when neither is set.
+    """
+    if server is None:
+        return None
+    return getattr(server, "secret_key", None) or getattr(server, "env_var", None)
+
+
+def credential_lookup_keys(server: Any) -> list[str]:
+    """Ordered secret-store keys to try when resolving *server*'s credential.
+
+    The namespaced storage key comes first, followed by the runtime ``env_var``
+    as a backward-compatible fallback so installs that stored the credential
+    under the legacy (un-namespaced) key keep working after an upgrade.
+    """
+    if server is None:
+        return []
+    keys: list[str] = []
+    for key in (
+        getattr(server, "secret_key", None),
+        getattr(server, "env_var", None),
+    ):
+        if key and key not in keys:
+            keys.append(key)
+    return keys
 
 
 # Category taxonomy used by Manifest.get_category_summary() and get_servers_in_category()
@@ -340,6 +377,7 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         args=data.get("args", []),
         requires_api_key=data.get("requires_api_key", False),
         env_var=data.get("env_var"),
+        secret_key=data.get("secret_key"),
         env_instructions=data.get("env_instructions"),
         auto_start=data.get("auto_start", False),
         transport=transport,

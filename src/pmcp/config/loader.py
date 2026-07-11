@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import tempfile
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -572,31 +573,70 @@ def set_startup_policy(
     )
 
 
+# A configured-env value that is ENTIRELY a single ${VAR} or $VAR reference.
+# Local stdio env is passed verbatim (no expansion), so such a value is a dead
+# literal for the runtime credential slot and must be resolved, not preserved.
+_LOCAL_ENV_PLACEHOLDER_RE = re.compile(
+    r"\$(?:\{[A-Za-z_][A-Za-z0-9_]*\}|[A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
 def _merge_manifest_defaults(
     name: str,
     config: LocalMcpServerConfig,
     manifest_servers: dict[str, "ManifestServerConfig"] | None,
 ) -> LocalMcpServerConfig | None:
-    """Merge a partial config with manifest defaults when possible."""
+    """Merge a partial config with manifest defaults when possible.
+
+    Also injects the credential for a configured local server that matches a
+    manifest api-key server: without this, a ``.mcp.json`` entry (or one that
+    ``pmcp init`` generates) that duplicates a manifest server with a namespaced
+    ``secret_key`` would inherit only the storage key from ``os.environ`` and
+    start the downstream server without its runtime ``env_var``. A credential
+    the config already sets for that var is preserved (genuine user override).
+    """
+    manifest_server = manifest_servers.get(name) if manifest_servers else None
+
     if config.command:
-        return config
+        merged = config
+    else:
+        if not manifest_servers:
+            logger.warning(
+                f"Skipping server '{name}' - command missing and manifest unavailable"
+            )
+            return None
+        if not manifest_server:
+            logger.warning(
+                f"Skipping server '{name}' - command missing and no manifest default found"
+            )
+            return None
+        merged = config.model_copy(deep=True)
+        merged.command = manifest_server.command
+        merged.args = [*manifest_server.args, *config.args]
 
-    if not manifest_servers:
-        logger.warning(
-            f"Skipping server '{name}' - command missing and manifest unavailable"
+    if manifest_server and manifest_server.env_var:
+        from pmcp.manifest.loader import credential_lookup_keys
+
+        env_var = manifest_server.env_var
+        existing = (merged.env or {}).get(env_var)
+        # A local stdio server's env is passed verbatim — ${VAR}/$VAR placeholders
+        # are NOT expanded (only remote headers are). So a pmcp-init-style
+        # {"API_TOKEN": "${API_TOKEN}"} (or a hand-authored "$API_TOKEN") is a
+        # non-functional literal that merely clobbers the inherited value; treat
+        # such an unexpanded placeholder as unset and resolve the real credential.
+        # A concrete value is a genuine user override and is preserved.
+        is_placeholder = bool(
+            existing and re.fullmatch(_LOCAL_ENV_PLACEHOLDER_RE, existing)
         )
-        return None
+        if not existing or is_placeholder:
+            for lookup_key in credential_lookup_keys(manifest_server):
+                value = os.environ.get(lookup_key)
+                if value:
+                    if merged is config:
+                        merged = config.model_copy(deep=True)
+                    merged.env = {**(merged.env or {}), env_var: value}
+                    break
 
-    manifest_server = manifest_servers.get(name)
-    if not manifest_server:
-        logger.warning(
-            f"Skipping server '{name}' - command missing and no manifest default found"
-        )
-        return None
-
-    merged = config.model_copy(deep=True)
-    merged.command = manifest_server.command
-    merged.args = [*manifest_server.args, *config.args]
     return merged
 
 
@@ -886,12 +926,19 @@ def _manifest_server_to_config(
             ),
         )
 
-    # Build env dict if server requires API key
+    # Build env dict if server requires API key. The credential is looked up
+    # under its (optionally namespaced) storage key, with the runtime env_var as
+    # a legacy fallback, but is always injected into the subprocess under the
+    # runtime env_var the downstream server actually reads.
     env: dict[str, str] | None = None
     if server.env_var:
-        env_value = env_lookup(server.env_var)
-        if env_value:
-            env = {server.env_var: env_value}
+        from pmcp.manifest.loader import credential_lookup_keys
+
+        for lookup_key in credential_lookup_keys(server):
+            env_value = env_lookup(lookup_key)
+            if env_value:
+                env = {server.env_var: env_value}
+                break
 
     return ResolvedServerConfig(
         name=server.name,
@@ -962,8 +1009,15 @@ def resolve_startup_configs(
             return
 
         if eager and manifest_server and manifest_server.requires_api_key:
+            from pmcp.manifest.loader import credential_lookup_keys
+
             env_var = manifest_server.env_var
-            if env_var and not is_auth_available(env_var):
+            # Auth is available if the credential is present under any of the
+            # server's lookup keys (namespaced storage key or legacy env_var);
+            # checking only the runtime env_var would skip a namespaced-only
+            # credential as MISSING_AUTH.
+            lookup_keys = credential_lookup_keys(manifest_server)
+            if lookup_keys and not any(is_auth_available(key) for key in lookup_keys):
                 skipped.append(
                     StartupSkip(
                         name=config.name,
@@ -1017,7 +1071,16 @@ def resolve_startup_configs(
         if legacy_manifest_auto_start and server.auto_start and name not in disabled:
             eager = True
 
-        config = _manifest_server_to_config(server, lambda _env_var: None)
+        # Resolve the credential from os.environ (namespaced storage key first,
+        # legacy env_var fallback) so the startup config injects the runtime
+        # env_var into the spawned subprocess. Previously this used a lambda that
+        # discarded env, relying on _connect_stdio seeding os.environ.copy() to
+        # supply the credential — but after namespacing os.environ holds the
+        # storage key (BRIGHTDATA_API_TOKEN), not the runtime env_var (API_TOKEN),
+        # so eager/lazy/refresh spawns would launch without the credential.
+        # Resolving here keeps both this path and the connect path symmetric, so
+        # the refresh diff (issue #79) still sees no spurious env change.
+        config = _manifest_server_to_config(server, os.environ.get)
         source: Literal["manifest", "provisioned"] = (
             "provisioned" if name in provisioned else "manifest"
         )
