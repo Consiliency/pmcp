@@ -1,3 +1,3 @@
 """PMCP - A meta-server for minimal Claude Code tool bloat."""
 
-__version__ = "1.19.2"
+__version__ = "1.19.3"

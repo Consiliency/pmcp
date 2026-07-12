@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.3] - 2026-07-12
+
+### Security
+- **No cross-server credential bleed.** The gateway loads every PMCP-stored
+  credential into its own `os.environ`, and the subprocess-spawn paths copied
+  that whole environment — so each downstream MCP server received *every other*
+  server's credentials (e.g. `@brightdata/mcp` got the OpenAI key). Downstream
+  subprocesses now inherit the gateway environment **minus** PMCP-managed secret
+  keys (the keys in the user `pmcp.env` + project `.env.pmcp` stores), then get
+  only their own resolved credential re-applied. This covers both the server
+  spawn (`_connect_stdio`) and the paths that execute a server's **package code**
+  (`start_install`/`install_server`, and the `update_server` / `verify_installation`
+  `--help` probes). Non-secret ambient vars (`PATH`/`HOME`/`NODE_*`/proxy/locale)
+  are preserved. (#96)
+
+  Scope: only PMCP-managed secrets are stripped — not secrets the operator
+  exported into the shell or a plain `.env`. Behavior change: a server that
+  relied on *ambient inheritance* of a secret it does not declare (no config
+  `env` block, no manifest credential) no longer receives it. Follow-ups tracked
+  in #96: sanitizing the trusted-CLI probes as defense-in-depth, and the durable
+  fix of not loading secrets into the global `os.environ` at all.
+
 ## [1.19.2] - 2026-07-11
 
 ### Fixed
