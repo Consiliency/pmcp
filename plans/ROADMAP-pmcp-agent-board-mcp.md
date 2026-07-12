@@ -55,6 +55,19 @@ So: **multiple env vars and non-secret config are natively expressible via path 
   confirmation *within* CRED-1, **not an amendment** requiring re-ratification. (What *would* require
   re-ratification: changing the descriptor var names, or weakening the descriptor-only property.)
 
+> **RESOLVED (portal + message-board, verified against `agent-board-runtime/src/config.ts`; recorded
+> in the frozen contract §7 / portal #211, merged):** **Option B.** The board credential is a pure
+> 1Password **pointer** — `config.ts` reads only `MESSAGE_BOARD_RUNTIME_CREDENTIAL_DESCRIPTOR` /
+> `MESSAGE_BOARD_AGENT_1PASSWORD_ITEM` and resolves it itself; there is **no required raw-secret var**,
+> so there is nothing to store-resolve. Ship the minimal public manifest **stub** for discoverability;
+> the real ENDPOINT/descriptor/config live in the operator `.mcp.json` overlay, **verbatim**. Option A
+> is **not** taken (no store-resolved actual-secret var exists). If a future deployment ever introduces
+> a true-secret var, *that single var* — not the pointers — becomes the Option-A case.
+>
+> **`${machine_id}` RESOLVED:** owned by the **operator / wiring layer** (portal half's `MBP-WIRE`
+> phase), per-host. `config.ts` has no hostname/UUID fallback, so each host's overlay sets
+> `MESSAGE_BOARD_RUNTIME_MACHINE_ID`. It is **not** a PMCP catalog-static value → **not** in the stub.
+
 ## 3. The fork — how the entry is shaped (recommendation + one question back)
 
 The message-board entry needs **6 config vars** (`ENDPOINT`, `SUPABASE_URL`,
@@ -118,10 +131,15 @@ self-described tiers and ships the safe set as the provision default.
 
 | Phase | Deliverable | Gate / blocker |
 |---|---|---|
-| **P0 (this doc)** | Interface confirmations (§1–§5): slot syntax, CRED-1 + ENDPOINT-1 ratified, safe-tier default, the A/B fork + questions back. | none — landing now |
-| **P1** | Resolve the fork with the portal/board (§3 question). If **B**: author the minimal discoverability stub in `manifest.yaml` (+ `env_instructions` documenting the var contract) and the operator `.mcp.json` overlay template — no schema change. If **A**: schema extension roadmap (env block + multi-slot descriptor credentials) as a separate versioned PMCP phase. | blocked on the §3 answer |
-| **P2** | Land the chosen entry (stub or extended) + the safe-tier scope policy default. Discoverable via `catalog_search`; documents the contract. | after P1; no live endpoint needed |
+| **P0 (this doc)** | Interface confirmations (§1–§5): slot syntax, CRED-1 + ENDPOINT-1 ratified, safe-tier default. **A/B fork now RESOLVED → Option B; `${machine_id}` → operator.** | ✅ done |
+| **P1** | Author the minimal Option-B discoverability stub in `manifest.yaml` (command/args `npx -y @consiliency/agent-board-mcp@<pin>`, keywords, description, `env_instructions` documenting the frozen var contract + "needs operator overlay + deployed board") and an operator `.mcp.json` overlay template. **No schema change.** | **blocked on IF-SCHEMA-1** — `@consiliency/agent-board-mcp` is not yet published to npm (no pinnable version; verified E404). Authoring a stub with a nonexistent pin would ship a broken catalog entry. |
+| **P2** | Land the stub + the safe-tier scope-policy default. Discoverable via `catalog_search`; documents the contract. | after P1 (needs the published pin) |
 | **P3** | Live end-to-end provision + VERIFY round-trip. | **blocked on IF-ENDPOINT-1** (board deployed + health probe + owner) and portal#208 drift (IF-DRIFT-1) |
+
+**Holding at P0 by agreement** (portal + advisor): the stub is cleared to author, but two upstream
+halves gate it — the **published npm pin** (message-board's IF-SCHEMA-1) and the **live endpoint**
+(IF-ENDPOINT-1). PMCP's half fans out to P1 the moment the pin publishes; nothing here is buildable or
+testable before then.
 
 ## Acceptance (mirrors the spine VERIFY)
 A real message round-trips: agent A sends via a PMCP-provisioned `agent-board` → board persists →
