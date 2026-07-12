@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from pmcp.env_store import resolve_scope_path
+from pmcp.env_store import resolve_scope_path, sanitized_subprocess_env
 from pmcp.manifest.environment import Platform
 from pmcp.manifest.loader import ServerConfig, credential_lookup_keys
 
@@ -518,15 +518,17 @@ def build_install_child_env(server_config: ServerConfig) -> dict[str, str]:
     gateway's own ``os.environ`` only holds the namespaced storage key after
     ``auth_connect``, so a bare inherited environment would omit the runtime var.
     """
-    child_env = os.environ.copy()
+    own_env: dict[str, str] = {}
     env_var = server_config.env_var
     if env_var:
         for key in credential_lookup_keys(server_config):
             value = os.environ.get(key)
             if value:
-                child_env[env_var] = value
+                own_env[env_var] = value
                 break
-    return child_env
+    # Inherit the gateway env minus PMCP-managed secrets (no cross-server bleed),
+    # then apply this server's own resolved credential.
+    return sanitized_subprocess_env(own_env)
 
 
 async def check_api_key(server_config: ServerConfig) -> None:
@@ -632,13 +634,16 @@ async def verify_installation(server_config: ServerConfig) -> bool:
         True if server can be started, False otherwise
     """
     try:
-        # Try to start the server briefly
+        # Try to start the server briefly. Sanitized env: this executes the
+        # server's own package code, so it must not inherit other servers'
+        # credentials from the gateway environment.
         process = await asyncio.create_subprocess_exec(
             server_config.command,
             *server_config.args[:1],  # Just first arg to test
             "--help",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=build_install_child_env(server_config),
         )
 
         await asyncio.wait_for(process.communicate(), timeout=5.0)

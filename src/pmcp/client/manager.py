@@ -24,6 +24,7 @@ from mcp.shared.message import SessionMessage
 
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
+from pmcp.env_store import sanitized_subprocess_env
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     resolve_remote_headers_for_tenant,
@@ -1273,10 +1274,10 @@ class ClientManager:
 
         logger.info(f"Connecting to MCP server: {name}")
 
-        # Build environment
-        env = os.environ.copy()
-        if local_config.env:
-            env.update(local_config.env)
+        # Build environment: inherit the gateway env MINUS PMCP-managed secrets
+        # (so this server never receives another server's stored credentials),
+        # then apply this server's own resolved credentials.
+        env = sanitized_subprocess_env(local_config.env, self._project_root)
 
         # Spawn process (semaphore caps concurrent spawns to avoid FD exhaustion)
         async with self._spawn_semaphore:

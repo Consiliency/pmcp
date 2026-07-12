@@ -54,6 +54,7 @@ from pmcp.manifest.environment import CLIInfo, detect_platform, probe_clis
 from pmcp.templates.code_snippets_loader import get_code_snippet
 from pmcp.manifest.installer import (
     MissingApiKeyError,
+    build_install_child_env,
     get_job_manager,
     InstallError,
 )
@@ -3394,12 +3395,20 @@ class GatewayTools:
             )
         return None
 
-    async def _run_update_probe_command(self, command: list[str]) -> tuple[bool, str]:
-        """Run an update probe command and return (ok, output)."""
+    async def _run_update_probe_command(
+        self, command: list[str], env: dict[str, str] | None = None
+    ) -> tuple[bool, str]:
+        """Run an update probe command and return (ok, output).
+
+        ``env`` should be sanitized (this probe runs the downstream server's own
+        package code, e.g. ``npx <pkg> --help``, so it must not inherit other
+        servers' credentials from the gateway's environment).
+        """
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=env,
         )
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
         output = (
@@ -4780,7 +4789,11 @@ class GatewayTools:
             update_cmd = ["uvx", "--refresh", package_name, "--help"]
 
         try:
-            ok, output = await self._run_update_probe_command(update_cmd)
+            # Sanitized env: the probe executes the server's own package code, so
+            # it gets only this server's resolved credential, never other servers'.
+            ok, output = await self._run_update_probe_command(
+                update_cmd, env=build_install_child_env(server_config)
+            )
         except TimeoutError:
             return UpdateServerOutput(
                 ok=False,

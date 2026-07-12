@@ -4253,11 +4253,13 @@ class TestCapabilityAndProvision:
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
-        monkeypatch.setattr(
-            gateway_tools,
-            "_run_update_probe_command",
-            lambda command: __import__("asyncio").sleep(0, result=(True, "ok")),
-        )
+        probe_calls: dict[str, object] = {}
+
+        def _fake_probe(command, env=None):
+            probe_calls["env"] = env
+            return __import__("asyncio").sleep(0, result=(True, "ok"))
+
+        monkeypatch.setattr(gateway_tools, "_run_update_probe_command", _fake_probe)
         monkeypatch.setattr(
             gateway_tools,
             "refresh",
@@ -4280,6 +4282,9 @@ class TestCapabilityAndProvision:
         assert result.server == "playwright"
         assert result.package_type == "npm"
         assert result.latest_version == "1.2.3"
+        # The update probe runs the server's own package code, so it must get a
+        # sanitized env (a dict), not inherit the gateway's full environment.
+        assert isinstance(probe_calls["env"], dict)
 
     @pytest.mark.asyncio
     async def test_invoke_includes_update_warning(self, monkeypatch):
