@@ -634,13 +634,16 @@ async def verify_installation(server_config: ServerConfig) -> bool:
         True if server can be started, False otherwise
     """
     try:
-        # Try to start the server briefly
+        # Try to start the server briefly. Sanitized env: this executes the
+        # server's own package code, so it must not inherit other servers'
+        # credentials from the gateway environment.
         process = await asyncio.create_subprocess_exec(
             server_config.command,
             *server_config.args[:1],  # Just first arg to test
             "--help",
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=build_install_child_env(server_config),
         )
 
         await asyncio.wait_for(process.communicate(), timeout=5.0)
