@@ -141,6 +141,47 @@ halves gate it — the **published npm pin** (message-board's IF-SCHEMA-1) and t
 (IF-ENDPOINT-1). PMCP's half fans out to P1 the moment the pin publishes; nothing here is buildable or
 testable before then.
 
+---
+
+## Unblock verification — 2026-07-13 (message-board deliverables landed, with two corrections)
+
+message-board reported both deliverables done. **Verified against source of truth:**
+
+- **IF-ENDPOINT-1 — SATISFIED.** `MESSAGE_BOARD_RUNTIME_ENDPOINT = https://mqccjfqngptkemnchlko.supabase.co`
+  (`MODE=embedded_mcp`) is live and reachable over HTTPS (root `404`, `/rest/v1/` `401` — the expected
+  authenticated-only Supabase behavior). Operator overlay template landed:
+  `plans/agent-board-overlay.template.jsonc`.
+- **The mcp pin — EXISTS but on a PRIVATE registry, not public npm (correction).** The hand-off said
+  "fill the catalog with `@consiliency/agent-board-mcp@1.1.0`". That version **does** exist — but on
+  **GitHub Packages** (org `Consiliency`, private, repo `message-board`), **not** public npm
+  (`npm view` → E404). The deployed `@consiliency/agent-board-schema@1.1.0` is the DB *schema bundle*;
+  `agent-board-mcp` is the separate stdio-server package. **New requirement:** a catalog/overlay
+  `npx -y @consiliency/agent-board-mcp@1.1.0` fails against default npm — the `@consiliency` scope must
+  route to `https://npm.pkg.github.com` with a `read:packages` token (an operator `.npmrc`), **or**
+  message-board publishes the mcp package to public npm.
+
+### New coordination question (binds PMCP ↔ message-board)
+**Private GitHub Packages vs public npm for `@consiliency/agent-board-mcp`:** should the operator
+supply a GitHub Packages `.npmrc` + `read:packages` token (folds into the same operator/wiring layer as
+`MACHINE_ID` / the descriptor), or will message-board publish the mcp package to **public npm**? Public
+npm is the cleaner catalog story (no registry auth to distribute); private is fine if the token wiring
+is owned by the operator half. **This decides whether a live provision needs npm-registry wiring.**
+
+### Superseded assumption (recorded, per message-board's flag)
+The endpoint is now a **message-board-owned** Supabase project, not portal-hosted — this **supersedes
+ratified Assumption 1** (endpoint-to-be-portal-hosted). No change to PMCP's half (we consume the URL
+wherever hosted); recorded here for the contract trail.
+
+### Remaining inputs before a LIVE provision + VERIFY round-trip
+1. The registry decision above (public npm, or the GitHub Packages `.npmrc`/token approach).
+2. `MESSAGE_BOARD_RUNTIME_CREDENTIAL_DESCRIPTOR` / `MESSAGE_BOARD_AGENT_1PASSWORD_ITEM` — the `op://`
+   descriptor pointers (operator/1Password-owned; not fabricated here).
+3. `MESSAGE_BOARD_RUNTIME_BOARD_SCOPE` and `MACHINE_ID` (per-host, operator/MBP-WIRE).
+
+**Not a PMCP blocker beyond these inputs.** The overlay template is ready; a live `agent-board`
+provision + the VERIFY round-trip fill in the three items above. (Maintainer countersign for the
+Portal's prod mutation is separate and the maintainer's, not PMCP's.)
+
 ## Acceptance (mirrors the spine VERIFY)
 A real message round-trips: agent A sends via a PMCP-provisioned `agent-board` → board persists →
 agent B reads via its own PMCP-provisioned `agent-board`, **zero manual paste, descriptor-based

@@ -1,0 +1,43 @@
+// Operator overlay entry for @consiliency/agent-board-mcp (Option B — verbatim .mcp.json).
+// Drop this into ~/.pmcp.json (or a project .mcp.json / private overlay). PMCP injects the
+// `env` map VERBATIM; the board runtime resolves the credential DESCRIPTOR itself.
+// Values marked <<FILL>> are operator/wiring-owned and are NOT PMCP catalog-static.
+//
+// VERIFIED 2026-07-13:
+//   - endpoint live: https://mqccjfqngptkemnchlko.supabase.co (MODE=embedded_mcp) — reachable, auth-only.
+//   - @consiliency/agent-board-mcp@1.1.0 exists on PRIVATE GitHub Packages (org Consiliency),
+//     NOT public npm. `npx` against default npm returns E404 — see the .npmrc requirement below.
+{
+  "mcpServers": {
+    "agent-board": {
+      "command": "npx",
+      "args": ["-y", "@consiliency/agent-board-mcp@1.1.0"],
+      "env": {
+        // --- non-secret config (confirmed) ---
+        "MESSAGE_BOARD_RUNTIME_ENDPOINT": "https://mqccjfqngptkemnchlko.supabase.co",
+        "MESSAGE_BOARD_SUPABASE_URL": "https://mqccjfqngptkemnchlko.supabase.co",
+        "MESSAGE_BOARD_RUNTIME_MODE": "embedded_mcp",
+        "MESSAGE_BOARD_RUNTIME_TRUST_DOMAIN": "consiliency",
+
+        // --- operator/wiring-owned (must be filled per deployment/host) ---
+        "MESSAGE_BOARD_RUNTIME_BOARD_SCOPE": "<<FILL: board scope>>",
+        "MESSAGE_BOARD_RUNTIME_MACHINE_ID": "<<FILL: per-host id — operator/MBP-WIRE, PMCP does not derive ${machine_id}>>",
+
+        // --- CREDENTIAL SLOT: a 1Password DESCRIPTOR POINTER only (CRED-1 Option B). NEVER a key. ---
+        "MESSAGE_BOARD_RUNTIME_CREDENTIAL_DESCRIPTOR": "<<FILL: op:// 1Password reference>>",
+        "MESSAGE_BOARD_AGENT_1PASSWORD_ITEM": "<<FILL: op:// 1Password item reference>>"
+      }
+    }
+  }
+}
+
+// PRIVATE-REGISTRY REQUIREMENT (new — surfaced 2026-07-13):
+// @consiliency/agent-board-mcp is on GitHub Packages, so the operator's npm environment must
+// route the @consiliency scope there, e.g. in ~/.npmrc:
+//
+//   @consiliency:registry=https://npm.pkg.github.com
+//   //npm.pkg.github.com/:_authToken=${GITHUB_TOKEN_WITH_read_packages}
+//
+// Without this, `npx -y @consiliency/agent-board-mcp@1.1.0` fails E404. This is an operator/
+// wiring concern (like MACHINE_ID and the descriptor) — OR message-board publishes the mcp
+// package to public npm, which removes the requirement. See the coordination question in the roadmap.
