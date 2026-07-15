@@ -1,43 +1,45 @@
 // Operator overlay entry for @consiliency/agent-board-mcp (Option B — verbatim .mcp.json).
-// Drop this into ~/.pmcp.json (or a project .mcp.json / private overlay). PMCP injects the
-// `env` map VERBATIM; the board runtime resolves the credential DESCRIPTOR itself.
-// Values marked <<FILL>> are operator/wiring-owned and are NOT PMCP catalog-static.
+// Drop into ~/.pmcp.json. PMCP injects `env` VERBATIM — NO ${VAR}/${cred}/${machine_id} expansion
+// (those coordination-proposal placeholders would ship as literal broken strings; use real values).
 //
-// VERIFIED 2026-07-13:
-//   - endpoint live: https://mqccjfqngptkemnchlko.supabase.co (MODE=embedded_mcp) — reachable, auth-only.
-//   - @consiliency/agent-board-mcp@1.1.0 exists on PRIVATE GitHub Packages (org Consiliency),
-//     NOT public npm. `npx` against default npm returns E404 — see the .npmrc requirement below.
+// VERIFIED 2026-07-15 against the SHIPPED client @consiliency/agent-board-client@1.2.0 (the dep the
+// mcp package delegates config to). The env var names below are the ONES THE CLIENT ACTUALLY READS —
+// they differ from the earlier coordination messages (no RUNTIME_ prefix on SCOPE/TRUST_DOMAIN;
+// descriptor is VAULT+ITEM; there is no MESSAGE_BOARD_RUNTIME_MODE / _RUNTIME_CREDENTIAL_DESCRIPTOR).
+//
+// READ HALF PROVEN THROUGH THE PMCP GATEWAY: gateway_connect_server(agent-board) -> online, descriptor
+// resolved, gateway_invoke(agent_board.runtime_status) -> {ok:true, ready:true, missingFields:[],
+// boardScope:"consiliency", noSecret:true}. #96 held: the subprocess got its own op token + config but
+// NOT other servers' PMCP-managed secrets. Entry was removed from ~/.pmcp.json after the proof so no
+// live op token sits at rest until the send half is wired.
 {
   "mcpServers": {
     "agent-board": {
       "command": "npx",
-      "args": ["-y", "@consiliency/agent-board-mcp@1.1.0"],
+      "args": ["-y", "@consiliency/agent-board-mcp@1.2.0"],   // public npm — no registry token
       "env": {
-        // --- non-secret config (confirmed) ---
+        // --- non-secret config (confirmed / proven) ---
         "MESSAGE_BOARD_RUNTIME_ENDPOINT": "https://mqccjfqngptkemnchlko.supabase.co",
         "MESSAGE_BOARD_SUPABASE_URL": "https://mqccjfqngptkemnchlko.supabase.co",
-        "MESSAGE_BOARD_RUNTIME_MODE": "embedded_mcp",
-        "MESSAGE_BOARD_RUNTIME_TRUST_DOMAIN": "consiliency",
+        "MESSAGE_BOARD_BOARD_SCOPE": "consiliency",            // NOT ..._RUNTIME_BOARD_SCOPE; value=consiliency (proven; go-live prompt's "message-board" was wrong)
+        "MESSAGE_BOARD_TRUST_DOMAIN": "consiliency",           // NOT ..._RUNTIME_TRUST_DOMAIN
+        "MESSAGE_BOARD_RUNTIME_MACHINE_ID": "<<FILL: per-host machine id, e.g. /etc/machine-id>>",
 
-        // --- operator/wiring-owned (must be filled per deployment/host) ---
-        "MESSAGE_BOARD_RUNTIME_BOARD_SCOPE": "<<FILL: board scope>>",
-        "MESSAGE_BOARD_RUNTIME_MACHINE_ID": "<<FILL: per-host id — operator/MBP-WIRE, PMCP does not derive ${machine_id}>>",
+        // --- credential DESCRIPTOR (CRED-1 Option B): 1Password item pointer; carries url/anon/service_role only ---
+        "MESSAGE_BOARD_AGENT_1PASSWORD_VAULT": "Consiliency Deploy Secrets",
+        "MESSAGE_BOARD_AGENT_1PASSWORD_ITEM": "Agent Board API Keys - message-board canonical mqccjfqngptkemnchlko",
 
-        // --- CREDENTIAL SLOT: a 1Password DESCRIPTOR POINTER only (CRED-1 Option B). NEVER a key. ---
-        "MESSAGE_BOARD_RUNTIME_CREDENTIAL_DESCRIPTOR": "<<FILL: op:// 1Password reference>>",
-        "MESSAGE_BOARD_AGENT_1PASSWORD_ITEM": "<<FILL: op:// 1Password item reference>>"
+        // --- secret-zero: op token that lets the runtime resolve the descriptor. Scoped HERE (not pmcp.env,
+        //     which #96 would strip; not the gateway ambient env, which would bleed to all servers).
+        //     A live 1Password service-account token — treat as a secret at rest. ---
+        "OP_SERVICE_ACCOUNT_TOKEN": "<<FILL: ops_... service-account token with read on the vault above>>"
+
+        // --- SEND HALF (signed writes) — STILL BLOCKED pending message-board's per-host signing-identity flow.
+        //     The board is signed-write enforced and the descriptor has NO signing key. To send, add the agent
+        //     signing identity the client reads: MESSAGE_BOARD_SIGNING_PRIVATE_KEY, MESSAGE_BOARD_SIGNING_KEY_ID,
+        //     (MESSAGE_BOARD_SIGNING_KEY_VERSION / _SIGNING_PUBLIC_KEY_FINGERPRINT), plus the agent identity
+        //     (MESSAGE_BOARD_AGENT_ID / _AGENT_ROLE) minted via register_agent. Awaiting the exact flow. ---
       }
     }
   }
 }
-
-// PRIVATE-REGISTRY REQUIREMENT (new — surfaced 2026-07-13):
-// @consiliency/agent-board-mcp is on GitHub Packages, so the operator's npm environment must
-// route the @consiliency scope there, e.g. in ~/.npmrc:
-//
-//   @consiliency:registry=https://npm.pkg.github.com
-//   //npm.pkg.github.com/:_authToken=${GITHUB_TOKEN_WITH_read_packages}
-//
-// Without this, `npx -y @consiliency/agent-board-mcp@1.1.0` fails E404. This is an operator/
-// wiring concern (like MACHINE_ID and the descriptor) — OR message-board publishes the mcp
-// package to public npm, which removes the requirement. See the coordination question in the roadmap.
