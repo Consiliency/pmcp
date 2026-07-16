@@ -41,6 +41,14 @@ So: **multiple env vars and non-secret config are natively expressible via path 
 
 ## 2. Ratification — IF-0-MBPLANE-CRED-1 (ask #1 + descriptor-only)
 
+> **⚠️ Superseded var names (2026-07-16):** the specific descriptor var names referenced in this section
+> (`MESSAGE_BOARD_RUNTIME_CREDENTIAL_DESCRIPTOR` / `MESSAGE_BOARD_AGENT_1PASSWORD_ITEM`) are **not** what
+> the shipped client reads — verified against the published `@consiliency/agent-board-client@1.2.1` dist,
+> which reads neither. The *structural* CRED-1 ratification below (PMCP injects descriptor pointers only,
+> never key material) stands; only the example var names are stale. The proven credential contract is in
+> `plans/agent-board-overlay.template.jsonc` (op:// refs for `..._SUPABASE_SERVICE_ROLE_KEY` /
+> `..._SIGNING_PRIVATE_KEY`).
+
 **RATIFIED**, with one precision the portal + board halves must record:
 
 - **PMCP's contribution to "descriptor pointer only, never a raw signing key" is *structural*, not
@@ -113,17 +121,24 @@ endpoint + health probe exist and are owned;** the discoverability stub (Option 
 
 ## 5. Scope / tier policy (ask #3) — safe-tier default
 
-**RATIFIED: default provision = safe tier only.** PMCP's `PolicyManager` gates at the **server** and
-**tool** level (`is_server_allowed` / `is_tool_allowed`); there is no native `safe|supervisor|admin`
-*tier enum*, so the three tiers map onto tool allow/deny:
-- **Safe (default):** allow the read-only/metadata-safe tools (status, inbox, notification, runtime
-  diagnostics, fetch-descriptor).
-- **Supervisor / Admin:** **denied by default**; enabled only via explicit PMCP policy (an operator
-  allowlist). Admin additionally must never print secrets — enforced by the policy gate, and by the
-  cross-server secret-bleed fix already shipped in **v1.19.3** (#96), so an `agent-board` subprocess
-  never receives another server's credentials regardless of tier.
-The exact tool → tier mapping is owned by message-board's tool contract; PMCP consumes their
-self-described tiers and ships the safe set as the provision default.
+**RATIFIED INTENT: default provision = safe tier only — but this is an OPEN OPERATOR STEP, not an
+enforced default. ⚠️ Do not read this section as a shipped guarantee.** Two facts (verified against the
+shipped artifacts, 2026-07-16) mean safe-tier is NOT the effective default until the operator gates it:
+- The shipped `agent-board-mcp@1.2.2` server registers **all** tool tiers (`safe_default` + `supervisor`
+  + `elevated_admin`) **unconditionally** — `MCP_TOOL_GROUPS` exists but nothing gates registration on it.
+- PMCP's tool policy **defaults to allow-all** (`policy/policy.py` `is_tool_allowed` returns `True` with
+  no allow/denylist configured), and **no `agent-board` policy or manifest stub landed** in this repo.
+
+So with the overlay entry alone, every harness on the gateway can reach the supervisor/admin tools over a
+`service_role` connection (which bypasses RLS). **The operator MUST add a PMCP tool-policy denylist** to
+realize the safe-tier default — deny `agent-board::*`, then allow only the safe/read set (status, inbox,
+notification, runtime-diagnostics, fetch-descriptor) plus the send/thread tools actually used (see the
+overlay template's TOOL-TIER SAFETY note). PMCP's `PolicyManager` gates at the **server**/**tool** level
+(`is_server_allowed` / `is_tool_allowed`); there is no native `safe|supervisor|admin` tier enum, so the
+tiers map onto tool allow/deny. Independently, the cross-server secret-bleed fix in **v1.19.3** (#96)
+ensures an `agent-board` subprocess never receives another server's credentials regardless of tier — but
+that is orthogonal to tool-tier gating. The exact tool → tier mapping is owned by message-board's tool
+contract.
 
 ---
 
@@ -133,13 +148,13 @@ self-described tiers and ships the safe set as the provision default.
 |---|---|---|
 | **P0 (this doc)** | Interface confirmations (§1–§5): slot syntax, CRED-1 + ENDPOINT-1 ratified, safe-tier default. **A/B fork now RESOLVED → Option B; `${machine_id}` → operator.** | ✅ done |
 | **P1** | Author the operator `.mcp.json` overlay template (`plans/agent-board-overlay.template.jsonc`). **No schema change.** | ✅ done — pin published to **public npm** (`@consiliency/agent-board-mcp@1.2.2`). |
-| **P2** | Overlay-verbatim entry (Option B); safe-tier via scope policy. Config lives in the operator overlay, not the public catalog. | ✅ done — proven overlay landed (service_role + op:// descriptors). |
+| **P2** | Overlay-verbatim entry (Option B). Config lives in the operator overlay, not the public catalog. | ✅ overlay done (service_role + op:// descriptors). ⚠️ **safe-tier gating is an OPEN operator step, not shipped** — see §5. |
 | **P3** | Live end-to-end provision + VERIFY round-trip. | ✅ **done — send↔receive PROVEN through the gateway 2026-07-16** (see closeout below). |
 
-**Holding at P0 by agreement** (portal + advisor): the stub is cleared to author, but two upstream
-halves gate it — the **published npm pin** (message-board's IF-SCHEMA-1) and the **live endpoint**
-(IF-ENDPOINT-1). PMCP's half fans out to P1 the moment the pin publishes; nothing here is buildable or
-testable before then.
+**(Historical — superseded by the 2026-07-16 go-live; see the closeout below.)** *At the time of
+writing:* holding at P0 by agreement (portal + advisor) — the stub was cleared to author, but two
+upstream halves gated it: the **published npm pin** (message-board's IF-SCHEMA-1) and the **live
+endpoint** (IF-ENDPOINT-1). Both have since landed; P1–P3 are complete.
 
 ---
 
@@ -216,7 +231,8 @@ subprocess gets its own token + config, never another server's secrets. Proven r
 **Superseded by the proven config:** the earlier proposed var names
 (`MESSAGE_BOARD_RUNTIME_MODE`/`_RUNTIME_TRUST_DOMAIN`/`_RUNTIME_BOARD_SCOPE`/`_RUNTIME_CREDENTIAL_DESCRIPTOR`)
 are **not** what the shipped client reads — see the overlay template for the actual contract
-(`BOARD_SCOPE`/`TRUST_DOMAIN` unprefixed; connection + signing via op:// refs; `AGENT_AUTH_MODE`).
+(`MESSAGE_BOARD_BOARD_SCOPE` / `MESSAGE_BOARD_TRUST_DOMAIN` — same `MESSAGE_BOARD_` prefix but **no
+`RUNTIME_` segment**; connection + signing via op:// refs; `MESSAGE_BOARD_AGENT_AUTH_MODE`).
 
 **Durable track (off critical path):** board-native Ed25519 auth-exchange (short-lived tokens minted
 from the host signing key) — **message-board#27**. `service_role` is the ratified stopgap and is

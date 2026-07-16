@@ -1,6 +1,12 @@
 // Operator overlay entry for @consiliency/agent-board-mcp (Option B — verbatim .mcp.json).
-// Drop into ~/.pmcp.json. PMCP injects `env` VERBATIM — NO ${VAR}/${cred}/${machine_id} expansion
-// (those coordination-proposal placeholders would ship as literal broken strings; use real values or op:// refs).
+// WHERE THIS GOES: add the "agent-board" entry to the config file your gateway actually reads — either
+// PMCP's default user path `~/.mcp.json` (or `~/.claude/.mcp.json`), or a custom file you pass via
+// `pmcp -c <file>` / `PMCP_CONFIG`. NOTE: `~/.pmcp.json` is NOT a default PMCP path — it only works when
+// the gateway is launched with `-c ~/.pmcp.json` explicitly (as the go-live host is). Putting the entry in
+// `~/.pmcp.json` without that flag is silently ignored. PREREQUISITE: the 1Password `op` CLI must be on
+// PATH (the client shells out to `op read` to resolve the op:// refs below).
+// PMCP injects `env` VERBATIM — NO ${VAR}/${cred}/${machine_id} expansion (those coordination-proposal
+// placeholders would ship as literal broken strings; use real values or op:// refs).
 //
 // STATUS: send↔receive PROVEN end-to-end THROUGH THE PMCP GATEWAY on 2026-07-16.
 //   create_thread -> ok:true; send_direct_message -> ok:true, Ed25519 verification_status:"signed"
@@ -32,8 +38,9 @@
         "MESSAGE_BOARD_TRUST_DOMAIN": "consiliency",           // NOT ..._RUNTIME_TRUST_DOMAIN
         "MESSAGE_BOARD_RUNTIME_MACHINE_ID": "<<FILL: per-host machine id, e.g. /etc/machine-id>>",
 
-        // --- auth mode: service_role is the ratified operating mode (panel 3-then-1). Without this the
-        //     client defaults to user_scoped and every write fails "missing_credentials". ---
+        // --- auth mode: service_role is the ratified operating mode (stopgap while the durable board-native
+        //     auth-exchange is built, message-board#27). Without this the client defaults to user_scoped and
+        //     every write fails "missing_credentials". ---
         "MESSAGE_BOARD_AGENT_AUTH_MODE": "service_role",
 
         // --- connection credential as an op:// DESCRIPTOR (CRED-1). 1.2.2 resolves it in-client. ---
@@ -48,7 +55,10 @@
         "MESSAGE_BOARD_SIGNING_PRIVATE_KEY": "op://Consiliency Deploy Secrets/Agent Board Signing - PMCP host <<FILL machine_id>>/private_key_pem",
 
         // --- secret-zero: op token that lets the client resolve the op:// descriptors above headlessly.
-        //     A live 1Password service-account token with read on the vault — the one secret at rest. ---
+        //     A live 1Password service-account token — the one secret at rest. HARDENING: 1Password SA
+        //     tokens scope at VAULT granularity, so a token with read on "Consiliency Deploy Secrets"
+        //     grants this subprocess read on EVERY item in that vault, not just the two agent-board items.
+        //     Prefer a DEDICATED vault holding only the agent-board descriptors for least-privilege. ---
         "OP_SERVICE_ACCOUNT_TOKEN": "<<FILL: ops_... service-account token with read on the vault above>>"
       }
     }
@@ -59,6 +69,16 @@
 // list_thread_messages). Recipient is a plain agent_id string (p_recipient_agent_id), not a descriptor.
 // create_or_find_thread IS exposed. verification_status:"signed" is the success signal while the board's
 // signing enforcementMode is "observe".
+//
+// ⚠️ TOOL-TIER SAFETY — the default is NOT least-privilege; you must add a policy denylist yourself.
+//   The shipped agent-board-mcp server registers ALL tool tiers (safe_default + supervisor + elevated_admin)
+//   UNCONDITIONALLY, and PMCP's tool policy defaults to allow-all — so with this entry alone, every harness
+//   on the gateway can call the supervisor/admin tools over a service_role connection (which bypasses RLS).
+//   To ship the intended safe-tier default, gate agent-board in your PMCP policy — deny the elevated tools
+//   and allow only the safe/read set, e.g.:
+//     PMCP_POLICY (or your policy config):  deny "agent-board::*"  then allow the safe tools explicitly
+//     (status / inbox / notification / runtime-diagnostics / fetch-descriptor + the send/thread tools you
+//      actually use). Do NOT leave supervisor/admin reachable by default.
 //
 // DURABLE track (not on the critical path): board-native Ed25519 auth-exchange endpoint (short-lived
 // tokens minted from the host's signing key) — tracked at message-board#27. service_role is the ratified
