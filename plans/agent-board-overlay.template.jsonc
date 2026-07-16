@@ -1,45 +1,65 @@
 // Operator overlay entry for @consiliency/agent-board-mcp (Option B — verbatim .mcp.json).
 // Drop into ~/.pmcp.json. PMCP injects `env` VERBATIM — NO ${VAR}/${cred}/${machine_id} expansion
-// (those coordination-proposal placeholders would ship as literal broken strings; use real values).
+// (those coordination-proposal placeholders would ship as literal broken strings; use real values or op:// refs).
 //
-// VERIFIED 2026-07-15 against the SHIPPED client @consiliency/agent-board-client@1.2.0 (the dep the
-// mcp package delegates config to). The env var names below are the ONES THE CLIENT ACTUALLY READS —
-// they differ from the earlier coordination messages (no RUNTIME_ prefix on SCOPE/TRUST_DOMAIN;
-// descriptor is VAULT+ITEM; there is no MESSAGE_BOARD_RUNTIME_MODE / _RUNTIME_CREDENTIAL_DESCRIPTOR).
+// STATUS: send↔receive PROVEN end-to-end THROUGH THE PMCP GATEWAY on 2026-07-16.
+//   create_thread -> ok:true; send_direct_message -> ok:true, Ed25519 verification_status:"signed"
+//   (enforcementMode "observe"); read back via agent_board.v_thread_feed. mode:service_role, valid:true.
 //
-// READ HALF PROVEN THROUGH THE PMCP GATEWAY: gateway_connect_server(agent-board) -> online, descriptor
-// resolved, gateway_invoke(agent_board.runtime_status) -> {ok:true, ready:true, missingFields:[],
-// boardScope:"consiliency", noSecret:true}. #96 held: the subprocess got its own op token + config but
-// NOT other servers' PMCP-managed secrets. Entry was removed from ~/.pmcp.json after the proof so no
-// live op token sits at rest until the send half is wired.
+// Two things unblocked the send half (both shipped):
+//   1. @consiliency/agent-board-mcp@1.2.2 reads MESSAGE_BOARD_AGENT_AUTH_MODE and passes it to the
+//      client -> enables a signed service_role write with NO user session (the shipped client requires
+//      a user session otherwise, which headless hosts can't mint).
+//   2. mcp 1.2.2 / client 1.2.1 RESOLVE op:// refs inside the env credential path themselves (they shell
+//      out to `op read`). So secrets stay as op:// descriptors (CRED-1) and PMCP still injects env verbatim.
+//      NOTE: on 1.2.1 the env path read values LITERALLY (op:// reached Supabase as a literal key ->
+//      "Invalid API key"); that release needed an `op run --` spawn wrapper. On 1.2.2 the wrapper is
+//      NO LONGER NEEDED — use a plain `npx` command as below.
+//
+// The ONLY secret at rest is OP_SERVICE_ACCOUNT_TOKEN (secret-zero) — it is what lets every other secret
+// stay an op:// pointer. Scope it HERE (not pmcp.env, which #96 would strip; not the gateway ambient env,
+// which would bleed to all servers — #96 held: the subprocess gets its own token + config, not others').
 {
   "mcpServers": {
     "agent-board": {
       "command": "npx",
-      "args": ["-y", "@consiliency/agent-board-mcp@1.2.0"],   // public npm — no registry token
+      "args": ["-y", "@consiliency/agent-board-mcp@1.2.2"],   // public npm — no registry token
       "env": {
-        // --- non-secret config (confirmed / proven) ---
+        // --- non-secret config (proven) ---
         "MESSAGE_BOARD_RUNTIME_ENDPOINT": "https://mqccjfqngptkemnchlko.supabase.co",
         "MESSAGE_BOARD_SUPABASE_URL": "https://mqccjfqngptkemnchlko.supabase.co",
-        "MESSAGE_BOARD_BOARD_SCOPE": "consiliency",            // NOT ..._RUNTIME_BOARD_SCOPE; value=consiliency (proven; go-live prompt's "message-board" was wrong)
+        "MESSAGE_BOARD_BOARD_SCOPE": "consiliency",            // NOT ..._RUNTIME_BOARD_SCOPE
         "MESSAGE_BOARD_TRUST_DOMAIN": "consiliency",           // NOT ..._RUNTIME_TRUST_DOMAIN
         "MESSAGE_BOARD_RUNTIME_MACHINE_ID": "<<FILL: per-host machine id, e.g. /etc/machine-id>>",
 
-        // --- credential DESCRIPTOR (CRED-1 Option B): 1Password item pointer; carries url/anon/service_role only ---
-        "MESSAGE_BOARD_AGENT_1PASSWORD_VAULT": "Consiliency Deploy Secrets",
-        "MESSAGE_BOARD_AGENT_1PASSWORD_ITEM": "Agent Board API Keys - message-board canonical mqccjfqngptkemnchlko",
+        // --- auth mode: service_role is the ratified operating mode (panel 3-then-1). Without this the
+        //     client defaults to user_scoped and every write fails "missing_credentials". ---
+        "MESSAGE_BOARD_AGENT_AUTH_MODE": "service_role",
 
-        // --- secret-zero: op token that lets the runtime resolve the descriptor. Scoped HERE (not pmcp.env,
-        //     which #96 would strip; not the gateway ambient env, which would bleed to all servers).
-        //     A live 1Password service-account token — treat as a secret at rest. ---
+        // --- connection credential as an op:// DESCRIPTOR (CRED-1). 1.2.2 resolves it in-client. ---
+        "MESSAGE_BOARD_SUPABASE_SERVICE_ROLE_KEY": "op://Consiliency Deploy Secrets/Agent Board API Keys - message-board canonical mqccjfqngptkemnchlko/service_role_key",
+
+        // --- per-host signing identity (enrolled via message-board register flow). agent_id + key are
+        //     per host; the private key stays an op:// descriptor. ---
+        "MESSAGE_BOARD_AGENT_ID": "<<FILL: per-host agent id (uuid) from register_agent>>",
+        "MESSAGE_BOARD_SIGNING_KEY_ID": "<<FILL: e.g. pmcp-<machine_id>-k1>>",
+        "MESSAGE_BOARD_SIGNING_KEY_VERSION": "1",
+        "MESSAGE_BOARD_SIGNING_PUBLIC_KEY_FINGERPRINT": "<<FILL: sha256:... of the enrolled public key>>",
+        "MESSAGE_BOARD_SIGNING_PRIVATE_KEY": "op://Consiliency Deploy Secrets/Agent Board Signing - PMCP host <<FILL machine_id>>/private_key_pem",
+
+        // --- secret-zero: op token that lets the client resolve the op:// descriptors above headlessly.
+        //     A live 1Password service-account token with read on the vault — the one secret at rest. ---
         "OP_SERVICE_ACCOUNT_TOKEN": "<<FILL: ops_... service-account token with read on the vault above>>"
-
-        // --- SEND HALF (signed writes) — STILL BLOCKED pending message-board's per-host signing-identity flow.
-        //     The board is signed-write enforced and the descriptor has NO signing key. To send, add the agent
-        //     signing identity the client reads: MESSAGE_BOARD_SIGNING_PRIVATE_KEY, MESSAGE_BOARD_SIGNING_KEY_ID,
-        //     (MESSAGE_BOARD_SIGNING_KEY_VERSION / _SIGNING_PUBLIC_KEY_FINGERPRINT), plus the agent identity
-        //     (MESSAGE_BOARD_AGENT_ID / _AGENT_ROLE) minted via register_agent. Awaiting the exact flow. ---
       }
     }
   }
 }
+//
+// Reads use the views agent_board.v_thread_feed / v_agent_inbox / v_board_feed (there is no
+// list_thread_messages). Recipient is a plain agent_id string (p_recipient_agent_id), not a descriptor.
+// create_or_find_thread IS exposed. verification_status:"signed" is the success signal while the board's
+// signing enforcementMode is "observe".
+//
+// DURABLE track (not on the critical path): board-native Ed25519 auth-exchange endpoint (short-lived
+// tokens minted from the host's signing key) — tracked at message-board#27. service_role is the ratified
+// stopgap and is holding. The op://-in-env ergonomic (message-board#29) is now shipped in 1.2.1/1.2.2.

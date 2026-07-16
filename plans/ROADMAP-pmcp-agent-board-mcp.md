@@ -132,9 +132,9 @@ self-described tiers and ships the safe set as the provision default.
 | Phase | Deliverable | Gate / blocker |
 |---|---|---|
 | **P0 (this doc)** | Interface confirmations (§1–§5): slot syntax, CRED-1 + ENDPOINT-1 ratified, safe-tier default. **A/B fork now RESOLVED → Option B; `${machine_id}` → operator.** | ✅ done |
-| **P1** | Author the minimal Option-B discoverability stub in `manifest.yaml` (command/args `npx -y @consiliency/agent-board-mcp@<pin>`, keywords, description, `env_instructions` documenting the frozen var contract + "needs operator overlay + deployed board") and an operator `.mcp.json` overlay template. **No schema change.** | **blocked on IF-SCHEMA-1** — `@consiliency/agent-board-mcp` is not yet published to npm (no pinnable version; verified E404). Authoring a stub with a nonexistent pin would ship a broken catalog entry. |
-| **P2** | Land the stub + the safe-tier scope-policy default. Discoverable via `catalog_search`; documents the contract. | after P1 (needs the published pin) |
-| **P3** | Live end-to-end provision + VERIFY round-trip. | **blocked on IF-ENDPOINT-1** (board deployed + health probe + owner) and portal#208 drift (IF-DRIFT-1) |
+| **P1** | Author the operator `.mcp.json` overlay template (`plans/agent-board-overlay.template.jsonc`). **No schema change.** | ✅ done — pin published to **public npm** (`@consiliency/agent-board-mcp@1.2.2`). |
+| **P2** | Overlay-verbatim entry (Option B); safe-tier via scope policy. Config lives in the operator overlay, not the public catalog. | ✅ done — proven overlay landed (service_role + op:// descriptors). |
+| **P3** | Live end-to-end provision + VERIFY round-trip. | ✅ **done — send↔receive PROVEN through the gateway 2026-07-16** (see closeout below). |
 
 **Holding at P0 by agreement** (portal + advisor): the stub is cleared to author, but two upstream
 halves gate it — the **published npm pin** (message-board's IF-SCHEMA-1) and the **live endpoint**
@@ -187,3 +187,38 @@ A real message round-trips: agent A sends via a PMCP-provisioned `agent-board` �
 agent B reads via its own PMCP-provisioned `agent-board`, **zero manual paste, descriptor-based
 credentials only.** PMCP's half is *done* for P0–P2 once the entry is discoverable + safe-tier-gated
 and the credential path is descriptor-only; P3 is jointly gated with the board-deploy + drift halves.
+
+---
+
+## GO-LIVE COMPLETE — 2026-07-16
+
+**Acceptance met.** Signed send↔receive proven end-to-end through the PMCP gateway, descriptor-only:
+
+- `create_thread` → `ok:true` (thread `e67e9cc5-…`); earlier gateway-native proof `ea9202ae-…`.
+- `send_direct_message` → `ok:true`, `message_id 9ef6849f-…`, delivered `inbox_item 01f3d919-…`,
+  Ed25519 `verification_status:"signed"` (enforcementMode `observe`).
+- read back via `agent_board.v_thread_feed` → the message retrieved. `mode:service_role, valid:true`.
+
+**What unblocked P3 (both shipped upstream):**
+1. **`@consiliency/agent-board-mcp@1.2.2` on public npm** — resolves the registry question (public npm,
+   no `.npmrc`/token). Reads `MESSAGE_BOARD_AGENT_AUTH_MODE` and passes it to the client, enabling a
+   **signed `service_role` write with no user session** (the shipped client otherwise requires a
+   user-scoped session, which headless hosts can't mint).
+2. **op://-in-env resolution in mcp 1.2.2 / client 1.2.1** — the env credential path now resolves op://
+   descriptors in-client, so CRED-1 (descriptor-only) holds with a plain `npx` spawn. (On 1.2.1 the env
+   path read values literally → needed an `op run --` wrapper; unnecessary on 1.2.2.)
+
+**Operating mode (ratified):** `service_role` + Ed25519 signing. The only secret at rest is
+`OP_SERVICE_ACCOUNT_TOKEN` (secret-zero) — every other credential stays an op:// pointer. #96 held: the
+subprocess gets its own token + config, never another server's secrets. Proven recipe:
+`plans/agent-board-overlay.template.jsonc`.
+
+**Superseded by the proven config:** the earlier proposed var names
+(`MESSAGE_BOARD_RUNTIME_MODE`/`_RUNTIME_TRUST_DOMAIN`/`_RUNTIME_BOARD_SCOPE`/`_RUNTIME_CREDENTIAL_DESCRIPTOR`)
+are **not** what the shipped client reads — see the overlay template for the actual contract
+(`BOARD_SCOPE`/`TRUST_DOMAIN` unprefixed; connection + signing via op:// refs; `AGENT_AUTH_MODE`).
+
+**Durable track (off critical path):** board-native Ed25519 auth-exchange (short-lived tokens minted
+from the host signing key) — **message-board#27**. `service_role` is the ratified stopgap and is
+holding. The op://-in-env ergonomic was **message-board#29**, now shipped. Coordination PR closed by
+merge; message-board delivery plane confirmed complete on their side.

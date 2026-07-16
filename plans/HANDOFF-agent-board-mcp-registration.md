@@ -5,6 +5,14 @@
 > gate require re-ratification with the portal + message-board halves. Spine + full contract:
 > `consiliency-portal:plans/unification/message-board-plane/CONTRACT-message-board-plane.md`.
 
+> **✅ RESOLVED — GO-LIVE COMPLETE (2026-07-16).** This inbound proposal is preserved as the historical
+> coordination record. It is now fully satisfied: send↔receive is proven end-to-end through the PMCP
+> gateway with descriptor-only credentials. **The proposed env var names below were superseded** by what
+> the shipped client actually reads — the authoritative, proven config is
+> `plans/agent-board-overlay.template.jsonc`, and the closeout is in
+> `plans/ROADMAP-pmcp-agent-board-mcp.md` (§ "GO-LIVE COMPLETE"). Pin: public npm
+> `@consiliency/agent-board-mcp@1.2.2`; mode: `service_role` + Ed25519 signing.
+
 # Proposal: register `@consiliency/agent-board-mcp` in PMCP
 
 **For:** the agent driving PMCP (currently mid-change on namespaced credential/secrets resolution — this is written to *fit* that model, not fight it).
