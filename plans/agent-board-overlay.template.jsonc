@@ -44,7 +44,7 @@
         "MESSAGE_BOARD_AGENT_AUTH_MODE": "service_role",
 
         // --- connection credential as an op:// DESCRIPTOR (CRED-1). 1.2.2 resolves it in-client. ---
-        "MESSAGE_BOARD_SUPABASE_SERVICE_ROLE_KEY": "op://Consiliency Deploy Secrets/Agent Board API Keys - message-board canonical mqccjfqngptkemnchlko/service_role_key",
+        "MESSAGE_BOARD_SUPABASE_SERVICE_ROLE_KEY": "op://Agent Board Secrets/Agent Board API Keys - message-board canonical mqccjfqngptkemnchlko/service_role_key",
 
         // --- per-host signing identity (enrolled via message-board register flow). agent_id + key are
         //     per host; the private key stays an op:// descriptor. ---
@@ -52,7 +52,7 @@
         "MESSAGE_BOARD_SIGNING_KEY_ID": "<<FILL: e.g. pmcp-<machine_id>-k1>>",
         "MESSAGE_BOARD_SIGNING_KEY_VERSION": "1",
         "MESSAGE_BOARD_SIGNING_PUBLIC_KEY_FINGERPRINT": "<<FILL: sha256:... of the enrolled public key>>",
-        "MESSAGE_BOARD_SIGNING_PRIVATE_KEY": "op://Consiliency Deploy Secrets/Agent Board Signing - PMCP host <<FILL machine_id>>/private_key_pem",
+        "MESSAGE_BOARD_SIGNING_PRIVATE_KEY": "op://Agent Board Secrets/Agent Board Signing - PMCP host <<FILL machine_id>>/private_key_pem",
 
         // --- secret-zero: op token that lets the client resolve the op:// descriptors above headlessly.
         //     A live 1Password service-account token — the one secret at rest. HARDENING: 1Password SA
