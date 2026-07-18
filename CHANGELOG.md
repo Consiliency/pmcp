@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.19.4] - 2026-07-18
+
+### Changed
+- **Packaging metadata points at the new owning org.** The project URLs
+  (`Repository`/`Homepage`/`Issues`) now target `Consiliency/pmcp` following the
+  GitHub repository transfer from `ViperJuice/pmcp` (the old URLs still redirect,
+  but the PyPI project page linked to the stale location). No functional or API
+  changes — this is a metadata-only patch. It also serves as the first release
+  published from the new org, validating the trusted-publishing path end-to-end.
+  (#100 follow-up)
+
 ## [1.19.3] - 2026-07-12
 
 ### Security

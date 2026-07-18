@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pmcp"
-version = "1.19.3"
+version = "1.19.4"
 description = "PMCP - Progressive MCP: Minimal context bloat with on-demand tool discovery"
 readme = "README.md"
 license = "MIT"
@@ -40,9 +40,9 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/ViperJuice/pmcp"
-Homepage = "https://github.com/ViperJuice/pmcp"
-Issues = "https://github.com/ViperJuice/pmcp/issues"
+Repository = "https://github.com/Consiliency/pmcp"
+Homepage = "https://github.com/Consiliency/pmcp"
+Issues = "https://github.com/Consiliency/pmcp/issues"
 
 [project.optional-dependencies]
 dev = [
