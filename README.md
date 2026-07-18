@@ -1378,7 +1378,7 @@ export PMCP_REQUEST_CEILING_MS=600000
 docker run -it --rm \
   -v ~/.mcp.json:/home/appuser/.mcp.json:ro \
   -v ~/.env:/app/.env:ro \
-  ghcr.io/viperjuice/pmcp:latest
+  ghcr.io/consiliency/pmcp:latest
 
 # Using Docker Compose
 docker-compose up -d
