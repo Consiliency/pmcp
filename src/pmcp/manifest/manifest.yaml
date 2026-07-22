@@ -634,6 +634,21 @@ servers:
     env_var: "EVERART_API_KEY"
     env_instructions: "Get API key at https://everart.ai"
 
+  pangram:
+    transport: "local"
+    description: "Detect AI-generated text with Pangram Labs - classifies text as human-written, AI-generated, or AI-assisted, with per-class fractions and a per-segment breakdown"
+    keywords: [pangram, ai detection, ai-generated, ai detector, authenticity, plagiarism, text classification, human or ai, content provenance, ai text]
+    install:
+      mac: ["uvx", "pangram-mcp"]
+      linux: ["uvx", "pangram-mcp"]
+      wsl: ["uvx", "pangram-mcp"]
+      windows: ["uvx", "pangram-mcp"]
+    command: "uvx"
+    args: ["pangram-mcp"]
+    requires_api_key: true
+    env_var: "PANGRAM_API_KEY"
+    env_instructions: "Get an API key from https://pangram.com and set PANGRAM_API_KEY (e.g. `pmcp secrets set PANGRAM_API_KEY <key>`, or an op:// descriptor in the operator overlay)"
+
   # === Finance & Data ===
 
   coinmarketcap:
