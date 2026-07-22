@@ -637,7 +637,7 @@ servers:
   pangram:
     transport: "local"
     description: "Detect AI-generated text with Pangram Labs - classifies text as human-written, AI-generated, or AI-assisted, with per-class fractions and a per-segment breakdown"
-    keywords: [pangram, ai detection, ai-generated, ai detector, authenticity, plagiarism, text classification, human or ai, content provenance, ai text]
+    keywords: [pangram, ai detection, ai-generated, ai detector, authenticity, llm detection, text classification, human or ai, content provenance, ai text]
     install:
       mac: ["uvx", "pangram-mcp"]
       linux: ["uvx", "pangram-mcp"]
