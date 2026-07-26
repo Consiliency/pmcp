@@ -777,6 +777,74 @@
       "task_summary": "gateway.describe nested-schema fidelity (#87) + index-it-mcp stdio transport & pilot docs (#89); ship v1.19.1",
       "type": "detailed",
       "updated_at": "2026-07-06T09:20:00Z"
+    },
+    {
+      "acceptance_criteria_count": 8,
+      "created_at": "2026-07-26T06:42:14Z",
+      "file": "plans/detailed-103-scoped-advisor-audit-20260726.md",
+      "handoff_ref": null,
+      "lifecycle": [
+        {
+          "at": "2026-07-26T06:42:14Z",
+          "by": "codex-execute-detailed",
+          "metadata": {
+            "branch": "codex/103-scoped-advisor-audit",
+            "source_plan": "Consiliency/agent-harness plans/detailed-310-pmcp-scoped-advisor-prerequisite-20260726.md"
+          },
+          "transition": "executing"
+        },
+        {
+          "at": "2026-07-26T06:54:58Z",
+          "by": "codex-execute-detailed",
+          "metadata": {
+            "acceptance_status": "satisfied",
+            "diagnostic": "verified and ready for exact-head review",
+            "dirty_path_classification": "all tracked changes plan-owned",
+            "doc_delta_decision": "docs_and_release_metadata_updated",
+            "full_suite": "2250 passed, 3 skipped, 24 deselected",
+            "reflection_path": "/home/viperjuice/.codex/skills/codex-execute-detailed/reflections/a40182b2/codex-103-scoped-advisor-audit/20260726T064214Z-05-103-scoped-advisor-audit.md",
+            "run_id": "20260726T064214Z-05-103-scoped-advisor-audit",
+            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
+            "verification_status": "passed",
+            "verification_summary": "PASS - strict policy, control filtering, pre-lazy-start denial, correlated private audit, four isolated stdio instances, capability probe, lint, typecheck, and full suite passed."
+          },
+          "transition": "completed"
+        },
+        {
+          "at": "2026-07-26T07:24:11Z",
+          "by": "codex-execute-detailed",
+          "metadata": {
+            "acceptance_status": "satisfied_after_panel_reconciliation",
+            "diagnostic": "exact-head review blockers reconciled and complete suite reverified",
+            "full_suite": "2251 passed, 3 skipped, 24 deselected",
+            "panel_reconciliation": "latched audit failure; deny resource and prompt surfaces; ASCII correlations; privacy-safe unknown controls; single-use ledgers; pre-start describe denial; scoped discovery suppression only with active audited session",
+            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
+            "verification_status": "passed",
+            "verification_summary": "PASS - all exact-head Codex and Grok blockers reconciled; lint, format, typecheck, focused compatibility, and full suite passed."
+          },
+          "transition": "completed"
+        },
+        {
+          "at": "2026-07-26T07:52:23Z",
+          "by": "codex-execute-detailed",
+          "metadata": {
+            "acceptance_status": "satisfied_after_second_panel_reconciliation",
+            "diagnostic": "Grok exact-head discovery finding reproduced and closed",
+            "focused_suite": "195 passed",
+            "full_suite": "2251 passed, 3 skipped, 24 deselected",
+            "panel_reconciliation": "audited scoped catalog now suppresses registry candidates and stale update notices; adversarial injected-result regression added",
+            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
+            "verification_status": "passed"
+          },
+          "transition": "completed"
+        }
+      ],
+      "owner_skill": "codex-plan-detailed",
+      "slug": "detailed-103-scoped-advisor-audit-20260726",
+      "status": "completed",
+      "task_summary": "Release fail-closed scoped advisor policy and privacy-safe audit capability for Consiliency/pmcp#103.",
+      "type": "detailed",
+      "updated_at": "2026-07-26T07:52:23Z"
     }
   ],
   "schema_version": 1

@@ -356,6 +356,19 @@ def get_gateway_tool_definitions() -> list[Tool]:
                         "type": "object",
                         "description": "Arguments to pass to the tool (must match tool schema)",
                     },
+                    "run_correlation_id": {
+                        "type": "string",
+                        "description": "Scoped-advisor run correlation ID",
+                    },
+                    "seat_correlation_id": {
+                        "type": "string",
+                        "description": "Scoped-advisor seat correlation ID",
+                    },
+                    "evidence_label_digest": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "SHA-256 digest of the caller evidence label",
+                    },
                     "options": {
                         "type": "object",
                         "properties": {
@@ -1422,8 +1435,9 @@ class GatewayTools:
         """gateway.catalog_search - Search for available tools."""
         parsed = CatalogSearchInput.model_validate(input_data)
         cli_hints = []
+        scoped_advisor = self._policy_manager.scoped_advisor_active is True
         query = parsed.query.strip() if parsed.query else ""
-        if query:
+        if query and not scoped_advisor:
             manifest = load_manifest()
             detected_clis, detected_cli_infos = await self._resolve_cli_availability(
                 manifest
@@ -1488,7 +1502,7 @@ class GatewayTools:
             ]
 
         # Text search (if query provided) - word-based matching
-        if parsed.query:
+        if parsed.query and not scoped_advisor:
             query_words = parsed.query.lower().split()
             tools = [
                 t
@@ -1521,7 +1535,7 @@ class GatewayTools:
 
         # Apply limit
         registry_candidates: list[CapabilityCandidate] = []
-        if parsed.query:
+        if parsed.query and not scoped_advisor:
             registry_candidates = await self._registry_candidates_for_query(
                 parsed.query, limit=min(5, parsed.limit)
             )
@@ -1529,7 +1543,7 @@ class GatewayTools:
         # Surface manifest-provisionable servers that have never been started
         # (no cached tools) so agents can provision them directly (#78).
         manifest_candidates: list[CapabilityCandidate] = []
-        if parsed.include_offline and parsed.query:
+        if parsed.include_offline and parsed.query and not scoped_advisor:
             manifest_candidates = self._manifest_candidates_for_query(
                 parsed.query,
                 manifest=load_manifest(),
@@ -1573,12 +1587,15 @@ class GatewayTools:
 
         # Collect stale-update notices from precomputed cache (no network call)
         stale_updates: list[str] | None = None
-        if self._stale_check_cache:
+        if self._stale_check_cache and not scoped_advisor:
             stale = [
                 f"Update available for '{sn}': {current} -> {latest}. "
                 f"Call gateway.update_server(server_name='{sn}') to update."
                 for sn, (_, current, latest) in self._stale_check_cache.items()
-                if current and latest and is_version_newer(current, latest)
+                if current
+                and latest
+                and is_version_newer(current, latest)
+                and self._policy_manager.is_server_allowed(sn)
             ]
             if stale:
                 stale_updates = stale
@@ -1597,6 +1614,13 @@ class GatewayTools:
         """gateway.describe - Get detailed info about a tool."""
         parsed = DescribeInput.model_validate(input_data)
 
+        # Match invoke: deny before registry lookup or lazy-start side effects.
+        if not self._policy_manager.is_tool_allowed(parsed.tool_id):
+            raise GatewayException(
+                ErrorCode.E402_TOOL_DENIED,
+                details={"tool_id": parsed.tool_id},
+            )
+
         tool_info = self._client_manager.get_tool(parsed.tool_id)
 
         if not tool_info:
@@ -1614,12 +1638,6 @@ class GatewayTools:
                     ErrorCode.E301_TOOL_NOT_FOUND,
                     details={"tool_id": parsed.tool_id},
                 )
-
-        if not self._policy_manager.is_tool_allowed(parsed.tool_id):
-            raise GatewayException(
-                ErrorCode.E402_TOOL_DENIED,
-                details={"tool_id": parsed.tool_id},
-            )
 
         update_warning = await self._get_update_warning(tool_info.server_name)
         self._record_feedback_event(
@@ -1713,6 +1731,36 @@ class GatewayTools:
         trace_context = self._extract_trace_context(input_data)
         parsed = InvokeInput.model_validate(input_data)
 
+        # Policy denial must happen before registry lookup or lazy-start so an
+        # out-of-scope server cannot be started as a side effect of inspection.
+        if not self._policy_manager.is_tool_allowed(parsed.tool_id):
+            server_name = parsed.tool_id.split("::", 1)[0]
+            error = make_error(
+                ErrorCode.E402_TOOL_DENIED,
+                tool_id=parsed.tool_id,
+            )
+            self._audit(
+                method="gateway.invoke",
+                action="invoke",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=server_name,
+                tool_id=parsed.tool_id,
+                auth_state="policy_denied",
+                auth_event="policy_denied",
+                error=error.message,
+                trace_context=trace_context,
+            )
+            return InvokeOutput(
+                tool_id=parsed.tool_id,
+                ok=False,
+                truncated=False,
+                raw_size_estimate=0,
+                errors=[error.model_dump_json()],
+                auth_state="policy_denied",
+                feedback_hint=self._feedback_hint(),
+            )
+
         # Check if tool exists in registry
         tool_info = self._client_manager.get_tool(parsed.tool_id)
 
@@ -1787,35 +1835,6 @@ class GatewayTools:
                     errors=[error.model_dump_json()],
                     feedback_hint=self._feedback_hint(),
                 )
-
-        # Check policy
-        if not self._policy_manager.is_tool_allowed(parsed.tool_id):
-            error = make_error(
-                ErrorCode.E402_TOOL_DENIED,
-                tool_id=parsed.tool_id,
-            )
-            self._audit(
-                method="gateway.invoke",
-                action="invoke",
-                outcome="refused",
-                started_at=audit_started_at,
-                server_name=tool_info.server_name,
-                tool_id=parsed.tool_id,
-                protocol_version=self._protocol_version(tool_info.server_name),
-                auth_state="policy_denied",
-                auth_event="policy_denied",
-                error=error.message,
-                trace_context=trace_context,
-            )
-            return InvokeOutput(
-                tool_id=parsed.tool_id,
-                ok=False,
-                truncated=False,
-                raw_size_estimate=0,
-                errors=[error.model_dump_json()],
-                auth_state="policy_denied",
-                feedback_hint=self._feedback_hint(),
-            )
 
         # Pre-dispatch: validate required arguments
         required = (tool_info.input_schema or {}).get("required", [])

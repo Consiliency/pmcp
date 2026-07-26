@@ -1225,6 +1225,45 @@ redaction:
     - "(password|secret)[\\s]*[:=][\\s]*[\"']?([^\\s\"']+)"
 ```
 
+An explicitly requested policy (`--policy` or `PMCP_POLICY`) is a fail-closed
+boundary: a missing, unreadable, malformed, or schema-invalid file terminates
+startup. Best-effort fallback applies only to automatically discovered default
+locations when the operator did not request a policy.
+
+#### Scoped advisor research
+
+PMCP v1.20.0 adds the `scoped_advisor_audit.v1` profile for isolated advisor
+research. Start each seat with the shipped policy, a unique lock directory, and
+an explicit audit sink:
+
+```bash
+pmcp \
+  --policy examples/scoped-advisor-policy.yaml \
+  --audit-jsonl /run/board/seat-1/audit.jsonl \
+  --lock-dir /run/board/seat-1/locks
+```
+
+The profile exposes only `gateway.health`, `gateway.catalog_search`,
+`gateway.describe`, and `gateway.invoke`; downstream invocation is limited to
+the policy's Firecrawl and Bright Data research patterns. MCP resource and
+prompt surfaces are denied, and scoped catalog results omit native-CLI,
+registry, and provision candidates. Every invoke must
+supply `run_correlation_id`, `seat_correlation_id`, and a SHA-256
+`evidence_label_digest` together. The append-only audit stores correlations,
+tool/status/policy/result digests, and a hashed public-source reference—not raw
+URLs, queries, arguments, credentials, or result bodies—and ends with one
+fsynced completeness marker.
+
+Consumers can fail closed on older installations with:
+
+```bash
+pmcp capabilities --json
+```
+
+The capability is active in `gateway.health` only when the exact explicit
+advisor policy and audit sink are both present. Concurrent seats must use unique
+`--lock-dir` and `--audit-jsonl` paths.
+
 Tenant code-mode hosting uses the same policy fields. This example allows only
 the tenant server, blocks a high-risk submission tool, bounds output, and adds a
 tenant artifact redaction pattern without granting access to unrelated MCP
