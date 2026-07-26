@@ -1245,7 +1245,9 @@ pmcp \
 
 The profile exposes only `gateway.health`, `gateway.catalog_search`,
 `gateway.describe`, and `gateway.invoke`; downstream invocation is limited to
-the policy's Firecrawl and Bright Data research patterns. Every invoke must
+the policy's Firecrawl and Bright Data research patterns. MCP resource and
+prompt surfaces are denied, and scoped catalog results omit native-CLI,
+registry, and provision candidates. Every invoke must
 supply `run_correlation_id`, `seat_correlation_id`, and a SHA-256
 `evidence_label_digest` together. The append-only audit stores correlations,
 tool/status/policy/result digests, and a hashed public-source reference—not raw

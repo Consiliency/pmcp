@@ -30,6 +30,8 @@ uv run ruff check src tests/test_scoped_advisor_audit.py
 uv run pytest tests/test_policy.py tests/test_server.py tests/test_tools.py \
   tests/test_cli.py tests/test_singleton_lock_scope.py \
   tests/test_scoped_advisor_audit.py -q
+uv run pytest tests/test_scoped_advisor_audit.py \
+  tests/test_offline_discovery.py -q
 uv run pytest -q
 ```
 

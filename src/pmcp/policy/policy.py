@@ -43,6 +43,7 @@ class PolicyManager:
         self._policy = GatewayPolicy()
         self._redaction_regexes: list[re.Pattern[str]] = []
         self._explicit_policy = policy_path is not None
+        self._scoped_advisor_active = False
 
         if policy_path:
             self._load_policy(policy_path, fatal=True)
@@ -167,6 +168,10 @@ class PolicyManager:
             return False
         if self._policy.servers.denylist or self._policy.tools.denylist:
             return False
+        if self._policy.resources.allowlist or self._policy.resources.denylist != ["*"]:
+            return False
+        if self._policy.prompts.allowlist or self._policy.prompts.denylist != ["*"]:
+            return False
         allowed_patterns = {
             "firecrawl::*search*",
             "firecrawl::*scrape*",
@@ -182,6 +187,17 @@ class PolicyManager:
         }
         configured = set(self._policy.tools.allowlist)
         return bool(configured) and configured <= allowed_patterns
+
+    @property
+    def scoped_advisor_active(self) -> bool:
+        """Return whether the audited scoped-advisor session is active."""
+        return self._scoped_advisor_active
+
+    def activate_scoped_advisor(self) -> None:
+        """Activate scoped behavior after the policy and audit sink are ready."""
+        if not self.is_scoped_advisor_policy():
+            raise ValueError("scoped advisor activation requires the exact policy")
+        self._scoped_advisor_active = True
 
     def is_resource_allowed(self, resource_id: str) -> bool:
         """Check if resource is allowed by policy.

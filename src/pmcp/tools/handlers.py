@@ -1435,8 +1435,9 @@ class GatewayTools:
         """gateway.catalog_search - Search for available tools."""
         parsed = CatalogSearchInput.model_validate(input_data)
         cli_hints = []
+        scoped_advisor = self._policy_manager.scoped_advisor_active is True
         query = parsed.query.strip() if parsed.query else ""
-        if query:
+        if query and not scoped_advisor:
             manifest = load_manifest()
             detected_clis, detected_cli_infos = await self._resolve_cli_availability(
                 manifest
@@ -1501,7 +1502,7 @@ class GatewayTools:
             ]
 
         # Text search (if query provided) - word-based matching
-        if parsed.query:
+        if parsed.query and not scoped_advisor:
             query_words = parsed.query.lower().split()
             tools = [
                 t
@@ -1542,7 +1543,7 @@ class GatewayTools:
         # Surface manifest-provisionable servers that have never been started
         # (no cached tools) so agents can provision them directly (#78).
         manifest_candidates: list[CapabilityCandidate] = []
-        if parsed.include_offline and parsed.query:
+        if parsed.include_offline and parsed.query and not scoped_advisor:
             manifest_candidates = self._manifest_candidates_for_query(
                 parsed.query,
                 manifest=load_manifest(),
@@ -1591,7 +1592,10 @@ class GatewayTools:
                 f"Update available for '{sn}': {current} -> {latest}. "
                 f"Call gateway.update_server(server_name='{sn}') to update."
                 for sn, (_, current, latest) in self._stale_check_cache.items()
-                if current and latest and is_version_newer(current, latest)
+                if current
+                and latest
+                and is_version_newer(current, latest)
+                and self._policy_manager.is_server_allowed(sn)
             ]
             if stale:
                 stale_updates = stale
@@ -1610,6 +1614,13 @@ class GatewayTools:
         """gateway.describe - Get detailed info about a tool."""
         parsed = DescribeInput.model_validate(input_data)
 
+        # Match invoke: deny before registry lookup or lazy-start side effects.
+        if not self._policy_manager.is_tool_allowed(parsed.tool_id):
+            raise GatewayException(
+                ErrorCode.E402_TOOL_DENIED,
+                details={"tool_id": parsed.tool_id},
+            )
+
         tool_info = self._client_manager.get_tool(parsed.tool_id)
 
         if not tool_info:
@@ -1627,12 +1638,6 @@ class GatewayTools:
                     ErrorCode.E301_TOOL_NOT_FOUND,
                     details={"tool_id": parsed.tool_id},
                 )
-
-        if not self._policy_manager.is_tool_allowed(parsed.tool_id):
-            raise GatewayException(
-                ErrorCode.E402_TOOL_DENIED,
-                details={"tool_id": parsed.tool_id},
-            )
 
         update_warning = await self._get_update_warning(tool_info.server_name)
         self._record_feedback_event(

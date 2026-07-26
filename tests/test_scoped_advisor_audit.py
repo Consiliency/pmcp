@@ -8,7 +8,12 @@ import time
 from pathlib import Path
 
 import pytest
-from mcp.types import CallToolRequest, ListToolsRequest
+from mcp.types import (
+    CallToolRequest,
+    ListPromptsRequest,
+    ListResourcesRequest,
+    ListToolsRequest,
+)
 from pydantic import ValidationError
 
 from pmcp.policy.policy import PolicyManager
@@ -45,6 +50,8 @@ def _write_scoped_policy(path: Path) -> Path:
                         "brightdata::*scrape*",
                     ]
                 },
+                "resources": {"denylist": ["*"]},
+                "prompts": {"denylist": ["*"]},
             }
         )
     )
@@ -92,12 +99,16 @@ def test_explicit_policy_failures_are_fatal_but_default_discovery_is_best_effort
 def test_gateway_tool_policy_is_case_sensitive_and_scoped() -> None:
     policy = PolicyManager(Path("examples/scoped-advisor-policy.yaml"))
     assert policy.is_scoped_advisor_policy() is True
+    assert policy.scoped_advisor_active is False
     assert policy.is_gateway_tool_allowed("gateway.invoke") is True
     assert policy.is_gateway_tool_allowed("Gateway.invoke") is False
     assert policy.is_gateway_tool_allowed("gateway.provision") is False
     assert policy.is_tool_allowed("firecrawl::web_search") is True
     assert policy.is_tool_allowed("brightdata::scrape_page") is True
     assert policy.is_tool_allowed("github::create_issue") is False
+
+    policy.activate_scoped_advisor()
+    assert policy.scoped_advisor_active is True
 
 
 def test_invoke_correlations_are_typed_and_atomic() -> None:
@@ -107,6 +118,11 @@ def test_invoke_correlations_are_typed_and_atomic() -> None:
         InvokeInput(
             tool_id="firecrawl::search",
             **{**_correlations(), "evidence_label_digest": "not-a-digest"},
+        )
+    with pytest.raises(ValidationError):
+        InvokeInput(
+            tool_id="firecrawl::search",
+            **{**_correlations(), "run_correlation_id": "rún-103"},
         )
     parsed = InvokeInput(tool_id="firecrawl::search", **_correlations())
     assert parsed.seat_correlation_id == "seat-codex"
@@ -128,6 +144,8 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
     )
     for server_name in ("firecrawl", "brightdata", "github"):
         manager.set_server_online(server_name)
+    manager.get_all_resources = lambda: []  # type: ignore[attr-defined]
+    manager.get_all_prompts = lambda: []  # type: ignore[attr-defined]
     manager.set_call_tool_response(
         {
             "content": [
@@ -152,6 +170,30 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
         "gateway.describe",
         "gateway.invoke",
     }
+    resources = await server._server.request_handlers[ListResourcesRequest](
+        ListResourcesRequest(params={})
+    )
+    prompts = await server._server.request_handlers[ListPromptsRequest](
+        ListPromptsRequest(params={})
+    )
+    assert resources.root.resources == []
+    assert prompts.root.prompts == []
+
+    catalog = await call_handler(
+        CallToolRequest(
+            params={
+                "name": "gateway.catalog_search",
+                "arguments": {
+                    "query": "native cli execution path",
+                    "include_offline": True,
+                },
+            }
+        )
+    )
+    catalog_payload = json.loads(catalog.root.content[0].text)
+    assert catalog_payload["cli_hints"] == []
+    assert catalog_payload["registry_candidates"] == []
+    assert catalog_payload["manifest_candidates"] == []
 
     invoked = await call_handler(
         CallToolRequest(
@@ -221,6 +263,19 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
         "policy_denied"
     )
 
+    describe_denied = await call_handler(
+        CallToolRequest(
+            params={
+                "name": "gateway.describe",
+                "arguments": {"tool_id": "github::unregistered_mutation"},
+            }
+        )
+    )
+    assert (
+        "blocked by policy"
+        in json.loads(describe_denied.root.content[0].text)["message"]
+    )
+
     denied = await call_handler(
         CallToolRequest(
             params={
@@ -236,6 +291,15 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
     )
     assert "blocked by policy" in json.loads(denied.root.content[0].text)["message"]
 
+    raw_tool_name = "gateway.sk-secret-token"
+    raw_name_denied = await call_handler(
+        CallToolRequest(params={"name": raw_tool_name, "arguments": {}})
+    )
+    assert (
+        "blocked by policy"
+        in json.loads(raw_name_denied.root.content[0].text)["message"]
+    )
+
     health = await server._gateway_tools.health()
     assert health.gateway_diagnostics.capabilities == [SCOPED_ADVISOR_AUDIT_CAPABILITY]
     await server.shutdown()
@@ -245,13 +309,21 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
     assert [record["terminal_status"] for record in invocations] == [
         "success",
         "success",
+        "success",
+        "denied",
+        "denied",
         "denied",
         "denied",
         "denied",
     ]
-    assert invocations[0]["run_correlation_id"] == "run-103"
-    assert invocations[0]["seat_correlation_id"] == "seat-codex"
-    assert invocations[0]["source_reference_hash"]
+    firecrawl_record = next(
+        record
+        for record in invocations
+        if record["downstream_tool_id"] == "firecrawl::web_search"
+    )
+    assert firecrawl_record["run_correlation_id"] == "run-103"
+    assert firecrawl_record["seat_correlation_id"] == "seat-codex"
+    assert firecrawl_record["source_reference_hash"]
     assert records[-1]["record_count"] == len(records)
     raw_audit = audit_path.read_text()
     for forbidden in (
@@ -266,8 +338,11 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
         "secret query with spaces",
         "seat secret with spaces",
         "not-a-digest-secret",
+        raw_tool_name,
     ):
         assert forbidden not in raw_audit
+    assert invocations[-1]["gateway_tool"] is None
+    assert invocations[-1]["gateway_tool_digest"]
 
 
 @pytest.mark.asyncio
@@ -336,6 +411,9 @@ def test_audit_validator_rejects_truncation_gaps_and_duplicate_completion(
     duplicate.write_text("\n".join(json.dumps(r) for r in duplicate_records) + "\n")
     with pytest.raises(ScopedAdvisorAuditError, match="completion"):
         validate_scoped_advisor_audit(duplicate)
+
+    with pytest.raises(ScopedAdvisorAuditError, match="sink unavailable"):
+        ScopedAdvisorAudit(valid, policy_digest="b" * 64)
 
 
 @pytest.mark.skipif(
@@ -429,6 +507,46 @@ def test_audit_sink_failure_fails_closed(tmp_path: Path) -> None:
             arguments={},
             result={"ok": True},
         )
+
+
+@pytest.mark.asyncio
+async def test_failed_audit_latches_before_later_dispatch(tmp_path: Path) -> None:
+    server = GatewayServer(
+        policy_path=_write_scoped_policy(tmp_path / "policy.json"),
+        audit_jsonl=tmp_path / "audit.jsonl",
+    )
+    manager = MockClientManager([create_tool_info("firecrawl", "web_search")])
+    manager.set_server_online("firecrawl")
+    called = False
+
+    async def track_call(tool_id: str, args: dict, timeout_ms: int) -> dict:
+        nonlocal called
+        called = True
+        return {"ok": True}
+
+    manager.call_tool = track_call  # type: ignore[method-assign]
+    server._client_manager = manager  # type: ignore[assignment]
+    server._gateway_tools._client_manager = manager  # type: ignore[assignment]
+    server._create_server()
+    assert server._server is not None
+    assert server._scoped_advisor_audit is not None
+    assert server._scoped_advisor_audit._file is not None
+    server._scoped_advisor_audit._file.close()
+
+    result = await server._server.request_handlers[CallToolRequest](
+        CallToolRequest(
+            params={
+                "name": "gateway.invoke",
+                "arguments": {
+                    "tool_id": "firecrawl::web_search",
+                    "arguments": {"query": "must not dispatch"},
+                    **_correlations(),
+                },
+            }
+        )
+    )
+    assert "audit sink is unavailable" in result.root.content[0].text
+    assert called is False
 
 
 def test_terminal_completion_is_fsynced_once(

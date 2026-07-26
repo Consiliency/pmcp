@@ -17,6 +17,12 @@ SCOPED_ADVISOR_AUDIT_CAPABILITY = "scoped_advisor_audit.v1"
 _CORRELATION_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TOOL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+::[A-Za-z0-9_.-]{1,192}$")
+_SCOPED_GATEWAY_TOOLS = {
+    "gateway.health",
+    "gateway.catalog_search",
+    "gateway.describe",
+    "gateway.invoke",
+}
 
 
 class ScopedAdvisorAuditError(RuntimeError):
@@ -136,7 +142,7 @@ class ScopedAdvisorAudit:
         self._file: TextIO | None = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self._file = self.path.open("a", encoding="utf-8")
+            self._file = self.path.open("x", encoding="utf-8")
             self._write(
                 {
                     "event": "audit.started",
@@ -168,6 +174,11 @@ class ScopedAdvisorAudit:
             self._close_quietly()
             raise ScopedAdvisorAuditError("scoped advisor audit write failed") from exc
 
+    def require_available(self) -> None:
+        """Fail before dispatch when the durable audit channel is no longer live."""
+        if self._failed or self._completed or self._file is None or self._file.closed:
+            raise ScopedAdvisorAuditError("scoped advisor audit sink is unavailable")
+
     def record_invocation(
         self,
         *,
@@ -181,6 +192,9 @@ class ScopedAdvisorAudit:
         run_correlation_id = arguments.get("run_correlation_id")
         seat_correlation_id = arguments.get("seat_correlation_id")
         evidence_label_digest = arguments.get("evidence_label_digest")
+        safe_gateway_tool = (
+            gateway_tool if gateway_tool in _SCOPED_GATEWAY_TOOLS else None
+        )
         self._write(
             {
                 "event": "audit.invocation",
@@ -196,7 +210,8 @@ class ScopedAdvisorAudit:
                 if isinstance(seat_correlation_id, str)
                 and _CORRELATION_PATTERN.fullmatch(seat_correlation_id)
                 else None,
-                "gateway_tool": gateway_tool,
+                "gateway_tool": safe_gateway_tool,
+                "gateway_tool_digest": _digest(gateway_tool),
                 "downstream_tool_id": downstream_tool_id
                 if isinstance(downstream_tool_id, str)
                 and _TOOL_ID_PATTERN.fullmatch(downstream_tool_id)

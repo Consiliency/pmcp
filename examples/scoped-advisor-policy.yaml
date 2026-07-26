@@ -23,5 +23,9 @@ tools:
     - brightdata::*unlocker*
 resources:
   allowlist: []
+  denylist:
+    - "*"
 prompts:
   allowlist: []
+  denylist:
+    - "*"

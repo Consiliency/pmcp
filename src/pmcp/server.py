@@ -41,6 +41,7 @@ from pmcp.identity import (
     acquire_singleton_lock,
     release_singleton_lock,
 )
+from pmcp.errors import ErrorCode, GatewayException
 from pmcp.manifest.loader import load_manifest
 from pmcp.manifest.refresher import (
     get_cache_path,
@@ -144,6 +145,7 @@ class GatewayServer:
             self._scoped_advisor_audit = ScopedAdvisorAudit(
                 self._audit_jsonl, policy_digest=self._policy_manager.policy_digest
             )
+            self._policy_manager.activate_scoped_advisor()
         self._gateway_tools.set_transport_diagnostics(
             GatewayDiagnosticsInfo(
                 transport="gateway",
@@ -189,6 +191,10 @@ class GatewayServer:
             result=result,
         )
 
+    def _require_scoped_audit(self) -> None:
+        if self._scoped_advisor_audit is not None:
+            self._scoped_advisor_audit.require_available()
+
     def _setup_handlers(self) -> None:
         """Set up MCP request handlers."""
         if self._server is None:
@@ -196,6 +202,7 @@ class GatewayServer:
 
         @self._server.list_tools()
         async def list_tools() -> list[Tool]:
+            self._require_scoped_audit()
             return sorted(
                 (
                     tool
@@ -209,6 +216,7 @@ class GatewayServer:
         async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             try:
                 result: Any
+                self._require_scoped_audit()
 
                 if not self._policy_manager.is_gateway_tool_allowed(name):
                     payload = {
@@ -325,9 +333,15 @@ class GatewayServer:
             except Exception as e:
                 logger.error(f"Tool execution error: {e}")
                 try:
+                    failure_status = (
+                        "denied"
+                        if isinstance(e, GatewayException)
+                        and e.code == ErrorCode.E402_TOOL_DENIED
+                        else "failure"
+                    )
                     self._record_scoped_invocation(
                         gateway_tool=name,
-                        terminal_status="failure",
+                        terminal_status=failure_status,
                         arguments=arguments,
                         result={"error_type": type(e).__name__},
                     )
@@ -354,6 +368,7 @@ class GatewayServer:
         # Resource handlers - proxy from downstream servers + L3 guidance
         @self._server.list_resources()
         async def list_resources() -> list[Resource]:
+            self._require_scoped_audit()
             resources = self._client_manager.get_all_resources()
             # Filter by policy
             allowed_resources = [
@@ -372,7 +387,12 @@ class GatewayServer:
             ]
 
             # Add L3 guidance resource if enabled
-            if self._guidance_config.include_methodology_resource:
+            if (
+                self._guidance_config.include_methodology_resource
+                and self._policy_manager.is_resource_allowed(
+                    "pmcp::pmcp://guidance/code-execution"
+                )
+            ):
                 resource_list.append(
                     Resource(
                         uri=AnyUrl("pmcp://guidance/code-execution"),
@@ -386,11 +406,16 @@ class GatewayServer:
 
         @self._server.read_resource()
         async def read_resource(uri: AnyUrl) -> list[TextResourceContents]:
+            self._require_scoped_audit()
             # Find resource by URI
             uri_str = str(uri)
 
             # Check if it's our L3 guidance resource
             if uri_str == "pmcp://guidance/code-execution":
+                if not self._policy_manager.is_resource_allowed(
+                    "pmcp::pmcp://guidance/code-execution"
+                ):
+                    raise ValueError(f"Resource blocked by policy: {uri_str}")
                 if not self._guidance_config.include_methodology_resource:
                     raise ValueError("Code execution guidance resource is disabled")
 
@@ -440,6 +465,7 @@ class GatewayServer:
         # Prompt handlers - proxy from downstream servers
         @self._server.list_prompts()
         async def list_prompts() -> list[Prompt]:
+            self._require_scoped_audit()
             prompts = self._client_manager.get_all_prompts()
             # Filter by policy
             allowed_prompts = [
@@ -470,6 +496,7 @@ class GatewayServer:
         async def get_prompt(
             name: str, arguments: dict[str, str] | None = None
         ) -> GetPromptResult:
+            self._require_scoped_audit()
             # name is the prompt_id (server::name format)
             # Check policy
             if not self._policy_manager.is_prompt_allowed(name):
@@ -593,7 +620,12 @@ class GatewayServer:
 
         statuses = self._client_manager.get_all_server_statuses()
         online = sum(1 for s in statuses if s.status.value == "online")
-        tools = self._client_manager.get_all_tools()
+        tools = [
+            tool
+            for tool in self._client_manager.get_all_tools()
+            if self._policy_manager.is_server_allowed(tool.server_name)
+            and self._policy_manager.is_tool_allowed(tool.tool_id)
+        ]
 
         logger.info(
             f"Gateway initialized: {online}/{len(statuses)} servers online, {len(tools)} tools indexed"
@@ -602,15 +634,22 @@ class GatewayServer:
         # Generate capability summary for MCP instructions
         # Try pre-built cache first, then LLM, then template
         logger.info("Generating capability summary...")
-        self._capability_summary = await generate_capability_summary(
-            tools,
-            cache=self._descriptions_cache,
-            include_code_guidance=self._guidance_config.include_mcp_instructions,
-            custom_instructions=self._guidance_config.custom_instructions,
-            provisionable_categories=manifest.get_category_summary()
-            if manifest
-            else None,
-        )
+        if self._policy_manager.scoped_advisor_active:
+            self._capability_summary = (
+                "PMCP scoped advisor research: only approved Firecrawl and Bright "
+                "Data tools are available. Use gateway.catalog_search, "
+                "gateway.describe, and correlated gateway.invoke calls."
+            )
+        else:
+            self._capability_summary = await generate_capability_summary(
+                tools,
+                cache=self._descriptions_cache,
+                include_code_guidance=self._guidance_config.include_mcp_instructions,
+                custom_instructions=self._guidance_config.custom_instructions,
+                provisionable_categories=manifest.get_category_summary()
+                if manifest
+                else None,
+            )
 
         # If no cache and we have tools, auto-generate cache for next time
         if not self._descriptions_cache and tools and manifest:

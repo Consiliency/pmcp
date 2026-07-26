@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+import re
 from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -719,7 +720,7 @@ class InvokeInput(BaseModel):
     def _validate_correlation_id(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        if not all(char.isalnum() or char in "._:-" for char in value):
+        if re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", value) is None:
             raise ValueError("correlation IDs may contain only alphanumerics and ._:-")
         return value
 

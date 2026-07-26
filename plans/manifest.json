@@ -809,6 +809,20 @@
             "verification_summary": "PASS - strict policy, control filtering, pre-lazy-start denial, correlated private audit, four isolated stdio instances, capability probe, lint, typecheck, and full suite passed."
           },
           "transition": "completed"
+        },
+        {
+          "at": "2026-07-26T07:24:11Z",
+          "by": "codex-execute-detailed",
+          "metadata": {
+            "acceptance_status": "satisfied_after_panel_reconciliation",
+            "diagnostic": "exact-head review blockers reconciled and complete suite reverified",
+            "full_suite": "2251 passed, 3 skipped, 24 deselected",
+            "panel_reconciliation": "latched audit failure; deny resource and prompt surfaces; ASCII correlations; privacy-safe unknown controls; single-use ledgers; pre-start describe denial; scoped discovery suppression only with active audited session",
+            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
+            "verification_status": "passed",
+            "verification_summary": "PASS - all exact-head Codex and Grok blockers reconciled; lint, format, typecheck, focused compatibility, and full suite passed."
+          },
+          "transition": "completed"
         }
       ],
       "owner_skill": "codex-plan-detailed",
@@ -816,7 +830,7 @@
       "status": "completed",
       "task_summary": "Release fail-closed scoped advisor policy and privacy-safe audit capability for Consiliency/pmcp#103.",
       "type": "detailed",
-      "updated_at": "2026-07-26T06:54:58Z"
+      "updated_at": "2026-07-26T07:24:11Z"
     }
   ],
   "schema_version": 1
