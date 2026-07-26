@@ -115,7 +115,7 @@ def parse_args() -> argparse.Namespace:
 
 Environment overrides:
   PMCP_CONFIG, PMCP_POLICY, PMCP_LOG_LEVEL,
-  PMCP_TRANSPORT, PMCP_HOST, PMCP_PORT, PMCP_LOCK_DIR
+  PMCP_TRANSPORT, PMCP_HOST, PMCP_PORT, PMCP_LOCK_DIR, PMCP_AUDIT_JSONL
 """
 
     parser = argparse.ArgumentParser(
@@ -192,6 +192,12 @@ Environment overrides:
         type=Path,
         default=None,
         help="Directory for singleton lock file. Default: ~/.pmcp (global per-user lock)",
+    )
+    parser.add_argument(
+        "--audit-jsonl",
+        type=Path,
+        default=None,
+        help="Explicit scoped-advisor JSONL audit sink. Also read from PMCP_AUDIT_JSONL.",
     )
     parser.add_argument(
         "--auth-token",
@@ -456,6 +462,12 @@ Environment overrides:
         action="store_true",
         help="Overwrite existing configuration",
     )
+
+    capabilities_parser = subparsers.add_parser(
+        "capabilities",
+        help="Print machine-readable PMCP capability/version metadata",
+    )
+    capabilities_parser.add_argument("--json", action="store_true")
 
     # Setup command
     setup_parser = subparsers.add_parser(
@@ -2108,6 +2120,8 @@ async def run_server(args: argparse.Namespace) -> None:
         args.config = Path(os.environ["PMCP_CONFIG"])
     if not args.policy and os.environ.get("PMCP_POLICY"):
         args.policy = Path(os.environ["PMCP_POLICY"])
+    if not getattr(args, "audit_jsonl", None) and os.environ.get("PMCP_AUDIT_JSONL"):
+        args.audit_jsonl = Path(os.environ["PMCP_AUDIT_JSONL"])
     if os.environ.get("PMCP_LOG_LEVEL"):
         args.log_level = os.environ["PMCP_LOG_LEVEL"]
 
@@ -2213,6 +2227,7 @@ async def run_server(args: argparse.Namespace) -> None:
         host=args.host,
         port=args.port,
         lock_dir=lock_dir,
+        audit_jsonl=getattr(args, "audit_jsonl", None),
         auth_token=getattr(args, "auth_token", None),
         max_concurrent_spawns=getattr(args, "max_concurrent_spawns", 8),
         rate_limit_rpm=getattr(args, "rate_limit", 0),
@@ -2319,6 +2334,34 @@ def run_guidance(args: argparse.Namespace) -> None:
     print("To change configuration:")
     print("  Edit ~/.claude/gateway-guidance.yaml")
     print("  Or set level: off | minimal | standard")
+
+
+def run_capabilities(args: argparse.Namespace) -> None:
+    """Print the installed capability contract for fail-closed consumers."""
+    from pmcp.scoped_advisor_audit import SCOPED_ADVISOR_AUDIT_CAPABILITY
+
+    payload: dict[str, Any] = {
+        "pmcp_version": importlib.metadata.version("pmcp"),
+        "capabilities": [
+            {
+                "name": SCOPED_ADVISOR_AUDIT_CAPABILITY,
+                "activation_requires": [
+                    "explicit_policy",
+                    "gateway_tool_filtering",
+                    "typed_correlations",
+                    "explicit_audit_jsonl",
+                    "unique_lock_dir",
+                    "terminal_completion_fsync",
+                ],
+            }
+        ],
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(f"pmcp {payload['pmcp_version']}")
+        for capability in payload["capabilities"]:
+            print(capability["name"])
 
 
 def _build_gateway_auth_client(args: argparse.Namespace) -> tuple[Any, Any]:
@@ -2526,6 +2569,8 @@ async def async_main(args: argparse.Namespace) -> None:
         run_config(args)  # Synchronous command
     elif args.command == "guidance":
         run_guidance(args)  # Synchronous command
+    elif args.command == "capabilities":
+        run_capabilities(args)  # Synchronous command
     elif args.command == "doctor":
         await run_doctor(args)
     elif args.command == "upgrade":

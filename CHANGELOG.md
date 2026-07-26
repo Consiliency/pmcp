@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.20.0] - 2026-07-26
+
+### Security
+- Add the fail-closed `scoped_advisor_audit.v1` profile for isolated advisor
+  research. Explicit policy failures now terminate startup, gateway-owned tools
+  are filtered in discovery and dispatch, and the shipped profile exposes only
+  health, catalog search, describe, and invoke controls over approved Firecrawl
+  and Bright Data research patterns.
+- Add typed run/seat/evidence correlations and an explicit JSONL audit sink with
+  privacy-safe source/result digests, contiguous sequence/count validation, and
+  exactly one fsynced terminal marker. Raw URLs, queries, arguments,
+  credentials, and result bodies are not written to the audit. (Consiliency/pmcp#103)
+
+### Added
+- `pmcp capabilities --json`, `--audit-jsonl`, and `PMCP_AUDIT_JSONL` expose the
+  released feature contract required by Consiliency/agent-harness#310.
+
 ## [1.19.4] - 2026-07-18
 
 ### Changed

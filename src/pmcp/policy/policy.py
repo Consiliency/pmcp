@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import json
 import logging
 import re
@@ -41,19 +42,20 @@ class PolicyManager:
     def __init__(self, policy_path: Path | None = None) -> None:
         self._policy = GatewayPolicy()
         self._redaction_regexes: list[re.Pattern[str]] = []
+        self._explicit_policy = policy_path is not None
 
         if policy_path:
-            self._load_policy(policy_path)
+            self._load_policy(policy_path, fatal=True)
         else:
             # Try default locations
             for default_path in DEFAULT_POLICY_PATHS:
                 if default_path.exists():
-                    self._load_policy(default_path)
+                    self._load_policy(default_path, fatal=False)
                     break
 
         self._compile_redaction_patterns()
 
-    def _load_policy(self, policy_path: Path) -> None:
+    def _load_policy(self, policy_path: Path, *, fatal: bool) -> None:
         """Load policy from file."""
         try:
             content = policy_path.read_text()
@@ -63,10 +65,15 @@ class PolicyManager:
             else:
                 data = json.loads(content)
 
-            if data:
-                self._policy = GatewayPolicy.model_validate(data)
+            if not isinstance(data, dict):
+                raise ValueError("policy root must be an object")
+            self._policy = GatewayPolicy.model_validate(data)
             logger.info(f"Loaded policy from {policy_path}")
         except Exception as e:
+            if fatal:
+                raise ValueError(
+                    f"Failed to load explicit policy {policy_path}: {e}"
+                ) from e
             logger.warning(f"Failed to load policy from {policy_path}: {e}")
 
     def _compile_redaction_patterns(self) -> None:
@@ -122,6 +129,59 @@ class PolicyManager:
             return self._matches_any(tool_id, allowlist)
 
         return True
+
+    def is_gateway_tool_allowed(self, tool_name: str) -> bool:
+        """Check a PMCP-owned gateway control against the explicit policy."""
+        denylist = self._policy.gateway_tools.denylist
+        allowlist = self._policy.gateway_tools.allowlist
+        if denylist and self._matches_any(tool_name, denylist):
+            return False
+        if allowlist:
+            return self._matches_any(tool_name, allowlist)
+        return True
+
+    @property
+    def explicit_policy(self) -> bool:
+        return self._explicit_policy
+
+    @property
+    def policy_digest(self) -> str:
+        payload = self._policy.model_dump_json(exclude_none=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def is_scoped_advisor_policy(self) -> bool:
+        """Return whether the loaded policy is the exact safe advisor profile."""
+        required_controls = {
+            "gateway.health",
+            "gateway.catalog_search",
+            "gateway.describe",
+            "gateway.invoke",
+        }
+        if not self._explicit_policy:
+            return False
+        if set(self._policy.gateway_tools.allowlist) != required_controls:
+            return False
+        if self._policy.gateway_tools.denylist:
+            return False
+        if set(self._policy.servers.allowlist) != {"firecrawl", "brightdata"}:
+            return False
+        if self._policy.servers.denylist or self._policy.tools.denylist:
+            return False
+        allowed_patterns = {
+            "firecrawl::*search*",
+            "firecrawl::*scrape*",
+            "firecrawl::*crawl*",
+            "firecrawl::*map*",
+            "firecrawl::*extract*",
+            "brightdata::*search*",
+            "brightdata::*scrape*",
+            "brightdata::*crawl*",
+            "brightdata::*query*",
+            "brightdata::*fetch*",
+            "brightdata::*unlocker*",
+        }
+        configured = set(self._policy.tools.allowlist)
+        return bool(configured) and configured <= allowed_patterns
 
     def is_resource_allowed(self, resource_id: str) -> bool:
         """Check if resource is allowed by policy.

@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from pmcp.validation import is_valid_package_name
 
@@ -118,6 +118,8 @@ class GatewayDiagnosticsInfo(BaseModel):
     header_compatibility: dict[str, str] = Field(default_factory=dict)
     session_compatibility: dict[str, str] = Field(default_factory=dict)
     auth_metadata_present: bool = False
+    capabilities: list[str] = Field(default_factory=list)
+    policy_digest: str | None = None
     rate_limit_enabled: bool = False
     rate_limit_rpm: int | None = None
     auth_state_semantics: dict[AuthState, AuthStateSemanticsInfo] = Field(
@@ -708,6 +710,33 @@ class InvokeInput(BaseModel):
     options: InvokeOptions | None = None
     trace_context: TraceContextInfo | None = None
     meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+    run_correlation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    seat_correlation_id: str | None = Field(default=None, min_length=1, max_length=128)
+    evidence_label_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("run_correlation_id", "seat_correlation_id")
+    @classmethod
+    def _validate_correlation_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not all(char.isalnum() or char in "._:-" for char in value):
+            raise ValueError("correlation IDs may contain only alphanumerics and ._:-")
+        return value
+
+    @model_validator(mode="after")
+    def _reject_partial_scoped_correlation(self) -> "InvokeInput":
+        values = (
+            self.run_correlation_id,
+            self.seat_correlation_id,
+            self.evidence_label_digest,
+        )
+        if any(value is not None for value in values) and not all(
+            value is not None for value in values
+        ):
+            raise ValueError(
+                "scoped advisor correlation fields must be supplied together"
+            )
+        return self
 
 
 class InvokeOutput(BaseModel):
@@ -890,12 +919,16 @@ class ServerPolicy(BaseModel):
     allowlist: list[str] = Field(default_factory=list)
     denylist: list[str] = Field(default_factory=list)
 
+    model_config = ConfigDict(extra="forbid")
+
 
 class ToolPolicy(BaseModel):
     """Tool allow/deny policy."""
 
     allowlist: list[str] = Field(default_factory=list)  # Glob patterns
     denylist: list[str] = Field(default_factory=list)  # Glob patterns
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class ResourcePolicy(BaseModel):
@@ -904,12 +937,16 @@ class ResourcePolicy(BaseModel):
     allowlist: list[str] = Field(default_factory=list)  # Glob patterns (server::uri)
     denylist: list[str] = Field(default_factory=list)  # Glob patterns
 
+    model_config = ConfigDict(extra="forbid")
+
 
 class PromptPolicy(BaseModel):
     """Prompt allow/deny policy."""
 
     allowlist: list[str] = Field(default_factory=list)  # Glob patterns (server::name)
     denylist: list[str] = Field(default_factory=list)  # Glob patterns
+
+    model_config = ConfigDict(extra="forbid")
 
 
 class LimitsPolicy(BaseModel):
@@ -919,22 +956,29 @@ class LimitsPolicy(BaseModel):
     max_output_bytes: int = 50000  # 50KB
     max_output_tokens: int = 4000
 
+    model_config = ConfigDict(extra="forbid")
+
 
 class RedactionPolicy(BaseModel):
     """Secret redaction policy."""
 
     patterns: list[str] = Field(default_factory=list)  # Regex patterns
 
+    model_config = ConfigDict(extra="forbid")
+
 
 class GatewayPolicy(BaseModel):
     """Complete gateway policy."""
 
     servers: ServerPolicy = Field(default_factory=ServerPolicy)
+    gateway_tools: ToolPolicy = Field(default_factory=ToolPolicy)
     tools: ToolPolicy = Field(default_factory=ToolPolicy)
     resources: ResourcePolicy = Field(default_factory=ResourcePolicy)
     prompts: PromptPolicy = Field(default_factory=PromptPolicy)
     limits: LimitsPolicy = Field(default_factory=LimitsPolicy)
     redaction: RedactionPolicy = Field(default_factory=RedactionPolicy)
+
+    model_config = ConfigDict(extra="forbid")
 
 
 # === Capability Request Types ===

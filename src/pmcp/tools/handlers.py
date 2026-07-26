@@ -356,6 +356,19 @@ def get_gateway_tool_definitions() -> list[Tool]:
                         "type": "object",
                         "description": "Arguments to pass to the tool (must match tool schema)",
                     },
+                    "run_correlation_id": {
+                        "type": "string",
+                        "description": "Scoped-advisor run correlation ID",
+                    },
+                    "seat_correlation_id": {
+                        "type": "string",
+                        "description": "Scoped-advisor seat correlation ID",
+                    },
+                    "evidence_label_digest": {
+                        "type": "string",
+                        "pattern": "^[0-9a-f]{64}$",
+                        "description": "SHA-256 digest of the caller evidence label",
+                    },
                     "options": {
                         "type": "object",
                         "properties": {
@@ -1713,6 +1726,36 @@ class GatewayTools:
         trace_context = self._extract_trace_context(input_data)
         parsed = InvokeInput.model_validate(input_data)
 
+        # Policy denial must happen before registry lookup or lazy-start so an
+        # out-of-scope server cannot be started as a side effect of inspection.
+        if not self._policy_manager.is_tool_allowed(parsed.tool_id):
+            server_name = parsed.tool_id.split("::", 1)[0]
+            error = make_error(
+                ErrorCode.E402_TOOL_DENIED,
+                tool_id=parsed.tool_id,
+            )
+            self._audit(
+                method="gateway.invoke",
+                action="invoke",
+                outcome="refused",
+                started_at=audit_started_at,
+                server_name=server_name,
+                tool_id=parsed.tool_id,
+                auth_state="policy_denied",
+                auth_event="policy_denied",
+                error=error.message,
+                trace_context=trace_context,
+            )
+            return InvokeOutput(
+                tool_id=parsed.tool_id,
+                ok=False,
+                truncated=False,
+                raw_size_estimate=0,
+                errors=[error.model_dump_json()],
+                auth_state="policy_denied",
+                feedback_hint=self._feedback_hint(),
+            )
+
         # Check if tool exists in registry
         tool_info = self._client_manager.get_tool(parsed.tool_id)
 
@@ -1787,35 +1830,6 @@ class GatewayTools:
                     errors=[error.model_dump_json()],
                     feedback_hint=self._feedback_hint(),
                 )
-
-        # Check policy
-        if not self._policy_manager.is_tool_allowed(parsed.tool_id):
-            error = make_error(
-                ErrorCode.E402_TOOL_DENIED,
-                tool_id=parsed.tool_id,
-            )
-            self._audit(
-                method="gateway.invoke",
-                action="invoke",
-                outcome="refused",
-                started_at=audit_started_at,
-                server_name=tool_info.server_name,
-                tool_id=parsed.tool_id,
-                protocol_version=self._protocol_version(tool_info.server_name),
-                auth_state="policy_denied",
-                auth_event="policy_denied",
-                error=error.message,
-                trace_context=trace_context,
-            )
-            return InvokeOutput(
-                tool_id=parsed.tool_id,
-                ok=False,
-                truncated=False,
-                raw_size_estimate=0,
-                errors=[error.model_dump_json()],
-                auth_state="policy_denied",
-                feedback_hint=self._feedback_hint(),
-            )
 
         # Pre-dispatch: validate required arguments
         required = (tool_info.input_schema or {}).get("required", [])

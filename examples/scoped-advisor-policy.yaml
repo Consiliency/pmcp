@@ -1,0 +1,27 @@
+servers:
+  allowlist:
+    - firecrawl
+    - brightdata
+gateway_tools:
+  allowlist:
+    - gateway.health
+    - gateway.catalog_search
+    - gateway.describe
+    - gateway.invoke
+tools:
+  allowlist:
+    - firecrawl::*search*
+    - firecrawl::*scrape*
+    - firecrawl::*crawl*
+    - firecrawl::*map*
+    - firecrawl::*extract*
+    - brightdata::*search*
+    - brightdata::*scrape*
+    - brightdata::*crawl*
+    - brightdata::*query*
+    - brightdata::*fetch*
+    - brightdata::*unlocker*
+resources:
+  allowlist: []
+prompts:
+  allowlist: []

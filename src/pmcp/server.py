@@ -48,9 +48,20 @@ from pmcp.manifest.refresher import (
     refresh_all,
 )
 from pmcp.policy.policy import PolicyManager
+from pmcp.scoped_advisor_audit import (
+    SCOPED_ADVISOR_AUDIT_CAPABILITY,
+    ScopedAdvisorAudit,
+    ScopedAdvisorAuditError,
+)
 from pmcp.summary import generate_capability_summary
 from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
-from pmcp.types import DescriptionsCache, LocalMcpServerConfig, ResolvedServerConfig
+from pmcp.types import (
+    DescriptionsCache,
+    GatewayDiagnosticsInfo,
+    InvokeInput,
+    LocalMcpServerConfig,
+    ResolvedServerConfig,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +79,7 @@ class GatewayServer:
         host: str = "127.0.0.1",
         port: int = 3344,
         lock_dir: Path | str | None = None,
+        audit_jsonl: Path | str | None = None,
         auth_token: str | None = None,
         max_concurrent_spawns: int = 8,
         rate_limit_rpm: int = 0,
@@ -99,6 +111,13 @@ class GatewayServer:
 
         # Initialize policy manager
         self._policy_manager = PolicyManager(policy_path)
+        self._scoped_advisor_audit: ScopedAdvisorAudit | None = None
+        self._audit_jsonl = Path(audit_jsonl) if audit_jsonl is not None else None
+        if audit_jsonl is not None:
+            if not self._policy_manager.is_scoped_advisor_policy():
+                raise ValueError(
+                    "--audit-jsonl requires the exact explicit scoped-advisor policy"
+                )
 
         # Initialize guidance config
         self._guidance_config: GuidanceConfig = load_guidance_config(
@@ -121,6 +140,25 @@ class GatewayServer:
             custom_config_path=custom_config_path,
             guidance_config=self._guidance_config,
         )
+        if self._audit_jsonl is not None:
+            self._scoped_advisor_audit = ScopedAdvisorAudit(
+                self._audit_jsonl, policy_digest=self._policy_manager.policy_digest
+            )
+        self._gateway_tools.set_transport_diagnostics(
+            GatewayDiagnosticsInfo(
+                transport="gateway",
+                capabilities=(
+                    [SCOPED_ADVISOR_AUDIT_CAPABILITY]
+                    if self._scoped_advisor_audit is not None
+                    else []
+                ),
+                policy_digest=(
+                    self._policy_manager.policy_digest
+                    if self._scoped_advisor_audit is not None
+                    else None
+                ),
+            )
+        )
 
         # Server will be created after initialization with capability summary
         self._server: Server | None = None
@@ -134,6 +172,23 @@ class GatewayServer:
         self._server = Server("mcp-gateway", instructions=instructions)
         self._setup_handlers()
 
+    def _record_scoped_invocation(
+        self,
+        *,
+        gateway_tool: str,
+        terminal_status: str,
+        arguments: dict[str, Any] | None,
+        result: Any,
+    ) -> None:
+        if self._scoped_advisor_audit is None:
+            return
+        self._scoped_advisor_audit.record_invocation(
+            gateway_tool=gateway_tool,
+            terminal_status=terminal_status,
+            arguments=arguments,
+            result=result,
+        )
+
     def _setup_handlers(self) -> None:
         """Set up MCP request handlers."""
         if self._server is None:
@@ -141,12 +196,41 @@ class GatewayServer:
 
         @self._server.list_tools()
         async def list_tools() -> list[Tool]:
-            return sorted(get_gateway_tool_definitions(), key=lambda tool: tool.name)
+            return sorted(
+                (
+                    tool
+                    for tool in get_gateway_tool_definitions()
+                    if self._policy_manager.is_gateway_tool_allowed(tool.name)
+                ),
+                key=lambda tool: tool.name,
+            )
 
         @self._server.call_tool()
         async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
             try:
                 result: Any
+
+                if not self._policy_manager.is_gateway_tool_allowed(name):
+                    payload = {
+                        "error": True,
+                        "message": f"Gateway tool blocked by policy: {name}",
+                    }
+                    self._record_scoped_invocation(
+                        gateway_tool=name,
+                        terminal_status="denied",
+                        arguments=arguments,
+                        result=payload,
+                    )
+                    return [
+                        TextContent(type="text", text=json.dumps(payload, indent=2))
+                    ]
+
+                if self._scoped_advisor_audit is not None and name == "gateway.invoke":
+                    scoped_input = InvokeInput.model_validate(arguments)
+                    if scoped_input.run_correlation_id is None:
+                        raise ValueError(
+                            "scoped advisor invoke requires run, seat, and evidence correlations"
+                        )
 
                 if name == "gateway.catalog_search":
                     result = await self._gateway_tools.catalog_search(arguments)
@@ -209,10 +293,57 @@ class GatewayServer:
                 if hasattr(result, "model_dump"):
                     result = result.model_dump()
 
+                terminal_status = "success"
+                if isinstance(result, dict) and result.get("ok") is False:
+                    terminal_status = (
+                        "denied"
+                        if result.get("auth_state") == "policy_denied"
+                        else "failure"
+                    )
+                self._record_scoped_invocation(
+                    gateway_tool=name,
+                    terminal_status=terminal_status,
+                    arguments=arguments,
+                    result=result,
+                )
+
                 return [TextContent(type="text", text=json.dumps(result, indent=2))]
 
+            except ScopedAdvisorAuditError:
+                logger.error("Scoped advisor audit channel failed")
+                return [
+                    TextContent(
+                        type="text",
+                        text=json.dumps(
+                            {
+                                "error": True,
+                                "message": "Scoped advisor audit channel failed",
+                            }
+                        ),
+                    )
+                ]
             except Exception as e:
                 logger.error(f"Tool execution error: {e}")
+                try:
+                    self._record_scoped_invocation(
+                        gateway_tool=name,
+                        terminal_status="failure",
+                        arguments=arguments,
+                        result={"error_type": type(e).__name__},
+                    )
+                except ScopedAdvisorAuditError:
+                    logger.error("Scoped advisor audit channel failed")
+                    return [
+                        TextContent(
+                            type="text",
+                            text=json.dumps(
+                                {
+                                    "error": True,
+                                    "message": "Scoped advisor audit channel failed",
+                                }
+                            ),
+                        )
+                    ]
                 return [
                     TextContent(
                         type="text",
@@ -576,18 +707,20 @@ class GatewayServer:
         # Acquire singleton lock to prevent multiple gateway instances
         # Uses self._lock_dir (None = global lock at ~/.pmcp)
         if not acquire_singleton_lock(self._lock_dir):
+            if self._scoped_advisor_audit is not None:
+                self._scoped_advisor_audit.complete()
             logger.error(
                 "Another gateway instance is already running. "
                 "Only one gateway should run at a time to prevent recursive spawning."
             )
             raise RuntimeError("Another gateway instance is already running")
 
-        await self.initialize()
-
-        if self._server is None:
-            raise RuntimeError("Server not initialized after initialization")
-
         try:
+            await self.initialize()
+
+            if self._server is None:
+                raise RuntimeError("Server not initialized after initialization")
+
             async with stdio_server() as (read_stream, write_stream):
                 logger.info("MCP Gateway server started (stdio)")
                 await self._server.run(
@@ -607,18 +740,20 @@ class GatewayServer:
         # Acquire singleton lock to prevent multiple gateway instances
         # Uses self._lock_dir (None = global lock at ~/.pmcp)
         if not acquire_singleton_lock(self._lock_dir):
+            if self._scoped_advisor_audit is not None:
+                self._scoped_advisor_audit.complete()
             logger.error(
                 "Another gateway instance is already running. "
                 "Only one gateway should run at a time to prevent recursive spawning."
             )
             raise RuntimeError("Another gateway instance is already running")
 
-        await self.initialize()
-
-        if self._server is None:
-            raise RuntimeError("Server not initialized after initialization")
-
         try:
+            await self.initialize()
+
+            if self._server is None:
+                raise RuntimeError("Server not initialized after initialization")
+
             app = create_http_app(
                 self._server,
                 auth_token=self._auth_token,
@@ -659,4 +794,6 @@ class GatewayServer:
         finally:
             # Always release singleton lock
             release_singleton_lock()
+            if self._scoped_advisor_audit is not None:
+                self._scoped_advisor_audit.complete()
         logger.info("MCP Gateway shut down")
