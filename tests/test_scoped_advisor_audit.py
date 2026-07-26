@@ -179,6 +179,16 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
     assert resources.root.resources == []
     assert prompts.root.prompts == []
 
+    async def fail_registry_discovery(*args, **kwargs):
+        raise AssertionError("scoped catalog attempted registry discovery")
+
+    server._gateway_tools._registry_candidates_for_query = fail_registry_discovery  # type: ignore[method-assign]
+    server._gateway_tools._stale_check_cache["firecrawl"] = (
+        time.time(),
+        "1.0.0",
+        "2.0.0",
+    )
+
     catalog = await call_handler(
         CallToolRequest(
             params={
@@ -194,6 +204,7 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
     assert catalog_payload["cli_hints"] == []
     assert catalog_payload["registry_candidates"] == []
     assert catalog_payload["manifest_candidates"] == []
+    assert catalog_payload["stale_updates"] is None
 
     invoked = await call_handler(
         CallToolRequest(

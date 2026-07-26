@@ -1535,7 +1535,7 @@ class GatewayTools:
 
         # Apply limit
         registry_candidates: list[CapabilityCandidate] = []
-        if parsed.query:
+        if parsed.query and not scoped_advisor:
             registry_candidates = await self._registry_candidates_for_query(
                 parsed.query, limit=min(5, parsed.limit)
             )
@@ -1587,7 +1587,7 @@ class GatewayTools:
 
         # Collect stale-update notices from precomputed cache (no network call)
         stale_updates: list[str] | None = None
-        if self._stale_check_cache:
+        if self._stale_check_cache and not scoped_advisor:
             stale = [
                 f"Update available for '{sn}': {current} -> {latest}. "
                 f"Call gateway.update_server(server_name='{sn}') to update."

@@ -823,6 +823,20 @@
             "verification_summary": "PASS - all exact-head Codex and Grok blockers reconciled; lint, format, typecheck, focused compatibility, and full suite passed."
           },
           "transition": "completed"
+        },
+        {
+          "at": "2026-07-26T07:52:23Z",
+          "by": "codex-execute-detailed",
+          "metadata": {
+            "acceptance_status": "satisfied_after_second_panel_reconciliation",
+            "diagnostic": "Grok exact-head discovery finding reproduced and closed",
+            "focused_suite": "195 passed",
+            "full_suite": "2251 passed, 3 skipped, 24 deselected",
+            "panel_reconciliation": "audited scoped catalog now suppresses registry candidates and stale update notices; adversarial injected-result regression added",
+            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
+            "verification_status": "passed"
+          },
+          "transition": "completed"
         }
       ],
       "owner_skill": "codex-plan-detailed",
@@ -830,7 +844,7 @@
       "status": "completed",
       "task_summary": "Release fail-closed scoped advisor policy and privacy-safe audit capability for Consiliency/pmcp#103.",
       "type": "detailed",
-      "updated_at": "2026-07-26T07:24:11Z"
+      "updated_at": "2026-07-26T07:52:23Z"
     }
   ],
   "schema_version": 1
