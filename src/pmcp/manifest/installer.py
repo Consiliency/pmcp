@@ -517,8 +517,15 @@ def build_install_child_env(server_config: ServerConfig) -> dict[str, str]:
     receive its ``env_var`` at spawn time it starts without its credential. The
     gateway's own ``os.environ`` only holds the namespaced storage key after
     ``auth_connect``, so a bare inherited environment would omit the runtime var.
+
+    Also applies the server's declared ``extra_env`` — non-secret vars such as a
+    base URL selecting a self-hosted deployment. Without this, the only way to
+    reach a non-default endpoint is to start the whole gateway with the variable
+    already exported, which is process-global and invisible to the manifest.
     """
-    own_env: dict[str, str] = {}
+    # Declared non-secret vars first (e.g. a self-hosted base URL), so the
+    # credential resolved below always wins if the two name the same key.
+    own_env: dict[str, str] = dict(getattr(server_config, "extra_env", {}) or {})
     env_var = server_config.env_var
     if env_var:
         for key in credential_lookup_keys(server_config):
