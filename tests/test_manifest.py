@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -29,6 +30,7 @@ from pmcp.manifest.loader import (
     CLIAlternative,
     Manifest,
     ServerConfig,
+    _parse_server_config,
     load_manifest,
 )
 from pmcp.manifest.matcher import (
@@ -1170,6 +1172,99 @@ def test_build_install_child_env_legacy_fallback(monkeypatch: pytest.MonkeyPatch
 
     env = build_install_child_env(_brightdata_config())
     assert env["API_TOKEN"] == "legacy-token"
+
+
+def _self_hosted_firecrawl_config(**overrides: Any) -> ServerConfig:
+    """A server pointed at a self-hosted deployment via a non-secret base URL."""
+    kwargs: dict[str, Any] = dict(
+        name="firecrawl",
+        description="Firecrawl",
+        keywords=["firecrawl"],
+        install={"linux": ["npx", "-y", "firecrawl-mcp"]},
+        command="npx",
+        args=["-y", "firecrawl-mcp"],
+        requires_api_key=True,
+        env_var="FIRECRAWL_API_KEY",
+        extra_env={"FIRECRAWL_API_URL": "http://firecrawl.internal:3002"},
+    )
+    kwargs.update(overrides)
+    return ServerConfig(**kwargs)
+
+
+def test_build_install_child_env_applies_extra_env(monkeypatch: pytest.MonkeyPatch):
+    """A declared non-secret var reaches the spawned server, so a self-hosted
+    endpoint no longer requires exporting it into the whole gateway."""
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "fc-key")
+
+    env = build_install_child_env(_self_hosted_firecrawl_config())
+    assert env["FIRECRAWL_API_URL"] == "http://firecrawl.internal:3002"
+    assert env["FIRECRAWL_API_KEY"] == "fc-key"
+
+
+def test_build_install_child_env_extra_env_does_not_shadow_credential(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """extra_env must never override the resolved credential: a manifest typo
+    naming the credential key would otherwise silently replace the real secret
+    with a literal from version control."""
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "real-secret")
+
+    config = _self_hosted_firecrawl_config(
+        extra_env={"FIRECRAWL_API_KEY": "placeholder-from-yaml"}
+    )
+    env = build_install_child_env(config)
+    assert env["FIRECRAWL_API_KEY"] == "real-secret"
+
+
+def test_build_install_child_env_extra_env_without_credential(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A no-auth self-hosted endpoint still gets its URL when no credential is
+    stored, rather than the var being dropped along with the missing secret."""
+    monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+
+    env = build_install_child_env(_self_hosted_firecrawl_config())
+    assert env["FIRECRAWL_API_URL"] == "http://firecrawl.internal:3002"
+    assert "FIRECRAWL_API_KEY" not in env
+
+
+def test_parse_extra_env_coerces_scalars_and_skips_bad_entries():
+    """YAML scalars are usable unquoted; unusable entries are dropped rather
+    than costing the whole server entry."""
+    config = _parse_server_config(
+        "demo",
+        {
+            "command": "npx",
+            "extra_env": {
+                "PORT": 3002,
+                "RATIO": 1.5,
+                "DEBUG": True,
+                "OFF": False,
+                "URL": "http://example.internal",
+                "BAD": {"nested": "mapping"},
+            },
+        },
+    )
+    assert config.extra_env == {
+        "PORT": "3002",
+        "RATIO": "1.5",
+        "DEBUG": "true",
+        "OFF": "false",
+        "URL": "http://example.internal",
+    }
+
+
+@pytest.mark.parametrize("raw", ["not-a-mapping", ["a", "b"], 42])
+def test_parse_extra_env_rejects_non_mappings(raw: Any):
+    """A malformed extra_env is ignored, not raised, so it cannot drop a server."""
+    config = _parse_server_config("demo", {"command": "npx", "extra_env": raw})
+    assert config.extra_env == {}
+
+
+def test_server_without_extra_env_defaults_empty():
+    """Every existing manifest entry omits extra_env; it must default to empty."""
+    config = _parse_server_config("demo", {"command": "npx"})
+    assert config.extra_env == {}
 
 
 def test_build_install_child_env_absent_credential_no_injection(

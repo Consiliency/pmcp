@@ -54,6 +54,11 @@ class ServerConfig:
     # servers sharing that runtime name do not collide in the flat secret store.
     secret_key: str | None = None
     env_instructions: str | None = None
+    # Non-secret environment variables passed to the server process alongside its
+    # credential — typically a base URL selecting a self-hosted deployment (e.g.
+    # FIRECRAWL_API_URL). Secrets belong in env_var/secret_key, which are resolved
+    # from the env store and always win over a colliding extra_env key.
+    extra_env: dict[str, str] = field(default_factory=dict)
     auto_start: bool = False
     transport: ServerTransport = "local"
     url: str | None = None
@@ -347,6 +352,37 @@ def _parse_cli_alternative(name: str, data: dict[str, Any]) -> CLIAlternative:
     )
 
 
+def _parse_extra_env(name: str, raw: Any) -> dict[str, str]:
+    """Parse a server's ``extra_env`` mapping, fail-soft.
+
+    Non-mappings and unusable entries are dropped with a warning rather than
+    raising, so one bad key never costs the whole server entry. YAML scalars are
+    coerced to ``str`` because values such as a port or a boolean flag are
+    naturally written unquoted.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning(f"Ignoring 'extra_env' for server '{name}': not a mapping")
+        return {}
+
+    parsed: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(key, str) or not key:
+            logger.warning(f"Skipping non-string 'extra_env' key for server '{name}'")
+            continue
+        if isinstance(value, bool):
+            parsed[key] = "true" if value else "false"
+        elif isinstance(value, (str, int, float)):
+            parsed[key] = str(value)
+        else:
+            logger.warning(
+                f"Skipping 'extra_env' key '{key}' for server '{name}': "
+                f"unsupported value type {type(value).__name__}"
+            )
+    return parsed
+
+
 def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
     """Parse a server config from raw YAML data."""
     install_data = data.get("install", {})
@@ -360,6 +396,8 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         ServerTransport,
         data.get("transport", "streamable-http" if data.get("url") else "local"),
     )
+
+    extra_env = _parse_extra_env(name, data.get("extra_env"))
 
     raw_discovery_metadata = data.get("discovery_metadata", {})
     if not isinstance(raw_discovery_metadata, dict):
@@ -379,6 +417,7 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         env_var=data.get("env_var"),
         secret_key=data.get("secret_key"),
         env_instructions=data.get("env_instructions"),
+        extra_env=extra_env,
         auto_start=data.get("auto_start", False),
         transport=transport,
         url=data.get("url"),
