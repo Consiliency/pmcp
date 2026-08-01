@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.0] - 2026-08-01
+
 ### Added
 - **Non-secret server environment variables (`extra_env`).** A manifest server
   entry can now declare environment variables beyond its single credential —
@@ -14,7 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   way to reach a non-default endpoint was to start the whole gateway with the
   variable pre-exported, which is process-global and invisible to the manifest.
   Values are non-secret by design; credentials stay in `env_var`/`secret_key`
-  and always win over a colliding `extra_env` key. (#108)
+  and always win over a colliding `extra_env` key. Applied on **every** server
+  spawn path — install-and-run, restart, refresh, lazy reconnect, and lifecycle
+  connect — so a self-hosted endpoint survives a gateway restart rather than
+  silently reverting to the vendor default. A configured `.mcp.json` entry that
+  duplicates a manifest server inherits it too, with any value that config sets
+  explicitly winning as a genuine user override. (#108, #109)
 - **Per-host overlay patching (`server_env`).** A private overlay
   (`~/.pmcp/manifest.yaml`, `<project>/.pmcp/manifest.yaml`,
   `$PMCP_MANIFEST_PATH`) can patch `extra_env` on an existing server without
@@ -23,18 +30,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a copy that would silently shadow later upstream fixes. `servers:` keeps its
   whole-entry-replace semantics unchanged; a patch naming an unknown server
   warns and is skipped rather than creating one. (#105)
-
-### Fixed
-- **`extra_env` is now applied on every server spawn path, not just
-  install-and-run.** `_manifest_server_to_config` built the runtime environment
-  from the credential alone, so a server picked up its declared non-secret
-  variables on first provision (which builds its own child environment) and then
-  silently lost them on every restart, refresh, lazy reconnect, and lifecycle
-  connect — falling back to the vendor default endpoint with no error. A
-  configured `.mcp.json` entry duplicating a manifest server likewise discarded
-  them; it now inherits `extra_env`, with any value the config sets explicitly
-  winning as a genuine user override. Credentials continue to take precedence
-  over a colliding `extra_env` key on both paths. (#109)
+- **`blacksmith` CLI alternative.** Agents now discover the Blacksmith CLI
+  (Testbox, job history, log search, CI usage) instead of looking for an MCP
+  server — Blacksmith publishes none, and its CLI is the supported agent
+  surface. (#106, #107)
 
 ## [1.20.0] - 2026-07-26
 
