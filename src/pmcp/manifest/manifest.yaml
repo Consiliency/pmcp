@@ -98,14 +98,19 @@ cli_alternatives:
   # is the supported agent surface ("agent-first ... the intended consumer is a
   # coding agent"), so it belongs here rather than under servers:.
   blacksmith:
-    keywords: [blacksmith, testbox, github actions, ci runner, ci analytics, flaky tests]
+    keywords: [blacksmith, testbox, github actions, ci runner, ci analytics,
+      flaky tests, job logs, log search, test timings, ci cost, billing, runner skus]
     check_command: ["blacksmith", "--version"]
     help_command: ["blacksmith", "--help"]
-    description: "Blacksmith CI runners and Testbox CLI"
+    description: "Blacksmith CI runners, Testbox, and CI analytics CLI"
+    # Capped at 4 by test_packaged_cli_alternatives_have_compact_examples, so
+    # these cover one capability each: job history, test timings, log search,
+    # testbox. Cost/runner-SKU discovery rides on the keywords instead.
     examples:
+      - "blacksmith jobs list"
+      - "blacksmith jobs tests <job_id>"
+      - "blacksmith logs search --query 'level:error' --since 24h"
       - "blacksmith testbox status"
-      - "blacksmith testbox warmup <workflow>"
-      - "blacksmith testbox run --id <id> \"<command>\""
     prefer_mcp_for: [github issues, pull requests, github api]
 
   curl:
