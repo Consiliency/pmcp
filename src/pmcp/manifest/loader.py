@@ -352,24 +352,31 @@ def _parse_cli_alternative(name: str, data: dict[str, Any]) -> CLIAlternative:
     )
 
 
-def _parse_extra_env(name: str, raw: Any) -> dict[str, str]:
-    """Parse a server's ``extra_env`` mapping, fail-soft.
+def _parse_extra_env(
+    name: str, raw: Any, field_label: str = "extra_env"
+) -> dict[str, str]:
+    """Parse an ``extra_env``-shaped mapping, fail-soft.
 
     Non-mappings and unusable entries are dropped with a warning rather than
     raising, so one bad key never costs the whole server entry. YAML scalars are
     coerced to ``str`` because values such as a port or a boolean flag are
     naturally written unquoted.
+
+    ``field_label`` names the source field in warnings, so a bad overlay patch
+    reports ``server_env`` rather than the shared ``extra_env`` shape it reuses.
     """
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        logger.warning(f"Ignoring 'extra_env' for server '{name}': not a mapping")
+        logger.warning(f"Ignoring '{field_label}' for server '{name}': not a mapping")
         return {}
 
     parsed: dict[str, str] = {}
     for key, value in raw.items():
         if not isinstance(key, str) or not key:
-            logger.warning(f"Skipping non-string 'extra_env' key for server '{name}'")
+            logger.warning(
+                f"Skipping non-string '{field_label}' key for server '{name}'"
+            )
             continue
         if isinstance(value, bool):
             parsed[key] = "true" if value else "false"
@@ -377,7 +384,7 @@ def _parse_extra_env(name: str, raw: Any) -> dict[str, str]:
             parsed[key] = str(value)
         else:
             logger.warning(
-                f"Skipping 'extra_env' key '{key}' for server '{name}': "
+                f"Skipping '{field_label}' key '{key}' for server '{name}': "
                 f"unsupported value type {type(value).__name__}"
             )
     return parsed
@@ -568,7 +575,7 @@ def _load_overlay_file(
                     f"Skipping non-string 'server_env' key in overlay {path}"
                 )
                 continue
-            parsed_patch = _parse_extra_env(name, patch)
+            parsed_patch = _parse_extra_env(name, patch, field_label="server_env")
             if parsed_patch:
                 server_env[name] = parsed_patch
     elif raw_server_env:

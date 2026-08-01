@@ -24,6 +24,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole-entry-replace semantics unchanged; a patch naming an unknown server
   warns and is skipped rather than creating one. (#105)
 
+### Fixed
+- **`extra_env` is now applied on every server spawn path, not just
+  install-and-run.** `_manifest_server_to_config` built the runtime environment
+  from the credential alone, so a server picked up its declared non-secret
+  variables on first provision (which builds its own child environment) and then
+  silently lost them on every restart, refresh, lazy reconnect, and lifecycle
+  connect — falling back to the vendor default endpoint with no error. A
+  configured `.mcp.json` entry duplicating a manifest server likewise discarded
+  them; it now inherits `extra_env`, with any value the config sets explicitly
+  winning as a genuine user override. Credentials continue to take precedence
+  over a colliding `extra_env` key on both paths. (#109)
+
 ## [1.20.0] - 2026-07-26
 
 ### Security

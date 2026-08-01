@@ -501,3 +501,73 @@ servers:
 
     entry = load_manifest(explicit).servers["explicit-only"]
     assert entry.extra_env == {}
+
+
+def test_server_env_empty_string_value_passes_through(monkeypatch, tmp_path):
+    """An empty-string patch value must reach the server, not be dropped as falsy.
+
+    Some servers treat "set but empty" differently from "unset", so silently
+    discarding it would change behavior the operator asked for.
+    """
+    name = _a_shipped_server_name()
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"""
+server_env:
+  {name}:
+    DELIBERATELY_EMPTY: ""
+""",
+    )
+
+    entry = load_manifest().servers[name]
+    assert entry.extra_env["DELIBERATELY_EMPTY"] == ""
+
+
+def test_server_env_env_path_source_outranks_user(monkeypatch, tmp_path):
+    """$PMCP_MANIFEST_PATH is the highest-precedence server_env source."""
+    name = _a_shipped_server_name()
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"""
+server_env:
+  {name}:
+    CONTESTED: "user"
+    ONLY_USER: "user"
+""",
+    )
+
+    env_overlay = tmp_path / "env-overlay.yaml"
+    _write(
+        env_overlay,
+        f"""
+server_env:
+  {name}:
+    CONTESTED: "env"
+""",
+    )
+    monkeypatch.setenv("PMCP_MANIFEST_PATH", str(env_overlay))
+
+    entry = load_manifest().servers[name]
+    assert entry.extra_env["CONTESTED"] == "env"
+    assert entry.extra_env["ONLY_USER"] == "user"
+
+
+def test_server_env_malformed_patch_warning_names_server_env(
+    monkeypatch, tmp_path, caplog
+):
+    """Warnings name server_env, not the extra_env shape it reuses internally."""
+    name = _a_shipped_server_name()
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"""
+server_env:
+  {name}:
+    BAD_VALUE: {{nested: mapping}}
+""",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_manifest()
+
+    assert any("server_env" in r.message for r in caplog.records)
+    assert not any("'extra_env'" in r.message for r in caplog.records)

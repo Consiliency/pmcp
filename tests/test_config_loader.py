@@ -43,20 +43,20 @@ class TestConfiguredEntryCredentialInheritance:
     would start the downstream server unauthenticated post-migration (os.environ
     holds only the storage key)."""
 
-    def _manifest(self) -> dict[str, ServerConfig]:
-        return {
-            "brightdata": ServerConfig(
-                name="brightdata",
-                description="Bright Data",
-                keywords=["brightdata"],
-                install={},
-                command="npx",
-                args=["-y", "@brightdata/mcp"],
-                requires_api_key=True,
-                env_var="API_TOKEN",
-                secret_key="BRIGHTDATA_API_TOKEN",
-            )
-        }
+    def _manifest(self, **overrides: object) -> dict[str, ServerConfig]:
+        base: dict[str, object] = dict(
+            name="brightdata",
+            description="Bright Data",
+            keywords=["brightdata"],
+            install={},
+            command="npx",
+            args=["-y", "@brightdata/mcp"],
+            requires_api_key=True,
+            env_var="API_TOKEN",
+            secret_key="BRIGHTDATA_API_TOKEN",
+        )
+        base.update(overrides)
+        return {"brightdata": ServerConfig(**base)}  # type: ignore[arg-type]
 
     def test_configured_entry_inherits_namespaced_credential(
         self, monkeypatch: pytest.MonkeyPatch
@@ -96,6 +96,49 @@ class TestConfiguredEntryCredentialInheritance:
 
         assert merged is not None
         assert merged.env == {"API_TOKEN": "user-set"}
+
+    def test_configured_entry_inherits_manifest_extra_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A .mcp.json entry duplicating a manifest server still gets extra_env.
+
+        Otherwise listing a server in .mcp.json silently discards a self-hosted
+        endpoint declared in the manifest or patched by an overlay.
+        """
+        monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "bd-secret")
+        config = LocalMcpServerConfig(command="npx", args=["-y", "@brightdata/mcp"])
+
+        merged = _merge_manifest_defaults(
+            "brightdata",
+            config,
+            self._manifest(extra_env={"BASE_URL": "http://self-hosted.internal"}),
+        )
+
+        assert merged is not None
+        assert merged.env == {
+            "BASE_URL": "http://self-hosted.internal",
+            "API_TOKEN": "bd-secret",
+        }
+
+    def test_configured_entry_extra_env_user_override_preserved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An explicit .mcp.json value outranks the manifest's extra_env."""
+        monkeypatch.setenv("BRIGHTDATA_API_TOKEN", "bd-secret")
+        config = LocalMcpServerConfig(
+            command="npx",
+            args=["-y", "@brightdata/mcp"],
+            env={"BASE_URL": "http://user-choice.internal"},
+        )
+
+        merged = _merge_manifest_defaults(
+            "brightdata",
+            config,
+            self._manifest(extra_env={"BASE_URL": "http://self-hosted.internal"}),
+        )
+
+        assert merged is not None
+        assert merged.env["BASE_URL"] == "http://user-choice.internal"
 
     def test_configured_entry_no_credential_available_leaves_env(
         self, monkeypatch: pytest.MonkeyPatch
@@ -499,6 +542,55 @@ class TestLoadConfigs:
         resolved = _manifest_server_to_config(server, store.get)
 
         assert resolved.config.env == {"API_TOKEN": "tok-new"}
+
+    def test_resolved_config_carries_extra_env(self) -> None:
+        """extra_env must survive manifest→runtime-config resolution.
+
+        Regression: install-and-run built its own child env and got extra_env,
+        but restart / refresh / lazy reconnect resolve through here instead. When
+        this path dropped it, a self-hosted endpoint worked on first provision
+        and then silently fell back to the vendor default on every later spawn.
+        """
+        server = self._local_server(
+            extra_env={"FIRECRAWL_API_URL": "http://self-hosted.internal:3002"}
+        )
+        store = {"API_TOKEN": "tok"}
+
+        resolved = _manifest_server_to_config(server, store.get)
+
+        assert resolved.config.env == {
+            "FIRECRAWL_API_URL": "http://self-hosted.internal:3002",
+            "API_TOKEN": "tok",
+        }
+
+    def test_resolved_config_credential_wins_over_extra_env(self) -> None:
+        """A colliding extra_env key must never replace the resolved credential."""
+        server = self._local_server(extra_env={"API_TOKEN": "placeholder-from-yaml"})
+        store = {"API_TOKEN": "real-secret"}
+
+        resolved = _manifest_server_to_config(server, store.get)
+
+        assert resolved.config.env == {"API_TOKEN": "real-secret"}
+
+    def test_resolved_config_extra_env_without_credential(self) -> None:
+        """A no-auth self-hosted endpoint still resolves its URL."""
+        server = self._local_server(
+            extra_env={"FIRECRAWL_API_URL": "http://self-hosted.internal:3002"}
+        )
+
+        resolved = _manifest_server_to_config(server, {}.get)
+
+        assert resolved.config.env == {
+            "FIRECRAWL_API_URL": "http://self-hosted.internal:3002"
+        }
+
+    def test_resolved_config_env_is_none_when_nothing_to_inject(self) -> None:
+        """No extra_env and no credential keeps the historical None shape."""
+        server = self._local_server()
+
+        resolved = _manifest_server_to_config(server, {}.get)
+
+        assert resolved.config.env is None
 
     def test_merges_manifest_defaults_for_partial_server_config(
         self, tmp_path: Path
