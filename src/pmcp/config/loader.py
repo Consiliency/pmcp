@@ -614,6 +614,25 @@ def _merge_manifest_defaults(
         merged.command = manifest_server.command
         merged.args = [*manifest_server.args, *config.args]
 
+    # Manifest-declared non-secret vars (including overlay `server_env` patches)
+    # apply to a configured server that duplicates a manifest entry, so a
+    # self-hosted endpoint is not lost just because the server is also listed in
+    # .mcp.json. A value the config already sets wins — an explicit user entry is
+    # a genuine override, same principle as the credential handling below.
+    manifest_extra_env: dict[str, str] = (
+        getattr(manifest_server, "extra_env", {}) or {} if manifest_server else {}
+    )
+    if manifest_extra_env:
+        missing = {
+            key: value
+            for key, value in manifest_extra_env.items()
+            if key not in (merged.env or {})
+        }
+        if missing:
+            if merged is config:
+                merged = config.model_copy(deep=True)
+            merged.env = {**(merged.env or {}), **missing}
+
     if manifest_server and manifest_server.env_var:
         from pmcp.manifest.loader import credential_lookup_keys
 
@@ -926,18 +945,25 @@ def _manifest_server_to_config(
             ),
         )
 
-    # Build env dict if server requires API key. The credential is looked up
-    # under its (optionally namespaced) storage key, with the runtime env_var as
-    # a legacy fallback, but is always injected into the subprocess under the
-    # runtime env_var the downstream server actually reads.
-    env: dict[str, str] | None = None
+    # Declared non-secret vars first (e.g. a self-hosted base URL from the
+    # manifest or an overlay `server_env` patch), then the credential on top so
+    # a resolved secret always wins a key collision. This mirrors
+    # manifest.installer.build_install_child_env: BOTH env-construction paths
+    # must carry extra_env, or a server picks up its self-hosted endpoint on
+    # install-and-run but silently loses it on every later restart, refresh, or
+    # lazy reconnect, which resolve through here instead.
+    env: dict[str, str] = dict(getattr(server, "extra_env", {}) or {})
+
+    # The credential is looked up under its (optionally namespaced) storage key,
+    # with the runtime env_var as a legacy fallback, but is always injected into
+    # the subprocess under the runtime env_var the downstream server reads.
     if server.env_var:
         from pmcp.manifest.loader import credential_lookup_keys
 
         for lookup_key in credential_lookup_keys(server):
             env_value = env_lookup(lookup_key)
             if env_value:
-                env = {server.env_var: env_value}
+                env[server.env_var] = env_value
                 break
 
     return ResolvedServerConfig(
@@ -946,7 +972,8 @@ def _manifest_server_to_config(
         config=LocalMcpServerConfig(
             command=server.command,
             args=server.args,
-            env=env,
+            # Preserve the previous None-when-nothing-to-inject shape.
+            env=env or None,
         ),
     )
 

@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Non-secret server environment variables (`extra_env`).** A manifest server
+  entry can now declare environment variables beyond its single credential —
+  typically a base URL selecting a self-hosted deployment. Previously the only
+  way to reach a non-default endpoint was to start the whole gateway with the
+  variable pre-exported, which is process-global and invisible to the manifest.
+  Values are non-secret by design; credentials stay in `env_var`/`secret_key`
+  and always win over a colliding `extra_env` key. (#108)
+- **Per-host overlay patching (`server_env`).** A private overlay
+  (`~/.pmcp/manifest.yaml`, `<project>/.pmcp/manifest.yaml`,
+  `$PMCP_MANIFEST_PATH`) can patch `extra_env` on an existing server without
+  redeclaring the whole entry, so pointing a shipped server at a self-hosted
+  endpoint no longer means hand-copying its command, args, and install block —
+  a copy that would silently shadow later upstream fixes. `servers:` keeps its
+  whole-entry-replace semantics unchanged; a patch naming an unknown server
+  warns and is skipped rather than creating one. (#105)
+
+### Fixed
+- **`extra_env` is now applied on every server spawn path, not just
+  install-and-run.** `_manifest_server_to_config` built the runtime environment
+  from the credential alone, so a server picked up its declared non-secret
+  variables on first provision (which builds its own child environment) and then
+  silently lost them on every restart, refresh, lazy reconnect, and lifecycle
+  connect — falling back to the vendor default endpoint with no error. A
+  configured `.mcp.json` entry duplicating a manifest server likewise discarded
+  them; it now inherits `extra_env`, with any value the config sets explicitly
+  winning as a genuine user override. Credentials continue to take precedence
+  over a colliding `extra_env` key on both paths. (#109)
+
 ## [1.20.0] - 2026-07-26
 
 ### Security

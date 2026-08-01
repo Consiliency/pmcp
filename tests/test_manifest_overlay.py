@@ -297,3 +297,277 @@ servers:
     assert "explicit-only" in manifest.servers
     assert "user-only" not in manifest.servers
     assert len(manifest.servers) == 1
+
+
+# --- server_env: patch a shipped server without redeclaring it -----------------
+
+
+def _a_shipped_server_name() -> str:
+    """Name of an arbitrary shipped server, for patching without redeclaring."""
+    return next(iter(load_manifest().servers))
+
+
+def test_server_env_patches_shipped_server(monkeypatch, tmp_path):
+    """A server_env patch sets extra_env while leaving the shipped entry intact.
+
+    This is the whole point of the feature: an operator supplies only a URL and
+    keeps inheriting the shipped command/args/install, so a later change to the
+    shipped entry is not shadowed by a stale hand-copied duplicate.
+    """
+    name = _a_shipped_server_name()
+    shipped = load_manifest().servers[name]
+
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"""
+server_env:
+  {name}:
+    SOME_BASE_URL: "http://self-hosted.internal:3002"
+""",
+    )
+
+    patched = load_manifest().servers[name]
+    assert patched.extra_env["SOME_BASE_URL"] == "http://self-hosted.internal:3002"
+    # Everything else is byte-identical to the shipped entry.
+    assert patched.command == shipped.command
+    assert patched.args == shipped.args
+    assert patched.install == shipped.install
+    assert patched.env_var == shipped.env_var
+    assert patched.requires_api_key == shipped.requires_api_key
+
+
+def test_server_env_merges_with_existing_extra_env(monkeypatch, tmp_path):
+    """A patch adds to extra_env per key rather than replacing the mapping."""
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        """
+servers:
+  patch-target:
+    description: "base"
+    keywords: [k]
+    command: "base-command"
+    args: []
+    extra_env:
+      KEEP_ME: "original"
+      OVERRIDE_ME: "original"
+server_env:
+  patch-target:
+    OVERRIDE_ME: "patched"
+    ADDED: "new"
+""",
+    )
+
+    entry = load_manifest().servers["patch-target"]
+    assert entry.extra_env == {
+        "KEEP_ME": "original",
+        "OVERRIDE_ME": "patched",
+        "ADDED": "new",
+    }
+
+
+def test_server_env_unknown_server_warns_and_skips(monkeypatch, tmp_path, caplog):
+    """A patch must never conjure a server the manifest does not define."""
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        """
+server_env:
+  no-such-server:
+    SOME_URL: "http://nowhere.internal"
+""",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        manifest = load_manifest()
+
+    assert "no-such-server" not in manifest.servers
+    assert any(
+        "no-such-server" in r.message and "server_env" in r.message
+        for r in caplog.records
+    )
+
+
+@pytest.mark.parametrize(
+    "server_env_block",
+    [
+        'server_env: "not-a-mapping"',
+        'server_env:\n  some-server: "scalar-not-a-mapping"',
+    ],
+)
+def test_server_env_malformed_is_skipped(monkeypatch, tmp_path, server_env_block):
+    """A malformed server_env is ignored; the rest of the overlay still loads."""
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"""
+servers:
+  sibling-entry:
+    description: "valid"
+    keywords: [s]
+    command: "sibling-command"
+    args: []
+{server_env_block}
+""",
+    )
+
+    manifest = load_manifest()  # must not raise
+    assert manifest.servers["sibling-entry"].command == "sibling-command"
+
+
+def test_server_env_precedence_across_sources(monkeypatch, tmp_path):
+    """Higher-precedence sources win per key; keys from both sources survive."""
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        """
+servers:
+  multi-patched:
+    description: "base"
+    keywords: [k]
+    command: "base-command"
+    args: []
+server_env:
+  multi-patched:
+    FROM_USER: "user"
+    CONTESTED: "user"
+""",
+    )
+
+    project = tmp_path / "proj"
+    _write(
+        project / ".pmcp" / "manifest.yaml",
+        """
+server_env:
+  multi-patched:
+    FROM_PROJECT: "project"
+    CONTESTED: "project"
+""",
+    )
+    monkeypatch.chdir(project)
+
+    entry = load_manifest().servers["multi-patched"]
+    assert entry.extra_env["FROM_USER"] == "user"
+    assert entry.extra_env["FROM_PROJECT"] == "project"
+    # project outranks user
+    assert entry.extra_env["CONTESTED"] == "project"
+
+
+def test_server_env_patch_applies_after_same_file_replace(monkeypatch, tmp_path):
+    """Within one overlay, the whole-entry replace lands before its own patch."""
+    name = _a_shipped_server_name()
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"""
+servers:
+  {name}:
+    description: "replaced"
+    keywords: [r]
+    command: "replaced-command"
+    args: []
+    extra_env:
+      FROM_REPLACE: "replace"
+server_env:
+  {name}:
+    FROM_PATCH: "patch"
+""",
+    )
+
+    entry = load_manifest().servers[name]
+    assert entry.command == "replaced-command"
+    assert entry.extra_env == {"FROM_REPLACE": "replace", "FROM_PATCH": "patch"}
+
+
+def test_explicit_path_skips_server_env(monkeypatch, tmp_path):
+    """An explicit manifest_path applies no overlays, server_env included."""
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        """
+server_env:
+  explicit-only:
+    SHOULD_NOT_APPLY: "nope"
+""",
+    )
+
+    explicit = tmp_path / "explicit.yaml"
+    _write(
+        explicit,
+        """
+version: "1.0"
+servers:
+  explicit-only:
+    description: "explicit"
+    keywords: [x]
+    command: "explicit-command"
+    args: []
+""",
+    )
+
+    entry = load_manifest(explicit).servers["explicit-only"]
+    assert entry.extra_env == {}
+
+
+def test_server_env_empty_string_value_passes_through(monkeypatch, tmp_path):
+    """An empty-string patch value must reach the server, not be dropped as falsy.
+
+    Some servers treat "set but empty" differently from "unset", so silently
+    discarding it would change behavior the operator asked for.
+    """
+    name = _a_shipped_server_name()
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"""
+server_env:
+  {name}:
+    DELIBERATELY_EMPTY: ""
+""",
+    )
+
+    entry = load_manifest().servers[name]
+    assert entry.extra_env["DELIBERATELY_EMPTY"] == ""
+
+
+def test_server_env_env_path_source_outranks_user(monkeypatch, tmp_path):
+    """$PMCP_MANIFEST_PATH is the highest-precedence server_env source."""
+    name = _a_shipped_server_name()
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"""
+server_env:
+  {name}:
+    CONTESTED: "user"
+    ONLY_USER: "user"
+""",
+    )
+
+    env_overlay = tmp_path / "env-overlay.yaml"
+    _write(
+        env_overlay,
+        f"""
+server_env:
+  {name}:
+    CONTESTED: "env"
+""",
+    )
+    monkeypatch.setenv("PMCP_MANIFEST_PATH", str(env_overlay))
+
+    entry = load_manifest().servers[name]
+    assert entry.extra_env["CONTESTED"] == "env"
+    assert entry.extra_env["ONLY_USER"] == "user"
+
+
+def test_server_env_malformed_patch_warning_names_server_env(
+    monkeypatch, tmp_path, caplog
+):
+    """Warnings name server_env, not the extra_env shape it reuses internally."""
+    name = _a_shipped_server_name()
+    _write(
+        Path.home() / ".pmcp" / "manifest.yaml",
+        f"""
+server_env:
+  {name}:
+    BAD_VALUE: {{nested: mapping}}
+""",
+    )
+
+    with caplog.at_level(logging.WARNING):
+        load_manifest()
+
+    assert any("server_env" in r.message for r in caplog.records)
+    assert not any("'extra_env'" in r.message for r in caplog.records)

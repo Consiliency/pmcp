@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -352,24 +352,31 @@ def _parse_cli_alternative(name: str, data: dict[str, Any]) -> CLIAlternative:
     )
 
 
-def _parse_extra_env(name: str, raw: Any) -> dict[str, str]:
-    """Parse a server's ``extra_env`` mapping, fail-soft.
+def _parse_extra_env(
+    name: str, raw: Any, field_label: str = "extra_env"
+) -> dict[str, str]:
+    """Parse an ``extra_env``-shaped mapping, fail-soft.
 
     Non-mappings and unusable entries are dropped with a warning rather than
     raising, so one bad key never costs the whole server entry. YAML scalars are
     coerced to ``str`` because values such as a port or a boolean flag are
     naturally written unquoted.
+
+    ``field_label`` names the source field in warnings, so a bad overlay patch
+    reports ``server_env`` rather than the shared ``extra_env`` shape it reuses.
     """
     if raw is None:
         return {}
     if not isinstance(raw, dict):
-        logger.warning(f"Ignoring 'extra_env' for server '{name}': not a mapping")
+        logger.warning(f"Ignoring '{field_label}' for server '{name}': not a mapping")
         return {}
 
     parsed: dict[str, str] = {}
     for key, value in raw.items():
         if not isinstance(key, str) or not key:
-            logger.warning(f"Skipping non-string 'extra_env' key for server '{name}'")
+            logger.warning(
+                f"Skipping non-string '{field_label}' key for server '{name}'"
+            )
             continue
         if isinstance(value, bool):
             parsed[key] = "true" if value else "false"
@@ -377,7 +384,7 @@ def _parse_extra_env(name: str, raw: Any) -> dict[str, str]:
             parsed[key] = str(value)
         else:
             logger.warning(
-                f"Skipping 'extra_env' key '{key}' for server '{name}': "
+                f"Skipping '{field_label}' key '{key}' for server '{name}': "
                 f"unsupported value type {type(value).__name__}"
             )
     return parsed
@@ -504,26 +511,33 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
 
 def _load_overlay_file(
     path: Path,
-) -> tuple[dict[str, ServerConfig], dict[str, CLIAlternative]]:
+) -> tuple[
+    dict[str, ServerConfig], dict[str, CLIAlternative], dict[str, dict[str, str]]
+]:
     """Parse an overlay manifest file, fail-soft.
 
-    Returns ``(servers, cli_alternatives)`` parsed from ``path``. A missing file,
-    OSError, YAML error, or non-mapping top-level document logs a warning naming
-    the file and returns empty dicts. Each server/CLI entry is parsed in its own
-    try/except so one malformed entry is skipped without dropping its siblings.
+    Returns ``(servers, cli_alternatives, server_env)`` parsed from ``path``. A
+    missing file, OSError, YAML error, or non-mapping top-level document logs a
+    warning naming the file and returns empty dicts. Each entry is parsed in its
+    own try/except so one malformed entry is skipped without dropping siblings.
+
+    ``server_env`` patches ``extra_env`` on a server that already exists, so an
+    operator can point a shipped server at a self-hosted endpoint without
+    restating its command, args, and install block. It deliberately cannot
+    create a server: ``servers:`` remains whole-entry replace.
     """
     try:
         with open(path, "r") as f:
             data = yaml.safe_load(f)
     except (OSError, yaml.YAMLError) as exc:
         logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
-        return {}, {}
+        return {}, {}, {}
 
     if not isinstance(data, dict):
         logger.warning(
             f"Skipping manifest overlay {path}: top-level document is not a mapping"
         )
-        return {}, {}
+        return {}, {}, {}
 
     servers: dict[str, ServerConfig] = {}
     raw_servers = data.get("servers", {})
@@ -552,7 +566,22 @@ def _load_overlay_file(
     elif raw_clis:
         logger.warning(f"Skipping 'cli_alternatives' in overlay {path}: not a mapping")
 
-    return servers, cli_alternatives
+    server_env: dict[str, dict[str, str]] = {}
+    raw_server_env = data.get("server_env", {})
+    if isinstance(raw_server_env, dict):
+        for name, patch in raw_server_env.items():
+            if not isinstance(name, str) or not name:
+                logger.warning(
+                    f"Skipping non-string 'server_env' key in overlay {path}"
+                )
+                continue
+            parsed_patch = _parse_extra_env(name, patch, field_label="server_env")
+            if parsed_patch:
+                server_env[name] = parsed_patch
+    elif raw_server_env:
+        logger.warning(f"Skipping 'server_env' in overlay {path}: not a mapping")
+
+    return servers, cli_alternatives, server_env
 
 
 def load_manifest(manifest_path: Path | None = None) -> Manifest:
@@ -562,8 +591,10 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
     overlay manifests are merged over the shipped manifest: user
     (``~/.pmcp/manifest.yaml``) < project (``<project>/.pmcp/manifest.yaml``) <
     ``$PMCP_MANIFEST_PATH``, each overriding the shipped entry of the same name
-    (whole-entry replace). An explicit ``manifest_path`` loads only that file
-    and applies no overlays. Overlay parsing is fail-soft and never raises.
+    (whole-entry replace). An overlay's ``server_env`` additionally patches
+    ``extra_env`` on an existing server without replacing it. An explicit
+    ``manifest_path`` loads only that file and applies no overlays. Overlay
+    parsing is fail-soft and never raises.
     """
     apply_overlays = manifest_path is None
     if manifest_path is None:
@@ -588,12 +619,15 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
     # Merge private/custom overlays over the shipped manifest (default path only).
     if apply_overlays:
         for label, overlay_path in _overlay_manifest_paths():
-            overlay_servers, overlay_clis = _load_overlay_file(overlay_path)
-            if overlay_servers or overlay_clis:
+            overlay_servers, overlay_clis, overlay_server_env = _load_overlay_file(
+                overlay_path
+            )
+            if overlay_servers or overlay_clis or overlay_server_env:
                 logger.info(
                     f"Applying manifest overlay ({label}) from {overlay_path}: "
                     f"{len(overlay_servers)} servers, "
-                    f"{len(overlay_clis)} CLI alternatives"
+                    f"{len(overlay_clis)} CLI alternatives, "
+                    f"{len(overlay_server_env)} server_env patches"
                 )
             for name in overlay_servers:
                 if name in servers:
@@ -603,6 +637,21 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
                     )
             servers.update(overlay_servers)
             cli_alternatives.update(overlay_clis)
+
+            # Applied AFTER this source's whole-entry replaces, so a patch can
+            # refine an entry the same overlay just replaced. Patching merges
+            # per key, leaving other extra_env values from the base intact.
+            for name, patch in overlay_server_env.items():
+                existing = servers.get(name)
+                if existing is None:
+                    logger.warning(
+                        f"Manifest overlay ({label}) from {overlay_path} has a "
+                        f"'server_env' patch for unknown server '{name}': skipped"
+                    )
+                    continue
+                servers[name] = replace(
+                    existing, extra_env={**existing.extra_env, **patch}
+                )
 
     manifest = Manifest(
         version=data.get("version", "1.0"),
