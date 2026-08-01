@@ -93,6 +93,21 @@ cli_alternatives:
       - "terraform fmt -check"
       - "terraform providers"
 
+  # Blacksmith ships no MCP server: [code]smith is an MCP *client*, and Testbox
+  # integrates with agents through a generated skill file, not a server. The CLI
+  # is the supported agent surface ("agent-first ... the intended consumer is a
+  # coding agent"), so it belongs here rather than under servers:.
+  blacksmith:
+    keywords: [blacksmith, testbox, github actions, ci runner, ci analytics, flaky tests]
+    check_command: ["blacksmith", "--version"]
+    help_command: ["blacksmith", "--help"]
+    description: "Blacksmith CI runners and Testbox CLI"
+    examples:
+      - "blacksmith testbox status"
+      - "blacksmith testbox warmup <workflow>"
+      - "blacksmith testbox run --id <id> \"<command>\""
+    prefer_mcp_for: [github issues, pull requests, github api]
+
   curl:
     keywords: [curl, http, request, api, download]
     check_command: ["curl", "--version"]
