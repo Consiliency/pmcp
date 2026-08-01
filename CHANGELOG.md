@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Non-secret server environment variables (`extra_env`).** A manifest server
+  entry can now declare environment variables beyond its single credential —
+  typically a base URL selecting a self-hosted deployment. Previously the only
+  way to reach a non-default endpoint was to start the whole gateway with the
+  variable pre-exported, which is process-global and invisible to the manifest.
+  Values are non-secret by design; credentials stay in `env_var`/`secret_key`
+  and always win over a colliding `extra_env` key. (#108)
+- **Per-host overlay patching (`server_env`).** A private overlay
+  (`~/.pmcp/manifest.yaml`, `<project>/.pmcp/manifest.yaml`,
+  `$PMCP_MANIFEST_PATH`) can patch `extra_env` on an existing server without
+  redeclaring the whole entry, so pointing a shipped server at a self-hosted
+  endpoint no longer means hand-copying its command, args, and install block —
+  a copy that would silently shadow later upstream fixes. `servers:` keeps its
+  whole-entry-replace semantics unchanged; a patch naming an unknown server
+  warns and is skipped rather than creating one. (#105)
+
 ## [1.20.0] - 2026-07-26
 
 ### Security
