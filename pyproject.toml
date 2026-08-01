@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pmcp"
-version = "1.21.0"
+version = "1.21.1"
 description = "PMCP - Progressive MCP: Minimal context bloat with on-demand tool discovery"
 readme = "README.md"
 license = "MIT"
@@ -31,7 +31,12 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    # Upper bound is load-bearing: mcp 2.0.0 renamed
+    # mcp.client.streamable_http.streamablehttp_client to streamable_http_client,
+    # which client/manager.py imports at module scope. Without the cap a fresh
+    # install resolves to 2.x and the gateway dies on startup with an ImportError.
+    # Raising this requires porting that import (and auditing the rest of 2.x).
+    "mcp>=1.0.0,<2.0.0",
     "pydantic>=2.0",
     "pyjwt[crypto]>=2.10.0",
     "pyyaml>=6.0",

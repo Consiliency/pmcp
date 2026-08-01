@@ -37,6 +37,45 @@ jobs:
       - name: Check coverage threshold
         run: uv run coverage report --fail-under=60
 
+  # Every other job installs via `uv sync`, which uses uv.lock — so they only
+  # ever exercise the PINNED dependency versions. That hid a shipped break: an
+  # unbounded `mcp>=1.0.0` let a real install resolve to mcp 2.0.0, which had
+  # renamed a symbol the gateway imports at startup. The whole suite passed
+  # while `pip install pmcp` was dead on arrival.
+  #
+  # This job resolves dependencies FRESH, exactly as a user does, and smoke-tests
+  # the installed console script. It is the only job that can catch a bad or
+  # missing version constraint.
+  install-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Build and install from the wheel, ignoring uv.lock
+        run: |
+          uv build --wheel --out-dir dist
+          uv venv /tmp/fresh
+          # No --frozen / no uv.lock: resolve from pyproject constraints alone.
+          VIRTUAL_ENV=/tmp/fresh uv pip install dist/*.whl
+
+      - name: Report the resolved versions (so a bad bump is visible in the log)
+        run: VIRTUAL_ENV=/tmp/fresh uv pip list
+
+      - name: Smoke-test the installed entry point
+        run: |
+          /tmp/fresh/bin/pmcp --version
+          # Import the modules a real startup touches, so a renamed or removed
+          # upstream symbol fails here rather than in a user's service log.
+          /tmp/fresh/bin/python -c "import pmcp.client.manager, pmcp.server, pmcp.config.loader"
+
   lint:
     runs-on: ubuntu-latest
     steps:

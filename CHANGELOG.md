@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.21.1] - 2026-08-01
+
+### Fixed
+- **A fresh install was dead on arrival.** The `mcp` dependency was declared as
+  `mcp>=1.0.0` with no upper bound. `mcp` 2.0.0 renamed
+  `mcp.client.streamable_http.streamablehttp_client` to
+  `streamable_http_client`, which `client/manager.py` imports at module scope,
+  so any clean `pip install pmcp` / `uv tool install pmcp` resolved to 2.x and
+  the gateway died at startup with
+  `ImportError: cannot import name 'streamablehttp_client'`. Existing installs
+  and development checkouts were unaffected — `uv.lock` pins a 1.x `mcp`, which
+  is precisely why the entire test suite passed while the published artifact was
+  broken. Now capped at `mcp>=1.0.0,<2.0.0`. Supporting `mcp` 2.x is tracked
+  separately; raising the cap requires porting that import and auditing the rest
+  of the 2.x surface.
+
+### Changed
+- **CI now installs the built wheel with dependencies resolved from scratch.**
+  Every existing job installs via `uv sync`, which uses `uv.lock`, so nothing
+  ever exercised the version constraints an end user actually resolves against.
+  A new `install-smoke` job builds the wheel, installs it into a clean
+  environment with no lockfile, prints the resolved versions, and imports the
+  modules a real startup touches. Verified to fail on the previous unbounded
+  constraint and pass on the capped one — this class of break can no longer ship
+  green.
+
 ## [1.21.0] - 2026-08-01
 
 ### Added
