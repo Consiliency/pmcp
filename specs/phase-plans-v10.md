@@ -1,5 +1,38 @@
 # PMCP — Phase Plan v10 (Code-Review Remediation)
 
+> **STATUS: CLOSED — 2026-08-05. Do not plan or execute phases from this roadmap.**
+> The remediation shipped across the 1.19.x–1.20.0 line, but **not through this
+> pipeline**: no `plans/phase-plan-v10-*.md` lane plans were ever produced and no
+> `plans/manifest.json` entries exist for it. The work landed as ordinary PRs, so
+> the unchecked boxes below are stale paperwork, not outstanding work.
+>
+> Verified present in the tree on 2026-08-05 (file:line evidence, not release notes):
+>
+> | Phase | Evidence |
+> |---|---|
+> | P1 — Reconnect & failure-path recovery | `src/pmcp/client/manager.py:611,1974` current-task-safe cancellation; CHANGELOG 1.19.0 "Downstream servers now actually recover from failure" |
+> | P2 — Auth / Origin wiring | `src/pmcp/server.py:88-109` `auth_mode` / `allowed_origins` threaded through; CHANGELOG 1.19.0 |
+> | P3 — Agent-reachable code-exec validation | `src/pmcp/validation.py:17,30` `_PACKAGE_NAME_RE` |
+> | P4 — Local credential hardening | `src/pmcp/cli.py:633,637` `--stdin` + argv warning; `src/pmcp/env_store.py:98` `chmod 0o700` |
+> | P5A — Transport DoS hardening | `src/pmcp/transport/http.py:68` `_MAX_BODY_BYTES`; `:191` `_check_rate_limit` |
+> | P5B — SSRF & registry hardening | `src/pmcp/auth.py:246` `allow_redirects=False`; `src/pmcp/manifest/registry.py:675` atomic `os.replace` |
+> | P6 — Robustness & quality sweep | **PARTIAL** — overlay shadow warning, symlink containment, version-check URL quoting (`version_checker.py:52,94`), malformed-config surfacing (`config/loader.py:316-330`), and **task-registry eviction** all landed. One item did not; see below. |
+>
+> **One P6 item was not completed and is carried into
+> `specs/phase-plans-v11.md` Phase 6 (P6CLEAN)** — it is not dropped:
+>
+> 1. `tests/test_manifest.py:1775` still uses `asyncio.sleep(0.3)` instead of polling
+>    job state — the wall-clock race P6 intended to remove.
+>
+> **Correction (2026-08-05, from pre-execution review).** An earlier draft of this
+> header claimed `_tasks` registry eviction was missing. That was wrong: it searched
+> `src/pmcp/tools/handlers.py` because that is where v10's P6 text pointed, but the
+> registry lives in `src/pmcp/client/manager.py`. It is **done** — `_tasks` with
+> `_max_terminal_tasks = 100` and oldest-first pruning of terminal records
+> (`client/manager.py:507-512`), a done-callback `pop` (`:597`), and a regression
+> test `test_terminal_task_records_are_evicted_past_cap`
+> (`tests/test_client_manager.py:1588`). Do not re-plan it.
+
 > How to use this document: save to `specs/phase-plans-v10.md`, then run `/claude-plan-phase <ALIAS>` to produce the lane-level plan for each phase (→ `plans/phase-plan-v10-<alias>.md`), then `/claude-execute-phase <alias>` to build it.
 
 ---
