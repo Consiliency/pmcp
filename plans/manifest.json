@@ -894,6 +894,45 @@
       "task_summary": "Port pmcp onto mcp 2.x (spec 2026-07-28), stage 1: runtime parity \u2014 raise the cap, re-register the six lowlevel handlers, extend the downstream version ladder. server/discover and subscriptions are stages 2-3.",
       "type": "detailed",
       "updated_at": "2026-08-05T17:40:00Z"
+    },
+    {
+      "acceptance_criteria_count": 4,
+      "created_at": "2026-08-05T23:44:50Z",
+      "file": "plans/phase-plan-v11-p6clean.md",
+      "handoff_ref": null,
+      "if_gates_produced": [
+        "IF-0-P6CLEAN-1"
+      ],
+      "lanes": [
+        "SL-0",
+        "SL-1"
+      ],
+      "lifecycle": [
+        {
+          "at": "2026-08-05T23:44:50Z",
+          "by": "claude-plan-phase",
+          "metadata": {
+            "artifact_state": "committed",
+            "branch": "plan/v11-p6clean",
+            "roadmap_sha256": "2f03c6f3c01d903e55b87bdbe4ca8b9b25fcbb318a48a30161d35cd6b76b3be0"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-phase",
+      "phase_alias": "P6CLEAN",
+      "reflection_ref": null,
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v11.md",
+        "slug": "phase-plans-v11",
+        "status": "committed",
+        "type": "roadmap"
+      },
+      "slug": "phase-plan-v11-p6clean",
+      "status": "committed",
+      "task_summary": "Close out the one unfinished item from specs/phase-plans-v10.md Phase 6: replace the asyncio.sleep(0.3) at tests/test_manifest.py:1775 with a deterministic await on InstallJob._monitor_task, plus CHANGELOG closeout. Task-registry eviction was verified already complete and is not re-planned.",
+      "type": "phase",
+      "updated_at": "2026-08-05T23:44:50Z"
     }
   ],
   "schema_version": 1
