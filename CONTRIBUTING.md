@@ -55,6 +55,13 @@ my-server:
   requires_api_key: true          # Set to false if no API key needed
   env_var: "MY_SERVER_API_KEY"    # Required if requires_api_key is true
   env_instructions: "Get your API key from https://..."
+  # Optional: names of extra_env variables whose presence (e.g. a self-hosted
+  # base URL) makes the credential above unnecessary. Both parties must act —
+  # you declare the field here, and an operator must separately supply the
+  # named variable via extra_env or an overlay server_env patch — so the field
+  # alone never relaxes anything. An unset, self-referencing, or placeholder
+  # value fails closed and the credential stays required.
+  api_key_optional_when: ["MY_SERVER_BASE_URL"]
   auto_start: false               # Set to true for essential servers only
 ```
 

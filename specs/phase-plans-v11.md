@@ -382,6 +382,42 @@ Let a manifest entry express "credential required for the vendor endpoint, optio
 - evidence paths: `plans/phase-plan-v11-P5.md`
 - redaction posture: `metadata_only`
 
+### Post-execution amendments
+
+- **Consumer count revised from six (above) to SEVEN.** Execution
+  (`plans/phase-plan-v11-P5.md`) independently re-derived the enforcement
+  surface with two sweeps rather than trusting this section's count, because
+  the count had already drifted 4 → 5 → 6 across planning rounds — each
+  omission would have left one path still demanding the placeholder while
+  every other gate was fixed. Sweep 1 (`rg -c requires_api_key src/**/*.py`,
+  AST-classified into reads/writes/definitions) found the six consumers
+  listed above. Sweep 2 (an AST walk of every `ast.If` whose test mentions
+  `env_var` but not `requires_api_key`) found the seventh: `pmcp init`
+  (`src/pmcp/cli.py:1528`, `run_init`) gates on `if server.env_var:` alone —
+  it contains no `requires_api_key` token at all, which is exactly why a
+  token-only sweep never found it across six review rounds. The counting
+  method is recorded here so it stops moving; see
+  `plans/phase-plan-v11-P5.md`'s "Sweep 1" / "Sweep 2" for the full
+  methodology and the four producer sites (keyword *writes*) deliberately
+  excluded from the consumer count.
+- **`Produces` was incomplete.** This section lists only `IF-0-P5-1`.
+  Execution additionally froze `IF-0-P5-2` (`ServerConfig.api_key_optional_when`
+  parsing), `IF-0-P5-3` (`_get_server_env_metadata`'s effective-value
+  contract, feeding the ninth downstream reporting sites unchanged), and
+  `IF-0-P5-4` (the child-environment consistency invariant — a relaxed gate
+  must imply the spawned child actually receives the relaxer, not merely that
+  the gate opened). `IF-0-P5-4` closes a distinct security gap found during
+  planning: a predicate that read `os.environ` instead of the manifest's
+  `extra_env` would relax a gate for a variable `sanitized_subprocess_env`
+  then strips before the child spawns, silently reaching the vendor endpoint
+  unauthenticated.
+- **EC-P5-3's "all six consumers" wording is stale.** The phase plan's
+  EC-P5-3 (`plans/phase-plan-v11-P5.md`) correctly enumerates and proves all
+  seven, including `pmcp init`.
+- No interface freeze in `plans/phase-plan-v11-P5.md` itself proved wrong
+  during execution — all four (`IF-0-P5-1` through `IF-0-P5-4`) shipped with
+  the signatures and semantics as frozen.
+
 ---
 
 ### Phase 6 — Deferred v10 robustness remnants (P6CLEAN)

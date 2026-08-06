@@ -40,6 +40,14 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 - Hanging downstream tools consuming connections indefinitely (60 s request timeout)
 - Multiple gateway instances fighting over resources (fcntl singleton lock)
 - Reconnect storms from crashing downstream servers (per-server reconnect flag)
+- **Unilateral credential relaxation**: a manifest server's `requires_api_key`
+  can only be relaxed by a variable the entry itself names in
+  `api_key_optional_when` — an operator's overlay can supply that variable's
+  value, but cannot make a server's credential optional unless the manifest
+  entry already declared it relaxable. A server also cannot name its own
+  credential as its relaxer. Every unset, malformed, self-referencing, or
+  placeholder (`${VAR}`) relaxer value fails closed and the credential stays
+  required (Consiliency/pmcp#114).
 
 ### Known limitations
 

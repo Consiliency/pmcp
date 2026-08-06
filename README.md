@@ -672,6 +672,13 @@ Returns (if not already configured):
 }
 ```
 
+`requires_api_key` here reflects the **effective** requirement, not merely
+whether the entry declares one — a server whose manifest entry carries
+`api_key_optional_when` and whose named variable is set reports
+`requires_api_key: false` and no `auth_connect` recommendation, even though
+the underlying entry still has `requires_api_key: true`. See
+[Private manifest overlay](#private-manifest-overlay) below.
+
 ### Provisioning
 
 ```bash
@@ -935,6 +942,28 @@ servers:
     headers:
       Authorization: "Bearer ${MY_REMOTE_TOKEN}"
 ```
+
+A server that supports a self-hosted, keyless deployment can declare which
+`extra_env` variable makes its credential optional via
+`api_key_optional_when`. Declaring the field alone changes nothing — an
+operator must separately supply that variable, either inline or via a
+`server_env` patch on a shipped entry:
+
+```yaml
+servers:
+  firecrawl:
+    api_key_optional_when: ["FIRECRAWL_API_URL"]
+
+server_env:
+  firecrawl:
+    FIRECRAWL_API_URL: "http://localhost:3002"
+```
+
+Both parties must act — the manifest entry names the variable, and the
+operator supplies it — so no overlay can unilaterally relax a credential the
+entry never declared relaxable. A server naming its own credential as its own
+relaxer is ignored, and an unset, empty, or unexpanded `${VAR}` value fails
+closed: the credential stays required.
 
 Overlay loading is **fail-soft**: a missing file is skipped silently, and a
 malformed file or a single bad entry logs a warning and is skipped without
