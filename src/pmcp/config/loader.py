@@ -990,6 +990,36 @@ def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerC
     return _manifest_server_to_config(server, os.environ.get)
 
 
+def _local_env(config: ResolvedServerConfig) -> dict[str, str] | None:
+    """The post-merge child environment for *config*, or ``None``.
+
+    Returns ``config.config.env`` for a local stdio server config — the value
+    the spawned child will actually receive after ``_merge_manifest_defaults``
+    — or ``None`` for a remote server or when no env is set. Passed as
+    ``credential_requirement``'s ``child_env`` so a configured duplicate that
+    overrides the manifest's ``extra_env`` (e.g. with an empty string or an
+    unexpanded placeholder) is judged on the value the child actually gets,
+    not on the manifest's declared default (Consiliency/pmcp#114).
+    """
+    if isinstance(config.config, LocalMcpServerConfig):
+        return config.config.env
+    return None
+
+
+def _eager_requires_credential(
+    manifest_server: "ManifestServerConfig", config: ResolvedServerConfig
+) -> bool:
+    """Whether *manifest_server* still needs a credential to start eagerly.
+
+    Local import avoids a circular import: ``pmcp.manifest`` (via its
+    ``__init__.py``) transitively imports ``pmcp.env_store``, which imports
+    ``find_project_root`` from this module.
+    """
+    from pmcp.manifest.loader import requires_credential
+
+    return requires_credential(manifest_server, child_env=_local_env(config))
+
+
 def resolve_startup_configs(
     configured_configs: Sequence[ResolvedServerConfig],
     manifest_servers: Mapping[str, "ManifestServerConfig"]
@@ -1035,7 +1065,11 @@ def resolve_startup_configs(
             classified_names.add(config.name)
             return
 
-        if eager and manifest_server and manifest_server.requires_api_key:
+        if (
+            eager
+            and manifest_server
+            and _eager_requires_credential(manifest_server, config)
+        ):
             from pmcp.manifest.loader import credential_lookup_keys
 
             env_var = manifest_server.env_var

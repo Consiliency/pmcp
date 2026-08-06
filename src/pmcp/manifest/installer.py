@@ -13,7 +13,11 @@ from typing import Literal
 
 from pmcp.env_store import resolve_scope_path, sanitized_subprocess_env
 from pmcp.manifest.environment import Platform
-from pmcp.manifest.loader import ServerConfig, credential_lookup_keys
+from pmcp.manifest.loader import (
+    ServerConfig,
+    credential_lookup_keys,
+    requires_credential,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -544,7 +548,7 @@ async def check_api_key(server_config: ServerConfig) -> None:
     Raises:
         MissingApiKeyError: If API key is required but not set
     """
-    if not server_config.requires_api_key:
+    if not requires_credential(server_config):
         return
 
     env_var = server_config.env_var
