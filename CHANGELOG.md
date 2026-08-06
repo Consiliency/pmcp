@@ -39,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the `/health` payload and the `pmcp/{version}` User-Agent among them — report
   the wrong release.
 
+### Fixed
+- **The last outstanding item from `specs/phase-plans-v10.md` Phase 6 is closed
+  out.** `test_monitor_server_ready_on_startup_pattern`
+  (`tests/test_manifest.py`) asserted `job.status == "server_ready"` after a
+  fixed `await asyncio.sleep(0.3)`, racing the install monitor's pattern match
+  against the wall clock. It now `await`s `job._monitor_task` directly — the
+  monitor task returns as soon as it detects the startup pattern, so this is a
+  deterministic, event-driven wait with no timing dependency, matching the
+  idiom its sibling tests in the same class already use.
+
 ## [1.21.1] - 2026-08-01
 
 ### Fixed
