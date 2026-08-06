@@ -159,6 +159,7 @@ from pmcp.manifest.loader import (
     ServerConfig,
     credential_lookup_keys,
     credential_storage_key,
+    is_usable_credential_value,
     requires_credential,
 )
 
@@ -2905,25 +2906,54 @@ class GatewayTools:
         never credential-checked at all here — `manifest_server` was always
         `None` for this path, so a genuinely-required server with no
         credential reached `ensure_connected`/`connect_server` unauthenticated
-        (Consiliency/pmcp#114 board review finding 1). Judges the manifest
-        server's requirement against *configured*'s actual child env (a
-        `.mcp.json` override wins over the manifest default, same as every
-        other consumer). Returns `(manifest_server, auth_env_options)` when
-        the credential is still required and unavailable, else `None`.
+        (Consiliency/pmcp#114 board review finding 1). Returns
+        `(manifest_server, auth_env_options)` when the credential is still
+        required and unavailable, else `None`.
         """
         manifest_server = load_manifest().get_server(server_name)
         if not manifest_server or not manifest_server.env_var:
             return None
-        child_env = (
-            configured.config.env
-            if isinstance(configured.config, LocalMcpServerConfig)
-            else None
-        )
-        if not requires_credential(manifest_server, child_env=child_env):
+
+        if isinstance(configured.config, RemoteMcpServerConfig):
+            # extra_env is carried to a spawned local subprocess's env; a
+            # remote connection has no such subprocess, so a relaxer can
+            # never actually reach it no matter what the manifest declares
+            # (board review finding 1, remote-configured-duplicate variant:
+            # loader.py's "never relax a remote server" clause checks the
+            # MANIFEST server's url, which can be None while the CONFIGURED
+            # duplicate is itself remote — that combination must still fail
+            # closed). Judge only the declared requirement, ignoring any
+            # relaxer.
+            required = bool(manifest_server.requires_api_key)
+        else:
+            child_env = (
+                configured.config.env
+                if isinstance(configured.config, LocalMcpServerConfig)
+                else None
+            )
+            required = requires_credential(manifest_server, child_env=child_env)
+
+        if not required:
             return None
+
         auth_env_options = self._auth_env_options(server_name, manifest_server.env_var)
         if self._check_any_api_key_available(auth_env_options):
             return None
+
+        # _check_any_api_key_available only checks process env and the PMCP
+        # secret stores BY VARIABLE NAME — it cannot see a concrete
+        # credential the user wrote directly into the configured entry's own
+        # `env` block (board review finding 2). An empty string or
+        # unexpanded `${VAR}` placeholder does NOT satisfy it — same
+        # usability rule as a relaxer value.
+        if (
+            isinstance(configured.config, LocalMcpServerConfig)
+            and configured.config.env
+        ):
+            for key in auth_env_options:
+                if is_usable_credential_value(configured.config.env.get(key)):
+                    return None
+
         return (manifest_server, auth_env_options)
 
     def _write_secret(self, scope: str, key: str, value: str) -> Path:
@@ -3436,19 +3466,31 @@ class GatewayTools:
         ``config.env``, not the manifest's bare ``extra_env`` — passed as
         ``child_env`` so an override (e.g. an empty or placeholder value in
         ``.mcp.json``) is judged correctly instead of always reading the
-        manifest default (Consiliency/pmcp#114 board review finding 1).
+        manifest default (Consiliency/pmcp#114 board review finding 1). A
+        configured duplicate that is itself REMOTE never relaxes, regardless
+        of the manifest's own transport — extra_env cannot reach an HTTP
+        connection, so relaxation is judged on the declared requirement only
+        (board review finding 1, remote variant).
         """
         manifest_server = manifest.get_server(server_name)
         if manifest_server:
             configured = configured_servers.get(server_name)
-            child_env = (
-                configured.config.env
-                if configured is not None
-                and isinstance(configured.config, LocalMcpServerConfig)
-                else None
-            )
+            if configured is not None and isinstance(
+                configured.config, RemoteMcpServerConfig
+            ):
+                requires_api_key = bool(manifest_server.requires_api_key)
+            else:
+                child_env = (
+                    configured.config.env
+                    if configured is not None
+                    and isinstance(configured.config, LocalMcpServerConfig)
+                    else None
+                )
+                requires_api_key = requires_credential(
+                    manifest_server, child_env=child_env
+                )
             return (
-                requires_credential(manifest_server, child_env=child_env),
+                requires_api_key,
                 manifest_server.env_var,
                 manifest_server.env_instructions,
             )

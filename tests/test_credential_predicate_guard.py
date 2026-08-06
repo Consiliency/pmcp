@@ -39,16 +39,36 @@ SRC_ROOT = Path(__file__).resolve().parent.parent / "src" / "pmcp"
 # _get_server_env_metadata's effective value (IF-0-P5-3) — not a manifest
 # ServerConfig's declared value. AST cannot distinguish the two by type, so
 # the exemption is explicit and reviewed by hand.
+#
+# _configured_duplicate_missing_credential and _get_server_env_metadata each
+# additionally have ONE attribute read of manifest_server.requires_api_key in
+# their remote-configured-duplicate branch: extra_env cannot reach a remote
+# connection, so that branch deliberately reads the DECLARED requirement
+# only, bypassing credential_requirement()'s relaxation logic on purpose
+# (Consiliency/pmcp#114 board review finding 1, remote variant).
 ALLOWLISTED_ATTRIBUTE_READS: set[tuple[str, str]] = {
     ("tools/handlers.py", "_sort_key"),
     ("tools/handlers.py", "request_capability"),
+    ("tools/handlers.py", "_configured_duplicate_missing_credential"),
+    ("tools/handlers.py", "_get_server_env_metadata"),
 }
 
-# Function that is allowed to read requires_api_key dynamically (via getattr)
-# because it duck-types over manifest ServerConfig, discovered-server configs,
-# and None. This IS the centralization point every other gate must route
-# through.
+# File exempted from check 2 in full: the centralization point every other
+# gate routes through — duck-types over manifest ServerConfig,
+# discovered-server configs, and None, so it necessarily reads the string
+# literal dynamically.
 DYNAMIC_READ_ALLOWED_FILE = "manifest/loader.py"
+
+# (file path, enclosing function) pairs — OUTSIDE DYNAMIC_READ_ALLOWED_FILE —
+# individually allowed one dynamic read each, reviewed by hand.
+DYNAMIC_READ_ALLOWLIST: set[tuple[str, str]] = {
+    # Same remote-configured-duplicate exemption as the two attribute reads
+    # above: extra_env cannot reach a remote connection, so this branch
+    # deliberately reads the declared requirement only, via getattr since
+    # manifest_server is typed Any here (Consiliency/pmcp#114 board review
+    # finding 1, remote variant).
+    ("config/loader.py", "_eager_requires_credential"),
+}
 
 
 def _iter_py_files() -> list[Path]:
@@ -192,10 +212,13 @@ class TestDynamicReads:
             if rel_path == DYNAMIC_READ_ALLOWED_FILE:
                 continue
             for lineno, func_name in visitor.dynamic_reads:
+                if (rel_path, func_name) in DYNAMIC_READ_ALLOWLIST:
+                    continue
                 violations.append(f"{rel_path}:{lineno} in {func_name}()")
         assert violations == [], (
             "Found a dynamic ('requires_api_key' string-literal) read "
-            f"outside manifest/loader.py: {violations}"
+            f"outside manifest/loader.py and outside the reviewed "
+            f"allowlist: {violations}"
         )
 
     def test_loader_dynamic_read_exists(self) -> None:
@@ -226,4 +249,16 @@ class TestAllowlistLiveness:
                 f"Allowlist entry ({rel_path}, {func_name}) no longer "
                 "corresponds to any requires_api_key read — remove the stale "
                 "entry so the guard doesn't silently widen"
+            )
+
+    def test_dynamic_read_allowlist_entries_still_present(self) -> None:
+        scan = _scan_all_files()
+        for rel_path, func_name in DYNAMIC_READ_ALLOWLIST:
+            assert rel_path in scan, f"Allowlisted file {rel_path} no longer exists"
+            visitor = scan[rel_path]
+            matching = [fn for _lineno, fn in visitor.dynamic_reads if fn == func_name]
+            assert matching, (
+                f"Dynamic-read allowlist entry ({rel_path}, {func_name}) no "
+                "longer corresponds to any requires_api_key dynamic read — "
+                "remove the stale entry so the guard doesn't silently widen"
             )

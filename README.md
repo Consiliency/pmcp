@@ -946,14 +946,14 @@ servers:
 A server that supports a self-hosted, keyless deployment can declare which
 `extra_env` variable makes its credential optional via
 `api_key_optional_when`. Declaring the field alone changes nothing — an
-operator must separately supply that variable, either inline or via a
-`server_env` patch on a shipped entry:
+operator must separately supply that variable. The shipped `firecrawl` entry
+already declares `api_key_optional_when: ["FIRECRAWL_API_URL"]`, so supplying
+the URL is all an overlay needs to do — via a `server_env` patch, **not** a
+`servers:` block (`servers:` is whole-entry replace: a partial `firecrawl:`
+entry here would erase its command/install metadata and reset
+`requires_api_key` to its unset default, turning the credential gate off):
 
 ```yaml
-servers:
-  firecrawl:
-    api_key_optional_when: ["FIRECRAWL_API_URL"]
-
 server_env:
   firecrawl:
     FIRECRAWL_API_URL: "http://localhost:3002"

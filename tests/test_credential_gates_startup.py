@@ -19,7 +19,7 @@ import pytest
 from pmcp.config.loader import StartupSkipReason, resolve_startup_configs
 from pmcp.manifest.installer import MissingApiKeyError, check_api_key
 from pmcp.manifest.loader import ServerConfig
-from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+from pmcp.types import LocalMcpServerConfig, RemoteMcpServerConfig, ResolvedServerConfig
 
 
 def _relaxable_server(
@@ -154,6 +154,85 @@ class TestGate1ConfiguredDuplicate:
             config=LocalMcpServerConfig(
                 command="firecrawl-mcp",
                 env={"FIRECRAWL_API_URL": ""},
+            ),
+        )
+        result = resolve_startup_configs(
+            [configured],
+            manifest_servers={"firecrawl": server},
+            enabled_auto_start={"firecrawl"},
+            is_auth_available=lambda _key: False,
+        )
+        assert result.eager_configs == []
+        assert len(result.skipped) == 1
+        assert result.skipped[0].reason == StartupSkipReason.MISSING_AUTH
+
+    def test_configured_remote_duplicate_fails_closed_despite_manifest_relaxer(
+        self,
+    ) -> None:
+        """Board review finding 1 (remote variant): the manifest server is
+        LOCAL with a usable relaxer, but the CONFIGURED duplicate is itself
+        REMOTE. extra_env cannot reach an HTTP connection, so this must fail
+        closed regardless of what the manifest's own extra_env says —
+        _local_env(config) previously returned None for a remote config,
+        falling back to the (usable) manifest default and relaxing a
+        credential that could never actually reach the connection."""
+        server = _relaxable_server(
+            api_key_optional_when=["FIRECRAWL_API_URL"],
+            extra_env={"FIRECRAWL_API_URL": "http://localhost:3002"},
+        )
+        configured = ResolvedServerConfig(
+            name="firecrawl",
+            source="project",
+            config=RemoteMcpServerConfig(url="https://vendor.example/mcp"),
+        )
+        result = resolve_startup_configs(
+            [configured],
+            manifest_servers={"firecrawl": server},
+            enabled_auto_start={"firecrawl"},
+            is_auth_available=lambda _key: False,
+        )
+        assert result.eager_configs == []
+        assert len(result.skipped) == 1
+        assert result.skipped[0].reason == StartupSkipReason.MISSING_AUTH
+
+    def test_configured_duplicate_literal_credential_in_own_env_satisfies(
+        self,
+    ) -> None:
+        """Board review finding 2: a concrete credential written directly
+        into the configured entry's own env block must satisfy the gate —
+        is_auth_available only checks process env / PMCP secret stores by
+        variable NAME and cannot see this literal."""
+        server = _relaxable_server(api_key_optional_when=[])
+        configured = ResolvedServerConfig(
+            name="firecrawl",
+            source="project",
+            config=LocalMcpServerConfig(
+                command="firecrawl-mcp",
+                env={"FIRECRAWL_API_KEY": "fc-real-key"},
+            ),
+        )
+        result = resolve_startup_configs(
+            [configured],
+            manifest_servers={"firecrawl": server},
+            enabled_auto_start={"firecrawl"},
+            is_auth_available=lambda _key: False,
+        )
+        assert [c.name for c in result.eager_configs] == ["firecrawl"]
+        assert result.skipped == []
+
+    def test_configured_duplicate_placeholder_credential_does_not_satisfy(
+        self,
+    ) -> None:
+        """The literal-credential exception (finding 2) must not accept an
+        empty string or an unexpanded ${VAR} placeholder — same usability
+        rule as a relaxer value."""
+        server = _relaxable_server(api_key_optional_when=[])
+        configured = ResolvedServerConfig(
+            name="firecrawl",
+            source="project",
+            config=LocalMcpServerConfig(
+                command="firecrawl-mcp",
+                env={"FIRECRAWL_API_KEY": "${FIRECRAWL_API_KEY}"},
             ),
         )
         result = resolve_startup_configs(

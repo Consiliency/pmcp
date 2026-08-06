@@ -123,14 +123,18 @@ def credential_lookup_keys(server: Any) -> list[str]:
 _PLACEHOLDER_RE = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
 
 
-def _is_usable_relaxer_value(value: Any) -> bool:
+def is_usable_credential_value(value: Any) -> bool:
     """True when *value* is a real, expanded value — not empty and not an
     unexpanded ``${VAR}``/``$VAR`` placeholder token.
 
     Local stdio env is passed to child processes verbatim, with no shell
     expansion (see config/loader.py's env-merge comments), so a literal
     ``${FIRECRAWL_API_URL}`` reaching the child is a dead string, not a real
-    URL, and must not relax a credential gate.
+    URL, and must not relax a credential gate. Public (not underscore-
+    prefixed) because it is also used to recognize a concrete credential
+    literal placed directly in a configured entry's own env block
+    (Consiliency/pmcp#114 board review finding 2) — the same "is this a real
+    value" rule applies to both a relaxer and a credential.
     """
     if not isinstance(value, str):
         return False
@@ -217,7 +221,7 @@ def credential_requirement(
             # that parse step.
             continue
         value = source.get(candidate) if hasattr(source, "get") else None
-        if _is_usable_relaxer_value(value):
+        if is_usable_credential_value(value):
             return CredentialRequirement(
                 required=False, declared=True, relaxed_by=candidate
             )
