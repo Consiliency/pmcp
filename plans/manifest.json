@@ -729,7 +729,7 @@
       ],
       "owner_skill": "claude-plan-detailed",
       "slug": "detailed-idle-timeout-downstream-calls",
-      "status": "staged",
+      "status": "committed",
       "task_summary": "Convert downstream-call timeout to inactivity (idle) timeout with absolute ceiling (#79 symptom 1a)",
       "type": "detailed",
       "updated_at": "2026-06-28T06:46:00Z"
@@ -751,7 +751,7 @@
       ],
       "owner_skill": "claude-plan-detailed",
       "slug": "detailed-private-manifest-overlay",
-      "status": "staged",
+      "status": "committed",
       "task_summary": "Private/custom MCP manifest overlay merged in load_manifest (user/project/PMCP_MANIFEST_PATH); ship v1.18.0",
       "type": "detailed",
       "updated_at": "2026-06-29T08:41:00Z"
@@ -773,7 +773,7 @@
       ],
       "owner_skill": "claude-plan-detailed",
       "slug": "detailed-describe-nested-schema-indexit-stdio",
-      "status": "staged",
+      "status": "committed",
       "task_summary": "gateway.describe nested-schema fidelity (#87) + index-it-mcp stdio transport & pilot docs (#89); ship v1.19.1",
       "type": "detailed",
       "updated_at": "2026-07-06T09:20:00Z"
