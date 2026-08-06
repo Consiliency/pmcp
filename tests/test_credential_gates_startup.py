@@ -37,10 +37,22 @@ def _pin_manifest_path(monkeypatch: pytest.MonkeyPatch, manifest_path: Path) -> 
     user-overlay lookup, not the independent project-overlay walk from
     Path.cwd() (_find_project_manifest). Passing an explicit manifest_path
     puts load_manifest() into its documented no-overlay mode, bypassing both
-    (Consiliency/pmcp#125)."""
+    (Consiliency/pmcp#125).
+
+    Both binding styles must be patched. cli.run_init imports load_manifest
+    INSIDE the function, so it picks up a patch on the loader module at call
+    time; cli_commands.secrets imports it at MODULE scope, binding the name
+    once at import, where a loader-module patch never reaches it. Patching
+    only the former silently leaves the latter resolving the real overlay
+    chain -- which is a false pass, not a failure, for any test asserting the
+    relaxed direction.
+    """
+    pinned = lambda *a, **kw: _real_load_manifest(manifest_path)  # noqa: E731
+    monkeypatch.setattr("pmcp.manifest.loader.load_manifest", pinned)
+    # Module-scope re-binders. raising=False so this stays correct if a
+    # consumer moves to a call-time import.
     monkeypatch.setattr(
-        "pmcp.manifest.loader.load_manifest",
-        lambda *a, **kw: _real_load_manifest(manifest_path),
+        "pmcp.cli_commands.secrets.load_manifest", pinned, raising=False
     )
 
 
@@ -343,7 +355,7 @@ def _write(path: Path, text: str) -> None:
 class TestGate5SecretsCheck:
     @pytest.mark.asyncio
     async def test_relaxed_server_reports_ok_with_no_missing_keys(
-        self, tmp_path: Path
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from pmcp.cli_commands.secrets import run_secrets_check
 
@@ -360,11 +372,8 @@ class TestGate5SecretsCheck:
             ),
         )
 
-        with patch.dict(
-            "os.environ",
-            {"HOME": str(home), "PMCP_MANIFEST_PATH": str(overlay)},
-            clear=False,
-        ):
+        _pin_manifest_path(monkeypatch, overlay)
+        with patch.dict("os.environ", {"HOME": str(home)}, clear=False):
             os.environ.pop("CRED_TEST_API_KEY", None)
             output = await run_secrets_check(argparse.Namespace(project=project))
 
@@ -374,7 +383,9 @@ class TestGate5SecretsCheck:
         assert output["ok"] is True
 
     @pytest.mark.asyncio
-    async def test_required_server_still_reports_missing(self, tmp_path: Path) -> None:
+    async def test_required_server_still_reports_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from pmcp.cli_commands.secrets import run_secrets_check
 
         home = tmp_path / "home"
@@ -390,11 +401,8 @@ class TestGate5SecretsCheck:
             ),
         )
 
-        with patch.dict(
-            "os.environ",
-            {"HOME": str(home), "PMCP_MANIFEST_PATH": str(overlay)},
-            clear=False,
-        ):
+        _pin_manifest_path(monkeypatch, overlay)
+        with patch.dict("os.environ", {"HOME": str(home)}, clear=False):
             os.environ.pop("CRED_TEST_API_KEY", None)
             output = await run_secrets_check(argparse.Namespace(project=project))
 
@@ -508,5 +516,4 @@ servers:
 
         captured = capsys.readouterr()
         assert "pmcp secrets set FIRECRAWL_API_KEY" in captured.out
-        assert "No credential needed" not in captured.out
         assert "No credential needed" not in captured.out
