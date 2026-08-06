@@ -57,6 +57,11 @@ pointed). See `## Execution Notes > Pre-verified as complete` for the evidence t
 `uv run mypy src/pmcp --exclude baml_client` → no issues in 41 source files. The tree
 is green going in, so any failure this phase surfaces is caused by this phase.
 
+Read that baseline with the caveat that `pyproject.toml:81` sets
+`addopts = "-m 'not live'"`: the 2276 excludes every `live`-marked integration test, and
+no part of it boots the gateway. That is why `## Verification` has a mandatory second
+step and why this plan does not treat a green suite as acceptance.
+
 ## Interface Freeze Gates
 
 - [ ] IF-0-P6CLEAN-1 — `InstallJob._monitor_task` is the awaitable completion handle for install monitoring, and `JobManager._monitor_install` returns (rather than looping) once `_is_server_started` matches, having set `job.status = "server_ready"` and left `job.process` alive for handoff. Tests may await this task instead of sleeping. Frozen at `src/pmcp/manifest/installer.py:61,143,331-341,388-390`. This phase consumes this contract; it does not change it.
@@ -127,7 +132,7 @@ criterion is about *how* the existing test waits.
 
 ### SL-1 - CHANGELOG, docs reconciliation, and phase reducer closeout
 
-- **Scope**: Record in the CHANGELOG that this closes out v10 Phase 6, reconcile the docs catalog, and run whole-phase verification.
+- **Scope**: Record in the CHANGELOG that this closes out v10 Phase 6, reconcile the docs catalog, and run whole-phase verification including the mandatory gateway boot and real downstream tool call.
 - **Owned files**: `CHANGELOG.md`, `.claude/docs-catalog.json`
 - **Interfaces provided**: (none)
 - **Interfaces consumed**: SL-0's merged change to `tests/test_manifest.py`
@@ -152,12 +157,18 @@ expected — if that holds, say so in the commit message.
 | SL-1.1 | docs | — | `.claude/docs-catalog.json` | — | `python3 "$(git rev-parse --show-toplevel)/.claude/skills/_shared/scaffold_docs_catalog.py" --rescan` (if the helper is absent, record "docs-catalog rescan helper unavailable; manual audit, catalog empty" and proceed) |
 | SL-1.2 | docs | SL-1.1 | `CHANGELOG.md` | — | — |
 | SL-1.3 | verify | SL-1.2 | — | full suite | see `## Verification` |
+| SL-1.4 | verify | SL-1.3 | — | gateway boot + real downstream call | see `## Verification` step 2; satisfies cross-cutting principle 1 |
+
+SL-1.4 creates its fixture server and isolated config in a temp dir at verification
+time rather than committing them, so this deliberately-small phase adds no new repo
+files. The tradeoff is that the gate is not reusable by CI; making it durable is worth
+doing but belongs to a phase that is allowed to add source, not this one.
 
 ## Execution Policy
 
 - work-unit defaults: work-unit=`lane_execute`, effort=`low`, unsupported=`inherit_default`, inherit-default=`true`
 - SL-0: effort=`low`, reason=single mechanical edit to one test with the target form already validated and three sibling tests as precedent
-- SL-1: work-unit=`phase_reducer`, effort=`low`, reason=one CHANGELOG paragraph plus a no-op catalog rescan
+- SL-1: work-unit=`phase_reducer`, effort=`medium`, reason=carries the principle-1 gateway boot whose lock-dir and isolated-config constraints can kill the operator's live gateway if handled carelessly
 
 ## Execution Notes
 
@@ -206,8 +217,38 @@ expected — if that holds, say so in the commit message.
 - **Environment.** Run `uv sync --all-extras`, never bare `uv sync`. Bare `uv sync`
   prunes pytest, after which `uv run pytest` silently falls through to a system pytest
   that cannot import `pmcp` and the failure looks like a code problem.
-- **Never bind port 3344.** A live systemd PMCP gateway owns it on this host. Nothing
-  in this phase needs a port, so no lane should start a server at all.
+- **Gateway acceptance is required, and this plan originally omitted it.** Cross-cutting
+  principle 1 (`specs/phase-plans-v11.md:87`) is unconditional: every phase touching
+  `pmcp` must prove (a) the process starts and listens and (b) a real downstream server
+  serves a real tool call through it. The first draft of this plan verified only
+  pytest/ruff/mypy and asserted "no lane should start a server at all." That was wrong.
+  The principle's stated rationale is *this repo's own history* — "2276 green tests
+  coexisted with a gateway that could not boot" — and the draft's verification section
+  leaned on exactly that 2276-test count as its proof. Argued in full under
+  `## Why the gateway boot stays, for a test-only phase`.
+- **Default pytest is weaker than it looks.** `pyproject.toml:81` sets
+  `addopts = "-m 'not live'"`, so `uv run pytest -q` silently excludes every test marked
+  `live` — the opt-in integration tests that touch real package managers and network.
+  A green 2276 therefore says nothing about live integration. This is a second reason
+  the boot check is not redundant with the suite.
+- **Gateway boot safety — non-negotiable, both mechanisms confirmed in source.**
+  - **Spare port only. Never 3344.** A live systemd PMCP gateway owns `127.0.0.1:3344`
+    on this host and it is the operator's daily driver (principle 3).
+  - **MUST pass `--lock-dir <tmpdir>`** (`src/pmcp/cli.py:191`; `PMCP_LOCK_DIR` is the
+    env equivalent at `cli.py:2201`). `_run_http` calls
+    `acquire_singleton_lock(self._lock_dir)` and `None` means a **global** lock under
+    `~/.pmcp` (`src/pmcp/server.py:779-784`, `acquire_singleton_lock` at
+    `src/pmcp/identity.py:176`). Booting without `--lock-dir` either fails against the
+    live gateway's lock or contends with it.
+  - **MUST pass `--config <isolated>`** (`src/pmcp/cli.py:139`). `_kill_orphan_processes`
+    (`src/pmcp/server.py:683`) scans `/proc` on Linux and sends **SIGKILL** to any
+    process whose argv0 + args fingerprint matches a *configured* stdio server. A second
+    instance loading the operator's real config would therefore SIGKILL the live
+    gateway's downstream children. The isolated config must contain **only** the
+    throwaway fixture server, whose command path is unique to the temp dir, so no
+    fingerprint can match anything the live gateway is running.
+  - **Guarded teardown.** Boot under `trap`/`finally` so the child gateway is killed and
+    the temp lock dir removed even when an assertion fails midway.
 - **`TMPDIR` note.** Some older plans in `plans/` prefix commands with
   `TMPDIR=/var/tmp`. That was not needed in this worktree — the full suite, ruff, and
   mypy all ran clean without it. Only reach for it if a lane hits a `/tmp` space or
@@ -226,8 +267,74 @@ expected — if that holds, say so in the commit message.
   `git checkout HEAD~N -- …` in a stale worktree produces commits that destroy
   peer-lane work on `--no-ff` merge. Concretely: SL-1 must see SL-0's change to
   `tests/test_manifest.py` before it runs SL-1.3.
-- **Concurrency with other v11 phases.** P6CLEAN shares no file with P1, PG, or P5 and
-  can be planned, executed, and merged independently of all of them.
+- **Concurrency with other v11 phases — the roadmap's "zero contention" claim is FALSE.**
+  The first draft of this plan repeated it ("shares no file with P1, PG, or P5"). That
+  does not survive contact with the lane plans. Verified against the roadmap's own
+  **Key files** blocks: P1 lists `tests/` and `CHANGELOG.md`; P5 lists `tests/`,
+  `CHANGELOG.md`, and `src/pmcp/manifest/installer.py`. See
+  `## Cross-Phase Serialization` — this is a merge-ordering contract, not a footnote.
+
+## Why the gateway boot stays, for a test-only phase
+
+The reasonable objection is that a boot-plus-downstream-call is disproportionate for a
+change that edits six lines of one test and cannot touch shipped code. I considered
+arguing for an exemption and decided against it. The reasoning, stated so it can be
+overruled deliberately rather than by omission:
+
+1. **The principle is unconditional and its rationale is precisely this argument.**
+   "This change is too small to break the boot" is the reasoning principle 1 exists to
+   defeat. #111 shipped a gateway that was dead on arrival while the suite was green,
+   because `uv.lock` pinned a working `mcp` and nothing ever booted the installed
+   artifact. An exemption granted on size is the same bet that already lost.
+2. **A test-only diff is exactly where the check is cheapest and least ambiguous.**
+   SL-0 cannot plausibly break the boot, so the gate should pass first try. That makes
+   it a near-zero-cost regression tripwire, not a research task. If it *does* fail, the
+   failure is real and attributable — the tree was green before this phase (baseline
+   measured in `## Context`).
+3. **It is load-bearing on the merged union, which is the thing that actually ships.**
+   Per `## Cross-Phase Serialization`, P6CLEAN merges alongside P1 and P5, and **P5
+   modifies `src/pmcp/manifest/installer.py`** — shipped gateway code, and the very file
+   IF-0-P6CLEAN-1 freezes. Verifying P6CLEAN in isolation proves little; the boot check
+   run on the merged union is where it earns its cost.
+4. **The suite cannot substitute for it.** `pyproject.toml:81` excludes `live` tests by
+   default, so the headline "2276 passed" covers no live integration at all.
+
+Net: the incremental cost is one guarded boot in the reducer lane; the incremental risk
+of skipping it is the exact failure mode the roadmap was written to stop. If the
+operator still wants the exemption, the place to grant it is a roadmap amendment to
+principle 1 — not a silent omission in a lane plan.
+
+## Cross-Phase Serialization
+
+P6CLEAN is **not** independently mergeable. Shared write surfaces, verified against the
+roadmap's **Key files** blocks:
+
+| File | P6CLEAN | P1 | P5 | Severity |
+|---|---|---|---|---|
+| `tests/test_manifest.py` | SL-0 (writes) | `tests/` | `tests/` + owns `src/pmcp/manifest/installer.py` | **Sharp** — a real test-file conflict |
+| `CHANGELOG.md` | SL-1 (writes) | writes | writes | Trivial — append conflict under `## [Unreleased]` |
+| `.claude/docs-catalog.json` | SL-1 (writes) | writes | writes | Trivial — currently `[]`, likely no-op |
+
+**Merge ownership order: P6CLEAN merges FIRST.** It is the smallest diff, it is
+test-only, and it has no dependency on either other phase. P1 and P5 then rebase onto
+it. The inverse order forces the six-line test edit to be re-derived on top of whatever
+P5 did to the same file, which is strictly worse.
+
+**The sharp edge is P5, and it is worse than a textual conflict.** P5 owns
+`src/pmcp/manifest/installer.py` — the file IF-0-P6CLEAN-1 freezes. SL-0's assertion
+depends on `_monitor_install` *returning* on startup-pattern match
+(`installer.py:331-341`) and on `job.process` surviving when status is `server_ready`
+(`installer.py:388-390`). If P5 changes either, SL-0's `await asyncio.wait_for(job._monitor_task, ...)`
+hangs to its 5s ceiling and fails — and it will fail in P5's branch, not this one, where
+the cause is non-obvious. **Action:** P5's executor must be told IF-0-P6CLEAN-1 is a
+frozen contract it consumes. If P5 needs to change monitor return semantics, that is a
+roadmap amendment, not a local decision.
+
+**Verify the merged union, not each phase in isolation.** Whichever phase merges last
+runs the full `## Verification` block — including the gateway boot — against the merged
+result. A per-phase green is necessary but not sufficient; three phases each green in
+isolation can still produce a broken union, which is the same class of gap principle 1
+describes.
 
 ## Acceptance Criteria
 
@@ -248,10 +355,22 @@ expected — if that holds, say so in the commit message.
 - [ ] EC-P6CLEAN-2 — CHANGELOG records the closeout. Proven by
   `rg -n 'v10' CHANGELOG.md` matching a new entry under `## [Unreleased]` that names
   Phase 6 of `specs/phase-plans-v10.md` as closed out.
+- [ ] Cross-cutting principle 1 (`specs/phase-plans-v11.md:87`) — the gateway starts and
+  listens, and a real downstream server serves a real tool call through it. Proven by
+  `## Verification` step 2: `GET http://127.0.0.1:$PORT/health` returns 200, and an MCP
+  client call to `gateway.invoke` against the fixture server returns the fixture's
+  actual result payload. Run on a spare port with `--lock-dir` and an isolated
+  `--config`; never against 3344.
+- [ ] Cross-phase — the merged union of P6CLEAN with whichever of P1/P5 land alongside it
+  passes the whole `## Verification` block, not merely each phase in isolation. Proven by
+  the last phase to merge re-running the block against the merged result.
 
 ## Verification
 
-Run from the repo root after both lanes merge:
+Run from the repo root after both lanes merge — and again on the merged union if P1 or
+P5 land alongside this phase (see `## Cross-Phase Serialization`).
+
+### Step 1 — Suite, lint, types, source-level criterion
 
 ```bash
 uv sync --all-extras
@@ -273,6 +392,92 @@ inside `test_monitor_server_ready_on_startup_pattern` (hits elsewhere in the fil
 expected and out of scope); ruff/format/mypy clean; full suite ≥2276 passed, 3 skipped;
 `rg -n 'v10' CHANGELOG.md` matches the new Unreleased entry; `git status --short` clean
 apart from the phase's own commits.
+
+Remember `uv run pytest -q` applies `-m 'not live'` (`pyproject.toml:81`). Step 1 alone
+is **not** acceptance for this phase.
+
+### Step 2 — Gateway boot + real downstream tool call (cross-cutting principle 1)
+
+Read `## Execution Notes > Gateway boot safety` before running this. Spare port only;
+`--lock-dir` and an isolated `--config` are both mandatory.
+
+```bash
+set -euo pipefail
+WORK="$(mktemp -d)"; PORT=38344   # spare port — NEVER 3344
+GW_PID=""
+cleanup() {
+  [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true
+  [ -n "$GW_PID" ] && wait "$GW_PID" 2>/dev/null || true
+  rm -rf "$WORK"
+}
+trap cleanup EXIT INT TERM
+
+# A real downstream MCP server, unique to $WORK so no /proc fingerprint can match
+# anything the live gateway on 3344 is running (server.py:683 SIGKILLs matches).
+cat > "$WORK/p6clean_fixture_server.py" <<'PY'
+from mcp.server.fastmcp import FastMCP
+mcp = FastMCP("p6clean-fixture")
+
+@mcp.tool()
+def ping(value: str) -> str:
+    """Echo the value back, prefixed, so the response is unambiguously ours."""
+    return f"p6clean-pong:{value}"
+
+if __name__ == "__main__":
+    mcp.run()
+PY
+
+# Isolated config containing ONLY the fixture server.
+cat > "$WORK/config.json" <<PY
+{"mcpServers": {"p6clean_fixture": {"command": "$(command -v python3)", "args": ["$WORK/p6clean_fixture_server.py"]}}}
+PY
+
+uv run pmcp --transport http --host 127.0.0.1 --port "$PORT" \
+  --lock-dir "$WORK/lock" --config "$WORK/config.json" > "$WORK/gw.log" 2>&1 &
+GW_PID=$!
+
+# (a) the process starts and listens
+for _ in $(seq 1 60); do
+  curl -sf "http://127.0.0.1:$PORT/health" > /dev/null && break
+  kill -0 "$GW_PID" 2>/dev/null || { echo "gateway exited early:"; cat "$WORK/gw.log"; exit 1; }
+  sleep 0.5
+done
+curl -sf "http://127.0.0.1:$PORT/health" | tee "$WORK/health.json"
+
+# (b) a real downstream server serves a real tool call through it
+PORT="$PORT" uv run python - <<'PY'
+import asyncio, os
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+async def main():
+    url = f"http://127.0.0.1:{os.environ['PORT']}/mcp"
+    async with streamablehttp_client(url) as (r, w, _):
+        async with ClientSession(r, w) as s:
+            await s.initialize()
+            names = {t.name for t in (await s.list_tools()).tools}
+            assert "gateway.invoke" in names, f"gateway.invoke missing: {sorted(names)}"
+            res = await s.call_tool("gateway.invoke", {
+                "tool_id": "p6clean_fixture::ping",
+                "arguments": {"value": "p6clean"},
+            })
+            body = "".join(getattr(c, "text", "") for c in res.content)
+            assert "p6clean-pong:p6clean" in body, f"downstream call failed: {body!r}"
+            print("PRINCIPLE-1 OK:", body)
+
+asyncio.run(main())
+PY
+```
+
+Expected: `/health` returns 200; `list_tools` includes `gateway.invoke`; the call returns
+`p6clean-pong:p6clean`, proving the request reached the downstream process and came back
+through the gateway. `cleanup` runs on every exit path. Afterwards confirm the operator's
+gateway is untouched: `curl -sf http://127.0.0.1:3344/health` still succeeds (principle 3).
+
+If `gateway.invoke`'s `tool_id` separator or argument shape differs at execution time,
+resolve it against the live gateway's `gateway.describe` output rather than editing the
+assertion to something weaker — a passing call that does not reach the downstream
+process satisfies nothing.
 
 ## Spec Closeout Plan
 
