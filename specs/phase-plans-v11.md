@@ -1,6 +1,6 @@
 # PMCP — Phase Plan v11 (MCP spec 2026-07-28 / mcp 2.x fleet migration)
 
-> How to use this document: run `/claude-plan-phase <ALIAS>` to produce the lane-level plan for each phase (→ `plans/phase-plan-v11-<alias>.md`), then `/claude-execute-phase <alias>` to build it.
+> How to use this document: run `/claude-plan-phase <ALIAS>` to produce the lane-level plan for each phase (→ `plans/phase-plan-v11-<ALIAS>.md` — the alias is UPPERCASE; `PLAN_RE` in `phase_loop_runtime.plan_manifest` requires an uppercase first character and will not match a lowercase filename), then `/claude-execute-phase <alias>` to build it.
 
 ---
 
@@ -141,7 +141,7 @@ Level `pmcp`'s CI up to the four guards already proven in `pangram-mcp`, so the 
 - schema: `spec_delta_closeout.v1`
 - decision: `no_spec_delta`
 - target surfaces: `.github/workflows/test.yml`, `tests/`
-- evidence paths: `plans/phase-plan-v11-p1.md`
+- evidence paths: `plans/phase-plan-v11-P1.md`
 - redaction posture: `metadata_only`
 
 ---
@@ -194,7 +194,7 @@ Raise `pmcp` onto `mcp` 2.x so it runs correctly on the new library and negotiat
 - schema: `spec_delta_closeout.v1`
 - decision: `roadmap_amendment`
 - target surfaces: `src/pmcp/server.py`, `src/pmcp/client/manager.py`, `pyproject.toml`
-- evidence paths: `plans/phase-plan-v11-p2.md`, `plans/detailed-mcp-2x-spec-2026-07-28-stage1-20260805-1740.md`
+- evidence paths: `plans/phase-plan-v11-P2.md`, `plans/detailed-mcp-2x-spec-2026-07-28-stage1-20260805-1740.md`
 - redaction posture: `metadata_only`
 - note: if Assumption 1a (the two-era split) proves wrong, this phase must raise a roadmap amendment before P3B is planned.
 
@@ -241,7 +241,7 @@ Implement `subscriptions/listen` and retire the HTTP GET endpoint it replaces, w
 - schema: `spec_delta_closeout.v1`
 - decision: `canonical_spec_update`
 - target surfaces: `src/pmcp/transport/http.py`, `src/pmcp/server.py`, `CHANGELOG.md`
-- evidence paths: `plans/phase-plan-v11-p3b.md`
+- evidence paths: `plans/phase-plan-v11-P3B.md`
 - redaction posture: `metadata_only`
 
 ---
@@ -282,7 +282,7 @@ Move the first-party `pangram-mcp` server off the removed `FastMCP` API onto `MC
 - schema: `spec_delta_closeout.v1`
 - decision: `no_spec_delta`
 - target surfaces: `src/pangram_mcp/server.py`, `pyproject.toml`
-- evidence paths: `plans/phase-plan-v11-pg.md`
+- evidence paths: `plans/phase-plan-v11-PG.md`
 - redaction posture: `metadata_only`
 
 ---
@@ -328,7 +328,7 @@ Let a manifest entry express "credential required for the vendor endpoint, optio
 - schema: `spec_delta_closeout.v1`
 - decision: `no_spec_delta`
 - target surfaces: `src/pmcp/manifest/loader.py`, `tests/`
-- evidence paths: `plans/phase-plan-v11-p5.md`
+- evidence paths: `plans/phase-plan-v11-P5.md`
 - redaction posture: `metadata_only`
 
 ---
@@ -364,7 +364,7 @@ Finish the one item from `specs/phase-plans-v10.md` Phase 6 that never landed, s
 - schema: `spec_delta_closeout.v1`
 - decision: `no_spec_delta`
 - target surfaces: `src/pmcp/tools/handlers.py`, `tests/test_manifest.py`
-- evidence paths: `plans/phase-plan-v11-p6clean.md`, `specs/phase-plans-v10.md`
+- evidence paths: `plans/phase-plan-v11-P6CLEAN.md`, `specs/phase-plans-v10.md`
 - redaction posture: `metadata_only`
 
 ---
