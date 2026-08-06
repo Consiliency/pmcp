@@ -159,6 +159,7 @@ from pmcp.manifest.loader import (
     ServerConfig,
     credential_lookup_keys,
     credential_storage_key,
+    requires_credential,
 )
 
 logger = logging.getLogger(__name__)
@@ -3197,7 +3198,7 @@ class GatewayTools:
                     ),
                 )
 
-            if server_config.requires_api_key and server_config.env_var:
+            if requires_credential(server_config) and server_config.env_var:
                 auth_env_options = self._auth_env_options(
                     server_name, server_config.env_var
                 )
@@ -3358,11 +3359,19 @@ class GatewayTools:
         manifest: Manifest,
         configured_servers: dict[str, ResolvedServerConfig],
     ) -> tuple[bool, str | None, str | None]:
-        """Get API-key metadata for a server candidate."""
+        """Get API-key metadata for a server candidate.
+
+        The first element is the *effective* requirement
+        (``requires_credential``), not the raw declared ``requires_api_key`` —
+        a relaxed server reports no key required here even though it still
+        carries ``env_var``/``env_instructions`` unchanged, so
+        ``gateway.auth_connect`` still works for an operator who later wants a
+        real key (IF-0-P5-3).
+        """
         manifest_server = manifest.get_server(server_name)
         if manifest_server:
             return (
-                manifest_server.requires_api_key,
+                requires_credential(manifest_server),
                 manifest_server.env_var,
                 manifest_server.env_instructions,
             )
@@ -4055,7 +4064,7 @@ class GatewayTools:
             )
 
         # Check API key if required
-        if server_config.requires_api_key and server_config.env_var:
+        if requires_credential(server_config) and server_config.env_var:
             auth_env_options = self._auth_env_options(
                 server_name, server_config.env_var
             )
