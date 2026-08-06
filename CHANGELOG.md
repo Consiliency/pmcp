@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.22.0] - 2026-08-06
+
 ### Added
 - **Manifest credential optionality (`api_key_optional_when`).** A manifest
   server entry can now name the `extra_env` variable (e.g. a self-hosted base
@@ -59,6 +61,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the wrong release.
 
 ### Fixed
+- **Credential-gate startup tests no longer depend on the machine's manifest
+  overlays.** `tests/test_credential_gates_startup.py` passed in CI but failed
+  for any operator with a real `~/.pmcp/manifest.yaml` supplying a relaxer
+  variable: the relaxer legitimately fired, so `pmcp init` printed
+  "No credential needed" where the test expected the credential instruction.
+  Patching `HOME` is not sufficient to isolate manifest resolution — it blocks
+  only the user-overlay lookup, not the independent project-overlay walk from
+  `Path.cwd()`, and `PMCP_MANIFEST_PATH` is the top of the overlay chain rather
+  than a bypass. These tests now pin an explicit manifest path. The direction
+  that mattered was the inverse of the observed failure: a test asserting the
+  *relaxed* path would have passed for the wrong reason — green because the
+  operator's overlay supplied the relaxer, not because the code worked.
+  (Consiliency/pmcp#125)
 - **The last outstanding item from `specs/phase-plans-v10.md` Phase 6 is closed
   out.** `test_monitor_server_ready_on_startup_pattern`
   (`tests/test_manifest.py`) asserted `job.status == "server_ready"` after a
