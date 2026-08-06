@@ -603,6 +603,12 @@ servers:
     requires_api_key: true
     env_var: "FIRECRAWL_API_KEY"
     env_instructions: "Set FIRECRAWL_API_KEY from https://www.firecrawl.dev"
+    # A self-hosted firecrawl deployment needs no vendor credential. Declaring
+    # FIRECRAWL_API_URL as the relaxer requires the operator to also supply it
+    # (via extra_env or an overlay server_env patch) before the gate relaxes —
+    # shipping this line alone changes nothing for an existing install.
+    # Consiliency/pmcp#114
+    api_key_optional_when: ["FIRECRAWL_API_URL"]
 
   tavily:
     description: "Tavily MCP - live web search and extraction tuned for AI workflows"
