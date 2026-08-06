@@ -231,24 +231,45 @@ doing but belongs to a phase that is allowed to add source, not this one.
   `live` — the opt-in integration tests that touch real package managers and network.
   A green 2276 therefore says nothing about live integration. This is a second reason
   the boot check is not redundant with the suite.
-- **Gateway boot safety — non-negotiable, both mechanisms confirmed in source.**
+- **Gateway boot safety — non-negotiable, every mechanism confirmed in source.**
+  The hazard: `_kill_orphan_processes` (`src/pmcp/server.py:683`) scans `/proc` on Linux
+  and sends **SIGKILL** to any process whose `(Path(command).name, tuple(args))`
+  fingerprint (`server.py:700`) matches a *configured* stdio server. It is fed
+  `resolution.lazy_configs + resolution.eager_configs` (`server.py:604`). So a careless
+  second instance SIGKILLs the live gateway's downstream children — violating principle 3.
+  - **`HOME` MUST be redirected to a throwaway dir on the boot invocation. This is the
+    load-bearing step.** An earlier draft of this plan relied on `--config` alone, which
+    is **wrong**: `--config` is *additive*, appended after the project and user paths
+    (`src/pmcp/config/loader.py:285-299`), and the server resolves shipped-manifest
+    entries regardless. Redirecting `HOME` is what actually suppresses `~/.mcp.json`,
+    `~/.claude/.mcp.json`, `~/.pmcp/manifest.yaml`, and the default singleton lock —
+    `default_user_config_paths()` resolves `Path.home()` **at call time**
+    (`config/loader.py:48-53`), so the env var genuinely takes effect. P1, PG, and P5 all
+    already do this.
   - **Spare port only. Never 3344.** A live systemd PMCP gateway owns `127.0.0.1:3344`
     on this host and it is the operator's daily driver (principle 3).
-  - **MUST pass `--lock-dir <tmpdir>`** (`src/pmcp/cli.py:191`; `PMCP_LOCK_DIR` is the
-    env equivalent at `cli.py:2201`). `_run_http` calls
-    `acquire_singleton_lock(self._lock_dir)` and `None` means a **global** lock under
-    `~/.pmcp` (`src/pmcp/server.py:779-784`, `acquire_singleton_lock` at
-    `src/pmcp/identity.py:176`). Booting without `--lock-dir` either fails against the
-    live gateway's lock or contends with it.
-  - **MUST pass `--config <isolated>`** (`src/pmcp/cli.py:139`). `_kill_orphan_processes`
-    (`src/pmcp/server.py:683`) scans `/proc` on Linux and sends **SIGKILL** to any
-    process whose argv0 + args fingerprint matches a *configured* stdio server. A second
-    instance loading the operator's real config would therefore SIGKILL the live
-    gateway's downstream children. The isolated config must contain **only** the
-    throwaway fixture server, whose command path is unique to the temp dir, so no
-    fingerprint can match anything the live gateway is running.
+  - **MUST also pass `--lock-dir <tmpdir>`** (`src/pmcp/cli.py:191`; `PMCP_LOCK_DIR` at
+    `cli.py:2201`). `_run_http` calls `acquire_singleton_lock(self._lock_dir)` and `None`
+    means a **global** lock under `~/.pmcp` (`src/pmcp/server.py:779-784`,
+    `acquire_singleton_lock` at `src/pmcp/identity.py:176`). Keep it even with `HOME`
+    redirected — belt and braces, and it makes the intent explicit.
+  - **MUST also pass `--config <isolated>`, `--project <empty dir>`, and `--policy
+    <fixture-only>`** (`src/pmcp/cli.py:139,133,144`). The policy is a real second layer,
+    not decoration: `is_server_allowed` is threaded into `resolve_startup_configs`
+    (`server.py:569`) and only surviving configs reach `_kill_orphan_processes`
+    (`server.py:604`), so a fixture-only allowlist narrows the kill set directly.
+  - **The fixture's fingerprint must be non-colliding by construction.** Both tuple
+    elements are made unique: command basename `p6clean-fixture-server` (a wrapper script
+    in the temp dir — no real server is named that) and a sole argument that is a fresh
+    `mktemp -d` path. Matching requires *both* to be equal, so no live process can match.
+  - **Assert principle 3 explicitly, before and after.** Snapshot `:3344`'s listener PID
+    and its children, and require both the health probe and the child PID set to be
+    unchanged afterwards. That is the evidence, not an assumption.
+  - **`/health` proves only that the HTTP server answers** — `transport/http.py:436`
+    returns `"ok": True` as a hardcoded literal. It covers principle 1(a) only; the real
+    `gateway.invoke` round-trip is the sole proof of 1(b).
   - **Guarded teardown.** Boot under `trap`/`finally` so the child gateway is killed and
-    the temp lock dir removed even when an assertion fails midway.
+    the temp dir removed even when an assertion fails midway.
 - **`TMPDIR` note.** Some older plans in `plans/` prefix commands with
   `TMPDIR=/var/tmp`. That was not needed in this worktree — the full suite, ruff, and
   mypy all ran clean without it. Only reach for it if a lane hits a `/tmp` space or
@@ -357,10 +378,15 @@ describes.
   Phase 6 of `specs/phase-plans-v10.md` as closed out.
 - [ ] Cross-cutting principle 1 (`specs/phase-plans-v11.md:87`) — the gateway starts and
   listens, and a real downstream server serves a real tool call through it. Proven by
-  `## Verification` step 2: `GET http://127.0.0.1:$PORT/health` returns 200, and an MCP
-  client call to `gateway.invoke` against the fixture server returns the fixture's
-  actual result payload. Run on a spare port with `--lock-dir` and an isolated
-  `--config`; never against 3344.
+  `## Verification` step 2: `GET http://127.0.0.1:$PORT/health` returns 200 (1a), and an
+  MCP client call to `gateway.invoke` returns `p6clean-pong:p6clean` from the fixture
+  process (1b — `/health` alone does not prove this; `transport/http.py:436` hardcodes
+  `"ok": True`). Run with `HOME` redirected, on a spare port, with `--lock-dir`,
+  `--config`, `--project`, and a fixture-only `--policy`; never against 3344.
+- [ ] Cross-cutting principle 3 (`specs/phase-plans-v11.md:89`) — the operator's gateway
+  survives the boot untouched. Proven by `## Verification` step 2's before/after
+  assertions: `curl -sf http://127.0.0.1:3344/health` succeeds both times, and
+  `pgrep -P $LIVE_PID` returns a byte-identical child PID set.
 - [ ] Cross-phase — the merged union of P6CLEAN with whichever of P1/P5 land alongside it
   passes the whole `## Verification` block, not merely each phase in isolation. Proven by
   the last phase to merge re-running the block against the merged result.
@@ -403,7 +429,8 @@ Read `## Execution Notes > Gateway boot safety` before running this. Spare port 
 
 ```bash
 set -euo pipefail
-WORK="$(mktemp -d)"; PORT=38344   # spare port — NEVER 3344
+WORK="$(mktemp -d)"; PORT=38344            # spare port — NEVER 3344
+FAKE_HOME="$WORK/home"; mkdir -p "$FAKE_HOME" "$WORK/proj"
 GW_PID=""
 cleanup() {
   [ -n "$GW_PID" ] && kill "$GW_PID" 2>/dev/null || true
@@ -412,8 +439,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# A real downstream MCP server, unique to $WORK so no /proc fingerprint can match
-# anything the live gateway on 3344 is running (server.py:683 SIGKILLs matches).
+# --- BEFORE: snapshot the operator's live gateway (principle 3 evidence) ---
+curl -sf http://127.0.0.1:3344/health >/dev/null || { echo "live gateway down BEFORE; abort"; exit 1; }
+LIVE_PID="$(ss -ltnpH 'sport = :3344' | grep -oP 'pid=\K[0-9]+' | head -1)"
+LIVE_KIDS_BEFORE="$(pgrep -P "$LIVE_PID" | sort | tr '\n' ' ')"
+echo "live gateway pid=$LIVE_PID children=[$LIVE_KIDS_BEFORE]"
+
+# --- Fixture: fingerprint cannot collide, by construction ---
+# _kill_orphan_processes fingerprints a config as (Path(command).name, tuple(args))
+# (server.py:700). BOTH elements below are unique to this run: the command basename
+# is p6clean-fixture-server (no real server is named that) and the sole arg is a
+# fresh mktemp path. No live process can match the pair.
 cat > "$WORK/p6clean_fixture_server.py" <<'PY'
 from mcp.server.fastmcp import FastMCP
 mcp = FastMCP("p6clean-fixture")
@@ -426,26 +462,52 @@ def ping(value: str) -> str:
 if __name__ == "__main__":
     mcp.run()
 PY
+cat > "$WORK/p6clean-fixture-server" <<PY
+#!/bin/sh
+exec "$PWD/.venv/bin/python" "$WORK/p6clean_fixture_server.py"
+PY
+chmod +x "$WORK/p6clean-fixture-server"
 
-# Isolated config containing ONLY the fixture server.
+# Isolated config: ONLY the fixture. Note --config is ADDITIVE (config/loader.py:285-299),
+# so this alone does not bound resolution — HOME redirection below is what does.
 cat > "$WORK/config.json" <<PY
-{"mcpServers": {"p6clean_fixture": {"command": "$(command -v python3)", "args": ["$WORK/p6clean_fixture_server.py"]}}}
+{"mcpServers": {"p6clean_fixture": {"command": "$WORK/p6clean-fixture-server", "args": ["--p6clean-run", "$WORK"]}}}
 PY
 
-uv run pmcp --transport http --host 127.0.0.1 --port "$PORT" \
-  --lock-dir "$WORK/lock" --config "$WORK/config.json" > "$WORK/gw.log" 2>&1 &
+# Fixture-only policy. is_server_allowed is threaded into resolve_startup_configs
+# (server.py:569), and only surviving configs reach _kill_orphan_processes
+# (server.py:604) — so this genuinely narrows the kill set.
+cat > "$WORK/policy.yaml" <<'PY'
+servers:
+  allowlist:
+    - p6clean_fixture
+PY
+
+# --- BOOT: HOME redirected. This is the load-bearing isolation. ---
+# default_user_config_paths() resolves Path.home() at call time (config/loader.py:48-53),
+# so HOME= suppresses ~/.mcp.json, ~/.claude/.mcp.json, ~/.pmcp/manifest.yaml, and the
+# default singleton lock. .venv/bin/pmcp is used instead of `uv run` so the redirected
+# HOME cannot send uv looking for a cache that isn't there.
+env HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" \
+  "$PWD/.venv/bin/pmcp" --transport http --host 127.0.0.1 --port "$PORT" \
+  --lock-dir "$WORK/lock" --config "$WORK/config.json" \
+  --project "$WORK/proj" --policy "$WORK/policy.yaml" > "$WORK/gw.log" 2>&1 &
 GW_PID=$!
 
-# (a) the process starts and listens
+# Confirm isolation actually took: the startup summary must show a tiny config set.
+# A count in the hundreds means HOME redirection failed — stop rather than continue.
 for _ in $(seq 1 60); do
   curl -sf "http://127.0.0.1:$PORT/health" > /dev/null && break
   kill -0 "$GW_PID" 2>/dev/null || { echo "gateway exited early:"; cat "$WORK/gw.log"; exit 1; }
   sleep 0.5
 done
+grep -E 'Startup policy summary' "$WORK/gw.log" || true
+
+# (a) the process starts and listens
 curl -sf "http://127.0.0.1:$PORT/health" | tee "$WORK/health.json"
 
 # (b) a real downstream server serves a real tool call through it
-PORT="$PORT" uv run python - <<'PY'
+PORT="$PORT" "$PWD/.venv/bin/python" - <<'PY'
 import asyncio, os
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
@@ -467,12 +529,25 @@ async def main():
 
 asyncio.run(main())
 PY
+
+# --- AFTER: the operator's gateway and its children must be untouched ---
+curl -sf http://127.0.0.1:3344/health >/dev/null || { echo "FAIL: live gateway died"; exit 1; }
+LIVE_KIDS_AFTER="$(pgrep -P "$LIVE_PID" | sort | tr '\n' ' ')"
+[ "$LIVE_KIDS_BEFORE" = "$LIVE_KIDS_AFTER" ] || {
+  echo "FAIL: live gateway children changed"; echo "  before=[$LIVE_KIDS_BEFORE]"; echo "  after =[$LIVE_KIDS_AFTER]"; exit 1; }
+echo "PRINCIPLE-3 OK: :3344 still listening, children unchanged"
 ```
 
-Expected: `/health` returns 200; `list_tools` includes `gateway.invoke`; the call returns
-`p6clean-pong:p6clean`, proving the request reached the downstream process and came back
-through the gateway. `cleanup` runs on every exit path. Afterwards confirm the operator's
-gateway is untouched: `curl -sf http://127.0.0.1:3344/health` still succeeds (principle 3).
+Expected: the startup summary shows only the fixture resolved (single-digit counts — a
+count in the hundreds means HOME redirection did not take, and the run must be stopped,
+not continued); `list_tools` includes `gateway.invoke`; the call returns
+`p6clean-pong:p6clean`; `:3344` still answers and `LIVE_KIDS` is byte-identical
+before and after. `cleanup` runs on every exit path.
+
+**`/health` is not functional proof.** `transport/http.py:436` returns `"ok": True` as a
+hardcoded literal, so the probe shows only that the HTTP server answers. The real
+downstream `gateway.invoke` returning `p6clean-pong:` is the proof for principle 1(b);
+`/health` covers only 1(a) "starts and listens." Do not let one stand in for the other.
 
 If `gateway.invoke`'s `tool_id` separator or argument shape differs at execution time,
 resolve it against the live gateway's `gateway.describe` output rather than editing the
