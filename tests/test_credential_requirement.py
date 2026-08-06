@@ -84,6 +84,43 @@ class TestExtraEnvRelaxation:
         assert result.relaxed_by is None
 
 
+class TestRemoteServersNeverRelax:
+    """Board review finding 2: extra_env is carried to a spawned local
+    subprocess's environment; a remote (url-based) server has no such
+    subprocess and authenticates via headers, so a relaxer set in extra_env
+    can never actually reach the connection. A remote entry must stay
+    required regardless of api_key_optional_when/extra_env."""
+
+    def test_remote_server_with_usable_relaxer_still_required(self) -> None:
+        server = _server(
+            url="https://mcp.example.com/sse",
+            api_key_optional_when=["FIRECRAWL_API_URL"],
+            extra_env={"FIRECRAWL_API_URL": "http://localhost:3002"},
+        )
+        result = credential_requirement(server)
+        assert result.required is True
+        assert result.relaxed_by is None
+
+    def test_remote_server_with_usable_relaxer_in_child_env_still_required(
+        self,
+    ) -> None:
+        server = _server(url="https://mcp.example.com/sse")
+        result = credential_requirement(
+            server, child_env={"FIRECRAWL_API_URL": "http://localhost:3002"}
+        )
+        assert result.required is True
+        assert result.relaxed_by is None
+
+    def test_local_server_unaffected_by_url_check(self) -> None:
+        # Sanity: a server with no url is unaffected by this clause.
+        server = _server(
+            url=None,
+            api_key_optional_when=["FIRECRAWL_API_URL"],
+            extra_env={"FIRECRAWL_API_URL": "http://localhost:3002"},
+        )
+        assert credential_requirement(server).required is False
+
+
 class TestOsEnvironInversionGuard:
     """Clause 2: the predicate must never read os.environ. This is the guard
     against the env-strip inversion documented in the plan: sanitized_subprocess_env

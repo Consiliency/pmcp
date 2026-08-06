@@ -2895,6 +2895,37 @@ class GatewayTools:
             return ["api_key", "subscription_token"]
         return ["api_key"]
 
+    def _configured_duplicate_missing_credential(
+        self, server_name: str, configured: ResolvedServerConfig
+    ) -> tuple[ServerConfig, list[str]] | None:
+        """Credential gate for a *configured* (.mcp.json) entry that also
+        matches a manifest server.
+
+        A `.mcp.json` entry duplicating a manifest server was previously
+        never credential-checked at all here — `manifest_server` was always
+        `None` for this path, so a genuinely-required server with no
+        credential reached `ensure_connected`/`connect_server` unauthenticated
+        (Consiliency/pmcp#114 board review finding 1). Judges the manifest
+        server's requirement against *configured*'s actual child env (a
+        `.mcp.json` override wins over the manifest default, same as every
+        other consumer). Returns `(manifest_server, auth_env_options)` when
+        the credential is still required and unavailable, else `None`.
+        """
+        manifest_server = load_manifest().get_server(server_name)
+        if not manifest_server or not manifest_server.env_var:
+            return None
+        child_env = (
+            configured.config.env
+            if isinstance(configured.config, LocalMcpServerConfig)
+            else None
+        )
+        if not requires_credential(manifest_server, child_env=child_env):
+            return None
+        auth_env_options = self._auth_env_options(server_name, manifest_server.env_var)
+        if self._check_any_api_key_available(auth_env_options):
+            return None
+        return (manifest_server, auth_env_options)
+
     def _write_secret(self, scope: str, key: str, value: str) -> Path:
         """Persist a secret in PMCP env storage."""
         return set_env_value(scope, key, value, self._project_root)
@@ -3176,6 +3207,38 @@ class GatewayTools:
                         missing_env_vars=missing_env_vars,
                     ),
                 )
+            # Same class of bug as the provision() and startup-resolution
+            # fixes (Consiliency/pmcp#114 board review finding 1): a
+            # configured duplicate of a manifest server was never
+            # credential-gated here at all.
+            credential_gap = self._configured_duplicate_missing_credential(
+                server_name, configured
+            )
+            if credential_gap:
+                manifest_server, auth_env_options = credential_gap
+                env_names = ", ".join(auth_env_options)
+                return (
+                    None,
+                    self._lifecycle_output(
+                        ok=False,
+                        server=server_name,
+                        action=action,
+                        prior_status=prior_status,
+                        message=(
+                            f"Server '{server_name}' requires authentication. "
+                            f"Set one of: {env_names}"
+                        ),
+                        errors=[
+                            f"Missing authentication environment variable for '{server_name}': {env_names}"
+                        ],
+                        missing_env_vars=auth_env_options,
+                        auth_state="missing_auth",
+                        auth_event="missing_credential",
+                        auth_methods=self._auth_methods_for_server(server_name),
+                        auth_metadata=self._auth_metadata_for_server(manifest_server),
+                        next_step=f"gateway.auth_connect(server_name='{server_name}')",
+                    ),
+                )
             return (configured, None)
 
         manifest = load_manifest()
@@ -3367,11 +3430,25 @@ class GatewayTools:
         carries ``env_var``/``env_instructions`` unchanged, so
         ``gateway.auth_connect`` still works for an operator who later wants a
         real key (IF-0-P5-3).
+
+        A server name present in *configured_servers* is a configured
+        duplicate: the child env it will actually receive is that entry's
+        ``config.env``, not the manifest's bare ``extra_env`` — passed as
+        ``child_env`` so an override (e.g. an empty or placeholder value in
+        ``.mcp.json``) is judged correctly instead of always reading the
+        manifest default (Consiliency/pmcp#114 board review finding 1).
         """
         manifest_server = manifest.get_server(server_name)
         if manifest_server:
+            configured = configured_servers.get(server_name)
+            child_env = (
+                configured.config.env
+                if configured is not None
+                and isinstance(configured.config, LocalMcpServerConfig)
+                else None
+            )
             return (
-                requires_credential(manifest_server),
+                requires_credential(manifest_server, child_env=child_env),
                 manifest_server.env_var,
                 manifest_server.env_instructions,
             )
@@ -3977,6 +4054,33 @@ class GatewayTools:
                     missing_env_vars=missing_env_vars,
                     auth_state="missing_auth",
                     auth_methods=self._auth_methods_for_server(server_name),
+                    next_step=f"gateway.auth_connect(server_name='{server_name}')",
+                    update_warning=update_warning,
+                    feedback_hint=self._feedback_hint(),
+                )
+            credential_gap = self._configured_duplicate_missing_credential(
+                server_name, configured
+            )
+            if credential_gap:
+                manifest_server, auth_env_options = credential_gap
+                return ProvisionOutput(
+                    ok=False,
+                    server=server_name,
+                    status="failed",
+                    message=(
+                        f"Server '{server_name}' requires authentication. "
+                        f"Set one of: {', '.join(auth_env_options)}"
+                    ),
+                    needs_api_key=True,
+                    env_var=manifest_server.env_var,
+                    env_instructions=manifest_server.env_instructions,
+                    auth_required=True,
+                    auth_mode="api_key",
+                    auth_methods=self._auth_methods_for_server(server_name),
+                    alternative_env_vars=auth_env_options,
+                    missing_env_vars=auth_env_options,
+                    auth_state="missing_auth",
+                    auth_metadata=self._auth_metadata_for_server(manifest_server),
                     next_step=f"gateway.auth_connect(server_name='{server_name}')",
                     update_warning=update_warning,
                     feedback_hint=self._feedback_hint(),

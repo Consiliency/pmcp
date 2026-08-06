@@ -19,6 +19,7 @@ import pytest
 from pmcp.config.loader import StartupSkipReason, resolve_startup_configs
 from pmcp.manifest.installer import MissingApiKeyError, check_api_key
 from pmcp.manifest.loader import ServerConfig
+from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
 
 
 def _relaxable_server(
@@ -86,6 +87,84 @@ class TestGate1EagerStartup:
         )
         assert [c.name for c in result.eager_configs] == ["firecrawl"]
         assert result.skipped == []
+
+
+class TestGate1ConfiguredDuplicate:
+    """Board review finding 1: a .mcp.json entry ("configured" source) whose
+    name duplicates a manifest server was previously never credential-gated
+    at all here — add_config's manifest_server param was always None for the
+    configured-entries loop, so a genuinely-required, credential-less
+    configured duplicate reached eager_configs unconditionally."""
+
+    def test_configured_duplicate_required_and_no_credential_is_skipped(
+        self,
+    ) -> None:
+        server = _relaxable_server(api_key_optional_when=[])
+        configured = ResolvedServerConfig(
+            name="firecrawl",
+            source="project",
+            config=LocalMcpServerConfig(command="firecrawl-mcp"),
+        )
+        result = resolve_startup_configs(
+            [configured],
+            manifest_servers={"firecrawl": server},
+            enabled_auto_start={"firecrawl"},
+            is_auth_available=lambda _key: False,
+        )
+        assert result.eager_configs == []
+        assert len(result.skipped) == 1
+        assert result.skipped[0].reason == StartupSkipReason.MISSING_AUTH
+        assert result.skipped[0].name == "firecrawl"
+
+    def test_configured_duplicate_relaxed_via_own_env_is_eager(self) -> None:
+        server = _relaxable_server(
+            api_key_optional_when=["FIRECRAWL_API_URL"],
+        )
+        # The configured entry's OWN env supplies the relaxer — not the
+        # manifest's extra_env (which is empty here) — proving child_env,
+        # not the manifest default, is what's judged.
+        configured = ResolvedServerConfig(
+            name="firecrawl",
+            source="project",
+            config=LocalMcpServerConfig(
+                command="firecrawl-mcp",
+                env={"FIRECRAWL_API_URL": "http://localhost:3002"},
+            ),
+        )
+        result = resolve_startup_configs(
+            [configured],
+            manifest_servers={"firecrawl": server},
+            enabled_auto_start={"firecrawl"},
+            is_auth_available=lambda _key: False,
+        )
+        assert [c.name for c in result.eager_configs] == ["firecrawl"]
+        assert result.skipped == []
+
+    def test_configured_duplicate_empty_string_override_fails_closed(self) -> None:
+        server = _relaxable_server(
+            api_key_optional_when=["FIRECRAWL_API_URL"],
+            extra_env={"FIRECRAWL_API_URL": "http://localhost:3002"},
+        )
+        # .mcp.json overrides the relaxer to an empty string — the child gets
+        # a dead literal, so this must still fail closed even though the
+        # manifest's own extra_env has a usable value.
+        configured = ResolvedServerConfig(
+            name="firecrawl",
+            source="project",
+            config=LocalMcpServerConfig(
+                command="firecrawl-mcp",
+                env={"FIRECRAWL_API_URL": ""},
+            ),
+        )
+        result = resolve_startup_configs(
+            [configured],
+            manifest_servers={"firecrawl": server},
+            enabled_auto_start={"firecrawl"},
+            is_auth_available=lambda _key: False,
+        )
+        assert result.eager_configs == []
+        assert len(result.skipped) == 1
+        assert result.skipped[0].reason == StartupSkipReason.MISSING_AUTH
 
 
 # ---------------------------------------------------------------------------

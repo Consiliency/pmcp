@@ -657,8 +657,23 @@ uv run pytest tests/test_credential_child_env.py -v
 
 # 5. No pre-existing test moved — EXIT-STATUS BEARING (EC-P5-4).
 #    `git diff | grep -v` always exits 0 and proves nothing; this fails the build.
+#    RECORDED EXCEPTION (post-execution, board review finding 4):
+#    tests/test_manifest_provision.py is intentionally in this allowlist.
+#    Its module-level `load_manifest()` call had no HOME isolation and picked
+#    up this machine's real ~/.pmcp/manifest.yaml overlay (which independently
+#    patches firecrawl's extra_env with a real self-hosted URL). That overlay
+#    was always inert for gating purposes pre-P5 (requires_api_key never read
+#    extra_env), so the gap was invisible; once requires_api_key gating became
+#    extra_env-sensitive, test_provision_missing_api_key[firecrawl] started
+#    failing for reasons unrelated to the shipped manifest's own default
+#    behaviour (test_credential_optionality_e2e.py's shipped-manifest tests
+#    prove that default is unaffected). Fixed by loading via an explicit
+#    manifest_path, which applies no overlays — the officially documented
+#    no-overlay mode of load_manifest(). This is the ONLY pre-existing test
+#    file this phase modifies; the exception is scoped to this one file, not
+#    a general weakening of the filter.
 test "$(git diff --name-only main -- tests/ \
-  | grep -vcE '^tests/test_credential_(requirement|gates_startup|gates_handlers|predicate_guard|optionality_e2e|child_env|boot)\.py$')" -eq 0
+  | grep -vcE '^tests/test_credential_(requirement|gates_startup|gates_handlers|predicate_guard|optionality_e2e|child_env|boot)\.py$|^tests/test_manifest_provision\.py$')" -eq 0
 
 # 6. Full suite, lint, types (EC-P5-4)
 uv run pytest

@@ -1122,6 +1122,12 @@ def resolve_startup_configs(
             config,
             eager=config.name in enabled and config.name not in disabled,
             source="configured",
+            # A .mcp.json entry that duplicates a manifest server must still
+            # be credential-gated — omitting manifest_server here let a
+            # genuinely-required, credential-less configured duplicate reach
+            # eager_configs with no MISSING_AUTH check at all (Consiliency/pmcp#114
+            # board review finding 1).
+            manifest_server=manifest_by_name.get(config.name),
         )
 
     for name, server in manifest_by_name.items():

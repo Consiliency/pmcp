@@ -86,6 +86,11 @@ servers:
   firecrawl:
     description: "Web scraping/crawling"
     keywords: [firecrawl, scraping, crawl, extract]
+    install:
+      mac: ["true"]
+      linux: ["true"]
+      wsl: ["true"]
+      windows: ["true"]
     command: "firecrawl-mcp"
     args: []
     requires_api_key: true
@@ -197,9 +202,14 @@ class TestRelaxedDirectionAllSevenGates:
         # Gate 3 — connect does not report missing_auth.
         assert outcomes["connect"].auth_state != "missing_auth"
 
-        # Gate 4 — provision does not need an api key.
+        # Gate 4 — provision actually succeeds (ok is True), not merely
+        # "didn't report needing a key". The fixture carries a real install
+        # command (`true`) so this exercises the full success path rather
+        # than accidentally passing via an unrelated InstallError.
         assert outcomes["provision"].needs_api_key is not True
         assert outcomes["provision"].auth_state != "missing_auth"
+        assert outcomes["provision"].ok is True, outcomes["provision"].message
+        assert outcomes["provision"].status == "started"
 
         # Gate 5 — ok is True; neither the credential nor the relaxer is
         # reported missing (read the returned field, never an exit code).

@@ -46,6 +46,13 @@ class MockClientManager:
         self.connected_configs.append(config)
         return []
 
+    def get_all_tools(self) -> list[Any]:
+        return []
+
+    async def ensure_connected(self, name: str) -> bool:
+        self._online.add(name)
+        return True
+
 
 def _relaxable_server(
     *,
@@ -80,6 +87,14 @@ def _manifest(*servers: ServerConfig) -> Manifest:
 
 
 def _gateway_tools(manifest: Manifest, monkeypatch: pytest.MonkeyPatch) -> GatewayTools:
+    return _gateway_tools_with_configured(manifest, [], monkeypatch)
+
+
+def _gateway_tools_with_configured(
+    manifest: Manifest,
+    configured_configs: list[ResolvedServerConfig],
+    monkeypatch: pytest.MonkeyPatch,
+) -> GatewayTools:
     client_manager = MockClientManager()
     policy_manager = PolicyManager()
     tools = GatewayTools(
@@ -87,7 +102,9 @@ def _gateway_tools(manifest: Manifest, monkeypatch: pytest.MonkeyPatch) -> Gatew
         policy_manager=policy_manager,
     )
     monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
-    monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+    monkeypatch.setattr(
+        "pmcp.tools.handlers.load_configs", lambda **_: configured_configs
+    )
     monkeypatch.setattr("pmcp.tools.handlers.load_dotenv", lambda *a, **kw: False)
     return tools
 
@@ -272,6 +289,118 @@ class TestGate6CapabilityDiscovery:
         assert by_name["tavily"].requires_api_key is True
         assert "No API key required: firecrawl." in result.message
         assert "Requires API key (not set): tavily" in result.message
+
+
+# ---------------------------------------------------------------------------
+# Configured-duplicate credential gate (board review finding 1)
+#
+# A .mcp.json entry duplicating a manifest server was previously never
+# credential-gated in connect_server (_resolve_lifecycle_config), provision,
+# or capability discovery (_get_server_env_metadata) — each of those code
+# paths branched on "is this name configured?" and never consulted the
+# manifest server's requires_api_key/api_key_optional_when at all for that
+# branch, regardless of what the predicate would say.
+# ---------------------------------------------------------------------------
+
+
+def _configured_local(
+    name: str, env: dict[str, str] | None = None
+) -> ResolvedServerConfig:
+    return ResolvedServerConfig(
+        name=name,
+        source="project",
+        config=LocalMcpServerConfig(command=f"{name}-mcp", env=env),
+    )
+
+
+class TestConfiguredDuplicateCredentialGate:
+    @pytest.mark.asyncio
+    async def test_connect_configured_duplicate_required_no_credential_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+        manifest = _manifest(_relaxable_server(api_key_optional_when=[]))
+        configured = _configured_local("firecrawl")
+        tools = _gateway_tools_with_configured(manifest, [configured], monkeypatch)
+
+        result = await tools.connect_server({"server_name": "firecrawl"})
+
+        assert result.ok is False
+        assert result.auth_state == "missing_auth"
+
+    @pytest.mark.asyncio
+    async def test_connect_configured_duplicate_relaxed_via_own_env_proceeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+        manifest = _manifest(
+            _relaxable_server(api_key_optional_when=["FIRECRAWL_API_URL"])
+        )
+        configured = _configured_local(
+            "firecrawl", env={"FIRECRAWL_API_URL": "http://localhost:3002"}
+        )
+        tools = _gateway_tools_with_configured(manifest, [configured], monkeypatch)
+
+        result = await tools.connect_server({"server_name": "firecrawl"})
+
+        assert result.auth_state != "missing_auth"
+
+    @pytest.mark.asyncio
+    async def test_provision_configured_duplicate_required_no_credential_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+        manifest = _manifest(_relaxable_server(api_key_optional_when=[]))
+        configured = _configured_local("firecrawl")
+        tools = _gateway_tools_with_configured(manifest, [configured], monkeypatch)
+
+        result = await tools.provision({"server_name": "firecrawl"})
+
+        assert result.ok is False
+        assert result.needs_api_key is True
+        assert result.auth_state == "missing_auth"
+
+    @pytest.mark.asyncio
+    async def test_provision_configured_duplicate_relaxed_via_own_env_proceeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+        manifest = _manifest(
+            _relaxable_server(api_key_optional_when=["FIRECRAWL_API_URL"])
+        )
+        configured = _configured_local(
+            "firecrawl", env={"FIRECRAWL_API_URL": "http://localhost:3002"}
+        )
+        tools = _gateway_tools_with_configured(manifest, [configured], monkeypatch)
+
+        result = await tools.provision({"server_name": "firecrawl"})
+
+        assert result.needs_api_key is not True
+        assert result.auth_state != "missing_auth"
+
+    @pytest.mark.asyncio
+    async def test_capability_discovery_judges_configured_child_env_not_manifest_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The manifest's own extra_env has a usable relaxer, but the
+        configured duplicate overrides it to an empty string — the child
+        gets a dead literal, so the effective requirement must be True."""
+        monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
+        manifest = _manifest(
+            _relaxable_server(
+                api_key_optional_when=["FIRECRAWL_API_URL"],
+                extra_env={"FIRECRAWL_API_URL": "http://localhost:3002"},
+            )
+        )
+        configured = _configured_local("firecrawl", env={"FIRECRAWL_API_URL": ""})
+        tools = _gateway_tools_with_configured(manifest, [configured], monkeypatch)
+        configured_servers = {"firecrawl": configured}
+
+        requires_api_key, _env_var, _instructions = tools._get_server_env_metadata(
+            "firecrawl", manifest, configured_servers
+        )
+
+        assert requires_api_key is True
 
 
 # ---------------------------------------------------------------------------

@@ -184,10 +184,22 @@ def credential_requirement(
     ``None``, the source is ``server.extra_env``, which is correct for every
     manifest-only call site because the two are identical by construction
     there.
+
+    A server with a ``url`` (remote/HTTP transport) is never relaxed, even if
+    ``api_key_optional_when`` names a variable present in ``extra_env``.
+    ``extra_env`` is carried to a spawned local subprocess's environment; a
+    remote connection has no such subprocess and authenticates via headers,
+    so a relaxer set there can never actually reach the connection. Without
+    this, a remote entry with a declared relaxer would be classified
+    not-required and connected to the vendor URL with no Authorization
+    header (Consiliency/pmcp#114 board review finding 2).
     """
     declared = bool(getattr(server, "requires_api_key", False)) if server else False
     if not declared:
         return CredentialRequirement(required=False, declared=False, relaxed_by=None)
+
+    if getattr(server, "url", None):
+        return CredentialRequirement(required=True, declared=True, relaxed_by=None)
 
     own_env_var = getattr(server, "env_var", None)
     own_secret_key = getattr(server, "secret_key", None)
