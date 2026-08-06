@@ -442,7 +442,11 @@ trap cleanup EXIT INT TERM
 # --- BEFORE: snapshot the operator's live gateway (principle 3 evidence) ---
 curl -sf http://127.0.0.1:3344/health >/dev/null || { echo "live gateway down BEFORE; abort"; exit 1; }
 LIVE_PID="$(ss -ltnpH 'sport = :3344' | grep -oP 'pid=\K[0-9]+' | head -1)"
-LIVE_KIDS_BEFORE="$(pgrep -P "$LIVE_PID" | sort | tr '\n' ' ')"
+[ -n "$LIVE_PID" ] || { echo "could not resolve :3344 listener pid; abort"; exit 1; }
+# `|| true` is required: pgrep -P exits 1 when a process has no children, which is a
+# perfectly valid state and must not kill the step under `set -e`. The [ -n ] guard
+# above is the one that must still fail hard.
+LIVE_KIDS_BEFORE="$(pgrep -P "$LIVE_PID" | sort | tr '\n' ' ' || true)"
 echo "live gateway pid=$LIVE_PID children=[$LIVE_KIDS_BEFORE]"
 
 # --- Fixture: fingerprint cannot collide, by construction ---
@@ -494,14 +498,29 @@ env HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   --project "$WORK/proj" --policy "$WORK/policy.yaml" > "$WORK/gw.log" 2>&1 &
 GW_PID=$!
 
-# Confirm isolation actually took: the startup summary must show a tiny config set.
-# A count in the hundreds means HOME redirection failed — stop rather than continue.
 for _ in $(seq 1 60); do
   curl -sf "http://127.0.0.1:$PORT/health" > /dev/null && break
   kill -0 "$GW_PID" 2>/dev/null || { echo "gateway exited early:"; cat "$WORK/gw.log"; exit 1; }
   sleep 0.5
 done
-grep -E 'Startup policy summary' "$WORK/gw.log" || true
+
+# --- Confirm isolation actually took ---
+# The ONLY number that means anything here is eager+lazy, because that is exactly what
+# _kill_orphan_processes receives (server.py:604). It must equal 1 — our fixture, and
+# nothing else. Do NOT assert on `skipped`: the shipped manifest always contributes 106
+# servers, so a CORRECTLY isolated run legitimately reports skipped=106 /
+# policy_denied=106. An earlier draft aborted on "counts in the hundreds", which had it
+# exactly backwards — it would have failed every correct run.
+SUMMARY="$(grep -E 'Startup policy summary' "$WORK/gw.log" | tail -1)"
+[ -n "$SUMMARY" ] || { echo "no startup summary in log; abort"; cat "$WORK/gw.log"; exit 1; }
+echo "$SUMMARY"
+EAGER="$(printf '%s' "$SUMMARY" | grep -oP 'eager=\K[0-9]+')"
+LAZY="$(printf '%s' "$SUMMARY" | grep -oP 'lazy=\K[0-9]+')"
+[ "$((EAGER + LAZY))" -eq 1 ] || {
+  echo "FAIL: isolation did not take — eager+lazy=$((EAGER + LAZY)), expected exactly 1 (the fixture)."
+  echo "      HOME redirection or --policy is not in effect; _kill_orphan_processes would see foreign configs."
+  exit 1; }
+echo "ISOLATION OK: eager=$EAGER lazy=$LAZY (fixture only)"
 
 # (a) the process starts and listens
 curl -sf "http://127.0.0.1:$PORT/health" | tee "$WORK/health.json"
@@ -532,15 +551,17 @@ PY
 
 # --- AFTER: the operator's gateway and its children must be untouched ---
 curl -sf http://127.0.0.1:3344/health >/dev/null || { echo "FAIL: live gateway died"; exit 1; }
-LIVE_KIDS_AFTER="$(pgrep -P "$LIVE_PID" | sort | tr '\n' ' ')"
+LIVE_KIDS_AFTER="$(pgrep -P "$LIVE_PID" | sort | tr '\n' ' ' || true)"
 [ "$LIVE_KIDS_BEFORE" = "$LIVE_KIDS_AFTER" ] || {
   echo "FAIL: live gateway children changed"; echo "  before=[$LIVE_KIDS_BEFORE]"; echo "  after =[$LIVE_KIDS_AFTER]"; exit 1; }
 echo "PRINCIPLE-3 OK: :3344 still listening, children unchanged"
 ```
 
-Expected: the startup summary shows only the fixture resolved (single-digit counts — a
-count in the hundreds means HOME redirection did not take, and the run must be stopped,
-not continued); `list_tools` includes `gateway.invoke`; the call returns
+Expected: the startup summary reports `eager + lazy == 1` — the fixture and nothing else.
+`skipped` and `policy_denied` will both read ~106 on a **correct** run, because the
+shipped manifest always contributes that many and the fixture-only policy denies them
+all; those numbers are evidence that the policy worked, not that isolation failed. Then
+`list_tools` includes `gateway.invoke`; the call returns
 `p6clean-pong:p6clean`; `:3344` still answers and `LIVE_KIDS` is byte-identical
 before and after. `cleanup` runs on every exit path.
 
@@ -559,6 +580,6 @@ process satisfies nothing.
 - schema: `spec_delta_closeout.v1`
 - decision: `no_spec_delta`
 - target surfaces: `tests/test_manifest.py`, `CHANGELOG.md`, `.claude/docs-catalog.json`
-- evidence paths: `plans/phase-plan-v11-p6clean.md`
+- evidence paths: `plans/phase-plan-v11-P6CLEAN.md`
 - redaction posture: `metadata_only`
 - downstream handling: `none`
