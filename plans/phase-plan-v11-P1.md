@@ -289,6 +289,29 @@ Implementation contract:
 - [ ] EC-P1-5 — proven by V5: `uv run pytest tests/ -q`, `uv run ruff check src/ tests/`, `uv run ruff format --check src/ tests/`, `uv run mypy src/pmcp --exclude baml_client` all green, and `rg -n '^### Changed' -A 20 CHANGELOG.md` showing the new entry under `## [Unreleased]`.
 - [ ] Plan-internal — the roadmap amendment narrowing P1's dependency-bound non-goal is present in the same merge as the `pyproject.toml` floor change, proven by `git show --stat HEAD` (or the phase merge commit) listing both `pyproject.toml` and `specs/phase-plans-v11.md`, and by `rg -n 'Post-execution amendments' -A 10 specs/phase-plans-v11.md`.
 
+## Post-execution amendments
+
+*Recorded pre-merge by SL-docs.3, in the same commit as the `pyproject.toml`
+floor change.* The roadmap's Phase 1 "Non-goals: changing any dependency bound"
+has been narrowed to the **ceiling** only; the matching
+`### Post-execution amendments` block is in `specs/phase-plans-v11.md`. P1
+changed `mcp>=1.0.0,<2.0.0` to `mcp>=1.8.0,<2.0.0` and regenerated `uv.lock`
+(one line: the `[package.metadata] requires-dist` entry). The floor was set by
+installing the built wheel pinned at each candidate — 1.0.0/1.6.0/1.7.0/1.7.1
+all fail the startup import with
+`ModuleNotFoundError: No module named 'mcp.client.streamable_http'`, and 1.8.0
+both imports and serves a real downstream tool call through the booted gateway.
+P2 is unaffected: it still raises the cap and re-derives the floor for `mcp` 2.x.
+
+`roadmap_sha256` in this file's frontmatter is deliberately left at its
+plan-time value (`2f03c6f3…`). It records the roadmap state this plan was
+derived from, which is the pre-amendment state; it is read only by
+`claude-plan-phase`'s planning-time validator, never by an execution gate.
+
+SL-docs.5's post-merge evidence (the correlated `workflow_dispatch` run for
+EC-P1-2 and #112's refreshed head for EC-P1-4) is **not** included — by
+construction it cannot exist before the merge.
+
 ## Verification
 
 Run from the merged branch. `/tmp/p1*` are throwaway paths. **V2b and V2c start a gateway on port `3388`** — read `## Execution Notes > Boot-check isolation` first and prefer a CI runner or container over the operator's host. No step may bind `3344`.

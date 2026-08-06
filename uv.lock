@@ -1063,7 +1063,7 @@ http = [
 [package.metadata]
 requires-dist = [
     { name = "aiohttp", specifier = ">=3.9.0" },
-    { name = "mcp", specifier = ">=1.0.0,<2.0.0" },
+    { name = "mcp", specifier = ">=1.8.0,<2.0.0" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.0" },
     { name = "pmcp", extras = ["dev", "http"], marker = "extra == 'all'" },
     { name = "prometheus-client", marker = "extra == 'http'", specifier = ">=0.20" },

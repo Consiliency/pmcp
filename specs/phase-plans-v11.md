@@ -139,10 +139,61 @@ Level `pmcp`'s CI up to the four guards already proven in `pangram-mcp`, so the 
 
 **Spec closeout policy**
 - schema: `spec_delta_closeout.v1`
-- decision: `no_spec_delta`
-- target surfaces: `.github/workflows/test.yml`, `tests/`
-- evidence paths: `plans/phase-plan-v11-P1.md`
+- decision: `roadmap_amendment`
+- target surfaces: `.github/workflows/test.yml`, `pyproject.toml`, `uv.lock`, `tests/`
+- evidence paths: `plans/phase-plan-v11-P1.md`, `specs/phase-plans-v11.md`
 - redaction posture: `metadata_only`
+
+**Post-execution amendments**
+
+*P1's dependency-bound non-goal is narrowed to the ceiling.* The "Non-goals"
+above read "changing any dependency bound". Held literally, the phase is
+unmergeable: `min-version-smoke` installs pinned at the declared floor, and the
+declared floor of `mcp>=1.0.0` does not install. That would land a permanently
+red job on `main`, contradicting EC-P1-5 and undermining P2, whose premise is
+that these guards are trustworthy. Cross-Cutting Principle 2 forbids weakening
+the guard to make the phase pass; Principles 4 and 5 require both bounds be
+declared and set by installing. The reading that satisfies all three: **the
+non-goal reserves the ceiling raise for P2, while a floor that installation
+proves false is corrected here.** P1 therefore changed `mcp>=1.0.0,<2.0.0` to
+`mcp>=1.8.0,<2.0.0` and regenerated `uv.lock`. **P2 is unaffected** — it still
+raises the cap and re-derives the floor for `mcp` 2.x.
+
+Evidence for the 1.8.0 floor, gathered by installing the built wheel pinned at
+each candidate rather than by reading source:
+
+| pinned `mcp` | `import pmcp.client.manager, pmcp.server, pmcp.config.loader` |
+|---|---|
+| 1.0.0 / 1.6.0 / 1.7.0 / 1.7.1 | `ModuleNotFoundError: No module named 'mcp.client.streamable_http'` |
+| 1.8.0 | OK — and the gateway boots, listens, and serves a real downstream tool call |
+
+`client/manager.py:22` imports `streamablehttp_client` from
+`mcp.client.streamable_http`, a module that first exists in `mcp` 1.8.0. The
+functional half of that evidence is the acceptance step: at `mcp==1.8.0`, with
+the startup set bounded by `--policy` to a single throwaway stdio fixture, an
+MCP client over Streamable HTTP initialized against the gateway,
+`gateway.connect_server` brought the fixture online, and `gateway.invoke` on
+`p1probe::p1_echo` returned `p1-floor-ok:floor` with `isError: false`. Imports
+are not acceptance for a gateway, and `/health` is barely stronger — it returns
+`"ok": True` as a hardcoded literal — so both are retained as preconditions
+only.
+
+*EC-P1-1 was tightened, not weakened.* Its text asks only that the job "imports
+the gateway's startup modules". As shipped, `min-version-smoke` also boots the
+gateway and serves a real downstream tool call, per Cross-Cutting Principle 1.
+The `mcp` 2.x break this roadmap exists to fix was invisible to imports and
+would also have been invisible to `/health`. Strengthening a guard is always in
+scope; weakening one never is.
+
+*Post-merge operational evidence (EC-P1-2, EC-P1-4).* Pending. Neither is
+provable from a lane worktree: `workflow_dispatch` is only dispatchable once the
+workflow is on the default branch, and #112's checks are only meaningful when
+re-run against post-P1 `main`. Recorded here by the post-merge closeout, which
+gates nothing — the correlated `workflow_dispatch` run URL, conclusion, and
+`headSha`; and #112's old and refreshed head SHAs with the conclusion against
+the new one. After P1, #112 is expected to fail `install-smoke` **only**: it
+raises the cap but not the floor, so `min-version-smoke` still installs
+`mcp==1.8.0` and passes.
 
 ---
 

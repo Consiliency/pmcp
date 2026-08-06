@@ -36,7 +36,16 @@ dependencies = [
     # which client/manager.py imports at module scope. Without the cap a fresh
     # install resolves to 2.x and the gateway dies on startup with an ImportError.
     # Raising this requires porting that import (and auditing the rest of 2.x).
-    "mcp>=1.0.0,<2.0.0",
+    #
+    # The lower bound is load-bearing too, and was set by INSTALLING, not by
+    # reading source. client/manager.py imports streamablehttp_client from
+    # mcp.client.streamable_http at module scope, and that module first exists
+    # in mcp 1.8.0: the previously declared >=1.0.0 was never installable, and
+    # 1.0.0/1.6.0/1.7.0/1.7.1 all die with
+    # `ModuleNotFoundError: No module named 'mcp.client.streamable_http'`.
+    # At 1.8.0 the gateway boots, listens, and serves a real downstream tool
+    # call. The min-version-smoke CI job re-proves this floor on every run.
+    "mcp>=1.8.0,<2.0.0",
     "pydantic>=2.0",
     "pyjwt[crypto]>=2.10.0",
     "pyyaml>=6.0",

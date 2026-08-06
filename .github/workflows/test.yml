@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # 1.21.0 could have broken with ZERO commits to this repo: mcp 2.0.0 was
+  # published after the last CI run and nothing re-ran to notice. Push/PR
+  # triggers cannot catch a dependency that moves underneath a released
+  # package, so run weekly against the released artifact.
+  schedule:
+    - cron: "0 8 * * 1"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -75,6 +82,87 @@ jobs:
           # Import the modules a real startup touches, so a renamed or removed
           # upstream symbol fails here rather than in a user's service log.
           /tmp/fresh/bin/python -c "import pmcp.client.manager, pmcp.server, pmcp.config.loader"
+
+  # install-smoke proves the CEILING: the unpinned resolve still works. It says
+  # nothing about the FLOOR, because a fresh resolve always picks the newest
+  # allowed version. A declared lower bound that was never installed is a guess,
+  # and this repo shipped one: `mcp>=1.0.0` while mcp.client.streamable_http —
+  # imported by client/manager.py at module scope — first exists in mcp 1.8.0.
+  # This job installs pinned at exactly the declared floor and proves it works.
+  min-version-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python 3.12
+        run: uv python install 3.12
+
+      - name: Resolve the declared minimum mcp from pyproject
+        id: floor
+        run: |
+          FLOOR=$(python3 <<'PY'
+          import pathlib
+          import re
+
+          text = pathlib.Path("pyproject.toml").read_text()
+          match = re.search(r'"mcp>=([0-9.]+),<', text)
+          assert match, "could not parse the mcp lower bound from pyproject.toml"
+          print(match.group(1))
+          PY
+          )
+          echo "floor=$FLOOR" >> "$GITHUB_OUTPUT"
+          echo "declared mcp floor: $FLOOR"
+
+      - name: Install at the floor and import the startup modules
+        env:
+          FLOOR: ${{ steps.floor.outputs.floor }}
+        run: |
+          uv build --wheel --out-dir dist
+          uv venv /tmp/floor
+          VIRTUAL_ENV=/tmp/floor uv pip install dist/*.whl "mcp==${FLOOR}"
+          VIRTUAL_ENV=/tmp/floor uv pip list
+          /tmp/floor/bin/pmcp --version
+          /tmp/floor/bin/python -c "import pmcp.client.manager, pmcp.server, pmcp.config.loader"
+
+      # Imports are not acceptance for a gateway, and neither is /health —
+      # transport/http.py:435-436 returns "ok": True as a hardcoded literal.
+      # Only a real downstream tool call exercises session init, discovery,
+      # and invocation, which is where an mcp break actually lands.
+      - name: Serve a real downstream tool call at the floor
+        env:
+          FLOOR: ${{ steps.floor.outputs.floor }}
+        run: |
+          VIRTUAL_ENV=/tmp/floor uv pip install "$(ls dist/*.whl)[http]" "mcp==${FLOOR}"
+          mkdir -p /tmp/floorhome/lock /tmp/floorhome/xdg
+          cp .github/probe/p1_probe_server.py .github/probe/p1_probe_client.py /tmp/floorhome/
+          printf '{"mcpServers": {"p1probe": {"command": "/tmp/floor/bin/python", "args": ["/tmp/floorhome/p1_probe_server.py"]}}}\n' > /tmp/floorhome/mcp.json
+          printf 'servers:\n  allowlist: ["p1probe"]\n' > /tmp/floorhome/policy.yaml
+          HOME=/tmp/floorhome XDG_CONFIG_HOME=/tmp/floorhome/xdg /tmp/floor/bin/pmcp \
+            --transport http --host 127.0.0.1 --port 3399 \
+            --config /tmp/floorhome/mcp.json \
+            --project /tmp/floorhome \
+            --policy /tmp/floorhome/policy.yaml \
+            --lock-dir /tmp/floorhome/lock -l info > /tmp/floorboot.log 2>&1 &
+          PROBE_PID=$!
+          trap 'kill "$PROBE_PID" 2>/dev/null' EXIT
+          for _ in $(seq 1 30); do
+            curl -sf --max-time 2 http://127.0.0.1:3399/health > /dev/null && break
+            sleep 1
+          done
+          cat /tmp/floorboot.log
+          # Assert the RESOLVED set is exactly the one fixture. Do NOT tripwire on
+          # "a count in the hundreds" — the shipped manifest always contributes 106,
+          # so a correctly isolated run legitimately reports skipped=106 and
+          # policy_denied=106. Hundreds in those buckets is the CORRECT output; what
+          # proves isolation is that lazy+eager (the denominator here) is exactly 1.
+          grep -E 'Gateway initialized: [0-9]+/1 servers online' /tmp/floorboot.log
+          /tmp/floor/bin/python /tmp/floorhome/p1_probe_client.py http://127.0.0.1:3399/mcp
+          kill "$PROBE_PID" 2>/dev/null || true
 
   lint:
     runs-on: ubuntu-latest
