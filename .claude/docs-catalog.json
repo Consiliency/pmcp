@@ -1,1 +1,322 @@
-[]
+{
+  "version": 1,
+  "last_updated": "2026-08-06T03:37:43+00:00",
+  "files": {
+    "README.md": {
+      "purpose": "root project README",
+      "touched_by_phases": []
+    },
+    "CHANGELOG.md": {
+      "purpose": "release changelog",
+      "touched_by_phases": [
+        "P1"
+      ]
+    },
+    "CONTRIBUTING.md": {
+      "purpose": "contribution guidelines",
+      "touched_by_phases": [
+        "P1"
+      ]
+    },
+    "SECURITY.md": {
+      "purpose": "security policy",
+      "touched_by_phases": []
+    },
+    ".claude/plans/ticklish-inventing-stearns.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "specs/README.md": {
+      "purpose": "root project README",
+      "touched_by_phases": []
+    },
+    "specs/active/pmcp-gateway-orchestration-plan.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v1.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v10.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v11.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": [
+        "P1"
+      ]
+    },
+    "specs/phase-plans-v2.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v3.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v4.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v5.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v6.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v7.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v8.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v9.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/tenant-code-mode-host-contract.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/HANDOFF-agent-board-mcp-registration.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/ROADMAP-pmcp-agent-board-mcp.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/codebase-review-2026-06-15.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/detailed-103-scoped-advisor-audit-20260726.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/detailed-describe-nested-schema-and-indexit-stdio-20260706-0920.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/detailed-idle-timeout-downstream-calls-20260628-0646.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/detailed-mcp-2x-spec-2026-07-28-stage1-20260805-1740.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/detailed-overlay-server-env-patch-20260801-1530.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/detailed-private-manifest-overlay-20260629-0841.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v1-config.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v1-observe.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v1-resolver.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v1-runtime.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v11-P1.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": [
+        "P1"
+      ]
+    },
+    "plans/phase-plan-v11-P5.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v11-P6CLEAN.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v11-PG.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v2-lifecycle.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v2-ops.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v2-refresh.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v2-serialize.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v2-soak.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v3-auth.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v3-config.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v3-conform.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v3-observe.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v3-proto.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v3-tasks.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v4-authobs.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v4-authsoak.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v4-elicit.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v4-remote.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v4-safeurl.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v4-store.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v5-catalogcli.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v5-clihint.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v5-climatch.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v5-clisoak.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v5-reqcli.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v6-hostcontract.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v6-hostmeta.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v6-hostpolicy.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v6-hostreg.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v6-hostsoak.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v7-AUTHRS.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v7-CONCURR.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v7-ENVFIX.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v7-MANIFEST.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v7-REDACT.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v7-REGISTRY.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v8-AUTHFIX.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v8-COMPLETE.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v8-MATCHFIX.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v8-REGFIX.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v8-RELEASE.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v9-SPECCURRENCY.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/v7-code-review-findings.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/v7-issue-tracker.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    }
+  }
+}

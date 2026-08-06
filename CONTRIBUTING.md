@@ -76,6 +76,13 @@ Currently, only Playwright and Context7 are auto-start servers.
 - **Linting**: Use `ruff check` for linting
 - **Type hints**: Required for all public functions (mypy checked in CI)
 - **Tests**: Required for new features
+- **Dependency bounds**: Set them by installing, not by reading source. `uv.lock`
+  pins development checkouts, so the full suite can pass while a declared bound
+  is wrong in both directions. Two CI jobs cover this: `install-smoke` resolves
+  fresh with no lockfile (the ceiling), and `min-version-smoke` installs pinned
+  at exactly the declared floor and serves a real downstream tool call through
+  the booted gateway (the floor). If you change a bound in `pyproject.toml`, run
+  `uv lock` in the same commit.
 
 ```bash
 # Format code

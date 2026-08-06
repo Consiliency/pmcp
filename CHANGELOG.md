@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The declared `mcp` floor was corrected from `>=1.0.0` to `>=1.8.0`, because
+  `>=1.0.0` was never installable.** `client/manager.py` imports
+  `streamablehttp_client` from `mcp.client.streamable_http` at module scope, and
+  that module first exists in `mcp` 1.8.0 — pinning 1.0.0, 1.6.0, 1.7.0, or
+  1.7.1 fails the gateway's startup import with
+  `ModuleNotFoundError: No module named 'mcp.client.streamable_http'`. The bound
+  was set by installing at each candidate, not by reading source. The upper
+  bound is unchanged; supporting `mcp` 2.x is still tracked separately.
+- **CI now proves the declared minimum actually works.** `install-smoke` only
+  ever exercised the *ceiling* — a fresh resolve always picks the newest allowed
+  version, so a bogus lower bound is invisible to it. A new `min-version-smoke`
+  job parses the floor out of `pyproject.toml`, installs the built wheel pinned
+  at exactly that version, imports the gateway's startup modules, then boots the
+  gateway and drives a real tool call through it to a throwaway downstream
+  server. Imports alone are not acceptance for a gateway, and neither is
+  `/health` — it returns a hardcoded literal. Only the round trip exercises
+  session initialization, tool discovery, and invocation, which is where an
+  `mcp` break actually lands.
+- **The test workflow now runs on a schedule and on demand.** A weekly
+  `schedule:` (`0 8 * * 1`) plus `workflow_dispatch:` join the existing push and
+  pull-request triggers. 1.21.0 could have broken with zero commits to this
+  repo: `mcp` 2.0.0 was published after the last CI run and nothing re-ran to
+  notice. Push and PR triggers cannot catch a dependency that moves underneath
+  an already-released package.
+- **A drift test pins `pmcp.__version__` to the installed distribution's
+  metadata.** `tests/test_package_metadata.py` fails when the version in
+  `pyproject.toml` and the one in `src/pmcp/__init__.py` disagree. A release
+  that bumps one without the other makes everything reading `pmcp.__version__` —
+  the `/health` payload and the `pmcp/{version}` User-Agent among them — report
+  the wrong release.
+
 ## [1.21.1] - 2026-08-01
 
 ### Fixed
