@@ -15,7 +15,11 @@ from pmcp.env_store import (
     validate_env_var_name,
     write_env_file,
 )
-from pmcp.manifest.loader import credential_storage_key, load_manifest
+from pmcp.manifest.loader import (
+    credential_storage_key,
+    load_manifest,
+    requires_credential,
+)
 from pmcp.remote_auth import collect_remote_header_env_vars
 from pmcp.types import LocalMcpServerConfig, RemoteMcpServerConfig
 
@@ -92,8 +96,8 @@ def _extract_required_keys(
         credential_var: str | None = None
         if (
             manifest_server
-            and manifest_server.requires_api_key
             and manifest_server.env_var
+            and requires_credential(manifest_server, child_env=cfg.config.env)
         ):
             credential_var = manifest_server.env_var
             storage_key = credential_storage_key(manifest_server) or credential_var
@@ -102,12 +106,28 @@ def _extract_required_keys(
             if storage_key != credential_var:
                 credential_fallbacks[storage_key] = credential_var
 
+        # Manifest-supplied non-secrets (e.g. a self-hosted base URL from
+        # extra_env) are not credentials the operator must store — reported
+        # missing here they'd flip `secrets check`'s ok to false for a value
+        # that is already present via the manifest, not the secret store.
+        # Skipped only when the configured env_map still carries the exact
+        # manifest literal; a `.mcp.json` override to a different value (or a
+        # genuine ${VAR} indirection, handled by the ENV_REF_PATTERN branch
+        # below) is not skipped.
+        manifest_extra_env = getattr(manifest_server, "extra_env", None) or {}
+
         for env_key, env_value in env_map.items():
             # The credential var is required via the manifest above; don't re-add
             # its bare runtime name (which would bypass the storage-key mapping).
-            if env_key != credential_var:
-                server_keys.add(env_key)
-                all_keys.add(env_key)
+            if env_key == credential_var:
+                continue
+            if (
+                env_key in manifest_extra_env
+                and manifest_extra_env[env_key] == env_value
+            ):
+                continue
+            server_keys.add(env_key)
+            all_keys.add(env_key)
 
             for pattern_match in ENV_REF_PATTERN.finditer(env_value):
                 var_name = pattern_match.group(1) or pattern_match.group(2)

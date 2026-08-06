@@ -12,10 +12,12 @@ Live smoke tier (opt-in, ``pytest -m live``):
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+import pmcp.manifest.loader as _loader_module
 from pmcp.manifest.installer import JobManager
 from pmcp.manifest.loader import load_manifest
 from pmcp.policy.policy import PolicyManager
@@ -23,9 +25,19 @@ from pmcp.tools.handlers import GatewayTools
 
 # ---------------------------------------------------------------------------
 # Module-level manifest load — shared across all parametrized cases
+#
+# Loaded with an explicit manifest_path so NO private/custom overlay applies
+# (load_manifest() only merges overlays for its no-arg default path). Without
+# this, a developer's real ~/.pmcp/manifest.yaml server_env patch (e.g.
+# pointing firecrawl at a self-hosted FIRECRAWL_API_URL) would change
+# _api_key_servers' effective-requirement behaviour under test — the shipped
+# manifest's api_key_optional_when field (Consiliency/pmcp#114) makes that
+# overlay load-bearing for the first time, where before P5 it was inert for
+# gating purposes.
 # ---------------------------------------------------------------------------
 
-_manifest = load_manifest()
+_SHIPPED_MANIFEST_PATH = Path(_loader_module.__file__).parent / "manifest.yaml"
+_manifest = load_manifest(_SHIPPED_MANIFEST_PATH)
 _all_servers = list(_manifest.servers.values())
 _api_key_servers = [s for s in _all_servers if s.requires_api_key]
 _no_key_servers = [s for s in _all_servers if not s.requires_api_key]

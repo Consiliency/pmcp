@@ -1528,20 +1528,32 @@ async def run_init(args: argparse.Namespace) -> None:
             if server.env_var:
                 from pmcp.manifest.loader import (
                     credential_lookup_keys,
+                    credential_requirement,
                     credential_storage_key,
                 )
 
-                found_key = next(
-                    (k for k in credential_lookup_keys(server) if os.environ.get(k)),
-                    None,
-                )
-                storage_key = credential_storage_key(server) or server.env_var
-                if found_key:
-                    print(f"    Found {found_key} in environment")
+                requirement = credential_requirement(server)
+                if requirement.required:
+                    found_key = next(
+                        (
+                            k
+                            for k in credential_lookup_keys(server)
+                            if os.environ.get(k)
+                        ),
+                        None,
+                    )
+                    storage_key = credential_storage_key(server) or server.env_var
+                    if found_key:
+                        print(f"    Found {found_key} in environment")
+                    else:
+                        print(
+                            f"    Note: store the credential with "
+                            f"`pmcp secrets set {storage_key} <value>`"
+                        )
                 else:
                     print(
-                        f"    Note: store the credential with "
-                        f"`pmcp secrets set {storage_key} <value>`"
+                        f"    No credential needed — {requirement.relaxed_by} "
+                        f"selects a self-hosted endpoint"
                     )
 
             selected_servers[name] = config

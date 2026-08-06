@@ -68,3 +68,7 @@ code_index.db
 
 # index-it-mcp local index cache
 .mcp-index/
+
+# claude-execute-phase orchestrator worktrees
+.claude/worktrees/
+.worktrees/

@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Manifest credential optionality (`api_key_optional_when`).** A manifest
+  server entry can now name the `extra_env` variable (e.g. a self-hosted base
+  URL) whose presence makes its declared credential unnecessary, so reaching
+  a self-hosted endpoint no longer requires planting a placeholder secret like
+  `FIRECRAWL_API_KEY=self-hosted-no-auth` — which previously read as a real
+  credential to whoever found it. The field alone changes nothing: an operator
+  must separately supply the named variable via `extra_env` or a `server_env`
+  overlay patch before the credential relaxes, and a server cannot name its
+  own credential as its relaxer. Every one of the seven places that gate on
+  `requires_api_key` — eager startup, install/provision preflight, lifecycle
+  connect, provisioning, `pmcp secrets check`, capability discovery
+  (`gateway.catalog_search`/`gateway.request_capability`), and `pmcp init` —
+  now reads the effective requirement through one shared predicate, and every
+  unset, malformed, self-referencing, or placeholder (`${VAR}`) relaxer value
+  fails closed. Ships `firecrawl`'s `api_key_optional_when: ["FIRECRAWL_API_URL"]`
+  as the first entry using it — inert on its own for every existing install.
+  (Consiliency/pmcp#114)
+
 ### Changed
 - **The declared `mcp` floor was corrected from `>=1.0.0` to `>=1.8.0`, because
   `>=1.0.0` was never installable.** `client/manager.py` imports

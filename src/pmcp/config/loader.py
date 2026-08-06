@@ -990,6 +990,50 @@ def manifest_server_to_config(server: "ManifestServerConfig") -> ResolvedServerC
     return _manifest_server_to_config(server, os.environ.get)
 
 
+def _local_env(config: ResolvedServerConfig) -> dict[str, str] | None:
+    """The post-merge child environment for *config*, or ``None``.
+
+    Returns ``config.config.env`` for a local stdio server config — the value
+    the spawned child will actually receive after ``_merge_manifest_defaults``
+    — or ``None`` for a remote server or when no env is set. Passed as
+    ``credential_requirement``'s ``child_env`` so a configured duplicate that
+    overrides the manifest's ``extra_env`` (e.g. with an empty string or an
+    unexpanded placeholder) is judged on the value the child actually gets,
+    not on the manifest's declared default (Consiliency/pmcp#114).
+    """
+    if isinstance(config.config, LocalMcpServerConfig):
+        return config.config.env
+    return None
+
+
+def _eager_requires_credential(
+    manifest_server: "ManifestServerConfig", config: ResolvedServerConfig
+) -> bool:
+    """Whether *manifest_server* still needs a credential to start eagerly.
+
+    Local import avoids a circular import: ``pmcp.manifest`` (via its
+    ``__init__.py``) transitively imports ``pmcp.env_store``, which imports
+    ``find_project_root`` from this module.
+
+    A *configured* entry that is itself remote never relaxes, regardless of
+    the manifest's own transport: extra_env is carried to a spawned local
+    subprocess's env, and a remote connection has no such subprocess. Without
+    this, ``_local_env`` returns ``None`` for a remote ``config``, falling
+    back to the manifest's own (possibly usable) ``extra_env`` and relaxing a
+    credential that can never actually reach the remote connection
+    (Consiliency/pmcp#114 board review finding 1, remote-configured-duplicate
+    variant — the same class as ``credential_requirement``'s own
+    manifest-``url`` clause, but keyed on the CONFIGURED entry's transport,
+    which the predicate cannot see).
+    """
+    from pmcp.manifest.loader import requires_credential
+
+    if isinstance(config.config, RemoteMcpServerConfig):
+        return bool(getattr(manifest_server, "requires_api_key", False))
+
+    return requires_credential(manifest_server, child_env=_local_env(config))
+
+
 def resolve_startup_configs(
     configured_configs: Sequence[ResolvedServerConfig],
     manifest_servers: Mapping[str, "ManifestServerConfig"]
@@ -1035,8 +1079,15 @@ def resolve_startup_configs(
             classified_names.add(config.name)
             return
 
-        if eager and manifest_server and manifest_server.requires_api_key:
-            from pmcp.manifest.loader import credential_lookup_keys
+        if (
+            eager
+            and manifest_server
+            and _eager_requires_credential(manifest_server, config)
+        ):
+            from pmcp.manifest.loader import (
+                credential_lookup_keys,
+                is_usable_credential_value,
+            )
 
             env_var = manifest_server.env_var
             # Auth is available if the credential is present under any of the
@@ -1044,7 +1095,26 @@ def resolve_startup_configs(
             # checking only the runtime env_var would skip a namespaced-only
             # credential as MISSING_AUTH.
             lookup_keys = credential_lookup_keys(manifest_server)
-            if lookup_keys and not any(is_auth_available(key) for key in lookup_keys):
+            auth_available = lookup_keys and any(
+                is_auth_available(key) for key in lookup_keys
+            )
+            # is_auth_available only checks process env / PMCP secret stores
+            # BY NAME — it cannot see a concrete credential the user wrote
+            # directly into a *configured* (.mcp.json) entry's own env block.
+            # A usable (non-empty, non-placeholder) literal there satisfies it
+            # too (Consiliency/pmcp#114 board review finding 2). Scoped to
+            # source == "configured" only: a manifest-only config's env is
+            # ALSO populated from os.environ by _manifest_server_to_config
+            # (unconditionally, regardless of any is_auth_available mock), so
+            # checking it here for manifest-sourced entries would silently
+            # re-derive the same os.environ read through a second path and
+            # defeat a caller's deliberate is_auth_available override.
+            if not auth_available and source == "configured":
+                own_env = _local_env(config) or {}
+                auth_available = any(
+                    is_usable_credential_value(own_env.get(key)) for key in lookup_keys
+                )
+            if lookup_keys and not auth_available:
                 skipped.append(
                     StartupSkip(
                         name=config.name,
@@ -1088,6 +1158,12 @@ def resolve_startup_configs(
             config,
             eager=config.name in enabled and config.name not in disabled,
             source="configured",
+            # A .mcp.json entry that duplicates a manifest server must still
+            # be credential-gated — omitting manifest_server here let a
+            # genuinely-required, credential-less configured duplicate reach
+            # eager_configs with no MISSING_AUTH check at all (Consiliency/pmcp#114
+            # board review finding 1).
+            manifest_server=manifest_by_name.get(config.name),
         )
 
     for name, server in manifest_by_name.items():
