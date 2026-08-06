@@ -16,10 +16,32 @@ from unittest.mock import patch
 
 import pytest
 
+import pmcp.manifest.loader as _manifest_loader_module
 from pmcp.config.loader import StartupSkipReason, resolve_startup_configs
 from pmcp.manifest.installer import MissingApiKeyError, check_api_key
 from pmcp.manifest.loader import ServerConfig
+from pmcp.manifest.loader import load_manifest as _real_load_manifest
 from pmcp.types import LocalMcpServerConfig, RemoteMcpServerConfig, ResolvedServerConfig
+
+# The real shipped manifest.yaml, loaded via an explicit path so NO overlay
+# (~/.pmcp/manifest.yaml, a project .pmcp/manifest.yaml reachable by walking
+# up from cwd, or $PMCP_MANIFEST_PATH) applies (Consiliency/pmcp#125). Same
+# immunity property tests/test_manifest_provision.py already relies on.
+SHIPPED_MANIFEST_PATH = Path(_manifest_loader_module.__file__).parent / "manifest.yaml"
+
+
+def _pin_manifest_path(monkeypatch: pytest.MonkeyPatch, manifest_path: Path) -> None:
+    """Force every load_manifest() call — however many layers of local
+    import away, as in cli.run_init — to resolve against *manifest_path*
+    only. Patching HOME (or Path.home) is NOT sufficient: it only blocks the
+    user-overlay lookup, not the independent project-overlay walk from
+    Path.cwd() (_find_project_manifest). Passing an explicit manifest_path
+    puts load_manifest() into its documented no-overlay mode, bypassing both
+    (Consiliency/pmcp#125)."""
+    monkeypatch.setattr(
+        "pmcp.manifest.loader.load_manifest",
+        lambda *a, **kw: _real_load_manifest(manifest_path),
+    )
 
 
 def _relaxable_server(
@@ -408,15 +430,16 @@ class TestGate5SecretsCheck:
 class TestGate7RunInit:
     @pytest.mark.asyncio
     async def test_relaxed_server_prints_no_credential_needed(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from pmcp.cli import run_init
 
-        home = tmp_path / "home"
-        overlay = tmp_path / "overlay.yaml"
-        home.mkdir()
+        fixture_manifest = tmp_path / "manifest.yaml"
         _write(
-            overlay,
+            fixture_manifest,
             """
 servers:
   firecrawl:
@@ -431,20 +454,16 @@ servers:
       FIRECRAWL_API_URL: "http://localhost:3002"
 """,
         )
+        _pin_manifest_path(monkeypatch, fixture_manifest)
+        monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
         project = tmp_path / "project"
         args = argparse.Namespace(command="init", project=project, force=False)
 
         def _select_firecrawl(prompt: str) -> str:
             return "y" if "firecrawl" in prompt else ""
 
-        with patch.dict(
-            "os.environ",
-            {"HOME": str(home), "PMCP_MANIFEST_PATH": str(overlay)},
-            clear=False,
-        ):
-            os.environ.pop("FIRECRAWL_API_KEY", None)
-            with patch("builtins.input", side_effect=_select_firecrawl):
-                await run_init(args)
+        with patch("builtins.input", side_effect=_select_firecrawl):
+            await run_init(args)
 
         content = (project / ".mcp.json").read_text()
         assert '"firecrawl"' in content
@@ -456,29 +475,38 @@ servers:
 
     @pytest.mark.asyncio
     async def test_required_server_instruction_unchanged(
-        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+        self,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """A server that still requires a credential keeps the exact
-        `pmcp secrets set` instruction — byte-for-byte unchanged."""
+        `pmcp secrets set` instruction — byte-for-byte unchanged.
+
+        Pinned against the real shipped manifest.yaml (no overlay applied),
+        proving this against the actual production firecrawl entry rather
+        than a synthetic one — immune to a developer's own
+        ~/.pmcp/manifest.yaml server_env patch for firecrawl, or any other
+        overlay (Consiliency/pmcp#125). Env-based isolation (patching HOME)
+        was not sufficient here: it blocks only the user-overlay lookup, not
+        the independent project-overlay walk from Path.cwd()."""
         from pmcp.cli import run_init
 
-        home = tmp_path / "home"
-        home.mkdir()
+        _pin_manifest_path(monkeypatch, SHIPPED_MANIFEST_PATH)
+        monkeypatch.delenv("FIRECRAWL_API_KEY", raising=False)
         project = tmp_path / "project"
         args = argparse.Namespace(command="init", project=project, force=False)
 
         def _select_firecrawl(prompt: str) -> str:
             return "y" if "firecrawl" in prompt else ""
 
-        with patch.dict("os.environ", {"HOME": str(home)}, clear=False):
-            os.environ.pop("FIRECRAWL_API_KEY", None)
-            os.environ.pop("PMCP_MANIFEST_PATH", None)
-            with patch("builtins.input", side_effect=_select_firecrawl):
-                await run_init(args)
+        with patch("builtins.input", side_effect=_select_firecrawl):
+            await run_init(args)
 
         content = (project / ".mcp.json").read_text()
         assert '"firecrawl"' in content
 
         captured = capsys.readouterr()
         assert "pmcp secrets set FIRECRAWL_API_KEY" in captured.out
+        assert "No credential needed" not in captured.out
         assert "No credential needed" not in captured.out
