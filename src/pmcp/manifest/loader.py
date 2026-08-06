@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -59,6 +61,12 @@ class ServerConfig:
     # FIRECRAWL_API_URL). Secrets belong in env_var/secret_key, which are resolved
     # from the env store and always win over a colliding extra_env key.
     extra_env: dict[str, str] = field(default_factory=dict)
+    # Names of extra_env variables whose presence (with a usable value) relaxes
+    # requires_api_key for this server — e.g. a self-hosted base URL that makes
+    # the vendor credential unnecessary. See credential_requirement() below for
+    # the full contract (Consiliency/pmcp#114). Empty by default, which is
+    # today's behaviour byte-for-byte: requires_api_key alone still gates.
+    api_key_optional_when: list[str] = field(default_factory=list)
     auto_start: bool = False
     transport: ServerTransport = "local"
     url: str | None = None
@@ -110,6 +118,106 @@ def credential_lookup_keys(server: Any) -> list[str]:
         if key and key not in keys:
             keys.append(key)
     return keys
+
+
+_PLACEHOLDER_RE = re.compile(r"^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$")
+
+
+def _is_usable_relaxer_value(value: Any) -> bool:
+    """True when *value* is a real, expanded value — not empty and not an
+    unexpanded ``${VAR}``/``$VAR`` placeholder token.
+
+    Local stdio env is passed to child processes verbatim, with no shell
+    expansion (see config/loader.py's env-merge comments), so a literal
+    ``${FIRECRAWL_API_URL}`` reaching the child is a dead string, not a real
+    URL, and must not relax a credential gate.
+    """
+    if not isinstance(value, str):
+        return False
+    stripped = value.strip()
+    if not stripped:
+        return False
+    if _PLACEHOLDER_RE.match(stripped):
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class CredentialRequirement:
+    """Result of evaluating whether *server* still needs a credential.
+
+    Frozen per IF-0-P5-1 (plans/phase-plan-v11-P5.md) — every field name and
+    meaning below is depended on unchanged by all seven gate consumers.
+    """
+
+    required: bool  # effective requirement after relaxation
+    declared: bool  # server.requires_api_key as shipped
+    relaxed_by: str | None  # extra_env var name that relaxed it, else None
+
+
+def credential_requirement(
+    server: Any, *, child_env: Mapping[str, str] | None = None
+) -> CredentialRequirement:
+    """Evaluate the effective credential requirement for *server*.
+
+    ``server`` is duck-typed over ``requires_api_key``, ``env_var``,
+    ``secret_key``, ``extra_env``, and ``api_key_optional_when`` — this accepts
+    manifest ``ServerConfig``, discovered-server configs, and ``None`` (treated
+    as not-required).
+
+    This function **never reads ``os.environ``**, the secret store, per-request
+    arguments, or a URL's shape — see the env-strip inversion analysis in
+    plans/phase-plan-v11-P5.md. ``sanitized_subprocess_env`` strips managed
+    secret keys from ``os.environ`` before a child process is spawned, so a
+    predicate reading ``os.environ`` could relax a gate for a variable the
+    child never actually receives — silently redirecting a "self-hosted"
+    server to the vendor endpoint with no credential. Restricting the source to
+    ``extra_env`` (and the caller-supplied ``child_env``, which must itself
+    trace back to ``extra_env``, never to ``os.environ``) keeps "the gate
+    relaxed" and "the child receives the variable" a structural invariant.
+
+    ``child_env``, when given, must be the post-merge environment the child
+    process will actually receive (e.g. ``ResolvedServerConfig.config.env``
+    after ``_merge_manifest_defaults``) — **never** ``os.environ`` or a copy of
+    it. Passing ``os.environ`` is a contract violation (guarded against in
+    ``tests/test_credential_predicate_guard.py``). When ``child_env`` is
+    ``None``, the source is ``server.extra_env``, which is correct for every
+    manifest-only call site because the two are identical by construction
+    there.
+    """
+    declared = bool(getattr(server, "requires_api_key", False)) if server else False
+    if not declared:
+        return CredentialRequirement(required=False, declared=False, relaxed_by=None)
+
+    own_env_var = getattr(server, "env_var", None)
+    own_secret_key = getattr(server, "secret_key", None)
+    optional_when = getattr(server, "api_key_optional_when", None) or []
+
+    if child_env is not None:
+        source: Mapping[str, str] = child_env
+    else:
+        source = getattr(server, "extra_env", None) or {}
+
+    for candidate in optional_when:
+        if candidate == own_env_var or candidate == own_secret_key:
+            # Self-relaxation is impossible — also enforced at parse time, but
+            # a duck-typed non-ServerConfig object may not have gone through
+            # that parse step.
+            continue
+        value = source.get(candidate) if hasattr(source, "get") else None
+        if _is_usable_relaxer_value(value):
+            return CredentialRequirement(
+                required=False, declared=True, relaxed_by=candidate
+            )
+
+    return CredentialRequirement(required=True, declared=True, relaxed_by=None)
+
+
+def requires_credential(
+    server: Any, *, child_env: Mapping[str, str] | None = None
+) -> bool:
+    """Convenience wrapper: ``credential_requirement(server, ...).required``."""
+    return credential_requirement(server, child_env=child_env).required
 
 
 # Category taxonomy used by Manifest.get_category_summary() and get_servers_in_category()
@@ -390,6 +498,43 @@ def _parse_extra_env(
     return parsed
 
 
+def _parse_api_key_optional_when(
+    name: str, raw: Any, env_var: str | None, secret_key: str | None
+) -> list[str]:
+    """Parse the ``api_key_optional_when`` list, fail-soft and fail-closed.
+
+    Absent key -> ``[]`` (today's behaviour unchanged). A non-list value drops
+    to ``[]`` with a warning. Non-string members are dropped. A member equal to
+    the server's own ``env_var`` or ``secret_key`` is dropped with a warning —
+    self-relaxation is impossible by construction (a server cannot declare its
+    own credential as the thing that makes the credential unnecessary).
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        logger.warning(
+            f"Ignoring 'api_key_optional_when' for server '{name}': not a list"
+        )
+        return []
+
+    parsed: list[str] = []
+    for item in raw:
+        if not isinstance(item, str) or not item:
+            logger.warning(
+                f"Skipping non-string 'api_key_optional_when' entry for server '{name}'"
+            )
+            continue
+        if item == env_var or item == secret_key:
+            logger.warning(
+                f"Server '{name}' names its own credential variable "
+                f"('{item}') in 'api_key_optional_when'; ignoring — a "
+                f"credential cannot relax itself"
+            )
+            continue
+        parsed.append(item)
+    return parsed
+
+
 def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
     """Parse a server config from raw YAML data."""
     install_data = data.get("install", {})
@@ -405,6 +550,11 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
     )
 
     extra_env = _parse_extra_env(name, data.get("extra_env"))
+    env_var = data.get("env_var")
+    secret_key = data.get("secret_key")
+    api_key_optional_when = _parse_api_key_optional_when(
+        name, data.get("api_key_optional_when"), env_var, secret_key
+    )
 
     raw_discovery_metadata = data.get("discovery_metadata", {})
     if not isinstance(raw_discovery_metadata, dict):
@@ -421,10 +571,11 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         command=data.get("command", ""),
         args=data.get("args", []),
         requires_api_key=data.get("requires_api_key", False),
-        env_var=data.get("env_var"),
-        secret_key=data.get("secret_key"),
+        env_var=env_var,
+        secret_key=secret_key,
         env_instructions=data.get("env_instructions"),
         extra_env=extra_env,
+        api_key_optional_when=api_key_optional_when,
         auto_start=data.get("auto_start", False),
         transport=transport,
         url=data.get("url"),
