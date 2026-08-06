@@ -1771,11 +1771,14 @@ class TestMonitorInstall:
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
 
-        # Wait for pattern detection
-        await asyncio.sleep(0.3)
-
+        # Wait deterministically for the monitor to detect the startup pattern
+        # and return, rather than racing a fixed wall-clock sleep against the
+        # subprocess. The monitor returns as soon as it matches, deliberately
+        # leaving the process alive for handoff.
         job = manager.get_job(job_id)
         assert job is not None
+        assert job._monitor_task is not None
+        await asyncio.wait_for(job._monitor_task, timeout=5.0)
         assert job.status == "server_ready"
 
         # Clean up - kill the process
