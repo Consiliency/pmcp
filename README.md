@@ -1,30 +1,42 @@
-# PMCP - Progressive MCP
+# PMCP — Progressive MCP
 
 <!-- mcp-name: io.github.ViperJuice/pmcp -->
 
 [![PyPI version](https://badge.fury.io/py/pmcp.svg)](https://pypi.org/project/pmcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Progressive disclosure for MCP** - Minimal context bloat with on-demand tool discovery and dynamic server provisioning.
+**A smart middle-man that lets your AI coding assistant use dozens of external tools without wasting time and money loading them all up front.**
 
-## The Problem
+PMCP sits between your AI assistant (like Claude Code) and the many outside services it can plug into — GitHub, Jira, databases, and 90+ others. Instead of forcing the assistant to load every tool's full instruction manual before you've even asked a question, PMCP hands it a short menu first and only pulls up the detailed instructions for a tool at the moment it's actually needed.
 
-When Claude Code connects directly to multiple MCP servers (GitHub, Jira, DB, etc.), it loads **all** tool schemas into context. This causes:
-- **Context bloat**: Dozens of tool definitions consume tokens before you even ask a question
-- **Static configuration**: Requires Claude Code restart to see new servers
-- **No progressive disclosure**: Full schemas shown even when not needed
+## Why it exists
 
-Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a key challenge with MCP tooling.
+AI coding assistants connect to external services through a standard called **MCP** ("Model Context Protocol" — think of it as a universal plug that lets an AI talk to other software). The catch: when an assistant connects to a dozen of these services directly, it loads *all* of their tool definitions into its working memory at once.
 
-## The Solution
+That working memory is limited and metered — every tool definition it holds costs **tokens** (the units you pay for) and crowds out room for your actual work. Loading 50+ tools you may never use is slow, expensive, and, worse, adding a new service usually means restarting the whole assistant.
 
-**PMCP** acts as a single MCP server that Claude Code connects to. Instead of exposing all downstream tools, it provides:
+PMCP fixes this by being the **single** connection point. It keeps everything compact and on-demand, so the assistant stays fast, cheap, and flexible.
 
-- **26 stable meta-tools** (not the 50+ underlying tools)
-- **Lazy by default**: downstream servers are available on demand and only eager-start when listed in `autoStart`
-- **Dynamically provisions** new servers on-demand from a manifest of 90+
-- **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
-- **Policy enforcement**: Output size caps and optional secret redaction
+## Who it's for
+
+Developers and teams who use AI coding assistants with lots of connected tools and want them to run **leaner, cheaper, and without constant reconfiguration** — especially anyone hitting "too many tools / context is full" limits.
+
+## What you get
+
+- **💸 Lower token cost** — the assistant sees a short menu, not 50+ full manuals, so it spends fewer tokens (less money) before doing real work.
+- **⚡ Load tools only when needed** — external services stay dormant until first use ("lazy by default"), instead of all starting up front.
+- **🔌 Add tools on the fly** — pull in a new service from a library of 90+ without restarting your assistant.
+- **🗂️ One stable connection** — your assistant connects to just one gateway (~26 steady meta-tools) instead of juggling many changing ones.
+- **🔒 Built-in guardrails** — caps on output size and optional automatic hiding of secrets/credentials.
+- **🔑 Works out of the box** — core capability matching needs no API key.
+
+## See it in action
+
+> _Demo placeholder — the repo currently has no visuals. The highest-impact addition would be either:_
+> - _a simple **before/after diagram** (assistant loading 50+ tools vs. one compact gateway), or_
+> - _a short **terminal GIF** of `pmcp setup` and a first tool request._
+>
+> _Drop it here once created — this is the spot a visitor looks first._
 
 ## Quick Start
 
