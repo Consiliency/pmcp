@@ -17,9 +17,10 @@ from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, TypeVar
 
+import httpx2
 import mcp.types as mcp_types
 from mcp.client.sse import sse_client
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
 
 from pmcp.auth import sanitize_auth_diagnostic
@@ -456,6 +457,12 @@ class ManagedClient:
     is_remote: bool = False
     sse_exit_stack: AsyncExitStack | None = None
     write_stream: Any | None = None
+    # The httpx2.AsyncClient pmcp owns for a streamable-HTTP downstream (mcp
+    # 2.0.0's streamable_http_client() takes a caller-supplied client and does
+    # not close it — see IF-0-P2-2). None for SSE and stdio downstreams, which
+    # don't take one. Entered into sse_exit_stack, so it closes with the
+    # transport; exposed here so tests (and callers) can assert `.is_closed`.
+    remote_http_client: httpx2.AsyncClient | None = None
     status: ServerStatus = field(
         default_factory=lambda: ServerStatus(
             name="",
@@ -1377,11 +1384,29 @@ class ClientManager:
         headers = _remote_headers(
             config.name, remote_config, project_root=self._project_root
         )
+        # mcp 2.0.0's streamable_http_client() no longer builds its own httpx
+        # client from headers/timeout kwargs the way 1.x's streamablehttp_client()
+        # did internally via create_mcp_http_client(); it takes a caller-supplied
+        # httpx2.AsyncClient and (per IF-0-P2-2) does not close it. Reproduce
+        # create_mcp_http_client's behaviour explicitly: follow_redirects=True
+        # (httpx2's own default is False) and the same (30s connect, 300s read)
+        # timeout. `headers` is omitted entirely when unset, matching 1.x's
+        # create_mcp_http_client(headers=None) passthrough.
+        remote_timeout = httpx2.Timeout(30.0, read=300.0)
+        if headers is not None:
+            http_client = httpx2.AsyncClient(
+                follow_redirects=True, timeout=remote_timeout, headers=headers
+            )
+        else:
+            http_client = httpx2.AsyncClient(
+                follow_redirects=True, timeout=remote_timeout
+            )
         await self._connect_remote_stream(
             config,
-            streamablehttp_client(remote_config.url, headers=headers),
+            streamable_http_client(remote_config.url, http_client=http_client),
             transport_name="streamable HTTP",
             resolved_headers=headers,
+            remote_http_client=http_client,
         )
 
     async def _connect_remote_stream(
@@ -1391,6 +1416,7 @@ class ClientManager:
         *,
         transport_name: str,
         resolved_headers: dict[str, str] | None = None,
+        remote_http_client: httpx2.AsyncClient | None = None,
     ) -> None:
         """Connect to a remote MCP server using a read/write stream transport."""
         name = config.name
@@ -1414,7 +1440,17 @@ class ClientManager:
         logger.info(f"Connecting to remote MCP server via {transport_name}: {name}")
 
         remote_stack = AsyncExitStack()
-        transport = await remote_stack.enter_async_context(transport_context)
+        # Enter the owned httpx2 client before the transport: AsyncExitStack
+        # unwinds LIFO, so on cleanup the transport closes first and the client
+        # last, and if entering the transport itself raises, the except below
+        # still closes (rather than leaks) the client we already own.
+        if remote_http_client is not None:
+            await remote_stack.enter_async_context(remote_http_client)
+        try:
+            transport = await remote_stack.enter_async_context(transport_context)
+        except Exception:
+            await remote_stack.aclose()
+            raise
         read_stream, write_stream = transport[:2]
 
         managed = ManagedClient(
@@ -1425,6 +1461,7 @@ class ClientManager:
             write_stream=write_stream,
             status=status,
             resolved_remote_headers=resolved_headers,
+            remote_http_client=remote_http_client,
         )
         self._clients[name] = managed
 
@@ -1504,6 +1541,9 @@ class ClientManager:
                 managed.status.pending_request_count = len(managed.pending_requests)
 
                 if "error" in message:
+                    # TODO(P3B): message["error"] also carries JSON-RPC "code"
+                    # and "data" fields that are dropped here, exposing only
+                    # "message" to callers.
                     pending.future.set_exception(
                         Exception(message["error"].get("message", "Unknown error"))
                     )
@@ -1717,6 +1757,9 @@ class ClientManager:
                     managed.status.pending_request_count = len(managed.pending_requests)
 
                     if "error" in payload:
+                        # TODO(P3B): payload["error"] also carries JSON-RPC
+                        # "code" and "data" fields that are dropped here,
+                        # exposing only "message" to callers.
                         pending.future.set_exception(
                             Exception(payload["error"].get("message", "Unknown error"))
                         )
@@ -1781,7 +1824,11 @@ class ClientManager:
         if managed.is_remote:
             if managed.write_stream is None:
                 raise RuntimeError("Remote stream not connected")
-            msg = mcp_types.JSONRPCMessage.model_validate(request)
+            # mcp 2.0.0's JSONRPCMessage is a bare union (JSONRPCRequest |
+            # JSONRPCNotification | JSONRPCResponse | JSONRPCError), not a
+            # pydantic model, so it has no .model_validate(); construct via its
+            # published TypeAdapter instead.
+            msg = mcp_types.jsonrpc_message_adapter.validate_python(request)
             await managed.write_stream.send(SessionMessage(msg))
         else:
             if not managed.process or not managed.process.stdin:
@@ -1899,7 +1946,7 @@ class ClientManager:
         if managed.is_remote:
             if managed.write_stream is None:
                 raise RuntimeError("Remote stream not connected")
-            msg = mcp_types.JSONRPCMessage.model_validate(notification)
+            msg = mcp_types.jsonrpc_message_adapter.validate_python(notification)
             await managed.write_stream.send(SessionMessage(msg))
         elif managed.process and managed.process.stdin:
             data = json.dumps(notification) + "\n"
@@ -2003,7 +2050,29 @@ class ClientManager:
                     await asyncio.shield(task)
                 except (asyncio.CancelledError, Exception):
                     pass
-        await _terminate_process_tree(managed.process, name)
+        if managed.is_remote:
+            # Previously a no-op for remote clients: this function closed no
+            # transport at all here, so a reconnect (the only caller that hits
+            # this branch) leaked the SSE/streamable-HTTP transport — and, since
+            # IF-0-P2-2, would also leak the owned httpx2.AsyncClient. Guarded
+            # the same way as the two explicit-disconnect close sites
+            # (`disconnect_server`, `_disconnect_all_unlocked`), but this
+            # function's contract is "never raises", so an unmatched error is
+            # logged and swallowed here rather than re-raised.
+            if managed.sse_exit_stack is not None:
+                try:
+                    await managed.sse_exit_stack.aclose()
+                except RuntimeError as e:
+                    if _is_cancel_scope_task_mismatch_error(e):
+                        logger.debug(
+                            f"[{name}] Ignoring SSE shutdown cancel-scope mismatch: {e}"
+                        )
+                    else:
+                        logger.warning(f"[{name}] Error closing remote transport: {e}")
+                except Exception as e:
+                    logger.warning(f"[{name}] Error closing remote transport: {e}")
+        else:
+            await _terminate_process_tree(managed.process, name)
         self._clients.pop(name, None)
         self._servers.pop(name, None)
         self._remove_server_indexes(name)
