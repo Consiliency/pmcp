@@ -50,7 +50,9 @@ did all of:
 
 1. **argument adaptation** — unpacked `req.params.name` / `req.params.arguments or {}`
    into the domain-shaped body (`:516-517`);
-2. **tool input-schema validation** — `jsonschema.validate(instance=arguments, schema=tool.inputSchema)`,
+2. **tool input-schema validation** — `jsonschema.validate(instance=arguments, schema=tool.inputSchema)`
+   (that is 1.x source quoted verbatim; the field is genuinely `inputSchema` there. The 2.x
+   port reads **`tool.input_schema`** — see IF-0-P2-1 and Trap 5),
    returning `_make_error_result(f"Input validation error: {e.message}")` on failure
    (`:521-525`). **`mcp` 2.0.0's low-level `Server` does none of this.** `mcp/server/validation.py`
    contains only sampling/elicitation validation; `jsonschema` appears server-side only under
@@ -65,7 +67,8 @@ did all of:
    (`server.py:194`).
 
 Output-schema validation is a no-op here: `src/pmcp/tools/handlers.py` declares 26 tools,
-all with `inputSchema` and none with `outputSchema`.
+all constructed with the `inputSchema=` keyword (still valid in 2.0.0 — Trap 5) and none
+declaring an output schema.
 
 ### Trap 1a — the roadmap's registration question is answered by source, and the answer is the constructor callbacks
 
@@ -295,12 +298,22 @@ records the pid at run time and never hardcodes one.
   on_read_resource=self._handle_read_resource, on_list_prompts=self._handle_list_prompts,
   on_get_prompt=self._handle_get_prompt)`. Each `_handle_*` is an `async` bound method with
   signature `(self, ctx: ServerRequestContext, params: <the SDK's canonical params model for
-  that method>) -> <the SDK's canonical result model>`, i.e. `PaginatedRequestParams | None
+  that method>) -> <the SDK's canonical result model>`. **The `| None` on the three paginated
+  params is mandatory in the annotation and must not be dropped**: the runner validates absent
+  params as `{}` and never passes `None` at runtime (`lowlevel/server.py:483-487`), but the
+  SDK types the kwarg as `Callable[[…, PaginatedRequestParams | None], …]` and callable
+  parameters are contravariant, so a handler annotated `params: PaginatedRequestParams`
+  fails SL-2.4's mypy gate — verified: `error: Argument "on_list_tools" to "Server" has
+  incompatible type … expected "Callable[[ServerRequestContext[Any, Any],
+  PaginatedRequestParams | None], Awaitable[ListToolsResult]] | None"`. The bodies may
+  therefore ignore the `None` branch, but the signatures must declare it. That is:
+  `PaginatedRequestParams | None
   -> ListToolsResult`, `CallToolRequestParams -> CallToolResult`, `PaginatedRequestParams |
   None -> ListResourcesResult`, `ReadResourceRequestParams -> ReadResourceResult`,
   `PaginatedRequestParams | None -> ListPromptsResult`, `GetPromptRequestParams ->
   GetPromptResult`. `_handle_call_tool` validates `params.arguments or {}` against the
-  matching tool's `inputSchema` with `jsonschema.validate` **before** dispatch and returns
+  matching tool's **`input_schema`** (the 2.0.0 attribute name — an `AttributeError` waits on
+  `.inputSchema`) with `jsonschema.validate` **before** dispatch and returns
   `CallToolResult(isError=True, content=[TextContent(type="text", text="Input validation
   error: <msg>")])` on `jsonschema.ValidationError`. The existing domain closures are
   preserved as private helpers; adapters do argument unpacking, schema validation, and result
@@ -315,7 +328,11 @@ records the pid at run time and never hardcodes one.
   (`manager.py:1416`) **before** the transport context, and passes it as
   `streamable_http_client(url, http_client=<that client>)`. The client is exposed on
   `ManagedClient` as a new field `remote_http_client: httpx2.AsyncClient | None = None` so a
-  test can assert `.is_closed` after cleanup. `_connect_sse` and
+  test can assert `.is_closed` after cleanup. **`_cleanup_client` (`manager.py:1987`) closes
+  `managed.sse_exit_stack` for remote clients**, reusing the guarded
+  `aclose()` + `_is_cancel_scope_task_mismatch_error` pattern that already exists at
+  `manager.py:832-843` and `:1946-1957` — without that the exit-stack ownership buys nothing
+  on the reconnect path and EC-P2-7's leak assertion fails as designed. `_connect_sse` and
   `PREFERRED_PROTOCOL_VERSION` are unchanged. Consumed by SL-4's EC-P2-7 tests.
 
 - [ ] IF-0-P2-3 — **Dependency contract, published day 1.** `pyproject.toml` declares
@@ -489,7 +506,21 @@ streamable_http_client`, adds `import httpx2`, rewrites `_connect_streamable_htt
 (`:1371-1385`) per IF-0-P2-2, adds `remote_http_client` to `ManagedClient`, and threads the
 client into `_connect_remote_stream`'s `remote_stack` (`:1416`) ahead of the transport.
 `manager.py:1418`'s `transport[:2]` is left alone — 2.0.0 yields a 2-tuple and the slice
-still holds. **SL-3.2 also fixes Trap 6**: `manager.py:1784` and `:1902` become
+still holds.
+
+**`_cleanup_client` must learn to close the transport, and this is not free cleanup.**
+`_cleanup_client` (`manager.py:1987-2009`) cancels the read/stderr tasks, calls
+`_terminate_process_tree`, and pops `_clients`/`_servers`/the indexes — it never touches
+`sse_exit_stack`. Only the two explicit-disconnect paths do
+(`manager.py:832-843` and `:1946-1957`), and `_connect_remote_stream` calls `_cleanup_client`
+on the **reconnect** path (`manager.py:1400`, "Existing live connection found; cleaning up
+before reconnect"). So today a reconnect already leaks the transport, and after this lane it
+would also leak the owned `httpx2.AsyncClient`. SL-3.2 adds the guarded close to
+`_cleanup_client` for `managed.is_remote`, copying the existing
+`_is_cancel_scope_task_mismatch_error` handling verbatim rather than inventing new error
+handling. That is the minimum change that makes EC-P2-7's `is_closed`-after-cleanup
+assertion true, and it fixes a pre-existing reconnect leak as a side effect — called out
+here so it is not mistaken for scope creep. **SL-3.2 also fixes Trap 6**: `manager.py:1784` and `:1902` become
 `SessionMessage(mcp_types.jsonrpc_message_adapter.validate_python(<envelope>))`. That is a
 hard runtime break, not a lint issue — `JSONRPCMessage` is a bare `types.UnionType` in 2.0.0
 and has no `model_validate`, so every remote outbound request and notification raises
@@ -516,7 +547,7 @@ phase whose whole premise is behaviour preservation.
 - **Scope**: Port the pre-existing suite and CI probes onto `mcp` 2.x, and build the
   deployed-wire runtime harness that proves the six handlers answer in both eras and that
   authenticated and redirected remote downstreams still connect.
-- **Owned files**: `tests/*.py`, `tests/fixtures/**`, `tests/mcp2x/conftest.py`, `tests/runtime/**`, `.github/probe/**`
+- **Owned files**: `tests/test_*.py`, `tests/conftest.py`, `tests/__init__.py`, `tests/fixtures/**`, `tests/runtime/**`, `.github/probe/**`
 - **Interfaces provided**: `tests/runtime/harness.py` (`gateway_on_spare_port` fixture, `modern_post` helper)
 - **Interfaces consumed**: IF-0-P2-1 (the six `_handle_*` methods and their result models), IF-0-P2-2 (`ManagedClient.remote_http_client`), IF-0-P2-3 (declared bounds), IF-0-P2-4 (the modern envelope literals)
 - **Parallel-safe**: no (terminal integration lane; depends on SL-1, SL-2, SL-3)
@@ -525,14 +556,14 @@ phase whose whole premise is behaviour preservation.
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-4.1 | test | — | `tests/runtime/harness.py`, `tests/runtime/conftest.py` | The `gateway_on_spare_port` fixture itself: it refuses to bind `3344`, it applies the full isolation set, and it asserts `Gateway initialized: <n>/1 servers online` in the boot log | `uv run pytest tests/runtime/ -q -k harness` |
+| SL-4.1 | test | — | `tests/runtime/test_harness.py`, `tests/runtime/harness.py`, `tests/runtime/conftest.py` | The `gateway_on_spare_port` fixture itself, asserted from a **collectable** test module: the allocated port is never `3344`, the boot command carries all six isolation controls (`--config`, `--project`, `--policy`, `--lock-dir`, redirected `HOME`, redirected `XDG_CONFIG_HOME`) and a cwd inside the throwaway dir, the boot log matches `Gateway initialized: <n>/1 servers online`, and the live-gateway pid + child set are unchanged across the fixture's setup/teardown | `uv run pytest tests/runtime/test_harness.py -q` |
 | SL-4.2 | test | SL-4.1 | `tests/runtime/test_wire_handshake_era.py` | EC-P2-2 and EC-P2-3: boot on a spare port, POST handshake-era JSON-RPC to `/mcp`, and validate a **typed** result for each of `tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, `prompts/get` by parsing each response's `result` with the SDK's own model; plus a `tools/call` with arguments violating the tool's `inputSchema` returning `isError: true` and text starting `Input validation error:`; plus a boot-log assertion that no line matches `Fatal error` | `uv run pytest tests/runtime/test_wire_handshake_era.py -q` |
 | SL-4.3 | test | SL-4.1 | `tests/runtime/test_wire_modern_era.py` | EC-P2-5 and EC-P2-6: over the same deployed `/mcp`, a `server/discover` returning a `DiscoverResult` whose `supported_versions` contains `2026-07-28` and whose `capabilities` advertise tools, resources, and prompts; and modern-envelope `tools/list`, `tools/call`, and invalid-argument `tools/call` built strictly per IF-0-P2-4 | `uv run pytest tests/runtime/test_wire_modern_era.py -q` |
 | SL-4.4 | test | SL-4.1 | `tests/runtime/test_downstream_remote.py`, `tests/runtime/fake_remote.py` | EC-P2-7: a fake `mcp` 2.x Streamable HTTP downstream that 401s without the configured `Authorization` header, connected through the gateway and serving a real `gateway.invoke`; a second route that 307-redirects `/relocated` → `/mcp` and still resolves; and a leak proof — N=5 disconnect/reconnect cycles, asserting the previous `ManagedClient.remote_http_client.is_closed` is `True` after each `_cleanup_client` and that the process's open socket count does not grow | `uv run pytest tests/runtime/test_downstream_remote.py -q` |
 | SL-4.5 | test | SL-4.1 | `tests/runtime/test_downstream_handshake_era.py` | EC-P2-4: a downstream fixture pinned to `mcp` 1.x connected through the 2.x gateway, serving a real tool call, with `ServerStatus.protocol_version` asserted to be a `HANDSHAKE_PROTOCOL_VERSIONS` member and asserted **not** to be `2026-07-28` | `uv run pytest tests/runtime/test_downstream_handshake_era.py -q` |
 | SL-4.6 | impl | SL-4.5 | `.github/probe/p1_probe_server.py`, `.github/probe/p1_probe_client.py` | — | — |
-| SL-4.7 | impl | SL-4.6 | `tests/*.py`, `tests/fixtures/**`, `tests/mcp2x/conftest.py` | — | — |
-| SL-4.8 | verify | SL-4.7 | `tests/**`, `.github/probe/**` | full suite | `uv run pytest tests/ -q && uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv run mypy src/pmcp --exclude baml_client` |
+| SL-4.7 | impl | SL-4.6 | `tests/test_*.py`, `tests/conftest.py`, `tests/__init__.py`, `tests/fixtures/**` | — | — |
+| SL-4.8 | verify | SL-4.7 | `tests/**`, `.github/probe/**` | full suite | `uv run pytest tests/ -q`, then `uv run pytest tests/runtime/ -q -rs > /tmp/p2rt.txt; ! grep -qE '^SKIPPED' /tmp/p2rt.txt` (a skipped acceptance test is a failed one), then `uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv run mypy src/pmcp --exclude baml_client` |
 
 SL-4.6 keeps both probe **filenames** so `.github/workflows/test.yml:142` and `:164` need no
 edit: `p1_probe_server.py` becomes `from mcp.server import MCPServer` / `MCPServer("p1probe")`
@@ -540,9 +571,16 @@ edit: `p1_probe_server.py` becomes `from mcp.server import MCPServer` / `MCPServ
 `mcp/server/mcpserver/server.py:621` and `:357`), and `p1_probe_client.py` becomes
 `from mcp.client.streamable_http import streamable_http_client` with `async with
 streamable_http_client(url) as (read, write):` (2.0.0 yields a 2-tuple, so the current
-3-tuple unpack must change). `ClientSession` in that file stays. SL-4.7 sweeps the 50
-pre-existing `tests/*.py` for 1.x-only API — at minimum `tests/test_credential_boot.py:43,45`'s
-`FastMCP` — and repairs them.
+3-tuple unpack must change). `ClientSession` in that file stays. SL-4.7 sweeps the 48
+pre-existing `tests/test_*.py` plus `tests/conftest.py` for 1.x-only API and repairs them. Two
+classes are already located, so the sweep starts from evidence rather than from scratch:
+`tests/test_credential_boot.py:43,45`'s `FastMCP` (gone in 2.0.0), and **seven camelCase
+attribute reads that now raise `AttributeError`** — `tests/test_tools.py:1244`, `:1851`,
+`:1854`, `:1856`, `:1862` and `tests/test_baseline_constraints.py:117`, `:120`, all
+`tool.inputSchema` on `mcp.types.Tool`, which become `tool.input_schema`. A repo-wide
+`grep -rnE '\.(inputSchema|outputSchema|mimeType|isError|structuredContent)\b'` over `src/`,
+`tests/`, and `.github/` returns those seven and nothing else — **no `src/` site is an
+attribute read**, so this class is confined to Lane D.
 
 **How SL-4.5 gets a genuine `mcp` 1.x downstream inside a 2.x project**, since this is the one
 acceptance row whose mechanism is not obvious: a session-scoped fixture builds a throwaway
@@ -550,8 +588,15 @@ venv once — `uv venv <tmp>/mcp1 && VIRTUAL_ENV=<tmp>/mcp1 uv pip install "mcp=
 registers the downstream in the fixture manifest as
 `{"command": "<tmp>/mcp1/bin/python", "args": ["<tmp>/p2_downstream_1x.py"]}`, where that
 script is a 1.x `FastMCP` server. The gateway's own interpreter stays on 2.x; only the
-subprocess is pinned. The fixture skips (never silently passes) if `uv` is unavailable or the
-install fails, and the same `(basename, args)` uniqueness rule as the CI probe applies so the
+subprocess is pinned. **The fixture has no skip path: if `uv` is unavailable or the 1.x install fails it calls
+`pytest.fail`, not `pytest.skip`.** A skipped test exits 0, so for a CI acceptance gate
+skipping *is* passing silently — the exact false-green shape this repo keeps getting burned
+by, and `pytest.skip` would let EC-P2-4 go green having proven nothing. There is no
+legitimate environment to accommodate: `uv sync --all-extras` is already a precondition of
+every command in this plan and of all five CI jobs, so a runner without `uv` cannot execute
+the phase at all. SL-4.8 additionally asserts the acceptance modules reported **zero** skips
+by running `uv run pytest tests/runtime/ -q -rs` and failing if the short summary lists any
+`SKIPPED` line. The same `(basename, args)` uniqueness rule as the CI probe applies so the
 orphan-kill scan cannot match an unrelated process. `1.25.0` is the version this worktree's
 venv already resolves, so it is the known-good 1.x peer.
 
@@ -733,11 +778,26 @@ overrides the docs-sweep template's default list for this phase only.
 - **Single-writer files**: `pyproject.toml`, `uv.lock`, `CHANGELOG.md`,
   `.github/workflows/test.yml` — SL-1 only; no other lane adds a CHANGELOG entry.
   `src/pmcp/server.py`, `src/pmcp/transport/http.py`, `src/pmcp/tools/handlers.py` — SL-2 only. `src/pmcp/client/manager.py`,
-  `src/pmcp/cli.py`, `src/pmcp/manifest/refresher.py` — SL-3 only. `tests/conftest.py` and
-  every pre-existing `tests/*.py` — SL-4 only; SL-1/2/3 put their new tests under
-  `tests/mcp2x/` with distinct filenames so the globs stay disjoint
-  (`tests/*.py` does not match `tests/mcp2x/*.py`). `.claude/docs-catalog.json` and
-  `specs/phase-plans-v11.md` — SL-docs only.
+  `src/pmcp/cli.py`, `src/pmcp/manifest/refresher.py` — SL-3 only. Every pre-existing test
+  file — SL-4 only; SL-1/2/3 put their new tests under `tests/mcp2x/`.
+  `.claude/docs-catalog.json` and `specs/phase-plans-v11.md` — SL-docs only.
+- **The test-file globs are chosen against `fnmatch`, not `glob`.** An earlier draft gave
+  SL-4 `tests/*.py` and argued it could not collide with `tests/mcp2x/*.py`. That is true of
+  `glob`/`pathlib`, where `*` stops at a `/`, and **false** of the predicate the scheduler
+  actually uses: `phase_loop_runtime.lane_scheduler._patterns_overlap` compares with
+  `fnmatchcase`, whose `*` crosses `/`. Checked against that function directly,
+  `_patterns_overlap('tests/*.py', 'tests/mcp2x/test_server_handlers.py')` is `True`, so
+  `tests/*.py` collided with all three of SL-1, SL-2, and SL-3 and the whole parallel-safety
+  argument rested on a wrong assumption. The globs below all return `False` against every
+  `tests/mcp2x/*` path under the same function: `tests/test_*.py`, `tests/conftest.py`,
+  `tests/__init__.py`, `tests/fixtures/**`, `tests/runtime/**`. Three consequences that are
+  easy to get wrong: `tests/test_*.py` does **not** match `tests/conftest.py`, so conftest
+  must be listed separately or it is silently unowned; it does not match `tests/__init__.py`
+  either, and that file exists (48 `test_*.py` + `conftest.py` + `__init__.py` = the 50 files
+  in `tests/`), so it is listed too; and `tests/mcp2x/` needs no conftest of its own, since
+  pytest's conftest lookup is hierarchical and `tests/conftest.py` already applies to the
+  subdirectory. **Any future edit to these globs must be re-checked with
+  `_patterns_overlap`, not by eye.**
 - **Cross-phase file collision.** `CHANGELOG.md` and `.claude/docs-catalog.json` are written
   by every concurrent phase in this repo and are not lane-partitionable. Writes serialize on
   merge order; whichever phase merges second rebases and re-applies its entry rather than
