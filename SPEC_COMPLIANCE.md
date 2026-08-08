@@ -27,9 +27,17 @@ revision is documented in the MCP specification changelog:
 
 ## Draft Revision Impact
 
-The draft revision after `2025-11-25` is not treated as a stable PMCP contract
-yet. The draft changelog calls out the following migration areas for PMCP to
-review when they become stable:
+**Partially adopted as of v11 Phase 2 (`2026-07-28`).** PMCP now serves the
+modern era to its own clients for the six proxied operations plus
+`server/discover`, selected per request by an `MCP-Protocol-Version:
+2026-07-28` header and a `params._meta` envelope — never through `initialize`,
+which continues to negotiate the handshake era (`2024-11-05`–`2025-11-25`).
+Downstream connections remain handshake-era only: `PREFERRED_PROTOCOL_VERSION`
+is unchanged at `2025-11-25`, so no downstream server is reached at
+`2026-07-28`. A modern-era `tools/call` is still proxied live over that
+handshake-era downstream connection; only the upstream envelope differs.
+
+The remaining draft migration areas below are **not** yet addressed:
 
 - Stateless/no-session Streamable HTTP removes protocol-level sessions and the
   `Mcp-Session-Id` header. Revisit `src/pmcp/transport/http.py`.
@@ -38,9 +46,13 @@ review when they become stable:
   added, unsolicited task handles are allowed, MRTR is introduced, and
   `resultType` becomes required. Track SEP-2663 and SEP-2322, then revisit
   PMCP task APIs and release notes.
-- `server/discover` becomes the up-front discovery RPC for supported protocol
-  versions, capabilities, and identity. Track SEP-2575, then revisit gateway
-  server metadata.
+- ~~`server/discover` becomes the up-front discovery RPC for supported protocol
+  versions, capabilities, and identity.~~ **Shipped (SEP-2575).** The SDK
+  registers it unconditionally on every `Server`, and its default handler
+  returns `supported_versions` and capabilities derived at call time, so PMCP
+  adds no aggregated inventory of its own — `DiscoverResult` carries only
+  `supported_versions`, `capabilities`, and `instructions`. Covered by
+  `tests/runtime/test_wire_modern_era.py`.
 - `CacheableResult` changes result caching semantics. Revisit brokered result
   handling and cache boundaries for SEP-2549.
 - Dynamic Client Registration changes toward Client ID Metadata Documents.
@@ -57,5 +69,7 @@ review when they become stable:
   discovery metadata changes.
 - [ ] Re-check task APIs for `io.modelcontextprotocol/tasks`, `tasks/get`,
   `tasks/update`, MRTR, unsolicited handles, and required `resultType`.
-- [ ] Re-check release notes for any stable `server/discover`, authorization,
-  and migration guidance operators must follow.
+- [x] Re-check release notes for any stable `server/discover` — shipped in v11
+  Phase 2; see the Draft Revision Impact entry above.
+- [ ] Re-check release notes for authorization and migration guidance
+  operators must follow.
