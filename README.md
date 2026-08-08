@@ -776,11 +776,23 @@ values. Audit events are bounded in memory and include method/action, server or
 tool identity, protocol version when known, task ID when present, outcome,
 latency, auth state, and redacted error text.
 
-PMCP's Streamable HTTP endpoint remains compatible with existing clients that
-send no draft headers. It also tolerates `MCP-Protocol-Version`, `Mcp-Method`,
-and `Mcp-Name` request headers for clients experimenting with draft MCP
-transport conventions. These headers are compatibility inputs, not a promise
-that PMCP implements every draft MCP extension.
+PMCP's Streamable HTTP endpoint serves two protocol eras on the same `/mcp`
+route, upstream of clients. A client that negotiates through `initialize` is
+served the handshake era — `2024-11-05` through `2025-11-25`. A client that
+instead sends an `MCP-Protocol-Version: 2026-07-28` header together with a
+`params._meta` envelope carrying `io.modelcontextprotocol/protocolVersion`
+and `io.modelcontextprotocol/clientCapabilities` is served the modern era —
+`2026-07-28` — for `tools/list`, `tools/call`, `resources/list`,
+`resources/read`, `prompts/list`, `prompts/get`, and `server/discover`. The
+modern era is not reachable through `initialize`; it is selected per request
+by those headers. Because the modern era has no server-initiated
+back-channel, requests like `sampling/createMessage` and `elicitation/create`
+do not exist at `2026-07-28` — PMCP does not proxy either today, so this is a
+protocol-era limitation, not a PMCP gap. Downstream, PMCP's connections to
+the servers it proxies are negotiated only at the handshake era described
+above (`2025-11-25` preferred) — no downstream server is ever reached at
+`2026-07-28`. A modern-era client's `tools/call` is still proxied live over
+that handshake-era downstream connection; only the upstream envelope differs.
 
 Servers stopped with `gateway.disconnect_server` remain visible in health as
 `offline` or `lazy` when PMCP still knows their configuration, and startup policy
