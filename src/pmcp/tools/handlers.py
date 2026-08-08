@@ -282,7 +282,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Set include_offline=True to also discover provisionable servers not yet running. "
                 "This is the primary tool discovery entry point."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "query": {
@@ -329,7 +329,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Get detailed information about a specific tool, including its arguments and constraints. "
                 "Use this before invoking a tool to understand its requirements."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "tool_id": {
@@ -347,7 +347,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Arguments are validated against the tool schema before execution. "
                 "Output is automatically truncated if too large."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "tool_id": {
@@ -405,7 +405,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Use this when new MCP servers have been configured or to recover from connection errors. "
                 "Refuses by default while downstream requests are pending; set force=true to cancel them."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "source": {
@@ -431,7 +431,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Connect or start a known downstream MCP server by name. "
                 "Resolves configured, provisioned manifest, and registered discovered servers."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server_name": {
@@ -448,7 +448,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Disconnect a running downstream MCP server without changing persistent config. "
                 "Refuses by default when that server has pending requests; set force=true to cancel them."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server_name": {
@@ -470,7 +470,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Restart a known downstream MCP server without changing persistent config. "
                 "Refuses by default when that server has pending requests; set force=true to cancel them."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server_name": {
@@ -492,7 +492,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Get the health status of the gateway and all connected MCP servers. "
                 "Shows server status, tool counts, and last refresh time."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {},
             },
@@ -503,7 +503,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Show read-only effective configuration and startup policy status "
                 "with source attribution and non-secret diagnostics."
             ),
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         Tool(
             name="gateway.get_startup_policy",
@@ -511,7 +511,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Return persisted autoStart and legacy disableAutoStart entries "
                 "grouped by config source."
             ),
-            inputSchema={"type": "object", "properties": {}},
+            input_schema={"type": "object", "properties": {}},
         ),
         Tool(
             name="gateway.set_startup_policy",
@@ -519,7 +519,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Preview or explicitly apply an autoStart add/remove/set operation "
                 "against one selected config source or path."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "operation": {
@@ -547,7 +547,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "it does NOT start anything — call gateway.provision to actually install/start the recommended server. "
                 "Prefer this over gateway.provision when you don't already know the exact server name."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "query": {
@@ -570,7 +570,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Detects the platform (mac/wsl/linux/windows) and probes for installed CLIs. "
                 "This information is used to prefer CLIs over MCP servers when matching capabilities."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "platform": {
@@ -595,7 +595,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Poll gateway.provision_status to check progress. "
                 "Use gateway.request_capability instead if you don't know the exact server name."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server_name": {
@@ -612,7 +612,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Update a subordinate MCP server package to latest version and reconnect it. "
                 "Use this when invoke/describe/provision warn that a newer version is available."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server_name": {
@@ -629,7 +629,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Store credentials for a server and make them available to provisioning. "
                 "Use this when gateway.provision reports missing authentication."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server_name": {
@@ -679,7 +679,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Prepare and optionally submit a PMCP feedback issue to GitHub. "
                 "By default returns an exact preview payload; set confirm_submission=true to submit."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "title": {
@@ -719,7 +719,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Use after gateway.provision returns a job_id. "
                 "Returns progress percentage, output log, and final tools when complete."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "job_id": {
@@ -737,7 +737,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Shows elapsed time, heartbeat age, and current state for each request. "
                 "Use this to monitor long-running operations before deciding to cancel."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server": {
@@ -755,7 +755,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Use force=true to cancel anyway. "
                 "Use gateway.list_pending first to see request IDs and health status."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "request_id": {
@@ -777,7 +777,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "List brokered downstream MCP tasks. "
                 "MCP task IDs are opaque downstream task identifiers, not PMCP request IDs."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server_name": {
@@ -794,7 +794,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
         Tool(
             name="gateway.tasks_get",
             description="Get current status for one downstream MCP task.",
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server_name": {"type": "string"},
@@ -809,7 +809,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Fetch a downstream MCP task result and apply the same output "
                 "redaction and truncation options as gateway.invoke."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server_name": {"type": "string"},
@@ -831,7 +831,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Cancel a downstream MCP task by opaque task ID. "
                 "Use gateway.cancel only for PMCP request IDs from gateway.list_pending."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "server_name": {"type": "string"},
@@ -848,7 +848,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Use this when gateway.request_capability returns not_available. "
                 "Returns package names and metadata; call gateway.register_discovered_server then gateway.provision to install."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "query": {
@@ -873,7 +873,7 @@ def get_gateway_tool_definitions() -> list[Tool]:
                 "Call this after gateway.search_registry to register the chosen package, "
                 "then call gateway.provision to install and start it."
             ),
-            inputSchema={
+            input_schema={
                 "type": "object",
                 "properties": {
                     "package": {
