@@ -113,9 +113,16 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   held in gateway memory for visibility and cancellation. They are not durable
   audit records and do not provide cross-user authorization isolation on
   unauthenticated local transports.
-- **Draft protocol compatibility is additive**: PMCP tolerates current/draft MCP
-  protocol and Streamable HTTP header metadata where documented, but unsupported
-  draft extensions remain out of scope until PMCP explicitly claims them.
+- **Two protocol eras are served on one endpoint, through the same policy
+  gate**: the `MCP-Protocol-Version: 2026-07-28` header plus a `params._meta`
+  envelope route a request to the modern era instead of the
+  `initialize`-negotiated handshake era (`2024-11-05`–`2025-11-25`) — see
+  README's protocol-negotiation section. Both eras dispatch through the same
+  registered handlers, so the same policy, audit, and input-schema validation
+  applies regardless of which era selected the request; the modern era is not
+  a lower-trust bypass. Unsupported draft extensions beyond the six proxied
+  operations and `server/discover` remain out of scope until PMCP explicitly
+  claims them.
 
 ## Reporting a Vulnerability
 

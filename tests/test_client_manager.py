@@ -15,6 +15,7 @@ import time
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx2
 import pytest
 
 from pmcp.client.manager import (
@@ -1013,13 +1014,24 @@ class TestRemoteConnectSseHeaders:
             async def __anext__(self) -> None:
                 raise StopAsyncIteration
 
+        # mcp 2.0.0's streamable_http_client() no longer builds its own httpx
+        # client from a headers= kwarg (IF-0-P2-2) — pmcp resolves the headers
+        # into an httpx2.AsyncClient it owns and passes that client in, so the
+        # header assertion below spies on the AsyncClient construction rather
+        # than on streamable_http_client's arguments.
+        real_async_client = httpx2.AsyncClient
+
+        def spy_async_client(*args: object, **kwargs: object) -> httpx2.AsyncClient:
+            captured_headers.update(kwargs.get("headers") or {})
+            return real_async_client(*args, **kwargs)  # type: ignore[arg-type]
+
         @asynccontextmanager
-        async def mock_streamablehttp_client(
-            url: str, headers: dict[str, str] | None = None
+        async def mock_streamable_http_client(
+            url: str, *, http_client: httpx2.AsyncClient | None = None
         ):
             assert url == "https://example.com/mcp"
-            captured_headers.update(headers or {})
-            yield EmptyReadStream(), MagicMock(), MagicMock(return_value=None)
+            assert http_client is not None
+            yield EmptyReadStream(), MagicMock()
 
         manager._send_initialize = AsyncMock()
 
@@ -1036,8 +1048,12 @@ class TestRemoteConnectSseHeaders:
         manager._send_request = AsyncMock(side_effect=mock_send_request)
         manager._read_sse = AsyncMock()
 
-        with patch(
-            "pmcp.client.manager.streamablehttp_client", mock_streamablehttp_client
+        with (
+            patch("pmcp.client.manager.httpx2.AsyncClient", spy_async_client),
+            patch(
+                "pmcp.client.manager.streamable_http_client",
+                mock_streamable_http_client,
+            ),
         ):
             await manager._connect_streamable_http(config)
 
@@ -1076,20 +1092,30 @@ class TestRemoteConnectSseHeaders:
             async def __anext__(self) -> None:
                 raise StopAsyncIteration
 
+        real_async_client = httpx2.AsyncClient
+
+        def spy_async_client(*args: object, **kwargs: object) -> httpx2.AsyncClient:
+            captured_headers.update(kwargs.get("headers") or {})
+            return real_async_client(*args, **kwargs)  # type: ignore[arg-type]
+
         @asynccontextmanager
-        async def mock_streamablehttp_client(
-            url: str, headers: dict[str, str] | None = None
+        async def mock_streamable_http_client(
+            url: str, *, http_client: httpx2.AsyncClient | None = None
         ):
             assert url == "https://example.com/mcp"
-            captured_headers.update(headers or {})
-            yield EmptyReadStream(), MagicMock(), MagicMock(return_value=None)
+            assert http_client is not None
+            yield EmptyReadStream(), MagicMock()
 
         manager._send_initialize = AsyncMock()
         manager._send_request = AsyncMock(return_value={"tools": []})
         manager._read_sse = AsyncMock()
 
-        with patch(
-            "pmcp.client.manager.streamablehttp_client", mock_streamablehttp_client
+        with (
+            patch("pmcp.client.manager.httpx2.AsyncClient", spy_async_client),
+            patch(
+                "pmcp.client.manager.streamable_http_client",
+                mock_streamable_http_client,
+            ),
         ):
             await manager._connect_streamable_http(config)
 
@@ -1141,9 +1167,9 @@ class TestRemoteConnectSseHeaders:
             ),
         )
 
-        mock_streamablehttp_client = MagicMock()
+        mock_streamable_http_client = MagicMock()
         with patch(
-            "pmcp.client.manager.streamablehttp_client", mock_streamablehttp_client
+            "pmcp.client.manager.streamable_http_client", mock_streamable_http_client
         ):
             with pytest.raises(MissingRemoteHeaderAuthError) as exc_info:
                 await manager._connect_streamable_http(config)
@@ -1152,7 +1178,7 @@ class TestRemoteConnectSseHeaders:
             "PMCP_OTHER_TOKEN",
             "PMCP_TEST_TOKEN",
         ]
-        mock_streamablehttp_client.assert_not_called()
+        mock_streamable_http_client.assert_not_called()
 
     def test_remote_headers_passes_tenant_context_to_resolver(self) -> None:
         config = RemoteMcpServerConfig(

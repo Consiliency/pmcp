@@ -6,14 +6,14 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
-from mcp.types import (
-    CallToolRequest,
-    ListPromptsRequest,
-    ListResourcesRequest,
-    ListToolsRequest,
-)
+from mcp.server.connection import Connection
+from mcp.server.context import ServerRequestContext
+from mcp.server.session import ServerSession
+from mcp.types import CallToolRequestParams, PaginatedRequestParams
 from pydantic import ValidationError
 
 from pmcp.policy.policy import PolicyManager
@@ -64,6 +64,24 @@ def _correlations() -> dict[str, str]:
         "seat_correlation_id": "seat-codex",
         "evidence_label_digest": "a" * 64,
     }
+
+
+# A HANDSHAKE_PROTOCOL_VERSIONS member; the specific value is irrelevant to
+# these handlers, which read no protocol-version-gated behaviour off `ctx`.
+# Mirrors tests/mcp2x/test_server_handlers.py's `_make_ctx` — duplicated
+# rather than imported, since that module belongs to a different lane.
+_PROTOCOL_VERSION = "2025-11-25"
+
+
+def _make_ctx() -> ServerRequestContext[Any, Any]:
+    connection = Connection.from_envelope(_PROTOCOL_VERSION, None, None)
+    session = ServerSession(MagicMock(), connection)
+    return ServerRequestContext(
+        session=session,
+        lifespan_context={},
+        protocol_version=_PROTOCOL_VERSION,
+        method="test",
+    )
 
 
 def test_explicit_policy_failures_are_fatal_but_default_discovery_is_best_effort(
@@ -160,24 +178,31 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
     server._gateway_tools._client_manager = manager  # type: ignore[assignment]
     server._create_server()
     assert server._server is not None
-    list_handler = server._server.request_handlers[ListToolsRequest]
-    call_handler = server._server.request_handlers[CallToolRequest]
+    list_entry = server._server.get_request_handler("tools/list")
+    call_tool_entry = server._server.get_request_handler("tools/call")
+    resources_entry = server._server.get_request_handler("resources/list")
+    prompts_entry = server._server.get_request_handler("prompts/list")
+    assert list_entry is not None
+    assert call_tool_entry is not None
+    assert resources_entry is not None
+    assert prompts_entry is not None
 
-    listed = await list_handler(ListToolsRequest(params={}))
-    assert {tool.name for tool in listed.root.tools} == {
+    async def call_handler(name: str, arguments: dict) -> Any:
+        return await call_tool_entry.handler(
+            _make_ctx(), CallToolRequestParams(name=name, arguments=arguments)
+        )
+
+    listed = await list_entry.handler(_make_ctx(), PaginatedRequestParams())
+    assert {tool.name for tool in listed.tools} == {
         "gateway.health",
         "gateway.catalog_search",
         "gateway.describe",
         "gateway.invoke",
     }
-    resources = await server._server.request_handlers[ListResourcesRequest](
-        ListResourcesRequest(params={})
-    )
-    prompts = await server._server.request_handlers[ListPromptsRequest](
-        ListPromptsRequest(params={})
-    )
-    assert resources.root.resources == []
-    assert prompts.root.prompts == []
+    resources = await resources_entry.handler(_make_ctx(), PaginatedRequestParams())
+    prompts = await prompts_entry.handler(_make_ctx(), PaginatedRequestParams())
+    assert resources.resources == []
+    assert prompts.prompts == []
 
     async def fail_registry_discovery(*args, **kwargs):
         raise AssertionError("scoped catalog attempted registry discovery")
@@ -190,67 +215,48 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
     )
 
     catalog = await call_handler(
-        CallToolRequest(
-            params={
-                "name": "gateway.catalog_search",
-                "arguments": {
-                    "query": "native cli execution path",
-                    "include_offline": True,
-                },
-            }
-        )
+        "gateway.catalog_search",
+        {"query": "native cli execution path", "include_offline": True},
     )
-    catalog_payload = json.loads(catalog.root.content[0].text)
+    catalog_payload = json.loads(catalog.content[0].text)
     assert catalog_payload["cli_hints"] == []
     assert catalog_payload["registry_candidates"] == []
     assert catalog_payload["manifest_candidates"] == []
     assert catalog_payload["stale_updates"] is None
 
     invoked = await call_handler(
-        CallToolRequest(
-            params={
-                "name": "gateway.invoke",
-                "arguments": {
-                    "tool_id": "firecrawl::web_search",
-                    "arguments": {
-                        "url": "https://example.com/private/path?token=secret",
-                        "query": "super secret query",
-                        "credential": "sk-private-value",
-                    },
-                    **_correlations(),
-                },
-            }
-        )
+        "gateway.invoke",
+        {
+            "tool_id": "firecrawl::web_search",
+            "arguments": {
+                "url": "https://example.com/private/path?token=secret",
+                "query": "super secret query",
+                "credential": "sk-private-value",
+            },
+            **_correlations(),
+        },
     )
-    assert json.loads(invoked.root.content[0].text)["ok"] is True
+    assert json.loads(invoked.content[0].text)["ok"] is True
 
     brightdata = await call_handler(
-        CallToolRequest(
-            params={
-                "name": "gateway.invoke",
-                "arguments": {
-                    "tool_id": "brightdata::scrape_page",
-                    "arguments": {"query": "current benchmark evidence"},
-                    **{**_correlations(), "seat_correlation_id": "seat-gemini"},
-                },
-            }
-        )
+        "gateway.invoke",
+        {
+            "tool_id": "brightdata::scrape_page",
+            "arguments": {"query": "current benchmark evidence"},
+            **{**_correlations(), "seat_correlation_id": "seat-gemini"},
+        },
     )
-    assert json.loads(brightdata.root.content[0].text)["ok"] is True
+    assert json.loads(brightdata.content[0].text)["ok"] is True
 
     downstream_denied = await call_handler(
-        CallToolRequest(
-            params={
-                "name": "gateway.invoke",
-                "arguments": {
-                    "tool_id": "github::create_issue",
-                    "arguments": {"title": "must not mutate"},
-                    **_correlations(),
-                },
-            }
-        )
+        "gateway.invoke",
+        {
+            "tool_id": "github::create_issue",
+            "arguments": {"title": "must not mutate"},
+            **_correlations(),
+        },
     )
-    denied_payload = json.loads(downstream_denied.root.content[0].text)
+    denied_payload = json.loads(downstream_denied.content[0].text)
     assert denied_payload["ok"] is False
     assert denied_payload["auth_state"] == "policy_denied"
 
@@ -259,57 +265,35 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
 
     server._gateway_tools._ensure_server_for_tool = fail_lazy_start  # type: ignore[method-assign]
     lazy_denied = await call_handler(
-        CallToolRequest(
-            params={
-                "name": "gateway.invoke",
-                "arguments": {
-                    "tool_id": "github::unregistered_mutation",
-                    "arguments": {},
-                    **_correlations(),
-                },
-            }
-        )
+        "gateway.invoke",
+        {
+            "tool_id": "github::unregistered_mutation",
+            "arguments": {},
+            **_correlations(),
+        },
     )
-    assert json.loads(lazy_denied.root.content[0].text)["auth_state"] == (
-        "policy_denied"
-    )
+    assert json.loads(lazy_denied.content[0].text)["auth_state"] == ("policy_denied")
 
     describe_denied = await call_handler(
-        CallToolRequest(
-            params={
-                "name": "gateway.describe",
-                "arguments": {"tool_id": "github::unregistered_mutation"},
-            }
-        )
+        "gateway.describe", {"tool_id": "github::unregistered_mutation"}
     )
-    assert (
-        "blocked by policy"
-        in json.loads(describe_denied.root.content[0].text)["message"]
-    )
+    assert "blocked by policy" in json.loads(describe_denied.content[0].text)["message"]
 
     denied = await call_handler(
-        CallToolRequest(
-            params={
-                "name": "gateway.provision",
-                "arguments": {
-                    "tool_id": "raw credential value",
-                    "run_correlation_id": "secret query with spaces",
-                    "seat_correlation_id": "seat secret with spaces",
-                    "evidence_label_digest": "not-a-digest-secret",
-                },
-            }
-        )
+        "gateway.provision",
+        {
+            "server_name": "not-allowlisted-server",
+            "tool_id": "raw credential value",
+            "run_correlation_id": "secret query with spaces",
+            "seat_correlation_id": "seat secret with spaces",
+            "evidence_label_digest": "not-a-digest-secret",
+        },
     )
-    assert "blocked by policy" in json.loads(denied.root.content[0].text)["message"]
+    assert "blocked by policy" in json.loads(denied.content[0].text)["message"]
 
     raw_tool_name = "gateway.sk-secret-token"
-    raw_name_denied = await call_handler(
-        CallToolRequest(params={"name": raw_tool_name, "arguments": {}})
-    )
-    assert (
-        "blocked by policy"
-        in json.loads(raw_name_denied.root.content[0].text)["message"]
-    )
+    raw_name_denied = await call_handler(raw_tool_name, {})
+    assert "blocked by policy" in json.loads(raw_name_denied.content[0].text)["message"]
 
     health = await server._gateway_tools.health()
     assert health.gateway_diagnostics.capabilities == [SCOPED_ADVISOR_AUDIT_CAPABILITY]
@@ -374,17 +358,17 @@ async def test_scoped_server_rejects_uncorrelated_invoke_before_dispatch(
 
     server._gateway_tools.invoke = fake_invoke  # type: ignore[method-assign]
     assert server._server is not None
-    handler = server._server.request_handlers[CallToolRequest]
-    result = await handler(
-        CallToolRequest(
-            params={
-                "name": "gateway.invoke",
-                "arguments": {"tool_id": "firecrawl::web_search"},
-            }
-        )
+    call_tool_entry = server._server.get_request_handler("tools/call")
+    assert call_tool_entry is not None
+    result = await call_tool_entry.handler(
+        _make_ctx(),
+        CallToolRequestParams(
+            name="gateway.invoke",
+            arguments={"tool_id": "firecrawl::web_search"},
+        ),
     )
     assert called is False
-    assert json.loads(result.root.content[0].text)["error"] is True
+    assert json.loads(result.content[0].text)["error"] is True
     await server.shutdown()
 
 
@@ -544,19 +528,23 @@ async def test_failed_audit_latches_before_later_dispatch(tmp_path: Path) -> Non
     assert server._scoped_advisor_audit._file is not None
     server._scoped_advisor_audit._file.close()
 
-    result = await server._server.request_handlers[CallToolRequest](
-        CallToolRequest(
-            params={
-                "name": "gateway.invoke",
-                "arguments": {
-                    "tool_id": "firecrawl::web_search",
-                    "arguments": {"query": "must not dispatch"},
-                    **_correlations(),
-                },
-            }
-        )
+    call_tool_entry = server._server.get_request_handler("tools/call")
+    assert call_tool_entry is not None
+    result = await call_tool_entry.handler(
+        _make_ctx(),
+        CallToolRequestParams(
+            name="gateway.invoke",
+            arguments={
+                "tool_id": "firecrawl::web_search",
+                "arguments": {"query": "must not dispatch"},
+                **_correlations(),
+            },
+        ),
     )
-    assert "audit sink is unavailable" in result.root.content[0].text
+    # `_handle_call_tool`'s outer except maps every `ScopedAdvisorAuditError`
+    # (including "scoped advisor audit sink is unavailable") to this fixed,
+    # non-leaking message — server.py:379/386, unchanged by the mcp 2.x port.
+    assert "Scoped advisor audit channel failed" in result.content[0].text
     assert called is False
 
 

@@ -1241,7 +1241,7 @@ class TestRefreshCompatibility:
             if tool.name == "gateway.refresh"
         )
 
-        schema = refresh_tool.inputSchema
+        schema = refresh_tool.input_schema
         assert "force" in schema["properties"]
         assert schema["properties"]["force"]["type"] == "boolean"
         assert schema.get("required", []) == []
@@ -1848,21 +1848,21 @@ class TestServerLifecycleTools:
         assert "gateway.connect_server" in tools
         assert "gateway.disconnect_server" in tools
         assert "gateway.restart_server" in tools
-        assert tools["gateway.connect_server"].inputSchema["required"] == [
+        assert tools["gateway.connect_server"].input_schema["required"] == [
             "server_name"
         ]
-        assert "force" not in tools["gateway.connect_server"].inputSchema["properties"]
+        assert "force" not in tools["gateway.connect_server"].input_schema["properties"]
         assert (
-            tools["gateway.disconnect_server"].inputSchema["properties"]["force"][
+            tools["gateway.disconnect_server"].input_schema["properties"]["force"][
                 "type"
             ]
             == "boolean"
         )
         assert (
-            tools["gateway.restart_server"].inputSchema["properties"]["force"]["type"]
+            tools["gateway.restart_server"].input_schema["properties"]["force"]["type"]
             == "boolean"
         )
-        assert "force" not in tools["gateway.refresh"].inputSchema.get("required", [])
+        assert "force" not in tools["gateway.refresh"].input_schema.get("required", [])
 
     @pytest.mark.asyncio
     async def test_connect_server_already_online(

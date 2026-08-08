@@ -855,6 +855,18 @@ overrides the docs-sweep template's default list for this phase only.
   moved to `:1856`/`:1879`. The error-`code`/`data` discard exists at `:1718` as well as
   `:1506`. `src/pmcp/manifest/registry.py` is **not** affected despite a camelCase regex
   suggesting otherwise, and needs no owner.
+- **Post-execution: all of the above confirmed as planned, plus findings SL-1..SL-4
+  surfaced only by running the real gates** — `Tool(inputSchema=...)` validates at
+  runtime but fails `mypy` (26 sites in `tools/handlers.py` needed `input_schema=` after
+  all), a second `httpx2.AsyncClient` leak on failed connects (not just the reconnect
+  path IF-0-P2-2 named), an open `disconnect_all()`/anyio cancel-scope interaction
+  deferred to P3B, three pre-existing test bugs unmasked by the port, and
+  `booted_gateway()`'s no-live-gateway-required semantics. The `cli.py`/error-discard
+  line numbers above have moved again since this note was written (`:1856`/`:1879` and
+  `:1544`/`:1760` respectively — re-grep rather than trust either set of numbers). Full
+  record with citations: `specs/phase-plans-v11.md` → Phase 2 →
+  `### Post-execution amendments`. The V5a verification command in this file's own
+  `## Verification` block was corrected in place for the same reason (item 1 there).
 
 ## Execution Policy
 - execute: effort=medium
@@ -1065,9 +1077,17 @@ rg -n '2026-07-28' CHANGELOG.md
 rg -n '2025-11-25' CHANGELOG.md
 # V5a — the four now-direct dependencies are declared with two-sided bounds, and the
 #       two 2.0.0 API removals have no callers left.
+#       POST-EXECUTION CORRECTION (SL-docs, see specs/phase-plans-v11.md > Phase 2 >
+#       Post-execution amendments, item 1): the bare `from mcp.server.fastmcp` grep
+#       below has one INTENTIONAL match once SL-4 lands —
+#       tests/runtime/test_downstream_handshake_era.py's `DOWNSTREAM_1X_SRC`, a string
+#       literal holding the source of the mcp==1.25.0-pinned subprocess fixture
+#       EC-P2-4 requires. It is never imported into this 2.0.0 process — confirmed by
+#       AST that the module has zero real fastmcp imports. Exclude that one file by
+#       path rather than deleting the fixture.
 rg -n '"mcp>=2\.0\.0,<3\.0\.0"|"httpx>=|"httpx2>=|"jsonschema>=' pyproject.toml
 ! rg -n 'AnyUrl' src/pmcp/server.py
 ! rg -n 'JSONRPCMessage\.model_validate' src/pmcp/
-! rg -n 'from mcp.server.fastmcp' .github/probe/ tests/
+! rg -n 'from mcp.server.fastmcp' .github/probe/ tests/ --glob '!tests/runtime/test_downstream_handshake_era.py'
 gh pr view 112 --json state,url --jq '.state'   # expect CLOSED
 ```

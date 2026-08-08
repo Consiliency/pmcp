@@ -11,18 +11,30 @@ import sys
 from pathlib import Path
 from typing import Any, Literal
 
+import jsonschema
 from mcp.server import Server
+from mcp.server.context import ServerRequestContext
 from mcp.types import (
+    BlobResourceContents,
+    CallToolRequestParams,
+    CallToolResult,
+    ContentBlock,
+    GetPromptRequestParams,
     GetPromptResult,
+    ListPromptsResult,
+    ListResourcesResult,
+    ListToolsResult,
+    PaginatedRequestParams,
     Prompt,
     PromptArgument,
     PromptMessage,
+    ReadResourceRequestParams,
+    ReadResourceResult,
     Resource,
     TextContent,
     TextResourceContents,
     Tool,
 )
-from pydantic import AnyUrl
 
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
@@ -171,8 +183,16 @@ class GatewayServer:
 
     def _create_server(self, instructions: str | None = None) -> None:
         """Create the MCP server with optional capability instructions."""
-        self._server = Server("mcp-gateway", instructions=instructions)
-        self._setup_handlers()
+        self._server = Server(
+            "mcp-gateway",
+            instructions=instructions,
+            on_list_tools=self._handle_list_tools,
+            on_call_tool=self._handle_call_tool,
+            on_list_resources=self._handle_list_resources,
+            on_read_resource=self._handle_read_resource,
+            on_list_prompts=self._handle_list_prompts,
+            on_get_prompt=self._handle_get_prompt,
+        )
 
     def _record_scoped_invocation(
         self,
@@ -195,12 +215,13 @@ class GatewayServer:
         if self._scoped_advisor_audit is not None:
             self._scoped_advisor_audit.require_available()
 
-    def _setup_handlers(self) -> None:
-        """Set up MCP request handlers."""
-        if self._server is None:
-            raise RuntimeError("Server not initialized")
+    async def _handle_list_tools(
+        self,
+        ctx: ServerRequestContext[Any, Any],
+        params: PaginatedRequestParams | None,
+    ) -> ListToolsResult:
+        """Adapter for `tools/list`: wraps the bare-list body into a typed result."""
 
-        @self._server.list_tools()
         async def list_tools() -> list[Tool]:
             self._require_scoped_audit()
             return sorted(
@@ -212,8 +233,45 @@ class GatewayServer:
                 key=lambda tool: tool.name,
             )
 
-        @self._server.call_tool()
-        async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+        return ListToolsResult(tools=await list_tools())
+
+    def _find_gateway_tool(self, name: str) -> Tool | None:
+        """Look up a gateway tool definition by name, for input-schema validation."""
+        return next(
+            (tool for tool in get_gateway_tool_definitions() if tool.name == name),
+            None,
+        )
+
+    async def _handle_call_tool(
+        self,
+        ctx: ServerRequestContext[Any, Any],
+        params: CallToolRequestParams,
+    ) -> CallToolResult:
+        """Adapter for `tools/call`.
+
+        Restores the behaviour the removed 1.x ``call_tool`` decorator supplied:
+        argument unpacking from typed params, tool input-schema validation
+        (2.0.0's low-level ``Server`` does none), and wrapping the domain
+        body's bare ``list[TextContent]`` into a ``CallToolResult``.
+        """
+        name = params.name
+        arguments = params.arguments or {}
+
+        tool = self._find_gateway_tool(name)
+        if tool is not None:
+            try:
+                jsonschema.validate(instance=arguments, schema=tool.input_schema)
+            except jsonschema.ValidationError as e:
+                return CallToolResult(
+                    is_error=True,
+                    content=[
+                        TextContent(
+                            type="text", text=f"Input validation error: {e.message}"
+                        )
+                    ],
+                )
+
+        async def call_tool(name: str, arguments: dict[str, Any]) -> list[ContentBlock]:
             try:
                 result: Any
                 self._require_scoped_audit()
@@ -365,8 +423,16 @@ class GatewayServer:
                     )
                 ]
 
-        # Resource handlers - proxy from downstream servers + L3 guidance
-        @self._server.list_resources()
+        content = await call_tool(name, arguments)
+        return CallToolResult(content=content)
+
+    async def _handle_list_resources(
+        self,
+        ctx: ServerRequestContext[Any, Any],
+        params: PaginatedRequestParams | None,
+    ) -> ListResourcesResult:
+        """Adapter for `resources/list`: proxies downstream servers + L3 guidance."""
+
         async def list_resources() -> list[Resource]:
             self._require_scoped_audit()
             resources = self._client_manager.get_all_resources()
@@ -378,10 +444,10 @@ class GatewayServer:
             ]
             resource_list = [
                 Resource(
-                    uri=AnyUrl(r.uri),
+                    uri=r.uri,
                     name=r.name or r.uri,
                     description=r.description,
-                    mimeType=r.mime_type,
+                    mime_type=r.mime_type,
                 )
                 for r in allowed_resources
             ]
@@ -395,17 +461,27 @@ class GatewayServer:
             ):
                 resource_list.append(
                     Resource(
-                        uri=AnyUrl("pmcp://guidance/code-execution"),
+                        uri="pmcp://guidance/code-execution",
                         name="Code Execution Guide",
                         description="Comprehensive guide for using PMCP with code execution patterns",
-                        mimeType="text/markdown",
+                        mime_type="text/markdown",
                     )
                 )
 
             return sorted(resource_list, key=lambda resource: str(resource.uri))
 
-        @self._server.read_resource()
-        async def read_resource(uri: AnyUrl) -> list[TextResourceContents]:
+        return ListResourcesResult(resources=await list_resources())
+
+    async def _handle_read_resource(
+        self,
+        ctx: ServerRequestContext[Any, Any],
+        params: ReadResourceRequestParams,
+    ) -> ReadResourceResult:
+        """Adapter for `resources/read`."""
+
+        async def read_resource(
+            uri: str,
+        ) -> list[TextResourceContents | BlobResourceContents]:
             self._require_scoped_audit()
             # Find resource by URI
             uri_str = str(uri)
@@ -431,8 +507,8 @@ class GatewayServer:
 
                 return [
                     TextResourceContents(
-                        uri=AnyUrl(uri_str),
-                        mimeType="text/markdown",
+                        uri=uri_str,
+                        mime_type="text/markdown",
                         text=content,
                     )
                 ]
@@ -454,16 +530,23 @@ class GatewayServer:
             # Convert to TextResourceContents
             return [
                 TextResourceContents(
-                    uri=AnyUrl(c.get("uri", uri_str)),
-                    mimeType=c.get("mimeType"),
+                    uri=c.get("uri", uri_str),
+                    mime_type=c.get("mimeType"),
                     text=c.get("text", ""),
                 )
                 for c in contents
                 if "text" in c  # Only text contents for now
             ]
 
-        # Prompt handlers - proxy from downstream servers
-        @self._server.list_prompts()
+        return ReadResourceResult(contents=await read_resource(params.uri))
+
+    async def _handle_list_prompts(
+        self,
+        ctx: ServerRequestContext[Any, Any],
+        params: PaginatedRequestParams | None,
+    ) -> ListPromptsResult:
+        """Adapter for `prompts/list`: proxies downstream servers."""
+
         async def list_prompts() -> list[Prompt]:
             self._require_scoped_audit()
             prompts = self._client_manager.get_all_prompts()
@@ -492,7 +575,16 @@ class GatewayServer:
             ]
             return sorted(prompts_list, key=lambda prompt: prompt.name)
 
-        @self._server.get_prompt()
+        return ListPromptsResult(prompts=await list_prompts())
+
+    async def _handle_get_prompt(
+        self,
+        ctx: ServerRequestContext[Any, Any],
+        params: GetPromptRequestParams,
+    ) -> GetPromptResult:
+        """Adapter for `prompts/get`. The body already returns `GetPromptResult`
+        directly, so this adapter only unpacks typed params."""
+
         async def get_prompt(
             name: str, arguments: dict[str, str] | None = None
         ) -> GetPromptResult:
@@ -518,6 +610,8 @@ class GatewayServer:
                     for m in messages
                 ],
             )
+
+        return await get_prompt(params.name, params.arguments)
 
     async def initialize(self) -> None:
         """Initialize connections to downstream servers and generate capability summary."""

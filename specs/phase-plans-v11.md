@@ -249,6 +249,130 @@ Raise `pmcp` onto `mcp` 2.x so it runs correctly on the new library and negotiat
 - redaction posture: `metadata_only`
 - note: if Assumption 1a (the two-era split) proves wrong, this phase must raise a roadmap amendment before P3B is planned.
 
+### Post-execution amendments
+
+Recorded by SL-docs after SL-1 through SL-4 landed and were verified. Assumption 1a
+(the two-era split) was **confirmed, not falsified** — `mcp_types/version.py` declares
+exactly the split this roadmap describes — so nothing below reopens that axis; these are
+corrections to detail the roadmap's lane partition and scope notes got wrong or omitted,
+plus findings surfaced only during execution.
+
+1. **The roadmap's 4-lane partition (Scope notes, above) omits four files the phase plan
+   had to give an explicit owner.** `src/pmcp/manifest/refresher.py` (its `ClientSession`/
+   `stdio_client` imports were verified unaffected, but the file needed an owner to prove
+   that), `src/pmcp/transport/http.py` and `src/pmcp/tools/handlers.py` (both went to Lane
+   A / SL-2, alongside `src/pmcp/server.py`), and `.github/probe/**` (went to Lane D /
+   SL-4). `src/pmcp/manifest/registry.py` was checked and needs **no** owner: it has no
+   `mcp` import, and its camelCase identifiers (`isLatest`, `remoteUrl`, `nextCursor`, …)
+   are keys of the unrelated MCP Registry REST API, not MCP protocol models — a camelCase
+   regex sweep pulls it in but a check for `mcp` usage correctly excludes it.
+2. **`mcp.server.fastmcp` not existing in `mcp` 2.0.0 is what actually gates EC-P2-1.**
+   `.github/probe/p1_probe_server.py` imported it; `min-version-smoke` boots a gateway
+   from that probe at the declared floor, so EC-P2-1 cannot pass until the probe is
+   ported to `mcp.server.MCPServer`. The roadmap's Scope notes for Lane D name the probes
+   but not this specific blocking dependency.
+3. **Two hard runtime breaks the roadmap never named, both load-bearing:**
+   - `Resource.uri` and `TextResourceContents.uri` move from `AnyUrl` to `str` in `mcp`
+     2.0.0. `Resource(uri=AnyUrl(...))` raises `ValidationError` under 2.0.0's `Tool`/
+     `Resource` models; `src/pmcp/server.py` constructed exactly that at four call sites
+     and imported `AnyUrl` for it. SL-2 dropped the import and passed plain strings.
+   - `JSONRPCMessage` stops being a pydantic model — it is a bare `types.UnionType` in
+     2.0.0 (`mcp_types/jsonrpc.py`) with no `.model_validate`. `client/manager.py` called
+     `JSONRPCMessage.model_validate(...)` on every outbound remote request and
+     notification; the replacement is `mcp_types.jsonrpc_message_adapter` (a
+     `TypeAdapter`), which SL-3 substituted at both call sites.
+   - A **measured** finding narrows the churn these two breaks might suggest: 2.0.0's
+     `MCPModel` keeps `populate_by_name=True`, so constructor-keyword camelCase (e.g.
+     `Tool(inputSchema=...)`) still validates — only *attribute reads* of the camelCase
+     name break. `src/pmcp/tools/handlers.py`'s 26 `inputSchema=` construction sites
+     therefore needed no source change; only the handful of `.inputSchema`/`.mimeType`/
+     `.isError` *attribute reads* elsewhere (`src/pmcp/server.py`, and seven sites in
+     `tests/`) had to move to snake_case. See item 6 below for a second gate the plan
+     checked only against runtime evidence, not this one.
+4. **`cli.py`'s two `import httpx` sites are at `:1856` and `:1879`**, not the roadmap's
+   approximate `~:1844`/`~:1867` (both files have moved since the roadmap was written).
+   Both were left unedited, per Decision 2: `httpx` is now declared directly rather than
+   riding `mcp`'s (removed) transitive dependency, and `httpx2` is declared separately for
+   the downstream transport client — two HTTP stacks coexist deliberately.
+5. **The JSON-RPC error `code`/`data` discard the roadmap flagged exists at two sites, not
+   one**: `client/manager.py`'s stdio path (`_handle_stdout_line`, currently `:1544`) and
+   its remote path (`_read_sse`, currently `:1760` — the roadmap's `~:1718` has also
+   moved). Both do `Exception(payload["error"].get("message", "Unknown error"))`,
+   discarding `code` and `data`. No P2 exit criterion depends on typed downstream errors,
+   so SL-3 left the behaviour unchanged at both sites and added a `# TODO(P3B)` naming the
+   dropped fields at each — **deferred to P3B**, not a P2 defect.
+6. **Three of the "resolved" Execution Notes decisions, plus a fourth the roadmap didn't
+   anticipate at all, all confirmed as recorded** — Decision 1 (`Server.__init__(on_*=...)`
+   over `add_request_handler`, on typed-`params_type` and mypy-checked-result-type
+   grounds), Decision 2 (declare both `httpx` and `httpx2`, leave `cli.py` unedited), and
+   Decision 3 (keep the default `OpenTelemetryMiddleware`, pinned by test rather than left
+   to inherit silently) all landed exactly as decided, with the source citations the plan
+   gives. The fourth, found only once execution ran the CI gates the plan's own reasoning
+   had not: **`Tool(inputSchema=...)` validates at runtime but fails `mypy`**, both true
+   simultaneously. SL-2/SL-4 hit `Unexpected keyword argument "inputSchema" for "Tool"; did
+   you mean "input_schema"?` from `uv run mypy src/pmcp --exclude baml_client` on the
+   pre-fix tree and changed all 26 sites in `src/pmcp/tools/handlers.py` to `input_schema=`
+   (confirmed by this docs session: `git show 5f40168:src/pmcp/tools/handlers.py | grep -c
+   inputSchema=` on the pre-P2 commit is exactly 26; `mypy` on the current, fixed tree is
+   clean). Runtime acceptance is fine — `populate_by_name=True` accepts the field name and
+   the camelCase alias equally as a *constructor* keyword — but mypy synthesizes
+   `Tool.__init__` from
+   the field names via `dataclass_transform` and has no notion of alias acceptance, so it
+   only accepts `input_schema=`. `uv run mypy src/pmcp` is a required CI gate
+   (`tool test command` for SL-2.4/SL-4.8), so this is not cosmetic: item 3's "26 sites
+   need no change" claim was verified against runtime behaviour only, which is the wrong
+   gate. All 26 sites in `src/pmcp/tools/handlers.py` were changed to `input_schema=`.
+   **Rule for future phases: in pmcp source, prefer the field name over the wire alias**,
+   even where an SDK's own prose examples show the camelCase alias — it is the only form
+   both runtime and `mypy` accept.
+7. **A second `httpx2.AsyncClient` leak beyond the one IF-0-P2-2 named.** IF-0-P2-2
+   describes the reconnect-path leak (`_cleanup_client` not closing `sse_exit_stack` for
+   remote clients) and SL-3 fixed it. Execution surfaced a second, adjacent leak the
+   interface freeze didn't name: if entering the transport context itself raises *after*
+   the owned `httpx2.AsyncClient` is already in `remote_stack`, the client leaked on
+   failed connects too. SL-3 fixed both in `_connect_remote_stream` — the client is
+   entered into `remote_stack` first, and a transport-context failure now closes
+   `remote_stack` in the `except` branch before re-raising, rather than leaking. Note the
+   *first* leak (the reconnect path) is **pre-existing** — it predates the mcp 2.x port,
+   since `_cleanup_client` never closed `sse_exit_stack` for remote clients even on 1.x —
+   so it reads as a bug fix carried by this phase, not as a regression 2.x introduced.
+8. **Open debt for P3B, surfaced but not a P2 defect.** `ClientManager`'s concurrent
+   `asyncio.gather` shutdown of every managed client (the `disconnect_all` path) trips
+   anyio's cross-task cancel-scope guard when a fully connected-then-torn-down
+   streamable-HTTP client crosses an event-loop boundary while sharing that loop with
+   another anyio-driven server (e.g. a test's own uvicorn fixture). Isolated by bisection:
+   reproduces with a plain, unauthenticated, non-redirected connect, so it is orthogonal
+   to IF-0-P2-2's transport rebuild and reads as an anyio/httpx2/uvicorn interaction
+   rather than a pmcp defect. `tests/runtime/test_downstream_remote.py` works around it by
+   sharing one `run_fake_remote` lifecycle across all of EC-P2-7's assertions and using
+   per-name `disconnect_server()` rather than `disconnect_all()`; its module docstring
+   carries the full reproduction recipe. Not an exit criterion for P2 — flagged here so
+   P3B (which touches `ClientManager`'s shutdown paths directly) inherits the context
+   rather than rediscovering it.
+9. **Three pre-existing test bugs surfaced once migration errors stopped masking them**,
+   all unrelated to the port and fixed in the same commit that repaired the suite
+   (`dcc2b0d`): a `test_scoped_advisor_audit.py` call to `gateway.provision` omitted the
+   schema-required `server_name` argument, which only started failing once IF-0-P2-1's
+   restored input-schema validation ran — correctly — *before* the policy check the test
+   meant to exercise; the same file's audit-latch test asserted the raised exception's own
+   message ("audit sink is unavailable") rather than the fixed, non-leaking message
+   `_handle_call_tool`'s `except ScopedAdvisorAuditError` has always mapped it to ("Scoped
+   advisor audit channel failed" — unchanged by this port); and
+   `test_baseline_constraints.py` pinned the *absence* of a `description` field on
+   `Server`/`Implementation`, which `mcp` 2.0.0 added. pmcp does not use the new
+   `description` surface — a possible future target, deliberately not acted on here — the
+   test now documents the surface exists rather than asserting it doesn't.
+10. **`booted_gateway()` (`tests/runtime/harness.py`) must not require a live gateway on
+    `:3344`.** `tests/runtime/` runs under the default `uv run pytest tests/` on every CI
+    matrix leg with no marker (see the plan's "No new pytest marker" note), and GitHub
+    runners carry no pmcp systemd unit at all. A hard assertion that a live gateway exists
+    would have failed 13 of 18 runtime tests on the phase PR's own CI — making EC-P2-8
+    unreachable there before it could even report red for a real reason. The fixture
+    treats an absent live gateway (`live_pid is None`) as "nothing to protect, proceed,"
+    matching the plan's own V0a/V0b semantics where an empty `LIVE_PID` on both sides is a
+    passing comparison, not an abort condition. Recorded so a future edit doesn't
+    reintroduce a hard assert here.
+
 ---
 
 ### Phase 3B — Subscriptions and GET retirement (P3B)

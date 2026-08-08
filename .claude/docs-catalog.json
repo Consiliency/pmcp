@@ -1,18 +1,20 @@
 {
   "version": 1,
-  "last_updated": "2026-08-06T06:22:47+00:00",
+  "last_updated": "2026-08-08T06:49:11+00:00",
   "files": {
     "README.md": {
       "purpose": "root project README",
       "touched_by_phases": [
-        "P5"
+        "P5",
+        "P2"
       ]
     },
     "CHANGELOG.md": {
       "purpose": "release changelog",
       "touched_by_phases": [
         "P1",
-        "P5"
+        "P5",
+        "P2"
       ]
     },
     "CONTRIBUTING.md": {
@@ -25,7 +27,8 @@
     "SECURITY.md": {
       "purpose": "security policy",
       "touched_by_phases": [
-        "P5"
+        "P5",
+        "P2"
       ]
     },
     ".claude/plans/ticklish-inventing-stearns.md": {
@@ -51,7 +54,8 @@
     "specs/phase-plans-v11.md": {
       "purpose": "multi-phase roadmap spec",
       "touched_by_phases": [
-        "P1"
+        "P1",
+        "P2"
       ]
     },
     "specs/phase-plans-v2.md": {
@@ -146,6 +150,12 @@
       "purpose": "per-phase lane plan",
       "touched_by_phases": [
         "P1"
+      ]
+    },
+    "plans/phase-plan-v11-P2.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": [
+        "P2"
       ]
     },
     "plans/phase-plan-v11-P5.md": {

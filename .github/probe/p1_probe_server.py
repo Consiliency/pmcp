@@ -18,9 +18,9 @@ The gateway SIGKILLs orphaned downstream processes at startup, matching on
 unrelated process on the runner can collide with.
 """
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
-mcp = FastMCP("p1probe")
+mcp = MCPServer("p1probe")
 
 
 @mcp.tool()
