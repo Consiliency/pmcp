@@ -31,21 +31,53 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
-    # Upper bound is load-bearing: mcp 2.0.0 renamed
-    # mcp.client.streamable_http.streamablehttp_client to streamable_http_client,
-    # which client/manager.py imports at module scope. Without the cap a fresh
-    # install resolves to 2.x and the gateway dies on startup with an ImportError.
-    # Raising this requires porting that import (and auditing the rest of 2.x).
+    # Upper bound is load-bearing: 3.0.0 is unreleased and unaudited. pmcp's
+    # P2 phase ported the gateway's upstream handlers and downstream
+    # transport onto mcp 2.0.0's rewritten low-level Server (typed on_*
+    # callbacks replace the removed decorators) and Streamable HTTP client
+    # (streamable_http_client replaces streamablehttp_client, and owns a
+    # caller-supplied httpx2.AsyncClient rather than building its own). A
+    # future 3.x may reshape either surface again; raising this cap requires
+    # re-auditing both the way P2 did for 2.x, not just relaxing the pin.
     #
-    # The lower bound is load-bearing too, and was set by INSTALLING, not by
-    # reading source. client/manager.py imports streamablehttp_client from
-    # mcp.client.streamable_http at module scope, and that module first exists
-    # in mcp 1.8.0: the previously declared >=1.0.0 was never installable, and
-    # 1.0.0/1.6.0/1.7.0/1.7.1 all die with
-    # `ModuleNotFoundError: No module named 'mcp.client.streamable_http'`.
-    # At 1.8.0 the gateway boots, listens, and serves a real downstream tool
-    # call. The min-version-smoke CI job re-proves this floor on every run.
-    "mcp>=1.8.0,<2.0.0",
+    # The lower bound is load-bearing too: 2.0.0 is the first mcp release
+    # with all three symbols pmcp now imports directly — the low-level
+    # Server's on_* constructor kwargs (server.py), streamable_http_client
+    # (client/manager.py), and the server/discover handler + the
+    # 2026-07-28 modern-era envelope (mcp_types.version) — and it is also
+    # simply the oldest stable 2.x release; there is no 2.0.0-rc or 1.x
+    # release that has these. Below 2.0.0, client/manager.py's module-scope
+    # `from mcp.client.streamable_http import streamable_http_client`
+    # raises ImportError (that name doesn't exist before 2.0.0) and the
+    # gateway dies on startup. The min-version-smoke CI job re-proves this
+    # floor on every run, including a real downstream tool call through a
+    # booted gateway.
+    "mcp>=2.0.0,<3.0.0",
+    # httpx (distinct from httpx2 below) is for cli.py's two diagnostics
+    # probes (_probe_sse_endpoint, _probe_http_health), which do a bare
+    # `import httpx`. Through mcp 1.x this rode in transitively via mcp's
+    # own httpx dependency; mcp 2.0.0 depends on httpx2 instead and declares
+    # no httpx at all, so an undeclared `import httpx` would now be a
+    # ModuleNotFoundError on a clean install. Declared directly rather than
+    # left transitive, per this repo's standing rule against undeclared
+    # transitive imports (it has shipped broken twice riding one).
+    "httpx>=0.27,<1.0",
+    # httpx2 (distinct from httpx above) is for client/manager.py's
+    # downstream Streamable HTTP transport: streamable_http_client requires
+    # a caller-supplied httpx2.AsyncClient (mcp 2.0.0 no longer builds and
+    # owns its own), and pmcp constructs one explicitly with
+    # follow_redirects=True to match 1.x's create_mcp_http_client default,
+    # since httpx2.AsyncClient's own default is False. The floor matches
+    # mcp 2.0.0's own `Requires-Dist: httpx2>=2.5.0`.
+    "httpx2>=2.5.0,<3.0.0",
+    # jsonschema is for server.py's restored tool input-schema validation.
+    # mcp 1.x's low-level Server did `jsonschema.validate(instance=arguments,
+    # schema=tool.inputSchema)` inside its call_tool decorator; mcp 2.0.0's
+    # low-level Server does no such validation (mcp/server/validation.py is
+    # sampling/elicitation only), so pmcp now does this check itself and
+    # must depend on jsonschema directly rather than ride mcp's transitive
+    # `Requires-Dist: jsonschema>=4.20.0`, whose floor this matches.
+    "jsonschema>=4.20.0,<5.0.0",
     "pydantic>=2.0",
     "pyjwt[crypto]>=2.10.0",
     "pyyaml>=6.0",

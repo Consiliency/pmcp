@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The declared `mcp` bound is raised from `>=1.8.0,<2.0.0` to `>=2.0.0,<3.0.0`,
+  and the gateway's upstream server and downstream client are ported onto it.**
+  pmcp now serves two protocol eras simultaneously, each reached a different
+  way: the handshake era — `2024-11-05` through `2025-11-25` — is negotiated
+  the way it always was, through `initialize`; the modern era — `2026-07-28`
+  — is not negotiable through `initialize` at all, and is instead selected
+  per request by the `MCP-Protocol-Version` header plus a `params._meta`
+  envelope (`io.modelcontextprotocol/protocolVersion` and
+  `io.modelcontextprotocol/clientCapabilities`), with `server/discover`
+  advertising it out of band. Downstream, pmcp continues to speak only the
+  handshake era to the servers it proxies — `client/manager.py`'s
+  `PREFERRED_PROTOCOL_VERSION` ceiling is unchanged at `2025-11-25` — so no
+  downstream server is reached at `2026-07-28` by this or any prior release.
+  One limitation of the modern era is structural, not a pmcp gap: it has no
+  back-channel, so server-initiated requests such as `sampling/createMessage`
+  and `elicitation/create` do not exist at `2026-07-28` (pmcp does not proxy
+  either today, so this changes nothing pmcp currently does — it is recorded
+  here because a future phase that wants to add one will hit it).
+  Declares `httpx`, `httpx2`, and `jsonschema` as direct dependencies for the
+  first time — `mcp` 2.0.0 depends on `httpx2` rather than `httpx`, and no
+  longer validates tool input schemas itself — closing the undeclared-
+  transitive-dependency gap that has shipped this repo broken before.
+
 ## [1.22.0] - 2026-08-06
 
 ### Added
