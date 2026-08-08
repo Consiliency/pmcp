@@ -179,6 +179,83 @@ diagnostics paths. See `## Execution Notes > Decision 2` for the resolution.
 - `tests/test_credential_boot.py:43,45` builds a `FastMCP("p5-fixture")` fixture and
   `:258,263` uses `ClientSession`; the former breaks for the same reason.
 
+### Trap 5 — the pydantic model reshape, measured rather than assumed
+
+Every wire model in 2.0.0 derives from `MCPModel`, whose
+`model_config = ConfigDict(alias_generator=to_camel, populate_by_name=True)`
+(`mcp_types/_types.py:45-48`) renames the Python fields to snake_case while keeping the
+camelCase wire alias — `Tool.inputSchema` is now `Tool.input_schema`
+(`mcp_types/_types.py:1416`), `outputSchema` → `output_schema` (`:1424`). This is the single
+largest churn class in the phase and the roadmap does not mention it. **Its blast radius was
+measured empirically**, by installing `mcp==2.0.0` into a throwaway venv and exercising the
+models, not by reading the diff:
+
+- **Constructor keywords by camelCase still work.** `Tool(name=…, inputSchema={…})` validates
+  and yields `t.input_schema` — `populate_by_name=True` accepts the field name and the alias
+  is the primary validation key. **So `src/pmcp/tools/handlers.py`'s 26 `inputSchema=` sites,
+  which are all constructor keywords, need no change.**
+- **Attribute reads by camelCase now raise.** `t.inputSchema`, `r.mimeType`, and `c.isError`
+  each raise `AttributeError`. Any read site must move to snake_case.
+- **`Resource.uri` and `TextResourceContents.uri` are now `str`, not `AnyUrl`** — this is the
+  real breakage in `server.py` and it is not a naming issue.
+  `Resource(uri=AnyUrl("http://x/y"), …)` raises
+  `ValidationError: uri — Input should be a valid string`. pmcp does exactly that at
+  `server.py:381`, `:398`, `:434`, and `:457`, imports `AnyUrl` at `:25`, and types the
+  handler `read_resource(uri: AnyUrl)` at `:408`. Note `server.py:405`'s
+  `key=lambda resource: str(resource.uri)` is harmless either way.
+- **`Tool` lost `extra="allow"`.** 1.25.0 set `model_config = ConfigDict(extra="allow")` on
+  `Tool` (`.venv/…/mcp/types.py:1339`); 2.0.0's `Tool` sets none, so pydantic's default
+  `extra="ignore"` applies and unknown fields are silently dropped — verified:
+  `Tool.model_validate({... "vendorExtra": {...}})` round-trips without `vendorExtra`. For a
+  gateway this reads as a proxying-fidelity regression, so it gets an explicit acceptance
+  check (EC-P2-3's fidelity assertion) rather than a note. **It does not in fact bite pmcp's
+  proxy path today**: `manager.py:1099-1130` (`_index_tools`) reads downstream tools as raw
+  dicts and builds pmcp's own `ToolInfo` against its own `known_fields` allowlist — no
+  downstream tool is ever round-tripped through `mcp.types.Tool`. The check exists so that
+  stays true.
+- **`client/manager.py`'s six camelCase hits are not model fields at all.** `:1105`, `:1106`,
+  `:1121`, `:1122`, `:1152`, `:1166` are keys of raw JSON-RPC payload dicts
+  (`tool.get("inputSchema", {})`), which are camelCase on the wire in every SDK version.
+  They must **not** be renamed.
+- **`src/pmcp/manifest/registry.py` is not affected and needs no lane.** It has no `mcp`
+  import and constructs no MCP model; its camelCase identifiers (`isLatest`, `remoteUrl`,
+  `nextCursor`, `protectedResourceMetadataUrl`, …) are keys of the **MCP Registry REST API**,
+  an unrelated external HTTP contract. A regex sweep for camelCase sweeps them in; a check
+  for `mcp` usage does not.
+
+Net: the reshape touches **`src/pmcp/server.py` only**, plus a no-op verification pass over
+`src/pmcp/tools/handlers.py`. Both go to Lane A, which is why `tools/handlers.py` is added to
+SL-2's owned files — no file is left unowned.
+
+### Trap 6 — `JSONRPCMessage` is no longer a model, and this breaks every remote request
+
+Not named by the roadmap and not previously reported. In 1.25.0,
+`JSONRPCMessage` is `class JSONRPCMessage(RootModel[...])` (`.venv/…/mcp/types.py:223`). In
+2.0.0 it is a bare union — `JSONRPCMessage = JSONRPCRequest | JSONRPCNotification |
+JSONRPCResponse | JSONRPCError` (`mcp_types/jsonrpc.py:145`) — a `types.UnionType` with no
+`model_validate`. `client/manager.py:1784` and `:1902` call
+`mcp_types.JSONRPCMessage.model_validate(...)` to build every outbound request and
+notification on the remote (SSE and Streamable HTTP) paths, so after the bump both raise
+`AttributeError: 'types.UnionType' object has no attribute 'model_validate'`. Every remote
+downstream stops working — including the one EC-P2-7 exercises.
+
+The replacement is published beside it: `jsonrpc_message_adapter: TypeAdapter[JSONRPCMessage]`
+(`mcp_types/jsonrpc.py:148`), re-exported as `mcp.types.jsonrpc_message_adapter`. Verified in
+the 2.0.0 venv: `jsonrpc_message_adapter.validate_python(<the tools/call dict>)` yields a
+`JSONRPCRequest` whose `model_dump(by_alias=True, mode="json", exclude_none=True)` reproduces
+the input exactly, nested `arguments` included; `SessionMessage(<that model>)` constructs; and
+the notification and `initialize` envelopes round-trip identically. The read side is
+unaffected — `SessionMessage.message` is now typed as that union of concrete models
+(`mcp/shared/message.py:62`), so `manager.py:1701`'s `message.message.model_dump(...)` still
+holds.
+
+### Trap 7 — `Server.middleware` arrives pre-populated with OpenTelemetry
+
+`mcp/server/lowlevel/server.py:439` sets `self.middleware = [OpenTelemetryMiddleware()]` in
+`__init__` — an instance attribute, not a constructor keyword — and `opentelemetry-api` is a
+hard dependency of `mcp` 2.0.0 (`METADATA:29`). Inheriting it silently is what this plan is
+supposed to prevent, so SL-2 makes it a decision: see `## Execution Notes > Decision 3`.
+
 ### PR #112, decided by its own CI
 
 `gh pr view 112`: branch `dependabot/pip/mcp-gte-1.0.0-and-lt-3.0.0`, title
@@ -242,12 +319,16 @@ records the pid at run time and never hardcodes one.
   `PREFERRED_PROTOCOL_VERSION` are unchanged. Consumed by SL-4's EC-P2-7 tests.
 
 - [ ] IF-0-P2-3 — **Dependency contract, published day 1.** `pyproject.toml` declares
-  exactly `"mcp>=2.0.0,<3.0.0"`, `"httpx2>=2.5.0,<3.0.0"`, and `"jsonschema>=4.20.0,<5.0.0"`,
-  each with the existing load-bearing-bound comment style rewritten (not deleted) to say why
-  each bound is load-bearing; `uv.lock` is regenerated in the same commit. `httpx2`'s floor
-  matches `mcp` 2.0.0's own `Requires-Dist: httpx2>=2.5.0`; `jsonschema`'s matches its
-  `Requires-Dist: jsonschema>=4.20.0`. Consumed by every other lane — nothing else compiles
-  until this merges.
+  exactly `"mcp>=2.0.0,<3.0.0"`, `"httpx>=0.27,<1.0"`, `"httpx2>=2.5.0,<3.0.0"`, and
+  `"jsonschema>=4.20.0,<5.0.0"`, each with the existing load-bearing-bound comment style
+  rewritten (not deleted) to say why each bound is load-bearing and which module imports it;
+  `uv.lock` is regenerated in the same commit. `httpx` is for `cli.py`'s two diagnostics
+  probes, which `mcp` 2.0.0 no longer supplies transitively; `httpx2` is for the downstream
+  transport client that `streamable_http_client` requires and its floor matches `mcp` 2.0.0's
+  own `Requires-Dist: httpx2>=2.5.0`; `jsonschema` is for the restored tool input-schema
+  check and its floor matches `Requires-Dist: jsonschema>=4.20.0`. Two HTTP stacks coexist
+  deliberately — see `## Execution Notes > Decision 2`. Consumed by every other lane —
+  nothing else compiles until this merges.
 
 - [ ] IF-0-P2-4 — **Modern-envelope wire contract** (test-facing; frozen so SL-4 cannot
   approximate it). A modern request POSTed to the gateway's `/mcp` carries HTTP headers
@@ -321,7 +402,7 @@ must say so in its commit message and re-derive the `install-smoke` byte-freeze.
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-1.1 | test | — | `tests/mcp2x/test_dependency_bounds.py` | Declared bounds are two-sided and match what is installed: parse `pyproject.toml` for `mcp`, `httpx2`, `jsonschema`, assert each has both `>=` and `<`; assert `importlib.metadata.version("mcp")` starts with `2.`; assert the P1 floor regex `r'"mcp>=([0-9.]+),<'` still matches and yields `2.0.0`; assert `import httpx2` and `import jsonschema` both succeed | `uv run pytest tests/mcp2x/test_dependency_bounds.py -q` |
+| SL-1.1 | test | — | `tests/mcp2x/test_dependency_bounds.py` | Declared bounds are two-sided and match what is installed: parse `pyproject.toml` for `mcp`, `httpx`, `httpx2`, `jsonschema`, assert each has both `>=` and `<`; assert `importlib.metadata.version("mcp")` starts with `2.`; assert the P1 floor regex `r'"mcp>=([0-9.]+),<'` still matches and yields `2.0.0`; assert `import httpx`, `import httpx2`, and `import jsonschema` all succeed; assert `httpx` and `httpx2` are distinct modules with distinct `__version__`s, so a future resolver change cannot collapse them | `uv run pytest tests/mcp2x/test_dependency_bounds.py -q` |
 | SL-1.2 | impl | SL-1.1 | `pyproject.toml`, `uv.lock` | — | — |
 | SL-1.3 | impl | SL-1.2 | `CHANGELOG.md` | — | — |
 | SL-1.4 | verify | SL-1.3 | `pyproject.toml`, `uv.lock`, `CHANGELOG.md`, `.github/workflows/test.yml`, `tests/mcp2x/test_dependency_bounds.py` | all SL-1 tests | `uv sync --all-extras && uv run pytest tests/mcp2x/test_dependency_bounds.py -q && git diff --exit-code -- .github/workflows/test.yml` |
@@ -331,17 +412,20 @@ block at `pyproject.toml:34-47` rather than deleting it (the ceiling rationale c
 "2.0.0 renamed `streamablehttp_client`" to "3.0.0 is unreleased and unaudited"; the floor
 rationale changes from "1.8.0 is where `mcp.client.streamable_http` first exists" to "2.0.0
 is the only stable 2.x release and the first with `streamable_http_client`,
-`Server(on_*=...)`, and `server/discover`"), adds `"httpx2>=2.5.0,<3.0.0"` and
-`"jsonschema>=4.20.0,<5.0.0"` each with a one-line comment naming the importing module
-(`cli.py` and `server.py` respectively), then runs `uv lock`. SL-1.3 writes the
+`Server(on_*=...)`, and `server/discover`"), adds `"httpx>=0.27,<1.0"`, `"httpx2>=2.5.0,<3.0.0"`, and
+`"jsonschema>=4.20.0,<5.0.0"` each with a one-line comment naming the importing module and
+why it is no longer transitive (`cli.py` for `httpx`, `client/manager.py` for `httpx2`,
+`server.py` for `jsonschema`), then runs `uv lock`. SL-1.3 writes the
 `## [Unreleased]` entry described in `## Execution Notes > CHANGELOG`.
 
 ### SL-2 — Upstream server on mcp 2.x (roadmap Lane A)
 
 - **Scope**: Re-register the six proxied handlers through `Server.__init__`'s typed `on_*`
-  callbacks and write the adapters that restore argument adaptation, tool input-schema
-  validation, result wrapping, and exception-to-error mapping.
-- **Owned files**: `src/pmcp/server.py`, `src/pmcp/transport/http.py`, `tests/mcp2x/test_server_handlers.py`
+  callbacks, write the adapters that restore argument adaptation, tool input-schema
+  validation, result wrapping, and exception-to-error mapping, and carry the 2.0.0 model
+  reshape (`Resource`/`TextResourceContents` `uri` from `AnyUrl` to `str`, snake_case
+  attribute reads) through the same file.
+- **Owned files**: `src/pmcp/server.py`, `src/pmcp/transport/http.py`, `src/pmcp/tools/handlers.py`, `tests/mcp2x/test_server_handlers.py`
 - **Interfaces provided**: IF-0-P2-1
 - **Interfaces consumed**: IF-0-P2-3 (`mcp>=2.0.0`, `jsonschema` declared)
 - **Parallel-safe**: yes
@@ -350,10 +434,10 @@ is the only stable 2.x release and the first with `streamable_http_client`,
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-2.1 | test | — | `tests/mcp2x/test_server_handlers.py` | For each of the six methods: invoke the registered `HandlerEntry.handler` obtained via `server.get_request_handler("<method>")` with a real `ServerRequestContext` and the entry's own `params_type` model, and assert the return value is an instance of the SDK result model (`ListToolsResult`, `CallToolResult`, `ListResourcesResult`, `ReadResourceResult`, `ListPromptsResult`, `GetPromptResult`) with the expected payload. Plus: `get_request_handler("<method>").params_type is <canonical model>` for all six; `_handle_call_tool` with arguments violating a tool's `inputSchema` returns `CallToolResult(isError=True)` whose text starts `Input validation error:`; `_handle_read_resource` on an unknown URI and `_handle_get_prompt` on a policy-blocked prompt each raise so the runner maps them to a JSON-RPC error; `server.get_request_handler("server/discover")` is not `None` | `uv run pytest tests/mcp2x/test_server_handlers.py -q` |
+| SL-2.1 | test | — | `tests/mcp2x/test_server_handlers.py` | For each of the six methods: invoke the registered `HandlerEntry.handler` obtained via `server.get_request_handler("<method>")` with a real `ServerRequestContext` and the entry's own `params_type` model, and assert the return value is an instance of the SDK result model (`ListToolsResult`, `CallToolResult`, `ListResourcesResult`, `ReadResourceResult`, `ListPromptsResult`, `GetPromptResult`) with the expected payload. Plus: `get_request_handler("<method>").params_type is <canonical model>` for all six; `_handle_call_tool` with arguments violating a tool's `inputSchema` returns `CallToolResult(isError=True)` whose text starts `Input validation error:`; `_handle_read_resource` on an unknown URI and `_handle_get_prompt` on a policy-blocked prompt each raise so the runner maps them to a JSON-RPC error; `server.get_request_handler("server/discover")` is not `None`. **Model-reshape pins**: every `Resource` and `TextResourceContents` the handlers emit carries a `str` `uri` (constructing one with `AnyUrl` must fail, so the test asserts the emitted `.uri` is `str`); `Tool.model_fields` contains `input_schema` and not `inputSchema`; every tool from `get_gateway_tool_definitions()` survives `Tool.model_validate(t.model_dump(by_alias=True))` with an identical `model_dump(by_alias=True)` — the **proxying-fidelity** assertion that catches the dropped `extra="allow"`; and `Server("probe").middleware` matches whatever Decision 3 settles on | `uv run pytest tests/mcp2x/test_server_handlers.py -q` |
 | SL-2.2 | impl | SL-2.1 | `src/pmcp/server.py` | — | — |
-| SL-2.3 | impl | SL-2.2 | `src/pmcp/transport/http.py` | — | — |
-| SL-2.4 | verify | SL-2.3 | `src/pmcp/server.py`, `src/pmcp/transport/http.py`, `tests/mcp2x/test_server_handlers.py` | all SL-2 tests | `uv run pytest tests/mcp2x/test_server_handlers.py -q && uv run ruff check src/pmcp/server.py src/pmcp/transport/http.py && uv run mypy src/pmcp --exclude baml_client` |
+| SL-2.3 | impl | SL-2.2 | `src/pmcp/tools/handlers.py`, `src/pmcp/transport/http.py` | — | — |
+| SL-2.4 | verify | SL-2.3 | `src/pmcp/server.py`, `src/pmcp/transport/http.py`, `src/pmcp/tools/handlers.py`, `tests/mcp2x/test_server_handlers.py` | all SL-2 tests | `uv run pytest tests/mcp2x/test_server_handlers.py -q && uv run ruff check src/pmcp/server.py src/pmcp/transport/http.py src/pmcp/tools/handlers.py && uv run mypy src/pmcp --exclude baml_client && ! rg -n 'AnyUrl' src/pmcp/server.py` |
 
 SL-2.2 converts the six closures in `_setup_handlers` (`server.py:198-520`) into six private
 `async` methods per IF-0-P2-1, keeping each existing body verbatim as an inner helper so the
@@ -366,7 +450,18 @@ and `Server.run` (`mcp/server/lowlevel/server.py:691-701`) is
 `run(read_stream, write_stream, initialization_options, raise_exceptions=False)`, which
 `server.py:765-769`'s three-positional call already satisfies, with
 `create_initialization_options` still present at `:527`. If either turns out to differ at
-runtime the lane fixes it and says so in its commit message. SL-2.3 re-verifies `StreamableHTTPSessionManager(app=..., json_response=..., stateless=...)`
+runtime the lane fixes it and says so in its commit message.
+
+SL-2.2 also carries Trap 5 through this file: drop the `AnyUrl` import at `server.py:25`,
+pass plain strings at `:381`, `:398`, `:434`, and `:457`, and take `params.uri` as `str` in
+the `read_resource` adapter (`:408`). SL-2.4's `! rg -n 'AnyUrl' src/pmcp/server.py` is a
+paired grep, not a standalone one — SL-2.1's assertion that every emitted `Resource.uri` is a
+`str` is the test half. **`src/pmcp/tools/handlers.py` is expected to need no edit**: its 26
+`inputSchema=` sites are constructor keywords and 2.0.0 still accepts the camelCase alias
+(verified in a `mcp==2.0.0` venv). SL-2.3 owns proving that rather than assuming it, and
+records "verified no change needed" if so.
+
+SL-2.3 re-verifies `StreamableHTTPSessionManager(app=..., json_response=..., stateless=...)`
 against 2.0.0 and is **expected to be a no-op**; if it is, the lane records "verified no
 change needed" in its commit message rather than inventing a diff.
 
@@ -384,21 +479,28 @@ change needed" in its commit message rather than inventing a diff.
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-3.1 | test | — | `tests/mcp2x/test_client_transport.py` | `_connect_streamable_http` passes an `httpx2.AsyncClient` whose `.follow_redirects is True`, whose `.timeout` is `httpx2.Timeout(30.0, read=300.0)`, and whose `.headers` contain every key `_remote_headers` resolved, into `streamable_http_client(url, http_client=...)` — asserted by monkeypatching `streamable_http_client` and capturing the kwargs; `PREFERRED_PROTOCOL_VERSION == "2025-11-25"` and is a `HANDSHAKE_PROTOCOL_VERSIONS` member and **not** in `MODERN_PROTOCOL_VERSIONS`; `_connect_sse` still calls `sse_client(url, headers=...)` unchanged; `SessionMessage` still exposes `.message` so `_read_sse`'s `model_dump` path holds; `manifest.refresher` imports and its `ClientSession` round trip works against an in-process 2.x fixture; `cli._probe_http_health` and `cli._probe_sse_endpoint` resolve `httpx2` and return the documented tuples against a local stub server | `uv run pytest tests/mcp2x/test_client_transport.py -q` |
+| SL-3.1 | test | — | `tests/mcp2x/test_client_transport.py` | `_connect_streamable_http` passes an `httpx2.AsyncClient` whose `.follow_redirects is True`, whose `.timeout` is `httpx2.Timeout(30.0, read=300.0)`, and whose `.headers` contain every key `_remote_headers` resolved, into `streamable_http_client(url, http_client=...)` — asserted by monkeypatching `streamable_http_client` and capturing the kwargs; **`_send_request`'s outbound envelope survives `jsonrpc_message_adapter.validate_python` with `params.arguments` byte-identical**, including a nested-object payload, for a request, a notification, and the `initialize` envelope; `PREFERRED_PROTOCOL_VERSION == "2025-11-25"` and is a `HANDSHAKE_PROTOCOL_VERSIONS` member and **not** in `MODERN_PROTOCOL_VERSIONS`; `_connect_sse` still calls `sse_client(url, headers=...)` unchanged; `SessionMessage(<concrete model>)` constructs and `.message.model_dump(by_alias=True, mode="json", exclude_none=True)` round-trips, so `_read_sse` holds; `manifest.refresher` imports and its `ClientSession` round trip works against an in-process 2.x fixture; `cli._probe_http_health` and `cli._probe_sse_endpoint` still resolve `httpx` and return the documented tuples against a local stub server | `uv run pytest tests/mcp2x/test_client_transport.py -q` |
 | SL-3.2 | impl | SL-3.1 | `src/pmcp/client/manager.py` | — | — |
-| SL-3.3 | impl | SL-3.2 | `src/pmcp/cli.py`, `src/pmcp/manifest/refresher.py` | — | — |
-| SL-3.4 | verify | SL-3.3 | `src/pmcp/client/manager.py`, `src/pmcp/manifest/refresher.py`, `src/pmcp/cli.py`, `tests/mcp2x/test_client_transport.py` | all SL-3 tests | `uv run pytest tests/mcp2x/test_client_transport.py -q && uv run ruff check src/pmcp && uv run mypy src/pmcp --exclude baml_client && rg -n 'follow_redirects=True' src/pmcp/client/manager.py` |
+| SL-3.3 | impl | SL-3.2 | `src/pmcp/manifest/refresher.py`, `src/pmcp/cli.py` | — | — |
+| SL-3.4 | verify | SL-3.3 | `src/pmcp/client/manager.py`, `src/pmcp/manifest/refresher.py`, `src/pmcp/cli.py`, `tests/mcp2x/test_client_transport.py` | all SL-3 tests | `uv run pytest tests/mcp2x/test_client_transport.py -q && uv run ruff check src/pmcp && uv run mypy src/pmcp --exclude baml_client && rg -n 'follow_redirects=True' src/pmcp/client/manager.py && ! rg -n 'JSONRPCMessage\.model_validate' src/pmcp/` |
 
 SL-3.2 changes the import at `manager.py:22` to `from mcp.client.streamable_http import
 streamable_http_client`, adds `import httpx2`, rewrites `_connect_streamable_http`
 (`:1371-1385`) per IF-0-P2-2, adds `remote_http_client` to `ManagedClient`, and threads the
 client into `_connect_remote_stream`'s `remote_stack` (`:1416`) ahead of the transport.
 `manager.py:1418`'s `transport[:2]` is left alone — 2.0.0 yields a 2-tuple and the slice
-still holds. SL-3.3 renames `httpx` → `httpx2` at `cli.py:1856` and `:1879` (the call sites
-use only `Timeout`, `AsyncClient(timeout=…, follow_redirects=True)`, `.stream`, `.get`,
-`.status_code`, `.json()`, all of which `httpx2` 2.9.1 exports, and `httpx2.AsyncClient.__init__`
-is keyword-only, which these call sites already satisfy), and proves `manifest/refresher.py`
-either unchanged or minimally adjusted.
+still holds. **SL-3.2 also fixes Trap 6**: `manager.py:1784` and `:1902` become
+`SessionMessage(mcp_types.jsonrpc_message_adapter.validate_python(<envelope>))`. That is a
+hard runtime break, not a lint issue — `JSONRPCMessage` is a bare `types.UnionType` in 2.0.0
+and has no `model_validate`, so every remote outbound request and notification raises
+`AttributeError` until this lands. The adapter was verified in a `mcp==2.0.0` venv to
+round-trip the `tools/call`, `notifications/initialized`, and `initialize` envelopes with
+nested `arguments` byte-identical.
+
+**`src/pmcp/cli.py` is expected to need no edit** — see `## Execution Notes > Decision 2`.
+It stays in this lane's owned files so the `httpx` question has one owner, and SL-3.3 proves
+the two `import httpx` sites still resolve once SL-1 declares `httpx` rather than editing
+them. SL-3.3 also proves `manifest/refresher.py` either unchanged or minimally adjusted.
 
 **Also in scope for SL-3.2, as an explicit disposition rather than a silent drop**: the
 roadmap's `_read_*` audit. JSON-RPC error `code` and `data` are discarded at **two** sites,
@@ -492,7 +594,7 @@ overrides the docs-sweep template's default list for this phase only.
 |---|---|---|---|---|
 | SL-docs.1 | docs | — | `.claude/docs-catalog.json` | Rescan: `python3 "$(git rev-parse --show-toplevel)/.claude/skills/_shared/scaffold_docs_catalog.py" --rescan`. Picks up any new doc files created by impl lanes; preserves `touched_by_phases` history. If the helper is absent, record "docs-catalog rescan helper unavailable; manual catalog audit" in the commit message and proceed. |
 | SL-docs.2 | docs | SL-docs.1 | per catalog | For each file in the catalog, decide: does this phase's work change it? If yes, update the file and append `P2` to its `touched_by_phases`. If no, leave it. Record in the commit message any files intentionally skipped. |
-| SL-docs.3 | docs | SL-docs.2 | `specs/phase-plans-v11.md`, `plans/phase-plan-v11-P2.md` | Append `### Post-execution amendments` to the Phase 2 section recording: (a) the three files the roadmap's lane partition omitted — `src/pmcp/manifest/refresher.py`, `src/pmcp/transport/http.py`, `.github/probe/**` — and which lane took each; (b) the corrected `cli.py` line numbers (`:1856`, `:1879`); (c) the second error-`code`/`data` discard site at `manager.py:1718` and its deferral to P3B; (d) the two open decisions as resolved, with their source citations; (e) `mcp.server.fastmcp` not existing in 2.0.0, which is what actually gates EC-P2-1. |
+| SL-docs.3 | docs | SL-docs.2 | `specs/phase-plans-v11.md`, `plans/phase-plan-v11-P2.md` | Append `### Post-execution amendments` to the Phase 2 section recording: (a) the four files the roadmap's lane partition omitted — `src/pmcp/manifest/refresher.py`, `src/pmcp/transport/http.py`, `src/pmcp/tools/handlers.py`, `.github/probe/**` — and which lane took each, plus that `src/pmcp/manifest/registry.py` was checked and is unaffected; (b) the corrected `cli.py` line numbers (`:1856`, `:1879`); (c) the second error-`code`/`data` discard site at `manager.py:1718` and its deferral to P3B; (d) the three decisions as resolved, with their source citations; (e) `mcp.server.fastmcp` not existing in 2.0.0, which is what actually gates EC-P2-1; (f) **the two hard runtime breaks the roadmap never named** — `Resource.uri`/`TextResourceContents.uri` moving from `AnyUrl` to `str`, and `JSONRPCMessage` ceasing to be a pydantic model (`jsonrpc_message_adapter` is the replacement) — and the measured finding that constructor-keyword camelCase still validates, so the snake_case churn is far smaller than a regex sweep suggests. |
 | SL-docs.4 | verify | SL-docs.3 | — | Run any repo doc linters (`markdownlint`, `vale`, `prettier --check`, Mermaid/PlantUML render check). If none configured, no-op. |
 | SL-docs.5 | docs | SL-docs.4 | `specs/phase-plans-v11.md` | **Post-merge**, outside the lane DAG: record PR #112's closure — the closing comment URL, the phase PR number that superseded it, and its final state — as the EC-P2-8 evidence artifact. Gates nothing; by construction this evidence cannot exist before the merge. |
 
@@ -502,7 +604,9 @@ overrides the docs-sweep template's default list for this phase only.
   read this session in `mcp/server/lowlevel/server.py`: `:446-462` funnels the `on_*` kwargs
   into `self._request_handlers` as `HandlerEntry(params_type, handler)`, and `:472-496`
   shows `add_request_handler` writing the *same* `HandlerEntry` into the *same* dict. They
-  are functionally identical, so the choice is decided entirely by failure modes. The
+  are **equivalent at runtime** — the constructor only *stores* the callbacks, applying no
+  wrapping, adaptation, or validation of its own — so this is not a behavioural tradeoff and
+  the choice is decided entirely by authoring-time failure modes. The
   constructor binds the SDK's canonical `params_type` per spec method (`:457` `tools/list` →
   `PaginatedRequestParams`, `:458` `tools/call` → `CallToolRequestParams`, `:453`
   `resources/read` → `ReadResourceRequestParams`, `:450` `prompts/get` →
@@ -515,24 +619,40 @@ overrides the docs-sweep template's default list for this phase only.
   `add_request_handler` erases that to `HandlerResult = BaseModel | dict | None`
   (`mcp/server/context.py:132`), which accepts almost anything. **`MCPServer` is not used**,
   per the roadmap.
-- **Decision 2 — migrate `cli.py` to `httpx2` and declare `httpx2`; do not declare `httpx`.**
-  Source evidence: `mcp` 2.0.0's `METADATA:26` is `Requires-Dist: httpx2>=2.5.0` and the file
-  declares no `httpx` at all, so the bare `import httpx` at `cli.py:1856`/`:1879` becomes a
-  `ModuleNotFoundError` after the bump. Declaring `httpx` would work but would put a second,
-  otherwise-unused HTTP stack in every install purely to avoid a two-line diff, and would
-  leave pmcp's diagnostics on a different HTTP library than its own transport. The migration
-  is mechanical and was checked against the real package: `httpx2` 2.9.1 exports
-  `AsyncClient`, `Timeout`, `Response`, `HTTPStatusError`, `TimeoutException`,
-  `RequestError`, `Auth`, `BasicAuth` and 67 more names; `AsyncClient.__init__`
-  (`httpx2/_client.py`) accepts `headers`, `timeout`, and `follow_redirects` and is
-  keyword-only, which both call sites already satisfy; `AsyncClient.stream`, `.get`, `.post`
-  and `Response.json` / `.raise_for_status` all exist. **Neither option is "leave it
-  transitive"** — this repo has already shipped broken twice by riding an undeclared
-  transitive dependency, which is why P1's guards exist. SL-1 declares `httpx2>=2.5.0,<3.0.0`
-  in the same day-1 freeze, and SL-3 does the rename. The same rule forces the third
-  declaration: SL-2 will `import jsonschema` directly (2.0.0's low-level `Server` does no
-  input-schema validation), and although `mcp` 2.0.0 requires `jsonschema>=4.20.0`
-  transitively, pmcp declares it.
+- **Decision 2 — declare BOTH `httpx` and `httpx2`; leave `cli.py` unchanged.** The forcing
+  fact: `mcp` 2.0.0's `METADATA:26` is `Requires-Dist: httpx2>=2.5.0` and the file declares no
+  `httpx` at all, so the bare `import httpx` at `cli.py:1856`/`:1879` becomes a
+  `ModuleNotFoundError` after the bump. **`httpx2` must be declared regardless** of what
+  `cli.py` does: `streamable_http_client(url, http_client=…)` requires an `httpx2.AsyncClient`
+  specifically, and IF-0-P2-2 puts an explicit `follow_redirects=True` in pmcp's own source
+  (httpx2's own default is `False`; the SDK's `create_mcp_http_client` sets it, so a
+  caller-supplied client must too). So the only live question is `cli.py`'s two diagnostics
+  probes, and the answer is to declare `httpx` and not touch them — the lowest-risk option,
+  zero diff on a file nothing else in this phase changes. The cost is a second HTTP stack in
+  the install; the two majors coexist as separate distributions with separate import names.
+  Recorded for the record: `httpx2.alias_httpx()` is **not** an option (its own docs say
+  "Libraries should never call this"), and it was never proposed here — the alternative
+  considered and rejected was a plain `import httpx` → `import httpx2` rename at those two
+  sites, which is mechanically safe (`httpx2` 2.9.1 exports `AsyncClient`, `Timeout`,
+  `Response`, `HTTPStatusError`, `TimeoutException`, `RequestError`, `Auth`, `BasicAuth` and
+  67 more; `AsyncClient.__init__` accepts `headers`/`timeout`/`follow_redirects` and is
+  keyword-only, which both call sites already satisfy) but buys only install weight at the
+  cost of a diff. **Neither option is "leave it transitive"** — this repo has shipped broken
+  twice by riding an undeclared transitive dependency, which is why P1's guards exist. The
+  same rule forces the fourth declaration: SL-2 will `import jsonschema` directly, since
+  2.0.0's low-level `Server` does no input-schema validation, and although `mcp` 2.0.0
+  requires `jsonschema>=4.20.0` transitively, pmcp declares it.
+- **Decision 3 — keep `Server.middleware`'s default `OpenTelemetryMiddleware`, explicitly.**
+  `mcp/server/lowlevel/server.py:439` sets `self.middleware = [OpenTelemetryMiddleware()]` as
+  an instance attribute, so dropping it is a one-line post-construction assignment
+  (`self._server.middleware = []`) — the question is whether to. Keep it: `opentelemetry-api`
+  is a hard `mcp` 2.0.0 dependency (`METADATA:29`) so removing the middleware saves no
+  install weight, and `opentelemetry-api` without an SDK is a no-op provider, so the runtime
+  cost is a span context manager per request against a no-op tracer. Dropping it would also
+  diverge pmcp from every other 2.x server for no stated benefit, and P2 is
+  behaviour-preserving. SL-2.1 pins `Server("probe").middleware` in a test so the inheritance
+  is recorded as a decision rather than an accident, and a future phase that wants pmcp's own
+  `src/pmcp/observability` wired into that seam has an assertion to change.
 - **PR #112 — superseded, not merged.** Its own `install-smoke` run proves a bare cap raise
   ships a dead install (`ImportError: cannot import name 'streamablehttp_client'`, run
   `31195645987`), and its bound `>=1.8.0,<3.0.0` also keeps a floor this phase must raise.
@@ -554,14 +674,36 @@ overrides the docs-sweep template's default list for this phase only.
   `2025-11-25` via `initialize`, and modern `2026-07-28` via the per-request `_meta` envelope
   plus `server/discover` — and must not claim `2026-07-28` is negotiable through `initialize`
   or that downstream servers are reached at it. EC-P2-8 checks this sentence.
-- **Runtime-step safety, non-negotiable, applies to every SL-4 task and every `## Verification`
-  block that binds a port.** A live gateway runs on `127.0.0.1:3344` under systemd; its pid
-  **this session** was `1119829` (the previously recorded `~1861700` is stale — it restarts).
-  Therefore: record the pid at run time with `ss -ltnp | grep ':3344 '` before and after each
-  runtime step and assert it is unchanged; never bind `3344` (the `gateway_on_spare_port`
-  fixture asserts `port != 3344` and allocates via `socket.bind(("127.0.0.1", 0))`); never
-  use `pgrep -f "pmcp …"`, which self-matches the invoking shell — use the listening socket
-  or a bracketed pattern.
+- **Runtime-step safety is a PROCEDURE, not a constant — no pid may be hardcoded anywhere.**
+  A live gateway runs on `127.0.0.1:3344` as a systemd **user** unit (`pmcp.service` under
+  `user@1000.service`) and it restarts periodically, so any literal pid written into this plan
+  or a test is stale before P2 executes. It currently serves **1.21.1**, not the 1.22.0 on
+  `main`, so it is **not** running the code P2 modifies — which is why the goal is to leave it
+  strictly alone rather than to reason about it. Every runtime step must:
+  1. resolve the pid from the socket — `ss -ltnpH 'sport = :3344'`, regex `pid=(\d+)` — the
+     helper `_live_gateway_pid()` at `tests/test_credential_boot.py:58-68` already does
+     exactly this and SL-4 reuses it rather than reinventing it;
+  2. **never** use `pgrep -f "pmcp …"`, which self-matches the invoking shell's command line
+     and silently makes the whole before/after comparison meaningless;
+  3. snapshot `pgrep -P <pid>` children **before**, assert `/health` OK before, and after the
+     step assert `/health` still OK and the child set is identical — the pattern at
+     `tests/test_credential_boot.py:88-93` and `:233-239`;
+  4. never bind `3344`. The `gateway_on_spare_port` fixture asserts `port != 3344` and
+     allocates via `socket.bind(("127.0.0.1", 0))`.
+- **EC-P2-7 is greenfield — budget for it.** There is no fixture anywhere in `tests/` that
+  stands up a real HTTP MCP server for pmcp to connect to as a client; every existing
+  remote-downstream test patches `streamablehttp_client`. For EC-P2-7 that mocking approach is
+  **disqualified as evidence**: the criterion exists to prove the *rebuilt* client carries
+  headers, follows redirects, and leaks no clients across reconnects, and a patched transport
+  proves none of those. SL-4.4 therefore builds `tests/runtime/fake_remote.py` from scratch —
+  a 2.x `MCPServer` mounted in a Starlette app on a spare port, with an auth-checking route
+  that 401s without the configured header and a second route that 307-redirects to `/mcp`.
+  This is the largest single piece of new code in Lane D and the reason SL-4 is not `effort=low`.
+- **New Lane D assertions read the six-field startup summary.** `server.py:580-585` now emits
+  `eager=, lazy=, skipped=, policy_denied=, missing_auth=, unknown_auto_start=`. The existing
+  regex at `tests/test_credential_boot.py:183-187` captures only the first four and still
+  matches as a prefix, so it is not broken and SL-4 leaves it alone; but any *new* assertion
+  is written against the six-field form.
 - **Boot isolation requires all six controls together, and the assertion is a count of one.**
   `--config` alone does not isolate (the manifest layer falls back to the package-shipped
   catalog), `HOME` alone does not isolate (it removes only the user overlay), and
@@ -590,7 +732,7 @@ overrides the docs-sweep template's default list for this phase only.
   SL-4.3 POSTs to a running gateway's `/mcp` on a spare port.
 - **Single-writer files**: `pyproject.toml`, `uv.lock`, `CHANGELOG.md`,
   `.github/workflows/test.yml` — SL-1 only; no other lane adds a CHANGELOG entry.
-  `src/pmcp/server.py`, `src/pmcp/transport/http.py` — SL-2 only. `src/pmcp/client/manager.py`,
+  `src/pmcp/server.py`, `src/pmcp/transport/http.py`, `src/pmcp/tools/handlers.py` — SL-2 only. `src/pmcp/client/manager.py`,
   `src/pmcp/cli.py`, `src/pmcp/manifest/refresher.py` — SL-3 only. `tests/conftest.py` and
   every pre-existing `tests/*.py` — SL-4 only; SL-1/2/3 put their new tests under
   `tests/mcp2x/` with distinct filenames so the globs stay disjoint
@@ -602,10 +744,10 @@ overrides the docs-sweep template's default list for this phase only.
   resolving in place, and the catalog rescan is re-run after the rebase. The orchestrator
   should expect an add/add or content conflict on exactly these two paths across phases and
   must not read it as a stale-base signal.
-- **Known destructive changes**: `src/pmcp/server.py` — SL-2 deletes the `_setup_handlers`
+- **Known destructive changes**: `src/pmcp/server.py` — SL-2 deletes the `AnyUrl` import at `:25` and the `_setup_handlers`
   method and the six `@self._server.<decorator>()` registrations inside it; the handler
   bodies are preserved as inner helpers, not deleted. `src/pmcp/client/manager.py` — SL-3
-  deletes the `streamablehttp_client` import at `:22` and the call at `:1382`. Nothing else
+  deletes the `streamablehttp_client` import at `:22`, the call at `:1382`, and the two `JSONRPCMessage.model_validate` calls at `:1784` and `:1902`. Nothing else
   is removed; no file is deleted.
 - **Expected add/add conflicts**: none — there is no preamble lane and no lane stubs a file
   another lane replaces. `tests/mcp2x/` is created by whichever of SL-1/SL-2/SL-3 commits
@@ -625,11 +767,34 @@ overrides the docs-sweep template's default list for this phase only.
   Silent `git reset --hard` or `git checkout HEAD~N -- …` in a stale worktree produces commits
   that destroy peer-lane work on `--no-ff` merge. SL-4 additionally must not start before
   SL-2 and SL-3 have merged, since its acceptance tests exercise their symbols.
+- **Two 2.x hazards checked and deliberately not made exit criteria.** `get_session_id` /
+  `GetSessionIdCallback` dropped from the 2.x transport yield: `grep -rn "get_session_id"
+  src/pmcp/` returns nothing, and `manager.py:1418`'s `transport[:2]` slice works on the
+  2-tuple, so pmcp never used it. `NoBackChannelError` on modern connections: pmcp proxies
+  neither `sampling/createMessage` nor `elicitation/create` (the only `elicitation` hits in
+  `src/` are unrelated URL-validation helpers in `auth.py`). SL-1.3 gives the second one a
+  single CHANGELOG sentence documenting the era limitation — server-initiated requests do not
+  exist at `2026-07-28` — and neither gets a lane task.
+- **Plan-level validation, since this repo has no `scripts/validate_plan_doc.py`.** `scripts/`
+  contains only `pipeline-bootstrap`, so the checks are: `phase-loop validate-roadmap --repo .
+  --roadmap specs/phase-plans-v11.md` (run at plan time: `OK — 6 phase(s)`),
+  `phase_loop_runtime.planner_validation.validate_plan_dispatch_hints` against this file
+  (run at plan time: 0 findings), and the Lane validation checklist walked by hand. Note
+  `phase_loop_runtime` is importable from the **system** `python3` and the `phase-loop`
+  console script at `/home/viperjuice/.local/bin/phase-loop`, but **not** from this
+  worktree's `.venv` — a venv-scoped import check reports it absent and is the wrong check.
+  There is no `validate-plan` subcommand; `goal-coverage-audit` is the plan-vs-roadmap
+  EC-coverage check and is the executor's to run, not the planner's.
 - **Roadmap gaps this plan closes** (all reported to the lead, all recorded by SL-docs.3):
   the roadmap's Key files and 4-lane partition omit `src/pmcp/manifest/refresher.py`,
-  `src/pmcp/transport/http.py`, and `.github/probe/**`; the last of these gates EC-P2-1
-  because `mcp.server.fastmcp` does not exist in 2.0.0. The `cli.py` line numbers have moved
-  to `:1856`/`:1879`. The error-`code`/`data` discard exists at `:1718` as well as `:1506`.
+  `src/pmcp/transport/http.py`, `src/pmcp/tools/handlers.py`, and `.github/probe/**`; the
+  last of these gates EC-P2-1 because `mcp.server.fastmcp` does not exist in 2.0.0. The
+  roadmap also names neither of the two hard runtime breaks this plan found — the
+  `AnyUrl` → `str` change on `Resource.uri` / `TextResourceContents.uri` (Trap 5) and
+  `JSONRPCMessage` ceasing to be a pydantic model (Trap 6). The `cli.py` line numbers have
+  moved to `:1856`/`:1879`. The error-`code`/`data` discard exists at `:1718` as well as
+  `:1506`. `src/pmcp/manifest/registry.py` is **not** affected despite a camelCase regex
+  suggesting otherwise, and needs no owner.
 
 ## Execution Policy
 - execute: effort=medium
@@ -637,7 +802,7 @@ overrides the docs-sweep template's default list for this phase only.
 - SL-1: effort=low, reason=three specifier edits plus a lock regeneration
 - SL-2: effort=high, reason=four removed decorator behaviours must be restored by hand and a wrong params_type silently disables validation
 - SL-3: effort=high, reason=transport ownership and redirect semantics regress silently rather than failing loudly
-- SL-4: effort=medium, reason=harness construction is mechanical but the isolation rules are unforgiving
+- SL-4: effort=high, reason=the authenticated and redirected HTTP downstream fixture is greenfield and mocking the transport is disqualified as evidence there
 - SL-5: effort=low, reason=docs sweep plus a spec amendment
 
 ## Spec Closeout Plan
@@ -664,8 +829,12 @@ overrides the docs-sweep template's default list for this phase only.
       six methods POSTed to the deployed `/mcp` and each response's `result` parsed with the
       SDK's own typed model, plus the invalid-argument `tools/call` returning
       `isError: true` with text starting `Input validation error:`. Unit-level coverage of the
-      same contract is `uv run pytest tests/mcp2x/test_server_handlers.py -q`. Registry
-      presence is asserted only as a precondition inside those tests, never as the criterion.
+      same contract is `uv run pytest tests/mcp2x/test_server_handlers.py -q`, which also
+      carries the **proxying-fidelity** assertion forced by 2.0.0 dropping `extra="allow"`
+      from `Tool`: every gateway tool survives
+      `Tool.model_validate(t.model_dump(by_alias=True))` with an identical re-dump, so a
+      field silently disappearing in transit fails the build. Registry presence is asserted
+      only as a precondition inside those tests, never as the criterion.
 - [ ] EC-P2-4 — proven by `uv run pytest tests/runtime/test_downstream_handshake_era.py -q`:
       a downstream pinned to `mcp` 1.x serves a real tool call through the 2.x gateway and its
       recorded `protocol_version` is asserted to be in `HANDSHAKE_PROTOCOL_VERSIONS` and
@@ -688,8 +857,13 @@ overrides the docs-sweep template's default list for this phase only.
       307-redirected downstream resolving (proving `follow_redirects=True`); and five
       disconnect/reconnect cycles after each of which the prior
       `ManagedClient.remote_http_client.is_closed` is `True` and the process's open socket count
-      has not grown. Paired grep, not standalone:
-      `rg -n 'follow_redirects=True' src/pmcp/client/manager.py`.
+      has not grown. The fixture is greenfield — no HTTP downstream fixture exists in
+      `tests/` today and every current remote test patches the transport, which proves none
+      of these three properties, so a mocked client is explicitly **not** acceptable evidence
+      here. Paired greps, not standalone:
+      `rg -n 'follow_redirects=True' src/pmcp/client/manager.py` and
+      `! rg -n 'JSONRPCMessage\.model_validate' src/pmcp/` — the latter because
+      `JSONRPCMessage` is not a model in 2.0.0 and every remote request dies on it.
 - [ ] EC-P2-8 — proven by V5: `uv run pytest tests/ -q`, `uv run ruff check src/ tests/`,
       `uv run ruff format --check src/ tests/`, and `uv run mypy src/pmcp --exclude baml_client`
       all green; `rg -n '2026-07-28' CHANGELOG.md` showing the `## [Unreleased]` entry naming
@@ -829,5 +1003,11 @@ uv run ruff format --check src/ tests/
 uv run mypy src/pmcp --exclude baml_client
 rg -n '2026-07-28' CHANGELOG.md
 rg -n '2025-11-25' CHANGELOG.md
+# V5a — the four now-direct dependencies are declared with two-sided bounds, and the
+#       two 2.0.0 API removals have no callers left.
+rg -n '"mcp>=2\.0\.0,<3\.0\.0"|"httpx>=|"httpx2>=|"jsonschema>=' pyproject.toml
+! rg -n 'AnyUrl' src/pmcp/server.py
+! rg -n 'JSONRPCMessage\.model_validate' src/pmcp/
+! rg -n 'from mcp.server.fastmcp' .github/probe/ tests/
 gh pr view 112 --json state,url --jq '.state'   # expect CLOSED
 ```
