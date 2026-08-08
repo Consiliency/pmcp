@@ -40,9 +40,9 @@ LIVE_GATEWAY_PORT = 3344  # NEVER boot the test fixture on this port.
 SPARE_PORT = 38345  # Distinct from P6CLEAN's 38344 to avoid any collision.
 
 FIXTURE_SERVER_SRC = """\
-from mcp.server.fastmcp import FastMCP
+from mcp.server import MCPServer
 
-mcp = FastMCP("p5-fixture")
+mcp = MCPServer("p5-fixture")
 
 
 @mcp.tool()
@@ -256,10 +256,10 @@ def _wait_for_health(gw_proc: subprocess.Popen, gw_log: Path) -> None:
 
 async def _invoke_fixture_ping() -> None:
     from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
+    from mcp.client.streamable_http import streamable_http_client
 
     url = f"http://127.0.0.1:{SPARE_PORT}/mcp"
-    async with streamablehttp_client(url) as (read, write, _):
+    async with streamable_http_client(url) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
             tool_names = {t.name for t in (await session.list_tools()).tools}

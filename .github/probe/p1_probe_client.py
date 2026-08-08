@@ -17,7 +17,7 @@ import json
 import sys
 
 from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
+from mcp.client.streamable_http import streamable_http_client
 
 SENTINEL = "p1-floor-ok:"
 
@@ -58,7 +58,7 @@ def _check(label: str, result: object) -> dict:
     produce a JSON body at all, and `ok` catches gateway-level ones.
     """
     payload = _text_of(result)
-    if getattr(result, "isError", False):
+    if getattr(result, "is_error", False):
         raise ProbeFailure(f"{label} failed at the transport level: {payload}")
 
     try:
@@ -81,7 +81,7 @@ def _check(label: str, result: object) -> dict:
 
 
 async def main(url: str) -> None:
-    async with streamablehttp_client(url) as (read, write, _):
+    async with streamable_http_client(url) as (read, write):
         async with ClientSession(read, write) as session:
             await session.initialize()
 

@@ -114,14 +114,14 @@ class TestGatewayToolSurface:
         """Verify each tool has a valid inputSchema."""
         tools = get_gateway_tool_definitions()
         for tool in tools:
-            assert tool.inputSchema is not None, (
+            assert tool.input_schema is not None, (
                 f"Tool '{tool.name}' has no inputSchema"
             )
-            assert isinstance(tool.inputSchema, dict), (
+            assert isinstance(tool.input_schema, dict), (
                 f"Tool '{tool.name}' inputSchema is not a dict"
             )
             # All schemas should be objects
-            assert tool.inputSchema.get("type") == "object", (
+            assert tool.input_schema.get("type") == "object", (
                 f"Tool '{tool.name}' inputSchema type is not 'object'"
             )
 
@@ -180,9 +180,13 @@ class TestTransportConstraints:
         )
 
     def test_mcp_sdk_implementation_description_surface_is_documented(self) -> None:
-        """Installed SDK has no Implementation.description field for PMCP to set."""
-        assert "description" not in inspect.signature(Server).parameters
-        assert "description" not in Implementation.model_fields
+        """mcp 2.0.0 added a `description` surface (1.25.0 had none): both
+        `Server.__init__` and `Implementation` now accept/carry it. pmcp does
+        not set it today — this pins the SDK surface as present so a future
+        lane that wants a richer initialize-handshake description has a
+        known, tested target rather than rediscovering the surface."""
+        assert "description" in inspect.signature(Server).parameters
+        assert "description" in Implementation.model_fields
 
 
 # === Test Class 3: Singleton Lock Constraints ===

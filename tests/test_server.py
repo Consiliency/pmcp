@@ -3,10 +3,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
+from unittest.mock import MagicMock
 import json
 
 import pytest
-from mcp.types import CallToolRequest, ListToolsRequest
+from mcp.server.connection import Connection
+from mcp.server.context import ServerRequestContext
+from mcp.server.session import ServerSession
+from mcp.types import CallToolRequestParams, PaginatedRequestParams
 
 from pmcp.server import GatewayServer
 from pmcp.types import (
@@ -16,6 +21,23 @@ from pmcp.types import (
     ServerStatus,
     ServerStatusEnum,
 )
+
+# A HANDSHAKE_PROTOCOL_VERSIONS member; the specific value is irrelevant to
+# these handlers, which read no protocol-version-gated behaviour off `ctx`.
+# Mirrors tests/mcp2x/test_server_handlers.py's `_make_ctx` — duplicated
+# rather than imported, since that module belongs to a different lane.
+_PROTOCOL_VERSION = "2025-11-25"
+
+
+def _make_ctx() -> ServerRequestContext[Any, Any]:
+    connection = Connection.from_envelope(_PROTOCOL_VERSION, None, None)
+    session = ServerSession(MagicMock(), connection)
+    return ServerRequestContext(
+        session=session,
+        lifespan_context={},
+        protocol_version=_PROTOCOL_VERSION,
+        method="test",
+    )
 
 
 class TestGatewayServerInit:
@@ -170,12 +192,12 @@ class TestServerCreation:
         # Server is created, we just verify it's not None
         # (internal _instructions attribute may not be exposed)
 
-    def test_setup_handlers_requires_server(self) -> None:
-        """Test setup_handlers raises if server not initialized."""
-        server = GatewayServer()
-
-        with pytest.raises(RuntimeError, match="Server not initialized"):
-            server._setup_handlers()
+    # `_setup_handlers` no longer exists (IF-0-P2-1: the six handlers are
+    # registered directly via `Server.__init__(on_*=...)` inside
+    # `_create_server`, which always constructs `self._server`), so there is
+    # no remaining seam where a caller can reach an uninitialized `_server`
+    # through this path — the test that pinned `_setup_handlers`' guard is
+    # removed rather than reworked.
 
     @pytest.mark.asyncio
     async def test_lifecycle_tools_are_routed_through_call_tool_handler(self) -> None:
@@ -202,19 +224,21 @@ class TestServerCreation:
         server._gateway_tools.restart_server = fake_restart  # type: ignore[method-assign]
 
         assert server._server is not None
-        handler = server._server.request_handlers[CallToolRequest]
+        entry = server._server.get_request_handler("tools/call")
+        assert entry is not None
 
         for tool_name in [
             "gateway.connect_server",
             "gateway.disconnect_server",
             "gateway.restart_server",
         ]:
-            result = await handler(
-                CallToolRequest(
-                    params={"name": tool_name, "arguments": {"server_name": "test"}}
-                )
+            result = await entry.handler(
+                _make_ctx(),
+                CallToolRequestParams(
+                    name=tool_name, arguments={"server_name": "test"}
+                ),
             )
-            payload = json.loads(result.root.content[0].text)
+            payload = json.loads(result.content[0].text)
             assert payload == {"ok": True, "server": "test"}
 
         assert called == ["connect", "disconnect", "restart"]
@@ -249,7 +273,8 @@ class TestServerCreation:
         server._gateway_tools.tasks_cancel = fake_tasks_cancel  # type: ignore[method-assign]
 
         assert server._server is not None
-        handler = server._server.request_handlers[CallToolRequest]
+        entry = server._server.get_request_handler("tools/call")
+        assert entry is not None
 
         for tool_name in [
             "gateway.tasks_list",
@@ -257,15 +282,14 @@ class TestServerCreation:
             "gateway.tasks_result",
             "gateway.tasks_cancel",
         ]:
-            result = await handler(
-                CallToolRequest(
-                    params={
-                        "name": tool_name,
-                        "arguments": {"server_name": "test", "task_id": "task-1"},
-                    }
-                )
+            result = await entry.handler(
+                _make_ctx(),
+                CallToolRequestParams(
+                    name=tool_name,
+                    arguments={"server_name": "test", "task_id": "task-1"},
+                ),
             )
-            payload = json.loads(result.root.content[0].text)
+            payload = json.loads(result.content[0].text)
             assert payload["ok"] is True
 
         assert called == ["list", "get", "result", "cancel"]
@@ -277,11 +301,13 @@ class TestServerCreation:
         server._create_server()
 
         assert server._server is not None
-        handler = server._server.request_handlers[CallToolRequest]
-        result = await handler(
-            CallToolRequest(params={"name": "gateway.tasks_delete", "arguments": {}})
+        entry = server._server.get_request_handler("tools/call")
+        assert entry is not None
+        result = await entry.handler(
+            _make_ctx(),
+            CallToolRequestParams(name="gateway.tasks_delete", arguments={}),
         )
-        payload = json.loads(result.root.content[0].text)
+        payload = json.loads(result.content[0].text)
         assert payload["error"] is True
         assert "Unknown tool" in payload["message"]
 
@@ -293,9 +319,10 @@ class TestServerCreation:
         server._create_server()
 
         assert server._server is not None
-        handler = server._server.request_handlers[ListToolsRequest]
-        result = await handler(ListToolsRequest(params={}))
-        names = [tool.name for tool in result.root.tools]
+        entry = server._server.get_request_handler("tools/list")
+        assert entry is not None
+        result = await entry.handler(_make_ctx(), PaginatedRequestParams())
+        names = [tool.name for tool in result.tools]
 
         assert names == sorted(names)
         assert {
@@ -330,22 +357,22 @@ class TestServerCreation:
         server._gateway_tools.set_startup_policy = fake_set_startup_policy  # type: ignore[method-assign]
 
         assert server._server is not None
-        handler = server._server.request_handlers[CallToolRequest]
+        entry = server._server.get_request_handler("tools/call")
+        assert entry is not None
         routed: dict[str, str] = {}
         for tool_name in [
             "gateway.config_status",
             "gateway.get_startup_policy",
             "gateway.set_startup_policy",
         ]:
-            result = await handler(
-                CallToolRequest(
-                    params={
-                        "name": tool_name,
-                        "arguments": {"operation": "add", "names": ["svc"]},
-                    }
-                )
+            result = await entry.handler(
+                _make_ctx(),
+                CallToolRequestParams(
+                    name=tool_name,
+                    arguments={"operation": "add", "names": ["svc"]},
+                ),
             )
-            payload = json.loads(result.root.content[0].text)
+            payload = json.loads(result.content[0].text)
             routed[tool_name] = payload["surface"]
             assert payload["ok"] is True
 
