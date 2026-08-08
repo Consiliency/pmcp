@@ -152,16 +152,27 @@ def booted_gateway(
     "Boot isolation requires all six controls together" verbatim:
       - never binds :3344, resolved via `alloc_port()`
       - passes all six isolation controls plus a cwd inside the throwaway dir
-      - the live gateway's pid and child set are identical before and after
+      - a live gateway on :3344, if one exists, has an identical pid and
+        child set before and after (on a runner with none, the pid stays
+        `None` throughout -- see below)
       - never deletes or moves the operator's real files — only the
         redirected `HOME`/`XDG_CONFIG_HOME` env vars change where the code
         looks, matching "Never isolate by moving or deleting files outside
         the worktree"
     """
+    # A live gateway on :3344 is an operator-host fixture, not a CI one --
+    # V0a/V0b in the plan's own Verification block treat an empty
+    # `LIVE_PID` as a valid state (`test "$(...)" = "$LIVE_PID"` passes
+    # when both sides are empty), and CI's runners have no pmcp systemd
+    # unit at all. Mirror that: `None` here means "nothing to protect",
+    # not "abort" -- the boot-isolation and wire-behaviour evidence this
+    # harness exists for must still run on a runner with no live gateway.
     live_pid = _live_gateway_pid()
-    assert live_pid, "FAIL: could not resolve live gateway pid on :3344 -- abort"
-    assert _live_health_ok(), "live gateway health check failed BEFORE boot -- abort"
-    children_before = _children_of(live_pid)
+    if live_pid is not None:
+        assert _live_health_ok(), (
+            "live gateway health check failed BEFORE boot -- abort"
+        )
+    children_before = _children_of(live_pid) if live_pid is not None else []
 
     with tempfile.TemporaryDirectory(prefix="pmcp-rt-") as work_str:
         work = Path(work_str)
@@ -261,12 +272,22 @@ def booted_gateway(
                 proc.kill()
                 proc.wait(timeout=10)
 
-    assert _live_health_ok(), "FAIL: live gateway died during/after the boot"
-    children_after = _children_of(live_pid)
-    assert children_before == children_after, (
-        "FAIL: live gateway's child set changed -- "
-        f"before={children_before} after={children_after}"
+    # A gateway that didn't exist before this boot must not exist after it
+    # either -- this harness allocates a spare port and must never leave
+    # its own process listening on :3344 (`port != 3344` already backs
+    # this at the transport level; this re-checks at the process level).
+    live_pid_after = _live_gateway_pid()
+    assert live_pid_after == live_pid, (
+        "FAIL: live gateway pid on :3344 changed across the boot -- "
+        f"before={live_pid} after={live_pid_after}"
     )
+    if live_pid is not None:
+        assert _live_health_ok(), "FAIL: live gateway died during/after the boot"
+        children_after = _children_of(live_pid)
+        assert children_before == children_after, (
+            "FAIL: live gateway's child set changed -- "
+            f"before={children_before} after={children_after}"
+        )
 
 
 @pytest.fixture(scope="session")

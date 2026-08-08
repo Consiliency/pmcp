@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,8 +81,15 @@ def legacy_1x_downstream(
     work = tmp_path_factory.mktemp("pmcp-rt-mcp1x")
     venv_dir = work / "venv"
 
+    # The RUNNING interpreter's own version, not a hardcoded one: CI's
+    # matrix covers 3.10/3.11/3.12 (`.github/workflows/test.yml`), and
+    # pinning "3.11" here would force `uv` to fetch a managed CPython
+    # mid-test on the 3.10/3.12 legs -- a network/toolchain dependency this
+    # fixture doesn't need. mcp==1.25.0 supports all three (Requires-Python
+    # >=3.10).
+    python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
     venv_result = subprocess.run(
-        [uv, "venv", str(venv_dir), "--python", "3.11"],
+        [uv, "venv", str(venv_dir), "--python", python_version],
         capture_output=True,
         text=True,
         check=False,
