@@ -37,7 +37,14 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 - Request floods via per-source-IP sliding-window rate limiting (`--rate-limit`
   / `PMCP_RATE_LIMIT`) on `/mcp`
 - Oversized payloads causing OOM (`Content-Length > 10 MB → 413`)
-- Hanging downstream tools consuming connections indefinitely (60 s request timeout)
+- Hanging downstream tools consuming connections indefinitely (60 s request
+  timeout, `--request-timeout` / `PMCP_REQUEST_TIMEOUT`) — applies to every
+  `/mcp` POST **except** `subscriptions/listen`, which is a long-lived stream
+  by design; see "Known limitations" below for what bounds it instead.
+- Unbounded long-lived streams on `/mcp` (`PMCP_MAX_LISTEN_STREAMS`, default
+  64, bounds concurrent `subscriptions/listen` subscriptions; retired GET's
+  pre-session keep-alive concurrency cap is this guard's one-for-one
+  predecessor)
 - Multiple gateway instances fighting over resources (fcntl singleton lock)
 - Reconnect storms from crashing downstream servers (per-server reconnect flag)
 - **Unilateral credential relaxation**: a manifest server's `requires_api_key`
@@ -121,8 +128,22 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   registered handlers, so the same policy, audit, and input-schema validation
   applies regardless of which era selected the request; the modern era is not
   a lower-trust bypass. Unsupported draft extensions beyond the six proxied
-  operations and `server/discover` remain out of scope until PMCP explicitly
-  claims them.
+  operations, `server/discover`, and `subscriptions/listen` remain out of
+  scope until PMCP explicitly claims them.
+- **`subscriptions/listen` has no absolute-lifetime cap, deliberately**: it is
+  exempt from the `request_timeout` wrapper that bounds every other `/mcp`
+  POST, because that wrapper silently truncated every subscription stream at
+  `request_timeout` seconds (60s by default) with no graceful close frame —
+  the defect this exemption fixes, not a property worth preserving for a
+  connection that is long-lived by design. What bounds exposure instead:
+  `PMCP_MAX_LISTEN_STREAMS` caps concurrent subscriptions (default 64, same
+  as the retired pre-session keep-alive's concurrency cap), the SDK's own
+  per-stream event-backlog cap bounds a single subscription's memory, and
+  `/mcp` auth applies to `subscriptions/listen` exactly as to every other
+  method whenever `auth_mode` is configured. There is no configurable
+  replacement for the retired `PMCP_KEEPALIVE_MAX_SECONDS` absolute-lifetime
+  bound; an operator who needs one must enforce it at a reverse proxy or load
+  balancer in front of PMCP.
 
 ## Reporting a Vulnerability
 

@@ -1,12 +1,13 @@
 {
   "version": 1,
-  "last_updated": "2026-08-08T06:49:11+00:00",
+  "last_updated": "2026-08-09T08:25:53+00:00",
   "files": {
     "README.md": {
       "purpose": "root project README",
       "touched_by_phases": [
         "P5",
-        "P2"
+        "P2",
+        "P3B"
       ]
     },
     "CHANGELOG.md": {
@@ -14,7 +15,8 @@
       "touched_by_phases": [
         "P1",
         "P5",
-        "P2"
+        "P2",
+        "P3B"
       ]
     },
     "CONTRIBUTING.md": {
@@ -28,7 +30,8 @@
       "purpose": "security policy",
       "touched_by_phases": [
         "P5",
-        "P2"
+        "P2",
+        "P3B"
       ]
     },
     ".claude/plans/ticklish-inventing-stearns.md": {
@@ -55,7 +58,8 @@
       "purpose": "multi-phase roadmap spec",
       "touched_by_phases": [
         "P1",
-        "P2"
+        "P2",
+        "P3B"
       ]
     },
     "specs/phase-plans-v2.md": {
@@ -333,6 +337,18 @@
     "plans/v7-issue-tracker.md": {
       "purpose": "markdown document",
       "touched_by_phases": []
+    },
+    "SPEC_COMPLIANCE.md": {
+      "purpose": "MCP specification compliance tracking matrix",
+      "touched_by_phases": [
+        "P3B"
+      ]
+    },
+    "plans/phase-plan-v11-P3B.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": [
+        "P3B"
+      ]
     }
   }
 }

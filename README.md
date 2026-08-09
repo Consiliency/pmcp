@@ -785,14 +785,43 @@ and `io.modelcontextprotocol/clientCapabilities` is served the modern era —
 `2026-07-28` — for `tools/list`, `tools/call`, `resources/list`,
 `resources/read`, `prompts/list`, `prompts/get`, and `server/discover`. The
 modern era is not reachable through `initialize`; it is selected per request
-by those headers. Because the modern era has no server-initiated
-back-channel, requests like `sampling/createMessage` and `elicitation/create`
-do not exist at `2026-07-28` — PMCP does not proxy either today, so this is a
-protocol-era limitation, not a PMCP gap. Downstream, PMCP's connections to
-the servers it proxies are negotiated only at the handshake era described
-above (`2025-11-25` preferred) — no downstream server is ever reached at
-`2026-07-28`. A modern-era client's `tools/call` is still proxied live over
-that handshake-era downstream connection; only the upstream envelope differs.
+by those headers. The modern era has no server-initiated **request**
+back-channel, so `sampling/createMessage` and `elicitation/create` do not
+exist at `2026-07-28` — PMCP does not proxy either today, so this is a
+protocol-era limitation, not a PMCP gap. (Server-initiated *notifications*
+are a separate mechanism — `subscriptions/listen`, below.) Downstream, PMCP's
+connections to the servers it proxies are negotiated only at the handshake
+era described above (`2025-11-25` preferred) — no downstream server is ever
+reached at `2026-07-28`. A modern-era client's `tools/call` is still proxied
+live over that handshake-era downstream connection; only the upstream
+envelope differs.
+
+**`GET /mcp` is retired.** It now answers `405 Method Not Allowed` with
+`Allow: POST, DELETE` instead of accepting a standing connection; there is no
+persistent GET/SSE channel of any kind, pre-session or otherwise. `GET
+/health` and `GET /metrics` are unaffected and remain separate, unauthenticated
+routes. The replacement for server-initiated notifications is
+`subscriptions/listen` — a long-lived POST stream reachable **only** at
+protocol version `2026-07-28` — over which a client that opens a subscription
+receives `notifications/tools/list_changed`, `notifications/resources/list_changed`,
+and `notifications/prompts/list_changed` as PMCP's own catalog changes (a
+`gateway.connect_server`, `gateway.disconnect_server`, or `gateway.refresh`
+call that adds, removes, or updates downstream tools, resources, or prompts).
+It does not proxy downstream servers' own `notifications/*` (see Non-Goals in
+the roadmap). No existing client loses delivered data from the GET
+retirement — PMCP never published anything on the old GET stream, so this
+removes a channel PMCP never wrote to, not one clients were receiving events
+over. The concurrency cap the old pre-session keep-alive shim enforced
+returns one-for-one as `PMCP_MAX_LISTEN_STREAMS` (default `64`, same as
+before), now bounding `subscriptions/listen` instead. The old shim's
+**absolute-lifetime** cap (`PMCP_KEEPALIVE_MAX_SECONDS`) is deliberately
+**not** replaced — a subscription is long-lived by design, and severing it
+every N seconds was the defect this release fixes, not a property worth
+preserving. `PMCP_MAX_KEEPALIVE_STREAMS` and `PMCP_KEEPALIVE_MAX_SECONDS` are
+both gone; if you relied on either, there is no drop-in replacement for the
+lifetime cap — what bounds exposure instead is the concurrency cap, the SDK's
+own per-stream event-backlog cap, and `/mcp` auth whenever `auth_mode` is
+configured.
 
 Servers stopped with `gateway.disconnect_server` remain visible in health as
 `offline` or `lazy` when PMCP still knows their configuration, and startup policy

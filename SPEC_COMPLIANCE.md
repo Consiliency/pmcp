@@ -27,15 +27,16 @@ revision is documented in the MCP specification changelog:
 
 ## Draft Revision Impact
 
-**Partially adopted as of v11 Phase 2 (`2026-07-28`).** PMCP now serves the
-modern era to its own clients for the six proxied operations plus
-`server/discover`, selected per request by an `MCP-Protocol-Version:
-2026-07-28` header and a `params._meta` envelope — never through `initialize`,
-which continues to negotiate the handshake era (`2024-11-05`–`2025-11-25`).
-Downstream connections remain handshake-era only: `PREFERRED_PROTOCOL_VERSION`
-is unchanged at `2025-11-25`, so no downstream server is reached at
-`2026-07-28`. A modern-era `tools/call` is still proxied live over that
-handshake-era downstream connection; only the upstream envelope differs.
+**Partially adopted as of v11 Phase 2 (`2026-07-28`), extended in Phase 3B.**
+PMCP now serves the modern era to its own clients for the six proxied
+operations plus `server/discover` and `subscriptions/listen`, selected per
+request by an `MCP-Protocol-Version: 2026-07-28` header and a `params._meta`
+envelope — never through `initialize`, which continues to negotiate the
+handshake era (`2024-11-05`–`2025-11-25`). Downstream connections remain
+handshake-era only: `PREFERRED_PROTOCOL_VERSION` is unchanged at
+`2025-11-25`, so no downstream server is reached at `2026-07-28`. A modern-era
+`tools/call` is still proxied live over that handshake-era downstream
+connection; only the upstream envelope differs.
 
 The remaining draft migration areas below are **not** yet addressed:
 
@@ -53,6 +54,26 @@ The remaining draft migration areas below are **not** yet addressed:
   adds no aggregated inventory of its own — `DiscoverResult` carries only
   `supported_versions`, `capabilities`, and `instructions`. Covered by
   `tests/runtime/test_wire_modern_era.py`.
+- ~~`subscriptions/listen` becomes the modern-era mechanism for delivering
+  `notifications/tools|resources|prompts/list_changed` to clients, replacing
+  any standing GET/SSE channel.~~ **Shipped (SEP-2575), v11 Phase 3B.**
+  `GET /mcp` is retired — it now returns `405 Method Not Allowed` with
+  `Allow: POST, DELETE` instead of accepting a standing connection —
+  and `subscriptions/listen` is the sole server-initiated channel, reachable
+  only at protocol version `2026-07-28`. The SDK supplies the listener
+  (`ListenHandler`, `SubscriptionBus`) in full; PMCP's own work is the wiring:
+  `ClientManager`'s catalog mutations (`connect_server`, `disconnect_server`,
+  `refresh`, and the other catalog-mutating entry points) publish the
+  corresponding event through `pmcp.subscriptions.BusCatalogEventSink`, which
+  self-schedules its own drain rather than relying on enumerated call sites.
+  `GET /health` and `GET /metrics` are unaffected. No existing client loses
+  delivered data — PMCP never published anything on the retired GET stream.
+  Covered by `tests/mcp2x/test_listen_registration.py`,
+  `tests/mcp2x/test_catalog_publishers.py`, `tests/mcp2x/test_get_retirement.py`,
+  `tests/mcp2x/test_listen_over_http.py`, `tests/runtime/test_get_retired.py`,
+  `tests/runtime/test_subscriptions_e2e.py`, and
+  `tests/runtime/test_publisher_coverage.py` (the AST guard that keeps the
+  publisher wiring honest after this phase).
 - `CacheableResult` changes result caching semantics. Revisit brokered result
   handling and cache boundaries for SEP-2549.
 - Dynamic Client Registration changes toward Client ID Metadata Documents.
@@ -71,5 +92,7 @@ The remaining draft migration areas below are **not** yet addressed:
   `tasks/update`, MRTR, unsolicited handles, and required `resultType`.
 - [x] Re-check release notes for any stable `server/discover` — shipped in v11
   Phase 2; see the Draft Revision Impact entry above.
+- [x] Re-check release notes for any stable `subscriptions/listen` — shipped
+  in v11 Phase 3B; see the Draft Revision Impact entry above.
 - [ ] Re-check release notes for authorization and migration guidance
   operators must follow.
