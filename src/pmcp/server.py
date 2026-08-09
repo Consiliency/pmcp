@@ -14,6 +14,7 @@ from typing import Any, Literal
 import jsonschema
 from mcp.server import Server
 from mcp.server.context import ServerRequestContext
+from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler
 from mcp.types import (
     BlobResourceContents,
     CallToolRequestParams,
@@ -66,6 +67,7 @@ from pmcp.scoped_advisor_audit import (
     ScopedAdvisorAudit,
     ScopedAdvisorAuditError,
 )
+from pmcp.subscriptions import BusCatalogEventSink
 from pmcp.summary import generate_capability_summary
 from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
 from pmcp.types import (
@@ -77,6 +79,23 @@ from pmcp.types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int, *, minimum: int) -> int:
+    """Read a positive int from the environment, clamped to ``minimum``.
+
+    Small local copy of `transport/http.py`'s `_env_int` (SL-4's file, not
+    imported from here to avoid a cross-lane import during P3B's parallel
+    execution) -- same behaviour: an absent or unparsable value falls back
+    to `default`, a parsable one is floored at `minimum`.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        return default
 
 
 class GatewayServer:
@@ -138,7 +157,26 @@ class GatewayServer:
         )
         logger.info(f"Guidance level: {self._guidance_config.level}")
 
+        # IF-0-P3B-2: bus, sink, and listen handler are constructed here,
+        # before ClientManager -- `_create_server` (which registers the
+        # handler on `Server`) runs later, so a bus created there would be
+        # invisible to a ClientManager already built.
+        self._subscription_bus = InMemorySubscriptionBus()
+        self._catalog_events = BusCatalogEventSink(self._subscription_bus)
+        self._listen_handler = ListenHandler(
+            self._subscription_bus,
+            max_subscriptions=_env_int(
+                "PMCP_MAX_LISTEN_STREAMS", 64, minimum=1
+            ),
+        )
+
         # Initialize client manager
+        # TODO(P3B/SL-3): pass catalog_events=self._catalog_events once
+        # ClientManager accepts it (IF-0-P3B-2) -- SL-3 (client/manager.py)
+        # lands the constructor kwarg in a sibling lane of this same phase;
+        # this file must not touch client/manager.py itself. Until that
+        # merges, ClientManager uses its null sink and no catalog mutation
+        # publishes -- SL-3's own tests cover that gap, not this lane's.
         self._client_manager = ClientManager(
             max_tools_per_server=self._policy_manager.get_max_tools_per_server(),
             max_concurrent_spawns=self._max_concurrent_spawns,
@@ -192,6 +230,7 @@ class GatewayServer:
             on_read_resource=self._handle_read_resource,
             on_list_prompts=self._handle_list_prompts,
             on_get_prompt=self._handle_get_prompt,
+            on_subscriptions_listen=self._listen_handler,
         )
 
     def _record_scoped_invocation(
@@ -917,6 +956,17 @@ class GatewayServer:
     async def shutdown(self) -> None:
         """Shutdown the server."""
         logger.info("Shutting down MCP Gateway...")
+        # IF-0-P3B-2: close open listen streams first. `close()` is sync and
+        # only closes memory object streams owned by their own handler
+        # tasks (no `disconnect_all`/`ClientManager` interaction, no
+        # cancel-scope crossing), so ordering it first here does not widen
+        # the anyio shutdown debt (Execution Notes > Decision 3). On a real
+        # process exit this runs from a `finally` after the transport has
+        # already ended, so the graceful `SubscriptionsListenResult` frame
+        # may not reach the wire -- that is spec-legal (an abrupt transport
+        # close carries no response); EC-P3B-2's server-close half is proven
+        # deterministically in-process instead (test_listen_registration.py).
+        self._listen_handler.close()
         self._gateway_tools.stop_stale_indexer()
         try:
             await asyncio.wait_for(self._client_manager.disconnect_all(), timeout=10.0)
