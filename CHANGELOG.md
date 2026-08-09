@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-08-09
+
+### Removed
+- **`GET /mcp` is retired.** It now answers `405 Method Not Allowed` with
+  `Allow: POST, DELETE` instead of accepting a standing connection. The
+  rmcp-compat pre-session keep-alive SSE workaround that used to answer that
+  GET is gone with it, and so are the two env vars that configured it,
+  `PMCP_MAX_KEEPALIVE_STREAMS` and `PMCP_KEEPALIVE_MAX_SECONDS`. `GET
+  /health` and `GET /metrics` are untouched by this and continue to work
+  exactly as before.
+  The concurrency cap the old keep-alive enforced returns one-for-one as
+  `PMCP_MAX_LISTEN_STREAMS` (same default, 64), bounding the new
+  `subscriptions/listen` stream instead. **The absolute-lifetime cap
+  (`PMCP_KEEPALIVE_MAX_SECONDS`) is deliberately not replaced** — a
+  subscription is long-lived by design, and a server that silently severs it
+  every N seconds is the defect this release fixes, not a property to
+  preserve. If you relied on that env var, there is no replacement for it;
+  what now bounds exposure is the concurrency cap, the SDK's own per-stream
+  event-backlog cap, and `/mcp` auth whenever `auth_mode` is configured.
+  The replacement for the retired GET stream is `subscriptions/listen`
+  (`notifications/tools/list_changed`, `notifications/resources/list_changed`
+  and `notifications/prompts/list_changed`, delivered on an open listen
+  stream), reachable only at protocol version `2026-07-28`. No existing
+  client loses delivered data from this change — pmcp never published
+  anything on the old GET stream, so retiring it removes a channel pmcp
+  never wrote to, not one clients were receiving events over.
+
 ### Changed
 - **The declared `mcp` bound is raised from `>=1.8.0,<2.0.0` to `>=2.0.0,<3.0.0`,
   and the gateway's upstream server and downstream client are ported onto it.**
