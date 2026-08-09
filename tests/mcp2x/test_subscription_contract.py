@@ -377,3 +377,36 @@ def test_pyproject_and_init_version_strings_agree_with_the_changelog_heading() -
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+@pytest.mark.asyncio
+async def test_cancelled_drain_does_not_wedge_the_sink() -> None:
+    """A drain cancelled mid-publish must still clear `_draining`.
+
+    Without the `finally`, an un-cleared flag leaves every later `note_*`
+    seeing a live drain, declining to re-arm, and silently never publishing
+    again -- the lost-wakeup failure re-entering through cancellation rather
+    than through the snapshot-and-exit shape.
+    """
+    bus = _GatedBus()
+    sink = BusCatalogEventSink(bus)
+
+    sink.note_tools_changed()
+    await bus.entered.wait()  # drain is suspended inside publish
+
+    # Cancel the in-flight drain task, as an event-loop teardown would.
+    for task in list(sink._drain_tasks):
+        task.cancel()
+    await asyncio.gather(*sink._drain_tasks, return_exceptions=True)
+
+    assert sink._draining is False, "cancelled drain wedged the sink"
+
+    # And the sink still works: a fresh note re-arms and delivers.
+    bus.gate.set()
+    bus.published.clear()
+    sink.note_prompts_changed()
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if any(isinstance(e, PromptsListChanged) for e in bus.published):
+            break
+    assert any(isinstance(e, PromptsListChanged) for e in bus.published)

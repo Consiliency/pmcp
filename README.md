@@ -111,8 +111,12 @@ Quick verification:
 
 ```bash
 systemctl --user is-active pmcp
-curl -sS http://127.0.0.1:3344/mcp
+curl -sS http://127.0.0.1:3344/health
 ```
+
+`/mcp` is POST-only as of 2.0.0 — a bare `curl` against it returns
+`405 Method Not Allowed` with `Allow: POST, DELETE`, so use `/health` for a
+liveness check.
 
 ### Security
 

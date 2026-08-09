@@ -131,12 +131,22 @@ class BusCatalogEventSink:
     async def _drain(self) -> None:
         """Self-scheduled drain: yield once, then loop until pending is empty."""
         await asyncio.sleep(0)
-        await self._drain_pending()
-        # No `await` between `_drain_pending` finding `_pending` empty (its
-        # `while` test failing) and this clear -- required so a `note_*`
-        # cannot land in a gap and go unobserved by both this drain and the
-        # next `note_*` (which would see `_draining` still True).
-        self._draining = False
+        try:
+            await self._drain_pending()
+        finally:
+            # `finally`, not a bare trailing statement: if this task is
+            # cancelled mid-drain, an un-cleared `_draining` would leave the
+            # sink permanently wedged -- every later `note_*` would see a
+            # live drain, decline to re-arm, and silently never publish
+            # again. That is the lost-wakeup failure this class exists to
+            # prevent, re-entering through cancellation instead of through
+            # the snapshot-and-exit shape.
+            #
+            # No `await` between `_drain_pending` finding `_pending` empty
+            # (its `while` test failing) and this clear -- required so a
+            # `note_*` cannot land in a gap and go unobserved by both this
+            # drain and the next `note_*`.
+            self._draining = False
 
     async def flush(self) -> None:
         """Drain any pending events immediately, in tools/resources/prompts order.
