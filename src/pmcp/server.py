@@ -165,22 +165,17 @@ class GatewayServer:
         self._catalog_events = BusCatalogEventSink(self._subscription_bus)
         self._listen_handler = ListenHandler(
             self._subscription_bus,
-            max_subscriptions=_env_int(
-                "PMCP_MAX_LISTEN_STREAMS", 64, minimum=1
-            ),
+            max_subscriptions=_env_int("PMCP_MAX_LISTEN_STREAMS", 64, minimum=1),
         )
 
-        # Initialize client manager
-        # TODO(P3B/SL-3): pass catalog_events=self._catalog_events once
-        # ClientManager accepts it (IF-0-P3B-2) -- SL-3 (client/manager.py)
-        # lands the constructor kwarg in a sibling lane of this same phase;
-        # this file must not touch client/manager.py itself. Until that
-        # merges, ClientManager uses its null sink and no catalog mutation
-        # publishes -- SL-3's own tests cover that gap, not this lane's.
+        # Initialize client manager. catalog_events=self._catalog_events
+        # completes IF-0-P3B-2: ClientManager's catalog mutators publish
+        # through the same sink the listen handler's bus is wired to.
         self._client_manager = ClientManager(
             max_tools_per_server=self._policy_manager.get_max_tools_per_server(),
             max_concurrent_spawns=self._max_concurrent_spawns,
             project_root=project_root,
+            catalog_events=self._catalog_events,
         )
 
         # Initialize gateway tools handler

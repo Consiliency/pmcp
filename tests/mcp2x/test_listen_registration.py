@@ -9,22 +9,11 @@ framing, `notifications/cancelled` cancellation), not a handler called
 directly, so the frame-by-frame assertions below are proof of the wired
 system rather than of the SDK in isolation.
 
-**Deliberately not covered here, and why**: IF-0-P3B-2 also calls for
-asserting `gw._client_manager` holds the same `CatalogEventSink` object as
-`gw._catalog_events` (identity). That requires `ClientManager.__init__` to
-accept a `catalog_events` keyword -- SL-3's interface
-(`ClientManager(catalog_events=...)`), owned file `src/pmcp/client/manager.py`,
-not this lane's. On this branch (based on `origin/exec/v11-p3b` at SL-1 only)
-that kwarg does not exist yet, so asserting it here would either edit a file
-this lane does not own or hard-fail this module for a reason outside this
-lane's control -- both wrong per the plan's single-writer rule. Reported to
-the orchestrator; to be added (one line in `server.py`'s `ClientManager(...)`
-call, one assertion here) once SL-3 merges into the integration branch, which
-must happen before SL-5 starts in any case. What *is* proven below instead:
-the bus, the sink, and the listen handler are constructed in the frozen
-order and the sink and the handler demonstrably share one bus (an event
-published through the sink reaches a stream opened via the handler) --
-i.e. everything IF-0-P3B-2 requires that does not need `ClientManager`.
+Also pins IF-0-P3B-2's `ClientManager` wiring, completed once SL-3 landed
+`ClientManager(catalog_events=...)`: `gw._client_manager`'s sink is the
+*same object* as `gw._catalog_events` (identity, not a merely-truthy
+second sink wired to a different bus -- that is exactly how "a listener
+with no publishers" would reappear while every test still passes).
 """
 
 from __future__ import annotations
@@ -159,12 +148,22 @@ def test_bus_sink_and_listen_handler_constructed_with_correct_types() -> None:
     assert isinstance(gw._listen_handler, ListenHandler)
 
 
+def test_client_manager_shares_the_same_catalog_events_sink() -> None:
+    """`gw._client_manager` was constructed with `catalog_events=self._catalog_events`
+    (IF-0-P3B-2): its sink is the *same object* as `gw._catalog_events`, by
+    identity -- a second, merely-truthy sink wired to a different bus would
+    satisfy a truthiness check while silently reintroducing "a listener with
+    no publishers", the failure this phase exists to prevent."""
+    gw = GatewayServer()
+    assert gw._client_manager._catalog_events is gw._catalog_events
+
+
 async def test_catalog_events_sink_and_listen_handler_share_one_bus() -> None:
     """The bus is constructed once and shared: an event published through
-    `gw._catalog_events` (the sink SL-3 will wire `ClientManager` to) is
+    `gw._catalog_events` (the sink `ClientManager` publishes through) is
     delivered on a stream opened through `gw._listen_handler` (the handler
     registered on `gw._server`). This is IF-0-P3B-2's construction-order
-    guarantee proven the way that does not require `ClientManager`."""
+    guarantee proven end to end at the bus/handler level."""
     gw = _new_server()
     async with duplex_session(gw) as duplex:
         await duplex.send(
@@ -238,7 +237,9 @@ async def test_two_concurrent_subscriptions_demultiplexed_by_id() -> None:
 
         await duplex.send(
             _modern_envelope(
-                9, "subscriptions/listen", {"notifications": {"promptsListChanged": True}}
+                9,
+                "subscriptions/listen",
+                {"notifications": {"promptsListChanged": True}},
             )
         )
         ack9 = await duplex.recv()
@@ -272,7 +273,9 @@ async def test_cancelled_notification_ends_subscription() -> None:
 
         await duplex.send(
             _modern_envelope(
-                2, "subscriptions/listen", {"notifications": {"promptsListChanged": True}}
+                2,
+                "subscriptions/listen",
+                {"notifications": {"promptsListChanged": True}},
             )
         )
         await duplex.recv()  # ack id 2
@@ -300,7 +303,9 @@ async def test_shutdown_sends_listen_result_before_close() -> None:
     async with duplex_session(gw) as duplex:
         await duplex.send(
             _modern_envelope(
-                42, "subscriptions/listen", {"notifications": {"toolsListChanged": True}}
+                42,
+                "subscriptions/listen",
+                {"notifications": {"toolsListChanged": True}},
             )
         )
         await duplex.recv()  # ack
@@ -309,7 +314,9 @@ async def test_shutdown_sends_listen_result_before_close() -> None:
 
         final = await duplex.recv()
         assert final.get("id") == 42
-        assert "method" not in final, "the terminal frame is a response, not a notification"
+        assert "method" not in final, (
+            "the terminal frame is a response, not a notification"
+        )
         assert final["result"]["resultType"] == "complete"
         assert final["result"]["_meta"][SUBSCRIPTION_ID_META_KEY] == 42
 
