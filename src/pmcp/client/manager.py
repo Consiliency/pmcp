@@ -30,6 +30,7 @@ from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     resolve_remote_headers_for_tenant,
 )
+from pmcp.subscriptions import CatalogEventSink
 from pmcp.types import (
     LocalMcpServerConfig,
     McpTaskInfo,
@@ -72,6 +73,25 @@ def _is_cancel_scope_task_mismatch_error(exc: BaseException) -> bool:
         and "entered" in msg
         and "exit" in msg
     )
+
+
+class _NullCatalogEventSink:
+    """No-op `CatalogEventSink` used when `ClientManager` is constructed with
+    no `catalog_events` (IF-0-P3B-2's default). Keeps every pre-P3B
+    construction site — `server.py`, `cli.py`, and ~20 test modules — working
+    unchanged: nothing publishes, but nothing raises either."""
+
+    def note_tools_changed(self) -> None:
+        pass
+
+    def note_resources_changed(self) -> None:
+        pass
+
+    def note_prompts_changed(self) -> None:
+        pass
+
+    async def flush(self) -> None:
+        pass
 
 
 async def _terminate_process_tree(
@@ -493,7 +513,12 @@ class ClientManager:
         max_tools_per_server: int = 100,
         max_concurrent_spawns: int = 8,
         project_root: Path | None = None,
+        *,
+        catalog_events: CatalogEventSink | None = None,
     ) -> None:
+        self._catalog_events: CatalogEventSink = (
+            catalog_events or _NullCatalogEventSink()
+        )
         self._clients: dict[str, ManagedClient] = {}
         self._tools: dict[str, ToolInfo] = {}
         self._resources: dict[str, ResourceInfo] = {}
@@ -868,6 +893,10 @@ class ClientManager:
             )
             self._revision_id = _generate_revision_id()
             self._last_refresh_ts = time.time()
+            # Ordering nicety, not the correctness mechanism (see
+            # _index_capabilities): coalesce this disconnect's note_* call(s)
+            # into one delivered burst.
+            await self._catalog_events.flush()
             return (True, cancelled, None)
 
     async def restart_server(
@@ -926,18 +955,30 @@ class ClientManager:
 
     def _remove_server_indexes(self, name: str) -> None:
         """Remove catalog entries owned by one server."""
+        tools_removed = False
         for tool_id, tool in list(self._tools.items()):
             if tool.server_name == name:
                 self._tools.pop(tool_id, None)
+                tools_removed = True
+        resources_removed = False
         for resource_id, resource in list(self._resources.items()):
             if resource.server_name == name:
                 self._resources.pop(resource_id, None)
+                resources_removed = True
+        prompts_removed = False
         for prompt_id, prompt in list(self._prompts.items()):
             if prompt.server_name == name:
                 self._prompts.pop(prompt_id, None)
+                prompts_removed = True
         for key in list(self._tasks):
             if key[0] == name:
                 self._tasks.pop(key, None)
+        if tools_removed:
+            self._catalog_events.note_tools_changed()
+        if resources_removed:
+            self._catalog_events.note_resources_changed()
+        if prompts_removed:
+            self._catalog_events.note_prompts_changed()
 
     def _server_supports_tasks(self, managed: ManagedClient) -> bool:
         capabilities = managed.status.server_capabilities or {}
@@ -1148,6 +1189,8 @@ class ClientManager:
 
             self._tools[tool_id] = tool_info
             indexed += 1
+        if indexed:
+            self._catalog_events.note_tools_changed()
         return indexed
 
     def _index_resources(self, name: str, resources: list[dict[str, Any]]) -> int:
@@ -1176,6 +1219,8 @@ class ClientManager:
                 raw_metadata=_raw_metadata(resource, known_fields),
             )
             self._resources[resource_id] = resource_info
+        if resources:
+            self._catalog_events.note_resources_changed()
         return len(resources)
 
     def _index_prompts(self, name: str, prompts: list[dict[str, Any]]) -> int:
@@ -1215,6 +1260,8 @@ class ClientManager:
                 raw_metadata=_raw_metadata(prompt, known_prompt_fields),
             )
             self._prompts[prompt_id] = prompt_info
+        if prompts:
+            self._catalog_events.note_prompts_changed()
         return len(prompts)
 
     async def _index_capabilities(self, managed: ManagedClient) -> tuple[int, int, int]:
@@ -1245,6 +1292,10 @@ class ClientManager:
         else:
             prompt_count = self._index_prompts(name, prompts_result.get("prompts", []))
 
+        # Ordering nicety, not the correctness mechanism (IF-0-P3B-1's
+        # self-scheduling drain is): coalesce a connect's up-to-three note_*
+        # calls into one delivered burst rather than three scheduled drains.
+        await self._catalog_events.flush()
         return indexed, resource_count, prompt_count
 
     async def _connect_stdio(self, config: ResolvedServerConfig) -> None:
@@ -1541,9 +1592,11 @@ class ClientManager:
                 managed.status.pending_request_count = len(managed.pending_requests)
 
                 if "error" in message:
-                    # TODO(P3B): message["error"] also carries JSON-RPC "code"
-                    # and "data" fields that are dropped here, exposing only
-                    # "message" to callers.
+                    # TODO(post-P3B): message["error"] also carries JSON-RPC
+                    # "code" and "data" fields that are dropped here, exposing
+                    # only "message" to callers. No P3B exit criterion
+                    # mentions typed downstream errors (Execution Notes >
+                    # Decision 5) — deferred again, not actioned in P3B.
                     pending.future.set_exception(
                         Exception(message["error"].get("message", "Unknown error"))
                     )
@@ -1757,9 +1810,12 @@ class ClientManager:
                     managed.status.pending_request_count = len(managed.pending_requests)
 
                     if "error" in payload:
-                        # TODO(P3B): payload["error"] also carries JSON-RPC
-                        # "code" and "data" fields that are dropped here,
-                        # exposing only "message" to callers.
+                        # TODO(post-P3B): payload["error"] also carries
+                        # JSON-RPC "code" and "data" fields that are dropped
+                        # here, exposing only "message" to callers. No P3B
+                        # exit criterion mentions typed downstream errors
+                        # (Execution Notes > Decision 5) — deferred again,
+                        # not actioned in P3B.
                         pending.future.set_exception(
                             Exception(payload["error"].get("message", "Unknown error"))
                         )
@@ -2024,12 +2080,31 @@ class ClientManager:
         self._connect_tasks.clear()
         self._reconnect_tasks.clear()
         self._clients.clear()
+        # Capture non-empty immediately before each clear (not after — the
+        # clear must happen first for the dict to actually be empty
+        # afterward, but the check must be the pre-clear state) so a
+        # wholesale teardown still announces what it emptied. Without this,
+        # refresh([]) (disconnect-all + no reconnect) empties every catalog
+        # and publishes nothing — the listener-with-no-publishers failure
+        # this phase exists to prevent. Deliberately NOT routed through
+        # _remove_server_indexes: that method is per-server-name, this is a
+        # wholesale clear, and rewriting it as a loop over names would
+        # change shutdown semantics for no benefit.
+        had_tools = bool(self._tools)
+        had_resources = bool(self._resources)
+        had_prompts = bool(self._prompts)
         self._tools.clear()
         self._resources.clear()
         self._prompts.clear()
         self._tasks.clear()
         self._servers.clear()
         self._lazy_configs.clear()
+        if had_tools:
+            self._catalog_events.note_tools_changed()
+        if had_resources:
+            self._catalog_events.note_resources_changed()
+        if had_prompts:
+            self._catalog_events.note_prompts_changed()
 
     async def _cleanup_client(self, name: str, managed: ManagedClient) -> None:
         """Cancel a client's read task, kill its process, and remove it from registries.
