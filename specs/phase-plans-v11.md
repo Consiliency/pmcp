@@ -97,7 +97,7 @@ Sequencing is constrained by a live hazard. Dependabot PR **#112** already propo
 
 - **IF-0-P1-1** — The four-guard CI contract for first-party Python packages: `install-smoke` (fresh resolve, no lockfile, import the **entry-point** module), `min-version-smoke` (install pinned at the declared floor), a `schedule:` trigger, and a `__version__`-vs-distribution-metadata drift test. P2 and PG both rely on these guards to detect a bad constraint.
 - **IF-0-P2-1** — `pmcp` runs on `mcp>=2.0.0,<3.0.0`, serves the MODERN era (`2026-07-28`) to clients via per-request `_meta` + `server/discover`, and speaks the HANDSHAKE era (ceiling `2025-11-25`) downstream. This is the protocol surface P3B extends.
-- **IF-0-P2-2** — Handler registration shape: `self._server.add_request_handler(<method-string>, <ParamsType>, <handler>)` on the lowlevel `Server`. P3B registers `subscriptions/listen` through this same call. (`server/discover` needs no registration — the 2.x lowlevel `Server` auto-registers it.)
+- **IF-0-P2-2** — ~~Handler registration shape: `self._server.add_request_handler(<method-string>, <ParamsType>, <handler>)` on the lowlevel `Server`. P3B registers `subscriptions/listen` through this same call.~~ **STALE, corrected by P3B — see Phase 3B → Post-execution amendments, item 1.** P2's own Decision 1 (`plans/phase-plan-v11-P2.md:648-666`) rejected `add_request_handler` in favour of `Server.__init__(on_*=...)`, and the frozen mechanism P2 actually shipped is IF-0-P2-1, not this gate — whose ID also collides with P2's plan-level IF-0-P2-2 (the downstream Streamable HTTP transport contract, `plans/phase-plan-v11-P2.md:323`). P3B registers `subscriptions/listen` via `on_subscriptions_listen=` on that same constructor. (`server/discover` needs no registration — the 2.x lowlevel `Server` auto-registers it.)
 - **IF-0-PG-1** — `pangram-mcp` on `mcp` 2.x, reachable from both a 1.x and a 2.x gateway, published to PyPI.
 - **IF-0-P5-1** — A manifest field expressing "credential optional under condition X", replacing the placeholder-secret workaround.
 
@@ -418,6 +418,106 @@ Implement `subscriptions/listen` and retire the HTTP GET endpoint it replaces, w
 - target surfaces: `src/pmcp/transport/http.py`, `src/pmcp/server.py`, `CHANGELOG.md`
 - evidence paths: `plans/phase-plan-v11-P3B.md`
 - redaction posture: `metadata_only`
+
+### Post-execution amendments
+
+Recorded by SL-docs after SL-1 through SL-5 landed and were verified. `plans/phase-plan-v11-P2.md`
+was checked against every item below and needs no edit of its own — its Decision 1 already
+recorded the constructor form correctly; the drift was entirely in this roadmap's own
+Top Interface-Freeze Gates section (item 1).
+
+1. **EC-P3B-1's "IF-0-P2-2 shape" pointed at a stale gate, and the gate itself is now
+   corrected in place above (Top Interface-Freeze Gates).** The roadmap's `IF-0-P2-2`
+   (`:100`, pre-amendment) prescribed `add_request_handler`, which P2's own Decision 1
+   rejected in favour of `Server.__init__(on_*=...)` — and the ID collided with P2's
+   plan-level IF-0-P2-2 (the downstream transport contract, `plans/phase-plan-v11-P2.md:323`).
+   P3B honoured EC-P3B-1's *intent* — register through the frozen handler-registration
+   mechanism, whatever it turns out to be — which is the constructor kwarg
+   `on_subscriptions_listen=`, typed exactly to `ListenHandler.__call__` and the only form
+   `mypy` accepts for a result-typed handler. `src/pmcp/server.py:228`.
+2. **A missing lane-dependency edge: SL-2 → SL-3.** SL-2's declared "Interfaces consumed"
+   named only IF-0-P3B-1 and was marked "Parallel-safe: yes"
+   (`plans/phase-plan-v11-P3B.md:455-456`), but IF-0-P3B-2 requires `GatewayServer` to pass
+   `catalog_events=` into `ClientManager` — a kwarg SL-3 owns. SL-5 *did* declare
+   IF-0-P3B-2 as consumed, so the roadmap-level interface existed; the lane table simply
+   never drew the SL-2 → SL-3 edge. SL-2 correctly stopped short of editing SL-3's file,
+   built everything else, and landed a one-line follow-up (`8a0e4ea`, "IF-0-P3B-2 follow-up")
+   after SL-3 merged (`dce7bf9` then `8a0e4ea`). Future lane tables must derive
+   "Interfaces consumed" from what the interface freeze's *construction order* requires,
+   not from what a lane's own scope paragraph mentions.
+3. **The two production `flush()` calls IF-0-P3B-1 mandated as an "ordering nicety" were
+   removed — a deliberate deviation from the plan's own text, not an oversight.** The plan
+   required `_index_capabilities` and `disconnect_server` to end with
+   `await self._catalog_events.flush()`. Both sit on exactly the paths EC-P3B-4 drives, so
+   the acceptance criterion could have passed with the self-scheduling drain silently
+   broken — `flush()` would deliver the event regardless and the mechanism under test would
+   never run. The plan carried this tension internally: it mandated the flushes *and*
+   required the e2e to prove self-draining. SL-3 resolved it in favour of the criterion;
+   `src/pmcp/client/manager.py` has no `flush()` call on either path (confirmed by grep —
+   the two remaining `flush()`-adjacent comments at `:896` and `:1292` are deliberate
+   "no flush() here" markers), and SL-3's lane tests plus EC-P3B-4 pass without them, which
+   is the proof the self-scheduling drain delivers on production paths rather than riding a
+   flush call site.
+4. **`gateway.refresh` is diff-based and will not reconnect a never-eager server; EC-P3B-4's
+   e2e models a real operator flow rather than assuming a bare refresh redelivers.**
+   `tools/handlers.py`'s refresh builds `to_connect` from `eager_by_name` only, so a
+   disconnected lazy server is left alone by a bare refresh. `tests/runtime/test_subscriptions_e2e.py`
+   therefore adds the second downstream fixture to `autoStart` on the isolated boot's
+   on-disk config between `disconnect_server` and `refresh` — modelling an operator editing
+   `autoStart` then refreshing — rather than defeating or working around the diff logic.
+   Verified by smoke test before the acceptance test was written.
+5. **`client/manager.py:1099` (as cited by this roadmap's Phase 3B scope notes) is
+   `_index_tools` at `:1106` on the commit P3B actually branched from** — consistent with
+   Phase 2's amendment 2, which found the same drift; line numbers in this roadmap are
+   provenance snapshots and move as the tree does.
+6. **The plan mispredicted one test failure.** It expected `tests/test_transport_http.py:212`
+   to go red on GET retirement; it did not, because that line's test
+   (`test_metrics_counter_increments_on_401`) carried a stale comment
+   ("GET with no session ID returns keep-alive SSE") but no assertion on the GET response
+   at all — it passed throughout. Adding a real `405` assertion there was new work SL-5.5
+   did, not a repair of a red test.
+7. **An inherited flaky assertion was fixed, not introduced by this phase.**
+   `tests/runtime/test_downstream_remote.py` asserted strict equality on socket counts
+   across reconnect cycles while its own comment and failure message described detecting
+   *growth*; a late-closing socket makes a later sample lower than an earlier one, so the
+   test could fail on a *decrease* while reporting "socket count grew". Inherited from P2
+   and already on `main` before P3B started; SL-5 changed the assertion to a no-growth
+   check consistent with its own stated intent.
+8. **Two harness capabilities EC-P3B-4 required that SL-5.1's contract did not name in
+   advance**: `booted_gateway(extra_servers_no_autostart=...)` — without it,
+   `gateway.connect_server` in the e2e test would be a no-op rather than a genuine first
+   connect, because the fixture would already be running — and
+   `booted_gateway(request_timeout=...)`, needed for the deployed-wire timing regression
+   that proves the `request_timeout` exemption. Both are additive to the harness's existing
+   design goal (nothing hardcodes a live catalog change) rather than a change to it.
+9. **The anyio `disconnect_all` debt Phase 2's amendment 8 flagged for this phase was
+   deferred again, deliberately — see this plan's Execution Notes → Decision 3 for the full
+   reasoning** (no production exposure in the systemd deployment, a real fix is a
+   concurrency refactor out of scope for the riskiest phase in the roadmap, the P2 workaround
+   still holds, and this phase's only new shutdown code — `ListenHandler.close()` — is sync
+   and never crosses a cancel scope). Recorded here so the debt does not read as forgotten;
+   it is carried forward to a future bounded phase after the 2.0.0 release.
+10. **The SDK ships the listener; this phase wrote no listen-stream state machine.** `mcp`
+    2.0.0's `mcp/server/subscriptions.py` supplies both `ListenHandler` (ack-first,
+    subscription-id stamping, filter honouring, backlog/concurrency bounds, graceful close)
+    and `SubscriptionBus`/`InMemorySubscriptionBus`. P3B's work was the wiring — a sink
+    bridging pmcp's sync catalog mutators to the SDK's async bus, construction order, and
+    HTTP transport survival — not the mechanism. This roadmap's Phase 3B objective and
+    scope notes read as though pmcp builds the subscription machinery; it does not.
+11. **One `2.0.0` release covers both P2 and P3B, deviating from this roadmap's stated
+    cadence.** Execution Notes → "Release cadence" (`:621`) states "P2 is a minor
+    (`1.22.0`)" and "P3B is a MAJOR version" as two separate releases. In practice, `1.22.0`
+    (2026-08-06) shipped P5's manifest credential optionality instead — P2's mcp-2.x port
+    sat in `## [Unreleased]` until P3B's SL-1 promoted it directly into `## [2.0.0]`
+    alongside the GET-retirement entry. This was raised with the operator as the one
+    droppable task in the phase and explicitly decided: keep a single `2.0.0`, do not cut
+    an interim minor at tag time — see `plans/phase-plan-v11-P3B.md`'s Execution Notes →
+    Decision 4 for the reasoning (P2 and P3B are one migration; a minor whose entire
+    content is "the SDK underneath changed" invites operators to take it and the major
+    separately, doubling the upgrade events for one migration) and the CI-coherence argument
+    (P1's drift test pins `pyproject.toml` against `src/pmcp/__init__.py` only, so a
+    CHANGELOG heading of `[2.0.0]` while both files still said `1.22.0` would have left
+    `main` self-inconsistent with nothing in CI flagging it).
 
 ---
 

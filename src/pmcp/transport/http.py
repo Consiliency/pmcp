@@ -1,10 +1,13 @@
 """HTTP transport for MCP Gateway.
 
-Uses the MCP streamable-HTTP transport (introduced in MCP spec 2025-03-26) instead
-of the legacy SSE transport.  Clients connect with a single POST to /mcp; the
-server upgrades to an SSE stream for the response when needed.  No persistent
-GET /sse connection is required, which eliminates the race-condition where tool
-calls arrived before the legacy SSE session completed its initialize handshake.
+Uses the MCP streamable-HTTP transport instead of the legacy SSE transport.
+Clients connect with a single POST to /mcp; the server upgrades to an SSE
+stream for the response when needed. GET /mcp is not served: it answers
+405 Method Not Allowed with `Allow: POST, DELETE`. There is no persistent
+GET/SSE connection of any kind, pre-session or otherwise. Server-initiated
+notifications are delivered over `subscriptions/listen` instead -- a
+long-lived POST stream reachable only at protocol version 2026-07-28 (see
+`pmcp.subscriptions`) -- not over a standalone GET channel.
 
 Claude Code config (.mcp.json):
     { "mcpServers": { "pmcp": { "type": "http", "url": "http://127.0.0.1:3344/mcp" } } }
@@ -19,7 +22,6 @@ import hmac
 import ipaddress
 import json
 import logging
-import os
 import uuid
 from collections.abc import AsyncIterator, MutableMapping
 from typing import TYPE_CHECKING, Any, Callable, Literal
@@ -28,7 +30,7 @@ from urllib.parse import urlparse
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response, StreamingResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
 
 from pmcp import __version__
@@ -66,46 +68,6 @@ _rl_store: dict[str, collections.deque] = {}
 _rl_lock: asyncio.Lock | None = None
 
 _MAX_BODY_BYTES: int = 10 * 1024 * 1024  # 10 MB
-
-# ---------------------------------------------------------------------------
-# Transport DoS guards for unauthenticated pre-session traffic
-# ---------------------------------------------------------------------------
-# The pre-session keepalive SSE stream (rmcp compatibility, see handle_mcp) is
-# infinite by design. Without bounds an unauthenticated client can open an
-# unlimited number of long-lived connections and exhaust the server
-# (connection-exhaustion DoS). We cap both the number of concurrent streams and
-# each stream's absolute lifetime. Both are env-tunable for operators.
-_DEFAULT_MAX_KEEPALIVE_STREAMS: int = 64
-_DEFAULT_KEEPALIVE_MAX_SECONDS: float = 300.0
-_KEEPALIVE_HEARTBEAT_SECONDS: float = 30.0
-
-# Live count of open pre-session keepalive streams. Mutated only from the event
-# loop thread; check-then-increment in handle_mcp has no await in between and is
-# therefore atomic. Held in a dict so nested closures can mutate without a
-# module-level ``global`` declaration (mirrors the _rl_store pattern).
-_keepalive_active: dict[str, int] = {"count": 0}
-
-
-def _env_int(name: str, default: int, *, minimum: int) -> int:
-    """Read a positive int from the environment, clamped to ``minimum``."""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return max(minimum, int(raw))
-    except ValueError:
-        return default
-
-
-def _env_float(name: str, default: float, *, minimum: float) -> float:
-    """Read a positive float from the environment, clamped to ``minimum``."""
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        return max(minimum, float(raw))
-    except ValueError:
-        return default
 
 
 async def _read_body_capped(
@@ -326,7 +288,7 @@ def create_http_app(
             "Mcp-Name": "accepted",
         },
         session_compatibility={
-            "pre_session_get": "rmcp_keepalive",
+            "get_stream": "retired",
             "initialized_without_session": "accepted",
         },
         auth_metadata_present=bool(auth_metadata.protected_resource_metadata_url),
@@ -590,67 +552,13 @@ def create_http_app(
                     )
                     return Response("Payload Too Large", status_code=413)
 
-        # Workaround for rmcp clients (e.g., Codex) that open the GET common
-        # stream before completing the initialize handshake (and therefore have
-        # no session ID yet). The MCP session manager returns 400 for session-less
-        # GETs; rmcp treats that as fatal and never establishes the common stream,
-        # so server-sent notifications and tool responses routed through that
-        # channel are lost. Return a minimal keep-alive SSE stream instead; rmcp
-        # will re-open the GET with a real session ID once it has one.
-        if request.method == "GET" and not request.headers.get("mcp-session-id"):
-            # DoS guard: cap concurrent pre-session streams and give each an
-            # absolute lifetime so an unauthenticated client cannot open an
-            # unbounded number of infinite connections.
-            max_streams = _env_int(
-                "PMCP_MAX_KEEPALIVE_STREAMS",
-                _DEFAULT_MAX_KEEPALIVE_STREAMS,
-                minimum=1,
-            )
-            if _keepalive_active["count"] >= max_streams:
-                logger.debug(
-                    "handle_mcp [%s]: 503 keepalive stream cap reached (%d)",
-                    request_id,
-                    max_streams,
-                )
-                return _reject(503, "Service Unavailable")
-            # No await between the check above and this increment: atomic on the
-            # event loop. The finally in the generator releases the slot.
-            _keepalive_active["count"] += 1
-            max_seconds = _env_float(
-                "PMCP_KEEPALIVE_MAX_SECONDS",
-                _DEFAULT_KEEPALIVE_MAX_SECONDS,
-                minimum=0.1,
-            )
-
-            async def _keepalive_sse() -> AsyncIterator[bytes]:
-                loop = asyncio.get_running_loop()
-                deadline = loop.time() + max_seconds
-                try:
-                    while loop.time() < deadline:
-                        yield b": keep-alive\n\n"
-                        remaining = deadline - loop.time()
-                        if remaining <= 0:
-                            break
-                        await asyncio.sleep(
-                            min(_KEEPALIVE_HEARTBEAT_SECONDS, remaining)
-                        )
-                except asyncio.CancelledError:
-                    pass
-                finally:
-                    _keepalive_active["count"] -= 1
-
-            logger.debug(
-                "handle_mcp [%s]: rmcp-compat serving pre-session GET as keep-alive"
-                " SSE (deadline=%ss, active=%d)",
-                request_id,
-                max_seconds,
-                _keepalive_active["count"],
-            )
-            return StreamingResponse(
-                _keepalive_sse(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache"},
-            )
+        # The JSON-RPC method of this POST body, parsed once below and used
+        # for two independent purposes: the rmcp-compat notifications/initialized
+        # workaround (session-less only), and — the reason it lives at this
+        # scope rather than nested inside that check — deciding whether this
+        # request is exempt from the request_timeout wrap further down.
+        # Stays None for DELETE and for any POST whose body doesn't parse.
+        body_method: str | None = None
 
         # Read the POST body up front, counting bytes against _MAX_BODY_BYTES so
         # a chunked / mislabeled request cannot bypass the header-only cap above.
@@ -678,6 +586,11 @@ def create_http_app(
                 )
                 return Response("Payload Too Large", status_code=413)
 
+            try:
+                body_method = json.loads(body_bytes).get("method")
+            except Exception:
+                pass
+
             # Workaround for rmcp clients (e.g., Codex) that send the
             # notifications/initialized message without the mcp-session-id header.
             # The MCP initialize response includes the session ID, but rmcp does
@@ -685,18 +598,16 @@ def create_http_app(
             # notification. PMCP normally returns 400 for session-less POSTs that
             # aren't initialize, which causes the rmcp worker to abort. Accept
             # this specific notification as a no-op when no session ID is present.
-            if not request.headers.get("mcp-session-id"):
-                try:
-                    body = json.loads(body_bytes)
-                    if body.get("method") == "notifications/initialized":
-                        logger.debug(
-                            "handle_mcp [%s]: rmcp-compat accepted"
-                            " notifications/initialized without session ID",
-                            request_id,
-                        )
-                        return Response(status_code=202)
-                except Exception:
-                    pass
+            if (
+                not request.headers.get("mcp-session-id")
+                and body_method == "notifications/initialized"
+            ):
+                logger.debug(
+                    "handle_mcp [%s]: rmcp-compat accepted"
+                    " notifications/initialized without session ID",
+                    request_id,
+                )
+                return Response(status_code=202)
 
             # Replay the already-consumed body through the receive callable so the
             # session manager can still read it (for both session-bearing POSTs
@@ -725,22 +636,38 @@ def create_http_app(
                 response_started = True
             await original_send(message)
 
-        try:
-            await asyncio.wait_for(
-                session_manager.handle_request(
-                    request.scope, request.receive, tracking_send
-                ),
-                timeout=request_timeout,
+        # subscriptions/listen opens a long-lived stream by design (a
+        # subscription outlives request_timeout on any real client — that is
+        # the point of it). Wrapping it in the same wait_for as ordinary
+        # request/response POSTs silently truncates every subscription at
+        # request_timeout seconds: the client sees a healthy ack and
+        # notifications, then "ASGI callable returned without completing
+        # response" and an incomplete chunked body, with no
+        # SubscriptionsListenResult, on every default deployment (measured,
+        # IF-0-P3B-3). ListenHandler's own concurrency and per-stream backlog
+        # caps bound the exposure instead; the absolute-lifetime cap this
+        # exemption removes is deliberately not replaced (CHANGELOG.md).
+        if body_method == "subscriptions/listen":
+            await session_manager.handle_request(
+                request.scope, request.receive, tracking_send
             )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "handle_mcp [%s]: request timed out after %ss",
-                request_id,
-                request_timeout,
-            )
-            if response_started:
-                return _NullResponse()
-            return Response("Gateway Timeout", status_code=504)
+        else:
+            try:
+                await asyncio.wait_for(
+                    session_manager.handle_request(
+                        request.scope, request.receive, tracking_send
+                    ),
+                    timeout=request_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "handle_mcp [%s]: request timed out after %ss",
+                    request_id,
+                    request_timeout,
+                )
+                if response_started:
+                    return _NullResponse()
+                return Response("Gateway Timeout", status_code=504)
         _inc("requests_ok")
         return _NullResponse()
 
@@ -752,9 +679,7 @@ def create_http_app(
         logger.info("Streamable-HTTP session manager stopped")
 
     routes = [
-        Route(
-            "/mcp", endpoint=handle_mcp, methods=["GET", "POST", "DELETE"], name="mcp"
-        ),
+        Route("/mcp", endpoint=handle_mcp, methods=["POST", "DELETE"], name="mcp"),
         Route("/health", endpoint=handle_health, methods=["GET"]),
         Route("/metrics", endpoint=handle_metrics, methods=["GET"]),
     ]

@@ -156,10 +156,20 @@ async def test_ec_p2_7_headers_redirect_and_reconnect_leak() -> None:
             # has its own one-time socket cost (control connection +
             # standalone SSE listener), which is not what this proves.
             # What matters is that cycles 2-5 add nothing further — every
-            # count in socket_counts_by_cycle[1:] must equal the first.
+            # count in socket_counts_by_cycle[1:] must be no greater than
+            # the first. Not strict equality (SL-5 fix, inherited from P2):
+            # a late-closing socket from the *previous* cycle's teardown can
+            # still be in FIN_WAIT/closing when the *next* cycle's count is
+            # sampled, making a later sample transiently *lower* than an
+            # earlier one (observed under concurrent load: [11,11,11,11,9]).
+            # A strict `==` fails on that decrease and its own message then
+            # claims the count "grew", sending the next reader hunting a
+            # leak that isn't there. The property this proves is "no
+            # growth", not "no fluctuation" — `<=` is what that means.
             baseline = socket_counts_by_cycle[0]
-            assert all(count == baseline for count in socket_counts_by_cycle[1:]), (
-                f"socket count grew across reconnect cycles: {socket_counts_by_cycle}"
+            assert all(count <= baseline for count in socket_counts_by_cycle[1:]), (
+                "socket count grew across reconnect cycles (a leak): "
+                f"baseline={baseline}, counts={socket_counts_by_cycle}"
             )
     finally:
         # disconnect_server (not disconnect_all, whose concurrent gather of
