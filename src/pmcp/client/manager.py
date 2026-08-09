@@ -893,10 +893,7 @@ class ClientManager:
             )
             self._revision_id = _generate_revision_id()
             self._last_refresh_ts = time.time()
-            # Ordering nicety, not the correctness mechanism (see
-            # _index_capabilities): coalesce this disconnect's note_* call(s)
-            # into one delivered burst.
-            await self._catalog_events.flush()
+            # No flush() here, deliberately -- see _index_capabilities.
             return (True, cancelled, None)
 
     async def restart_server(
@@ -1292,10 +1289,11 @@ class ClientManager:
         else:
             prompt_count = self._index_prompts(name, prompts_result.get("prompts", []))
 
-        # Ordering nicety, not the correctness mechanism (IF-0-P3B-1's
-        # self-scheduling drain is): coalesce a connect's up-to-three note_*
-        # calls into one delivered burst rather than three scheduled drains.
-        await self._catalog_events.flush()
+        # No flush() here, deliberately: IF-0-P3B-1's self-scheduling drain
+        # is the correctness mechanism, not this call site, and EC-P3B-4
+        # exercises exactly this path -- a flush() here would let that
+        # acceptance test pass even if the self-scheduling drain were
+        # completely broken.
         return indexed, resource_count, prompt_count
 
     async def _connect_stdio(self, config: ResolvedServerConfig) -> None:

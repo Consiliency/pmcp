@@ -16,7 +16,11 @@ exist at construction). This module covers:
   - the integration half: a real `ClientManager` wired to a real
     `BusCatalogEventSink` over a real `InMemorySubscriptionBus`, driven
     through `connect_server`/`disconnect_server` against a real stdio
-    downstream — no test in this half calls `note_*` or `flush()` itself;
+    downstream — no test in this half calls `note_*` or `flush()` itself,
+    and no production `ClientManager` code path calls `flush()` either
+    (grepping the module for a `flush(` call is empty): IF-0-P3B-1's
+    self-scheduling drain is the only thing that can deliver these events,
+    which is exactly what EC-P3B-4 needs to be proving;
   - the two regressions the board found: `refresh([])` (the
     `_disconnect_all_unlocked` silent-clear hole) and the lost-wakeup race,
     driven this time through the production mutators rather than the sink
@@ -49,9 +53,10 @@ POLL_INTERVAL_S = 0.02
 
 
 async def _poll_until(predicate: Callable[[], bool]) -> None:
-    """Poll rather than assert-immediately-after-return: SL-3.2's two
-    `flush()` call sites are an ordering nicety, not the correctness
-    mechanism, and this suite must stay green with either resolved."""
+    """Poll rather than assert-immediately-after-return: no production code
+    path calls `flush()`, so delivery here always goes through
+    `BusCatalogEventSink`'s self-scheduled drain, which is asynchronous
+    relative to the `note_*` call that armed it."""
     for _ in range(POLL_ATTEMPTS):
         if predicate():
             return
