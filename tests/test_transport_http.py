@@ -209,7 +209,8 @@ class TestAuthGuardHttp:
     def test_metrics_counter_increments_on_401(self) -> None:
         before = _metrics["requests_401"]
         client = _make_app(auth_token="secret")
-        client.get("/mcp")  # GET with no session ID returns keep-alive SSE, skip
+        get_response = client.get("/mcp")  # GET is retired (IF-0-P3B-3): 405, no stream
+        assert get_response.status_code == 405
         client.post("/mcp", content=b"{}")  # no auth → 401
         assert _metrics["requests_401"] > before
 

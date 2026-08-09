@@ -235,7 +235,8 @@ class TestHttpTransportRoutes:
         assert any("/mcp" in path for path in route_paths)
 
     def test_routes_use_correct_methods(self) -> None:
-        """/mcp endpoint should accept GET, POST, and DELETE."""
+        """/mcp endpoint accepts POST and DELETE only -- GET is retired
+        (IF-0-P3B-3): it now 405s instead of opening a keep-alive stream."""
         from pmcp.transport.http import create_http_app
 
         mock_server = MagicMock()
@@ -243,12 +244,13 @@ class TestHttpTransportRoutes:
 
         app = create_http_app(mock_server)
 
-        # Find the /mcp route and check it accepts GET and POST
+        # Find the /mcp route and check it accepts POST/DELETE, not GET.
         for route in app.routes:
             if hasattr(route, "path") and route.path == "/mcp":
                 if hasattr(route, "methods"):
-                    assert "GET" in route.methods
+                    assert "GET" not in route.methods
                     assert "POST" in route.methods
+                    assert "DELETE" in route.methods
 
 
 class TestHttpObservabilityContracts:

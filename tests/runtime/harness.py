@@ -24,14 +24,25 @@ Provides:
     one `text/event-stream` `data:` frame — IF-0-P2-4, Execution Notes >
     "EC-P2-6 must go over the deployed HTTP wire").
   - `RT_FIXTURE_SRC` — a real stdio `mcp.server.MCPServer` (2.0.0) exposing
-    one tool and one prompt, registered as the harness gateway's sole
-    `autoStart` downstream so `prompts/list`/`prompts/get` (which pmcp only
-    ever proxies from a live downstream — there is no built-in prompt) have
+    one tool, one prompt, and (SL-5.1) one resource, registered as the
+    harness gateway's sole `autoStart` downstream so `prompts/list`/
+    `prompts/get` and `resources/list`/`resources/read` (which pmcp only
+    ever proxies from a live downstream — there are no built-ins) have
     real typed content to exercise.
+  - `listen_envelope()` / `listen_stream()` (SL-5.1) — build and open an
+    IF-0-P3B-4 `subscriptions/listen` POST over the deployed HTTP wire,
+    yielding a `ListenStream` with `next_frame(timeout)` / `close()` for
+    incremental reads — `decode_modern_response` cannot be reused for a
+    listen stream because it reads a *complete* response and a listen
+    stream never completes on its own.
+  - `booted_gateway(..., request_timeout=<n>)` (SL-5.1) — appends
+    `--request-timeout <n>` to the boot command, for the V4b / EC-P3B-4
+    deployed-wire timeout-exemption regression.
 """
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -41,8 +52,8 @@ import socket
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Iterator
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -77,6 +88,14 @@ def rt_echo(text: str) -> str:
 def rt_greeting(name: str) -> str:
     """Greet someone by name."""
     return f"Hello, {name}!"
+
+
+@mcp.resource("rt-fixture://greeting-card")
+def rt_greeting_card() -> str:
+    """A static resource, present (SL-5.1) so EC-P3B-4 has real resource
+    content to exercise -- before this the fixture exposed only a tool and
+    a prompt, leaving resources/list_changed with nothing to prove against."""
+    return "rt-fixture: a greeting card"
 
 
 if __name__ == "__main__":
@@ -140,13 +159,27 @@ def booted_gateway(
     *,
     extra_servers: dict[str, Any] | None = None,
     extra_allowlist: list[str] | None = None,
+    extra_servers_no_autostart: dict[str, Any] | None = None,
+    request_timeout: int | None = None,
 ) -> Iterator[BootedGateway]:
     """Boot one fully isolated gateway with the `rt-fixture` stdio downstream
     eagerly started, on a spare port never `:3344`.
 
     `extra_servers` / `extra_allowlist` let a caller (e.g. SL-4.5's mcp-1.x
     downstream) add another `mcpServers` entry to the same isolated boot
-    without duplicating the isolation plumbing.
+    without duplicating the isolation plumbing. `extra_servers_no_autostart`
+    (SL-5.1) is the same idea but for a server that must exist in config
+    and be allowlisted while starting out *disconnected* -- needed for
+    EC-P3B-4, where `gateway.connect_server` must be a real first connect
+    (a server already running via `autoStart` would make that call a no-op,
+    and no catalog mutation means no publish to prove against).
+
+    `request_timeout` (SL-5.1), when given, appends `--request-timeout <n>`
+    to the boot command (the flag exists at `src/pmcp/cli.py:232`, also
+    honoured as `PMCP_REQUEST_TIMEOUT`). Used by the V4b / EC-P3B-4 deployed-
+    wire regression: a `subscriptions/listen` stream must outlive this
+    timeout (IF-0-P3B-3's exemption), which a short `request_timeout` proves
+    directly rather than waiting out the 60s default.
 
     Guarantees, matching Execution Notes > "Runtime-step safety" and
     "Boot isolation requires all six controls together" verbatim:
@@ -199,9 +232,16 @@ def booted_gateway(
         }
         if extra_servers:
             servers.update(extra_servers)
+        if extra_servers_no_autostart:
+            servers.update(extra_servers_no_autostart)
         auto_start = sorted({"rt-fixture", *(extra_servers or {})})
         allowlist = sorted(
-            {"rt-fixture", *(extra_allowlist or []), *(extra_servers or {})}
+            {
+                "rt-fixture",
+                *(extra_allowlist or []),
+                *(extra_servers or {}),
+                *(extra_servers_no_autostart or {}),
+            }
         )
 
         config_path = work / "config.json"
@@ -243,6 +283,8 @@ def booted_gateway(
             "-l",
             "info",
         ]
+        if request_timeout is not None:
+            command.extend(["--request-timeout", str(request_timeout)])
         with open(boot_log, "w") as log_fh:
             proc = subprocess.Popen(
                 command,
@@ -350,6 +392,83 @@ def decode_modern_response(response: httpx.Response) -> dict[str, Any]:
         )
         return json.loads(data_lines[-1][len("data:") :].strip())  # noqa: E203
     return response.json()
+
+
+def listen_envelope(
+    *, notifications: dict[str, bool], request_id: int = 1
+) -> tuple[dict[str, str], dict[str, Any]]:
+    """IF-0-P3B-4 wire envelope for a `subscriptions/listen` POST, built on
+    top of `modern_envelope` with the JSON-RPC id overridden to
+    `request_id` so concurrent subscriptions (e.g. EC-P3B-4's A/B) can be
+    told apart by `SUBSCRIPTION_ID_META_KEY`. `notifications` is passed in
+    wire (camelCase) form -- pmcp's own Python source constructs
+    `SubscriptionFilter` with field names; only JSON test payloads use the
+    alias."""
+    headers, body = modern_envelope(
+        "subscriptions/listen", {"notifications": notifications}
+    )
+    body["id"] = request_id
+    return headers, body
+
+
+@dataclass
+class ListenStream:
+    """Incremental reader for one open `subscriptions/listen` SSE stream.
+
+    `decode_modern_response` cannot be reused here -- it reads a *complete*
+    response, and a listen stream never completes on its own.
+    """
+
+    response: httpx.Response
+    _lines: AsyncIterator[str] = field(repr=False)
+    _client: httpx.AsyncClient = field(repr=False)
+
+    async def next_frame(self, timeout: float = 10.0) -> dict[str, Any]:
+        """The next decoded `data:` payload, skipping `: ping` comment
+        lines (IF-0-P3B-4's 15s keepalive) and blank lines."""
+
+        async def _read() -> dict[str, Any]:
+            async for line in self._lines:
+                if line.startswith("data:"):
+                    return json.loads(line[len("data:") :].strip())  # noqa: E203
+            raise AssertionError("listen stream ended before a data: frame arrived")
+
+        return await asyncio.wait_for(_read(), timeout=timeout)
+
+    async def close(self) -> None:
+        """End the subscription from the client side (a real disconnect,
+        not a pooled return) -- idempotent."""
+        await self._client.aclose()
+
+
+@contextlib.asynccontextmanager
+async def listen_stream(
+    base_url: str,
+    *,
+    notifications: dict[str, bool],
+    timeout: float = 30.0,
+    request_id: int = 1,
+) -> AsyncIterator[ListenStream]:
+    """Open a `subscriptions/listen` POST against `<base_url>/mcp`
+    (IF-0-P3B-4) and yield an incremental `ListenStream` reader for the
+    duration of the `async with` block. `timeout` bounds each `next_frame`
+    read via `ListenStream`'s own default, not the connection's lifetime --
+    a listen stream is long-lived by design (IF-0-P3B-3)."""
+    headers, body = listen_envelope(notifications=notifications, request_id=request_id)
+    client = httpx.AsyncClient(timeout=None)
+    try:
+        async with client.stream(
+            "POST", f"{base_url}/mcp", headers=headers, json=body, timeout=timeout
+        ) as response:
+            assert response.status_code == 200, (response.status_code, response.text)
+            assert "text/event-stream" in response.headers.get("content-type", ""), (
+                response.headers.get("content-type")
+            )
+            yield ListenStream(
+                response=response, _lines=response.aiter_lines(), _client=client
+            )
+    finally:
+        await client.aclose()
 
 
 def modern_post(
