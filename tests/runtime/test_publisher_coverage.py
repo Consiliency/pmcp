@@ -156,6 +156,16 @@ def test_ast_guard_actually_finds_writes() -> None:
     assert _PUBLISHING_METHODS <= found_functions, (
         f"expected writes from {_PUBLISHING_METHODS}, saw {found_functions}"
     )
+    # __init__'s write must be seen too, specifically via ast.AnnAssign
+    # (its `self._tools: dict[...] = {}` is annotated) -- without that
+    # visitor method the exemption in the test below would be vacuous: it
+    # would never fire because __init__ would never appear as a writer at
+    # all. This is the exact hole the plan's ast.AnnAssign requirement
+    # exists to close.
+    assert "__init__" in found_functions, (
+        "AST walk never saw __init__ write to a catalog dict -- "
+        "visit_AnnAssign is broken and the __init__ exemption is vacuous"
+    )
 
 
 def test_every_catalog_write_is_in_a_publishing_mutator_or_init() -> None:
