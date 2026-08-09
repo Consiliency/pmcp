@@ -148,17 +148,50 @@ GET, not clients that receive anything over it.
 
 ### The publisher gap — measured, and worse than "one file"
 
-`ClientManager` mutates exactly three indexes, in exactly four methods:
+`ClientManager` mutates three indexes from **six** write sites, not the four an earlier draft
+of this plan claimed. The full set, derived by grepping every store to `self._tools` /
+`self._resources` / `self._prompts` rather than from memory:
 
-- `_index_tools` (`client/manager.py:1106`, writes `self._tools` at `:1149`)
-- `_index_resources` (`:1153`)
-- `_index_prompts` (`:1181`)
-- `_remove_server_indexes` (`:927`), which clears all three plus `self._tasks`
+| Site | Method | Publishes? |
+|---|---|---|
+| `:1149` | `_index_tools` (`:1106`) | yes — `note_tools_changed` |
+| `:1178` | `_index_resources` (`:1153`) | yes — `note_resources_changed` |
+| `:1217` | `_index_prompts` (`:1181`) | yes — `note_prompts_changed` |
+| `:931`, `:934`, `:937` | `_remove_server_indexes` (`:927`) | yes — per kind that shrank |
+| `:2027-2029` | `_disconnect_all_unlocked` (`:1961`) | **yes — must be added** |
+| `:497-499` | `__init__` (`:491`) | **no — exempt, see below** |
 
-`_remove_server_indexes` is called from four sites (`:859`, `:1262`, `:1431`, `:2078`), and
-`_index_*` from `_index_capabilities` (`:1220-1248`). All four mutators are **sync**; the bus's
-`publish` is **async**. That seam is the whole design problem, and it is why the naive
-"await bus.publish() at the mutation site" does not typecheck.
+`_remove_server_indexes` is called from four sites (`:859`, `:1262`, `:1431`, `:2078`) and
+`_index_*` from `_index_capabilities` (`:1220-1248`). Every one of these mutators is **sync**;
+the bus's `publish` is **async**. That seam is the whole design problem, and it is why the
+naive "await bus.publish() at the mutation site" does not typecheck.
+
+**`_disconnect_all_unlocked` is a silent-clear hole and closing it is load-bearing.** It calls
+`self._tools.clear()` / `_resources.clear()` / `_prompts.clear()` directly at `:2027-2029`,
+bypassing `_remove_server_indexes` entirely, and it is reached from `ClientManager.refresh()`
+(`:2080-2084`, which calls `_disconnect_all_unlocked()` then `_connect_all_unlocked()`). So
+`refresh([])` would empty every catalog and publish **nothing at all** — the exact
+listener-with-no-publishers failure this phase exists to prevent. The tempting repair is to
+widen the AST guard's allowlist to include it; that would encode the bug as the specification.
+SL-3.2 instead makes `_disconnect_all_unlocked` call `note_*` for each kind that was non-empty
+before the clear, and SL-3.1 carries the `refresh([])` regression.
+
+Two honest qualifications on the severity, so the fix is aimed at something real: (a) the
+partial case bites even with a non-empty config — `refresh([...])` clears prompts and
+resources, and if the reconnected set has no prompts, `_index_prompts` never runs and the
+prompts clear goes unannounced; (b) `ClientManager.refresh` has **no caller in `src/` today** —
+`gateway.refresh` routes through `handlers.py:2361-2373` (`disconnect_server` + `connect_all`,
+which does go through `_remove_server_indexes`), and `handlers.py:4998`/`:5369` call
+`GatewayTools.refresh`, not `ClientManager.refresh`. So the hole is currently reachable from
+tests and from `disconnect_all()` at shutdown rather than from a live gateway path. It is
+still fixed here, and the regression is written at the `ClientManager.refresh([])` API level
+rather than over the deployed wire, because that is where the guarantee actually lives.
+
+**`__init__` (`:497-499`) is exempt, explicitly.** Those three statements are the annotated
+construction of the empty dicts; no bus, no sink, and no subscriber can exist at that point,
+and publishing there would mean publishing before `BusCatalogEventSink` is even built
+(IF-0-P3B-2 fixes that ordering). The AST guard names `__init__` as an allowed non-publishing
+writer rather than silently not matching it.
 
 **The roadmap's `:1099` is stale** — `_index_tools` is at `:1106` on `97ed73e`.
 
@@ -173,7 +206,8 @@ list is exactly the failure mode P5 documented** (a requirement re-implemented p
 where fixing a subset looks like fixing the class). This plan therefore does not enumerate
 them: IF-0-P3B-1 makes the sink self-draining, so a *new* mutation path publishes without any
 new call site, and SL-5 adds an AST guard that fails if a write to `_tools`/`_resources`/
-`_prompts` ever appears outside the four known mutators.
+`_prompts` ever appears outside the five publishing mutators plus the deliberately exempt
+`__init__`.
 
 ### Roadmap staleness found while planning
 
@@ -247,9 +281,24 @@ in this plan binds, signals, or restarts it, and no pid is hardcoded anywhere.
     `asyncio.get_running_loop()` succeeds, it creates one (kept in a strong-referenced set so
     it is not GC'd mid-flight) that awaits `asyncio.sleep(0)` and then drains. If there is no
     running loop, `note_*` records and returns — a sync unit test must not raise.
-  - `flush()` drains the pending set immediately: pop all, `await bus.publish(<event>())` per
-    kind, in the fixed order tools → resources → prompts. It is idempotent and a no-op when
-    empty.
+  - **The drain LOOPS until pending is empty, and clears its live flag in the same
+    synchronous step as the check that found it empty.** This is not an implementation detail
+    — it is the freeze, because the obvious "take a snapshot, publish it, exit" shape has a
+    lost-wakeup race that silently drops events. The race, concretely: the drain pops all
+    pending (set now empty) and suspends inside `await bus.publish(ToolsListChanged())`; a
+    `note_prompts_changed()` runs in that window, adds to pending, sees a live drain task, and
+    therefore does **not** re-arm; the drain returns and the prompts event sits in pending with
+    nothing scheduled to deliver it, surfacing only when some later unrelated mutation happens
+    to schedule a drain. The window is real, not theoretical: `InMemorySubscriptionBus.publish`
+    ends with an explicit `await anyio.lowlevel.checkpoint()`
+    (`mcp/server/subscriptions.py:115`), so it always yields. Required shape:
+    `while pending: kinds = pop_all(); for k in kinds: await bus.publish(k())` — and only when
+    the `while` test finds `pending` empty does the drain clear its live flag, with **no await
+    between that test and the clear**, so a `note_*` cannot slip in behind it.
+  - `flush()` drains the pending set immediately with the same loop, publishing in the fixed
+    order tools → resources → prompts. It is idempotent and a no-op when empty. **`flush()`
+    must never be load-bearing**: the plan claims the self-scheduling drain is the correctness
+    mechanism, and that claim is only true if the loop above is implemented as frozen.
   - **Self-scheduling is the correctness mechanism, not the flush call sites.** A future
     mutation path publishes with no new call site. SL-5's AST guard is what keeps that true.
   - A raising bus is isolated: `_drain` catches and logs, matching `InMemorySubscriptionBus.publish`'s
@@ -292,6 +341,18 @@ in this plan binds, signals, or restarts it, and no pid is hardcoded anywhere.
   `body_method`, and when `body_method == "subscriptions/listen"` the call is
   `await session_manager.handle_request(...)` with no `wait_for`. The parse replaces the
   narrower one at `:690` rather than adding a second. Rationale and evidence: measured spike 2.
+  **The exemption removes the only absolute lifetime bound on an inbound stream, and that is a
+  deliberate, operator-visible tradeoff rather than an oversight.** The retired keep-alive
+  carried two DoS controls: a concurrency cap (`PMCP_MAX_KEEPALIVE_STREAMS`, 64) and an
+  absolute lifetime (`PMCP_KEEPALIVE_MAX_SECONDS`, 300). The concurrency cap is replaced
+  one-for-one by `PMCP_MAX_LISTEN_STREAMS` (SL-2, same default). The lifetime cap is
+  **deliberately not replaced**: a subscription is long-lived by definition, and a server that
+  silently severs it every N seconds is precisely the defect measured spike 2 found. What
+  bounds the exposure instead is the concurrency cap, the SDK's own per-stream
+  `max_buffered_events` backlog cap, and the fact that `/mcp` is auth-gated whenever
+  `auth_mode` is configured. SL-1.3 states this in the CHANGELOG so an operator relying on
+  `PMCP_KEEPALIVE_MAX_SECONDS` learns the knob is gone and what replaced it, rather than
+  inferring it from a connection that no longer drops.
   Consumed by SL-5.
 
 - [ ] IF-0-P3B-4 — **Listen-stream wire contract** (test-facing; frozen so SL-5 cannot
@@ -373,8 +434,12 @@ the GET retirement is the first thing a reader sees, ahead of P2's mcp-2.x parag
 `### Removed` text must state: `GET /mcp` is retired and now answers `405 Method Not Allowed`
 with `Allow: POST, DELETE`; the rmcp pre-session keep-alive SSE workaround is gone with it,
 along with `PMCP_MAX_KEEPALIVE_STREAMS` and `PMCP_KEEPALIVE_MAX_SECONDS`; `/health` and
-`/metrics` are unaffected; and the replacement is `subscriptions/listen`, which is reachable
-**only** at protocol version `2026-07-28`. It must not claim any existing client loses
+`/metrics` are unaffected; that the concurrency cap returns as `PMCP_MAX_LISTEN_STREAMS`
+(same default of 64) while the absolute-lifetime cap is deliberately **not** replaced,
+because a subscription is long-lived by design — IF-0-P3B-3 carries the reasoning and an
+operator relying on `PMCP_KEEPALIVE_MAX_SECONDS` must learn it here; and that the
+replacement is `subscriptions/listen`, which is reachable **only** at protocol version
+`2026-07-28`. It must not claim any existing client loses
 delivered data — pmcp never wrote to the GET stream (Context, "Retiring GET removes a channel
 pmcp never writes to"). The version-string bump to `2.0.0` lands here rather than in the
 release task so that `/health`'s `version` field, `pyproject.toml`, and the CHANGELOG heading
@@ -420,7 +485,7 @@ therefore stated rather than left to judgement:
 
 ### SL-3 — Production event publishers in ClientManager (roadmap Lane C)
 
-- **Scope**: Wire the four catalog mutators to the frozen sink so that a real
+- **Scope**: Wire all five publishing catalog mutators to the frozen sink so that a real
   `connect_server` / `disconnect_server` / `refresh` publishes, and accept the sink through
   the constructor without breaking any existing construction site.
 - **Owned files**: `src/pmcp/client/manager.py`, `tests/mcp2x/test_catalog_publishers.py`
@@ -432,7 +497,7 @@ therefore stated rather than left to judgement:
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-3.1 | test | — | `tests/mcp2x/test_catalog_publishers.py` | `ClientManager()` with **no** `catalog_events` constructs and every existing call still works (the null-sink default); `ClientManager(catalog_events=<recorder>)` then `_index_tools("s", [<one tool dict>])` records exactly one `note_tools_changed`, `_index_resources` one `note_resources_changed`, `_index_prompts` one `note_prompts_changed`; `_index_tools("s", [])` with nothing indexed records **nothing** (no spurious event for a no-op); `_remove_server_indexes("s")` after indexing all three kinds records all three, and `_remove_server_indexes("never-connected")` records **nothing**; and — the integration half — a real `ClientManager` wired to a real `BusCatalogEventSink` over an `InMemorySubscriptionBus` with a recording listener, driven through `connect_server(<the tests/runtime stdio fixture config>)`, publishes at least `ToolsListChanged`, and through `disconnect_server(...)` publishes `ToolsListChanged` again — **without any test calling `note_*` or `flush` itself** | `uv run pytest tests/mcp2x/test_catalog_publishers.py -q` |
+| SL-3.1 | test | — | `tests/mcp2x/test_catalog_publishers.py` | `ClientManager()` with **no** `catalog_events` constructs and every existing call still works (the null-sink default); `ClientManager(catalog_events=<recorder>)` then `_index_tools("s", [<one tool dict>])` records exactly one `note_tools_changed`, `_index_resources` one `note_resources_changed`, `_index_prompts` one `note_prompts_changed`; `_index_tools("s", [])` with nothing indexed records **nothing** (no spurious event for a no-op); `_remove_server_indexes("s")` after indexing all three kinds records all three, and `_remove_server_indexes("never-connected")` records **nothing**; and — the integration half — a real `ClientManager` wired to a real `BusCatalogEventSink` over an `InMemorySubscriptionBus` with a recording listener, driven through `connect_server(<the tests/runtime stdio fixture config>)`, publishes at least `ToolsListChanged`, and through `disconnect_server(...)` publishes `ToolsListChanged` again — **without any test calling `note_*` or `flush` itself**. **Plus the two regressions the board found:** (i) `await manager.refresh([])` on a manager that had indexed all three kinds publishes `ToolsListChanged`, `ResourcesListChanged` **and** `PromptsListChanged` — this is the `_disconnect_all_unlocked` silent-clear hole and it fails on a naive implementation that only wires the four `_index_*`/`_remove_server_indexes` methods; and (ii) a **lost-wakeup** test: a recording bus whose `publish` awaits an `asyncio.Event` the test controls, a `note_tools_changed()` to start the drain, a `note_prompts_changed()` issued **while that publish is still suspended**, then release the event and assert `PromptsListChanged` is published without any `flush()` call. That is the IF-0-P3B-1 drain-loop freeze and it fails on the snapshot-and-exit shape | `uv run pytest tests/mcp2x/test_catalog_publishers.py -q` |
 | SL-3.2 | impl | SL-3.1 | `src/pmcp/client/manager.py` | — | — |
 | SL-3.3 | verify | SL-3.2 | `src/pmcp/client/manager.py`, `tests/mcp2x/test_catalog_publishers.py` | all SL-3 tests | `uv run pytest tests/mcp2x/test_catalog_publishers.py -q && uv run ruff check src/pmcp/client/manager.py && uv run mypy src/pmcp --exclude baml_client && rg -n 'note_tools_changed|note_resources_changed|note_prompts_changed' src/pmcp/client/manager.py` |
 
@@ -450,6 +515,15 @@ SL-3.2's edits, precisely:
   trains clients to ignore it.
 - `_remove_server_indexes` (`:927`): tracks whether it removed anything per kind (it already
   iterates each dict) and calls the matching `note_*` for each kind that actually shrank.
+- **`_disconnect_all_unlocked` (`:1961`, clears at `:2027-2029`): capture whether each of the
+  three dicts was non-empty immediately before its `.clear()`, and call the matching `note_*`
+  after.** Do **not** repoint it at `_remove_server_indexes` — that method is per-server-name
+  and this path is a wholesale teardown, so rewriting it as a loop over names would change
+  shutdown semantics for no benefit. Three booleans and three conditional calls is the whole
+  change. Without it, `ClientManager.refresh([])` empties every catalog and publishes nothing
+  (Context → "the publisher gap"), which is the failure this phase exists to prevent.
+- `__init__`'s three assignments at `:497-499` get **no** `note_*` — no sink or subscriber
+  exists yet at construction. The AST guard exempts `__init__` by name for this reason.
 - `_index_capabilities` (`:1220-1248`) ends with `await self._catalog_events.flush()` and
   `disconnect_server` (`:778`) ends with the same, so a connect or disconnect delivers in one
   coalesced burst rather than in three scheduled drains. **These two calls are an ordering
@@ -475,7 +549,7 @@ SL-3.2's edits, precisely:
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
 | SL-4.1 | test | — | `tests/mcp2x/test_get_retirement.py` | Against `create_http_app(<stub Server>)` driven by Starlette's `TestClient`: `GET /mcp` returns `405` and the `Allow` header contains `POST` and `DELETE` and **not** `GET`; the `/mcp` `Route.methods` set is exactly `{"POST", "DELETE"}` — **not** `{"POST", "DELETE", "HEAD"}`: Starlette synthesises `HEAD` only alongside `GET`, so once `GET` is removed `HEAD` goes with it, which the Starlette spike run this session confirmed (`Allow: POST, DELETE`, no `HEAD`). Asserting the exact set is what proves `GET` is gone rather than merely absent from a list; `GET /health` is `200` and its body still carries `ok`, `version`, `transport`, `gateway_diagnostics`; `GET /metrics` is `200` with the Prometheus content type; `app.state.gateway_diagnostics.session_compatibility` has no `pre_session_get` key and does have `get_stream == "retired"`; module-level `_keepalive_active`, `_DEFAULT_MAX_KEEPALIVE_STREAMS`, `_DEFAULT_KEEPALIVE_MAX_SECONDS` and `_KEEPALIVE_HEARTBEAT_SECONDS` no longer exist (`hasattr` is `False` on the module) | `uv run pytest tests/mcp2x/test_get_retirement.py -q` |
-| SL-4.2 | test | SL-4.1 | `tests/mcp2x/test_listen_over_http.py` | Against pmcp's own `create_http_app` under uvicorn on `alloc_port()` (never `3344`), with a real `ListenHandler` + `InMemorySubscriptionBus` the test also holds a reference to: an IF-0-P3B-4 listen POST returns `200 text/event-stream` whose first `data:` frame is the ack; a `bus.publish(ToolsListChanged())` arrives as a stamped `notifications/tools/list_changed`; **the app is constructed with `request_timeout=3` and the stream is still alive and still delivering at t > 8s** — the regression test for measured spike 2, which fails on today's code; the same request with `Accept: application/json` only returns `406`; and closing the client stream ends the subscription server-side, asserted by `len(listen_handler._streams) == 0` within 2s of the close (EC-P3B-2's HTTP client-close half). **Required test-function names, selected by `-k` in the acceptance commands**: `test_timeout_exemption_keeps_stream_alive` and `test_client_close_ends_subscription` | `uv run pytest tests/mcp2x/test_listen_over_http.py -q` |
+| SL-4.2 | test | SL-4.1 | `tests/mcp2x/test_listen_over_http.py` | Against pmcp's own `create_http_app` under uvicorn on `alloc_port()` (never `3344`), with a real `ListenHandler` + `InMemorySubscriptionBus` the test also holds a reference to: an IF-0-P3B-4 listen POST returns `200 text/event-stream` whose first `data:` frame is the ack; a `bus.publish(ToolsListChanged())` arrives as a stamped `notifications/tools/list_changed`; **the app is constructed with `request_timeout=3` and the stream is still alive and still delivering at t > 8s** — the regression test for measured spike 2, which fails on today's code; the same request with `Accept: application/json` only returns `406`; and closing the client stream ends the subscription server-side — asserted **observably**, not by reading the SDK-private `ListenHandler._streams`: construct the app with `max_subscriptions=1`, open a subscription, close the client stream, then open a second subscription and require it to be **acked**. If the server had not released the first slot the second is rejected before its ack, so this proves the release through public wire behaviour and cannot false-red on an SDK rename (EC-P3B-2's HTTP client-close half). **Required test-function names, selected by `-k` in the acceptance commands**: `test_timeout_exemption_keeps_stream_alive` and `test_client_close_ends_subscription` | `uv run pytest tests/mcp2x/test_listen_over_http.py -q` |
 | SL-4.3 | impl | SL-4.2 | `src/pmcp/transport/http.py` | — | — |
 | SL-4.4 | verify | SL-4.3 | `src/pmcp/transport/http.py`, `tests/mcp2x/test_get_retirement.py`, `tests/mcp2x/test_listen_over_http.py` | all SL-4 tests | `uv run pytest tests/mcp2x/test_get_retirement.py tests/mcp2x/test_listen_over_http.py -q && uv run ruff check src/pmcp/transport/http.py && uv run mypy src/pmcp --exclude baml_client && ! rg -n 'keepalive|KEEPALIVE|pre_session_get' src/pmcp/transport/http.py && ! rg -n 'methods=\["GET", "POST", "DELETE"\]' src/pmcp/transport/http.py` |
 
@@ -508,10 +582,10 @@ property of the endpoint and the docstring must say GET is not served and point 
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-5.1 | test | — | `tests/runtime/harness.py`, `tests/runtime/test_harness.py` | The new `listen_stream(base_url, *, notifications, timeout)` context manager: yields an object with `next_frame(timeout)` returning the next decoded `data:` payload (skipping `: ping` comment lines) and `close()`; asserted against the harness's own `gateway_on_spare_port` fixture by opening a subscription and receiving the ack. **Plus a new `booted_gateway(..., request_timeout: int | None = None)` keyword** that appends `--request-timeout <n>` to the boot command — the flag exists (`src/pmcp/cli.py:232`, also honoured as `PMCP_REQUEST_TIMEOUT` at `:2177-2179`) — asserted by a test that boots with `request_timeout=5` and greps the recorded `BootedGateway.command` for it. `alloc_port()` is reused, never a literal; the fixture never binds `3344`; `booted_gateway`'s existing no-live-gateway tolerance (`live_pid is None` proceeds) is preserved — **assert it, because a hard live-gateway requirement would fail this module on CI** | `uv run pytest tests/runtime/test_harness.py -q` |
-| SL-5.2 | test | SL-5.1 | `tests/runtime/test_subscriptions_e2e.py` | **EC-P3B-4.** Against a `booted_gateway(request_timeout=5)` (spare port, isolated `HOME`/`XDG_CONFIG_HOME`/`--config`/`--project`/`--policy`/`--lock-dir`, cwd inside the throwaway dir): open a listen stream filtered to tools+prompts; then over the *same* deployed `/mcp`, `modern_post` a `tools/call` of `gateway.connect_server` for a second fixture downstream and assert a `notifications/tools/list_changed` arrives on the listen stream within 10s carrying the correct `subscriptionId`; then `gateway.disconnect_server` and assert another arrives; then `gateway.refresh` and assert another — **and the last of these must land more than 12s after the subscription was opened**, so the whole module doubles as the deployed-wire regression for the `request_timeout` truncation (it fails on today's code, where the stream dies at 5s). Assert throughout that **no** `notifications/resources/list_changed` frame ever arrives (it was not requested). No test in this module calls `note_*`, `flush`, or `bus.publish` — the mutation is the only trigger | `uv run pytest tests/runtime/test_subscriptions_e2e.py -q` |
+| SL-5.1 | test | — | `tests/runtime/harness.py`, `tests/runtime/test_harness.py` | The new `listen_stream(base_url, *, notifications, timeout)` context manager: yields an object with `next_frame(timeout)` returning the next decoded `data:` payload (skipping `: ping` comment lines) and `close()`; asserted against the harness's own `gateway_on_spare_port` fixture by opening a subscription and receiving the ack. **Plus `RT_FIXTURE_SRC` gains a resource** via `@mcp.resource(...)` (verified present on `MCPServer` in 2.0.0 alongside `.tool()` and `.prompt()`), because EC-P3B-4 must prove resource delivery and the fixture exposes only a tool and a prompt today. The addition is purely additive; SL-5.6 re-runs P2's `test_wire_handshake_era.py` / `test_wire_modern_era.py` to confirm their `resources/list` assertions still hold. **Plus a new `booted_gateway(..., request_timeout: int | None = None)` keyword** that appends `--request-timeout <n>` to the boot command — the flag exists (`src/pmcp/cli.py:232`, also honoured as `PMCP_REQUEST_TIMEOUT` at `:2177-2179`) — asserted by a test that boots with `request_timeout=5` and greps the recorded `BootedGateway.command` for it. `alloc_port()` is reused, never a literal; the fixture never binds `3344`; `booted_gateway`'s existing no-live-gateway tolerance (`live_pid is None` proceeds) is preserved — **assert it, because a hard live-gateway requirement would fail this module on CI** | `uv run pytest tests/runtime/test_harness.py -q` |
+| SL-5.2 | test | SL-5.1 | `tests/runtime/test_subscriptions_e2e.py` | **EC-P3B-4, and it must cover all three kinds — the roadmap says the mutation causes the client to receive "the *corresponding*" `notifications/*/list_changed`, so a tools-only assertion lets a broken prompts or resources publisher ship.** Against a `booted_gateway(request_timeout=5)` (spare port, isolated `HOME`/`XDG_CONFIG_HOME`/`--config`/`--project`/`--policy`/`--lock-dir`, cwd inside the throwaway dir): open **subscription A** filtered to tools+resources+prompts; then over the *same* deployed `/mcp`, `modern_post` a `tools/call` of `gateway.connect_server` for a second fixture downstream (the `RT_FIXTURE_SRC` server, which after SL-5.1 exposes a tool, a prompt **and** a resource) and assert that **all three** of `notifications/tools/list_changed`, `notifications/prompts/list_changed` and `notifications/resources/list_changed` arrive on A within 10s, each carrying A's `subscriptionId`; then `gateway.disconnect_server` and assert all three arrive again; then `gateway.refresh` and assert the same — **and the last of these must land more than 12s after A was opened**, so the module doubles as the deployed-wire regression for the `request_timeout` truncation (it fails on today's code, where the stream dies at 5s). The filter-negative is a **separate subscription B**, opened concurrently with `toolsListChanged` only, on which a `tools/list_changed` must arrive and a `resources/list_changed` must **never** arrive — kept separate deliberately, because folding the negative into A would make "resources never arrives" the only resource coverage in the phase and would then pass against a completely broken resource publisher. No test in this module calls `note_*`, `flush`, or `bus.publish` — the mutation is the only trigger | `uv run pytest tests/runtime/test_subscriptions_e2e.py -q` |
 | SL-5.3 | test | SL-5.1 | `tests/runtime/test_get_retired.py` | **EC-P3B-3 over the deployed wire.** Against the same booted gateway: `GET /mcp` (with and without `Accept: text/event-stream`, with and without an `mcp-session-id` header) returns `405` within 5s — the timeout is the assertion that it does not hang, which is what today's code does; the `Allow` response header contains `POST`; `GET /health` returns `200` with a JSON body whose `version` matches `pmcp.__version__`; `GET /metrics` returns `200` with `text/plain` and a `pmcp_requests_total` line; and a POST `tools/call` still succeeds on the same process, so the route change did not break the live method path | `uv run pytest tests/runtime/test_get_retired.py -q` |
-| SL-5.4 | test | SL-5.1 | `tests/runtime/test_publisher_coverage.py` | The AST honesty guard: parse `src/pmcp/client/manager.py`, find every `ast.Assign`/`ast.AugAssign`/`ast.Subscript`-store and every `.pop(`/`.clear(` call whose target resolves to `self._tools`, `self._resources` or `self._prompts`, and assert the enclosing `FunctionDef` name is in `{"_index_tools", "_index_resources", "_index_prompts", "_remove_server_indexes"}` — and that each of those four bodies contains a call to a `note_*` attribute of `self._catalog_events`. A new mutation path added anywhere else fails this test with the name of the offending function. This is the mechanism that keeps EC-P3B-4 true after the phase, and it is modelled on P5's `test_credential_predicate_guard.py` | `uv run pytest tests/runtime/test_publisher_coverage.py -q` |
+| SL-5.4 | test | SL-5.1 | `tests/runtime/test_publisher_coverage.py` | The AST honesty guard: parse `src/pmcp/client/manager.py`, find every `ast.Assign`/`ast.AnnAssign`/`ast.AugAssign`/`ast.Subscript`-store and every `.pop(`/`.clear(` call whose target resolves to `self._tools`, `self._resources` or `self._prompts`, and assert the enclosing `FunctionDef` name is in the **publishing** set `{"_index_tools", "_index_resources", "_index_prompts", "_remove_server_indexes", "_disconnect_all_unlocked"}` **or** the single **exempt** name `"__init__"` — and that each of the five publishing bodies contains a call to a `note_*` attribute of `self._catalog_events`. The two sets are separate constants in the test with a comment on the exemption, so widening the allowlist to silence a failure is a visible edit rather than an invisible one. `ast.AnnAssign` is required or `__init__`'s annotated `self._tools: dict[...] = {}` at `:497-499` is not matched at all and the exemption would be vacuous. A new mutation path added anywhere else fails this test with the name of the offending function. This is the mechanism that keeps EC-P3B-4 true after the phase, and it is modelled on P5's `test_credential_predicate_guard.py` | `uv run pytest tests/runtime/test_publisher_coverage.py -q` |
 | SL-5.5 | impl | SL-5.4 | `tests/test_http_dos.py`, `tests/test_http_transport.py`, `tests/test_transport_http.py` | — | — |
 | SL-5.6 | impl | SL-5.5 | `tests/test_*.py`, `tests/conftest.py`, `tests/__init__.py`, `tests/fixtures/**` | — | — |
 | SL-5.7 | verify | SL-5.6 | `tests/**` | full suite | `uv run pytest tests/ -q`, then `uv run pytest tests/runtime/ -q -rs > /tmp/p3brt.txt; ! grep -qE '^SKIPPED' /tmp/p3brt.txt`, then `uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv run mypy src/pmcp --exclude baml_client` |
@@ -585,10 +659,21 @@ lane's ownership rather than nowhere.
   `adopt_process`), where patching eight of nine looks exactly like patching the class, and
   where `gateway.refresh` — which routes through `disconnect_server` + `connect_all` rather
   than `ClientManager.refresh` — is precisely the one an enumeration written from the roadmap
-  would miss. Instead, the four sync mutators call `note_*`, the sink schedules its own drain,
+  would miss. Instead, the five sync mutators call `note_*`, the sink schedules its own drain,
   and `tests/runtime/test_publisher_coverage.py` fails if a write to `_tools`/`_resources`/
-  `_prompts` ever appears outside those four. Coverage becomes structural rather than
-  enumerated.
+  `_prompts` ever appears outside those five (plus the exempt `__init__`). Coverage becomes
+  structural rather than enumerated.
+  **Two corrections from board review, both of which would have shipped silently broken.**
+  (a) An earlier draft of this plan said "exactly four mutators"; there are six write sites.
+  `_disconnect_all_unlocked` clears all three catalogs directly at `:2027-2029`, so
+  `ClientManager.refresh([])` would have emptied every catalog and published nothing — the
+  listener-with-no-publishers failure hiding *inside* the guard meant to detect it. The fix is
+  to make it publish, **not** to widen the allowlist. (b) The self-scheduling drain as first
+  specified had a lost-wakeup race (a `note_*` landing during an in-flight `publish` sees a
+  live drain and does not re-arm); IF-0-P3B-1 now freezes the drain-loop shape and SL-3.1
+  carries a deterministic regression for it. Both are recorded here because the shape of the
+  error — "the mechanism that guarantees coverage is itself the thing with the coverage gap" —
+  is the one this phase is most exposed to.
 - **Decision 3 — the anyio `disconnect_all` debt is DEFERRED again, deliberately.** The
   roadmap points at P3B as where this gets addressed; this plan declines, with reasons rather
   than silence. (1) **No production exposure.** The reproduction (Phase 2 amendment 8, recipe
@@ -768,8 +853,9 @@ lane's ownership rather than nowhere.
       later delivery; `GatewayServer.shutdown()` emits `SubscriptionsListenResult` with
       `resultType == "complete"` as the final frame before the stream ends) and by
       `uv run pytest tests/mcp2x/test_listen_over_http.py -q -k client_close` for the HTTP
-      half (closing the client stream drops the server-side subscription within 2s, asserted
-      on the handler's own stream set).
+      half (with `max_subscriptions=1`, closing the client stream frees the slot so a
+      second subscription is acked — an observable proof rather than an assertion on the
+      SDK's private stream set).
 - [ ] EC-P3B-3 — proven by `uv run pytest tests/runtime/test_get_retired.py -q`: against a
       booted gateway on a spare port, `GET /mcp` returns `405` with `Allow` containing `POST`
       **within a 5s bound** — the bound is the assertion that it no longer hangs, which is what
@@ -779,15 +865,23 @@ lane's ownership rather than nowhere.
       `curl --max-time`. Unit-level route-table coverage is
       `uv run pytest tests/mcp2x/test_get_retirement.py -q`.
 - [ ] EC-P3B-4 — proven by `uv run pytest tests/runtime/test_subscriptions_e2e.py -q`: with a
-      subscription open on a booted gateway's `/mcp`, a modern-envelope `tools/call` of
-      `gateway.connect_server`, then `gateway.disconnect_server`, then `gateway.refresh`, each
-      delivers a `notifications/tools/list_changed` on that stream stamped with the correct
-      `subscriptionId`, while a `notifications/resources/list_changed` never arrives because it
-      was not requested. No test in that module calls `note_*`, `flush`, or `bus.publish` — the
+      subscription (A) open on a booted gateway's `/mcp` filtered to all three kinds, a
+      modern-envelope `tools/call` of `gateway.connect_server`, then
+      `gateway.disconnect_server`, then `gateway.refresh`, each delivers **all three** of
+      `notifications/tools/list_changed`, `notifications/prompts/list_changed` and
+      `notifications/resources/list_changed` on A stamped with A's `subscriptionId` — the
+      roadmap says the mutation causes the client to receive "the **corresponding**"
+      notification, so a tools-only assertion would let a broken prompts or resources publisher
+      ship the phase. The filter-negative rides a **separate** subscription B (tools only, on
+      which resources must never arrive), so that "resources never arrives" is not also serving
+      as the phase's only resource coverage. Also proven at the unit level by
+      `uv run pytest tests/mcp2x/test_catalog_publishers.py -q`, whose `refresh([])` case
+      requires all three events from the `_disconnect_all_unlocked` clear path. No test in
+      either module calls `note_*`, `flush`, or `bus.publish` — the
       catalog mutation is the only trigger, which is what the criterion requires. Kept honest
       after the phase by `uv run pytest tests/runtime/test_publisher_coverage.py -q`, whose AST
-      guard fails if a write to `_tools`/`_resources`/`_prompts` appears outside the four
-      mutators that publish. **And the stream must be proven un-truncated, at two levels**:
+      guard fails if a write to `_tools`/`_resources`/`_prompts` appears outside the five
+      mutators that publish (with `__init__` the one named exemption). **And the stream must be proven un-truncated, at two levels**:
       SL-5.2 boots via `booted_gateway(request_timeout=5)` (the flag exists at
       `src/pmcp/cli.py:232`) and lands its last mutation-driven notification more than 12s
       into the subscription — that is V4b; and `uv run pytest
