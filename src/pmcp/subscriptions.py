@@ -123,30 +123,48 @@ class BusCatalogEventSink:
             # event because it loops until `_pending` is empty rather than
             # publishing one snapshot and exiting (see module docstring).
             return
+        self._start_drain(loop)
+
+    def _start_drain(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Mark a drain live and schedule it. Sole setter of `_draining=True`."""
         self._draining = True
         task = loop.create_task(self._drain())
         self._drain_tasks.add(task)
-        task.add_done_callback(self._drain_tasks.discard)
+        task.add_done_callback(self._on_drain_done)
+
+    def _on_drain_done(self, task: asyncio.Task[None]) -> None:
+        """Clear `_draining` and re-arm if work remains. Sole clearer of the flag.
+
+        This lives in the done-callback rather than in a `finally` inside
+        `_drain` because a task cancelled *before it starts* never enters its
+        body at all -- no `finally` can run, and the flag would stay set
+        forever, wedging every later `note_*`. The callback fires for every
+        terminal state: normal return, exception, cancellation mid-run, and
+        cancellation before the first step.
+
+        Re-arming matters as much as clearing. Events noted *while* a drain
+        was in flight stay in `_pending`; if that drain is then cancelled,
+        nothing is scheduled to publish them and they would sit there until
+        some unrelated later mutation happened to arm a drain. A cancellation
+        must delay delivery, never strand it.
+        """
+        self._drain_tasks.discard(task)
+        self._draining = False
+        if not self._pending:
+            return
+        try:
+            self._start_drain(asyncio.get_running_loop())
+        except RuntimeError:  # pragma: no cover - loop already closing
+            pass
 
     async def _drain(self) -> None:
-        """Self-scheduled drain: yield once, then loop until pending is empty."""
+        """Self-scheduled drain: yield once, then loop until pending is empty.
+
+        Deliberately does not touch `_draining` -- `_on_drain_done` owns it,
+        which is what covers the cancelled-before-first-step path.
+        """
         await asyncio.sleep(0)
-        try:
-            await self._drain_pending()
-        finally:
-            # `finally`, not a bare trailing statement: if this task is
-            # cancelled mid-drain, an un-cleared `_draining` would leave the
-            # sink permanently wedged -- every later `note_*` would see a
-            # live drain, decline to re-arm, and silently never publish
-            # again. That is the lost-wakeup failure this class exists to
-            # prevent, re-entering through cancellation instead of through
-            # the snapshot-and-exit shape.
-            #
-            # No `await` between `_drain_pending` finding `_pending` empty
-            # (its `while` test failing) and this clear -- required so a
-            # `note_*` cannot land in a gap and go unobserved by both this
-            # drain and the next `note_*`.
-            self._draining = False
+        await self._drain_pending()
 
     async def flush(self) -> None:
         """Drain any pending events immediately, in tools/resources/prompts order.

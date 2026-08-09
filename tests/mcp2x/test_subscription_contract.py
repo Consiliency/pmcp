@@ -380,6 +380,70 @@ if __name__ == "__main__":
 
 
 @pytest.mark.asyncio
+async def test_cancellation_before_the_drain_starts_does_not_wedge_the_sink() -> None:
+    """Cancelling during `_drain`'s initial yield must still clear the flag.
+
+    The first fix put `await asyncio.sleep(0)` *outside* the `try`, so a
+    cancellation landing on that yield skipped the `finally` entirely and
+    left `_draining` True forever with the event still pending.
+    """
+    bus = _GatedBus()
+    sink = BusCatalogEventSink(bus)
+
+    bus.gate.set()  # publish should not block once a drain finally runs
+    sink.note_tools_changed()
+    # Cancel before the task has run at all -- it is still at `sleep(0)`.
+    for task in list(sink._drain_tasks):
+        task.cancel()
+    await asyncio.gather(*sink._drain_tasks, return_exceptions=True)
+
+    # The property that matters is delivery, not the flag: the sink must
+    # re-arm itself and publish the still-pending event with no further
+    # `note_*` to prod it. (`_draining` may legitimately be True right here
+    # -- that is the *replacement* drain being live, not a wedge.)
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if any(isinstance(e, ToolsListChanged) for e in bus.published):
+            break
+    assert any(isinstance(e, ToolsListChanged) for e in bus.published), (
+        f"pre-start cancellation stranded the event: {bus.published}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_event_noted_during_a_cancelled_drain_is_not_stranded() -> None:
+    """A note landing while a drain is in flight must still be delivered
+    even if that drain is then cancelled -- **without** a later unrelated
+    note to re-arm the sink.
+
+    The earlier version of this test issued a fresh note after cancelling,
+    which re-armed the drain and masked the stranding it claimed to rule
+    out. Nothing here notes anything after the cancellation.
+    """
+    bus = _GatedBus()
+    sink = BusCatalogEventSink(bus)
+
+    sink.note_tools_changed()
+    await bus.entered.wait()  # drain suspended inside publish
+
+    sink.note_prompts_changed()  # lands while the drain is in flight
+    for task in list(sink._drain_tasks):
+        task.cancel()
+    bus.gate.set()
+    await asyncio.gather(*sink._drain_tasks, return_exceptions=True)
+
+    # No further note_* -- the re-arm must come from the sink itself.
+    for _ in range(100):
+        await asyncio.sleep(0.01)
+        if any(isinstance(e, PromptsListChanged) for e in bus.published):
+            break
+    assert any(isinstance(e, PromptsListChanged) for e in bus.published), (
+        f"event noted during a cancelled drain was stranded: {bus.published}"
+    )
+    assert sink._draining is False
+
+
+@pytest.mark.asyncio
 async def test_cancelled_drain_does_not_wedge_the_sink() -> None:
     """A drain cancelled mid-publish must still clear `_draining`.
 

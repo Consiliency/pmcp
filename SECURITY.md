@@ -4,9 +4,15 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.14.x  | ✅ Active  |
-| 1.13.x  | ✅ Maintenance |
-| < 1.13  | ❌ No longer supported |
+| 2.0.x   | ✅ Active  |
+| 1.22.x  | ✅ Security fixes only |
+| < 1.22  | ❌ No longer supported |
+
+2.0.0 is a breaking release: `GET /mcp` is retired (405) and the
+`PMCP_KEEPALIVE_MAX_SECONDS` lifetime cap is removed with no replacement by
+design. See the CHANGELOG before upgrading. 1.22.x receives security fixes
+only; it is the last 1.x line and is pinned to `mcp` 1.x, which no longer
+receives upstream releases.
 
 ## Threat Model
 
