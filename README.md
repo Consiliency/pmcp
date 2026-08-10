@@ -5,26 +5,30 @@
 [![PyPI version](https://badge.fury.io/py/pmcp.svg)](https://pypi.org/project/pmcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-**Progressive disclosure for MCP** - Minimal context bloat with on-demand tool discovery and dynamic server provisioning.
+**A gateway that lets your AI coding assistant use dozens of external tools without loading them all up front.**
 
-## The Problem
+PMCP sits between your assistant (Claude Code, Codex, and others) and the services it can plug into — GitHub, Jira, databases, 90+ more. Instead of loading every tool's full schema before you've asked a question, it offers a short menu first and fetches the detailed schema only when a tool is actually used.
 
-When Claude Code connects directly to multiple MCP servers (GitHub, Jira, DB, etc.), it loads **all** tool schemas into context. This causes:
-- **Context bloat**: Dozens of tool definitions consume tokens before you even ask a question
-- **Static configuration**: Requires Claude Code restart to see new servers
-- **No progressive disclosure**: Full schemas shown even when not needed
+## Why it exists
 
-Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a key challenge with MCP tooling.
+Assistants reach external services through **MCP** (Model Context Protocol) — a common interface for an AI to talk to other software. When an assistant connects to a dozen MCP servers directly, it loads *all* of their tool definitions into context at once.
 
-## The Solution
+Context is limited and metered: every tool definition costs tokens and crowds out room for the actual work. Loading 50+ tools you may never call is slow and expensive, and adding a new service usually means restarting the assistant. Anthropic has [highlighted context bloat](https://www.anthropic.com/news) as a key challenge with MCP tooling.
 
-**PMCP** acts as a single MCP server that Claude Code connects to. Instead of exposing all downstream tools, it provides:
+PMCP is the single connection point that keeps this compact and on-demand.
 
-- **26 stable meta-tools** (not the 50+ underlying tools)
-- **Lazy by default**: downstream servers are available on demand and only eager-start when listed in `autoStart`
-- **Dynamically provisions** new servers on-demand from a manifest of 90+
-- **Progressive disclosure**: Compact capability cards first, detailed schemas only on request
-- **Policy enforcement**: Output size caps and optional secret redaction
+## Who it's for
+
+Developers and teams running AI coding assistants with many connected tools — especially anyone hitting "too many tools" or context-full limits.
+
+## What you get
+
+- **Lower token cost** — the assistant sees a compact capability card, not 50+ full schemas, before doing real work.
+- **Load tools only when needed** — downstream servers stay dormant until first use ("lazy by default"), and eager-start only when listed in `autoStart`.
+- **Add tools without restarting** — provision a new server on demand from a manifest of 90+.
+- **One stable connection** — your assistant sees ~26 steady meta-tools instead of a shifting set of many.
+- **Guardrails built in** — output size caps and optional secret redaction.
+- **Works out of the box** — core capability matching needs no API key.
 
 ## Quick Start
 
