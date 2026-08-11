@@ -65,6 +65,66 @@ class TestHelperFunctions:
         """Test medium risk hint inference (default)."""
         assert _infer_risk_hint("process_item", "Process an item") == RiskHint.MEDIUM
 
+    def test_risk_words_match_on_word_boundaries_not_substrings(self) -> None:
+        """A risk word inside a longer word must not count.
+
+        Observed against a real server: context7's `resolve-library-id` is a
+        read-only documentation lookup, and its description contains "Source
+        Reputation". Plain substring matching found "put" inside "reputation"
+        and classified the tool HIGH, which then told users through
+        `gateway.describe` that it "may modify data or have side effects".
+        Long descriptions make that near-certain for almost any tool.
+        """
+        assert (
+            _infer_risk_hint(
+                "resolve-library-id",
+                "Each result includes Source Reputation and Benchmark Score.",
+            )
+            != RiskHint.HIGH
+        )
+        # A few more of the same shape, so this is not a one-word fix.
+        assert _infer_risk_hint("summarize", "Produces a runnable summary") != (
+            RiskHint.HIGH
+        )
+        assert _infer_risk_hint("inspect", "Reads the input schema") != RiskHint.HIGH
+        # Genuine whole-word matches must still be caught.
+        assert _infer_risk_hint("delete_file", "Delete a file") == RiskHint.HIGH
+        assert _infer_risk_hint("post_message", "Post a message") == RiskHint.HIGH
+
+    def test_server_tool_annotations_win_over_the_keyword_guess(self) -> None:
+        """MCP `ToolAnnotations` are authoritative; our heuristic is a fallback.
+
+        A server declaring `readOnlyHint`/`destructiveHint` knows what its own
+        tool does. Guessing from English prose and overriding that declaration
+        is how a read-only lookup ends up labelled destructive.
+        """
+        # readOnly wins even when the prose screams high risk.
+        assert (
+            _infer_risk_hint(
+                "delete_everything",
+                "Delete and remove and drop all data",
+                {"readOnlyHint": True},
+            )
+            == RiskHint.LOW
+        )
+        # destructive wins even when the prose looks safe.
+        assert (
+            _infer_risk_hint("list_items", "List all items", {"destructiveHint": True})
+            == RiskHint.HIGH
+        )
+        # Both set: the unsafe reading is the safe default.
+        assert (
+            _infer_risk_hint(
+                "thing", "does a thing", {"readOnlyHint": True, "destructiveHint": True}
+            )
+            == RiskHint.HIGH
+        )
+        # Absent or unrelated annotations fall through to the heuristic.
+        assert _infer_risk_hint("read_file", "Read a file", None) == RiskHint.LOW
+        assert (
+            _infer_risk_hint("read_file", "Read a file", {"title": "x"}) == RiskHint.LOW
+        )
+
     def test_extract_tags(self) -> None:
         """Test tag extraction."""
         tags = _extract_tags("github", "create_issue", "Create a GitHub issue")

@@ -9,6 +9,7 @@ import logging
 import os
 from pathlib import Path
 import random
+import re
 import signal
 import string
 import time
@@ -319,34 +320,57 @@ def _generate_revision_id() -> str:
     return f"rev-{int(time.time() * 1000)}-{suffix}"
 
 
-def _infer_risk_hint(tool_name: str, description: str) -> RiskHint:
-    """Infer risk level from tool name/description."""
-    low_risk_patterns = ["read", "get", "list", "search", "query", "fetch", "describe"]
-    high_risk_patterns = [
-        "delete",
-        "remove",
-        "drop",
-        "execute",
-        "run",
-        "write",
-        "create",
-        "update",
-        "modify",
-        "send",
-        "post",
-        "put",
-    ]
+_LOW_RISK_WORDS = ("read", "get", "list", "search", "query", "fetch", "describe")
+_HIGH_RISK_WORDS = (
+    "delete",
+    "remove",
+    "drop",
+    "execute",
+    "run",
+    "write",
+    "create",
+    "update",
+    "modify",
+    "send",
+    "post",
+    "put",
+)
 
-    combined = f"{tool_name} {description}".lower()
+# Word-boundary, not substring. Plain `in` matching against a whole description
+# is why `resolve-library-id` -- a read-only docs lookup -- was classified HIGH
+# and told users it "may modify data": its description says "Source Reputation",
+# and "reputation" contains "put". Long descriptions make that near-certain for
+# almost any tool.
+_LOW_RISK_RE = re.compile(rf"\b({'|'.join(_LOW_RISK_WORDS)})\b")
+_HIGH_RISK_RE = re.compile(rf"\b({'|'.join(_HIGH_RISK_WORDS)})\b")
 
-    for pattern in high_risk_patterns:
-        if pattern in combined:
+
+def _infer_risk_hint(
+    tool_name: str,
+    description: str,
+    annotations: dict[str, Any] | None = None,
+) -> RiskHint:
+    """Infer risk level, preferring the server's own declaration.
+
+    MCP defines `ToolAnnotations` (`readOnlyHint`, `destructiveHint`) precisely
+    so a server can state this authoritatively. Those win over any guess we
+    make from the tool's prose: the server knows what its tool does and we are
+    pattern-matching English. The keyword heuristic below is only a fallback
+    for servers that declare nothing.
+    """
+    if annotations:
+        # destructive wins over read-only if a server sets both, since the
+        # unsafe reading is the safe default.
+        if annotations.get("destructiveHint") is True:
             return RiskHint.HIGH
-
-    for pattern in low_risk_patterns:
-        if pattern in combined:
+        if annotations.get("readOnlyHint") is True:
             return RiskHint.LOW
 
+    combined = f"{tool_name} {description}".lower()
+    if _HIGH_RISK_RE.search(combined):
+        return RiskHint.HIGH
+    if _LOW_RISK_RE.search(combined):
+        return RiskHint.LOW
     return RiskHint.MEDIUM
 
 
@@ -1180,7 +1204,9 @@ class ClientManager:
                 schema_dialect=_schema_dialect(input_schema, output_schema),
                 raw_metadata=_raw_metadata(tool, known_fields),
                 tags=_extract_tags(name, tool_name, description),
-                risk_hint=_infer_risk_hint(tool_name, description),
+                risk_hint=_infer_risk_hint(
+                    tool_name, description, tool.get("annotations")
+                ),
             )
 
             self._tools[tool_id] = tool_info

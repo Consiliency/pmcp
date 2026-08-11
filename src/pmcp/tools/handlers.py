@@ -1724,7 +1724,13 @@ class GatewayTools:
             invoke_template=invoke_template,
             code_snippet=code_snippet,
             update_warning=update_warning,
-            feedback_hint=self._feedback_hint(),
+            # No feedback hint on a SUCCESSFUL describe. `_feedback_hint()`
+            # opens with "Technical failure detected", which is false here and
+            # was reaching every client on every successful describe. The
+            # convention is already correct on invoke's success path (it passes
+            # None); this site just did not follow it. Describe's own error
+            # paths below still emit it.
+            feedback_hint=None,
         )
 
     async def invoke(self, input_data: dict[str, Any]) -> InvokeOutput:
