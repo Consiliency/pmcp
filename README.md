@@ -1,5 +1,7 @@
 # PMCP - Progressive MCP
 
+[![MCP Toplist](https://mcptoplist.com/badge/glama%2FConsiliency%2Fpmcp.svg)](https://mcptoplist.com/server/glama%2FConsiliency%2Fpmcp)
+
 <!-- mcp-name: io.github.ViperJuice/pmcp -->
 
 [![PyPI version](https://badge.fury.io/py/pmcp.svg)](https://pypi.org/project/pmcp/)
