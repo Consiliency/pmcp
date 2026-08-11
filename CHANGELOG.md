@@ -7,7 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.1] - 2026-08-11
+
 ### Fixed
+- `gateway.describe` no longer claims a technical failure on success. The
+  feedback hint it emitted opens with "Technical failure detected", and it
+  was attached unconditionally, so every *successful* describe told the
+  client something had gone wrong. `invoke`'s success path already passed
+  none; this site did not follow that convention. All 25 hint call sites
+  were audited -- the other 24 are genuine failure paths and are unchanged.
+- Tool risk classification now honours the server's own MCP
+  `ToolAnnotations`. A tool declaring `readOnlyHint` / `destructiveHint`
+  states this authoritatively; PMCP was overriding that with a keyword
+  guess. The fallback heuristic also matched risk words as *substrings*
+  against the whole description, so context7's read-only
+  `resolve-library-id` was classified high-risk and reported as one that
+  "may modify data" -- because its description says "Source Reputation",
+  and "reputation" contains "put". The fallback now matches on word
+  boundaries. Risk is advisory (display and `catalog_search` filtering);
+  policy does not gate on it, so this is not a security change.
+- A gateway with no downstream server connected no longer tells clients it
+  has no tools. Downstream servers are lazy unless listed in `autoStart`,
+  so "MCP Gateway: No tools currently available" was what a fresh gateway
+  sent *every* client on connect, while its own ~26 meta-tools were
+  available and were the route to everything else. The message now says no
+  downstream server is connected yet, that this is normal, and names the
+  tools that do work. Both the cached and template paths share one helper
+  so the first impression cannot differ by cache state.
 - Remote downstream transports (SSE, streamable HTTP) are now entered and
   closed in a dedicated per-client owner task, fixing an anyio cancel-scope
   task-ownership violation during teardown: the exit stack used to be

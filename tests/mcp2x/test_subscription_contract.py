@@ -362,17 +362,32 @@ def test_changelog_2_0_0_block_leads_with_removed_and_names_the_breaking_change(
 
 
 def test_pyproject_and_init_version_strings_agree_with_the_changelog_heading() -> None:
+    """All three version sites agree -- whatever the current version is.
+
+    This originally pinned the literal "2.0.0", which made it a test that
+    fails on every future release rather than a guard on the invariant it
+    exists to protect. P1's drift test already pins `pyproject.toml` against
+    `src/pmcp/__init__.py`; nothing pins either against the CHANGELOG, which
+    is the gap that let a release ship a heading its sources disagreed with.
+    So: read the version, don't assert it.
+    """
     pyproject_text = (REPO_ROOT / "pyproject.toml").read_text()
     init_text = (REPO_ROOT / "src" / "pmcp" / "__init__.py").read_text()
 
-    assert re.search(r'^version = "2\.0\.0"', pyproject_text, re.MULTILINE), (
-        pyproject_text
-    )
-    assert re.search(r'^__version__ = "2\.0\.0"', init_text, re.MULTILINE), init_text
+    pyproject_match = re.search(r'^version = "([^"]+)"', pyproject_text, re.MULTILINE)
+    assert pyproject_match, pyproject_text
+    version = pyproject_match.group(1)
 
-    # And the [2.0.0] block itself must exist (redundant with the test
-    # above, but this is the one place all three sites are checked together).
-    _changelog_2_0_0_block()
+    assert re.search(
+        rf'^__version__ = "{re.escape(version)}"', init_text, re.MULTILINE
+    ), f"pyproject.toml says {version!r}; src/pmcp/__init__.py disagrees:\n{init_text}"
+
+    changelog_text = (REPO_ROOT / "CHANGELOG.md").read_text()
+    assert re.search(rf"^## \[{re.escape(version)}\]", changelog_text, re.MULTILINE), (
+        f"sources say {version!r} but CHANGELOG.md has no '## [{version}]' heading -- "
+        "a release whose notes and sources disagree reports the wrong version from "
+        "/health and the pmcp/{version} User-Agent"
+    )
 
 
 if __name__ == "__main__":
