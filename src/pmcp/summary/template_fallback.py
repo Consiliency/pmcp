@@ -44,6 +44,35 @@ CAPABILITY_KEYWORDS = {
 }
 
 
+def _no_downstream_tools_summary(provisionable_categories: str | None = None) -> str:
+    """Instructions when no downstream server has been indexed yet.
+
+    This is the first thing every client is told on connect, and with
+    `autoStart` empty -- the default, since downstream servers are lazy --
+    it is what a fresh gateway always sends. It previously read "No tools
+    currently available", which is wrong in the way that matters: the
+    gateway's own meta-tools are available, and they are how a client
+    reaches everything else. `gateway.refresh` was also the wrong next
+    step; it re-reads configuration rather than surfacing what is already
+    reachable on demand.
+    """
+    lines = [
+        "MCP Gateway: no downstream server is connected yet.",
+        "",
+        "This is normal. Downstream servers are lazy by default and start on "
+        "first use; the gateway's own tools are available right now and are "
+        "how you reach them:",
+        "  - gateway.catalog_search - find a capability across all known servers",
+        "  - gateway.describe - full schema for one tool before calling it",
+        "  - gateway.invoke - call a downstream tool (connects its server if needed)",
+        "  - gateway.request_capability - describe a need in plain language; "
+        "provisions a server if one is missing",
+    ]
+    if provisionable_categories:
+        lines += ["", f"Provisionable categories: {provisionable_categories}"]
+    return "\n".join(lines)
+
+
 def extract_capabilities(tools: list[ToolInfo]) -> list[str]:
     """Extract capability keywords from tool names and descriptions."""
     text = " ".join(f"{t.tool_name} {t.short_description}".lower() for t in tools)
@@ -100,10 +129,7 @@ def template_summary(
         provisionable_categories: If set, appended after default L0 trigger patterns
     """
     if not tools:
-        return (
-            "MCP Gateway: No tools currently available.\n"
-            "Use gateway.refresh to reload server configurations."
-        )
+        return _no_downstream_tools_summary(provisionable_categories)
 
     by_server = group_by_server(tools)
 

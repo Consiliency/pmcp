@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import pytest
 
 from pmcp.summary.template_fallback import (
@@ -132,9 +133,39 @@ class TestTemplateSummary:
         assert "matching CLI hints" in summary
 
     def test_handles_empty_tools(self) -> None:
+        """No downstream tools is the DEFAULT state, not an error state.
+
+        Downstream servers are lazy unless listed in `autoStart`, so this is
+        what a fresh gateway sends every client on connect. It must not claim
+        the gateway has nothing to offer -- the meta-tools are available and
+        are the route to everything else.
+        """
         summary = template_summary([])
-        assert "No tools currently available" in summary
-        assert "gateway.refresh" in summary
+        assert "no downstream server is connected yet" in summary
+        # Names the tools that DO work right now, and how to reach the rest.
+        assert "gateway.catalog_search" in summary
+        assert "gateway.invoke" in summary
+        assert "gateway.request_capability" in summary
+        # Must not tell the reader there is nothing here, nor point them at
+        # gateway.refresh, which re-reads config rather than surfacing what
+        # is already reachable on demand.
+        assert "No tools currently available" not in summary
+        assert "gateway.refresh" not in summary
+
+    def test_empty_tools_summary_matches_across_both_paths(self) -> None:
+        """The cached and template paths must give the same first impression.
+
+        Both are reachable depending on whether a descriptions cache exists;
+        a client should not be told different things about the gateway based
+        on cache state.
+        """
+        from pmcp.summary.generator import generate_capability_summary
+
+        template = template_summary([], provisionable_categories="browser, search")
+        generated = asyncio.run(
+            generate_capability_summary([], provisionable_categories="browser, search")
+        )
+        assert template == generated
 
     def test_includes_tool_counts(self) -> None:
         tools = [
@@ -186,7 +217,9 @@ class TestGenerateCapabilitySummary:
     @pytest.mark.asyncio
     async def test_handles_empty_tools(self) -> None:
         summary = await generate_capability_summary([])
-        assert "No tools" in summary
+        assert "no downstream server is connected yet" in summary
+        assert "gateway.catalog_search" in summary
+        assert "No tools" not in summary
 
     @pytest.mark.asyncio
     async def test_falls_back_to_template_if_llm_unavailable(self) -> None:
