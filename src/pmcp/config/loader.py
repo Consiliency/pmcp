@@ -312,6 +312,66 @@ def _read_config_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     return data, None
 
 
+REGISTRY_ALLOW_PRIVATE_CONFIG_KEY = "allowPrivateRegistry"
+
+
+def registry_allow_private_from_config(
+    project_root: Path | None = None,
+    user_config_paths: Sequence[Path] | None = None,
+    custom_config_path: Path | None = None,
+) -> bool | None:
+    """Read the top-level ``allowPrivateRegistry`` flag from the config files.
+
+    The private-registry opt-in was env-var-only (`PMCP_REGISTRY_ALLOW_PRIVATE`),
+    which roadmap v9's PRIVREG criterion specified as "env var + config field"
+    (Consiliency/pmcp#139). This is the config half.
+
+    Precedence matches `load_configs`: project > user > custom, first match
+    wins. Returns ``None`` when no config file states a preference, so the
+    caller can distinguish "not configured" from "configured false" -- the env
+    var only overrides when it is explicitly set, and an explicit ``false``
+    here must not be silently upgraded by an absent env var.
+
+    Deliberately a plain reader rather than module-level state mutated at load
+    time: a process-global toggle is exactly the shape that made
+    `sse_starlette`'s `AppStatus.should_exit` latch so hard to diagnose.
+    """
+    candidates: list[Path] = []
+    if project_root is not None:
+        candidates.append(Path(project_root) / ".mcp.json")
+    candidates.extend(
+        list(user_config_paths)
+        if user_config_paths is not None
+        else default_user_config_paths()
+    )
+    if custom_config_path is not None:
+        candidates.append(Path(custom_config_path))
+
+    for path in candidates:
+        raw, error = _read_config_object(path)
+        if raw is None:
+            if error is not None:
+                logger.warning(
+                    "Ignoring %s while reading %s: %s",
+                    REGISTRY_ALLOW_PRIVATE_CONFIG_KEY,
+                    path,
+                    error,
+                )
+            continue
+        if REGISTRY_ALLOW_PRIVATE_CONFIG_KEY not in raw:
+            continue
+        value = raw[REGISTRY_ALLOW_PRIVATE_CONFIG_KEY]
+        if isinstance(value, bool):
+            return value
+        logger.warning(
+            "Ignoring %s in %s: expected a boolean, got %r",
+            REGISTRY_ALLOW_PRIVATE_CONFIG_KEY,
+            path,
+            value,
+        )
+    return None
+
+
 def _parse_config_or_warn(path: Path) -> McpConfigFile | None:
     """Parse a config file, surfacing a WARNING when it exists but is malformed.
 

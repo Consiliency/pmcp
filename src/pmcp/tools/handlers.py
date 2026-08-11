@@ -31,6 +31,7 @@ from pmcp.auth import (
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
+    registry_allow_private_from_config,
     StartupObservationSnapshot,
     StartupSkipReason,
     build_startup_observation_snapshot,
@@ -2975,7 +2976,16 @@ class GatewayTools:
         cached = load_registry_cache()
         if cached is not None and cached.servers:
             return cached
-        endpoint = effective_registry_endpoint()
+        # The private-registry opt-in has two sources (#139): the env var and
+        # the `allowPrivateRegistry` config field. Resolve the config half here,
+        # where the config paths are known, rather than reaching for global
+        # state inside registry.py.
+        endpoint = effective_registry_endpoint(
+            config_value=registry_allow_private_from_config(
+                project_root=self._project_root,
+                custom_config_path=self._custom_config_path,
+            )
+        )
         # Draft-schema tolerance applies only when actually using a private
         # endpoint, so enabling the flag never changes public-registry results.
         fetched = await fetch_registry_servers(

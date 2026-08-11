@@ -114,18 +114,30 @@ def default_registry_cache_path() -> Path:
     return base / "pmcp" / "registry-cache.json"
 
 
-def registry_private_enabled() -> bool:
+def registry_private_enabled(config_value: bool | None = None) -> bool:
     """Opt-in flag (default OFF) for private registries + draft-schema tolerance.
 
     Aimed at developers debugging their own private MCP servers against PMCP.
     With it off, PMCP uses only the public registry and the GA-shaped behavior.
+
+    Two sources, since roadmap v9's PRIVREG criterion specified "env var +
+    config field" and only the env var was built (Consiliency/pmcp#139).
+    `config_value` is the `allowPrivateRegistry` config field, or ``None`` when
+    no config file states a preference.
+
+    The env var wins **only when explicitly set**. Absence is not a preference:
+    reading an unset env var as ``false`` would silently override a config file
+    that said ``true``, which is the whole point of adding the field.
     """
-    return os.environ.get(REGISTRY_ALLOW_PRIVATE_ENV, "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    raw = os.environ.get(REGISTRY_ALLOW_PRIVATE_ENV)
+    if raw is not None and raw.strip():
+        return raw.strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+    return bool(config_value)
 
 
 def _is_loopback_endpoint_host(hostname: str) -> bool:
@@ -163,7 +175,10 @@ def _private_endpoint_allowed(endpoint: str) -> bool:
     return parsed.scheme == "http" and _is_loopback_endpoint_host(hostname)
 
 
-def effective_registry_endpoint(default: str = DEFAULT_REGISTRY_ENDPOINT) -> str:
+def effective_registry_endpoint(
+    default: str = DEFAULT_REGISTRY_ENDPOINT,
+    config_value: bool | None = None,
+) -> str:
     """Return the configured private registry endpoint only when opt-in is on.
 
     Flag off (default): the configured private endpoint is ignored and the
@@ -171,7 +186,7 @@ def effective_registry_endpoint(default: str = DEFAULT_REGISTRY_ENDPOINT) -> str
     https:// (or loopback http://) URL that does not target a link-local or
     metadata host; otherwise it is rejected and the public endpoint is used.
     """
-    if registry_private_enabled():
+    if registry_private_enabled(config_value):
         private = os.environ.get(REGISTRY_PRIVATE_ENDPOINT_ENV, "").strip()
         if private:
             if _private_endpoint_allowed(private):
