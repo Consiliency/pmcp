@@ -746,6 +746,112 @@ class TestDisconnectAll:
         assert "transport exit boom" in error
 
     @pytest.mark.asyncio
+    async def test_disconnect_server_reports_failure_when_owner_already_crashed(
+        self,
+    ) -> None:
+        """An owner that crashes *before* anyone asks it to shut down (the
+        crash-while-parked case `_on_transport_owner_done` only logs) must
+        still surface its exception the next time `disconnect_server` looks
+        -- not be silently treated as "already closed, nothing to report"
+        just because `task.done()` is already True by the time we check.
+        Board-review regression: `_close_remote_transport`'s early
+        `if task.done(): return` used to discard the result entirely."""
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="remote",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                type="streamable-http", url="http://example.invalid/mcp"
+            ),
+        )
+        status = ServerStatus(
+            name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+        shutdown = asyncio.Event()
+
+        async def crashing_owner() -> None:
+            # Crashes immediately, without ever waiting on `shutdown` --
+            # simulates the transport dying while parked, before anyone
+            # asked it to close.
+            raise RuntimeError("owner crashed while parked")
+
+        owner_task = asyncio.create_task(crashing_owner())
+        # Let the owner actually finish before touching it, so `task.done()`
+        # is already True when `_close_remote_transport` looks -- exercising
+        # the early-return branch, not the awaited-task branch covered by
+        # test_disconnect_server_reports_failure_when_transport_exit_raises.
+        for _ in range(10):
+            if owner_task.done():
+                break
+            await asyncio.sleep(0)
+        assert owner_task.done()
+
+        managed = ManagedClient(
+            config=config,
+            process=None,
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=status,
+            transport_owner_task=owner_task,
+            transport_shutdown=shutdown,
+        )
+        manager._clients["remote"] = managed
+        manager._servers["remote"] = status
+
+        ok, _cancelled, error = await manager.disconnect_server("remote", force=True)
+
+        assert ok is False
+        assert error is not None
+        assert "owner crashed while parked" in error
+
+    @pytest.mark.asyncio
+    async def test_close_remote_transport_propagates_failure_during_timeout_escalation(
+        self,
+    ) -> None:
+        """A transport-exit failure that surfaces while the owner unwinds
+        under our own escalating `task.cancel()` (the timeout branch) must
+        still propagate -- only the CancelledError our own cancel() causes
+        may be swallowed. Distinct from the timeout-as-success contract,
+        which stays (see test_close_remote_transport_escalates_to_cancel_on_timeout):
+        that covers a *clean* forced unwind; this covers one that fails.
+        Board-review regression: the escalation used to run under
+        `asyncio.gather(task, return_exceptions=True)`, which discarded
+        genuine failures indistinguishably from the expected CancelledError."""
+        manager = ClientManager()
+        status = ServerStatus(
+            name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+        shutdown = asyncio.Event()
+
+        async def owner_that_fails_on_cancel() -> None:
+            # Ignores `shutdown` entirely, so the graceful wait always times
+            # out. When escalated via task.cancel(), raises a genuine
+            # failure instead of letting CancelledError propagate --
+            # simulating __aexit__ swallowing the cancellation and
+            # surfacing its own error, e.g. a broken connection encountered
+            # during forced unwind.
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("transport failed to unwind under cancel") from None
+
+        owner_task = asyncio.create_task(owner_that_fails_on_cancel())
+        managed = ManagedClient(
+            config=MagicMock(),
+            process=None,
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=status,
+            transport_owner_task=owner_task,
+            transport_shutdown=shutdown,
+        )
+
+        with pytest.raises(
+            RuntimeError, match="transport failed to unwind under cancel"
+        ):
+            await manager._close_remote_transport("remote", managed, timeout=0.05)
+
+    @pytest.mark.asyncio
     async def test_connect_cancelled_during_ownership_transfer_leaves_no_owner(
         self,
     ) -> None:

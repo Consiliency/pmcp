@@ -1539,30 +1539,59 @@ class ClientManager:
             return
         shutdown.set()
         if task.done():
+            # The owner already exited -- possibly with a genuine failure it
+            # was carrying (the crash-while-parked case `_on_transport_owner_done`
+            # only logs). Retrieve, don't discard: a cancelled owner closed
+            # cleanly enough to report as closed, but a real exception must
+            # still reach `disconnect_server`'s (False, cancelled, str(e)).
+            if not task.cancelled():
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
             return
         try:
             await asyncio.wait_for(asyncio.shield(task), timeout)
         except asyncio.TimeoutError:
             # The 5s budget bounds this graceful wait only, not the
-            # escalation below: the gather() after cancel() is itself
+            # escalation below: awaiting the cancelled owner is itself
             # unbounded, and an __aexit__ that ignores cancellation hangs
             # there -- the same hang class as today's dead-peer teardown,
-            # neither introduced nor removed by this method.
+            # neither introduced nor removed by this method. Timeout-as-
+            # success is deliberate (a dead peer must not read as "disconnect
+            # refused"), but that only covers the timeout itself -- a genuine
+            # failure surfacing *while* the owner unwinds under our cancel
+            # must still propagate, so only the CancelledError our own
+            # cancel() causes is swallowed below.
             logger.warning(
                 f"[{name}] remote transport did not close within {timeout}s; cancelling"
             )
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         except asyncio.CancelledError:
             # NOT the same case as the timeout above. The shield keeps the
             # owner alive, so a CancelledError here is *our caller* being
             # cancelled, not the owner. Escalate to the owner so its stack
-            # still unwinds, then re-raise: swallowing it would suppress
-            # cancellation of whatever task is running disconnect_server /
-            # _shutdown_one, which is the exact cancellation-correctness
-            # class this fix exists to fix.
+            # still unwinds, then re-raise the caller's own cancellation --
+            # swallowing it would suppress cancellation of whatever task is
+            # running disconnect_server / _shutdown_one, which is the exact
+            # cancellation-correctness class this fix exists to fix. A
+            # genuine failure surfacing from the owner during this forced
+            # unwind can't also be raised (the caller's own CancelledError
+            # takes precedence, per the same reasoning), but is logged rather
+            # than silently dropped.
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                logger.warning(
+                    f"[{name}] remote transport failed to unwind while "
+                    f"escalating our caller's cancellation: {exc}"
+                )
             raise
         # NOTE: no `except Exception` here, deliberately. A transport exit
         # that genuinely fails must propagate, or disconnect_server's
