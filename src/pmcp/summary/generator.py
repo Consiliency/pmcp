@@ -8,7 +8,10 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from pmcp.summary.template_fallback import template_summary
+from pmcp.summary.template_fallback import (
+    _no_downstream_tools_summary,
+    template_summary,
+)
 
 if TYPE_CHECKING:
     from pmcp.types import DescriptionsCache, ToolInfo
@@ -108,10 +111,10 @@ async def generate_capability_summary(
         Human-readable capability summary for MCP instructions
     """
     if not tools:
-        return (
-            "MCP Gateway: No tools currently available.\n"
-            "Use gateway.refresh to reload server configurations."
-        )
+        # Single source of truth with the template path -- both are reachable
+        # depending on whether a descriptions cache exists, and a client must
+        # not get different first impressions depending on cache state.
+        return _no_downstream_tools_summary(provisionable_categories)
 
     # 1. Try pre-built cache first
     if cache:

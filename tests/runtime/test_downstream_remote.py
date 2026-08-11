@@ -30,6 +30,36 @@ and looks like an anyio/httpx2/uvicorn interaction rather than a pmcp bug;
 reported to the team lead rather than routed around silently. Keeping
 everything in one test function's one event loop avoids it and keeps the
 evidence real.
+
+DIAGNOSIS (2026-08-11, from an attempt to split this into four focused
+tests — the split was reverted, this is what it taught us). The constraint
+above is real and still holds; do not split this file without fixing the
+cause first. Two distinct symptoms, one root:
+
+  1. `disconnect_all()` in teardown fails outright with
+     `CancelledError: Cancelled via cancel scope <id> by <Task ...
+     _disconnect_all_unlocked.<locals>._shutdown_one() ...
+     cb=[gather.<locals>._done_callback()]`.
+  2. With one test per event loop, tests that run *after* a completed
+     connect-and-teardown fail their next connect with "SSE stream ended
+     without a response" — the cross-loop breakage described above.
+
+Root cause, now identified: `managed.sse_exit_stack` is entered in the
+task that performs the connect and closed in a *different* task —
+`_shutdown_one` under `asyncio.gather`, or a later loop's teardown. anyio
+cancel scopes are bound to the task that created them, so closing that
+stack elsewhere violates its invariant. It is not an httpx2 or uvicorn
+defect; it is pmcp entering a task-bound resource in one task and
+releasing it in another.
+
+The fix is therefore per-client task ownership of teardown: the task that
+owns a client's exit stack must be the one that closes it, on request.
+That is a connection-lifecycle restructuring affecting every client, which
+is why it stays deferred to its own phase rather than being patched in
+alongside unrelated work. Two things that do NOT fix it, both tried:
+swapping `disconnect_all()` for per-name `disconnect_server()` in teardown
+(symptom 2 remains), and assuming P2's leak fix resolved it (it fixed the
+leak, not the task-ownership violation).
 """
 
 from __future__ import annotations
