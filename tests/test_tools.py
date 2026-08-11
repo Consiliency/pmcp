@@ -2216,6 +2216,22 @@ class TestDescribe:
         assert result.schema_dialect == "https://json-schema.org/draft/2020-12/schema"
 
     @pytest.mark.asyncio
+    async def test_successful_describe_carries_no_failure_feedback_hint(
+        self, gateway_tools: GatewayTools
+    ) -> None:
+        """A successful describe must not claim a technical failure occurred.
+
+        `_feedback_hint()` opens with "Technical failure detected", and this
+        site emitted it unconditionally, so every successful describe told the
+        client something had gone wrong. `invoke`'s success path already passed
+        None; this one simply did not follow the convention. Describe's own
+        error paths still emit the hint, which is where it belongs.
+        """
+        result = await gateway_tools.describe({"tool_id": "github::create_issue"})
+
+        assert result.feedback_hint is None
+
+    @pytest.mark.asyncio
     async def test_describe_uses_default_schema_dialect_when_schema_omits_marker(
         self, gateway_tools: GatewayTools
     ) -> None:
