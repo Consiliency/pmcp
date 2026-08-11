@@ -64,17 +64,6 @@ logger = logging.getLogger(__name__)
 _TaskT = TypeVar("_TaskT", bound=asyncio.Task[Any])
 
 
-def _is_cancel_scope_task_mismatch_error(exc: BaseException) -> bool:
-    """Return True for benign anyio cancel-scope task mismatch during shutdown."""
-    msg = str(exc).lower()
-    return (
-        "cancel scope" in msg
-        and "different task" in msg
-        and "entered" in msg
-        and "exit" in msg
-    )
-
-
 class _NullCatalogEventSink:
     """No-op `CatalogEventSink` used when `ClientManager` is constructed with
     no `catalog_events` (IF-0-P3B-2's default). Keeps every pre-P3B
@@ -475,14 +464,24 @@ class ManagedClient:
     config: ResolvedServerConfig
     process: asyncio.subprocess.Process | None = None
     is_remote: bool = False
-    sse_exit_stack: AsyncExitStack | None = None
     write_stream: Any | None = None
     # The httpx2.AsyncClient pmcp owns for a streamable-HTTP downstream (mcp
     # 2.0.0's streamable_http_client() takes a caller-supplied client and does
     # not close it — see IF-0-P2-2). None for SSE and stdio downstreams, which
-    # don't take one. Entered into sse_exit_stack, so it closes with the
-    # transport; exposed here so tests (and callers) can assert `.is_closed`.
+    # don't take one. Entered into the transport owner task's exit stack (see
+    # `transport_owner_task`), so it closes with the transport; exposed here
+    # so tests (and callers) can assert `.is_closed`.
     remote_http_client: httpx2.AsyncClient | None = None
+    # The task that entered this remote client's transport exit stack and
+    # will close it, on request via `transport_shutdown`. anyio cancel scopes
+    # are bound to the task that created them, so the stack must be entered
+    # and unwound in the same task — this task. None for stdio clients, which
+    # have no exit stack.
+    transport_owner_task: asyncio.Task[None] | None = None
+    # Graceful-teardown signal the owner task parks on (`await shutdown.wait()`)
+    # after publishing its streams. Set by `_close_remote_transport` to ask the
+    # owner to unwind its own stack, in its own task.
+    transport_shutdown: asyncio.Event | None = None
     status: ServerStatus = field(
         default_factory=lambda: ServerStatus(
             name="",
@@ -861,16 +860,16 @@ class ClientManager:
 
             try:
                 if managed.is_remote:
-                    if managed.sse_exit_stack is not None:
-                        try:
-                            await managed.sse_exit_stack.aclose()
-                        except RuntimeError as e:
-                            if _is_cancel_scope_task_mismatch_error(e):
-                                logger.debug(
-                                    f"[{name}] Ignoring SSE shutdown cancel-scope mismatch: {e}"
-                                )
-                            else:
-                                raise
+                    # _close_remote_transport never swallows a genuine
+                    # transport-exit failure -- that's deliberate, so it can
+                    # still reach the `except Exception` below and return
+                    # (False, cancelled, str(e)) rather than reporting a
+                    # broken teardown as a successful disconnect. A timeout
+                    # that escalates to cancel is logged there and returns
+                    # normally: the transport is closed either way, and
+                    # `False` here would make a dead-peer disconnect look
+                    # like a refusal to the caller.
+                    await self._close_remote_transport(name, managed)
                 else:
                     await _terminate_process_tree(managed.process, name)
             except Exception as e:
@@ -1458,6 +1457,121 @@ class ClientManager:
             remote_http_client=http_client,
         )
 
+    async def _own_remote_transport(
+        self,
+        name: str,
+        transport_context: Any,
+        remote_http_client: httpx2.AsyncClient | None,
+        ready: asyncio.Future[tuple[Any, Any]],
+        shutdown: asyncio.Event,
+    ) -> None:
+        """Own a remote client's transport for its whole lifetime: enter its
+        exit stack here, park here, and unwind it here.
+
+        anyio cancel scopes are bound to the task that creates them, so the
+        task that enters this stack is the only task that may ever close it.
+        This task exists so that task is always this one -- never a caller of
+        `disconnect_server` / `_disconnect_all_unlocked` / `_cleanup_client`
+        running in some other task.
+        """
+        try:
+            async with AsyncExitStack() as stack:
+                # LIFO: client entered first so it closes last, preserving
+                # the ordering this code documented before this change --
+                # transport closes first, the owned httpx2 client last, and
+                # a failure entering the transport still closes the client
+                # we already own rather than leaking it.
+                if remote_http_client is not None:
+                    await stack.enter_async_context(remote_http_client)
+                transport = await stack.enter_async_context(transport_context)
+                ready.set_result(transport[:2])
+                await shutdown.wait()
+        except BaseException as exc:
+            if not ready.done():
+                # Pre-handoff failure: the connect caller is the one waiting
+                # on `ready`, so hand it the exception rather than raising
+                # into a task nobody is awaiting yet. The `async with` above
+                # has already unwound whatever it entered.
+                ready.set_exception(exc)
+                return
+            # Post-handoff failure: do NOT swallow. `_close_remote_transport`
+            # awaits this task and re-raises what it raises, which is what
+            # keeps `disconnect_server`'s (False, cancelled, str(e)) contract
+            # reachable.
+            raise
+
+    def _on_transport_owner_done(
+        self, name: str, shutdown: asyncio.Event, task: asyncio.Task[None]
+    ) -> None:
+        """Log an owner task that exits before anyone asked it to.
+
+        Without this, a transport that dies while parked at
+        `await shutdown.wait()` is invisible until someone disconnects, and
+        the loop separately logs "Task exception was never retrieved".
+        Reading `task.exception()` here does not consume it: a later
+        `_close_remote_transport` awaiting this task still re-raises the
+        real failure.
+        """
+        if task.cancelled() or shutdown.is_set():
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning(
+                f"[{name}] remote transport owner exited unexpectedly: {exc}"
+            )
+
+    async def _close_remote_transport(
+        self, name: str, managed: ManagedClient, timeout: float = 5.0
+    ) -> None:
+        """Signal a remote client's transport owner task to unwind its stack
+        and wait for it. The single entry point for all three close sites
+        (`disconnect_server`, `_disconnect_all_unlocked._shutdown_one`,
+        `_cleanup_client`) -- each decides for itself whether a failure here
+        should propagate or be swallowed; this method never swallows on
+        their behalf.
+
+        Idempotent: setting the shutdown event twice, awaiting an already-
+        finished owner, or being called for a client with no owner (stdio)
+        all return without effect.
+        """
+        task, shutdown = managed.transport_owner_task, managed.transport_shutdown
+        if task is None or shutdown is None:
+            return
+        shutdown.set()
+        if task.done():
+            return
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout)
+        except asyncio.TimeoutError:
+            # The 5s budget bounds this graceful wait only, not the
+            # escalation below: the gather() after cancel() is itself
+            # unbounded, and an __aexit__ that ignores cancellation hangs
+            # there -- the same hang class as today's dead-peer teardown,
+            # neither introduced nor removed by this method.
+            logger.warning(
+                f"[{name}] remote transport did not close within {timeout}s; cancelling"
+            )
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        except asyncio.CancelledError:
+            # NOT the same case as the timeout above. The shield keeps the
+            # owner alive, so a CancelledError here is *our caller* being
+            # cancelled, not the owner. Escalate to the owner so its stack
+            # still unwinds, then re-raise: swallowing it would suppress
+            # cancellation of whatever task is running disconnect_server /
+            # _shutdown_one, which is the exact cancellation-correctness
+            # class this fix exists to fix.
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
+        # NOTE: no `except Exception` here, deliberately. A transport exit
+        # that genuinely fails must propagate, or disconnect_server's
+        # `except Exception -> return (False, cancelled, str(e))` can never
+        # fire and a broken teardown would report as a successful
+        # disconnect. The swallow belongs at the two call sites that
+        # legitimately must not fail -- _shutdown_one and _cleanup_client --
+        # not here.
+
     async def _connect_remote_stream(
         self,
         config: ResolvedServerConfig,
@@ -1488,31 +1602,46 @@ class ClientManager:
 
         logger.info(f"Connecting to remote MCP server via {transport_name}: {name}")
 
-        remote_stack = AsyncExitStack()
-        # Enter the owned httpx2 client before the transport: AsyncExitStack
-        # unwinds LIFO, so on cleanup the transport closes first and the client
-        # last, and if entering the transport itself raises, the except below
-        # still closes (rather than leaks) the client we already own.
-        if remote_http_client is not None:
-            await remote_stack.enter_async_context(remote_http_client)
-        try:
-            transport = await remote_stack.enter_async_context(transport_context)
-        except Exception:
-            await remote_stack.aclose()
-            raise
-        read_stream, write_stream = transport[:2]
-
-        managed = ManagedClient(
-            config=config,
-            process=None,
-            is_remote=True,
-            sse_exit_stack=remote_stack,
-            write_stream=write_stream,
-            status=status,
-            resolved_remote_headers=resolved_headers,
-            remote_http_client=remote_http_client,
+        ready: asyncio.Future[tuple[Any, Any]] = (
+            asyncio.get_running_loop().create_future()
         )
-        self._clients[name] = managed
+        shutdown = asyncio.Event()
+        owner_task = self._track_background_task(
+            asyncio.create_task(
+                self._own_remote_transport(
+                    name, transport_context, remote_http_client, ready, shutdown
+                )
+            ),
+            name,
+        )
+        owner_task.add_done_callback(
+            lambda t: self._on_transport_owner_done(name, shutdown, t)
+        )
+
+        try:
+            read_stream, write_stream = await ready
+            managed = ManagedClient(
+                config=config,
+                process=None,
+                is_remote=True,
+                write_stream=write_stream,
+                status=status,
+                resolved_remote_headers=resolved_headers,
+                remote_http_client=remote_http_client,
+                transport_owner_task=owner_task,
+                transport_shutdown=shutdown,
+            )
+            self._clients[name] = managed
+        except BaseException:
+            # BaseException, not Exception: cancellation is the case that
+            # bites here, and it is a BaseException. Cancel rather than
+            # signal-and-wait -- a cancelled caller must not linger, and the
+            # peer reaps its own session on timeout. The owner's `async
+            # with` unwinds in the owner, as always -- never touch its stack
+            # from this task.
+            owner_task.cancel()
+            await asyncio.gather(owner_task, return_exceptions=True)
+            raise
 
         try:
             managed.read_task = self._track_background_task(
@@ -1546,7 +1675,7 @@ class ClientManager:
                     await asyncio.shield(managed.read_task)
                 except (asyncio.CancelledError, Exception):
                     pass
-            await remote_stack.aclose()
+            await self._close_remote_transport(name, managed)
             # Drop the stale ERROR client so it can't be found as a live
             # connection on the next connect attempt.
             if self._clients.get(name) is managed:
@@ -2042,18 +2171,14 @@ class ClientManager:
                     except (asyncio.TimeoutError, asyncio.CancelledError):
                         pass
 
-                # Close transport
+                # Close transport. _close_remote_transport itself never
+                # swallows a genuine transport-exit failure; the swallow
+                # belongs here -- this loop runs under `asyncio.gather`
+                # across every connected client, and one client's teardown
+                # failure must not abort the others' or the wholesale
+                # shutdown budget (issue #79/1c).
                 if managed.is_remote:
-                    if managed.sse_exit_stack is not None:
-                        try:
-                            await managed.sse_exit_stack.aclose()
-                        except RuntimeError as e:
-                            if _is_cancel_scope_task_mismatch_error(e):
-                                logger.debug(
-                                    f"[{name}] Ignoring SSE shutdown cancel-scope mismatch: {e}"
-                                )
-                            else:
-                                raise
+                    await self._close_remote_transport(name, managed)
                 else:
                     await _terminate_process_tree(managed.process, name)
             except Exception as e:
@@ -2130,20 +2255,13 @@ class ClientManager:
             # IF-0-P2-2, would also leak the owned httpx2.AsyncClient. Guarded
             # the same way as the two explicit-disconnect close sites
             # (`disconnect_server`, `_disconnect_all_unlocked`), but this
-            # function's contract is "never raises", so an unmatched error is
-            # logged and swallowed here rather than re-raised.
-            if managed.sse_exit_stack is not None:
-                try:
-                    await managed.sse_exit_stack.aclose()
-                except RuntimeError as e:
-                    if _is_cancel_scope_task_mismatch_error(e):
-                        logger.debug(
-                            f"[{name}] Ignoring SSE shutdown cancel-scope mismatch: {e}"
-                        )
-                    else:
-                        logger.warning(f"[{name}] Error closing remote transport: {e}")
-                except Exception as e:
-                    logger.warning(f"[{name}] Error closing remote transport: {e}")
+            # function's contract is "never raises" (for non-cancellation
+            # failures -- `_close_remote_transport` itself never swallows, so
+            # an unmatched error is logged and swallowed here instead).
+            try:
+                await self._close_remote_transport(name, managed)
+            except Exception as e:
+                logger.warning(f"[{name}] Error closing remote transport: {e}")
         else:
             await _terminate_process_tree(managed.process, name)
         self._clients.pop(name, None)
