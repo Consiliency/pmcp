@@ -136,11 +136,47 @@ async def _own_remote_transport(
             await shutdown.wait()
     except BaseException as exc:
         if not ready.done():
+            # Pre-handoff failure: the connect caller is the one waiting, so
+            # hand it the exception rather than raising into a task nobody
+            # awaits yet.
             ready.set_exception(exc)
-        elif not isinstance(exc, asyncio.CancelledError):
-            logger.warning(f"[{name}] remote transport owner failed: {exc}")
-        if isinstance(exc, asyncio.CancelledError):
-            raise
+            return
+        # Post-handoff failure: do NOT swallow. The owner task carries the
+        # exception, and _close_remote_transport re-raises it when it awaits
+        # this task, which is what preserves disconnect_server's
+        # (False, cancelled, str(e)) contract at manager.py:876-878.
+        raise
+```
+
+Attach a done-callback that logs an owner that exits before it was asked to —
+otherwise a transport that dies while parked is invisible until someone
+disconnects, and the loop emits `Task exception was never retrieved`. Reading
+`task.exception()` in the callback does not consume it: awaiting the task later
+still re-raises, so teardown still reports the real failure.
+
+Ownership transfer must be guarded. The owner is live from `create_task`, but
+`ManagedClient` does not reference it until after `await ready` resolves.
+Cancel the connect task inside that window and the owner parks forever with
+nothing pointing at it:
+
+```python
+owner_task = self._track_background_task(
+    asyncio.create_task(self._own_remote_transport(...)), name
+)
+try:
+    read_stream, write_stream = await ready
+    managed = ManagedClient(
+        ..., transport_owner_task=owner_task, transport_shutdown=shutdown
+    )
+    self._clients[name] = managed
+except BaseException:
+    # BaseException, not Exception: cancellation is the case that bites here,
+    # and it is a BaseException. Cancel rather than signal-and-wait -- a
+    # cancelled caller must not linger, and the peer reaps its own session on
+    # timeout. The owner's `async with` unwinds in the owner, as always.
+    owner_task.cancel()
+    await asyncio.gather(owner_task, return_exceptions=True)
+    raise
 ```
 
 Everything the stack owns is entered and unwound inside this one task, so the
@@ -159,6 +195,9 @@ async def _close_remote_transport(
     try:
         await asyncio.wait_for(asyncio.shield(task), timeout)
     except asyncio.TimeoutError:
+        logger.warning(
+            f"[{name}] remote transport did not close within {timeout}s; cancelling"
+        )
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
     except asyncio.CancelledError:
@@ -171,8 +210,13 @@ async def _close_remote_transport(
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         raise
-    except Exception as exc:
-        logger.warning(f"[{name}] remote transport close failed: {exc}")
+    # NOTE: no `except Exception` here, deliberately. A transport exit that
+    # genuinely fails must propagate, or disconnect_server's
+    # `except Exception -> return (False, cancelled, str(e))` at
+    # manager.py:876-878 can never fire and a broken teardown is reported as a
+    # successful disconnect. The swallow belongs at the two call sites that
+    # legitimately must not fail -- _shutdown_one and _cleanup_client -- not
+    # here.
 ```
 
 Properties to preserve and state in code comments:
@@ -185,6 +229,16 @@ Properties to preserve and state in code comments:
   out. Today a connect task that dies leaves the stack open forever.
 - **Idempotent.** Setting the event twice, awaiting a finished owner, or being
   called for a client that never got an owner (stdio) all return without effect.
+- **The 5 s budget bounds the graceful wait, not the escalation.** The
+  `await asyncio.gather(task, ...)` after `task.cancel()` is itself unbounded:
+  an `__aexit__` that ignores cancellation hangs there. That is the same hang
+  class as today's dead-peer `aclose()`, neither introduced nor removed by this
+  change. Stated as a known residual rather than papered over — do not let the
+  timeout number imply teardown is bounded end to end.
+- **`ready` is created with `asyncio.get_running_loop().create_future()`**, not
+  a bare `asyncio.Future()`, matching the existing idiom at `manager.py:1864`
+  (which uses the older `get_event_loop()`; the running-loop accessor is the
+  non-deprecated spelling of the same intent inside a coroutine).
 - **Peer-already-gone is the common shutdown case.** Session termination fails
   fast (`Session termination failed: All connection attempts failed`), but the
   configured connect timeout is 30 s, so the 5 s budget is what stops a dead peer
@@ -201,6 +255,7 @@ Properties to preserve and state in code comments:
 | Swap `disconnect_all()` for per-name `disconnect_server()` in test teardown | Already tried and recorded as failed; also addresses only one of three close sites and leaves the invariant violated. |
 | Fold `_read_sse` into the owner task | Scope creep. The read loop's task identity is not implicated; it reads memory-object streams, which are not task-bound. Explicitly rejected. |
 | Bump `sse_starlette` and hope the global is gone | Not gated on: the latch is in the currently pinned version, an unbounded dependency bump is exactly the failure mode this repo has already paid for twice, and the one-line harness reset is version-independent. |
+| Close the ownership-transfer window by publishing `ManagedClient` *before* awaiting `ready` | Structurally eliminates the window rather than guarding it, and was tempting for that reason. Rejected: it makes `_clients[name]` observable with `write_stream=None` for the duration of transport establishment — a state that does not exist today (the current code sets `write_stream` in the same statement that publishes) and that the health monitor and `_send_initialize` would both have to learn to tolerate. Guarding the window is smaller and does not widen the observable state machine. |
 | Keep `_is_cancel_scope_task_mismatch_error` as defence-in-depth | After the fix a mismatch means a new ownership bug. A swallow at DEBUG is precisely what let this sit undiagnosed for months. Delete it. |
 
 ---
@@ -228,19 +283,29 @@ Properties to preserve and state in code comments:
   replace inline `AsyncExitStack()` entry with: create `ready` future + `shutdown`
   event, `self._track_background_task(asyncio.create_task(self._own_remote_transport(...)), name)`,
   `read_stream, write_stream = await ready`. Populate the two new `ManagedClient`
-  fields instead of `sse_exit_stack`. Both the pre-`ready` failure (transport
-  refuses) and the post-`ready` failure (`_send_initialize` / `_index_capabilities`
-  raises, around `:1541-1550`) must tear down via `_close_remote_transport`, never
-  `remote_stack.aclose()`.
+  fields instead of `sse_exit_stack`. Three teardown paths, all
+  `BaseException`-safe — an executor who copies only `except Exception` here
+  reintroduces the orphan, so write them as shown in the design section:
+  (i) the **ownership-transfer guard** around `await ready` + publication
+  (cancel the owner and re-raise); (ii) the pre-`ready` failure, where the owner
+  hands the exception back through `ready` and has already unwound its own
+  stack; (iii) the post-connect failure (`_send_initialize` /
+  `_index_capabilities` raises, around `:1541-1550`), which goes through
+  `_close_remote_transport` — never `remote_stack.aclose()`, which no longer
+  exists.
 - `ClientManager.disconnect_server` (around `:862-878`) — **modify** — the
   `managed.is_remote` branch calls `await self._close_remote_transport(name, managed)`.
-  Keep the surrounding `try/except` that maps failure onto the
-  `(bool, int, str | None)` return. **Contract decision: a timeout that escalates
-  to cancel returns success with a WARNING log** — the transport is closed either
-  way, and returning `False` would make a dead-peer disconnect look like a refusal
-  to the `gateway.disconnect_server` caller.
+  The surrounding `except Exception as e: return (False, cancelled, str(e))`
+  (`:876-878`) is preserved **and must remain reachable** — that is why
+  `_close_remote_transport` does not swallow. **Contract decisions:** a timeout
+  that escalates to cancel returns success with a WARNING log (the transport is
+  closed either way, and `False` would make a dead-peer disconnect look like a
+  refusal to the `gateway.disconnect_server` caller); a transport exit that
+  raises for any other reason returns `(False, cancelled, str(e))` as today.
 - `ClientManager._disconnect_all_unlocked._shutdown_one` (around `:2045-2056`) —
-  **modify** — same replacement. The concurrent `asyncio.gather` becomes safe
+  **modify** — same replacement, relying on this function's existing
+  `except Exception as e: logger.warning(...)` to swallow — this is one of the
+  two sites that legitimately must not fail. The concurrent `asyncio.gather` becomes safe
   structurally: each close now happens in its own client's owner task, so
   `_shutdown_one` never touches a foreign cancel scope. Symptom 1 dies by
   construction, and the concurrency that exists for the 8 s stdio-reap budget
@@ -291,8 +356,21 @@ Properties to preserve and state in code comments:
   constructs a stack at `:673`) — **delete** — it asserts the swallow that this
   change removes. Deleting a test that pins removed behaviour is correct; note it
   explicitly in the PR body so it is not mistaken for coverage loss.
-- **Add** a replacement unit test: `_close_remote_transport` escalates to cancel
-  when the owner ignores the shutdown event past the timeout, and still returns.
+- **Add** `test_close_remote_transport_escalates_to_cancel_on_timeout` — the
+  owner ignores the shutdown event past the timeout; assert it is cancelled, the
+  call returns, and the WARNING is logged.
+- **Add** `test_disconnect_server_reports_failure_when_transport_exit_raises` —
+  a transport whose `__aexit__` raises must yield `(False, cancelled, "<msg>")`,
+  not `(True, ...)`. Without this the preserved contract at `:876-878` is
+  unenforced no matter what the plan says.
+- **Add** `test_connect_cancelled_during_ownership_transfer_leaves_no_owner` —
+  the orphan regression. A fake transport signals an `asyncio.Event` from its
+  `__aenter__`; the test awaits that signal (the connect task is then parked at
+  `await ready`) and cancels the connect task. Assert the owner task is `done()`
+  and that no task tagged with the server name survives in
+  `manager._background_tasks`. Must be proven to fail without the
+  ownership-transfer guard — the same revert-to-red discipline as the acceptance
+  test, since a guard bug is silent by construction.
 
 ### `CHANGELOG.md` (modify)
 
@@ -401,6 +479,11 @@ Behaviours and edge cases to check by hand:
 - [ ] Reverting only `src/pmcp/client/manager.py` turns the reconnect test red
       with `CancelledError: Cancelled via cancel scope ... _shutdown_one()`;
       restoring it turns it green. Both outputs pasted into the PR body.
+- [ ] Cancelling the connect task inside the ownership-transfer window leaves no
+      surviving owner task, proven by a test that is red without the guard.
+- [ ] A transport exit that raises still yields `(False, cancelled, "<msg>")`
+      from `disconnect_server` — the `:876-878` contract is enforced by test, not
+      by assertion in this document.
 - [ ] `grep -rn "sse_exit_stack\|_is_cancel_scope_task_mismatch_error" src/ tests/`
       returns no matches, and a full `tests/runtime/` run at DEBUG logs no
       cancel-scope mismatch.
