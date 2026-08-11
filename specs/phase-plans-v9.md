@@ -157,24 +157,24 @@ Fold in the cheap unmet 2025-11-25 MUST/SHOULD items and stand up a tracked
 PMCP's transport and task-brokering surfaces.
 
 **Exit criteria**
-- [ ] Streamable HTTP returns **HTTP 403** for an invalid/disallowed `Origin`
+- [x] Streamable HTTP returns **HTTP 403** for an invalid/disallowed `Origin`
   header; a request with a bad `Origin` is rejected (test fails on HEAD). [PR #1439]
-- [ ] Tool input-validation failures are returned as **tool-execution errors**
+- [x] Tool input-validation failures are returned as **tool-execution errors**
   (result with `isError`/error envelope) rather than JSON-RPC protocol errors, so
   the model can self-correct. [SEP-1303]
-- [ ] Insufficient scope at runtime returns **403** with
+- [x] Insufficient scope at runtime returns **403** with
   `WWW-Authenticate: error="insufficient_scope", scope="…"`. [SEP-835]
-- [ ] PMCP advertises **JSON Schema 2020-12** as the default schema dialect where
+- [x] PMCP advertises **JSON Schema 2020-12** as the default schema dialect where
   it surfaces schema dialect metadata. [SEP-1613]
-- [ ] Tool/resource/prompt **icons** (when provided by a downstream server) are
+- [x] Tool/resource/prompt **icons** (when provided by a downstream server) are
   passed through `gateway.catalog_search`/`describe` discovery metadata. [SEP-973]
-- [ ] `SPEC_COMPLIANCE.md` exists with: target revision (2025-11-25), a
+- [x] `SPEC_COMPLIANCE.md` exists with: target revision (2025-11-25), a
   per-requirement compliance table, a **draft-revision impact/migration
   assessment** (stateless/no-session transport, tasks→extension with `tasks/list`
   removed and `tasks/result`→`tasks/get` polling + `tasks/update`, MRTR,
   `resultType`, `server/discover`, `CacheableResult`, DCR→CIMD), and a tracking
   checklist for adopting the next stable revision.
-- [ ] `ruff`, `mypy`, full `pytest` (TMPDIR outside `/tmp`) green.
+- [x] `ruff`, `mypy`, full `pytest` (TMPDIR outside `/tmp`) green.
 
 **Scope notes**
 - Lanes: (a) `transport/http.py` — Origin 403 + `insufficient_scope` 403 step-up
@@ -213,15 +213,15 @@ Add `updated_since` delta sync to the registry client so a refresh fetches only
 servers changed since the last sync and merges them into the cache.
 
 **Exit criteria**
-- [ ] The registry cache persists a `last_synced_at` RFC3339 timestamp.
-- [ ] When a timestamp exists, the client issues `GET /v0/servers?updated_since=…`
+- [x] The registry cache persists a `last_synced_at` RFC3339 timestamp.
+- [x] When a timestamp exists, the client issues `GET /v0/servers?updated_since=…`
   and **merges** returned entries (add/update; dedup to latest) into the cached
   set rather than replacing it (test with a recorded delta fixture, fails on HEAD).
-- [ ] No timestamp (cold cache) or a server/HTTP error falls back to the existing
+- [x] No timestamp (cold cache) or a server/HTTP error falls back to the existing
   full paginated fetch; failure degrades to the current cache, never crashes.
-- [ ] Pagination (`metadata.nextCursor`) and the size bound from v8 still apply to
+- [x] Pagination (`metadata.nextCursor`) and the size bound from v8 still apply to
   the delta fetch.
-- [ ] `ruff`, `mypy`, full `pytest` green; tests use recorded fixtures (no live
+- [x] `ruff`, `mypy`, full `pytest` green; tests use recorded fixtures (no live
   network).
 
 **Scope notes**
@@ -260,16 +260,16 @@ own private MCP servers — without changing default behavior.
 - [ ] A single config flag (env var + config field), default **OFF**, gates the
   feature; with it off, registry behavior is byte-identical to pre-v9 (public
   registry only, GA schema fields only) — asserted by a flag-off regression test.
-- [ ] With the flag ON, PMCP can be pointed at a configured private/custom
+- [x] With the flag ON, PMCP can be pointed at a configured private/custom
   registry endpoint (in addition to or instead of the public one) and parses its
   `/v0/servers` response.
-- [ ] With the flag ON, the parser tolerates draft/non-GA `server.json` schema
+- [x] With the flag ON, the parser tolerates draft/non-GA `server.json` schema
   fields (preserves unknown fields in `raw`, surfaces known draft fields) instead
   of dropping or erroring on them; with the flag OFF, unknown/draft fields are
   ignored as today.
-- [ ] Private endpoints and draft tolerance are documented as a debugging feature
+- [x] Private endpoints and draft tolerance are documented as a debugging feature
   with an explicit "not for production discovery" caveat.
-- [ ] `ruff`, `mypy`, full `pytest` green; tests cover both flag states.
+- [x] `ruff`, `mypy`, full `pytest` green; tests cover both flag states.
 
 **Scope notes**
 - Lanes: (a) `config/loader.py` — the opt-in flag + private endpoint config
@@ -306,12 +306,12 @@ Cut v1.15.0: version bump, CHANGELOG, README/`SPEC_COMPLIANCE.md` wiring, and th
 full release gate.
 
 **Exit criteria**
-- [ ] `__version__` and `pyproject.toml` bumped to `1.15.0`; `uv.lock` synced.
-- [ ] CHANGELOG `[1.15.0]` entry covers: MCP 2025-11-25 spec fold-ins (with SEP/PR
+- [x] `__version__` and `pyproject.toml` bumped to `1.15.0`; `uv.lock` synced.
+- [x] CHANGELOG `[1.15.0]` entry covers: MCP 2025-11-25 spec fold-ins (with SEP/PR
   references), registry `updated_since` incremental sync, and the opt-in
   private-registry/draft-schema flag (default off).
-- [ ] README links `SPEC_COMPLIANCE.md` and documents the private-registry flag.
-- [ ] Full release gate passes: `ruff check`, `ruff format --check`, `mypy
+- [x] README links `SPEC_COMPLIANCE.md` and documents the private-registry flag.
+- [x] Full release gate passes: `ruff check`, `ruff format --check`, `mypy
   src/pmcp`, `pytest -q` (TMPDIR outside `/tmp`), `uv build`, `git diff --check`.
 
 **Scope notes**
@@ -362,14 +362,14 @@ full release gate.
 
 ## Acceptance Criteria
 
-- [ ] PMCP satisfies the folded-in 2025-11-25 MUST/SHOULD items, and
+- [x] PMCP satisfies the folded-in 2025-11-25 MUST/SHOULD items, and
   `SPEC_COMPLIANCE.md` tracks per-requirement status plus a draft-revision
   migration assessment — each with adversarial tests / cited SEPs.
-- [ ] Registry refresh can sync incrementally via `updated_since`, merging deltas
+- [x] Registry refresh can sync incrementally via `updated_since`, merging deltas
   into the cache and degrading to a full fetch on cold cache or error.
-- [ ] An opt-in default-OFF flag enables private/custom registries and
+- [x] An opt-in default-OFF flag enables private/custom registries and
   draft-schema tolerance for debugging, with flag-off behavior provably unchanged.
-- [ ] Full release gate passes and `__version__ == 1.15.0`.
+- [x] Full release gate passes and `__version__ == 1.15.0`.
 
 ## Verification
 

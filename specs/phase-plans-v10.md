@@ -121,11 +121,11 @@ These are the narrowest contracts that unblock downstream phases. `/claude-plan-
 Make downstream servers actually recover from transient failure: fix the stdio reconnect `RecursionError` self-cancel, add remote (SSE/HTTP) auto-reconnect parity, and clean up failed connects so no stale ERROR client or leaked stderr task remains.
 
 **Exit criteria**
-- [ ] A real (non-mocked) integration test kills a live stdio server subprocess and asserts the manager returns it to `ONLINE` within the reconnect backoff — the test fails on today's code (`RecursionError`) and passes after the fix.
-- [ ] `_cancel_background_tasks` never cancels `asyncio.current_task()` (unit test asserts calling it from within a tracked task does not cancel that task).
-- [ ] A dropped remote (SSE/HTTP) server schedules a reconnect (parity with stdio); test drives `_read_sse`'s finally path.
-- [ ] A connect that fails at `initialize` leaves no entry in `_clients` and no live stderr reader task (test asserts both).
-- [ ] Full suite + ruff + mypy green; CHANGELOG "Fixed" entry.
+- [x] A real (non-mocked) integration test kills a live stdio server subprocess and asserts the manager returns it to `ONLINE` within the reconnect backoff — the test fails on today's code (`RecursionError`) and passes after the fix.
+- [x] `_cancel_background_tasks` never cancels `asyncio.current_task()` (unit test asserts calling it from within a tracked task does not cancel that task).
+- [x] A dropped remote (SSE/HTTP) server schedules a reconnect (parity with stdio); test drives `_read_sse`'s finally path.
+- [x] A connect that fails at `initialize` leaves no entry in `_clients` and no live stderr reader task (test asserts both).
+- [x] Full suite + ruff + mypy green; CHANGELOG "Fixed" entry.
 
 **Scope notes**
 - Single-writer file: `src/pmcp/client/manager.py` — all three fixes edit it; keep them in one lane to avoid conflicts. Second lane owns `tests/` (new `test_client_manager_reconnect.py` integration + unit tests) and can start against the fix's intended behavior.
@@ -161,11 +161,11 @@ Make downstream servers actually recover from transient failure: fix the stdio r
 Connect the already-implemented, already-tested OAuth resource-server auth mode and Origin/Host validation to the running server so operators can actually enable them; default posture rejects cross-origin browser requests (DNS-rebinding defense).
 
 **Exit criteria**
-- [ ] `GatewayServer` + CLI accept and pass `auth_mode`, `resource_server_*`, `required_scopes`, and `allowed_origins` to `create_http_app` (test asserts a resource-server-configured server actually validates a JWT and rejects an unsigned/aud-mismatched token end-to-end).
-- [ ] With no explicit config, a cross-origin browser `Origin` header is rejected 403 on `/mcp` (test), while same-origin / no-Origin (non-browser) requests pass; `Host` is validated.
-- [ ] `pmcp --help` documents the new flags; `PMCP_ALLOWED_ORIGINS` env honored.
-- [ ] No regression to `none` / `shared-secret` modes (existing auth tests pass unchanged).
-- [ ] Full suite + ruff + mypy green; CHANGELOG "Added/Fixed" + README auth section.
+- [x] `GatewayServer` + CLI accept and pass `auth_mode`, `resource_server_*`, `required_scopes`, and `allowed_origins` to `create_http_app` (test asserts a resource-server-configured server actually validates a JWT and rejects an unsigned/aud-mismatched token end-to-end).
+- [x] With no explicit config, a cross-origin browser `Origin` header is rejected 403 on `/mcp` (test), while same-origin / no-Origin (non-browser) requests pass; `Host` is validated.
+- [x] `pmcp --help` documents the new flags; `PMCP_ALLOWED_ORIGINS` env honored.
+- [x] No regression to `none` / `shared-secret` modes (existing auth tests pass unchanged).
+- [x] Full suite + ruff + mypy green; CHANGELOG "Added/Fixed" + README auth section.
 
 **Scope notes**
 - Publish IF-0-P2-1 (the `GatewayServer.__init__` signature + flag names) on day 1 so the three lanes start against the contract.
@@ -203,11 +203,11 @@ Connect the already-implemented, already-tested OAuth resource-server auth mode 
 Close the two paths where agent/registry-supplied data reaches code execution: validate the package identifier before it becomes `npx -y <name>`, and stop `auth_connect` from storing an arbitrary process-affecting env var (`LD_PRELOAD`/`NODE_OPTIONS`/`PATH`). Also scrub all feedback fields and lock the provision handoff (same file, same security theme).
 
 **Exit criteria**
-- [ ] `register_discovered_server`/`provision` reject a package name that isn't a valid npm/pypi identifier or that starts with `-` (test: `-g`, `../evil`, `a b` rejected; `@scope/name`, `name` accepted); the exact install command is surfaced for confirmation before execution.
-- [ ] `auth_connect` refuses to write an `env_var` not declared by the target server (or not on an allowlist) — test asserts `LD_PRELOAD` is rejected, the server's declared `env_var` is accepted.
-- [ ] `submit_feedback` runs `_scrub_sensitive_text` over `title`, `failed_tool_call`, and `subordinate_server` (test asserts a secret in each is redacted before the payload is built).
-- [ ] `provision_status` guards the `server_ready → adopt_process` handoff with a per-job lock/CAS and does not re-run a full `refresh` on repeat polls of a finished job (test: two concurrent polls adopt once).
-- [ ] Full suite + ruff + mypy green; CHANGELOG "Security/Fixed".
+- [x] `register_discovered_server`/`provision` reject a package name that isn't a valid npm/pypi identifier or that starts with `-` (test: `-g`, `../evil`, `a b` rejected; `@scope/name`, `name` accepted); the exact install command is surfaced for confirmation before execution.
+- [x] `auth_connect` refuses to write an `env_var` not declared by the target server (or not on an allowlist) — test asserts `LD_PRELOAD` is rejected, the server's declared `env_var` is accepted.
+- [x] `submit_feedback` runs `_scrub_sensitive_text` over `title`, `failed_tool_call`, and `subordinate_server` (test asserts a secret in each is redacted before the payload is built).
+- [x] `provision_status` guards the `server_ready → adopt_process` handoff with a per-job lock/CAS and does not re-run a full `refresh` on repeat polls of a finished job (test: two concurrent polls adopt once).
+- [x] Full suite + ruff + mypy green; CHANGELOG "Security/Fixed".
 
 **Scope notes**
 - Publish IF-0-P3-1 (`is_valid_package_name`, `env_var_allowed_for_server`) day 1.
@@ -243,12 +243,12 @@ Close the two paths where agent/registry-supplied data reaches code execution: v
 Stop leaking local credentials: take `secrets set` off the argv, create the secret directory `0700`, and resolve the case-insensitive policy match. Fold in the remaining `cli.py` UX findings (status eager-connect, doctor 401 disambiguation, env-override sentinels).
 
 **Exit criteria**
-- [ ] `pmcp secrets set <key>` reads the value via `getpass`/`--stdin` (positional value optional); test asserts no value on argv.
-- [ ] The secret directory (`~/.config/pmcp` / project) is created mode `0700` (test asserts dir bits, not just the `0600` file).
-- [ ] Policy allow/deny matching is case-sensitive (or the case-insensitivity is confirmed intentional and documented) — test pins the decision.
-- [ ] `pmcp status` with no gateway does NOT eagerly connect every server (defaults to the lazy/no-connect view); a flag opts into active probing.
-- [ ] `doctor` distinguishes 401/403 ("gateway up, needs auth") from unreachable; explicit `--flag` overrides the env-override magic-number sentinels (`==8`/`==60`).
-- [ ] Full suite + ruff + mypy green; CHANGELOG.
+- [x] `pmcp secrets set <key>` reads the value via `getpass`/`--stdin` (positional value optional); test asserts no value on argv.
+- [x] The secret directory (`~/.config/pmcp` / project) is created mode `0700` (test asserts dir bits, not just the `0600` file).
+- [x] Policy allow/deny matching is case-sensitive (or the case-insensitivity is confirmed intentional and documented) — test pins the decision.
+- [x] `pmcp status` with no gateway does NOT eagerly connect every server (defaults to the lazy/no-connect view); a flag opts into active probing.
+- [x] `doctor` distinguishes 401/403 ("gateway up, needs auth") from unreachable; explicit `--flag` overrides the env-override magic-number sentinels (`==8`/`==60`).
+- [x] Full suite + ruff + mypy green; CHANGELOG.
 
 **Scope notes**
 - Lanes are file-disjoint → 3 parallel lanes: (a) `cli.py` (secrets stdin + status/doctor/sentinels), (b) `env_store.py` (0700 dir), (c) `policy.py` (case decision).
@@ -283,10 +283,10 @@ Stop leaking local credentials: take `secrets set` off the argv, create the secr
 Bound the HTTP transport's resource usage: cap and time-limit the unauthenticated pre-session keepalive SSE streams, and enforce the body-size limit against chunked/unadvertised-length POSTs.
 
 **Exit criteria**
-- [ ] Concurrent pre-session keepalive streams are capped and have an idle deadline (test: N+1th stream is rejected or the stream closes after the deadline).
-- [ ] A chunked POST exceeding the 10 MB body cap is rejected while reading (test with no/false `content-length`), not just on the header.
-- [ ] `/health` + `/metrics` exposure decision documented (optionally bindable/gated on non-loopback).
-- [ ] Full suite + ruff + mypy green; CHANGELOG.
+- [x] Concurrent pre-session keepalive streams are capped and have an idle deadline (test: N+1th stream is rejected or the stream closes after the deadline).
+- [x] A chunked POST exceeding the 10 MB body cap is rejected while reading (test with no/false `content-length`), not just on the header.
+- [x] `/health` + `/metrics` exposure decision documented (optionally bindable/gated on non-loopback).
+- [x] Full suite + ruff + mypy green; CHANGELOG.
 
 **Scope notes**
 - Decompose into 2 lanes: (a) `src/pmcp/transport/http.py` implementation (keepalive-stream cap + idle deadline + streaming body-size enforcement) as the single writer of that file, and (b) `tests/` covering both limits (disjoint file, starts against the intended behavior).
@@ -319,11 +319,11 @@ Bound the HTTP transport's resource usage: cap and time-limit the unauthenticate
 Harden the outbound HTTP paths: disable redirects on JWKS/metadata fetches (SSRF), guard the registry response size during read (OOM), require https + a host allowlist for the private registry endpoint, and make the registry cache write atomic with tight perms.
 
 **Exit criteria**
-- [ ] JWKS fetch (`auth.py` aiohttp) and `fetch_json_metadata` (`auth.py` urlopen) use `allow_redirects=False` / a no-redirect opener and re-validate any target (test: a 302 to an internal host is not followed).
-- [ ] The registry client enforces the 2 MB cap during read (streamed / `Content-Length` pre-check), not after `resp.read()` (test: oversized response aborts early).
-- [ ] With `PMCP_REGISTRY_ALLOW_PRIVATE` on, a non-https or non-allowlisted `PMCP_REGISTRY_PRIVATE_ENDPOINT` is rejected (test).
-- [ ] Registry cache is written via temp + `os.replace` (atomic) with restrictive perms (test).
-- [ ] Full suite + ruff + mypy green; CHANGELOG.
+- [x] JWKS fetch (`auth.py` aiohttp) and `fetch_json_metadata` (`auth.py` urlopen) use `allow_redirects=False` / a no-redirect opener and re-validate any target (test: a 302 to an internal host is not followed).
+- [x] The registry client enforces the 2 MB cap during read (streamed / `Content-Length` pre-check), not after `resp.read()` (test: oversized response aborts early).
+- [x] With `PMCP_REGISTRY_ALLOW_PRIVATE` on, a non-https or non-allowlisted `PMCP_REGISTRY_PRIVATE_ENDPOINT` is rejected (test).
+- [x] Registry cache is written via temp + `os.replace` (atomic) with restrictive perms (test).
+- [x] Full suite + ruff + mypy green; CHANGELOG.
 
 **Scope notes**
 - File-disjoint from all other phases → parallel root (depends on none).
@@ -357,12 +357,12 @@ Harden the outbound HTTP paths: disable redirects on JWKS/metadata fetches (SSRF
 Clear the remaining MED/LOW robustness and quality findings across the manager, manifest overlay, config loader, and version checker, and de-flake the sleep-based subprocess tests.
 
 **Exit criteria**
-- [ ] `_tasks` registry evicts terminal (completed/failed/cancelled) records (TTL/LRU); `disconnect_server` inspects/cancels pending state under `_lifecycle_lock`; dead `managed.request_id` removed; `background_task` done-callback uses `pop(t, None)` (tests where practical).
-- [ ] Manifest overlay logs a prominent warning when an overlay entry shadows a shipped server by name, and `_find_project_manifest` keeps discovery within the resolved project root (no out-of-tree symlink follow).
-- [ ] Malformed `.mcp.json` parse errors are surfaced in `pmcp status` (not silently swallowed in `load_configs`); `find_project_root` does not resolve to `$HOME`.
-- [ ] Version-check URLs are `urllib.parse.quote`-escaped for pypi/cargo/docker.
-- [ ] `test_monitor_reads_stderr` and `test_monitor_keeps_last_20_lines` poll job state instead of `asyncio.sleep(0.3)` (no wall-clock race).
-- [ ] Full suite + ruff + mypy green; CHANGELOG.
+- [x] `_tasks` registry evicts terminal (completed/failed/cancelled) records (TTL/LRU); `disconnect_server` inspects/cancels pending state under `_lifecycle_lock`; dead `managed.request_id` removed; `background_task` done-callback uses `pop(t, None)` (tests where practical).
+- [x] Manifest overlay logs a prominent warning when an overlay entry shadows a shipped server by name, and `_find_project_manifest` keeps discovery within the resolved project root (no out-of-tree symlink follow).
+- [x] Malformed `.mcp.json` parse errors are surfaced in `pmcp status` (not silently swallowed in `load_configs`); `find_project_root` does not resolve to `$HOME`.
+- [x] Version-check URLs are `urllib.parse.quote`-escaped for pypi/cargo/docker.
+- [x] `test_monitor_reads_stderr` and `test_monitor_keeps_last_20_lines` poll job state instead of `asyncio.sleep(0.3)` (no wall-clock race).
+- [x] Full suite + ruff + mypy green; CHANGELOG.
 
 **Scope notes**
 - File-disjoint lanes → up to 5 parallel: (a) `manager.py` (after P1's IF-0-P1-1 — task/lifecycle stable), (b) `manifest/loader.py`, (c) `config/loader.py`, (d) `manifest/version_checker.py` + misc, (e) `tests/` de-flake.
@@ -405,12 +405,12 @@ Clear the remaining MED/LOW robustness and quality findings across the manager, 
 
 ## Acceptance Criteria
 
-- [ ] A killed downstream stdio server auto-recovers to ONLINE (the `RecursionError` is gone), and a dropped remote server reconnects — both proven by non-mocked integration tests.
-- [ ] An operator can enable OAuth resource-server auth and Origin validation via CLI/env and see them enforced end-to-end; the default posture rejects cross-origin browser requests.
-- [ ] An invalid/hostile package name is rejected before any `npx` execution, and `auth_connect` cannot store a non-declared process-affecting env var.
-- [ ] `secrets set` never places a credential on argv; the secret directory is `0700`.
-- [ ] Outbound JWKS/metadata/registry fetches don't follow redirects to internal hosts and can't OOM the gateway; the transport bounds keepalive streams and chunked bodies.
-- [ ] Full suite green (≥ current 2100 passing), ruff (lint+format) + mypy clean, at every phase's merge; the two known-flaky monitor tests are deterministic.
+- [x] A killed downstream stdio server auto-recovers to ONLINE (the `RecursionError` is gone), and a dropped remote server reconnects — both proven by non-mocked integration tests.
+- [x] An operator can enable OAuth resource-server auth and Origin validation via CLI/env and see them enforced end-to-end; the default posture rejects cross-origin browser requests.
+- [x] An invalid/hostile package name is rejected before any `npx` execution, and `auth_connect` cannot store a non-declared process-affecting env var.
+- [x] `secrets set` never places a credential on argv; the secret directory is `0700`.
+- [x] Outbound JWKS/metadata/registry fetches don't follow redirects to internal hosts and can't OOM the gateway; the transport bounds keepalive streams and chunked bodies.
+- [x] Full suite green (≥ current 2100 passing), ruff (lint+format) + mypy clean, at every phase's merge; the two known-flaky monitor tests are deterministic.
 
 ## Verification
 
