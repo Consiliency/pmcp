@@ -461,3 +461,95 @@ async def test_allow_draft_schema_includes_non_latest(monkeypatch) -> None:
     )
     assert {s.name for s in on.servers} == {"Latest", "Draft"}
     assert "registry_draft_schema_allowed" in on.diagnostics
+
+
+def test_config_field_enables_private_registry_without_the_env_var(
+    monkeypatch, tmp_path
+) -> None:
+    """The config half of v9 PRIVREG's "env var + config field" (#139).
+
+    Only the env var was ever built, so an operator whose gateway config lives
+    in a file had no way to express this without editing the unit's
+    environment. The default stays OFF.
+    """
+    import json
+
+    from pmcp.config.loader import registry_allow_private_from_config
+    from pmcp.manifest.registry import registry_private_enabled
+
+    monkeypatch.delenv("PMCP_REGISTRY_ALLOW_PRIVATE", raising=False)
+    project = tmp_path / "proj"
+    project.mkdir()
+
+    # No config file at all: still off, and "no preference" is None, not False.
+    assert (
+        registry_allow_private_from_config(project_root=project, user_config_paths=[])
+        is None
+    )
+
+    (project / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {}, "allowPrivateRegistry": True})
+    )
+    value = registry_allow_private_from_config(
+        project_root=project, user_config_paths=[]
+    )
+    assert value is True
+    assert registry_private_enabled(value) is True
+
+
+def test_env_var_overrides_the_config_field_only_when_explicitly_set(
+    monkeypatch, tmp_path
+) -> None:
+    """Absence of the env var is not a preference.
+
+    Reading an unset `PMCP_REGISTRY_ALLOW_PRIVATE` as "false" would silently
+    override a config file that said true -- which would defeat the point of
+    adding the field. An explicitly-set env var still wins in both directions.
+    """
+    import json
+
+    from pmcp.config.loader import registry_allow_private_from_config
+    from pmcp.manifest.registry import registry_private_enabled
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {}, "allowPrivateRegistry": True})
+    )
+    config_true = registry_allow_private_from_config(
+        project_root=project, user_config_paths=[]
+    )
+
+    # Unset env: the config field stands.
+    monkeypatch.delenv("PMCP_REGISTRY_ALLOW_PRIVATE", raising=False)
+    assert registry_private_enabled(config_true) is True
+
+    # Empty-string env is also not a preference.
+    monkeypatch.setenv("PMCP_REGISTRY_ALLOW_PRIVATE", "")
+    assert registry_private_enabled(config_true) is True
+
+    # Explicitly off: env wins over a config field that said true.
+    monkeypatch.setenv("PMCP_REGISTRY_ALLOW_PRIVATE", "0")
+    assert registry_private_enabled(config_true) is False
+
+    # Explicitly on: env wins over a config field that said false.
+    monkeypatch.setenv("PMCP_REGISTRY_ALLOW_PRIVATE", "1")
+    assert registry_private_enabled(False) is True
+
+
+def test_non_boolean_config_field_is_ignored_not_coerced(monkeypatch, tmp_path) -> None:
+    """A truthy string must not silently enable a security-relevant opt-in."""
+    import json
+
+    from pmcp.config.loader import registry_allow_private_from_config
+
+    monkeypatch.delenv("PMCP_REGISTRY_ALLOW_PRIVATE", raising=False)
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / ".mcp.json").write_text(
+        json.dumps({"mcpServers": {}, "allowPrivateRegistry": "yes"})
+    )
+    assert (
+        registry_allow_private_from_config(project_root=project, user_config_paths=[])
+        is None
+    )
