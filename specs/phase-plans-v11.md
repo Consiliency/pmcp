@@ -112,7 +112,7 @@ Level `pmcp`'s CI up to the four guards already proven in `pangram-mcp`, so the 
 
 **Exit criteria**
 - [x] EC-P1-1 — A `min-version-smoke` job parses the declared `mcp` floor out of `pyproject.toml`, installs the built wheel pinned at exactly that version, and imports the gateway's startup modules; it fails if the floor is unsatisfiable or non-functional.
-- [ ] EC-P1-2 — `.github/workflows/test.yml` gains a `schedule:` trigger and `workflow_dispatch`; a manually dispatched run passes on unchanged `main`.
+- [x] EC-P1-2 — `.github/workflows/test.yml` gains a `schedule:` trigger and `workflow_dispatch`; a manually dispatched run passes on unchanged `main`.
 - [x] EC-P1-3 — A test asserts `pmcp.__version__ == importlib.metadata.version("pmcp")`, failing if either drifts.
 - [x] EC-P1-4 — The existing `install-smoke` job is unmodified and still passes, and PR #112 still fails only that job (the guard's behaviour is unchanged by this phase).
 - [x] EC-P1-5 — Full suite, ruff, and mypy green; CHANGELOG entry under `### Changed`.
@@ -210,7 +210,7 @@ Raise `pmcp` onto `mcp` 2.x so it runs correctly on the new library and negotiat
 - [x] EC-P2-5 — A **modern-era** request carrying `io.modelcontextprotocol/protocolVersion: 2026-07-28` in `_meta` is accepted and answered, and the SDK's default `server/discover` returns correct `supported_versions` and `capabilities`. Validating the SDK default is sufficient — `DiscoverResult` carries only `supported_versions`, `capabilities`, and `instructions`, so there is no aggregated inventory to add.
 - [x] EC-P2-6 — **The six proxied handlers work under a modern envelope, exercised over the deployed HTTP wire** — POSTed to the running gateway's `/mcp` on a spare port, not via stdio or direct dispatch: a modern `tools/list` returns the aggregated catalog, a modern `tools/call` succeeds, and a modern `tools/call` with invalid arguments returns a schema-validation error. The envelope must be complete (`_meta` carrying both `protocolVersion` and `clientCapabilities`) with matching HTTP routing headers, since the session manager selects the modern handler from the protocol-version header. A stdio-only or direct-dispatch test can pass while `/mcp` is broken.
 - [x] EC-P2-7 — **An authenticated remote downstream over Streamable HTTP still connects and serves a tool call**, proving the rebuilt `http_client` carries headers. Additionally: a **redirected** downstream still resolves (proving `follow_redirects=True`), and repeated disconnect/reconnect cycles leak no httpx2 clients (proving exit-stack ownership). stdio-only verification does not satisfy this.
-- [ ] EC-P2-8 — Full suite green, ruff/mypy clean, CHANGELOG accurate about which eras are served, and PR #112 resolved per the Execution Notes.
+- [x] EC-P2-8 — Full suite green, ruff/mypy clean, CHANGELOG accurate about which eras are served, and PR #112 resolved per the Execution Notes.
 
 **Scope notes**
 - **The two eras are the design.** `mcp_types.version` splits them explicitly: `HANDSHAKE_PROTOCOL_VERSIONS = (2024-11-05, 2025-03-26, 2025-06-18, 2025-11-25)` versus `MODERN_PROTOCOL_VERSIONS = (2026-07-28,)`. `2026-07-28` **cannot be requested through `initialize`** — it is reached via per-request `_meta` plus `server/discover`. Therefore: **do not raise `PREFERRED_PROTOCOL_VERSION` to `2026-07-28`.** That constant governs the downstream *handshake* ladder and its ceiling of `2025-11-25` is correct. Upstream (serving clients) and downstream (calling servers) are different eras and must be kept separate in both code and tests.
@@ -530,7 +530,7 @@ Move the first-party `pangram-mcp` server off the removed `FastMCP` API onto `MC
 - [x] EC-PG-1 — `src/pangram_mcp/server.py` uses `MCPServer` instead of `mcp.server.fastmcp.FastMCP`; the `analyze` tool keeps its `ToolAnnotations` and its input/output contract is byte-identical.
 - [x] EC-PG-2 — `pyproject.toml` declares a two-sided `mcp` bound whose floor is verified by installing at exactly that floor (not by reading source), and all four guards from IF-0-P1-1 pass.
 - [x] EC-PG-3 — The **currently published 1.x** `pmcp` gateway connects to the ported server and `pangram::analyze` returns a live classification — this is the test of Assumption 6; if it fails, PG gains a dependency on P2 and the roadmap is amended.
-- [ ] EC-PG-4 — After P2 lands, the 2.x gateway also connects and serves `pangram::analyze`.
+- [x] EC-PG-4 — After P2 lands, the 2.x gateway also connects and serves `pangram::analyze`.
 - [x] EC-PG-5 — Published to PyPI; `uvx pangram-mcp` starts clean from a cold cache.
 
 **Scope notes**
