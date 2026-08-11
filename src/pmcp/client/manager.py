@@ -1588,9 +1588,14 @@ class ClientManager:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
+                # exc_info, not just the message: this is by construction the
+                # hardest path here to reproduce (needs a caller cancelled
+                # *while* a forced owner unwind is independently failing), so
+                # the traceback matters if it's ever seen again.
                 logger.warning(
                     f"[{name}] remote transport failed to unwind while "
-                    f"escalating our caller's cancellation: {exc}"
+                    f"escalating our caller's cancellation: {exc}",
+                    exc_info=exc,
                 )
             raise
         # NOTE: no `except Exception` here, deliberately. A transport exit
