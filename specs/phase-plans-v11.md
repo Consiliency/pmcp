@@ -111,11 +111,11 @@ Sequencing is constrained by a live hazard. Dependabot PR **#112** already propo
 Level `pmcp`'s CI up to the four guards already proven in `pangram-mcp`, so the cap raise in P2 cannot ship a package that installs but cannot run.
 
 **Exit criteria**
-- [ ] EC-P1-1 — A `min-version-smoke` job parses the declared `mcp` floor out of `pyproject.toml`, installs the built wheel pinned at exactly that version, and imports the gateway's startup modules; it fails if the floor is unsatisfiable or non-functional.
+- [x] EC-P1-1 — A `min-version-smoke` job parses the declared `mcp` floor out of `pyproject.toml`, installs the built wheel pinned at exactly that version, and imports the gateway's startup modules; it fails if the floor is unsatisfiable or non-functional.
 - [ ] EC-P1-2 — `.github/workflows/test.yml` gains a `schedule:` trigger and `workflow_dispatch`; a manually dispatched run passes on unchanged `main`.
-- [ ] EC-P1-3 — A test asserts `pmcp.__version__ == importlib.metadata.version("pmcp")`, failing if either drifts.
-- [ ] EC-P1-4 — The existing `install-smoke` job is unmodified and still passes, and PR #112 still fails only that job (the guard's behaviour is unchanged by this phase).
-- [ ] EC-P1-5 — Full suite, ruff, and mypy green; CHANGELOG entry under `### Changed`.
+- [x] EC-P1-3 — A test asserts `pmcp.__version__ == importlib.metadata.version("pmcp")`, failing if either drifts.
+- [x] EC-P1-4 — The existing `install-smoke` job is unmodified and still passes, and PR #112 still fails only that job (the guard's behaviour is unchanged by this phase).
+- [x] EC-P1-5 — Full suite, ruff, and mypy green; CHANGELOG entry under `### Changed`.
 
 **Scope notes**
 - Decompose into 2 lanes with disjoint files. `.github/workflows/test.yml` is a **single-writer file** — one lane owns it entirely; splitting the two job additions across lanes would serialize on conflicts.
@@ -203,13 +203,13 @@ raises the cap but not the floor, so `min-version-smoke` still installs
 Raise `pmcp` onto `mcp` 2.x so it runs correctly on the new library and negotiates `2026-07-28` with clients, while continuing to serve every downstream server exactly as today. Behaviour-preserving: no new client-visible protocol features.
 
 **Exit criteria**
-- [ ] EC-P2-1 — A wheel built from this phase installs into a clean environment with no lockfile, resolves `mcp` 2.x, and `pmcp --version` succeeds — `install-smoke` and `min-version-smoke` both green.
-- [ ] EC-P2-2 — The gateway starts on HTTP and listens on its configured port with no `Fatal error` in the log (this is the check that catches the `'Server' object has no attribute 'list_tools'` class of break, which the unit suite cannot).
-- [ ] EC-P2-3 — Each of the six handlers is exercised **at the wire level** — a real request in, a validated typed result out — for `tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, `prompts/get`. Registry-presence assertions are explicitly **not** sufficient. `tools/call` is additionally tested with **invalid** arguments and must return a schema-validation error, proving the validation the removed decorators used to supply is still in place.
-- [ ] EC-P2-4 — A downstream server still on `mcp` 1.x connects through the 2.x gateway over the **handshake** path and serves a real tool call; the negotiated version for that server is a `HANDSHAKE_PROTOCOL_VERSIONS` member (≤ `2025-11-25`), not `2026-07-28`.
-- [ ] EC-P2-5 — A **modern-era** request carrying `io.modelcontextprotocol/protocolVersion: 2026-07-28` in `_meta` is accepted and answered, and the SDK's default `server/discover` returns correct `supported_versions` and `capabilities`. Validating the SDK default is sufficient — `DiscoverResult` carries only `supported_versions`, `capabilities`, and `instructions`, so there is no aggregated inventory to add.
-- [ ] EC-P2-6 — **The six proxied handlers work under a modern envelope, exercised over the deployed HTTP wire** — POSTed to the running gateway's `/mcp` on a spare port, not via stdio or direct dispatch: a modern `tools/list` returns the aggregated catalog, a modern `tools/call` succeeds, and a modern `tools/call` with invalid arguments returns a schema-validation error. The envelope must be complete (`_meta` carrying both `protocolVersion` and `clientCapabilities`) with matching HTTP routing headers, since the session manager selects the modern handler from the protocol-version header. A stdio-only or direct-dispatch test can pass while `/mcp` is broken.
-- [ ] EC-P2-7 — **An authenticated remote downstream over Streamable HTTP still connects and serves a tool call**, proving the rebuilt `http_client` carries headers. Additionally: a **redirected** downstream still resolves (proving `follow_redirects=True`), and repeated disconnect/reconnect cycles leak no httpx2 clients (proving exit-stack ownership). stdio-only verification does not satisfy this.
+- [x] EC-P2-1 — A wheel built from this phase installs into a clean environment with no lockfile, resolves `mcp` 2.x, and `pmcp --version` succeeds — `install-smoke` and `min-version-smoke` both green.
+- [x] EC-P2-2 — The gateway starts on HTTP and listens on its configured port with no `Fatal error` in the log (this is the check that catches the `'Server' object has no attribute 'list_tools'` class of break, which the unit suite cannot).
+- [x] EC-P2-3 — Each of the six handlers is exercised **at the wire level** — a real request in, a validated typed result out — for `tools/list`, `tools/call`, `resources/list`, `resources/read`, `prompts/list`, `prompts/get`. Registry-presence assertions are explicitly **not** sufficient. `tools/call` is additionally tested with **invalid** arguments and must return a schema-validation error, proving the validation the removed decorators used to supply is still in place.
+- [x] EC-P2-4 — A downstream server still on `mcp` 1.x connects through the 2.x gateway over the **handshake** path and serves a real tool call; the negotiated version for that server is a `HANDSHAKE_PROTOCOL_VERSIONS` member (≤ `2025-11-25`), not `2026-07-28`.
+- [x] EC-P2-5 — A **modern-era** request carrying `io.modelcontextprotocol/protocolVersion: 2026-07-28` in `_meta` is accepted and answered, and the SDK's default `server/discover` returns correct `supported_versions` and `capabilities`. Validating the SDK default is sufficient — `DiscoverResult` carries only `supported_versions`, `capabilities`, and `instructions`, so there is no aggregated inventory to add.
+- [x] EC-P2-6 — **The six proxied handlers work under a modern envelope, exercised over the deployed HTTP wire** — POSTed to the running gateway's `/mcp` on a spare port, not via stdio or direct dispatch: a modern `tools/list` returns the aggregated catalog, a modern `tools/call` succeeds, and a modern `tools/call` with invalid arguments returns a schema-validation error. The envelope must be complete (`_meta` carrying both `protocolVersion` and `clientCapabilities`) with matching HTTP routing headers, since the session manager selects the modern handler from the protocol-version header. A stdio-only or direct-dispatch test can pass while `/mcp` is broken.
+- [x] EC-P2-7 — **An authenticated remote downstream over Streamable HTTP still connects and serves a tool call**, proving the rebuilt `http_client` carries headers. Additionally: a **redirected** downstream still resolves (proving `follow_redirects=True`), and repeated disconnect/reconnect cycles leak no httpx2 clients (proving exit-stack ownership). stdio-only verification does not satisfy this.
 - [ ] EC-P2-8 — Full suite green, ruff/mypy clean, CHANGELOG accurate about which eras are served, and PR #112 resolved per the Execution Notes.
 
 **Scope notes**
@@ -381,12 +381,12 @@ plus findings surfaced only during execution.
 Implement `subscriptions/listen` and retire the HTTP GET endpoint it replaces, which is the one part of this migration that changes observable client behaviour.
 
 **Exit criteria**
-- [ ] EC-P3B-1 — `subscriptions/listen` is registered through the IF-0-P2-2 shape, honours the `notifications` filter, sends `notifications/subscriptions/acknowledged` as the first message carrying `io.modelcontextprotocol/subscriptionId` in `_meta`, and never sends a notification type the client did not request.
-- [ ] EC-P3B-2 — Cancellation works from both sides: a client closing the stream (HTTP) or sending `notifications/cancelled` (stdio) ends the subscription, and a server-initiated close sends the empty `subscriptions/listen` response before closing.
-- [ ] EC-P3B-3 — The HTTP GET path on `/mcp` is retired without breaking `/health` or `/metrics`, and a client using the old GET flow receives a defined error rather than a hang.
-- [ ] EC-P3B-4 — **A real catalog mutation delivers a notification end to end.** Calling `gateway.connect_server` / `disconnect_server` / `refresh` — which mutate the tool, resource, and prompt indexes in `ClientManager` — causes a subscribed client to receive the corresponding `notifications/*/list_changed`. A synthetic test that fires the publisher directly does **not** satisfy this criterion.
-- [ ] EC-P3B-5 — Gateway starts, a downstream tool call still succeeds, and a client with no subscription is unaffected; full suite, ruff, mypy green.
-- [ ] EC-P3B-6 — CHANGELOG documents the GET retirement as a breaking client-visible change, released as a **major version**.
+- [x] EC-P3B-1 — `subscriptions/listen` is registered through the IF-0-P2-2 shape, honours the `notifications` filter, sends `notifications/subscriptions/acknowledged` as the first message carrying `io.modelcontextprotocol/subscriptionId` in `_meta`, and never sends a notification type the client did not request.
+- [x] EC-P3B-2 — Cancellation works from both sides: a client closing the stream (HTTP) or sending `notifications/cancelled` (stdio) ends the subscription, and a server-initiated close sends the empty `subscriptions/listen` response before closing.
+- [x] EC-P3B-3 — The HTTP GET path on `/mcp` is retired without breaking `/health` or `/metrics`, and a client using the old GET flow receives a defined error rather than a hang.
+- [x] EC-P3B-4 — **A real catalog mutation delivers a notification end to end.** Calling `gateway.connect_server` / `disconnect_server` / `refresh` — which mutate the tool, resource, and prompt indexes in `ClientManager` — causes a subscribed client to receive the corresponding `notifications/*/list_changed`. A synthetic test that fires the publisher directly does **not** satisfy this criterion.
+- [x] EC-P3B-5 — Gateway starts, a downstream tool call still succeeds, and a client with no subscription is unaffected; full suite, ruff, mypy green.
+- [x] EC-P3B-6 — CHANGELOG documents the GET retirement as a breaking client-visible change, released as a **major version**.
 
 **Scope notes**
 - **A listener with no publishers is the failure mode to design against.** `subscriptions/listen` lives in `src/pmcp/server.py`, but the events that should drive it originate in `src/pmcp/client/manager.py`, where tools/resources/prompts are indexed and removed (around `:1099`). Without an explicit event path from those mutations to the subscription, handler-level tests pass while live `connect_server` / disconnect / refresh deliver nothing. Define the publisher interface **before** the listener.
@@ -527,11 +527,11 @@ Top Interface-Freeze Gates section (item 1).
 Move the first-party `pangram-mcp` server off the removed `FastMCP` API onto `MCPServer`, raising its `mcp` cap, and prove it is reachable from both a 1.x and a 2.x gateway.
 
 **Exit criteria**
-- [ ] EC-PG-1 — `src/pangram_mcp/server.py` uses `MCPServer` instead of `mcp.server.fastmcp.FastMCP`; the `analyze` tool keeps its `ToolAnnotations` and its input/output contract is byte-identical.
-- [ ] EC-PG-2 — `pyproject.toml` declares a two-sided `mcp` bound whose floor is verified by installing at exactly that floor (not by reading source), and all four guards from IF-0-P1-1 pass.
-- [ ] EC-PG-3 — The **currently published 1.x** `pmcp` gateway connects to the ported server and `pangram::analyze` returns a live classification — this is the test of Assumption 6; if it fails, PG gains a dependency on P2 and the roadmap is amended.
+- [x] EC-PG-1 — `src/pangram_mcp/server.py` uses `MCPServer` instead of `mcp.server.fastmcp.FastMCP`; the `analyze` tool keeps its `ToolAnnotations` and its input/output contract is byte-identical.
+- [x] EC-PG-2 — `pyproject.toml` declares a two-sided `mcp` bound whose floor is verified by installing at exactly that floor (not by reading source), and all four guards from IF-0-P1-1 pass.
+- [x] EC-PG-3 — The **currently published 1.x** `pmcp` gateway connects to the ported server and `pangram::analyze` returns a live classification — this is the test of Assumption 6; if it fails, PG gains a dependency on P2 and the roadmap is amended.
 - [ ] EC-PG-4 — After P2 lands, the 2.x gateway also connects and serves `pangram::analyze`.
-- [ ] EC-PG-5 — Published to PyPI; `uvx pangram-mcp` starts clean from a cold cache.
+- [x] EC-PG-5 — Published to PyPI; `uvx pangram-mcp` starts clean from a cold cache.
 
 **Scope notes**
 - Decompose into 2 lanes with disjoint files. Lane A owns `src/pangram_mcp/server.py` (the API port). Lane B owns `pyproject.toml` + `tests/` (bound raise, floor bisection, drift test).
@@ -568,10 +568,10 @@ Move the first-party `pangram-mcp` server off the removed `FastMCP` API onto `MC
 Let a manifest entry express "credential required for the vendor endpoint, optional for a self-hosted one", removing the placeholder-secret workaround that #114 documents.
 
 **Exit criteria**
-- [ ] EC-P5-1 — A manifest entry can declare that its credential is optional under a named condition, and the requirement is evaluated by **one shared predicate** that every enforcement path calls — not re-implemented per call site.
-- [ ] EC-P5-2 — A server whose credential is genuinely required still fails closed at **every** gate; no server becomes reachable without auth that was not already.
-- [ ] EC-P5-3 — With the new field in use, an operator reaches a self-hosted endpoint with **no placeholder credential** anywhere, and it works through **all six consumers**: eager startup, provision/install, lifecycle connect, `pmcp secrets check` diagnostics, and capability discovery (`gateway.catalog_search` / `gateway.request_capability` must not report the server as key-missing or advise `auth_connect`). Passing only the connect path does not satisfy this.
-- [ ] EC-P5-4 — Existing manifest entries are unaffected (the field is optional and defaults to today's behaviour); full suite, ruff, mypy green.
+- [x] EC-P5-1 — A manifest entry can declare that its credential is optional under a named condition, and the requirement is evaluated by **one shared predicate** that every enforcement path calls — not re-implemented per call site.
+- [x] EC-P5-2 — A server whose credential is genuinely required still fails closed at **every** gate; no server becomes reachable without auth that was not already.
+- [x] EC-P5-3 — With the new field in use, an operator reaches a self-hosted endpoint with **no placeholder credential** anywhere, and it works through **all six consumers**: eager startup, provision/install, lifecycle connect, `pmcp secrets check` diagnostics, and capability discovery (`gateway.catalog_search` / `gateway.request_capability` must not report the server as key-missing or advise `auth_connect`). Passing only the connect path does not satisfy this.
+- [x] EC-P5-4 — Existing manifest entries are unaffected (the field is optional and defaults to today's behaviour); full suite, ruff, mypy green.
 
 **Scope notes**
 - **`requires_api_key` is enforced in FIVE independent places** — eager startup (`src/pmcp/config/loader.py`, around `:1038`), install (`src/pmcp/manifest/installer.py` `check_api_key`, around `:541`), lifecycle connect (`src/pmcp/tools/handlers.py`, around `:3200`), provisioning (`src/pmcp/tools/handlers.py`, around `:4058`), **diagnostics** (`src/pmcp/cli_commands/secrets.py`, around `:93` — `pmcp secrets check`), and **capability discovery** (`_get_server_env_metadata`, `src/pmcp/tools/handlers.py:3355`, consumed at `:1403`, `:3643`, `:3730`, `:3840` — this is what makes `gateway.catalog_search` and `gateway.request_capability` report a server as key-missing and tell operators to run `gateway.auth_connect`) — spanning 6 files and ~26 references. Successive review rounds found this list at four, then five, then six; each time the omitted consumer would have kept demanding the placeholder while every other path was fixed. Patching a subset produces a server that connects manually but fails auto-start, provisioning, or diagnostics. **Centralize first, then consume — and enumerate by grepping, not from memory.**
@@ -650,8 +650,8 @@ Let a manifest entry express "credential required for the vendor endpoint, optio
 Finish the one item from `specs/phase-plans-v10.md` Phase 6 that never landed, so the closed v10 roadmap has no silent leftovers.
 
 **Exit criteria**
-- [ ] EC-P6CLEAN-1 — `tests/test_manifest.py:1775` polls job state instead of `asyncio.sleep(0.3)`; the test passes with no wall-clock dependency and does not regress under load.
-- [ ] EC-P6CLEAN-2 — Full suite, ruff, and mypy green; CHANGELOG entry recording that this closes out v10 P6.
+- [x] EC-P6CLEAN-1 — `tests/test_manifest.py:1775` polls job state instead of `asyncio.sleep(0.3)`; the test passes with no wall-clock dependency and does not regress under load.
+- [x] EC-P6CLEAN-2 — Full suite, ruff, and mypy green; CHANGELOG entry recording that this closes out v10 P6.
 
 **Scope notes**
 - **Single lane, justified.** This is one test-file change; a second lane would contend on the same file for no benefit. This is the preamble/cleanup exception to the ≥2-lane rule, not an oversight.
