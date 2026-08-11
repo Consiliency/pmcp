@@ -627,62 +627,285 @@ class TestDisconnectAll:
 
     @pytest.mark.asyncio
     async def test_disconnect_all_closes_remote_stack(self) -> None:
-        """Test that disconnect_all closes remote SSE transports."""
+        """disconnect_all signals a remote client's transport owner task and
+        waits for it to unwind, rather than closing an exit stack directly
+        from a foreign task (the anyio cancel-scope task-ownership fix)."""
         manager = ClientManager()
         status = ServerStatus(
             name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
         )
 
-        sse_stack = MagicMock()
-        sse_stack.aclose = AsyncMock()
+        shutdown = asyncio.Event()
+
+        async def owner() -> None:
+            await shutdown.wait()
+
+        owner_task = asyncio.create_task(owner())
 
         managed = ManagedClient(
             config=MagicMock(),
             process=None,
             is_remote=True,
-            sse_exit_stack=sse_stack,
             write_stream=MagicMock(),
             status=status,
+            transport_owner_task=owner_task,
+            transport_shutdown=shutdown,
         )
         manager._clients["remote"] = managed
         manager._servers["remote"] = status
 
         await manager.disconnect_all()
 
-        sse_stack.aclose.assert_awaited_once()
+        assert shutdown.is_set()
+        assert owner_task.done()
 
     @pytest.mark.asyncio
-    async def test_disconnect_all_ignores_cancel_scope_task_mismatch(self) -> None:
-        """Benign anyio cancel-scope mismatch should not be logged as warning."""
+    async def test_close_remote_transport_escalates_to_cancel_on_timeout(self) -> None:
+        """An owner task that ignores the graceful shutdown signal past the
+        timeout budget is cancelled directly; _close_remote_transport still
+        returns normally (the transport is closed either way) and logs a
+        WARNING rather than raising."""
         manager = ClientManager()
         status = ServerStatus(
             name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
         )
+        shutdown = asyncio.Event()
+        cancelled = asyncio.Event()
 
-        sse_stack = MagicMock()
-        sse_stack.aclose = AsyncMock(
-            side_effect=RuntimeError(
-                "Attempted to exit cancel scope in a different task than it was entered in"
-            )
-        )
+        async def stubborn_owner() -> None:
+            # Ignores `shutdown` entirely -- only a direct task.cancel() ends
+            # this, which is exactly the escalation being tested.
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
 
+        owner_task = asyncio.create_task(stubborn_owner())
         managed = ManagedClient(
             config=MagicMock(),
             process=None,
             is_remote=True,
-            sse_exit_stack=sse_stack,
             write_stream=MagicMock(),
             status=status,
+            transport_owner_task=owner_task,
+            transport_shutdown=shutdown,
+        )
+
+        with patch("pmcp.client.manager.logger.warning") as mock_warning:
+            await manager._close_remote_transport("remote", managed, timeout=0.05)
+
+        assert cancelled.is_set()
+        assert owner_task.done()
+        mock_warning.assert_called_once()
+        assert "did not close within" in mock_warning.call_args[0][0]
+
+    @pytest.mark.asyncio
+    async def test_disconnect_server_reports_failure_when_transport_exit_raises(
+        self,
+    ) -> None:
+        """A transport owner whose stack exit raises must be reported as a
+        failed disconnect -- `(False, cancelled, "<msg>")` -- not
+        `(True, ...)`. Without this, `disconnect_server`'s
+        `except Exception -> return (False, cancelled, str(e))` contract is
+        unenforced no matter what the design says."""
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="remote",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                type="streamable-http", url="http://example.invalid/mcp"
+            ),
+        )
+        status = ServerStatus(
+            name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+        shutdown = asyncio.Event()
+
+        async def raising_owner() -> None:
+            await shutdown.wait()
+            raise RuntimeError("transport exit boom")
+
+        owner_task = asyncio.create_task(raising_owner())
+        managed = ManagedClient(
+            config=config,
+            process=None,
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=status,
+            transport_owner_task=owner_task,
+            transport_shutdown=shutdown,
         )
         manager._clients["remote"] = managed
         manager._servers["remote"] = status
 
-        with patch("pmcp.client.manager.logger.warning") as mock_warning:
-            await manager.disconnect_all()
+        ok, _cancelled, error = await manager.disconnect_server("remote", force=True)
 
-        assert manager._clients == {}
-        assert manager._servers == {}
-        mock_warning.assert_not_called()
+        assert ok is False
+        assert error is not None
+        assert "transport exit boom" in error
+
+    @pytest.mark.asyncio
+    async def test_disconnect_server_reports_failure_when_owner_already_crashed(
+        self,
+    ) -> None:
+        """An owner that crashes *before* anyone asks it to shut down (the
+        crash-while-parked case `_on_transport_owner_done` only logs) must
+        still surface its exception the next time `disconnect_server` looks
+        -- not be silently treated as "already closed, nothing to report"
+        just because `task.done()` is already True by the time we check.
+        Board-review regression: `_close_remote_transport`'s early
+        `if task.done(): return` used to discard the result entirely."""
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="remote",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                type="streamable-http", url="http://example.invalid/mcp"
+            ),
+        )
+        status = ServerStatus(
+            name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+        shutdown = asyncio.Event()
+
+        async def crashing_owner() -> None:
+            # Crashes immediately, without ever waiting on `shutdown` --
+            # simulates the transport dying while parked, before anyone
+            # asked it to close.
+            raise RuntimeError("owner crashed while parked")
+
+        owner_task = asyncio.create_task(crashing_owner())
+        # Let the owner actually finish before touching it, so `task.done()`
+        # is already True when `_close_remote_transport` looks -- exercising
+        # the early-return branch, not the awaited-task branch covered by
+        # test_disconnect_server_reports_failure_when_transport_exit_raises.
+        for _ in range(10):
+            if owner_task.done():
+                break
+            await asyncio.sleep(0)
+        assert owner_task.done()
+
+        managed = ManagedClient(
+            config=config,
+            process=None,
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=status,
+            transport_owner_task=owner_task,
+            transport_shutdown=shutdown,
+        )
+        manager._clients["remote"] = managed
+        manager._servers["remote"] = status
+
+        ok, _cancelled, error = await manager.disconnect_server("remote", force=True)
+
+        assert ok is False
+        assert error is not None
+        assert "owner crashed while parked" in error
+
+    @pytest.mark.asyncio
+    async def test_close_remote_transport_propagates_failure_during_timeout_escalation(
+        self,
+    ) -> None:
+        """A transport-exit failure that surfaces while the owner unwinds
+        under our own escalating `task.cancel()` (the timeout branch) must
+        still propagate -- only the CancelledError our own cancel() causes
+        may be swallowed. Distinct from the timeout-as-success contract,
+        which stays (see test_close_remote_transport_escalates_to_cancel_on_timeout):
+        that covers a *clean* forced unwind; this covers one that fails.
+        Board-review regression: the escalation used to run under
+        `asyncio.gather(task, return_exceptions=True)`, which discarded
+        genuine failures indistinguishably from the expected CancelledError."""
+        manager = ClientManager()
+        status = ServerStatus(
+            name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+        shutdown = asyncio.Event()
+
+        async def owner_that_fails_on_cancel() -> None:
+            # Ignores `shutdown` entirely, so the graceful wait always times
+            # out. When escalated via task.cancel(), raises a genuine
+            # failure instead of letting CancelledError propagate --
+            # simulating __aexit__ swallowing the cancellation and
+            # surfacing its own error, e.g. a broken connection encountered
+            # during forced unwind.
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                raise RuntimeError("transport failed to unwind under cancel") from None
+
+        owner_task = asyncio.create_task(owner_that_fails_on_cancel())
+        managed = ManagedClient(
+            config=MagicMock(),
+            process=None,
+            is_remote=True,
+            write_stream=MagicMock(),
+            status=status,
+            transport_owner_task=owner_task,
+            transport_shutdown=shutdown,
+        )
+
+        with pytest.raises(
+            RuntimeError, match="transport failed to unwind under cancel"
+        ):
+            await manager._close_remote_transport("remote", managed, timeout=0.05)
+
+    @pytest.mark.asyncio
+    async def test_connect_cancelled_during_ownership_transfer_leaves_no_owner(
+        self,
+    ) -> None:
+        """Cancelling the connect task while it is parked at `await ready`
+        (the owner task already alive and entering the transport, but
+        `ManagedClient` not yet published) must not park a live,
+        unreferenced owner task. Regression for the ownership-transfer guard
+        in `_connect_remote_stream` -- proven red without it during
+        development (reverting `except BaseException` to `except Exception`
+        there leaves the owner orphaned and this test fails)."""
+        manager = ClientManager()
+        config = ResolvedServerConfig(
+            name="remote",
+            source="custom",
+            config=RemoteMcpServerConfig(
+                type="streamable-http", url="http://example.invalid/mcp"
+            ),
+        )
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class _HangingTransport:
+            async def __aenter__(self) -> tuple[Any, Any]:
+                entered.set()
+                await release.wait()
+                return (MagicMock(), MagicMock())
+
+            async def __aexit__(self, *exc_info: Any) -> None:
+                return None
+
+        connect_task = asyncio.create_task(
+            manager._connect_remote_stream(
+                config, _HangingTransport(), transport_name="test"
+            )
+        )
+        await entered.wait()
+
+        connect_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await connect_task
+
+        # Owner-task discard runs as a done-callback scheduled via
+        # call_soon, not synchronously when the task completes -- yield once
+        # so it has run before asserting.
+        await asyncio.sleep(0)
+
+        owner_tasks = [
+            t
+            for t in manager._background_tasks
+            if manager._background_task_servers.get(t) == "remote"
+        ]
+        assert owner_tasks == []
+        assert "remote" not in manager._clients
 
     @pytest.mark.asyncio
     async def test_disconnect_all_uses_stable_client_snapshot(self) -> None:

@@ -21,6 +21,7 @@ from dataclasses import dataclass
 
 import uvicorn
 from mcp.server import MCPServer
+from sse_starlette.sse import AppStatus
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, RedirectResponse
@@ -109,3 +110,10 @@ async def run_fake_remote(
     finally:
         server.should_exit = True
         await task
+        # sse_starlette.sse.AppStatus.should_exit is a process-global class
+        # attribute, latched True by its uvicorn-shutdown signal handler and
+        # never reset. Left alone, every SSE stream created afterwards — in
+        # any event loop, against any server — terminates immediately, which
+        # poisons whichever test runs next. This is the one site that resets
+        # it; nothing else in the repo should.
+        AppStatus.should_exit = False

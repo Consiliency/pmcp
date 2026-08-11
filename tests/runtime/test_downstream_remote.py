@@ -15,51 +15,36 @@ so this must run in-process rather than through a booted gateway subprocess
 — the "no mocks" bar applies to the fake remote peer, not to how the
 gateway code runs.
 
-All five properties below share ONE `run_fake_remote` lifecycle inside ONE
-test function, rather than one `run_fake_remote` per test — empirically,
-not a style choice: a real streamable-http client connection that fully
-establishes its standalone SSE listener and is then torn down leaves
-something in anyio's process-global task/cancel-scope bookkeeping that
-breaks the *next independent* event loop's uvicorn server (reproduced with
-`git bisect`-style isolation — a connect-only cycle, or a second server
-with no client at all, does not trigger it; only a fully connected-then-
-disconnected client followed by a *separate* `asyncio.run()`/event-loop
-boundary does). That is orthogonal to anything IF-0-P2-2 changed — it
-reproduces with a plain, non-redirected, non-authenticated connect too —
-and looks like an anyio/httpx2/uvicorn interaction rather than a pmcp bug;
-reported to the team lead rather than routed around silently. Keeping
-everything in one test function's one event loop avoids it and keeps the
-evidence real.
+Four independent properties, four independent tests, each with its own
+`ClientManager`, its own `run_fake_remote(alloc_port(), ...)`, and a
+`disconnect_all()` teardown. This file used to cram all four into one test
+function sharing one `run_fake_remote` lifecycle, to dodge two bugs that
+made splitting it fail:
 
-DIAGNOSIS (2026-08-11, from an attempt to split this into four focused
-tests — the split was reverted, this is what it taught us). The constraint
-above is real and still holds; do not split this file without fixing the
-cause first. Two distinct symptoms, one root:
-
-  1. `disconnect_all()` in teardown fails outright with
+  1. `disconnect_all()` in teardown raised
      `CancelledError: Cancelled via cancel scope <id> by <Task ...
      _disconnect_all_unlocked.<locals>._shutdown_one() ...
-     cb=[gather.<locals>._done_callback()]`.
-  2. With one test per event loop, tests that run *after* a completed
-     connect-and-teardown fail their next connect with "SSE stream ended
-     without a response" — the cross-loop breakage described above.
+     cb=[gather.<locals>._done_callback()]`. Root cause: the remote
+     transport's exit stack was entered in the task that performed the
+     connect and closed in a *different* task — `_shutdown_one` under
+     `asyncio.gather`, or a later loop's teardown. anyio cancel scopes are
+     bound to the task that created them, so closing that stack elsewhere
+     violated its invariant. Fixed in `src/pmcp/client/manager.py`: a
+     long-lived per-client owner task now enters and unwinds the transport
+     in itself, so ownership never crosses a task boundary.
+  2. Independently, tests run *after* a completed connect-and-teardown
+     failed their next connect with "SSE stream ended without a response".
+     This was not a pmcp bug: `sse_starlette.sse.AppStatus.should_exit` is a
+     process-global class attribute, latched `True` the first time any
+     uvicorn server in the process shuts down and never reset, so every SSE
+     stream created afterwards — in any loop, against any server —
+     terminates immediately. Fixed in `tests/runtime/fake_remote.py`'s
+     `run_fake_remote` `finally:` block, which is the one place that resets
+     it.
 
-Root cause, now identified: `managed.sse_exit_stack` is entered in the
-task that performs the connect and closed in a *different* task —
-`_shutdown_one` under `asyncio.gather`, or a later loop's teardown. anyio
-cancel scopes are bound to the task that created them, so closing that
-stack elsewhere violates its invariant. It is not an httpx2 or uvicorn
-defect; it is pmcp entering a task-bound resource in one task and
-releasing it in another.
-
-The fix is therefore per-client task ownership of teardown: the task that
-owns a client's exit stack must be the one that closes it, on request.
-That is a connection-lifecycle restructuring affecting every client, which
-is why it stays deferred to its own phase rather than being patched in
-alongside unrelated work. Two things that do NOT fix it, both tried:
-swapping `disconnect_all()` for per-name `disconnect_server()` in teardown
-(symptom 2 remains), and assuming P2's leak fix resolved it (it fixed the
-leak, not the task-ownership violation).
+These two causes are unrelated — the earlier "two symptoms, one root"
+framing in this docstring was wrong. Both are fixed now, independently, and
+the file is split.
 """
 
 from __future__ import annotations
@@ -87,25 +72,23 @@ def _config(
 
 
 @pytest.mark.asyncio
-async def test_ec_p2_7_headers_redirect_and_reconnect_leak() -> None:
+async def test_ec_p2_7_configured_headers_reach_peer() -> None:
+    """Headers set by IF-0-P2-2's httpx2.AsyncClient construction really
+    reach the peer: the fake remote 401s without the exact configured
+    Authorization value, so a successful connect + real gateway.invoke
+    proves the rebuilt client carries them, not just that a mock recorded a
+    kwarg."""
     manager = ClientManager()
-    connected_names: list[str] = []
     try:
         async with run_fake_remote(
             alloc_port(), expected_auth_value=AUTH_VALUE
         ) as remote:
-            # 1. Headers set by IF-0-P2-2's httpx2.AsyncClient construction
-            #    really reach the peer: the fake remote 401s without the
-            #    exact configured Authorization value, so a successful
-            #    connect + real gateway.invoke proves the rebuilt client
-            #    carries them, not just that a mock recorded a kwarg.
             errors = await manager.connect_server(
                 _config(
                     "fr-auth", remote.mcp_url, headers={"Authorization": AUTH_VALUE}
                 )
             )
             assert errors == []
-            connected_names.append("fr-auth")
             assert manager.is_server_online("fr-auth") is True
 
             gateway_tools = GatewayTools(
@@ -120,15 +103,25 @@ async def test_ec_p2_7_headers_redirect_and_reconnect_leak() -> None:
             assert result.ok is True
             content = result.result["content"]  # type: ignore[index]
             assert content[0]["text"] == "fr-echo:wire-proof"
+    finally:
+        await manager.disconnect_all()
 
-            # 2. Negative case: without this, (1) would be hollow — a fake
-            #    remote that accepts everything can't prove headers matter.
-            #    Confirms the 401 gate is live, not dead code.
+
+@pytest.mark.asyncio
+async def test_ec_p2_7_auth_gate_rejects_missing_and_wrong_header() -> None:
+    """Negative case: without this, the positive header-carrying test would
+    be hollow — a fake remote that accepts everything can't prove headers
+    matter. Confirms the 401 gate is live, not dead code, both for a
+    missing Authorization header and for the wrong value."""
+    manager = ClientManager()
+    try:
+        async with run_fake_remote(
+            alloc_port(), expected_auth_value=AUTH_VALUE
+        ) as remote:
             errors = await manager.connect_server(_config("fr-noauth", remote.mcp_url))
             assert errors != []
             assert manager.is_server_online("fr-noauth") is False
 
-            # 2b. Wrong value, not just absent.
             errors = await manager.connect_server(
                 _config(
                     "fr-wrongauth",
@@ -137,11 +130,22 @@ async def test_ec_p2_7_headers_redirect_and_reconnect_leak() -> None:
                 )
             )
             assert errors != []
+            assert manager.is_server_online("fr-wrongauth") is False
+    finally:
+        await manager.disconnect_all()
 
-            # 3. Proves follow_redirects=True (IF-0-P2-2): the configured
-            #    URL points at /relocated, which 307s to /mcp. httpx2's own
-            #    default is follow_redirects=False, so this fails if pmcp
-            #    ever drops the explicit override.
+
+@pytest.mark.asyncio
+async def test_ec_p2_7_follows_redirects() -> None:
+    """Proves follow_redirects=True (IF-0-P2-2): the configured URL points
+    at /relocated, which 307s to /mcp. httpx2's own default is
+    follow_redirects=False, so this fails if pmcp ever drops the explicit
+    override."""
+    manager = ClientManager()
+    try:
+        async with run_fake_remote(
+            alloc_port(), expected_auth_value=AUTH_VALUE
+        ) as remote:
             errors = await manager.connect_server(
                 _config(
                     "fr-redirect",
@@ -150,24 +154,30 @@ async def test_ec_p2_7_headers_redirect_and_reconnect_leak() -> None:
                 )
             )
             assert errors == []
-            connected_names.append("fr-redirect")
             assert manager.is_server_online("fr-redirect") is True
+    finally:
+        await manager.disconnect_all()
 
-            # 4. The leak proof. Calls the private `_connect_streamable_http`
-            #    directly (not the public `connect_server`, whose
-            #    singleflight guard short-circuits as a no-op when the
-            #    server is already ONLINE — manager.py:580-581 — and so
-            #    never reaches the reconnect branch at all): each call finds
-            #    `name in self._clients` from the previous iteration and
-            #    takes `_connect_remote_stream`'s "existing live connection"
-            #    branch, which calls `_cleanup_client` — the method
-            #    IF-0-P2-2 taught to close `managed.sse_exit_stack` (and
-            #    therefore the owned `httpx2.AsyncClient`) for remote
-            #    clients; before this phase it did not.
+
+@pytest.mark.asyncio
+async def test_ec_p2_7_reconnect_does_not_leak_transports() -> None:
+    """The leak proof. Calls the private `_connect_streamable_http` directly
+    (not the public `connect_server`, whose singleflight guard short-circuits
+    as a no-op when the server is already ONLINE, and so never reaches the
+    reconnect branch at all): each call finds `name in self._clients` from
+    the previous iteration and takes `_connect_remote_stream`'s "existing
+    live connection" branch, which calls `_cleanup_client` — the method
+    IF-0-P2-2 taught to close the remote transport (and therefore the owned
+    `httpx2.AsyncClient`) for remote clients; before that phase it did not."""
+    manager = ClientManager()
+    prior_clients: list[object] = []
+    try:
+        async with run_fake_remote(
+            alloc_port(), expected_auth_value=AUTH_VALUE
+        ) as remote:
             reconnect_config = _config(
                 "fr-reconnect", remote.mcp_url, headers={"Authorization": AUTH_VALUE}
             )
-            prior_clients = []
             socket_counts_by_cycle = []
             for _ in range(5):
                 await manager._connect_streamable_http(reconnect_config)
@@ -175,11 +185,10 @@ async def test_ec_p2_7_headers_redirect_and_reconnect_leak() -> None:
                 assert managed.remote_http_client is not None
                 prior_clients.append(managed.remote_http_client)
                 socket_counts_by_cycle.append(open_socket_fd_count())
-            connected_names.append("fr-reconnect")
 
             for closed_client in prior_clients[:-1]:
-                assert closed_client.is_closed is True
-            assert prior_clients[-1].is_closed is False
+                assert closed_client.is_closed is True  # type: ignore[attr-defined]
+            assert prior_clients[-1].is_closed is False  # type: ignore[attr-defined]
 
             # Compare against the count right after the FIRST cycle, not
             # before it: establishing this server's very first connection
@@ -202,14 +211,8 @@ async def test_ec_p2_7_headers_redirect_and_reconnect_leak() -> None:
                 f"baseline={baseline}, counts={socket_counts_by_cycle}"
             )
     finally:
-        # disconnect_server (not disconnect_all, whose concurrent gather of
-        # every managed client's shutdown can trip anyio's cross-task
-        # cancel-scope guard — see the module docstring) closes each
-        # connected client explicitly.
-        for name in connected_names:
-            if manager.is_server_online(name):
-                await manager.disconnect_server(name, force=True)
+        await manager.disconnect_all()
 
-    # The final reconnect-cycle client is closed too, by the disconnect
+    # The final reconnect-cycle client is closed too, by disconnect_all
     # above rather than by a further reconnect.
-    assert prior_clients[-1].is_closed is True
+    assert prior_clients[-1].is_closed is True  # type: ignore[attr-defined]

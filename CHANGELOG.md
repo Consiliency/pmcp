@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Remote downstream transports (SSE, streamable HTTP) are now entered and
+  closed in a dedicated per-client owner task, fixing an anyio cancel-scope
+  task-ownership violation during teardown: the exit stack used to be
+  entered by the task that connected and closed by whichever task called
+  `disconnect_server` / `disconnect_all` / a reconnect, which anyio's
+  cancel scopes don't allow. This did not leak resources (the owned
+  `httpx2.AsyncClient` always closed), but the violation itself was real
+  and, in the one path where the entering task was still alive, surfaced as
+  a `CancelledError` escaping `disconnect_all()`.
+
 ## [2.0.0] - 2026-08-09
 
 ### Removed
