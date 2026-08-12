@@ -221,7 +221,7 @@ jobs:
             exit 0
           fi
 
-          echo "::error::This PR changes files under src/ but does not update CHANGELOG.md. Add an entry under '## [Unreleased]' in CHANGELOG.md, or apply the 'skip-changelog' label if this change ships no user-visible behavior."
+          echo "::error::This PR changes files under src/ but does not update CHANGELOG.md. Add an entry under '## [Unreleased]' in CHANGELOG.md, or apply the 'skip-changelog' label if this change ships no user-visible behavior. Note: applying the label to an already-open PR does not re-run this check by itself — push a commit (or use 'Re-run jobs') after labeling for it to go green."
           exit 1
 
   typecheck:
