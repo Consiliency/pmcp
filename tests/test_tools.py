@@ -4849,7 +4849,9 @@ class TestUpdateServerVersionRepair:
     load_descriptions_cache reads the same stale value back off disk.
     """
 
-    def _make_manifest_with_playwright(self, monkeypatch: pytest.MonkeyPatch) -> Manifest:
+    def _make_manifest_with_playwright(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> Manifest:
         manifest = Manifest(
             version="1.0",
             cli_alternatives={},
