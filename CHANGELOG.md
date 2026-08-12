@@ -51,7 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     function, so they can never disagree, and a server whose effective
     config pins a concrete version is refused outright (`ok: false`,
     explaining the pin and which config file it came from) rather than
-    probed and silently mis-recorded.
+    probed and silently mis-recorded. Pin detection covers every package
+    manager the tool can update, not just npm: a `:tag`-pinned docker image
+    and a `cargo install --version` pin are refused the same way. Docker
+    needed its own handling because package detection strips the tag off the
+    image reference, so `docker run acme/server:1.2.3` would otherwise pull
+    `acme/server:latest`, restart the still-pinned config, and record the new
+    digest as active.
 
 ## [2.1.0] - 2026-08-12
 
