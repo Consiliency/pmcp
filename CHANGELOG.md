@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-08-12
+
 ### Fixed
 - **`gateway.update_server` now actually restarts the server, and no longer
   leaves a stale "update available" notice behind after a successful
