@@ -73,6 +73,7 @@ from pmcp.manifest.registry import (
     fetch_registry_servers,
     load_registry_cache,
 )
+from pmcp.manifest.refresher import save_descriptions_cache
 from pmcp.manifest.version_checker import (
     detect_package_type,
     get_package_version,
@@ -974,6 +975,7 @@ class GatewayTools:
         custom_config_path: Path | None = None,
         guidance_config: GuidanceConfig | None = None,
         descriptions_cache: DescriptionsCache | None = None,
+        descriptions_cache_path: Path | None = None,
     ) -> None:
         self._client_manager = client_manager
         self._policy_manager = policy_manager
@@ -981,6 +983,10 @@ class GatewayTools:
         self._custom_config_path = custom_config_path
         self._guidance_config = guidance_config
         self._descriptions_cache = descriptions_cache
+        # Where the descriptions cache lives on disk (.mcp-gateway/descriptions.yaml
+        # by default). Needed so a successful gateway.update_server can persist the
+        # refreshed version, not just patch the in-memory copy -- see update_server().
+        self._descriptions_cache_path = descriptions_cache_path
         self._detected_clis: set[str] | None = None
         self._detected_cli_infos: dict[str, CLIInfo] = {}
         self._platform: str | None = None
@@ -5015,7 +5021,45 @@ class GatewayTools:
         latest_version, _ = await get_package_version(
             server_config.command, server_config.args, timeout=5.0
         )
-        self._stale_check_cache.pop(server_name, None)
+
+        # gateway.refresh() only reloads configs and reconnects transports; it
+        # never touches the descriptions cache, so `desc.version` (an upstream
+        # snapshot from the last `pmcp refresh`, not "installed version") would
+        # otherwise stay pinned at its pre-update value forever and keep
+        # producing a stale "update available" notice from every emission site
+        # (_get_update_warning, catalog_search's stale_updates, the background
+        # stale sweep) -- even after this update succeeded. If we have a fresh
+        # latest_version, write it in as the new baseline and persist it so the
+        # fix survives a restart (load_descriptions_cache reads this file back).
+        # A `None` latest_version means the version fetch failed; leave the old
+        # value rather than write something worse than what's already there.
+        now = time.time()
+        if latest_version:
+            if (
+                self._descriptions_cache is not None
+                and server_name in self._descriptions_cache.servers
+            ):
+                self._descriptions_cache.servers[server_name].version = latest_version
+                if self._descriptions_cache_path is not None:
+                    try:
+                        save_descriptions_cache(
+                            self._descriptions_cache, self._descriptions_cache_path
+                        )
+                    except Exception as e:
+                        # The package update itself already succeeded; a bookkeeping
+                        # failure here shouldn't flip the reported result to failed.
+                        logger.warning(
+                            f"Failed to persist descriptions cache after updating "
+                            f"'{server_name}': {e}"
+                        )
+            # Repopulate (not just pop) with the fresh (current, latest) pair so
+            # catalog_search's stale_updates -- which reads _stale_check_cache
+            # directly -- agrees the server is current immediately, instead of
+            # leaving a hole that a later _get_update_warning/_run_stale_index
+            # recompute would refill from the (now-stale) descriptions value.
+            self._stale_check_cache[server_name] = (now, latest_version, latest_version)
+        else:
+            self._stale_check_cache.pop(server_name, None)
 
         message = f"Updated '{server_name}' ({package_type}:{package_name}) and refreshed gateway connections."
         if not refresh_result.ok:

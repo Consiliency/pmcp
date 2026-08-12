@@ -4836,6 +4836,250 @@ class TestStaleIndexer:
         assert gt._stale_index_task is None
 
 
+class TestUpdateServerVersionRepair:
+    """A successful gateway.update_server must clear the stale-notice trail.
+
+    gateway.refresh() (called from inside update_server) never touches the
+    descriptions cache -- only refresh_all() (server.py's own startup/refresh
+    path, which update_server does not call) does. Without this repair,
+    desc.version stays pinned at its pre-update value forever, and every
+    notice emission site (_get_update_warning, catalog_search's
+    stale_updates, the background stale sweep) keeps recomputing the same
+    stale "update available" notice from it -- even across a restart, since
+    load_descriptions_cache reads the same stale value back off disk.
+    """
+
+    def _make_manifest_with_playwright(self, monkeypatch: pytest.MonkeyPatch) -> Manifest:
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "playwright": ServerConfig(
+                    name="playwright",
+                    description="Browser automation",
+                    keywords=["browser"],
+                    install={},
+                    command="npx",
+                    args=["-y", "@playwright/mcp"],
+                    requires_api_key=False,
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        return manifest
+
+    def _make_cache(self, version: str = "0.1.0") -> DescriptionsCache:
+        return DescriptionsCache(
+            generated_at="2024-01-01T00:00:00",
+            gateway_version="1.0.0",
+            servers={
+                "playwright": GeneratedServerDescriptions(
+                    package="@playwright/mcp",
+                    version=version,
+                    generated_at="2024-01-01T00:00:00",
+                    capability_summary="Browser automation",
+                    tools=[],
+                )
+            },
+        )
+
+    def _wire_success(
+        self,
+        gt: GatewayTools,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        latest_version: str | None,
+    ) -> None:
+        """Wire update_server's collaborators for a successful probe + refresh."""
+
+        async def _fake_probe(command, env=None):
+            return (True, "ok")
+
+        monkeypatch.setattr(gt, "_run_update_probe_command", _fake_probe)
+        monkeypatch.setattr(
+            gt,
+            "refresh",
+            lambda input_data: __import__("asyncio").sleep(
+                0, result=types.SimpleNamespace(ok=True)
+            ),
+        )
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            return (latest_version, "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_server_bumps_descriptions_cache_version(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On success, the descriptions-cache version is rewritten to latest."""
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        assert result.latest_version == "0.2.0"
+        assert cache.servers["playwright"].version == "0.2.0"
+
+    @pytest.mark.asyncio
+    async def test_update_server_clears_get_update_warning(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """_get_update_warning must stop reporting the update as available.
+
+        Reproduces the maintainer's report: gateway.update_server("context7")
+        reported success but the notice kept recurring on every subsequent
+        call.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        await gt.update_server({"server_name": "playwright"})
+
+        warning = await gt._get_update_warning("playwright")
+        assert warning is None
+
+    @pytest.mark.asyncio
+    async def test_update_server_clears_catalog_search_stale_updates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """catalog_search's stale_updates must also stop naming the server.
+
+        This is the trap: update_server's own _stale_check_cache.pop() would
+        already make an *immediate* catalog_search go quiet, so that alone
+        doesn't discriminate the fix. Force the recompute that production
+        traffic would trigger (a follow-up _get_update_warning, or the
+        background stale sweep) before checking catalog_search, so a
+        left-behind stale descriptions value has a chance to leak back in.
+        """
+        tools = [
+            ToolInfo(
+                tool_id="playwright::snapshot",
+                server_name="playwright",
+                tool_name="snapshot",
+                description="Take snapshot",
+                short_description="Take snapshot",
+                input_schema={"type": "object", "properties": {}},
+                tags=["browser"],
+                risk_hint=RiskHint.LOW,
+            )
+        ]
+        client_manager = MockClientManager(tools)
+        client_manager.set_server_online("playwright")
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        await gt.update_server({"server_name": "playwright"})
+        # Force the same recompute _get_update_warning or the background
+        # sweep would perform on the next call.
+        await gt._get_update_warning("playwright")
+
+        result = await gt.catalog_search({})
+
+        assert result.stale_updates is None
+
+    @pytest.mark.asyncio
+    async def test_update_server_persists_version_across_restart(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The repaired version must survive a restart, not just live in memory.
+
+        Simulates a restart by discarding the in-process GatewayTools and
+        re-loading the cache file from disk, the same way
+        GatewayServer.initialize() does at startup.
+        """
+        from pmcp.manifest.refresher import load_descriptions_cache
+
+        self._make_manifest_with_playwright(monkeypatch)
+        cache_path = tmp_path / "descriptions.yaml"
+        cache = self._make_cache(version="0.1.0")
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+            descriptions_cache_path=cache_path,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        result = await gt.update_server({"server_name": "playwright"})
+        assert result.ok is True
+
+        reloaded = load_descriptions_cache(cache_path)
+        assert reloaded is not None
+        assert reloaded.servers["playwright"].version == "0.2.0"
+
+    @pytest.mark.asyncio
+    async def test_update_server_failed_probe_does_not_bump_version(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A failed update probe must not touch the recorded version."""
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+
+        async def _fake_probe_fails(command, env=None):
+            return (False, "npm ERR! network timeout")
+
+        monkeypatch.setattr(gt, "_run_update_probe_command", _fake_probe_fails)
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert cache.servers["playwright"].version == "0.1.0"
+
+    @pytest.mark.asyncio
+    async def test_update_server_none_latest_version_leaves_old_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A failed version fetch (None) must leave the old version intact.
+
+        Writing "unknown" (or any other sentinel) would be worse than leaving
+        the previous, at-least-plausible value in place.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version=None)
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        assert result.latest_version is None
+        assert cache.servers["playwright"].version == "0.1.0"
+        assert "playwright" not in gt._stale_check_cache
+
+
 class TestInvokeErrorPaths:
     """Tests for gateway.invoke error handling paths."""
 
