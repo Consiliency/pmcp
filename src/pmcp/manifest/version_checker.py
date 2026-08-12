@@ -312,49 +312,75 @@ def detect_package_type(
             i += 1
 
     elif command == "docker":
-        # docker run [options] image[:tag] [cmd...]
-        _value_flags = {
-            "-e",
-            "--env",
-            "-v",
-            "--volume",
-            "-p",
-            "--publish",
-            "--name",
-            "--network",
-            "-u",
-            "--user",
-            "--entrypoint",
-            "-w",
-            "--workdir",
-            "--label",
-            "-l",
-            "--memory",
-            "-m",
-            "--cpus",
-            "--add-host",
-            "--dns",
-            "--hostname",
-            "-h",
-        }
-        skip_next = False
-        for arg in args:
-            if skip_next:
-                skip_next = False
-                continue
-            if arg in ("run", "exec", "start", "create", "pull", "push"):
-                continue
-            if arg in _value_flags:
-                skip_next = True
-                continue
-            if arg.startswith("-"):
-                continue
-            # First positional arg after subcommand is the image name; strip tag
-            image = arg.split(":")[0]
+        raw = _docker_image_arg(args)
+        if raw is not None:
+            # Strip the tag: docker run [options] image[:tag] [cmd...]
+            image = raw.split(":")[0]
             if image:
                 return ("docker", image)
 
     return ("unknown", None)
+
+
+def _docker_image_arg(args: list[str]) -> str | None:
+    """Return the raw ``docker`` image token from *args*, or ``None``.
+
+    "Raw" means with any ``:tag`` suffix still attached -- factored out of
+    ``detect_package_type``'s docker branch for the same reason
+    ``_npm_package_arg`` was: gateway.update_server's pin detection needs the
+    untouched token, and re-implementing this scan separately would risk the
+    two disagreeing about which argument is "the image".
+    """
+    _value_flags = {
+        "-e",
+        "--env",
+        "-v",
+        "--volume",
+        "-p",
+        "--publish",
+        "--name",
+        "--network",
+        "-u",
+        "--user",
+        "--entrypoint",
+        "-w",
+        "--workdir",
+        "--label",
+        "-l",
+        "--memory",
+        "-m",
+        "--cpus",
+        "--add-host",
+        "--dns",
+        "--hostname",
+        "-h",
+    }
+    skip_next = False
+    for arg in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ("run", "exec", "start", "create", "pull", "push"):
+            continue
+        if arg in _value_flags:
+            skip_next = True
+            continue
+        if arg.startswith("-"):
+            continue
+        # First positional arg after the subcommand is the image reference.
+        return arg
+    return None
+
+
+def _docker_image_tag(image_ref: str) -> str | None:
+    """Return the ``:tag`` on a docker image reference, or ``None``.
+
+    Only the final path segment can carry a tag, so a registry host with a
+    port (``registry:5000/img:1.2.3``) does not read as a tag of ``5000``.
+    """
+    last_segment = image_ref.rsplit("/", 1)[-1]
+    name, sep, tag = last_segment.partition(":")
+    return tag if sep and name and tag else None
 
 
 async def get_package_version(

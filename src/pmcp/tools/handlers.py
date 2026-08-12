@@ -75,6 +75,8 @@ from pmcp.manifest.registry import (
 )
 from pmcp.manifest.refresher import save_descriptions_cache
 from pmcp.manifest.version_checker import (
+    _docker_image_arg,
+    _docker_image_tag,
     _npm_package_arg,
     _npm_tag,
     detect_package_type,
@@ -290,6 +292,17 @@ def _detect_effective_version_pin(
     failed fetch" gate already protects against) -- this check exists only
     to turn that into a clear, specific refusal message instead of an opaque
     "could not fetch latest version" one.
+
+    docker: ``detect_package_type`` strips the ``:tag`` off the image
+    reference, so without this branch ``docker run acme/server:1.2.3`` would
+    pull ``acme/server:latest``, restart the still-pinned ``1.2.3`` config,
+    and then record the latest digest as active -- the same silent
+    misreporting the npm branch above exists to prevent (board review round
+    3). Uses ``_docker_image_arg``/``_docker_image_tag`` so a registry host
+    with a port (``registry:5000/img``) is not misread as a tag.
+
+    cargo: ``cargo install`` pins with a separate ``--version X`` flag rather
+    than an inline suffix, so it needs its own scan.
     """
     if package_type == "npm":
         raw = _npm_package_arg(args)
@@ -304,6 +317,19 @@ def _detect_effective_version_pin(
             if "==" in arg:
                 _, _, version = arg.partition("==")
                 return version or None
+    if package_type == "docker":
+        raw_image = _docker_image_arg(args)
+        if raw_image is None:
+            return None
+        tag = _docker_image_tag(raw_image)
+        return None if not tag or tag == "latest" else tag
+    if package_type == "cargo":
+        for index, arg in enumerate(args):
+            if arg.startswith("--version="):
+                _, _, version = arg.partition("=")
+                return version or None
+            if arg == "--version" and index + 1 < len(args):
+                return args[index + 1] or None
     return None
 
 

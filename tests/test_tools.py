@@ -5429,6 +5429,89 @@ class TestUpdateServerVersionRepair:
         assert cache.servers["playwright"].version == "0.1.0"
         assert "playwright" not in gt._stale_check_cache
 
+    @pytest.mark.asyncio
+    async def test_update_server_refuses_pinned_docker_tag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A ``:tag``-pinned docker image must refuse, exactly like an npm pin.
+
+        Board review round 3: ``detect_package_type`` strips the tag off a
+        docker image reference (``image = raw.split(":")[0]``), so without a
+        docker branch in ``_detect_effective_version_pin`` this tool would
+        ``docker pull acme/server:latest``, restart the still-pinned
+        ``1.2.3`` config, and then record the freshly-pulled digest as the
+        running version -- the same silent misreporting the npm pin gate
+        exists to prevent, just via a different package manager.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        pinned_override = ResolvedServerConfig(
+            name="playwright",
+            source="project",
+            config=LocalMcpServerConfig(
+                command="docker", args=["run", "--rm", "acme/server:1.2.3"]
+            ),
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_configs", lambda **_: [pinned_override]
+        )
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+
+        probe_calls: list[Any] = []
+
+        async def _fake_probe(command, env=None):
+            probe_calls.append(command)
+            return (True, "ok")
+
+        monkeypatch.setattr(gt, "_run_update_probe_command", _fake_probe)
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            return ("sha256:beefbeef", "docker")  # must be ignored
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert "pinned" in result.message.lower()
+        assert "1.2.3" in result.message
+        assert probe_calls == []  # never even attempted
+        assert cache.servers["playwright"].version == "0.1.0"
+        assert "playwright" not in gt._stale_check_cache
+
+    def test_detect_effective_version_pin_matrix(self):
+        """Pin detection per package manager, including the not-a-pin cases."""
+        from pmcp.tools.handlers import _detect_effective_version_pin as detect
+
+        # npm: explicit version pins, @latest is not a pin, bare is not a pin.
+        assert detect("npm", "npx", ["-y", "@playwright/mcp@1.2.3"]) == "1.2.3"
+        assert detect("npm", "npx", ["-y", "@playwright/mcp@latest"]) is None
+        assert detect("npm", "npx", ["-y", "@playwright/mcp"]) is None
+
+        # docker: only the final path segment can carry a tag, so a registry
+        # host with a port must not read as a pin of "5000".
+        assert detect("docker", "docker", ["run", "acme/server:1.2.3"]) == "1.2.3"
+        assert detect("docker", "docker", ["run", "acme/server:latest"]) is None
+        assert detect("docker", "docker", ["run", "acme/server"]) is None
+        assert detect("docker", "docker", ["run", "registry:5000/img"]) is None
+        assert detect("docker", "docker", ["run", "registry:5000/img:2.0"]) == "2.0"
+
+        # cargo: pins via a separate --version flag, both spellings.
+        assert detect("cargo", "cargo", ["install", "srv", "--version", "1.0"]) == "1.0"
+        assert detect("cargo", "cargo", ["install", "srv", "--version=1.0"]) == "1.0"
+        assert detect("cargo", "cargo", ["install", "srv"]) is None
+
+        # pypi/uvx inline == pin.
+        assert detect("pypi", "uvx", ["srv==1.2.3"]) == "1.2.3"
+        assert detect("pypi", "uvx", ["srv"]) is None
+
 
 class TestInvokeErrorPaths:
     """Tests for gateway.invoke error handling paths."""
