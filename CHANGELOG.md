@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-08-12
+
+### Added
+- **`allowPrivateRegistry` config field.** The private-registry opt-in was
+  env-var-only (`PMCP_REGISTRY_ALLOW_PRIVATE`), which roadmap v9's PRIVREG
+  criterion specified as "env var + config field"; only the env var was ever
+  built. It is now also a top-level boolean in the config file, beside
+  `autoStart`, resolved project > user > custom. The env var still wins, but
+  **only when explicitly set** -- an unset variable is not a preference, so it
+  cannot silently override a config file that enabled the flag. Non-boolean
+  values are ignored with a warning rather than coerced, so a truthy string
+  cannot quietly enable a security-relevant opt-in. Default remains OFF.
+  (Consiliency/pmcp#139)
+- **`telnyx` manifest entry.** Telnyx now publishes an official MCP server
+  (`telnyx-mcp`, maintained by `team-telnyx`, from
+  `github.com/team-telnyx/telnyx-node`); the entry was previously deferred
+  because the package name then tracked the Telnyx SDK version line. Note its
+  primary tool is `execute`, which runs TypeScript against a pre-authenticated
+  SDK client -- a code-execution surface rather than a narrow API wrapper, and
+  classified HIGH risk accordingly. (Consiliency/pmcp#77, partial: Algolia
+  still has no official server and remains deferred.)
+
 ## [2.0.1] - 2026-08-11
 
 ### Fixed
