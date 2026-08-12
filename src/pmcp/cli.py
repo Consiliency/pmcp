@@ -2651,3 +2651,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+# THROWAWAY: verifying changelog CI guard fails red — will be reverted
