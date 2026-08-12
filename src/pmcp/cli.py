@@ -2651,3 +2651,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+# THROWAWAY 3: verifying live-label changelog guard (to be reverted)
