@@ -35,6 +35,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     connection -- is now written into the descriptions cache and persisted
     to disk, so both the notice and the offline tool listing stay accurate
     across restarts.
+  - A third bug in the same area: `update_server` resolved its probe target
+    (the command it version-checks and updates) via a manifest/discovered-only
+    lookup, while the restart above resolves via the same precedence
+    `gateway.restart_server` uses, where a `.mcp.json` entry overrides the
+    manifest. For a server configured in both places -- README documents
+    pinning a server's exact version via `.mcp.json` as the supported
+    override channel -- this meant probing and version-checking one command
+    while restarting a different one. Concretely: manifest has an unpinned
+    `npx -y context7`, `.mcp.json` pins `npx -y context7@1.2.3`; the probe
+    detects/installs upstream's real latest, the restart activates the
+    *pinned* 1.2.3 process, and the (now-fixed) bookkeeping above would
+    record the probed "latest" as current -- silently misreporting the
+    pinned server's version. Both steps now resolve through the identical
+    function, so they can never disagree, and a server whose effective
+    config pins a concrete version is refused outright (`ok: false`,
+    explaining the pin and which config file it came from) rather than
+    probed and silently mis-recorded.
 
 ## [2.1.0] - 2026-08-12
 
