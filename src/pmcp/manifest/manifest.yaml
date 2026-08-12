@@ -953,6 +953,20 @@ servers:
     env_var: "TWILIO_ACCOUNT_SID"
     env_instructions: "Set TWILIO_ACCOUNT_SID, TWILIO_API_KEY, TWILIO_API_SECRET from https://console.twilio.com"
 
+  telnyx:
+    description: "Telnyx communications - voice calls, SMS/MMS, phone numbers, messaging profiles"
+    keywords: [telnyx, sms, mms, voice, calls, phone, numbers, messaging, telephony, communication, api]
+    install:
+      mac: ["npx", "-y", "telnyx-mcp"]
+      linux: ["npx", "-y", "telnyx-mcp"]
+      wsl: ["npx", "-y", "telnyx-mcp"]
+      windows: ["npx", "-y", "telnyx-mcp"]
+    command: "npx"
+    args: ["-y", "telnyx-mcp"]
+    requires_api_key: true
+    env_var: "TELNYX_API_KEY"
+    env_instructions: "Set TELNYX_API_KEY from https://portal.telnyx.com/#/app/api-keys. TELNYX_PUBLIC_KEY, TELNYX_CLIENT_ID and TELNYX_CLIENT_SECRET are also supported for webhook verification and OAuth."
+
   mailgun:
     description: "Mailgun email API - send emails, manage domains, mailing lists, templates"
     keywords: [mailgun, email, sending, transactional, smtp, domains, templates, api]
