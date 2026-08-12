@@ -21,28 +21,28 @@ random delay, so the disconnect's transport teardown races the tool call's
 still-open SSE read.
 """
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: E402
 
-import argparse
-import asyncio
-import contextlib
-import json
-import logging
-import random
-import sys
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
+import argparse  # noqa: E402
+import asyncio  # noqa: E402
+import contextlib  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+import random  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 logging.basicConfig(level=logging.ERROR)
 
-from pmcp.client.manager import ClientManager
-from pmcp.policy.policy import PolicyManager
-from pmcp.tools.handlers import GatewayTools
-from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
-from tests.runtime.fake_remote import run_fake_remote
-from tests.runtime.harness import alloc_port
+from pmcp.client.manager import ClientManager  # noqa: E402
+from pmcp.policy.policy import PolicyManager  # noqa: E402
+from pmcp.tools.handlers import GatewayTools  # noqa: E402
+from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig  # noqa: E402
+from tests.runtime.fake_remote import run_fake_remote  # noqa: E402
+from tests.runtime.harness import alloc_port  # noqa: E402
 
 TARGET_STRING = "SSE stream ended without a response"
 SIBLING_STRING = "SSE stream ended and reconnection attempts were exhausted"
@@ -82,13 +82,17 @@ def _classify(message: str, result: TrialResult) -> None:
         result.other.append(message)
 
 
-async def _run_trial(trial_id: int, races: int, min_delay_ms: float, max_delay_ms: float) -> TrialResult:
+async def _run_trial(
+    trial_id: int, races: int, min_delay_ms: float, max_delay_ms: float
+) -> TrialResult:
     result = TrialResult(trial_id=trial_id, races=races)
     start = time.monotonic()
 
     async with run_fake_remote(alloc_port(), expected_auth_value=AUTH_VALUE) as remote:
         manager = ClientManager()
-        gateway_tools = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
+        gateway_tools = GatewayTools(
+            client_manager=manager, policy_manager=PolicyManager()
+        )
         config = _config("probe-race", remote.mcp_url)
         try:
             for i in range(races):
@@ -107,7 +111,10 @@ async def _run_trial(trial_id: int, races: int, min_delay_ms: float, max_delay_m
 
                 call_task = asyncio.create_task(
                     gateway_tools.invoke(
-                        {"tool_id": "probe-race::fr_echo", "arguments": {"text": f"race-{i}"}}
+                        {
+                            "tool_id": "probe-race::fr_echo",
+                            "arguments": {"text": f"race-{i}"},
+                        }
                     )
                 )
                 disc_task = asyncio.create_task(_delayed_disconnect())

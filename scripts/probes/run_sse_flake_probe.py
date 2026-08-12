@@ -26,7 +26,11 @@ PROBE = Path(__file__).with_name("sse_flake_probe.py")
 
 
 async def _run_one(
-    trial_id: int, servers: int, cycles: int, calls_per_cycle: int, sem: asyncio.Semaphore
+    trial_id: int,
+    servers: int,
+    cycles: int,
+    calls_per_cycle: int,
+    sem: asyncio.Semaphore,
 ) -> dict:
     async with sem:
         proc = await asyncio.create_subprocess_exec(
@@ -88,7 +92,15 @@ async def main_async(args: argparse.Namespace) -> int:
     for done in asyncio.as_completed(tasks):
         r = await done
         results.append(r)
-        tag = "HIT" if r.get("target_hits") else ("SIBLING" if r.get("sibling_hits") else ("CRASH" if r.get("crashed") else "clean"))
+        tag = (
+            "HIT"
+            if r.get("target_hits")
+            else (
+                "SIBLING"
+                if r.get("sibling_hits")
+                else ("CRASH" if r.get("crashed") else "clean")
+            )
+        )
         print(
             f"[{len(results)}/{args.trials}] trial={r.get('trial_id')} {tag} "
             f"elapsed={r.get('elapsed_s', 0):.1f}s "
@@ -104,12 +116,18 @@ async def main_async(args: argparse.Namespace) -> int:
     crashed = [r for r in results if r.get("crashed")]
 
     print()
-    print(f"=== {args.trials} trials, servers={args.servers} cycles={args.cycles} "
-          f"calls_per_cycle={args.calls_per_cycle} jobs={args.jobs} "
-          f"wall={elapsed:.1f}s ===")
-    print(f"TARGET hits ('SSE stream ended without a response'): {len(hits)}/{args.trials}")
-    print(f"sibling-only hits ('...reconnection attempts were exhausted'): "
-          f"{len(sibling_only)}/{args.trials}")
+    print(
+        f"=== {args.trials} trials, servers={args.servers} cycles={args.cycles} "
+        f"calls_per_cycle={args.calls_per_cycle} jobs={args.jobs} "
+        f"wall={elapsed:.1f}s ==="
+    )
+    print(
+        f"TARGET hits ('SSE stream ended without a response'): {len(hits)}/{args.trials}"
+    )
+    print(
+        f"sibling-only hits ('...reconnection attempts were exhausted'): "
+        f"{len(sibling_only)}/{args.trials}"
+    )
     print(f"probe crashes (not a flake hit, a probe bug): {len(crashed)}/{args.trials}")
 
     if hits:
@@ -120,20 +138,26 @@ async def main_async(args: argparse.Namespace) -> int:
     if crashed:
         print("\n--- probe crashes ---")
         for r in crashed[:5]:
-            print(f"trial {r['trial_id']}: rc={r.get('returncode')} note={r.get('note')}")
+            print(
+                f"trial {r['trial_id']}: rc={r.get('returncode')} note={r.get('note')}"
+            )
             print(r.get("stderr_tail", "")[-800:])
 
     print()
-    print(json.dumps({
-        "trials": args.trials,
-        "servers": args.servers,
-        "cycles": args.cycles,
-        "calls_per_cycle": args.calls_per_cycle,
-        "target_hit_count": len(hits),
-        "sibling_only_count": len(sibling_only),
-        "crash_count": len(crashed),
-        "elapsed_s": elapsed,
-    }))
+    print(
+        json.dumps(
+            {
+                "trials": args.trials,
+                "servers": args.servers,
+                "cycles": args.cycles,
+                "calls_per_cycle": args.calls_per_cycle,
+                "target_hit_count": len(hits),
+                "sibling_only_count": len(sibling_only),
+                "crash_count": len(crashed),
+                "elapsed_s": elapsed,
+            }
+        )
+    )
 
     return 0
 
@@ -144,7 +168,9 @@ def main() -> int:
     parser.add_argument("--servers", type=int, default=8)
     parser.add_argument("--cycles", type=int, default=5)
     parser.add_argument("--calls-per-cycle", type=int, default=20)
-    parser.add_argument("--jobs", type=int, default=4, help="max concurrent trial subprocesses")
+    parser.add_argument(
+        "--jobs", type=int, default=4, help="max concurrent trial subprocesses"
+    )
     args = parser.parse_args()
     return asyncio.run(main_async(args))
 

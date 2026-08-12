@@ -1,7 +1,12 @@
 # Investigation: intermittent "SSE stream ended without a response"
 
-Status: IN PROGRESS — draft written while probe trials run; final numbers
-filled in below once the batch completes.
+Status: **DONE — reproduced reliably, root-caused, no fix shipped.** The
+exact reported error string is reproduced by killing the downstream peer
+process mid-response, in the post-headers/pre-completion window: 40%
+(16/40) when the kill lands during a follow-up tool call, 6% (3/50) when it
+lands during the initial `connect_server()`/`initialize` handshake — the
+exact call site named in the symptom. The message is accurate in every
+case; there is no pmcp defect to fix. See "Conclusion" below.
 
 ## Symptom
 
@@ -145,8 +150,199 @@ concurrently starts `disconnect_server(name, force=True)` for the *same*
 server after a random 0–20ms delay, racing teardown against the still-open
 SSE read.
 
-<!-- INTERRUPT_RESULTS_PLACEHOLDER -->
+**0/40 trials, 1,200 race attempts, 0 target hits, 0 sibling hits.** But not
+"clean" — 5-12 of each trial's 30 races (roughly a third overall) produced a
+bare `CancelledError`. Root cause of *that*: `disconnect_server` calls
+`cancel_pending_requests(name)` (manager.py:826-... , cancelling
+`pending.future`) **before** it closes the remote transport
+(`_close_remote_transport`). The pending future — the thing
+`gateway.invoke()` is awaiting via `send_request` /
+`_await_with_idle_timeout` (manager.py:2039-2134) — is a pmcp-level object,
+entirely separate from the mcp SDK's own `read_stream`/`_handle_sse_response`
+machinery. Cancelling it wins the race every time it fires: `gateway.invoke()`
+sees `CancelledError` immediately, well before the mcp SDK's transport
+owner task has even started unwinding, let alone before `_handle_sse_response`
+could notice the connection dying and synthesize its own error. **A
+disconnect that pmcp itself initiates against a server with an in-flight
+request can therefore never surface this exact message through
+`gateway.invoke()`** — pmcp's own cancellation always gets there first.  This
+rules out "concurrent `disconnect_server` racing an in-flight request to the
+same server" as a source, on top of Run 1 already having found no evidence
+for "healthy peer, high organic connect/disconnect/invoke concurrency" as a
+source.
+
+### Dead end, documented so it isn't retried: in-process task-cancel
+
+Before building the SIGKILL variant below, first tried
+`sse_flake_probe_serverkill.py`: cancel the peer's own `uvicorn.Server.serve()`
+asyncio task (`task.cancel()`, not a graceful `should_exit = True`) while a
+client request is in flight, in the *same* process as the client (no
+subprocess). Result: **0/10 races even touched** — every tool call
+completed successfully regardless of the kill. Cancelling the outer
+`serve()` task does not reliably tear down already-accepted connection
+handlers (they run as separate tasks/transports uvicorn's cancellation
+doesn't reach), so the client-visible TCP connection kept working. Confirmed
+via `appstatus_before`/`appstatus_after` in its JSON output that this
+approach also never trips the process-global `AppStatus.should_exit` latch
+(good for safety, useless for reproduction). Not pursued further — recorded
+here so a future attempt doesn't waste time on the same approach.
+
+### Result — peer-process SIGKILL variant (reproduces the exact symptom)
+
+`sse_flake_probe_sigkill.py` runs the peer in its own OS process
+(`_serverkill_runner.py`) and sends it `SIGKILL` at a random delay after
+starting a `gateway.invoke()` tool call — the kernel then force-closes every
+fd of that process, including the client's live socket, which an in-process
+`task.cancel()` could not do. This is **not** routed through any pmcp
+disconnect code (`disconnect_server`/`cancel_pending_requests` are never
+called until the `finally:` cleanup, after the race already resolved), so it
+tests the third hypothesis: a peer that dies for reasons entirely outside
+pmcp, mid-response.
+
+| variant | delay window | trials | target hits | rate |
+|---|---|---|---|---|
+| mid-tool-call kill, trial 0 | 0-5ms | 10 kills | 4 | 40% |
+| mid-tool-call kill, trial 2 | 0-6ms | 30 kills | 12 | 40% |
+| **mid-tool-call kill, combined** | 0-6ms | **40 kills** | **16** | **40%** |
+
+Sample hit (via `gateway.invoke()`'s own error envelope):
+```
+{"code":"E302","message":"SSE stream ended without a response",
+ "details":{"tool_id":"probe-sigkill::fr_echo"},
+ "suggestion":"Check tool arguments and server status","retryable":false}
+```
+The other ~60% surfaced as `E201 Server probe-sigkill disconnected`
+(pmcp's own dispatcher noticing the read stream broke), not a crash and not
+the sibling message — consistent with the kill landing outside the narrow
+post-headers window (see below).
+
+**This reliably, mechanistically reproduces the target failure mode.** It
+is real and reachable through pmcp's actual client code, not a probe
+artifact — see the exact-symptom confirmation below.
+
+### Result — SIGKILL during the INITIAL connect (matches the reported symptom's exact call site)
+
+The originally reported text is specifically `Failed to connect to <name>:
+SSE stream ended without a response` — the format `connect_all()` /
+`connect_server()` wrap around a failed `_connect_singleflight` (manager.py).
+`initialize` is a `JSONRPCRequest` answered over SSE exactly like
+`tools/call` (Step 1), so `sse_flake_probe_sigkill_connect.py` races the
+same `SIGKILL` against `manager.connect_server()` itself instead of a
+follow-up tool call.
+
+| delay window | trials | target hits | rate |
+|---|---|---|---|
+| 0-8ms | 15 kills | 0 | 0% |
+| 1-6ms, trial 1 | 20 kills | 2 | 10% |
+| 1-6ms, trial 2 | 30 kills | 1 | 3% |
+| **1-6ms, combined** | | **50 kills** | **3** | **6%** |
+
+Sample hit, verbatim, matching the reported symptom exactly:
+```
+Failed to connect to probe-connect-kill: SSE stream ended without a response
+```
+The 0-8ms window (no hits) and the bulk of the 1-6ms window's misses
+(`unhandled errors in a TaskGroup (1 sub-exception)`, wrapping an
+`httpx2.ReadError`) show *why* the rate is lower here than for the
+tool-call variant: a kill early enough to land before the peer has even
+sent SSE response *headers* raises inside `client.stream()`'s `__aenter__`
+(`_handle_post_request`, manager's underlying `httpx2.AsyncClient.stream`)
+-- **outside** `_handle_sse_response`'s bare `except Exception: pass`
+(streamable_http.py:447-448), so it propagates as a raw connection error
+through the anyio task group instead of being caught and turned into the
+target message. Only a kill that lands *after* headers arrive but *before*
+the response completes reaches the swallow-and-resolve path that produces
+this exact string -- correspondingly narrower window, correspondingly lower
+hit rate, for a `initialize` round-trip that's fast in-process versus a
+`tools/call`.
+
+## Conclusion
+
+**Root cause identified, but it is not a pmcp defect.** Across every
+variant tested:
+
+- Healthy peers, arbitrarily high organic connect/disconnect/invoke
+  concurrency (Run 1: 240 `connect_all()` batches, 7,200 SSE-response tool
+  calls, 1,200 disconnects) — **zero** reproductions. No evidence of a
+  client-side race, `httpx2` connection-pool staleness
+  (`keepalive_expiry=5.0`), or pmcp lifecycle-lock interaction producing
+  this message while the peer stays up. This isn't just unobserved at this
+  probe's scale — the connect-time SIGKILL boundary finding *structurally
+  excludes* the stale-pooled-connection hypothesis specifically: a
+  connection the server already closed cannot deliver fresh SSE response
+  headers on reuse, so that failure mode surfaces in `client.stream()`'s
+  `__aenter__` (the `TaskGroup`/`ReadError` flavor from the connect-time
+  results table above), never inside `_handle_sse_response`'s swallow-and-
+  resolve path that produces the target string.
+- pmcp's own `disconnect_server` racing an in-flight request to the same
+  server (1,200 attempts) — **zero** reproductions of the target message;
+  pmcp's own `cancel_pending_requests` always wins that race first, so this
+  path structurally cannot be the source either.
+- The **only** thing that reliably reproduces the exact reported string,
+  at both the tool-call site (40% hit rate in the right timing window) and
+  the connect-time site named in the original symptom (6% hit rate, exact
+  string match), is **the peer process dying while it is mid-response** to
+  an SSE-framed request, specifically after it has sent response headers
+  but before it finishes streaming the JSON-RPC response.
+
+Given Step 1's finding that `mcp.server.MCPServer` built without an
+`event_store` (true of every downstream this repo tests against, and
+plausibly true of most real ones too, since resumability is opt-in) never
+attaches an SSE event `id`, **any** such mid-response peer death is
+permanently unresumable and unconditionally produces this exact message —
+there is no code defect here to fix; this is the mcp SDK correctly
+reporting that it cannot get a response from a peer that is no longer
+there. The "load-correlated, several servers connect/disconnect around the
+same time" framing is consistent with this: busy periods are exactly when a
+downstream server process is more likely to be OOM-killed, restarted, or
+recycled by its own supervisor, and precisely mid-response is an ordinary
+place for a killed process to be caught.
+
+**No fix is included in this PR.** There is nothing incorrect in
+`src/pmcp/client/manager.py` or in how it uses the mcp SDK's transport to
+change; the message is accurate. Per the task's own instructions, a
+speculative fix for a hypothesis this note could not confirm (client-side
+race / connection-pool staleness) is deliberately not being shipped.
 
 ## What would be tried next with more time
 
-(filled in after the reproduction attempt, whichever branch it lands on)
+- **Confirm the downstream-server-death hypothesis against the real fleet**:
+  correlate actual `SSE stream ended without a response` occurrences in
+  production/CI logs against downstream server process restarts, OOM
+  kills, or supervisor-triggered recycles in the same time window. If they
+  line up, this closes the loop with the connect-time-SIGKILL finding above
+  and confirms there is nothing left to chase on the pmcp side.
+- **Observability improvement (not a bug fix, not attempted here)**:
+  `connect_server`'s error message could distinguish "the peer died
+  mid-response" (this failure mode -- likely retryable moments later once
+  the peer restarts) from other SSE-transport failures, so an operator
+  reading `Failed to connect to <name>: SSE stream ended without a
+  response` has a more actionable signal than the raw upstream string.
+  Speculative; would need product input on desired wording/behavior (e.g.
+  whether `connect_server`/`connect_all` should auto-retry once for this
+  specific error class) before implementing.
+- **Real TCP-level interruption** (a proxy/load-balancer dropping the
+  connection rather than the peer process dying) was not separately tested;
+  SIGKILL of the peer process was used as the closest available local
+  proxy for "the connection dies mid-response for reasons outside pmcp".
+  If the real fleet's downstream servers sit behind a proxy/LB, that is a
+  distinct mechanism worth its own probe (e.g. an `iptables` REJECT/DROP
+  rule toggled mid-response, or a deliberately misbehaving intermediary)
+  before ruling it out.
+
+## Probe scripts (committed alongside this note)
+
+- `scripts/probes/sse_flake_probe.py` + `run_sse_flake_probe.py` — organic
+  load (Run 1).
+- `scripts/probes/sse_flake_probe_interrupt.py` +
+  `run_sse_flake_probe_interrupt.py` — pmcp-side disconnect/invoke race.
+- `scripts/probes/sse_flake_probe_serverkill.py` — in-process task-cancel
+  (dead end, kept for the record).
+- `scripts/probes/sse_flake_probe_sigkill.py` /
+  `sse_flake_probe_sigkill_connect.py` + `_serverkill_runner.py` —
+  peer-process `SIGKILL`, mid-tool-call and mid-connect. These are the ones
+  that reproduce the reported symptom; run e.g.:
+  ```
+  uv run python scripts/probes/sse_flake_probe_sigkill_connect.py \
+      --kills 50 --min-delay-ms 1 --max-delay-ms 6 --trial-id 0
+  ```

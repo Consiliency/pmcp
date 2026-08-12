@@ -27,16 +27,16 @@ string was observed) -- a hard crash (uncaught exception, non-JSON output)
 is a distinct, worse outcome the driver also has to handle.
 """
 
-from __future__ import annotations
+from __future__ import annotations  # noqa: E402
 
-import argparse
-import asyncio
-import json
-import logging
-import sys
-import time
-from dataclasses import dataclass, field
-from pathlib import Path
+import argparse  # noqa: E402
+import asyncio  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+import sys  # noqa: E402
+import time  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
+from pathlib import Path  # noqa: E402
 
 # The probe classifies via returned error strings / exceptions, not logs;
 # INFO/DEBUG httpx+pmcp logging is pure I/O overhead here and, at the
@@ -50,12 +50,12 @@ logging.basicConfig(level=logging.ERROR)
 # requiring callers to invoke via `-m` or set PYTHONPATH themselves.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from pmcp.client.manager import ClientManager
-from pmcp.policy.policy import PolicyManager
-from pmcp.tools.handlers import GatewayTools
-from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
-from tests.runtime.fake_remote import run_fake_remote
-from tests.runtime.harness import alloc_port
+from pmcp.client.manager import ClientManager  # noqa: E402
+from pmcp.policy.policy import PolicyManager  # noqa: E402
+from pmcp.tools.handlers import GatewayTools  # noqa: E402
+from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig  # noqa: E402
+from tests.runtime.fake_remote import run_fake_remote  # noqa: E402
+from tests.runtime.harness import alloc_port  # noqa: E402
 
 TARGET_STRING = "SSE stream ended without a response"
 SIBLING_STRING = "SSE stream ended and reconnection attempts were exhausted"
@@ -103,7 +103,9 @@ async def _run_trial(
 
     async with _fake_remotes(n_servers) as remotes:
         manager = ClientManager()
-        gateway_tools = GatewayTools(client_manager=manager, policy_manager=PolicyManager())
+        gateway_tools = GatewayTools(
+            client_manager=manager, policy_manager=PolicyManager()
+        )
         try:
             for cycle in range(cycles):
                 configs = [
@@ -133,7 +135,8 @@ async def _run_trial(
                         }
                     )
                     for i in range(calls_per_cycle)
-                    for name in [online[i % len(online)]] if online
+                    for name in [online[i % len(online)]]
+                    if online
                 ]
                 call_results = await asyncio.gather(*call_tasks, return_exceptions=True)
                 for cr in call_results:
