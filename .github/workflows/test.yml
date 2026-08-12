@@ -196,6 +196,12 @@ jobs:
   changelog:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
+    # A job-level permissions: block replaces the repo default for every
+    # scope, not just the one named — so contents: read has to be repeated
+    # here or actions/checkout below loses read access.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -205,8 +211,22 @@ jobs:
           fetch-depth: 0
 
       - name: Require a CHANGELOG.md entry for src/ changes
-        if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-changelog') }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # Query live labels via the API instead of github.event.pull_request.labels.
+          # That context is frozen in the event payload at the moment the workflow
+          # was triggered (opened/synchronize/reopened); a "Re-run jobs" replays that
+          # same frozen payload rather than re-fetching it, so a label applied to an
+          # already-running/failed PR would never be seen that way. Reading live here
+          # means "apply the label, then re-run the job" actually works.
+          LABELS=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name')
+          echo "Current labels: $LABELS"
+          if echo "$LABELS" | grep -qx 'skip-changelog'; then
+            echo "skip-changelog label present — skipping the CHANGELOG.md check."
+            exit 0
+          fi
+
           CHANGED=$(git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD")
           echo "Changed files:"
           echo "$CHANGED"
@@ -221,7 +241,7 @@ jobs:
             exit 0
           fi
 
-          echo "::error::This PR changes files under src/ but does not update CHANGELOG.md. Add an entry under '## [Unreleased]' in CHANGELOG.md, or apply the 'skip-changelog' label if this change ships no user-visible behavior. Note: applying the label to an already-open PR does not re-run this check by itself — push a commit (or use 'Re-run jobs') after labeling for it to go green."
+          echo "::error::This PR changes files under src/ but does not update CHANGELOG.md. Add an entry under '## [Unreleased]' in CHANGELOG.md, or apply the 'skip-changelog' label and re-run this check if this change ships no user-visible behavior."
           exit 1
 
   typecheck:
