@@ -2651,4 +2651,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-# THROWAWAY 2: verifying skip-changelog label bypass with fresh src/ change — will be reverted
