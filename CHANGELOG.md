@@ -8,18 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
-- **`gateway.update_server` no longer leaves a stale "update available"
-  notice behind after a successful update.** `update_server` calls
-  `gateway.refresh()` to reconnect, but `refresh()` only reloads configs and
-  transports -- it never touches the descriptions cache, so the recorded
-  `version` (an upstream-latest snapshot from the last `refresh`/describe
-  pass, not the installed version) stayed pinned at its pre-update value.
-  Every notice path (`gateway.describe`/`invoke`'s update warning,
-  `catalog_search`'s `stale_updates`, and the background stale sweep) kept
-  recomputing the identical stale notice from that value -- surviving even a
-  restart, since the cache is reloaded from disk. On a successful update,
-  the freshly-probed latest version is now written into the descriptions
-  cache and persisted to disk so the fix survives a restart too.
+- **`gateway.update_server` now actually restarts the server, and no longer
+  leaves a stale "update available" notice behind after a successful
+  update.** Two compounding bugs:
+  - `update_server` called `gateway.refresh()` to activate the update, but
+    `refresh()` is a diff-based reconcile that deliberately leaves a server
+    whose resolved command/args are unchanged connected and running. A
+    version-only update (`npx pkg@latest`, `uvx --refresh pkg`) never
+    changes argv, so `refresh()` alone never respawned the process -- the
+    gateway kept serving the OLD package despite `update_server` reporting
+    success. `update_server` now explicitly restarts the target server
+    (reusing `gateway.restart_server`'s own resolve/disconnect/connect
+    machinery) and gates every downstream effect on that restart actually
+    succeeding; a refused or failed restart is now reported as `ok: false`
+    with a message explaining the update was fetched but not activated,
+    instead of silently claiming success.
+  - Separately, the recorded `version` (an upstream-latest snapshot from the
+    last `refresh`/describe pass, not the installed version) stayed pinned
+    at its pre-update value forever, because nothing in the update path ever
+    rewrote it. Every notice path (`gateway.describe`/`invoke`'s update
+    warning, `catalog_search`'s `stale_updates`, and the background stale
+    sweep) kept recomputing the identical stale notice from that value --
+    surviving even a restart, since the cache is reloaded from disk. Once
+    the server restart succeeds, the freshly-probed version -- along with
+    the tool list and generation timestamp, read live from the just-restarted
+    connection -- is now written into the descriptions cache and persisted
+    to disk, so both the notice and the offline tool listing stay accurate
+    across restarts.
 
 ## [2.1.0] - 2026-08-12
 
