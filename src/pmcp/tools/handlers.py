@@ -11,6 +11,7 @@ import time
 import platform
 import shutil
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any, Literal, cast
@@ -116,6 +117,7 @@ from pmcp.types import (
     ListPendingInput,
     ListPendingOutput,
     PendingRequestInfo,
+    PrebuiltToolInfo,
     ProvisionInput,
     ProvisionJobStatus,
     ProvisionOutput,
@@ -611,8 +613,11 @@ def get_gateway_tool_definitions() -> list[Tool]:
         Tool(
             name="gateway.update_server",
             description=(
-                "Update a subordinate MCP server package to latest version and reconnect it. "
-                "Use this when invoke/describe/provision warn that a newer version is available."
+                "Update a subordinate MCP server package to latest version and restart it "
+                "so the new version is actually running. "
+                "Use this when invoke/describe/provision warn that a newer version is available. "
+                "Refuses to restart by default when the server has pending requests; "
+                "set force=true to cancel them."
             ),
             input_schema={
                 "type": "object",
@@ -620,7 +625,12 @@ def get_gateway_tool_definitions() -> list[Tool]:
                     "server_name": {
                         "type": "string",
                         "description": "Name of server to update",
-                    }
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Cancel this server's pending requests before restarting",
+                    },
                 },
                 "required": ["server_name"],
             },
@@ -4948,7 +4958,7 @@ class GatewayTools:
         )
 
     async def update_server(self, input_data: dict[str, Any]) -> UpdateServerOutput:
-        """gateway.update_server - Update a subordinate MCP package and reconnect."""
+        """gateway.update_server - Update a subordinate MCP package and restart it."""
         parsed = UpdateServerInput.model_validate(input_data)
         server_name = parsed.server_name
 
@@ -5022,56 +5032,129 @@ class GatewayTools:
             server_config.command, server_config.args, timeout=5.0
         )
 
-        # gateway.refresh() only reloads configs and reconnects transports; it
-        # never touches the descriptions cache, so `desc.version` (an upstream
-        # snapshot from the last `pmcp refresh`, not "installed version") would
-        # otherwise stay pinned at its pre-update value forever and keep
-        # producing a stale "update available" notice from every emission site
-        # (_get_update_warning, catalog_search's stale_updates, the background
-        # stale sweep) -- even after this update succeeded. If we have a fresh
-        # latest_version, write it in as the new baseline and persist it so the
-        # fix survives a restart (load_descriptions_cache reads this file back).
-        # A `None` latest_version means the version fetch failed; leave the old
-        # value rather than write something worse than what's already there.
-        now = time.time()
-        if latest_version:
-            if (
-                self._descriptions_cache is not None
-                and server_name in self._descriptions_cache.servers
-            ):
-                self._descriptions_cache.servers[server_name].version = latest_version
-                if self._descriptions_cache_path is not None:
-                    try:
-                        save_descriptions_cache(
-                            self._descriptions_cache, self._descriptions_cache_path
-                        )
-                    except Exception as e:
-                        # The package update itself already succeeded; a bookkeeping
-                        # failure here shouldn't flip the reported result to failed.
-                        logger.warning(
-                            f"Failed to persist descriptions cache after updating "
-                            f"'{server_name}': {e}"
-                        )
-            # Repopulate (not just pop) with the fresh (current, latest) pair so
-            # catalog_search's stale_updates -- which reads _stale_check_cache
-            # directly -- agrees the server is current immediately, instead of
-            # leaving a hole that a later _get_update_warning/_run_stale_index
-            # recompute would refill from the (now-stale) descriptions value.
-            self._stale_check_cache[server_name] = (now, latest_version, latest_version)
-        else:
-            self._stale_check_cache.pop(server_name, None)
+        # gateway.refresh() is a diff-based reconcile (_refresh_config_unchanged):
+        # it deliberately leaves a server whose command/args are unchanged
+        # connected and running, so a version-only update like `npx pkg@latest`
+        # never changes argv and refresh() alone never respawns the process --
+        # the OLD package keeps serving requests despite the probe having
+        # installed the new one. Explicitly restart the target server, reusing
+        # the same resolve+disconnect+connect machinery gateway.restart_server
+        # already exercises, so the freshly-fetched package is what's actually
+        # running.
+        restart_result = await self.restart_server(
+            {"server_name": server_name, "force": parsed.force}
+        )
 
-        message = f"Updated '{server_name}' ({package_type}:{package_name}) and refreshed gateway connections."
-        if not refresh_result.ok:
-            message += " Some servers failed to reconnect; inspect gateway.health."
+        # `desc.version` (an upstream snapshot from the last `pmcp
+        # refresh`/describe pass, not "installed version") is what every stale
+        # "update available" notice emission site reads (_get_update_warning,
+        # catalog_search's stale_updates, the background stale sweep). Only
+        # bump/persist it -- and only clear the memoized stale-check entry --
+        # once the server has actually been restarted onto the new package.
+        # If the restart failed or was refused, the gateway is still serving
+        # the OLD version, so the notice is still telling the truth and must
+        # be left alone.
+        now = time.time()
+        if restart_result.ok:
+            if latest_version:
+                if (
+                    self._descriptions_cache is not None
+                    and server_name in self._descriptions_cache.servers
+                ):
+                    desc_entry = self._descriptions_cache.servers[server_name]
+                    desc_entry.version = latest_version
+                    # The restart just gave us a live, freshly-connected tool
+                    # list for this server -- regenerate `tools`/`generated_at`
+                    # from it too, not just `version`. Otherwise the entry
+                    # would claim tools were "generated" for a version they
+                    # weren't (GeneratedServerDescriptions.version is
+                    # documented as "Package version when generated"), and a
+                    # package update that changed tool signatures/descriptions
+                    # or added/removed tools would keep serving the pre-update
+                    # tool list to offline catalog_search. This regenerates
+                    # from the connection `restart_server` already made --
+                    # no extra stdio round-trip, unlike refresher.refresh_server.
+                    # `capability_summary` is deliberately left as-is: it only
+                    # feeds GatewayServer.initialize()'s startup MCP-instructions
+                    # text (computed once, not read live by catalog_search or
+                    # invoke), so leaving it one refresh cycle behind is a much
+                    # smaller, non-functional gap than a stale `tools` list was.
+                    live_tools = [
+                        t
+                        for t in self._client_manager.get_all_tools()
+                        if t.server_name == server_name
+                    ]
+                    desc_entry.tools = [
+                        PrebuiltToolInfo(
+                            name=t.tool_name,
+                            description=t.description,
+                            short_description=t.short_description,
+                            tags=t.tags,
+                            risk_hint=t.risk_hint.value,
+                        )
+                        for t in live_tools
+                    ]
+                    desc_entry.generated_at = datetime.now(timezone.utc).isoformat()
+                    if self._descriptions_cache_path is not None:
+                        try:
+                            save_descriptions_cache(
+                                self._descriptions_cache, self._descriptions_cache_path
+                            )
+                        except Exception as e:
+                            # The package update + restart already succeeded; a
+                            # bookkeeping failure here shouldn't flip the
+                            # reported result to failed.
+                            logger.warning(
+                                f"Failed to persist descriptions cache after updating "
+                                f"'{server_name}': {e}"
+                            )
+                # Repopulate (not just pop) with the fresh (current, latest)
+                # pair so catalog_search's stale_updates -- which reads
+                # _stale_check_cache directly -- agrees the server is current
+                # immediately, instead of leaving a hole that a later
+                # _get_update_warning/_run_stale_index recompute would refill
+                # from the (now-stale) descriptions value.
+                self._stale_check_cache[server_name] = (
+                    now,
+                    latest_version,
+                    latest_version,
+                )
+            else:
+                self._stale_check_cache.pop(server_name, None)
+
+            message = (
+                f"Updated and restarted '{server_name}' ({package_type}:{package_name}); "
+                "the new version is now active."
+            )
+            if not refresh_result.ok:
+                message += (
+                    " Some other servers failed to reconnect during the gateway "
+                    "refresh; inspect gateway.health."
+                )
+        else:
+            restart_errors = (
+                "; ".join(restart_result.errors)
+                if restart_result.errors
+                else restart_result.message
+            )
+            message = (
+                f"Fetched the update for '{server_name}' ({package_type}:{package_name}), "
+                f"but could not restart the server to activate it: {restart_errors}. "
+                "The gateway is still serving the previous version. Retry "
+                f"gateway.update_server(server_name='{server_name}') or "
+                f"gateway.restart_server(server_name='{server_name}', force=true)."
+            )
 
         return UpdateServerOutput(
-            ok=True,
+            ok=restart_result.ok,
             server=server_name,
             package_type=package_type,
             package_name=package_name,
             refreshed=refresh_result.ok,
+            restarted=restart_result.ok,
             latest_version=latest_version,
+            cancelled_request_count=restart_result.cancelled_request_count,
+            cancelled_task_count=restart_result.cancelled_task_count,
             message=message,
         )
 

@@ -4837,16 +4837,31 @@ class TestStaleIndexer:
 
 
 class TestUpdateServerVersionRepair:
-    """A successful gateway.update_server must clear the stale-notice trail.
+    """A successful gateway.update_server must clear the stale-notice trail
+    -- but only once the update is actually *active*, not merely fetched.
 
-    gateway.refresh() (called from inside update_server) never touches the
-    descriptions cache -- only refresh_all() (server.py's own startup/refresh
-    path, which update_server does not call) does. Without this repair,
-    desc.version stays pinned at its pre-update value forever, and every
-    notice emission site (_get_update_warning, catalog_search's
-    stale_updates, the background stale sweep) keeps recomputing the same
-    stale "update available" notice from it -- even across a restart, since
-    load_descriptions_cache reads the same stale value back off disk.
+    gateway.refresh() (also called from inside update_server, for broader
+    reconciliation) never touches the descriptions cache -- only
+    refresh_all() (server.py's own startup/refresh path, which update_server
+    does not call) does. That alone motivates writing the freshly-probed
+    version into the descriptions cache on success.
+
+    But refresh() is *also* diff-based (_refresh_config_unchanged): it
+    deliberately leaves a server whose resolved command/args are unchanged
+    connected and running, so it never respawns the process. A version-only
+    update (`npx pkg@latest`, `uvx --refresh pkg`) never changes argv, so
+    refresh() alone never restarts the target server -- the OLD package
+    keeps serving requests no matter how many times refresh() runs. Board
+    review caught that an earlier version of this fix wrote the new version
+    into the cache (and silenced the notice) without ever actually
+    restarting the server, which trades a noisy-but-honest notice for a
+    silently wrong served version -- worse. update_server now explicitly
+    restarts the server (reusing gateway.restart_server's own resolve +
+    disconnect + connect machinery) and only bumps/persists the descriptions
+    cache -- including regenerating `tools`/`generated_at` from the tool
+    list that restart just gave it live -- when that restart actually
+    succeeded. If the restart fails or is refused, the notice is left
+    exactly alone: it is still telling the truth.
     """
 
     def _make_manifest_with_playwright(
@@ -4869,6 +4884,11 @@ class TestUpdateServerVersionRepair:
             discovery_queue_path=".mcp-gateway/discovery_queue.json",
         )
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        # _resolve_lifecycle_config (used by the real gateway.restart_server
+        # call update_server now makes) checks configured .mcp.json entries
+        # before the manifest -- return none, so "playwright" resolves via
+        # the manifest fixture above instead of hitting the real filesystem.
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         return manifest
 
     def _make_cache(self, version: str = "0.1.0") -> DescriptionsCache:
@@ -4893,7 +4913,15 @@ class TestUpdateServerVersionRepair:
         *,
         latest_version: str | None,
     ) -> None:
-        """Wire update_server's collaborators for a successful probe + refresh."""
+        """Wire update_server's probe + version-fetch + broad refresh().
+
+        Deliberately does NOT stub gateway.restart_server or the
+        ClientManager it drives -- that is the exact machinery under test
+        here (board review: an earlier version of this fix never actually
+        restarted the server). `refresh()` is a separate, broader
+        reconciliation pass unrelated to this defect and is stubbed as
+        before.
+        """
 
         async def _fake_probe(command, env=None):
             return (True, "ok")
@@ -4915,6 +4943,72 @@ class TestUpdateServerVersionRepair:
         )
 
     @pytest.mark.asyncio
+    async def test_refresh_alone_does_not_restart_config_unchanged_online_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The invariant that made the original defect invisible.
+
+        A version-only update never changes a server's resolved
+        command/args, so refresh()'s diff-based reconcile (which exists to
+        avoid needlessly respawning unrelated unchanged servers) leaves it
+        connected exactly as-is -- it does not restart it. update_server
+        cannot rely on calling refresh() to activate an update; it must
+        restart the server explicitly.
+        """
+        client_manager = MockClientManager()
+        config = ResolvedServerConfig(
+            name="playwright",
+            source="project",
+            config=LocalMcpServerConfig(command="npx", args=["-y", "@playwright/mcp"]),
+        )
+        client_manager.add_connected_server(config)
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        patch_refresh_config_sources(monkeypatch, [config])
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_enabled_auto_start", lambda **_: {"playwright"}
+        )
+        monkeypatch.setattr(gt, "_load_provisioned_registry", lambda: {})
+
+        result = await gt.refresh({"reason": "test"})
+
+        assert result.ok is True
+        assert "disconnect_server:playwright:True" not in client_manager.events
+        assert "connect_server:playwright" not in client_manager.events
+        assert client_manager.is_server_online("playwright") is True
+
+    @pytest.mark.asyncio
+    async def test_update_server_explicitly_restarts_the_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """update_server must actually restart the server, not just refresh().
+
+        Proves the board-review fix: with refresh() fully stubbed out (see
+        _wire_success), the only way disconnect/connect events can appear on
+        the client manager is through update_server's own explicit restart
+        call.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        assert result.restarted is True
+        assert "disconnect_server:playwright:False" in client_manager.events
+        assert "connect_server:playwright" in client_manager.events
+        assert client_manager.is_server_online("playwright") is True
+
+    @pytest.mark.asyncio
     async def test_update_server_bumps_descriptions_cache_version(
         self, monkeypatch: pytest.MonkeyPatch
     ):
@@ -4931,6 +5025,7 @@ class TestUpdateServerVersionRepair:
         result = await gt.update_server({"server_name": "playwright"})
 
         assert result.ok is True
+        assert result.restarted is True
         assert result.latest_version == "0.2.0"
         assert cache.servers["playwright"].version == "0.2.0"
 
@@ -5077,9 +5172,128 @@ class TestUpdateServerVersionRepair:
         result = await gt.update_server({"server_name": "playwright"})
 
         assert result.ok is True
+        assert result.restarted is True
         assert result.latest_version is None
         assert cache.servers["playwright"].version == "0.1.0"
         assert "playwright" not in gt._stale_check_cache
+
+    @pytest.mark.asyncio
+    async def test_update_server_restart_failure_leaves_notice_intact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A refused/failed restart must NOT bump the version or silence the notice.
+
+        The package may have been fetched successfully, but if the running
+        server was never restarted onto it, the gateway is still serving the
+        OLD version -- the "update available" notice is still correct and
+        must be left alone. `ok` must reflect that the update was not fully
+        activated.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        client_manager.set_server_online("playwright")
+        client_manager.add_pending_request("playwright")
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        # Default force=False: MockClientManager.disconnect_server refuses a
+        # restart while a request is pending, exactly like real ClientManager.
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert result.restarted is False
+        assert "could not restart" in result.message.lower()
+        assert cache.servers["playwright"].version == "0.1.0"
+        assert "playwright" not in gt._stale_check_cache
+
+        warning = await gt._get_update_warning("playwright")
+        assert warning is not None
+        assert "0.1.0" in warning and "0.2.0" in warning
+
+    @pytest.mark.asyncio
+    async def test_update_server_force_cancels_pending_and_activates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """force=true cancels pending work so the restart can proceed.
+
+        Surfaces the cancellation count on the output, mirroring
+        gateway.restart_server's own cancelled_request_count.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        client_manager.set_server_online("playwright")
+        request = client_manager.add_pending_request("playwright")
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        result = await gt.update_server({"server_name": "playwright", "force": True})
+
+        assert result.ok is True
+        assert result.restarted is True
+        assert result.cancelled_request_count == 1
+        assert request.future.cancelled()
+        assert cache.servers["playwright"].version == "0.2.0"
+
+    @pytest.mark.asyncio
+    async def test_update_server_regenerates_tools_from_live_connection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Restart gives update_server a live tool list -- use it.
+
+        GeneratedServerDescriptions.version is documented as "Package version
+        when generated". Bumping only `version` while leaving `tools` at the
+        pre-update snapshot would make the record lie about its own
+        provenance, and would keep serving the pre-update tool list to
+        offline catalog_search even after a package update that changed
+        tools. Regenerate `tools`/`generated_at` together with `version`,
+        from the connection the restart just made -- no extra stdio
+        round-trip. `capability_summary` is deliberately left as-is (it only
+        feeds the startup MCP-instructions text, not live catalog_search).
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        old_generated_at = cache.servers["playwright"].generated_at
+        old_summary = cache.servers["playwright"].capability_summary
+        live_tools = [
+            ToolInfo(
+                tool_id="playwright::new_tool",
+                server_name="playwright",
+                tool_name="new_tool",
+                description="A tool that only exists in the new version",
+                short_description="New in 0.2.0",
+                input_schema={"type": "object", "properties": {}},
+                tags=["new"],
+                risk_hint=RiskHint.HIGH,
+            )
+        ]
+        client_manager = MockClientManager(live_tools)
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        entry = cache.servers["playwright"]
+        assert [t.name for t in entry.tools] == ["new_tool"]
+        assert entry.tools[0].tags == ["new"]
+        assert entry.tools[0].risk_hint == "high"
+        assert entry.generated_at != old_generated_at
+        # Deliberately unchanged -- see docstring.
+        assert entry.capability_summary == old_summary
 
 
 class TestInvokeErrorPaths:
