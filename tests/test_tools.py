@@ -5295,6 +5295,140 @@ class TestUpdateServerVersionRepair:
         # Deliberately unchanged -- see docstring.
         assert entry.capability_summary == old_summary
 
+    @pytest.mark.asyncio
+    async def test_update_server_uses_configured_override_not_manifest(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A .mcp.json override must drive the probe, not the manifest.
+
+        Board review (round 2): update_server previously resolved its probe
+        target via _get_server_config_for_update (manifest/discovered only)
+        while gateway.restart_server resolves via _resolve_lifecycle_config
+        (.mcp.json overrides the manifest). For a server configured in both
+        places with a *different*, unpinned package, that meant probing and
+        version-checking the manifest's package while restarting a
+        completely different one -- and if both happened to succeed, writing
+        the manifest package's "latest" into the cache for a server that was
+        never actually running it. Unifying resolution around
+        _resolve_lifecycle_config must make the .mcp.json override win end
+        to end: the probe, the version check, AND the restarted process must
+        all be the *same* configured package.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        configured_override = ResolvedServerConfig(
+            name="playwright",
+            source="project",
+            config=LocalMcpServerConfig(
+                command="npx", args=["-y", "different-playwright-fork"]
+            ),
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_configs", lambda **_: [configured_override]
+        )
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+
+        async def _fake_probe(command, env=None):
+            return (True, "ok")
+
+        monkeypatch.setattr(gt, "_run_update_probe_command", _fake_probe)
+        monkeypatch.setattr(
+            gt,
+            "refresh",
+            lambda input_data: __import__("asyncio").sleep(
+                0, result=types.SimpleNamespace(ok=True)
+            ),
+        )
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            # The manifest's bare "@playwright/mcp" would resolve to a
+            # DIFFERENT (wrong) answer than the .mcp.json override -- if
+            # this is ever called with the manifest's args, the config
+            # resolution has diverged from what actually gets restarted.
+            if "different-playwright-fork" in args:
+                return ("9.9.9", "npm")
+            return ("0.2.0", "npm")  # manifest's package -- must not be used
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        assert result.latest_version == "9.9.9"
+        assert cache.servers["playwright"].version == "9.9.9"
+        # The server that was actually restarted ran the configured override.
+        assert client_manager.connected_configs[-1].config.args == [
+            "-y",
+            "different-playwright-fork",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_update_server_refuses_pinned_configured_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A version-pinned .mcp.json override must refuse, not silently lie.
+
+        The exact board-review failure scenario: manifest has an unpinned
+        `npx -y @playwright/mcp`, .mcp.json pins `@playwright/mcp@1.2.3`
+        (README documents this pinning pattern for index-it-mcp as the
+        supported override channel). Restarting the pinned server succeeds
+        (it's a perfectly valid process to run) -- the bug was recording
+        upstream's unrelated "latest" as if it were now running. The probe
+        must never even be attempted: there is nothing @latest can do while
+        the pin stands.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        pinned_override = ResolvedServerConfig(
+            name="playwright",
+            source="project",
+            config=LocalMcpServerConfig(
+                command="npx", args=["-y", "@playwright/mcp@1.2.3"]
+            ),
+        )
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_configs", lambda **_: [pinned_override]
+        )
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+
+        probe_calls: list[Any] = []
+
+        async def _fake_probe(command, env=None):
+            probe_calls.append(command)
+            return (True, "ok")
+
+        monkeypatch.setattr(gt, "_run_update_probe_command", _fake_probe)
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            return ("9.9.9", "npm")  # upstream's real latest -- must be ignored
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert "pinned" in result.message.lower()
+        assert "1.2.3" in result.message
+        assert "project" in result.message.lower()
+        assert probe_calls == []  # never even attempted
+        assert "disconnect_server:playwright:False" not in client_manager.events
+        assert cache.servers["playwright"].version == "0.1.0"
+        assert "playwright" not in gt._stale_check_cache
+
 
 class TestInvokeErrorPaths:
     """Tests for gateway.invoke error handling paths."""

@@ -32,6 +32,50 @@ def _strip_npm_tag(package: str) -> str:
     return name if tag_sep and name else package
 
 
+def _npm_tag(package: str) -> str | None:
+    """The npm dist-tag/version suffix ``_strip_npm_tag`` would discard, or
+    ``None`` if *package* has no such suffix.
+
+    Mirrors ``_strip_npm_tag``'s own scope-aware ``rpartition`` exactly (same
+    guard conditions), so the two functions can never disagree about whether
+    a suffix is present or where it starts. Used by gateway.update_server's
+    pin detection.
+    """
+    if package.startswith("@"):
+        scope, sep, remainder = package.partition("/")
+        if not sep:
+            return None
+        _name, tag_sep, tag = remainder.rpartition("@")
+        return tag if tag_sep and _name else None
+
+    _name, tag_sep, tag = package.rpartition("@")
+    return tag if tag_sep and _name else None
+
+
+def _npm_package_arg(args: list[str]) -> str | None:
+    """Return the raw npm/npx package token from *args*, or ``None``.
+
+    "Raw" means *before* ``_strip_npm_tag`` removes any ``@tag``/``@version``
+    suffix -- factored out of ``detect_package_type``'s npm branch so a
+    caller that needs the untouched token (gateway.update_server's pin
+    detection) can get it from the exact same scan ``detect_package_type``
+    itself uses, instead of re-implementing the scan a second time and
+    risking it picking a different argument as "the package".
+    """
+    for arg in args:
+        if arg == "-y":
+            continue
+        # Skip flags
+        if arg.startswith("-"):
+            continue
+        # Found package name (might have @version or @dist-tag suffix)
+        pkg = _strip_npm_tag(arg)
+        # Handle scoped packages like @playwright/mcp
+        if pkg.startswith("@") or not pkg.startswith("-"):
+            return arg
+    return None
+
+
 async def get_npm_version(package_name: str, timeout: float = 10.0) -> str | None:
     """
     Get the latest version of an npm package.
@@ -231,17 +275,9 @@ def detect_package_type(
     """
     if command in ("npx", "npm"):
         # Find npm package in args (usually after -y flag)
-        for i, arg in enumerate(args):
-            if arg == "-y":
-                continue
-            # Skip flags
-            if arg.startswith("-"):
-                continue
-            # Found package name (might have @version or @dist-tag suffix)
-            pkg = _strip_npm_tag(arg)
-            # Handle scoped packages like @playwright/mcp
-            if pkg.startswith("@") or not pkg.startswith("-"):
-                return ("npm", pkg)
+        raw = _npm_package_arg(args)
+        if raw is not None:
+            return ("npm", _strip_npm_tag(raw))
 
     elif command == "uvx":
         # First non-flag argument is the package
