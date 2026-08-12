@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`gateway.update_server` now actually restarts the server, and no longer
+  leaves a stale "update available" notice behind after a successful
+  update.** Two compounding bugs:
+  - `update_server` called `gateway.refresh()` to activate the update, but
+    `refresh()` is a diff-based reconcile that deliberately leaves a server
+    whose resolved command/args are unchanged connected and running. A
+    version-only update (`npx pkg@latest`, `uvx --refresh pkg`) never
+    changes argv, so `refresh()` alone never respawned the process -- the
+    gateway kept serving the OLD package despite `update_server` reporting
+    success. `update_server` now explicitly restarts the target server
+    (reusing `gateway.restart_server`'s own resolve/disconnect/connect
+    machinery) and gates every downstream effect on that restart actually
+    succeeding; a refused or failed restart is now reported as `ok: false`
+    with a message explaining the update was fetched but not activated,
+    instead of silently claiming success.
+  - Separately, the recorded `version` (an upstream-latest snapshot from the
+    last `refresh`/describe pass, not the installed version) stayed pinned
+    at its pre-update value forever, because nothing in the update path ever
+    rewrote it. Every notice path (`gateway.describe`/`invoke`'s update
+    warning, `catalog_search`'s `stale_updates`, and the background stale
+    sweep) kept recomputing the identical stale notice from that value --
+    surviving even a restart, since the cache is reloaded from disk. Once
+    the server restart succeeds, the freshly-probed version -- along with
+    the tool list and generation timestamp, read live from the just-restarted
+    connection -- is now written into the descriptions cache and persisted
+    to disk, so both the notice and the offline tool listing stay accurate
+    across restarts.
+  - A third bug in the same area: `update_server` resolved its probe target
+    (the command it version-checks and updates) via a manifest/discovered-only
+    lookup, while the restart above resolves via the same precedence
+    `gateway.restart_server` uses, where a `.mcp.json` entry overrides the
+    manifest. For a server configured in both places -- README documents
+    pinning a server's exact version via `.mcp.json` as the supported
+    override channel -- this meant probing and version-checking one command
+    while restarting a different one. Concretely: manifest has an unpinned
+    `npx -y context7`, `.mcp.json` pins `npx -y context7@1.2.3`; the probe
+    detects/installs upstream's real latest, the restart activates the
+    *pinned* 1.2.3 process, and the (now-fixed) bookkeeping above would
+    record the probed "latest" as current -- silently misreporting the
+    pinned server's version. Both steps now resolve through the identical
+    function, so they can never disagree, and a server whose effective
+    config pins a concrete version is refused outright (`ok: false`,
+    explaining the pin and which config file it came from) rather than
+    probed and silently mis-recorded. Pin detection covers every package
+    manager the tool can update, not just npm: a `:tag`-pinned docker image
+    and a `cargo install --version` pin are refused the same way. Docker
+    needed its own handling because package detection strips the tag off the
+    image reference, so `docker run acme/server:1.2.3` would otherwise pull
+    `acme/server:latest`, restart the still-pinned config, and record the new
+    digest as active.
+
 ## [2.1.0] - 2026-08-12
 
 ### Added

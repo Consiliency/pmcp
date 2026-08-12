@@ -126,6 +126,7 @@ class GatewayServer:
         self._project_root = project_root
         self._custom_config_path = custom_config_path
         self._cache_dir = cache_dir or Path(".mcp-gateway")
+        self._descriptions_cache_path = get_cache_path(self._cache_dir)
         self._host = host
         self._port = port
         self._auth_token = auth_token
@@ -185,6 +186,7 @@ class GatewayServer:
             project_root=project_root,
             custom_config_path=custom_config_path,
             guidance_config=self._guidance_config,
+            descriptions_cache_path=self._descriptions_cache_path,
         )
         if self._audit_jsonl is not None:
             self._scoped_advisor_audit = ScopedAdvisorAudit(
@@ -652,7 +654,7 @@ class GatewayServer:
         logger.info("Initializing MCP Gateway...")
 
         # Load pre-built descriptions cache
-        cache_path = get_cache_path(self._cache_dir)
+        cache_path = self._descriptions_cache_path
         self._descriptions_cache = load_descriptions_cache(cache_path)
 
         if self._descriptions_cache:

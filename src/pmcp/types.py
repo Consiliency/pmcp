@@ -1236,6 +1236,13 @@ class UpdateServerInput(BaseModel):
     """Input for gateway.update_server."""
 
     server_name: str = Field(min_length=1, description="Server to update")
+    force: bool = Field(
+        default=False,
+        description=(
+            "Restart the server even if it has pending requests or active MCP "
+            "tasks, cancelling them. Mirrors gateway.restart_server's force flag."
+        ),
+    )
 
 
 class UpdateServerOutput(BaseModel):
@@ -1246,7 +1253,16 @@ class UpdateServerOutput(BaseModel):
     package_type: Literal["npm", "pypi", "cargo", "docker", "unknown"]
     package_name: str | None = None
     refreshed: bool = False
+    # Whether the server was actually restarted onto the new package. Distinct
+    # from `refreshed`: gateway.refresh()'s diff-based reconcile deliberately
+    # leaves a server whose command/args are unchanged connected and running
+    # (see _refresh_config_unchanged), so a version-only update never
+    # respawns the process through refresh() alone -- only an explicit
+    # restart does.
+    restarted: bool = False
     latest_version: str | None = None
+    cancelled_request_count: int = 0
+    cancelled_task_count: int = 0
     message: str
 
 

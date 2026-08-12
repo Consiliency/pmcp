@@ -11,6 +11,7 @@ import time
 import platform
 import shutil
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable
 from typing import Any, Literal, cast
@@ -47,7 +48,7 @@ from pmcp.config.loader import (
     summarize_startup_resolution,
 )
 from pmcp.errors import ErrorCode, GatewayException, make_error
-from pmcp.env_store import set_env_value
+from pmcp.env_store import sanitized_subprocess_env, set_env_value
 from pmcp.validation import env_var_allowed, is_valid_package_name
 from pmcp.identity import filter_self_references
 from pmcp.manifest.code_patterns_loader import get_code_hint
@@ -55,7 +56,6 @@ from pmcp.manifest.environment import CLIInfo, detect_platform, probe_clis
 from pmcp.templates.code_snippets_loader import get_code_snippet
 from pmcp.manifest.installer import (
     MissingApiKeyError,
-    build_install_child_env,
     get_job_manager,
     InstallError,
 )
@@ -73,7 +73,12 @@ from pmcp.manifest.registry import (
     fetch_registry_servers,
     load_registry_cache,
 )
+from pmcp.manifest.refresher import save_descriptions_cache
 from pmcp.manifest.version_checker import (
+    _docker_image_arg,
+    _docker_image_tag,
+    _npm_package_arg,
+    _npm_tag,
     detect_package_type,
     get_package_version,
     is_version_newer,
@@ -115,6 +120,7 @@ from pmcp.types import (
     ListPendingInput,
     ListPendingOutput,
     PendingRequestInfo,
+    PrebuiltToolInfo,
     ProvisionInput,
     ProvisionJobStatus,
     ProvisionOutput,
@@ -260,6 +266,82 @@ def _refresh_config_unchanged(
             and old_cfg.type == new_cfg.type
         )
     return False
+
+
+def _detect_effective_version_pin(
+    package_type: Literal["npm", "pypi", "cargo", "docker", "unknown"],
+    command: str,
+    args: list[str],
+) -> str | None:
+    """Return the pinned version/tag *args* explicitly locks to, or ``None``.
+
+    Used by gateway.update_server: a server pinned to a concrete version
+    cannot be moved to ``@latest`` by this tool while the pin stands (the
+    README documents pinning a server's version in ``.mcp.json`` as the
+    supported configuration channel, e.g. for ``index-it-mcp``).
+
+    npm: reuses ``_npm_package_arg``/``_strip_npm_tag`` (the exact scan
+    ``detect_package_type`` itself uses) rather than re-scanning
+    independently, so this can never disagree with detect_package_type about
+    which arg is "the package". ``@latest`` is not a pin -- it's what
+    gateway.update_server would install anyway.
+
+    pypi/uvx: ``detect_package_type`` does not strip anything for uvx, so an
+    inline ``pkg==1.2.3`` token already makes the later PyPI lookup fail
+    (returning ``latest_version=None``, which the existing "don't write on a
+    failed fetch" gate already protects against) -- this check exists only
+    to turn that into a clear, specific refusal message instead of an opaque
+    "could not fetch latest version" one.
+
+    docker: ``detect_package_type`` strips the ``:tag`` off the image
+    reference, so without this branch ``docker run acme/server:1.2.3`` would
+    pull ``acme/server:latest``, restart the still-pinned ``1.2.3`` config,
+    and then record the latest digest as active -- the same silent
+    misreporting the npm branch above exists to prevent (board review round
+    3). Uses ``_docker_image_arg``/``_docker_image_tag`` so a registry host
+    with a port (``registry:5000/img``) is not misread as a tag.
+
+    cargo: ``cargo install`` pins with a separate ``--version X`` flag rather
+    than an inline suffix, so it needs its own scan.
+    """
+    if package_type == "npm":
+        raw = _npm_package_arg(args)
+        if raw is None:
+            return None
+        tag = _npm_tag(raw)
+        return None if not tag or tag == "latest" else tag
+    if package_type == "pypi" and command == "uvx":
+        for arg in args:
+            if arg.startswith("-"):
+                continue
+            if "==" in arg:
+                _, _, version = arg.partition("==")
+                return version or None
+    if package_type == "docker":
+        raw_image = _docker_image_arg(args)
+        if raw_image is None:
+            return None
+        tag = _docker_image_tag(raw_image)
+        return None if not tag or tag == "latest" else tag
+    if package_type == "cargo":
+        for index, arg in enumerate(args):
+            if arg.startswith("--version="):
+                _, _, version = arg.partition("=")
+                return version or None
+            if arg == "--version" and index + 1 < len(args):
+                return args[index + 1] or None
+    return None
+
+
+# Human-readable label for a ResolvedServerConfig.source, used in messages
+# that need to point an operator at the file a pin (or other override) came
+# from.
+_CONFIG_SOURCE_LABELS: dict[str, str] = {
+    "project": "the project .mcp.json",
+    "user": "the user .mcp.json",
+    "custom": "the custom MCP config file",
+    "manifest": "the manifest entry",
+}
 
 
 # Risk level ordering for filtering
@@ -610,8 +692,11 @@ def get_gateway_tool_definitions() -> list[Tool]:
         Tool(
             name="gateway.update_server",
             description=(
-                "Update a subordinate MCP server package to latest version and reconnect it. "
-                "Use this when invoke/describe/provision warn that a newer version is available."
+                "Update a subordinate MCP server package to latest version and restart it "
+                "so the new version is actually running. "
+                "Use this when invoke/describe/provision warn that a newer version is available. "
+                "Refuses to restart by default when the server has pending requests; "
+                "set force=true to cancel them."
             ),
             input_schema={
                 "type": "object",
@@ -619,7 +704,12 @@ def get_gateway_tool_definitions() -> list[Tool]:
                     "server_name": {
                         "type": "string",
                         "description": "Name of server to update",
-                    }
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Cancel this server's pending requests before restarting",
+                    },
                 },
                 "required": ["server_name"],
             },
@@ -974,6 +1064,7 @@ class GatewayTools:
         custom_config_path: Path | None = None,
         guidance_config: GuidanceConfig | None = None,
         descriptions_cache: DescriptionsCache | None = None,
+        descriptions_cache_path: Path | None = None,
     ) -> None:
         self._client_manager = client_manager
         self._policy_manager = policy_manager
@@ -981,6 +1072,10 @@ class GatewayTools:
         self._custom_config_path = custom_config_path
         self._guidance_config = guidance_config
         self._descriptions_cache = descriptions_cache
+        # Where the descriptions cache lives on disk (.mcp-gateway/descriptions.yaml
+        # by default). Needed so a successful gateway.update_server can persist the
+        # refreshed version, not just patch the in-memory copy -- see update_server().
+        self._descriptions_cache_path = descriptions_cache_path
         self._detected_clis: set[str] | None = None
         self._detected_cli_infos: dict[str, CLIInfo] = {}
         self._platform: str | None = None
@@ -4942,22 +5037,51 @@ class GatewayTools:
         )
 
     async def update_server(self, input_data: dict[str, Any]) -> UpdateServerOutput:
-        """gateway.update_server - Update a subordinate MCP package and reconnect."""
+        """gateway.update_server - Update a subordinate MCP package and restart it."""
         parsed = UpdateServerInput.model_validate(input_data)
         server_name = parsed.server_name
 
-        server_config = self._get_server_config_for_update(server_name)
-        if not server_config:
+        # Resolve the server's EFFECTIVE config through the exact same
+        # function -- and therefore the exact same .mcp.json-over-manifest
+        # precedence -- gateway.restart_server itself uses below. Board
+        # review: this tool previously resolved the probe target through
+        # _get_server_config_for_update, which only ever consults the
+        # manifest/discovered servers and never .mcp.json. For a server
+        # configured in both places (README documents pinning a server's
+        # version via .mcp.json as the supported override channel), that
+        # meant probing one command while restarting a different one --
+        # structurally capable of probing/installing upstream @latest while
+        # restarting onto a completely different, e.g. pinned, config.
+        # Resolving once through restart_server's own resolver makes that
+        # divergence impossible: both calls are the same lookup against the
+        # same inputs, so they can't disagree.
+        prior_status = self._status_value(server_name)
+        resolved_config, resolve_failure = self._resolve_lifecycle_config(
+            server_name, action="restart", prior_status=prior_status
+        )
+        if resolve_failure is not None:
             return UpdateServerOutput(
                 ok=False,
                 server=server_name,
                 package_type="unknown",
-                message=f"Server '{server_name}' not found in manifest or discovered servers.",
+                message=resolve_failure.message,
+            )
+        if resolved_config is None:
+            return UpdateServerOutput(
+                ok=False,
+                server=server_name,
+                package_type="unknown",
+                message=f"Server '{server_name}' could not be resolved.",
             )
 
-        package_type, package_name = detect_package_type(
-            server_config.command, server_config.args
-        )
+        if isinstance(resolved_config.config, LocalMcpServerConfig):
+            command = resolved_config.config.command
+            args = resolved_config.config.args
+        else:
+            # Remote servers have no local package for this tool to update.
+            command, args = "", []
+
+        package_type, package_name = detect_package_type(command, args)
         if package_type == "unknown" or not package_name:
             return UpdateServerOutput(
                 ok=False,
@@ -4966,6 +5090,24 @@ class GatewayTools:
                 message=(
                     f"Could not determine package manager for '{server_name}'. "
                     "Supported managers: npm (npx), pypi (uvx/pip), cargo, docker."
+                ),
+            )
+
+        pinned_to = _detect_effective_version_pin(package_type, command, args)
+        if pinned_to is not None:
+            source_desc = _CONFIG_SOURCE_LABELS.get(
+                resolved_config.source, f"the {resolved_config.source} config"
+            )
+            return UpdateServerOutput(
+                ok=False,
+                server=server_name,
+                package_type=package_type,
+                package_name=package_name,
+                message=(
+                    f"'{server_name}' is pinned to '{pinned_to}' in {source_desc} "
+                    f"({command} {' '.join(args)}). gateway.update_server will not "
+                    "move a pinned server to the latest version -- edit or remove "
+                    "the pin in that config to allow updates."
                 ),
             )
 
@@ -4980,10 +5122,21 @@ class GatewayTools:
 
         try:
             # Sanitized env: the probe executes the server's own package code, so
-            # it gets only this server's resolved credential, never other servers'.
-            ok, output = await self._run_update_probe_command(
-                update_cmd, env=build_install_child_env(server_config)
+            # it gets only this server's resolved credential, never other
+            # servers'. resolved_config.config.env already carries this
+            # server's fully-resolved credential -- for a manifest server,
+            # _manifest_server_to_config injects it the same way
+            # build_install_child_env used to (same credential_lookup_keys
+            # scan); for a .mcp.json server it's whatever that entry declares.
+            # Using it here means the probe's env can never diverge from the
+            # restart's env either, for the same reason command/args can't.
+            probe_env = sanitized_subprocess_env(
+                resolved_config.config.env
+                if isinstance(resolved_config.config, LocalMcpServerConfig)
+                else None,
+                self._project_root,
             )
+            ok, output = await self._run_update_probe_command(update_cmd, env=probe_env)
         except TimeoutError:
             return UpdateServerOutput(
                 ok=False,
@@ -5012,22 +5165,131 @@ class GatewayTools:
             )
 
         refresh_result = await self.refresh({"reason": f"update_server:{server_name}"})
-        latest_version, _ = await get_package_version(
-            server_config.command, server_config.args, timeout=5.0
-        )
-        self._stale_check_cache.pop(server_name, None)
+        latest_version, _ = await get_package_version(command, args, timeout=5.0)
 
-        message = f"Updated '{server_name}' ({package_type}:{package_name}) and refreshed gateway connections."
-        if not refresh_result.ok:
-            message += " Some servers failed to reconnect; inspect gateway.health."
+        # gateway.refresh() is a diff-based reconcile (_refresh_config_unchanged):
+        # it deliberately leaves a server whose command/args are unchanged
+        # connected and running, so a version-only update like `npx pkg@latest`
+        # never changes argv and refresh() alone never respawns the process --
+        # the OLD package keeps serving requests despite the probe having
+        # installed the new one. Explicitly restart the target server, reusing
+        # the same resolve+disconnect+connect machinery gateway.restart_server
+        # already exercises, so the freshly-fetched package is what's actually
+        # running.
+        restart_result = await self.restart_server(
+            {"server_name": server_name, "force": parsed.force}
+        )
+
+        # `desc.version` (an upstream snapshot from the last `pmcp
+        # refresh`/describe pass, not "installed version") is what every stale
+        # "update available" notice emission site reads (_get_update_warning,
+        # catalog_search's stale_updates, the background stale sweep). Only
+        # bump/persist it -- and only clear the memoized stale-check entry --
+        # once the server has actually been restarted onto the new package.
+        # If the restart failed or was refused, the gateway is still serving
+        # the OLD version, so the notice is still telling the truth and must
+        # be left alone.
+        now = time.time()
+        if restart_result.ok:
+            if latest_version:
+                if (
+                    self._descriptions_cache is not None
+                    and server_name in self._descriptions_cache.servers
+                ):
+                    desc_entry = self._descriptions_cache.servers[server_name]
+                    desc_entry.version = latest_version
+                    # The restart just gave us a live, freshly-connected tool
+                    # list for this server -- regenerate `tools`/`generated_at`
+                    # from it too, not just `version`. Otherwise the entry
+                    # would claim tools were "generated" for a version they
+                    # weren't (GeneratedServerDescriptions.version is
+                    # documented as "Package version when generated"), and a
+                    # package update that changed tool signatures/descriptions
+                    # or added/removed tools would keep serving the pre-update
+                    # tool list to offline catalog_search. This regenerates
+                    # from the connection `restart_server` already made --
+                    # no extra stdio round-trip, unlike refresher.refresh_server.
+                    # `capability_summary` is deliberately left as-is: it only
+                    # feeds GatewayServer.initialize()'s startup MCP-instructions
+                    # text (computed once, not read live by catalog_search or
+                    # invoke), so leaving it one refresh cycle behind is a much
+                    # smaller, non-functional gap than a stale `tools` list was.
+                    live_tools = [
+                        t
+                        for t in self._client_manager.get_all_tools()
+                        if t.server_name == server_name
+                    ]
+                    desc_entry.tools = [
+                        PrebuiltToolInfo(
+                            name=t.tool_name,
+                            description=t.description,
+                            short_description=t.short_description,
+                            tags=t.tags,
+                            risk_hint=t.risk_hint.value,
+                        )
+                        for t in live_tools
+                    ]
+                    desc_entry.generated_at = datetime.now(timezone.utc).isoformat()
+                    if self._descriptions_cache_path is not None:
+                        try:
+                            save_descriptions_cache(
+                                self._descriptions_cache, self._descriptions_cache_path
+                            )
+                        except Exception as e:
+                            # The package update + restart already succeeded; a
+                            # bookkeeping failure here shouldn't flip the
+                            # reported result to failed.
+                            logger.warning(
+                                f"Failed to persist descriptions cache after updating "
+                                f"'{server_name}': {e}"
+                            )
+                # Repopulate (not just pop) with the fresh (current, latest)
+                # pair so catalog_search's stale_updates -- which reads
+                # _stale_check_cache directly -- agrees the server is current
+                # immediately, instead of leaving a hole that a later
+                # _get_update_warning/_run_stale_index recompute would refill
+                # from the (now-stale) descriptions value.
+                self._stale_check_cache[server_name] = (
+                    now,
+                    latest_version,
+                    latest_version,
+                )
+            else:
+                self._stale_check_cache.pop(server_name, None)
+
+            message = (
+                f"Updated and restarted '{server_name}' ({package_type}:{package_name}); "
+                "the new version is now active."
+            )
+            if not refresh_result.ok:
+                message += (
+                    " Some other servers failed to reconnect during the gateway "
+                    "refresh; inspect gateway.health."
+                )
+        else:
+            restart_errors = (
+                "; ".join(restart_result.errors)
+                if restart_result.errors
+                else restart_result.message
+            )
+            message = (
+                f"Fetched the update for '{server_name}' ({package_type}:{package_name}), "
+                f"but could not restart the server to activate it: {restart_errors}. "
+                "The gateway is still serving the previous version. Retry "
+                f"gateway.update_server(server_name='{server_name}') or "
+                f"gateway.restart_server(server_name='{server_name}', force=true)."
+            )
 
         return UpdateServerOutput(
-            ok=True,
+            ok=restart_result.ok,
             server=server_name,
             package_type=package_type,
             package_name=package_name,
             refreshed=refresh_result.ok,
+            restarted=restart_result.ok,
             latest_version=latest_version,
+            cancelled_request_count=restart_result.cancelled_request_count,
+            cancelled_task_count=restart_result.cancelled_task_count,
             message=message,
         )
 
