@@ -186,6 +186,44 @@ jobs:
       - name: Run ruff format check
         run: uv run ruff format --check src/ tests/
 
+  # 2.0.1 and 2.1.0 both merged feature PRs against an empty [Unreleased]
+  # block, so the maintainer had to hand-backfill CHANGELOG.md at release
+  # time by reconstructing it from git log. This job catches it at PR time
+  # instead: a PR that changes anything under src/ (shipped code) must also
+  # touch CHANGELOG.md. Runs on pull_request only — push/schedule/
+  # workflow_dispatch have no PR base ref to diff against, so the job is a
+  # no-op there via the `if:` below.
+  changelog:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # actions/checkout defaults to a shallow (depth-1) clone, which
+          # doesn't contain the PR base ref needed for the three-dot diff
+          # below. fetch-depth: 0 fetches full history for all branches.
+          fetch-depth: 0
+
+      - name: Require a CHANGELOG.md entry for src/ changes
+        if: ${{ !contains(github.event.pull_request.labels.*.name, 'skip-changelog') }}
+        run: |
+          CHANGED=$(git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          if ! echo "$CHANGED" | grep -q '^src/'; then
+            echo "No changes under src/ — CHANGELOG.md not required."
+            exit 0
+          fi
+
+          if echo "$CHANGED" | grep -q '^CHANGELOG\.md$'; then
+            echo "CHANGELOG.md was updated."
+            exit 0
+          fi
+
+          echo "::error::This PR changes files under src/ but does not update CHANGELOG.md. Add an entry under '## [Unreleased]' in CHANGELOG.md, or apply the 'skip-changelog' label if this change ships no user-visible behavior."
+          exit 1
+
   typecheck:
     runs-on: ubuntu-latest
     steps:
