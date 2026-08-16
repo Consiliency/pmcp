@@ -5652,6 +5652,98 @@ class TestUpdateServerVersionRepair:
 
         assert "playwright" not in gt._stale_check_cache
 
+    # --- Consiliency/pmcp#151: config must not drift across the probe window ---
+
+    @pytest.mark.asyncio
+    async def test_update_server_aborts_when_config_changes_during_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A config edit landing during the (up to 60s) probe must abort the update.
+
+        Board finding B2: `refresh()` runs AFTER the probe and reloads config from
+        disk, so the pre-probe config can be stale by the time the restart runs.
+        Reusing it would disconnect the EDITED server and reconnect the old
+        package -- worse than the race being fixed. The update must abort, and
+        must not record a version or seed the stale-check cache.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+
+        original = ResolvedServerConfig(
+            name="playwright",
+            source="project",
+            config=LocalMcpServerConfig(command="npx", args=["-y", "@playwright/mcp"]),
+        )
+        edited = ResolvedServerConfig(
+            name="playwright",
+            source="project",
+            config=LocalMcpServerConfig(command="npx", args=["-y", "@acme/replacement"]),
+        )
+        # First resolution (pre-probe) sees the original; every later resolution
+        # sees the edit, i.e. the file changed while the probe was running.
+        seen: list[int] = []
+
+        def fake_load_configs(**_kwargs):
+            seen.append(1)
+            return [original] if len(seen) == 1 else [edited]
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", fake_load_configs)
+
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="9.9.9")
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert "configuration changed" in result.message.lower()
+        # No bookkeeping may have happened: the package was fetched, not activated.
+        assert cache.servers["playwright"].version == "0.1.0"
+        assert "playwright" not in gt._stale_check_cache
+        assert not any("disconnect_server" in e for e in client_manager.events)
+
+    @pytest.mark.asyncio
+    async def test_update_server_restart_consumes_the_confirmed_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Happy path: config unchanged -> restart receives the caller's config."""
+        self._make_manifest_with_playwright(monkeypatch)
+        stable = ResolvedServerConfig(
+            name="playwright",
+            source="project",
+            config=LocalMcpServerConfig(command="npx", args=["-y", "@playwright/mcp"]),
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [stable])
+
+        cache = self._make_cache(version="0.1.0")
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="9.9.9")
+
+        handed: list[ResolvedServerConfig | None] = []
+        real_restart = gt.restart_server
+
+        async def spy_restart(input_data, *, resolved_config=None):
+            handed.append(resolved_config)
+            return await real_restart(input_data, resolved_config=resolved_config)
+
+        monkeypatch.setattr(gt, "restart_server", spy_restart)
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        # The restart consumed a pre-resolved config rather than resolving again.
+        assert len(handed) == 1 and handed[0] is not None
+        assert handed[0].config.command == "npx"
+        assert handed[0].config.args == ["-y", "@playwright/mcp"]
+
     def test_detect_effective_version_pin_matrix(self):
         """Pin detection per package manager, including the not-a-pin cases."""
         from pmcp.tools.handlers import _detect_effective_version_pin as detect
