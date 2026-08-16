@@ -5596,7 +5596,9 @@ class TestUpdateServerVersionRepair:
             override=ResolvedServerConfig(
                 name="playwright",
                 source="project",
-                config=LocalMcpServerConfig(command="npx", args=["-y", "@playwright/mcp"]),
+                config=LocalMcpServerConfig(
+                    command="npx", args=["-y", "@playwright/mcp"]
+                ),
             ),
             allowed=False,
         )
@@ -5612,7 +5614,9 @@ class TestUpdateServerVersionRepair:
         assert "playwright" not in gt._stale_check_cache
 
     @pytest.mark.asyncio
-    async def test_notice_ignores_remote_override(self, monkeypatch: pytest.MonkeyPatch):
+    async def test_notice_ignores_remote_override(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
         """A remote override has no local package to version-check -> no notice,
         and specifically no AttributeError reaching for .command."""
         gt = self._gt_with_override(
@@ -5676,7 +5680,9 @@ class TestUpdateServerVersionRepair:
         edited = ResolvedServerConfig(
             name="playwright",
             source="project",
-            config=LocalMcpServerConfig(command="npx", args=["-y", "@acme/replacement"]),
+            config=LocalMcpServerConfig(
+                command="npx", args=["-y", "@acme/replacement"]
+            ),
         )
         # First resolution (pre-probe) sees the original; every later resolution
         # sees the edit, i.e. the file changed while the probe was running.

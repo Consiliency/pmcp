@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Stale "update available" notices no longer compare two different packages.**
+  `gateway.update_server` resolves its target with `.mcp.json` taking precedence
+  over the manifest, but the two notice paths (`gateway.describe`/`invoke`'s
+  update warning and the background stale sweep) still resolved manifest-only.
+  For a server configured in both places under one name they version-checked a
+  package that was not the one running, so once the 6h stale-check TTL expired a
+  notice could be invented for an update that did not exist, or a real update
+  could be hidden. Both paths now use the same precedence.
+
+  Resolving the lookup was only half the repair: the *current* side of the
+  comparison comes from the descriptions cache, which was generated from
+  whichever package that cache last described. When the effective config names a
+  different package than the cache entry records, the two versions are not
+  comparable at all — the gateway now stays silent until `pmcp refresh`
+  re-describes the server, rather than emitting a comparison it cannot justify.
+  A policy-denied server also produces no notice; configured entries are read
+  before policy filtering, so this needed an explicit check.
+
+- **A configuration edit during an update can no longer activate the wrong
+  package.** `gateway.update_server` resolved the server once before its update
+  probe (which may run for up to 60 seconds) and the restart resolved again
+  afterwards — and `gateway.refresh()`, which runs in between, reloads
+  configuration from disk. An edit landing in that window meant the probe and
+  the restart could disagree about which package the server runs, and the
+  freshly probed version could be recorded against a different package. The
+  update now re-resolves after the probe and aborts with `ok: false` when the
+  effective command or arguments changed, recording no version state; the
+  confirmed configuration is handed to the restart so it cannot resolve a third
+  time.
+
 ## [2.1.1] - 2026-08-12
 
 ### Fixed
