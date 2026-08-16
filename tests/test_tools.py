@@ -5486,6 +5486,172 @@ class TestUpdateServerVersionRepair:
         assert cache.servers["playwright"].version == "0.1.0"
         assert "playwright" not in gt._stale_check_cache
 
+    # --- Consiliency/pmcp#150: notice paths must resolve the EFFECTIVE package ---
+
+    def _gt_with_override(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        override: ResolvedServerConfig | None,
+        cache_version: str = "0.1.0",
+        allowed: bool = True,
+    ) -> GatewayTools:
+        """GatewayTools whose manifest says @playwright/mcp and whose .mcp.json
+        says whatever `override` names. The descriptions cache always describes
+        the MANIFEST package, which is the situation #150 is about."""
+        self._make_manifest_with_playwright(monkeypatch)
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_configs",
+            lambda **_: ([override] if override is not None else []),
+        )
+        policy = PolicyManager()
+        if not allowed:
+            monkeypatch.setattr(policy, "is_server_allowed", lambda _name: False)
+        return GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=policy,
+            descriptions_cache=self._make_cache(version=cache_version),
+        )
+
+    @pytest.mark.asyncio
+    async def test_notice_suppressed_when_cache_package_mismatches_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A .mcp.json override naming a DIFFERENT package must not produce a notice.
+
+        Board finding B1. The cache entry describes the manifest package
+        (@playwright/mcp @ 0.1.0). The override runs a different package
+        entirely. Comparing the cached version against the override package's
+        upstream latest compares unrelated packages -- which is exactly how #150
+        both invents false notices and hides real ones. The correct behaviour is
+        silence until `pmcp refresh` re-describes the server.
+        """
+        gt = self._gt_with_override(
+            monkeypatch,
+            override=ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=LocalMcpServerConfig(
+                    command="npx", args=["-y", "@acme/totally-different"]
+                ),
+            ),
+        )
+
+        queried: list[tuple[str, list[str]]] = []
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            queried.append((command, list(args)))
+            return ("99.0.0", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        assert await gt._get_update_warning("playwright") is None
+        # And it must not have compared at all -- no lookup, no cache write.
+        assert queried == []
+        assert "playwright" not in gt._stale_check_cache
+
+    @pytest.mark.asyncio
+    async def test_notice_uses_configured_override_when_package_matches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Same package via a .mcp.json override -> the override's argv is used."""
+        gt = self._gt_with_override(
+            monkeypatch,
+            override=ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=LocalMcpServerConfig(
+                    command="npx", args=["-y", "@playwright/mcp", "--headless"]
+                ),
+            ),
+        )
+
+        queried: list[tuple[str, list[str]]] = []
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            queried.append((command, list(args)))
+            return ("9.9.9", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        warning = await gt._get_update_warning("playwright")
+
+        assert warning is not None and "9.9.9" in warning
+        # The OVERRIDE argv was version-checked, not the bare manifest argv.
+        assert queried == [("npx", ["-y", "@playwright/mcp", "--headless"])]
+
+    @pytest.mark.asyncio
+    async def test_notice_stays_silent_for_policy_denied_server(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Board finding B3: _load_all_configured_servers returns entries BEFORE
+        policy filtering, so without an explicit is_server_allowed check a denied
+        server leaks update notices."""
+        gt = self._gt_with_override(
+            monkeypatch,
+            override=ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=LocalMcpServerConfig(command="npx", args=["-y", "@playwright/mcp"]),
+            ),
+            allowed=False,
+        )
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            raise AssertionError("denied server must not be version-checked")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        assert await gt._get_update_warning("playwright") is None
+        assert "playwright" not in gt._stale_check_cache
+
+    @pytest.mark.asyncio
+    async def test_notice_ignores_remote_override(self, monkeypatch: pytest.MonkeyPatch):
+        """A remote override has no local package to version-check -> no notice,
+        and specifically no AttributeError reaching for .command."""
+        gt = self._gt_with_override(
+            monkeypatch,
+            override=ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=RemoteMcpServerConfig(url="https://example.invalid/mcp"),
+            ),
+        )
+        assert await gt._get_update_warning("playwright") is None
+
+    @pytest.mark.asyncio
+    async def test_stale_sweep_skips_package_identity_mismatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """The background sweep must not cache a cross-package (current, latest)."""
+        gt = self._gt_with_override(
+            monkeypatch,
+            override=ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=LocalMcpServerConfig(
+                    command="npx", args=["-y", "@acme/totally-different"]
+                ),
+            ),
+        )
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            return ("99.0.0", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        await gt._run_stale_index()
+
+        assert "playwright" not in gt._stale_check_cache
+
     def test_detect_effective_version_pin_matrix(self):
         """Pin detection per package manager, including the not-a-pin cases."""
         from pmcp.tools.handlers import _detect_effective_version_pin as detect
