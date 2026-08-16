@@ -1347,13 +1347,17 @@ class GatewayTools:
             cached = self._stale_check_cache.get(server_name)
             if cached and (now - cached[0]) < self._stale_check_ttl_seconds:
                 continue
-            server_config = self._get_server_config_for_update(server_name)
-            if not server_config or not server_config.command:
+            # #150: resolve with .mcp.json-over-manifest precedence, matching
+            # gateway.update_server, and only compare versions when the effective
+            # package is the one this cache entry actually describes.
+            target = self._effective_notice_target(server_name)
+            if target is None:
+                continue
+            command, args = target
+            if not self._notice_package_matches_cache(server_name, command, args):
                 continue
             try:
-                latest, _ = await get_package_version(
-                    server_config.command, server_config.args, timeout=5.0
-                )
+                latest, _ = await get_package_version(command, args, timeout=5.0)
                 self._stale_check_cache[server_name] = (
                     now,
                     server_desc.version,
@@ -2905,15 +2909,31 @@ class GatewayTools:
             message=f"Server '{server_name}' disconnected.",
         )
 
-    async def restart_server(self, input_data: dict[str, Any]) -> LifecycleServerOutput:
-        """gateway.restart_server - Restart one known server."""
+    async def restart_server(
+        self,
+        input_data: dict[str, Any],
+        *,
+        resolved_config: ResolvedServerConfig | None = None,
+    ) -> LifecycleServerOutput:
+        """gateway.restart_server - Restart one known server.
+
+        ``resolved_config`` is INTERNAL (keyword-only, never part of the public
+        tool schema): a caller that already resolved this server -- and gated it
+        through the same ``_resolve_lifecycle_config`` -- passes its config so the
+        restart cannot resolve again and pick up a config edit that landed in
+        between (Consiliency/pmcp#151). When ``None``, behavior is unchanged.
+        """
         parsed = RestartServerInput.model_validate(input_data)
         server_name = parsed.server_name
         prior_status = self._status_value(server_name)
 
-        config, failure = self._resolve_lifecycle_config(
-            server_name, action="restart", prior_status=prior_status
-        )
+        if resolved_config is not None:
+            config: ResolvedServerConfig | None = resolved_config
+            failure: LifecycleServerOutput | None = None
+        else:
+            config, failure = self._resolve_lifecycle_config(
+                server_name, action="restart", prior_status=prior_status
+            )
         if failure is not None:
             return failure
         if config is None:
@@ -3610,17 +3630,96 @@ class GatewayTools:
         return (False, None, None)
 
     def _get_server_config_for_update(self, server_name: str) -> ServerConfig | None:
-        """Resolve server config from manifest or discovered candidates."""
+        """Resolve server config from manifest or discovered candidates.
+
+        Manifest-oriented: this deliberately does NOT consult ``.mcp.json``. The
+        stale-notice paths must not use it -- see ``_effective_notice_target``.
+        """
         manifest = load_manifest()
         server_config = manifest.get_server(server_name)
         if server_config:
             return server_config
         return self._discovered_server_configs.get(server_name)
 
-    async def _get_update_warning(self, server_name: str) -> str | None:
-        """Best-effort stale version warning for a server."""
+    def _effective_notice_target(
+        self, server_name: str
+    ) -> tuple[str, list[str]] | None:
+        """(command, args) a stale-update notice should version-check, or ``None``.
+
+        Consiliency/pmcp#150. ``gateway.update_server`` resolves its target through
+        ``_resolve_lifecycle_config``, where a ``.mcp.json`` entry OVERRIDES the
+        manifest. The notice paths resolved manifest-only, so for a server
+        configured in both places under the same name they version-checked a
+        DIFFERENT package than the one that actually runs -- surfacing a false
+        "update available" or hiding a real one once the stale-check TTL expired.
+
+        This shares that precedence without reusing ``_resolve_lifecycle_config``:
+        that function returns ``LifecycleServerOutput`` FAILURE objects for policy
+        denial, missing remote-header env vars, and credential gaps. Those are
+        right for a lifecycle ACTION and wrong for a best-effort notice, which has
+        no channel for a failure output and must simply stay silent.
+
+        Returns ``None`` -- meaning "no notice" -- when the server does not
+        resolve, is policy-denied, or resolves to a remote entry (no local package
+        to version-check). ``is_server_allowed`` is a pure predicate, so this stays
+        side-effect free; ``_load_all_configured_servers`` returns entries BEFORE
+        policy filtering, so without this check a denied server would leak notices.
+        Credential/header gaps are deliberately NOT checked: they do not change
+        which package is installed, so a notice about it is still truthful.
+        """
+        if not self._policy_manager.is_server_allowed(server_name):
+            return None
+
+        configured = self._load_all_configured_servers().get(server_name)
+        if configured is not None:
+            local = configured.config
+            if not isinstance(local, LocalMcpServerConfig) or not local.command:
+                return None
+            return (local.command, list(local.args))
+
         server_config = self._get_server_config_for_update(server_name)
         if not server_config or not server_config.command:
+            return None
+        return (server_config.command, list(server_config.args))
+
+    def _notice_package_matches_cache(
+        self, server_name: str, command: str, args: list[str]
+    ) -> bool:
+        """Whether the effective config describes the SAME package the cache does.
+
+        Consiliency/pmcp#150, board finding B1: resolving the *latest* lookup to the
+        effective package is only half a fix. The *current* side of the comparison
+        is ``GeneratedServerDescriptions.version``, which was generated from
+        whatever package the descriptions cache last described. If a ``.mcp.json``
+        override names a DIFFERENT package than the cached entry, comparing the
+        two versions compares unrelated packages -- e.g. cached ``A==10.0.0`` vs
+        effective ``B==2.0.0`` hides B's real update.
+
+        ``GeneratedServerDescriptions`` records the package it describes, so a
+        mismatch is detectable. On mismatch the caller must stay silent rather
+        than emit a comparison it cannot justify; the cache is refreshed by
+        ``pmcp refresh``, which is where re-describing the server belongs.
+        """
+        if not self._descriptions_cache:
+            return False
+        entry = self._descriptions_cache.servers.get(server_name)
+        if entry is None:
+            return False
+        _pkg_type, package_name = detect_package_type(command, args)
+        if not package_name or not entry.package:
+            return False
+        return package_name == entry.package
+
+    async def _get_update_warning(self, server_name: str) -> str | None:
+        """Best-effort stale version warning for a server."""
+        # #150: same precedence gateway.update_server uses, and stay silent when
+        # the effective package is not the one the descriptions cache describes --
+        # comparing versions across two different packages is worse than no notice.
+        target = self._effective_notice_target(server_name)
+        if target is None:
+            return None
+        command, args = target
+        if not self._notice_package_matches_cache(server_name, command, args):
             return None
 
         # Require a known local version to compare against.
@@ -3641,9 +3740,7 @@ class GatewayTools:
                 )
             return None
 
-        latest, _pkg_type = await get_package_version(
-            server_config.command, server_config.args, timeout=3.0
-        )
+        latest, _pkg_type = await get_package_version(command, args, timeout=3.0)
         self._stale_check_cache[server_name] = (now, current_version, latest)
 
         if latest and is_version_newer(current_version, latest):
@@ -5165,6 +5262,35 @@ class GatewayTools:
             )
 
         refresh_result = await self.refresh({"reason": f"update_server:{server_name}"})
+
+        # #151: the probe above can take up to 60s, and refresh() just RELOADED
+        # config from disk. If an edit landed in that window, the config resolved
+        # before the probe is stale -- and reusing it would disconnect the edited
+        # server and reconnect the old package, which is worse than the race it
+        # replaces. Re-resolve and require the effective spawn identity to be
+        # unchanged; on drift, abort BEFORE mutating any cache or notice state.
+        recheck_config, recheck_failure = self._resolve_lifecycle_config(
+            server_name, action="restart", prior_status=self._status_value(server_name)
+        )
+        recheck_target = (
+            (recheck_config.config.command, list(recheck_config.config.args))
+            if recheck_config is not None
+            and isinstance(recheck_config.config, LocalMcpServerConfig)
+            else None
+        )
+        if recheck_failure is not None or recheck_target != (command, list(args)):
+            return UpdateServerOutput(
+                ok=False,
+                server=server_name,
+                package_type=package_type,
+                package_name=package_name,
+                message=(
+                    f"'{server_name}' configuration changed while the update was "
+                    "running; the package was fetched but NOT activated, and no "
+                    "version state was recorded. Re-run gateway.update_server."
+                ),
+            )
+
         latest_version, _ = await get_package_version(command, args, timeout=5.0)
 
         # gateway.refresh() is a diff-based reconcile (_refresh_config_unchanged):
@@ -5177,7 +5303,10 @@ class GatewayTools:
         # already exercises, so the freshly-fetched package is what's actually
         # running.
         restart_result = await self.restart_server(
-            {"server_name": server_name, "force": parsed.force}
+            {"server_name": server_name, "force": parsed.force},
+            # #151: hand over the config just re-resolved and confirmed unchanged,
+            # so the restart cannot resolve a third time and pick up a later edit.
+            resolved_config=recheck_config,
         )
 
         # `desc.version` (an upstream snapshot from the last `pmcp
