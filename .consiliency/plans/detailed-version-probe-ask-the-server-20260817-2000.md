@@ -134,6 +134,23 @@ Edge cases: server ignores the flag and runs (circleci); exits 0 with no version
 - **Probing on the request path.** Probes run only on the background sweep, behind the cache. A `describe` call must never spawn a process.
 - **docker / cargo.** No probe; `None` → no notice.
 
+## Measured: the startup side effects are real, not hypothetical
+
+Probing `@circleci/mcp-server-circleci --version` — one of the servers that ignores the flag — was measured while running:
+
+```
+t=3s   pids=7  open_sockets=5
+t=6s   pids=6  open_sockets=4
+t=9s   pids=5  open_sockets=4
+t=12s  pids=5  open_sockets=4
+```
+
+**Seven processes and five open network sockets**, sustained until killed. That is a real MCP server starting up and connecting outward, caused by an advisory update check, on a schedule, for a server that yields no version anyway.
+
+(By contrast `@eslint/mcp` had exited before the 10s sample — it prints its message and stops, so the cost there is bounded.)
+
+This materially strengthens the case against the approach: the servers that pay this cost are exactly the ones that give nothing back. Any implementation must at minimum avoid probing a server twice once it is known not to answer — but that only bounds the cost, it does not remove the first probe's side effects, and a cache expiry re-incurs them.
+
 ## Open question for the board
 
 The probe runs `<command> <args> --version`, i.e. **it starts the package**. For a server that ignores the flag this briefly runs a real server process that is then killed. Is that acceptable for something as trivial as an update notice — particularly for a server with side effects at startup (opening a browser, connecting to a database, writing state)? If not, the honest conclusion may be that no safe automatic probe exists and the feature should be removed rather than made 50% correct. I want the board's view, because this is the strongest argument against the whole approach and it is not one I can settle from the code.
