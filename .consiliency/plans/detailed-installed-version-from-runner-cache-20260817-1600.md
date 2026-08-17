@@ -38,6 +38,8 @@ So the obvious implementation — shell out to `npm ls` / `uv pip show` — **re
 
 The directory name is a hash of the *argument set*, so pmcp cannot compute it — it must scan and match on the dependency name. Measured cost: **0.36s for 114 entries**, filesystem reads only, no subprocess and no network.
 
+**Why matching on `dependencies` cannot collide with a transitive dependency** (the obvious objection, checked before planning): every npx cache entry declares **exactly one** dependency — the package npx was invoked for — while its `node_modules/` holds the full transitive closure. Sampled six entries, all `len(dependencies) == 1`, against a `node_modules` of 212 packages in one of them. So the match must be against `dependencies`, never `node_modules`; matching the latter would resolve any transitive package and is the trap to avoid.
+
 *uv* (`uv cache dir`/`environments-v2/<a>/<b>/`): a normal venv whose `lib/python*/site-packages/*.dist-info` directories carry name and version (`sse_starlette-3.4.6.dist-info`). Note the layout is **two levels deep**, not one — my first probe assumed one and found nothing.
 
 **Why this source is different from the five that failed.** It is bound to the package identity by construction: the cache entry names the package, and the version is read from that package's own metadata. Every prior attempt compared a version whose provenance was unrelated to the configured package — an upstream snapshot (`descriptions_cache.version`), or the MCP `serverInfo.version` (an *implementation* version; FastMCP 1.x reported the SDK's, mcp 2.x defaults it to `""`).
