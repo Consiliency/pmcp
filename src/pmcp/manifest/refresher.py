@@ -216,7 +216,7 @@ async def refresh_server(
             server_config.command, server_config.args
         )
 
-        if version and not is_version_newer(existing_cache.version, version):
+        if version and not is_version_newer(existing_cache.version, version, pkg_type):
             logger.debug(
                 f"Server {server_name} is up to date (v{existing_cache.version})"
             )
@@ -411,11 +411,11 @@ async def check_staleness(
         if not server_config:
             continue
 
-        version, _ = await get_package_version(
+        version, pkg_type = await get_package_version(
             server_config.command, server_config.args
         )
 
-        if version and is_version_newer(desc.version, version):
+        if version and is_version_newer(desc.version, version, pkg_type):
             stale_servers[name] = (desc.version, version)
             logger.info(f"Server {name} is stale: {desc.version} -> {version}")
 

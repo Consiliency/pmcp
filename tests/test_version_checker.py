@@ -291,12 +291,12 @@ class TestIsVersionNewer:
         """
         import re as _re
 
-        from pmcp.manifest.version_checker import _is_digest
+        from pmcp.manifest.version_checker import _digest_identity
 
         # Mirrors get_docker_version's truncation of a registry digest.
         produced = "sha256:abcdef1234567890"[7:19]
         assert _re.fullmatch(r"[0-9a-f]{12}", produced)
-        assert _is_digest(produced)
+        assert _digest_identity(produced) == produced
         assert is_version_newer(produced, "0123456789ab") is True
 
     def test_long_numeric_version_is_not_mistaken_for_a_digest(self) -> None:
@@ -307,10 +307,44 @@ class TestIsVersionNewer:
         pattern, and is then never compared against a dotted release -- silently
         dropping a real update. Found while reviewing my own digest rule.
         """
-        from pmcp.manifest.version_checker import _is_digest
+        from pmcp.manifest.version_checker import _digest_identity
 
-        assert _is_digest("202612180000") is False
+        assert _digest_identity("202612180000") is None
         assert is_version_newer("202612180000", "202612190000") is True
+
+    def test_semver_ecosystem_prerelease_ordering(self) -> None:
+        """npm/Cargo publish SemVer, where `-1` is a PRERELEASE.
+
+        PEP 440 -- what `packaging` implements -- reads `1.0.0-1` as the POST
+        release `1.0.0.post1`, the opposite order. 79 of the manifest's 107
+        servers are npm, so without an ecosystem-aware path this inverts
+        precedence on a real published format: it hides the `1.0.0-1 -> 1.0.0`
+        upgrade and fabricates the reverse.
+        """
+        assert is_version_newer("1.0.0-1", "1.0.0", "npm") is True
+        assert is_version_newer("1.0.0", "1.0.0-1", "npm") is False
+        assert is_version_newer("1.0.0-alpha", "1.0.0-beta", "npm") is True
+        assert is_version_newer("1.0.0+build.4", "1.0.0+build.5", "npm") is False
+        # cargo shares SemVer semantics.
+        assert is_version_newer("1.0.0-1", "1.0.0", "cargo") is True
+
+    def test_pypi_keeps_pep440_ordering(self) -> None:
+        """PyPI publishes PEP 440; post-releases and its prerelease forms hold."""
+        assert is_version_newer("1.0.post1", "1.0.post2", "pypi") is True
+        assert is_version_newer("1.0a1", "1.0", "pypi") is True
+
+    def test_same_digest_in_two_representations_is_not_an_update(self) -> None:
+        """One image, two spellings, must not read as a new release.
+
+        `get_docker_version` emits a bare truncated digest, but a prefixed or
+        untruncated form can reach the comparator from a cached value or a
+        registry that does not truncate. Comparing raw strings called that an
+        update -- a fabricated notice for an unchanged image.
+        """
+        assert is_version_newer("abcdef123456", "sha256:abcdef123456") is False
+        assert is_version_newer("sha256:abcdef1234567890", "abcdef123456") is False
+        # A genuinely different image still registers.
+        assert is_version_newer("abcdef123456", "fedcba654321") is True
 
     def test_build_metadata_is_not_a_new_release(self) -> None:
         """A local/build-metadata difference is not an update to announce."""

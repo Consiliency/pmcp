@@ -1351,7 +1351,7 @@ class GatewayTools:
             if not server_config or not server_config.command:
                 continue
             try:
-                latest, _ = await get_package_version(
+                latest, pkg_type = await get_package_version(
                     server_config.command, server_config.args, timeout=5.0
                 )
                 self._stale_check_cache[server_name] = (
@@ -1359,7 +1359,7 @@ class GatewayTools:
                     server_desc.version,
                     latest,
                 )
-                if latest and is_version_newer(server_desc.version, latest):
+                if latest and is_version_newer(server_desc.version, latest, pkg_type):
                     logger.info(
                         f"Update available for '{server_name}': "
                         f"{server_desc.version} -> {latest}"
@@ -3641,12 +3641,15 @@ class GatewayTools:
                 )
             return None
 
-        latest, _pkg_type = await get_package_version(
+        latest, pkg_type = await get_package_version(
             server_config.command, server_config.args, timeout=3.0
         )
         self._stale_check_cache[server_name] = (now, current_version, latest)
 
-        if latest and is_version_newer(current_version, latest):
+        # Pass the ecosystem: npm/cargo publish SemVer, where `-1` is a
+        # PRERELEASE, while PEP 440 reads it as a POST-release. Without this the
+        # ordering inverts for the 79 npm servers in the manifest.
+        if latest and is_version_newer(current_version, latest, pkg_type):
             return (
                 f"Update available for '{server_name}': {current_version} -> {latest}. "
                 f"Call gateway.update_server with server_name='{server_name}'."
