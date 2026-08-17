@@ -113,3 +113,46 @@ Edge cases: server in manifest only; `.mcp.json` only; both with the same packag
 automation:
   suite_command: "uv run pytest -q"
 ```
+
+---
+
+## Board review — REJECTED (3/3 DISAGREE). Do not implement as written.
+
+Boarded before implementation. grok-4.6, codex and gemini all blocked, and two converged independently on a flaw that is fatal to this plan's central claim. Verified against source; recorded here so the next attempt does not repeat it.
+
+### B1 (fatal) — re-keying the cache does NOT make a cross-package comparison unrepresentable
+
+The plan's whole premise. It is wrong. Both writers still source `current` from the single server-scoped `GeneratedServerDescriptions.version`:
+
+- `_run_stale_index` (`handlers.py:1367`) writes `server_desc.version` as `current`
+- `_get_update_warning` (`handlers.py:3782`) reads `self._descriptions_cache.servers[server_name].version`
+
+So after an A→B switch this plan stores `(A_version, B_latest)` under key `(server, B)` — the composite key makes the entry look authoritative while the comparison remains exactly as wrong as before. Re-keying relabels the poison; it does not prevent it.
+
+### B2 (root cause, and the reason three fixes failed) — nothing observes an INSTALLED version
+
+grok's diagnosis, which is more precise than my framing: `get_package_version` returns **upstream latest only**. There is no code path anywhere that observes the *installed* version of a package. `GeneratedServerDescriptions.version` is itself an upstream snapshot from the last describe pass, not an installed version.
+
+That is why every attempt to "establish a baseline for B" has failed, including the #154 self-heal: **the baseline does not exist to be established.** `update_server` cannot serve as the recovery either — notices must work *before* an update, and its success path writes only `version`, never the description's `package` (`handlers.py:5393`).
+
+This reframes #150. It is not a cache-keying bug. The system compares an upstream-latest snapshot taken at describe time against an upstream-latest fetched now, and calls the difference an available update. That works only while the described package and the configured package are the same. Any real fix must decide what "currently installed version" means and where it comes from — a question this plan never asks.
+
+### B3 — `(server, package_name)` is not a complete identity anyway
+
+`detect_package_type` distinguishes ecosystems while allowing identical name strings across them. Verified:
+
+```
+npx foo -> ('npm', 'foo')
+uvx foo -> ('pypi', 'foo')     # same package_name, different ecosystem
+```
+
+Switching `npx foo` to `uvx foo` reuses `(server, "foo")` and compares versions from different registries. The key would need the package *type* too — but per B1/B2 the key is not where the fix lives.
+
+### Also raised
+
+- Orphaned old-package keys stay user-visible (`catalog_search` enumerates every raw entry) and grow unboundedly; TTL hides them after 6h but never removes them.
+- The acceptance criteria as written are not falsifying — the resume criterion cannot be honestly satisfied while B2 stands.
+
+### Status
+
+Plan rejected, not implemented. #150 needs a decision about installed-version provenance before any further code. #151's fix is independent of all of this and was accepted in every round.
