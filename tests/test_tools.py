@@ -5656,6 +5656,77 @@ class TestUpdateServerVersionRepair:
 
         assert "playwright" not in gt._stale_check_cache
 
+    @pytest.mark.asyncio
+    async def test_warm_poisoned_cache_entry_is_evicted_not_just_skipped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Board round 2, finding 1: skipping is not enough -- evict.
+
+        `catalog_search` reads `_stale_check_cache` directly with NO TTL check and
+        NO package-identity check. So a tuple derived from package A, left in the
+        cache when a notice path skips on mismatch, keeps being attributed to
+        package B indefinitely. The first version of this fix skipped without
+        evicting, and every test started from an EMPTY cache -- so none of them
+        could catch it. This one pre-populates the poisoned entry.
+        """
+        gt = self._gt_with_override(
+            monkeypatch,
+            override=ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=LocalMcpServerConfig(
+                    command="npx", args=["-y", "@acme/totally-different"]
+                ),
+            ),
+        )
+        # A-derived tuple, warm (now) and stale-looking: 0.1.0 -> 99.0.0.
+        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "99.0.0")
+
+        assert await gt._get_update_warning("playwright") is None
+        # The poisoned entry must be GONE, not merely bypassed...
+        assert "playwright" not in gt._stale_check_cache
+        # ...so catalog_search cannot serve it for the newly-configured package.
+        out = await gt.catalog_search({"query": "browser"})
+        assert not (out.stale_updates or [])
+
+    @pytest.mark.asyncio
+    async def test_mismatch_repoints_cache_so_notices_can_resume(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Board round 2, finding 3: silence must not be permanent.
+
+        `pmcp refresh` -> `refresh_all` re-describes MANIFEST entries only, so a
+        server whose effective package comes from a .mcp.json override would
+        never gain a matching cache entry -- "silent until refresh" would mean
+        "silent forever" for exactly the servers #150 is about. Instead the entry
+        is re-pointed at the configured package, so the next check compares like
+        with like.
+        """
+        gt = self._gt_with_override(
+            monkeypatch,
+            override=ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=LocalMcpServerConfig(
+                    command="npx", args=["-y", "@acme/replacement"]
+                ),
+            ),
+        )
+        assert gt._descriptions_cache is not None
+        assert gt._descriptions_cache.servers["playwright"].package == "@playwright/mcp"
+
+        # Pass 1: mismatch -> no notice, but the entry is re-pointed.
+        assert await gt._get_update_warning("playwright") is None
+        entry = gt._descriptions_cache.servers["playwright"]
+        assert entry.package == "@acme/replacement"
+        assert entry.version == ""  # A's version is not comparable to B's
+
+        # Pass 2: a version is now observable for the configured package, so the
+        # server is no longer permanently silent.
+        assert gt._notice_package_matches_cache(
+            "playwright", "npx", ["-y", "@acme/replacement"]
+        )
+
     # --- Consiliency/pmcp#151: config must not drift across the probe window ---
 
     @pytest.mark.asyncio
@@ -5711,6 +5782,60 @@ class TestUpdateServerVersionRepair:
         assert cache.servers["playwright"].version == "0.1.0"
         assert "playwright" not in gt._stale_check_cache
         assert not any("disconnect_server" in e for e in client_manager.events)
+
+    @pytest.mark.asyncio
+    async def test_update_server_aborts_on_env_only_drift(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Board round 2, finding 2: command+args is not process identity.
+
+        An edit that leaves argv identical but changes the effective env -- e.g.
+        DOCKER_HOST, or a package-manager registry/cache variable -- points the
+        probe and the restart at different installations. The drift check uses
+        `_refresh_config_unchanged`, the repo's own "same downstream process"
+        predicate, which also covers cwd and the effective env override.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        original = ResolvedServerConfig(
+            name="playwright",
+            source="project",
+            config=LocalMcpServerConfig(
+                command="npx",
+                args=["-y", "@playwright/mcp"],
+                env={"NPM_CONFIG_REGISTRY": "https://a.invalid"},
+            ),
+        )
+        env_edited = ResolvedServerConfig(
+            name="playwright",
+            source="project",
+            config=LocalMcpServerConfig(
+                command="npx",
+                args=["-y", "@playwright/mcp"],
+                env={"NPM_CONFIG_REGISTRY": "https://b.invalid"},
+            ),
+        )
+        seen: list[int] = []
+
+        def fake_load_configs(**_kwargs):
+            seen.append(1)
+            return [original] if len(seen) == 1 else [env_edited]
+
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", fake_load_configs)
+
+        cache = self._make_cache(version="0.1.0")
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="9.9.9")
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert "configuration changed" in result.message.lower()
+        assert cache.servers["playwright"].version == "0.1.0"
+        assert "playwright" not in gt._stale_check_cache
 
     @pytest.mark.asyncio
     async def test_update_server_restart_consumes_the_confirmed_config(
