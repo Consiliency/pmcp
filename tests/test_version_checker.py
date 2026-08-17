@@ -18,6 +18,7 @@ from pmcp.manifest.version_checker import (
     get_package_version,
     get_pypi_version,
     is_version_newer,
+    is_version_orderable,
 )
 from pmcp import __version__
 
@@ -226,6 +227,194 @@ class TestIsVersionNewer:
         # "rc1" parses as (1,), "rc2" parses as (2,)
         assert is_version_newer("1.0.0-rc1", "1.0.0-rc2") is True
         assert is_version_newer("v2.0-beta1", "v2.0-beta2") is True
+
+    # --- fail-closed: never fabricate an "update available" ------------------
+
+    def test_unorderable_current_reports_no_update(self) -> None:
+        """A version this function cannot order must NOT read as out of date.
+
+        Consiliency/pmcp#150 board review. Returning True here makes the gateway
+        tell an operator their server is stale, so an unreadable version has to
+        report no update. Previously every one of these extracted digits (or an
+        empty tuple) and compared as OLDER than any real release, fabricating a
+        notice for any server whose version string is not a release number.
+        """
+        for unreadable in (
+            "nightly",
+            "release-channel-a",
+            "build-1",  # contains a digit but is not a version
+            "main",
+            "latest",
+            "abc.def",
+            "2026-08-17-nightly",
+        ):
+            assert is_version_newer(unreadable, "2.0.0") is False, unreadable
+
+    def test_empty_current_reports_no_update(self) -> None:
+        """The empty string is mcp 2.x's DEFAULT serverInfo.version.
+
+        It is reached in practice by any server that does not set a version
+        explicitly, so it must not compare as older than every release.
+        """
+        assert is_version_newer("", "2.0.0") is False
+
+    def test_unorderable_latest_reports_no_update(self) -> None:
+        """An unreadable *latest* is equally unusable -- refuse to guess."""
+        assert is_version_newer("1.0.0", "nightly") is False
+        assert is_version_newer("1.0.0", "") is False
+
+    def test_docker_digests_compare_by_inequality(self) -> None:
+        """Digests are identities, not ordinals.
+
+        Uses the BARE 12-hex form ``get_docker_version`` actually returns -- it
+        strips the ``sha256:`` prefix and truncates (see ``TestGetDockerVersion``).
+        A previous version of this guard matched only ``sha256:``-prefixed values
+        and was tested with invented literals, so it never fired against the real
+        producer and silenced every docker update notice. Ordering hex is
+        meaningless, but a DIFFERENT digest is genuinely a new image.
+        """
+        assert is_version_newer("abcdef123456", "abcdef123456") is False
+        assert is_version_newer("abcdef123456", "fedcba654321") is True
+        # The prefixed/full form is still accepted, in case the producer ever
+        # stops truncating.
+        assert is_version_newer("sha256:abcdef123456", "sha256:fedcba654321") is True
+
+    def test_digest_and_version_are_not_comparable(self) -> None:
+        """A digest and a release number describe different things."""
+        assert is_version_newer("1.0.0", "abcdef123456") is False
+        assert is_version_newer("abcdef123456", "1.0.0") is False
+
+    def test_docker_producer_output_is_orderable(self) -> None:
+        """Drive the PRODUCER, not a literal, so the two cannot drift apart.
+
+        The prior bug was exactly this drift: the comparator matched a format
+        the producer does not emit.
+        """
+        import re as _re
+
+        from pmcp.manifest.version_checker import _digest_identity
+
+        # Mirrors get_docker_version's truncation of a registry digest.
+        produced = "sha256:abcdef1234567890"[7:19]
+        assert _re.fullmatch(r"[0-9a-f]{12}", produced)
+        assert _digest_identity(produced) == produced
+        assert is_version_newer(produced, "0123456789ab") is True
+
+    def test_long_numeric_version_is_not_mistaken_for_a_digest(self) -> None:
+        """A purely numeric string is a version, not a digest.
+
+        `202612180000` is a plausible calendar/build stamp and is 12 chars of
+        `[0-9a-f]`. Without a hex-letter requirement it matches the digest
+        pattern, and is then never compared against a dotted release -- silently
+        dropping a real update. Found while reviewing my own digest rule.
+        """
+        from pmcp.manifest.version_checker import _digest_identity
+
+        assert _digest_identity("202612180000") is None
+        assert is_version_newer("202612180000", "202612190000") is True
+
+    def test_semver_ecosystem_prerelease_ordering(self) -> None:
+        """npm/Cargo publish SemVer, where `-1` is a PRERELEASE.
+
+        PEP 440 -- what `packaging` implements -- reads `1.0.0-1` as the POST
+        release `1.0.0.post1`, the opposite order. 79 of the manifest's 107
+        servers are npm, so without an ecosystem-aware path this inverts
+        precedence on a real published format: it hides the `1.0.0-1 -> 1.0.0`
+        upgrade and fabricates the reverse.
+        """
+        assert is_version_newer("1.0.0-1", "1.0.0", "npm") is True
+        assert is_version_newer("1.0.0", "1.0.0-1", "npm") is False
+        assert is_version_newer("1.0.0-alpha", "1.0.0-beta", "npm") is True
+        assert is_version_newer("1.0.0+build.4", "1.0.0+build.5", "npm") is False
+        # cargo shares SemVer semantics.
+        assert is_version_newer("1.0.0-1", "1.0.0", "cargo") is True
+
+    def test_unorderable_version_is_not_reported_as_up_to_date(self) -> None:
+        """`not is_version_newer(...)` is ambiguous under a fail-closed comparator.
+
+        Regression introduced by this PR and caught in review: `refresher` negates
+        the comparator, and once unreadable input returns False, `not(...)` reads
+        as "up to date". Since that function persists the literal `"unknown"`
+        after a failed lookup, the stale cache would be returned forever.
+        `is_version_orderable` is the discriminator callers need.
+        """
+        assert is_version_orderable("unknown") is False
+        assert is_version_orderable("") is False
+        assert is_version_orderable("nightly") is False
+        assert is_version_orderable("1.0.0") is True
+        assert is_version_orderable("1.0.0-1", "npm") is True
+        assert is_version_orderable("987654321098", "docker") is True
+
+    def test_all_numeric_docker_digest_is_a_digest(self) -> None:
+        """A truncated SHA-256 can be all digits.
+
+        `get_docker_version` truncates to 12 hex chars, so `987654321098` is a
+        perfectly valid digest. An earlier hex-letter requirement rejected it and
+        silently dropped real image updates. Shape alone cannot disambiguate a
+        digest from a calendar version, so the package type decides.
+        """
+        assert is_version_newer("987654321098", "123456789012", "docker") is True
+        assert is_version_newer("987654321098", "987654321098", "docker") is False
+        # Without a docker type, a numeric string stays a VERSION and is ordered.
+        assert is_version_newer("202612180000", "202612190000") is True
+
+    def test_invalid_semver_is_not_ordered(self) -> None:
+        """SemVer 2.0.0 rules 2, 9 and 10: no leading zeros, no empty identifiers.
+
+        These strings cannot be published to npm, and ordering them fabricated
+        updates (`1.0.0-01` -> `1.0.0` reported an upgrade).
+        """
+        for invalid in ("1.0.0-01", "01.0.0", "1.0.0-a..b", "1.0.00", "1.0.0-"):
+            assert is_version_newer(invalid, "1.0.0", "npm") is False, invalid
+            assert is_version_newer("1.0.0", invalid, "npm") is False, invalid
+
+    def test_semver_spec_precedence_chain(self) -> None:
+        """The canonical chain from SemVer 2.0.0 spec section 11.4.
+
+        Pins hand-written precedence against the specification rather than
+        against my own intuition, in both directions. Includes `beta.2` <
+        `beta.11`, which naive string ordering gets backwards.
+        """
+        chain = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ]
+        for older, newer in zip(chain, chain[1:]):
+            assert is_version_newer(older, newer, "npm") is True, f"{older} -> {newer}"
+            assert is_version_newer(newer, older, "npm") is False, f"{newer} -> {older}"
+
+    def test_pypi_keeps_pep440_ordering(self) -> None:
+        """PyPI publishes PEP 440; post-releases and its prerelease forms hold."""
+        assert is_version_newer("1.0.post1", "1.0.post2", "pypi") is True
+        assert is_version_newer("1.0a1", "1.0", "pypi") is True
+
+    def test_same_digest_in_two_representations_is_not_an_update(self) -> None:
+        """One image, two spellings, must not read as a new release.
+
+        `get_docker_version` emits a bare truncated digest, but a prefixed or
+        untruncated form can reach the comparator from a cached value or a
+        registry that does not truncate. Comparing raw strings called that an
+        update -- a fabricated notice for an unchanged image.
+        """
+        assert is_version_newer("abcdef123456", "sha256:abcdef123456") is False
+        assert is_version_newer("sha256:abcdef1234567890", "abcdef123456") is False
+        # A genuinely different image still registers.
+        assert is_version_newer("abcdef123456", "fedcba654321") is True
+
+    def test_build_metadata_is_not_a_new_release(self) -> None:
+        """A local/build-metadata difference is not an update to announce."""
+        assert is_version_newer("1.0.0+build.4", "1.0.0+build.5") is False
+
+    def test_prerelease_precedence(self) -> None:
+        """PEP 440 ordering: a prerelease is OLDER than its release."""
+        assert is_version_newer("1.0.0-rc1", "1.0.0") is True
+        assert is_version_newer("1.0.0", "1.0.0-rc1") is False
 
 
 class TestGetNpmVersion:

@@ -220,7 +220,14 @@ jobs:
           # same frozen payload rather than re-fetching it, so a label applied to an
           # already-running/failed PR would never be seen that way. Reading live here
           # means "apply the label, then re-run the job" actually works.
-          LABELS=$(gh api "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels" --jq '.[].name')
+          # Use the PULLS endpoint, not /issues/<n>/labels: this job grants
+          # `pull-requests: read`, and the issues endpoint needs `issues: read`,
+          # so it returned "Validation Failed (HTTP 422)". Under `bash -e` that
+          # non-zero exit killed the step BEFORE the CHANGELOG check ran, so the
+          # guard failed on its own permissions rather than on the PR's content.
+          # `|| true` keeps a future API hiccup from doing the same: a lookup
+          # failure must not decide the check, it just means "no label seen".
+          LABELS=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '.labels[].name' || true)
           echo "Current labels: $LABELS"
           if echo "$LABELS" | grep -qx 'skip-changelog'; then
             echo "skip-changelog label present — skipping the CHANGELOG.md check."

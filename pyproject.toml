@@ -31,6 +31,12 @@ classifiers = [
     "Typing :: Typed",
 ]
 dependencies = [
+    # Version ordering for update notices. Hand-rolled digit extraction
+    # fabricated "update available" notices for any non-numeric version
+    # (`nightly`, `build-1`, and the empty string the MCP SDK defaults to);
+    # packaging implements PEP 440 ordering and rejects non-versions outright.
+    # Pure-Python, no transitive deps, already ubiquitous in the ecosystem.
+    "packaging>=22",
     # Upper bound is load-bearing: 3.0.0 is unreleased and unaudited. pmcp's
     # P2 phase ported the gateway's upstream handlers and downstream
     # transport onto mcp 2.0.0's rewritten low-level Server (typed on_*

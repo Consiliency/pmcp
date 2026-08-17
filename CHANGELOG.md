@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Update notices are no longer fabricated for servers whose version is not a
+  release number.** The version comparison extracted digits from whatever it was
+  given and had no way to say "I cannot read this", so a server reporting
+  `nightly`, `build-1`, `main`, or an empty string compared as *older* than any
+  real release and produced an "update available" notice that was never true.
+  An empty version is the default for servers built on the current MCP SDK, so
+  this was reachable in ordinary use.
+
+  Comparison now uses `packaging.version` (a new dependency), which implements
+  PEP 440 ordering and rejects anything that is not a release outright. Beyond
+  removing the false notices, this corrects ordering that the previous
+  digit-extraction approach got wrong: a pre-release such as `1.0.0-rc1` is now
+  correctly older than `1.0.0` (previously the real release was hidden), and a
+  build-metadata difference is no longer announced as a new release. Docker
+  images, whose "version" is a content digest rather than a number, are compared
+  for difference instead of order.
+
 ## [2.1.1] - 2026-08-12
 
 ### Fixed

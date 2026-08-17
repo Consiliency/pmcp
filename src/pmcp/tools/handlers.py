@@ -1085,7 +1085,14 @@ class GatewayTools:
         # so concurrent polls cannot double-adopt or re-refresh a finished job.
         self._provision_finalize_locks: dict[str, asyncio.Lock] = {}
         self._provision_finalized: set[str] = set()
-        self._stale_check_cache: dict[str, tuple[float, str | None, str | None]] = {}
+        # (checked_at, current, latest, package_type). The package type is
+        # carried so the READ sites can order correctly: npm/cargo publish
+        # SemVer, where `-1` is a prerelease, while PEP 440 reads it as a
+        # post-release. Without it, catalog_search inverts npm prereleases --
+        # hiding a real upgrade and fabricating its reverse (ah board review).
+        self._stale_check_cache: dict[
+            str, tuple[float, str | None, str | None, str | None]
+        ] = {}
         self._stale_check_ttl_seconds = 6 * 60 * 60
         self._stale_index_interval_seconds = 60 * 60  # Re-index every hour
         self._stale_index_task: asyncio.Task[None] | None = None
@@ -1351,15 +1358,16 @@ class GatewayTools:
             if not server_config or not server_config.command:
                 continue
             try:
-                latest, _ = await get_package_version(
+                latest, pkg_type = await get_package_version(
                     server_config.command, server_config.args, timeout=5.0
                 )
                 self._stale_check_cache[server_name] = (
                     now,
                     server_desc.version,
                     latest,
+                    pkg_type,
                 )
-                if latest and is_version_newer(server_desc.version, latest):
+                if latest and is_version_newer(server_desc.version, latest, pkg_type):
                     logger.info(
                         f"Update available for '{server_name}': "
                         f"{server_desc.version} -> {latest}"
@@ -1689,10 +1697,12 @@ class GatewayTools:
             stale = [
                 f"Update available for '{sn}': {current} -> {latest}. "
                 f"Call gateway.update_server(server_name='{sn}') to update."
-                for sn, (_, current, latest) in self._stale_check_cache.items()
+                for sn, (_, current, latest, pkg_type) in (
+                    self._stale_check_cache.items()
+                )
                 if current
                 and latest
-                and is_version_newer(current, latest)
+                and is_version_newer(current, latest, pkg_type)
                 and self._policy_manager.is_server_allowed(sn)
             ]
             if stale:
@@ -3634,19 +3644,25 @@ class GatewayTools:
         cached = self._stale_check_cache.get(server_name)
         if cached and (now - cached[0]) < self._stale_check_ttl_seconds:
             latest_cached = cached[2]
-            if latest_cached and is_version_newer(current_version, latest_cached):
+            cached_pkg_type = cached[3]
+            if latest_cached and is_version_newer(
+                current_version, latest_cached, cached_pkg_type
+            ):
                 return (
                     f"Update available for '{server_name}': {current_version} -> {latest_cached}. "
                     f"Call gateway.update_server with server_name='{server_name}'."
                 )
             return None
 
-        latest, _pkg_type = await get_package_version(
+        latest, pkg_type = await get_package_version(
             server_config.command, server_config.args, timeout=3.0
         )
-        self._stale_check_cache[server_name] = (now, current_version, latest)
+        self._stale_check_cache[server_name] = (now, current_version, latest, pkg_type)
 
-        if latest and is_version_newer(current_version, latest):
+        # Pass the ecosystem: npm/cargo publish SemVer, where `-1` is a
+        # PRERELEASE, while PEP 440 reads it as a POST-release. Without this the
+        # ordering inverts for the 79 npm servers in the manifest.
+        if latest and is_version_newer(current_version, latest, pkg_type):
             return (
                 f"Update available for '{server_name}': {current_version} -> {latest}. "
                 f"Call gateway.update_server with server_name='{server_name}'."
@@ -5253,6 +5269,7 @@ class GatewayTools:
                     now,
                     latest_version,
                     latest_version,
+                    package_type,
                 )
             else:
                 self._stale_check_cache.pop(server_name, None)

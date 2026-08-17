@@ -9,6 +9,7 @@ from typing import Literal
 from urllib.parse import quote
 
 import aiohttp
+from packaging.version import InvalidVersion, Version
 
 from pmcp import __version__
 
@@ -415,39 +416,191 @@ async def get_package_version(
     return (None, "unknown")
 
 
-def is_version_newer(current: str, latest: str) -> bool:
+# `get_docker_version` returns a BARE hex digest -- it strips the `sha256:`
+# prefix and truncates to 12 chars (see its implementation, pinned by
+# TestGetDockerVersion). Matching on a `sha256:` prefix therefore never fires
+# against the real producer; an earlier version of this guard did exactly that
+# and silenced every docker update notice. Accept the bare form, and the
+# prefixed form for robustness if the producer ever stops truncating.
+# Shape alone cannot separate a digest from a version: `get_docker_version`
+# truncates SHA-256 to 12 hex chars, which can be ALL NUMERIC (`987654321098`),
+# while `202612180000` is a plausible calendar version. An earlier attempt
+# required a hex letter and thereby dropped real all-numeric digest changes.
+# So shape is only a candidate test -- `package_type` decides, and callers have
+# it (board review round 4).
+_DIGEST_RE = re.compile(r"^(?:sha256:)?[0-9a-f]{12,64}$")
+_DIGEST_LETTER_RE = re.compile(r"^(?:sha256:)?(?=[0-9a-f]*[a-f])[0-9a-f]{12,64}$")
+
+
+def _digest_identity(value: str, package_type: str | None = None) -> str | None:
+    """Canonical digest identity for *value*, or ``None`` if it is not a digest.
+
+    Canonicalises so the SAME image never reads as an update just because the
+    producer's representation changed: the `sha256:` prefix is dropped and the
+    hex truncated to the 12 chars `get_docker_version` emits. Without this,
+    `abcdef123456` vs `sha256:abcdef123456` -- one image, two spellings --
+    compares as a new release.
+
+    A digest is an identity, not an ordinal: "newer" can only mean "different".
     """
-    Compare versions to check if latest is newer than current.
+    candidate = (value or "").strip()
+    # With a known docker package type, any hex-shaped value is a digest --
+    # including an all-numeric truncation. Without one, require a hex letter so
+    # a numeric calendar version is not misread as a digest and silently
+    # excluded from ordering.
+    pattern = _DIGEST_RE if package_type == "docker" else _DIGEST_LETTER_RE
+    if not pattern.match(candidate):
+        return None
+    hex_part = candidate[7:] if candidate.startswith("sha256:") else candidate
+    return hex_part[:12]
 
-    Handles common version formats:
-    - Semver: 1.2.3, 0.0.19
-    - Date-based: 2025.12.18
 
-    Args:
-        current: Current cached version
-        latest: Latest available version
+def _parse_version(value: str) -> Version | None:
+    """Parse *value* as a release version, or ``None`` if it is not one.
 
-    Returns:
-        True if latest > current
+    Uses ``packaging.version``, which implements PEP 440 ordering (including
+    pre-release, post-release and dev precedence) and raises on anything that
+    is not a version. Hand-rolled digit extraction was tried three times and
+    produced a fabricated-notice bug every time: it silently turned `build-1`
+    into `(1,)`, `2026-08-17-nightly` into `(2026, 8, 17)`, and `""` into `()`,
+    each of which compared as OLDER than a real release.
+
+    A leading ``v`` is accepted (``v1.2.3``) since registries commonly emit it.
+    """
+    candidate = (value or "").strip()
+    if not candidate:
+        return None
+    candidate = re.sub(r"^[vV]", "", candidate)
+    try:
+        return Version(candidate)
+    except InvalidVersion:
+        return None
+
+
+# npm and Cargo publish SemVer, where `-anything` is a PRERELEASE ordered BELOW
+# the release. PEP 440 (what `packaging` implements) reads `1.0.0-1` as the
+# POST-release `1.0.0.post1` -- the opposite order. 79 of the manifest's 107
+# servers are npm, so using PEP 440 for them inverts precedence on a real
+# format: it hides `1.0.0-1 -> 1.0.0` and fabricates the reverse.
+_SEMVER_ECOSYSTEMS = frozenset({"npm", "cargo"})
+
+# SemVer 2.0.0 rules 2, 9 and 10: core identifiers are non-negative integers
+# WITHOUT leading zeros; numeric prerelease identifiers likewise; and identifiers
+# must not be empty. An earlier version accepted `1.0.0-01`, `01.0.0` and
+# `1.0.0-a..b` and ORDERED them, fabricating updates from strings npm could
+# never have published (board review round 4).
+_SEMVER_CORE = r"(0|[1-9]\d*)"
+_SEMVER_PRE_IDENT = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
+_SEMVER_RE = re.compile(
+    rf"^[vV]?{_SEMVER_CORE}\.{_SEMVER_CORE}\.{_SEMVER_CORE}"
+    rf"(?:-({_SEMVER_PRE_IDENT}(?:\.{_SEMVER_PRE_IDENT})*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
+)
+
+
+def _is_semver_ecosystem(package_type: str | None) -> bool:
+    return package_type in _SEMVER_ECOSYSTEMS
+
+
+def _semver_key(value: str) -> tuple[tuple[int, int, int], list[object]] | None:
+    """SemVer 2.0.0 precedence key, or ``None`` if *value* is not SemVer.
+
+    Build metadata is ignored (spec: it does not affect precedence). A release
+    outranks any prerelease of the same core version; prerelease identifiers
+    compare numerically when numeric, else lexically, with numeric ranked lower.
+    """
+    match = _SEMVER_RE.match((value or "").strip())
+    if not match:
+        return None
+    core = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    prerelease = match.group(4)
+    if prerelease is None:
+        # No prerelease sorts ABOVE any prerelease of the same core.
+        return (core, [])
+    parts: list[object] = []
+    for ident in prerelease.split("."):
+        parts.append((0, int(ident), "") if ident.isdigit() else (1, 0, ident))
+    return (core, parts)
+
+
+def _semver_is_newer(current: str, latest: str) -> bool:
+    """SemVer precedence, failing closed when either side is not SemVer."""
+    current_key = _semver_key(current)
+    latest_key = _semver_key(latest)
+    if current_key is None or latest_key is None:
+        return False
+    current_core, current_pre = current_key
+    latest_core, latest_pre = latest_key
+    if latest_core != current_core:
+        return latest_core > current_core
+    # Same core: a release (empty prerelease list) outranks any prerelease.
+    if not latest_pre:
+        return bool(current_pre)
+    if not current_pre:
+        return False
+    return latest_pre > current_pre  # type: ignore[operator]
+
+
+def is_version_orderable(value: str, package_type: str | None = None) -> bool:
+    """Whether *value* can be ordered at all -- a release version or a digest.
+
+    Exists because ``not is_version_newer(a, b)`` is ambiguous under a
+    fail-closed comparator: it is True both when *a* is genuinely current AND
+    when *a* is unreadable. A caller that treats "not newer" as "up to date"
+    must first check that the value is orderable, or an unreadable version
+    (`"unknown"`, `""`) reads as current forever.
+    """
+    if _digest_identity(value, package_type) is not None:
+        return True
+    if _is_semver_ecosystem(package_type):
+        return _semver_key(value) is not None
+    return _parse_version(value) is not None
+
+
+def is_version_newer(
+    current: str, latest: str, package_type: str | None = None
+) -> bool:
+    """Whether *latest* is a strictly newer release than *current*.
+
+    FAILS CLOSED. Returning ``True`` tells an operator their server is out of
+    date, so anything this function cannot actually order returns ``False``
+    (Consiliency/pmcp#150 board review). An unreadable version produces no
+    notice rather than a false one.
+
+    * Both sides parse as versions -> PEP 440 ordering, so `1.0.0-rc1` is
+      correctly OLDER than `1.0.0`, and build metadata is not precedence.
+    * Both sides are digests -> any difference is a new image. This is the
+      docker lane: `get_docker_version` returns a bare 12-hex digest.
+    * Anything else -- unparseable, empty (the mcp 2.x default
+      ``serverInfo.version``), or a digest compared against a version -> no
+      update.
     """
     if current == latest:
         return False
 
-    # Try to parse as semver-like (X.Y.Z or X.Y)
-    def parse_version(v: str) -> tuple[int, ...]:
-        # Remove any non-numeric prefixes (v1.0.0 -> 1.0.0)
-        v = re.sub(r"^[vV]", "", v)
-        # Extract numeric parts
-        parts = re.findall(r"\d+", v)
-        return tuple(int(p) for p in parts)
+    current_digest = _digest_identity(current, package_type)
+    latest_digest = _digest_identity(latest, package_type)
+    if current_digest is not None or latest_digest is not None:
+        # Comparable only when BOTH are digests; then any difference in the
+        # CANONICAL identity is a new image. A digest and a version describe
+        # different things and are not ordered.
+        if current_digest is None or latest_digest is None:
+            return False
+        return current_digest != latest_digest
 
-    try:
-        current_parts = parse_version(current)
-        latest_parts = parse_version(latest)
-        return latest_parts > current_parts
-    except (ValueError, TypeError):
-        # Fall back to string comparison
-        return latest > current
+    if _is_semver_ecosystem(package_type):
+        return _semver_is_newer(current, latest)
+
+    current_version = _parse_version(current)
+    latest_version = _parse_version(latest)
+    if current_version is None or latest_version is None:
+        return False
+
+    # Compare on the PUBLIC segment: a local/build-metadata difference
+    # (`1.0.0+build.4` -> `+build.5`) is not a new release, and announcing one
+    # would be the same fabricated notice this function exists to prevent.
+    # Pre-release precedence is retained, since `.public` keeps it.
+    return Version(latest_version.public) > Version(current_version.public)
 
 
 def clear_version_cache() -> None:
