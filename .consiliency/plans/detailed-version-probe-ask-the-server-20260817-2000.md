@@ -165,3 +165,26 @@ The probe runs `<command> <args> --version`, i.e. **it starts the package**. For
 automation:
   suite_command: "uv run pytest -q"
 ```
+
+
+---
+
+## Board review — REJECTED 3/3, with an explicit recommendation to REMOVE the feature
+
+Boarded with the side-effect question foregrounded and a statement that a recommendation to abandon would be acted on. All three legs blocked, and both readable legs answered the question directly.
+
+**grok:** *"Automatic `<command> <args> --version` probes are disqualifying. Remove the automatic notices rather than ship a 50%-correct scheduled spawn."* And on the proposed mitigation: *"'Probe only servers already running' does not"* remove the hazard.
+
+**codex:** *"Yes, automatic probing is disqualifying. It executes third-party server code merely to produce an advisory, including packages known to ignore `--version`."* On the mitigation: it *"would reduce the number of executions, but it does not remove the per-server hazard; those servers are precisely the ones most likely to have valid credentials and live"* connections.
+
+This matches the measurement taken before the verdicts arrived: probing one flag-ignoring server spawned **7 processes and opened 5 network sockets**. Executing third-party code on a schedule to produce an advisory notice is not a defensible trade.
+
+### A live bug found in passing — not part of this plan
+
+grok noted, and I verified, that the **existing** `_run_update_probe_command` (shipped, used by `gateway.update_server`) spawns **without** `start_new_session` and on timeout does `await asyncio.wait_for(process.communicate(), timeout=60.0)` — which abandons the child. No kill, no process-group cleanup. A probe that hangs today orphans its whole process tree.
+
+That is independent of #150 and should be filed separately.
+
+### Conclusion after eight attempts
+
+Every approach has failed at the same joint: pmcp cannot cheaply and safely observe which package artifact a running server is executing. The remaining options are not technical refinements but a product decision, and the board's recommendation is the honest one: **remove the automatic notices**, keep `gateway.update_server` as the explicit, user-initiated path, and word any remaining message so it does not claim to know the installed version.
