@@ -151,3 +151,47 @@ When several npx cache entries contain the same package at different versions (d
 automation:
   suite_command: "uv run pytest -q"
 ```
+
+
+---
+
+## Board review — REJECTED (3/3 DISAGREE). Do not implement as written.
+
+Boarded before implementation. All three legs blocked. Every finding verified against this machine's real caches; recorded so the seventh attempt starts from facts.
+
+### B1 (fatal) — the fallback contradicts this plan's own acceptance criterion
+
+The Changes section keeps `descriptions_cache.version` as a fallback when no installed version is available; the Acceptance section requires **no notice** in that case. Those cannot both hold.
+
+And the fallback is not salvageable by the package-identity check: that value is written from the upstream registry (`refresher.py:243`), and this repo already labels it an upstream snapshot (`handlers.py:5199`). Identity agreement makes it the *right package's* upstream snapshot — still not an observed installed version. Keeping it means the sixth attempt still emits inferred-version notices, which is the whole defect.
+
+Worse, my proposed test (`test_notice_silent_when_installed_version_unavailable`) specifies "no cache entry **and no orderable fallback**" — so it would pass while the real regression (cache missing, description orderable) went uncovered. That is the same test-shape failure as rounds 1–4 on PR #154.
+
+### B2 — neither probe identifies the environment that actually ran
+
+**npx.** Matching `dependencies` does avoid transitive collisions (verified earlier). But it does not bind an entry to the *configured argument set*, and the cache holds the same package at several versions simultaneously. Verified on this machine:
+
+```
+@consiliency/agent-board-mcp -> ^1.2.0  ^1.2.1  ^1.2.2
+npm                          -> ^10.9.8 ^11.18.0 ^12.0.1
+playwright                   -> ^1.56.1 ^1.61.1
+```
+
+Newest-by-mtime picks whichever was invoked last — which can be an unrelated invocation, or `update_server`'s own `pkg@latest` probe, rather than the configured server's entry. The Open question at the end of this plan asked exactly this and the board's answer is that mtime is not sound.
+
+**uv.** Worse than npx, because there is no equivalent of npx's single-declared-dependency marker. Every environment contains its full transitive closure — verified: one env holds **30** `.dist-info` directories. Scanning by name matches a transitive dependency as readily as the invoked package.
+
+### B3 — undocumented internal layouts
+
+Both probes depend on cache layouts that are internal to npm and uv, not public interfaces. A layout change makes `installed_version` return `None` forever, which is indistinguishable from "no update available" — a silent, permanent regression. The proposed layout-change test guards the shape but cannot detect that the *real* cache has moved.
+
+### Where this leaves #150
+
+The runner caches do contain real installed versions — that part of the research holds, and it is the first source in six attempts that is bound to package identity. What they do not provide is a reliable mapping from *a configured server* to *the specific cache entry that server runs*.
+
+Options that would close that gap, none yet assessed:
+- Have pmcp record the resolved version at spawn time, when it knows the exact argv it launched — provenance by construction rather than by inference.
+- Probe the running process (`--version` on the same argv), accepting a subprocess per check.
+- Narrow the feature to servers pmcp installed itself, where the argument set is known.
+
+All three are materially different in cost and coverage from what this plan proposed.
