@@ -4865,6 +4865,84 @@ class TestStaleIndexer:
         assert gt._stale_index_task is None
 
 
+class TestUpdateProbeProcessCleanup:
+    """The update probe must not orphan its process tree on timeout.
+
+    Shipped behaviour before this fix: `_run_update_probe_command` spawned
+    WITHOUT `start_new_session` and awaited `wait_for(communicate(), 60)`. On
+    timeout `wait_for` cancels the await but never signals the child, so a probe
+    against a package that ignores its flag and runs as a server left the whole
+    tree alive -- including grandchildren such as the Chrome that
+    @playwright/mcp launches, which holds the profile SingletonLock and breaks
+    the next launch.
+
+    Spawns a REAL process tree: a mocked subprocess cannot demonstrate an
+    orphan, and this bug is entirely about what survives the call.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timeout_reaps_the_whole_process_tree(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import os
+        import sys as _sys
+
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        # Parent spawns a grandchild, prints its pid, then hangs -- the shape of
+        # a server that ignores the probe flag. The grandchild outlives the
+        # parent unless the whole process GROUP is signalled.
+        marker = tmp_pid_file = None
+        import tempfile
+
+        fd, tmp_pid_file = tempfile.mkstemp()
+        os.close(fd)
+        script = (
+            "import subprocess,sys,time;"
+            f"p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
+            f"open({tmp_pid_file!r},'w').write(str(p.pid));"
+            "time.sleep(30)"
+        )
+
+        real_wait_for = asyncio.wait_for
+
+        async def _fast_timeout(awaitable, timeout=None):
+            # Let the child start and record its grandchild, then time out.
+            return await real_wait_for(awaitable, timeout=1.5)
+
+        monkeypatch.setattr("pmcp.tools.handlers.asyncio.wait_for", _fast_timeout)
+
+        with pytest.raises((TimeoutError, asyncio.TimeoutError)):
+            await gt._run_update_probe_command([_sys.executable, "-c", script])
+
+        await asyncio.sleep(0.5)
+        grandchild = (open(tmp_pid_file).read() or "").strip()
+        assert grandchild, "test setup failed: grandchild pid never recorded"
+        alive = os.path.exists(f"/proc/{grandchild}")
+        os.unlink(tmp_pid_file)
+        assert not alive, (
+            f"probe orphaned grandchild pid={grandchild}: the process tree "
+            "survived the timeout"
+        )
+
+    @pytest.mark.asyncio
+    async def test_normal_probe_still_returns_output(self) -> None:
+        """The happy path is unchanged by the hardening."""
+        import sys as _sys
+
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        ok, output = await gt._run_update_probe_command(
+            [_sys.executable, "-c", "print('probe-ok')"]
+        )
+        assert ok is True
+        assert "probe-ok" in output
+
+
 class TestUpdateServerVersionRepair:
     """A successful gateway.update_server must clear the stale-notice trail
     -- but only once the update is actually *active*, not merely fetched.
