@@ -265,18 +265,48 @@ class TestIsVersionNewer:
     def test_docker_digests_compare_by_inequality(self) -> None:
         """Digests are identities, not ordinals.
 
-        ``get_docker_version`` returns ``sha256:...``. Ordering hex is
-        meaningless, but a DIFFERENT digest is genuinely a new image -- so
-        digests compare for inequality. Without this the fail-closed rule would
-        silence the whole docker lane, since no digest is version-shaped.
+        Uses the BARE 12-hex form ``get_docker_version`` actually returns -- it
+        strips the ``sha256:`` prefix and truncates (see ``TestGetDockerVersion``).
+        A previous version of this guard matched only ``sha256:``-prefixed values
+        and was tested with invented literals, so it never fired against the real
+        producer and silenced every docker update notice. Ordering hex is
+        meaningless, but a DIFFERENT digest is genuinely a new image.
         """
-        assert is_version_newer("sha256:abc123", "sha256:abc123") is False
-        assert is_version_newer("sha256:abc123", "sha256:def456") is True
+        assert is_version_newer("abcdef123456", "abcdef123456") is False
+        assert is_version_newer("abcdef123456", "fedcba654321") is True
+        # The prefixed/full form is still accepted, in case the producer ever
+        # stops truncating.
+        assert is_version_newer("sha256:abcdef123456", "sha256:fedcba654321") is True
 
     def test_digest_and_version_are_not_comparable(self) -> None:
         """A digest and a release number describe different things."""
-        assert is_version_newer("1.0.0", "sha256:abc123") is False
-        assert is_version_newer("sha256:abc123", "1.0.0") is False
+        assert is_version_newer("1.0.0", "abcdef123456") is False
+        assert is_version_newer("abcdef123456", "1.0.0") is False
+
+    def test_docker_producer_output_is_orderable(self) -> None:
+        """Drive the PRODUCER, not a literal, so the two cannot drift apart.
+
+        The prior bug was exactly this drift: the comparator matched a format
+        the producer does not emit.
+        """
+        import re as _re
+
+        from pmcp.manifest.version_checker import _is_digest
+
+        # Mirrors get_docker_version's truncation of a registry digest.
+        produced = "sha256:abcdef1234567890"[7:19]
+        assert _re.fullmatch(r"[0-9a-f]{12}", produced)
+        assert _is_digest(produced)
+        assert is_version_newer(produced, "0123456789ab") is True
+
+    def test_build_metadata_is_not_a_new_release(self) -> None:
+        """A local/build-metadata difference is not an update to announce."""
+        assert is_version_newer("1.0.0+build.4", "1.0.0+build.5") is False
+
+    def test_prerelease_precedence(self) -> None:
+        """PEP 440 ordering: a prerelease is OLDER than its release."""
+        assert is_version_newer("1.0.0-rc1", "1.0.0") is True
+        assert is_version_newer("1.0.0", "1.0.0-rc1") is False
 
 
 class TestGetNpmVersion:

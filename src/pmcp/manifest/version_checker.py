@@ -9,6 +9,7 @@ from typing import Literal
 from urllib.parse import quote
 
 import aiohttp
+from packaging.version import InvalidVersion, Version
 
 from pmcp import __version__
 
@@ -415,76 +416,82 @@ async def get_package_version(
     return (None, "unknown")
 
 
-# A version must START with a numeric release component -- `1`, `1.0`, `1.2.3`,
-# `2025.12.18` -- optionally `v`-prefixed, optionally followed by a pre-release or
-# build suffix (`-rc1`, `+build.5`). Anything that merely CONTAINS a digit
-# (`build-1`, `release-channel-a`) is not a version and must not be ordered:
-# `build-1` parses to `(1,)` under a digits-anywhere scan and compares as older
-# than every real release, which is exactly the fabricated-notice bug.
-_VERSION_RE = re.compile(r"^[vV]?\d+(?:\.\d+)*(?:[-+.].*)?$")
-
-
-def _parse_version_parts(value: str) -> tuple[int, ...]:
-    """Numeric components of a version-shaped string, in order.
-
-    Returns ``()`` when *value* is not version-shaped, which callers treat as
-    "cannot be ordered" rather than "equal to zero".
-    """
-    candidate = (value or "").strip()
-    if not _VERSION_RE.match(candidate):
-        return ()
-    stripped = re.sub(r"^[vV]", "", candidate)
-    return tuple(int(part) for part in re.findall(r"\d+", stripped))
+# `get_docker_version` returns a BARE hex digest -- it strips the `sha256:`
+# prefix and truncates to 12 chars (see its implementation, pinned by
+# TestGetDockerVersion). Matching on a `sha256:` prefix therefore never fires
+# against the real producer; an earlier version of this guard did exactly that
+# and silenced every docker update notice. Accept the bare form, and the
+# prefixed form for robustness if the producer ever stops truncating.
+_DIGEST_RE = re.compile(r"^(?:sha256:)?[0-9a-f]{12,64}$")
 
 
 def _is_digest(value: str) -> bool:
-    """Whether *value* is a content digest rather than a version.
+    """Whether *value* is a content digest rather than an orderable version.
 
-    ``get_docker_version`` returns a digest (``sha256:...``), which is an
-    identity, not an ordinal -- "newer" is only ever "different".
+    A digest is an identity: "newer" can only mean "different". Ordering hex is
+    meaningless, so digests are compared for inequality instead.
     """
-    return bool(value) and value.startswith("sha256:")
+    return bool(value) and bool(_DIGEST_RE.match(value.strip()))
+
+
+def _parse_version(value: str) -> Version | None:
+    """Parse *value* as a release version, or ``None`` if it is not one.
+
+    Uses ``packaging.version``, which implements PEP 440 ordering (including
+    pre-release, post-release and dev precedence) and raises on anything that
+    is not a version. Hand-rolled digit extraction was tried three times and
+    produced a fabricated-notice bug every time: it silently turned `build-1`
+    into `(1,)`, `2026-08-17-nightly` into `(2026, 8, 17)`, and `""` into `()`,
+    each of which compared as OLDER than a real release.
+
+    A leading ``v`` is accepted (``v1.2.3``) since registries commonly emit it.
+    """
+    candidate = (value or "").strip()
+    if not candidate:
+        return None
+    candidate = re.sub(r"^[vV]", "", candidate)
+    try:
+        return Version(candidate)
+    except InvalidVersion:
+        return None
 
 
 def is_version_newer(current: str, latest: str) -> bool:
-    """Whether *latest* is a newer release than *current*.
+    """Whether *latest* is a strictly newer release than *current*.
 
-    Handles semver (``1.2.3``), 2-part (``1.0``), date-based (``2025.12.18``),
-    a ``v`` prefix, and trailing pre-release markers (``1.0.0-rc1``).
+    FAILS CLOSED. Returning ``True`` tells an operator their server is out of
+    date, so anything this function cannot actually order returns ``False``
+    (Consiliency/pmcp#150 board review). An unreadable version produces no
+    notice rather than a false one.
 
-    FAILS CLOSED. Returning ``True`` makes the gateway tell an operator their
-    server is out of date, so anything this function cannot actually order must
-    return ``False``. Previously it extracted digits from whatever it was given
-    and compared them with no way to signal "unreadable", so a server reporting
-    ``nightly``, ``build-1`` or ``""`` compared as OLDER than any real version
-    and produced a fabricated update notice (Consiliency/pmcp#150 board review).
-    Those cases now report no update.
-
-    Specifically:
-
-    * either side unparseable (no digits at all) -> ``False``. ``""`` is the
-      mcp 2.x default ``serverInfo.version``, so this case is reached in practice.
-    * digests (``sha256:...``) are compared for INEQUALITY, not order -- a
-      different digest means a new image, and ordering hex is meaningless.
-      Without this, the docker lane would be silenced entirely.
-    * mixed digest/version -> ``False``; they are not comparable.
+    * Both sides parse as versions -> PEP 440 ordering, so `1.0.0-rc1` is
+      correctly OLDER than `1.0.0`, and build metadata is not precedence.
+    * Both sides are digests -> any difference is a new image. This is the
+      docker lane: `get_docker_version` returns a bare 12-hex digest.
+    * Anything else -- unparseable, empty (the mcp 2.x default
+      ``serverInfo.version``), or a digest compared against a version -> no
+      update.
     """
     if current == latest:
         return False
 
-    if _is_digest(current) or _is_digest(latest):
+    current_is_digest = _is_digest(current)
+    latest_is_digest = _is_digest(latest)
+    if current_is_digest or latest_is_digest:
         # Comparable only when BOTH are digests; then any difference is an update.
-        return _is_digest(current) and _is_digest(latest)
+        # A digest and a version describe different things and are not ordered.
+        return current_is_digest and latest_is_digest
 
-    current_parts = _parse_version_parts(current)
-    latest_parts = _parse_version_parts(latest)
-
-    # No orderable content on either side: refuse to guess rather than
-    # fabricate an update notice.
-    if not current_parts or not latest_parts:
+    current_version = _parse_version(current)
+    latest_version = _parse_version(latest)
+    if current_version is None or latest_version is None:
         return False
 
-    return latest_parts > current_parts
+    # Compare on the PUBLIC segment: a local/build-metadata difference
+    # (`1.0.0+build.4` -> `+build.5`) is not a new release, and announcing one
+    # would be the same fabricated notice this function exists to prevent.
+    # Pre-release precedence is retained, since `.public` keeps it.
+    return Version(latest_version.public) > Version(current_version.public)
 
 
 def clear_version_cache() -> None:
