@@ -430,13 +430,22 @@ async def get_package_version(
 _DIGEST_RE = re.compile(r"^(?:sha256:)?(?=[0-9a-f]*[a-f])[0-9a-f]{12,64}$")
 
 
-def _is_digest(value: str) -> bool:
-    """Whether *value* is a content digest rather than an orderable version.
+def _digest_identity(value: str) -> str | None:
+    """Canonical digest identity for *value*, or ``None`` if it is not a digest.
 
-    A digest is an identity: "newer" can only mean "different". Ordering hex is
-    meaningless, so digests are compared for inequality instead.
+    Canonicalises so the SAME image never reads as an update just because the
+    producer's representation changed: the `sha256:` prefix is dropped and the
+    hex truncated to the 12 chars `get_docker_version` emits. Without this,
+    `abcdef123456` vs `sha256:abcdef123456` -- one image, two spellings --
+    compares as a new release.
+
+    A digest is an identity, not an ordinal: "newer" can only mean "different".
     """
-    return bool(value) and bool(_DIGEST_RE.match(value.strip()))
+    candidate = (value or "").strip()
+    if not _DIGEST_RE.match(candidate):
+        return None
+    hex_part = candidate[7:] if candidate.startswith("sha256:") else candidate
+    return hex_part[:12]
 
 
 def _parse_version(value: str) -> Version | None:
@@ -461,7 +470,64 @@ def _parse_version(value: str) -> Version | None:
         return None
 
 
-def is_version_newer(current: str, latest: str) -> bool:
+# npm and Cargo publish SemVer, where `-anything` is a PRERELEASE ordered BELOW
+# the release. PEP 440 (what `packaging` implements) reads `1.0.0-1` as the
+# POST-release `1.0.0.post1` -- the opposite order. 79 of the manifest's 107
+# servers are npm, so using PEP 440 for them inverts precedence on a real
+# format: it hides `1.0.0-1 -> 1.0.0` and fabricates the reverse.
+_SEMVER_ECOSYSTEMS = frozenset({"npm", "cargo"})
+
+_SEMVER_RE = re.compile(
+    r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+)
+
+
+def _is_semver_ecosystem(package_type: str | None) -> bool:
+    return package_type in _SEMVER_ECOSYSTEMS
+
+
+def _semver_key(value: str) -> tuple[tuple[int, int, int], list[object]] | None:
+    """SemVer 2.0.0 precedence key, or ``None`` if *value* is not SemVer.
+
+    Build metadata is ignored (spec: it does not affect precedence). A release
+    outranks any prerelease of the same core version; prerelease identifiers
+    compare numerically when numeric, else lexically, with numeric ranked lower.
+    """
+    match = _SEMVER_RE.match((value or "").strip())
+    if not match:
+        return None
+    core = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    prerelease = match.group(4)
+    if prerelease is None:
+        # No prerelease sorts ABOVE any prerelease of the same core.
+        return (core, [])
+    parts: list[object] = []
+    for ident in prerelease.split("."):
+        parts.append((0, int(ident), "") if ident.isdigit() else (1, 0, ident))
+    return (core, parts)
+
+
+def _semver_is_newer(current: str, latest: str) -> bool:
+    """SemVer precedence, failing closed when either side is not SemVer."""
+    current_key = _semver_key(current)
+    latest_key = _semver_key(latest)
+    if current_key is None or latest_key is None:
+        return False
+    current_core, current_pre = current_key
+    latest_core, latest_pre = latest_key
+    if latest_core != current_core:
+        return latest_core > current_core
+    # Same core: a release (empty prerelease list) outranks any prerelease.
+    if not latest_pre:
+        return bool(current_pre)
+    if not current_pre:
+        return False
+    return latest_pre > current_pre  # type: ignore[operator]
+
+
+def is_version_newer(
+    current: str, latest: str, package_type: str | None = None
+) -> bool:
     """Whether *latest* is a strictly newer release than *current*.
 
     FAILS CLOSED. Returning ``True`` tells an operator their server is out of
@@ -480,12 +546,18 @@ def is_version_newer(current: str, latest: str) -> bool:
     if current == latest:
         return False
 
-    current_is_digest = _is_digest(current)
-    latest_is_digest = _is_digest(latest)
-    if current_is_digest or latest_is_digest:
-        # Comparable only when BOTH are digests; then any difference is an update.
-        # A digest and a version describe different things and are not ordered.
-        return current_is_digest and latest_is_digest
+    current_digest = _digest_identity(current)
+    latest_digest = _digest_identity(latest)
+    if current_digest is not None or latest_digest is not None:
+        # Comparable only when BOTH are digests; then any difference in the
+        # CANONICAL identity is a new image. A digest and a version describe
+        # different things and are not ordered.
+        if current_digest is None or latest_digest is None:
+            return False
+        return current_digest != latest_digest
+
+    if _is_semver_ecosystem(package_type):
+        return _semver_is_newer(current, latest)
 
     current_version = _parse_version(current)
     latest_version = _parse_version(latest)
