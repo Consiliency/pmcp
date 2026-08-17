@@ -126,3 +126,43 @@ The guard re-reads the installed version for a *running* process. If the on-disk
 automation:
   suite_command: "uv run pytest -q"
 ```
+
+
+---
+
+## Board review — REJECTED. Do not implement as written.
+
+Boarded before implementation (2 usable legs, both blocking). I independently reproduced the central finding before reading the verdicts.
+
+### B1 (fatal) — "argv is authoritative provenance" is false
+
+The plan's entire basis. `create_subprocess_exec` returns once **`npx` itself** has started — before that runner has selected, fetched or launched the underlying package. npm may resolve to a *local*, *global*, or *cache-backed* copy; only the cache branch produces an `_npx` directory at all. So `resolve_spawned_version(command, args, ...)` would still be reconstructing runner behaviour after the fact — the very scan-and-guess that sank attempt 6, relocated to the spawn path where a mistake is more expensive.
+
+Verified independently on this machine before the verdicts arrived: a live `npx -y @eslint/mcp` process tree exposes **no** `_npx` path anywhere — not in any descendant's `cmdline`, not in `cwd`, not in open file descriptors. There is no observable link from the process pmcp started to the cache entry backing it.
+
+```
+scanning all node processes for _npx references...
+  (none)
+--- any process whose cwd or fds touch _npx ---
+  (none)
+```
+
+So the claim "provenance is by construction rather than inference" does not hold. Knowing the argv tells pmcp what it *asked for*, not what npm *chose*.
+
+### B2 — the A→B cross-package defect survives this plan
+
+The plan changes only where `current` comes from. Both notice writers still obtain `latest` via `_get_server_config_for_update` (`handlers.py:3622`), which prefers the **manifest** and ignores the running `.mcp.json` override. So B's observed installed version can still be compared against **A's** upstream latest — the original #150 defect, intact.
+
+Adding `version_source="spawn"` records provenance without *binding* it, and the server-keyed stale cache can still retain A's latest across a reconnect to B. Both sides of the comparison must come from the same effective configuration.
+
+### What this means after seven attempts
+
+Every approach so far has failed at the same joint: pmcp cannot observe, for a running server, **which package artifact is actually executing**. Not from the descriptions cache (upstream snapshot), not from `serverInfo` (implementation version), not from the runner caches (no server→entry binding), and not from spawn argv (npm resolves after the call returns).
+
+The remaining honest options are narrower than any attempted so far:
+
+- **Ask the process.** Run the server's own `--version` on the identical argv. It is the only method that observes the artifact that actually ran. Costs a subprocess per check.
+- **Only what pmcp installed.** Restrict notices to servers pmcp installed itself, recording the resolved version at install time. Correct by construction, but excludes hand-configured `.mcp.json` servers — the exact case #150 is about.
+- **Remove the feature.** No automatic notice can be wrong if there is no automatic notice; `gateway.update_server` still reports on demand.
+
+Note the second and third are the only ones that cannot be confidently wrong.
