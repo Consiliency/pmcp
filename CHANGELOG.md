@@ -21,9 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comparison comes from the descriptions cache, which was generated from
   whichever package that cache last described. When the effective config names a
   different package than the cache entry records, the two versions are not
-  comparable at all — the gateway now stays silent until `pmcp refresh`
-  re-describes the server, rather than emitting a comparison it cannot justify.
-  A policy-denied server also produces no notice; configured entries are read
+  comparable at all. The gateway now re-points that cache entry at the package
+  actually configured — recording the new package identity, dropping the version
+  that belonged to the old one, and evicting the memoized stale-check tuple — so
+  it emits nothing for that one pass and then resumes accurate notices on its
+  own. (Going quiet instead would have been permanent for these servers:
+  `pmcp refresh` re-describes manifest entries, so a server whose package comes
+  from a `.mcp.json` override would never regain a matching entry.) Evicting the
+  memoized tuple also matters because `gateway.catalog_search` serves stale
+  notices straight from that cache without a freshness or identity check.
+  A policy-denied server produces no notice; configured entries are read
   before policy filtering, so this needed an explicit check.
 
 - **A configuration edit during an update can no longer activate the wrong
@@ -33,10 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   configuration from disk. An edit landing in that window meant the probe and
   the restart could disagree about which package the server runs, and the
   freshly probed version could be recorded against a different package. The
-  update now re-resolves after the probe and aborts with `ok: false` when the
-  effective command or arguments changed, recording no version state; the
-  confirmed configuration is handed to the restart so it cannot resolve a third
-  time.
+  update now re-resolves after the probe *and* after the version lookup that
+  follows it, and aborts with `ok: false` when the configuration changed,
+  recording no version state; the confirmed configuration is handed to the
+  restart so it cannot resolve a third time. The comparison uses the same
+  "describes the same downstream process" check `gateway.refresh` uses, so a
+  change to the working directory or to the effective environment — a registry
+  or cache variable that redirects which installation is used, for instance — is
+  caught even when the command line is untouched.
 
 ## [2.1.1] - 2026-08-12
 
