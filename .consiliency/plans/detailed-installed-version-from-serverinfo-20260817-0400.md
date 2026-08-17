@@ -135,3 +135,53 @@ The offline fallback keeps the old described-version comparison when a server is
 automation:
   suite_command: "uv run pytest -q"
 ```
+
+---
+
+## Board review — REJECTED (3/3 DISAGREE). Do not implement as written.
+
+Boarded before implementation. All three legs blocked. Verified against source and reproduced; recorded so the next attempt starts from facts rather than from my framing.
+
+### B1 (fatal) — `serverInfo.version` is NOT an installed-package version
+
+The plan's premise. It is wrong, and **this repo already documented it** — `plans/phase-plan-v11-PG.md:44`, which I failed to find before writing the plan:
+
+> "1.x FastMCP defaulted it to the *mcp library* version (a probe against the current build reports `{"name": "pangram", "version": "1.29.0"}` — plainly wrong, it is not this package's version). `MCPServer.__init__` defaults `version: str = ""`, so a literal port reports an empty string."
+
+MCP defines `serverInfo.version` as an *implementation* version, unconstrained and self-declared. FastMCP 1.x reports the SDK version; mcp 2.x defaults it to `""`. Comparing that against an npm/PyPI registry version can fabricate or hide updates just as readily as the bug being fixed.
+
+My empirical check was not wrong, but it was not sufficient: context7 reports `4.0.2` and `npm view @upstash/context7-mcp version` is also `4.0.2`. One well-behaved server proves the value *can* match, not that it *must*. A single confirming example is not an identity guarantee, and I over-read it.
+
+### B2 — package identity is still unbound
+
+`_effective_notice_target` reloads current *disk* config, while `server_version` describes the *connected process*, whose connect-time config is separately available (`manager.py:2732`). After an unrefreshed edit, an online A process can still be compared against B's latest. Conversely, after reconnecting as B, the server-scoped stale cache can retain A's tuple — and the plan's `"installed" | "described"` marker records neither package nor connection identity, so it does not close this.
+
+### B3 — "unparseable version means silence" is false
+
+`is_version_newer` (`version_checker.py:436`) extracts digits and never reports a parse failure. Reproduced:
+
+```
+is_version_newer('nightly',           '2.0.0') -> True
+is_version_newer('release-channel-a', '2.0.0') -> True
+is_version_newer('build-1',           '2.0.0') -> True
+is_version_newer('',                  '2.0.0') -> True   # the mcp 2.x default!
+is_version_newer('1.29.0',            '2.0.0') -> True   # the FastMCP SDK-version case
+```
+
+Each emits a notice. And my proposed test used `'nightly-2026-08-17'`, which returns `False` — it would have **passed by accident** while the criterion it claimed to prove was false. That is the fourth time a test of mine would have passed while its bug survived; the pattern is mine, not the board's.
+
+Note the two worst cases are exactly B1's: an empty version (mcp 2.x default) and an SDK version (FastMCP 1.x) both compare as "older" and would produce a fabricated notice for every such server.
+
+### What this means for #150
+
+Direct probing is still the right instinct, but `serverInfo.version` is the wrong probe. Any fix needs a version whose **identity is bound to the package being compared**. Candidates, none yet assessed:
+
+- Query the package manager for the actually-installed version (`npm ls`, `uv pip show`, `cargo`, `docker image inspect`) — real identity, but a new subprocess per server and per-ecosystem handling.
+- Record the version resolved at install/update time as provenance, and compare only that.
+- Narrow the feature: only emit notices for servers pmcp installed itself, where provenance is known.
+
+Any of these needs `is_version_newer` to gain a fail-closed parse mode first (B3), or it will fabricate notices regardless of the source.
+
+### Status
+
+Plan rejected, not implemented. #151's fix remains independent and accepted.
