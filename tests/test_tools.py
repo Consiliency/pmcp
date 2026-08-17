@@ -4894,7 +4894,6 @@ class TestUpdateProbeProcessCleanup:
         # Parent spawns a grandchild, prints its pid, then hangs -- the shape of
         # a server that ignores the probe flag. The grandchild outlives the
         # parent unless the whole process GROUP is signalled.
-        marker = tmp_pid_file = None
         import tempfile
 
         fd, tmp_pid_file = tempfile.mkstemp()

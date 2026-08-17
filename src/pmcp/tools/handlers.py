@@ -3694,9 +3694,7 @@ class GatewayTools:
             start_new_session=True,
         )
         try:
-            stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=60.0
-            )
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
         except (TimeoutError, asyncio.CancelledError):
             # Reap the tree before propagating; the caller turns TimeoutError
             # into a user-facing "probe timed out" result, and cancellation must
