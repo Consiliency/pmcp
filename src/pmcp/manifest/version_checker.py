@@ -422,15 +422,17 @@ async def get_package_version(
 # against the real producer; an earlier version of this guard did exactly that
 # and silenced every docker update notice. Accept the bare form, and the
 # prefixed form for robustness if the producer ever stops truncating.
-# The `[a-f]` lookahead is load-bearing: without it a long all-numeric version
-# (`202612180000`, a plausible calendar/build stamp) matches as a "digest" and
-# is then never compared against a dotted release, silently dropping a real
-# update. A digest in practice always contains at least one hex letter; a purely
-# numeric string is a version, so let `packaging` order it.
-_DIGEST_RE = re.compile(r"^(?:sha256:)?(?=[0-9a-f]*[a-f])[0-9a-f]{12,64}$")
+# Shape alone cannot separate a digest from a version: `get_docker_version`
+# truncates SHA-256 to 12 hex chars, which can be ALL NUMERIC (`987654321098`),
+# while `202612180000` is a plausible calendar version. An earlier attempt
+# required a hex letter and thereby dropped real all-numeric digest changes.
+# So shape is only a candidate test -- `package_type` decides, and callers have
+# it (board review round 4).
+_DIGEST_RE = re.compile(r"^(?:sha256:)?[0-9a-f]{12,64}$")
+_DIGEST_LETTER_RE = re.compile(r"^(?:sha256:)?(?=[0-9a-f]*[a-f])[0-9a-f]{12,64}$")
 
 
-def _digest_identity(value: str) -> str | None:
+def _digest_identity(value: str, package_type: str | None = None) -> str | None:
     """Canonical digest identity for *value*, or ``None`` if it is not a digest.
 
     Canonicalises so the SAME image never reads as an update just because the
@@ -442,7 +444,12 @@ def _digest_identity(value: str) -> str | None:
     A digest is an identity, not an ordinal: "newer" can only mean "different".
     """
     candidate = (value or "").strip()
-    if not _DIGEST_RE.match(candidate):
+    # With a known docker package type, any hex-shaped value is a digest --
+    # including an all-numeric truncation. Without one, require a hex letter so
+    # a numeric calendar version is not misread as a digest and silently
+    # excluded from ordering.
+    pattern = _DIGEST_RE if package_type == "docker" else _DIGEST_LETTER_RE
+    if not pattern.match(candidate):
         return None
     hex_part = candidate[7:] if candidate.startswith("sha256:") else candidate
     return hex_part[:12]
@@ -477,8 +484,17 @@ def _parse_version(value: str) -> Version | None:
 # format: it hides `1.0.0-1 -> 1.0.0` and fabricates the reverse.
 _SEMVER_ECOSYSTEMS = frozenset({"npm", "cargo"})
 
+# SemVer 2.0.0 rules 2, 9 and 10: core identifiers are non-negative integers
+# WITHOUT leading zeros; numeric prerelease identifiers likewise; and identifiers
+# must not be empty. An earlier version accepted `1.0.0-01`, `01.0.0` and
+# `1.0.0-a..b` and ORDERED them, fabricating updates from strings npm could
+# never have published (board review round 4).
+_SEMVER_CORE = r"(0|[1-9]\d*)"
+_SEMVER_PRE_IDENT = r"(?:0|[1-9]\d*|\d*[A-Za-z-][0-9A-Za-z-]*)"
 _SEMVER_RE = re.compile(
-    r"^[vV]?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$"
+    rf"^[vV]?{_SEMVER_CORE}\.{_SEMVER_CORE}\.{_SEMVER_CORE}"
+    rf"(?:-({_SEMVER_PRE_IDENT}(?:\.{_SEMVER_PRE_IDENT})*))?"
+    r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$"
 )
 
 
@@ -525,6 +541,22 @@ def _semver_is_newer(current: str, latest: str) -> bool:
     return latest_pre > current_pre  # type: ignore[operator]
 
 
+def is_version_orderable(value: str, package_type: str | None = None) -> bool:
+    """Whether *value* can be ordered at all -- a release version or a digest.
+
+    Exists because ``not is_version_newer(a, b)`` is ambiguous under a
+    fail-closed comparator: it is True both when *a* is genuinely current AND
+    when *a* is unreadable. A caller that treats "not newer" as "up to date"
+    must first check that the value is orderable, or an unreadable version
+    (`"unknown"`, `""`) reads as current forever.
+    """
+    if _digest_identity(value, package_type) is not None:
+        return True
+    if _is_semver_ecosystem(package_type):
+        return _semver_key(value) is not None
+    return _parse_version(value) is not None
+
+
 def is_version_newer(
     current: str, latest: str, package_type: str | None = None
 ) -> bool:
@@ -546,8 +578,8 @@ def is_version_newer(
     if current == latest:
         return False
 
-    current_digest = _digest_identity(current)
-    latest_digest = _digest_identity(latest)
+    current_digest = _digest_identity(current, package_type)
+    latest_digest = _digest_identity(latest, package_type)
     if current_digest is not None or latest_digest is not None:
         # Comparable only when BOTH are digests; then any difference in the
         # CANONICAL identity is a new image. A digest and a version describe

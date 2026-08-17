@@ -21,6 +21,7 @@ from pmcp.manifest.version_checker import (
     detect_package_type,
     get_package_version,
     is_version_newer,
+    is_version_orderable,
 )
 from pmcp.types import (
     DescriptionsCache,
@@ -216,7 +217,17 @@ async def refresh_server(
             server_config.command, server_config.args
         )
 
-        if version and not is_version_newer(existing_cache.version, version, pkg_type):
+        # `not is_version_newer(...)` means "not newer", which is NOT the same as
+        # "up to date" now that the comparator fails closed: an unorderable
+        # cached version (e.g. the literal "unknown" this function persists
+        # below after a failed lookup) yields False and would pin the stale
+        # cache forever. Require the cached version to be orderable before
+        # trusting "not newer" as up-to-date (board review round 4).
+        if (
+            version
+            and is_version_orderable(existing_cache.version)
+            and not is_version_newer(existing_cache.version, version, pkg_type)
+        ):
             logger.debug(
                 f"Server {server_name} is up to date (v{existing_cache.version})"
             )
