@@ -328,6 +328,27 @@ class TestIsVersionNewer:
         # cargo shares SemVer semantics.
         assert is_version_newer("1.0.0-1", "1.0.0", "cargo") is True
 
+    def test_semver_spec_precedence_chain(self) -> None:
+        """The canonical chain from SemVer 2.0.0 spec section 11.4.
+
+        Pins hand-written precedence against the specification rather than
+        against my own intuition, in both directions. Includes `beta.2` <
+        `beta.11`, which naive string ordering gets backwards.
+        """
+        chain = [
+            "1.0.0-alpha",
+            "1.0.0-alpha.1",
+            "1.0.0-alpha.beta",
+            "1.0.0-beta",
+            "1.0.0-beta.2",
+            "1.0.0-beta.11",
+            "1.0.0-rc.1",
+            "1.0.0",
+        ]
+        for older, newer in zip(chain, chain[1:]):
+            assert is_version_newer(older, newer, "npm") is True, f"{older} -> {newer}"
+            assert is_version_newer(newer, older, "npm") is False, f"{newer} -> {older}"
+
     def test_pypi_keeps_pep440_ordering(self) -> None:
         """PyPI publishes PEP 440; post-releases and its prerelease forms hold."""
         assert is_version_newer("1.0.post1", "1.0.post2", "pypi") is True
