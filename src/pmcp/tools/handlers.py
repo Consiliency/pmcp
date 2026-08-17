@@ -1355,6 +1355,12 @@ class GatewayTools:
                 continue
             command, args = target
             if not self._notice_package_matches_cache(server_name, command, args):
+                # Re-point rather than skip: skipping leaves the poisoned tuple
+                # readable by catalog_search, which checks neither TTL nor
+                # package identity.
+                self._repoint_cache_entry_to_effective_package(
+                    server_name, command, args
+                )
                 continue
             try:
                 latest, _ = await get_package_version(command, args, timeout=5.0)
@@ -3696,9 +3702,17 @@ class GatewayTools:
         effective ``B==2.0.0`` hides B's real update.
 
         ``GeneratedServerDescriptions`` records the package it describes, so a
-        mismatch is detectable. On mismatch the caller must stay silent rather
-        than emit a comparison it cannot justify; the cache is refreshed by
-        ``pmcp refresh``, which is where re-describing the server belongs.
+        mismatch is detectable.
+
+        Board review round 2: staying silent on mismatch is NOT a usable end
+        state. ``pmcp refresh`` -> ``refresh_all`` iterates
+        ``manifest.servers`` and re-describes MANIFEST entries only, so a server
+        whose effective package comes from a ``.mcp.json`` override would never
+        gain a matching entry -- "silent until refresh" would mean "silent
+        forever" for exactly the servers #150 is about. So on mismatch the
+        caller REPOINTS the entry at the package that is actually configured
+        (see ``_repoint_cache_entry_to_effective_package``) and resumes normal
+        notices from the next check, rather than going quiet indefinitely.
         """
         if not self._descriptions_cache:
             return False
@@ -3710,16 +3724,59 @@ class GatewayTools:
             return False
         return package_name == entry.package
 
+    def _repoint_cache_entry_to_effective_package(
+        self, server_name: str, command: str, args: list[str]
+    ) -> None:
+        """Re-point a stale descriptions entry at the package actually configured.
+
+        Recovery half of the #150 fix. When the descriptions cache describes
+        package A but the effective config runs package B, the recorded
+        ``version`` belongs to A and cannot be compared against B's upstream
+        latest. Rather than emit that comparison (the original bug) or go
+        permanently silent (unreachable recovery, see
+        ``_notice_package_matches_cache``), record the new package identity and
+        DROP the incomparable version, so the next check re-establishes a
+        baseline for B.
+
+        Also evicts the memoized stale-check tuple: ``catalog_search`` reads
+        ``_stale_check_cache`` directly, with no TTL and no identity check, so a
+        skipped-but-retained entry would keep being attributed to the new
+        package indefinitely (board review round 2, finding 1).
+
+        ``tools``/``capability_summary`` are left alone: they still describe A
+        and are only served for OFFLINE servers, and re-describing a server
+        requires a live connection this best-effort path does not have.
+        ``pmcp refresh --force`` regenerates them.
+        """
+        self._stale_check_cache.pop(server_name, None)
+        if not self._descriptions_cache:
+            return
+        entry = self._descriptions_cache.servers.get(server_name)
+        if entry is None:
+            return
+        _pkg_type, package_name = detect_package_type(command, args)
+        if not package_name or package_name == entry.package:
+            return
+        entry.package = package_name
+        # The old version described a different package; there is no honest
+        # value to keep. An empty version makes every notice path treat this
+        # server as "no known local version" until one is observed.
+        entry.version = ""
+
     async def _get_update_warning(self, server_name: str) -> str | None:
         """Best-effort stale version warning for a server."""
-        # #150: same precedence gateway.update_server uses, and stay silent when
-        # the effective package is not the one the descriptions cache describes --
-        # comparing versions across two different packages is worse than no notice.
+        # #150: same precedence gateway.update_server uses. When the effective
+        # package is not the one the descriptions cache describes, comparing the
+        # two versions compares unrelated packages -- so re-point the entry at
+        # the configured package (dropping the incomparable version and evicting
+        # the memoized tuple) and emit nothing THIS pass; the next one compares
+        # like with like.
         target = self._effective_notice_target(server_name)
         if target is None:
             return None
         command, args = target
         if not self._notice_package_matches_cache(server_name, command, args):
+            self._repoint_cache_entry_to_effective_package(server_name, command, args)
             return None
 
         # Require a known local version to compare against.
@@ -5269,16 +5326,26 @@ class GatewayTools:
         # server and reconnect the old package, which is worse than the race it
         # replaces. Re-resolve and require the effective spawn identity to be
         # unchanged; on drift, abort BEFORE mutating any cache or notice state.
+        #
+        # Board review round 2: compare with `_refresh_config_unchanged`, the
+        # repo's own predicate for "same downstream process", rather than
+        # command+args alone. It also covers `cwd` and the EFFECTIVE `env`
+        # override, so an edit to e.g. DOCKER_HOST or a package-manager
+        # registry/cache variable -- which leaves argv identical while pointing
+        # the probe and the restart at different installations -- is caught too.
+        latest_version, _ = await get_package_version(command, args, timeout=5.0)
+
+        # Re-resolve AFTER the version lookup as well: that lookup is another
+        # await, and a check performed before it would leave its own window open.
         recheck_config, recheck_failure = self._resolve_lifecycle_config(
             server_name, action="restart", prior_status=self._status_value(server_name)
         )
-        recheck_target = (
-            (recheck_config.config.command, list(recheck_config.config.args))
-            if recheck_config is not None
-            and isinstance(recheck_config.config, LocalMcpServerConfig)
-            else None
+        config_drifted = (
+            recheck_failure is not None
+            or recheck_config is None
+            or not _refresh_config_unchanged(resolved_config, recheck_config)
         )
-        if recheck_failure is not None or recheck_target != (command, list(args)):
+        if config_drifted:
             return UpdateServerOutput(
                 ok=False,
                 server=server_name,
@@ -5290,8 +5357,6 @@ class GatewayTools:
                     "version state was recorded. Re-run gateway.update_server."
                 ),
             )
-
-        latest_version, _ = await get_package_version(command, args, timeout=5.0)
 
         # gateway.refresh() is a diff-based reconcile (_refresh_config_unchanged):
         # it deliberately leaves a server whose command/args are unchanged
