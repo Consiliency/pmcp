@@ -18,6 +18,7 @@ from pmcp.manifest.version_checker import (
     get_package_version,
     get_pypi_version,
     is_version_newer,
+    is_version_orderable,
 )
 from pmcp import __version__
 
@@ -327,6 +328,45 @@ class TestIsVersionNewer:
         assert is_version_newer("1.0.0+build.4", "1.0.0+build.5", "npm") is False
         # cargo shares SemVer semantics.
         assert is_version_newer("1.0.0-1", "1.0.0", "cargo") is True
+
+    def test_unorderable_version_is_not_reported_as_up_to_date(self) -> None:
+        """`not is_version_newer(...)` is ambiguous under a fail-closed comparator.
+
+        Regression introduced by this PR and caught in review: `refresher` negates
+        the comparator, and once unreadable input returns False, `not(...)` reads
+        as "up to date". Since that function persists the literal `"unknown"`
+        after a failed lookup, the stale cache would be returned forever.
+        `is_version_orderable` is the discriminator callers need.
+        """
+        assert is_version_orderable("unknown") is False
+        assert is_version_orderable("") is False
+        assert is_version_orderable("nightly") is False
+        assert is_version_orderable("1.0.0") is True
+        assert is_version_orderable("1.0.0-1", "npm") is True
+        assert is_version_orderable("987654321098", "docker") is True
+
+    def test_all_numeric_docker_digest_is_a_digest(self) -> None:
+        """A truncated SHA-256 can be all digits.
+
+        `get_docker_version` truncates to 12 hex chars, so `987654321098` is a
+        perfectly valid digest. An earlier hex-letter requirement rejected it and
+        silently dropped real image updates. Shape alone cannot disambiguate a
+        digest from a calendar version, so the package type decides.
+        """
+        assert is_version_newer("987654321098", "123456789012", "docker") is True
+        assert is_version_newer("987654321098", "987654321098", "docker") is False
+        # Without a docker type, a numeric string stays a VERSION and is ordered.
+        assert is_version_newer("202612180000", "202612190000") is True
+
+    def test_invalid_semver_is_not_ordered(self) -> None:
+        """SemVer 2.0.0 rules 2, 9 and 10: no leading zeros, no empty identifiers.
+
+        These strings cannot be published to npm, and ordering them fabricated
+        updates (`1.0.0-01` -> `1.0.0` reported an upgrade).
+        """
+        for invalid in ("1.0.0-01", "01.0.0", "1.0.0-a..b", "1.0.00", "1.0.0-"):
+            assert is_version_newer(invalid, "1.0.0", "npm") is False, invalid
+            assert is_version_newer("1.0.0", invalid, "npm") is False, invalid
 
     def test_semver_spec_precedence_chain(self) -> None:
         """The canonical chain from SemVer 2.0.0 spec section 11.4.
