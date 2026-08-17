@@ -227,6 +227,57 @@ class TestIsVersionNewer:
         assert is_version_newer("1.0.0-rc1", "1.0.0-rc2") is True
         assert is_version_newer("v2.0-beta1", "v2.0-beta2") is True
 
+    # --- fail-closed: never fabricate an "update available" ------------------
+
+    def test_unorderable_current_reports_no_update(self) -> None:
+        """A version this function cannot order must NOT read as out of date.
+
+        Consiliency/pmcp#150 board review. Returning True here makes the gateway
+        tell an operator their server is stale, so an unreadable version has to
+        report no update. Previously every one of these extracted digits (or an
+        empty tuple) and compared as OLDER than any real release, fabricating a
+        notice for any server whose version string is not a release number.
+        """
+        for unreadable in (
+            "nightly",
+            "release-channel-a",
+            "build-1",  # contains a digit but is not a version
+            "main",
+            "latest",
+            "abc.def",
+            "2026-08-17-nightly",
+        ):
+            assert is_version_newer(unreadable, "2.0.0") is False, unreadable
+
+    def test_empty_current_reports_no_update(self) -> None:
+        """The empty string is mcp 2.x's DEFAULT serverInfo.version.
+
+        It is reached in practice by any server that does not set a version
+        explicitly, so it must not compare as older than every release.
+        """
+        assert is_version_newer("", "2.0.0") is False
+
+    def test_unorderable_latest_reports_no_update(self) -> None:
+        """An unreadable *latest* is equally unusable -- refuse to guess."""
+        assert is_version_newer("1.0.0", "nightly") is False
+        assert is_version_newer("1.0.0", "") is False
+
+    def test_docker_digests_compare_by_inequality(self) -> None:
+        """Digests are identities, not ordinals.
+
+        ``get_docker_version`` returns ``sha256:...``. Ordering hex is
+        meaningless, but a DIFFERENT digest is genuinely a new image -- so
+        digests compare for inequality. Without this the fail-closed rule would
+        silence the whole docker lane, since no digest is version-shaped.
+        """
+        assert is_version_newer("sha256:abc123", "sha256:abc123") is False
+        assert is_version_newer("sha256:abc123", "sha256:def456") is True
+
+    def test_digest_and_version_are_not_comparable(self) -> None:
+        """A digest and a release number describe different things."""
+        assert is_version_newer("1.0.0", "sha256:abc123") is False
+        assert is_version_newer("sha256:abc123", "1.0.0") is False
+
 
 class TestGetNpmVersion:
     """Tests for get_npm_version function."""
