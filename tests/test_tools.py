@@ -4689,7 +4689,7 @@ class TestStaleIndexer:
         await gt._run_stale_index()
 
         assert "playwright" in gt._stale_check_cache
-        _, current, latest = gt._stale_check_cache["playwright"]
+        _, current, latest, _pkg = gt._stale_check_cache["playwright"]
         assert current == "0.1.0"
         assert latest == "0.2.0"
 
@@ -4716,7 +4716,7 @@ class TestStaleIndexer:
         self._make_manifest_with_playwright(monkeypatch)
 
         # Pre-populate cache as fresh
-        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.1.0")
+        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.1.0", "npm")
 
         network_called = []
 
@@ -4764,7 +4764,7 @@ class TestStaleIndexer:
         )
 
         # Pre-populate stale check cache with a stale entry
-        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.2.0")
+        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.2.0", "npm")
 
         result = await gt.catalog_search({})
 
@@ -4773,6 +4773,35 @@ class TestStaleIndexer:
         assert "playwright" in result.stale_updates[0]
         assert "0.1.0" in result.stale_updates[0]
         assert "0.2.0" in result.stale_updates[0]
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_orders_npm_prereleases_by_semver(self) -> None:
+        """catalog_search must use the memo's ecosystem, not PEP 440.
+
+        Board review: the memo previously stored only (checked_at, current,
+        latest), so this read site fell back to PEP 440. npm publishes SemVer,
+        where `1.0.0-1` is a PRERELEASE below `1.0.0`; PEP 440 reads it as the
+        POST-release `1.0.0.post1`. That inversion both HID the real
+        `1.0.0-1 -> 1.0.0` upgrade and FABRICATED its reverse -- reachable
+        through catalog_search even after the direct paths were fixed.
+        """
+        client_manager = MockClientManager()
+        client_manager.set_server_online("playwright")
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        # A real npm upgrade: prerelease -> release. Must be reported.
+        gt._stale_check_cache["playwright"] = (time.time(), "1.0.0-1", "1.0.0", "npm")
+        result = await gt.catalog_search({})
+        assert result.stale_updates is not None
+        assert "1.0.0-1" in result.stale_updates[0]
+
+        # The reverse is NOT an upgrade and must not be announced.
+        gt._stale_check_cache["playwright"] = (time.time(), "1.0.0", "1.0.0-1", "npm")
+        result = await gt.catalog_search({})
+        assert not (result.stale_updates or [])
         assert result.cli_hints == []
 
     @pytest.mark.asyncio
@@ -4801,7 +4830,7 @@ class TestStaleIndexer:
             policy_manager=PolicyManager(),
         )
         gt._detected_cli_infos = {"git": CLIInfo(name="git", path="/usr/bin/git")}
-        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.2.0")
+        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.2.0", "npm")
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
         )
@@ -4818,7 +4847,7 @@ class TestStaleIndexer:
         import time
 
         gt = self._make_gateway_tools()
-        gt._stale_check_cache["playwright"] = (time.time(), "0.2.0", "0.2.0")
+        gt._stale_check_cache["playwright"] = (time.time(), "0.2.0", "0.2.0", "npm")
 
         result = await gt.catalog_search({})
 
