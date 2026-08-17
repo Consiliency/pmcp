@@ -422,7 +422,12 @@ async def get_package_version(
 # against the real producer; an earlier version of this guard did exactly that
 # and silenced every docker update notice. Accept the bare form, and the
 # prefixed form for robustness if the producer ever stops truncating.
-_DIGEST_RE = re.compile(r"^(?:sha256:)?[0-9a-f]{12,64}$")
+# The `[a-f]` lookahead is load-bearing: without it a long all-numeric version
+# (`202612180000`, a plausible calendar/build stamp) matches as a "digest" and
+# is then never compared against a dotted release, silently dropping a real
+# update. A digest in practice always contains at least one hex letter; a purely
+# numeric string is a version, so let `packaging` order it.
+_DIGEST_RE = re.compile(r"^(?:sha256:)?(?=[0-9a-f]*[a-f])[0-9a-f]{12,64}$")
 
 
 def _is_digest(value: str) -> bool:

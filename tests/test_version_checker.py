@@ -299,6 +299,19 @@ class TestIsVersionNewer:
         assert _is_digest(produced)
         assert is_version_newer(produced, "0123456789ab") is True
 
+    def test_long_numeric_version_is_not_mistaken_for_a_digest(self) -> None:
+        """A purely numeric string is a version, not a digest.
+
+        `202612180000` is a plausible calendar/build stamp and is 12 chars of
+        `[0-9a-f]`. Without a hex-letter requirement it matches the digest
+        pattern, and is then never compared against a dotted release -- silently
+        dropping a real update. Found while reviewing my own digest rule.
+        """
+        from pmcp.manifest.version_checker import _is_digest
+
+        assert _is_digest("202612180000") is False
+        assert is_version_newer("202612180000", "202612190000") is True
+
     def test_build_metadata_is_not_a_new_release(self) -> None:
         """A local/build-metadata difference is not an update to announce."""
         assert is_version_newer("1.0.0+build.4", "1.0.0+build.5") is False
