@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Update notices are no longer fabricated for servers whose version is not a
+  release number.** The version comparison extracted digits from whatever it was
+  given and had no way to say "I cannot read this", so a server reporting
+  `nightly`, `build-1`, `main`, or an empty string compared as *older* than any
+  real release and produced an "update available" notice that was never true.
+  An empty version is the default for servers built on the current MCP SDK, so
+  this was reachable in ordinary use. The comparison now recognises release
+  numbers specifically (`1.2.3`, `1.0`, `2025.12.18`, a `v` prefix, and
+  pre-release suffixes such as `-rc1`) and reports no update when either side is
+  not one, rather than guessing. Docker images, whose "version" is a content
+  digest, are compared for difference instead of order, so they keep working.
+
 ## [2.1.1] - 2026-08-12
 
 ### Fixed
