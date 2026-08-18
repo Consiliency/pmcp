@@ -3695,10 +3695,17 @@ class GatewayTools:
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
-        except (TimeoutError, asyncio.CancelledError):
+        except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
             # Reap the tree before propagating; the caller turns TimeoutError
             # into a user-facing "probe timed out" result, and cancellation must
             # not leak a process either.
+            #
+            # asyncio.TimeoutError is listed EXPLICITLY: it only became an alias
+            # of the builtin TimeoutError in 3.11, and this project supports
+            # 3.10, where catching the builtin alone lets the timeout escape and
+            # the cleanup never runs. CI caught this on 3.10 while 3.11 and 3.12
+            # both passed -- the fix silently did nothing on the oldest
+            # supported version.
             await _terminate_process_tree(process, "update-probe")
             raise
         output = (
