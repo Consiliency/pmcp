@@ -4872,63 +4872,93 @@ class TestUpdateProbeProcessCleanup:
     WITHOUT `start_new_session` and awaited `wait_for(communicate(), 60)`. On
     timeout `wait_for` cancels the await but never signals the child, so a probe
     against a package that ignores its flag and runs as a server left the whole
-    tree alive -- including grandchildren such as the Chrome that
-    @playwright/mcp launches, which holds the profile SingletonLock and breaks
-    the next launch.
+    tree alive -- including grandchildren such as the browser `@playwright/mcp`
+    launches, which holds the profile SingletonLock and breaks the next launch.
 
-    Spawns a REAL process tree: a mocked subprocess cannot demonstrate an
-    orphan, and this bug is entirely about what survives the call.
+    RUN IN A CHILD INTERPRETER. Demonstrating an orphan requires spawning real
+    process trees, and doing that inside the pytest process perturbs state that
+    neighbouring tests measure -- `tests/runtime/test_downstream_remote.py`
+    asserts on THIS process's open socket count and on the process-global
+    `sse_starlette.AppStatus` latch. Running the scenario in a subprocess keeps
+    the real-process proof (a mock cannot show an orphan) without touching the
+    suite's shared state. Stdlib only; no test-runner plugin needed.
     """
 
-    @pytest.mark.asyncio
-    async def test_timeout_reaps_the_whole_process_tree(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import os
+    _SCENARIO = """
+import asyncio, os, sys, tempfile
+
+sys.path.insert(0, {src!r})
+from pmcp.tools.handlers import GatewayTools
+from pmcp.policy.policy import PolicyManager
+
+
+class _CM:
+    def is_server_online(self, name): return False
+    def get_all_tools(self): return []
+
+
+async def main():
+    gt = GatewayTools(client_manager=_CM(), policy_manager=PolicyManager())
+    fd, pidfile = tempfile.mkstemp()
+    os.close(fd)
+    # Parent spawns a grandchild, records its pid, then hangs -- the shape of a
+    # server that ignores the probe flag. The grandchild outlives the parent
+    # unless the whole process GROUP is signalled.
+    script = (
+        "import subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
+        "open(%r,'w').write(str(p.pid));"
+        "time.sleep(30)" % pidfile
+    )
+    real_wait_for = asyncio.wait_for
+
+    async def fast(aw, timeout=None):
+        return await real_wait_for(aw, timeout=1.5)
+
+    import pmcp.tools.handlers as H
+    H.asyncio.wait_for = fast
+    try:
+        await gt._run_update_probe_command([sys.executable, "-c", script])
+    except BaseException:
+        pass
+    await asyncio.sleep(0.5)
+    pid = (open(pidfile).read() or "").strip()
+    os.unlink(pidfile)
+    if not pid:
+        print("SETUP-FAILED"); return
+    print("ORPHANED" if os.path.exists("/proc/" + pid) else "REAPED")
+
+asyncio.run(main())
+"""
+
+    def _run_scenario(self) -> str:
+        import subprocess
         import sys as _sys
+        from pathlib import Path as _Path
 
-        gt = GatewayTools(
-            client_manager=MockClientManager(),  # type: ignore
-            policy_manager=PolicyManager(),
+        src = str(_Path(__file__).resolve().parents[1] / "src")
+        out = subprocess.run(
+            [_sys.executable, "-c", self._SCENARIO.format(src=src)],
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
-        # Parent spawns a grandchild, prints its pid, then hangs -- the shape of
-        # a server that ignores the probe flag. The grandchild outlives the
-        # parent unless the whole process GROUP is signalled.
-        import tempfile
-
-        fd, tmp_pid_file = tempfile.mkstemp()
-        os.close(fd)
-        script = (
-            "import subprocess,sys,time;"
-            f"p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
-            f"open({tmp_pid_file!r},'w').write(str(p.pid));"
-            "time.sleep(30)"
+        return (
+            (out.stdout or "").strip().splitlines()[-1]
+            if out.stdout.strip()
+            else out.stderr[-400:]
         )
 
-        real_wait_for = asyncio.wait_for
-
-        async def _fast_timeout(awaitable, timeout=None):
-            # Let the child start and record its grandchild, then time out.
-            return await real_wait_for(awaitable, timeout=1.5)
-
-        monkeypatch.setattr("pmcp.tools.handlers.asyncio.wait_for", _fast_timeout)
-
-        with pytest.raises((TimeoutError, asyncio.TimeoutError)):
-            await gt._run_update_probe_command([_sys.executable, "-c", script])
-
-        await asyncio.sleep(0.5)
-        grandchild = (open(tmp_pid_file).read() or "").strip()
-        assert grandchild, "test setup failed: grandchild pid never recorded"
-        alive = os.path.exists(f"/proc/{grandchild}")
-        os.unlink(tmp_pid_file)
-        assert not alive, (
-            f"probe orphaned grandchild pid={grandchild}: the process tree "
-            "survived the timeout"
+    def test_timeout_reaps_the_whole_process_tree(self) -> None:
+        result = self._run_scenario()
+        assert result == "REAPED", (
+            f"probe did not reap its process tree (got {result!r}): a hung probe "
+            "leaves grandchildren alive"
         )
 
     @pytest.mark.asyncio
     async def test_normal_probe_still_returns_output(self) -> None:
-        """The happy path is unchanged by the hardening."""
+        """The happy path is unchanged by the hardening (safe in-process)."""
         import sys as _sys
 
         gt = GatewayTools(
