@@ -31,7 +31,9 @@ Machinery:
 - `InvokeOutput.update_warning` (`754`)
 - `ProvisionOutput.update_warning` (`1204`)
 
-Note `ProvisionOutput.update_warning` is set from `provision`, a path not in the three emission sites above — it must be traced during implementation rather than assumed dead.
+**Correction, traced before boarding:** `provision` is a **fourth emission site**, not a stray field. It calls `_get_update_warning` at `handlers.py:4188` and attaches `update_warning` at **ten** further return paths (`4200, 4228, 4250, 4277, 4298, 4326, 4339, 4358, 4387, 4411`).
+
+Total attachment points are therefore **16**, not the six this plan first documented: `describe` 1, `invoke` 5, `provision` 10. A removal that stops at `describe`/`invoke` leaves `provision` calling a deleted method — the exact half-removal failure this plan warns about, which I nearly committed.
 
 **Documentation:** `README.md:480` states these tools "may return `update_warning` when a newer package version is detected."
 
@@ -44,7 +46,7 @@ Note `ProvisionOutput.update_warning` is set from `provision`, a path not in the
 - `_stale_check_cache`, `_stale_index_interval_seconds`, `_stale_index_task`, `_stale_check_ttl_seconds` — **delete**.
 - `_effective_notice_target`, `_notice_package_matches_cache` — **delete** (no remaining callers once the above go; verify by grep rather than assumption).
 - `catalog_search` — **modify** — drop the `stale_updates` construction and stop passing it.
-- `describe` / `invoke` — **modify** — drop the `_get_update_warning` calls and the `update_warning=` arguments at every return path. `invoke` has **six**; missing one leaves a dangling reference.
+- `describe` / `invoke` / `provision` — **modify** — drop the `_get_update_warning` calls and every `update_warning=` argument. Counts matter here: `describe` 1, `invoke` 5, `provision` 10 — **16 attachment points**. Missing one leaves a call to a deleted method.
 - `update_server` — **modify** — remove writes to `_stale_check_cache`, keep everything else. Its own probe-and-report behaviour is explicitly retained.
 
 ### `src/pmcp/server.py` (modify)
