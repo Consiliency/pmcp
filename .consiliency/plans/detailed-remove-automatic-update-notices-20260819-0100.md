@@ -31,9 +31,19 @@ Machinery:
 - `InvokeOutput.update_warning` (`754`)
 - `ProvisionOutput.update_warning` (`1204`)
 
-**Correction, traced before boarding:** `provision` is a **fourth emission site**, not a stray field. It calls `_get_update_warning` at `handlers.py:4188` and attaches `update_warning` at **ten** further return paths (`4200, 4228, 4250, 4277, 4298, 4326, 4339, 4358, 4387, 4411`).
+**Corrected inventory — I got this number wrong twice before the board caught it.**
 
-Total attachment points are therefore **16**, not the six this plan first documented: `describe` 1, `invoke` 5, `provision` 10. A removal that stops at `describe`/`invoke` leaves `provision` calling a deleted method — the exact half-removal failure this plan warns about, which I nearly committed.
+Authoritative count from source (`grep -c 'update_warning=' src/pmcp/tools/handlers.py`): **26 attachment sites**, plus **3** calls to `_get_update_warning` (`1750`, `1982`, `4188`).
+
+| caller | call site | `update_warning=` attachments |
+|---|---|---|
+| `describe` | 1750 | 1 (`1832`) |
+| `invoke` | 1982 | 5 (`2069, 2104, 2153, 2188, 2238`) |
+| `provision` | 4188 | **20** (`4200 … 4630`) |
+
+My first draft said six. My own pre-board correction said sixteen, because I stopped reading the grep output at `4411` when it continues to `4630`. The board caught the second undercount.
+
+**That miscount pattern is the finding, not a footnote.** `provision` alone accounts for 20 of 26 sites, so the mechanical edit is concentrated exactly where I kept failing to look. The implementation must therefore be driven by `grep -c`, verified to reach **zero**, rather than by any hand-enumerated list in this document.
 
 **Documentation:** `README.md:480` states these tools "may return `update_warning` when a newer package version is detected."
 
@@ -46,7 +56,7 @@ Total attachment points are therefore **16**, not the six this plan first docume
 - `_stale_check_cache`, `_stale_index_interval_seconds`, `_stale_index_task`, `_stale_check_ttl_seconds` — **delete**.
 - `_effective_notice_target`, `_notice_package_matches_cache` — **delete**. Second correction found while boarding: these have **zero references anywhere in `src/` or `tests/`**. The plan said "used only by the above", which was wrong — they were never wired in at all, and are already-dead residue from the abandoned #154 attempts. Deleting them is unrelated to this feature's behaviour.
 - `catalog_search` — **modify** — drop the `stale_updates` construction and stop passing it.
-- `describe` / `invoke` / `provision` — **modify** — drop the `_get_update_warning` calls and every `update_warning=` argument. Counts matter here: `describe` 1, `invoke` 5, `provision` 10 — **16 attachment points**. Missing one leaves a call to a deleted method.
+- `describe` / `invoke` / `provision` — **modify** — drop all **3** `_get_update_warning` calls and all **26** `update_warning=` arguments (`describe` 1, `invoke` 5, `provision` 20). Do not work from a list: run `grep -c 'update_warning=' src/pmcp/tools/handlers.py` and drive it to `0`. I miscounted this twice by reading a truncated grep.
 - `update_server` — **modify** — remove writes to `_stale_check_cache`, keep everything else. Its own probe-and-report behaviour is explicitly retained.
 
 ### `src/pmcp/server.py` (modify)
