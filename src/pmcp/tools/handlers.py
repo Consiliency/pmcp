@@ -29,7 +29,7 @@ from pmcp.auth import (
     sanitize_url_elicitation_url,
 )
 
-from pmcp.client.manager import ClientManager
+from pmcp.client.manager import ClientManager, _terminate_process_tree
 from pmcp.config.guidance import GuidanceConfig
 from pmcp.config.loader import (
     registry_allow_private_from_config,
@@ -3678,13 +3678,36 @@ class GatewayTools:
         package code, e.g. ``npx <pkg> --help``, so it must not inherit other
         servers' credentials from the gateway's environment).
         """
+        # start_new_session makes the child a process-group leader, so a probe
+        # that hangs can be reaped as a TREE. Without it the timeout below
+        # abandoned the child: `wait_for` cancels the `communicate()` await but
+        # never signals the process, so a probe like `npx <pkg> --help` against a
+        # package that ignores the flag and runs as a server left its whole
+        # process tree alive -- including grandchildren such as the Chrome that
+        # @playwright/mcp launches, which then holds the profile SingletonLock
+        # and breaks the next launch.
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=env,
+            start_new_session=True,
         )
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
+        except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
+            # Reap the tree before propagating; the caller turns TimeoutError
+            # into a user-facing "probe timed out" result, and cancellation must
+            # not leak a process either.
+            #
+            # asyncio.TimeoutError is listed EXPLICITLY: it only became an alias
+            # of the builtin TimeoutError in 3.11, and this project supports
+            # 3.10, where catching the builtin alone lets the timeout escape and
+            # the cleanup never runs. CI caught this on 3.10 while 3.11 and 3.12
+            # both passed -- the fix silently did nothing on the oldest
+            # supported version.
+            await _terminate_process_tree(process, "update-probe")
+            raise
         output = (
             stdout.decode("utf-8", errors="replace")
             + "\n"

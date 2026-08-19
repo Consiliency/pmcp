@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **`gateway.update_server` no longer orphans a process tree when its update
+  probe hangs.** The probe runs the downstream package's own code (e.g.
+  `npx <pkg> --help`) with a 60-second timeout, but the process was spawned
+  without its own session and the timeout only abandoned the wait — it never
+  signalled the child. A package that ignores the probe flag and runs as a
+  server therefore left its whole tree alive, including grandchildren such as
+  the browser `@playwright/mcp` launches, which holds the profile lock and
+  breaks the next launch. The probe now spawns as a process-group leader and
+  reaps the group on timeout or cancellation.
+
+
+### Fixed
 - **Update notices are no longer fabricated for servers whose version is not a
   release number.** The version comparison extracted digits from whatever it was
   given and had no way to say "I cannot read this", so a server reporting

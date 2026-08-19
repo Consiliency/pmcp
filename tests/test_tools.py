@@ -4865,6 +4865,113 @@ class TestStaleIndexer:
         assert gt._stale_index_task is None
 
 
+class TestUpdateProbeProcessCleanup:
+    """The update probe must not orphan its process tree on timeout.
+
+    Shipped behaviour before this fix: `_run_update_probe_command` spawned
+    WITHOUT `start_new_session` and awaited `wait_for(communicate(), 60)`. On
+    timeout `wait_for` cancels the await but never signals the child, so a probe
+    against a package that ignores its flag and runs as a server left the whole
+    tree alive -- including grandchildren such as the browser `@playwright/mcp`
+    launches, which holds the profile SingletonLock and breaks the next launch.
+
+    RUN IN A CHILD INTERPRETER. Demonstrating an orphan requires spawning real
+    process trees, and doing that inside the pytest process perturbs state that
+    neighbouring tests measure -- `tests/runtime/test_downstream_remote.py`
+    asserts on THIS process's open socket count and on the process-global
+    `sse_starlette.AppStatus` latch. Running the scenario in a subprocess keeps
+    the real-process proof (a mock cannot show an orphan) without touching the
+    suite's shared state. Stdlib only; no test-runner plugin needed.
+    """
+
+    _SCENARIO = """
+import asyncio, os, sys, tempfile
+
+sys.path.insert(0, {src!r})
+from pmcp.tools.handlers import GatewayTools
+from pmcp.policy.policy import PolicyManager
+
+
+class _CM:
+    def is_server_online(self, name): return False
+    def get_all_tools(self): return []
+
+
+async def main():
+    gt = GatewayTools(client_manager=_CM(), policy_manager=PolicyManager())
+    fd, pidfile = tempfile.mkstemp()
+    os.close(fd)
+    # Parent spawns a grandchild, records its pid, then hangs -- the shape of a
+    # server that ignores the probe flag. The grandchild outlives the parent
+    # unless the whole process GROUP is signalled.
+    script = (
+        "import subprocess,sys,time;"
+        "p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']);"
+        "open(%r,'w').write(str(p.pid));"
+        "time.sleep(30)" % pidfile
+    )
+    real_wait_for = asyncio.wait_for
+
+    async def fast(aw, timeout=None):
+        return await real_wait_for(aw, timeout=1.5)
+
+    import pmcp.tools.handlers as H
+    H.asyncio.wait_for = fast
+    try:
+        await gt._run_update_probe_command([sys.executable, "-c", script])
+    except BaseException:
+        pass
+    await asyncio.sleep(0.5)
+    pid = (open(pidfile).read() or "").strip()
+    os.unlink(pidfile)
+    if not pid:
+        print("SETUP-FAILED"); return
+    print("ORPHANED" if os.path.exists("/proc/" + pid) else "REAPED")
+
+asyncio.run(main())
+"""
+
+    def _run_scenario(self) -> str:
+        import subprocess
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        src = str(_Path(__file__).resolve().parents[1] / "src")
+        out = subprocess.run(
+            [_sys.executable, "-c", self._SCENARIO.format(src=src)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        return (
+            (out.stdout or "").strip().splitlines()[-1]
+            if out.stdout.strip()
+            else out.stderr[-400:]
+        )
+
+    def test_timeout_reaps_the_whole_process_tree(self) -> None:
+        result = self._run_scenario()
+        assert result == "REAPED", (
+            f"probe did not reap its process tree (got {result!r}): a hung probe "
+            "leaves grandchildren alive"
+        )
+
+    @pytest.mark.asyncio
+    async def test_normal_probe_still_returns_output(self) -> None:
+        """The happy path is unchanged by the hardening (safe in-process)."""
+        import sys as _sys
+
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        ok, output = await gt._run_update_probe_command(
+            [_sys.executable, "-c", "print('probe-ok')"]
+        )
+        assert ok is True
+        assert "probe-ok" in output
+
+
 class TestUpdateServerVersionRepair:
     """A successful gateway.update_server must clear the stale-notice trail
     -- but only once the update is actually *active*, not merely fetched.
