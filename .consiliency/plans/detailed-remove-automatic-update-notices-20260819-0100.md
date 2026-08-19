@@ -44,7 +44,7 @@ Total attachment points are therefore **16**, not the six this plan first docume
 - `_get_update_warning` — **delete**.
 - `_run_stale_index`, `_stale_indexer_loop`, `start_stale_indexer`, `stop_stale_indexer` — **delete**.
 - `_stale_check_cache`, `_stale_index_interval_seconds`, `_stale_index_task`, `_stale_check_ttl_seconds` — **delete**.
-- `_effective_notice_target`, `_notice_package_matches_cache` — **delete** (no remaining callers once the above go; verify by grep rather than assumption).
+- `_effective_notice_target`, `_notice_package_matches_cache` — **delete**. Second correction found while boarding: these have **zero references anywhere in `src/` or `tests/`**. The plan said "used only by the above", which was wrong — they were never wired in at all, and are already-dead residue from the abandoned #154 attempts. Deleting them is unrelated to this feature's behaviour.
 - `catalog_search` — **modify** — drop the `stale_updates` construction and stop passing it.
 - `describe` / `invoke` / `provision` — **modify** — drop the `_get_update_warning` calls and every `update_warning=` argument. Counts matter here: `describe` 1, `invoke` 5, `provision` 10 — **16 attachment points**. Missing one leaves a call to a deleted method.
 - `update_server` — **modify** — remove writes to `_stale_check_cache`, keep everything else. Its own probe-and-report behaviour is explicitly retained.
@@ -87,6 +87,8 @@ This **does** change the protocol surface: four fields are removed from three to
 5. README, then CHANGELOG last.
 
 No new dependency. No migration: `_stale_check_cache` is in-memory and rebuilt per process.
+
+**Blast radius confirmed by grep:** every reference to the deleted machinery lives in `src/pmcp/tools/handlers.py` — nothing else in `src/` touches it. But **15 test references** depend on `_stale_check_cache`, so the test deletions are a larger share of this change than the source deletions, and each must be classified as "asserts the removed feature" (delete) or "asserts `update_server`" (keep).
 
 ## Verification
 
