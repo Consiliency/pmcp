@@ -5104,13 +5104,47 @@ class GatewayTools:
                     f"{recheck_failure.message if recheck_failure else 'server not found'}"
                 ),
             )
-        # Reuse refresh()'s own predicate rather than full-model equality: it
-        # compares the fields that determine the spawned process, ignores
-        # `source` (the same effective server can arrive as manifest or as a
-        # configured entry), and compares `env` by effective override only --
-        # naive full-env comparison caused spurious teardowns in #79, and here
-        # it would cause spurious refusals of legitimate updates.
-        if not _refresh_config_unchanged(resolved_config, recheck_config):
+        # Two-part check. _refresh_config_unchanged covers command/args/cwd and
+        # is the right predicate for process identity -- it ignores `source`
+        # (the same effective server can arrive as manifest or as a configured
+        # entry) and compares `env` by effective override only, because naive
+        # full-env comparison caused spurious teardowns in #79 and here would
+        # cause spurious refusals of legitimate updates.
+        #
+        # But it is NOT sufficient on its own for this decision (ah board
+        # review). It discards an explicit env entry whose value equals the
+        # ambient value, while sanitized_subprocess_env strips every
+        # PMCP-managed key and restores only explicit entries. So dropping
+        # `env={"KEY": <same value as os.environ>}` compares "unchanged" yet
+        # silently removes KEY from the spawned process -- and the reverse edit
+        # newly exposes a managed credential. That is a material change to what
+        # gets launched, which is exactly what this guard exists to catch.
+        # Verified empirically, not inferred.
+        #
+        # This is not a defect in _refresh_config_unchanged for refresh()'s own
+        # purpose (deciding whether to tear down a running server); the stakes
+        # differ here, where we are deciding whether the thing we probed is the
+        # thing we are about to launch.
+        #
+        # Both sides are sanitized NOW, in one synchronous block, so ambient
+        # os.environ and env-store state are identical for the two calls and
+        # cancel out -- only the config-driven difference remains.
+        probe_child_env = sanitized_subprocess_env(
+            resolved_config.config.env
+            if isinstance(resolved_config.config, LocalMcpServerConfig)
+            else None,
+            self._project_root,
+        )
+        restart_child_env = sanitized_subprocess_env(
+            recheck_config.config.env
+            if isinstance(recheck_config.config, LocalMcpServerConfig)
+            else None,
+            self._project_root,
+        )
+        if (
+            not _refresh_config_unchanged(resolved_config, recheck_config)
+            or probe_child_env != restart_child_env
+        ):
             return UpdateServerOutput(
                 ok=False,
                 server=server_name,

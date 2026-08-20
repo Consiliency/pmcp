@@ -5040,6 +5040,102 @@ class TestUpdateServerVersionRepair:
         assert cache.servers["playwright"].version == "0.1.0"
 
     @pytest.mark.asyncio
+    async def test_update_server_refuses_when_managed_credential_is_dropped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Dropping an explicit env entry that matches ambient must still refuse.
+
+        Board review of this PR found the guard's first comparator insufficient.
+        `_refresh_config_unchanged` discards an explicit env entry whose value
+        equals `os.environ`, but `sanitized_subprocess_env` strips every
+        PMCP-managed key and restores only explicit entries. So removing
+        `env={"KEY": <same value as ambient>}` mid-probe compares "unchanged"
+        while the restarted process silently loses KEY -- and the reverse edit
+        newly exposes a managed credential to it.
+
+        The other TOCTOU test only changes argv and cannot catch this: it is a
+        different axis of the same "restart onto something other than what was
+        probed" defect.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        monkeypatch.setattr(
+            "pmcp.env_store.managed_secret_keys", lambda project=None: {"SECRET_TOKEN"}
+        )
+        monkeypatch.setenv("SECRET_TOKEN", "value")
+
+        with_credential = [
+            ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=LocalMcpServerConfig(
+                    command="npx",
+                    args=["-y", "@playwright/mcp"],
+                    env={"SECRET_TOKEN": "value"},
+                ),
+            )
+        ]
+        # Identical command/args; the ONLY change is the explicit env entry,
+        # whose value matches ambient -- invisible to the effective-override
+        # comparison, but decisive for the spawned process.
+        without_credential = [
+            ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=LocalMcpServerConfig(
+                    command="npx", args=["-y", "@playwright/mcp"], env=None
+                ),
+            )
+        ]
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.load_configs", lambda **_: with_credential
+        )
+
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+
+        refresh_called = False
+
+        async def _tracking_refresh(input_data):
+            nonlocal refresh_called
+            refresh_called = True
+            return types.SimpleNamespace(ok=True)
+
+        monkeypatch.setattr(gt, "refresh", _tracking_refresh)
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            return ("0.2.0", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        async def _probe_that_drops_the_credential(command, env=None):
+            assert env is not None and env.get("SECRET_TOKEN") == "value", (
+                "probe should have received the credential"
+            )
+            monkeypatch.setattr(
+                "pmcp.tools.handlers.load_configs", lambda **_: without_credential
+            )
+            return (True, "ok")
+
+        monkeypatch.setattr(
+            gt, "_run_update_probe_command", _probe_that_drops_the_credential
+        )
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert "changed while the update was being fetched" in result.message
+        assert refresh_called is False
+        assert not any("connect_server" in e for e in client_manager.events)
+        assert cache.servers["playwright"].version == "0.1.0"
+
+    @pytest.mark.asyncio
     async def test_update_server_refuses_when_server_removed_during_probe(
         self, monkeypatch: pytest.MonkeyPatch
     ):
