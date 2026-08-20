@@ -2410,9 +2410,6 @@ class TestInvoke:
             client_manager=client_manager,  # type: ignore
             policy_manager=PolicyManager(),
         )
-        monkeypatch.setattr(
-            gateway_tools, "_get_update_warning", AsyncMock(return_value=None)
-        )
 
         started = asyncio.Event()
         release = asyncio.Event()
@@ -4303,40 +4300,6 @@ class TestCapabilityAndProvision:
         assert isinstance(probe_calls["env"], dict)
 
     @pytest.mark.asyncio
-    async def test_invoke_includes_update_warning(self, monkeypatch):
-        tools = [
-            ToolInfo(
-                tool_id="playwright::snapshot",
-                server_name="playwright",
-                tool_name="snapshot",
-                description="Take snapshot",
-                short_description="Take snapshot",
-                input_schema={"type": "object", "properties": {}},
-                tags=["browser"],
-                risk_hint=RiskHint.LOW,
-            )
-        ]
-        client_manager = MockClientManager(tools)
-        client_manager.set_server_online("playwright")
-        policy_manager = PolicyManager()
-        gateway_tools = GatewayTools(
-            client_manager=client_manager,  # type: ignore
-            policy_manager=policy_manager,
-        )
-
-        async def fake_update_warning(server_name: str):
-            return "Update available for 'playwright': 0.1.0 -> 0.2.0"
-
-        monkeypatch.setattr(gateway_tools, "_get_update_warning", fake_update_warning)
-
-        result = await gateway_tools.invoke(
-            {"tool_id": "playwright::snapshot", "arguments": {}}
-        )
-
-        assert result.ok is True
-        assert result.update_warning is not None
-
-    @pytest.mark.asyncio
     async def test_submit_feedback_preview_includes_telemetry_and_scrubs(
         self, monkeypatch
     ):
@@ -4623,246 +4586,6 @@ class TestSearchRegistryAndRegister:
         assert connected.name == "excalidraw"
         assert connected.config.type == "streamable-http"
         assert connected.config.url == "https://mcp.excalidraw.com"
-
-
-class TestStaleIndexer:
-    """Tests for background stale-version indexer and catalog_search stale_updates."""
-
-    def _make_gateway_tools(self, descriptions_cache=None):
-        client_manager = MockClientManager()
-        policy_manager = PolicyManager()
-        gt = GatewayTools(
-            client_manager=client_manager,  # type: ignore
-            policy_manager=policy_manager,
-            descriptions_cache=descriptions_cache,
-        )
-        return gt
-
-    def _make_manifest_with_playwright(self, monkeypatch):
-        manifest = Manifest(
-            version="1.0",
-            cli_alternatives={},
-            servers={
-                "playwright": ServerConfig(
-                    name="playwright",
-                    description="Browser automation",
-                    keywords=["browser"],
-                    install={},
-                    command="npx",
-                    args=["-y", "@playwright/mcp"],
-                    requires_api_key=False,
-                )
-            },
-            discovery_queue_path=".mcp-gateway/discovery_queue.json",
-        )
-        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
-        return manifest
-
-    @pytest.mark.asyncio
-    async def test_run_stale_index_populates_cache(self, monkeypatch):
-        """_run_stale_index populates _stale_check_cache without a warm cache."""
-        from pmcp.types import DescriptionsCache, GeneratedServerDescriptions
-
-        cache = DescriptionsCache(
-            generated_at="2024-01-01T00:00:00",
-            gateway_version="1.0.0",
-            servers={
-                "playwright": GeneratedServerDescriptions(
-                    package="@playwright/mcp",
-                    version="0.1.0",
-                    generated_at="2024-01-01T00:00:00",
-                    capability_summary="Browser automation",
-                    tools=[],
-                )
-            },
-        )
-        gt = self._make_gateway_tools(descriptions_cache=cache)
-        self._make_manifest_with_playwright(monkeypatch)
-
-        async def fake_get_package_version(command, args, timeout=5.0):
-            return ("0.2.0", "npm")
-
-        monkeypatch.setattr(
-            "pmcp.tools.handlers.get_package_version", fake_get_package_version
-        )
-
-        await gt._run_stale_index()
-
-        assert "playwright" in gt._stale_check_cache
-        _, current, latest, _pkg = gt._stale_check_cache["playwright"]
-        assert current == "0.1.0"
-        assert latest == "0.2.0"
-
-    @pytest.mark.asyncio
-    async def test_run_stale_index_skips_fresh_cache(self, monkeypatch):
-        """_run_stale_index skips servers whose cache entry is still fresh."""
-        import time
-        from pmcp.types import DescriptionsCache, GeneratedServerDescriptions
-
-        cache = DescriptionsCache(
-            generated_at="2024-01-01T00:00:00",
-            gateway_version="1.0.0",
-            servers={
-                "playwright": GeneratedServerDescriptions(
-                    package="@playwright/mcp",
-                    version="0.1.0",
-                    generated_at="2024-01-01T00:00:00",
-                    capability_summary="Browser automation",
-                    tools=[],
-                )
-            },
-        )
-        gt = self._make_gateway_tools(descriptions_cache=cache)
-        self._make_manifest_with_playwright(monkeypatch)
-
-        # Pre-populate cache as fresh
-        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.1.0", "npm")
-
-        network_called = []
-
-        async def fake_get_package_version(command, args, timeout=5.0):
-            network_called.append(True)
-            return ("0.2.0", "npm")
-
-        monkeypatch.setattr(
-            "pmcp.tools.handlers.get_package_version", fake_get_package_version
-        )
-
-        await gt._run_stale_index()
-
-        assert not network_called, "Network should not be called when cache is fresh"
-
-    @pytest.mark.asyncio
-    async def test_run_stale_index_no_descriptions_cache(self):
-        """_run_stale_index is a no-op when no descriptions cache is present."""
-        gt = self._make_gateway_tools(descriptions_cache=None)
-        # Should not raise
-        await gt._run_stale_index()
-
-    @pytest.mark.asyncio
-    async def test_catalog_search_includes_stale_updates(self, monkeypatch):
-        """catalog_search returns stale_updates when indexer has detected stale servers."""
-        import time
-
-        tools = [
-            ToolInfo(
-                tool_id="playwright::snapshot",
-                server_name="playwright",
-                tool_name="snapshot",
-                description="Take snapshot",
-                short_description="Take snapshot",
-                input_schema={"type": "object", "properties": {}},
-                tags=["browser"],
-                risk_hint=RiskHint.LOW,
-            )
-        ]
-        client_manager = MockClientManager(tools)
-        client_manager.set_server_online("playwright")
-        gt = GatewayTools(
-            client_manager=client_manager,  # type: ignore
-            policy_manager=PolicyManager(),
-        )
-
-        # Pre-populate stale check cache with a stale entry
-        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.2.0", "npm")
-
-        result = await gt.catalog_search({})
-
-        assert result.stale_updates is not None
-        assert len(result.stale_updates) == 1
-        assert "playwright" in result.stale_updates[0]
-        assert "0.1.0" in result.stale_updates[0]
-        assert "0.2.0" in result.stale_updates[0]
-
-    @pytest.mark.asyncio
-    async def test_catalog_search_orders_npm_prereleases_by_semver(self) -> None:
-        """catalog_search must use the memo's ecosystem, not PEP 440.
-
-        Board review: the memo previously stored only (checked_at, current,
-        latest), so this read site fell back to PEP 440. npm publishes SemVer,
-        where `1.0.0-1` is a PRERELEASE below `1.0.0`; PEP 440 reads it as the
-        POST-release `1.0.0.post1`. That inversion both HID the real
-        `1.0.0-1 -> 1.0.0` upgrade and FABRICATED its reverse -- reachable
-        through catalog_search even after the direct paths were fixed.
-        """
-        client_manager = MockClientManager()
-        client_manager.set_server_online("playwright")
-        gt = GatewayTools(
-            client_manager=client_manager,  # type: ignore
-            policy_manager=PolicyManager(),
-        )
-
-        # A real npm upgrade: prerelease -> release. Must be reported.
-        gt._stale_check_cache["playwright"] = (time.time(), "1.0.0-1", "1.0.0", "npm")
-        result = await gt.catalog_search({})
-        assert result.stale_updates is not None
-        assert "1.0.0-1" in result.stale_updates[0]
-
-        # The reverse is NOT an upgrade and must not be announced.
-        gt._stale_check_cache["playwright"] = (time.time(), "1.0.0", "1.0.0-1", "npm")
-        result = await gt.catalog_search({})
-        assert not (result.stale_updates or [])
-        assert result.cli_hints == []
-
-    @pytest.mark.asyncio
-    async def test_catalog_search_stale_updates_coexist_with_cli_hints(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        """catalog_search serializes stale_updates independently from cli_hints."""
-        import time
-
-        tools = [
-            ToolInfo(
-                tool_id="playwright::snapshot",
-                server_name="playwright",
-                tool_name="snapshot",
-                description="Take snapshot",
-                short_description="Take snapshot",
-                input_schema={"type": "object", "properties": {}},
-                tags=["browser"],
-                risk_hint=RiskHint.LOW,
-            )
-        ]
-        client_manager = MockClientManager(tools)
-        client_manager.set_server_online("playwright")
-        gt = GatewayTools(
-            client_manager=client_manager,  # type: ignore
-            policy_manager=PolicyManager(),
-        )
-        gt._detected_cli_infos = {"git": CLIInfo(name="git", path="/usr/bin/git")}
-        gt._stale_check_cache["playwright"] = (time.time(), "0.1.0", "0.2.0", "npm")
-        monkeypatch.setattr(
-            "pmcp.tools.handlers.load_manifest", create_manifest_for_request_tests
-        )
-
-        result = await gt.catalog_search({"query": "git"})
-
-        assert result.stale_updates is not None
-        assert "playwright" in result.stale_updates[0]
-        assert result.cli_hints[0].name == "git"
-
-    @pytest.mark.asyncio
-    async def test_catalog_search_no_stale_updates_when_up_to_date(self):
-        """catalog_search returns None for stale_updates when all servers are up to date."""
-        import time
-
-        gt = self._make_gateway_tools()
-        gt._stale_check_cache["playwright"] = (time.time(), "0.2.0", "0.2.0", "npm")
-
-        result = await gt.catalog_search({})
-
-        assert result.stale_updates is None
-
-    @pytest.mark.asyncio
-    async def test_start_stop_stale_indexer(self):
-        """start_stale_indexer creates a task; stop_stale_indexer cancels it."""
-        gt = self._make_gateway_tools()
-
-        gt.start_stale_indexer()
-        assert gt._stale_index_task is not None
-        assert not gt._stale_index_task.done()
-        gt.stop_stale_indexer()
-        assert gt._stale_index_task is None
 
 
 class TestUpdateProbeProcessCleanup:
@@ -5166,75 +4889,6 @@ class TestUpdateServerVersionRepair:
         assert cache.servers["playwright"].version == "0.2.0"
 
     @pytest.mark.asyncio
-    async def test_update_server_clears_get_update_warning(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        """_get_update_warning must stop reporting the update as available.
-
-        Reproduces the maintainer's report: gateway.update_server("context7")
-        reported success but the notice kept recurring on every subsequent
-        call.
-        """
-        self._make_manifest_with_playwright(monkeypatch)
-        cache = self._make_cache(version="0.1.0")
-        gt = GatewayTools(
-            client_manager=MockClientManager(),  # type: ignore
-            policy_manager=PolicyManager(),
-            descriptions_cache=cache,
-        )
-        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
-
-        await gt.update_server({"server_name": "playwright"})
-
-        warning = await gt._get_update_warning("playwright")
-        assert warning is None
-
-    @pytest.mark.asyncio
-    async def test_update_server_clears_catalog_search_stale_updates(
-        self, monkeypatch: pytest.MonkeyPatch
-    ):
-        """catalog_search's stale_updates must also stop naming the server.
-
-        This is the trap: update_server's own _stale_check_cache.pop() would
-        already make an *immediate* catalog_search go quiet, so that alone
-        doesn't discriminate the fix. Force the recompute that production
-        traffic would trigger (a follow-up _get_update_warning, or the
-        background stale sweep) before checking catalog_search, so a
-        left-behind stale descriptions value has a chance to leak back in.
-        """
-        tools = [
-            ToolInfo(
-                tool_id="playwright::snapshot",
-                server_name="playwright",
-                tool_name="snapshot",
-                description="Take snapshot",
-                short_description="Take snapshot",
-                input_schema={"type": "object", "properties": {}},
-                tags=["browser"],
-                risk_hint=RiskHint.LOW,
-            )
-        ]
-        client_manager = MockClientManager(tools)
-        client_manager.set_server_online("playwright")
-        self._make_manifest_with_playwright(monkeypatch)
-        cache = self._make_cache(version="0.1.0")
-        gt = GatewayTools(
-            client_manager=client_manager,  # type: ignore
-            policy_manager=PolicyManager(),
-            descriptions_cache=cache,
-        )
-        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
-
-        await gt.update_server({"server_name": "playwright"})
-        # Force the same recompute _get_update_warning or the background
-        # sweep would perform on the next call.
-        await gt._get_update_warning("playwright")
-
-        result = await gt.catalog_search({})
-
-        assert result.stale_updates is None
-
-    @pytest.mark.asyncio
     async def test_update_server_persists_version_across_restart(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -5311,7 +4965,6 @@ class TestUpdateServerVersionRepair:
         assert result.restarted is True
         assert result.latest_version is None
         assert cache.servers["playwright"].version == "0.1.0"
-        assert "playwright" not in gt._stale_check_cache
 
     @pytest.mark.asyncio
     async def test_update_server_restart_failure_leaves_notice_intact(
@@ -5345,11 +4998,6 @@ class TestUpdateServerVersionRepair:
         assert result.restarted is False
         assert "could not restart" in result.message.lower()
         assert cache.servers["playwright"].version == "0.1.0"
-        assert "playwright" not in gt._stale_check_cache
-
-        warning = await gt._get_update_warning("playwright")
-        assert warning is not None
-        assert "0.1.0" in warning and "0.2.0" in warning
 
     @pytest.mark.asyncio
     async def test_update_server_force_cancels_pending_and_activates(
@@ -5563,7 +5211,6 @@ class TestUpdateServerVersionRepair:
         assert probe_calls == []  # never even attempted
         assert "disconnect_server:playwright:False" not in client_manager.events
         assert cache.servers["playwright"].version == "0.1.0"
-        assert "playwright" not in gt._stale_check_cache
 
     @pytest.mark.asyncio
     async def test_update_server_refuses_pinned_docker_tag(
@@ -5620,7 +5267,6 @@ class TestUpdateServerVersionRepair:
         assert "1.2.3" in result.message
         assert probe_calls == []  # never even attempted
         assert cache.servers["playwright"].version == "0.1.0"
-        assert "playwright" not in gt._stale_check_cache
 
     def test_detect_effective_version_pin_matrix(self):
         """Pin detection per package manager, including the not-a-pin cases."""
