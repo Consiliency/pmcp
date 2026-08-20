@@ -804,9 +804,6 @@ class GatewayServer:
 
         logger.debug("Capability summary:\n%s", self._capability_summary)
 
-        # Start background stale-version indexer (precomputes warnings for low latency)
-        self._gateway_tools.start_stale_indexer()
-
         # Create MCP server with capability instructions
         self._create_server(instructions=self._capability_summary)
 
@@ -964,7 +961,6 @@ class GatewayServer:
         # close carries no response); EC-P3B-2's server-close half is proven
         # deterministically in-process instead (test_listen_registration.py).
         self._listen_handler.close()
-        self._gateway_tools.stop_stale_indexer()
         try:
             await asyncio.wait_for(self._client_manager.disconnect_all(), timeout=10.0)
         except asyncio.TimeoutError:

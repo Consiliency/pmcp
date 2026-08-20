@@ -636,7 +636,6 @@ class CatalogSearchOutput(BaseModel):
     # started (no cached tools). Surfaced when include_offline=True so agents can
     # provision the exact server instead of falling back to web search (#78).
     manifest_candidates: list[CapabilityCandidate] = Field(default_factory=list)
-    stale_updates: list[str] | None = None
 
 
 class DescribeInput(BaseModel):
@@ -688,7 +687,6 @@ class SchemaCard(BaseModel):
     invoke_template: InvokeTemplate | None = None
     # L2: Minimal code example (3-4 lines, opt-in via guidance config)
     code_snippet: str | None = None
-    update_warning: str | None = None
     feedback_hint: str | None = None
 
 
@@ -751,7 +749,6 @@ class InvokeOutput(BaseModel):
     summary: str | None = None
     raw_size_estimate: int
     errors: list[str] | None = None
-    update_warning: str | None = None
     feedback_hint: str | None = None
     missing_env_vars: list[str] = Field(default_factory=list)
     auth_state: AuthState = "none"
@@ -1201,7 +1198,6 @@ class ProvisionOutput(BaseModel):
     auth_metadata: AuthMetadataInfo | None = None
     auth_challenge: AuthChallengeInfo | None = None
     url_elicitations: list[UrlElicitationInfo] | None = None
-    update_warning: str | None = None
     feedback_hint: str | None = None
 
 
