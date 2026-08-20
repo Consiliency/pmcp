@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+- **Automatic "update available" notices.** `gateway.describe`, `gateway.invoke`
+  and `gateway.provision` no longer return `update_warning`,
+  `gateway.catalog_search` no longer returns `stale_updates`, and the hourly
+  background stale-version indexer is gone. **These fields are removed from the
+  tool output schemas, not merely left empty** — a client reading them will no
+  longer find the keys, which previously appeared as explicit nulls.
+
+  The gateway cannot determine which version of a package a running server is
+  actually executing. The recorded version was an upstream snapshot taken when
+  the server was last described, so a notice could both invent an update that
+  did not exist and hide one that did — particularly for a server configured in
+  both the manifest and `.mcp.json`. Eight separate attempts to source a
+  trustworthy version failed, and the only remaining method — running each
+  server's own `--version` on a schedule — would mean executing third-party
+  package code with that server's credentials to produce an advisory message.
+
+  **`gateway.update_server` is unchanged** and remains the way to check and
+  apply updates: it probes the package, reports what it found, restarts the
+  server, and refuses servers pinned to a specific version.
+
+
 ### Fixed
 - **`gateway.update_server` no longer orphans a process tree when its update
   probe hangs.** The probe runs the downstream package's own code (e.g.

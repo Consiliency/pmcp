@@ -477,8 +477,7 @@ URL-mode gateway calls.
 
 - `gateway.update_server` is the phase-1 update path for subordinate MCPs.
 - `pmcp update <server>` and `pmcp update --all` call the same gateway update workflow.
-- `gateway.describe`, `gateway.invoke`, and `gateway.provision` may return `update_warning` when a newer package version is detected.
-- Background stale-version indexing is active — warnings are zero-latency via hourly pre-population.
+- Update information is reported on request by `gateway.update_server`; the gateway does not volunteer unprompted "update available" notices. It cannot observe which package version a running server is actually executing, so a volunteered notice could be wrong in either direction (Consiliency/pmcp#150).
 
 ### Feedback Telemetry
 
