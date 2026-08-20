@@ -41,10 +41,23 @@ It is explicitly **not** "the config on disk at the instant the restart complete
 
 - `_restart_resolved_server` — **add** — private helper holding the post-resolve body of `restart_server`: active-task accounting, the `_client_manager.restart_server(config, force=...)` call, and `_lifecycle_output` shaping. Signature `(self, server_name: str, config: ResolvedServerConfig, *, force: bool, prior_status: str) -> LifecycleServerOutput`.
 - `restart_server` — **modify** — becomes resolve + delegate to the helper. **Behaviour must be byte-identical**; this is a pure extraction and any observable change is a bug in the refactor.
+**Board correction — the check must precede `refresh()`, not merely precede the restart.** My first implementation placed the guard immediately before the restart, which two reviewers independently blocked. Between the probe and the restart, `update_server` calls `await self.refresh(...)` — and `refresh()` is itself a **diff-based config reconcile**: it re-reads the config and disconnects/reconnects any server whose definition changed. So a mid-probe edit could cause `refresh()` to **activate the freshly-fetched package on its own**, after which the guard would report "fetched but NOT activated" — a false statement.
+
+Worse, it defeats the test I had planned. `refresh()` activates through `disconnect_server` + `connect_all`, **not** `restart_server`, so the planned assertion "`_client_manager.restart_server` was never called" would have passed while the bug survived. That is the exact failure mode this plan's test section warns about, and I walked into it.
+
+The guard therefore sits immediately after the probe's success check and **before** `refresh()`. The tests must assert the target's actual connect/disconnect state, not just that `restart_server` was skipped.
+
 - `update_server` — **modify** — after the probe returns:
   1. **Recompute `prior_status`.** The pre-probe value is up to 60 seconds stale. Use the fresh value for resolve#2 and the helper.
   2. Resolve #2 via `_resolve_lifecycle_config`. On failure, return `UpdateServerOutput(ok=False, ...)` exactly as the pre-probe failure path does. This also covers *server deleted from config mid-probe* for free.
-  3. Compare resolve#2's `ResolvedServerConfig` against resolve#1's with a **strict full-model `==`, including `source`**. A benign `source` flip (e.g. the same config moving project→user) will refuse; that is rare and fails closed, which is the correct bias here.
+  3. Compare resolve#2 against resolve#1 using the **existing `_refresh_config_unchanged(old, new)`** (`handlers.py:177`).
+
+     **Correction to this plan, found while implementing — the original said "strict full-model `==`, including `source`", and that was wrong.** `handlers.py` already carries a battle-tested predicate for exactly this question ("do these two describe the same downstream process?"), and it deliberately does *not* use full-model equality. Its docstring records why, and both reasons apply here:
+
+     * **`env` is compared by *effective* override only** — entries that genuinely differ from `os.environ`. Naive full-`env` comparison "would spuriously tear down running provisioned servers on every refresh (issue #79)". A full-model `==` in `update_server` would reintroduce that class as **spurious refusals of legitimate updates**.
+     * **`source` is excluded deliberately** — the same effective server can present as `manifest` or as a configured source. My original plan called over-refusal on a source flip "rare and fails closed". That was a judgement made without reading this function; the codebase had already decided the question, with a linked issue.
+
+     Reusing it also keeps **one** definition of "same server" instead of a second, subtly different one. `update_server` only reaches the comparison for local servers (remote returns early — no local package to update), so only the `LocalMcpServerConfig` branch is exercised; the header-rotation logic is inert here and needs no arguments.
   4. On mismatch — refuse. Return `ok=False` with a message saying the configuration changed during the update and the package was **fetched but not activated**, and do **not** restart, do **not** persist any version bookkeeping.
   5. On match — call `_restart_resolved_server` with **resolve#2's config object**. Since it is equal to #1 the choice is immaterial by construction; using the compared object is what makes the window exactly zero rather than one event-loop tick.
 - The comment block at `4924-4936` — **rewrite**. It currently asserts *"Resolving once through restart_server's own resolver makes that divergence impossible: both calls are the same lookup against the same inputs, so they can't disagree."* The premise "same inputs" is exactly what a mid-probe edit breaks. The issue names this comment specifically.

@@ -2839,9 +2839,33 @@ class GatewayTools:
                 errors=[f"Unable to resolve server: {server_name}"],
             )
 
+        return await self._restart_resolved_server(
+            server_name, config, force=parsed.force, prior_status=prior_status
+        )
+
+    async def _restart_resolved_server(
+        self,
+        server_name: str,
+        config: ResolvedServerConfig,
+        *,
+        force: bool,
+        prior_status: str,
+    ) -> LifecycleServerOutput:
+        """Restart a server whose config the caller has ALREADY resolved.
+
+        Split out of ``restart_server`` so ``update_server`` can restart onto
+        the exact config object it probed and verified, instead of triggering a
+        second independent resolve across the probe's 60-second await
+        (Consiliency/pmcp#151).
+
+        Every safety check -- policy, remote-header env vars, credential gaps --
+        lives in ``_resolve_lifecycle_config``, which the caller runs to obtain
+        ``config``. This helper deliberately holds none of them, so calling it
+        with an unresolved or unverified config would bypass all three.
+        """
         active_tasks_before = len(self._client_manager.get_active_tasks(server_name))
         ok, cancelled, errors = await self._client_manager.restart_server(
-            config, force=parsed.force
+            config, force=force
         )
         active_tasks_after = len(self._client_manager.get_active_tasks(server_name))
         return self._lifecycle_output(
@@ -4931,9 +4955,12 @@ class GatewayTools:
         # meant probing one command while restarting a different one --
         # structurally capable of probing/installing upstream @latest while
         # restarting onto a completely different, e.g. pinned, config.
-        # Resolving once through restart_server's own resolver makes that
-        # divergence impossible: both calls are the same lookup against the
-        # same inputs, so they can't disagree.
+        # Resolving through restart_server's own resolver makes that
+        # divergence impossible for a STABLE configuration: both reads are the
+        # same lookup, so identical inputs cannot produce different answers.
+        # They are still two separate reads of a file that can change between
+        # them, which is why the restart below re-resolves and verifies rather
+        # than assuming this one still holds (Consiliency/pmcp#151).
         prior_status = self._status_value(server_name)
         resolved_config, resolve_failure = self._resolve_lifecycle_config(
             server_name, action="restart", prior_status=prior_status
@@ -5043,6 +5070,61 @@ class GatewayTools:
                 message=f"Update command failed: {short_output}",
             )
 
+        # Consiliency/pmcp#151: the probe above is a 60-second await, and the
+        # config loaders re-read from disk on every call, so the configuration
+        # backing this update may have changed since it was resolved. Verify
+        # BEFORE going any further.
+        #
+        # This check must precede refresh(). refresh() is itself a diff-based
+        # config reconcile: it re-reads the config and disconnects/reconnects
+        # servers whose definition changed, which means it can ACTIVATE the
+        # freshly-fetched package on its own, via disconnect_server +
+        # connect_all rather than restart_server. Checking after it would let
+        # this tool report "fetched but not activated" after activation had
+        # already happened -- a false statement, and one that a test asserting
+        # "restart_server was never called" would not catch (ah board review).
+        #
+        # The guarantee is "the config restarted onto is the config that was
+        # probed" -- NOT "the config on disk when the restart completes". An
+        # edit landing after this check applies on the next update.
+        recheck_config, recheck_failure = self._resolve_lifecycle_config(
+            server_name,
+            action="restart",
+            prior_status=self._status_value(server_name),
+        )
+        if recheck_failure is not None or recheck_config is None:
+            return UpdateServerOutput(
+                ok=False,
+                server=server_name,
+                package_type=package_type,
+                package_name=package_name,
+                message=(
+                    f"'{server_name}' could no longer be resolved after the update "
+                    f"was fetched, so it was not activated: "
+                    f"{recheck_failure.message if recheck_failure else 'server not found'}"
+                ),
+            )
+        # Reuse refresh()'s own predicate rather than full-model equality: it
+        # compares the fields that determine the spawned process, ignores
+        # `source` (the same effective server can arrive as manifest or as a
+        # configured entry), and compares `env` by effective override only --
+        # naive full-env comparison caused spurious teardowns in #79, and here
+        # it would cause spurious refusals of legitimate updates.
+        if not _refresh_config_unchanged(resolved_config, recheck_config):
+            return UpdateServerOutput(
+                ok=False,
+                server=server_name,
+                package_type=package_type,
+                package_name=package_name,
+                message=(
+                    f"Configuration for '{server_name}' changed while the update "
+                    f"was being fetched. The package was fetched but NOT activated, "
+                    f"and no version was recorded. Re-run "
+                    f"gateway.update_server(server_name='{server_name}') to update "
+                    f"against the current configuration."
+                ),
+            )
+
         refresh_result = await self.refresh({"reason": f"update_server:{server_name}"})
         latest_version, _ = await get_package_version(command, args, timeout=5.0)
 
@@ -5055,8 +5137,11 @@ class GatewayTools:
         # the same resolve+disconnect+connect machinery gateway.restart_server
         # already exercises, so the freshly-fetched package is what's actually
         # running.
-        restart_result = await self.restart_server(
-            {"server_name": server_name, "force": parsed.force}
+        restart_result = await self._restart_resolved_server(
+            server_name,
+            recheck_config,
+            force=parsed.force,
+            prior_status=self._status_value(server_name),
         )
 
         # `desc.version` is an upstream snapshot from the last `pmcp
