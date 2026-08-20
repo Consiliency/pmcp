@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-08-20
+
 ### Removed
 - **Automatic "update available" notices.** `gateway.describe`, `gateway.invoke`
   and `gateway.provision` no longer return `update_warning`,
@@ -40,8 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   breaks the next launch. The probe now spawns as a process-group leader and
   reaps the group on timeout or cancellation.
 
-
-### Fixed
 - **Update notices are no longer fabricated for servers whose version is not a
   release number.** The version comparison extracted digits from whatever it was
   given and had no way to say "I cannot read this", so a server reporting
