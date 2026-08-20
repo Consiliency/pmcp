@@ -10,7 +10,6 @@ import time
 from typing import Any, cast
 import types
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -1405,6 +1404,70 @@ class TestRefreshConfigUnchanged:
             config=RemoteMcpServerConfig(url="https://x"),
         )
         assert _refresh_config_unchanged(local, remote) is False
+
+
+class TestAutomaticUpdateNoticesRemoved:
+    """Consiliency/pmcp#150: the gateway no longer volunteers update notices.
+
+    Eight attempts failed to make the notice trustworthy, because pmcp cannot
+    observe which package artifact a running server is executing. The advisor
+    board's conclusion was to remove the feature rather than ship a claim that
+    can be wrong in both directions. `gateway.update_server` keeps reporting
+    versions on request -- that path is explicitly retained.
+
+    These tests assert the removal is COMPLETE. A half-removal is the failure
+    mode: `provision` alone carried 20 of the 26 attachment sites, and a missed
+    one would call a deleted method at runtime.
+    """
+
+    def test_no_notice_fields_on_public_output_models(self) -> None:
+        """The removed fields are gone from every output model that carried them.
+
+        Checked against the model fields rather than a live call: today
+        `server.py` serialises with `model_dump()` and no `exclude_none`, so a
+        surviving field would be emitted on the wire as an explicit null.
+        """
+        from pmcp.types import (
+            CatalogSearchOutput,
+            InvokeOutput,
+            ProvisionOutput,
+            SchemaCard,
+        )
+
+        assert "stale_updates" not in CatalogSearchOutput.model_fields
+        for model in (SchemaCard, InvokeOutput, ProvisionOutput):
+            assert "update_warning" not in model.model_fields, model.__name__
+
+    def test_no_notice_machinery_on_gateway_tools(self) -> None:
+        """The emission helpers and the background indexer are gone.
+
+        Named explicitly so a future re-introduction has to be deliberate rather
+        than accidental -- `hasattr` here is the cheap guard that the source
+        grep in the PR cannot enforce over time.
+        """
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        for attr in (
+            "_get_update_warning",
+            "_run_stale_index",
+            "_stale_indexer_loop",
+            "start_stale_indexer",
+            "stop_stale_indexer",
+            "_stale_check_cache",
+        ):
+            assert not hasattr(gt, attr), f"{attr} survived the removal"
+
+    @pytest.mark.asyncio
+    async def test_catalog_search_emits_no_stale_updates(self) -> None:
+        """A real catalog_search payload carries no notice key at all."""
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+        result = await gt.catalog_search({"query": "anything"})
+        assert "stale_updates" not in result.model_dump()
 
 
 class TestCatalogSearch:
