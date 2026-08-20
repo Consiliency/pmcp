@@ -693,7 +693,8 @@ def get_gateway_tool_definitions() -> list[Tool]:
             description=(
                 "Update a subordinate MCP server package to latest version and restart it "
                 "so the new version is actually running. "
-                "Use this when invoke/describe/provision warn that a newer version is available. "
+                "Call this to check for and apply an update -- the gateway does not "
+                "volunteer update notices, so nothing will prompt you. "
                 "Refuses to restart by default when the server has pending requests; "
                 "set force=true to cancel them."
             ),

@@ -1459,6 +1459,32 @@ class TestAutomaticUpdateNoticesRemoved:
         ):
             assert not hasattr(gt, attr), f"{attr} survived the removal"
 
+    def test_exported_tool_descriptions_do_not_promise_notices(self) -> None:
+        """The tools/list prose must not tell agents to wait for a notice.
+
+        Board review of this PR: `gateway.update_server`'s description still read
+        "Use this when invoke/describe/provision warn that a newer version is
+        available" -- shipped to every client through `tools/list`, instructing
+        agents to wait for notices that no longer exist.
+
+        The identifier grep that verified this removal could not catch it,
+        because it is PROSE, not a symbol. This test closes that class of gap.
+        """
+        from pmcp.tools.handlers import get_gateway_tool_definitions
+
+        forbidden = (
+            "warn that a newer version",
+            "newer version is available",
+            "update_warning",
+            "stale_updates",
+        )
+        for tool in get_gateway_tool_definitions():
+            text = (tool.description or "").lower()
+            for phrase in forbidden:
+                assert phrase.lower() not in text, (
+                    f"{tool.name} description still promises update notices: {phrase!r}"
+                )
+
     @pytest.mark.asyncio
     async def test_catalog_search_emits_no_stale_updates(self) -> None:
         """A real catalog_search payload carries no notice key at all."""
