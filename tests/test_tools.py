@@ -4957,6 +4957,235 @@ class TestUpdateServerVersionRepair:
         assert client_manager.is_server_online("playwright") is True
 
     @pytest.mark.asyncio
+    async def test_update_server_refuses_when_config_changes_during_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A config edit landing inside the probe window must refuse, not activate.
+
+        Consiliency/pmcp#151. The probe is a 60-second await and the config
+        loaders re-read on every call, so `.mcp.json` can change underneath a
+        running update. Before the fix, update_server probed package A and then
+        let a second, independent resolve restart onto package B -- persisting
+        A's version as B's.
+
+        The `refresh_called` assertion is the load-bearing one. Two reviewers
+        blocked the first implementation for putting this guard AFTER
+        `refresh()`, which is itself a diff-based reconcile that
+        disconnects/reconnects changed servers -- so it could have activated the
+        fetched package before the guard ever ran, making "fetched but not
+        activated" a lie. Because refresh() activates via disconnect + connect
+        rather than restart_server, asserting only "restart_server was not
+        called" would have passed while the bug survived.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+
+        refresh_called = False
+
+        async def _tracking_refresh(input_data):
+            nonlocal refresh_called
+            refresh_called = True
+            return types.SimpleNamespace(ok=True)
+
+        monkeypatch.setattr(gt, "refresh", _tracking_refresh)
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            return ("0.2.0", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        async def _probe_that_edits_the_config(command, env=None):
+            # Stand-in for an operator (or an automated rollout) editing
+            # .mcp.json while the probe runs. Routed through the real
+            # _resolve_lifecycle_config -> load_configs path, so a cached
+            # resolve would make this test fail -- it doubles as the
+            # no-caching check.
+            monkeypatch.setattr(
+                "pmcp.tools.handlers.load_configs",
+                lambda **_: [
+                    ResolvedServerConfig(
+                        name="playwright",
+                        source="project",
+                        config=LocalMcpServerConfig(
+                            command="npx",
+                            args=["-y", "@playwright/mcp@1.0.0-pinned"],
+                        ),
+                    )
+                ],
+            )
+            return (True, "ok")
+
+        monkeypatch.setattr(
+            gt, "_run_update_probe_command", _probe_that_edits_the_config
+        )
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert "changed while the update was being fetched" in result.message
+        # Nothing was activated -- not by the restart, and not by refresh().
+        assert refresh_called is False
+        assert not any("disconnect_server" in e for e in client_manager.events)
+        assert not any("connect_server" in e for e in client_manager.events)
+        # The bug class is "persist A's bookkeeping for B". This is the
+        # assertion that actually pins it.
+        assert cache.servers["playwright"].version == "0.1.0"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("direction", ["drop", "add"])
+    async def test_update_server_refuses_when_managed_credential_changes(
+        self, monkeypatch: pytest.MonkeyPatch, direction: str
+    ):
+        """Dropping an explicit env entry that matches ambient must still refuse.
+
+        Board review of this PR found the guard's first comparator insufficient.
+        `_refresh_config_unchanged` discards an explicit env entry whose value
+        equals `os.environ`, but `sanitized_subprocess_env` strips every
+        PMCP-managed key and restores only explicit entries. So removing
+        `env={"KEY": <same value as ambient>}` mid-probe compares "unchanged"
+        while the restarted process silently loses KEY -- and the reverse edit
+        newly exposes a managed credential to it.
+
+        The other TOCTOU test only changes argv and cannot catch this: it is a
+        different axis of the same "restart onto something other than what was
+        probed" defect.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        monkeypatch.setattr(
+            "pmcp.env_store.managed_secret_keys", lambda project=None: {"SECRET_TOKEN"}
+        )
+        monkeypatch.setenv("SECRET_TOKEN", "value")
+
+        with_credential = [
+            ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=LocalMcpServerConfig(
+                    command="npx",
+                    args=["-y", "@playwright/mcp"],
+                    env={"SECRET_TOKEN": "value"},
+                ),
+            )
+        ]
+        # Identical command/args; the ONLY change is the explicit env entry,
+        # whose value matches ambient -- invisible to the effective-override
+        # comparison, but decisive for the spawned process.
+        without_credential = [
+            ResolvedServerConfig(
+                name="playwright",
+                source="project",
+                config=LocalMcpServerConfig(
+                    command="npx", args=["-y", "@playwright/mcp"], env=None
+                ),
+            )
+        ]
+        # Both directions matter and the defect is symmetric: dropping the
+        # entry silently REMOVES a managed credential from the restarted
+        # server, adding one newly EXPOSES it. Board review asked whether the
+        # test covered the reverse; it did not.
+        before, after = (
+            (with_credential, without_credential)
+            if direction == "drop"
+            else (without_credential, with_credential)
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: before)
+
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+
+        refresh_called = False
+
+        async def _tracking_refresh(input_data):
+            nonlocal refresh_called
+            refresh_called = True
+            return types.SimpleNamespace(ok=True)
+
+        monkeypatch.setattr(gt, "refresh", _tracking_refresh)
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            return ("0.2.0", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        async def _probe_that_changes_the_credential(command, env=None):
+            assert env is not None
+            expected = "value" if direction == "drop" else None
+            assert env.get("SECRET_TOKEN") == expected, (
+                f"probe env should start {direction!r}-side: "
+                f"expected {expected!r}, got {env.get('SECRET_TOKEN')!r}"
+            )
+            monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: after)
+            return (True, "ok")
+
+        monkeypatch.setattr(
+            gt, "_run_update_probe_command", _probe_that_changes_the_credential
+        )
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert "changed while the update was being fetched" in result.message
+        assert refresh_called is False
+        assert not any("connect_server" in e for e in client_manager.events)
+        assert cache.servers["playwright"].version == "0.1.0"
+
+    @pytest.mark.asyncio
+    async def test_update_server_refuses_when_server_removed_during_probe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A server deleted from config mid-probe must refuse, not restart."""
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        client_manager = MockClientManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+
+        async def fake_get_package_version(command, args, timeout=5.0):
+            return ("0.2.0", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        async def _probe_that_removes_the_server(command, env=None):
+            empty = Manifest(
+                version="1.0",
+                cli_alternatives={},
+                servers={},
+                discovery_queue_path=".mcp-gateway/discovery_queue.json",
+            )
+            monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: empty)
+            return (True, "ok")
+
+        monkeypatch.setattr(
+            gt, "_run_update_probe_command", _probe_that_removes_the_server
+        )
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert "could no longer be resolved" in result.message
+        assert cache.servers["playwright"].version == "0.1.0"
+
+    @pytest.mark.asyncio
     async def test_update_server_bumps_descriptions_cache_version(
         self, monkeypatch: pytest.MonkeyPatch
     ):

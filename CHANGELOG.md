@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`gateway.update_server` no longer risks restarting onto a different package
+  than the one it probed.** The tool resolved the server's config, ran an update
+  probe with a 60-second timeout, and then let `gateway.restart_server` resolve
+  the config a second, independent time. The config loaders re-read from disk on
+  every call, so a `.mcp.json` or manifest edit landing inside that window could
+  make pmcp probe and install package A, restart onto package B, and then record
+  A's version as B's — the silent-misreport class, reached through a race rather
+  than through resolver divergence.
+
+  `update_server` now re-resolves after the probe, verifies the result still
+  describes the same downstream process, and restarts onto that exact verified
+  config. If the configuration changed, or the server is gone from the config
+  entirely, the update is refused: the package was fetched but is **not**
+  activated and **no** version is recorded, with a message saying so.
+
+  The check runs *before* `gateway.refresh()`, which is itself a diff-based
+  reconcile that can disconnect and reconnect a changed server on its own —
+  checking afterwards would have allowed the fetched package to be activated
+  before the refusal was reported.
+
+  The verification covers configuration-driven changes to the spawned process
+  environment as well as to the command: dropping an explicit `env` entry whose
+  value happens to match the ambient one would otherwise compare as unchanged
+  while silently removing a PMCP-managed credential from the restarted server
+  (or, reversed, newly exposing one to it). It deliberately does not freeze the
+  *ambient* environment across the update — a shell or secret-store change
+  during the probe affects the probe and the restart alike.
+
+  This matters more since 2.2.0: with the automatic update notices removed,
+  `gateway.update_server` is the only update path.
+
+
 ## [2.2.0] - 2026-08-20
 
 ### Removed
