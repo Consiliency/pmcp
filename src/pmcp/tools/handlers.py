@@ -5126,21 +5126,32 @@ class GatewayTools:
         # differ here, where we are deciding whether the thing we probed is the
         # thing we are about to launch.
         #
-        # Both sides are sanitized NOW, in one synchronous block, so ambient
-        # os.environ and env-store state are identical for the two calls and
-        # cancel out -- only the config-driven difference remains.
-        probe_child_env = sanitized_subprocess_env(
-            resolved_config.config.env
-            if isinstance(resolved_config.config, LocalMcpServerConfig)
-            else None,
-            self._project_root,
-        )
-        restart_child_env = sanitized_subprocess_env(
-            recheck_config.config.env
-            if isinstance(recheck_config.config, LocalMcpServerConfig)
-            else None,
-            self._project_root,
-        )
+        # Scope, stated precisely: this detects a CONFIG-driven change to the
+        # child environment. It does not freeze the ambient environment across
+        # the update -- an os.environ or secret-store change during the probe
+        # affects both sides equally and cancels out by construction. Holding
+        # the probe's exact environment all the way to the spawn would mean
+        # threading a frozen env through ClientManager, which is a separate
+        # concern from this TOCTOU (tracked separately).
+        #
+        # Derive BOTH sides from ONE stripped base. Calling
+        # sanitized_subprocess_env twice would re-read the credential files
+        # twice (managed_secret_keys hits disk per call), so a write landing
+        # between the two reads could make identical configs compare unequal --
+        # a spurious refusal on the only update path pmcp has (ah board
+        # review, second pass). One read, one base, no window.
+        stripped_base = sanitized_subprocess_env(None, self._project_root)
+
+        def _child_env(candidate: ResolvedServerConfig) -> dict[str, str]:
+            own = (
+                candidate.config.env
+                if isinstance(candidate.config, LocalMcpServerConfig)
+                else None
+            )
+            return {**stripped_base, **(own or {})}
+
+        probe_child_env = _child_env(resolved_config)
+        restart_child_env = _child_env(recheck_config)
         if (
             not _refresh_config_unchanged(resolved_config, recheck_config)
             or probe_child_env != restart_child_env

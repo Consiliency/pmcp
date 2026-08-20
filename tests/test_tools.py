@@ -5040,8 +5040,9 @@ class TestUpdateServerVersionRepair:
         assert cache.servers["playwright"].version == "0.1.0"
 
     @pytest.mark.asyncio
-    async def test_update_server_refuses_when_managed_credential_is_dropped(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("direction", ["drop", "add"])
+    async def test_update_server_refuses_when_managed_credential_changes(
+        self, monkeypatch: pytest.MonkeyPatch, direction: str
     ):
         """Dropping an explicit env entry that matches ambient must still refuse.
 
@@ -5086,9 +5087,16 @@ class TestUpdateServerVersionRepair:
                 ),
             )
         ]
-        monkeypatch.setattr(
-            "pmcp.tools.handlers.load_configs", lambda **_: with_credential
+        # Both directions matter and the defect is symmetric: dropping the
+        # entry silently REMOVES a managed credential from the restarted
+        # server, adding one newly EXPOSES it. Board review asked whether the
+        # test covered the reverse; it did not.
+        before, after = (
+            (with_credential, without_credential)
+            if direction == "drop"
+            else (without_credential, with_credential)
         )
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: before)
 
         cache = self._make_cache(version="0.1.0")
         client_manager = MockClientManager()
@@ -5114,17 +5122,18 @@ class TestUpdateServerVersionRepair:
             "pmcp.tools.handlers.get_package_version", fake_get_package_version
         )
 
-        async def _probe_that_drops_the_credential(command, env=None):
-            assert env is not None and env.get("SECRET_TOKEN") == "value", (
-                "probe should have received the credential"
+        async def _probe_that_changes_the_credential(command, env=None):
+            assert env is not None
+            expected = "value" if direction == "drop" else None
+            assert env.get("SECRET_TOKEN") == expected, (
+                f"probe env should start {direction!r}-side: "
+                f"expected {expected!r}, got {env.get('SECRET_TOKEN')!r}"
             )
-            monkeypatch.setattr(
-                "pmcp.tools.handlers.load_configs", lambda **_: without_credential
-            )
+            monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: after)
             return (True, "ok")
 
         monkeypatch.setattr(
-            gt, "_run_update_probe_command", _probe_that_drops_the_credential
+            gt, "_run_update_probe_command", _probe_that_changes_the_credential
         )
 
         result = await gt.update_server({"server_name": "playwright"})

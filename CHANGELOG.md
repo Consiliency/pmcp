@@ -28,11 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checking afterwards would have allowed the fetched package to be activated
   before the refusal was reported.
 
-  The verification covers the spawned process environment as well as the
-  command: dropping an explicit `env` entry whose value happens to match the
-  ambient one would otherwise compare as unchanged while silently removing a
-  PMCP-managed credential from the restarted server (or, reversed, newly
-  exposing one to it).
+  The verification covers configuration-driven changes to the spawned process
+  environment as well as to the command: dropping an explicit `env` entry whose
+  value happens to match the ambient one would otherwise compare as unchanged
+  while silently removing a PMCP-managed credential from the restarted server
+  (or, reversed, newly exposing one to it). It deliberately does not freeze the
+  *ambient* environment across the update — a shell or secret-store change
+  during the probe affects the probe and the restart alike.
 
   This matters more since 2.2.0: with the automatic update notices removed,
   `gateway.update_server` is the only update path.
