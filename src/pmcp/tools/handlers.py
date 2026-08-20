@@ -1085,17 +1085,6 @@ class GatewayTools:
         # so concurrent polls cannot double-adopt or re-refresh a finished job.
         self._provision_finalize_locks: dict[str, asyncio.Lock] = {}
         self._provision_finalized: set[str] = set()
-        # (checked_at, current, latest, package_type). The package type is
-        # carried so the READ sites can order correctly: npm/cargo publish
-        # SemVer, where `-1` is a prerelease, while PEP 440 reads it as a
-        # post-release. Without it, catalog_search inverts npm prereleases --
-        # hiding a real upgrade and fabricating its reverse (ah board review).
-        self._stale_check_cache: dict[
-            str, tuple[float, str | None, str | None, str | None]
-        ] = {}
-        self._stale_check_ttl_seconds = 6 * 60 * 60
-        self._stale_index_interval_seconds = 60 * 60  # Re-index every hour
-        self._stale_index_task: asyncio.Task[None] | None = None
         self._feedback_events: list[dict[str, Any]] = []
         self._audit_events: deque[GatewayAuditEvent] = deque(maxlen=64)
         self._provisioned_registry: dict[str, str | None] = (
@@ -1315,65 +1304,6 @@ class GatewayTools:
         self._save_provisioned_registry()
 
     # === Stale Version Indexer ===
-
-    def start_stale_indexer(self) -> None:
-        """Start the background stale-version indexing task."""
-        if self._stale_index_task is None or self._stale_index_task.done():
-            self._stale_index_task = asyncio.create_task(self._stale_indexer_loop())
-            logger.info("Started stale-version indexer background task")
-
-    def stop_stale_indexer(self) -> None:
-        """Stop the background stale-version indexing task."""
-        if self._stale_index_task and not self._stale_index_task.done():
-            self._stale_index_task.cancel()
-            self._stale_index_task = None
-            logger.debug("Stopped stale-version indexer background task")
-
-    async def _stale_indexer_loop(self) -> None:
-        """Background loop: precompute stale version checks for all known servers."""
-        while True:
-            try:
-                await self._run_stale_index()
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.debug(f"Stale indexer pass failed: {e}")
-            try:
-                await asyncio.sleep(self._stale_index_interval_seconds)
-            except asyncio.CancelledError:
-                break
-
-    async def _run_stale_index(self) -> None:
-        """One pass: fetch latest versions for all servers in the descriptions cache."""
-        if not self._descriptions_cache:
-            return
-        now = time.time()
-        servers = list(self._descriptions_cache.servers.items())
-        for server_name, server_desc in servers:
-            # Skip if cache entry is still fresh
-            cached = self._stale_check_cache.get(server_name)
-            if cached and (now - cached[0]) < self._stale_check_ttl_seconds:
-                continue
-            server_config = self._get_server_config_for_update(server_name)
-            if not server_config or not server_config.command:
-                continue
-            try:
-                latest, pkg_type = await get_package_version(
-                    server_config.command, server_config.args, timeout=5.0
-                )
-                self._stale_check_cache[server_name] = (
-                    now,
-                    server_desc.version,
-                    latest,
-                    pkg_type,
-                )
-                if latest and is_version_newer(server_desc.version, latest, pkg_type):
-                    logger.info(
-                        f"Update available for '{server_name}': "
-                        f"{server_desc.version} -> {latest}"
-                    )
-            except Exception as e:
-                logger.debug(f"Stale check failed for '{server_name}': {e}")
 
     async def _ensure_server_for_tool(self, tool_id: str) -> bool:
         """Ensure server is connected for a tool, triggering lazy-start if needed.
@@ -1691,23 +1621,6 @@ class GatewayTools:
                 )
             )
 
-        # Collect stale-update notices from precomputed cache (no network call)
-        stale_updates: list[str] | None = None
-        if self._stale_check_cache and not scoped_advisor:
-            stale = [
-                f"Update available for '{sn}': {current} -> {latest}. "
-                f"Call gateway.update_server(server_name='{sn}') to update."
-                for sn, (_, current, latest, pkg_type) in (
-                    self._stale_check_cache.items()
-                )
-                if current
-                and latest
-                and is_version_newer(current, latest, pkg_type)
-                and self._policy_manager.is_server_allowed(sn)
-            ]
-            if stale:
-                stale_updates = stale
-
         return CatalogSearchOutput(
             results=results,
             total_available=total_available,
@@ -1715,7 +1628,6 @@ class GatewayTools:
             cli_hints=cli_hints,
             registry_candidates=registry_candidates,
             manifest_candidates=manifest_candidates,
-            stale_updates=stale_updates,
         )
 
     async def describe(self, input_data: dict[str, Any]) -> SchemaCard:
@@ -1747,7 +1659,6 @@ class GatewayTools:
                     details={"tool_id": parsed.tool_id},
                 )
 
-        update_warning = await self._get_update_warning(tool_info.server_name)
         self._record_feedback_event(
             "invoke_attempt",
             {
@@ -1829,7 +1740,6 @@ class GatewayTools:
             safety_notes=safety_notes if safety_notes else None,
             invoke_template=invoke_template,
             code_snippet=code_snippet,
-            update_warning=update_warning,
             # No feedback hint on a SUCCESSFUL describe. `_feedback_hint()`
             # opens with "Technical failure detected", which is false here and
             # was reaching every client on every successful describe. The
@@ -1979,7 +1889,6 @@ class GatewayTools:
                 feedback_hint=self._feedback_hint(),
             )
 
-        update_warning = await self._get_update_warning(tool_info.server_name)
 
         # Call the tool
         _call_start = time.monotonic()
@@ -2066,7 +1975,6 @@ class GatewayTools:
                 truncated=processed["truncated"],
                 summary=processed["summary"],
                 raw_size_estimate=processed["raw_size"],
-                update_warning=update_warning,
                 feedback_hint=None,
             )
 
@@ -2101,7 +2009,6 @@ class GatewayTools:
                 truncated=False,
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
-                update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
 
@@ -2150,7 +2057,6 @@ class GatewayTools:
                 truncated=False,
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
-                update_warning=update_warning,
                 auth_state=cast(Any, auth_state),
                 auth_challenge=auth_challenge,
                 next_step="Resolve remote authorization out of band, then retry gateway.invoke."
@@ -2185,7 +2091,6 @@ class GatewayTools:
                     truncated=False,
                     raw_size_estimate=0,
                     errors=["URL-mode elicitation required."],
-                    update_warning=update_warning,
                     auth_state="elicitation_required",
                     url_elicitations=url_elicitations,
                     next_step=url_elicitations[0].next_step,
@@ -2235,7 +2140,6 @@ class GatewayTools:
                 truncated=False,
                 raw_size_estimate=0,
                 errors=[error.model_dump_json()],
-                update_warning=update_warning,
                 auth_state=cast(Any, auth_state),
                 auth_challenge=auth_challenge,
                 next_step="Resolve remote authorization out of band, then retry gateway.invoke."
@@ -3627,48 +3531,6 @@ class GatewayTools:
             return server_config
         return self._discovered_server_configs.get(server_name)
 
-    async def _get_update_warning(self, server_name: str) -> str | None:
-        """Best-effort stale version warning for a server."""
-        server_config = self._get_server_config_for_update(server_name)
-        if not server_config or not server_config.command:
-            return None
-
-        # Require a known local version to compare against.
-        current_version: str | None = None
-        if self._descriptions_cache and server_name in self._descriptions_cache.servers:
-            current_version = self._descriptions_cache.servers[server_name].version
-        if not current_version:
-            return None
-
-        now = time.time()
-        cached = self._stale_check_cache.get(server_name)
-        if cached and (now - cached[0]) < self._stale_check_ttl_seconds:
-            latest_cached = cached[2]
-            cached_pkg_type = cached[3]
-            if latest_cached and is_version_newer(
-                current_version, latest_cached, cached_pkg_type
-            ):
-                return (
-                    f"Update available for '{server_name}': {current_version} -> {latest_cached}. "
-                    f"Call gateway.update_server with server_name='{server_name}'."
-                )
-            return None
-
-        latest, pkg_type = await get_package_version(
-            server_config.command, server_config.args, timeout=3.0
-        )
-        self._stale_check_cache[server_name] = (now, current_version, latest, pkg_type)
-
-        # Pass the ecosystem: npm/cargo publish SemVer, where `-1` is a
-        # PRERELEASE, while PEP 440 reads it as a POST-release. Without this the
-        # ordering inverts for the 79 npm servers in the manifest.
-        if latest and is_version_newer(current_version, latest, pkg_type):
-            return (
-                f"Update available for '{server_name}': {current_version} -> {latest}. "
-                f"Call gateway.update_server with server_name='{server_name}'."
-            )
-        return None
-
     async def _run_update_probe_command(
         self, command: list[str], env: dict[str, str] | None = None
     ) -> tuple[bool, str]:
@@ -4185,7 +4047,6 @@ class GatewayTools:
         """gateway.provision - Start background installation of an MCP server."""
         parsed = ProvisionInput.model_validate(input_data)
         server_name = parsed.server_name
-        update_warning = await self._get_update_warning(server_name)
         self._record_feedback_event("provision_attempt", {"server": server_name})
 
         configured_servers = self._load_configured_servers()
@@ -4197,7 +4058,6 @@ class GatewayTools:
                 status="failed",
                 message=f"Server '{server_name}' is blocked by policy.",
                 auth_state="policy_denied",
-                update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
 
@@ -4225,7 +4085,6 @@ class GatewayTools:
                     )
                     for t in tools[:10]
                 ],
-                update_warning=update_warning,
                 feedback_hint=None,
             )
 
@@ -4247,7 +4106,6 @@ class GatewayTools:
                     auth_state="missing_auth",
                     auth_methods=self._auth_methods_for_server(server_name),
                     next_step=f"gateway.auth_connect(server_name='{server_name}')",
-                    update_warning=update_warning,
                     feedback_hint=self._feedback_hint(),
                 )
             credential_gap = self._configured_duplicate_missing_credential(
@@ -4274,7 +4132,6 @@ class GatewayTools:
                     auth_state="missing_auth",
                     auth_metadata=self._auth_metadata_for_server(manifest_server),
                     next_step=f"gateway.auth_connect(server_name='{server_name}')",
-                    update_warning=update_warning,
                     feedback_hint=self._feedback_hint(),
                 )
             try:
@@ -4295,7 +4152,6 @@ class GatewayTools:
                         auth_state="elicitation_required",
                         next_step=url_elicitations[0].next_step,
                         url_elicitations=url_elicitations,
-                        update_warning=update_warning,
                         feedback_hint=self._feedback_hint(),
                     )
                 raise
@@ -4323,7 +4179,6 @@ class GatewayTools:
                         )
                         for t in tools[:10]
                     ],
-                    update_warning=update_warning,
                     feedback_hint=None,
                 )
 
@@ -4336,7 +4191,6 @@ class GatewayTools:
                     "Run gateway.refresh and check gateway.health for connection errors."
                 ),
                 auth_state="unknown",
-                update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
 
@@ -4355,7 +4209,6 @@ class GatewayTools:
                 message=(
                     f"Server '{server_name}' not found in manifest or .mcp.json configuration."
                 ),
-                update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
 
@@ -4384,7 +4237,6 @@ class GatewayTools:
                     auth_state="missing_auth",
                     auth_metadata=self._auth_metadata_for_server(server_config),
                     next_step=f"gateway.auth_connect(server_name='{server_name}')",
-                    update_warning=update_warning,
                     feedback_hint=self._feedback_hint(),
                 )
 
@@ -4408,7 +4260,6 @@ class GatewayTools:
                         auth_methods=self._auth_methods_for_server(server_name),
                         auth_metadata=self._auth_metadata_for_server(server_config),
                         next_step=f"gateway.auth_connect(server_name='{server_name}')",
-                        update_warning=update_warning,
                         feedback_hint=self._feedback_hint(),
                     )
                 errors = await self._client_manager.connect_all([resolved_config])
@@ -4435,7 +4286,6 @@ class GatewayTools:
                             auth_metadata=self._auth_metadata_for_server(server_config),
                             next_step=url_elicitations[0].next_step,
                             url_elicitations=url_elicitations,
-                            update_warning=update_warning,
                             feedback_hint=self._feedback_hint(),
                         )
                     auth_challenge = self._auth_challenge_from_message(message)
@@ -4459,7 +4309,6 @@ class GatewayTools:
                         auth_challenge=auth_challenge,
                         auth_metadata=self._auth_metadata_for_server(server_config),
                         next_step="Resolve remote authorization out of band, then retry gateway.provision.",
-                        update_warning=update_warning,
                         feedback_hint=self._feedback_hint(),
                     )
 
@@ -4489,7 +4338,6 @@ class GatewayTools:
                         )
                         for t in tools[:10]
                     ],
-                    update_warning=update_warning,
                     feedback_hint=None,
                 )
 
@@ -4507,7 +4355,6 @@ class GatewayTools:
                     auth_state="missing_auth",
                     auth_metadata=self._auth_metadata_for_server(server_config),
                     next_step=f"gateway.auth_connect(server_name='{server_name}')",
-                    update_warning=update_warning,
                     feedback_hint=self._feedback_hint(),
                 )
 
@@ -4526,7 +4373,6 @@ class GatewayTools:
                         auth_metadata=self._auth_metadata_for_server(server_config),
                         next_step=url_elicitations[0].next_step,
                         url_elicitations=url_elicitations,
-                        update_warning=update_warning,
                         feedback_hint=self._feedback_hint(),
                     )
                 logger.error(f"Failed to connect remote server {server_name}: {e}")
@@ -4545,7 +4391,6 @@ class GatewayTools:
                     message=f"Failed to connect remote server '{server_name}': {self._sanitize_error(e)}",
                     auth_state="unknown",
                     auth_metadata=self._auth_metadata_for_server(server_config),
-                    update_warning=update_warning,
                     feedback_hint=self._feedback_hint(),
                 )
 
@@ -4562,7 +4407,6 @@ class GatewayTools:
                 status="started",
                 job_id=job_id,
                 message=f"Installation started for '{server_name}'. Poll gateway.provision_status('{job_id}') for progress.",
-                update_warning=update_warning,
                 feedback_hint=None,
             )
 
@@ -4590,7 +4434,6 @@ class GatewayTools:
                 auth_state="missing_auth",
                 next_step=f"gateway.auth_connect(server_name='{server_name}')",
                 auth_metadata=self._auth_metadata_for_server(server_config),
-                update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
 
@@ -4608,7 +4451,6 @@ class GatewayTools:
                 server=server_name,
                 status="failed",
                 message=self._sanitize_error(e),
-                update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
 
@@ -4627,7 +4469,6 @@ class GatewayTools:
                 server=server_name,
                 status="failed",
                 message=f"Failed to start provisioning '{server_name}': {self._sanitize_error(e)}",
-                update_warning=update_warning,
                 feedback_hint=self._feedback_hint(),
             )
 
@@ -5219,15 +5060,14 @@ class GatewayTools:
             {"server_name": server_name, "force": parsed.force}
         )
 
-        # `desc.version` (an upstream snapshot from the last `pmcp
-        # refresh`/describe pass, not "installed version") is what every stale
-        # "update available" notice emission site reads (_get_update_warning,
-        # catalog_search's stale_updates, the background stale sweep). Only
-        # bump/persist it -- and only clear the memoized stale-check entry --
-        # once the server has actually been restarted onto the new package.
-        # If the restart failed or was refused, the gateway is still serving
-        # the OLD version, so the notice is still telling the truth and must
-        # be left alone.
+        # `desc.version` is an upstream snapshot from the last `pmcp
+        # refresh`/describe pass, NOT the installed version -- pmcp cannot
+        # observe which artifact a running server executes, which is why the
+        # automatic update notices were removed (Consiliency/pmcp#150). It is
+        # still recorded here so the descriptions cache reflects what this
+        # update fetched, and only once the server has actually been restarted
+        # onto the new package: a failed or refused restart means the gateway
+        # is still serving the old version.
         now = time.time()
         if restart_result.ok:
             if latest_version:
@@ -5282,20 +5122,6 @@ class GatewayTools:
                                 f"Failed to persist descriptions cache after updating "
                                 f"'{server_name}': {e}"
                             )
-                # Repopulate (not just pop) with the fresh (current, latest)
-                # pair so catalog_search's stale_updates -- which reads
-                # _stale_check_cache directly -- agrees the server is current
-                # immediately, instead of leaving a hole that a later
-                # _get_update_warning/_run_stale_index recompute would refill
-                # from the (now-stale) descriptions value.
-                self._stale_check_cache[server_name] = (
-                    now,
-                    latest_version,
-                    latest_version,
-                    package_type,
-                )
-            else:
-                self._stale_check_cache.pop(server_name, None)
 
             message = (
                 f"Updated and restarted '{server_name}' ({package_type}:{package_name}); "
