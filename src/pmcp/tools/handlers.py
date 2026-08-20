@@ -81,7 +81,6 @@ from pmcp.manifest.version_checker import (
     _npm_tag,
     detect_package_type,
     get_package_version,
-    is_version_newer,
 )
 from pmcp.policy.policy import PolicyManager
 from pmcp.remote_auth import (
@@ -1888,7 +1887,6 @@ class GatewayTools:
                 errors=[error.model_dump_json()],
                 feedback_hint=self._feedback_hint(),
             )
-
 
         # Call the tool
         _call_start = time.monotonic()
@@ -5068,7 +5066,6 @@ class GatewayTools:
         # update fetched, and only once the server has actually been restarted
         # onto the new package: a failed or refused restart means the gateway
         # is still serving the old version.
-        now = time.time()
         if restart_result.ok:
             if latest_version:
                 if (
