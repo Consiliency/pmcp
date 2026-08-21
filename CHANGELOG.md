@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **SemVer comparison now uses the `semver` library instead of a hand-written
+  key** (new dependency, pure-Python, no transitive dependencies). The npm and
+  Cargo lane needs true SemVer 2.0.0 precedence because PEP 440 disagrees with
+  it — PEP 440 reads `1.0.0-1` as the post-release `1.0.0.post1`, SemVer as a
+  prerelease *below* `1.0.0` — and 79 of the manifest's 107 servers are npm.
+  This module replaced hand-rolled version logic with `packaging` precisely
+  because every hand-rolled form of it produced a fabricated-notice bug; the
+  SemVer lane was the last piece still hand-written.
+
+### Fixed
+- **An all-numeric truncated image digest is no longer misread as a version.**
+  `get_docker_version` truncates SHA-256 to 12 hex characters, which can be all
+  digits — the same shape as a calendar version like `202612180000` — so with
+  no package type the shape alone could not classify it, and a genuinely
+  different image could read as no change. The two values are compared as a
+  pair from one server, so when either side is unmistakably a digest (a hex
+  letter, or the `sha256:` prefix) the all-numeric side is now treated as one
+  too. Calendar versions still order normally.
+- **A `sha256:`-prefixed digest with no hex letter is now recognised.** The
+  pattern required a hex letter even when the prefix was present, so an
+  all-numeric prefixed digest was rejected outright.
+- **The CHANGELOG CI guard no longer treats a failed label lookup as "no
+  label".** A live-lookup failure now falls back to the frozen event payload
+  before concluding the `skip-changelog` label is absent, so an API hiccup
+  cannot block a PR that really was labelled.
+
+
 ### Fixed
 - **`gateway.update_server` no longer risks restarting onto a different package
   than the one it probed.** The tool resolved the server's config, ran an update

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -972,3 +973,104 @@ class TestVersionCheckUrlEscaping:
         )
         assert "org/img%20name" in url
         assert "img name" not in url
+
+
+class TestAllNumericDigestDisambiguation:
+    """Consiliency/pmcp#156 item 3: an all-numeric truncated digest.
+
+    `get_docker_version` truncates SHA-256 to 12 hex chars, which can be all
+    digits -- the same shape as a calendar version. With no package type the
+    shape alone cannot classify it.
+
+    Fail-closed was tried and reverted: refusing to order any bare 12-digit
+    string breaks CalVer, which #155 deliberately supports. The partner value
+    disambiguates instead, since the two are compared as a pair from one server.
+    """
+
+    def test_lettered_partner_promotes_an_all_numeric_digest(self) -> None:
+        """One side unmistakably a digest makes the all-numeric side one too.
+
+        Without this the pair falls through to version parsing and a real image
+        change reads as no change.
+        """
+        assert is_version_newer("987654321098", "abcdef123456") is True
+        assert is_version_newer("abcdef123456", "987654321098") is True
+
+    def test_sha256_prefix_alone_identifies_an_all_numeric_digest(self) -> None:
+        """The `sha256:` prefix names a digest even with no hex letter.
+
+        The digest pattern previously required a hex letter *even when the
+        prefix was present*, so an all-numeric prefixed digest was rejected.
+        """
+        assert is_version_newer("sha256:987654321098", "sha256:123456789012") is True
+        assert is_version_orderable("sha256:987654321098") is True
+
+    def test_same_image_two_spellings_is_not_an_update(self) -> None:
+        """Promotion must not break canonicalisation."""
+        assert is_version_newer("sha256:abcdef123456", "abcdef123456") is False
+
+    def test_calendar_versions_still_order(self) -> None:
+        """The reverted fail-closed would have broken exactly this."""
+        assert is_version_newer("202612180000", "202612190000") is True
+        assert is_version_orderable("202612180000") is True
+
+
+def test_no_unguarded_negation_of_is_version_newer() -> None:
+    """`not is_version_newer(...)` must be gated on `is_version_orderable`.
+
+    Consiliency/pmcp#156 item 2. `is_version_newer` fails closed, so `False`
+    means EITHER "current" OR "unorderable". Negating it collapses those into
+    "up to date".
+
+    This is a recorded regression, not a hypothetical: making the function fail
+    closed silently inverted the existing negated caller in `refresher.py`,
+    which then treated the literal `"unknown"` it persists after a failed
+    lookup as current -- pinning that cache forever. The audit at the time
+    checked all eight call sites for ARITY but not for NEGATION.
+
+    AST rather than grep, so comments and strings that merely mention the
+    pattern do not register.
+    """
+    from pathlib import Path
+
+    src_root = Path(__file__).resolve().parent.parent / "src"
+    offenders: list[str] = []
+
+    for path in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            # Look at whole statements, so a guard in the same `and` chain counts.
+            if not isinstance(node, ast.stmt):
+                continue
+            negated = [
+                child
+                for child in ast.walk(node)
+                if isinstance(child, ast.UnaryOp)
+                and isinstance(child.op, ast.Not)
+                and isinstance(child.operand, ast.Call)
+                and _called_name(child.operand) == "is_version_newer"
+            ]
+            if not negated:
+                continue
+            guarded = any(
+                isinstance(child, ast.Call)
+                and _called_name(child) == "is_version_orderable"
+                for child in ast.walk(node)
+            )
+            if not guarded:
+                offenders.append(f"{path.relative_to(src_root)}:{node.lineno}")
+
+    assert not offenders, (
+        "`not is_version_newer(...)` without an `is_version_orderable(...)` "
+        "guard in the same statement -- an unorderable version will read as "
+        f"up to date: {offenders}"
+    )
+
+
+def _called_name(call: ast.Call) -> str | None:
+    """Name of the function a Call node invokes, plain or attribute."""
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None

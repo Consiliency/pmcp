@@ -213,6 +213,10 @@ jobs:
       - name: Require a CHANGELOG.md entry for src/ changes
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Frozen at trigger time -- the fallback below, not the primary source.
+          # Passed as env rather than interpolated into the script body so a
+          # label's text can never be parsed as shell.
+          PAYLOAD_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
         run: |
           # Query live labels via the API instead of github.event.pull_request.labels.
           # That context is frozen in the event payload at the moment the workflow
@@ -225,9 +229,18 @@ jobs:
           # so it returned "Validation Failed (HTTP 422)". Under `bash -e` that
           # non-zero exit killed the step BEFORE the CHANGELOG check ran, so the
           # guard failed on its own permissions rather than on the PR's content.
-          # `|| true` keeps a future API hiccup from doing the same: a lookup
-          # failure must not decide the check, it just means "no label seen".
+          # `|| true` keeps a future API hiccup from killing the step. But
+          # "lookup failed" is NOT "no label": treating them alike false-blocks
+          # a PR that really was labelled (Consiliency/pmcp#156 item 4). On an
+          # empty result, fall back to the frozen event payload -- stale for a
+          # label applied after the trigger, but strictly better than ignoring
+          # the label outright. Live lookup first, payload second, "no label"
+          # only if both come up empty.
           LABELS=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '.labels[].name' || true)
+          if [ -z "$LABELS" ]; then
+            echo "Live label lookup empty or failed — falling back to the event payload."
+            LABELS=$(printf '%s' "$PAYLOAD_LABELS_JSON" | jq -r '.[]?' 2>/dev/null || true)
+          fi
           echo "Current labels: $LABELS"
           if echo "$LABELS" | grep -qx 'skip-changelog'; then
             echo "skip-changelog label present — skipping the CHANGELOG.md check."
