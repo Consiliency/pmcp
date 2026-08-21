@@ -55,6 +55,8 @@ from pmcp.client.manager import ClientManager
 from pmcp.policy.policy import PolicyManager
 from pmcp.tools.handlers import GatewayTools
 from pmcp.types import RemoteMcpServerConfig, ResolvedServerConfig
+from sse_starlette.sse import AppStatus
+
 from tests.runtime.fake_remote import run_fake_remote
 from tests.runtime.harness import alloc_port, open_socket_fd_count
 
@@ -216,3 +218,38 @@ async def test_ec_p2_7_reconnect_does_not_leak_transports() -> None:
     # The final reconnect-cycle client is closed too, by disconnect_all
     # above rather than by a further reconnect.
     assert prior_clients[-1].is_closed is True  # type: ignore[attr-defined]
+
+
+@pytest.mark.asyncio
+async def test_ec_p2_7_fake_remote_survives_a_pre_latched_appstatus() -> None:
+    """A poisoned `AppStatus.should_exit` must not break the next server.
+
+    Consiliency/pmcp#158. `sse_starlette.sse.AppStatus.should_exit` is a
+    process-global class attribute latched True by uvicorn's shutdown handler
+    and never reset. `run_fake_remote` cleared it on teardown, which protects
+    against its OWN shutdown but not against a server started elsewhere in the
+    interpreter -- `tests/mcp2x/test_listen_over_http.py` and
+    `tests/test_http_dos.py` both stop uvicorn servers, and `tests/mcp2x` sorts
+    immediately before `tests/runtime`.
+
+    Inheriting a latched flag makes every SSE stream end instantly, which is
+    why the leak test above failed intermittently in CI with "SSE stream ended
+    without a response" while passing in isolation locally.
+
+    This latches the flag deliberately -- the state a full-suite run can
+    genuinely produce -- and asserts a connection still works.
+    """
+    AppStatus.should_exit = True
+    manager = ClientManager()
+    try:
+        async with run_fake_remote(
+            alloc_port(), expected_auth_value=AUTH_VALUE
+        ) as remote:
+            config = _config(
+                "fr-latched", remote.mcp_url, headers={"Authorization": AUTH_VALUE}
+            )
+            await manager._connect_streamable_http(config)
+            assert manager._clients["fr-latched"].remote_http_client is not None
+    finally:
+        await manager.disconnect_all()
+        AppStatus.should_exit = False

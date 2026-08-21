@@ -29,6 +29,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A `sha256:`-prefixed digest with no hex letter is now recognised.** The
   pattern required a hex letter even when the prefix was present, so an
   all-numeric prefixed digest was rejected outright.
+- **The intermittent `test_ec_p2_7_reconnect_does_not_leak_transports` failure
+  is fixed at its root.** `sse_starlette.sse.AppStatus.should_exit` is a
+  process-global class attribute that uvicorn's shutdown handler latches `True`
+  and never resets. The fake-remote test server cleared it on teardown, which
+  protects against its own shutdown but not against a server started elsewhere
+  in the same interpreter — and `tests/mcp2x`, which stops uvicorn servers,
+  sorts immediately before `tests/runtime`. Inheriting the latched flag made
+  every SSE stream end instantly, so the test failed in CI while passing in
+  isolation. The flag is now cleared on entry as well as exit, with a test that
+  latches it deliberately and asserts a connection still works.
 - **The CHANGELOG CI guard no longer treats a failed label lookup as "no
   label".** A live-lookup failure now falls back to the frozen event payload
   before concluding the `skip-changelog` label is absent, so an API hiccup
