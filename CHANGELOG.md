@@ -18,14 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SemVer lane was the last piece still hand-written.
 
 ### Fixed
-- **An all-numeric truncated image digest is no longer misread as a version.**
+- **An all-numeric truncated image digest is documented as incomparable
+  without a package type, and callers are now pinned to pass one.**
   `get_docker_version` truncates SHA-256 to 12 hex characters, which can be all
-  digits — the same shape as a calendar version like `202612180000` — so with
-  no package type the shape alone could not classify it, and a genuinely
-  different image could read as no change. The two values are compared as a
-  pair from one server, so when either side is unmistakably a digest (a hex
-  letter, or the `sha256:` prefix) the all-numeric side is now treated as one
-  too. Calendar versions still order normally.
+  digits — the same shape as a calendar version like `202612180000`. Resolving
+  that by guessing (promoting the numeric side when its partner is a digest)
+  was implemented and rejected: the guess fabricates an update when the numeric
+  side really is a calendar version, which is what `is_version_newer`'s
+  fail-closed contract exists to prevent. A mixed pair therefore stays
+  incomparable, and a test now enforces that every caller passes the package
+  type, which is what actually resolves it.
 - **A `sha256:`-prefixed digest with no hex letter is now recognised.** The
   pattern required a hex letter even when the prefix was present, so an
   all-numeric prefixed digest was rejected outright.

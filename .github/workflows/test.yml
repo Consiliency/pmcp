@@ -236,9 +236,16 @@ jobs:
           # label applied after the trigger, but strictly better than ignoring
           # the label outright. Live lookup first, payload second, "no label"
           # only if both come up empty.
-          LABELS=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '.labels[].name' || true)
-          if [ -z "$LABELS" ]; then
-            echo "Live label lookup empty or failed — falling back to the event payload."
+          # Branch on the EXIT STATUS, never on emptiness. A successful lookup
+          # returning zero labels is authoritative -- it means the label was
+          # removed. Falling back to the frozen payload there would resurrect a
+          # deleted `skip-changelog` and silently bypass this guard, which is
+          # worse than the false block the fallback exists to prevent
+          # (ah board review).
+          if LABELS=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '.labels[].name'); then
+            echo "Live label lookup succeeded."
+          else
+            echo "Live label lookup FAILED — falling back to the event payload."
             LABELS=$(printf '%s' "$PAYLOAD_LABELS_JSON" | jq -r '.[]?' 2>/dev/null || true)
           fi
           echo "Current labels: $LABELS"

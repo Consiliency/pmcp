@@ -463,29 +463,25 @@ def _digest_identity(value: str, package_type: str | None = None) -> str | None:
 
 
 # A truncated SHA-256 can be all digits (`987654321098`), and so can a calendar
-# version (`202612180000`). With package_type == "docker" the type settles it;
-# without one the shape alone cannot (Consiliency/pmcp#156 item 3).
+# version (`202612180000`). With `package_type == "docker"` the type settles it;
+# without one, the shape alone cannot (Consiliency/pmcp#156 item 3).
 #
-# Fail-closed was tried here and REVERTED: refusing to order any bare 12-digit
-# string breaks CalVer, which #155 deliberately supports and pins with
-# test_long_numeric_version_is_not_mistaken_for_a_digest. That would trade a
-# live capability for a latent bug -- the issue notes every current caller
-# passes the type.
+# Two resolutions were tried and both REJECTED, so this records why the
+# ambiguity is left in place rather than "fixed":
 #
-# The partner value disambiguates instead. These two are compared as a PAIR
-# from one server, so if either side is unmistakably a digest (a hex letter, or
-# the `sha256:` prefix), the other all-numeric side is a digest too. A
-# truncated digest is all-numeric roughly 1 time in 11,500, so the mixed pair
-# covers essentially the whole real surface; a both-all-numeric pair stays
-# versions, which is also what CalVer needs.
-_ALL_NUMERIC_HEX_RE = re.compile(r"^[0-9]{12}$")
-
-
-def _is_all_numeric_digest_shape(value: str) -> bool:
-    """Bare 12 digits: the shape a digest and a calendar version share."""
-    return bool(_ALL_NUMERIC_HEX_RE.match((value or "").strip()))
-
-
+#   * Fail closed on any bare 12-digit string. Breaks CalVer, which #155
+#     deliberately supports and pins with
+#     test_long_numeric_version_is_not_mistaken_for_a_digest.
+#   * Promote an all-numeric value to a digest when its PARTNER is
+#     unmistakably one. Resolves the ambiguity by GUESSING, and the guess can
+#     fabricate: a genuine CalVer paired with a digest then reports an update
+#     that never happened, which is exactly what the fail-closed contract on
+#     `is_version_newer` exists to prevent (ah board review).
+#
+# So a mixed pair stays incomparable, per the documented contract. The
+# ambiguity is unreachable while callers pass the package type -- both live
+# callers in `refresher.py` do, and
+# `test_all_is_version_newer_callers_pass_package_type` keeps it that way.
 def _parse_version(value: str) -> Version | None:
     """Parse *value* as a release version, or ``None`` if it is not one.
 
@@ -611,15 +607,6 @@ def is_version_newer(
 
     current_digest = _digest_identity(current, package_type)
     latest_digest = _digest_identity(latest, package_type)
-    # One side unmistakably a digest promotes an all-numeric partner, which the
-    # shape alone could not classify. Without this, a real image change reads
-    # as no change (or worse, gets ordered numerically like a version).
-    if latest_digest is not None and current_digest is None:
-        if _is_all_numeric_digest_shape(current):
-            current_digest = current.strip()[:12]
-    elif current_digest is not None and latest_digest is None:
-        if _is_all_numeric_digest_shape(latest):
-            latest_digest = latest.strip()[:12]
     if current_digest is not None or latest_digest is not None:
         # Comparable only when BOTH are digests; then any difference in the
         # CANONICAL identity is a new image. A digest and a version describe

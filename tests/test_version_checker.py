@@ -987,14 +987,21 @@ class TestAllNumericDigestDisambiguation:
     disambiguates instead, since the two are compared as a pair from one server.
     """
 
-    def test_lettered_partner_promotes_an_all_numeric_digest(self) -> None:
-        """One side unmistakably a digest makes the all-numeric side one too.
+    def test_mixed_numeric_and_lettered_pair_stays_incomparable(self) -> None:
+        """An ambiguous pair must NOT be resolved by guessing.
 
-        Without this the pair falls through to version parsing and a real image
-        change reads as no change.
+        Promoting the all-numeric side to a digest because its partner is one
+        was implemented and then rejected in board review: the guess fabricates
+        an update when the numeric side is a genuine calendar version, which is
+        exactly what `is_version_newer`'s fail-closed contract exists to
+        prevent. Incomparable is the correct answer without a package type.
         """
-        assert is_version_newer("987654321098", "abcdef123456") is True
-        assert is_version_newer("abcdef123456", "987654321098") is True
+        assert is_version_newer("202612180000", "abcdef123456") is False
+        assert is_version_newer("abcdef123456", "202612180000") is False
+
+    def test_package_type_resolves_the_ambiguity(self) -> None:
+        """The type is what makes an all-numeric digest orderable."""
+        assert is_version_newer("987654321098", "123456789012", "docker") is True
 
     def test_sha256_prefix_alone_identifies_an_all_numeric_digest(self) -> None:
         """The `sha256:` prefix names a digest even with no hex letter.
@@ -1015,6 +1022,43 @@ class TestAllNumericDigestDisambiguation:
         assert is_version_orderable("202612180000") is True
 
 
+def test_all_is_version_newer_callers_pass_package_type() -> None:
+    """Every `is_version_newer(...)` call must pass a package type.
+
+    The type is what disambiguates an all-numeric truncated digest from a
+    calendar version. Without it the pair is incomparable by design (see
+    TestAllNumericDigestDisambiguation), so a caller that drops the type
+    silently loses update detection for docker servers.
+
+    #156 called that risk latent because every caller passes the type. This
+    pins that, instead of leaving it as a fact that happened to be true when
+    the issue was written.
+    """
+    from pathlib import Path
+
+    src_root = Path(__file__).resolve().parent.parent / "src"
+    offenders: list[str] = []
+
+    for path in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for call in ast.walk(tree):
+            if not isinstance(call, ast.Call):
+                continue
+            if _called_name(call) != "is_version_newer":
+                continue
+            has_type = len(call.args) >= 3 or any(
+                kw.arg == "package_type" for kw in call.keywords
+            )
+            if not has_type:
+                offenders.append(f"{path.relative_to(src_root)}:{call.lineno}")
+
+    assert not offenders, (
+        "`is_version_newer(...)` called without a package_type -- an "
+        "all-numeric image digest becomes indistinguishable from a calendar "
+        f"version and stops being comparable: {offenders}"
+    )
+
+
 def test_no_unguarded_negation_of_is_version_newer() -> None:
     """`not is_version_newer(...)` must be gated on `is_version_orderable`.
 
@@ -1028,6 +1072,16 @@ def test_no_unguarded_negation_of_is_version_newer() -> None:
     lookup as current -- pinning that cache forever. The audit at the time
     checked all eight call sites for ARITY but not for NEGATION.
 
+    Co-occurrence in the statement is NOT enough (ah board review). Both
+    conditions below have to hold, or
+    ``not is_version_newer(a, b) or is_version_orderable(a)`` -- which still
+    enters the "up to date" branch for an unorderable ``a`` -- would pass:
+
+    1. the guard and the negated call share an ``and`` chain, so the guard
+       actually short-circuits the negation rather than sitting in an ``or``;
+    2. the guard's first argument is the same expression as the negated call's
+       first argument, so guarding a DIFFERENT value does not count.
+
     AST rather than grep, so comments and strings that merely mention the
     pattern do not register.
     """
@@ -1039,32 +1093,70 @@ def test_no_unguarded_negation_of_is_version_newer() -> None:
     for path in sorted(src_root.rglob("*.py")):
         tree = ast.parse(path.read_text(), filename=str(path))
         for node in ast.walk(tree):
-            # Look at whole statements, so a guard in the same `and` chain counts.
             if not isinstance(node, ast.stmt):
                 continue
-            negated = [
-                child
-                for child in ast.walk(node)
-                if isinstance(child, ast.UnaryOp)
-                and isinstance(child.op, ast.Not)
-                and isinstance(child.operand, ast.Call)
-                and _called_name(child.operand) == "is_version_newer"
-            ]
-            if not negated:
-                continue
-            guarded = any(
-                isinstance(child, ast.Call)
-                and _called_name(child) == "is_version_orderable"
-                for child in ast.walk(node)
-            )
-            if not guarded:
-                offenders.append(f"{path.relative_to(src_root)}:{node.lineno}")
+            for negation in _negated_is_version_newer(node):
+                assert isinstance(negation.operand, ast.Call)
+                if not negation.operand.args:
+                    continue
+                subject = ast.dump(negation.operand.args[0])
+                if not _guarded_in_and_chain(node, negation, subject):
+                    offenders.append(f"{path.relative_to(src_root)}:{node.lineno}")
 
     assert not offenders, (
-        "`not is_version_newer(...)` without an `is_version_orderable(...)` "
-        "guard in the same statement -- an unorderable version will read as "
-        f"up to date: {offenders}"
+        "`not is_version_newer(x, ...)` without `is_version_orderable(x)` in "
+        "the same `and` chain -- an unorderable version will read as up to "
+        f"date: {offenders}"
     )
+
+
+def _negated_is_version_newer(node: ast.AST) -> list[ast.UnaryOp]:
+    """Every `not is_version_newer(...)` inside *node*."""
+    return [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.UnaryOp)
+        and isinstance(child.op, ast.Not)
+        and isinstance(child.operand, ast.Call)
+        and _called_name(child.operand) == "is_version_newer"
+    ]
+
+
+def _guarded_in_and_chain(node: ast.AST, negation: ast.UnaryOp, subject: str) -> bool:
+    """Whether an `and` chain guards *negation* with `is_version_orderable(subject)`.
+
+    The guard must be a SIBLING operand of the `and` chain, positioned BEFORE
+    the operand holding the negation, and about the same value.
+
+    Sibling-and-before is the whole point, and a looser version of this check
+    accepted the bypass it was written to reject: searching anywhere inside the
+    chain's operands finds a guard nested in an `or` beside the negation
+    (`x and (not is_version_newer(a, b) or is_version_orderable(a))`), which
+    does not short-circuit anything.
+    """
+    for chain in ast.walk(node):
+        if not isinstance(chain, ast.BoolOp) or not isinstance(chain.op, ast.And):
+            continue
+        holder = next(
+            (
+                index
+                for index, value in enumerate(chain.values)
+                if any(negation is child for child in ast.walk(value))
+            ),
+            None,
+        )
+        if holder is None:
+            continue
+        for value in chain.values[:holder]:
+            for call in ast.walk(value):
+                if (
+                    isinstance(call, ast.Call)
+                    and _called_name(call) == "is_version_orderable"
+                    and call.args
+                    and ast.dump(call.args[0]) == subject
+                ):
+                    return True
+    return False
 
 
 def _called_name(call: ast.Call) -> str | None:
