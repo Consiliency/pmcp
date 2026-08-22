@@ -20,8 +20,8 @@ from pmcp.manifest.loader import Manifest, ServerConfig, load_manifest
 from pmcp.manifest.version_checker import (
     detect_package_type,
     get_package_version,
+    are_versions_comparable,
     is_version_newer,
-    is_version_orderable,
 )
 from pmcp.types import (
     DescriptionsCache,
@@ -231,8 +231,7 @@ async def refresh_server(
         # through three earlier rounds).
         if (
             version
-            and is_version_orderable(existing_cache.version, pkg_type)
-            and is_version_orderable(version, pkg_type)
+            and are_versions_comparable(existing_cache.version, version, pkg_type)
             and not is_version_newer(existing_cache.version, version, pkg_type)
         ):
             logger.debug(

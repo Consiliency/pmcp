@@ -18,6 +18,7 @@ from pmcp.manifest.version_checker import (
     get_npm_version,
     get_package_version,
     get_pypi_version,
+    are_versions_comparable,
     is_version_newer,
     is_version_orderable,
 )
@@ -1062,6 +1063,89 @@ def test_all_is_version_newer_callers_pass_package_type() -> None:
     )
 
 
+class TestPairComparability:
+    """`are_versions_comparable` is a PAIR property, not two unary checks.
+
+    Board review of #163 found the earlier both-sides guard still wrong:
+    `"1.0.0"` and `"abcdef123456"` are each individually orderable, so two
+    unary `is_version_orderable` calls both passed -- but a version and a digest
+    are mutually incomparable, `is_version_newer` failed closed to False, and
+    the negation reported "up to date" for a pair it could not order. Reachable
+    because refresh_all reuses a cache entry by server name without checking
+    that the package type still matches.
+    """
+
+    def test_version_against_digest_is_not_comparable(self) -> None:
+        """The case two unary guards let through."""
+        assert is_version_orderable("1.0.0", "docker") is True
+        assert is_version_orderable("abcdef123456", "docker") is True
+        assert are_versions_comparable("1.0.0", "abcdef123456", "docker") is False
+
+    def test_matching_kinds_are_comparable(self) -> None:
+        assert are_versions_comparable("1.0.0", "2.0.0", "npm") is True
+        assert are_versions_comparable("abcdef123456", "abcdef123457", "docker") is True
+
+    def test_unreadable_on_either_side_is_not_comparable(self) -> None:
+        assert are_versions_comparable("1.0.0", "nightly", "npm") is False
+        assert are_versions_comparable("nightly", "1.0.0", "npm") is False
+        assert are_versions_comparable("unknown", "2.0.0", "npm") is False
+
+    def test_incomparable_pairs_are_never_ordered(self) -> None:
+        """The safety invariant: incomparable => `is_version_newer` is False BOTH ways.
+
+        This is what makes `are_versions_comparable` a sound guard. If a pair it
+        rejects could still be ordered, the guard would suppress a real update;
+        if a pair it accepts could not be ordered, the negation would read "up
+        to date" for something incomparable -- the defect this whole predicate
+        exists to close.
+
+        Stated one-directionally on purpose. The converse ("comparable implies
+        one side is newer") is FALSE for equal values, and writing it that way
+        first produced a real failure: `abcdef123456` and
+        `sha256:abcdef123456` are the same image in two spellings, so they are
+        comparable and neither is newer. Textual inequality is not value
+        inequality here.
+        """
+        values = [
+            "1.0.0",
+            "2.0.0",
+            "1.0.0-rc1",
+            "nightly",
+            "unknown",
+            "",
+            "abcdef123456",
+            "abcdef123457",
+            "sha256:abcdef123456",
+            "202612180000",
+        ]
+        for pkg_type in (None, "npm", "cargo", "docker", "pypi"):
+            for current in values:
+                for latest in values:
+                    if are_versions_comparable(current, latest, pkg_type):
+                        continue
+                    assert not is_version_newer(current, latest, pkg_type), (
+                        f"{current!r} -> {latest!r} ({pkg_type!r}) reported newer "
+                        f"despite being incomparable"
+                    )
+                    assert not is_version_newer(latest, current, pkg_type), (
+                        f"{latest!r} -> {current!r} ({pkg_type!r}) reported newer "
+                        f"despite being incomparable"
+                    )
+
+    def test_comparable_pairs_that_differ_are_ordered(self) -> None:
+        """A comparable pair with genuinely different values orders one way."""
+        for current, latest, pkg_type in [
+            ("1.0.0", "2.0.0", "npm"),
+            ("1.0.0-rc1", "1.0.0", "npm"),
+            ("abcdef123456", "abcdef123457", "docker"),
+            ("202612180000", "202612190000", None),
+        ]:
+            assert are_versions_comparable(current, latest, pkg_type) is True
+            assert is_version_newer(current, latest, pkg_type) or is_version_newer(
+                latest, current, pkg_type
+            )
+
+
 def test_no_unguarded_negation_of_is_version_newer() -> None:
     """`not is_version_newer(...)` must be gated on `is_version_orderable`.
 
@@ -1129,25 +1213,27 @@ def test_no_unguarded_negation_of_is_version_newer() -> None:
                 # unorderable FETCHED version fail closed to False and read as
                 # "up to date", which is the very defect this check exists to
                 # catch -- and it survived three rounds of this test.
-                conditions = _guaranteed_conditions(tree, negation)
-                unguarded = [
-                    ast.unparse(arg)
-                    for arg in negation.operand.args[:2]
-                    if not any(
-                        _is_guard_for(condition, ast.dump(arg))
-                        for condition in conditions
-                    )
-                ]
-                if unguarded:
+                # The guard must be the PAIR predicate over the SAME two
+                # operands. Two unary is_version_orderable() calls are not
+                # enough -- a version and a digest are each orderable yet
+                # mutually incomparable, and that gap kept this defect alive
+                # through a whole round of "fixing" it.
+                pair = tuple(ast.dump(a) for a in negation.operand.args[:2])
+                guarded = any(
+                    _is_pair_guard_for(condition, pair)
+                    for condition in _guaranteed_conditions(tree, negation)
+                )
+                if not guarded:
                     offenders.append(
                         f"{path.relative_to(src_root)}:{node.lineno} "
-                        f"(unguarded: {', '.join(unguarded)})"
+                        f"({ast.unparse(negation.operand.args[0])}, "
+                        f"{ast.unparse(negation.operand.args[1])})"
                     )
 
     assert not offenders, (
-        "`not is_version_newer(a, b)` without `is_version_orderable(...)` "
-        "guarding BOTH a and b -- an unorderable version on either side will "
-        f"read as up to date: {offenders}"
+        "`not is_version_newer(a, b)` without `are_versions_comparable(a, b)` "
+        "guarding the SAME pair -- an incomparable pair will read as up to "
+        f"date: {offenders}"
     )
 
 
@@ -1200,14 +1286,14 @@ def _strip(expr: ast.expr) -> ast.expr:
             return expr
 
 
-def _is_guard_for(expr: ast.expr, subject: str) -> bool:
-    """Whether *expr* is exactly `is_version_orderable(subject)`."""
+def _is_pair_guard_for(expr: ast.expr, pair: tuple[str, ...]) -> bool:
+    """Whether *expr* is `are_versions_comparable(a, b)` for exactly *pair*."""
     call = _strip(expr)
     return (
         isinstance(call, ast.Call)
-        and _called_name(call) == "is_version_orderable"
-        and bool(call.args)
-        and ast.dump(call.args[0]) == subject
+        and _called_name(call) == "are_versions_comparable"
+        and len(call.args) >= 2
+        and tuple(ast.dump(a) for a in call.args[:2]) == pair
     )
 
 

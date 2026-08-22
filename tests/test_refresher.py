@@ -637,6 +637,55 @@ class TestUpToDateShortCircuit:
             f"version -- the stale cache would be pinned forever (calls={calls})"
         )
 
+    @pytest.mark.asyncio
+    async def test_incomparable_pair_does_not_short_circuit(
+        self, temp_dir: Path
+    ) -> None:
+        """A cached npm version vs a fetched digest must refresh, not skip.
+
+        The case two unary orderability guards let through: `1.0.0` and
+        `abcdef123456` are each orderable, so both guards passed, but the pair
+        is incomparable, the comparator failed closed, and the negation
+        reported "up to date" -- returning the stale npm cache for what is now
+        a docker server. `refresh_all` reuses a cache entry by server NAME and
+        never checks that the package still matches, which is what makes this
+        reachable.
+        """
+        existing = GeneratedServerDescriptions(
+            package="srv",
+            version="1.0.0",
+            generated_at="2025-01-01T00:00:00Z",
+            capability_summary="stale npm summary",
+            tools=[],
+        )
+        server = ServerConfig(
+            name="srv",
+            description="",
+            keywords=[],
+            install={},
+            command="docker",
+            args=["run", "srv"],
+        )
+        calls: list[tuple] = []
+
+        async def fake_version(command, args, timeout=None):
+            calls.append((command, tuple(args)))
+            return ("abcdef123456", "docker")
+
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=fake_version
+        ):
+            with patch(
+                "mcp.client.stdio.stdio_client",
+                side_effect=RuntimeError("stop after the short-circuit decision"),
+            ):
+                await refresh_server(server, existing_cache=existing)
+
+        assert len(calls) >= 2, (
+            "short-circuited as up-to-date across an incomparable "
+            f"version/digest pair (calls={calls})"
+        )
+
 
 class TestRefreshAll:
     @pytest.mark.asyncio

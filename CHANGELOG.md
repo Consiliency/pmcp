@@ -24,8 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version reading as current — but it checked only the cached side. With a
   cached `1.0.0` and a fetched `nightly`, the guard passed, the comparison
   failed closed, and the negation still reported "up to date", never
-  refreshing. Both sides are now checked, and both checks carry the package
-  type.
+  refreshing.
+
+  Checking each side individually turned out to be insufficient too:
+  comparability is a property of the **pair**. `1.0.0` and `abcdef123456` are
+  each orderable on their own, but a version and a digest cannot be ordered
+  against each other, so the same "up to date" answer came back for a server
+  whose cache entry was reused by name after its package type changed. A new
+  `are_versions_comparable(current, latest, package_type)` asks about the pair,
+  and that is what now guards the short-circuit.
 - **An all-numeric truncated image digest is documented as incomparable
   without a package type, and callers are now pinned to pass one.**
   `get_docker_version` truncates SHA-256 to 12 hex characters, which can be all
