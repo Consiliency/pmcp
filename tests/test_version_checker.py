@@ -982,9 +982,12 @@ class TestAllNumericDigestDisambiguation:
     digits -- the same shape as a calendar version. With no package type the
     shape alone cannot classify it.
 
-    Fail-closed was tried and reverted: refusing to order any bare 12-digit
-    string breaks CalVer, which #155 deliberately supports. The partner value
-    disambiguates instead, since the two are compared as a pair from one server.
+    Two resolutions were tried and both rejected. Fail-closed on any bare
+    12-digit string breaks CalVer, which #155 deliberately supports. Promoting
+    the numeric side when its partner is a digest resolves the ambiguity by
+    guessing, and the guess fabricates an update when the numeric side really
+    is a calendar version. So a mixed pair stays incomparable, and the package
+    type -- which every caller passes -- is what resolves it.
     """
 
     def test_mixed_numeric_and_lettered_pair_stays_incomparable(self) -> None:
@@ -1100,7 +1103,11 @@ def test_no_unguarded_negation_of_is_version_newer() -> None:
                 if not negation.operand.args:
                     continue
                 subject = ast.dump(negation.operand.args[0])
-                if not _guarded_in_and_chain(node, negation, subject):
+                guarded = any(
+                    _is_guard_for(condition, subject)
+                    for condition in _guaranteed_conditions(tree, negation)
+                )
+                if not guarded:
                     offenders.append(f"{path.relative_to(src_root)}:{node.lineno}")
 
     assert not offenders, (
@@ -1122,41 +1129,92 @@ def _negated_is_version_newer(node: ast.AST) -> list[ast.UnaryOp]:
     ]
 
 
-def _guarded_in_and_chain(node: ast.AST, negation: ast.UnaryOp, subject: str) -> bool:
-    """Whether an `and` chain guards *negation* with `is_version_orderable(subject)`.
+def _conjuncts(expr: ast.expr) -> list[ast.expr]:
+    """Sub-expressions that MUST be truthy for *expr* to be truthy.
 
-    The guard must be a SIBLING operand of the `and` chain, positioned BEFORE
-    the operand holding the negation, and about the same value.
-
-    Sibling-and-before is the whole point, and a looser version of this check
-    accepted the bypass it was written to reject: searching anywhere inside the
-    chain's operands finds a guard nested in an `or` beside the negation
-    (`x and (not is_version_newer(a, b) or is_version_orderable(a))`), which
-    does not short-circuit anything.
+    `a and b` contributes both. `a or b` contributes only itself: either side
+    alone can carry it, so neither is guaranteed. That distinction is the whole
+    point -- searching inside an `or` is what let
+    `(ready or is_version_orderable(x)) and not is_version_newer(x, y)` pass two
+    earlier versions of this check.
     """
-    for chain in ast.walk(node):
-        if not isinstance(chain, ast.BoolOp) or not isinstance(chain.op, ast.And):
-            continue
-        holder = next(
-            (
-                index
-                for index, value in enumerate(chain.values)
-                if any(negation is child for child in ast.walk(value))
-            ),
-            None,
-        )
-        if holder is None:
-            continue
-        for value in chain.values[:holder]:
-            for call in ast.walk(value):
-                if (
-                    isinstance(call, ast.Call)
-                    and _called_name(call) == "is_version_orderable"
-                    and call.args
-                    and ast.dump(call.args[0]) == subject
-                ):
-                    return True
-    return False
+    if isinstance(expr, ast.BoolOp) and isinstance(expr.op, ast.And):
+        return [c for value in expr.values for c in _conjuncts(value)]
+    return [expr]
+
+
+def _strip(expr: ast.expr) -> ast.expr:
+    """Unwrap forms whose truthiness is equivalent to their operand's."""
+    while True:
+        if (
+            isinstance(expr, ast.Call)
+            and _called_name(expr) == "bool"
+            and len(expr.args) == 1
+        ):
+            expr = expr.args[0]
+        elif (
+            isinstance(expr, ast.UnaryOp)
+            and isinstance(expr.op, ast.Not)
+            and isinstance(expr.operand, ast.UnaryOp)
+            and isinstance(expr.operand.op, ast.Not)
+        ):
+            expr = expr.operand.operand
+        else:
+            return expr
+
+
+def _is_guard_for(expr: ast.expr, subject: str) -> bool:
+    """Whether *expr* is exactly `is_version_orderable(subject)`."""
+    call = _strip(expr)
+    return (
+        isinstance(call, ast.Call)
+        and _called_name(call) == "is_version_orderable"
+        and bool(call.args)
+        and ast.dump(call.args[0]) == subject
+    )
+
+
+def _guaranteed_conditions(tree: ast.AST, negation: ast.UnaryOp) -> list[ast.expr]:
+    """Conditions that must have held wherever *negation* is evaluated.
+
+    Two sources, both real control flow rather than proximity:
+
+    * an enclosing ``and`` chain -- operands BEFORE the one holding the
+      negation, since a later operand only runs if every earlier one was
+      truthy;
+    * an enclosing ``if`` whose BODY (not ``orelse``) contains the negation.
+
+    Modelling the `if` form matters: a guard in an enclosing `if` is genuinely
+    safe, and an earlier version of this check rejected it, which would have
+    blocked a legitimate refactor.
+    """
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+
+    def contains(node: ast.AST) -> bool:
+        return any(negation is child for child in ast.walk(node))
+
+    conditions: list[ast.expr] = []
+    seen = id(negation)
+    node: ast.AST | None = negation
+    while node is not None:
+        parent = parents.get(id(node))
+        if parent is None:
+            break
+        if isinstance(parent, ast.BoolOp) and isinstance(parent.op, ast.And):
+            holder = next(
+                (i for i, v in enumerate(parent.values) if id(v) == seen), None
+            )
+            if holder is not None:
+                for value in parent.values[:holder]:
+                    conditions.extend(_conjuncts(value))
+        elif isinstance(parent, ast.If) and any(contains(b) for b in parent.body):
+            conditions.extend(_conjuncts(parent.test))
+        seen = id(parent)
+        node = parent
+    return conditions
 
 
 def _called_name(call: ast.Call) -> str | None:

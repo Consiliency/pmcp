@@ -42,12 +42,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   isolation. The flag is now cleared on entry as well as exit, with a test that
   latches it deliberately and asserts a connection still works.
 - **The CHANGELOG CI guard no longer treats a failed label lookup as "no
-  label".** A live-lookup failure now falls back to the frozen event payload
+  label".** A live-lookup *failure* now falls back to the frozen event payload
   before concluding the `skip-changelog` label is absent, so an API hiccup
-  cannot block a PR that really was labelled.
+  cannot block a PR that really was labelled. A lookup that *succeeds* and
+  returns no labels stays authoritative — otherwise removing the label would
+  not re-enable the check.
 
-
-### Fixed
 - **`gateway.update_server` no longer risks restarting onto a different package
   than the one it probed.** The tool resolved the server's config, ran an update
   probe with a 60-second timeout, and then let `gateway.restart_server` resolve

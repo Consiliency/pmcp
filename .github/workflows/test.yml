@@ -229,13 +229,10 @@ jobs:
           # so it returned "Validation Failed (HTTP 422)". Under `bash -e` that
           # non-zero exit killed the step BEFORE the CHANGELOG check ran, so the
           # guard failed on its own permissions rather than on the PR's content.
-          # `|| true` keeps a future API hiccup from killing the step. But
-          # "lookup failed" is NOT "no label": treating them alike false-blocks
-          # a PR that really was labelled (Consiliency/pmcp#156 item 4). On an
-          # empty result, fall back to the frozen event payload -- stale for a
-          # label applied after the trigger, but strictly better than ignoring
-          # the label outright. Live lookup first, payload second, "no label"
-          # only if both come up empty.
+          # A lookup FAILURE is not "no label": treating them alike false-blocks
+          # a PR that really was labelled (Consiliency/pmcp#156 item 4). On
+          # failure, fall back to the frozen event payload -- stale for a label
+          # applied after the trigger, but better than ignoring the label.
           # Branch on the EXIT STATUS, never on emptiness. A successful lookup
           # returning zero labels is authoritative -- it means the label was
           # removed. Falling back to the frozen payload there would resurrect a
