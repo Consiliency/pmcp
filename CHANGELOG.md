@@ -7,7 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **SemVer comparison now uses the `semver` library instead of a hand-written
+  key** (new dependency, pure-Python, no transitive dependencies). The npm and
+  Cargo lane needs true SemVer 2.0.0 precedence because PEP 440 disagrees with
+  it — PEP 440 reads `1.0.0-1` as the post-release `1.0.0.post1`, SemVer as a
+  prerelease *below* `1.0.0` — and 79 of the manifest's 107 servers are npm.
+  This module replaced hand-rolled version logic with `packaging` precisely
+  because every hand-rolled form of it produced a fabricated-notice bug; the
+  SemVer lane was the last piece still hand-written.
+
 ### Fixed
+- **A stale descriptions cache is no longer pinned when the FETCHED version is
+  unreadable.** The "already up to date" short-circuit negates a comparator
+  that fails closed, so an orderability guard was added to stop an unreadable
+  version reading as current — but it checked only the cached side. With a
+  cached `1.0.0` and a fetched `nightly`, the guard passed, the comparison
+  failed closed, and the negation still reported "up to date", never
+  refreshing.
+
+  Checking each side individually turned out to be insufficient too:
+  comparability is a property of the **pair**. `1.0.0` and `abcdef123456` are
+  each orderable on their own, but a version and a digest cannot be ordered
+  against each other, so the same "up to date" answer came back for a server
+  whose cache entry was reused by name after its package type changed. A new
+  `are_versions_comparable(current, latest, package_type)` asks about the pair,
+  and that is what now guards the short-circuit.
+- **An all-numeric truncated image digest is documented as incomparable
+  without a package type, and callers are now pinned to pass one.**
+  `get_docker_version` truncates SHA-256 to 12 hex characters, which can be all
+  digits — the same shape as a calendar version like `202612180000`. Resolving
+  that by guessing (promoting the numeric side when its partner is a digest)
+  was implemented and rejected: the guess fabricates an update when the numeric
+  side really is a calendar version, which is what `is_version_newer`'s
+  fail-closed contract exists to prevent. A mixed pair therefore stays
+  incomparable, and a test now enforces that every caller passes the package
+  type, which is what actually resolves it.
+- **A `sha256:`-prefixed digest with no hex letter is now recognised.** The
+  pattern required a hex letter even when the prefix was present, so an
+  all-numeric prefixed digest was rejected outright.
+- **The intermittent `test_ec_p2_7_reconnect_does_not_leak_transports` failure
+  is fixed at its root.** `sse_starlette.sse.AppStatus.should_exit` is a
+  process-global class attribute that uvicorn's shutdown handler latches `True`
+  and never resets. The fake-remote test server cleared it on teardown, which
+  protects against its own shutdown but not against a server started elsewhere
+  in the same interpreter — and `tests/mcp2x`, which stops uvicorn servers,
+  sorts immediately before `tests/runtime`. Inheriting the latched flag made
+  every SSE stream end instantly, so the test failed in CI while passing in
+  isolation. The flag is now cleared on entry as well as exit, with a test that
+  latches it deliberately and asserts a connection still works.
+- **The CHANGELOG CI guard no longer treats a failed label lookup as "no
+  label".** A live-lookup *failure* now falls back to the frozen event payload
+  before concluding the `skip-changelog` label is absent, so an API hiccup
+  cannot block a PR that really was labelled. A lookup that *succeeds* and
+  returns no labels stays authoritative — otherwise removing the label would
+  not re-enable the check.
+
 - **`gateway.update_server` no longer risks restarting onto a different package
   than the one it probed.** The tool resolved the server's config, ran an update
   probe with a 60-second timeout, and then let `gateway.restart_server` resolve

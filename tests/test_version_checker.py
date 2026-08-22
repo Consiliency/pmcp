@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from pmcp.manifest.version_checker import (
+    _digest_identity,
+    _parse_version,
+    _semver_parse,
     _USER_AGENT,
     _version_cache,
     clear_version_cache,
@@ -17,6 +21,7 @@ from pmcp.manifest.version_checker import (
     get_npm_version,
     get_package_version,
     get_pypi_version,
+    are_versions_comparable,
     is_version_newer,
     is_version_orderable,
 )
@@ -972,3 +977,474 @@ class TestVersionCheckUrlEscaping:
         )
         assert "org/img%20name" in url
         assert "img name" not in url
+
+
+class TestAllNumericDigestDisambiguation:
+    """Consiliency/pmcp#156 item 3: an all-numeric truncated digest.
+
+    `get_docker_version` truncates SHA-256 to 12 hex chars, which can be all
+    digits -- the same shape as a calendar version. With no package type the
+    shape alone cannot classify it.
+
+    Two resolutions were tried and both rejected. Fail-closed on any bare
+    12-digit string breaks CalVer, which #155 deliberately supports. Promoting
+    the numeric side when its partner is a digest resolves the ambiguity by
+    guessing, and the guess fabricates an update when the numeric side really
+    is a calendar version. So a mixed pair stays incomparable, and the package
+    type -- which every caller passes -- is what resolves it.
+    """
+
+    def test_mixed_numeric_and_lettered_pair_stays_incomparable(self) -> None:
+        """An ambiguous pair must NOT be resolved by guessing.
+
+        Promoting the all-numeric side to a digest because its partner is one
+        was implemented and then rejected in board review: the guess fabricates
+        an update when the numeric side is a genuine calendar version, which is
+        exactly what `is_version_newer`'s fail-closed contract exists to
+        prevent. Incomparable is the correct answer without a package type.
+        """
+        assert is_version_newer("202612180000", "abcdef123456") is False
+        assert is_version_newer("abcdef123456", "202612180000") is False
+
+    def test_package_type_resolves_the_ambiguity(self) -> None:
+        """The type is what makes an all-numeric digest orderable."""
+        assert is_version_newer("987654321098", "123456789012", "docker") is True
+
+    def test_sha256_prefix_alone_identifies_an_all_numeric_digest(self) -> None:
+        """The `sha256:` prefix names a digest even with no hex letter.
+
+        The digest pattern previously required a hex letter *even when the
+        prefix was present*, so an all-numeric prefixed digest was rejected.
+        """
+        assert is_version_newer("sha256:987654321098", "sha256:123456789012") is True
+        assert is_version_orderable("sha256:987654321098") is True
+
+    def test_same_image_two_spellings_is_not_an_update(self) -> None:
+        """Promotion must not break canonicalisation."""
+        assert is_version_newer("sha256:abcdef123456", "abcdef123456") is False
+
+    def test_calendar_versions_still_order(self) -> None:
+        """The reverted fail-closed would have broken exactly this."""
+        assert is_version_newer("202612180000", "202612190000") is True
+        assert is_version_orderable("202612180000") is True
+
+
+def test_all_is_version_newer_callers_pass_package_type() -> None:
+    """Every `is_version_newer(...)` call must pass a package type.
+
+    The type is what disambiguates an all-numeric truncated digest from a
+    calendar version. Without it the pair is incomparable by design (see
+    TestAllNumericDigestDisambiguation), so a caller that drops the type
+    silently loses update detection for docker servers.
+
+    #156 called that risk latent because every caller passes the type. This
+    pins that, instead of leaving it as a fact that happened to be true when
+    the issue was written.
+    """
+    from pathlib import Path
+
+    src_root = Path(__file__).resolve().parent.parent / "src"
+    offenders: list[str] = []
+
+    for path in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for call in ast.walk(tree):
+            if not isinstance(call, ast.Call):
+                continue
+            if _called_name(call) != "is_version_newer":
+                continue
+            has_type = len(call.args) >= 3 or any(
+                kw.arg == "package_type" for kw in call.keywords
+            )
+            if not has_type:
+                offenders.append(f"{path.relative_to(src_root)}:{call.lineno}")
+
+    assert not offenders, (
+        "`is_version_newer(...)` called without a package_type -- an "
+        "all-numeric image digest becomes indistinguishable from a calendar "
+        f"version and stops being comparable: {offenders}"
+    )
+
+
+_CORPUS_VALUES = [
+    "1.0.0",
+    "2.0.0",
+    "1.0.0-rc1",
+    "1.0.0-1",
+    "1.0.0+b",
+    "v1.0.0",
+    "0.0.1",
+    "10.0.0",
+    "nightly",
+    "unknown",
+    "",
+    "main",
+    "build-1",
+    "abcdef123456",
+    "abcdef123457",
+    "sha256:abcdef123456",
+    "a" * 64,
+    "987654321098",
+    "123456789012",
+    "202612180000",
+    "202612190000",
+    "1.0",
+    "1.0.0.post1",
+    "2026-08-17-nightly",
+    "01.0.0",
+    "1.0.0-01",
+    "1.0.0-a..b",
+    "  1.0.0  ",
+]
+_CORPUS_TYPES = (None, "npm", "cargo", "docker", "pypi", "cli", "bogus")
+
+
+class TestPairComparability:
+    """`are_versions_comparable` is a PAIR property, not two unary checks.
+
+    Board review of #163 found the earlier both-sides guard still wrong:
+    `"1.0.0"` and `"abcdef123456"` are each individually orderable, so two
+    unary `is_version_orderable` calls both passed -- but a version and a digest
+    are mutually incomparable, `is_version_newer` failed closed to False, and
+    the negation reported "up to date" for a pair it could not order. Reachable
+    because refresh_all reuses a cache entry by server name without checking
+    that the package type still matches.
+    """
+
+    def test_version_against_digest_is_not_comparable(self) -> None:
+        """The case two unary guards let through."""
+        assert is_version_orderable("1.0.0", "docker") is True
+        assert is_version_orderable("abcdef123456", "docker") is True
+        assert are_versions_comparable("1.0.0", "abcdef123456", "docker") is False
+
+    def test_matching_kinds_are_comparable(self) -> None:
+        assert are_versions_comparable("1.0.0", "2.0.0", "npm") is True
+        assert are_versions_comparable("abcdef123456", "abcdef123457", "docker") is True
+
+    def test_unreadable_on_either_side_is_not_comparable(self) -> None:
+        assert are_versions_comparable("1.0.0", "nightly", "npm") is False
+        assert are_versions_comparable("nightly", "1.0.0", "npm") is False
+        assert are_versions_comparable("unknown", "2.0.0", "npm") is False
+
+    def test_incomparable_pairs_are_never_ordered(self) -> None:
+        """The safety invariant: incomparable => `is_version_newer` is False BOTH ways.
+
+        This is what makes `are_versions_comparable` a sound guard. If a pair it
+        rejects could still be ordered, the guard would suppress a real update;
+        if a pair it accepts could not be ordered, the negation would read "up
+        to date" for something incomparable -- the defect this whole predicate
+        exists to close.
+
+        Stated one-directionally on purpose. The converse ("comparable implies
+        one side is newer") is FALSE for equal values, and writing it that way
+        first produced a real failure: `abcdef123456` and
+        `sha256:abcdef123456` are the same image in two spellings, so they are
+        comparable and neither is newer. Textual inequality is not value
+        inequality here.
+        """
+        for pkg_type in _CORPUS_TYPES:
+            for current in _CORPUS_VALUES:
+                for latest in _CORPUS_VALUES:
+                    if are_versions_comparable(current, latest, pkg_type):
+                        continue
+                    assert not is_version_newer(current, latest, pkg_type), (
+                        f"{current!r} -> {latest!r} ({pkg_type!r}) reported newer "
+                        f"despite being incomparable"
+                    )
+                    assert not is_version_newer(latest, current, pkg_type), (
+                        f"{latest!r} -> {current!r} ({pkg_type!r}) reported newer "
+                        f"despite being incomparable"
+                    )
+
+    def test_comparable_pairs_are_always_ordered_or_equal(self) -> None:
+        """The DANGEROUS drift direction, over the same corpus.
+
+        `test_incomparable_pairs_are_never_ordered` skips every pair the
+        predicate accepts, so on its own it cannot catch the failure that
+        actually matters (ah board review): the predicate reporting a pair
+        comparable when `is_version_newer` cannot order it. That is precisely
+        what lets `not is_version_newer(...)` report "up to date" for something
+        incomparable — the defect the predicate exists to close.
+
+        So: for every accepted pair, either one direction is newer, or the two
+        are canonically the SAME value. Canonical identity is computed here
+        independently of the predicate, so the two cannot agree by sharing a
+        bug.
+        """
+
+        def canonical(value: str, pkg_type: str | None) -> object:
+            """Identity of *value*, for deciding whether two spellings agree.
+
+            Must match what `is_version_newer` actually compares, which took
+            two corrections to get right:
+
+            * PARSED, not string form -- `1.0` and `1.0.0` are the same PEP 440
+              release but render differently;
+            * the PUBLIC segment, reparsed -- `is_version_newer` compares
+              `.public` on purpose, since build metadata (`1.0.0+b`) is not a
+              new release, so full `Version` equality reports drift that is not
+              there.
+
+            Both failures were my helper being wrong, not the code. Digests are
+            already canonicalised by `_digest_identity`
+            (`abcdef123456` == `sha256:abcdef123456`).
+            """
+            digest = _digest_identity(value, pkg_type)
+            if digest is not None:
+                return ("digest", digest)
+            if pkg_type in ("npm", "cargo"):
+                parsed = _semver_parse(value)
+                return ("semver", parsed) if parsed is not None else ("raw", value)
+            release = _parse_version(value)
+            if release is None:
+                return ("raw", value)
+            return ("pep440", _parse_version(release.public))
+
+        for pkg_type in _CORPUS_TYPES:
+            for current in _CORPUS_VALUES:
+                for latest in _CORPUS_VALUES:
+                    if not are_versions_comparable(current, latest, pkg_type):
+                        continue
+                    ordered = is_version_newer(
+                        current, latest, pkg_type
+                    ) or is_version_newer(latest, current, pkg_type)
+                    if ordered:
+                        continue
+                    assert canonical(current, pkg_type) == canonical(
+                        latest, pkg_type
+                    ), (
+                        f"({current!r}, {latest!r}, {pkg_type!r}) reported "
+                        f"comparable, but is_version_newer orders it in neither "
+                        f"direction and the two are not the same value -- a "
+                        f"caller negating the comparison would read 'up to date'"
+                    )
+
+    def test_comparable_pairs_that_differ_are_ordered(self) -> None:
+        """A comparable pair with genuinely different values orders one way."""
+        for current, latest, pkg_type in [
+            ("1.0.0", "2.0.0", "npm"),
+            ("1.0.0-rc1", "1.0.0", "npm"),
+            ("abcdef123456", "abcdef123457", "docker"),
+            ("202612180000", "202612190000", None),
+        ]:
+            assert are_versions_comparable(current, latest, pkg_type) is True
+            assert is_version_newer(current, latest, pkg_type) or is_version_newer(
+                latest, current, pkg_type
+            )
+
+
+def test_no_unguarded_negation_of_is_version_newer() -> None:
+    """`not is_version_newer(...)` must be gated on `is_version_orderable`.
+
+    Consiliency/pmcp#156 item 2. `is_version_newer` fails closed, so `False`
+    means EITHER "current" OR "unorderable". Negating it collapses those into
+    "up to date".
+
+    This is a recorded regression, not a hypothetical: making the function fail
+    closed silently inverted the existing negated caller in `refresher.py`,
+    which then treated the literal `"unknown"` it persists after a failed
+    lookup as current -- pinning that cache forever. The audit at the time
+    checked all eight call sites for ARITY but not for NEGATION.
+
+    Co-occurrence in the statement is NOT enough (ah board review). Both
+    conditions below have to hold, or
+    ``not is_version_newer(a, b) or is_version_orderable(a)`` -- which still
+    enters the "up to date" branch for an unorderable ``a`` -- would pass:
+
+    1. the guard and the negated call share an ``and`` chain, so the guard
+       actually short-circuits the negation rather than sitting in an ``or``;
+    2. the guard's first argument is the same expression as the negated call's
+       first argument, so guarding a DIFFERENT value does not count.
+
+    AST rather than grep, so comments and strings that merely mention the
+    pattern do not register.
+
+    Known limitation, stated rather than hidden: this models `and` chains and
+    enclosing `if` tests, NOT early-exit guards. A negative guard that returns
+    early --
+
+        if not is_version_orderable(v):
+            return False
+        ...
+        if not is_version_newer(v, x, t):
+
+    -- is genuinely safe but will trip this test. That is the safe direction to
+    fail (it blocks and asks for a human), but if you hit it legitimately,
+    restructure into the `and` chain or extend `_guaranteed_conditions` to
+    model early exits rather than deleting the assertion.
+
+    It is also UNSOUND in the other direction, and deliberately so rather than
+    silently: it matches on expression syntax, so it accepts a guarded value
+    that is reassigned before the comparison, and a guard whose scope has ended
+    before a closure evaluates it. A syntactic check cannot prove a dataflow
+    property. Consiliency/pmcp#164 replaces the fail-closed boolean with a
+    tri-state result, which makes the hazard unrepresentable and this test
+    unnecessary; treat this as a smoke alarm until then.
+    """
+    from pathlib import Path
+
+    src_root = Path(__file__).resolve().parent.parent / "src"
+    offenders: list[str] = []
+
+    for path in sorted(src_root.rglob("*.py")):
+        tree = ast.parse(path.read_text(), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.stmt):
+                continue
+            for negation in _negated_is_version_newer(node):
+                assert isinstance(negation.operand, ast.Call)
+                if len(negation.operand.args) < 2:
+                    continue
+                # BOTH operands, not just the first. is_version_newer is a
+                # two-sided comparison: guarding only the cached side let an
+                # unorderable FETCHED version fail closed to False and read as
+                # "up to date", which is the very defect this check exists to
+                # catch -- and it survived three rounds of this test.
+                # The guard must be the PAIR predicate over the SAME two
+                # operands. Two unary is_version_orderable() calls are not
+                # enough -- a version and a digest are each orderable yet
+                # mutually incomparable, and that gap kept this defect alive
+                # through a whole round of "fixing" it.
+                if len(negation.operand.args) < 3:
+                    offenders.append(
+                        f"{path.relative_to(src_root)}:{node.lineno} "
+                        f"(no package_type on the comparison)"
+                    )
+                    continue
+                pair = tuple(ast.dump(a) for a in negation.operand.args[:3])
+                guarded = any(
+                    _is_pair_guard_for(condition, pair)
+                    for condition in _guaranteed_conditions(tree, negation)
+                )
+                if not guarded:
+                    offenders.append(
+                        f"{path.relative_to(src_root)}:{node.lineno} "
+                        f"({ast.unparse(negation.operand.args[0])}, "
+                        f"{ast.unparse(negation.operand.args[1])})"
+                    )
+
+    assert not offenders, (
+        "`not is_version_newer(a, b)` without `are_versions_comparable(a, b)` "
+        "guarding the SAME pair -- an incomparable pair will read as up to "
+        f"date: {offenders}"
+    )
+
+
+def _negated_is_version_newer(node: ast.AST) -> list[ast.UnaryOp]:
+    """Every `not is_version_newer(...)` inside *node*."""
+    return [
+        child
+        for child in ast.walk(node)
+        if isinstance(child, ast.UnaryOp)
+        and isinstance(child.op, ast.Not)
+        and isinstance(child.operand, ast.Call)
+        and _called_name(child.operand) == "is_version_newer"
+    ]
+
+
+def _conjuncts(expr: ast.expr) -> list[ast.expr]:
+    """Sub-expressions that MUST be truthy for *expr* to be truthy.
+
+    `a and b` contributes both. `a or b` contributes only itself: either side
+    alone can carry it, so neither is guaranteed. That distinction is the whole
+    point -- searching inside an `or` is what let
+    `(ready or is_version_orderable(x)) and not is_version_newer(x, y)` pass two
+    earlier versions of this check.
+    """
+    if isinstance(expr, ast.BoolOp) and isinstance(expr.op, ast.And):
+        return [c for value in expr.values for c in _conjuncts(value)]
+    return [expr]
+
+
+def _strip(expr: ast.expr) -> ast.expr:
+    """Unwrap forms whose truthiness is equivalent to their operand's."""
+    while True:
+        if (
+            isinstance(expr, ast.Call)
+            and _called_name(expr) == "bool"
+            and len(expr.args) == 1
+        ):
+            expr = expr.args[0]
+        elif (
+            isinstance(expr, ast.UnaryOp)
+            and isinstance(expr.op, ast.Not)
+            and isinstance(expr.operand, ast.UnaryOp)
+            and isinstance(expr.operand.op, ast.Not)
+        ):
+            expr = expr.operand.operand
+        elif isinstance(expr, ast.NamedExpr):
+            # `(ok := guard)` is truthy exactly when `guard` is.
+            expr = expr.value
+        else:
+            return expr
+
+
+def _is_pair_guard_for(expr: ast.expr, pair: tuple[str, ...]) -> bool:
+    """Whether *expr* is `are_versions_comparable(...)` for exactly *pair*.
+
+    The package type is part of the pair, not an optional extra: it decides how
+    both values are classified. `are_versions_comparable("202612180000",
+    "1.0.0")` is True, while the same pair classified as docker is
+    incomparable -- so a guard that drops the type would pass while the
+    comparator beside it fails closed, recreating the unsafe short-circuit
+    (ah board review).
+    """
+    call = _strip(expr)
+    return (
+        isinstance(call, ast.Call)
+        and _called_name(call) == "are_versions_comparable"
+        and len(call.args) >= 3
+        and tuple(ast.dump(a) for a in call.args[:3]) == pair
+    )
+
+
+def _guaranteed_conditions(tree: ast.AST, negation: ast.UnaryOp) -> list[ast.expr]:
+    """Conditions that must have held wherever *negation* is evaluated.
+
+    Two sources, both real control flow rather than proximity:
+
+    * an enclosing ``and`` chain -- operands BEFORE the one holding the
+      negation, since a later operand only runs if every earlier one was
+      truthy;
+    * an enclosing ``if`` whose BODY (not ``orelse``) contains the negation.
+
+    Modelling the `if` form matters: a guard in an enclosing `if` is genuinely
+    safe, and an earlier version of this check rejected it, which would have
+    blocked a legitimate refactor.
+    """
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+
+    def contains(node: ast.AST) -> bool:
+        return any(negation is child for child in ast.walk(node))
+
+    conditions: list[ast.expr] = []
+    seen = id(negation)
+    node: ast.AST | None = negation
+    while node is not None:
+        parent = parents.get(id(node))
+        if parent is None:
+            break
+        if isinstance(parent, ast.BoolOp) and isinstance(parent.op, ast.And):
+            holder = next(
+                (i for i, v in enumerate(parent.values) if id(v) == seen), None
+            )
+            if holder is not None:
+                for value in parent.values[:holder]:
+                    conditions.extend(_conjuncts(value))
+        elif isinstance(parent, ast.If) and any(contains(b) for b in parent.body):
+            conditions.extend(_conjuncts(parent.test))
+        seen = id(parent)
+        node = parent
+    return conditions
+
+
+def _called_name(call: ast.Call) -> str | None:
+    """Name of the function a Call node invokes, plain or attribute."""
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None

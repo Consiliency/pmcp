@@ -20,6 +20,7 @@ from pmcp.manifest.refresher import (
     check_staleness,
     get_cache_path,
     load_descriptions_cache,
+    refresh_server,
     refresh_all,
     save_descriptions_cache,
 )
@@ -574,6 +575,116 @@ class TestCheckStaleness:
                     result = await check_staleness()
                     # No error, but server not flagged as stale
                     assert "server1" not in result
+
+
+class TestUpToDateShortCircuit:
+    """The "already up to date" short-circuit must not fire on unorderable input.
+
+    Consiliency/pmcp#156 item 2. `is_version_newer` fails closed, so `False`
+    means either "current" or "could not be ordered". The short-circuit negates
+    it, and an orderability guard was added to stop an unreadable value reading
+    as current.
+
+    That guard checked only the CACHED side. Board review proved the defect was
+    therefore still live: with a cached `1.0.0` (orderable) and a FETCHED
+    `nightly` (not), the guard passes, the comparator fails closed, and the
+    negation returns "up to date" -- pinning the cache exactly as before.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unorderable_fetched_version_does_not_short_circuit(
+        self, temp_dir: Path
+    ) -> None:
+        """A cached release vs an unorderable fetched version must refresh."""
+        existing = GeneratedServerDescriptions(
+            package="srv",
+            version="1.0.0",
+            generated_at="2025-01-01T00:00:00Z",
+            capability_summary="stale summary",
+            tools=[],
+        )
+        server = ServerConfig(
+            name="srv",
+            description="",
+            keywords=[],
+            install={},
+            command="npx",
+            args=["srv"],
+        )
+
+        calls: list[tuple] = []
+
+        async def fake_version(command, args, timeout=None):
+            calls.append((command, tuple(args)))
+            return ("nightly", "npm")
+
+        # `refresh_server` calls get_package_version ONCE for the up-to-date
+        # check, and again on the refresh path just before connecting. So a
+        # second call is the observable proof it did not short-circuit --
+        # asserting on the return value alone cannot tell "refreshed" from
+        # "returned the stale cache", since both yield a cache object.
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=fake_version
+        ):
+            with patch(
+                "mcp.client.stdio.stdio_client",
+                side_effect=RuntimeError("stop after the short-circuit decision"),
+            ):
+                await refresh_server(server, existing_cache=existing)
+
+        assert len(calls) >= 2, (
+            "short-circuited as up-to-date against an unorderable fetched "
+            f"version -- the stale cache would be pinned forever (calls={calls})"
+        )
+
+    @pytest.mark.asyncio
+    async def test_incomparable_pair_does_not_short_circuit(
+        self, temp_dir: Path
+    ) -> None:
+        """A cached npm version vs a fetched digest must refresh, not skip.
+
+        The case two unary orderability guards let through: `1.0.0` and
+        `abcdef123456` are each orderable, so both guards passed, but the pair
+        is incomparable, the comparator failed closed, and the negation
+        reported "up to date" -- returning the stale npm cache for what is now
+        a docker server. `refresh_all` reuses a cache entry by server NAME and
+        never checks that the package still matches, which is what makes this
+        reachable.
+        """
+        existing = GeneratedServerDescriptions(
+            package="srv",
+            version="1.0.0",
+            generated_at="2025-01-01T00:00:00Z",
+            capability_summary="stale npm summary",
+            tools=[],
+        )
+        server = ServerConfig(
+            name="srv",
+            description="",
+            keywords=[],
+            install={},
+            command="docker",
+            args=["run", "srv"],
+        )
+        calls: list[tuple] = []
+
+        async def fake_version(command, args, timeout=None):
+            calls.append((command, tuple(args)))
+            return ("abcdef123456", "docker")
+
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=fake_version
+        ):
+            with patch(
+                "mcp.client.stdio.stdio_client",
+                side_effect=RuntimeError("stop after the short-circuit decision"),
+            ):
+                await refresh_server(server, existing_cache=existing)
+
+        assert len(calls) >= 2, (
+            "short-circuited as up-to-date across an incomparable "
+            f"version/digest pair (calls={calls})"
+        )
 
 
 class TestRefreshAll:

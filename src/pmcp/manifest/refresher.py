@@ -20,8 +20,8 @@ from pmcp.manifest.loader import Manifest, ServerConfig, load_manifest
 from pmcp.manifest.version_checker import (
     detect_package_type,
     get_package_version,
+    are_versions_comparable,
     is_version_newer,
-    is_version_orderable,
 )
 from pmcp.types import (
     DescriptionsCache,
@@ -219,13 +219,19 @@ async def refresh_server(
 
         # `not is_version_newer(...)` means "not newer", which is NOT the same as
         # "up to date" now that the comparator fails closed: an unorderable
-        # cached version (e.g. the literal "unknown" this function persists
-        # below after a failed lookup) yields False and would pin the stale
-        # cache forever. Require the cached version to be orderable before
-        # trusting "not newer" as up-to-date (board review round 4).
+        # version yields False and would pin the stale cache forever.
+        #
+        # BOTH sides must be orderable, and both checks must carry `pkg_type`.
+        # Guarding only the cached side left the defect live: with
+        # current="1.0.0" (orderable) and latest="nightly" (not), the guard
+        # passed, the comparator failed closed to False, and `not False` read
+        # as up-to-date -- pinning the cache exactly as before. `pkg_type`
+        # matters because it is what makes an all-numeric docker digest
+        # orderable at all (ah board review; the one-sided version shipped
+        # through three earlier rounds).
         if (
             version
-            and is_version_orderable(existing_cache.version)
+            and are_versions_comparable(existing_cache.version, version, pkg_type)
             and not is_version_newer(existing_cache.version, version, pkg_type)
         ):
             logger.debug(

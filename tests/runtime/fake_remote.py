@@ -93,6 +93,19 @@ async def run_fake_remote(
         app, host="127.0.0.1", port=port, log_level="warning", lifespan="on"
     )
     server = uvicorn.Server(config)
+    # Clear the latch on the way IN, not only on the way out
+    # (Consiliency/pmcp#158). The teardown below resets it after this server
+    # stops, but that only protects against OUR OWN shutdown -- it does nothing
+    # about a server started elsewhere in this interpreter that latched the flag
+    # and never cleared it (tests/mcp2x/test_listen_over_http.py and
+    # tests/test_http_dos.py both stop uvicorn servers). `tests/mcp2x` sorts
+    # immediately before `tests/runtime`, so in a full-suite run this server
+    # would start with the flag already True and every SSE stream it served
+    # would end instantly -- "SSE stream ended without a response", the exact
+    # error that made test_ec_p2_7_reconnect_does_not_leak_transports flaky.
+    # Verified by latching the flag directly: connect fails with that message
+    # and succeeds without it.
+    AppStatus.should_exit = False
     task = asyncio.create_task(server.serve())
     try:
         for _ in range(200):
@@ -115,5 +128,6 @@ async def run_fake_remote(
         # never reset. Left alone, every SSE stream created afterwards — in
         # any event loop, against any server — terminates immediately, which
         # poisons whichever test runs next. This is the one site that resets
-        # it; nothing else in the repo should.
+        # it; nothing else in the repo should. It is cleared on entry too, so a
+        # server started elsewhere in this interpreter cannot poison this one.
         AppStatus.should_exit = False
