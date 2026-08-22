@@ -1087,6 +1087,20 @@ def test_no_unguarded_negation_of_is_version_newer() -> None:
 
     AST rather than grep, so comments and strings that merely mention the
     pattern do not register.
+
+    Known limitation, stated rather than hidden: this models `and` chains and
+    enclosing `if` tests, NOT early-exit guards. A negative guard that returns
+    early --
+
+        if not is_version_orderable(v):
+            return False
+        ...
+        if not is_version_newer(v, x, t):
+
+    -- is genuinely safe but will trip this test. That is the safe direction to
+    fail (it blocks and asks for a human), but if you hit it legitimately,
+    restructure into the `and` chain or extend `_guaranteed_conditions` to
+    model early exits rather than deleting the assertion.
     """
     from pathlib import Path
 
@@ -1159,6 +1173,9 @@ def _strip(expr: ast.expr) -> ast.expr:
             and isinstance(expr.operand.op, ast.Not)
         ):
             expr = expr.operand.operand
+        elif isinstance(expr, ast.NamedExpr):
+            # `(ok := guard)` is truthy exactly when `guard` is.
+            expr = expr.value
         else:
             return expr
 
