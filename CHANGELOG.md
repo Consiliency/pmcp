@@ -18,6 +18,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   SemVer lane was the last piece still hand-written.
 
 ### Fixed
+- **A stale descriptions cache is no longer pinned when the FETCHED version is
+  unreadable.** The "already up to date" short-circuit negates a comparator
+  that fails closed, so an orderability guard was added to stop an unreadable
+  version reading as current — but it checked only the cached side. With a
+  cached `1.0.0` and a fetched `nightly`, the guard passed, the comparison
+  failed closed, and the negation still reported "up to date", never
+  refreshing. Both sides are now checked, and both checks carry the package
+  type.
 - **An all-numeric truncated image digest is documented as incomparable
   without a package type, and callers are now pinned to pass one.**
   `get_docker_version` truncates SHA-256 to 12 hex characters, which can be all

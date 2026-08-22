@@ -1101,6 +1101,14 @@ def test_no_unguarded_negation_of_is_version_newer() -> None:
     fail (it blocks and asks for a human), but if you hit it legitimately,
     restructure into the `and` chain or extend `_guaranteed_conditions` to
     model early exits rather than deleting the assertion.
+
+    It is also UNSOUND in the other direction, and deliberately so rather than
+    silently: it matches on expression syntax, so it accepts a guarded value
+    that is reassigned before the comparison, and a guard whose scope has ended
+    before a closure evaluates it. A syntactic check cannot prove a dataflow
+    property. Consiliency/pmcp#164 replaces the fail-closed boolean with a
+    tri-state result, which makes the hazard unrepresentable and this test
+    unnecessary; treat this as a smoke alarm until then.
     """
     from pathlib import Path
 
@@ -1114,20 +1122,32 @@ def test_no_unguarded_negation_of_is_version_newer() -> None:
                 continue
             for negation in _negated_is_version_newer(node):
                 assert isinstance(negation.operand, ast.Call)
-                if not negation.operand.args:
+                if len(negation.operand.args) < 2:
                     continue
-                subject = ast.dump(negation.operand.args[0])
-                guarded = any(
-                    _is_guard_for(condition, subject)
-                    for condition in _guaranteed_conditions(tree, negation)
-                )
-                if not guarded:
-                    offenders.append(f"{path.relative_to(src_root)}:{node.lineno}")
+                # BOTH operands, not just the first. is_version_newer is a
+                # two-sided comparison: guarding only the cached side let an
+                # unorderable FETCHED version fail closed to False and read as
+                # "up to date", which is the very defect this check exists to
+                # catch -- and it survived three rounds of this test.
+                conditions = _guaranteed_conditions(tree, negation)
+                unguarded = [
+                    ast.unparse(arg)
+                    for arg in negation.operand.args[:2]
+                    if not any(
+                        _is_guard_for(condition, ast.dump(arg))
+                        for condition in conditions
+                    )
+                ]
+                if unguarded:
+                    offenders.append(
+                        f"{path.relative_to(src_root)}:{node.lineno} "
+                        f"(unguarded: {', '.join(unguarded)})"
+                    )
 
     assert not offenders, (
-        "`not is_version_newer(x, ...)` without `is_version_orderable(x)` in "
-        "the same `and` chain -- an unorderable version will read as up to "
-        f"date: {offenders}"
+        "`not is_version_newer(a, b)` without `is_version_orderable(...)` "
+        "guarding BOTH a and b -- an unorderable version on either side will "
+        f"read as up to date: {offenders}"
     )
 
 
