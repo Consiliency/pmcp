@@ -9,6 +9,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from pmcp.manifest.version_checker import (
+    _digest_identity,
+    _parse_version,
+    _semver_parse,
     _USER_AGENT,
     _version_cache,
     clear_version_cache,
@@ -1063,6 +1066,39 @@ def test_all_is_version_newer_callers_pass_package_type() -> None:
     )
 
 
+_CORPUS_VALUES = [
+    "1.0.0",
+    "2.0.0",
+    "1.0.0-rc1",
+    "1.0.0-1",
+    "1.0.0+b",
+    "v1.0.0",
+    "0.0.1",
+    "10.0.0",
+    "nightly",
+    "unknown",
+    "",
+    "main",
+    "build-1",
+    "abcdef123456",
+    "abcdef123457",
+    "sha256:abcdef123456",
+    "a" * 64,
+    "987654321098",
+    "123456789012",
+    "202612180000",
+    "202612190000",
+    "1.0",
+    "1.0.0.post1",
+    "2026-08-17-nightly",
+    "01.0.0",
+    "1.0.0-01",
+    "1.0.0-a..b",
+    "  1.0.0  ",
+]
+_CORPUS_TYPES = (None, "npm", "cargo", "docker", "pypi", "cli", "bogus")
+
+
 class TestPairComparability:
     """`are_versions_comparable` is a PAIR property, not two unary checks.
 
@@ -1106,21 +1142,9 @@ class TestPairComparability:
         comparable and neither is newer. Textual inequality is not value
         inequality here.
         """
-        values = [
-            "1.0.0",
-            "2.0.0",
-            "1.0.0-rc1",
-            "nightly",
-            "unknown",
-            "",
-            "abcdef123456",
-            "abcdef123457",
-            "sha256:abcdef123456",
-            "202612180000",
-        ]
-        for pkg_type in (None, "npm", "cargo", "docker", "pypi"):
-            for current in values:
-                for latest in values:
+        for pkg_type in _CORPUS_TYPES:
+            for current in _CORPUS_VALUES:
+                for latest in _CORPUS_VALUES:
                     if are_versions_comparable(current, latest, pkg_type):
                         continue
                     assert not is_version_newer(current, latest, pkg_type), (
@@ -1130,6 +1154,69 @@ class TestPairComparability:
                     assert not is_version_newer(latest, current, pkg_type), (
                         f"{latest!r} -> {current!r} ({pkg_type!r}) reported newer "
                         f"despite being incomparable"
+                    )
+
+    def test_comparable_pairs_are_always_ordered_or_equal(self) -> None:
+        """The DANGEROUS drift direction, over the same corpus.
+
+        `test_incomparable_pairs_are_never_ordered` skips every pair the
+        predicate accepts, so on its own it cannot catch the failure that
+        actually matters (ah board review): the predicate reporting a pair
+        comparable when `is_version_newer` cannot order it. That is precisely
+        what lets `not is_version_newer(...)` report "up to date" for something
+        incomparable — the defect the predicate exists to close.
+
+        So: for every accepted pair, either one direction is newer, or the two
+        are canonically the SAME value. Canonical identity is computed here
+        independently of the predicate, so the two cannot agree by sharing a
+        bug.
+        """
+
+        def canonical(value: str, pkg_type: str | None) -> object:
+            """Identity of *value*, for deciding whether two spellings agree.
+
+            Must match what `is_version_newer` actually compares, which took
+            two corrections to get right:
+
+            * PARSED, not string form -- `1.0` and `1.0.0` are the same PEP 440
+              release but render differently;
+            * the PUBLIC segment, reparsed -- `is_version_newer` compares
+              `.public` on purpose, since build metadata (`1.0.0+b`) is not a
+              new release, so full `Version` equality reports drift that is not
+              there.
+
+            Both failures were my helper being wrong, not the code. Digests are
+            already canonicalised by `_digest_identity`
+            (`abcdef123456` == `sha256:abcdef123456`).
+            """
+            digest = _digest_identity(value, pkg_type)
+            if digest is not None:
+                return ("digest", digest)
+            if pkg_type in ("npm", "cargo"):
+                parsed = _semver_parse(value)
+                return ("semver", parsed) if parsed is not None else ("raw", value)
+            release = _parse_version(value)
+            if release is None:
+                return ("raw", value)
+            return ("pep440", _parse_version(release.public))
+
+        for pkg_type in _CORPUS_TYPES:
+            for current in _CORPUS_VALUES:
+                for latest in _CORPUS_VALUES:
+                    if not are_versions_comparable(current, latest, pkg_type):
+                        continue
+                    ordered = is_version_newer(
+                        current, latest, pkg_type
+                    ) or is_version_newer(latest, current, pkg_type)
+                    if ordered:
+                        continue
+                    assert canonical(current, pkg_type) == canonical(
+                        latest, pkg_type
+                    ), (
+                        f"({current!r}, {latest!r}, {pkg_type!r}) reported "
+                        f"comparable, but is_version_newer orders it in neither "
+                        f"direction and the two are not the same value -- a "
+                        f"caller negating the comparison would read 'up to date'"
                     )
 
     def test_comparable_pairs_that_differ_are_ordered(self) -> None:
@@ -1218,7 +1305,13 @@ def test_no_unguarded_negation_of_is_version_newer() -> None:
                 # enough -- a version and a digest are each orderable yet
                 # mutually incomparable, and that gap kept this defect alive
                 # through a whole round of "fixing" it.
-                pair = tuple(ast.dump(a) for a in negation.operand.args[:2])
+                if len(negation.operand.args) < 3:
+                    offenders.append(
+                        f"{path.relative_to(src_root)}:{node.lineno} "
+                        f"(no package_type on the comparison)"
+                    )
+                    continue
+                pair = tuple(ast.dump(a) for a in negation.operand.args[:3])
                 guarded = any(
                     _is_pair_guard_for(condition, pair)
                     for condition in _guaranteed_conditions(tree, negation)
@@ -1287,13 +1380,21 @@ def _strip(expr: ast.expr) -> ast.expr:
 
 
 def _is_pair_guard_for(expr: ast.expr, pair: tuple[str, ...]) -> bool:
-    """Whether *expr* is `are_versions_comparable(a, b)` for exactly *pair*."""
+    """Whether *expr* is `are_versions_comparable(...)` for exactly *pair*.
+
+    The package type is part of the pair, not an optional extra: it decides how
+    both values are classified. `are_versions_comparable("202612180000",
+    "1.0.0")` is True, while the same pair classified as docker is
+    incomparable -- so a guard that drops the type would pass while the
+    comparator beside it fails closed, recreating the unsafe short-circuit
+    (ah board review).
+    """
     call = _strip(expr)
     return (
         isinstance(call, ast.Call)
         and _called_name(call) == "are_versions_comparable"
-        and len(call.args) >= 2
-        and tuple(ast.dump(a) for a in call.args[:2]) == pair
+        and len(call.args) >= 3
+        and tuple(ast.dump(a) for a in call.args[:3]) == pair
     )
 
 
