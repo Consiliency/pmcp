@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "last_updated": "2026-08-09T08:25:53+00:00",
+  "last_updated": "2026-08-23T05:59:17+00:00",
   "files": {
     "README.md": {
       "purpose": "root project README",
@@ -61,6 +61,10 @@
         "P2",
         "P3B"
       ]
+    },
+    "specs/phase-plans-v12.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
     },
     "specs/phase-plans-v2.md": {
       "purpose": "multi-phase roadmap spec",
@@ -162,6 +166,12 @@
         "P2"
       ]
     },
+    "plans/phase-plan-v11-P3B.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": [
+        "P3B"
+      ]
+    },
     "plans/phase-plan-v11-P5.md": {
       "purpose": "per-phase lane plan",
       "touched_by_phases": []
@@ -171,6 +181,14 @@
       "touched_by_phases": []
     },
     "plans/phase-plan-v11-PG.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v12-FANOUT.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v12-TRISTATE.md": {
       "purpose": "per-phase lane plan",
       "touched_by_phases": []
     },
@@ -337,18 +355,6 @@
     "plans/v7-issue-tracker.md": {
       "purpose": "markdown document",
       "touched_by_phases": []
-    },
-    "SPEC_COMPLIANCE.md": {
-      "purpose": "MCP specification compliance tracking matrix",
-      "touched_by_phases": [
-        "P3B"
-      ]
-    },
-    "plans/phase-plan-v11-P3B.md": {
-      "purpose": "per-phase lane plan",
-      "touched_by_phases": [
-        "P3B"
-      ]
     }
   }
 }

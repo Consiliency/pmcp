@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **`version_checker.compare_versions(current, latest, package_type)` is now the
+  sole version-classification path; `is_version_newer` and
+  `are_versions_comparable` are deleted, not deprecated.** The old pair
+  answered "is X newer" and "can X and Y be ordered at all" as two separate
+  booleans, and `is_version_newer` failed closed, so its `False` meant either
+  "up to date" or "cannot be ordered" — the same ambiguity `are_versions_comparable`
+  existed to guard against. A caller combining them as
+  `are_versions_comparable(...) and not is_version_newer(...)`, or skipping the
+  guard and just negating, collapsed those two meanings back into one `False`.
+  That exact collapse shipped three times (#155, #156, #163), and an AST lint
+  written to police the pattern was bypassed by reviewers four times, because a
+  syntactic check cannot prove a dataflow property. `compare_versions` returns
+  a three-way `Literal["newer", "not_newer", "incomparable"]` instead, so a
+  caller has to name the branch it means. Deleting the two wrappers — rather
+  than leaving them as deprecated aliases — is what makes the collapse
+  unrepresentable instead of merely detectable: a function that no longer
+  exists cannot be negated into the old ambiguity. The AST lint is deleted
+  with them, since there is nothing left for it to police. `is_version_orderable`
+  is unaffected and remains. Behavior is unchanged: all prerelease ordering,
+  SemVer-vs-PEP 440 disagreement on `1.0.0-1`, build-metadata, digest
+  canonicalization, CalVer, and mixed version/digest cases classify identically
+  to before.
+
 ## [2.2.1] - 2026-08-23
 
 ### Changed
