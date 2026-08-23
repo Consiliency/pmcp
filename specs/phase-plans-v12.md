@@ -41,7 +41,7 @@ The v12 addition is one edge: the downstream read loop already parses every inbo
 ## Assumptions (fail-loud if wrong)
 
 1. `SubscriptionBus` and `CatalogEventSink` can carry a downstream-originated event without schema change — the client-visible payload is the same `notifications/*/list_changed` regardless of who caused it. **This says nothing about whether the catalog behind that payload is correct; see FANOUT's reconciliation requirement, which is the phase's real content.**
-2. ~~The downstream read loop sees notification frames at all.~~ **Verified during review, and it is no longer an assumption.** `_handle_stdout_line` (`manager.py:1760`) parses every frame; a notification carries no `id`, so `msg_id is not None` is false and it falls through with no `else` — seen, then dropped. The SSE loop (`manager.py:~1986`) has the *same* shape. Both are confirmed insertion points, and **there are two of them, not one** — a fan-out wired into only the stdio path leaves every remote server silent.
+2. ~~The downstream read loop sees notification frames at all.~~ **Verified during review, and it is no longer an assumption.** `_handle_stdout_line` (`manager.py:1760`) parses every frame; a notification carries no `id`, so `msg_id is not None` is false and it falls through with no `else` — seen, then dropped. The SSE loop (`manager.py:~1986`) has the *same* shape. Both are confirmed insertion points, and **there are two of them, not one** — a fan-out wired into only the stdio path leaves every remote server silent. The remote path is reachable too: mcp 2.x opens the standalone GET stream for server-initiated messages on `notifications/initialized` (SDK `streamable_http.py:566`), which pmcp sends in `_send_initialize` (`manager.py:2185`). **Cited, not assumed — no phase-zero probe needed.** Note `tests/runtime/fake_remote.py` drives only the remote loop, so the stdio path needs its own test.
 3. `refresher.py` and `handlers.py` remain the only consumers of the version-comparison API. A new consumer appearing mid-roadmap changes the migration surface.
 4. No downstream server in the manifest depends on the gateway silently dropping its notifications.
 
@@ -68,17 +68,18 @@ The v12 addition is one edge: the downstream read loop already parses every inbo
 Replace the fail-closed boolean `is_version_newer` with a tri-state result so "incomparable" cannot be collapsed into "up to date" by negation, and delete the syntactic lint that exists only to police that collapse.
 
 **Exit criteria**
-- [ ] EC-TRISTATE-1 — `compare_versions(current, latest, package_type)` returns one of exactly three values (`newer`, `not_newer`, `incomparable`) and is the single classification path; `is_version_newer` and `are_versions_comparable` remain as thin wrappers over it, so the three cannot drift.
+- [ ] EC-TRISTATE-1 — `compare_versions(current, latest, package_type)` returns one of exactly three values (`newer`, `not_newer`, `incomparable`) and is the **only** classification path.
 - [ ] EC-TRISTATE-2 — Both `refresher.py` call sites consume the tri-state directly, and the "already up to date" short-circuit fires only on an explicit `not_newer`. Proven by a test that is RED when the short-circuit treats `incomparable` as up-to-date.
-- [ ] EC-TRISTATE-3 — `test_no_unguarded_negation_of_is_version_newer` is **deleted**, and its deletion is safe because no reachable code path can negate a tri-state into "up to date". A test asserts no `src/` call site negates `is_version_newer` at all.
-- [ ] EC-TRISTATE-4 — The wrapper/primary agreement is pinned across the existing 28-value × 7-type corpus: `compare_versions` returning `incomparable` implies `is_version_newer` is False in both directions, and the corpus test fails when drift is injected into either.
+- [ ] EC-TRISTATE-3 — **`is_version_newer` and `are_versions_comparable` are deleted outright**, along with `test_no_unguarded_negation_of_is_version_newer`. Not kept as wrappers and policed — *deleted*. A function that does not exist cannot be negated, which is the difference between unrepresentable and merely detectable. They may exist as intra-phase migration shims; the criterion is their removal by phase end.
+- [ ] EC-TRISTATE-4 — `compare_versions` is pinned against the existing 28-value × 7-type corpus in its own right: every pair classified `incomparable` is ordered in neither direction, every `newer` pair reverses to `not_newer`, and the test fails when drift is injected. (This is no longer a *wrapper-agreement* test — with EC-TRISTATE-3 there are no wrappers to agree with.)
 - [ ] EC-TRISTATE-5 — Full suite, ruff, mypy green; CHANGELOG records the new API and the lint's removal.
 
 **Scope notes**
 - Decompose into 3 lanes. Lane A owns `src/pmcp/manifest/version_checker.py` (the tri-state and the two wrappers). Lane B owns `src/pmcp/manifest/refresher.py` (both call sites). Lane C owns `tests/` (corpus, drift, lint deletion).
 - **Publish the `Literal` return type as an intra-phase freeze on day 1** so Lane B and Lane C start against the contract instead of waiting for Lane A's body.
 - Lanes A and B share no file. Lane B is the only writer of `refresher.py` in this phase, which is why UPDPATH must follow rather than run beside it.
-- **The wrappers are the risk, not the tri-state, and the panel pushed to delete them outright.** The counter-argument is real: keeping `is_version_newer` preserves the exact negatable boolean the phase exists to remove, and a lint is what failed four times. The roadmap keeps it, narrowly, because it has **zero `src/` callers after Lane B** — it survives only for tests and any out-of-tree consumer — and EC-TRISTATE-3 asserts no `src/` call site negates it *at all*, which is a stronger and far simpler property than the deleted lint tried to prove. **If Lane A finds the wrapper has even one production caller left, delete it instead and update EC-TRISTATE-1.**
+- **The wrappers are deleted, and this reverses the first draft.** That draft kept `is_version_newer` and policed it with a test asserting no `src/` call site negates it. The panel overturned it on the roadmap's own principle, and the argument is decisive: **that replacement test is itself syntactic.** It misses `f = is_version_newer; not f(...)`, `x == False`, and `if is_version_newer(...): ... else: <treat as up to date>` — the last of which reproduces the collapse with no negation at all. That is exactly the #163 lesson ("a syntactic check cannot prove a dataflow property") applied to the lint's own replacement; a smaller lint inherits the same unsoundness with fewer lines. Retention also cost a drift corpus maintained for a function nothing calls.
+- **The compatibility argument does not hold.** pmcp's public surface is its MCP tool schemas, not this internal module. Grep-verified: the only `src/` consumers today are `refresher.py:235` and `:435`, both migrated by EC-TRISTATE-2, leaving zero callers. `is_version_orderable` stays — it answers a genuinely unary question and is correctly scoped as a non-goal.
 - The known limitations documented in the existing lint (early-exit guards, reassigned values, closure scope) are the reason it is being deleted rather than extended. Do not port them forward.
 
 **Non-goals**
@@ -96,7 +97,7 @@ Replace the fail-closed boolean `is_version_newer` with a tri-state result so "i
 - (none)
 
 **Produces**
-- IF-0-TRISTATE-1 — `compare_versions(current: str, latest: str, package_type: str | None) -> Literal["newer", "not_newer", "incomparable"]`, plus the guarantee that `is_version_newer(a, b, t)` is exactly `compare_versions(a, b, t) == "newer"`.
+- IF-0-TRISTATE-1 — `compare_versions(current: str, latest: str, package_type: str | None) -> Literal["newer", "not_newer", "incomparable"]`. This is the whole contract: after this phase there is no boolean form to keep in agreement with it.
 
 ### Phase 2 — Update-path identity and environment contracts (UPDPATH)
 
@@ -109,7 +110,7 @@ Close the two remaining correctness gaps in the update path: a refresh short-cir
 - [ ] EC-UPDPATH-3 — `refresh_all`'s by-name cache lookup carries package identity, so a caller assembling the pair itself cannot bypass EC-UPDPATH-1.
 - [ ] EC-UPDPATH-6 — **`check_staleness` gets the same identity gate.** It is a third site (`refresher.py:426`) pairing `existing_cache.servers` with `manifest.get_server(name)` by name and comparing versions only, and it backs `pmcp refresh --check-versions`. Without this, a cache for `old-package@2.0.0` against a config for `new-package@1.0.0` reports "All cached descriptions are up to date" at the CLI. Proven by a CLI-level regression test, not just a unit test.
 - [ ] EC-UPDPATH-7 — A cache entry whose `package` field is **absent** (written before 2.2.1) does not crash and does not silently pass the identity gate; it forces a refresh.
-- [ ] EC-UPDPATH-4 — The ambient-environment contract for `gateway.update_server` is **documented and pinned by a test**: a credential rotated during the probe window is picked up by the restarted server rather than frozen to the probe's snapshot, and the CHANGELOG/README state this is intended.
+- [ ] EC-UPDPATH-4 — The ambient-environment contract is **documented and pinned by a test**: a credential rotated during the probe window is picked up by the restarted server rather than frozen to the probe's snapshot. The docs frame this as **"`update_server` follows the same live-environment contract as every other spawn path"** — connect, refresh and auto-reconnect all use live `os.environ` — so the documented invariant is the *uniformity*, not a probe-window special case.
 - [ ] EC-UPDPATH-5 — Full suite, ruff, mypy green; CHANGELOG records both fixes.
 
 **Scope notes**
@@ -147,7 +148,8 @@ When a downstream server announces its catalog changed, **re-fetch and reconcile
 - [ ] EC-FANOUT-3 — Both dispatch paths are wired: **stdio** (`_handle_stdout_line`) and **SSE/remote** (`_read_sse`). A test proves fan-out for each transport independently; covering one and not the other is the expected failure.
 - [ ] EC-FANOUT-4 — Publishing is suppressed when reconciliation finds **no actual change**, so a chatty downstream server cannot spam subscribed clients with `list_changed` for a catalog that did not move.
 - [ ] EC-FANOUT-5 — The same holds for `resources/list_changed` and `prompts/list_changed`, and an unrecognised `notifications/*` method is a no-op that neither raises nor kills the read loop.
-- [ ] EC-FANOUT-6 — Reconciliation cannot stall or deadlock the read loop. Re-indexing issues `tools/list` **to the same downstream connection** whose reader is handling the notification, which is a self-deadlock risk, not a hypothetical one. Proven by a test that emits a notification and asserts an unrelated request **on that same downstream** still completes.
+- [ ] EC-FANOUT-6 — Reconciliation runs as a **spawned, per-server-coalesced background task**, never inline in the dispatch path. This is not a style preference: `_index_capabilities` awaits `_send_request` (`manager.py:1292`), and those futures are resolved by the very read loop that received the notification (`pending.future.set_result` at **`:1791`** and **`:2010`** — the two dispatch functions). An inline await deadlocks **instantly**. Coalescing bounds a downstream that spams `list_changed` to one in-flight re-index per server. Proven by a test that emits a notification and asserts an unrelated request **on that same downstream** still completes.
+- [ ] EC-FANOUT-9 — **After a real downstream emission, a client fetching through the gateway sees the change.** A tool the downstream server added is returned by `gateway.catalog_search` and is invocable via `gateway.invoke`. This is the criterion that catches a forward-to-sink implementation, which would satisfy every notification-shaped criterion above while the gateway still served the old catalog — `get_tool` reads `self._tools` (`manager.py:2698`), populated only by `_index_tools`. It is also the only criterion that catches the inline-await deadlock in EC-FANOUT-6, because a deadlocked re-index never refreshes the catalog.
 - [ ] EC-FANOUT-7 — JSON-RPC `error` objects preserve `code` and `data` alongside `message` in **both** dispatch paths, replacing both `TODO(post-P3B)` markers. Scoped to the `ClientManager` boundary: `gateway.invoke` maps every exception to `E302` through `str(e)`, and surfacing typed errors to MCP clients would change a `gateway.*` contract, which this roadmap forbids. A follow-up issue records that gap rather than smuggling it in.
 - [ ] EC-FANOUT-8 — Full suite, ruff, mypy green; CHANGELOG documents downstream fan-out as new client-visible behaviour and the typed errors as an internal fix.
 
@@ -182,7 +184,7 @@ When a downstream server announces its catalog changed, **re-fetch and reconcile
 
 ## Top Interface-Freeze Gates
 
-- **IF-0-TRISTATE-1** — `compare_versions(current: str, latest: str, package_type: str | None) -> Literal["newer", "not_newer", "incomparable"]`, with `is_version_newer(a, b, t) == (compare_versions(a, b, t) == "newer")` and `are_versions_comparable(a, b, t) == (compare_versions(a, b, t) != "incomparable")`. UPDPATH's Lane A consumes this.
+- **IF-0-TRISTATE-1** — `compare_versions(current: str, latest: str, package_type: str | None) -> Literal["newer", "not_newer", "incomparable"]`, the sole classification path. `is_version_newer` and `are_versions_comparable` are deleted by phase end (EC-TRISTATE-3), so there is no boolean form to keep in agreement. UPDPATH's Lane A consumes this.
 - **IF-0-FANOUT-1** — The downstream-event contract: which downstream `notifications/*` method maps to which `CatalogEventSink` call, the **reconcile-then-publish** ordering, the **suppress-if-unchanged** rule, and the no-op guarantee for unrecognised methods. FANOUT's Lanes B and D consume this on day 1.
 
 ## Phase Dependency DAG
@@ -217,13 +219,15 @@ uv run pytest -q                                   # 2568 baseline + new; 0 fail
 uv run ruff check . && uv run ruff format --check src/ tests/ && uv run mypy src
 
 # TRISTATE: the collapse is unrepresentable, and the lint is gone.
-# Do NOT grep for this. Two drafts of this command were wrong: a bare grep
-# false-fails on `refresher.py:220` (a comment), and narrowing to `^[^#]*`
-# still false-fails on `version_checker.py:560` and `:614`, which are
-# DOCSTRING lines and do not start with `#`. Distinguishing a call from prose
-# needs a parse, which is what the acceptance test already does -- run it
-# instead of reimplementing it badly in the recipe.
-uv run pytest tests/test_version_checker.py -q -k 'negates_is_version_newer'
+# With EC-TRISTATE-3 the function is GONE, so the check is import-time, not a
+# grep and not a lint. Two earlier drafts of this line were wrong: one named a
+# test file that has never existed, and a narrowed grep still matched docstring
+# lines at `version_checker.py:560` and `:614`. Absence is the assertion.
+uv run python -c "
+import pmcp.manifest.version_checker as v
+assert not hasattr(v, 'is_version_newer'), 'the negatable boolean is back'
+assert not hasattr(v, 'are_versions_comparable'), 'the pair wrapper is back'
+print('  wrappers absent')"
 uv run pytest tests/test_version_checker.py -q -k 'compare_versions or corpus'
 
 # UPDPATH: package identity gates the short-circuit.
