@@ -2,13 +2,9 @@
   "version": 1,
   "last_updated": "2026-08-23T05:59:17+00:00",
   "files": {
-    "README.md": {
-      "purpose": "root project README",
-      "touched_by_phases": [
-        "P5",
-        "P2",
-        "P3B"
-      ]
+    ".claude/plans/ticklish-inventing-stearns.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
     },
     "CHANGELOG.md": {
       "purpose": "release changelog",
@@ -26,6 +22,14 @@
         "P5"
       ]
     },
+    "README.md": {
+      "purpose": "root project README",
+      "touched_by_phases": [
+        "P5",
+        "P2",
+        "P3B"
+      ]
+    },
     "SECURITY.md": {
       "purpose": "security policy",
       "touched_by_phases": [
@@ -34,73 +38,11 @@
         "P3B"
       ]
     },
-    ".claude/plans/ticklish-inventing-stearns.md": {
-      "purpose": "markdown document",
-      "touched_by_phases": []
-    },
-    "specs/README.md": {
-      "purpose": "root project README",
-      "touched_by_phases": []
-    },
-    "specs/active/pmcp-gateway-orchestration-plan.md": {
-      "purpose": "markdown document",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v1.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v10.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v11.md": {
-      "purpose": "multi-phase roadmap spec",
+    "SPEC_COMPLIANCE.md": {
+      "purpose": "MCP specification compliance tracking matrix",
       "touched_by_phases": [
-        "P1",
-        "P2",
         "P3B"
       ]
-    },
-    "specs/phase-plans-v12.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v2.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v3.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v4.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v5.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v6.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v7.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v8.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v9.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/tenant-code-mode-host-contract.md": {
-      "purpose": "markdown document",
-      "touched_by_phases": []
     },
     "plans/HANDOFF-agent-board-mcp-registration.md": {
       "purpose": "markdown document",
@@ -353,6 +295,70 @@
       "touched_by_phases": []
     },
     "plans/v7-issue-tracker.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "specs/README.md": {
+      "purpose": "root project README",
+      "touched_by_phases": []
+    },
+    "specs/active/pmcp-gateway-orchestration-plan.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v1.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v10.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v11.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": [
+        "P1",
+        "P2",
+        "P3B"
+      ]
+    },
+    "specs/phase-plans-v12.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v2.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v3.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v4.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v5.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v6.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v7.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v8.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v9.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/tenant-code-mode-host-contract.md": {
       "purpose": "markdown document",
       "touched_by_phases": []
     }
