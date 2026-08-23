@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-08-23
+
 ### Changed
 - **SemVer comparison now uses the `semver` library instead of a hand-written
   key** (new dependency, pure-Python, no transitive dependencies). The npm and
@@ -93,7 +95,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   This matters more since 2.2.0: with the automatic update notices removed,
   `gateway.update_server` is the only update path.
-
 
 ## [2.2.0] - 2026-08-20
 
