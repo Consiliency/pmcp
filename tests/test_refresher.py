@@ -580,10 +580,16 @@ class TestCheckStaleness:
 class TestUpToDateShortCircuit:
     """The "already up to date" short-circuit must not fire on unorderable input.
 
-    Consiliency/pmcp#156 item 2. `is_version_newer` fails closed, so `False`
-    means either "current" or "could not be ordered". The short-circuit negates
-    it, and an orderability guard was added to stop an unreadable value reading
-    as current.
+    Consiliency/pmcp#156 item 2, retained after the tri-state migration.
+    Historically `is_version_newer` failed closed, so `False` meant either
+    "current" or "could not be ordered"; the short-circuit negated it, and an
+    orderability guard was bolted on to stop an unreadable value reading as
+    current. That function no longer exists (Consiliency/pmcp#164) -- the
+    short-circuit now tests `compare_versions(...) == "not_newer"`, so an
+    `incomparable` pair simply is not `not_newer` and falls through to a
+    refresh. This test is kept because the OUTCOME it pins is the same one
+    that defect produced, and it must keep holding under the new
+    representation.
 
     That guard checked only the CACHED side. Board review proved the defect was
     therefore still live: with a cached `1.0.0` (orderable) and a FETCHED
