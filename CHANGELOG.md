@@ -64,10 +64,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offers **zero** entries is a genuine answer — the server emptied that kind —
   and still clears the entries and publishes.
 
+  A reply the gateway cannot read is a failed listing too, and an **absent**
+  collection is not an empty one. A `tools/list` reply of `{}` — missing the
+  `tools` array the protocol requires — is malformed, not an announcement that
+  the server has no tools, and the same goes for a reply carrying something
+  other than an array in its place (`{"tools": {}}`, `{"tools": null}`). Each
+  of those now keeps the kind's previous entries and publishes nothing, exactly
+  like a request that failed; only a genuine array is an answer, and an empty
+  array still clears. Per kind, still: an unreadable `tools` reply no longer
+  costs an honest `resources` answer arriving in the same pass.
+
+  A catalog entry carrying no identity fails to parse rather than acquiring
+  one. A resource with no `uri`, or a prompt or tool with no `name` (or an
+  empty one), used to be indexed under a synthesized identifier of the form
+  `server::` — a catalog entry the downstream never offered, which replaced the
+  real entries and was published as a change. Such an entry is now skipped like
+  any other unparseable one, and a listing of nothing but those falls under the
+  all-unparseable rule above and keeps the previous entries.
+
   Failure classification is conservative by design. Any failure to list a kind
-  — a transport error, a server that does not implement it, or a listing that
-  could not be parsed at all — keeps that kind's previous entries; only an
-  explicit empty answer clears them. The accepted cost is the mirror case: a
+  — a transport error, a server that does not implement it, a reply whose
+  collection is absent or is not an array, or a listing that could not be
+  parsed at all — keeps that kind's previous entries; only an explicit empty
+  answer clears them. The accepted cost is the mirror case: a
   server that drops a capability mid-session and never reconnects keeps stale
   entries in the catalog, which then fail loudly at invoke time. That is the
   deliberate trade — a stale entry that errors when called is recoverable and
