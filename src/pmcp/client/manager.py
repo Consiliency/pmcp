@@ -488,6 +488,74 @@ def _entry_label(entry: Any, key: str = "name") -> str:
     return repr(entry)[:120]
 
 
+def _required_identity(entry: Any, key: str) -> str:
+    """The identity a catalog entry cannot be indexed without.
+
+    Raises rather than defaulting, and that is the whole point. `entry.get(key,
+    "")` turns an entry with no identity into one whose identity is the empty
+    string, so `{}` indexes as `srv::` -- a wholly synthetic entry that replaces
+    the real one and gets published as a change. The MCP models reject those
+    payloads outright; defaulting here invents an identity the protocol never
+    offered.
+
+    Every caller runs inside its parser's per-entry `try`, so raising routes the
+    entry into the existing skip, and a listing in which *no* entry parses
+    routes into `_reconcile_once`'s offered-but-none-parseable rule, which keeps
+    the prior entries. Both are the behaviour we want for "this entry told us
+    nothing": not "it is gone".
+
+    `entry` is typed `Any` because a non-object entry (`["a string"]`) must land
+    here too, rather than raising `AttributeError` somewhere less legible.
+    """
+    if not isinstance(entry, dict):
+        raise TypeError(f"catalog entry is {type(entry).__name__}, not an object")
+    value = entry.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"catalog entry has no usable `{key}`")
+    return value
+
+
+def _listing_entries(name: str, kind: str, result: Any) -> list[dict[str, Any]] | None:
+    """The entries a `*/list` reply offered, or `None` if it offered none readably.
+
+    `result.get(kind, [])` conflates two different answers. A reply of
+    `{"tools": []}` says the server has no tools; a reply of `result: {}` is
+    missing a field the protocol requires, so it says nothing at all -- and the
+    default turns the second into the first, clearing the catalog and publishing
+    a removal built out of a malformed response. `list()` on a non-list widens
+    the same hole: `{"tools": {}}` coerces to `[]` and reads as an explicit
+    empty answer, while `{"tools": null}` raises `TypeError` out of
+    `_fetch_server_listings` and costs the *other* two kinds their reconcile.
+
+    So: absent field, non-object reply, or non-list value all return `None`,
+    which callers already treat as a failed listing -- prior entries kept,
+    nothing published. Only a genuine list is an answer, and an empty one still
+    clears. "We could not read the answer" is not "they are gone", the same
+    principle `_reconcile_once` applies to a request that failed and to a
+    listing whose every entry was unparseable.
+    """
+    if not isinstance(result, dict):
+        logger.warning(
+            f"[{name}] {kind}/list answered with "
+            f"{type(result).__name__}, not an object; treating as unreadable"
+        )
+        return None
+    if kind not in result:
+        logger.warning(
+            f"[{name}] {kind}/list answered without its required `{kind}` field; "
+            f"treating as unreadable rather than as an empty {kind} list"
+        )
+        return None
+    offered = result[kind]
+    if not isinstance(offered, list):
+        logger.warning(
+            f"[{name}] {kind}/list answered with `{kind}` as "
+            f"{type(offered).__name__}, not a list; treating as unreadable"
+        )
+        return None
+    return list(offered)
+
+
 def _schema_dialect(*schemas: dict[str, Any] | None) -> str:
     for schema in schemas:
         if schema and isinstance(schema.get("$schema"), str):
@@ -523,7 +591,7 @@ def _parse_tool_entries(
             break
 
         try:
-            tool_name = tool["name"]
+            tool_name = _required_identity(tool, "name")
             tool_id = make_tool_id(name, tool_name)
             description = tool.get("description", "")
             input_schema = tool.get("inputSchema", {})
@@ -574,7 +642,7 @@ def _parse_resource_entries(
     }
     for resource in resources:
         try:
-            uri = resource.get("uri", "")
+            uri = _required_identity(resource, "uri")
             resource_id = f"{name}::{uri}"
             resource_info = ResourceInfo(
                 resource_id=resource_id,
@@ -615,7 +683,7 @@ def _parse_prompt_entries(
     known_arg_fields = {"name", "title", "description", "required"}
     for prompt in prompts:
         try:
-            prompt_name = prompt.get("name", "")
+            prompt_name = _required_identity(prompt, "name")
             prompt_id = f"{name}::{prompt_name}"
             arguments = None
             if prompt.get("arguments"):
@@ -1588,10 +1656,17 @@ class ClientManager:
 
         Return shape, per kind:
 
-        - `list[...]` -- the server answered. An **empty list is an answer**: it
+        - `list[...]` -- the server answered, and the reply carried the
+          collection the protocol requires. An **empty list is an answer**: it
           means the kind is genuinely empty and its entries should be cleared.
-        - `None` -- the request failed, i.e. we could not ask. The caller must
-          leave that kind exactly as it was and publish nothing for it.
+        - `None` -- we could not read an answer. The caller must leave that kind
+          exactly as it was and publish nothing for it.
+
+        `None` covers two cases that used to look different and are not. The
+        request failing is the obvious one. The other is a reply we cannot read:
+        its required collection absent, or present but not a list. Those are
+        malformed, not empty -- see `_listing_entries`, which draws the line.
+        Any kind can now come back `None`, `tools` included.
 
         Only `tools/list` failing raises. A server that does not implement
         resources or prompts is ordinary and answers those two with an error,
@@ -1609,7 +1684,7 @@ class ClientManager:
         )
 
         listings: dict[str, list[dict[str, Any]] | None] = {
-            "tools": list(tools_result.get("tools", []))
+            "tools": _listing_entries(name, "tools", tools_result)
         }
         for kind, result in (
             ("resources", listing_results[0]),
@@ -1619,7 +1694,7 @@ class ClientManager:
                 logger.debug(f"Server {name} doesn't support {kind}: {result}")
                 listings[kind] = None
             else:
-                listings[kind] = list(result.get(kind, []))
+                listings[kind] = _listing_entries(name, kind, result)
         return listings
 
     async def _index_capabilities(self, managed: ManagedClient) -> tuple[int, int, int]:
@@ -1673,9 +1748,11 @@ class ClientManager:
         a `gateway.invoke` running concurrently with a reconcile sees the old
         catalog or the new one, never an empty one. A kind whose listing failed
         is left exactly as it was -- "we could not ask" is not "they are gone" --
-        and so is a kind that offered entries of which not one could be parsed,
-        which is the same state reached by a different route. An answer of zero
-        entries is still an answer and does clear the kind.
+        and so are the three states reached by different routes to the same
+        place: a reply missing its required collection or carrying a non-list in
+        its place, and a listing that offered entries of which not one could be
+        parsed. An answer of zero entries is still an answer and does clear the
+        kind.
 
         Suppress-while-churning, publish-once-if-changed. The swap's removal and
         re-index halves both call `CatalogEventSink.note_*` unconditionally, so
@@ -1810,6 +1887,17 @@ class ClientManager:
         offered-but-none-parseable is treated as failure. Mixed listings keep
         the per-entry semantics: something parsed, so the kind answered and is
         replaced by what parsed.
+
+        A listing that never arrived readably never reaches that rule at all.
+        `_listing_entries` has already collapsed an absent collection, or one
+        that is not a list, to `None` -- so it is `offered is None` here, the
+        same branch as a request that failed outright. That distinction is load
+        bearing: `result: {}` and `{"tools": []}` are different answers, and
+        only the second one means the kind is empty. Likewise an entry with no
+        identity now fails to parse (`_required_identity`) instead of indexing
+        as `srv::`, so a listing of nothing but such entries lands in the
+        offered-but-none-parseable rule above rather than replacing real entries
+        with synthetic ones.
 
         (On connect there is no prior catalog to protect -- `_connect_stdio` and
         friends remove this server's indexes first -- so `_index_capabilities`

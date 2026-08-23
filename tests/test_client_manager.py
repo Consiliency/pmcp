@@ -27,6 +27,7 @@ from pmcp.client.manager import (
     _extract_tags,
     _infer_risk_hint,
     _remote_headers,
+    _required_identity,
     _terminate_process_tree,
     _truncate_description,
 )
@@ -5288,3 +5289,299 @@ class TestReconcileMalformedEntryResilience:
 
         assert manager._catalog_suppressed == {}
         assert not manager._catalog_publishing_suppressed("srv")
+
+
+class TestUnreadableListingIsNotAnEmptyOne:
+    """FANOUT repair G1/G2: the two remaining routes by which "we could not read
+    this" became "it is gone".
+
+    `TestReconcileMalformedEntryResilience` covers the listing that *arrived*
+    and could not be parsed. These cover the two steps on either side of it: a
+    reply whose required collection never arrived readably at all (G1), and an
+    entry that arrived carrying no identity (G2). Both used to be laundered into
+    a valid-looking answer by a defaulting `.get` -- `result.get(kind, [])` and
+    `entry.get(identity, "")` -- and published as a removal.
+    """
+
+    _managed = staticmethod(TestReconcileMalformedEntryResilience._managed)
+    _drain = staticmethod(TestReconcileMalformedEntryResilience._drain)
+
+    @staticmethod
+    def _wire_raw(manager: ClientManager, replies: dict[str, Any]) -> None:
+        """Stub `_send_request` with whole `result` objects, not per-kind entry
+        lists.
+
+        `TestReconcileMalformedEntryResilience._wire_listings` always wraps what
+        it is given as `{kind: list(entries)}`, so it can express a malformed
+        *entry* but never a malformed *reply* -- the absent collection and the
+        non-list collection under test here are both unreachable through it.
+        """
+
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            kind = method.split("/")[0]
+            return cast(dict[str, Any], replies.get(kind, {kind: []}))
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+
+    async def _prime_and_relist(
+        self, kind: str, primed: list[dict[str, Any]], relisted: Any
+    ) -> tuple[ClientManager, _RecordingSink, int]:
+        """Index a real catalog for `kind`, then re-list it with `relisted`.
+
+        `primed` is a well-formed entry list and is wrapped for you; `relisted`
+        is the whole `result` object, unwrapped, because the malformed replies
+        under test are exactly the ones that cannot be expressed as an entry
+        list.
+
+        Priming over a *populated* catalog is the whole point: every one of
+        these defects is invisible against an empty one, because there is
+        nothing there to falsely remove.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        notification = f"notifications/{kind}/list_changed"
+
+        self._wire_raw(manager, {kind: {kind: primed}})
+        manager._handle_downstream_notification("srv", managed, notification)
+        await self._drain(manager)
+        published_while_priming = cast(int, getattr(sink, kind))
+
+        self._wire_raw(manager, {kind: relisted})
+        manager._handle_downstream_notification("srv", managed, notification)
+        await self._drain(manager)
+        return manager, sink, published_while_priming
+
+    # ---- G1: an absent collection is not an explicit empty one ----------
+
+    @pytest.mark.asyncio
+    async def test_absent_tools_collection_preserves_and_publishes_nothing(
+        self,
+    ) -> None:
+        """`result: {}` -- the reply is missing the collection the protocol
+        requires. `result.get("tools", [])` turned that into `[]`, which the
+        classifier read as "the server answered and it is empty", so the prior
+        tools were cleared and a removal published. Two different meanings,
+        one outcome.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools", [{"name": "alpha", "inputSchema": {}}], {}
+        )
+
+        assert set(manager._tools) == {"srv::alpha"}, (
+            "a reply missing its required `tools` field was read as an empty "
+            "catalog and wiped the prior tools"
+        )
+        assert sink.tools == primed_publishes, (
+            "published a removal for a reply we could not read"
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicitly_empty_tools_collection_still_clears_and_publishes(
+        self,
+    ) -> None:
+        """The other side of the same line, restated here rather than left to
+        `test_explicitly_empty_relist_still_clears_and_publishes`: this pins the
+        *distinction*, so a fix that preserved both would fail here even though
+        the G1 test above would pass.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools", [{"name": "alpha", "inputSchema": {}}], {"tools": []}
+        )
+
+        assert manager._tools == {}
+        assert sink.tools == primed_publishes + 1
+
+    @pytest.mark.asyncio
+    async def test_absent_collection_preserves_resources_and_prompts_too(
+        self,
+    ) -> None:
+        """The same `.get(kind, [])` served all three kinds; resources and
+        prompts reached it by a different line and must be fixed by the same
+        rule."""
+        resources, _, _ = await self._prime_and_relist(
+            "resources", [{"uri": "mem://r1"}], {}
+        )
+        prompts, _, _ = await self._prime_and_relist("prompts", [{"name": "p1"}], {})
+
+        assert set(resources._resources) == {"srv::mem://r1"}
+        assert set(prompts._prompts) == {"srv::p1"}
+
+    # ---- G3: a non-list where a list is expected ------------------------
+
+    @pytest.mark.asyncio
+    async def test_tools_collection_as_an_empty_mapping_preserves(self) -> None:
+        """The fifth trigger. `list({})` is `[]`, so an object where the
+        protocol requires an array was coerced into a perfectly valid-looking
+        "the kind is empty" answer -- and cleared and published exactly like
+        G1, one step further along.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools", [{"name": "alpha", "inputSchema": {}}], {"tools": {}}
+        )
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert sink.tools == primed_publishes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "collection",
+        [
+            pytest.param({"a": 1}, id="non-empty-mapping"),
+            pytest.param("abc", id="string"),
+            pytest.param(7, id="number"),
+        ],
+    )
+    async def test_tools_collection_as_other_non_lists_preserves(
+        self, collection: Any
+    ) -> None:
+        """These were preserved before the fix too, but only by accident: `list()`
+        coerced them into entries (a mapping's keys, a string's characters)
+        which then all happened to fail parsing, so the all-malformed rule
+        caught them. `7` did not even get that far -- it raised `TypeError`.
+        Pin the outcome so it stops depending on that chain.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools", [{"name": "alpha", "inputSchema": {}}], {"tools": collection}
+        )
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert sink.tools == primed_publishes
+
+    @pytest.mark.asyncio
+    async def test_a_null_collection_costs_only_its_own_kind(self) -> None:
+        """`{"tools": null}` used to raise `TypeError` out of
+        `_fetch_server_listings` -- before resources and prompts were ever
+        classified -- so one malformed kind aborted the whole reconcile and an
+        honest resources answer arriving in the same pass was thrown away.
+        Per kind, still.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+
+        self._wire_raw(
+            manager,
+            {
+                "tools": {"tools": [{"name": "alpha", "inputSchema": {}}]},
+                "resources": {"resources": [{"uri": "mem://old"}]},
+            },
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+
+        self._wire_raw(
+            manager,
+            {
+                "tools": {"tools": None},
+                "resources": {"resources": [{"uri": "mem://new"}]},
+            },
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert set(manager._resources) == {"srv::mem://new"}, (
+            "an unreadable tools listing swallowed an honest resources answer"
+        )
+
+    # ---- G2: an entry with no identity is not an entry -------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kind", "primed", "store_attr", "primed_id"),
+        [
+            pytest.param(
+                "resources", [{"uri": "mem://r1"}], "_resources", "srv::mem://r1"
+            ),
+            pytest.param("prompts", [{"name": "p1"}], "_prompts", "srv::p1"),
+        ],
+    )
+    async def test_empty_entry_objects_do_not_invent_an_identity(
+        self, kind: str, primed: list[dict[str, Any]], store_attr: str, primed_id: str
+    ) -> None:
+        """`resource.get("uri", "")` and `prompt.get("name", "")` made `{}`
+        parse successfully as an entry whose identity is `srv::`. It then
+        replaced the real entry and the change was published -- a catalog entry
+        the downstream never offered and the MCP models would reject.
+
+        With the identity required, `{}` fails to parse, which routes it into
+        the per-entry skip and -- since nothing else parsed -- into the
+        all-malformed preserve-prior rule.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            kind, primed, {kind: [{}]}
+        )
+
+        store = cast(dict[str, Any], getattr(manager, store_attr))
+        assert set(store) == {primed_id}
+        assert f"srv::{''}" not in store, "synthesized a bogus `srv::` identity"
+        assert getattr(sink, kind) == primed_publishes
+
+    @pytest.mark.asyncio
+    async def test_an_empty_string_tool_name_is_not_an_identity_either(self) -> None:
+        """Tools reached the same place by a different route. `tool["name"]`
+        does not default, so a *missing* name already raised -- but a name of
+        `""` sailed through and indexed as `srv::`, replacing the real tool.
+        Requiring a non-empty string closes both at once.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools",
+            [{"name": "alpha", "inputSchema": {}}],
+            {"tools": [{"name": "", "inputSchema": {}}]},
+        )
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert sink.tools == primed_publishes
+
+    @pytest.mark.asyncio
+    async def test_an_identity_less_entry_costs_only_itself(self) -> None:
+        """The per-entry semantics are unchanged by the stricter identity: an
+        entry with none is skipped, and a good entry beside it is still indexed
+        and published. Without this, "fail to parse" could be over-applied into
+        a rule that preserves whenever *any* entry is bad.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "resources",
+            [{"uri": "mem://r1"}],
+            {"resources": [{}, {"uri": "mem://r2"}]},
+        )
+
+        assert set(manager._resources) == {"srv::mem://r2"}
+        assert sink.resources == primed_publishes + 1
+
+    @pytest.mark.asyncio
+    async def test_entries_that_are_not_objects_are_skipped_not_indexed(self) -> None:
+        """A listing of bare strings. Each entry fails to parse rather than
+        raising out of the parser, and with none of them parseable the kind is
+        preserved."""
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools", [{"name": "alpha", "inputSchema": {}}], {"tools": ["a string", 3]}
+        )
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert sink.tools == primed_publishes
+
+    def test_required_identity_rejects_every_non_identity(self) -> None:
+        """The helper directly, so the rule is pinned independently of the three
+        parsers that call it."""
+        assert _required_identity({"name": "ok"}, "name") == "ok"
+        for entry in ({}, {"name": ""}, {"name": None}, {"name": 3}, {"name": ["a"]}):
+            with pytest.raises((TypeError, ValueError)):
+                _required_identity(entry, "name")
+        for entry in ("a string", 3, None, ["a"]):
+            with pytest.raises(TypeError):
+                _required_identity(entry, "name")
