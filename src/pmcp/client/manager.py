@@ -14,6 +14,7 @@ import signal
 import string
 import time
 from collections import deque
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, TypeVar
@@ -64,8 +65,13 @@ except ImportError:
 logger = logging.getLogger(__name__)
 _TaskT = TypeVar("_TaskT", bound=asyncio.Task[Any])
 
+# The three catalog kinds, in the order reconciliation fetches and applies them.
+# Iterating this rather than three hand-written branches is what keeps
+# "each kind is handled independently" true as kinds are added.
+CATALOG_KINDS: tuple[str, str, str] = ("tools", "resources", "prompts")
+
 # IF-0-FANOUT-1: the downstream `notifications/*` methods this gateway acts on,
-# mapped to the catalog kind whose identifier set decides whether reconciliation
+# mapped to the catalog kind whose entries decide whether reconciliation
 # publishes. Every method absent from this mapping is a no-op by construction --
 # see `ClientManager._handle_downstream_notification`.
 DOWNSTREAM_LIST_CHANGED_METHODS: dict[str, str] = {
@@ -1067,22 +1073,45 @@ class ClientManager:
         """
         return bool(self._catalog_suppressed.get(server_name))
 
-    def _server_catalog_ids(self, name: str) -> dict[str, set[str]]:
-        """The identifier sets one server currently owns, per catalog kind.
+    def _server_catalog_snapshot(self, name: str) -> dict[str, dict[str, Any]]:
+        """What one server currently owns, per catalog kind, by *content*.
 
-        Identifier *sets*, never counts: renaming a tool leaves the count
-        identical while the catalog genuinely moved, and a count-based diff
-        would silently swallow that change.
+        Not identifier sets and emphatically not counts. A count-based diff
+        misses a rename, an identifier-set diff misses an edit in place: a tool
+        whose `description` or `inputSchema` changed under the same name is a
+        real catalog change that a subscriber has to hear about. Comparing the
+        model dumps catches adds, removes, renames, and edits with one rule.
+
+        `model_dump()` in python mode, not `mode="json"`: every field here was
+        parsed out of JSON already, so the python dump is comparable by `==`
+        without paying for -- or risking a serializer warning on -- the
+        arbitrary values carried in `raw_metadata`.
         """
         return {
-            "tools": {k for k, v in self._tools.items() if v.server_name == name},
-            "resources": {
-                k for k, v in self._resources.items() if v.server_name == name
+            "tools": {
+                k: v.model_dump()
+                for k, v in self._tools.items()
+                if v.server_name == name
             },
-            "prompts": {k for k, v in self._prompts.items() if v.server_name == name},
+            "resources": {
+                k: v.model_dump()
+                for k, v in self._resources.items()
+                if v.server_name == name
+            },
+            "prompts": {
+                k: v.model_dump()
+                for k, v in self._prompts.items()
+                if v.server_name == name
+            },
         }
 
-    def _remove_server_indexes(self, name: str, *, drop_tasks: bool = True) -> None:
+    def _remove_server_indexes(
+        self,
+        name: str,
+        *,
+        drop_tasks: bool = True,
+        kinds: Collection[str] | None = None,
+    ) -> None:
         """Remove catalog entries owned by one server.
 
         `drop_tasks=False` keeps the server's tracked `McpTaskRecord`s. Dropping
@@ -1090,22 +1119,32 @@ class ClientManager:
         the connection, and wrong for a `list_changed` reconcile, where the
         server is still up and its in-flight tasks are still running -- evicting
         them there would silently break `gateway.tasks_list`/`tasks_result`.
+
+        `kinds=None` removes all three, which is what a disconnect wants.
+        Reconciliation passes only the kinds whose re-listing actually
+        succeeded: a `resources/list` that failed means "we could not ask", and
+        turning that into "they are gone" both deletes entries the server still
+        has and publishes a false removal.
         """
+        selected = CATALOG_KINDS if kinds is None else tuple(kinds)
         tools_removed = False
-        for tool_id, tool in list(self._tools.items()):
-            if tool.server_name == name:
-                self._tools.pop(tool_id, None)
-                tools_removed = True
+        if "tools" in selected:
+            for tool_id, tool in list(self._tools.items()):
+                if tool.server_name == name:
+                    self._tools.pop(tool_id, None)
+                    tools_removed = True
         resources_removed = False
-        for resource_id, resource in list(self._resources.items()):
-            if resource.server_name == name:
-                self._resources.pop(resource_id, None)
-                resources_removed = True
+        if "resources" in selected:
+            for resource_id, resource in list(self._resources.items()):
+                if resource.server_name == name:
+                    self._resources.pop(resource_id, None)
+                    resources_removed = True
         prompts_removed = False
-        for prompt_id, prompt in list(self._prompts.items()):
-            if prompt.server_name == name:
-                self._prompts.pop(prompt_id, None)
-                prompts_removed = True
+        if "prompts" in selected:
+            for prompt_id, prompt in list(self._prompts.items()):
+                if prompt.server_name == name:
+                    self._prompts.pop(prompt_id, None)
+                    prompts_removed = True
         if drop_tasks:
             for key in list(self._tasks):
                 if key[0] == name:
@@ -1404,11 +1443,32 @@ class ClientManager:
             self._catalog_events.note_prompts_changed()
         return len(prompts)
 
-    async def _index_capabilities(self, managed: ManagedClient) -> tuple[int, int, int]:
+    async def _fetch_server_listings(
+        self, managed: ManagedClient
+    ) -> dict[str, list[dict[str, Any]] | None]:
+        """List one server's three catalog kinds, mutating nothing.
+
+        Every downstream request reconciliation makes lives here, and no catalog
+        write does. That separation is the whole point: the caller can do all of
+        its awaiting first and then apply the result in one synchronous block,
+        so the catalog is never left empty across a network round trip for a
+        concurrent `gateway.invoke` to trip over.
+
+        Return shape, per kind:
+
+        - `list[...]` -- the server answered. An **empty list is an answer**: it
+          means the kind is genuinely empty and its entries should be cleared.
+        - `None` -- the request failed, i.e. we could not ask. The caller must
+          leave that kind exactly as it was and publish nothing for it.
+
+        Only `tools/list` failing raises. A server that does not implement
+        resources or prompts is ordinary and answers those two with an error,
+        which is why they are gathered with `return_exceptions=True` and mapped
+        to `None` rather than propagated.
+        """
         name = managed.config.name
 
         tools_result = await self._send_request(managed, "tools/list", {})
-        indexed = self._index_tools(name, tools_result.get("tools", []))
 
         resources_task = self._send_request(managed, "resources/list", {})
         prompts_task = self._send_request(managed, "prompts/list", {})
@@ -1416,21 +1476,33 @@ class ClientManager:
             resources_task, prompts_task, return_exceptions=True
         )
 
-        resource_count = 0
-        resources_result = listing_results[0]
-        if isinstance(resources_result, BaseException):
-            logger.debug(f"Server {name} doesn't support resources: {resources_result}")
-        else:
-            resource_count = self._index_resources(
-                name, resources_result.get("resources", [])
-            )
+        listings: dict[str, list[dict[str, Any]] | None] = {
+            "tools": list(tools_result.get("tools", []))
+        }
+        for kind, result in (
+            ("resources", listing_results[0]),
+            ("prompts", listing_results[1]),
+        ):
+            if isinstance(result, BaseException):
+                logger.debug(f"Server {name} doesn't support {kind}: {result}")
+                listings[kind] = None
+            else:
+                listings[kind] = list(result.get(kind, []))
+        return listings
 
-        prompt_count = 0
-        prompts_result = listing_results[1]
-        if isinstance(prompts_result, BaseException):
-            logger.debug(f"Server {name} doesn't support prompts: {prompts_result}")
-        else:
-            prompt_count = self._index_prompts(name, prompts_result.get("prompts", []))
+    async def _index_capabilities(self, managed: ManagedClient) -> tuple[int, int, int]:
+        name = managed.config.name
+        listings = await self._fetch_server_listings(managed)
+
+        indexed = self._index_tools(name, listings["tools"] or [])
+
+        resources = listings["resources"]
+        resource_count = (
+            0 if resources is None else self._index_resources(name, resources)
+        )
+
+        prompts = listings["prompts"]
+        prompt_count = 0 if prompts is None else self._index_prompts(name, prompts)
 
         # No flush() here, deliberately: IF-0-P3B-1's self-scheduling drain
         # is the correctness mechanism, not this call site, and EC-P3B-4
@@ -1463,14 +1535,22 @@ class ClientManager:
         refetch and then hand it the stale catalog. Reconciliation therefore
         always completes before anything is published.
 
-        Suppress-while-churning, publish-once-if-changed. Reconciliation is a
-        remove-then-reindex, and both halves call `CatalogEventSink.note_*`
-        unconditionally, so a chatty downstream would spam subscribers even when
-        nothing moved. Sink calls originating from the server under
-        reconciliation are suppressed for its duration; afterwards the server's
-        identifier sets are compared before against after, and exactly one
-        `note_*` is published per catalog kind that actually differs. Identifier
-        sets, never counts: a rename leaves the count unchanged.
+        Fetch-then-swap. Reconciliation lists the server's three catalog kinds
+        first and writes nothing while doing so, then removes and re-indexes in
+        a single synchronous block. Nothing can interleave inside that block, so
+        a `gateway.invoke` running concurrently with a reconcile sees the old
+        catalog or the new one, never an empty one. A kind whose listing failed
+        is left exactly as it was -- "we could not ask" is not "they are gone".
+
+        Suppress-while-churning, publish-once-if-changed. The swap's removal and
+        re-index halves both call `CatalogEventSink.note_*` unconditionally, so
+        a chatty downstream would spam subscribers even when nothing moved. Sink
+        calls originating from the server under reconciliation are suppressed
+        for the duration of the swap; afterwards its entries are compared before
+        against after, and exactly one `note_*` is published per catalog kind
+        that actually differs. Entries, not identifiers and certainly not
+        counts: a rename leaves the count unchanged, and an edited description
+        or schema leaves the identifiers unchanged too.
 
         Unrecognised methods are a no-op. Any other `notifications/*` (or any
         other method name) returns False having published nothing, scheduled
@@ -1520,7 +1600,7 @@ class ClientManager:
     async def _reconcile_server_catalog(self, name: str) -> None:
         """Re-index one server's catalog, then publish what actually moved.
 
-        Spawned, never awaited from a dispatch path. `_index_capabilities`
+        Spawned, never awaited from a dispatch path. `_fetch_server_listings`
         awaits `_send_request`, and the future it waits on is resolved by the
         very read loop that received the notification --
         `pending.future.set_result` in `_handle_stdout_line` (stdio) and in
@@ -1563,49 +1643,63 @@ class ClientManager:
                 self._reconcile_tasks.pop(name, None)
 
     async def _reconcile_once(self, name: str, managed: ManagedClient) -> None:
-        """One remove-then-reindex pass, published only if the catalog moved."""
-        before = self._server_catalog_ids(name)
-        prev_tools = {k: v for k, v in self._tools.items() if v.server_name == name}
-        prev_resources = {
-            k: v for k, v in self._resources.items() if v.server_name == name
-        }
-        prev_prompts = {k: v for k, v in self._prompts.items() if v.server_name == name}
+        """One fetch-then-swap pass, published per kind only if that kind moved.
 
+        Fetch first. Every downstream request happens before any catalog write,
+        so a `tools/list` that fails costs nothing: there is nothing to roll
+        back because nothing was removed. (The previous order -- remove, then
+        re-list -- needed a rollback precisely because it had already destroyed
+        the state it was trying to preserve.)
+
+        Then swap, synchronously. The block below contains no `await` by
+        construction: `_remove_server_indexes` and the three `_index_*` are all
+        plain methods. asyncio cannot interleave another task inside it, so a
+        concurrent `gateway.invoke` sees either the whole old catalog or the
+        whole new one and never the empty window between them. Adding an await
+        in there would silently reintroduce that window.
+
+        Per kind, independently. A kind whose listing failed is absent from
+        `refreshed`: it is neither removed nor re-indexed nor published, because
+        "we could not ask" is not "they are gone". A kind that answered is
+        replaced wholesale and published only if its entries actually differ.
+        """
+        try:
+            listings = await self._fetch_server_listings(managed)
+        except Exception as e:
+            # The downstream announced a change and then failed to list. The
+            # catalog has not been touched, so leaving it alone *is* the
+            # rollback, and there is nothing to publish.
+            logger.warning(f"[{name}] Catalog reconciliation failed: {e}")
+            return
+
+        refreshed = tuple(k for k in CATALOG_KINDS if listings[k] is not None)
+        before = self._server_catalog_snapshot(name)
+
+        # ---- apply: synchronous, no `await` below this line --------------
         self._catalog_suppressed[name] = self._catalog_suppressed.get(name, 0) + 1
         try:
             # `drop_tasks=False`: the server is still connected, so its tracked
             # task records must survive a catalog refresh.
-            self._remove_server_indexes(name, drop_tasks=False)
-            try:
-                await self._index_capabilities(managed)
-            except Exception as e:
-                # The downstream announced a change and then failed to list.
-                # Roll back rather than leave the catalog half-removed: the
-                # previous entries are strictly better than none.
-                logger.warning(f"[{name}] Catalog reconciliation failed: {e}")
-                self._remove_server_indexes(name, drop_tasks=False)
-                # Disclosure: these three writes are a catalog mutation outside
-                # the five publishing mutators that
-                # `tests/runtime/test_publisher_coverage.py` models. That guard
-                # does not currently see `dict.update`, so it does not fire
-                # here. It is safe on its own terms -- this restores exactly the
-                # entries `_remove_server_indexes` just took out, so the catalog
-                # ends identical to how it started and there is nothing to
-                # publish. Widening the guard to model `update` is a follow-up
-                # for whoever owns that file; it is not this lane's to edit.
-                self._tools.update(prev_tools)
-                self._resources.update(prev_resources)
-                self._prompts.update(prev_prompts)
-                return
+            self._remove_server_indexes(name, drop_tasks=False, kinds=refreshed)
+            tools = listings["tools"]
+            if tools is not None:
+                self._index_tools(name, tools)
+            resources = listings["resources"]
+            if resources is not None:
+                self._index_resources(name, resources)
+            prompts = listings["prompts"]
+            if prompts is not None:
+                self._index_prompts(name, prompts)
         finally:
             depth = self._catalog_suppressed.get(name, 1) - 1
             if depth > 0:
                 self._catalog_suppressed[name] = depth
             else:
                 self._catalog_suppressed.pop(name, None)
+        # ---- end apply ----------------------------------------------------
 
-        after = self._server_catalog_ids(name)
-        for kind in ("tools", "resources", "prompts"):
+        after = self._server_catalog_snapshot(name)
+        for kind in refreshed:
             if before[kind] != after[kind]:
                 self._publish_catalog_change(kind)
 

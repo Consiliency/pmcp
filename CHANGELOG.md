@@ -22,12 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client "refetch" and handed it the *old* catalog — with a tool the server
   just removed still invocable. The gateway now re-indexes the announcing
   server first and publishes only once that finishes, and only for the catalog
-  kinds whose identifier set actually changed (compared by identifier, not
-  count, so a rename still publishes). A downstream that announces a change
-  and then fails to re-list rolls its previous entries back rather than
-  leaving the catalog half-removed, and publishes nothing. **The guarantee for
-  a subscribed client:** the catalog is reconciled *before* the notification
-  goes out, so a client that refetches on receipt sees the change, every time.
+  kinds that actually changed. Changed by *content*, not by identifier and not
+  by count: a rename publishes, and so does a tool whose description or input
+  schema was edited under an unchanged name.
+
+  Reconciliation fetches first and swaps second. It lists the server's tools,
+  resources, and prompts without touching the catalog, then removes and
+  re-indexes in a single synchronous block that contains no `await` — so a
+  `gateway.invoke` arriving mid-reconcile sees either the whole old catalog or
+  the whole new one, and never the empty window in between. A downstream that
+  announces a change and then fails `tools/list` therefore costs nothing:
+  nothing was removed, so there is nothing to roll back, and nothing is
+  published. Each kind is handled independently — a `resources/list` that
+  fails (which is also how a server that simply does not implement resources
+  answers) leaves the existing resources in place and publishes nothing for
+  them, while the kinds that did answer still reconcile normally. **The
+  guarantee for a subscribed client:** the catalog is reconciled *before* the
+  notification goes out, so a client that refetches on receipt sees the change,
+  every time.
 
   Reconciliation runs as a spawned, per-server-coalesced background task
   rather than inline in the read loop — re-indexing awaits a response that the
