@@ -99,6 +99,9 @@ Replace the fail-closed boolean `is_version_newer` with a tri-state result so "i
 **Produces**
 - IF-0-TRISTATE-1 — `compare_versions(current: str, latest: str, package_type: str | None) -> Literal["newer", "not_newer", "incomparable"]`. This is the whole contract: after this phase there is no boolean form to keep in agreement with it.
 
+**Post-execution amendments (2026-08-23)**
+- The Scope notes above proposed 3 lanes split by file — Lane A on `version_checker.py`, Lane B on `refresher.py`, Lane C on `tests/` — but that split did not survive the decision to delete the wrappers outright (EC-TRISTATE-3) rather than keep them as policed shims. Deleting `is_version_newer`/`are_versions_comparable` and migrating `refresher.py`'s two call sites off them is one atomic change: a task-level reducer gate between "delete" and "migrate" would trip a lane `cycle` diagnostic (each waits on the other to land first — the wrappers can't go while a caller still uses them, and the caller can't move to `compare_versions` while treating the deletion as a separate, later lane), and splitting them into two lanes instead would trip `overlapping_write_ownership` on `version_checker.py`, since the migration lane would need to observe the same file the deletion lane is editing to confirm no call sites remain. The phase executed as one working lane covering `version_checker.py` and `refresher.py` together, with tests alongside.
+
 ### Phase 2 — Update-path identity and environment contracts (UPDPATH)
 
 **Objective**
