@@ -41,6 +41,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   notification goes out, so a client that refetches on receipt sees the change,
   every time.
 
+  A malformed catalog entry costs only itself. Indexing guards each entry
+  individually, so one tool the gateway cannot parse is logged and skipped
+  while the rest of that listing is indexed normally — the entries before it
+  *and* after it. This matters most on the reconcile path, where the swap has
+  already removed the server's previous entries by the time indexing runs: an
+  exception escaping there would have left the server with no catalog at all,
+  permanently, because the read loop stays healthy and no reconnect arrives to
+  heal it. `gateway.refresh` and connect-time indexing reach the same code, so
+  this is a deliberate connect-time behaviour change too: **a server with one
+  unparseable tool now connects with the rest of its catalog instead of failing
+  outright.**
+
+  A listing whose entries are *all* unparseable is treated as a failed listing,
+  not as an empty one. Offered entries of which not one survives parsing leaves
+  the gateway in the same epistemic state as a request that failed — it could
+  not read the answer — so that kind keeps its previous entries and publishes
+  nothing. Failing to parse a listing costs visibility of the server's catalog;
+  it does not stop the server's tools from working, and announcing a removal on
+  the strength of it would tell every subscribed client those tools are gone.
+  The boundary is the count offered, not the count indexed: a listing that
+  offers **zero** entries is a genuine answer — the server emptied that kind —
+  and still clears the entries and publishes.
+
+  Failure classification is conservative by design. Any failure to list a kind
+  — a transport error, a server that does not implement it, or a listing that
+  could not be parsed at all — keeps that kind's previous entries; only an
+  explicit empty answer clears them. The accepted cost is the mirror case: a
+  server that drops a capability mid-session and never reconnects keeps stale
+  entries in the catalog, which then fail loudly at invoke time. That is the
+  deliberate trade — a stale entry that errors when called is recoverable and
+  self-announcing, whereas a falsely removed entry is invisible: it silently
+  disappears from every subscribed client's catalog with nothing to point at.
+
   Reconciliation runs as a spawned, per-server-coalesced background task
   rather than inline in the read loop — re-indexing awaits a response that the
   very read loop which received the notification is responsible for

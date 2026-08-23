@@ -5120,6 +5120,128 @@ class TestReconcileMalformedEntryResilience:
         assert manager._tools == {} and manager._resources == {}
         assert manager._prompts == {}
 
+    # ---- F1: a listing nobody could parse is a failed listing -----------
+
+    @pytest.mark.asyncio
+    async def test_all_malformed_relist_preserves_the_prior_catalog(self) -> None:
+        """Offered entries, none of them parseable, over a *populated* catalog.
+
+        The per-entry guard handles one bad entry among good ones; this is the
+        corner where every entry is bad. Counting that as an answer would remove
+        the prior entries, index nothing and publish the removal -- a false
+        "those tools are gone" built out of "we could not read the answer".
+        `test_index_of_only_malformed_entries_publishes_nothing` cannot catch it:
+        it indexes into an empty catalog, so it has nothing to lose.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(manager, {"tools": [{"name": "alpha", "inputSchema": {}}]})
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+        published_while_priming = sink.tools
+
+        self._wire_listings(
+            manager,
+            {"tools": [{"name": "bad", "inputSchema": "not-a-dict"}]},
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._tools) == {"srv::alpha"}, (
+            "a listing whose every entry was unparseable wiped the prior catalog"
+        )
+        assert sink.tools == published_while_priming, (
+            "published a removal for entries we merely failed to read"
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_malformed_relist_leaves_the_other_kinds_alone(self) -> None:
+        """Per kind, still. Tools unreadable must not hold back an honest
+        resources answer arriving in the same reconcile."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(
+            manager,
+            {
+                "tools": [{"name": "alpha", "inputSchema": {}}],
+                "resources": [{"uri": "mem://old"}],
+            },
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+
+        self._wire_listings(
+            manager,
+            {
+                "tools": [{"name": "bad", "inputSchema": "not-a-dict"}],
+                "resources": [{"uri": "mem://new"}],
+            },
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert set(manager._resources) == {"srv::mem://new"}
+
+    @pytest.mark.asyncio
+    async def test_explicitly_empty_relist_still_clears_and_publishes(self) -> None:
+        """The boundary of the rule above: *no* entries offered is an answer --
+        the server emptied the kind -- and must clear and publish. Preserving
+        here would strand entries the downstream has explicitly disowned."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(manager, {"tools": [{"name": "alpha", "inputSchema": {}}]})
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+        published_while_priming = sink.tools
+
+        self._wire_listings(manager, {"tools": []})
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._tools == {}
+        assert sink.tools == published_while_priming + 1
+
+    def test_partly_malformed_relist_still_replaces_the_kind(self) -> None:
+        """Mixed listings keep the per-entry semantics: some entries parsed, so
+        the kind answered and is replaced wholesale by what parsed."""
+        manager = ClientManager()
+        manager._index_tools("srv", [{"name": "gone", "inputSchema": {}}])
+
+        assert (
+            manager._index_tools(
+                "srv",
+                [
+                    {"name": "bad", "inputSchema": "not-a-dict"},
+                    {"name": "kept", "inputSchema": {}},
+                ],
+            )
+            == 1
+        )
+        assert "srv::kept" in manager._tools
+
     # ---- D6: the suppression counter's `finally` ------------------------
 
     @pytest.mark.asyncio

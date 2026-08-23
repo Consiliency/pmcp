@@ -495,6 +495,161 @@ def _schema_dialect(*schemas: dict[str, Any] | None) -> str:
     return DEFAULT_SCHEMA_DIALECT
 
 
+def _parse_tool_entries(
+    name: str, tools: list[dict[str, Any]], limit: int
+) -> list[tuple[str, ToolInfo]]:
+    """Parse one server's `tools/list` payload into indexable entries.
+
+    Pure: it reads the listing, logs the entries it had to skip, and returns
+    what survived. It touches no catalog dict, which is what lets
+    `_reconcile_once` run it *before* removing anything and decide from the
+    result whether the listing is usable at all -- see its "offered but none
+    parseable" rule. `_index_tools` does the writing.
+    """
+    entries: list[tuple[str, ToolInfo]] = []
+    known_fields = {
+        "name",
+        "title",
+        "description",
+        "inputSchema",
+        "outputSchema",
+        "icons",
+        "annotations",
+        "execution",
+    }
+    for tool in tools:
+        if len(entries) >= limit:
+            logger.warning(f"Server {name} has more than {limit} tools, truncating")
+            break
+
+        try:
+            tool_name = tool["name"]
+            tool_id = make_tool_id(name, tool_name)
+            description = tool.get("description", "")
+            input_schema = tool.get("inputSchema", {})
+            output_schema = tool.get("outputSchema")
+
+            tool_info = ToolInfo(
+                tool_id=tool_id,
+                server_name=name,
+                tool_name=tool_name,
+                title=tool.get("title"),
+                description=description,
+                short_description=_truncate_description(description),
+                input_schema=input_schema,
+                icons=tool.get("icons"),
+                output_schema=output_schema,
+                annotations=tool.get("annotations"),
+                execution=tool.get("execution"),
+                schema_dialect=_schema_dialect(input_schema, output_schema),
+                raw_metadata=_raw_metadata(tool, known_fields),
+                tags=_extract_tags(name, tool_name, description),
+                risk_hint=_infer_risk_hint(
+                    tool_name, description, tool.get("annotations")
+                ),
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{name}] Skipping unparseable tool {_entry_label(tool)}: {e}"
+            )
+            continue
+
+        entries.append((tool_id, tool_info))
+    return entries
+
+
+def _parse_resource_entries(
+    name: str, resources: list[dict[str, Any]]
+) -> list[tuple[str, ResourceInfo]]:
+    """Parse one server's `resources/list` payload. Pure, per `_parse_tool_entries`."""
+    entries: list[tuple[str, ResourceInfo]] = []
+    known_fields = {
+        "uri",
+        "name",
+        "title",
+        "description",
+        "mimeType",
+        "icons",
+        "annotations",
+    }
+    for resource in resources:
+        try:
+            uri = resource.get("uri", "")
+            resource_id = f"{name}::{uri}"
+            resource_info = ResourceInfo(
+                resource_id=resource_id,
+                server_name=name,
+                uri=uri,
+                name=resource.get("name"),
+                title=resource.get("title"),
+                description=resource.get("description"),
+                mime_type=resource.get("mimeType"),
+                icons=resource.get("icons"),
+                annotations=resource.get("annotations"),
+                raw_metadata=_raw_metadata(resource, known_fields),
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{name}] Skipping unparseable resource "
+                f"{_entry_label(resource, key='uri')}: {e}"
+            )
+            continue
+
+        entries.append((resource_id, resource_info))
+    return entries
+
+
+def _parse_prompt_entries(
+    name: str, prompts: list[dict[str, Any]]
+) -> list[tuple[str, PromptInfo]]:
+    """Parse one server's `prompts/list` payload. Pure, per `_parse_tool_entries`."""
+    entries: list[tuple[str, PromptInfo]] = []
+    known_prompt_fields = {
+        "name",
+        "title",
+        "description",
+        "arguments",
+        "icons",
+        "annotations",
+    }
+    known_arg_fields = {"name", "title", "description", "required"}
+    for prompt in prompts:
+        try:
+            prompt_name = prompt.get("name", "")
+            prompt_id = f"{name}::{prompt_name}"
+            arguments = None
+            if prompt.get("arguments"):
+                arguments = [
+                    PromptArgumentInfo(
+                        name=arg.get("name", ""),
+                        title=arg.get("title"),
+                        description=arg.get("description"),
+                        required=arg.get("required", False),
+                        raw_metadata=_raw_metadata(arg, known_arg_fields),
+                    )
+                    for arg in prompt["arguments"]
+                ]
+            prompt_info = PromptInfo(
+                prompt_id=prompt_id,
+                server_name=name,
+                name=prompt_name,
+                title=prompt.get("title"),
+                description=prompt.get("description"),
+                arguments=arguments,
+                icons=prompt.get("icons"),
+                annotations=prompt.get("annotations"),
+                raw_metadata=_raw_metadata(prompt, known_prompt_fields),
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{name}] Skipping unparseable prompt {_entry_label(prompt)}: {e}"
+            )
+            continue
+
+        entries.append((prompt_id, prompt_info))
+    return entries
+
+
 def _is_protocol_version_initialize_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return (
@@ -1336,15 +1491,21 @@ class ClientManager:
                 errors.append(message)
         return cancelled, errors
 
-    def _index_tools(self, name: str, tools: list[dict[str, Any]]) -> int:
+    def _index_tools(
+        self,
+        name: str,
+        tools: list[dict[str, Any]],
+        *,
+        parsed: list[tuple[str, ToolInfo]] | None = None,
+    ) -> int:
         """Index one server's tools, skipping any entry we cannot parse.
 
-        The guard below is per *entry*, not per call, and that placement is the
-        whole point. Reconciliation removes this server's entries and then calls
-        this method; an exception escaping here would leave the removal done and
-        the re-index half-finished, so one malformed tool from a downstream
-        would silently cost the server its entire catalog -- permanently, since
-        the read loop stays healthy and no reconnect comes along to heal it. A
+        The guard is per *entry*, not per call, and that placement is the whole
+        point. Reconciliation removes this server's entries and then calls this
+        method; an exception escaping here would leave the removal done and the
+        re-index half-finished, so one malformed tool from a downstream would
+        silently cost the server its entire catalog -- permanently, since the
+        read loop stays healthy and no reconnect comes along to heal it. A
         single `try` around the loop would be barely better: it would still lose
         every entry after the bad one.
 
@@ -1352,160 +1513,64 @@ class ClientManager:
         and `refresh` reach the same three methods, so they inherit this too: a
         server with one unparseable tool now connects with the rest of its
         catalog instead of failing outright.
+
+        The parsing itself lives in `_parse_tool_entries`, which writes nothing.
+        `parsed` lets a caller that has already run it -- `_reconcile_once`,
+        which must know how many entries survive parsing *before* it removes
+        anything -- hand the result straight in, so each listing is parsed once
+        and each unparseable entry is logged once. Callers with a raw listing
+        omit it and this method parses for them.
         """
-        indexed = 0
-        known_fields = {
-            "name",
-            "title",
-            "description",
-            "inputSchema",
-            "outputSchema",
-            "icons",
-            "annotations",
-            "execution",
-        }
-        for tool in tools:
-            if indexed >= self._max_tools_per_server:
-                logger.warning(
-                    f"Server {name} has more than {self._max_tools_per_server} tools, truncating"
-                )
-                break
-
-            try:
-                tool_name = tool["name"]
-                tool_id = make_tool_id(name, tool_name)
-                description = tool.get("description", "")
-                input_schema = tool.get("inputSchema", {})
-                output_schema = tool.get("outputSchema")
-
-                tool_info = ToolInfo(
-                    tool_id=tool_id,
-                    server_name=name,
-                    tool_name=tool_name,
-                    title=tool.get("title"),
-                    description=description,
-                    short_description=_truncate_description(description),
-                    input_schema=input_schema,
-                    icons=tool.get("icons"),
-                    output_schema=output_schema,
-                    annotations=tool.get("annotations"),
-                    execution=tool.get("execution"),
-                    schema_dialect=_schema_dialect(input_schema, output_schema),
-                    raw_metadata=_raw_metadata(tool, known_fields),
-                    tags=_extract_tags(name, tool_name, description),
-                    risk_hint=_infer_risk_hint(
-                        tool_name, description, tool.get("annotations")
-                    ),
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[{name}] Skipping unparseable tool {_entry_label(tool)}: {e}"
-                )
-                continue
-
+        entries = (
+            _parse_tool_entries(name, tools, self._max_tools_per_server)
+            if parsed is None
+            else parsed
+        )
+        for tool_id, tool_info in entries:
             self._tools[tool_id] = tool_info
-            indexed += 1
+        indexed = len(entries)
         if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_tools_changed()
         return indexed
 
-    def _index_resources(self, name: str, resources: list[dict[str, Any]]) -> int:
+    def _index_resources(
+        self,
+        name: str,
+        resources: list[dict[str, Any]],
+        *,
+        parsed: list[tuple[str, ResourceInfo]] | None = None,
+    ) -> int:
         """Index one server's resources, skipping any entry we cannot parse.
 
-        Per-entry, for the reason spelled out on `_index_tools`. The count
-        returned is what was actually indexed, not what was offered, so a caller
-        reporting it is not overstating the catalog.
+        Per-entry, for the reason spelled out on `_index_tools`, and `parsed`
+        for the reason spelled out there too. The count returned is what was
+        actually indexed, not what was offered, so a caller reporting it is not
+        overstating the catalog.
         """
-        indexed = 0
-        known_fields = {
-            "uri",
-            "name",
-            "title",
-            "description",
-            "mimeType",
-            "icons",
-            "annotations",
-        }
-        for resource in resources:
-            try:
-                uri = resource.get("uri", "")
-                resource_id = f"{name}::{uri}"
-                resource_info = ResourceInfo(
-                    resource_id=resource_id,
-                    server_name=name,
-                    uri=uri,
-                    name=resource.get("name"),
-                    title=resource.get("title"),
-                    description=resource.get("description"),
-                    mime_type=resource.get("mimeType"),
-                    icons=resource.get("icons"),
-                    annotations=resource.get("annotations"),
-                    raw_metadata=_raw_metadata(resource, known_fields),
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[{name}] Skipping unparseable resource "
-                    f"{_entry_label(resource, key='uri')}: {e}"
-                )
-                continue
-
+        entries = _parse_resource_entries(name, resources) if parsed is None else parsed
+        for resource_id, resource_info in entries:
             self._resources[resource_id] = resource_info
-            indexed += 1
+        indexed = len(entries)
         if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_resources_changed()
         return indexed
 
-    def _index_prompts(self, name: str, prompts: list[dict[str, Any]]) -> int:
+    def _index_prompts(
+        self,
+        name: str,
+        prompts: list[dict[str, Any]],
+        *,
+        parsed: list[tuple[str, PromptInfo]] | None = None,
+    ) -> int:
         """Index one server's prompts, skipping any entry we cannot parse.
 
         Per-entry, for the reason spelled out on `_index_tools`. The count
         returned is what was actually indexed, not what was offered.
         """
-        indexed = 0
-        known_prompt_fields = {
-            "name",
-            "title",
-            "description",
-            "arguments",
-            "icons",
-            "annotations",
-        }
-        known_arg_fields = {"name", "title", "description", "required"}
-        for prompt in prompts:
-            try:
-                prompt_name = prompt.get("name", "")
-                prompt_id = f"{name}::{prompt_name}"
-                arguments = None
-                if prompt.get("arguments"):
-                    arguments = [
-                        PromptArgumentInfo(
-                            name=arg.get("name", ""),
-                            title=arg.get("title"),
-                            description=arg.get("description"),
-                            required=arg.get("required", False),
-                            raw_metadata=_raw_metadata(arg, known_arg_fields),
-                        )
-                        for arg in prompt["arguments"]
-                    ]
-                prompt_info = PromptInfo(
-                    prompt_id=prompt_id,
-                    server_name=name,
-                    name=prompt_name,
-                    title=prompt.get("title"),
-                    description=prompt.get("description"),
-                    arguments=arguments,
-                    icons=prompt.get("icons"),
-                    annotations=prompt.get("annotations"),
-                    raw_metadata=_raw_metadata(prompt, known_prompt_fields),
-                )
-            except Exception as e:
-                logger.warning(
-                    f"[{name}] Skipping unparseable prompt {_entry_label(prompt)}: {e}"
-                )
-                continue
-
+        entries = _parse_prompt_entries(name, prompts) if parsed is None else parsed
+        for prompt_id, prompt_info in entries:
             self._prompts[prompt_id] = prompt_info
-            indexed += 1
+        indexed = len(entries)
         if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_prompts_changed()
         return indexed
@@ -1607,7 +1672,10 @@ class ClientManager:
         a single synchronous block. Nothing can interleave inside that block, so
         a `gateway.invoke` running concurrently with a reconcile sees the old
         catalog or the new one, never an empty one. A kind whose listing failed
-        is left exactly as it was -- "we could not ask" is not "they are gone".
+        is left exactly as it was -- "we could not ask" is not "they are gone" --
+        and so is a kind that offered entries of which not one could be parsed,
+        which is the same state reached by a different route. An answer of zero
+        entries is still an answer and does clear the kind.
 
         Suppress-while-churning, publish-once-if-changed. The swap's removal and
         re-index halves both call `CatalogEventSink.note_*` unconditionally, so
@@ -1729,6 +1797,29 @@ class ClientManager:
         `refreshed`: it is neither removed nor re-indexed nor published, because
         "we could not ask" is not "they are gone". A kind that answered is
         replaced wholesale and published only if its entries actually differ.
+
+        A listing nobody could parse is a failed listing. If a kind offers
+        entries and *not one* of them survives parsing, we are in the same
+        epistemic state as a failed request -- we could not read the answer --
+        so that kind is dropped from `refreshed` too and left exactly as it was.
+        A parse failure degrades our visibility of the server's catalog; it does
+        not make the server's tools stop working, and publishing a removal on
+        the strength of it would tell every subscriber they are gone. Note the
+        boundary: a listing that offers *zero* entries is a real answer -- the
+        server emptied that kind -- and still clears and publishes. Only
+        offered-but-none-parseable is treated as failure. Mixed listings keep
+        the per-entry semantics: something parsed, so the kind answered and is
+        replaced by what parsed.
+
+        (On connect there is no prior catalog to protect -- `_connect_stdio` and
+        friends remove this server's indexes first -- so `_index_capabilities`
+        deliberately keeps the plain per-entry behaviour: an all-malformed
+        listing there yields an empty catalog for that kind, not a failed
+        connect.)
+
+        Parsing happens before the apply block, not inside it. It is pure CPU
+        and writes nothing, so doing it early costs nothing and is what lets the
+        decision above be made while the old catalog is still intact.
         """
         try:
             listings = await self._fetch_server_listings(managed)
@@ -1739,7 +1830,41 @@ class ClientManager:
             logger.warning(f"[{name}] Catalog reconciliation failed: {e}")
             return
 
-        refreshed = tuple(k for k in CATALOG_KINDS if listings[k] is not None)
+        tools = listings["tools"]
+        resources = listings["resources"]
+        prompts = listings["prompts"]
+        parsed_tools = (
+            None
+            if tools is None
+            else _parse_tool_entries(name, tools, self._max_tools_per_server)
+        )
+        parsed_resources = (
+            None if resources is None else _parse_resource_entries(name, resources)
+        )
+        parsed_prompts = (
+            None if prompts is None else _parse_prompt_entries(name, prompts)
+        )
+
+        usable: dict[str, bool] = {}
+        for kind, offered, parsed in (
+            ("tools", tools, parsed_tools),
+            ("resources", resources, parsed_resources),
+            ("prompts", prompts, parsed_prompts),
+        ):
+            if offered is None:
+                usable[kind] = False
+                continue
+            if offered and not parsed:
+                logger.warning(
+                    f"[{name}] Every {kind} entry in the listing was unparseable "
+                    f"({len(offered)} offered); keeping the previous {kind} "
+                    "rather than reporting them removed"
+                )
+                usable[kind] = False
+                continue
+            usable[kind] = True
+
+        refreshed = tuple(k for k in CATALOG_KINDS if usable[k])
         before = self._server_catalog_snapshot(name)
 
         # ---- apply: synchronous, no `await` below this line --------------
@@ -1748,15 +1873,12 @@ class ClientManager:
             # `drop_tasks=False`: the server is still connected, so its tracked
             # task records must survive a catalog refresh.
             self._remove_server_indexes(name, drop_tasks=False, kinds=refreshed)
-            tools = listings["tools"]
-            if tools is not None:
-                self._index_tools(name, tools)
-            resources = listings["resources"]
-            if resources is not None:
-                self._index_resources(name, resources)
-            prompts = listings["prompts"]
-            if prompts is not None:
-                self._index_prompts(name, prompts)
+            if usable["tools"] and tools is not None:
+                self._index_tools(name, tools, parsed=parsed_tools)
+            if usable["resources"] and resources is not None:
+                self._index_resources(name, resources, parsed=parsed_resources)
+            if usable["prompts"] and prompts is not None:
+                self._index_prompts(name, prompts, parsed=parsed_prompts)
         finally:
             depth = self._catalog_suppressed.get(name, 1) - 1
             if depth > 0:
