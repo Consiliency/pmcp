@@ -187,6 +187,12 @@ When a downstream server announces its catalog changed, **re-fetch and reconcile
 **Produces**
 - IF-0-FANOUT-1 — The downstream-event contract: which downstream `notifications/*` method maps to which `CatalogEventSink` call, the reconcile-then-publish ordering, the suppress-if-unchanged rule, and the no-op guarantee for unrecognised methods.
 
+### Post-execution amendments (2026-08-23)
+
+- **Lane B was a no-op.** The plan's `src/pmcp/subscriptions.py` in Key files implied a new publish path there. There wasn't one to add: `_index_*` and `_remove_server_indexes` already call `self._catalog_events.note_*` unconditionally, so once reconciliation calls them in the right order — remove, re-index, compare, publish-if-changed — the existing `note_*` → `SubscriptionBus` wiring publishes for free. `subscriptions.py` has zero diff across the phase.
+- **The Lane A/C branch partition described in Scope notes was never actually available**, for a more specific reason than "A and C sit in the same `if/else`": the two `TODO(post-P3B)` error branches this phase closed live in *two different functions* (`_handle_stdout_line` and the `_read_sse` loop), one per transport, not one shared branch. Serializing A → B → C within the same file, as the plan already recommended, is what actually happened; there was no branch-level split to reject at merge time because none existed to consider.
+- **SL-1's owned-files list omitted a test file.** SL-1 (Lanes A+B) is source-only by its own accounting, but its RED tests for `_handle_downstream_notification` and the reconcile scheduler had nowhere else to go and landed in `tests/test_client_manager.py` — the file SL-3 (Lane D) owned — as two clearly-named additions (`TestDownstreamReconcileScheduler` and its reconciliation-behaviour siblings). This did not collide with SL-3's own additions to the same file; it is recorded here as a gap in the plan's owned-files split, not as lane drift.
+
 ## Top Interface-Freeze Gates
 
 - **IF-0-TRISTATE-1** — `compare_versions(current: str, latest: str, package_type: str | None) -> Literal["newer", "not_newer", "incomparable"]`, the sole classification path. `is_version_newer` and `are_versions_comparable` are deleted by phase end (EC-TRISTATE-3), so there is no boolean form to keep in agreement. UPDPATH's Lane A consumes this.

@@ -811,11 +811,16 @@ routes. The replacement for server-initiated notifications is
 `subscriptions/listen` — a long-lived POST stream reachable **only** at
 protocol version `2026-07-28` — over which a client that opens a subscription
 receives `notifications/tools/list_changed`, `notifications/resources/list_changed`,
-and `notifications/prompts/list_changed` as PMCP's own catalog changes (a
+and `notifications/prompts/list_changed` as PMCP's own catalog changes — a
 `gateway.connect_server`, `gateway.disconnect_server`, or `gateway.refresh`
-call that adds, removes, or updates downstream tools, resources, or prompts).
-It does not proxy downstream servers' own `notifications/*` (see Non-Goals in
-the roadmap). No existing client loses delivered data from the GET
+call that adds, removes, or updates downstream tools, resources, or prompts,
+**or a downstream server's own `notifications/*/list_changed`**. A downstream
+notification is not relayed as-is: PMCP re-indexes that server's catalog
+first and publishes only once reconciliation confirms something actually
+moved, so a client that refetches on receipt of the notification sees the
+new catalog rather than the stale one. Progress and logging notifications
+from a downstream server are not proxied — catalog-change notifications
+only. No existing client loses delivered data from the GET
 retirement — PMCP never published anything on the old GET stream, so this
 removes a channel PMCP never wrote to, not one clients were receiving events
 over. The concurrency cap the old pre-session keep-alive shim enforced
