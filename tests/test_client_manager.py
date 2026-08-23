@@ -4410,3 +4410,352 @@ class TestDownstreamReconcileScheduler:
         assert err.code == -32000
         assert err.data == ["a", "b"]
         assert str(err) == "boom"
+
+
+class TestDownstreamNotificationBehaviouralGuarantees:
+    """FANOUT SL-3.2: storm suppression, the resources/prompts kinds, the
+    unrecognised-method no-op, and typed downstream errors on both dispatch
+    paths.
+
+    Test names here are chosen to match the `-k` patterns the roadmap's
+    acceptance criteria pin (EC-FANOUT-4, EC-FANOUT-5, EC-FANOUT-7).
+    `TestDownstreamReconcileScheduler` above (SL-1's own tests) deliberately
+    avoids those substrings so this lane could claim them without renaming
+    anything -- see that class's docstring. This class duplicates the small
+    `_managed`/`_wire`/`_drain` helpers rather than reaching into that
+    class's internals, so neither lane's tests depend on the other's shape.
+    """
+
+    @staticmethod
+    def _managed(name: str) -> ManagedClient:
+        status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=MagicMock(), status=status)
+        managed.config.name = name
+        return managed
+
+    @staticmethod
+    async def _drain(manager: ClientManager, timeout: float = 5.0) -> None:
+        """Wait until no reconcile is in flight."""
+
+        async def _wait() -> None:
+            while manager._reconcile_tasks:
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(_wait(), timeout)
+
+    def _wire(self, manager: ClientManager, state: dict[str, list[str]]) -> list[str]:
+        """Same shape as `TestDownstreamReconcileScheduler._wire`, without the
+        gating hook that class's deadlock test needs -- none of this class's
+        tests need to pause a reconcile mid-flight."""
+        calls: list[str] = []
+
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            calls.append(method)
+            if method == "tools/list":
+                return {
+                    "tools": [
+                        {"name": n, "inputSchema": {}} for n in state.get("tools", [])
+                    ]
+                }
+            if method == "resources/list":
+                return {
+                    "resources": [
+                        {"uri": f"mem://{n}"} for n in state.get("resources", [])
+                    ]
+                }
+            if method == "prompts/list":
+                return {"prompts": [{"name": n} for n in state.get("prompts", [])]}
+            return {}
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+        return calls
+
+    # ---- EC-FANOUT-4: storm suppression -----------------------------------
+
+    @pytest.mark.asyncio
+    async def test_unchanged_catalog_publishes_nothing_across_a_notification_storm(
+        self,
+    ) -> None:
+        """A downstream that emits `list_changed` repeatedly with nothing
+        actually different in its catalog must publish exactly zero events,
+        even though `_remove_server_indexes`/`_index_*` call `note_*`
+        unconditionally on every pass -- the suppress-while-churning rule is
+        what stands between this and a spam storm reaching subscribers."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(
+            manager, {"tools": ["alpha"], "resources": ["r1"], "prompts": ["p1"]}
+        )
+
+        # Prime the catalog, as connect-time indexing would.
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        # A burst of ten notifications, the catalog never actually moving.
+        for _ in range(10):
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+        await self._drain(manager)
+
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+        assert set(manager._tools) == {"srv::alpha"}
+
+    # ---- EC-FANOUT-5: resources/prompts kinds and the unknown no-op -------
+
+    @pytest.mark.asyncio
+    async def test_resources_list_changed_reconciles_and_publishes_only_resources(
+        self,
+    ) -> None:
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {
+            "tools": ["alpha"],
+            "resources": ["r1"],
+            "prompts": ["p1"],
+        }
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/resources/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        state["resources"] = ["r1", "r2"]
+        assert (
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/resources/list_changed"
+            )
+            is True
+        )
+        await self._drain(manager)
+
+        assert "srv::mem://r2" in manager._resources
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 1, 0)
+
+    @pytest.mark.asyncio
+    async def test_prompts_list_changed_reconciles_and_publishes_only_prompts(
+        self,
+    ) -> None:
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {
+            "tools": ["alpha"],
+            "resources": ["r1"],
+            "prompts": ["p1"],
+        }
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/prompts/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        state["prompts"] = ["p1", "p2"]
+        assert (
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/prompts/list_changed"
+            )
+            is True
+        )
+        await self._drain(manager)
+
+        assert "srv::p2" in manager._prompts
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 1)
+
+    @pytest.mark.asyncio
+    async def test_unknown_notification_is_a_noop_on_stdio_dispatch_and_does_not_kill_the_read_loop(
+        self,
+    ) -> None:
+        """An unrecognised `notifications/*` on the stdio path must not raise,
+        must not schedule a reconcile, and must not stop the next line -- a
+        real request/response pair -- from being processed normally right
+        after it."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+
+        unknown_line = json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/message"}
+        ).encode()
+        manager._handle_stdout_line("srv", managed, unknown_line, time.time())
+
+        assert not manager._reconcile_tasks
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+
+        # The read loop must still be alive to process a normal response.
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[42] = PendingRequest(
+            request_id=42,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+        response_line = json.dumps(
+            {"jsonrpc": "2.0", "id": 42, "result": {"ok": True}}
+        ).encode()
+        manager._handle_stdout_line("srv", managed, response_line, time.time())
+
+        assert fut.done()
+        assert fut.result() == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_unknown_notification_is_a_noop_on_sse_dispatch_and_does_not_kill_the_read_loop(
+        self,
+    ) -> None:
+        """The same, through `_read_sse`: that loop's blanket `except
+        Exception` would tear the connection down and force a reconnect if
+        the handler ever raised on an unrecognised method. This proves it
+        doesn't, by letting a real response frame flow right after it, in the
+        same stream, and resolve normally."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        managed.is_remote = True
+        manager._clients["srv"] = managed
+        manager._schedule_reconnect = MagicMock()  # type: ignore[method-assign]
+
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[43] = PendingRequest(
+            request_id=43,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+
+        def _frame(payload: dict[str, Any]) -> Any:
+            frame = MagicMock()
+            frame.message.model_dump.return_value = payload
+            return frame
+
+        async def stream() -> Any:
+            yield _frame({"jsonrpc": "2.0", "method": "notifications/message"})
+            yield _frame({"jsonrpc": "2.0", "id": 43, "result": {"ok": True}})
+
+        await manager._read_sse("srv", managed, stream())
+
+        assert not manager._reconcile_tasks
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+        assert fut.done()
+        assert fut.result() == {"ok": True}
+
+    # ---- EC-FANOUT-7: typed downstream errors, both dispatch paths --------
+
+    @pytest.mark.asyncio
+    async def test_typed_downstream_error_preserves_code_and_data_on_stdio_dispatch(
+        self,
+    ) -> None:
+        """`code`/`data` survive alongside `message`, and `str()` stays
+        exactly the downstream message -- `gateway.invoke` maps every
+        exception to E302 through `str(e)`, so nothing about that mapping
+        may change here."""
+        from pmcp.client.manager import DownstreamError
+
+        manager = ClientManager()
+        managed = self._managed("srv")
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[11] = PendingRequest(
+            request_id=11,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "error": {
+                    "code": -32601,
+                    "message": "Method not found",
+                    "data": {"method": "tools/frobnicate"},
+                },
+            }
+        ).encode()
+
+        manager._handle_stdout_line("srv", managed, line, time.time())
+
+        err = fut.exception()
+        assert isinstance(err, DownstreamError)
+        assert err.code == -32601
+        assert err.data == {"method": "tools/frobnicate"}
+        assert str(err) == "Method not found"
+
+    @pytest.mark.asyncio
+    async def test_typed_downstream_error_preserves_code_and_data_on_sse_dispatch(
+        self,
+    ) -> None:
+        """The same guarantee, through the remote dispatch path."""
+        from pmcp.client.manager import DownstreamError
+
+        manager = ClientManager()
+        managed = self._managed("srv")
+        managed.is_remote = True
+        manager._clients["srv"] = managed
+        manager._schedule_reconnect = MagicMock()  # type: ignore[method-assign]
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[12] = PendingRequest(
+            request_id=12,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+
+        def _frame(payload: dict[str, Any]) -> Any:
+            frame = MagicMock()
+            frame.message.model_dump.return_value = payload
+            return frame
+
+        async def stream() -> Any:
+            yield _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 12,
+                    "error": {
+                        "code": -32000,
+                        "message": "downstream unavailable",
+                        "data": {"retry_after_ms": 500},
+                    },
+                }
+            )
+
+        await manager._read_sse("srv", managed, stream())
+
+        err = fut.exception()
+        assert isinstance(err, DownstreamError)
+        assert err.code == -32000
+        assert err.data == {"retry_after_ms": 500}
+        assert str(err) == "downstream unavailable"

@@ -49,6 +49,9 @@ the file is split.
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
+
 import pytest
 
 from pmcp.client.manager import ClientManager
@@ -253,3 +256,212 @@ async def test_ec_p2_7_fake_remote_survives_a_pre_latched_appstatus() -> None:
     finally:
         await manager.disconnect_all()
         AppStatus.should_exit = False
+
+
+# ============================================================================
+# SL-3 (FANOUT) — EC-FANOUT-1/2/3/9: catalog freshness, remote transport.
+#
+# `tests/runtime/test_emitter_harness.py` (SL-2) already proves the emitter's
+# frames reach `ClientManager._read_sse`; that only proves the notification
+# arrived, which a forward-to-sink implementation that never re-indexes would
+# also satisfy. This proves the CATALOG moved: after a real emission, an
+# ADDED tool is returned by `gateway.catalog_search` and answers a real
+# `gateway.invoke`, and a REMOVED tool is gone from both.
+# `tests/runtime/test_downstream_stdio.py` is this section's stdio twin;
+# EC-FANOUT-3 requires both to pass independently.
+# ============================================================================
+
+
+async def _catalog_tool_ids(gateway_tools: GatewayTools, server: str) -> set[str]:
+    """The tool_ids `gateway.catalog_search` currently returns for `server`,
+    with no text query -- `CatalogSearchInput.query` is optional, and the
+    server filter alone is enough to scope this to one downstream."""
+    output = await gateway_tools.catalog_search(
+        {"filters": {"server": server}, "limit": 100}
+    )
+    return {card.tool_id for card in output.results}
+
+
+async def _wait_until(
+    predicate: Callable[[], Awaitable[bool]],
+    *,
+    attempts: int = 50,
+    interval: float = 0.05,
+) -> bool:
+    """Poll an async predicate until it is True or `attempts` is exhausted.
+    Returns the last observed value, so a failing assertion shows what the
+    catalog actually held rather than just "timed out"."""
+    result = False
+    for _ in range(attempts):
+        result = await predicate()
+        if result:
+            return True
+        await asyncio.sleep(interval)
+    return result
+
+
+@pytest.mark.asyncio
+class TestRemoteDownstreamNotificationCatalogFreshness:
+    async def test_downstream_notification_added_tool_is_searchable_and_invocable(
+        self,
+    ) -> None:
+        """EC-FANOUT-1/9, remote half of EC-FANOUT-3: a tool ADDED by the
+        downstream after connect is returned by `gateway.catalog_search` and
+        answers a real `gateway.invoke` call -- proof the index actually
+        moved, not just that a notification was received."""
+        manager = ClientManager()
+        try:
+            async with run_fake_remote(
+                alloc_port(), expected_auth_value=AUTH_VALUE
+            ) as remote:
+                errors = await manager.connect_server(
+                    _config(
+                        "fr-fanout-add",
+                        remote.mcp_url,
+                        headers={"Authorization": AUTH_VALUE},
+                    )
+                )
+                assert errors == []
+                gateway_tools = GatewayTools(
+                    client_manager=manager, policy_manager=PolicyManager()
+                )
+                tool_id = "fr-fanout-add::fr_dyn"
+
+                assert tool_id not in await _catalog_tool_ids(
+                    gateway_tools, "fr-fanout-add"
+                )
+
+                await remote.emitter.add_tool("fr_dyn", description="dynamic")
+                await remote.emitter.emit("notifications/tools/list_changed")
+
+                found = await _wait_until(
+                    lambda: _tool_present(gateway_tools, "fr-fanout-add", tool_id)
+                )
+                assert found, "gateway.catalog_search never reflected the added tool"
+
+                result = await gateway_tools.invoke(
+                    {"tool_id": tool_id, "arguments": {"text": "hi"}}
+                )
+                assert result.ok is True, result.errors
+        finally:
+            await manager.disconnect_all()
+
+    async def test_downstream_notification_removed_tool_disappears_from_catalog_and_invoke(
+        self,
+    ) -> None:
+        """EC-FANOUT-2, remote half of EC-FANOUT-3: the flip side. A tool the
+        downstream REMOVES is gone from both `gateway.catalog_search` and
+        `gateway.invoke` after the server announces the change."""
+        manager = ClientManager()
+        try:
+            async with run_fake_remote(
+                alloc_port(), expected_auth_value=AUTH_VALUE
+            ) as remote:
+                errors = await manager.connect_server(
+                    _config(
+                        "fr-fanout-remove",
+                        remote.mcp_url,
+                        headers={"Authorization": AUTH_VALUE},
+                    )
+                )
+                assert errors == []
+                gateway_tools = GatewayTools(
+                    client_manager=manager, policy_manager=PolicyManager()
+                )
+                tool_id = "fr-fanout-remove::fr_removable"
+
+                await remote.emitter.add_tool("fr_removable")
+                await remote.emitter.emit("notifications/tools/list_changed")
+                found = await _wait_until(
+                    lambda: _tool_present(gateway_tools, "fr-fanout-remove", tool_id)
+                )
+                assert found, "setup: added tool never appeared in the catalog"
+
+                await remote.emitter.remove_tool("fr_removable")
+                await remote.emitter.emit("notifications/tools/list_changed")
+
+                gone = await _wait_until(
+                    lambda: _tool_absent(gateway_tools, "fr-fanout-remove", tool_id)
+                )
+                assert gone, (
+                    "gateway.catalog_search still lists a tool the downstream removed"
+                )
+
+                result = await gateway_tools.invoke(
+                    {"tool_id": tool_id, "arguments": {}}
+                )
+                assert result.ok is False
+                assert result.errors
+        finally:
+            await manager.disconnect_all()
+
+
+async def _tool_present(gateway_tools: GatewayTools, server: str, tool_id: str) -> bool:
+    return tool_id in await _catalog_tool_ids(gateway_tools, server)
+
+
+async def _tool_absent(gateway_tools: GatewayTools, server: str, tool_id: str) -> bool:
+    return tool_id not in await _catalog_tool_ids(gateway_tools, server)
+
+
+# ============================================================================
+# SL-3.3 (FANOUT) — EC-FANOUT-6: no self-deadlock.
+#
+# `_reconcile_server_catalog` must be scheduled with `asyncio.create_task`,
+# never awaited inline from the dispatch path: `_index_capabilities` awaits
+# `_send_request`, and that future is resolved by the very read loop
+# (`_read_sse`) that received the notification. An inline await would freeze
+# that loop permanently -- it would be waiting on a future only its own next
+# iteration could resolve.
+#
+# The unrelated request MUST go to the same downstream whose read loop
+# handled the notification. The loops are per-connection, so a request to a
+# *different* server would stay unaffected by a broken (deadlocked) server's
+# loop either way, and would not exercise this hazard at all.
+# ============================================================================
+
+
+@pytest.mark.asyncio
+class TestRemoteSelfDeadlock:
+    async def test_unrelated_request_to_same_downstream_completes_after_notification(
+        self,
+    ) -> None:
+        manager = ClientManager()
+        try:
+            async with run_fake_remote(
+                alloc_port(), expected_auth_value=AUTH_VALUE
+            ) as remote:
+                errors = await manager.connect_server(
+                    _config(
+                        "fr-deadlock",
+                        remote.mcp_url,
+                        headers={"Authorization": AUTH_VALUE},
+                    )
+                )
+                assert errors == []
+                gateway_tools = GatewayTools(
+                    client_manager=manager, policy_manager=PolicyManager()
+                )
+
+                await remote.emitter.add_tool("fr_dyn_deadlock")
+                await remote.emitter.emit("notifications/tools/list_changed")
+
+                # Issue the unrelated request immediately, while the reconcile
+                # the notification just triggered may still be in flight, to
+                # the SAME downstream. A deadlocked read loop would never
+                # resolve this -- bound it so a real deadlock fails this test
+                # with a timeout instead of hanging the suite.
+                result = await asyncio.wait_for(
+                    gateway_tools.invoke(
+                        {
+                            "tool_id": "fr-deadlock::fr_echo",
+                            "arguments": {"text": "still-alive"},
+                        }
+                    ),
+                    timeout=5.0,
+                )
+                assert result.ok is True, result.errors
+                content = result.result["content"]  # type: ignore[index]
+                assert content[0]["text"] == "fr-echo:still-alive"
+        finally:
+            await manager.disconnect_all()
