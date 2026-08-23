@@ -580,10 +580,16 @@ class TestCheckStaleness:
 class TestUpToDateShortCircuit:
     """The "already up to date" short-circuit must not fire on unorderable input.
 
-    Consiliency/pmcp#156 item 2. `is_version_newer` fails closed, so `False`
-    means either "current" or "could not be ordered". The short-circuit negates
-    it, and an orderability guard was added to stop an unreadable value reading
-    as current.
+    Consiliency/pmcp#156 item 2, retained after the tri-state migration.
+    Historically `is_version_newer` failed closed, so `False` meant either
+    "current" or "could not be ordered"; the short-circuit negated it, and an
+    orderability guard was bolted on to stop an unreadable value reading as
+    current. That function no longer exists (Consiliency/pmcp#164) -- the
+    short-circuit now tests `compare_versions(...) == "not_newer"`, so an
+    `incomparable` pair simply is not `not_newer` and falls through to a
+    refresh. This test is kept because the OUTCOME it pins is the same one
+    that defect produced, and it must keep holding under the new
+    representation.
 
     That guard checked only the CACHED side. Board review proved the defect was
     therefore still live: with a cached `1.0.0` (orderable) and a FETCHED
@@ -685,6 +691,61 @@ class TestUpToDateShortCircuit:
             "short-circuited as up-to-date across an incomparable "
             f"version/digest pair (calls={calls})"
         )
+
+
+class TestShortCircuitUsesCompareVersions:
+    """SL-1.3 (Consiliency/pmcp#164) migrates the short-circuit onto the
+    tri-state `compare_versions` directly, replacing the `are_versions_
+    comparable(...) and not is_version_newer(...)` pair.
+
+    RED until `refresher.py` imports and calls `compare_versions` -- `patch`
+    with the default `create=False` refuses to stand in for an attribute
+    that does not exist yet, which is the point: this fails for the right
+    reason (the migration hasn't happened) rather than a wrong one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_is_a_single_compare_versions_call(
+        self, temp_dir: Path
+    ) -> None:
+        existing = GeneratedServerDescriptions(
+            package="srv",
+            version="1.0.0",
+            generated_at="2025-01-01T00:00:00Z",
+            capability_summary="stale summary",
+            tools=[],
+        )
+        server = ServerConfig(
+            name="srv",
+            description="",
+            keywords=[],
+            install={},
+            command="npx",
+            args=["srv"],
+        )
+
+        async def fake_version(command, args, timeout=None):
+            return ("1.0.0", "npm")
+
+        calls: list[tuple] = []
+
+        def fake_compare(current, latest, package_type=None):
+            calls.append((current, latest, package_type))
+            return "not_newer"
+
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=fake_version
+        ):
+            with patch(
+                "pmcp.manifest.refresher.compare_versions", side_effect=fake_compare
+            ):
+                result = await refresh_server(server, existing_cache=existing)
+
+        assert calls == [("1.0.0", "1.0.0", "npm")], (
+            "the short-circuit must resolve to exactly one compare_versions "
+            f"call over (cached, fetched, package_type), got {calls}"
+        )
+        assert result is existing
 
 
 class TestRefreshAll:

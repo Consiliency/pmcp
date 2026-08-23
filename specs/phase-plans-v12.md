@@ -71,7 +71,9 @@ Replace the fail-closed boolean `is_version_newer` with a tri-state result so "i
 - [ ] EC-TRISTATE-1 — `compare_versions(current, latest, package_type)` returns one of exactly three values (`newer`, `not_newer`, `incomparable`) and is the **only** classification path.
 - [ ] EC-TRISTATE-2 — Both `refresher.py` call sites consume the tri-state directly, and the "already up to date" short-circuit fires only on an explicit `not_newer`. Proven by a test that is RED when the short-circuit treats `incomparable` as up-to-date.
 - [ ] EC-TRISTATE-3 — **`is_version_newer` and `are_versions_comparable` are deleted outright**, along with `test_no_unguarded_negation_of_is_version_newer`. Not kept as wrappers and policed — *deleted*. A function that does not exist cannot be negated, which is the difference between unrepresentable and merely detectable. They may exist as intra-phase migration shims; the criterion is their removal by phase end.
-- [ ] EC-TRISTATE-4 — `compare_versions` is pinned against the existing 28-value × 7-type corpus in its own right: every pair classified `incomparable` is ordered in neither direction, every `newer` pair reverses to `not_newer`, and the test fails when drift is injected. (This is no longer a *wrapper-agreement* test — with EC-TRISTATE-3 there are no wrappers to agree with.)
+- [ ] EC-TRISTATE-4 — `compare_versions` is pinned against the existing 28-value × 7-type corpus in its own right: every pair classified `incomparable` is ordered in neither direction, and the test fails when drift is injected. Additionally, an **ordinal** `newer` (SemVer / PEP 440 lanes) must reverse to `not_newer`, while a **digest** difference is `newer` in *both* directions and is exempt — a digest is an identity, not an ordinal. (This is no longer a *wrapper-agreement* test — with EC-TRISTATE-3 there are no wrappers to agree with.)
+
+  *Amended 2026-08-23 during execution review.* The original wording required universal reversal, which is false for the digest lane, and the corpus asserted only the safety direction — a mutant making the SemVer lane return `newer` in both directions passed all seven corpus tests. Antisymmetry is now asserted separately and scoped to the ordinal lanes.
 - [ ] EC-TRISTATE-5 — Full suite, ruff, mypy green; CHANGELOG records the new API and the lint's removal.
 
 **Scope notes**
@@ -98,6 +100,9 @@ Replace the fail-closed boolean `is_version_newer` with a tri-state result so "i
 
 **Produces**
 - IF-0-TRISTATE-1 — `compare_versions(current: str, latest: str, package_type: str | None) -> Literal["newer", "not_newer", "incomparable"]`. This is the whole contract: after this phase there is no boolean form to keep in agreement with it.
+
+**Post-execution amendments (2026-08-23)**
+- The Scope notes above proposed 3 lanes split by file — Lane A on `version_checker.py`, Lane B on `refresher.py`, Lane C on `tests/` — but that split did not survive the decision to delete the wrappers outright (EC-TRISTATE-3) rather than keep them as policed shims. Deleting `is_version_newer`/`are_versions_comparable` and migrating `refresher.py`'s two call sites off them is one atomic change: a task-level reducer gate between "delete" and "migrate" would trip a lane `cycle` diagnostic (each waits on the other to land first — the wrappers can't go while a caller still uses them, and the caller can't move to `compare_versions` while treating the deletion as a separate, later lane), and splitting them into two lanes instead would trip `overlapping_write_ownership` on `version_checker.py`, since the migration lane would need to observe the same file the deletion lane is editing to confirm no call sites remain. The phase executed as one working lane covering `version_checker.py` and `refresher.py` together, with tests alongside.
 
 ### Phase 2 — Update-path identity and environment contracts (UPDPATH)
 

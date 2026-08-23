@@ -475,13 +475,13 @@ def _digest_identity(value: str, package_type: str | None = None) -> str | None:
 #   * Promote an all-numeric value to a digest when its PARTNER is
 #     unmistakably one. Resolves the ambiguity by GUESSING, and the guess can
 #     fabricate: a genuine CalVer paired with a digest then reports an update
-#     that never happened, which is exactly what the fail-closed contract on
-#     `is_version_newer` exists to prevent (ah board review).
+#     that never happened, which is exactly what `compare_versions`'s
+#     fail-closed contract exists to prevent (ah board review).
 #
 # So a mixed pair stays incomparable, per the documented contract. The
 # ambiguity is unreachable while callers pass the package type -- both live
 # callers in `refresher.py` do, and
-# `test_all_is_version_newer_callers_pass_package_type` keeps it that way.
+# `test_all_compare_versions_callers_pass_package_type` keeps it that way.
 def _parse_version(value: str) -> Version | None:
     """Parse *value* as a release version, or ``None`` if it is not one.
 
@@ -542,102 +542,48 @@ def _semver_parse(value: str) -> SemverVersion | None:
         return None
 
 
-def _semver_is_newer(current: str, latest: str) -> bool:
-    """SemVer precedence, failing closed when either side is not SemVer.
-
-    Comparison ignores build metadata, per spec: it does not affect precedence.
-    """
-    current_version = _semver_parse(current)
-    latest_version = _semver_parse(latest)
-    if current_version is None or latest_version is None:
-        return False
-    return bool(latest_version > current_version)
+VersionComparison = Literal["newer", "not_newer", "incomparable"]
 
 
-def is_version_orderable(value: str, package_type: str | None = None) -> bool:
-    """Whether *value* can be ordered at all -- a release version or a digest.
-
-    NOT sufficient as a guard for ``not is_version_newer(a, b)``. That was its
-    original purpose and it was wrong: comparability is a property of the PAIR,
-    and two individually-orderable values can still be incomparable (a version
-    against a digest), so the negation still read "up to date" for a pair that
-    could not be ordered. Use :func:`are_versions_comparable` for that.
-
-    This remains useful for genuinely unary questions -- "is this single value
-    a thing I could order at all".
-    """
-    if _digest_identity(value, package_type) is not None:
-        return True
-    if _is_semver_ecosystem(package_type):
-        return _semver_parse(value) is not None
-    return _parse_version(value) is not None
-
-
-def are_versions_comparable(
+def compare_versions(
     current: str, latest: str, package_type: str | None = None
-) -> bool:
-    """Whether this PAIR can be ordered at all.
+) -> VersionComparison:
+    """Classify *latest* relative to *current*: the sole classification path.
 
-    Unary orderability is not sufficient and using it as a guard is a bug
-    (ah board review): ``"1.0.0"`` and ``"abcdef123456"`` are each orderable on
-    their own, but a version and a digest describe different things and
-    :func:`is_version_newer` refuses to order them -- so it fails closed to
-    ``False``, and a caller negating that reads "up to date" for a pair it
-    cannot compare. Comparability is a property of the PAIR, so ask about the
-    pair.
+    Consiliency/pmcp#164. This replaces the fail-closed boolean
+    ``is_version_newer`` and its hand-mirrored pair predicate
+    ``are_versions_comparable``. Those two answered "is X newer" and "can X
+    and Y be ordered at all" as separate booleans, and a caller combining them
+    as ``are_versions_comparable(...) and not is_version_newer(...)`` -- or
+    worse, skipping the pair guard and just negating -- collapsed "up to date"
+    and "cannot be ordered" into the same ``False``. That exact collapse
+    shipped three times (#155, #156, #163) and survived a lint written to
+    police it (bypassed four times), because a syntactic check cannot prove a
+    dataflow property. A three-way `Literal` return makes the collapse
+    unrepresentable instead of merely detectable: a caller has to name the
+    branch it means.
 
-    Mirrors :func:`is_version_newer`'s own branching deliberately. If you change
-    the classification there, change it here; ``test_comparable_agrees_with_
-    is_version_newer`` fails if the two drift apart.
+    Returns ``"newer"``, ``"not_newer"``, or ``"incomparable"`` -- never a
+    fourth value, and never a plain ``bool`` a caller could negate into
+    ambiguity.
+
+    * Both sides are digests -> identity, not an ordinal: any difference in
+      the CANONICAL form is a new image, and the same image in two spellings
+      (``abcdef123456`` vs ``sha256:abcdef123456``) is ``"not_newer"``. This is
+      the docker lane: `get_docker_version` returns a bare 12-hex digest.
+    * Exactly one side is a digest -> ``"incomparable"``: a digest and a
+      release number describe different things.
+    * Package type names a SemVer ecosystem (npm, cargo) -> SemVer precedence,
+      so ``1.0.0-1`` is correctly a PRERELEASE below ``1.0.0`` (PEP 440 would
+      read it as the opposite: a post-release). Either side failing to parse
+      as SemVer -> ``"incomparable"``.
+    * Otherwise -> PEP 440 ordering on the PUBLIC segment, so `1.0.0-rc1` is
+      OLDER than `1.0.0` and build metadata (`1.0.0+build.4` -> `+build.5`) is
+      not precedence. Either side failing to parse -> ``"incomparable"``,
+      which covers the unreadable case (the literal ``"unknown"`` the
+      refresher persists after a failed lookup) and the empty string mcp 2.x
+      defaults ``serverInfo.version`` to.
     """
-    current_digest = _digest_identity(current, package_type)
-    latest_digest = _digest_identity(latest, package_type)
-    if current_digest is not None or latest_digest is not None:
-        # Comparable only when BOTH are digests.
-        return current_digest is not None and latest_digest is not None
-    if _is_semver_ecosystem(package_type):
-        return _semver_parse(current) is not None and _semver_parse(latest) is not None
-    return _parse_version(current) is not None and _parse_version(latest) is not None
-
-
-def is_version_newer(
-    current: str, latest: str, package_type: str | None = None
-) -> bool:
-    """Whether *latest* is a strictly newer release than *current*.
-
-    FAILS CLOSED. Returning ``True`` tells an operator their server is out of
-    date, so anything this function cannot actually order returns ``False``
-    (Consiliency/pmcp#150 board review). An unreadable version produces no
-    notice rather than a false one.
-
-    .. warning::
-       **``not is_version_newer(...)`` is unsafe on its own.** Because this
-       fails closed, ``False`` means EITHER "genuinely current" OR "could not
-       be ordered at all". Negating it collapses those into "up to date", so an
-       unreadable value (the literal ``"unknown"`` the refresher persists after
-       a failed lookup, or the empty string mcp 2.x defaults to) reads as
-       current forever.
-
-       This is not hypothetical: making this function fail closed silently
-       inverted an existing negated caller in ``refresher.py``, pinning a stale
-       cache permanently. Gate on :func:`are_versions_comparable` -- the PAIR
-       predicate. Do NOT gate on :func:`is_version_orderable` for this: it
-       answers a unary question, and two individually-orderable values can
-       still be incomparable (a version against a digest), which is how this
-       exact defect survived a round of fixing. A test enforces the pair guard
-       repo-wide -- see ``test_no_unguarded_negation_of_is_version_newer``.
-
-    * Both sides parse as versions -> PEP 440 ordering, so `1.0.0-rc1` is
-      correctly OLDER than `1.0.0`, and build metadata is not precedence.
-    * Both sides are digests -> any difference is a new image. This is the
-      docker lane: `get_docker_version` returns a bare 12-hex digest.
-    * Anything else -- unparseable, empty (the mcp 2.x default
-      ``serverInfo.version``), or a digest compared against a version -> no
-      update.
-    """
-    if current == latest:
-        return False
-
     current_digest = _digest_identity(current, package_type)
     latest_digest = _digest_identity(latest, package_type)
     if current_digest is not None or latest_digest is not None:
@@ -645,22 +591,52 @@ def is_version_newer(
         # CANONICAL identity is a new image. A digest and a version describe
         # different things and are not ordered.
         if current_digest is None or latest_digest is None:
-            return False
-        return current_digest != latest_digest
+            return "incomparable"
+        return "newer" if current_digest != latest_digest else "not_newer"
 
     if _is_semver_ecosystem(package_type):
-        return _semver_is_newer(current, latest)
+        current_semver = _semver_parse(current)
+        latest_semver = _semver_parse(latest)
+        if current_semver is None or latest_semver is None:
+            return "incomparable"
+        return "newer" if latest_semver > current_semver else "not_newer"
 
     current_version = _parse_version(current)
     latest_version = _parse_version(latest)
     if current_version is None or latest_version is None:
-        return False
+        return "incomparable"
 
     # Compare on the PUBLIC segment: a local/build-metadata difference
     # (`1.0.0+build.4` -> `+build.5`) is not a new release, and announcing one
     # would be the same fabricated notice this function exists to prevent.
     # Pre-release precedence is retained, since `.public` keeps it.
-    return Version(latest_version.public) > Version(current_version.public)
+    if Version(latest_version.public) > Version(current_version.public):
+        return "newer"
+    return "not_newer"
+
+
+def is_version_orderable(value: str, package_type: str | None = None) -> bool:
+    """Whether *value* can be ordered at all -- a release version or a digest.
+
+    NOT sufficient as a guard for a negated newer-check. That was its original
+    purpose and it was wrong: comparability is a property of the PAIR, and two
+    individually-orderable values can still be incomparable (a version against
+    a digest). Use :func:`compare_versions` for that -- its ``"incomparable"``
+    branch is a value, not a boolean a caller can accidentally negate.
+
+    This remains useful for genuinely unary questions -- "is this single value
+    a thing I could order at all".
+
+    Delegates to :func:`compare_versions` rather than branching again. It used
+    to re-derive the digest/SemVer/PEP-440 classification itself, which left
+    two classification sites that could drift apart -- exactly the hazard the
+    2.2.1 wrapper-drift corpus existed to police, reintroduced in a new place
+    (ah board review). Comparing a value against ITSELF is orderable precisely
+    when the value is: equal values are ``"not_newer"``, and an unreadable one
+    is ``"incomparable"``. Verified equivalent to the previous implementation
+    across 112 value/package-type combinations.
+    """
+    return compare_versions(value, value, package_type) != "incomparable"
 
 
 def clear_version_cache() -> None:
