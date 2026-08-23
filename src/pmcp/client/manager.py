@@ -90,6 +90,18 @@ DOWNSTREAM_LIST_CHANGED_METHODS: dict[str, str] = {
 # the single pending re-run.
 _RECONCILE_RERUN_DEBOUNCE_S = 0.25
 
+# Ceiling on `nextCursor` follows for one catalog kind (Consiliency/pmcp#173).
+# A downstream that always returns a cursor would otherwise spin the fetch
+# forever, and reconciliation runs on every downstream notification, so the
+# loop is reachable by a misbehaving peer rather than only at connect.
+#
+# Sized against the thing that consumes the result: `max_tools_per_server`
+# defaults to 100, and the MCP page size servers actually use is tens of
+# entries, so 50 pages clears any honest catalog by a wide margin while still
+# bounding a server that never stops paginating. Exceeding it makes the kind
+# UNREADABLE, not partial -- indexing a truncated view is what #173 was about.
+_MAX_LISTING_PAGES = 50
+
 
 class DownstreamError(Exception):
     """A JSON-RPC `error` object returned by a downstream MCP server.
@@ -1675,17 +1687,15 @@ class ClientManager:
         """
         name = managed.config.name
 
-        tools_result = await self._send_request(managed, "tools/list", {})
+        tools_entries = await self._fetch_listing_pages(managed, "tools")
 
-        resources_task = self._send_request(managed, "resources/list", {})
-        prompts_task = self._send_request(managed, "prompts/list", {})
+        resources_task = self._fetch_listing_pages(managed, "resources")
+        prompts_task = self._fetch_listing_pages(managed, "prompts")
         listing_results = await asyncio.gather(
             resources_task, prompts_task, return_exceptions=True
         )
 
-        listings: dict[str, list[dict[str, Any]] | None] = {
-            "tools": _listing_entries(name, "tools", tools_result)
-        }
+        listings: dict[str, list[dict[str, Any]] | None] = {"tools": tools_entries}
         for kind, result in (
             ("resources", listing_results[0]),
             ("prompts", listing_results[1]),
@@ -1694,8 +1704,79 @@ class ClientManager:
                 logger.debug(f"Server {name} doesn't support {kind}: {result}")
                 listings[kind] = None
             else:
-                listings[kind] = _listing_entries(name, kind, result)
+                listings[kind] = result
         return listings
+
+    async def _fetch_listing_pages(
+        self, managed: ManagedClient, kind: str
+    ) -> list[dict[str, Any]] | None:
+        """Follow `nextCursor` for one kind, or `None` if any page is unreadable.
+
+        The listing path used to send `{}` once and keep whatever came back, so
+        a downstream with more entries than its page size had everything past
+        page one silently missing -- and, once reconciliation started publishing,
+        announced as removed (Consiliency/pmcp#173). The truncation predated
+        that; what made it urgent is asserting freshness over a partial view.
+
+        A failure on page N makes the WHOLE kind unreadable rather than partial.
+        Merging the pages that did arrive is exactly the false-removal shape this
+        module has now been corrected for four times: entries the server still
+        has would be dropped and the drop published. `None` means "we could not
+        read the answer", and the caller already handles that by keeping the
+        prior entries and publishing nothing.
+
+        `tools/list` failing on page one still raises, preserving the contract
+        that a server which cannot list its tools is a connect-time error while
+        a server without resources or prompts is ordinary.
+        """
+        collected: list[dict[str, Any]] = []
+        seen_cursors: set[str] = set()
+        cursor: str | None = None
+
+        for page in range(_MAX_LISTING_PAGES):
+            params: dict[str, Any] = {"cursor": cursor} if cursor else {}
+            result = await self._send_request(managed, f"{kind}/list", params)
+
+            entries = _listing_entries(managed.config.name, kind, result)
+            if entries is None:
+                # _listing_entries already logged why. One bad page discards the
+                # whole kind on purpose -- see the docstring.
+                if page > 0:
+                    logger.warning(
+                        f"[{managed.config.name}] {kind}/list page {page + 1} was "
+                        f"unreadable; discarding {len(collected)} entries already "
+                        f"collected rather than publishing a partial listing"
+                    )
+                return None
+            collected.extend(entries)
+
+            if not isinstance(
+                result, dict
+            ):  # pragma: no cover - _listing_entries guards
+                return None
+            raw_cursor = result.get("nextCursor") or result.get("next_cursor")
+            if not raw_cursor:
+                return collected
+            if not isinstance(raw_cursor, str):
+                logger.warning(
+                    f"[{managed.config.name}] {kind}/list returned a non-string "
+                    f"cursor ({type(raw_cursor).__name__}); treating as unreadable"
+                )
+                return None
+            if raw_cursor in seen_cursors:
+                logger.warning(
+                    f"[{managed.config.name}] {kind}/list repeated cursor "
+                    f"{raw_cursor!r}; treating as unreadable rather than looping"
+                )
+                return None
+            seen_cursors.add(raw_cursor)
+            cursor = raw_cursor
+
+        logger.warning(
+            f"[{managed.config.name}] {kind}/list exceeded {_MAX_LISTING_PAGES} "
+            f"pages; treating as unreadable rather than indexing a truncated view"
+        )
+        return None
 
     async def _index_capabilities(self, managed: ManagedClient) -> tuple[int, int, int]:
         name = managed.config.name
