@@ -687,6 +687,61 @@ class TestUpToDateShortCircuit:
         )
 
 
+class TestShortCircuitUsesCompareVersions:
+    """SL-1.3 (Consiliency/pmcp#164) migrates the short-circuit onto the
+    tri-state `compare_versions` directly, replacing the `are_versions_
+    comparable(...) and not is_version_newer(...)` pair.
+
+    RED until `refresher.py` imports and calls `compare_versions` -- `patch`
+    with the default `create=False` refuses to stand in for an attribute
+    that does not exist yet, which is the point: this fails for the right
+    reason (the migration hasn't happened) rather than a wrong one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_short_circuit_is_a_single_compare_versions_call(
+        self, temp_dir: Path
+    ) -> None:
+        existing = GeneratedServerDescriptions(
+            package="srv",
+            version="1.0.0",
+            generated_at="2025-01-01T00:00:00Z",
+            capability_summary="stale summary",
+            tools=[],
+        )
+        server = ServerConfig(
+            name="srv",
+            description="",
+            keywords=[],
+            install={},
+            command="npx",
+            args=["srv"],
+        )
+
+        async def fake_version(command, args, timeout=None):
+            return ("1.0.0", "npm")
+
+        calls: list[tuple] = []
+
+        def fake_compare(current, latest, package_type=None):
+            calls.append((current, latest, package_type))
+            return "not_newer"
+
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=fake_version
+        ):
+            with patch(
+                "pmcp.manifest.refresher.compare_versions", side_effect=fake_compare
+            ):
+                result = await refresh_server(server, existing_cache=existing)
+
+        assert calls == [("1.0.0", "1.0.0", "npm")], (
+            "the short-circuit must resolve to exactly one compare_versions "
+            f"call over (cached, fetched, package_type), got {calls}"
+        )
+        assert result is existing
+
+
 class TestRefreshAll:
     @pytest.mark.asyncio
     async def test_refresh_all_uses_bounded_concurrency_for_version_checks(

@@ -15,6 +15,7 @@ from pmcp.manifest.version_checker import (
     _USER_AGENT,
     _version_cache,
     clear_version_cache,
+    compare_versions,
     detect_package_type,
     get_cargo_version,
     get_docker_version,
@@ -24,6 +25,7 @@ from pmcp.manifest.version_checker import (
     are_versions_comparable,
     is_version_newer,
     is_version_orderable,
+    VersionComparison,
 )
 from pmcp import __version__
 
@@ -420,6 +422,80 @@ class TestIsVersionNewer:
         """PEP 440 ordering: a prerelease is OLDER than its release."""
         assert is_version_newer("1.0.0-rc1", "1.0.0") is True
         assert is_version_newer("1.0.0", "1.0.0-rc1") is False
+
+
+class TestCompareVersions:
+    """`compare_versions` is the single classification path (IF-0-TRISTATE-1).
+
+    Consiliency/pmcp#164. `is_version_newer` fails closed to a boolean, so
+    `False` collapses "up to date" and "cannot be ordered" into one value --
+    the exact ambiguity that made `not is_version_newer(...)` a recurring
+    defect (#155, #156, #163). A tri-state return makes the collapse
+    unrepresentable: a caller has to name the branch it means.
+    """
+
+    @pytest.mark.parametrize(
+        ("current", "latest", "package_type", "expected"),
+        [
+            ("1.0.0", "2.0.0", "npm", "newer"),
+            ("1.0.0-rc1", "1.0.0", "npm", "newer"),
+            # SemVer, not PEP 440: `-1` is a prerelease, not a post-release.
+            ("1.0.0-1", "1.0.0", "npm", "newer"),
+            ("2.0.0", "1.0.0", "npm", "not_newer"),
+            # Build metadata is not a release.
+            ("1.0.0", "1.0.0+b", None, "not_newer"),
+            # Same PEP 440 release, different rendering.
+            ("1.0", "1.0.0", None, "not_newer"),
+            # Same image, two spellings of the digest.
+            ("abcdef123456", "sha256:abcdef123456", "docker", "not_newer"),
+            ("abcdef123456", "abcdef123457", "docker", "newer"),
+            # CalVer.
+            ("202612180000", "202612190000", None, "newer"),
+            # Version vs digest.
+            ("1.0.0", "abcdef123456", "docker", "incomparable"),
+            ("1.0.0", "nightly", "npm", "incomparable"),
+            ("unknown", "2.0.0", "npm", "incomparable"),
+        ],
+    )
+    def test_parity_with_removed_predicates(
+        self,
+        current: str,
+        latest: str,
+        package_type: str | None,
+        expected: VersionComparison,
+    ) -> None:
+        """Every answer the two deleted predicates gave must survive as one of
+        the three tri-state values -- this is a representation change, not a
+        behaviour change."""
+        assert compare_versions(current, latest, package_type) == expected
+
+    def test_result_is_always_one_of_the_three_literal_values(self) -> None:
+        """No input -- however malformed -- may produce a fourth value.
+
+        That is the whole point of narrowing the return type to a `Literal`:
+        unlike a bare `str`, a caller and a type checker can both rely on
+        there being exactly three branches, ever.
+        """
+        allowed = {"newer", "not_newer", "incomparable"}
+        for pkg_type in _CORPUS_TYPES:
+            for current in _CORPUS_VALUES:
+                for latest in _CORPUS_VALUES:
+                    result = compare_versions(current, latest, pkg_type)
+                    assert result in allowed, (
+                        f"compare_versions({current!r}, {latest!r}, "
+                        f"{pkg_type!r}) returned {result!r}, outside the "
+                        f"three-value contract"
+                    )
+
+    def test_incomparable_is_not_the_same_as_not_newer(self) -> None:
+        """The distinction the boolean could never make.
+
+        A caller gating a short-circuit on `== "not_newer"` must NOT fire for
+        an incomparable pair -- that was the exact defect `not
+        is_version_newer(...)` produced by conflating the two.
+        """
+        assert compare_versions("1.0.0", "nightly", "npm") == "incomparable"
+        assert compare_versions("1.0.0", "nightly", "npm") != "not_newer"
 
 
 class TestGetNpmVersion:
