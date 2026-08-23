@@ -64,6 +64,59 @@ except ImportError:
 logger = logging.getLogger(__name__)
 _TaskT = TypeVar("_TaskT", bound=asyncio.Task[Any])
 
+# IF-0-FANOUT-1: the downstream `notifications/*` methods this gateway acts on,
+# mapped to the catalog kind whose identifier set decides whether reconciliation
+# publishes. Every method absent from this mapping is a no-op by construction --
+# see `ClientManager._handle_downstream_notification`.
+DOWNSTREAM_LIST_CHANGED_METHODS: dict[str, str] = {
+    "notifications/tools/list_changed": "tools",
+    "notifications/resources/list_changed": "resources",
+    "notifications/prompts/list_changed": "prompts",
+}
+
+# Minimum gap between consecutive reconciles of the same server. The first
+# reconcile after a notification is never delayed; only a *re-run* waits. This
+# bounds the one pathological case coalescing alone does not: a downstream that
+# emits `list_changed` in response to the `tools/list` that reconciliation
+# itself issues, which would otherwise drive the re-run loop forever at full
+# speed. With the debounce that server costs one reconcile per interval instead
+# of a hot spin, and notifications arriving during the wait still collapse into
+# the single pending re-run.
+_RECONCILE_RERUN_DEBOUNCE_S = 0.25
+
+
+class DownstreamError(Exception):
+    """A JSON-RPC `error` object returned by a downstream MCP server.
+
+    Preserves the `code` and `data` members alongside `message`, which the two
+    dispatch paths previously discarded.
+
+    Scoped to the `ClientManager` boundary by design. `gateway.invoke` maps every
+    exception to `E302` through `str(e)`, so `str()` here is exactly the
+    downstream `message` and nothing about the `gateway.*` error contract
+    changes. Surfacing `code`/`data` to MCP clients is a separate contract change
+    tracked as a follow-up (EC-FANOUT-7).
+    """
+
+    def __init__(
+        self, message: str, *, code: int | None = None, data: Any = None
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.data = data
+
+
+def _downstream_error(error: Any) -> DownstreamError:
+    """Build a `DownstreamError` from a JSON-RPC `error` member."""
+    if not isinstance(error, dict):
+        return DownstreamError(str(error))
+    return DownstreamError(
+        str(error.get("message", "Unknown error")),
+        code=error.get("code"),
+        data=error.get("data"),
+    )
+
 
 class _NullCatalogEventSink:
     """No-op `CatalogEventSink` used when `ClientManager` is constructed with
@@ -558,6 +611,15 @@ class ClientManager:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._background_task_servers: dict[asyncio.Task[Any], str | None] = {}
         self._reconnect_tasks: dict[str, asyncio.Task[None]] = {}
+        # FANOUT: at most one in-flight catalog reconcile per server name, plus
+        # the re-run flags a notification sets when it arrives while one is
+        # already running. See `_handle_downstream_notification`.
+        self._reconcile_tasks: dict[str, asyncio.Task[None]] = {}
+        self._reconcile_reruns: set[str] = set()
+        # Server names whose `note_*` publishes are currently suppressed, with a
+        # depth so overlapping reconciles of the same name nest correctly. Keyed
+        # by server so a reconcile of A never swallows a genuine publish for B.
+        self._catalog_suppressed: dict[str, int] = {}
         self._request_counters: dict[str, int] = {}
         self._tasks: dict[tuple[str, str], McpTaskRecord] = {}
         # Cap on retained terminal (completed/failed/cancelled) task records.
@@ -903,6 +965,12 @@ class ClientManager:
             await self._cancel_background_tasks(server_name=name)
             self._connect_tasks.pop(name, None)
             self._reconnect_tasks.pop(name, None)
+            # A reconcile cancelled before it ever started never runs its own
+            # `finally`, so clear its bookkeeping here too. The catalog removal
+            # below supersedes whatever it would have published.
+            self._reconcile_tasks.pop(name, None)
+            self._reconcile_reruns.discard(name)
+            self._catalog_suppressed.pop(name, None)
             self._clients.pop(name, None)
             self._remove_server_indexes(name)
             if config is not None and config.source in {"project", "user", "custom"}:
@@ -973,8 +1041,56 @@ class ClientManager:
 
         await self._connect_stdio(config)
 
-    def _remove_server_indexes(self, name: str) -> None:
-        """Remove catalog entries owned by one server."""
+    def _publish_catalog_change(self, kind: str) -> None:
+        """Publish one catalog-kind change to the sink, unconditionally."""
+        if kind == "tools":
+            self._catalog_events.note_tools_changed()
+        elif kind == "resources":
+            self._catalog_events.note_resources_changed()
+        elif kind == "prompts":
+            self._catalog_events.note_prompts_changed()
+
+    def _catalog_publishing_suppressed(self, server_name: str) -> bool:
+        """True while `server_name` is mid-reconcile, i.e. while its `note_*`
+        publishes are being withheld.
+
+        Suppression is keyed by server name rather than being a global flag on
+        purpose: reconciling A must not swallow the connect-time publishes of a
+        B being indexed concurrently. The reconcile republishes for itself, once
+        per kind that actually differs, once it has finished churning.
+
+        Deliberately a *predicate* rather than a wrapper around the sink: each
+        publishing mutator keeps its literal `self._catalog_events.note_*(...)`
+        call, which is what `tests/runtime/test_publisher_coverage.py`'s AST
+        honesty guard asserts. Hiding those calls behind a helper would make
+        that guard vacuous.
+        """
+        return bool(self._catalog_suppressed.get(server_name))
+
+    def _server_catalog_ids(self, name: str) -> dict[str, set[str]]:
+        """The identifier sets one server currently owns, per catalog kind.
+
+        Identifier *sets*, never counts: renaming a tool leaves the count
+        identical while the catalog genuinely moved, and a count-based diff
+        would silently swallow that change.
+        """
+        return {
+            "tools": {k for k, v in self._tools.items() if v.server_name == name},
+            "resources": {
+                k for k, v in self._resources.items() if v.server_name == name
+            },
+            "prompts": {k for k, v in self._prompts.items() if v.server_name == name},
+        }
+
+    def _remove_server_indexes(self, name: str, *, drop_tasks: bool = True) -> None:
+        """Remove catalog entries owned by one server.
+
+        `drop_tasks=False` keeps the server's tracked `McpTaskRecord`s. Dropping
+        them is right for a disconnect, where the downstream's tasks died with
+        the connection, and wrong for a `list_changed` reconcile, where the
+        server is still up and its in-flight tasks are still running -- evicting
+        them there would silently break `gateway.tasks_list`/`tasks_result`.
+        """
         tools_removed = False
         for tool_id, tool in list(self._tools.items()):
             if tool.server_name == name:
@@ -990,14 +1106,16 @@ class ClientManager:
             if prompt.server_name == name:
                 self._prompts.pop(prompt_id, None)
                 prompts_removed = True
-        for key in list(self._tasks):
-            if key[0] == name:
-                self._tasks.pop(key, None)
-        if tools_removed:
+        if drop_tasks:
+            for key in list(self._tasks):
+                if key[0] == name:
+                    self._tasks.pop(key, None)
+        suppressed = self._catalog_publishing_suppressed(name)
+        if tools_removed and not suppressed:
             self._catalog_events.note_tools_changed()
-        if resources_removed:
+        if resources_removed and not suppressed:
             self._catalog_events.note_resources_changed()
-        if prompts_removed:
+        if prompts_removed and not suppressed:
             self._catalog_events.note_prompts_changed()
 
     def _server_supports_tasks(self, managed: ManagedClient) -> bool:
@@ -1211,7 +1329,7 @@ class ClientManager:
 
             self._tools[tool_id] = tool_info
             indexed += 1
-        if indexed:
+        if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_tools_changed()
         return indexed
 
@@ -1241,7 +1359,7 @@ class ClientManager:
                 raw_metadata=_raw_metadata(resource, known_fields),
             )
             self._resources[resource_id] = resource_info
-        if resources:
+        if resources and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_resources_changed()
         return len(resources)
 
@@ -1282,7 +1400,7 @@ class ClientManager:
                 raw_metadata=_raw_metadata(prompt, known_prompt_fields),
             )
             self._prompts[prompt_id] = prompt_info
-        if prompts:
+        if prompts and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_prompts_changed()
         return len(prompts)
 
@@ -1320,6 +1438,176 @@ class ClientManager:
         # acceptance test pass even if the self-scheduling drain were
         # completely broken.
         return indexed, resource_count, prompt_count
+
+    def _handle_downstream_notification(
+        self, name: str, managed: ManagedClient, method: str
+    ) -> bool:
+        """Act on one JSON-RPC notification received from a downstream server.
+
+        This is IF-0-FANOUT-1, the downstream-event contract. It is called from
+        both dispatch paths -- `_handle_stdout_line` (stdio) and `_read_sse`
+        (remote) -- for every frame that carries a `method` and no `id`.
+
+        Method mapping. Exactly three methods are recognised, each requesting a
+        re-index of the *whole* of that one server's catalog (the gateway's
+        catalog is index-backed, not proxied, so a per-kind refetch would still
+        need the same round trip):
+
+        - `notifications/tools/list_changed`
+        - `notifications/resources/list_changed`
+        - `notifications/prompts/list_changed`
+
+        Reconcile-then-publish ordering. The gateway serves `gateway.invoke` and
+        `gateway.catalog_search` out of its own index, so a notification
+        forwarded straight to the subscription sink would tell a client to
+        refetch and then hand it the stale catalog. Reconciliation therefore
+        always completes before anything is published.
+
+        Suppress-while-churning, publish-once-if-changed. Reconciliation is a
+        remove-then-reindex, and both halves call `CatalogEventSink.note_*`
+        unconditionally, so a chatty downstream would spam subscribers even when
+        nothing moved. Sink calls originating from the server under
+        reconciliation are suppressed for its duration; afterwards the server's
+        identifier sets are compared before against after, and exactly one
+        `note_*` is published per catalog kind that actually differs. Identifier
+        sets, never counts: a rename leaves the count unchanged.
+
+        Unrecognised methods are a no-op. Any other `notifications/*` (or any
+        other method name) returns False having published nothing, scheduled
+        nothing, and raised nothing. This function never raises: `_read_sse`
+        wraps its loop in a blanket `except Exception` that tears the connection
+        down and triggers a reconnect, so a raise here would turn an unknown
+        notification into a dropped server.
+
+        Never blocks the caller. The reconcile runs in a task spawned with
+        `asyncio.create_task`, never awaited inline -- see
+        `_reconcile_server_catalog` for why an inline await deadlocks
+        immediately.
+
+        Args:
+            name: The downstream server's registered name.
+            managed: The client that received the notification.
+            method: The notification's JSON-RPC `method`.
+
+        Returns:
+            True if the method was recognised and a reconcile was requested,
+            False if it was ignored.
+        """
+        if method not in DOWNSTREAM_LIST_CHANGED_METHODS:
+            return False
+
+        existing = self._reconcile_tasks.get(name)
+        if existing is not None and not existing.done():
+            # Coalesce: a notification arriving mid-reconcile sets a re-run flag
+            # the running task picks up, rather than spawning a second task. A
+            # downstream that emits `list_changed` on every request is therefore
+            # bounded to one in-flight re-index plus one queued re-run.
+            self._reconcile_reruns.add(name)
+            return True
+
+        try:
+            task = asyncio.create_task(self._reconcile_server_catalog(name))
+        except RuntimeError:
+            # No running loop. Both real dispatch paths run inside one, so this
+            # is unreachable in production; returning False (rather than
+            # raising) keeps the never-raises guarantee absolute.
+            logger.debug(f"[{name}] No running loop; dropped {method}")
+            return False
+        self._reconcile_tasks[name] = task
+        self._track_background_task(task, name)
+        return True
+
+    async def _reconcile_server_catalog(self, name: str) -> None:
+        """Re-index one server's catalog, then publish what actually moved.
+
+        Spawned, never awaited from a dispatch path. `_index_capabilities`
+        awaits `_send_request`, and the future it waits on is resolved by the
+        very read loop that received the notification --
+        `pending.future.set_result` in `_handle_stdout_line` (stdio) and in
+        `_read_sse` (remote). Awaiting inline would make that loop wait on a
+        future only it can resolve: an immediate, total deadlock of the
+        connection, not an occasional one.
+
+        (Line references as surveyed pre-FANOUT, at ff2cb95: the await is
+        `manager.py:1292`, the two resolutions are `:1791` and `:2010`. Anchored
+        by symbol above because this change shifts all three.)
+
+        Re-runs are a loop inside this one task rather than a second task, which
+        is what keeps the coalescing bound at one in-flight reconcile per server.
+        """
+        try:
+            while True:
+                self._reconcile_reruns.discard(name)
+                # Re-resolve the client every iteration: a reconnect swaps the
+                # ManagedClient object outright, and a stale reference would
+                # send `tools/list` down a transport that is already closed.
+                managed = self._clients.get(name)
+                if managed is None:
+                    return
+                await self._reconcile_once(name, managed)
+                if name not in self._reconcile_reruns:
+                    return
+                # A re-run is pending. Wait a beat before honouring it so a
+                # server that emits `list_changed` in reply to our own
+                # `tools/list` cannot spin this loop at full speed; further
+                # notifications during the wait fold into this same re-run.
+                await asyncio.sleep(_RECONCILE_RERUN_DEBOUNCE_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - defensive
+            # Never let a reconcile surface as an unhandled task exception.
+            logger.warning(f"[{name}] Catalog reconciliation task failed: {e}")
+        finally:
+            self._reconcile_reruns.discard(name)
+            if self._reconcile_tasks.get(name) is asyncio.current_task():
+                self._reconcile_tasks.pop(name, None)
+
+    async def _reconcile_once(self, name: str, managed: ManagedClient) -> None:
+        """One remove-then-reindex pass, published only if the catalog moved."""
+        before = self._server_catalog_ids(name)
+        prev_tools = {k: v for k, v in self._tools.items() if v.server_name == name}
+        prev_resources = {
+            k: v for k, v in self._resources.items() if v.server_name == name
+        }
+        prev_prompts = {k: v for k, v in self._prompts.items() if v.server_name == name}
+
+        self._catalog_suppressed[name] = self._catalog_suppressed.get(name, 0) + 1
+        try:
+            # `drop_tasks=False`: the server is still connected, so its tracked
+            # task records must survive a catalog refresh.
+            self._remove_server_indexes(name, drop_tasks=False)
+            try:
+                await self._index_capabilities(managed)
+            except Exception as e:
+                # The downstream announced a change and then failed to list.
+                # Roll back rather than leave the catalog half-removed: the
+                # previous entries are strictly better than none.
+                logger.warning(f"[{name}] Catalog reconciliation failed: {e}")
+                self._remove_server_indexes(name, drop_tasks=False)
+                # Disclosure: these three writes are a catalog mutation outside
+                # the five publishing mutators that
+                # `tests/runtime/test_publisher_coverage.py` models. That guard
+                # does not currently see `dict.update`, so it does not fire
+                # here. It is safe on its own terms -- this restores exactly the
+                # entries `_remove_server_indexes` just took out, so the catalog
+                # ends identical to how it started and there is nothing to
+                # publish. Widening the guard to model `update` is a follow-up
+                # for whoever owns that file; it is not this lane's to edit.
+                self._tools.update(prev_tools)
+                self._resources.update(prev_resources)
+                self._prompts.update(prev_prompts)
+                return
+        finally:
+            depth = self._catalog_suppressed.get(name, 1) - 1
+            if depth > 0:
+                self._catalog_suppressed[name] = depth
+            else:
+                self._catalog_suppressed.pop(name, None)
+
+        after = self._server_catalog_ids(name)
+        for kind in ("tools", "resources", "prompts"):
+            if before[kind] != after[kind]:
+                self._publish_catalog_change(kind)
 
     async def _connect_stdio(self, config: ResolvedServerConfig) -> None:
         """Connect to a local stdio MCP server."""
@@ -1779,16 +2067,17 @@ class ClientManager:
                 managed.status.pending_request_count = len(managed.pending_requests)
 
                 if "error" in message:
-                    # TODO(post-P3B): message["error"] also carries JSON-RPC
-                    # "code" and "data" fields that are dropped here, exposing
-                    # only "message" to callers. No P3B exit criterion
-                    # mentions typed downstream errors (Execution Notes >
-                    # Decision 5) — deferred again, not actioned in P3B.
-                    pending.future.set_exception(
-                        Exception(message["error"].get("message", "Unknown error"))
-                    )
+                    pending.future.set_exception(_downstream_error(message["error"]))
                 else:
                     pending.future.set_result(message.get("result", {}))
+            else:
+                # A notification carries a `method` and no `id`, so it falls
+                # through the gate above with nothing to resolve. Server->client
+                # *requests* also carry a method but do have an id, and are not
+                # ours to handle here — hence the explicit `msg_id is None`.
+                method = message.get("method")
+                if msg_id is None and isinstance(method, str):
+                    self._handle_downstream_notification(name, managed, method)
         except json.JSONDecodeError:
             # Non-JSON output already counted as a heartbeat by the caller.
             logger.debug(
@@ -1997,17 +2286,20 @@ class ClientManager:
                     managed.status.pending_request_count = len(managed.pending_requests)
 
                     if "error" in payload:
-                        # TODO(post-P3B): payload["error"] also carries
-                        # JSON-RPC "code" and "data" fields that are dropped
-                        # here, exposing only "message" to callers. No P3B
-                        # exit criterion mentions typed downstream errors
-                        # (Execution Notes > Decision 5) — deferred again,
-                        # not actioned in P3B.
                         pending.future.set_exception(
-                            Exception(payload["error"].get("message", "Unknown error"))
+                            _downstream_error(payload["error"])
                         )
                     else:
                         pending.future.set_result(payload.get("result", {}))
+                else:
+                    # Same fall-through as the stdio path: a notification has a
+                    # method and no id. `_handle_downstream_notification` never
+                    # raises, which matters more here — this loop's blanket
+                    # `except Exception` would tear the connection down and
+                    # trigger a reconnect.
+                    method = payload.get("method")
+                    if msg_id is None and isinstance(method, str):
+                        self._handle_downstream_notification(name, managed, method)
         except Exception as e:
             logger.debug(f"[{name}] SSE read error: {e}")
         finally:
@@ -2262,6 +2554,9 @@ class ClientManager:
         await self._cancel_background_tasks(exclude=exclude)
         self._connect_tasks.clear()
         self._reconnect_tasks.clear()
+        self._reconcile_tasks.clear()
+        self._reconcile_reruns.clear()
+        self._catalog_suppressed.clear()
         self._clients.clear()
         # Capture non-empty immediately before each clear (not after — the
         # clear must happen first for the dict to actually be empty
