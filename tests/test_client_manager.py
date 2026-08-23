@@ -4284,6 +4284,211 @@ class TestDownstreamReconcileScheduler:
         assert spins <= 6, f"reconcile loop is spinning: {spins} passes in 0.6s"
         assert spins >= 1
 
+    # ---- SL-fix: fetch-first atomicity, per-kind isolation, content ------
+
+    @pytest.mark.asyncio
+    async def test_reconcile_never_hides_a_live_tool_from_a_concurrent_read(
+        self,
+    ) -> None:
+        """A `gateway.invoke` arriving mid-reconcile must still resolve a tool the
+        downstream still has.
+
+        Reconciliation is a spawned background task, so an ordinary production
+        interleaving puts a lookup between its awaits. A remove-then-refetch
+        order leaves the catalog *empty* for that server across three downstream
+        round trips, and a concurrent invoke gets a spurious tool-not-found for a
+        tool that exists. The poller below stands in for that traffic: it reads
+        the catalog on every event-loop tick for the whole pass, so any await
+        inside the mutation window gives it a chance to observe the hole.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        gate = asyncio.Event()
+        state: dict[str, list[str]] = {
+            "tools": ["alpha"],
+            "resources": ["r1"],
+            "prompts": ["p1"],
+        }
+        self._wire(manager, state, gate)
+
+        # Prime the catalog as connect-time indexing would, ungated.
+        gate.set()
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert "srv::alpha" in manager._tools
+        gate.clear()
+
+        misses = 0
+        stop = asyncio.Event()
+
+        async def poll() -> None:
+            nonlocal misses
+            while not stop.is_set():
+                if "srv::alpha" not in manager._tools:
+                    misses += 1
+                await asyncio.sleep(0)
+
+        poller = asyncio.create_task(poll())
+        state["tools"] = ["alpha", "beta"]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        # Let the reconcile reach its gated downstream request, with the poller
+        # reading the catalog on every tick while it sits there.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        gate.set()
+        await self._drain(manager)
+        stop.set()
+        await poller
+
+        assert "srv::beta" in manager._tools, "the reconcile did not land"
+        assert misses == 0, (
+            f"a concurrent read saw srv::alpha missing {misses} times during "
+            "reconciliation -- the catalog must never be emptied across an await"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reconcile_leaves_a_kind_whose_listing_failed_untouched(self) -> None:
+        """`resources/list` failing while `tools/list` succeeds must not publish a
+        removal of resources the server still has.
+
+        `_index_capabilities` swallows resources/prompts listing failures on
+        purpose -- a server that does not implement them is normal -- so those
+        failures never reach the reconcile's abort path. Removing all three kinds
+        up front therefore turns "we could not ask" into "they are gone", and
+        publishes that false removal. Each kind has to be handled independently:
+        a kind whose listing failed is left exactly as it was and is not
+        published, while a kind that succeeded still reconciles normally.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {
+            "tools": ["alpha"],
+            "resources": ["r1"],
+            "prompts": ["p1"],
+        }
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        before_resources = dict(manager._resources)
+        before_prompts = dict(manager._prompts)
+        assert before_resources and before_prompts
+        sink.tools = sink.resources = sink.prompts = 0
+
+        healthy_send = manager._send_request
+
+        async def resources_down(
+            managed_arg: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            if method == "resources/list":
+                raise ConnectionError("resources/list is down")
+            return await healthy_send(managed_arg, method, params, *args, **kwargs)
+
+        manager._send_request = resources_down  # type: ignore[method-assign]
+        state["tools"] = ["alpha", "beta"]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._resources == before_resources, (
+            "a kind whose listing failed was dropped from the catalog"
+        )
+        assert sink.resources == 0, (
+            "a false resources removal was published for a listing that failed"
+        )
+        # The kinds that did answer still reconciled.
+        assert "srv::beta" in manager._tools
+        assert sink.tools == 1
+        assert manager._prompts == before_prompts
+        assert sink.prompts == 0
+
+    @pytest.mark.asyncio
+    async def test_reconcile_publishes_a_content_change_under_a_stable_name(
+        self,
+    ) -> None:
+        """A tool whose description or schema changed under the same name is a real
+        catalog change and must publish.
+
+        Comparing identifier *sets* catches adds, removes, and renames and misses
+        this entirely -- yet it is the common case for a server that re-lists
+        after editing a tool in place. The comparison has to be over the entries
+        themselves.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        entry: dict[str, Any] = {
+            "name": "alpha",
+            "description": "first",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+
+        async def one_tool(
+            managed_arg: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            if method == "tools/list":
+                return {"tools": [dict(entry)]}
+            return {}
+
+        manager._send_request = one_tool  # type: ignore[method-assign]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+        sink.tools = sink.resources = sink.prompts = 0
+
+        # Same name, new description: the identifier set is unchanged.
+        entry["description"] = "second"
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert manager._tools["srv::alpha"].description == "second"
+        assert sink.tools == 1, (
+            "a changed description under an unchanged tool name published nothing"
+        )
+
+        # Same name, same description, new input schema.
+        entry["inputSchema"] = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+        }
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert manager._tools["srv::alpha"].input_schema == entry["inputSchema"]
+        assert sink.tools == 2, (
+            "a changed input schema under an unchanged tool name published nothing"
+        )
+
+        # A re-list with nothing changed still publishes nothing.
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert sink.tools == 2
+
     # ---- SL-1.6: both dispatch paths, and typed errors ------------------
 
     @pytest.mark.asyncio
