@@ -473,6 +473,21 @@ def _raw_metadata(
     return metadata or None
 
 
+def _entry_label(entry: Any, key: str = "name") -> str:
+    """Best-effort identifier for a catalog entry we failed to parse.
+
+    Deliberately total: it is only ever called from an `except` branch, so a
+    label that itself raised would turn a skipped entry back into the lost
+    catalog the guard exists to prevent. `entry` is typed `Any` because the
+    whole point is that it did not have the shape we expected.
+    """
+    if isinstance(entry, dict):
+        identifier = entry.get(key)
+        if isinstance(identifier, str) and identifier:
+            return repr(identifier)
+    return repr(entry)[:120]
+
+
 def _schema_dialect(*schemas: dict[str, Any] | None) -> str:
     for schema in schemas:
         if schema and isinstance(schema.get("$schema"), str):
@@ -1322,6 +1337,22 @@ class ClientManager:
         return cancelled, errors
 
     def _index_tools(self, name: str, tools: list[dict[str, Any]]) -> int:
+        """Index one server's tools, skipping any entry we cannot parse.
+
+        The guard below is per *entry*, not per call, and that placement is the
+        whole point. Reconciliation removes this server's entries and then calls
+        this method; an exception escaping here would leave the removal done and
+        the re-index half-finished, so one malformed tool from a downstream
+        would silently cost the server its entire catalog -- permanently, since
+        the read loop stays healthy and no reconnect comes along to heal it. A
+        single `try` around the loop would be barely better: it would still lose
+        every entry after the bad one.
+
+        `_index_resources` / `_index_prompts` guard identically. `connect_server`
+        and `refresh` reach the same three methods, so they inherit this too: a
+        server with one unparseable tool now connects with the rest of its
+        catalog instead of failing outright.
+        """
         indexed = 0
         known_fields = {
             "name",
@@ -1340,31 +1371,37 @@ class ClientManager:
                 )
                 break
 
-            tool_name = tool["name"]
-            tool_id = make_tool_id(name, tool_name)
-            description = tool.get("description", "")
-            input_schema = tool.get("inputSchema", {})
-            output_schema = tool.get("outputSchema")
+            try:
+                tool_name = tool["name"]
+                tool_id = make_tool_id(name, tool_name)
+                description = tool.get("description", "")
+                input_schema = tool.get("inputSchema", {})
+                output_schema = tool.get("outputSchema")
 
-            tool_info = ToolInfo(
-                tool_id=tool_id,
-                server_name=name,
-                tool_name=tool_name,
-                title=tool.get("title"),
-                description=description,
-                short_description=_truncate_description(description),
-                input_schema=input_schema,
-                icons=tool.get("icons"),
-                output_schema=output_schema,
-                annotations=tool.get("annotations"),
-                execution=tool.get("execution"),
-                schema_dialect=_schema_dialect(input_schema, output_schema),
-                raw_metadata=_raw_metadata(tool, known_fields),
-                tags=_extract_tags(name, tool_name, description),
-                risk_hint=_infer_risk_hint(
-                    tool_name, description, tool.get("annotations")
-                ),
-            )
+                tool_info = ToolInfo(
+                    tool_id=tool_id,
+                    server_name=name,
+                    tool_name=tool_name,
+                    title=tool.get("title"),
+                    description=description,
+                    short_description=_truncate_description(description),
+                    input_schema=input_schema,
+                    icons=tool.get("icons"),
+                    output_schema=output_schema,
+                    annotations=tool.get("annotations"),
+                    execution=tool.get("execution"),
+                    schema_dialect=_schema_dialect(input_schema, output_schema),
+                    raw_metadata=_raw_metadata(tool, known_fields),
+                    tags=_extract_tags(name, tool_name, description),
+                    risk_hint=_infer_risk_hint(
+                        tool_name, description, tool.get("annotations")
+                    ),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{name}] Skipping unparseable tool {_entry_label(tool)}: {e}"
+                )
+                continue
 
             self._tools[tool_id] = tool_info
             indexed += 1
@@ -1373,6 +1410,13 @@ class ClientManager:
         return indexed
 
     def _index_resources(self, name: str, resources: list[dict[str, Any]]) -> int:
+        """Index one server's resources, skipping any entry we cannot parse.
+
+        Per-entry, for the reason spelled out on `_index_tools`. The count
+        returned is what was actually indexed, not what was offered, so a caller
+        reporting it is not overstating the catalog.
+        """
+        indexed = 0
         known_fields = {
             "uri",
             "name",
@@ -1383,26 +1427,41 @@ class ClientManager:
             "annotations",
         }
         for resource in resources:
-            uri = resource.get("uri", "")
-            resource_id = f"{name}::{uri}"
-            resource_info = ResourceInfo(
-                resource_id=resource_id,
-                server_name=name,
-                uri=uri,
-                name=resource.get("name"),
-                title=resource.get("title"),
-                description=resource.get("description"),
-                mime_type=resource.get("mimeType"),
-                icons=resource.get("icons"),
-                annotations=resource.get("annotations"),
-                raw_metadata=_raw_metadata(resource, known_fields),
-            )
+            try:
+                uri = resource.get("uri", "")
+                resource_id = f"{name}::{uri}"
+                resource_info = ResourceInfo(
+                    resource_id=resource_id,
+                    server_name=name,
+                    uri=uri,
+                    name=resource.get("name"),
+                    title=resource.get("title"),
+                    description=resource.get("description"),
+                    mime_type=resource.get("mimeType"),
+                    icons=resource.get("icons"),
+                    annotations=resource.get("annotations"),
+                    raw_metadata=_raw_metadata(resource, known_fields),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{name}] Skipping unparseable resource "
+                    f"{_entry_label(resource, key='uri')}: {e}"
+                )
+                continue
+
             self._resources[resource_id] = resource_info
-        if resources and not self._catalog_publishing_suppressed(name):
+            indexed += 1
+        if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_resources_changed()
-        return len(resources)
+        return indexed
 
     def _index_prompts(self, name: str, prompts: list[dict[str, Any]]) -> int:
+        """Index one server's prompts, skipping any entry we cannot parse.
+
+        Per-entry, for the reason spelled out on `_index_tools`. The count
+        returned is what was actually indexed, not what was offered.
+        """
+        indexed = 0
         known_prompt_fields = {
             "name",
             "title",
@@ -1413,35 +1472,43 @@ class ClientManager:
         }
         known_arg_fields = {"name", "title", "description", "required"}
         for prompt in prompts:
-            prompt_name = prompt.get("name", "")
-            prompt_id = f"{name}::{prompt_name}"
-            arguments = None
-            if prompt.get("arguments"):
-                arguments = [
-                    PromptArgumentInfo(
-                        name=arg.get("name", ""),
-                        title=arg.get("title"),
-                        description=arg.get("description"),
-                        required=arg.get("required", False),
-                        raw_metadata=_raw_metadata(arg, known_arg_fields),
-                    )
-                    for arg in prompt["arguments"]
-                ]
-            prompt_info = PromptInfo(
-                prompt_id=prompt_id,
-                server_name=name,
-                name=prompt_name,
-                title=prompt.get("title"),
-                description=prompt.get("description"),
-                arguments=arguments,
-                icons=prompt.get("icons"),
-                annotations=prompt.get("annotations"),
-                raw_metadata=_raw_metadata(prompt, known_prompt_fields),
-            )
+            try:
+                prompt_name = prompt.get("name", "")
+                prompt_id = f"{name}::{prompt_name}"
+                arguments = None
+                if prompt.get("arguments"):
+                    arguments = [
+                        PromptArgumentInfo(
+                            name=arg.get("name", ""),
+                            title=arg.get("title"),
+                            description=arg.get("description"),
+                            required=arg.get("required", False),
+                            raw_metadata=_raw_metadata(arg, known_arg_fields),
+                        )
+                        for arg in prompt["arguments"]
+                    ]
+                prompt_info = PromptInfo(
+                    prompt_id=prompt_id,
+                    server_name=name,
+                    name=prompt_name,
+                    title=prompt.get("title"),
+                    description=prompt.get("description"),
+                    arguments=arguments,
+                    icons=prompt.get("icons"),
+                    annotations=prompt.get("annotations"),
+                    raw_metadata=_raw_metadata(prompt, known_prompt_fields),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{name}] Skipping unparseable prompt {_entry_label(prompt)}: {e}"
+                )
+                continue
+
             self._prompts[prompt_id] = prompt_info
-        if prompts and not self._catalog_publishing_suppressed(name):
+            indexed += 1
+        if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_prompts_changed()
-        return len(prompts)
+        return indexed
 
     async def _fetch_server_listings(
         self, managed: ManagedClient

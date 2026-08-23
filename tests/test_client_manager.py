@@ -4964,3 +4964,205 @@ class TestDownstreamNotificationBehaviouralGuarantees:
         assert err.code == -32000
         assert err.data == {"retry_after_ms": 500}
         assert str(err) == "downstream unavailable"
+
+
+class TestReconcileMalformedEntryResilience:
+    """FANOUT repair D5/D6: a malformed downstream entry must cost only itself,
+    and the suppression counter must always unwind.
+
+    Before FANOUT a downstream could not trigger a re-index mid-session, so a
+    malformed entry could at worst fail a connect. Now `list_changed` re-enters
+    the indexers at any time, and the apply block removes before it re-indexes
+    -- so an entry that raises mid-apply takes the server's *previous* catalog
+    with it, permanently, with a healthy read loop and no reconnect to heal it.
+    """
+
+    @staticmethod
+    def _managed(name: str) -> ManagedClient:
+        status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=MagicMock(), status=status)
+        managed.config.name = name
+        return managed
+
+    @staticmethod
+    async def _drain(manager: ClientManager, timeout: float = 5.0) -> None:
+        async def _wait() -> None:
+            while manager._reconcile_tasks:
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(_wait(), timeout)
+
+    @staticmethod
+    def _wire_listings(
+        manager: ClientManager, listings: dict[str, list[dict[str, Any]]]
+    ) -> None:
+        """Stub `_send_request` with raw per-kind payloads, malformed entries
+        included -- `TestDownstreamReconcileScheduler._wire` only ever emits
+        well-formed ones, which is precisely what this class must not do."""
+
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            kind = method.split("/")[0]
+            return {kind: list(listings.get(kind, []))}
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+
+    # ---- D5: per-entry resilience ---------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_malformed_tool_is_skipped_without_losing_the_prior_catalog(
+        self,
+    ) -> None:
+        """One unparseable tool must not cost the other tools, and must never
+        cost the tools that were already indexed.
+
+        The malformed entry is deliberately *first*: with it last, the entries
+        ahead of it would already have been re-added before the raise and the
+        wipe would be invisible. First, it raises with the removal done and
+        nothing re-added -- the lead's reproduction, `after: []`.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(manager, {"tools": [{"name": "alpha", "inputSchema": {}}]})
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+
+        # `inputSchema` as a string reaches `_schema_dialect`, which calls
+        # `.get` on it -- an AttributeError raised mid-apply.
+        self._wire_listings(
+            manager,
+            {
+                "tools": [
+                    {"name": "bad", "inputSchema": "not-a-dict"},
+                    {"name": "alpha", "inputSchema": {}},
+                    {"name": "beta", "inputSchema": {}},
+                ]
+            },
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._tools) == {"srv::alpha", "srv::beta"}, (
+            "one malformed entry wiped the server's catalog"
+        )
+
+    @pytest.mark.asyncio
+    async def test_malformed_resource_and_prompt_entries_are_skipped(self) -> None:
+        """The same guarantee for the other two kinds, whose indexers construct
+        pydantic models just as directly."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(
+            manager,
+            {
+                "resources": [
+                    {"uri": ["not", "a", "string"]},
+                    {"uri": "mem://good"},
+                ],
+                "prompts": [
+                    {"name": "bad", "arguments": ["not-a-mapping"]},
+                    {"name": "good"},
+                ],
+            },
+        )
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/resources/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._resources) == {"srv::mem://good"}
+        assert set(manager._prompts) == {"srv::good"}
+
+    def test_index_tools_guard_is_per_entry_not_per_call(self) -> None:
+        """Called directly, not through reconciliation: a single `try` wrapped
+        around the whole loop would still lose every entry *after* the bad one,
+        so pin that entries on both sides of it survive."""
+        manager = ClientManager()
+
+        indexed = manager._index_tools(
+            "srv",
+            [
+                {"name": "before", "inputSchema": {}},
+                {"name": "bad", "inputSchema": "not-a-dict"},
+                {"name": "after", "inputSchema": {}},
+            ],
+        )
+
+        assert indexed == 2
+        assert set(manager._tools) == {"srv::before", "srv::after"}
+
+    def test_index_of_only_malformed_entries_publishes_nothing(self) -> None:
+        """Nothing was indexed, so there is nothing to announce -- a note here
+        would wake every subscriber for a catalog that did not move."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+
+        assert manager._index_tools("srv", [{"name": "b", "inputSchema": "x"}]) == 0
+        assert manager._index_resources("srv", [{"uri": ["nope"]}]) == 0
+        assert (
+            manager._index_prompts("srv", [{"name": "b", "arguments": ["nope"]}]) == 0
+        )
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+        assert manager._tools == {} and manager._resources == {}
+        assert manager._prompts == {}
+
+    # ---- D6: the suppression counter's `finally` ------------------------
+
+    @pytest.mark.asyncio
+    async def test_suppression_counter_unwinds_on_the_success_path(self) -> None:
+        """A leaked entry would leave that server's sink suppressed forever:
+        subscribed clients silently stop seeing its catalog changes, with no
+        error anywhere to point at."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(manager, {"tools": [{"name": "alpha", "inputSchema": {}}]})
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._tools, "reconcile did not run; the assertion below is vacuous"
+        assert manager._catalog_suppressed == {}
+        assert not manager._catalog_publishing_suppressed("srv")
+
+    @pytest.mark.asyncio
+    async def test_suppression_counter_unwinds_when_the_apply_block_raises(
+        self,
+    ) -> None:
+        """The failure must be injected *inside* the apply block. A failed fetch
+        returns before the counter is ever incremented, so it would leave this
+        test green even with the decrement deleted.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(manager, {"tools": [{"name": "alpha", "inputSchema": {}}]})
+
+        def boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("apply blew up after the counter went up")
+
+        manager._remove_server_indexes = boom  # type: ignore[method-assign]
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._catalog_suppressed == {}
+        assert not manager._catalog_publishing_suppressed("srv")
