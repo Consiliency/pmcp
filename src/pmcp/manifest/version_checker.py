@@ -475,13 +475,13 @@ def _digest_identity(value: str, package_type: str | None = None) -> str | None:
 #   * Promote an all-numeric value to a digest when its PARTNER is
 #     unmistakably one. Resolves the ambiguity by GUESSING, and the guess can
 #     fabricate: a genuine CalVer paired with a digest then reports an update
-#     that never happened, which is exactly what the fail-closed contract on
-#     `is_version_newer` exists to prevent (ah board review).
+#     that never happened, which is exactly what `compare_versions`'s
+#     fail-closed contract exists to prevent (ah board review).
 #
 # So a mixed pair stays incomparable, per the documented contract. The
 # ambiguity is unreachable while callers pass the package type -- both live
 # callers in `refresher.py` do, and
-# `test_all_is_version_newer_callers_pass_package_type` keeps it that way.
+# `test_all_compare_versions_callers_pass_package_type` keeps it that way.
 def _parse_version(value: str) -> Version | None:
     """Parse *value* as a release version, or ``None`` if it is not one.
 
@@ -632,33 +632,6 @@ def compare_versions(
     if Version(latest_version.public) > Version(current_version.public):
         return "newer"
     return "not_newer"
-
-
-def are_versions_comparable(
-    current: str, latest: str, package_type: str | None = None
-) -> bool:
-    """Whether this PAIR can be ordered at all.
-
-    Migration shim over :func:`compare_versions` (Consiliency/pmcp#164);
-    ``is_version_newer`` and this function are deleted once `refresher.py`
-    migrates onto the tri-state directly.
-    """
-    return compare_versions(current, latest, package_type) != "incomparable"
-
-
-def is_version_newer(
-    current: str, latest: str, package_type: str | None = None
-) -> bool:
-    """Whether *latest* is a strictly newer release than *current*.
-
-    FAILS CLOSED: an incomparable pair returns ``False``, same as "not newer".
-    Migration shim over :func:`compare_versions` (Consiliency/pmcp#164); this
-    function is deleted once `refresher.py` migrates onto the tri-state
-    directly. ``not is_version_newer(...)`` remains unsafe on its own for the
-    same reason it always was -- it cannot distinguish "up to date" from
-    "could not be ordered".
-    """
-    return compare_versions(current, latest, package_type) == "newer"
 
 
 def clear_version_cache() -> None:
