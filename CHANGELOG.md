@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A downstream server's own `notifications/tools/list_changed`,
+  `notifications/resources/list_changed`, and `notifications/prompts/list_changed`
+  now reach subscribed clients.** Previously the read loop parsed these frames
+  and silently dropped them on both transports — a notification has no `id`, so
+  it fell through the pending-request gate with no `else`. A downstream server
+  that added or removed a tool at runtime was invisible until the next
+  `gateway.refresh()`; that gap was v11 P3B's own Non-Goal.
+
+  This is reconciliation, not forwarding: `ClientManager`'s indexes back
+  `gateway.catalog_search`, `gateway.describe`, and `gateway.invoke`, so
+  relaying the raw notification to the subscription sink would have told a
+  client "refetch" and handed it the *old* catalog — with a tool the server
+  just removed still invocable. The gateway now re-indexes the announcing
+  server first and publishes only once that finishes, and only for the catalog
+  kinds whose identifier set actually changed (compared by identifier, not
+  count, so a rename still publishes). A downstream that announces a change
+  and then fails to re-list rolls its previous entries back rather than
+  leaving the catalog half-removed, and publishes nothing. **The guarantee for
+  a subscribed client:** the catalog is reconciled *before* the notification
+  goes out, so a client that refetches on receipt sees the change, every time.
+
+  Reconciliation runs as a spawned, per-server-coalesced background task
+  rather than inline in the read loop — re-indexing awaits a response that the
+  very read loop which received the notification is responsible for
+  resolving, so an inline await would deadlock the connection instantly. A
+  downstream that emits `list_changed` in reply to reconciliation's own
+  `tools/list` is bounded by a debounce on the re-run, not just coalescing, so
+  it costs one extra reconcile per interval instead of a hot spin. Both
+  transports are covered: stdio (`_handle_stdout_line`) and streamable
+  HTTP/SSE (`_read_sse`) previously shared the same silent-drop, and both now
+  dispatch through the same reconcile path. Unrecognised `notifications/*`
+  methods (progress, logging) remain a no-op, as before.
+
+### Fixed
+- **A downstream server's JSON-RPC `error` object no longer loses its `code`
+  and `data`.** Both dispatch paths kept only `message`, discarding the rest
+  of the `error` member. `ClientManager` now raises a typed `DownstreamError`
+  carrying `code` and `data` alongside `message`. Scoped to the
+  `ClientManager` boundary — `gateway.invoke` still maps every exception to
+  `E302` through `str(e)`, which is byte-identical to the old message, so no
+  `gateway.*` output changes; surfacing `code`/`data` to MCP clients is
+  tracked separately.
+
 ### Changed
 - **`version_checker.compare_versions(current, latest, package_type)` is now the
   sole version-classification path; `is_version_newer` and
