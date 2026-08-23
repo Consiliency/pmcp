@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **A downstream server's own `notifications/tools/list_changed`,
+  `notifications/resources/list_changed`, and `notifications/prompts/list_changed`
+  now reach subscribed clients.** Previously the read loop parsed these frames
+  and silently dropped them on both transports — a notification has no `id`, so
+  it fell through the pending-request gate with no `else`. A downstream server
+  that added or removed a tool at runtime was invisible until the next
+  `gateway.refresh()`; that gap was v11 P3B's own Non-Goal.
+
+  This is reconciliation, not forwarding: `ClientManager`'s indexes back
+  `gateway.catalog_search`, `gateway.describe`, and `gateway.invoke`, so
+  relaying the raw notification to the subscription sink would have told a
+  client "refetch" and handed it the *old* catalog — with a tool the server
+  just removed still invocable. The gateway now re-indexes the announcing
+  server first and publishes only once that finishes, and only for the catalog
+  kinds that actually changed. Changed by *content*, not by identifier and not
+  by count: a rename publishes, and so does a tool whose description or input
+  schema was edited under an unchanged name.
+
+  Reconciliation fetches first and swaps second. It lists the server's tools,
+  resources, and prompts without touching the catalog, then removes and
+  re-indexes in a single synchronous block that contains no `await` — so a
+  `gateway.invoke` arriving mid-reconcile sees either the whole old catalog or
+  the whole new one, and never the empty window in between. A downstream that
+  announces a change and then fails `tools/list` therefore costs nothing:
+  nothing was removed, so there is nothing to roll back, and nothing is
+  published. Each kind is handled independently — a `resources/list` that
+  fails (which is also how a server that simply does not implement resources
+  answers) leaves the existing resources in place and publishes nothing for
+  them, while the kinds that did answer still reconcile normally. **The
+  guarantee for a subscribed client:** the catalog is reconciled *before* the
+  notification goes out, so a client that refetches on receipt sees the change,
+  every time.
+
+  A malformed catalog entry costs only itself. Indexing guards each entry
+  individually, so one tool the gateway cannot parse is logged and skipped
+  while the rest of that listing is indexed normally — the entries before it
+  *and* after it. This matters most on the reconcile path, where the swap has
+  already removed the server's previous entries by the time indexing runs: an
+  exception escaping there would have left the server with no catalog at all,
+  permanently, because the read loop stays healthy and no reconnect arrives to
+  heal it. `gateway.refresh` and connect-time indexing reach the same code, so
+  this is a deliberate connect-time behaviour change too: **a server with one
+  unparseable tool now connects with the rest of its catalog instead of failing
+  outright.**
+
+  A listing whose entries are *all* unparseable is treated as a failed listing,
+  not as an empty one. Offered entries of which not one survives parsing leaves
+  the gateway in the same epistemic state as a request that failed — it could
+  not read the answer — so that kind keeps its previous entries and publishes
+  nothing. Failing to parse a listing costs visibility of the server's catalog;
+  it does not stop the server's tools from working, and announcing a removal on
+  the strength of it would tell every subscribed client those tools are gone.
+  The boundary is the count offered, not the count indexed: a listing that
+  offers **zero** entries is a genuine answer — the server emptied that kind —
+  and still clears the entries and publishes.
+
+  A reply the gateway cannot read is a failed listing too, and an **absent**
+  collection is not an empty one. A `tools/list` reply of `{}` — missing the
+  `tools` array the protocol requires — is malformed, not an announcement that
+  the server has no tools, and the same goes for a reply carrying something
+  other than an array in its place (`{"tools": {}}`, `{"tools": null}`). Each
+  of those now keeps the kind's previous entries and publishes nothing, exactly
+  like a request that failed; only a genuine array is an answer, and an empty
+  array still clears. Per kind, still: an unreadable `tools` reply no longer
+  costs an honest `resources` answer arriving in the same pass.
+
+  A catalog entry carrying no identity fails to parse rather than acquiring
+  one. A resource with no `uri`, or a prompt or tool with no `name` (or an
+  empty one), used to be indexed under a synthesized identifier of the form
+  `server::` — a catalog entry the downstream never offered, which replaced the
+  real entries and was published as a change. Such an entry is now skipped like
+  any other unparseable one, and a listing of nothing but those falls under the
+  all-unparseable rule above and keeps the previous entries.
+
+  Failure classification is conservative by design. Any failure to list a kind
+  — a transport error, a server that does not implement it, a reply whose
+  collection is absent or is not an array, or a listing that could not be
+  parsed at all — keeps that kind's previous entries; only an explicit empty
+  answer clears them. The accepted cost is the mirror case: a
+  server that drops a capability mid-session and never reconnects keeps stale
+  entries in the catalog, which then fail loudly at invoke time. That is the
+  deliberate trade — a stale entry that errors when called is recoverable and
+  self-announcing, whereas a falsely removed entry is invisible: it silently
+  disappears from every subscribed client's catalog with nothing to point at.
+
+  Reconciliation runs as a spawned, per-server-coalesced background task
+  rather than inline in the read loop — re-indexing awaits a response that the
+  very read loop which received the notification is responsible for
+  resolving, so an inline await would deadlock the connection instantly. A
+  downstream that emits `list_changed` in reply to reconciliation's own
+  `tools/list` is bounded by a debounce on the re-run, not just coalescing, so
+  it costs one extra reconcile per interval instead of a hot spin. Both
+  transports are covered: stdio (`_handle_stdout_line`) and streamable
+  HTTP/SSE (`_read_sse`) previously shared the same silent-drop, and both now
+  dispatch through the same reconcile path. Unrecognised `notifications/*`
+  methods (progress, logging) remain a no-op, as before.
+
+### Fixed
+- **A downstream server's JSON-RPC `error` object no longer loses its `code`
+  and `data`.** Both dispatch paths kept only `message`, discarding the rest
+  of the `error` member. `ClientManager` now raises a typed `DownstreamError`
+  carrying `code` and `data` alongside `message`. Scoped to the
+  `ClientManager` boundary — `gateway.invoke` still maps every exception to
+  `E302` through `str(e)`, which is byte-identical to the old message, so no
+  `gateway.*` output changes; surfacing `code`/`data` to MCP clients is
+  tracked separately.
+
 ### Changed
 - **`version_checker.compare_versions(current, latest, package_type)` is now the
   sole version-classification path; `is_version_newer` and

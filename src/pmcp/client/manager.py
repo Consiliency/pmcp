@@ -14,6 +14,7 @@ import signal
 import string
 import time
 from collections import deque
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, TypeVar
@@ -63,6 +64,64 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 _TaskT = TypeVar("_TaskT", bound=asyncio.Task[Any])
+
+# The three catalog kinds, in the order reconciliation fetches and applies them.
+# Iterating this rather than three hand-written branches is what keeps
+# "each kind is handled independently" true as kinds are added.
+CATALOG_KINDS: tuple[str, str, str] = ("tools", "resources", "prompts")
+
+# IF-0-FANOUT-1: the downstream `notifications/*` methods this gateway acts on,
+# mapped to the catalog kind whose entries decide whether reconciliation
+# publishes. Every method absent from this mapping is a no-op by construction --
+# see `ClientManager._handle_downstream_notification`.
+DOWNSTREAM_LIST_CHANGED_METHODS: dict[str, str] = {
+    "notifications/tools/list_changed": "tools",
+    "notifications/resources/list_changed": "resources",
+    "notifications/prompts/list_changed": "prompts",
+}
+
+# Minimum gap between consecutive reconciles of the same server. The first
+# reconcile after a notification is never delayed; only a *re-run* waits. This
+# bounds the one pathological case coalescing alone does not: a downstream that
+# emits `list_changed` in response to the `tools/list` that reconciliation
+# itself issues, which would otherwise drive the re-run loop forever at full
+# speed. With the debounce that server costs one reconcile per interval instead
+# of a hot spin, and notifications arriving during the wait still collapse into
+# the single pending re-run.
+_RECONCILE_RERUN_DEBOUNCE_S = 0.25
+
+
+class DownstreamError(Exception):
+    """A JSON-RPC `error` object returned by a downstream MCP server.
+
+    Preserves the `code` and `data` members alongside `message`, which the two
+    dispatch paths previously discarded.
+
+    Scoped to the `ClientManager` boundary by design. `gateway.invoke` maps every
+    exception to `E302` through `str(e)`, so `str()` here is exactly the
+    downstream `message` and nothing about the `gateway.*` error contract
+    changes. Surfacing `code`/`data` to MCP clients is a separate contract change
+    tracked as a follow-up (EC-FANOUT-7).
+    """
+
+    def __init__(
+        self, message: str, *, code: int | None = None, data: Any = None
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.data = data
+
+
+def _downstream_error(error: Any) -> DownstreamError:
+    """Build a `DownstreamError` from a JSON-RPC `error` member."""
+    if not isinstance(error, dict):
+        return DownstreamError(str(error))
+    return DownstreamError(
+        str(error.get("message", "Unknown error")),
+        code=error.get("code"),
+        data=error.get("data"),
+    )
 
 
 class _NullCatalogEventSink:
@@ -414,11 +473,249 @@ def _raw_metadata(
     return metadata or None
 
 
+def _entry_label(entry: Any, key: str = "name") -> str:
+    """Best-effort identifier for a catalog entry we failed to parse.
+
+    Deliberately total: it is only ever called from an `except` branch, so a
+    label that itself raised would turn a skipped entry back into the lost
+    catalog the guard exists to prevent. `entry` is typed `Any` because the
+    whole point is that it did not have the shape we expected.
+    """
+    if isinstance(entry, dict):
+        identifier = entry.get(key)
+        if isinstance(identifier, str) and identifier:
+            return repr(identifier)
+    return repr(entry)[:120]
+
+
+def _required_identity(entry: Any, key: str) -> str:
+    """The identity a catalog entry cannot be indexed without.
+
+    Raises rather than defaulting, and that is the whole point. `entry.get(key,
+    "")` turns an entry with no identity into one whose identity is the empty
+    string, so `{}` indexes as `srv::` -- a wholly synthetic entry that replaces
+    the real one and gets published as a change. The MCP models reject those
+    payloads outright; defaulting here invents an identity the protocol never
+    offered.
+
+    Every caller runs inside its parser's per-entry `try`, so raising routes the
+    entry into the existing skip, and a listing in which *no* entry parses
+    routes into `_reconcile_once`'s offered-but-none-parseable rule, which keeps
+    the prior entries. Both are the behaviour we want for "this entry told us
+    nothing": not "it is gone".
+
+    `entry` is typed `Any` because a non-object entry (`["a string"]`) must land
+    here too, rather than raising `AttributeError` somewhere less legible.
+    """
+    if not isinstance(entry, dict):
+        raise TypeError(f"catalog entry is {type(entry).__name__}, not an object")
+    value = entry.get(key)
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"catalog entry has no usable `{key}`")
+    return value
+
+
+def _listing_entries(name: str, kind: str, result: Any) -> list[dict[str, Any]] | None:
+    """The entries a `*/list` reply offered, or `None` if it offered none readably.
+
+    `result.get(kind, [])` conflates two different answers. A reply of
+    `{"tools": []}` says the server has no tools; a reply of `result: {}` is
+    missing a field the protocol requires, so it says nothing at all -- and the
+    default turns the second into the first, clearing the catalog and publishing
+    a removal built out of a malformed response. `list()` on a non-list widens
+    the same hole: `{"tools": {}}` coerces to `[]` and reads as an explicit
+    empty answer, while `{"tools": null}` raises `TypeError` out of
+    `_fetch_server_listings` and costs the *other* two kinds their reconcile.
+
+    So: absent field, non-object reply, or non-list value all return `None`,
+    which callers already treat as a failed listing -- prior entries kept,
+    nothing published. Only a genuine list is an answer, and an empty one still
+    clears. "We could not read the answer" is not "they are gone", the same
+    principle `_reconcile_once` applies to a request that failed and to a
+    listing whose every entry was unparseable.
+    """
+    if not isinstance(result, dict):
+        logger.warning(
+            f"[{name}] {kind}/list answered with "
+            f"{type(result).__name__}, not an object; treating as unreadable"
+        )
+        return None
+    if kind not in result:
+        logger.warning(
+            f"[{name}] {kind}/list answered without its required `{kind}` field; "
+            f"treating as unreadable rather than as an empty {kind} list"
+        )
+        return None
+    offered = result[kind]
+    if not isinstance(offered, list):
+        logger.warning(
+            f"[{name}] {kind}/list answered with `{kind}` as "
+            f"{type(offered).__name__}, not a list; treating as unreadable"
+        )
+        return None
+    return list(offered)
+
+
 def _schema_dialect(*schemas: dict[str, Any] | None) -> str:
     for schema in schemas:
         if schema and isinstance(schema.get("$schema"), str):
             return schema["$schema"]
     return DEFAULT_SCHEMA_DIALECT
+
+
+def _parse_tool_entries(
+    name: str, tools: list[dict[str, Any]], limit: int
+) -> list[tuple[str, ToolInfo]]:
+    """Parse one server's `tools/list` payload into indexable entries.
+
+    Pure: it reads the listing, logs the entries it had to skip, and returns
+    what survived. It touches no catalog dict, which is what lets
+    `_reconcile_once` run it *before* removing anything and decide from the
+    result whether the listing is usable at all -- see its "offered but none
+    parseable" rule. `_index_tools` does the writing.
+    """
+    entries: list[tuple[str, ToolInfo]] = []
+    known_fields = {
+        "name",
+        "title",
+        "description",
+        "inputSchema",
+        "outputSchema",
+        "icons",
+        "annotations",
+        "execution",
+    }
+    for tool in tools:
+        if len(entries) >= limit:
+            logger.warning(f"Server {name} has more than {limit} tools, truncating")
+            break
+
+        try:
+            tool_name = _required_identity(tool, "name")
+            tool_id = make_tool_id(name, tool_name)
+            description = tool.get("description", "")
+            input_schema = tool.get("inputSchema", {})
+            output_schema = tool.get("outputSchema")
+
+            tool_info = ToolInfo(
+                tool_id=tool_id,
+                server_name=name,
+                tool_name=tool_name,
+                title=tool.get("title"),
+                description=description,
+                short_description=_truncate_description(description),
+                input_schema=input_schema,
+                icons=tool.get("icons"),
+                output_schema=output_schema,
+                annotations=tool.get("annotations"),
+                execution=tool.get("execution"),
+                schema_dialect=_schema_dialect(input_schema, output_schema),
+                raw_metadata=_raw_metadata(tool, known_fields),
+                tags=_extract_tags(name, tool_name, description),
+                risk_hint=_infer_risk_hint(
+                    tool_name, description, tool.get("annotations")
+                ),
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{name}] Skipping unparseable tool {_entry_label(tool)}: {e}"
+            )
+            continue
+
+        entries.append((tool_id, tool_info))
+    return entries
+
+
+def _parse_resource_entries(
+    name: str, resources: list[dict[str, Any]]
+) -> list[tuple[str, ResourceInfo]]:
+    """Parse one server's `resources/list` payload. Pure, per `_parse_tool_entries`."""
+    entries: list[tuple[str, ResourceInfo]] = []
+    known_fields = {
+        "uri",
+        "name",
+        "title",
+        "description",
+        "mimeType",
+        "icons",
+        "annotations",
+    }
+    for resource in resources:
+        try:
+            uri = _required_identity(resource, "uri")
+            resource_id = f"{name}::{uri}"
+            resource_info = ResourceInfo(
+                resource_id=resource_id,
+                server_name=name,
+                uri=uri,
+                name=resource.get("name"),
+                title=resource.get("title"),
+                description=resource.get("description"),
+                mime_type=resource.get("mimeType"),
+                icons=resource.get("icons"),
+                annotations=resource.get("annotations"),
+                raw_metadata=_raw_metadata(resource, known_fields),
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{name}] Skipping unparseable resource "
+                f"{_entry_label(resource, key='uri')}: {e}"
+            )
+            continue
+
+        entries.append((resource_id, resource_info))
+    return entries
+
+
+def _parse_prompt_entries(
+    name: str, prompts: list[dict[str, Any]]
+) -> list[tuple[str, PromptInfo]]:
+    """Parse one server's `prompts/list` payload. Pure, per `_parse_tool_entries`."""
+    entries: list[tuple[str, PromptInfo]] = []
+    known_prompt_fields = {
+        "name",
+        "title",
+        "description",
+        "arguments",
+        "icons",
+        "annotations",
+    }
+    known_arg_fields = {"name", "title", "description", "required"}
+    for prompt in prompts:
+        try:
+            prompt_name = _required_identity(prompt, "name")
+            prompt_id = f"{name}::{prompt_name}"
+            arguments = None
+            if prompt.get("arguments"):
+                arguments = [
+                    PromptArgumentInfo(
+                        name=arg.get("name", ""),
+                        title=arg.get("title"),
+                        description=arg.get("description"),
+                        required=arg.get("required", False),
+                        raw_metadata=_raw_metadata(arg, known_arg_fields),
+                    )
+                    for arg in prompt["arguments"]
+                ]
+            prompt_info = PromptInfo(
+                prompt_id=prompt_id,
+                server_name=name,
+                name=prompt_name,
+                title=prompt.get("title"),
+                description=prompt.get("description"),
+                arguments=arguments,
+                icons=prompt.get("icons"),
+                annotations=prompt.get("annotations"),
+                raw_metadata=_raw_metadata(prompt, known_prompt_fields),
+            )
+        except Exception as e:
+            logger.warning(
+                f"[{name}] Skipping unparseable prompt {_entry_label(prompt)}: {e}"
+            )
+            continue
+
+        entries.append((prompt_id, prompt_info))
+    return entries
 
 
 def _is_protocol_version_initialize_error(exc: Exception) -> bool:
@@ -558,6 +855,15 @@ class ClientManager:
         self._background_tasks: set[asyncio.Task[Any]] = set()
         self._background_task_servers: dict[asyncio.Task[Any], str | None] = {}
         self._reconnect_tasks: dict[str, asyncio.Task[None]] = {}
+        # FANOUT: at most one in-flight catalog reconcile per server name, plus
+        # the re-run flags a notification sets when it arrives while one is
+        # already running. See `_handle_downstream_notification`.
+        self._reconcile_tasks: dict[str, asyncio.Task[None]] = {}
+        self._reconcile_reruns: set[str] = set()
+        # Server names whose `note_*` publishes are currently suppressed, with a
+        # depth so overlapping reconciles of the same name nest correctly. Keyed
+        # by server so a reconcile of A never swallows a genuine publish for B.
+        self._catalog_suppressed: dict[str, int] = {}
         self._request_counters: dict[str, int] = {}
         self._tasks: dict[tuple[str, str], McpTaskRecord] = {}
         # Cap on retained terminal (completed/failed/cancelled) task records.
@@ -903,6 +1209,12 @@ class ClientManager:
             await self._cancel_background_tasks(server_name=name)
             self._connect_tasks.pop(name, None)
             self._reconnect_tasks.pop(name, None)
+            # A reconcile cancelled before it ever started never runs its own
+            # `finally`, so clear its bookkeeping here too. The catalog removal
+            # below supersedes whatever it would have published.
+            self._reconcile_tasks.pop(name, None)
+            self._reconcile_reruns.discard(name)
+            self._catalog_suppressed.pop(name, None)
             self._clients.pop(name, None)
             self._remove_server_indexes(name)
             if config is not None and config.source in {"project", "user", "custom"}:
@@ -973,31 +1285,114 @@ class ClientManager:
 
         await self._connect_stdio(config)
 
-    def _remove_server_indexes(self, name: str) -> None:
-        """Remove catalog entries owned by one server."""
-        tools_removed = False
-        for tool_id, tool in list(self._tools.items()):
-            if tool.server_name == name:
-                self._tools.pop(tool_id, None)
-                tools_removed = True
-        resources_removed = False
-        for resource_id, resource in list(self._resources.items()):
-            if resource.server_name == name:
-                self._resources.pop(resource_id, None)
-                resources_removed = True
-        prompts_removed = False
-        for prompt_id, prompt in list(self._prompts.items()):
-            if prompt.server_name == name:
-                self._prompts.pop(prompt_id, None)
-                prompts_removed = True
-        for key in list(self._tasks):
-            if key[0] == name:
-                self._tasks.pop(key, None)
-        if tools_removed:
+    def _publish_catalog_change(self, kind: str) -> None:
+        """Publish one catalog-kind change to the sink, unconditionally."""
+        if kind == "tools":
             self._catalog_events.note_tools_changed()
-        if resources_removed:
+        elif kind == "resources":
             self._catalog_events.note_resources_changed()
-        if prompts_removed:
+        elif kind == "prompts":
+            self._catalog_events.note_prompts_changed()
+
+    def _catalog_publishing_suppressed(self, server_name: str) -> bool:
+        """True while `server_name` is mid-reconcile, i.e. while its `note_*`
+        publishes are being withheld.
+
+        Suppression is keyed by server name rather than being a global flag on
+        purpose: reconciling A must not swallow the connect-time publishes of a
+        B being indexed concurrently. The reconcile republishes for itself, once
+        per kind that actually differs, once it has finished churning.
+
+        Deliberately a *predicate* rather than a wrapper around the sink: each
+        publishing mutator keeps its literal `self._catalog_events.note_*(...)`
+        call, which is what `tests/runtime/test_publisher_coverage.py`'s AST
+        honesty guard asserts. Hiding those calls behind a helper would make
+        that guard vacuous.
+        """
+        return bool(self._catalog_suppressed.get(server_name))
+
+    def _server_catalog_snapshot(self, name: str) -> dict[str, dict[str, Any]]:
+        """What one server currently owns, per catalog kind, by *content*.
+
+        Not identifier sets and emphatically not counts. A count-based diff
+        misses a rename, an identifier-set diff misses an edit in place: a tool
+        whose `description` or `inputSchema` changed under the same name is a
+        real catalog change that a subscriber has to hear about. Comparing the
+        model dumps catches adds, removes, renames, and edits with one rule.
+
+        `model_dump()` in python mode, not `mode="json"`: every field here was
+        parsed out of JSON already, so the python dump is comparable by `==`
+        without paying for -- or risking a serializer warning on -- the
+        arbitrary values carried in `raw_metadata`.
+        """
+        return {
+            "tools": {
+                k: v.model_dump()
+                for k, v in self._tools.items()
+                if v.server_name == name
+            },
+            "resources": {
+                k: v.model_dump()
+                for k, v in self._resources.items()
+                if v.server_name == name
+            },
+            "prompts": {
+                k: v.model_dump()
+                for k, v in self._prompts.items()
+                if v.server_name == name
+            },
+        }
+
+    def _remove_server_indexes(
+        self,
+        name: str,
+        *,
+        drop_tasks: bool = True,
+        kinds: Collection[str] | None = None,
+    ) -> None:
+        """Remove catalog entries owned by one server.
+
+        `drop_tasks=False` keeps the server's tracked `McpTaskRecord`s. Dropping
+        them is right for a disconnect, where the downstream's tasks died with
+        the connection, and wrong for a `list_changed` reconcile, where the
+        server is still up and its in-flight tasks are still running -- evicting
+        them there would silently break `gateway.tasks_list`/`tasks_result`.
+
+        `kinds=None` removes all three, which is what a disconnect wants.
+        Reconciliation passes only the kinds whose re-listing actually
+        succeeded: a `resources/list` that failed means "we could not ask", and
+        turning that into "they are gone" both deletes entries the server still
+        has and publishes a false removal.
+        """
+        selected = CATALOG_KINDS if kinds is None else tuple(kinds)
+        tools_removed = False
+        if "tools" in selected:
+            for tool_id, tool in list(self._tools.items()):
+                if tool.server_name == name:
+                    self._tools.pop(tool_id, None)
+                    tools_removed = True
+        resources_removed = False
+        if "resources" in selected:
+            for resource_id, resource in list(self._resources.items()):
+                if resource.server_name == name:
+                    self._resources.pop(resource_id, None)
+                    resources_removed = True
+        prompts_removed = False
+        if "prompts" in selected:
+            for prompt_id, prompt in list(self._prompts.items()):
+                if prompt.server_name == name:
+                    self._prompts.pop(prompt_id, None)
+                    prompts_removed = True
+        if drop_tasks:
+            for key in list(self._tasks):
+                if key[0] == name:
+                    self._tasks.pop(key, None)
+        suppressed = self._catalog_publishing_suppressed(name)
+        if tools_removed and not suppressed:
+            self._catalog_events.note_tools_changed()
+        if resources_removed and not suppressed:
+            self._catalog_events.note_resources_changed()
+        if prompts_removed and not suppressed:
             self._catalog_events.note_prompts_changed()
 
     def _server_supports_tasks(self, managed: ManagedClient) -> bool:
@@ -1164,133 +1559,123 @@ class ClientManager:
                 errors.append(message)
         return cancelled, errors
 
-    def _index_tools(self, name: str, tools: list[dict[str, Any]]) -> int:
-        indexed = 0
-        known_fields = {
-            "name",
-            "title",
-            "description",
-            "inputSchema",
-            "outputSchema",
-            "icons",
-            "annotations",
-            "execution",
-        }
-        for tool in tools:
-            if indexed >= self._max_tools_per_server:
-                logger.warning(
-                    f"Server {name} has more than {self._max_tools_per_server} tools, truncating"
-                )
-                break
+    def _index_tools(
+        self,
+        name: str,
+        tools: list[dict[str, Any]],
+        *,
+        parsed: list[tuple[str, ToolInfo]] | None = None,
+    ) -> int:
+        """Index one server's tools, skipping any entry we cannot parse.
 
-            tool_name = tool["name"]
-            tool_id = make_tool_id(name, tool_name)
-            description = tool.get("description", "")
-            input_schema = tool.get("inputSchema", {})
-            output_schema = tool.get("outputSchema")
+        The guard is per *entry*, not per call, and that placement is the whole
+        point. Reconciliation removes this server's entries and then calls this
+        method; an exception escaping here would leave the removal done and the
+        re-index half-finished, so one malformed tool from a downstream would
+        silently cost the server its entire catalog -- permanently, since the
+        read loop stays healthy and no reconnect comes along to heal it. A
+        single `try` around the loop would be barely better: it would still lose
+        every entry after the bad one.
 
-            tool_info = ToolInfo(
-                tool_id=tool_id,
-                server_name=name,
-                tool_name=tool_name,
-                title=tool.get("title"),
-                description=description,
-                short_description=_truncate_description(description),
-                input_schema=input_schema,
-                icons=tool.get("icons"),
-                output_schema=output_schema,
-                annotations=tool.get("annotations"),
-                execution=tool.get("execution"),
-                schema_dialect=_schema_dialect(input_schema, output_schema),
-                raw_metadata=_raw_metadata(tool, known_fields),
-                tags=_extract_tags(name, tool_name, description),
-                risk_hint=_infer_risk_hint(
-                    tool_name, description, tool.get("annotations")
-                ),
-            )
+        `_index_resources` / `_index_prompts` guard identically. `connect_server`
+        and `refresh` reach the same three methods, so they inherit this too: a
+        server with one unparseable tool now connects with the rest of its
+        catalog instead of failing outright.
 
+        The parsing itself lives in `_parse_tool_entries`, which writes nothing.
+        `parsed` lets a caller that has already run it -- `_reconcile_once`,
+        which must know how many entries survive parsing *before* it removes
+        anything -- hand the result straight in, so each listing is parsed once
+        and each unparseable entry is logged once. Callers with a raw listing
+        omit it and this method parses for them.
+        """
+        entries = (
+            _parse_tool_entries(name, tools, self._max_tools_per_server)
+            if parsed is None
+            else parsed
+        )
+        for tool_id, tool_info in entries:
             self._tools[tool_id] = tool_info
-            indexed += 1
-        if indexed:
+        indexed = len(entries)
+        if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_tools_changed()
         return indexed
 
-    def _index_resources(self, name: str, resources: list[dict[str, Any]]) -> int:
-        known_fields = {
-            "uri",
-            "name",
-            "title",
-            "description",
-            "mimeType",
-            "icons",
-            "annotations",
-        }
-        for resource in resources:
-            uri = resource.get("uri", "")
-            resource_id = f"{name}::{uri}"
-            resource_info = ResourceInfo(
-                resource_id=resource_id,
-                server_name=name,
-                uri=uri,
-                name=resource.get("name"),
-                title=resource.get("title"),
-                description=resource.get("description"),
-                mime_type=resource.get("mimeType"),
-                icons=resource.get("icons"),
-                annotations=resource.get("annotations"),
-                raw_metadata=_raw_metadata(resource, known_fields),
-            )
+    def _index_resources(
+        self,
+        name: str,
+        resources: list[dict[str, Any]],
+        *,
+        parsed: list[tuple[str, ResourceInfo]] | None = None,
+    ) -> int:
+        """Index one server's resources, skipping any entry we cannot parse.
+
+        Per-entry, for the reason spelled out on `_index_tools`, and `parsed`
+        for the reason spelled out there too. The count returned is what was
+        actually indexed, not what was offered, so a caller reporting it is not
+        overstating the catalog.
+        """
+        entries = _parse_resource_entries(name, resources) if parsed is None else parsed
+        for resource_id, resource_info in entries:
             self._resources[resource_id] = resource_info
-        if resources:
+        indexed = len(entries)
+        if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_resources_changed()
-        return len(resources)
+        return indexed
 
-    def _index_prompts(self, name: str, prompts: list[dict[str, Any]]) -> int:
-        known_prompt_fields = {
-            "name",
-            "title",
-            "description",
-            "arguments",
-            "icons",
-            "annotations",
-        }
-        known_arg_fields = {"name", "title", "description", "required"}
-        for prompt in prompts:
-            prompt_name = prompt.get("name", "")
-            prompt_id = f"{name}::{prompt_name}"
-            arguments = None
-            if prompt.get("arguments"):
-                arguments = [
-                    PromptArgumentInfo(
-                        name=arg.get("name", ""),
-                        title=arg.get("title"),
-                        description=arg.get("description"),
-                        required=arg.get("required", False),
-                        raw_metadata=_raw_metadata(arg, known_arg_fields),
-                    )
-                    for arg in prompt["arguments"]
-                ]
-            prompt_info = PromptInfo(
-                prompt_id=prompt_id,
-                server_name=name,
-                name=prompt_name,
-                title=prompt.get("title"),
-                description=prompt.get("description"),
-                arguments=arguments,
-                icons=prompt.get("icons"),
-                annotations=prompt.get("annotations"),
-                raw_metadata=_raw_metadata(prompt, known_prompt_fields),
-            )
+    def _index_prompts(
+        self,
+        name: str,
+        prompts: list[dict[str, Any]],
+        *,
+        parsed: list[tuple[str, PromptInfo]] | None = None,
+    ) -> int:
+        """Index one server's prompts, skipping any entry we cannot parse.
+
+        Per-entry, for the reason spelled out on `_index_tools`. The count
+        returned is what was actually indexed, not what was offered.
+        """
+        entries = _parse_prompt_entries(name, prompts) if parsed is None else parsed
+        for prompt_id, prompt_info in entries:
             self._prompts[prompt_id] = prompt_info
-        if prompts:
+        indexed = len(entries)
+        if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_prompts_changed()
-        return len(prompts)
+        return indexed
 
-    async def _index_capabilities(self, managed: ManagedClient) -> tuple[int, int, int]:
+    async def _fetch_server_listings(
+        self, managed: ManagedClient
+    ) -> dict[str, list[dict[str, Any]] | None]:
+        """List one server's three catalog kinds, mutating nothing.
+
+        Every downstream request reconciliation makes lives here, and no catalog
+        write does. That separation is the whole point: the caller can do all of
+        its awaiting first and then apply the result in one synchronous block,
+        so the catalog is never left empty across a network round trip for a
+        concurrent `gateway.invoke` to trip over.
+
+        Return shape, per kind:
+
+        - `list[...]` -- the server answered, and the reply carried the
+          collection the protocol requires. An **empty list is an answer**: it
+          means the kind is genuinely empty and its entries should be cleared.
+        - `None` -- we could not read an answer. The caller must leave that kind
+          exactly as it was and publish nothing for it.
+
+        `None` covers two cases that used to look different and are not. The
+        request failing is the obvious one. The other is a reply we cannot read:
+        its required collection absent, or present but not a list. Those are
+        malformed, not empty -- see `_listing_entries`, which draws the line.
+        Any kind can now come back `None`, `tools` included.
+
+        Only `tools/list` failing raises. A server that does not implement
+        resources or prompts is ordinary and answers those two with an error,
+        which is why they are gathered with `return_exceptions=True` and mapped
+        to `None` rather than propagated.
+        """
         name = managed.config.name
 
         tools_result = await self._send_request(managed, "tools/list", {})
-        indexed = self._index_tools(name, tools_result.get("tools", []))
 
         resources_task = self._send_request(managed, "resources/list", {})
         prompts_task = self._send_request(managed, "prompts/list", {})
@@ -1298,21 +1683,33 @@ class ClientManager:
             resources_task, prompts_task, return_exceptions=True
         )
 
-        resource_count = 0
-        resources_result = listing_results[0]
-        if isinstance(resources_result, BaseException):
-            logger.debug(f"Server {name} doesn't support resources: {resources_result}")
-        else:
-            resource_count = self._index_resources(
-                name, resources_result.get("resources", [])
-            )
+        listings: dict[str, list[dict[str, Any]] | None] = {
+            "tools": _listing_entries(name, "tools", tools_result)
+        }
+        for kind, result in (
+            ("resources", listing_results[0]),
+            ("prompts", listing_results[1]),
+        ):
+            if isinstance(result, BaseException):
+                logger.debug(f"Server {name} doesn't support {kind}: {result}")
+                listings[kind] = None
+            else:
+                listings[kind] = _listing_entries(name, kind, result)
+        return listings
 
-        prompt_count = 0
-        prompts_result = listing_results[1]
-        if isinstance(prompts_result, BaseException):
-            logger.debug(f"Server {name} doesn't support prompts: {prompts_result}")
-        else:
-            prompt_count = self._index_prompts(name, prompts_result.get("prompts", []))
+    async def _index_capabilities(self, managed: ManagedClient) -> tuple[int, int, int]:
+        name = managed.config.name
+        listings = await self._fetch_server_listings(managed)
+
+        indexed = self._index_tools(name, listings["tools"] or [])
+
+        resources = listings["resources"]
+        resource_count = (
+            0 if resources is None else self._index_resources(name, resources)
+        )
+
+        prompts = listings["prompts"]
+        prompt_count = 0 if prompts is None else self._index_prompts(name, prompts)
 
         # No flush() here, deliberately: IF-0-P3B-1's self-scheduling drain
         # is the correctness mechanism, not this call site, and EC-P3B-4
@@ -1320,6 +1717,268 @@ class ClientManager:
         # acceptance test pass even if the self-scheduling drain were
         # completely broken.
         return indexed, resource_count, prompt_count
+
+    def _handle_downstream_notification(
+        self, name: str, managed: ManagedClient, method: str
+    ) -> bool:
+        """Act on one JSON-RPC notification received from a downstream server.
+
+        This is IF-0-FANOUT-1, the downstream-event contract. It is called from
+        both dispatch paths -- `_handle_stdout_line` (stdio) and `_read_sse`
+        (remote) -- for every frame that carries a `method` and no `id`.
+
+        Method mapping. Exactly three methods are recognised, each requesting a
+        re-index of the *whole* of that one server's catalog (the gateway's
+        catalog is index-backed, not proxied, so a per-kind refetch would still
+        need the same round trip):
+
+        - `notifications/tools/list_changed`
+        - `notifications/resources/list_changed`
+        - `notifications/prompts/list_changed`
+
+        Reconcile-then-publish ordering. The gateway serves `gateway.invoke` and
+        `gateway.catalog_search` out of its own index, so a notification
+        forwarded straight to the subscription sink would tell a client to
+        refetch and then hand it the stale catalog. Reconciliation therefore
+        always completes before anything is published.
+
+        Fetch-then-swap. Reconciliation lists the server's three catalog kinds
+        first and writes nothing while doing so, then removes and re-indexes in
+        a single synchronous block. Nothing can interleave inside that block, so
+        a `gateway.invoke` running concurrently with a reconcile sees the old
+        catalog or the new one, never an empty one. A kind whose listing failed
+        is left exactly as it was -- "we could not ask" is not "they are gone" --
+        and so are the three states reached by different routes to the same
+        place: a reply missing its required collection or carrying a non-list in
+        its place, and a listing that offered entries of which not one could be
+        parsed. An answer of zero entries is still an answer and does clear the
+        kind.
+
+        Suppress-while-churning, publish-once-if-changed. The swap's removal and
+        re-index halves both call `CatalogEventSink.note_*` unconditionally, so
+        a chatty downstream would spam subscribers even when nothing moved. Sink
+        calls originating from the server under reconciliation are suppressed
+        for the duration of the swap; afterwards its entries are compared before
+        against after, and exactly one `note_*` is published per catalog kind
+        that actually differs. Entries, not identifiers and certainly not
+        counts: a rename leaves the count unchanged, and an edited description
+        or schema leaves the identifiers unchanged too.
+
+        Unrecognised methods are a no-op. Any other `notifications/*` (or any
+        other method name) returns False having published nothing, scheduled
+        nothing, and raised nothing. This function never raises: `_read_sse`
+        wraps its loop in a blanket `except Exception` that tears the connection
+        down and triggers a reconnect, so a raise here would turn an unknown
+        notification into a dropped server.
+
+        Never blocks the caller. The reconcile runs in a task spawned with
+        `asyncio.create_task`, never awaited inline -- see
+        `_reconcile_server_catalog` for why an inline await deadlocks
+        immediately.
+
+        Args:
+            name: The downstream server's registered name.
+            managed: The client that received the notification.
+            method: The notification's JSON-RPC `method`.
+
+        Returns:
+            True if the method was recognised and a reconcile was requested,
+            False if it was ignored.
+        """
+        if method not in DOWNSTREAM_LIST_CHANGED_METHODS:
+            return False
+
+        existing = self._reconcile_tasks.get(name)
+        if existing is not None and not existing.done():
+            # Coalesce: a notification arriving mid-reconcile sets a re-run flag
+            # the running task picks up, rather than spawning a second task. A
+            # downstream that emits `list_changed` on every request is therefore
+            # bounded to one in-flight re-index plus one queued re-run.
+            self._reconcile_reruns.add(name)
+            return True
+
+        try:
+            task = asyncio.create_task(self._reconcile_server_catalog(name))
+        except RuntimeError:
+            # No running loop. Both real dispatch paths run inside one, so this
+            # is unreachable in production; returning False (rather than
+            # raising) keeps the never-raises guarantee absolute.
+            logger.debug(f"[{name}] No running loop; dropped {method}")
+            return False
+        self._reconcile_tasks[name] = task
+        self._track_background_task(task, name)
+        return True
+
+    async def _reconcile_server_catalog(self, name: str) -> None:
+        """Re-index one server's catalog, then publish what actually moved.
+
+        Spawned, never awaited from a dispatch path. `_fetch_server_listings`
+        awaits `_send_request`, and the future it waits on is resolved by the
+        very read loop that received the notification --
+        `pending.future.set_result` in `_handle_stdout_line` (stdio) and in
+        `_read_sse` (remote). Awaiting inline would make that loop wait on a
+        future only it can resolve: an immediate, total deadlock of the
+        connection, not an occasional one.
+
+        (Line references as surveyed pre-FANOUT, at ff2cb95: the await is
+        `manager.py:1292`, the two resolutions are `:1791` and `:2010`. Anchored
+        by symbol above because this change shifts all three.)
+
+        Re-runs are a loop inside this one task rather than a second task, which
+        is what keeps the coalescing bound at one in-flight reconcile per server.
+        """
+        try:
+            while True:
+                self._reconcile_reruns.discard(name)
+                # Re-resolve the client every iteration: a reconnect swaps the
+                # ManagedClient object outright, and a stale reference would
+                # send `tools/list` down a transport that is already closed.
+                managed = self._clients.get(name)
+                if managed is None:
+                    return
+                await self._reconcile_once(name, managed)
+                if name not in self._reconcile_reruns:
+                    return
+                # A re-run is pending. Wait a beat before honouring it so a
+                # server that emits `list_changed` in reply to our own
+                # `tools/list` cannot spin this loop at full speed; further
+                # notifications during the wait fold into this same re-run.
+                await asyncio.sleep(_RECONCILE_RERUN_DEBOUNCE_S)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # pragma: no cover - defensive
+            # Never let a reconcile surface as an unhandled task exception.
+            logger.warning(f"[{name}] Catalog reconciliation task failed: {e}")
+        finally:
+            self._reconcile_reruns.discard(name)
+            if self._reconcile_tasks.get(name) is asyncio.current_task():
+                self._reconcile_tasks.pop(name, None)
+
+    async def _reconcile_once(self, name: str, managed: ManagedClient) -> None:
+        """One fetch-then-swap pass, published per kind only if that kind moved.
+
+        Fetch first. Every downstream request happens before any catalog write,
+        so a `tools/list` that fails costs nothing: there is nothing to roll
+        back because nothing was removed. (The previous order -- remove, then
+        re-list -- needed a rollback precisely because it had already destroyed
+        the state it was trying to preserve.)
+
+        Then swap, synchronously. The block below contains no `await` by
+        construction: `_remove_server_indexes` and the three `_index_*` are all
+        plain methods. asyncio cannot interleave another task inside it, so a
+        concurrent `gateway.invoke` sees either the whole old catalog or the
+        whole new one and never the empty window between them. Adding an await
+        in there would silently reintroduce that window.
+
+        Per kind, independently. A kind whose listing failed is absent from
+        `refreshed`: it is neither removed nor re-indexed nor published, because
+        "we could not ask" is not "they are gone". A kind that answered is
+        replaced wholesale and published only if its entries actually differ.
+
+        A listing nobody could parse is a failed listing. If a kind offers
+        entries and *not one* of them survives parsing, we are in the same
+        epistemic state as a failed request -- we could not read the answer --
+        so that kind is dropped from `refreshed` too and left exactly as it was.
+        A parse failure degrades our visibility of the server's catalog; it does
+        not make the server's tools stop working, and publishing a removal on
+        the strength of it would tell every subscriber they are gone. Note the
+        boundary: a listing that offers *zero* entries is a real answer -- the
+        server emptied that kind -- and still clears and publishes. Only
+        offered-but-none-parseable is treated as failure. Mixed listings keep
+        the per-entry semantics: something parsed, so the kind answered and is
+        replaced by what parsed.
+
+        A listing that never arrived readably never reaches that rule at all.
+        `_listing_entries` has already collapsed an absent collection, or one
+        that is not a list, to `None` -- so it is `offered is None` here, the
+        same branch as a request that failed outright. That distinction is load
+        bearing: `result: {}` and `{"tools": []}` are different answers, and
+        only the second one means the kind is empty. Likewise an entry with no
+        identity now fails to parse (`_required_identity`) instead of indexing
+        as `srv::`, so a listing of nothing but such entries lands in the
+        offered-but-none-parseable rule above rather than replacing real entries
+        with synthetic ones.
+
+        (On connect there is no prior catalog to protect -- `_connect_stdio` and
+        friends remove this server's indexes first -- so `_index_capabilities`
+        deliberately keeps the plain per-entry behaviour: an all-malformed
+        listing there yields an empty catalog for that kind, not a failed
+        connect.)
+
+        Parsing happens before the apply block, not inside it. It is pure CPU
+        and writes nothing, so doing it early costs nothing and is what lets the
+        decision above be made while the old catalog is still intact.
+        """
+        try:
+            listings = await self._fetch_server_listings(managed)
+        except Exception as e:
+            # The downstream announced a change and then failed to list. The
+            # catalog has not been touched, so leaving it alone *is* the
+            # rollback, and there is nothing to publish.
+            logger.warning(f"[{name}] Catalog reconciliation failed: {e}")
+            return
+
+        tools = listings["tools"]
+        resources = listings["resources"]
+        prompts = listings["prompts"]
+        parsed_tools = (
+            None
+            if tools is None
+            else _parse_tool_entries(name, tools, self._max_tools_per_server)
+        )
+        parsed_resources = (
+            None if resources is None else _parse_resource_entries(name, resources)
+        )
+        parsed_prompts = (
+            None if prompts is None else _parse_prompt_entries(name, prompts)
+        )
+
+        usable: dict[str, bool] = {}
+        for kind, offered, parsed in (
+            ("tools", tools, parsed_tools),
+            ("resources", resources, parsed_resources),
+            ("prompts", prompts, parsed_prompts),
+        ):
+            if offered is None:
+                usable[kind] = False
+                continue
+            if offered and not parsed:
+                logger.warning(
+                    f"[{name}] Every {kind} entry in the listing was unparseable "
+                    f"({len(offered)} offered); keeping the previous {kind} "
+                    "rather than reporting them removed"
+                )
+                usable[kind] = False
+                continue
+            usable[kind] = True
+
+        refreshed = tuple(k for k in CATALOG_KINDS if usable[k])
+        before = self._server_catalog_snapshot(name)
+
+        # ---- apply: synchronous, no `await` below this line --------------
+        self._catalog_suppressed[name] = self._catalog_suppressed.get(name, 0) + 1
+        try:
+            # `drop_tasks=False`: the server is still connected, so its tracked
+            # task records must survive a catalog refresh.
+            self._remove_server_indexes(name, drop_tasks=False, kinds=refreshed)
+            if usable["tools"] and tools is not None:
+                self._index_tools(name, tools, parsed=parsed_tools)
+            if usable["resources"] and resources is not None:
+                self._index_resources(name, resources, parsed=parsed_resources)
+            if usable["prompts"] and prompts is not None:
+                self._index_prompts(name, prompts, parsed=parsed_prompts)
+        finally:
+            depth = self._catalog_suppressed.get(name, 1) - 1
+            if depth > 0:
+                self._catalog_suppressed[name] = depth
+            else:
+                self._catalog_suppressed.pop(name, None)
+        # ---- end apply ----------------------------------------------------
+
+        after = self._server_catalog_snapshot(name)
+        for kind in refreshed:
+            if before[kind] != after[kind]:
+                self._publish_catalog_change(kind)
 
     async def _connect_stdio(self, config: ResolvedServerConfig) -> None:
         """Connect to a local stdio MCP server."""
@@ -1779,16 +2438,17 @@ class ClientManager:
                 managed.status.pending_request_count = len(managed.pending_requests)
 
                 if "error" in message:
-                    # TODO(post-P3B): message["error"] also carries JSON-RPC
-                    # "code" and "data" fields that are dropped here, exposing
-                    # only "message" to callers. No P3B exit criterion
-                    # mentions typed downstream errors (Execution Notes >
-                    # Decision 5) — deferred again, not actioned in P3B.
-                    pending.future.set_exception(
-                        Exception(message["error"].get("message", "Unknown error"))
-                    )
+                    pending.future.set_exception(_downstream_error(message["error"]))
                 else:
                     pending.future.set_result(message.get("result", {}))
+            else:
+                # A notification carries a `method` and no `id`, so it falls
+                # through the gate above with nothing to resolve. Server->client
+                # *requests* also carry a method but do have an id, and are not
+                # ours to handle here — hence the explicit `msg_id is None`.
+                method = message.get("method")
+                if msg_id is None and isinstance(method, str):
+                    self._handle_downstream_notification(name, managed, method)
         except json.JSONDecodeError:
             # Non-JSON output already counted as a heartbeat by the caller.
             logger.debug(
@@ -1997,17 +2657,20 @@ class ClientManager:
                     managed.status.pending_request_count = len(managed.pending_requests)
 
                     if "error" in payload:
-                        # TODO(post-P3B): payload["error"] also carries
-                        # JSON-RPC "code" and "data" fields that are dropped
-                        # here, exposing only "message" to callers. No P3B
-                        # exit criterion mentions typed downstream errors
-                        # (Execution Notes > Decision 5) — deferred again,
-                        # not actioned in P3B.
                         pending.future.set_exception(
-                            Exception(payload["error"].get("message", "Unknown error"))
+                            _downstream_error(payload["error"])
                         )
                     else:
                         pending.future.set_result(payload.get("result", {}))
+                else:
+                    # Same fall-through as the stdio path: a notification has a
+                    # method and no id. `_handle_downstream_notification` never
+                    # raises, which matters more here — this loop's blanket
+                    # `except Exception` would tear the connection down and
+                    # trigger a reconnect.
+                    method = payload.get("method")
+                    if msg_id is None and isinstance(method, str):
+                        self._handle_downstream_notification(name, managed, method)
         except Exception as e:
             logger.debug(f"[{name}] SSE read error: {e}")
         finally:
@@ -2262,6 +2925,9 @@ class ClientManager:
         await self._cancel_background_tasks(exclude=exclude)
         self._connect_tasks.clear()
         self._reconnect_tasks.clear()
+        self._reconcile_tasks.clear()
+        self._reconcile_reruns.clear()
+        self._catalog_suppressed.clear()
         self._clients.clear()
         # Capture non-empty immediately before each clear (not after — the
         # clear must happen first for the dict to actually be empty

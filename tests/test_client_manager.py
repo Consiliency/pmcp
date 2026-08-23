@@ -27,6 +27,7 @@ from pmcp.client.manager import (
     _extract_tags,
     _infer_risk_hint,
     _remote_headers,
+    _required_identity,
     _terminate_process_tree,
     _truncate_description,
 )
@@ -35,6 +36,7 @@ from pmcp.remote_auth import MissingRemoteHeaderAuthError
 from pmcp.types import (
     LocalMcpServerConfig,
     McpTaskInfo,
+    McpTaskRecord,
     PromptInfo,
     RemoteMcpServerConfig,
     ResourceInfo,
@@ -3798,3 +3800,1788 @@ class TestReadStdoutFailureSurfacing:
         assert status.status == ServerStatusEnum.ERROR
         assert status.last_error is not None
         assert "pipe gone" in status.last_error
+
+
+class _RecordingSink:
+    """Counts `CatalogEventSink` publishes so a test can assert on the exact
+    number, not merely that something fired."""
+
+    def __init__(self) -> None:
+        self.tools = 0
+        self.resources = 0
+        self.prompts = 0
+
+    def note_tools_changed(self) -> None:
+        self.tools += 1
+
+    def note_resources_changed(self) -> None:
+        self.resources += 1
+
+    def note_prompts_changed(self) -> None:
+        self.prompts += 1
+
+    async def flush(self) -> None:
+        pass
+
+
+class TestDownstreamReconcileScheduler:
+    """FANOUT SL-1: the downstream-notification contract (IF-0-FANOUT-1) and the
+    coalesced reconcile scheduler behind it.
+
+    Owned by lane SL-1 inside a file lane SL-3 owns; kept to this one class, and
+    deliberately avoiding the `-k` patterns SL-3.2 claims (`unchanged_catalog`,
+    `unknown_notification`, `typed_downstream_error`).
+    """
+
+    @staticmethod
+    def _managed(name: str) -> ManagedClient:
+        status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=MagicMock(), status=status)
+        managed.config.name = name
+        return managed
+
+    # ---- SL-1.1: IF-0-FANOUT-1 shape ------------------------------------
+
+    def test_reconcile_contract_entry_point_has_frozen_signature(self) -> None:
+        """IF-0-FANOUT-1's entry point exists, is synchronous (both dispatch paths
+        call it, and the stdio one is not a coroutine), and takes the frozen
+        `(name, managed, method)` parameters."""
+        import inspect
+
+        handler = ClientManager._handle_downstream_notification
+        assert not inspect.iscoroutinefunction(handler), (
+            "must be sync: _handle_stdout_line is a plain def"
+        )
+        assert list(inspect.signature(handler).parameters) == [
+            "self",
+            "name",
+            "managed",
+            "method",
+        ]
+
+    def test_reconcile_contract_docstring_states_the_four_guarantees(self) -> None:
+        """The freeze is the docstring as much as the signature: SL-3 writes tests
+        against this text on day 1."""
+        import inspect
+
+        doc = inspect.getdoc(ClientManager._handle_downstream_notification) or ""
+        for fragment in (
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed",
+        ):
+            assert fragment in doc, f"method mapping missing {fragment!r}"
+        lowered = doc.lower()
+        assert "reconcile" in lowered and "publish" in lowered
+        assert "no-op" in lowered or "no op" in lowered
+
+    @pytest.mark.asyncio
+    async def test_reconcile_contract_unrecognised_method_is_a_silent_noop(
+        self,
+    ) -> None:
+        """An unrecognised `notifications/*` neither raises, nor publishes, nor
+        schedules anything — it returns False. A raise here would tear down the
+        SSE read loop through its blanket `except Exception`."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+
+        assert (
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/message"
+            )
+            is False
+        )
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+        assert not manager._background_tasks
+
+    @pytest.mark.asyncio
+    async def test_reconcile_contract_recognised_methods_are_accepted(self) -> None:
+        """Each of the three `list_changed` methods is recognised and returns True."""
+        for method in (
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed",
+        ):
+            manager = ClientManager()
+            managed = self._managed("srv")
+            manager._clients["srv"] = managed
+            self._wire(manager, {})
+            assert (
+                manager._handle_downstream_notification("srv", managed, method) is True
+            ), method
+            await manager._cancel_background_tasks()
+
+    # ---- SL-1.3: the coalesced scheduler --------------------------------
+
+    @staticmethod
+    async def _drain(manager: ClientManager, timeout: float = 5.0) -> None:
+        """Wait until no reconcile is in flight."""
+
+        async def _wait() -> None:
+            while manager._reconcile_tasks:
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(_wait(), timeout)
+
+    def _wire(
+        self,
+        manager: ClientManager,
+        state: dict[str, list[str]],
+        gate: asyncio.Event | None = None,
+    ) -> list[str]:
+        """Replace `_send_request` with a listing stub driven by `state`, and
+        return the list that records every method it was asked for.
+
+        `state` maps "tools"/"resources"/"prompts" to the identifier names the
+        downstream server currently reports, so a test mutates `state` to
+        simulate the downstream catalog moving underneath the gateway.
+        """
+        calls: list[str] = []
+
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            calls.append(method)
+            if gate is not None:
+                await gate.wait()
+            if method == "tools/list":
+                return {
+                    "tools": [
+                        {"name": n, "inputSchema": {}} for n in state.get("tools", [])
+                    ]
+                }
+            if method == "resources/list":
+                return {
+                    "resources": [
+                        {"uri": f"mem://{n}"} for n in state.get("resources", [])
+                    ]
+                }
+            if method == "prompts/list":
+                return {"prompts": [{"name": n} for n in state.get("prompts", [])]}
+            return {}
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_reconcile_is_spawned_and_not_awaited_in_the_dispatch_path(
+        self,
+    ) -> None:
+        """The handler must return *before* the reconcile's `tools/list` resolves.
+
+        This encodes the self-deadlock hazard directly. `_index_capabilities`
+        awaits `_send_request` (manager.py `:1292`) and those futures are
+        resolved by the very read loop that received the notification --
+        `pending.future.set_result` at `:1791` (stdio) and `:2010` (SSE). Here
+        the stand-in for that loop is the test body: it releases the gate only
+        after the handler has returned. An implementation that awaited the
+        reconcile inline could never reach that release, and this test would
+        time out rather than fail with a diff.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        gate = asyncio.Event()
+        state = {"tools": ["alpha"]}
+        calls = self._wire(manager, state, gate)
+
+        assert (
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+            is True
+        )
+        # Give the spawned task room to start and block on the gate.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert calls == ["tools/list"], "reconcile did not start"
+        assert "srv::alpha" not in manager._tools, (
+            "reconcile completed inline; it must not have, the gate is still shut"
+        )
+
+        gate.set()
+        await self._drain(manager)
+        assert "srv::alpha" in manager._tools
+
+    @pytest.mark.asyncio
+    async def test_reconcile_coalesces_to_one_in_flight_task_per_server(self) -> None:
+        """A storm of notifications during an in-flight reconcile collapses to a
+        single re-run, not one task per notification."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        gate = asyncio.Event()
+        calls = self._wire(manager, {"tools": ["alpha"]}, gate)
+
+        for _ in range(5):
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+            await asyncio.sleep(0)
+        # Only the first reconcile has issued a listing; it is still gated.
+        assert calls.count("tools/list") == 1
+        assert len(manager._reconcile_tasks) == 1
+
+        gate.set()
+        await self._drain(manager)
+        # The four later notifications collapsed into exactly one re-run.
+        assert calls.count("tools/list") == 2
+
+    @pytest.mark.asyncio
+    async def test_reconcile_coalescing_is_per_server_not_global(self) -> None:
+        """Two servers reconcile independently; one does not swallow the other."""
+        manager = ClientManager()
+        for name in ("one", "two"):
+            managed = self._managed(name)
+            manager._clients[name] = managed
+        calls = self._wire(manager, {"tools": ["alpha"]})
+
+        for name in ("one", "two"):
+            manager._handle_downstream_notification(
+                name, manager._clients[name], "notifications/tools/list_changed"
+            )
+        assert len(manager._reconcile_tasks) == 2
+        await self._drain(manager)
+
+        assert calls.count("tools/list") == 2
+        assert "one::alpha" in manager._tools
+        assert "two::alpha" in manager._tools
+
+    @pytest.mark.asyncio
+    async def test_reconcile_publishes_once_for_the_kind_that_changed(self) -> None:
+        """A downstream that adds a tool produces exactly one `note_tools_changed`
+        -- not one per index mutation -- and nothing for the untouched kinds."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {
+            "tools": ["alpha"],
+            "resources": ["r1"],
+            "prompts": ["p1"],
+        }
+        self._wire(manager, state)
+
+        # Prime the catalog as connect-time indexing would, then start counting.
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        state["tools"] = ["alpha", "beta"]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert "srv::beta" in manager._tools
+        assert (sink.tools, sink.resources, sink.prompts) == (1, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_publishes_nothing_when_identifier_sets_match(self) -> None:
+        """Reconciliation over a catalog that did not move publishes nothing, even
+        though `_remove_server_indexes` and `_index_*` both call `note_*`
+        unconditionally."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(
+            manager, {"tools": ["alpha"], "resources": ["r1"], "prompts": ["p1"]}
+        )
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        for _ in range(3):
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+            await self._drain(manager)
+
+        assert "srv::alpha" in manager._tools
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_publishes_on_rename_that_preserves_the_count(self) -> None:
+        """The count-diffing trap: one tool renamed leaves the count identical, so
+        only an identifier-set comparison detects it."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {"tools": ["alpha", "beta"]}
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        state["tools"] = ["alpha", "gamma"]  # same count, different set
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._tools) == {"srv::alpha", "srv::gamma"}
+        assert sink.tools == 1
+
+    @pytest.mark.asyncio
+    async def test_reconcile_removes_entries_the_downstream_dropped(self) -> None:
+        """`_index_*` only adds or overwrites, so reconciliation must pair a removal
+        with the re-index or a dropped tool lingers forever."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {"tools": ["alpha", "beta"]}
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha", "srv::beta"}
+
+        state["tools"] = ["alpha"]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+
+    @pytest.mark.asyncio
+    async def test_reconcile_failure_leaves_the_catalog_intact(self) -> None:
+        """A downstream that emits `list_changed` and then fails `tools/list` must
+        not leave the catalog half-removed, and must publish nothing."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {"tools": ["alpha"], "prompts": ["p1"]}
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        before_tools = dict(manager._tools)
+        before_prompts = dict(manager._prompts)
+        assert before_tools and before_prompts
+        sink.tools = sink.resources = sink.prompts = 0
+
+        async def failing_send(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise ConnectionError("downstream went away mid-reconcile")
+
+        manager._send_request = failing_send  # type: ignore[method-assign]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._tools == before_tools
+        assert manager._prompts == before_prompts
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_preserves_tracked_task_records(self) -> None:
+        """Reconciliation must not evict the server's in-flight `McpTaskRecord`s.
+
+        `_remove_server_indexes` drops them, which is right for a disconnect and
+        wrong for a `list_changed` — the downstream's tasks did not go anywhere.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(manager, {"tools": ["alpha"]})
+        record = McpTaskRecord(
+            server_name="srv",
+            tool_id="srv::alpha",
+            task_id="t-1",
+            status="working",
+        )
+        manager._tasks[("srv", "t-1")] = record
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._tasks.get(("srv", "t-1")) is record
+
+    @pytest.mark.asyncio
+    async def test_reconcile_is_a_noop_when_the_server_is_gone(self) -> None:
+        """A server disconnected between the notification and the reconcile must
+        not be re-indexed down a dead connection."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        calls = self._wire(manager, {"tools": ["alpha"]})
+        manager._clients.pop("srv")
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert calls == []
+        assert manager._tools == {}
+
+    @pytest.mark.asyncio
+    async def test_reconcile_does_not_spin_when_the_server_answers_with_a_storm(
+        self,
+    ) -> None:
+        """A downstream that emits `list_changed` in reply to the very
+        `tools/list` reconciliation issues would drive the re-run loop forever.
+
+        Coalescing alone does not bound this -- it bounds *concurrency*, and this
+        loop is sequential. The re-run debounce is what bounds it, so this test
+        asserts a hard ceiling on reconciles in a fixed window rather than a
+        specific count.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        calls: list[str] = []
+
+        async def storm_send(
+            managed_arg: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            calls.append(method)
+            if method == "tools/list":
+                # The server answers the listing by announcing another change.
+                manager._handle_downstream_notification(
+                    "srv", managed_arg, "notifications/tools/list_changed"
+                )
+                return {"tools": [{"name": "alpha", "inputSchema": {}}]}
+            return {}
+
+        manager._send_request = storm_send  # type: ignore[method-assign]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await asyncio.sleep(0.6)
+        spins = calls.count("tools/list")
+
+        # Cancel the (deliberately endless) loop before asserting.
+        await manager._cancel_background_tasks()
+
+        # Without the debounce this is thousands. With it, ~1 + 0.6/0.25.
+        assert spins <= 6, f"reconcile loop is spinning: {spins} passes in 0.6s"
+        assert spins >= 1
+
+    # ---- SL-fix: fetch-first atomicity, per-kind isolation, content ------
+
+    @pytest.mark.asyncio
+    async def test_reconcile_never_hides_a_live_tool_from_a_concurrent_read(
+        self,
+    ) -> None:
+        """A `gateway.invoke` arriving mid-reconcile must still resolve a tool the
+        downstream still has.
+
+        Reconciliation is a spawned background task, so an ordinary production
+        interleaving puts a lookup between its awaits. A remove-then-refetch
+        order leaves the catalog *empty* for that server across three downstream
+        round trips, and a concurrent invoke gets a spurious tool-not-found for a
+        tool that exists. The poller below stands in for that traffic: it reads
+        the catalog on every event-loop tick for the whole pass, so any await
+        inside the mutation window gives it a chance to observe the hole.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        gate = asyncio.Event()
+        state: dict[str, list[str]] = {
+            "tools": ["alpha"],
+            "resources": ["r1"],
+            "prompts": ["p1"],
+        }
+        self._wire(manager, state, gate)
+
+        # Prime the catalog as connect-time indexing would, ungated.
+        gate.set()
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert "srv::alpha" in manager._tools
+        gate.clear()
+
+        misses = 0
+        stop = asyncio.Event()
+
+        async def poll() -> None:
+            nonlocal misses
+            while not stop.is_set():
+                if "srv::alpha" not in manager._tools:
+                    misses += 1
+                await asyncio.sleep(0)
+
+        poller = asyncio.create_task(poll())
+        state["tools"] = ["alpha", "beta"]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        # Let the reconcile reach its gated downstream request, with the poller
+        # reading the catalog on every tick while it sits there.
+        for _ in range(20):
+            await asyncio.sleep(0)
+        gate.set()
+        await self._drain(manager)
+        stop.set()
+        await poller
+
+        assert "srv::beta" in manager._tools, "the reconcile did not land"
+        assert misses == 0, (
+            f"a concurrent read saw srv::alpha missing {misses} times during "
+            "reconciliation -- the catalog must never be emptied across an await"
+        )
+
+    @pytest.mark.asyncio
+    async def test_reconcile_leaves_a_kind_whose_listing_failed_untouched(self) -> None:
+        """`resources/list` failing while `tools/list` succeeds must not publish a
+        removal of resources the server still has.
+
+        `_index_capabilities` swallows resources/prompts listing failures on
+        purpose -- a server that does not implement them is normal -- so those
+        failures never reach the reconcile's abort path. Removing all three kinds
+        up front therefore turns "we could not ask" into "they are gone", and
+        publishes that false removal. Each kind has to be handled independently:
+        a kind whose listing failed is left exactly as it was and is not
+        published, while a kind that succeeded still reconciles normally.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {
+            "tools": ["alpha"],
+            "resources": ["r1"],
+            "prompts": ["p1"],
+        }
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        before_resources = dict(manager._resources)
+        before_prompts = dict(manager._prompts)
+        assert before_resources and before_prompts
+        sink.tools = sink.resources = sink.prompts = 0
+
+        healthy_send = manager._send_request
+
+        async def resources_down(
+            managed_arg: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            if method == "resources/list":
+                raise ConnectionError("resources/list is down")
+            return await healthy_send(managed_arg, method, params, *args, **kwargs)
+
+        manager._send_request = resources_down  # type: ignore[method-assign]
+        state["tools"] = ["alpha", "beta"]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._resources == before_resources, (
+            "a kind whose listing failed was dropped from the catalog"
+        )
+        assert sink.resources == 0, (
+            "a false resources removal was published for a listing that failed"
+        )
+        # The kinds that did answer still reconciled.
+        assert "srv::beta" in manager._tools
+        assert sink.tools == 1
+        assert manager._prompts == before_prompts
+        assert sink.prompts == 0
+
+    @pytest.mark.asyncio
+    async def test_reconcile_publishes_a_content_change_under_a_stable_name(
+        self,
+    ) -> None:
+        """A tool whose description or schema changed under the same name is a real
+        catalog change and must publish.
+
+        Comparing identifier *sets* catches adds, removes, and renames and misses
+        this entirely -- yet it is the common case for a server that re-lists
+        after editing a tool in place. The comparison has to be over the entries
+        themselves.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        entry: dict[str, Any] = {
+            "name": "alpha",
+            "description": "first",
+            "inputSchema": {"type": "object", "properties": {}},
+        }
+
+        async def one_tool(
+            managed_arg: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            if method == "tools/list":
+                return {"tools": [dict(entry)]}
+            return {}
+
+        manager._send_request = one_tool  # type: ignore[method-assign]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+        sink.tools = sink.resources = sink.prompts = 0
+
+        # Same name, new description: the identifier set is unchanged.
+        entry["description"] = "second"
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert manager._tools["srv::alpha"].description == "second"
+        assert sink.tools == 1, (
+            "a changed description under an unchanged tool name published nothing"
+        )
+
+        # Same name, same description, new input schema.
+        entry["inputSchema"] = {
+            "type": "object",
+            "properties": {"q": {"type": "string"}},
+        }
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert manager._tools["srv::alpha"].input_schema == entry["inputSchema"]
+        assert sink.tools == 2, (
+            "a changed input schema under an unchanged tool name published nothing"
+        )
+
+        # A re-list with nothing changed still publishes nothing.
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert sink.tools == 2
+
+    # ---- SL-1.6: both dispatch paths, and typed errors ------------------
+
+    @pytest.mark.asyncio
+    async def test_stdio_dispatch_path_reaches_the_reconcile_scheduler(self) -> None:
+        """`_handle_stdout_line` must recognise a notification. It has no `id`, so
+        it falls through the pending-request gate with nothing to resolve."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(manager, {"tools": ["alpha"]})
+
+        line = json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+        ).encode()
+        manager._handle_stdout_line("srv", managed, line, time.time())
+        await self._drain(manager)
+
+        assert "srv::alpha" in manager._tools
+
+    @pytest.mark.asyncio
+    async def test_sse_dispatch_path_reaches_the_reconcile_scheduler(self) -> None:
+        """The `_read_sse` loop must recognise a notification, and must survive it:
+        a raise inside that loop is caught by its blanket `except Exception`, which
+        marks the server ERROR and reconnects."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        managed.is_remote = True
+        manager._clients["srv"] = managed
+        self._wire(manager, {"tools": ["alpha"]})
+        manager._schedule_reconnect = MagicMock()  # type: ignore[method-assign]
+
+        def _frame(payload: dict[str, Any]) -> Any:
+            frame = MagicMock()
+            frame.message.model_dump.return_value = payload
+            return frame
+
+        async def stream() -> Any:
+            yield _frame(
+                {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+            )
+            yield _frame({"jsonrpc": "2.0", "method": "notifications/message"})
+
+        await manager._read_sse("srv", managed, stream())
+        await self._drain(manager)
+
+        assert "srv::alpha" in manager._tools
+
+    @pytest.mark.asyncio
+    async def test_stdio_dispatch_preserves_downstream_error_code_and_data(
+        self,
+    ) -> None:
+        """A JSON-RPC error keeps `code` and `data` alongside `message`, and `str()`
+        stays exactly the message so `gateway.invoke`'s E302 mapping is unchanged."""
+        from pmcp.client.manager import DownstreamError
+
+        manager = ClientManager()
+        managed = self._managed("srv")
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[7] = PendingRequest(
+            request_id=7,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params",
+                    "data": {"field": "path"},
+                },
+            }
+        ).encode()
+
+        manager._handle_stdout_line("srv", managed, line, time.time())
+
+        err = fut.exception()
+        assert isinstance(err, DownstreamError)
+        assert err.code == -32602
+        assert err.data == {"field": "path"}
+        assert str(err) == "Invalid params"
+
+    @pytest.mark.asyncio
+    async def test_sse_dispatch_preserves_downstream_error_code_and_data(self) -> None:
+        """The same, through the remote dispatch path."""
+        from pmcp.client.manager import DownstreamError
+
+        manager = ClientManager()
+        managed = self._managed("srv")
+        managed.is_remote = True
+        manager._clients["srv"] = managed
+        manager._schedule_reconnect = MagicMock()  # type: ignore[method-assign]
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[9] = PendingRequest(
+            request_id=9,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+
+        async def stream() -> Any:
+            frame = MagicMock()
+            frame.message.model_dump.return_value = {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "error": {"code": -32000, "message": "boom", "data": ["a", "b"]},
+            }
+            yield frame
+
+        await manager._read_sse("srv", managed, stream())
+
+        err = fut.exception()
+        assert isinstance(err, DownstreamError)
+        assert err.code == -32000
+        assert err.data == ["a", "b"]
+        assert str(err) == "boom"
+
+
+class TestDownstreamNotificationBehaviouralGuarantees:
+    """FANOUT SL-3.2: storm suppression, the resources/prompts kinds, the
+    unrecognised-method no-op, and typed downstream errors on both dispatch
+    paths.
+
+    Test names here are chosen to match the `-k` patterns the roadmap's
+    acceptance criteria pin (EC-FANOUT-4, EC-FANOUT-5, EC-FANOUT-7).
+    `TestDownstreamReconcileScheduler` above (SL-1's own tests) deliberately
+    avoids those substrings so this lane could claim them without renaming
+    anything -- see that class's docstring. This class duplicates the small
+    `_managed`/`_wire`/`_drain` helpers rather than reaching into that
+    class's internals, so neither lane's tests depend on the other's shape.
+    """
+
+    @staticmethod
+    def _managed(name: str) -> ManagedClient:
+        status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=MagicMock(), status=status)
+        managed.config.name = name
+        return managed
+
+    @staticmethod
+    async def _drain(manager: ClientManager, timeout: float = 5.0) -> None:
+        """Wait until no reconcile is in flight."""
+
+        async def _wait() -> None:
+            while manager._reconcile_tasks:
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(_wait(), timeout)
+
+    def _wire(self, manager: ClientManager, state: dict[str, list[str]]) -> list[str]:
+        """Same shape as `TestDownstreamReconcileScheduler._wire`, without the
+        gating hook that class's deadlock test needs -- none of this class's
+        tests need to pause a reconcile mid-flight."""
+        calls: list[str] = []
+
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            calls.append(method)
+            if method == "tools/list":
+                return {
+                    "tools": [
+                        {"name": n, "inputSchema": {}} for n in state.get("tools", [])
+                    ]
+                }
+            if method == "resources/list":
+                return {
+                    "resources": [
+                        {"uri": f"mem://{n}"} for n in state.get("resources", [])
+                    ]
+                }
+            if method == "prompts/list":
+                return {"prompts": [{"name": n} for n in state.get("prompts", [])]}
+            return {}
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+        return calls
+
+    # ---- EC-FANOUT-4: storm suppression -----------------------------------
+
+    @pytest.mark.asyncio
+    async def test_unchanged_catalog_publishes_nothing_across_a_notification_storm(
+        self,
+    ) -> None:
+        """A downstream that emits `list_changed` repeatedly with nothing
+        actually different in its catalog must publish exactly zero events,
+        even though `_remove_server_indexes`/`_index_*` call `note_*`
+        unconditionally on every pass -- the suppress-while-churning rule is
+        what stands between this and a spam storm reaching subscribers."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(
+            manager, {"tools": ["alpha"], "resources": ["r1"], "prompts": ["p1"]}
+        )
+
+        # Prime the catalog, as connect-time indexing would.
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        # A burst of ten notifications, the catalog never actually moving.
+        for _ in range(10):
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+        await self._drain(manager)
+
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+        assert set(manager._tools) == {"srv::alpha"}
+
+    # ---- EC-FANOUT-5: resources/prompts kinds and the unknown no-op -------
+
+    @pytest.mark.asyncio
+    async def test_resources_list_changed_reconciles_and_publishes_only_resources(
+        self,
+    ) -> None:
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {
+            "tools": ["alpha"],
+            "resources": ["r1"],
+            "prompts": ["p1"],
+        }
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/resources/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        state["resources"] = ["r1", "r2"]
+        assert (
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/resources/list_changed"
+            )
+            is True
+        )
+        await self._drain(manager)
+
+        assert "srv::mem://r2" in manager._resources
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 1, 0)
+
+    @pytest.mark.asyncio
+    async def test_prompts_list_changed_reconciles_and_publishes_only_prompts(
+        self,
+    ) -> None:
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {
+            "tools": ["alpha"],
+            "resources": ["r1"],
+            "prompts": ["p1"],
+        }
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/prompts/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        state["prompts"] = ["p1", "p2"]
+        assert (
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/prompts/list_changed"
+            )
+            is True
+        )
+        await self._drain(manager)
+
+        assert "srv::p2" in manager._prompts
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 1)
+
+    @pytest.mark.asyncio
+    async def test_unknown_notification_is_a_noop_on_stdio_dispatch_and_does_not_kill_the_read_loop(
+        self,
+    ) -> None:
+        """An unrecognised `notifications/*` on the stdio path must not raise,
+        must not schedule a reconcile, and must not stop the next line -- a
+        real request/response pair -- from being processed normally right
+        after it."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+
+        unknown_line = json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/message"}
+        ).encode()
+        manager._handle_stdout_line("srv", managed, unknown_line, time.time())
+
+        assert not manager._reconcile_tasks
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+
+        # The read loop must still be alive to process a normal response.
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[42] = PendingRequest(
+            request_id=42,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+        response_line = json.dumps(
+            {"jsonrpc": "2.0", "id": 42, "result": {"ok": True}}
+        ).encode()
+        manager._handle_stdout_line("srv", managed, response_line, time.time())
+
+        assert fut.done()
+        assert fut.result() == {"ok": True}
+
+    @pytest.mark.asyncio
+    async def test_unknown_notification_is_a_noop_on_sse_dispatch_and_does_not_kill_the_read_loop(
+        self,
+    ) -> None:
+        """The same, through `_read_sse`: that loop's blanket `except
+        Exception` would tear the connection down and force a reconnect if
+        the handler ever raised on an unrecognised method. This proves it
+        doesn't, by letting a real response frame flow right after it, in the
+        same stream, and resolve normally."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        managed.is_remote = True
+        manager._clients["srv"] = managed
+        manager._schedule_reconnect = MagicMock()  # type: ignore[method-assign]
+
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[43] = PendingRequest(
+            request_id=43,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+
+        def _frame(payload: dict[str, Any]) -> Any:
+            frame = MagicMock()
+            frame.message.model_dump.return_value = payload
+            return frame
+
+        async def stream() -> Any:
+            yield _frame({"jsonrpc": "2.0", "method": "notifications/message"})
+            yield _frame({"jsonrpc": "2.0", "id": 43, "result": {"ok": True}})
+
+        await manager._read_sse("srv", managed, stream())
+
+        assert not manager._reconcile_tasks
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+        assert fut.done()
+        assert fut.result() == {"ok": True}
+
+    # ---- EC-FANOUT-7: typed downstream errors, both dispatch paths --------
+
+    @pytest.mark.asyncio
+    async def test_typed_downstream_error_preserves_code_and_data_on_stdio_dispatch(
+        self,
+    ) -> None:
+        """`code`/`data` survive alongside `message`, and `str()` stays
+        exactly the downstream message -- `gateway.invoke` maps every
+        exception to E302 through `str(e)`, so nothing about that mapping
+        may change here."""
+        from pmcp.client.manager import DownstreamError
+
+        manager = ClientManager()
+        managed = self._managed("srv")
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[11] = PendingRequest(
+            request_id=11,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 11,
+                "error": {
+                    "code": -32601,
+                    "message": "Method not found",
+                    "data": {"method": "tools/frobnicate"},
+                },
+            }
+        ).encode()
+
+        manager._handle_stdout_line("srv", managed, line, time.time())
+
+        err = fut.exception()
+        assert isinstance(err, DownstreamError)
+        assert err.code == -32601
+        assert err.data == {"method": "tools/frobnicate"}
+        assert str(err) == "Method not found"
+
+    @pytest.mark.asyncio
+    async def test_typed_downstream_error_preserves_code_and_data_on_sse_dispatch(
+        self,
+    ) -> None:
+        """The same guarantee, through the remote dispatch path."""
+        from pmcp.client.manager import DownstreamError
+
+        manager = ClientManager()
+        managed = self._managed("srv")
+        managed.is_remote = True
+        manager._clients["srv"] = managed
+        manager._schedule_reconnect = MagicMock()  # type: ignore[method-assign]
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[12] = PendingRequest(
+            request_id=12,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+
+        def _frame(payload: dict[str, Any]) -> Any:
+            frame = MagicMock()
+            frame.message.model_dump.return_value = payload
+            return frame
+
+        async def stream() -> Any:
+            yield _frame(
+                {
+                    "jsonrpc": "2.0",
+                    "id": 12,
+                    "error": {
+                        "code": -32000,
+                        "message": "downstream unavailable",
+                        "data": {"retry_after_ms": 500},
+                    },
+                }
+            )
+
+        await manager._read_sse("srv", managed, stream())
+
+        err = fut.exception()
+        assert isinstance(err, DownstreamError)
+        assert err.code == -32000
+        assert err.data == {"retry_after_ms": 500}
+        assert str(err) == "downstream unavailable"
+
+
+class TestReconcileMalformedEntryResilience:
+    """FANOUT repair D5/D6: a malformed downstream entry must cost only itself,
+    and the suppression counter must always unwind.
+
+    Before FANOUT a downstream could not trigger a re-index mid-session, so a
+    malformed entry could at worst fail a connect. Now `list_changed` re-enters
+    the indexers at any time, and the apply block removes before it re-indexes
+    -- so an entry that raises mid-apply takes the server's *previous* catalog
+    with it, permanently, with a healthy read loop and no reconnect to heal it.
+    """
+
+    @staticmethod
+    def _managed(name: str) -> ManagedClient:
+        status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=MagicMock(), status=status)
+        managed.config.name = name
+        return managed
+
+    @staticmethod
+    async def _drain(manager: ClientManager, timeout: float = 5.0) -> None:
+        async def _wait() -> None:
+            while manager._reconcile_tasks:
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(_wait(), timeout)
+
+    @staticmethod
+    def _wire_listings(
+        manager: ClientManager, listings: dict[str, list[dict[str, Any]]]
+    ) -> None:
+        """Stub `_send_request` with raw per-kind payloads, malformed entries
+        included -- `TestDownstreamReconcileScheduler._wire` only ever emits
+        well-formed ones, which is precisely what this class must not do."""
+
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            kind = method.split("/")[0]
+            return {kind: list(listings.get(kind, []))}
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+
+    # ---- D5: per-entry resilience ---------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_malformed_tool_is_skipped_without_losing_the_prior_catalog(
+        self,
+    ) -> None:
+        """One unparseable tool must not cost the other tools, and must never
+        cost the tools that were already indexed.
+
+        The malformed entry is deliberately *first*: with it last, the entries
+        ahead of it would already have been re-added before the raise and the
+        wipe would be invisible. First, it raises with the removal done and
+        nothing re-added -- the lead's reproduction, `after: []`.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(manager, {"tools": [{"name": "alpha", "inputSchema": {}}]})
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+
+        # `inputSchema` as a string reaches `_schema_dialect`, which calls
+        # `.get` on it -- an AttributeError raised mid-apply.
+        self._wire_listings(
+            manager,
+            {
+                "tools": [
+                    {"name": "bad", "inputSchema": "not-a-dict"},
+                    {"name": "alpha", "inputSchema": {}},
+                    {"name": "beta", "inputSchema": {}},
+                ]
+            },
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._tools) == {"srv::alpha", "srv::beta"}, (
+            "one malformed entry wiped the server's catalog"
+        )
+
+    @pytest.mark.asyncio
+    async def test_malformed_resource_and_prompt_entries_are_skipped(self) -> None:
+        """The same guarantee for the other two kinds, whose indexers construct
+        pydantic models just as directly."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(
+            manager,
+            {
+                "resources": [
+                    {"uri": ["not", "a", "string"]},
+                    {"uri": "mem://good"},
+                ],
+                "prompts": [
+                    {"name": "bad", "arguments": ["not-a-mapping"]},
+                    {"name": "good"},
+                ],
+            },
+        )
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/resources/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._resources) == {"srv::mem://good"}
+        assert set(manager._prompts) == {"srv::good"}
+
+    def test_index_tools_guard_is_per_entry_not_per_call(self) -> None:
+        """Called directly, not through reconciliation: a single `try` wrapped
+        around the whole loop would still lose every entry *after* the bad one,
+        so pin that entries on both sides of it survive."""
+        manager = ClientManager()
+
+        indexed = manager._index_tools(
+            "srv",
+            [
+                {"name": "before", "inputSchema": {}},
+                {"name": "bad", "inputSchema": "not-a-dict"},
+                {"name": "after", "inputSchema": {}},
+            ],
+        )
+
+        assert indexed == 2
+        assert set(manager._tools) == {"srv::before", "srv::after"}
+
+    def test_index_of_only_malformed_entries_publishes_nothing(self) -> None:
+        """Nothing was indexed, so there is nothing to announce -- a note here
+        would wake every subscriber for a catalog that did not move."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+
+        assert manager._index_tools("srv", [{"name": "b", "inputSchema": "x"}]) == 0
+        assert manager._index_resources("srv", [{"uri": ["nope"]}]) == 0
+        assert (
+            manager._index_prompts("srv", [{"name": "b", "arguments": ["nope"]}]) == 0
+        )
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+        assert manager._tools == {} and manager._resources == {}
+        assert manager._prompts == {}
+
+    # ---- F1: a listing nobody could parse is a failed listing -----------
+
+    @pytest.mark.asyncio
+    async def test_all_malformed_relist_preserves_the_prior_catalog(self) -> None:
+        """Offered entries, none of them parseable, over a *populated* catalog.
+
+        The per-entry guard handles one bad entry among good ones; this is the
+        corner where every entry is bad. Counting that as an answer would remove
+        the prior entries, index nothing and publish the removal -- a false
+        "those tools are gone" built out of "we could not read the answer".
+        `test_index_of_only_malformed_entries_publishes_nothing` cannot catch it:
+        it indexes into an empty catalog, so it has nothing to lose.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(manager, {"tools": [{"name": "alpha", "inputSchema": {}}]})
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+        published_while_priming = sink.tools
+
+        self._wire_listings(
+            manager,
+            {"tools": [{"name": "bad", "inputSchema": "not-a-dict"}]},
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._tools) == {"srv::alpha"}, (
+            "a listing whose every entry was unparseable wiped the prior catalog"
+        )
+        assert sink.tools == published_while_priming, (
+            "published a removal for entries we merely failed to read"
+        )
+
+    @pytest.mark.asyncio
+    async def test_all_malformed_relist_leaves_the_other_kinds_alone(self) -> None:
+        """Per kind, still. Tools unreadable must not hold back an honest
+        resources answer arriving in the same reconcile."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(
+            manager,
+            {
+                "tools": [{"name": "alpha", "inputSchema": {}}],
+                "resources": [{"uri": "mem://old"}],
+            },
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+
+        self._wire_listings(
+            manager,
+            {
+                "tools": [{"name": "bad", "inputSchema": "not-a-dict"}],
+                "resources": [{"uri": "mem://new"}],
+            },
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert set(manager._resources) == {"srv::mem://new"}
+
+    @pytest.mark.asyncio
+    async def test_explicitly_empty_relist_still_clears_and_publishes(self) -> None:
+        """The boundary of the rule above: *no* entries offered is an answer --
+        the server emptied the kind -- and must clear and publish. Preserving
+        here would strand entries the downstream has explicitly disowned."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(manager, {"tools": [{"name": "alpha", "inputSchema": {}}]})
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+        published_while_priming = sink.tools
+
+        self._wire_listings(manager, {"tools": []})
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._tools == {}
+        assert sink.tools == published_while_priming + 1
+
+    def test_partly_malformed_relist_still_replaces_the_kind(self) -> None:
+        """Mixed listings keep the per-entry semantics: some entries parsed, so
+        the kind answered and is replaced wholesale by what parsed."""
+        manager = ClientManager()
+        manager._index_tools("srv", [{"name": "gone", "inputSchema": {}}])
+
+        assert (
+            manager._index_tools(
+                "srv",
+                [
+                    {"name": "bad", "inputSchema": "not-a-dict"},
+                    {"name": "kept", "inputSchema": {}},
+                ],
+            )
+            == 1
+        )
+        assert "srv::kept" in manager._tools
+
+    # ---- D6: the suppression counter's `finally` ------------------------
+
+    @pytest.mark.asyncio
+    async def test_suppression_counter_unwinds_on_the_success_path(self) -> None:
+        """A leaked entry would leave that server's sink suppressed forever:
+        subscribed clients silently stop seeing its catalog changes, with no
+        error anywhere to point at."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(manager, {"tools": [{"name": "alpha", "inputSchema": {}}]})
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._tools, "reconcile did not run; the assertion below is vacuous"
+        assert manager._catalog_suppressed == {}
+        assert not manager._catalog_publishing_suppressed("srv")
+
+    @pytest.mark.asyncio
+    async def test_suppression_counter_unwinds_when_the_apply_block_raises(
+        self,
+    ) -> None:
+        """The failure must be injected *inside* the apply block. A failed fetch
+        returns before the counter is ever incremented, so it would leave this
+        test green even with the decrement deleted.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire_listings(manager, {"tools": [{"name": "alpha", "inputSchema": {}}]})
+
+        def boom(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("apply blew up after the counter went up")
+
+        manager._remove_server_indexes = boom  # type: ignore[method-assign]
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._catalog_suppressed == {}
+        assert not manager._catalog_publishing_suppressed("srv")
+
+
+class TestUnreadableListingIsNotAnEmptyOne:
+    """FANOUT repair G1/G2: the two remaining routes by which "we could not read
+    this" became "it is gone".
+
+    `TestReconcileMalformedEntryResilience` covers the listing that *arrived*
+    and could not be parsed. These cover the two steps on either side of it: a
+    reply whose required collection never arrived readably at all (G1), and an
+    entry that arrived carrying no identity (G2). Both used to be laundered into
+    a valid-looking answer by a defaulting `.get` -- `result.get(kind, [])` and
+    `entry.get(identity, "")` -- and published as a removal.
+    """
+
+    _managed = staticmethod(TestReconcileMalformedEntryResilience._managed)
+    _drain = staticmethod(TestReconcileMalformedEntryResilience._drain)
+
+    @staticmethod
+    def _wire_raw(manager: ClientManager, replies: dict[str, Any]) -> None:
+        """Stub `_send_request` with whole `result` objects, not per-kind entry
+        lists.
+
+        `TestReconcileMalformedEntryResilience._wire_listings` always wraps what
+        it is given as `{kind: list(entries)}`, so it can express a malformed
+        *entry* but never a malformed *reply* -- the absent collection and the
+        non-list collection under test here are both unreachable through it.
+        """
+
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            kind = method.split("/")[0]
+            return cast(dict[str, Any], replies.get(kind, {kind: []}))
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+
+    async def _prime_and_relist(
+        self, kind: str, primed: list[dict[str, Any]], relisted: Any
+    ) -> tuple[ClientManager, _RecordingSink, int]:
+        """Index a real catalog for `kind`, then re-list it with `relisted`.
+
+        `primed` is a well-formed entry list and is wrapped for you; `relisted`
+        is the whole `result` object, unwrapped, because the malformed replies
+        under test are exactly the ones that cannot be expressed as an entry
+        list.
+
+        Priming over a *populated* catalog is the whole point: every one of
+        these defects is invisible against an empty one, because there is
+        nothing there to falsely remove.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        notification = f"notifications/{kind}/list_changed"
+
+        self._wire_raw(manager, {kind: {kind: primed}})
+        manager._handle_downstream_notification("srv", managed, notification)
+        await self._drain(manager)
+        published_while_priming = cast(int, getattr(sink, kind))
+
+        self._wire_raw(manager, {kind: relisted})
+        manager._handle_downstream_notification("srv", managed, notification)
+        await self._drain(manager)
+        return manager, sink, published_while_priming
+
+    # ---- G1: an absent collection is not an explicit empty one ----------
+
+    @pytest.mark.asyncio
+    async def test_absent_tools_collection_preserves_and_publishes_nothing(
+        self,
+    ) -> None:
+        """`result: {}` -- the reply is missing the collection the protocol
+        requires. `result.get("tools", [])` turned that into `[]`, which the
+        classifier read as "the server answered and it is empty", so the prior
+        tools were cleared and a removal published. Two different meanings,
+        one outcome.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools", [{"name": "alpha", "inputSchema": {}}], {}
+        )
+
+        assert set(manager._tools) == {"srv::alpha"}, (
+            "a reply missing its required `tools` field was read as an empty "
+            "catalog and wiped the prior tools"
+        )
+        assert sink.tools == primed_publishes, (
+            "published a removal for a reply we could not read"
+        )
+
+    @pytest.mark.asyncio
+    async def test_explicitly_empty_tools_collection_still_clears_and_publishes(
+        self,
+    ) -> None:
+        """The other side of the same line, restated here rather than left to
+        `test_explicitly_empty_relist_still_clears_and_publishes`: this pins the
+        *distinction*, so a fix that preserved both would fail here even though
+        the G1 test above would pass.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools", [{"name": "alpha", "inputSchema": {}}], {"tools": []}
+        )
+
+        assert manager._tools == {}
+        assert sink.tools == primed_publishes + 1
+
+    @pytest.mark.asyncio
+    async def test_absent_collection_preserves_resources_and_prompts_too(
+        self,
+    ) -> None:
+        """The same `.get(kind, [])` served all three kinds; resources and
+        prompts reached it by a different line and must be fixed by the same
+        rule."""
+        resources, _, _ = await self._prime_and_relist(
+            "resources", [{"uri": "mem://r1"}], {}
+        )
+        prompts, _, _ = await self._prime_and_relist("prompts", [{"name": "p1"}], {})
+
+        assert set(resources._resources) == {"srv::mem://r1"}
+        assert set(prompts._prompts) == {"srv::p1"}
+
+    # ---- G3: a non-list where a list is expected ------------------------
+
+    @pytest.mark.asyncio
+    async def test_tools_collection_as_an_empty_mapping_preserves(self) -> None:
+        """The fifth trigger. `list({})` is `[]`, so an object where the
+        protocol requires an array was coerced into a perfectly valid-looking
+        "the kind is empty" answer -- and cleared and published exactly like
+        G1, one step further along.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools", [{"name": "alpha", "inputSchema": {}}], {"tools": {}}
+        )
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert sink.tools == primed_publishes
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "collection",
+        [
+            pytest.param({"a": 1}, id="non-empty-mapping"),
+            pytest.param("abc", id="string"),
+            pytest.param(7, id="number"),
+        ],
+    )
+    async def test_tools_collection_as_other_non_lists_preserves(
+        self, collection: Any
+    ) -> None:
+        """These were preserved before the fix too, but only by accident: `list()`
+        coerced them into entries (a mapping's keys, a string's characters)
+        which then all happened to fail parsing, so the all-malformed rule
+        caught them. `7` did not even get that far -- it raised `TypeError`.
+        Pin the outcome so it stops depending on that chain.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools", [{"name": "alpha", "inputSchema": {}}], {"tools": collection}
+        )
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert sink.tools == primed_publishes
+
+    @pytest.mark.asyncio
+    async def test_a_null_collection_costs_only_its_own_kind(self) -> None:
+        """`{"tools": null}` used to raise `TypeError` out of
+        `_fetch_server_listings` -- before resources and prompts were ever
+        classified -- so one malformed kind aborted the whole reconcile and an
+        honest resources answer arriving in the same pass was thrown away.
+        Per kind, still.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+
+        self._wire_raw(
+            manager,
+            {
+                "tools": {"tools": [{"name": "alpha", "inputSchema": {}}]},
+                "resources": {"resources": [{"uri": "mem://old"}]},
+            },
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+
+        self._wire_raw(
+            manager,
+            {
+                "tools": {"tools": None},
+                "resources": {"resources": [{"uri": "mem://new"}]},
+            },
+        )
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert set(manager._resources) == {"srv::mem://new"}, (
+            "an unreadable tools listing swallowed an honest resources answer"
+        )
+
+    # ---- G2: an entry with no identity is not an entry -------------------
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("kind", "primed", "store_attr", "primed_id"),
+        [
+            pytest.param(
+                "resources", [{"uri": "mem://r1"}], "_resources", "srv::mem://r1"
+            ),
+            pytest.param("prompts", [{"name": "p1"}], "_prompts", "srv::p1"),
+        ],
+    )
+    async def test_empty_entry_objects_do_not_invent_an_identity(
+        self, kind: str, primed: list[dict[str, Any]], store_attr: str, primed_id: str
+    ) -> None:
+        """`resource.get("uri", "")` and `prompt.get("name", "")` made `{}`
+        parse successfully as an entry whose identity is `srv::`. It then
+        replaced the real entry and the change was published -- a catalog entry
+        the downstream never offered and the MCP models would reject.
+
+        With the identity required, `{}` fails to parse, which routes it into
+        the per-entry skip and -- since nothing else parsed -- into the
+        all-malformed preserve-prior rule.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            kind, primed, {kind: [{}]}
+        )
+
+        store = cast(dict[str, Any], getattr(manager, store_attr))
+        assert set(store) == {primed_id}
+        assert f"srv::{''}" not in store, "synthesized a bogus `srv::` identity"
+        assert getattr(sink, kind) == primed_publishes
+
+    @pytest.mark.asyncio
+    async def test_an_empty_string_tool_name_is_not_an_identity_either(self) -> None:
+        """Tools reached the same place by a different route. `tool["name"]`
+        does not default, so a *missing* name already raised -- but a name of
+        `""` sailed through and indexed as `srv::`, replacing the real tool.
+        Requiring a non-empty string closes both at once.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools",
+            [{"name": "alpha", "inputSchema": {}}],
+            {"tools": [{"name": "", "inputSchema": {}}]},
+        )
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert sink.tools == primed_publishes
+
+    @pytest.mark.asyncio
+    async def test_an_identity_less_entry_costs_only_itself(self) -> None:
+        """The per-entry semantics are unchanged by the stricter identity: an
+        entry with none is skipped, and a good entry beside it is still indexed
+        and published. Without this, "fail to parse" could be over-applied into
+        a rule that preserves whenever *any* entry is bad.
+        """
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "resources",
+            [{"uri": "mem://r1"}],
+            {"resources": [{}, {"uri": "mem://r2"}]},
+        )
+
+        assert set(manager._resources) == {"srv::mem://r2"}
+        assert sink.resources == primed_publishes + 1
+
+    @pytest.mark.asyncio
+    async def test_entries_that_are_not_objects_are_skipped_not_indexed(self) -> None:
+        """A listing of bare strings. Each entry fails to parse rather than
+        raising out of the parser, and with none of them parseable the kind is
+        preserved."""
+        manager, sink, primed_publishes = await self._prime_and_relist(
+            "tools", [{"name": "alpha", "inputSchema": {}}], {"tools": ["a string", 3]}
+        )
+
+        assert set(manager._tools) == {"srv::alpha"}
+        assert sink.tools == primed_publishes
+
+    def test_required_identity_rejects_every_non_identity(self) -> None:
+        """The helper directly, so the rule is pinned independently of the three
+        parsers that call it."""
+        assert _required_identity({"name": "ok"}, "name") == "ok"
+        for entry in ({}, {"name": ""}, {"name": None}, {"name": 3}, {"name": ["a"]}):
+            with pytest.raises((TypeError, ValueError)):
+                _required_identity(entry, "name")
+        for entry in ("a string", 3, None, ["a"]):
+            with pytest.raises(TypeError):
+                _required_identity(entry, "name")
