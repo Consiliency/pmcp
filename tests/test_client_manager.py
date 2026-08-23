@@ -3798,3 +3798,114 @@ class TestReadStdoutFailureSurfacing:
         assert status.status == ServerStatusEnum.ERROR
         assert status.last_error is not None
         assert "pipe gone" in status.last_error
+
+
+class _RecordingSink:
+    """Counts `CatalogEventSink` publishes so a test can assert on the exact
+    number, not merely that something fired."""
+
+    def __init__(self) -> None:
+        self.tools = 0
+        self.resources = 0
+        self.prompts = 0
+
+    def note_tools_changed(self) -> None:
+        self.tools += 1
+
+    def note_resources_changed(self) -> None:
+        self.resources += 1
+
+    def note_prompts_changed(self) -> None:
+        self.prompts += 1
+
+    async def flush(self) -> None:
+        pass
+
+
+class TestDownstreamReconcileScheduler:
+    """FANOUT SL-1: the downstream-notification contract (IF-0-FANOUT-1) and the
+    coalesced reconcile scheduler behind it.
+
+    Owned by lane SL-1 inside a file lane SL-3 owns; kept to this one class, and
+    deliberately avoiding the `-k` patterns SL-3.2 claims (`unchanged_catalog`,
+    `unknown_notification`, `typed_downstream_error`).
+    """
+
+    @staticmethod
+    def _managed(name: str) -> ManagedClient:
+        status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=MagicMock(), status=status)
+        managed.config.name = name
+        return managed
+
+    # ---- SL-1.1: IF-0-FANOUT-1 shape ------------------------------------
+
+    def test_reconcile_contract_entry_point_has_frozen_signature(self) -> None:
+        """IF-0-FANOUT-1's entry point exists, is synchronous (both dispatch paths
+        call it, and the stdio one is not a coroutine), and takes the frozen
+        `(name, managed, method)` parameters."""
+        import inspect
+
+        handler = ClientManager._handle_downstream_notification
+        assert not inspect.iscoroutinefunction(handler), (
+            "must be sync: _handle_stdout_line is a plain def"
+        )
+        assert list(inspect.signature(handler).parameters) == [
+            "self",
+            "name",
+            "managed",
+            "method",
+        ]
+
+    def test_reconcile_contract_docstring_states_the_four_guarantees(self) -> None:
+        """The freeze is the docstring as much as the signature: SL-3 writes tests
+        against this text on day 1."""
+        import inspect
+
+        doc = inspect.getdoc(ClientManager._handle_downstream_notification) or ""
+        for fragment in (
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed",
+        ):
+            assert fragment in doc, f"method mapping missing {fragment!r}"
+        lowered = doc.lower()
+        assert "reconcile" in lowered and "publish" in lowered
+        assert "no-op" in lowered or "no op" in lowered
+
+    @pytest.mark.asyncio
+    async def test_reconcile_contract_unrecognised_method_is_a_silent_noop(
+        self,
+    ) -> None:
+        """An unrecognised `notifications/*` neither raises, nor publishes, nor
+        schedules anything — it returns False. A raise here would tear down the
+        SSE read loop through its blanket `except Exception`."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+
+        assert (
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/message"
+            )
+            is False
+        )
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+        assert not manager._background_tasks
+
+    @pytest.mark.asyncio
+    async def test_reconcile_contract_recognised_methods_are_accepted(self) -> None:
+        """Each of the three `list_changed` methods is recognised and returns True."""
+        for method in (
+            "notifications/tools/list_changed",
+            "notifications/resources/list_changed",
+            "notifications/prompts/list_changed",
+        ):
+            manager = ClientManager()
+            managed = self._managed("srv")
+            manager._clients["srv"] = managed
+            assert (
+                manager._handle_downstream_notification("srv", managed, method) is True
+            ), method
+            await manager._cancel_background_tasks()

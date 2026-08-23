@@ -64,6 +64,16 @@ except ImportError:
 logger = logging.getLogger(__name__)
 _TaskT = TypeVar("_TaskT", bound=asyncio.Task[Any])
 
+# IF-0-FANOUT-1: the downstream `notifications/*` methods this gateway acts on,
+# mapped to the catalog kind whose identifier set decides whether reconciliation
+# publishes. Every method absent from this mapping is a no-op by construction --
+# see `ClientManager._handle_downstream_notification`.
+DOWNSTREAM_LIST_CHANGED_METHODS: dict[str, str] = {
+    "notifications/tools/list_changed": "tools",
+    "notifications/resources/list_changed": "resources",
+    "notifications/prompts/list_changed": "prompts",
+}
+
 
 class _NullCatalogEventSink:
     """No-op `CatalogEventSink` used when `ClientManager` is constructed with
@@ -1320,6 +1330,66 @@ class ClientManager:
         # acceptance test pass even if the self-scheduling drain were
         # completely broken.
         return indexed, resource_count, prompt_count
+
+    def _handle_downstream_notification(
+        self, name: str, managed: ManagedClient, method: str
+    ) -> bool:
+        """Act on one JSON-RPC notification received from a downstream server.
+
+        This is IF-0-FANOUT-1, the downstream-event contract. It is called from
+        both dispatch paths -- `_handle_stdout_line` (stdio) and `_read_sse`
+        (remote) -- for every frame that carries a `method` and no `id`.
+
+        Method mapping. Exactly three methods are recognised, each requesting a
+        re-index of the *whole* of that one server's catalog (the gateway's
+        catalog is index-backed, not proxied, so a per-kind refetch would still
+        need the same round trip):
+
+        - `notifications/tools/list_changed`
+        - `notifications/resources/list_changed`
+        - `notifications/prompts/list_changed`
+
+        Reconcile-then-publish ordering. The gateway serves `gateway.invoke` and
+        `gateway.catalog_search` out of its own index, so a notification
+        forwarded straight to the subscription sink would tell a client to
+        refetch and then hand it the stale catalog. Reconciliation therefore
+        always completes before anything is published.
+
+        Suppress-while-churning, publish-once-if-changed. Reconciliation is a
+        remove-then-reindex, and both halves call `CatalogEventSink.note_*`
+        unconditionally, so a chatty downstream would spam subscribers even when
+        nothing moved. Sink calls originating from the server under
+        reconciliation are suppressed for its duration; afterwards the server's
+        identifier sets are compared before against after, and exactly one
+        `note_*` is published per catalog kind that actually differs. Identifier
+        sets, never counts: a rename leaves the count unchanged.
+
+        Unrecognised methods are a no-op. Any other `notifications/*` (or any
+        other method name) returns False having published nothing, scheduled
+        nothing, and raised nothing. This function never raises: `_read_sse`
+        wraps its loop in a blanket `except Exception` that tears the connection
+        down and triggers a reconnect, so a raise here would turn an unknown
+        notification into a dropped server.
+
+        Never blocks the caller. The reconcile runs in a task spawned with
+        `asyncio.create_task`, never awaited inline -- see
+        `_reconcile_server_catalog` for why an inline await deadlocks
+        immediately.
+
+        Args:
+            name: The downstream server's registered name.
+            managed: The client that received the notification.
+            method: The notification's JSON-RPC `method`.
+
+        Returns:
+            True if the method was recognised and a reconcile was requested,
+            False if it was ignored.
+        """
+        if method not in DOWNSTREAM_LIST_CHANGED_METHODS:
+            return False
+        # IF-0-FANOUT-1 freeze (SL-1.2): recognition is published so peer lanes
+        # can build against it; the scheduler body lands in SL-1.4.
+        return True
 
     async def _connect_stdio(self, config: ResolvedServerConfig) -> None:
         """Connect to a local stdio MCP server."""
