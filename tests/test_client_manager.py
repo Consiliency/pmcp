@@ -35,6 +35,7 @@ from pmcp.remote_auth import MissingRemoteHeaderAuthError
 from pmcp.types import (
     LocalMcpServerConfig,
     McpTaskInfo,
+    McpTaskRecord,
     PromptInfo,
     RemoteMcpServerConfig,
     ResourceInfo,
@@ -3905,7 +3906,507 @@ class TestDownstreamReconcileScheduler:
             manager = ClientManager()
             managed = self._managed("srv")
             manager._clients["srv"] = managed
+            self._wire(manager, {})
             assert (
                 manager._handle_downstream_notification("srv", managed, method) is True
             ), method
             await manager._cancel_background_tasks()
+
+    # ---- SL-1.3: the coalesced scheduler --------------------------------
+
+    @staticmethod
+    async def _drain(manager: ClientManager, timeout: float = 5.0) -> None:
+        """Wait until no reconcile is in flight."""
+
+        async def _wait() -> None:
+            while manager._reconcile_tasks:
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(_wait(), timeout)
+
+    def _wire(
+        self,
+        manager: ClientManager,
+        state: dict[str, list[str]],
+        gate: asyncio.Event | None = None,
+    ) -> list[str]:
+        """Replace `_send_request` with a listing stub driven by `state`, and
+        return the list that records every method it was asked for.
+
+        `state` maps "tools"/"resources"/"prompts" to the identifier names the
+        downstream server currently reports, so a test mutates `state` to
+        simulate the downstream catalog moving underneath the gateway.
+        """
+        calls: list[str] = []
+
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            calls.append(method)
+            if gate is not None:
+                await gate.wait()
+            if method == "tools/list":
+                return {
+                    "tools": [
+                        {"name": n, "inputSchema": {}} for n in state.get("tools", [])
+                    ]
+                }
+            if method == "resources/list":
+                return {
+                    "resources": [
+                        {"uri": f"mem://{n}"} for n in state.get("resources", [])
+                    ]
+                }
+            if method == "prompts/list":
+                return {"prompts": [{"name": n} for n in state.get("prompts", [])]}
+            return {}
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+        return calls
+
+    @pytest.mark.asyncio
+    async def test_reconcile_is_spawned_and_not_awaited_in_the_dispatch_path(
+        self,
+    ) -> None:
+        """The handler must return *before* the reconcile's `tools/list` resolves.
+
+        This encodes the self-deadlock hazard directly. `_index_capabilities`
+        awaits `_send_request` (manager.py `:1292`) and those futures are
+        resolved by the very read loop that received the notification --
+        `pending.future.set_result` at `:1791` (stdio) and `:2010` (SSE). Here
+        the stand-in for that loop is the test body: it releases the gate only
+        after the handler has returned. An implementation that awaited the
+        reconcile inline could never reach that release, and this test would
+        time out rather than fail with a diff.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        gate = asyncio.Event()
+        state = {"tools": ["alpha"]}
+        calls = self._wire(manager, state, gate)
+
+        assert (
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+            is True
+        )
+        # Give the spawned task room to start and block on the gate.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        assert calls == ["tools/list"], "reconcile did not start"
+        assert "srv::alpha" not in manager._tools, (
+            "reconcile completed inline; it must not have, the gate is still shut"
+        )
+
+        gate.set()
+        await self._drain(manager)
+        assert "srv::alpha" in manager._tools
+
+    @pytest.mark.asyncio
+    async def test_reconcile_coalesces_to_one_in_flight_task_per_server(self) -> None:
+        """A storm of notifications during an in-flight reconcile collapses to a
+        single re-run, not one task per notification."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        gate = asyncio.Event()
+        calls = self._wire(manager, {"tools": ["alpha"]}, gate)
+
+        for _ in range(5):
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+            await asyncio.sleep(0)
+        # Only the first reconcile has issued a listing; it is still gated.
+        assert calls.count("tools/list") == 1
+        assert len(manager._reconcile_tasks) == 1
+
+        gate.set()
+        await self._drain(manager)
+        # The four later notifications collapsed into exactly one re-run.
+        assert calls.count("tools/list") == 2
+
+    @pytest.mark.asyncio
+    async def test_reconcile_coalescing_is_per_server_not_global(self) -> None:
+        """Two servers reconcile independently; one does not swallow the other."""
+        manager = ClientManager()
+        for name in ("one", "two"):
+            managed = self._managed(name)
+            manager._clients[name] = managed
+        calls = self._wire(manager, {"tools": ["alpha"]})
+
+        for name in ("one", "two"):
+            manager._handle_downstream_notification(
+                name, manager._clients[name], "notifications/tools/list_changed"
+            )
+        assert len(manager._reconcile_tasks) == 2
+        await self._drain(manager)
+
+        assert calls.count("tools/list") == 2
+        assert "one::alpha" in manager._tools
+        assert "two::alpha" in manager._tools
+
+    @pytest.mark.asyncio
+    async def test_reconcile_publishes_once_for_the_kind_that_changed(self) -> None:
+        """A downstream that adds a tool produces exactly one `note_tools_changed`
+        -- not one per index mutation -- and nothing for the untouched kinds."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {
+            "tools": ["alpha"],
+            "resources": ["r1"],
+            "prompts": ["p1"],
+        }
+        self._wire(manager, state)
+
+        # Prime the catalog as connect-time indexing would, then start counting.
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        state["tools"] = ["alpha", "beta"]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert "srv::beta" in manager._tools
+        assert (sink.tools, sink.resources, sink.prompts) == (1, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_publishes_nothing_when_identifier_sets_match(self) -> None:
+        """Reconciliation over a catalog that did not move publishes nothing, even
+        though `_remove_server_indexes` and `_index_*` both call `note_*`
+        unconditionally."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(
+            manager, {"tools": ["alpha"], "resources": ["r1"], "prompts": ["p1"]}
+        )
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        for _ in range(3):
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+            await self._drain(manager)
+
+        assert "srv::alpha" in manager._tools
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_publishes_on_rename_that_preserves_the_count(self) -> None:
+        """The count-diffing trap: one tool renamed leaves the count identical, so
+        only an identifier-set comparison detects it."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {"tools": ["alpha", "beta"]}
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        sink.tools = sink.resources = sink.prompts = 0
+
+        state["tools"] = ["alpha", "gamma"]  # same count, different set
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert set(manager._tools) == {"srv::alpha", "srv::gamma"}
+        assert sink.tools == 1
+
+    @pytest.mark.asyncio
+    async def test_reconcile_removes_entries_the_downstream_dropped(self) -> None:
+        """`_index_*` only adds or overwrites, so reconciliation must pair a removal
+        with the re-index or a dropped tool lingers forever."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {"tools": ["alpha", "beta"]}
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha", "srv::beta"}
+
+        state["tools"] = ["alpha"]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        assert set(manager._tools) == {"srv::alpha"}
+
+    @pytest.mark.asyncio
+    async def test_reconcile_failure_leaves_the_catalog_intact(self) -> None:
+        """A downstream that emits `list_changed` and then fails `tools/list` must
+        not leave the catalog half-removed, and must publish nothing."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        state: dict[str, list[str]] = {"tools": ["alpha"], "prompts": ["p1"]}
+        self._wire(manager, state)
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+        before_tools = dict(manager._tools)
+        before_prompts = dict(manager._prompts)
+        assert before_tools and before_prompts
+        sink.tools = sink.resources = sink.prompts = 0
+
+        async def failing_send(*args: Any, **kwargs: Any) -> dict[str, Any]:
+            raise ConnectionError("downstream went away mid-reconcile")
+
+        manager._send_request = failing_send  # type: ignore[method-assign]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._tools == before_tools
+        assert manager._prompts == before_prompts
+        assert (sink.tools, sink.resources, sink.prompts) == (0, 0, 0)
+
+    @pytest.mark.asyncio
+    async def test_reconcile_preserves_tracked_task_records(self) -> None:
+        """Reconciliation must not evict the server's in-flight `McpTaskRecord`s.
+
+        `_remove_server_indexes` drops them, which is right for a disconnect and
+        wrong for a `list_changed` — the downstream's tasks did not go anywhere.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(manager, {"tools": ["alpha"]})
+        record = McpTaskRecord(
+            server_name="srv",
+            tool_id="srv::alpha",
+            task_id="t-1",
+            status="working",
+        )
+        manager._tasks[("srv", "t-1")] = record
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert manager._tasks.get(("srv", "t-1")) is record
+
+    @pytest.mark.asyncio
+    async def test_reconcile_is_a_noop_when_the_server_is_gone(self) -> None:
+        """A server disconnected between the notification and the reconcile must
+        not be re-indexed down a dead connection."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        calls = self._wire(manager, {"tools": ["alpha"]})
+        manager._clients.pop("srv")
+
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await self._drain(manager)
+
+        assert calls == []
+        assert manager._tools == {}
+
+    @pytest.mark.asyncio
+    async def test_reconcile_does_not_spin_when_the_server_answers_with_a_storm(
+        self,
+    ) -> None:
+        """A downstream that emits `list_changed` in reply to the very
+        `tools/list` reconciliation issues would drive the re-run loop forever.
+
+        Coalescing alone does not bound this -- it bounds *concurrency*, and this
+        loop is sequential. The re-run debounce is what bounds it, so this test
+        asserts a hard ceiling on reconciles in a fixed window rather than a
+        specific count.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        calls: list[str] = []
+
+        async def storm_send(
+            managed_arg: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            calls.append(method)
+            if method == "tools/list":
+                # The server answers the listing by announcing another change.
+                manager._handle_downstream_notification(
+                    "srv", managed_arg, "notifications/tools/list_changed"
+                )
+                return {"tools": [{"name": "alpha", "inputSchema": {}}]}
+            return {}
+
+        manager._send_request = storm_send  # type: ignore[method-assign]
+        manager._handle_downstream_notification(
+            "srv", managed, "notifications/tools/list_changed"
+        )
+        await asyncio.sleep(0.6)
+        spins = calls.count("tools/list")
+
+        # Cancel the (deliberately endless) loop before asserting.
+        await manager._cancel_background_tasks()
+
+        # Without the debounce this is thousands. With it, ~1 + 0.6/0.25.
+        assert spins <= 6, f"reconcile loop is spinning: {spins} passes in 0.6s"
+        assert spins >= 1
+
+    # ---- SL-1.6: both dispatch paths, and typed errors ------------------
+
+    @pytest.mark.asyncio
+    async def test_stdio_dispatch_path_reaches_the_reconcile_scheduler(self) -> None:
+        """`_handle_stdout_line` must recognise a notification. It has no `id`, so
+        it falls through the pending-request gate with nothing to resolve."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(manager, {"tools": ["alpha"]})
+
+        line = json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+        ).encode()
+        manager._handle_stdout_line("srv", managed, line, time.time())
+        await self._drain(manager)
+
+        assert "srv::alpha" in manager._tools
+
+    @pytest.mark.asyncio
+    async def test_sse_dispatch_path_reaches_the_reconcile_scheduler(self) -> None:
+        """The `_read_sse` loop must recognise a notification, and must survive it:
+        a raise inside that loop is caught by its blanket `except Exception`, which
+        marks the server ERROR and reconnects."""
+        manager = ClientManager()
+        managed = self._managed("srv")
+        managed.is_remote = True
+        manager._clients["srv"] = managed
+        self._wire(manager, {"tools": ["alpha"]})
+        manager._schedule_reconnect = MagicMock()  # type: ignore[method-assign]
+
+        def _frame(payload: dict[str, Any]) -> Any:
+            frame = MagicMock()
+            frame.message.model_dump.return_value = payload
+            return frame
+
+        async def stream() -> Any:
+            yield _frame(
+                {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+            )
+            yield _frame({"jsonrpc": "2.0", "method": "notifications/message"})
+
+        await manager._read_sse("srv", managed, stream())
+        await self._drain(manager)
+
+        assert "srv::alpha" in manager._tools
+
+    @pytest.mark.asyncio
+    async def test_stdio_dispatch_preserves_downstream_error_code_and_data(
+        self,
+    ) -> None:
+        """A JSON-RPC error keeps `code` and `data` alongside `message`, and `str()`
+        stays exactly the message so `gateway.invoke`'s E302 mapping is unchanged."""
+        from pmcp.client.manager import DownstreamError
+
+        manager = ClientManager()
+        managed = self._managed("srv")
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[7] = PendingRequest(
+            request_id=7,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+        line = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 7,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params",
+                    "data": {"field": "path"},
+                },
+            }
+        ).encode()
+
+        manager._handle_stdout_line("srv", managed, line, time.time())
+
+        err = fut.exception()
+        assert isinstance(err, DownstreamError)
+        assert err.code == -32602
+        assert err.data == {"field": "path"}
+        assert str(err) == "Invalid params"
+
+    @pytest.mark.asyncio
+    async def test_sse_dispatch_preserves_downstream_error_code_and_data(self) -> None:
+        """The same, through the remote dispatch path."""
+        from pmcp.client.manager import DownstreamError
+
+        manager = ClientManager()
+        managed = self._managed("srv")
+        managed.is_remote = True
+        manager._clients["srv"] = managed
+        manager._schedule_reconnect = MagicMock()  # type: ignore[method-assign]
+        fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+        now = time.time()
+        managed.pending_requests[9] = PendingRequest(
+            request_id=9,
+            server_name="srv",
+            tool_id="srv::alpha",
+            started_at=now,
+            last_heartbeat=now,
+            timeout_ms=30000,
+            future=fut,
+        )
+
+        async def stream() -> Any:
+            frame = MagicMock()
+            frame.message.model_dump.return_value = {
+                "jsonrpc": "2.0",
+                "id": 9,
+                "error": {"code": -32000, "message": "boom", "data": ["a", "b"]},
+            }
+            yield frame
+
+        await manager._read_sse("srv", managed, stream())
+
+        err = fut.exception()
+        assert isinstance(err, DownstreamError)
+        assert err.code == -32000
+        assert err.data == ["a", "b"]
+        assert str(err) == "boom"
