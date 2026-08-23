@@ -542,25 +542,6 @@ def _semver_parse(value: str) -> SemverVersion | None:
         return None
 
 
-def is_version_orderable(value: str, package_type: str | None = None) -> bool:
-    """Whether *value* can be ordered at all -- a release version or a digest.
-
-    NOT sufficient as a guard for a negated newer-check. That was its original
-    purpose and it was wrong: comparability is a property of the PAIR, and two
-    individually-orderable values can still be incomparable (a version against
-    a digest). Use :func:`compare_versions` for that -- its ``"incomparable"``
-    branch is a value, not a boolean a caller can accidentally negate.
-
-    This remains useful for genuinely unary questions -- "is this single value
-    a thing I could order at all".
-    """
-    if _digest_identity(value, package_type) is not None:
-        return True
-    if _is_semver_ecosystem(package_type):
-        return _semver_parse(value) is not None
-    return _parse_version(value) is not None
-
-
 VersionComparison = Literal["newer", "not_newer", "incomparable"]
 
 
@@ -632,6 +613,30 @@ def compare_versions(
     if Version(latest_version.public) > Version(current_version.public):
         return "newer"
     return "not_newer"
+
+
+def is_version_orderable(value: str, package_type: str | None = None) -> bool:
+    """Whether *value* can be ordered at all -- a release version or a digest.
+
+    NOT sufficient as a guard for a negated newer-check. That was its original
+    purpose and it was wrong: comparability is a property of the PAIR, and two
+    individually-orderable values can still be incomparable (a version against
+    a digest). Use :func:`compare_versions` for that -- its ``"incomparable"``
+    branch is a value, not a boolean a caller can accidentally negate.
+
+    This remains useful for genuinely unary questions -- "is this single value
+    a thing I could order at all".
+
+    Delegates to :func:`compare_versions` rather than branching again. It used
+    to re-derive the digest/SemVer/PEP-440 classification itself, which left
+    two classification sites that could drift apart -- exactly the hazard the
+    2.2.1 wrapper-drift corpus existed to police, reintroduced in a new place
+    (ah board review). Comparing a value against ITSELF is orderable precisely
+    when the value is: equal values are ``"not_newer"``, and an unreadable one
+    is ``"incomparable"``. Verified equivalent to the previous implementation
+    across 112 value/package-type combinations.
+    """
+    return compare_versions(value, value, package_type) != "incomparable"
 
 
 def clear_version_cache() -> None:

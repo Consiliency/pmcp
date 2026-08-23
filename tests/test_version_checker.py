@@ -1342,3 +1342,58 @@ def _called_name(call: ast.Call) -> str | None:
     if isinstance(call.func, ast.Attribute):
         return call.func.attr
     return None
+
+
+class TestOrdinalReversal:
+    """An ordinal `newer` must reverse to `not_newer`. Digests must not.
+
+    Consiliency/pmcp#170 board review: the corpus asserted the safety direction
+    (incomparable => ordered in neither direction) but never that an ordinal
+    result is ANTISYMMETRIC. A mutant making the SemVer lane return `"newer"`
+    in both directions passed every corpus test.
+
+    The distinction matters and is why this is not a blanket rule: a digest is
+    an IDENTITY, not an ordinal. Two different digests are each "a new image"
+    relative to the other, so `newer` in both directions is correct there and
+    asserting universal reversal would be wrong.
+    """
+
+    ORDINAL = [
+        ("1.0.0", "2.0.0", "npm"),
+        ("1.0.0", "2.0.0", None),
+        ("1.0.0-rc1", "1.0.0", "npm"),
+        ("1.0.0-1", "1.0.0", "npm"),
+        ("0.0.1", "10.0.0", "npm"),
+        ("202612180000", "202612190000", None),
+        ("1.0.0", "1.0.1", "pypi"),
+    ]
+
+    IDENTITY = [
+        ("abcdef123456", "abcdef123457", "docker"),
+        ("987654321098", "123456789012", "docker"),
+    ]
+
+    def test_ordinal_newer_reverses_to_not_newer(self) -> None:
+        for current, latest, pkg_type in self.ORDINAL:
+            assert compare_versions(current, latest, pkg_type) == "newer", (
+                f"{current!r} -> {latest!r} ({pkg_type!r}) should be newer"
+            )
+            assert compare_versions(latest, current, pkg_type) == "not_newer", (
+                f"{latest!r} -> {current!r} ({pkg_type!r}) must reverse to "
+                f"not_newer; reporting newer both ways makes the comparison "
+                f"meaningless and is undetectable by the corpus alone"
+            )
+
+    def test_digest_difference_is_newer_in_both_directions(self) -> None:
+        """Pins the exemption, so nobody 'fixes' it into antisymmetry."""
+        for current, latest, pkg_type in self.IDENTITY:
+            assert compare_versions(current, latest, pkg_type) == "newer"
+            assert compare_versions(latest, current, pkg_type) == "newer"
+
+    def test_equal_values_are_not_newer_both_ways(self) -> None:
+        for value, pkg_type in [
+            ("1.0.0", "npm"),
+            ("abcdef123456", "docker"),
+            ("202612180000", None),
+        ]:
+            assert compare_versions(value, value, pkg_type) == "not_newer"
