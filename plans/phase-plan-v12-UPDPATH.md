@@ -2,7 +2,7 @@
 phase_loop_plan_version: 1
 phase: UPDPATH
 roadmap: specs/phase-plans-v12.md
-roadmap_sha256: bf1848c8178686235bf707d4959b26a7781ec12387dab7404ff789eadfe7485d
+roadmap_sha256: 3b6439a9dddb9ef5b5b709ed6fa32f889a082ed0b0118554e6ae9c2265bf4847
 ---
 
 # PHASE-2-UPDPATH: Update-path identity and environment contracts
@@ -26,11 +26,35 @@ v2.3.0:
   for `old-package@2.0.0` against a config for `new-package@1.0.0` prints
   "All cached descriptions are up to date."
 
-The cross-**ecosystem** case is already handled and must not be re-planned: a
-version against a digest classifies as `compare_versions(...) == "incomparable"`,
-which is not `"not_newer"`, so the short-circuit does not fire. Only the
-**same-ecosystem** case survives — `@old/pkg@1.0.0` cached, `@new/pkg@1.0.0`
-configured, both npm, both orderable, versions equal.
+The **docker** cross-ecosystem case is already handled and must not be
+re-planned: a version against a digest classifies as
+`compare_versions(...) == "incomparable"`, which is not `"not_newer"`, so the
+short-circuit does not fire.
+
+Two cases survive, and the second was missed on the first pass:
+
+1. **Same ecosystem** — `@old/pkg@1.0.0` cached, `@new/pkg@1.0.0` configured,
+   both npm, both orderable, versions equal.
+2. **npm ↔ pypi ↔ cargo** — all produce orderable *release* versions, so
+   `incomparable` never fires, and `GeneratedServerDescriptions`
+   (`types.py:1359-1367`) stores `package` as a bare name with **no ecosystem**.
+   So pypi `foo@1.0.0` against npm `foo@1.0.0` reads as the same package. This
+   is why IF-0-UPDPATH-2 adds `package_type` to the cached entry: a name alone
+   cannot express package identity, and the gate is only as good as what the
+   cache remembers.
+
+**The ambient-environment contract (EC-4) is two contracts, not one, and the
+original single-sentence version was false.** Verified empirically at v2.3.0: a
+manifest credential is resolved into `LocalMcpServerConfig.env`
+(`config/loader.py:1025`), so rotating it during the probe window makes the
+recheck's child environment differ from the probe's and `update_server` returns
+`ok=False` **without restarting** (`tools/handlers.py:5090-5165`). It is not
+"picked up by the restarted server." That refusal is the 2.2.1 TOCTOU guard
+behaving as designed. What *is* live is the genuinely ambient case: both sides
+derive from one `stripped_base`, so an ambient change cancels out and never
+refuses, and `sanitized_subprocess_env` (`env_store.py:138`) calls
+`os.environ.copy()` at spawn time — the same call connect, refresh and
+auto-reconnect reach. The phase documents both halves and changes neither.
 
 **A defect discovered while planning, which EC-6 depends on.** `cli.py:770`
 computes `cache_path = get_cache_path(args.cache_dir)` and the
@@ -43,25 +67,32 @@ and would have to reach past the CLI to monkeypatch — which is precisely the
 wiring as a prerequisite for its own test, and the plan records it as an
 in-scope behaviour change rather than smuggling it in.
 
-**The ambient-environment contract (EC-4) requires no source change.** Every
-stdio spawn path reaches `sanitized_subprocess_env` (`src/pmcp/env_store.py:124`),
-whose first statement is `os.environ.copy()` — evaluated at spawn time, not
-captured earlier. `_connect_stdio` calls it at `manager.py:2151`. So connect,
-refresh, auto-reconnect and `update_server`'s restart already share one
-live-environment contract; the phase's job is to *document the uniformity* and
-*pin it with a test*, not to change behaviour. The roadmap decided this
-deliberately over freezing or refusing, and that decision is confirmed and
-carried into this plan unchanged.
+Neither half of EC-4 requires a source change: the refusal and the live-spawn
+read both already work as described. The roadmap's *decision* — document rather
+than freeze or refuse — is unchanged and confirmed; only its description of what
+there is to document was corrected.
 
 ## Interface Freeze Gates
 
 - [ ] IF-0-UPDPATH-1 — `refresher.py` exposes one internal identity predicate
-  with the frozen signature `_same_package(cached_package: str, configured_package: str | None) -> bool`,
-  returning `False` when either side is empty, `None`, or unknown. All three
-  call sites (`refresh_server`, `refresh_all`, `check_staleness`) route through
-  it; no site re-implements the comparison inline. Frozen so the CHANGELOG entry
-  and any later phase cite one stable name, and so the "unknown → refresh"
-  semantics live in exactly one place that a test can pin.
+  with the frozen signature
+  `_same_package(cached_package: str, cached_type: str | None, configured_package: str | None, configured_type: str | None) -> bool`,
+  returning `False` when **any** of the four is empty, `None`, or `"unknown"`.
+  All three call sites (`refresh_server`, `refresh_all`, `check_staleness`)
+  route through it; no site re-implements the comparison inline. Frozen so the
+  CHANGELOG entry and any later phase cite one stable name, and so the
+  "unknown → refresh" semantics live in exactly one place that a test can pin.
+  **The type arms are not decorative** — a bare-name comparison cannot tell npm
+  `foo` from pypi `foo`, and both produce orderable release versions, so the
+  short-circuit fires on a genuine package swap.
+- [ ] IF-0-UPDPATH-2 — `GeneratedServerDescriptions` gains
+  `package_type: str | None = None` (`src/pmcp/types.py:1359`), and
+  `load_descriptions_cache` populates it via
+  `server_data.get("package_type")` — defaulting to `None`, **not** `""`, so an
+  absent value is distinguishable from a recorded empty one. Every cache
+  written before this phase therefore reads as unknown, which forces a refresh
+  under EC-UPDPATH-7; the migration is safe by construction and needs no
+  version bump of the cache format.
 
 ## Lane Index & Dependencies
 
@@ -84,9 +115,9 @@ SL-3 — Documentation & spec reconciliation (SL-docs)
 
 ### SL-1 — Package-identity gate across all three refresh sites
 
-- **Scope**: Resolve package identity before the freshness short-circuit at all three sites, refuse the short-circuit when identity differs or is unknown, and fix the CLI's dropped `cache_path` so the CLI-level regression test is honest.
-- **Owned files**: `src/pmcp/manifest/refresher.py`, `src/pmcp/cli.py`, `tests/test_refresher.py`, `tests/test_cli.py`
-- **Interfaces provided**: `_same_package` (IF-0-UPDPATH-1)
+- **Scope**: Give the cached entry a package type, resolve package identity before the freshness short-circuit at all three sites, refuse the short-circuit when identity differs or is unknown, close the failure paths that write a stale entry back, and fix the CLI's dropped `cache_path` so the CLI-level regression test is honest.
+- **Owned files**: `src/pmcp/manifest/refresher.py`, `src/pmcp/types.py`, `src/pmcp/cli.py`, `tests/test_refresher.py`, `tests/test_cli.py`
+- **Interfaces provided**: `_same_package` (IF-0-UPDPATH-1), `GeneratedServerDescriptions.package_type` (IF-0-UPDPATH-2)
 - **Interfaces consumed**: `compare_versions` (pre-existing), `detect_package_type` (pre-existing) — both live in `src/pmcp/manifest/version_checker.py` and are unchanged by this phase
 - **Parallel-safe**: yes
 
@@ -94,17 +125,31 @@ SL-3 — Documentation & spec reconciliation (SL-docs)
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-1.1 | test | — | `tests/test_refresher.py` | `TestPackageIdentityGate` and `TestUnknownPackageForcesRefresh` — asserting the *post-fix* behaviour: a same-ecosystem package swap refreshes via `refresh_server`, via `refresh_all`, and is reported stale by `check_staleness`; an empty `package` forces a refresh. RED today. | `uv run pytest tests/test_refresher.py::TestPackageIdentityGate tests/test_refresher.py::TestUnknownPackageForcesRefresh -q` |
-| SL-1.2 | test | — | `tests/test_cli.py` | `TestCheckVersionsIdentityGate` — asserting the *post-fix* behaviour: `pmcp refresh --check-versions --cache-dir <tmp>` reads `<tmp>`, and does not report up-to-date across a package swap. RED today. | `uv run pytest tests/test_cli.py::TestCheckVersionsIdentityGate -q` |
-| SL-1.3 | impl | SL-1.1 | `src/pmcp/manifest/refresher.py` | — | — |
-| SL-1.4 | impl | SL-1.2 | `src/pmcp/cli.py` | — | — |
-| SL-1.5 | verify | SL-1.4 | `src/pmcp/manifest/refresher.py`, `src/pmcp/cli.py`, `tests/test_refresher.py`, `tests/test_cli.py` | all SL-1 tests | `uv run pytest tests/test_refresher.py tests/test_cli.py -q` |
+| SL-1.1 | test | — | `tests/test_refresher.py` | `TestPackageIdentityGate` and `TestUnknownPackageForcesRefresh` — asserting the *post-fix* behaviour: a same-ecosystem package swap refreshes via `refresh_server`, via `refresh_all`, and is reported stale by `check_staleness`; an npm↔pypi swap at an equal version does the same; an empty `package` or absent `package_type` forces a refresh. RED today. | `uv run pytest tests/test_refresher.py::TestPackageIdentityGate tests/test_refresher.py::TestUnknownPackageForcesRefresh -q` |
+| SL-1.2 | test | — | `tests/test_refresher.py` | `TestMismatchedCacheNeverSurvivesFailure` — a failed or raising `refresh_server` must not write the identity-mismatched entry back through either `refresh_all` fallback path. RED today. | `uv run pytest tests/test_refresher.py::TestMismatchedCacheNeverSurvivesFailure -q` |
+| SL-1.3 | test | — | `tests/test_cli.py` | `TestCheckVersionsIdentityGate` — asserting the *post-fix* behaviour: `pmcp refresh --check-versions --cache-dir <tmp>` reads `<tmp>`, and does not report up-to-date across a package swap. RED today. | `uv run pytest tests/test_cli.py::TestCheckVersionsIdentityGate -q` |
+| SL-1.4 | impl | SL-1.1 | `src/pmcp/types.py` | — | — |
+| SL-1.5 | impl | SL-1.4 | `src/pmcp/manifest/refresher.py` | — | — |
+| SL-1.6 | impl | SL-1.3 | `src/pmcp/cli.py` | — | — |
+| SL-1.7 | verify | SL-1.6 | `src/pmcp/manifest/refresher.py`, `src/pmcp/types.py`, `src/pmcp/cli.py`, `tests/test_refresher.py`, `tests/test_cli.py` | all SL-1 tests | `uv run pytest tests/test_refresher.py tests/test_cli.py -q` |
 
-**Implementation notes binding on SL-1.3:**
+**Implementation notes binding on SL-1.4 – SL-1.6:**
 
 - Move `detect_package_type` / `pkg_name` resolution **above** the short-circuit
   (currently `:232`, must precede `:219`). EC-2 is this move; without it the
-  guard has nothing to compare.
+  guard has nothing to compare. **Move it — do not duplicate it.** A second
+  resolution call above the early return would satisfy EC-1 and EC-3 while
+  leaving the original below, which is not what EC-2 asks for; SL-1.7 must
+  confirm exactly one `detect_package_type` call remains in `refresh_server`.
+- `refresh_all`'s failure paths are part of the gate, not separate from it
+  (`refresher.py:358-367` returns the existing entry when `refresh_server`
+  returns `None` or raises, and `:376-378` re-adds every cached entry missing
+  from the new set). An identity-mismatched entry must not survive either path
+  back into the saved cache. Dropping the entry on a failed regeneration is
+  acceptable; writing the wrong package's descriptions back is not.
+- Populate `package_type` wherever an entry is written, not only where it is
+  read — an entry regenerated by this phase must carry its type, or the next
+  run reads it as unknown and refreshes forever.
 - The guard must read an unknown side as **"cannot confirm identity → refresh"**,
   never as **"cannot compare → skip the check."** The second phrasing is the
   natural one to reach for and is the same fail-open collapse as
@@ -119,7 +164,7 @@ SL-3 — Documentation & spec reconciliation (SL-docs)
 
 ### SL-2 — Ambient-environment contract pinned and documented
 
-- **Scope**: Pin with a test that a credential rotated during `update_server`'s probe window reaches the restarted server, and state the uniform live-environment contract in `update_server`'s own docstring.
+- **Scope**: Pin with two tests what actually happens across `update_server`'s probe window — a config-driven env change is refused, a genuinely ambient one is live at spawn — and state both halves in `update_server`'s own docstring.
 - **Owned files**: `src/pmcp/tools/handlers.py`, `tests/test_tools.py`
 - **Interfaces provided**: (none — documents existing behaviour)
 - **Interfaces consumed**: `sanitized_subprocess_env` (pre-existing) — `src/pmcp/env_store.py:124`, unchanged by this phase. SL-2 consumes nothing from SL-1 and can run before, after, or alongside it.
@@ -129,7 +174,7 @@ SL-3 — Documentation & spec reconciliation (SL-docs)
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-2.1 | test | — | `tests/test_tools.py` | `TestUpdateServerAmbientEnvironment` — a value mutated in `os.environ` between probe and restart is present in the restarted server's spawn environment; the pre-rotation value is absent | `uv run pytest tests/test_tools.py::TestUpdateServerAmbientEnvironment -q` |
+| SL-2.1 | test | — | `tests/test_tools.py` | `TestUpdateServerAmbientEnvironment` — **two** tests. (a) a *manifest credential* rotated between probe and recheck yields `ok=False`, no restart, and a message naming the config change; (b) a *genuinely ambient* variable (not an explicit `env` override) mutated in the same window does **not** cause a refusal, and the restarted server's spawn environment carries the new value | `uv run pytest tests/test_tools.py::TestUpdateServerAmbientEnvironment -q` |
 | SL-2.2 | impl | SL-2.1 | `src/pmcp/tools/handlers.py` | — | — |
 | SL-2.3 | verify | SL-2.2 | `src/pmcp/tools/handlers.py`, `tests/test_tools.py` | all SL-2 tests | `uv run pytest tests/test_tools.py -q` |
 
@@ -139,13 +184,21 @@ SL-3 — Documentation & spec reconciliation (SL-docs)
   (`handlers.py:4942`). If it turns into a behaviour change, the lane has
   exceeded EC-4 and must stop and report — freezing the ambient environment is
   an explicit Non-goal of this phase.
-- The docstring must frame the invariant as **uniformity** — "`update_server`
-  follows the same live-environment contract as every other spawn path" — not
-  as a probe-window special case, because there is no probe-window-specific
-  code to point at.
-- SL-2.1 asserts against the environment actually handed to the spawn, not
+- The docstring must state **both** halves and must not collapse them into a
+  single "live environment" sentence. A config-driven change (which includes
+  every manifest credential, since `config/loader.py:1025` resolves it into
+  `LocalMcpServerConfig.env`) is **refused**: the guarantee is "the config
+  restarted onto is the config that was probed," and the operator's rotation
+  applies on the next update. A genuinely ambient variable is **live at spawn**:
+  both sides of the guard derive from one `stripped_base`, so it cancels out and
+  never causes a refusal, and `sanitized_subprocess_env` reads `os.environ` at
+  spawn time exactly as connect, refresh and auto-reconnect do.
+- SL-2.1(b) asserts against the environment actually handed to the spawn, not
   against `os.environ` itself; asserting on `os.environ` would pass without
   the contract holding.
+- **Do not "fix" the refusal.** It is the 2.2.1 TOCTOU guard, which landed after
+  its own board review, and reopening it is an explicit Non-goal. A lane that
+  believes the refusal is wrong must stop and report rather than change it.
 
 ### SL-3 — Documentation & spec reconciliation (SL-docs)
 
@@ -192,10 +245,10 @@ names below are binding on the lanes.
 
 - [ ] EC-UPDPATH-1 — proven by `uv run pytest tests/test_refresher.py::TestPackageIdentityGate -q`: a cache for `old-package@1.0.0` against a config for `new-package@1.0.0` (same ecosystem, both orderable, equal versions) refreshes instead of returning the cached descriptions. RED before SL-1.3.
 - [ ] EC-UPDPATH-2 — proven by `uv run pytest tests/test_refresher.py::TestPackageIdentityGate -q`: the same class cannot pass unless identity is resolved before the short-circuit, since the short-circuit returns before `:232` is reached today.
-- [ ] EC-UPDPATH-3 — proven by `uv run pytest tests/test_refresher.py::TestPackageIdentityGate -q`: a test calling `refresh_all` directly shows it carries package identity into the pair it assembles, so the by-name cache lookup cannot bypass EC-1.
+- [ ] EC-UPDPATH-3 — proven by `uv run pytest tests/test_refresher.py::TestPackageIdentityGate tests/test_refresher.py::TestMismatchedCacheNeverSurvivesFailure -q`: a test calling `refresh_all` directly shows it carries package identity into the pair it assembles, **and** that an identity-mismatched entry survives neither the `None`/raise fallback (`:358-367`) nor the final merge (`:376-378`) back into the saved cache.
 - [ ] EC-UPDPATH-6 — proven by `uv run pytest tests/test_cli.py::TestCheckVersionsIdentityGate -q`: `pmcp refresh --check-versions` driven through `async_main` against a fixture cache does not print "All cached descriptions are up to date" across a same-ecosystem package swap, and honours `--cache-dir`.
 - [ ] EC-UPDPATH-7 — proven by `uv run pytest tests/test_refresher.py::TestUnknownPackageForcesRefresh -q`: an entry whose `package` is `""` (how `load_descriptions_cache` renders an absent field, `refresher.py:70`) forces a refresh; and a companion test in the same class fails if the guard is phrased to skip the comparison when either side is unknown.
-- [ ] EC-UPDPATH-4 — proven by `uv run pytest tests/test_tools.py::TestUpdateServerAmbientEnvironment -q`: a credential rotated during the probe window reaches the restarted server rather than a probe-time snapshot, and `update_server`'s docstring states the contract as uniform across spawn paths.
+- [ ] EC-UPDPATH-4 — proven by `uv run pytest tests/test_tools.py::TestUpdateServerAmbientEnvironment -q`: 4a — a manifest credential rotated during the probe window yields `ok=False` with no restart; 4b — a genuinely ambient variable rotated in the same window causes no refusal and reaches the restarted server's spawn environment. `update_server`'s docstring states both halves.
 - [ ] EC-UPDPATH-5 — proven by `uv run pytest tests/ -q`, `uv run ruff check src/ tests/`, `uv run ruff format --check src/ tests/`, `uv run mypy src/pmcp --exclude baml_client`, and a CHANGELOG entry covering both fixes.
 
 ## Verification
