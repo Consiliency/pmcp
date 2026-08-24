@@ -773,7 +773,7 @@ async def run_refresh(args: argparse.Namespace) -> None:
     if args.check_versions:
         # Just check for updates
         logger.info("Checking for package version updates...")
-        stale = await check_staleness()
+        stale = await check_staleness(cache_path=cache_path)
 
         if not stale:
             print("All cached descriptions are up to date.")

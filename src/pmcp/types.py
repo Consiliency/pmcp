@@ -1360,6 +1360,13 @@ class GeneratedServerDescriptions(BaseModel):
     """Pre-generated descriptions for a single server."""
 
     package: str  # e.g., "@playwright/mcp"
+    # Ecosystem the package name belongs to, e.g. "npm". A bare name cannot
+    # express package identity -- npm `foo` and pypi `foo` are different
+    # packages that both produce orderable release versions -- so the identity
+    # gate needs the type. `None` means the entry never recorded one (every
+    # cache written before this field existed), which reads as unknown and
+    # therefore forces a refresh.
+    package_type: str | None = None
     version: str  # Package version when generated
     generated_at: str  # ISO timestamp
     capability_summary: str  # L1: For MCP instructions
