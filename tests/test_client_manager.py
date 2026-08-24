@@ -5431,6 +5431,35 @@ class TestListingPagination:
         assert sink.tools == primed
 
     @pytest.mark.asyncio
+    async def test_a_deep_but_honest_catalog_assembles_completely(self) -> None:
+        """A catalog many pages deep, still inside the cap, must assemble.
+
+        Board review found the gap this closes: every other test here is two
+        pages deep, so a mutant shrinking `_MAX_LISTING_PAGES` to 2 passed the
+        entire suite. Nothing pinned that the cap is a runaway guard rather
+        than a catalog-size limit.
+
+        The failure direction is a freeze, not a false removal -- an honest
+        server would be reported as having no tools at all, which is the same
+        in-class defect that made the original cap of 50 wrong for a legal
+        page size of 1.
+        """
+        depth = 10
+        pages: list[Any] = [
+            {
+                "tools": [self._tool(f"t{i}")],
+                **({"nextCursor": f"p{i + 1}"} if i < depth - 1 else {}),
+            }
+            for i in range(depth)
+        ]
+        manager, sink, primed = await self._prime_then(pages)
+        assert sorted(manager._tools) == sorted(f"srv::t{i}" for i in range(depth)), (
+            "a deep but honest catalog was not assembled; the page cap is "
+            "acting as a catalog-size limit rather than a runaway guard"
+        )
+        assert sink.tools == primed + 1
+
+    @pytest.mark.asyncio
     async def test_exceeding_the_page_cap_is_unreadable_not_truncated(self) -> None:
         """The cap must preserve, not index the pages it managed to read.
 

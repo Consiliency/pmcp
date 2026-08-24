@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   truncated view.
 
   Connect and refresh share this path, so they read complete listings too.
+  One consequence worth stating plainly: a server whose `tools/list` fails on a
+  *later* page now connects successfully with an empty tools catalog, where
+  before pagination existed there was no later page to fail. Only a page-one
+  failure is still a connect error. That matches how connect already treats a
+  first page whose every entry is unparseable, but such a server sits at zero
+  tools until a downstream notification or a refresh reconciles it.
 
 
 ### Added
