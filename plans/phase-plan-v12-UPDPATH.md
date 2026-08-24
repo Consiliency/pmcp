@@ -2,7 +2,7 @@
 phase_loop_plan_version: 1
 phase: UPDPATH
 roadmap: specs/phase-plans-v12.md
-roadmap_sha256: e2511bc61287972feb31ca95454510cc4f7e102cd48e6d4640a1ed621782f061
+roadmap_sha256: 2015eca64695daef2a342a772e538a93f3e6f89dcb08840275bd541d9f06a84a
 ---
 
 # PHASE-2-UPDPATH: Update-path identity and environment contracts
