@@ -34,7 +34,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure is still a connect error. That matches how connect already treats a
   first page whose every entry is unparseable, but such a server sits at zero
   tools until a downstream notification or a refresh reconciles it.
-
+- **A downstream server's JSON-RPC `error` object no longer loses its `code`
+  and `data`.** Both dispatch paths kept only `message`, discarding the rest
+  of the `error` member. `ClientManager` now raises a typed `DownstreamError`
+  carrying `code` and `data` alongside `message`. Scoped to the
+  `ClientManager` boundary — `gateway.invoke` still maps every exception to
+  `E302` through `str(e)`, which is byte-identical to the old message, so no
+  `gateway.*` output changes; surfacing `code`/`data` to MCP clients is
+  tracked separately.
 
 ### Added
 - **A downstream server's own `notifications/tools/list_changed`,
@@ -133,16 +140,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HTTP/SSE (`_read_sse`) previously shared the same silent-drop, and both now
   dispatch through the same reconcile path. Unrecognised `notifications/*`
   methods (progress, logging) remain a no-op, as before.
-
-### Fixed
-- **A downstream server's JSON-RPC `error` object no longer loses its `code`
-  and `data`.** Both dispatch paths kept only `message`, discarding the rest
-  of the `error` member. `ClientManager` now raises a typed `DownstreamError`
-  carrying `code` and `data` alongside `message`. Scoped to the
-  `ClientManager` boundary — `gateway.invoke` still maps every exception to
-  `E302` through `str(e)`, which is byte-identical to the old message, so no
-  `gateway.*` output changes; surfacing `code`/`data` to MCP clients is
-  tracked separately.
 
 ### Changed
 - **`version_checker.compare_versions(current, latest, package_type)` is now the
