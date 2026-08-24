@@ -5207,6 +5207,85 @@ class TestUpdateServerVersionRepair:
         assert cache.servers["playwright"].version == "0.2.0"
 
     @pytest.mark.asyncio
+    async def test_update_server_drops_an_entry_whose_package_changed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A package CHANGE invalidates the entry; it is not patched in place.
+
+        `update_server` is a third write site for package identity, alongside
+        `refresh_server`'s constructor and `save_descriptions_cache`'s dict.
+        Patching `version`/`package`/`tools` field-by-field across a package
+        change leaves a permanently MIXED entry: `capability_summary` is
+        deliberately preserved on a version bump, but once `package` and
+        `version` both name the new package the freshness short-circuit
+        CONFIRMS identity and never regenerates it -- so the old package's
+        summary is served under the new package's label forever, not one
+        refresh cycle behind. Dropping the entry is this phase's own rule
+        applied here: cannot confirm the cache describes this package ->
+        refresh (ah board review, red-team seat).
+
+        The entry must start labelled with a DIFFERENT package or this test
+        sees nothing: `_make_cache` uses `@playwright/mcp`, exactly what
+        `detect_package_type` returns here, so any assertion about that value
+        holds whether or not the code under test ran at all. An earlier version
+        of this test made precisely that mistake -- deleting the package
+        assignment left it green -- which is the hollow-pin failure mode this
+        change exists to close, found independently by two board seats.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        cache.servers["playwright"].package = "@old-vendor/mcp"
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        assert "playwright" not in cache.servers, (
+            "an entry describing a different package must be dropped for "
+            "wholesale regeneration, not patched into a mixed entry carrying "
+            "the old package's capability_summary under the new package's name"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_server_backfills_package_type_on_a_same_package_bump(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A same-package version bump keeps the entry and records its type.
+
+        A cache written before the entry carried a package type reads as
+        unknown to `_same_package`, which forces a refresh every time. Since
+        `update_server` has just classified the package, this is the cheapest
+        place to backfill it -- and without it such an entry stays permanently
+        unverifiable.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        # Same package as configured, but legacy: no recorded type.
+        assert cache.servers["playwright"].package == "@playwright/mcp"
+        assert cache.servers["playwright"].package_type is None
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        entry = cache.servers["playwright"]
+        assert entry.version == "0.2.0"
+        assert entry.package_type == "npm", (
+            "a legacy entry stays permanently unverifiable if update_server "
+            "does not record the package type it just detected"
+        )
+
+    @pytest.mark.asyncio
     async def test_update_server_persists_version_across_restart(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
@@ -5428,6 +5507,17 @@ class TestUpdateServerVersionRepair:
             "pmcp.tools.handlers.load_configs", lambda **_: [configured_override]
         )
         cache = self._make_cache(version="0.1.0")
+        # Label the entry with the OVERRIDE's package, which is what is
+        # actually configured here. `_make_cache` uses the manifest's
+        # `@playwright/mcp`, and against the `different-playwright-fork`
+        # override that is a genuine package change -- which `update_server`
+        # now correctly responds to by DROPPING the entry for wholesale
+        # regeneration, leaving nothing for this version assertion to read.
+        # This test is about override resolution driving the probe, not about
+        # cache-identity handling (which
+        # `test_update_server_drops_an_entry_whose_package_changed` owns), so
+        # matching the label keeps it isolated to its own subject.
+        cache.servers["playwright"].package = "different-playwright-fork"
         client_manager = MockClientManager()
         gt = GatewayTools(
             client_manager=client_manager,  # type: ignore
@@ -6302,3 +6392,327 @@ class TestSanitizeError:
 
         assert "user:pass" not in json.dumps(tools._feedback_events)
         assert "secret-jwt" not in json.dumps(tools._feedback_events)
+
+
+class TestUpdateServerAmbientEnvironment:
+    """What actually happens to the child environment across `update_server`'s
+    probe window -- two different contracts that an earlier single-sentence
+    reading of this area conflated (phase UPDPATH, EC-4).
+
+    `update_server` probes for a new package version, then re-resolves the
+    config and refuses to restart if it changed (the Consiliency/pmcp#151
+    TOCTOU guard). Which side of that guard an environment change lands on
+    depends entirely on whether the variable is CONFIG-DRIVEN or AMBIENT:
+
+    (a) A manifest credential is config-driven, because `_manifest_server_to_config`
+        (`config/loader.py:1025`) resolves it INTO `LocalMcpServerConfig.env` at
+        load time. Rotate it inside the probe window and the recheck's resolved
+        `env` differs from the probe's, so the guard refuses -- the package is
+        fetched but NOT activated. That is the guarantee working as designed
+        ("the config restarted onto is the config that was probed"), not a
+        defect; the rotation applies on the next update.
+
+    (b) A genuinely ambient variable -- one no config declares as an explicit
+        `env` override -- is LIVE at spawn. Both sides of the guard derive from
+        the single `stripped_base` read in `update_server`, so an ambient change
+        cancels out and can never cause a refusal, and `sanitized_subprocess_env`
+        (`env_store.py:138`) calls `os.environ.copy()` at spawn time -- the same
+        read connect, refresh and auto-reconnect reach.
+
+    Test (b) is written against the environment actually handed to
+    `asyncio.create_subprocess_exec`, with a REAL `ClientManager._connect_stdio`
+    building it. Two shapes of this test pass vacuously and are deliberately
+    avoided: a fully mocked ClientManager has no spawn to capture at all (the
+    env is built inside `_connect_stdio`, `client/manager.py:2151`), and
+    rotating a PMCP-MANAGED key would exercise `sanitized_subprocess_env`'s
+    `own` arm -- which is (a)'s path, not (b)'s -- because the strip removes
+    every managed key from the base and re-applies only the server's own
+    resolved value. Asserting on `os.environ` itself would pass without the
+    contract holding.
+    """
+
+    _AMBIENT_KEY = "SL2_AMBIENT_VAR"
+    _CREDENTIAL_KEY = "SL2_MANIFEST_TOKEN"
+
+    def _install_manifest(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        env_var: str | None,
+    ) -> Manifest:
+        """Install a one-server manifest as the only resolution source.
+
+        `load_configs` returns nothing so `_resolve_lifecycle_config` falls
+        through to the manifest instead of the real filesystem, exactly as the
+        neighbouring update_server suites do.
+        """
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "ambient": ServerConfig(
+                    name="ambient",
+                    description="Fixture server",
+                    keywords=["fixture"],
+                    install={},
+                    command="npx",
+                    args=["-y", "@example/mcp"],
+                    requires_api_key=env_var is not None,
+                    env_var=env_var,
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+        monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+        # Keep the strip hermetic: unpatched, sanitized_subprocess_env reads the
+        # operator's real ~/.config/pmcp store inside the guard. Empty also makes
+        # _AMBIENT_KEY unambiguously NON-managed, which is what (b) requires.
+        monkeypatch.setattr(
+            "pmcp.env_store.managed_secret_keys", lambda project=None: set()
+        )
+        return manifest
+
+    def _make_cache(self) -> DescriptionsCache:
+        return DescriptionsCache(
+            generated_at="2024-01-01T00:00:00",
+            gateway_version="1.0.0",
+            servers={
+                "ambient": GeneratedServerDescriptions(
+                    package="@example/mcp",
+                    version="0.1.0",
+                    generated_at="2024-01-01T00:00:00",
+                    capability_summary="Fixture server",
+                    tools=[],
+                )
+            },
+        )
+
+    @pytest.mark.asyncio
+    async def test_manifest_credential_rotated_in_probe_window_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """(a) A manifest credential rotating mid-probe REFUSES the restart.
+
+        Counter-intuitive but correct, and the reason this lane documents two
+        contracts rather than one. The credential reaches the child process
+        through `LocalMcpServerConfig.env`, which the manifest resolver fills in
+        at load time -- so it is a CONFIG-driven value, and the recheck sees a
+        different one than the probe did. The guard fires before refresh() and
+        before any restart, so nothing is activated and no version is recorded.
+        """
+        manifest = self._install_manifest(monkeypatch, env_var=self._CREDENTIAL_KEY)
+        monkeypatch.setenv(self._CREDENTIAL_KEY, "OLD-TOKEN")
+
+        cache = self._make_cache()
+        client_manager = MockClientManager()
+        gt = GatewayTools(
+            client_manager=client_manager,  # type: ignore[arg-type]
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+
+        refresh_called = False
+
+        async def _tracking_refresh(input_data: dict[str, Any]) -> Any:
+            nonlocal refresh_called
+            refresh_called = True
+            return types.SimpleNamespace(ok=True)
+
+        monkeypatch.setattr(gt, "refresh", _tracking_refresh)
+
+        async def _fake_get_package_version(
+            command: str, args: list[str], timeout: float = 5.0
+        ) -> tuple[str | None, str]:
+            return ("0.2.0", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", _fake_get_package_version
+        )
+
+        async def _probe_that_rotates_the_credential(
+            command: list[str], env: dict[str, str] | None = None
+        ) -> tuple[bool, str]:
+            # The probe env is built from the config resolved BEFORE the probe;
+            # asserting the old value here is what proves the rotation below
+            # lands strictly inside the probe window rather than before it.
+            assert env is not None
+            assert env.get(self._CREDENTIAL_KEY) == "OLD-TOKEN", (
+                f"probe env should carry the pre-rotation credential, "
+                f"got {env.get(self._CREDENTIAL_KEY)!r}"
+            )
+            monkeypatch.setenv(self._CREDENTIAL_KEY, "ROTATED-TOKEN")
+            return (True, "ok")
+
+        monkeypatch.setattr(
+            gt, "_run_update_probe_command", _probe_that_rotates_the_credential
+        )
+
+        # The load-bearing fact behind this whole contract: the manifest
+        # resolver puts the credential INTO the config, so a rotation is a
+        # config difference to the guard, not an ambient one.
+        pre_probe = manifest_server_to_config(manifest.get_server("ambient"))
+        assert isinstance(pre_probe.config, LocalMcpServerConfig)
+        assert pre_probe.config.env == {self._CREDENTIAL_KEY: "OLD-TOKEN"}
+
+        result = await gt.update_server({"server_name": "ambient"})
+
+        assert result.ok is False
+        assert "changed while the update was being fetched" in result.message
+        # Nothing was activated -- not by the restart, and not by refresh(),
+        # which is itself a diff-based reconcile capable of activating.
+        assert refresh_called is False
+        assert not any("disconnect_server" in e for e in client_manager.events)
+        assert not any("connect_server" in e for e in client_manager.events)
+        assert cache.servers["ambient"].version == "0.1.0"
+
+    @pytest.mark.asyncio
+    async def test_ambient_variable_in_probe_window_is_live_at_spawn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """(b) A genuinely ambient variable does NOT refuse and IS live at spawn.
+
+        The server declares no `env` override at all, so the mutated variable
+        reaches the child only through `sanitized_subprocess_env`'s
+        `os.environ.copy()`. The assertion is against the env dict handed to
+        `asyncio.create_subprocess_exec` by a real `_connect_stdio`; only the
+        post-spawn JSON-RPC handshake is stubbed, which is downstream of the
+        env construction under test.
+        """
+        from pmcp.client.manager import ClientManager
+
+        manifest = self._install_manifest(monkeypatch, env_var=None)
+        # Pins "genuinely ambient": nothing in the resolved config declares this
+        # key (or any key), so a captured value can only have come from the
+        # spawn-time os.environ read.
+        resolved = manifest_server_to_config(manifest.get_server("ambient"))
+        assert isinstance(resolved.config, LocalMcpServerConfig)
+        assert resolved.config.env is None
+
+        monkeypatch.setenv(self._AMBIENT_KEY, "before-probe")
+
+        spawned_envs: list[dict[str, str]] = []
+        real_manager = ClientManager()
+
+        async def _fake_spawn(*args: Any, **kwargs: Any) -> Any:
+            spawned_envs.append(dict(kwargs["env"]))
+            return _FakeStdioProcess()
+
+        monkeypatch.setattr("asyncio.create_subprocess_exec", _fake_spawn)
+
+        # Everything below the spawn boundary: the handshake and the stdout
+        # reader would need a live MCP peer. `_connect_stdio` itself -- which
+        # calls sanitized_subprocess_env and passes env= to the spawn -- is
+        # untouched, and that is the code this test exists to pin.
+        async def _no_initialize(managed: Any) -> None:
+            return None
+
+        async def _no_capabilities(managed: Any) -> tuple[int, int, int]:
+            return (0, 0, 0)
+
+        async def _no_stdout(name: str, managed: Any) -> None:
+            return None
+
+        monkeypatch.setattr(real_manager, "_send_initialize", _no_initialize)
+        monkeypatch.setattr(real_manager, "_index_capabilities", _no_capabilities)
+        monkeypatch.setattr(real_manager, "_read_stdout", _no_stdout)
+
+        cache = self._make_cache()
+        gt = GatewayTools(
+            client_manager=real_manager,
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+
+        async def _stub_refresh(input_data: dict[str, Any]) -> Any:
+            return types.SimpleNamespace(ok=True)
+
+        monkeypatch.setattr(gt, "refresh", _stub_refresh)
+
+        async def _fake_get_package_version(
+            command: str, args: list[str], timeout: float = 5.0
+        ) -> tuple[str | None, str]:
+            return ("0.2.0", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", _fake_get_package_version
+        )
+
+        async def _probe_that_mutates_the_ambient_var(
+            command: list[str], env: dict[str, str] | None = None
+        ) -> tuple[bool, str]:
+            assert env is not None
+            assert env.get(self._AMBIENT_KEY) == "before-probe"
+            monkeypatch.setenv(self._AMBIENT_KEY, "after-probe")
+            return (True, "ok")
+
+        monkeypatch.setattr(
+            gt, "_run_update_probe_command", _probe_that_mutates_the_ambient_var
+        )
+
+        result = await gt.update_server({"server_name": "ambient"})
+
+        # No refusal: the ambient change cancels out across the one
+        # `stripped_base` both sides of the guard are derived from.
+        assert "changed while the update was being fetched" not in result.message
+        assert result.ok is True
+        assert result.restarted is True
+        # And it is live at the spawn -- the restarted server received the
+        # POST-probe value, not the one in force when the update began.
+        assert len(spawned_envs) == 1, f"expected exactly one spawn, got {spawned_envs}"
+        assert spawned_envs[0][self._AMBIENT_KEY] == "after-probe"
+
+
+class _FakeStdioProcess:
+    """A spawned-process stand-in for tests that patch
+    `asyncio.create_subprocess_exec` at the spawn boundary.
+
+    Only what `_connect_stdio` touches before/after the handshake it stubs:
+    `stdin` (never written to once `_send_initialize` is stubbed), `stdout`,
+    and `stderr=None` so no stderr reader task is started. It is deliberately
+    never disconnected by these tests -- teardown would reach
+    `_terminate_process_tree`, which signals a real process group.
+    """
+
+    def __init__(self) -> None:
+        self.stdin = None
+        self.stdout = None
+        self.stderr = None
+        self.pid = -1
+        self.returncode: int | None = None
+
+
+def test_update_server_docstring_states_both_probe_window_env_contracts() -> None:
+    """`update_server`'s own docstring must state BOTH halves of EC-4.
+
+    The behaviour is unchanged by this phase; what was wrong was the
+    description. A single "the environment is live across the update" sentence
+    is false for every manifest credential, because the manifest resolver puts
+    it in `LocalMcpServerConfig.env` and the TOCTOU guard then refuses. The
+    docstring is the only place a reader of this function meets that
+    distinction, so it is asserted rather than left to review.
+    """
+    doc = GatewayTools.update_server.__doc__ or ""
+    # Flattened so a phrase assertion pins the wording, not the line wrapping.
+    lowered = " ".join(doc.lower().split())
+
+    # Half one: a config-driven change -- explicitly including a manifest
+    # credential -- is refused rather than restarted onto.
+    assert "refus" in lowered, "docstring does not state the config-driven refusal"
+    assert "manifest credential" in lowered, (
+        "docstring does not name the manifest credential as config-driven, "
+        "which is the case an earlier reading got wrong"
+    )
+    assert "the config restarted onto is the config that was probed" in lowered, (
+        "docstring does not state the guarantee the refusal exists to uphold"
+    )
+
+    # Half two: a genuinely ambient variable is read at spawn time and is live.
+    assert "ambient" in lowered, "docstring does not state the ambient half"
+    assert "os.environ" in lowered and "spawn" in lowered, (
+        "docstring does not say the ambient value is read from os.environ at spawn time"
+    )
+    assert "cancel" in lowered, (
+        "docstring does not explain WHY an ambient change cannot refuse "
+        "(both guard sides derive from one stripped_base, so it cancels out)"
+    )

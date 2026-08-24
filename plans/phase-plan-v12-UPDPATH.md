@@ -2,7 +2,7 @@
 phase_loop_plan_version: 1
 phase: UPDPATH
 roadmap: specs/phase-plans-v12.md
-roadmap_sha256: 3b6439a9dddb9ef5b5b709ed6fa32f889a082ed0b0118554e6ae9c2265bf4847
+roadmap_sha256: 2015eca64695daef2a342a772e538a93f3e6f89dcb08840275bd541d9f06a84a
 ---
 
 # PHASE-2-UPDPATH: Update-path identity and environment contracts
@@ -367,3 +367,68 @@ automation:
   deliberately rotated; refusing would fail an update the operator wanted. A
   lane that finds the decision uncomfortable must stop and report rather than
   re-deciding it mid-execution.
+
+## Post-execution amendments (2026-08-24)
+
+Recorded by SL-3 after SL-1 and SL-2 merged. The full list of what execution
+discovered — including two operator-visible consequences this plan did not
+anticipate — is in `specs/phase-plans-v12.md` under
+"Post-execution amendments — UPDPATH (2026-08-24)". Only the points where **this
+document** was wrong or imprecise are repeated here.
+
+- **"Resolve identity before the short-circuit" was implemented as "resolve
+  before, compare inside."** The `detect_package_type` / `pkg_name` resolution
+  moved above the early return as this plan required, and exactly one call
+  remains in `refresh_server`. The `_same_package` **call**, however, is the
+  second conjunct of the existing `if version and … and compare_versions(…) ==
+  "not_newer"`, so `get_package_version` still runs before identity is
+  consulted. SL-1 reported that placing the guard ahead of the fetch broke
+  `TestUpToDateShortCircuit`'s call-count assertion, since a mismatch would then
+  skip the version lookup entirely. This plan read as though the guard would sit
+  ahead of the fetch; it does not, and nothing in EC-UPDPATH-1..3 requires it to.
+- **The `TestUpToDateShortCircuit` fixture warning was misplaced.** That class
+  needed no changes at all: both of its tests assert the short-circuit does
+  *not* fire, so an extra always-`False` conjunct cannot move their outcome —
+  which also means neither of them discriminates a degenerate gate. The
+  prediction was right for `TestCheckStaleness` (three fixtures gained
+  `package_type="npm"`), and the test this plan correctly identified as the one
+  that catches an always-`False` gate,
+  `test_short_circuit_is_a_single_compare_versions_call`, lives in
+  `TestShortCircuitUsesCompareVersions`, not in `TestUpToDateShortCircuit`; its
+  fixture needed `package_type="npm"` too. All four were pure insertions, so
+  `git diff --numstat -- tests/` reports zero deletions and the fixture work is
+  invisible unless you read the hunks.
+- **EC-3 needed state, not just a gated pair.** This plan named both of
+  `refresh_all`'s failure paths correctly but not what closing them costs:
+  setting `existing = None` stops the callee from short-circuiting and does
+  nothing about the final merge loop, which re-adds cached entries straight from
+  `existing_servers`. `refresh_all` keeps a `mismatched: set[str]` and excludes
+  those names from the merge.
+- **EC-7 needed no code path of its own** — the empty-`package` case falls out of
+  `_same_package`'s any-unknown arm for free.
+- **`roadmap_sha256` was refreshed at closeout**, and this is a deliberate change
+  of convention. This phase's own docs lane amended the roadmap, so the pin
+  written at planning time no longer matched and `validate_plan_doc` reported
+  `(FM) roadmap_sha256 does not match the referenced roadmap` as an **error**.
+
+  The pre-merge board split on it. The red-team seat called it blocking: the
+  validator is authoritative and prior stale pins do not override the contract.
+  The adversarial and correctness seats ruled the opposite — the field is
+  *provenance*, recording what the plan was planned against, and re-pinning
+  falsifies it, since this plan was demonstrably **not** planned against a
+  roadmap whose amendment block contains this plan's own closeout. The
+  correctness seat further noted that the phase-loop runtime deliberately
+  refuses to gate live behaviour on this hash, treating drift as
+  "not-corroborated" rather than an error.
+
+  Both readings are defensible; the maintainer chose to re-pin, so a shipped
+  artifact validates clean rather than normalising a validator error across
+  three plans. The planning-time binding is not lost — it is recoverable from
+  this file's own history. The v12 plans that ran before this one (TRISTATE,
+  FANOUT) still carry stale pins; UPDPATH is the first to refresh at closeout,
+  and that is the convention going forward.
+
+  Ordering matters and is easy to get wrong: the re-pin must be the **last**
+  step before merge. Computing it any earlier goes stale the moment a docs lane
+  or a board fix touches the roadmap again — which happened twice during this
+  phase's closeout.

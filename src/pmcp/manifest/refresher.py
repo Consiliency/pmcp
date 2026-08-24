@@ -68,6 +68,9 @@ def load_descriptions_cache(cache_path: Path | None = None) -> DescriptionsCache
             tools = [PrebuiltToolInfo(**t) for t in server_data.get("tools", [])]
             servers[name] = GeneratedServerDescriptions(
                 package=server_data.get("package", ""),
+                # Default to None, not "": an absent value must stay
+                # distinguishable from a recorded empty one.
+                package_type=server_data.get("package_type"),
                 version=server_data.get("version", ""),
                 generated_at=server_data.get("generated_at", ""),
                 capability_summary=server_data.get("capability_summary", ""),
@@ -101,6 +104,7 @@ def save_descriptions_cache(
         "servers": {
             name: {
                 "package": desc.package,
+                "package_type": desc.package_type,
                 "version": desc.version,
                 "generated_at": desc.generated_at,
                 "capability_summary": desc.capability_summary,
@@ -186,6 +190,45 @@ def _infer_risk(tool_name: str, description: str) -> str:
     return "low"
 
 
+# A package name or type that carries no identity information. `detect_package_type`
+# reports `"unknown"` for a command it cannot classify, and a cache written before
+# `package_type` existed reports `None`.
+_UNIDENTIFIED = ("", "unknown")
+
+
+def _same_package(
+    cached_package: str,
+    cached_type: str | None,
+    configured_package: str | None,
+    configured_type: str | None,
+) -> bool:
+    """Whether a cached entry and a configured server describe the same package.
+
+    Cached descriptions are paired with a server config by NAME, and freshness is
+    then decided by comparing versions. That answers "is the cache old" but not
+    "does the cache still describe this package", so a swap at an equal version
+    -- `old-pkg@1.0.0` cached against `new-pkg@1.0.0` configured -- serves the
+    wrong package's tool descriptions indefinitely.
+
+    **An unknown side means "cannot confirm identity", which resolves to
+    refresh -- never to "cannot compare, so skip the check."** Any of the four
+    values being empty, `None` or `"unknown"` therefore returns `False`, and at
+    every call site `False` means the freshness short-circuit does not fire.
+    The second reading is the natural one to reach for and is the same
+    fail-open collapse as `not is_version_newer(...)`, which shipped three
+    times (Consiliency/pmcp#155, #156, #163).
+
+    The type arms are not decorative: `package` is a bare name with no
+    ecosystem, so npm `foo` and pypi `foo` are indistinguishable without it,
+    and npm/pypi/cargo all produce orderable *release* versions so
+    `compare_versions` never reports them `incomparable`.
+    """
+    for value in (cached_package, cached_type, configured_package, configured_type):
+        if value is None or value in _UNIDENTIFIED:
+            return False
+    return cached_package == configured_package and cached_type == configured_type
+
+
 async def refresh_server(
     server_config: ServerConfig,
     existing_cache: GeneratedServerDescriptions | None = None,
@@ -209,16 +252,32 @@ async def refresh_server(
 
     server_name = server_config.name
 
+    # Determine package info. This MUST precede the freshness short-circuit
+    # below: the short-circuit cannot consult identity unless identity has
+    # already been resolved, which is why this resolution moved up here rather
+    # than being duplicated (Consiliency/pmcp#178, EC-UPDPATH-2).
+    pkg_type, pkg_name = detect_package_type(server_config.command, server_config.args)
+    if not pkg_name:
+        pkg_name = f"{server_config.command} {' '.join(server_config.args)}"
+
     # Check for staleness if we have cached data
     if existing_cache and not force:
         # Get current package version
-        version, pkg_type = await get_package_version(
+        version, fetched_type = await get_package_version(
             server_config.command, server_config.args
         )
 
+        # Identity before freshness: a version comparison is only meaningful
+        # once the cache is known to describe the package that is configured.
         if (
             version
-            and compare_versions(existing_cache.version, version, pkg_type)
+            and _same_package(
+                existing_cache.package,
+                existing_cache.package_type,
+                pkg_name,
+                pkg_type,
+            )
+            and compare_versions(existing_cache.version, version, fetched_type)
             == "not_newer"
         ):
             logger.debug(
@@ -227,11 +286,6 @@ async def refresh_server(
             return existing_cache
 
     logger.info(f"Refreshing descriptions for {server_name}...")
-
-    # Determine package info
-    pkg_type, pkg_name = detect_package_type(server_config.command, server_config.args)
-    if not pkg_name:
-        pkg_name = f"{server_config.command} {' '.join(server_config.args)}"
 
     # Get version
     version, _ = await get_package_version(server_config.command, server_config.args)
@@ -283,6 +337,7 @@ async def refresh_server(
 
                 return GeneratedServerDescriptions(
                     package=pkg_name,
+                    package_type=pkg_type,
                     version=version,
                     generated_at=datetime.now(timezone.utc).isoformat(),
                     capability_summary=capability_summary,
@@ -342,6 +397,16 @@ async def refresh_all(
     new_servers: dict[str, GeneratedServerDescriptions] = {}
     semaphore = asyncio.Semaphore(REFRESH_VERSION_LOOKUP_CONCURRENCY)
 
+    # Targeted servers whose cached entry does not describe the package the
+    # manifest now configures. `refresh_all` assembles the (cached, configured)
+    # pair itself, so it must apply the gate rather than rely on the callee, and
+    # such an entry must not come back through EITHER failure path below: the
+    # None/raise fallback returning it as a live result, or the merge loop at
+    # the end writing it straight back to disk. Dropping the entry when
+    # regeneration fails is acceptable; writing the wrong package's
+    # descriptions back is not.
+    mismatched: set[str] = set()
+
     async def refresh_target(
         name: str,
     ) -> tuple[str, GeneratedServerDescriptions | None]:
@@ -351,6 +416,20 @@ async def refresh_all(
             return name, None
 
         existing = existing_servers.get(name)
+        if existing is not None:
+            cfg_type, cfg_name = detect_package_type(
+                server_config.command, server_config.args
+            )
+            if not _same_package(
+                existing.package, existing.package_type, cfg_name, cfg_type
+            ):
+                logger.info(
+                    f"Cached descriptions for {name} do not confirm the "
+                    f"configured package (cached {existing.package!r}); "
+                    "discarding them and regenerating"
+                )
+                mismatched.add(name)
+                existing = None
 
         try:
             async with semaphore:
@@ -372,9 +451,11 @@ async def refresh_all(
         if result:
             new_servers[name] = result
 
-    # Merge with existing cache (keep servers not in target list)
+    # Merge with existing cache (keep servers not in target list). A targeted
+    # entry that failed the identity gate is deliberately absent from
+    # `new_servers`; re-adding it here would undo the gate.
     for name, desc in existing_servers.items():
-        if name not in new_servers:
+        if name not in new_servers and name not in mismatched:
             new_servers[name] = desc
 
     # Create new cache
@@ -415,9 +496,26 @@ async def check_staleness(
         if not server_config:
             continue
 
+        cfg_type, cfg_name = detect_package_type(
+            server_config.command, server_config.args
+        )
+
         version, pkg_type = await get_package_version(
             server_config.command, server_config.args
         )
+
+        # NOTE the inverted polarity relative to `refresh_server`. There, a
+        # match plus `not_newer` SKIPS a refresh, so an identity mismatch
+        # withholds the skip. Here, `newer` ADDS to the stale dict, so an
+        # identity mismatch must ADD -- porting that guard mechanically would
+        # report a swapped package as up to date, which is the defect.
+        if not _same_package(desc.package, desc.package_type, cfg_name, cfg_type):
+            stale_servers[name] = (desc.version, version or "unknown")
+            logger.info(
+                f"Server {name} is stale: cached package {desc.package!r} does "
+                f"not confirm the configured package {cfg_name!r}"
+            )
+            continue
 
         if version and compare_versions(desc.version, version, pkg_type) == "newer":
             stale_servers[name] = (desc.version, version)
