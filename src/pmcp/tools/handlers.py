@@ -4940,7 +4940,36 @@ class GatewayTools:
         )
 
     async def update_server(self, input_data: dict[str, Any]) -> UpdateServerOutput:
-        """gateway.update_server - Update a subordinate MCP package and restart it."""
+        """gateway.update_server - Update a subordinate MCP package and restart it.
+
+        The probe below is a 60-second await, and the config is re-resolved
+        after it before anything restarts. Two DIFFERENT things happen to the
+        child environment across that window, and they must not be described as
+        one:
+
+        1. A CONFIG-DRIVEN environment change is REFUSED. This includes every
+           manifest credential -- ``_manifest_server_to_config`` resolves it
+           into ``LocalMcpServerConfig.env`` at load time, so rotating it during
+           the probe makes the recheck's child environment differ from the
+           probe's and this tool returns ``ok=False`` without restarting: the
+           package is fetched but NOT activated and no version is recorded. The
+           guarantee is "the config restarted onto is the config that was
+           probed" (Consiliency/pmcp#151), so the operator's rotation applies on
+           the next update rather than to a process that was probed with the old
+           value.
+
+        2. A GENUINELY AMBIENT variable is LIVE at spawn. Both sides of the
+           guard below derive from ONE ``stripped_base``, so an ambient change
+           affects them equally and cancels out -- it can never cause a refusal.
+           ``sanitized_subprocess_env`` then calls ``os.environ.copy()`` at
+           spawn time, the same read ``connect``, ``refresh`` and
+           auto-reconnect reach, so the restarted server gets the value in force
+           when it is spawned, not the one in force when the update began.
+
+        Freezing the ambient environment across the update is deliberately NOT
+        done here; it would mean threading a frozen env through ClientManager,
+        which is a separate concern from this TOCTOU.
+        """
         parsed = UpdateServerInput.model_validate(input_data)
         server_name = parsed.server_name
 
@@ -5205,6 +5234,22 @@ class GatewayTools:
                 ):
                     desc_entry = self._descriptions_cache.servers[server_name]
                     desc_entry.version = latest_version
+                    # Re-label the entry with the package it now describes, not
+                    # just the version. This is a THIRD write site for package
+                    # identity alongside refresh_server's constructor and
+                    # save_descriptions_cache's dict, and omitting it re-opens
+                    # the exact defect the identity gate closes: an entry whose
+                    # `package` still names the OLD package while its version
+                    # and tools come from the NEW one. `_same_package` would
+                    # then CONFIRM identity against the stale label and the
+                    # short-circuit would serve the new package's descriptions
+                    # under the old package's name. It also strands a legacy
+                    # entry as permanently unverifiable, since `package_type`
+                    # would stay None even though we have just classified it.
+                    # Both are in scope from detect_package_type above, which
+                    # already refused an unclassifiable package.
+                    desc_entry.package = package_name
+                    desc_entry.package_type = package_type
                     # The restart just gave us a live, freshly-connected tool
                     # list for this server -- regenerate `tools`/`generated_at`
                     # from it too, not just `version`. Otherwise the entry
