@@ -95,12 +95,19 @@ _RECONCILE_RERUN_DEBOUNCE_S = 0.25
 # forever, and reconciliation runs on every downstream notification, so the
 # loop is reachable by a misbehaving peer rather than only at connect.
 #
-# Sized against the thing that consumes the result: `max_tools_per_server`
-# defaults to 100, and the MCP page size servers actually use is tens of
-# entries, so 50 pages clears any honest catalog by a wide margin while still
-# bounding a server that never stops paginating. Exceeding it makes the kind
-# UNREADABLE, not partial -- indexing a truncated view is what #173 was about.
-_MAX_LISTING_PAGES = 50
+# Exceeding it makes the kind UNREADABLE, not partial -- indexing a truncated
+# view is what #173 was about, so the bound must not resolve to "keep what we
+# got".
+#
+# That cuts both ways, which is why this is 500 and not the 50 first written
+# here (ah board review). Failing closed on an HONEST server is its own defect:
+# page size is the server's choice and 1 is legal, so a catalog of 100 tools --
+# `max_tools_per_server`'s own default -- can legitimately need 100 round trips,
+# and a 50-page cap would report that server as having no tools at all. The cap
+# is a runaway guard, not a catalog-size limit; 500 sequential round trips for
+# one kind is already pathological by any honest reading, while leaving real
+# small-page servers well inside it.
+_MAX_LISTING_PAGES = 500
 
 
 class DownstreamError(Exception):
