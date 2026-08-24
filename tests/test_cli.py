@@ -2379,3 +2379,238 @@ class TestCheckVersionsIdentityGate:
             "a cache for old-pkg against a config for new-pkg was not "
             f"reported at all (output: {out!r})"
         )
+
+
+class TestCheckVersionsUnverifiableDisplay:
+    """`pmcp refresh --check-versions` splits its report in two (EC-UPDPATH-7).
+
+    `check_staleness` returns one dict, but it holds two different things to
+    say to an operator. A server with a real newer version is actionable:
+    `pmcp refresh --force` settles it. A server whose latest version came back
+    `"unknown"` is not: for `node /opt/srv.js` there is no package to look up,
+    so the identity can never be confirmed, and the entry would be listed as
+    stale on every run forever under a remedy that cannot settle it.
+
+    The dict is the contract and it is correct -- the fix is at the point of
+    display, so these drive `async_main` end to end rather than asserting on
+    `check_staleness`. Fixtures follow `TestCheckVersionsIdentityGate`:
+    `load_manifest` is patched so the assertions do not depend on whichever
+    manifest overlays exist on the host, and `get_package_version` is patched
+    because it shells out to the network.
+    """
+
+    NEWER_HEADING = "servers with newer versions"
+    FORCE_FOOTER = "refresh --force"
+    UNVERIFIABLE_HEADING = "could not be confirmed"
+
+    @staticmethod
+    def _manifest(*names: str) -> Manifest:
+        """A manifest of *names* drawn from a fixed two-server cast.
+
+        `pkg` is classifiable (npx -> npm) and gets a real version back.
+        `local` is not: `node` classifies as `("unknown", None)`, which is the
+        whole subject of these tests.
+        """
+        cast = {
+            "pkg": ServerConfig(
+                name="pkg",
+                description="",
+                keywords=[],
+                install={},
+                command="npx",
+                args=["-y", "some-pkg"],
+            ),
+            "local": ServerConfig(
+                name="local",
+                description="",
+                keywords=[],
+                install={},
+                command="node",
+                args=["/opt/srv.js"],
+            ),
+        }
+        return Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={name: cast[name] for name in names},
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+    @staticmethod
+    def _write_cache(cache_dir: Path, **entries: str) -> None:
+        """Write a descriptions cache of *name*`=`*cached_version* entries.
+
+        Each entry records the package the server is configured with, so the
+        identity gate is satisfied for `pkg` and the version comparison alone
+        decides staleness. `local` records the `"{command} {args}"` fallback
+        that `refresh_server` writes for an unclassifiable server, with the
+        `"unknown"` type that makes its identity permanently unconfirmable.
+        """
+        packages = {
+            "pkg": ("some-pkg", "npm"),
+            "local": ("node /opt/srv.js", "unknown"),
+        }
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "descriptions.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "generated_at": "2025-01-01T00:00:00Z",
+                    "gateway_version": "1.0.0",
+                    "servers": {
+                        name: {
+                            "package": packages[name][0],
+                            "package_type": packages[name][1],
+                            "version": version,
+                            "generated_at": "2025-01-01T00:00:00Z",
+                            "capability_summary": f"{name} summary",
+                            "tools": [],
+                        }
+                        for name, version in entries.items()
+                    },
+                }
+            )
+        )
+
+    @staticmethod
+    async def _fake_version(
+        command: str, args: list[str], timeout: float = 10.0
+    ) -> tuple[str | None, str]:
+        """Stand in for the network: npm resolves, anything else does not."""
+        if command == "npx":
+            return ("2.0.0", "npm")
+        return (None, "unknown")
+
+    async def _run(self, cache_dir: Path, *names: str) -> None:
+        with patch(
+            "sys.argv",
+            [
+                "pmcp",
+                "refresh",
+                "--check-versions",
+                "--cache-dir",
+                str(cache_dir),
+            ],
+        ):
+            args = parse_args()
+
+        with patch(
+            "pmcp.manifest.refresher.load_manifest",
+            return_value=self._manifest(*names),
+        ):
+            with patch(
+                "pmcp.manifest.refresher.get_package_version",
+                new=AsyncMock(side_effect=self._fake_version),
+            ):
+                await async_main(args)
+
+    @pytest.mark.asyncio
+    async def test_unverifiable_only_is_not_offered_the_force_remedy(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The permanent-false-alarm case: report it, but do not prescribe.
+
+        `pmcp refresh --force` cannot settle this entry -- the next check still
+        cannot confirm the package -- so printing that footer sends an operator
+        after a fix that will not hold.
+        """
+        monkeypatch.chdir(tmp_path)
+        cache_dir = tmp_path / "cache"
+        self._write_cache(cache_dir, local="1.0.0")
+
+        await self._run(cache_dir, "local")
+
+        out = capsys.readouterr().out
+        assert self.UNVERIFIABLE_HEADING in out, (
+            f"an unconfirmable server was not reported separately: {out!r}"
+        )
+        assert "local" in out
+        assert self.FORCE_FOOTER not in out, (
+            "an unconfirmable server was offered --force, which cannot settle "
+            f"it: {out!r}"
+        )
+        assert self.NEWER_HEADING not in out, (
+            f"an unconfirmable server was reported as out of date: {out!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_genuinely_stale_still_prints_the_old_report(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """A real newer version is actionable and keeps its remedy verbatim."""
+        monkeypatch.chdir(tmp_path)
+        cache_dir = tmp_path / "cache"
+        self._write_cache(cache_dir, pkg="1.0.0")
+
+        await self._run(cache_dir, "pkg")
+
+        out = capsys.readouterr().out
+        assert "Found 1 servers with newer versions:" in out, out
+        assert "pkg: 1.0.0 -> 2.0.0" in out, out
+        assert "Run 'pmcp refresh --force' to update." in out, out
+        assert self.UNVERIFIABLE_HEADING not in out, (
+            f"a genuinely stale server was reported as unconfirmable: {out!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_mixed_result_sorts_each_server_into_its_own_group(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Membership, not mere presence -- both names print either way.
+
+        The footer is asserted to appear once and to fall in the stale section,
+        because a footer trailing the whole report reads as a remedy for the
+        unconfirmable servers too.
+        """
+        monkeypatch.chdir(tmp_path)
+        cache_dir = tmp_path / "cache"
+        self._write_cache(cache_dir, pkg="1.0.0", local="1.0.0")
+
+        await self._run(cache_dir, "pkg", "local")
+
+        out = capsys.readouterr().out
+        assert self.UNVERIFIABLE_HEADING in out, out
+        stale_section, _, unverifiable_section = out.partition(
+            self.UNVERIFIABLE_HEADING
+        )
+        assert "pkg: 1.0.0 -> 2.0.0" in stale_section, (
+            f"the genuinely stale server was not in the stale group: {out!r}"
+        )
+        assert "local" in unverifiable_section, (
+            f"the unconfirmable server was not in its own group: {out!r}"
+        )
+        assert "local" not in stale_section, (
+            f"the unconfirmable server was also reported as stale: {out!r}"
+        )
+        assert out.count(self.FORCE_FOOTER) == 1, out
+        assert self.FORCE_FOOTER in stale_section, (
+            "the --force footer trails the unconfirmable group, so it reads as "
+            f"a remedy for it: {out!r}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_report_is_unchanged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """The all-clear line is what operators grep for; leave it alone."""
+        monkeypatch.chdir(tmp_path)
+        cache_dir = tmp_path / "cache"
+        self._write_cache(cache_dir, pkg="2.0.0")
+
+        await self._run(cache_dir, "pkg")
+
+        out = capsys.readouterr().out
+        assert "All cached descriptions are up to date." in out, out
+        assert self.UNVERIFIABLE_HEADING not in out, out
+        assert self.FORCE_FOOTER not in out, out
