@@ -1,6 +1,359 @@
 {
   "plans": [
     {
+      "acceptance_criteria_count": 8,
+      "created_at": "2026-07-26T06:42:14Z",
+      "file": "plans/detailed-103-scoped-advisor-audit-20260726.md",
+      "handoff_ref": null,
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-07-26T06:42:14Z",
+          "by": "codex-execute-detailed",
+          "metadata": {
+            "branch": "codex/103-scoped-advisor-audit",
+            "source_plan": "Consiliency/agent-harness plans/detailed-310-pmcp-scoped-advisor-prerequisite-20260726.md"
+          },
+          "transition": "executing"
+        },
+        {
+          "at": "2026-07-26T06:54:58Z",
+          "by": "codex-execute-detailed",
+          "metadata": {
+            "acceptance_status": "satisfied",
+            "diagnostic": "verified and ready for exact-head review",
+            "dirty_path_classification": "all tracked changes plan-owned",
+            "doc_delta_decision": "docs_and_release_metadata_updated",
+            "full_suite": "2250 passed, 3 skipped, 24 deselected",
+            "reflection_path": "/home/viperjuice/.codex/skills/codex-execute-detailed/reflections/a40182b2/codex-103-scoped-advisor-audit/20260726T064214Z-05-103-scoped-advisor-audit.md",
+            "run_id": "20260726T064214Z-05-103-scoped-advisor-audit",
+            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
+            "verification_status": "passed",
+            "verification_summary": "PASS - strict policy, control filtering, pre-lazy-start denial, correlated private audit, four isolated stdio instances, capability probe, lint, typecheck, and full suite passed."
+          },
+          "transition": "completed"
+        },
+        {
+          "at": "2026-07-26T07:24:11Z",
+          "by": "codex-execute-detailed",
+          "metadata": {
+            "acceptance_status": "satisfied_after_panel_reconciliation",
+            "diagnostic": "exact-head review blockers reconciled and complete suite reverified",
+            "full_suite": "2251 passed, 3 skipped, 24 deselected",
+            "panel_reconciliation": "latched audit failure; deny resource and prompt surfaces; ASCII correlations; privacy-safe unknown controls; single-use ledgers; pre-start describe denial; scoped discovery suppression only with active audited session",
+            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
+            "verification_status": "passed",
+            "verification_summary": "PASS - all exact-head Codex and Grok blockers reconciled; lint, format, typecheck, focused compatibility, and full suite passed."
+          },
+          "transition": "completed"
+        },
+        {
+          "at": "2026-07-26T07:52:23Z",
+          "by": "codex-execute-detailed",
+          "metadata": {
+            "acceptance_status": "satisfied_after_second_panel_reconciliation",
+            "diagnostic": "Grok exact-head discovery finding reproduced and closed",
+            "focused_suite": "195 passed",
+            "full_suite": "2251 passed, 3 skipped, 24 deselected",
+            "panel_reconciliation": "audited scoped catalog now suppresses registry candidates and stale update notices; adversarial injected-result regression added",
+            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
+            "verification_status": "passed"
+          },
+          "transition": "completed"
+        }
+      ],
+      "owner_skill": "codex-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": null,
+      "roadmap_ref": null,
+      "slug": "detailed-103-scoped-advisor-audit-20260726",
+      "status": "completed",
+      "task_summary": "Release fail-closed scoped advisor policy and privacy-safe audit capability for Consiliency/pmcp#103.",
+      "type": "detailed",
+      "updated_at": "2026-07-26T07:52:23Z"
+    },
+    {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-07-06T09:20:00Z",
+      "file": "plans/detailed-describe-nested-schema-and-indexit-stdio-20260706-0920.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/20260706T0920Z-describe-nested-schema-indexit-stdio.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-07-06T09:20:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "artifact_state": "staged"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": null,
+      "roadmap_ref": null,
+      "slug": "detailed-describe-nested-schema-indexit-stdio",
+      "status": "committed",
+      "task_summary": "gateway.describe nested-schema fidelity (#87) + index-it-mcp stdio transport & pilot docs (#89); ship v1.19.1",
+      "type": "detailed",
+      "updated_at": "2026-07-06T09:20:00Z"
+    },
+    {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-06-28T06:46:00Z",
+      "file": "plans/detailed-idle-timeout-downstream-calls-20260628-0646.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/20260628T0646Z-idle-timeout.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-06-28T06:46:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "artifact_state": "staged"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": null,
+      "roadmap_ref": null,
+      "slug": "detailed-idle-timeout-downstream-calls",
+      "status": "committed",
+      "task_summary": "Convert downstream-call timeout to inactivity (idle) timeout with absolute ceiling (#79 symptom 1a)",
+      "type": "detailed",
+      "updated_at": "2026-06-28T06:46:00Z"
+    },
+    {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-06-29T08:41:00Z",
+      "file": "plans/detailed-private-manifest-overlay-20260629-0841.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/20260629T0841Z-private-manifest-overlay.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-06-29T08:41:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "artifact_state": "staged"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": null,
+      "roadmap_ref": null,
+      "slug": "detailed-private-manifest-overlay",
+      "status": "committed",
+      "task_summary": "Private/custom MCP manifest overlay merged in load_manifest (user/project/PMCP_MANIFEST_PATH); ship v1.18.0",
+      "type": "detailed",
+      "updated_at": "2026-06-29T08:41:00Z"
+    },
+    {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-08-05T17:40:00Z",
+      "file": "plans/detailed-mcp-2x-spec-2026-07-28-stage1-20260805-1740.md",
+      "handoff_ref": null,
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-08-05T17:40:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "branch": "main",
+            "follows": "Consiliency/pmcp#111",
+            "spec": "2026-07-28",
+            "stage": "1 of 3"
+          },
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": null,
+      "roadmap_ref": null,
+      "slug": "mcp-2x-spec-2026-07-28-stage1",
+      "status": "committed",
+      "task_summary": "Port pmcp onto mcp 2.x (spec 2026-07-28), stage 1: runtime parity \u2014 raise the cap, re-register the six lowlevel handlers, extend the downstream version ladder. server/discover and subscriptions are stages 2-3.",
+      "type": "detailed",
+      "updated_at": "2026-08-05T17:40:00Z"
+    },
+    {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-08-01T15:30:00Z",
+      "file": "plans/detailed-overlay-server-env-patch-20260801-1530.md",
+      "handoff_ref": null,
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-08-01T15:30:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "branch": "feat/manifest-extra-env",
+            "issue": "Consiliency/pmcp#105",
+            "part": "2 of 2"
+          },
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": null,
+      "roadmap_ref": null,
+      "slug": "overlay-server-env-patch",
+      "status": "committed",
+      "task_summary": "Let a private overlay point a shipped manifest server at a non-default endpoint without redeclaring the whole entry (part 2 of #105).",
+      "type": "detailed",
+      "updated_at": "2026-08-01T15:30:00Z"
+    },
+    {
+      "acceptance_criteria_count": null,
+      "created_at": "2026-08-05T00:00:00Z",
+      "file": "plans/phase-plan-v11-P1.md",
+      "handoff_ref": null,
+      "if_gates_produced": [
+        "IF-0-P1-1"
+      ],
+      "lanes": [
+        "SL-1",
+        "SL-2",
+        "SL-3"
+      ],
+      "lifecycle": [
+        {
+          "at": "2026-08-05T00:00:00Z",
+          "by": "claude-plan-phase",
+          "metadata": {
+            "artifact_state": "staged",
+            "branch": "plan/v11-p1",
+            "roadmap_sha256": "2f03c6f3c01d903e55b87bdbe4ca8b9b25fcbb318a48a30161d35cd6b76b3be0"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-phase",
+      "phase_alias": "P1",
+      "reflection_ref": null,
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v11.md",
+        "slug": "phase-plans-v11",
+        "status": "committed",
+        "type": "roadmap"
+      },
+      "slug": "phase-plan-v11-P1",
+      "status": "committed",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-08-05T00:00:00Z"
+    },
+    {
+      "acceptance_criteria_count": null,
+      "created_at": "2026-08-05T23:44:50Z",
+      "file": "plans/phase-plan-v11-P6CLEAN.md",
+      "handoff_ref": null,
+      "if_gates_produced": [
+        "IF-0-P6CLEAN-1"
+      ],
+      "lanes": [
+        "SL-0",
+        "SL-1"
+      ],
+      "lifecycle": [
+        {
+          "at": "2026-08-05T23:44:50Z",
+          "by": "claude-plan-phase",
+          "metadata": {
+            "artifact_state": "committed",
+            "branch": "plan/v11-p6clean",
+            "reconciled": "board-findings-gateway-acceptance-and-cross-phase-serialization",
+            "roadmap_sha256": "2f03c6f3c01d903e55b87bdbe4ca8b9b25fcbb318a48a30161d35cd6b76b3be0"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-phase",
+      "phase_alias": "P6CLEAN",
+      "reflection_ref": null,
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v11.md",
+        "slug": "phase-plans-v11",
+        "status": "committed",
+        "type": "roadmap"
+      },
+      "slug": "phase-plan-v11-P6CLEAN",
+      "status": "committed",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-08-05T23:44:50Z"
+    },
+    {
+      "acceptance_criteria_count": null,
+      "created_at": "2026-08-05T00:00:00Z",
+      "file": "plans/phase-plan-v11-PG.md",
+      "handoff_ref": null,
+      "if_gates_produced": [
+        "IF-0-PG-1"
+      ],
+      "lanes": [
+        "SL-0",
+        "SL-1",
+        "SL-2",
+        "SL-3"
+      ],
+      "lifecycle": [
+        {
+          "at": "2026-08-05T00:00:00Z",
+          "by": "claude-plan-phase",
+          "metadata": {
+            "artifact_state": "staged",
+            "branch": "plan/v11-pg-doc",
+            "roadmap_sha256": "2f03c6f3c01d903e55b87bdbe4ca8b9b25fcbb318a48a30161d35cd6b76b3be0",
+            "target_repo": "Consiliency/pangram-mcp"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-phase",
+      "phase_alias": "PG",
+      "reflection_ref": null,
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v11.md",
+        "slug": "phase-plans-v11",
+        "status": "committed",
+        "type": "roadmap"
+      },
+      "slug": "phase-plan-v11-PG",
+      "status": "committed",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-08-05T00:00:00Z"
+    },
+    {
+      "acceptance_criteria_count": null,
+      "created_at": "2026-08-24T00:00:00Z",
+      "file": "plans/phase-plan-v12-UPDPATH.md",
+      "handoff_ref": null,
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [],
+      "owner_skill": "claude-plan-phase",
+      "phase_alias": null,
+      "reflection_ref": null,
+      "roadmap_ref": null,
+      "slug": "phase-plan-v12-UPDPATH",
+      "status": "committed",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-08-24T00:00:00Z"
+    },
+    {
       "acceptance_criteria_count": null,
       "created_at": "2026-06-15T07:28:43Z",
       "file": "plans/phase-plan-v7-CONCURR.md",
@@ -348,6 +701,95 @@
       "task_summary": null,
       "type": "phase",
       "updated_at": "2026-06-25T02:28:14Z"
+    },
+    {
+      "acceptance_criteria_count": null,
+      "created_at": "2026-08-05T23:41:05Z",
+      "file": "plans/phase-plan-v11-P5.md",
+      "handoff_ref": null,
+      "if_gates_produced": [
+        "IF-0-P5-1",
+        "IF-0-P5-2",
+        "IF-0-P5-3",
+        "IF-0-P5-4"
+      ],
+      "lanes": [
+        "SL-1",
+        "SL-2",
+        "SL-3",
+        "SL-4",
+        "SL-5"
+      ],
+      "lifecycle": [
+        {
+          "at": "2026-08-05T23:41:05Z",
+          "by": "claude-plan-phase",
+          "metadata": {
+            "artifact_state": "committed",
+            "branch": "plan/v11-p5",
+            "issue": "Consiliency/pmcp#114",
+            "roadmap_sha256": "2f03c6f3c01d903e55b87bdbe4ca8b9b25fcbb318a48a30161d35cd6b76b3be0"
+          },
+          "transition": "planned"
+        },
+        {
+          "at": "2026-08-06T00:13:15Z",
+          "by": "claude-plan-phase",
+          "metadata": {
+            "artifact_state": "committed",
+            "branch": "plan/v11-p5",
+            "consumer_count": "6 -> 7 (src/pmcp/cli.py run_init)",
+            "review": "4-seat board; 4 blocking findings reconciled"
+          },
+          "transition": "planned"
+        },
+        {
+          "at": "2026-08-06T00:36:36Z",
+          "by": "claude-plan-phase",
+          "metadata": {
+            "artifact_state": "committed",
+            "branch": "plan/v11-p5",
+            "fixes": "nonexistent build_server_env -> build_install_child_env + _manifest_server_to_config; consumer 5 extra_env leak into required_keys; boot isolation via --policy per P6CLEAN cbe98be",
+            "review": "re-review; 3 blockers reconciled"
+          },
+          "transition": "planned"
+        },
+        {
+          "at": "2026-08-06T01:06:20Z",
+          "by": "claude-plan-phase",
+          "metadata": {
+            "artifact_state": "committed",
+            "branch": "plan/v11-p5",
+            "fixes": "_manifest_server_to_config requires env_lookup (2 args); predicate gains child_env for the configured-duplicate override path",
+            "review": "final board; 2 blockers reconciled"
+          },
+          "transition": "planned"
+        },
+        {
+          "at": "2026-08-06T01:10:28Z",
+          "by": "claude-plan-phase",
+          "metadata": {
+            "artifact_state": "committed",
+            "branch": "plan/v11-p5",
+            "fixes": "uppercase alias for PLAN_RE; dropped detailed-only fields; boot tripwire lazy+eager==1; pgrep -P zero-children"
+          },
+          "transition": "planned"
+        }
+      ],
+      "owner_skill": "claude-plan-phase",
+      "phase_alias": "P5",
+      "reflection_ref": null,
+      "roadmap_ref": {
+        "file": "specs/phase-plans-v11.md",
+        "slug": "phase-plans-v11",
+        "status": "imported",
+        "type": "phase"
+      },
+      "slug": "v11-P5",
+      "status": "committed",
+      "task_summary": null,
+      "type": "phase",
+      "updated_at": "2026-08-06T01:10:28Z"
     },
     {
       "acceptance_criteria_count": null,
@@ -711,398 +1153,6 @@
       "task_summary": null,
       "type": "phase",
       "updated_at": "2026-06-25T02:26:25Z"
-    },
-    {
-      "acceptance_criteria_count": 5,
-      "created_at": "2026-06-28T06:46:00Z",
-      "file": "plans/detailed-idle-timeout-downstream-calls-20260628-0646.md",
-      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/20260628T0646Z-idle-timeout.md",
-      "lifecycle": [
-        {
-          "at": "2026-06-28T06:46:00Z",
-          "by": "claude-plan-detailed",
-          "metadata": {
-            "artifact_state": "staged"
-          },
-          "transition": "planned"
-        }
-      ],
-      "owner_skill": "claude-plan-detailed",
-      "slug": "detailed-idle-timeout-downstream-calls",
-      "status": "committed",
-      "task_summary": "Convert downstream-call timeout to inactivity (idle) timeout with absolute ceiling (#79 symptom 1a)",
-      "type": "detailed",
-      "updated_at": "2026-06-28T06:46:00Z"
-    },
-    {
-      "acceptance_criteria_count": 5,
-      "created_at": "2026-06-29T08:41:00Z",
-      "file": "plans/detailed-private-manifest-overlay-20260629-0841.md",
-      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/20260629T0841Z-private-manifest-overlay.md",
-      "lifecycle": [
-        {
-          "at": "2026-06-29T08:41:00Z",
-          "by": "claude-plan-detailed",
-          "metadata": {
-            "artifact_state": "staged"
-          },
-          "transition": "planned"
-        }
-      ],
-      "owner_skill": "claude-plan-detailed",
-      "slug": "detailed-private-manifest-overlay",
-      "status": "committed",
-      "task_summary": "Private/custom MCP manifest overlay merged in load_manifest (user/project/PMCP_MANIFEST_PATH); ship v1.18.0",
-      "type": "detailed",
-      "updated_at": "2026-06-29T08:41:00Z"
-    },
-    {
-      "acceptance_criteria_count": 5,
-      "created_at": "2026-07-06T09:20:00Z",
-      "file": "plans/detailed-describe-nested-schema-and-indexit-stdio-20260706-0920.md",
-      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/20260706T0920Z-describe-nested-schema-indexit-stdio.md",
-      "lifecycle": [
-        {
-          "at": "2026-07-06T09:20:00Z",
-          "by": "claude-plan-detailed",
-          "metadata": {
-            "artifact_state": "staged"
-          },
-          "transition": "planned"
-        }
-      ],
-      "owner_skill": "claude-plan-detailed",
-      "slug": "detailed-describe-nested-schema-indexit-stdio",
-      "status": "committed",
-      "task_summary": "gateway.describe nested-schema fidelity (#87) + index-it-mcp stdio transport & pilot docs (#89); ship v1.19.1",
-      "type": "detailed",
-      "updated_at": "2026-07-06T09:20:00Z"
-    },
-    {
-      "acceptance_criteria_count": 8,
-      "created_at": "2026-07-26T06:42:14Z",
-      "file": "plans/detailed-103-scoped-advisor-audit-20260726.md",
-      "handoff_ref": null,
-      "lifecycle": [
-        {
-          "at": "2026-07-26T06:42:14Z",
-          "by": "codex-execute-detailed",
-          "metadata": {
-            "branch": "codex/103-scoped-advisor-audit",
-            "source_plan": "Consiliency/agent-harness plans/detailed-310-pmcp-scoped-advisor-prerequisite-20260726.md"
-          },
-          "transition": "executing"
-        },
-        {
-          "at": "2026-07-26T06:54:58Z",
-          "by": "codex-execute-detailed",
-          "metadata": {
-            "acceptance_status": "satisfied",
-            "diagnostic": "verified and ready for exact-head review",
-            "dirty_path_classification": "all tracked changes plan-owned",
-            "doc_delta_decision": "docs_and_release_metadata_updated",
-            "full_suite": "2250 passed, 3 skipped, 24 deselected",
-            "reflection_path": "/home/viperjuice/.codex/skills/codex-execute-detailed/reflections/a40182b2/codex-103-scoped-advisor-audit/20260726T064214Z-05-103-scoped-advisor-audit.md",
-            "run_id": "20260726T064214Z-05-103-scoped-advisor-audit",
-            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
-            "verification_status": "passed",
-            "verification_summary": "PASS - strict policy, control filtering, pre-lazy-start denial, correlated private audit, four isolated stdio instances, capability probe, lint, typecheck, and full suite passed."
-          },
-          "transition": "completed"
-        },
-        {
-          "at": "2026-07-26T07:24:11Z",
-          "by": "codex-execute-detailed",
-          "metadata": {
-            "acceptance_status": "satisfied_after_panel_reconciliation",
-            "diagnostic": "exact-head review blockers reconciled and complete suite reverified",
-            "full_suite": "2251 passed, 3 skipped, 24 deselected",
-            "panel_reconciliation": "latched audit failure; deny resource and prompt surfaces; ASCII correlations; privacy-safe unknown controls; single-use ledgers; pre-start describe denial; scoped discovery suppression only with active audited session",
-            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
-            "verification_status": "passed",
-            "verification_summary": "PASS - all exact-head Codex and Grok blockers reconciled; lint, format, typecheck, focused compatibility, and full suite passed."
-          },
-          "transition": "completed"
-        },
-        {
-          "at": "2026-07-26T07:52:23Z",
-          "by": "codex-execute-detailed",
-          "metadata": {
-            "acceptance_status": "satisfied_after_second_panel_reconciliation",
-            "diagnostic": "Grok exact-head discovery finding reproduced and closed",
-            "focused_suite": "195 passed",
-            "full_suite": "2251 passed, 3 skipped, 24 deselected",
-            "panel_reconciliation": "audited scoped catalog now suppresses registry candidates and stale update notices; adversarial injected-result regression added",
-            "verification_artifact_path": "/tmp/codex-execute-detailed-pmcp-103-scoped-advisor-audit-verification.md",
-            "verification_status": "passed"
-          },
-          "transition": "completed"
-        }
-      ],
-      "owner_skill": "codex-plan-detailed",
-      "slug": "detailed-103-scoped-advisor-audit-20260726",
-      "status": "completed",
-      "task_summary": "Release fail-closed scoped advisor policy and privacy-safe audit capability for Consiliency/pmcp#103.",
-      "type": "detailed",
-      "updated_at": "2026-07-26T07:52:23Z"
-    },
-    {
-      "acceptance_criteria_count": 5,
-      "created_at": "2026-08-01T15:30:00Z",
-      "file": "plans/detailed-overlay-server-env-patch-20260801-1530.md",
-      "handoff_ref": null,
-      "lifecycle": [
-        {
-          "at": "2026-08-01T15:30:00Z",
-          "by": "claude-plan-detailed",
-          "metadata": {
-            "branch": "feat/manifest-extra-env",
-            "issue": "Consiliency/pmcp#105",
-            "part": "2 of 2"
-          },
-          "transition": "committed"
-        }
-      ],
-      "owner_skill": "claude-plan-detailed",
-      "slug": "overlay-server-env-patch",
-      "status": "committed",
-      "task_summary": "Let a private overlay point a shipped manifest server at a non-default endpoint without redeclaring the whole entry (part 2 of #105).",
-      "type": "detailed",
-      "updated_at": "2026-08-01T15:30:00Z"
-    },
-    {
-      "acceptance_criteria_count": 5,
-      "created_at": "2026-08-05T17:40:00Z",
-      "file": "plans/detailed-mcp-2x-spec-2026-07-28-stage1-20260805-1740.md",
-      "handoff_ref": null,
-      "lifecycle": [
-        {
-          "at": "2026-08-05T17:40:00Z",
-          "by": "claude-plan-detailed",
-          "metadata": {
-            "branch": "main",
-            "follows": "Consiliency/pmcp#111",
-            "spec": "2026-07-28",
-            "stage": "1 of 3"
-          },
-          "transition": "committed"
-        }
-      ],
-      "owner_skill": "claude-plan-detailed",
-      "slug": "mcp-2x-spec-2026-07-28-stage1",
-      "status": "committed",
-      "task_summary": "Port pmcp onto mcp 2.x (spec 2026-07-28), stage 1: runtime parity \u2014 raise the cap, re-register the six lowlevel handlers, extend the downstream version ladder. server/discover and subscriptions are stages 2-3.",
-      "type": "detailed",
-      "updated_at": "2026-08-05T17:40:00Z"
-    },
-    {
-      "created_at": "2026-08-05T23:44:50Z",
-      "file": "plans/phase-plan-v11-P6CLEAN.md",
-      "handoff_ref": null,
-      "if_gates_produced": [
-        "IF-0-P6CLEAN-1"
-      ],
-      "lanes": [
-        "SL-0",
-        "SL-1"
-      ],
-      "lifecycle": [
-        {
-          "at": "2026-08-05T23:44:50Z",
-          "by": "claude-plan-phase",
-          "metadata": {
-            "artifact_state": "committed",
-            "branch": "plan/v11-p6clean",
-            "reconciled": "board-findings-gateway-acceptance-and-cross-phase-serialization",
-            "roadmap_sha256": "2f03c6f3c01d903e55b87bdbe4ca8b9b25fcbb318a48a30161d35cd6b76b3be0"
-          },
-          "transition": "planned"
-        }
-      ],
-      "owner_skill": "claude-plan-phase",
-      "phase_alias": "P6CLEAN",
-      "reflection_ref": null,
-      "roadmap_ref": {
-        "file": "specs/phase-plans-v11.md",
-        "slug": "phase-plans-v11",
-        "status": "committed",
-        "type": "roadmap"
-      },
-      "slug": "phase-plan-v11-P6CLEAN",
-      "status": "committed",
-      "type": "phase",
-      "updated_at": "2026-08-05T23:44:50Z"
-    },
-    {
-      "acceptance_criteria_count": null,
-      "created_at": "2026-08-05T00:00:00Z",
-      "file": "plans/phase-plan-v11-P1.md",
-      "handoff_ref": null,
-      "if_gates_produced": [
-        "IF-0-P1-1"
-      ],
-      "lanes": [
-        "SL-1",
-        "SL-2",
-        "SL-3"
-      ],
-      "lifecycle": [
-        {
-          "at": "2026-08-05T00:00:00Z",
-          "by": "claude-plan-phase",
-          "metadata": {
-            "artifact_state": "staged",
-            "branch": "plan/v11-p1",
-            "roadmap_sha256": "2f03c6f3c01d903e55b87bdbe4ca8b9b25fcbb318a48a30161d35cd6b76b3be0"
-          },
-          "transition": "planned"
-        }
-      ],
-      "owner_skill": "claude-plan-phase",
-      "phase_alias": "P1",
-      "reflection_ref": null,
-      "roadmap_ref": {
-        "file": "specs/phase-plans-v11.md",
-        "slug": "phase-plans-v11",
-        "status": "committed",
-        "type": "roadmap"
-      },
-      "slug": "phase-plan-v11-P1",
-      "status": "committed",
-      "task_summary": null,
-      "type": "phase",
-      "updated_at": "2026-08-05T00:00:00Z"
-    },
-    {
-      "acceptance_criteria_count": null,
-      "created_at": "2026-08-05T23:41:05Z",
-      "file": "plans/phase-plan-v11-P5.md",
-      "handoff_ref": null,
-      "if_gates_produced": [
-        "IF-0-P5-1",
-        "IF-0-P5-2",
-        "IF-0-P5-3",
-        "IF-0-P5-4"
-      ],
-      "lanes": [
-        "SL-1",
-        "SL-2",
-        "SL-3",
-        "SL-4",
-        "SL-5"
-      ],
-      "lifecycle": [
-        {
-          "at": "2026-08-05T23:41:05Z",
-          "by": "claude-plan-phase",
-          "metadata": {
-            "artifact_state": "committed",
-            "branch": "plan/v11-p5",
-            "issue": "Consiliency/pmcp#114",
-            "roadmap_sha256": "2f03c6f3c01d903e55b87bdbe4ca8b9b25fcbb318a48a30161d35cd6b76b3be0"
-          },
-          "transition": "planned"
-        },
-        {
-          "at": "2026-08-06T00:13:15Z",
-          "by": "claude-plan-phase",
-          "metadata": {
-            "artifact_state": "committed",
-            "branch": "plan/v11-p5",
-            "consumer_count": "6 -> 7 (src/pmcp/cli.py run_init)",
-            "review": "4-seat board; 4 blocking findings reconciled"
-          },
-          "transition": "planned"
-        },
-        {
-          "at": "2026-08-06T00:36:36Z",
-          "by": "claude-plan-phase",
-          "metadata": {
-            "artifact_state": "committed",
-            "branch": "plan/v11-p5",
-            "fixes": "nonexistent build_server_env -> build_install_child_env + _manifest_server_to_config; consumer 5 extra_env leak into required_keys; boot isolation via --policy per P6CLEAN cbe98be",
-            "review": "re-review; 3 blockers reconciled"
-          },
-          "transition": "planned"
-        },
-        {
-          "at": "2026-08-06T01:06:20Z",
-          "by": "claude-plan-phase",
-          "metadata": {
-            "artifact_state": "committed",
-            "branch": "plan/v11-p5",
-            "fixes": "_manifest_server_to_config requires env_lookup (2 args); predicate gains child_env for the configured-duplicate override path",
-            "review": "final board; 2 blockers reconciled"
-          },
-          "transition": "planned"
-        },
-        {
-          "at": "2026-08-06T01:10:28Z",
-          "by": "claude-plan-phase",
-          "metadata": {
-            "artifact_state": "committed",
-            "branch": "plan/v11-p5",
-            "fixes": "uppercase alias for PLAN_RE; dropped detailed-only fields; boot tripwire lazy+eager==1; pgrep -P zero-children"
-          },
-          "transition": "planned"
-        }
-      ],
-      "owner_skill": "claude-plan-phase",
-      "phase_alias": "P5",
-      "reflection_ref": null,
-      "roadmap_ref": {
-        "file": "specs/phase-plans-v11.md",
-        "slug": "phase-plans-v11",
-        "status": "imported",
-        "type": "phase"
-      },
-      "slug": "v11-P5",
-      "status": "committed",
-      "task_summary": null,
-      "type": "phase",
-      "updated_at": "2026-08-06T01:10:28Z"
-    },
-    {
-      "acceptance_criteria_count": null,
-      "created_at": "2026-08-05T00:00:00Z",
-      "file": "plans/phase-plan-v11-PG.md",
-      "handoff_ref": null,
-      "if_gates_produced": [
-        "IF-0-PG-1"
-      ],
-      "lanes": [
-        "SL-0",
-        "SL-1",
-        "SL-2",
-        "SL-3"
-      ],
-      "lifecycle": [
-        {
-          "at": "2026-08-05T00:00:00Z",
-          "by": "claude-plan-phase",
-          "metadata": {
-            "artifact_state": "staged",
-            "branch": "plan/v11-pg-doc",
-            "roadmap_sha256": "2f03c6f3c01d903e55b87bdbe4ca8b9b25fcbb318a48a30161d35cd6b76b3be0",
-            "target_repo": "Consiliency/pangram-mcp"
-          },
-          "transition": "planned"
-        }
-      ],
-      "owner_skill": "claude-plan-phase",
-      "phase_alias": "PG",
-      "reflection_ref": null,
-      "roadmap_ref": {
-        "file": "specs/phase-plans-v11.md",
-        "slug": "phase-plans-v11",
-        "status": "committed",
-        "type": "roadmap"
-      },
-      "slug": "phase-plan-v11-PG",
-      "status": "committed",
-      "task_summary": null,
-      "type": "phase",
-      "updated_at": "2026-08-05T00:00:00Z"
     }
   ],
   "schema_version": 1
