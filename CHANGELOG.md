@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Catalog listings are now read to the end.** `tools/list`, `resources/list`
+  and `prompts/list` were sent once with no cursor and whatever came back was
+  taken as the whole catalog, so a downstream with more entries than its page
+  size had the rest silently missing. That truncation predated downstream
+  fan-out, but once reconciliation began publishing `list_changed` it started
+  asserting the catalog was current over a partial view — and re-applying the
+  truncation on every downstream notification rather than once at connect.
+  `nextCursor` (and the `next_cursor` spelling) is now followed to the end.
+
+  A failure on **any** page makes the whole kind unreadable rather than
+  partial: prior entries are kept and nothing is published. Merging the pages
+  that did arrive would drop entries the server still has and announce the drop
+  — the same false-removal shape this module has been corrected for repeatedly.
+  Following the cursor is bounded, and a server that repeats a cursor or never
+  stops paginating is treated as unreadable rather than looping or indexing a
+  truncated view.
+
+  Connect and refresh share this path, so they read complete listings too.
+  One consequence worth stating plainly: a server whose `tools/list` fails on a
+  *later* page now connects successfully with an empty tools catalog, where
+  before pagination existed there was no later page to fail. Only a page-one
+  failure is still a connect error. That matches how connect already treats a
+  first page whose every entry is unparseable, but such a server sits at zero
+  tools until a downstream notification or a refresh reconciles it.
+
+
 ### Added
 - **A downstream server's own `notifications/tools/list_changed`,
   `notifications/resources/list_changed`, and `notifications/prompts/list_changed`

@@ -19,6 +19,7 @@ import httpx2
 import pytest
 
 from pmcp.client.manager import (
+    _MAX_LISTING_PAGES,
     ClientManager,
     DEFAULT_SCHEMA_DIALECT,
     ManagedClient,
@@ -4000,10 +4001,18 @@ class TestDownstreamReconcileScheduler:
         # Give the spawned task room to start and block on the gate.
         for _ in range(10):
             await asyncio.sleep(0)
-        assert calls == ["tools/list"], "reconcile did not start"
+        assert "tools/list" in calls, "reconcile did not start"
         assert "srv::alpha" not in manager._tools, (
             "reconcile completed inline; it must not have, the gate is still shut"
         )
+        # This used to assert `calls == ["tools/list"]`, which encoded the old
+        # sequencing -- tools was awaited to completion before resources and
+        # prompts were even started. Consiliency/pmcp#174 gathers all three
+        # together so a failure on a later tools page cannot starve the other
+        # two kinds, so all three requests are now in flight here. The property
+        # under test is unchanged and still proven by the two assertions above:
+        # the handler returned while the gate is shut, and nothing was indexed.
+        assert set(calls) <= {"tools/list", "resources/list", "prompts/list"}
 
         gate.set()
         await self._drain(manager)
@@ -5289,6 +5298,290 @@ class TestReconcileMalformedEntryResilience:
 
         assert manager._catalog_suppressed == {}
         assert not manager._catalog_publishing_suppressed("srv")
+
+
+class TestListingPagination:
+    """Consiliency/pmcp#173: `nextCursor` was never followed.
+
+    The listing path sent `{}` once and kept page one, so a downstream with
+    more entries than its page size had the rest silently missing -- and, once
+    reconciliation began publishing, announced as removed. The truncation
+    predated fan-out; asserting freshness over a partial view is what made it
+    worth fixing.
+
+    The rule these pin: a failure on ANY page makes the WHOLE kind unreadable,
+    never partial. Merging the pages that did arrive is the same false-removal
+    shape corrected four times over in this module -- entries the server still
+    has, dropped and the drop published.
+    """
+
+    _managed = staticmethod(TestReconcileMalformedEntryResilience._managed)
+    _drain = staticmethod(TestReconcileMalformedEntryResilience._drain)
+
+    @staticmethod
+    def _wire_pages(manager: ClientManager, pages: list[Any]) -> None:
+        """Serve `tools/list` from `pages`, indexed by cursor.
+
+        Cursor `pN` selects `pages[N]`; the first request carries none and gets
+        `pages[0]`. An element that is an exception is raised instead of
+        returned, which is how a mid-pagination transport failure is expressed.
+        """
+
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            if method != "tools/list":
+                return {method.split("/")[0]: []}
+            cursor = params.get("cursor")
+            index = 0 if cursor is None else int(str(cursor)[1:])
+            page = pages[index]
+            if isinstance(page, BaseException):
+                raise page
+            return cast(dict[str, Any], page)
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+
+    async def _prime_then(
+        self, pages: list[Any]
+    ) -> tuple[ClientManager, _RecordingSink, int]:
+        """Index one seed tool, then re-list `tools` from `pages`.
+
+        Priming over a populated catalog is what makes a false removal visible;
+        against an empty one there is nothing to lose.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        note = "notifications/tools/list_changed"
+
+        self._wire_pages(manager, [{"tools": [{"name": "seed", "inputSchema": {}}]}])
+        manager._handle_downstream_notification("srv", managed, note)
+        await self._drain(manager)
+        primed = sink.tools
+
+        self._wire_pages(manager, pages)
+        manager._handle_downstream_notification("srv", managed, note)
+        await self._drain(manager)
+        return manager, sink, primed
+
+    @staticmethod
+    def _tool(name: str) -> dict[str, Any]:
+        return {"name": name, "inputSchema": {}}
+
+    @pytest.mark.asyncio
+    async def test_multi_page_listing_is_assembled_completely(self) -> None:
+        """RED before the fix: page one was treated as the whole catalog."""
+        manager, sink, primed = await self._prime_then(
+            [
+                {"tools": [self._tool("a"), self._tool("b")], "nextCursor": "p1"},
+                {"tools": [self._tool("c")]},
+            ]
+        )
+        assert sorted(manager._tools) == ["srv::a", "srv::b", "srv::c"], (
+            "entries past page one were dropped; the cursor was not followed"
+        )
+        assert sink.tools == primed + 1
+
+    @pytest.mark.asyncio
+    async def test_snake_case_next_cursor_is_honoured(self) -> None:
+        """`list_tasks` accepts both spellings; the listing path must too."""
+        manager, _, _ = await self._prime_then(
+            [
+                {"tools": [self._tool("a")], "next_cursor": "p1"},
+                {"tools": [self._tool("b")]},
+            ]
+        )
+        assert sorted(manager._tools) == ["srv::a", "srv::b"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_later_page_preserves_the_prior_catalog(self) -> None:
+        """A transport failure on page two must not publish a partial listing."""
+        manager, sink, primed = await self._prime_then(
+            [
+                {"tools": [self._tool("a")], "nextCursor": "p1"},
+                RuntimeError("page two never arrived"),
+            ]
+        )
+        assert sorted(manager._tools) == ["srv::seed"], (
+            "a partially-read listing replaced the catalog"
+        )
+        assert sink.tools == primed, "a partial listing was published as a change"
+
+    @pytest.mark.asyncio
+    async def test_an_unreadable_later_page_preserves_the_prior_catalog(self) -> None:
+        """Same rule when page two arrives but is malformed rather than absent."""
+        manager, sink, primed = await self._prime_then(
+            [{"tools": [self._tool("a")], "nextCursor": "p1"}, {}]
+        )
+        assert sorted(manager._tools) == ["srv::seed"]
+        assert sink.tools == primed
+
+    @pytest.mark.asyncio
+    async def test_a_repeated_cursor_terminates_and_is_unreadable(self) -> None:
+        """A server handing back its own cursor must not spin the fetch forever."""
+        manager, sink, primed = await self._prime_then(
+            [{"tools": [self._tool("a")], "nextCursor": "p0"}]
+        )
+        assert sorted(manager._tools) == ["srv::seed"]
+        assert sink.tools == primed
+
+    @pytest.mark.asyncio
+    async def test_a_deep_but_honest_catalog_assembles_completely(self) -> None:
+        """A catalog many pages deep, still inside the cap, must assemble.
+
+        Board review found the gap this closes: every other test here is two
+        pages deep, so a mutant shrinking `_MAX_LISTING_PAGES` to 2 passed the
+        entire suite. Nothing pinned that the cap is a runaway guard rather
+        than a catalog-size limit.
+
+        The failure direction is a freeze, not a false removal -- an honest
+        server would be reported as having no tools at all, which is the same
+        in-class defect that made the original cap of 50 wrong for a legal
+        page size of 1.
+        """
+        depth = 10
+        pages: list[Any] = [
+            {
+                "tools": [self._tool(f"t{i}")],
+                **({"nextCursor": f"p{i + 1}"} if i < depth - 1 else {}),
+            }
+            for i in range(depth)
+        ]
+        manager, sink, primed = await self._prime_then(pages)
+        assert sorted(manager._tools) == sorted(f"srv::t{i}" for i in range(depth)), (
+            "a deep but honest catalog was not assembled; the page cap is "
+            "acting as a catalog-size limit rather than a runaway guard"
+        )
+        assert sink.tools == primed + 1
+
+    @pytest.mark.asyncio
+    async def test_exceeding_the_page_cap_is_unreadable_not_truncated(self) -> None:
+        """The cap must preserve, not index the pages it managed to read.
+
+        Indexing a truncated view is precisely what Consiliency/pmcp#173 is
+        about, so the bound cannot resolve to "keep what we got".
+        """
+        pages: list[Any] = [
+            {"tools": [self._tool(f"t{i}")], "nextCursor": f"p{i + 1}"}
+            for i in range(_MAX_LISTING_PAGES + 2)
+        ]
+        manager, sink, primed = await self._prime_then(pages)
+        assert sorted(manager._tools) == ["srv::seed"]
+        assert sink.tools == primed
+
+    @pytest.mark.parametrize("cursor", [0, "", False])
+    @pytest.mark.asyncio
+    async def test_a_falsey_cursor_is_unusable_not_the_end(self, cursor: Any) -> None:
+        """A falsey cursor must not read as "no more pages".
+
+        Board review of this PR: detecting absence with `x or y` / `if not
+        cursor` meant `nextCursor: 0` and `nextCursor: ""` were taken as the end
+        of the listing, so page one was published as the whole catalog -- the
+        exact truncation Consiliency/pmcp#173 is about -- and they also slipped
+        past the non-string rejection. Presence is now decided by KEY.
+        """
+        manager, sink, primed = await self._prime_then(
+            [
+                {"tools": [self._tool("a")], "nextCursor": cursor},
+                {"tools": [self._tool("b")]},
+            ]
+        )
+        assert sorted(manager._tools) == ["srv::seed"], (
+            "a falsey cursor was treated as the end of the listing"
+        )
+        assert sink.tools == primed
+
+    @pytest.mark.asyncio
+    async def test_an_explicit_null_cursor_ends_the_listing(self) -> None:
+        """`nextCursor: null` is the protocol saying "no more" -- not a defect.
+
+        The pin that keeps the falsey-cursor fix from over-reaching into
+        treating a well-formed final page as unreadable.
+        """
+        manager, sink, primed = await self._prime_then(
+            [{"tools": [self._tool("a")], "nextCursor": None}]
+        )
+        assert sorted(manager._tools) == ["srv::a"]
+        assert sink.tools == primed + 1
+
+    @pytest.mark.asyncio
+    async def test_a_later_tools_page_failure_does_not_starve_other_kinds(
+        self,
+    ) -> None:
+        """A tools page-two failure must not cost resources and prompts.
+
+        Board review: tools was awaited to completion before the other two were
+        started, so a later-page exception escaped and neither of them was ever
+        requested -- a healthy resources change sat unapplied because an
+        unrelated kind paginated badly. Only a page-ONE tools failure is a
+        connect-time error.
+        """
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        called: list[str] = []
+
+        async def fake_send(
+            _managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            kind = method.split("/")[0]
+            called.append(kind)
+            if kind == "tools":
+                if params.get("cursor") is None:
+                    return {"tools": [self._tool("a")], "nextCursor": "p1"}
+                raise RuntimeError("tools page two never arrived")
+            if kind == "resources":
+                return {"resources": [{"uri": "mem://r1", "name": "r1"}]}
+            return {"prompts": []}
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+        listings = await manager._fetch_server_listings(managed)
+
+        assert listings["tools"] is None, "a partial tools listing was kept"
+        assert listings["resources"] == [{"uri": "mem://r1", "name": "r1"}], (
+            "resources were never fetched because tools paginated badly"
+        )
+        assert {"tools", "resources", "prompts"} <= set(called)
+
+    @pytest.mark.asyncio
+    async def test_a_page_one_tools_failure_still_raises(self) -> None:
+        """The connect-time contract survives gathering all three kinds."""
+        manager = ClientManager(catalog_events=cast(Any, _RecordingSink()))
+        managed = self._managed("srv")
+
+        async def fake_send(
+            _managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            if method == "tools/list":
+                raise RuntimeError("this server cannot list tools")
+            return {method.split("/")[0]: []}
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+        with pytest.raises(RuntimeError, match="cannot list tools"):
+            await manager._fetch_server_listings(managed)
+
+    @pytest.mark.asyncio
+    async def test_a_single_page_listing_still_clears_when_explicitly_empty(
+        self,
+    ) -> None:
+        """The pagination loop must not weaken the empty-is-an-answer rule."""
+        manager, sink, primed = await self._prime_then([{"tools": []}])
+        assert manager._tools == {}
+        assert sink.tools == primed + 1
 
 
 class TestUnreadableListingIsNotAnEmptyOne:
