@@ -482,6 +482,11 @@ class TestCheckStaleness:
             servers={
                 "server1": GeneratedServerDescriptions(
                     package="@test/mcp",
+                    # Matches `npx -y @test/mcp` in `mock_manifest`. Without a
+                    # recorded type the identity gate cannot confirm the entry
+                    # and reports it stale, which is a different code path from
+                    # the version comparison these tests exist to pin.
+                    package_type="npm",
                     version="1.0.0",
                     generated_at="2025-01-01T00:00:00Z",
                     capability_summary="Test",
@@ -518,6 +523,11 @@ class TestCheckStaleness:
             servers={
                 "server1": GeneratedServerDescriptions(
                     package="@test/mcp",
+                    # Matches `npx -y @test/mcp` in `mock_manifest`. Without a
+                    # recorded type the identity gate cannot confirm the entry
+                    # and reports it stale, which is a different code path from
+                    # the version comparison these tests exist to pin.
+                    package_type="npm",
                     version="1.0.0",
                     generated_at="2025-01-01T00:00:00Z",
                     capability_summary="Test",
@@ -551,6 +561,11 @@ class TestCheckStaleness:
             servers={
                 "server1": GeneratedServerDescriptions(
                     package="@test/mcp",
+                    # Matches `npx -y @test/mcp` in `mock_manifest`. Without a
+                    # recorded type the identity gate cannot confirm the entry
+                    # and reports it stale, which is a different code path from
+                    # the version comparison these tests exist to pin.
+                    package_type="npm",
                     version="1.0.0",
                     generated_at="2025-01-01T00:00:00Z",
                     capability_summary="Test",
@@ -710,6 +725,11 @@ class TestShortCircuitUsesCompareVersions:
     ) -> None:
         existing = GeneratedServerDescriptions(
             package="srv",
+            # The identity gate added in Consiliency/pmcp#178 runs ahead of the
+            # comparison, so the pair has to be confirmably the same package
+            # for the short-circuit to be reached at all. `result is existing`
+            # below is what catches a degenerate always-False gate.
+            package_type="npm",
             version="1.0.0",
             generated_at="2025-01-01T00:00:00Z",
             capability_summary="stale summary",
@@ -847,6 +867,587 @@ class TestGeneratedDescriptionsTypes:
         )
         assert cache.gateway_version == GATEWAY_VERSION
         assert cache.servers == {}
+
+
+def _server_config(command: str, args: list[str], name: str = "srv") -> ServerConfig:
+    """A minimal manifest server entry."""
+    return ServerConfig(
+        name=name,
+        description="",
+        keywords=[],
+        install={},
+        command=command,
+        args=args,
+    )
+
+
+def _cached_entry(
+    package: str,
+    package_type: str | None,
+    version: str = "1.0.0",
+) -> GeneratedServerDescriptions:
+    """A cached description entry for `package`, as the cache would hold it."""
+    return GeneratedServerDescriptions(
+        package=package,
+        package_type=package_type,
+        version=version,
+        generated_at="2025-01-01T00:00:00Z",
+        capability_summary=f"stale {package or '<empty>'} summary",
+        tools=[],
+    )
+
+
+def _write_cache_file(
+    cache_path: Path,
+    entries: dict[str, tuple[str, str | None]],
+) -> None:
+    """Write a descriptions cache holding `name -> (package, package_type)`.
+
+    Written as raw YAML rather than through `save_descriptions_cache` so the
+    fixture does not depend on the writer this lane is also changing.
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        yaml.safe_dump(
+            {
+                "generated_at": "2025-01-01T00:00:00Z",
+                "gateway_version": "1.0.0",
+                "servers": {
+                    name: {
+                        "package": package,
+                        "package_type": package_type,
+                        "version": "1.0.0",
+                        "generated_at": "2025-01-01T00:00:00Z",
+                        "capability_summary": f"stale {package} summary",
+                        "tools": [],
+                    }
+                    for name, (package, package_type) in entries.items()
+                },
+            }
+        )
+    )
+
+
+def _manifest(servers: dict[str, ServerConfig]) -> Manifest:
+    return Manifest(
+        version="1.0",
+        cli_alternatives={},
+        servers=servers,
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
+
+
+async def _equal_version(command: str, args: list[str], timeout: float | None = None):
+    """Every package resolves to the same npm version -- so only identity can
+    distinguish the cached entry from the configured one."""
+    return ("1.0.0", "npm")
+
+
+class TestPackageIdentityGate:
+    """A cached entry is paired with a server config by NAME, and freshness is
+    then decided by comparing VERSIONS only. Nothing asks whether the cache
+    still describes the same PACKAGE (Consiliency/pmcp#178, EC-UPDPATH-1..3).
+
+    Two swaps slip past a versions-only check at an equal version:
+
+    1. **Same ecosystem** -- `old-pkg@1.0.0` cached, `new-pkg@1.0.0`
+       configured, both npm, both orderable, equal.
+    2. **Cross ecosystem** -- `GeneratedServerDescriptions.package` is a bare
+       name with no ecosystem, so pypi `foo@1.0.0` reads as the same package as
+       npm `foo@1.0.0`, and npm/pypi/cargo all produce orderable *release*
+       versions so `incomparable` never fires.
+
+    The docker case needs no test here: a version against a digest classifies
+    as `compare_versions(...) == "incomparable"`, which is not `"not_newer"`,
+    so the short-circuit already does not fire (`TestUpToDateShortCircuit`).
+
+    `refresh_server` returning `None` is the discriminator throughout: a
+    short-circuit returns the cached object itself, while a real refresh
+    reaches `stdio_client` -- patched here to raise -- and is caught into
+    `None`. Asserting on the return value alone cannot otherwise tell
+    "refreshed" from "returned the stale cache", since both yield a cache
+    object.
+    """
+
+    @pytest.mark.asyncio
+    async def test_same_ecosystem_swap_refreshes_via_refresh_server(self) -> None:
+        existing = _cached_entry("old-pkg", "npm")
+        server = _server_config("npx", ["-y", "new-pkg"])
+
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=_equal_version
+        ):
+            with patch(
+                "mcp.client.stdio.stdio_client",
+                side_effect=RuntimeError("stop after the identity decision"),
+            ):
+                result = await refresh_server(server, existing_cache=existing)
+
+        assert result is not existing, (
+            "short-circuited as up to date across an npm package swap at an "
+            "equal version -- old-pkg's descriptions would be served for "
+            "new-pkg forever"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_cross_ecosystem_swap_refreshes_via_refresh_server(self) -> None:
+        """Same bare name, different ecosystem, equal orderable versions."""
+        existing = _cached_entry("foo", "pypi")
+        server = _server_config("npx", ["-y", "foo"])
+
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=_equal_version
+        ):
+            with patch(
+                "mcp.client.stdio.stdio_client",
+                side_effect=RuntimeError("stop after the identity decision"),
+            ):
+                result = await refresh_server(server, existing_cache=existing)
+
+        assert result is not existing, (
+            "short-circuited across a pypi -> npm swap of the same bare name: "
+            "a name alone cannot express package identity"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_same_ecosystem_swap_is_reported_stale_by_check_staleness(
+        self,
+    ) -> None:
+        """`pmcp refresh --check-versions` must not print "up to date" here."""
+        cache = DescriptionsCache(
+            generated_at="2025-01-01T00:00:00Z",
+            gateway_version="1.0.0",
+            servers={"srv": _cached_entry("old-pkg", "npm")},
+        )
+        manifest = _manifest({"srv": _server_config("npx", ["-y", "new-pkg"])})
+
+        with patch(
+            "pmcp.manifest.refresher.load_descriptions_cache", return_value=cache
+        ):
+            with patch(
+                "pmcp.manifest.refresher.get_package_version",
+                new_callable=AsyncMock,
+                return_value=("1.0.0", "npm"),
+            ):
+                result = await check_staleness(manifest=manifest)
+
+        assert "srv" in result, (
+            "a cache for old-pkg against a config for new-pkg reported as up "
+            "to date -- operator-visible via `pmcp refresh --check-versions`"
+        )
+        assert result["srv"] == ("1.0.0", "1.0.0")
+
+    @pytest.mark.asyncio
+    async def test_cross_ecosystem_swap_is_reported_stale_by_check_staleness(
+        self,
+    ) -> None:
+        cache = DescriptionsCache(
+            generated_at="2025-01-01T00:00:00Z",
+            gateway_version="1.0.0",
+            servers={"srv": _cached_entry("foo", "pypi")},
+        )
+        manifest = _manifest({"srv": _server_config("npx", ["-y", "foo"])})
+
+        with patch(
+            "pmcp.manifest.refresher.load_descriptions_cache", return_value=cache
+        ):
+            with patch(
+                "pmcp.manifest.refresher.get_package_version",
+                new_callable=AsyncMock,
+                return_value=("1.0.0", "npm"),
+            ):
+                result = await check_staleness(manifest=manifest)
+
+        assert "srv" in result, (
+            "a pypi cache against an npm config of the same bare name "
+            "reported as up to date"
+        )
+
+    @pytest.mark.asyncio
+    async def test_swap_does_not_survive_refresh_all(self) -> None:
+        """EC-3: `refresh_all` assembles the (cached, configured) pair itself,
+        so it must not be able to bypass the gate."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "descriptions.yaml"
+            _write_cache_file(cache_path, {"srv": ("old-pkg", "npm")})
+            manifest = _manifest({"srv": _server_config("npx", ["-y", "new-pkg"])})
+
+            with patch(
+                "pmcp.manifest.refresher.get_package_version",
+                side_effect=_equal_version,
+            ):
+                with patch(
+                    "mcp.client.stdio.stdio_client",
+                    side_effect=RuntimeError("no server to connect to"),
+                ):
+                    cache = await refresh_all(manifest=manifest, cache_path=cache_path)
+
+            returned = cache.servers.get("srv")
+            assert returned is None or returned.package != "old-pkg", (
+                "refresh_all returned old-pkg's descriptions for a server now "
+                "configured to run new-pkg"
+            )
+
+            reloaded = load_descriptions_cache(cache_path)
+            assert reloaded is not None
+            saved = reloaded.servers.get("srv")
+            assert saved is None or saved.package != "old-pkg", (
+                "refresh_all wrote old-pkg's descriptions back to disk"
+            )
+
+    @pytest.mark.asyncio
+    async def test_cross_ecosystem_swap_does_not_survive_refresh_all(self) -> None:
+        """The cross-ecosystem swap at the third site: same bare name, so only
+        the recorded type distinguishes the cached entry from the config."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "descriptions.yaml"
+            _write_cache_file(cache_path, {"srv": ("foo", "pypi")})
+            manifest = _manifest({"srv": _server_config("npx", ["-y", "foo"])})
+
+            with patch(
+                "pmcp.manifest.refresher.get_package_version",
+                side_effect=_equal_version,
+            ):
+                with patch(
+                    "mcp.client.stdio.stdio_client",
+                    side_effect=RuntimeError("no server to connect to"),
+                ):
+                    cache = await refresh_all(manifest=manifest, cache_path=cache_path)
+
+            # The bare name is identical on both sides, so asserting on
+            # `package` cannot tell the entries apart -- the pypi entry either
+            # survived regeneration or it did not.
+            assert "srv" not in cache.servers, (
+                "refresh_all kept the pypi cache for a server now configured "
+                "to run the npm package of the same name"
+            )
+
+            reloaded = load_descriptions_cache(cache_path)
+            assert reloaded is None or "srv" not in reloaded.servers, (
+                "refresh_all wrote the pypi descriptions back to disk"
+            )
+
+    def test_package_type_survives_a_cache_round_trip(self) -> None:
+        """IF-0-UPDPATH-2: populated where the entry is WRITTEN, not only where
+        it is read -- otherwise every refreshed entry reloads as unknown and
+        the gate refreshes forever."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "descriptions.yaml"
+            save_descriptions_cache(
+                DescriptionsCache(
+                    generated_at="2025-01-01T00:00:00Z",
+                    gateway_version=GATEWAY_VERSION,
+                    servers={"srv": _cached_entry("new-pkg", "npm")},
+                ),
+                cache_path,
+            )
+
+            reloaded = load_descriptions_cache(cache_path)
+            assert reloaded is not None
+            assert reloaded.servers["srv"].package_type == "npm"
+
+    def test_absent_package_type_reads_as_none_not_empty_string(self) -> None:
+        """An absent value must stay distinguishable from a recorded empty one
+        (IF-0-UPDPATH-2), so pre-phase caches read as unknown."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "descriptions.yaml"
+            cache_path.write_text(
+                yaml.safe_dump(
+                    {
+                        "generated_at": "2025-01-01T00:00:00Z",
+                        "gateway_version": "1.0.0",
+                        "servers": {
+                            "srv": {
+                                "package": "new-pkg",
+                                "version": "1.0.0",
+                                "generated_at": "2025-01-01T00:00:00Z",
+                                "capability_summary": "legacy entry",
+                                "tools": [],
+                            }
+                        },
+                    }
+                )
+            )
+
+            reloaded = load_descriptions_cache(cache_path)
+            assert reloaded is not None
+            assert reloaded.servers["srv"].package_type is None
+
+    @pytest.mark.asyncio
+    async def test_regenerated_entry_records_its_package_type(self) -> None:
+        """A freshly generated entry carries the type it was generated for."""
+        server = _server_config("npx", ["-y", "new-pkg"])
+
+        class _FakeStdio:
+            async def __aenter__(self):
+                return (None, None)
+
+            async def __aexit__(self, *exc):
+                return False
+
+        tools_result = MagicMock()
+        tools_result.tools = []
+        fake_session = MagicMock()
+        fake_session.initialize = AsyncMock()
+        fake_session.list_tools = AsyncMock(return_value=tools_result)
+
+        class _FakeSession:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return fake_session
+
+            async def __aexit__(self, *exc):
+                return False
+
+        async def fake_version(command, args, timeout=None):
+            return ("2.0.0", "npm")
+
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=fake_version
+        ):
+            with patch("mcp.client.stdio.stdio_client", return_value=_FakeStdio()):
+                with patch("mcp.ClientSession", _FakeSession):
+                    result = await refresh_server(server)
+
+        assert result is not None
+        assert result.package == "new-pkg"
+        assert result.package_type == "npm"
+
+
+class TestUnknownPackageForcesRefresh:
+    """EC-UPDPATH-7. The gate must read an unknown side as "cannot confirm
+    identity -> refresh", NEVER as "cannot compare -> skip the check". The
+    second phrasing is the natural one to reach for, passes a naive suite, and
+    is the same fail-open collapse as `not is_version_newer(...)`, which
+    shipped three times (Consiliency/pmcp#155, #156, #163) before the tri-state
+    migration deleted the wrappers to make it unrepresentable.
+
+    `test_absent_cached_package_type_forces_refresh` is the discriminating one:
+    the package NAMES match and the VERSIONS match, so only the unknown type
+    can force the refresh. Under "only compare when both sides are known" it
+    short-circuits and the test fails.
+
+    The configured-unknown arms have no possible behavioural test --
+    `refresh_server` falls back to `pkg_name = f"{command} {args}"`, so the
+    configured name is never empty -- which is why the predicate is asserted
+    directly below.
+    """
+
+    @pytest.mark.asyncio
+    async def test_absent_cached_package_type_forces_refresh(self) -> None:
+        existing = _cached_entry("new-pkg", None)
+        server = _server_config("npx", ["-y", "new-pkg"])
+
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=_equal_version
+        ):
+            with patch(
+                "mcp.client.stdio.stdio_client",
+                side_effect=RuntimeError("stop after the identity decision"),
+            ):
+                result = await refresh_server(server, existing_cache=existing)
+
+        assert result is not existing, (
+            "an unrecorded package_type was read as 'cannot compare, skip the "
+            "check' rather than 'cannot confirm identity, refresh'"
+        )
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unknown_cached_package_type_forces_refresh(self) -> None:
+        existing = _cached_entry("new-pkg", "unknown")
+        server = _server_config("npx", ["-y", "new-pkg"])
+
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=_equal_version
+        ):
+            with patch(
+                "mcp.client.stdio.stdio_client",
+                side_effect=RuntimeError("stop after the identity decision"),
+            ):
+                result = await refresh_server(server, existing_cache=existing)
+
+        assert result is not existing
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_cached_package_forces_refresh(self) -> None:
+        existing = _cached_entry("", "npm")
+        server = _server_config("npx", ["-y", "new-pkg"])
+
+        with patch(
+            "pmcp.manifest.refresher.get_package_version", side_effect=_equal_version
+        ):
+            with patch(
+                "mcp.client.stdio.stdio_client",
+                side_effect=RuntimeError("stop after the identity decision"),
+            ):
+                result = await refresh_server(server, existing_cache=existing)
+
+        assert result is not existing
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_absent_cached_package_type_is_stale_via_check_staleness(
+        self,
+    ) -> None:
+        """Every cache written before this phase reads as unknown, so the
+        migration forces one refresh rather than silently trusting the entry."""
+        cache = DescriptionsCache(
+            generated_at="2025-01-01T00:00:00Z",
+            gateway_version="1.0.0",
+            servers={"srv": _cached_entry("new-pkg", None)},
+        )
+        manifest = _manifest({"srv": _server_config("npx", ["-y", "new-pkg"])})
+
+        with patch(
+            "pmcp.manifest.refresher.load_descriptions_cache", return_value=cache
+        ):
+            with patch(
+                "pmcp.manifest.refresher.get_package_version",
+                new_callable=AsyncMock,
+                return_value=("1.0.0", "npm"),
+            ):
+                result = await check_staleness(manifest=manifest)
+
+        assert "srv" in result
+
+    def test_predicate_matches_a_fully_known_identical_pair(self) -> None:
+        from pmcp.manifest.refresher import _same_package
+
+        assert _same_package("x", "npm", "x", "npm") is True
+
+    def test_predicate_refuses_every_unknown_arm(self) -> None:
+        from pmcp.manifest.refresher import _same_package
+
+        # cached name unknown
+        assert _same_package("", None, "x", "npm") is False
+        assert _same_package("", "npm", "x", "npm") is False
+        assert _same_package("unknown", "npm", "unknown", "npm") is False
+        # cached type unknown, name known on both sides
+        assert _same_package("x", None, "x", "npm") is False
+        assert _same_package("x", "", "x", "npm") is False
+        assert _same_package("x", "unknown", "x", "unknown") is False
+        # configured name unknown
+        assert _same_package("x", "npm", None, "npm") is False
+        assert _same_package("x", "npm", "", "npm") is False
+        # configured type unknown
+        assert _same_package("x", "npm", "x", None) is False
+        assert _same_package("x", "npm", "x", "") is False
+        assert _same_package("x", "npm", "x", "unknown") is False
+
+    def test_predicate_refuses_a_differing_pair(self) -> None:
+        from pmcp.manifest.refresher import _same_package
+
+        assert _same_package("x", "npm", "y", "npm") is False
+        assert _same_package("foo", "pypi", "foo", "npm") is False
+
+
+class TestMismatchedCacheNeverSurvivesFailure:
+    """`refresh_all` has two paths that put a cached entry into the saved cache
+    without regenerating it: the `None`/raise fallback inside `refresh_target`,
+    and the final merge loop that re-adds every cached entry missing from the
+    new set. An identity-mismatched entry must survive neither.
+
+    Both tests below require both fixes: closing only the fallback lets the
+    merge loop write the entry back, and closing only the merge loop leaves the
+    fallback returning it as a live result. Dropping the entry on a failed
+    regeneration is acceptable; writing the wrong package's descriptions back
+    is not.
+    """
+
+    @pytest.mark.asyncio
+    async def test_failed_refresh_does_not_write_mismatched_entry_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "descriptions.yaml"
+            _write_cache_file(cache_path, {"srv": ("old-pkg", "npm")})
+            manifest = _manifest({"srv": _server_config("npx", ["-y", "new-pkg"])})
+
+            async def failing_refresh(server_config, existing_cache=None, force=False):
+                return None
+
+            with patch(
+                "pmcp.manifest.refresher.refresh_server", side_effect=failing_refresh
+            ):
+                cache = await refresh_all(manifest=manifest, cache_path=cache_path)
+
+            assert "srv" not in cache.servers, (
+                "a failed regeneration handed old-pkg's descriptions back for a "
+                "server now configured to run new-pkg"
+            )
+            reloaded = load_descriptions_cache(cache_path)
+            assert reloaded is None or "srv" not in reloaded.servers
+
+    @pytest.mark.asyncio
+    async def test_raising_refresh_does_not_write_mismatched_entry_back(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "descriptions.yaml"
+            _write_cache_file(cache_path, {"srv": ("old-pkg", "npm")})
+            manifest = _manifest({"srv": _server_config("npx", ["-y", "new-pkg"])})
+
+            async def raising_refresh(server_config, existing_cache=None, force=False):
+                raise RuntimeError("regeneration blew up")
+
+            with patch(
+                "pmcp.manifest.refresher.refresh_server", side_effect=raising_refresh
+            ):
+                cache = await refresh_all(manifest=manifest, cache_path=cache_path)
+
+            assert "srv" not in cache.servers
+            reloaded = load_descriptions_cache(cache_path)
+            assert reloaded is None or "srv" not in reloaded.servers
+
+    @pytest.mark.asyncio
+    async def test_matching_entry_still_survives_a_failed_refresh(self) -> None:
+        """The gate must drop mismatched entries only -- a degenerate
+        always-drop would pass the two tests above for the wrong reason."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "descriptions.yaml"
+            _write_cache_file(cache_path, {"srv": ("new-pkg", "npm")})
+            manifest = _manifest({"srv": _server_config("npx", ["-y", "new-pkg"])})
+
+            async def failing_refresh(server_config, existing_cache=None, force=False):
+                return None
+
+            with patch(
+                "pmcp.manifest.refresher.refresh_server", side_effect=failing_refresh
+            ):
+                cache = await refresh_all(manifest=manifest, cache_path=cache_path)
+
+            assert cache.servers["srv"].package == "new-pkg"
+
+    @pytest.mark.asyncio
+    async def test_untargeted_entry_still_survives_the_merge(self) -> None:
+        """The merge loop's purpose -- keeping servers outside the target list
+        -- must be preserved."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir) / "descriptions.yaml"
+            _write_cache_file(
+                cache_path,
+                {"srv": ("new-pkg", "npm"), "other": ("other-pkg", "npm")},
+            )
+            manifest = _manifest(
+                {
+                    "srv": _server_config("npx", ["-y", "new-pkg"]),
+                    "other": _server_config("npx", ["-y", "other-pkg"], name="other"),
+                }
+            )
+
+            async def failing_refresh(server_config, existing_cache=None, force=False):
+                return None
+
+            with patch(
+                "pmcp.manifest.refresher.refresh_server", side_effect=failing_refresh
+            ):
+                cache = await refresh_all(
+                    manifest=manifest, cache_path=cache_path, servers=["srv"]
+                )
+
+            assert cache.servers["other"].package == "other-pkg"
 
 
 # Pytest fixture from conftest

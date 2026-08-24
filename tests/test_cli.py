@@ -9,8 +9,10 @@ from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 
 from pmcp.cli import async_main, parse_args, setup_logging
+from pmcp.manifest.loader import Manifest, ServerConfig
 
 
 class TestParseArgs:
@@ -2240,3 +2242,140 @@ class TestRunStatusWithData:
         output = json.loads(captured.out)
         assert "servers" in output
         assert "tools" in output or "total_tools" in output
+
+
+class TestCheckVersionsIdentityGate:
+    """`pmcp refresh --check-versions` end to end (EC-UPDPATH-6).
+
+    Two defects meet here. `run_refresh` computes
+    `cache_path = get_cache_path(args.cache_dir)` and then calls
+    `check_staleness()` with no arguments, so `--cache-dir X` silently inspects
+    the DEFAULT cache instead of `X`. And `check_staleness` compares versions
+    only, so a cache for one package against a config for another at the same
+    version prints "All cached descriptions are up to date."
+
+    The cache path is deliberately NOT monkeypatched -- pointing the CLI at a
+    fixture cache through its own flag is the whole point of the test, and a
+    test that reached past the CLI to patch it would be a unit test dressed as
+    a CLI test. `get_package_version` is patched because it shells out to the
+    network; `load_manifest` is patched so the assertion does not depend on
+    whichever manifest overlays happen to exist on the host.
+    """
+
+    @staticmethod
+    def _manifest() -> Manifest:
+        return Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "srv": ServerConfig(
+                    name="srv",
+                    description="",
+                    keywords=[],
+                    install={},
+                    command="npx",
+                    args=["-y", "new-pkg"],
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+
+    @staticmethod
+    def _write_cache(cache_dir: Path) -> None:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        (cache_dir / "descriptions.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "generated_at": "2025-01-01T00:00:00Z",
+                    "gateway_version": "1.0.0",
+                    "servers": {
+                        "srv": {
+                            "package": "old-pkg",
+                            "package_type": "npm",
+                            "version": "1.0.0",
+                            "generated_at": "2025-01-01T00:00:00Z",
+                            "capability_summary": "stale old-pkg summary",
+                            "tools": [],
+                        }
+                    },
+                }
+            )
+        )
+
+    @pytest.mark.asyncio
+    async def test_check_versions_reads_the_requested_cache_dir(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        # chdir so the DEFAULT cache location resolves under an empty tmp dir:
+        # without this the pre-fix read could find a real cache in the repo.
+        monkeypatch.chdir(tmp_path)
+        cache_dir = tmp_path / "fixture-cache"
+        self._write_cache(cache_dir)
+
+        with patch(
+            "sys.argv",
+            [
+                "pmcp",
+                "refresh",
+                "--check-versions",
+                "--cache-dir",
+                str(cache_dir),
+            ],
+        ):
+            args = parse_args()
+
+        with patch(
+            "pmcp.manifest.refresher.load_manifest", return_value=self._manifest()
+        ):
+            with patch(
+                "pmcp.manifest.refresher.get_package_version",
+                new=AsyncMock(return_value=("1.0.0", "npm")),
+            ):
+                await async_main(args)
+
+        out = capsys.readouterr().out
+        assert "All cached descriptions are up to date." not in out, (
+            "--check-versions inspected the default cache instead of "
+            "--cache-dir, so the fixture cache was never read"
+        )
+
+    @pytest.mark.asyncio
+    async def test_check_versions_does_not_report_up_to_date_across_a_swap(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        monkeypatch.chdir(tmp_path)
+        cache_dir = tmp_path / "fixture-cache"
+        self._write_cache(cache_dir)
+
+        with patch(
+            "sys.argv",
+            [
+                "pmcp",
+                "refresh",
+                "--check-versions",
+                "--cache-dir",
+                str(cache_dir),
+            ],
+        ):
+            args = parse_args()
+
+        with patch(
+            "pmcp.manifest.refresher.load_manifest", return_value=self._manifest()
+        ):
+            with patch(
+                "pmcp.manifest.refresher.get_package_version",
+                new=AsyncMock(return_value=("1.0.0", "npm")),
+            ):
+                await async_main(args)
+
+        out = capsys.readouterr().out
+        assert "srv" in out, (
+            "a cache for old-pkg against a config for new-pkg was not "
+            f"reported at all (output: {out!r})"
+        )
