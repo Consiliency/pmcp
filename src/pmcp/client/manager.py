@@ -1687,18 +1687,30 @@ class ClientManager:
         """
         name = managed.config.name
 
-        tools_entries = await self._fetch_listing_pages(managed, "tools")
-
-        resources_task = self._fetch_listing_pages(managed, "resources")
-        prompts_task = self._fetch_listing_pages(managed, "prompts")
+        # All three gathered together, tools included. Awaiting tools to
+        # completion first would let a failure on its page TWO escape and cost
+        # resources and prompts their reconcile entirely -- a healthy resources
+        # change would sit unapplied because an unrelated kind paginated badly
+        # (ah board review). Only a page-ONE tools failure is a connect-time
+        # error, and that is re-raised below; a later page is just this kind
+        # being unreadable, like any other.
         listing_results = await asyncio.gather(
-            resources_task, prompts_task, return_exceptions=True
+            self._fetch_listing_pages(managed, "tools"),
+            self._fetch_listing_pages(managed, "resources"),
+            self._fetch_listing_pages(managed, "prompts"),
+            return_exceptions=True,
         )
 
-        listings: dict[str, list[dict[str, Any]] | None] = {"tools": tools_entries}
+        tools_result = listing_results[0]
+        if isinstance(tools_result, BaseException):
+            # Preserves the contract that a server which cannot list its tools
+            # is a connect-time error, while one without resources or prompts
+            # is ordinary. `_fetch_listing_pages` only lets page one raise.
+            raise tools_result
+        listings: dict[str, list[dict[str, Any]] | None] = {"tools": tools_result}
         for kind, result in (
-            ("resources", listing_results[0]),
-            ("prompts", listing_results[1]),
+            ("resources", listing_results[1]),
+            ("prompts", listing_results[2]),
         ):
             if isinstance(result, BaseException):
                 logger.debug(f"Server {name} doesn't support {kind}: {result}")
@@ -1735,7 +1747,26 @@ class ClientManager:
 
         for page in range(_MAX_LISTING_PAGES):
             params: dict[str, Any] = {"cursor": cursor} if cursor else {}
-            result = await self._send_request(managed, f"{kind}/list", params)
+            if page == 0:
+                # Page one propagates: whether a server can list a kind at all
+                # is the caller's decision to make, and for tools it is a
+                # connect-time error.
+                result = await self._send_request(managed, f"{kind}/list", params)
+            else:
+                # A later page failing says nothing about whether the kind is
+                # supported -- only that we could not finish reading it. Raising
+                # here would cost the OTHER two kinds their reconcile, since all
+                # three are gathered together.
+                try:
+                    result = await self._send_request(managed, f"{kind}/list", params)
+                except Exception as exc:
+                    logger.warning(
+                        f"[{managed.config.name}] {kind}/list page {page + 1} "
+                        f"failed ({exc}); discarding {len(collected)} entries "
+                        f"already collected rather than publishing a partial "
+                        f"listing"
+                    )
+                    return None
 
             entries = _listing_entries(managed.config.name, kind, result)
             if entries is None:
@@ -1754,13 +1785,25 @@ class ClientManager:
                 result, dict
             ):  # pragma: no cover - _listing_entries guards
                 return None
-            raw_cursor = result.get("nextCursor") or result.get("next_cursor")
-            if not raw_cursor:
+            # Presence by KEY, not truthiness. `nextCursor: 0` and `""` are
+            # falsey, so `x or y` / `if not cursor` read them as "no more pages"
+            # and hand back page one as the whole catalog -- the exact
+            # truncation this method exists to stop -- while also slipping past
+            # the non-string rejection below (ah board review).
+            if "nextCursor" in result:
+                raw_cursor = result["nextCursor"]
+            elif "next_cursor" in result:
+                raw_cursor = result["next_cursor"]
+            else:
                 return collected
-            if not isinstance(raw_cursor, str):
+            if raw_cursor is None:
+                # An explicit null is the protocol's way of saying "no more".
+                return collected
+            if not isinstance(raw_cursor, str) or not raw_cursor:
                 logger.warning(
-                    f"[{managed.config.name}] {kind}/list returned a non-string "
-                    f"cursor ({type(raw_cursor).__name__}); treating as unreadable"
+                    f"[{managed.config.name}] {kind}/list returned an unusable "
+                    f"cursor ({raw_cursor!r}); treating as unreadable rather "
+                    f"than as the end of the listing"
                 )
                 return None
             if raw_cursor in seen_cursors:
