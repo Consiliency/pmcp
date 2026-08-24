@@ -5234,6 +5234,22 @@ class GatewayTools:
                 ):
                     desc_entry = self._descriptions_cache.servers[server_name]
                     desc_entry.version = latest_version
+                    # Re-label the entry with the package it now describes, not
+                    # just the version. This is a THIRD write site for package
+                    # identity alongside refresh_server's constructor and
+                    # save_descriptions_cache's dict, and omitting it re-opens
+                    # the exact defect the identity gate closes: an entry whose
+                    # `package` still names the OLD package while its version
+                    # and tools come from the NEW one. `_same_package` would
+                    # then CONFIRM identity against the stale label and the
+                    # short-circuit would serve the new package's descriptions
+                    # under the old package's name. It also strands a legacy
+                    # entry as permanently unverifiable, since `package_type`
+                    # would stay None even though we have just classified it.
+                    # Both are in scope from detect_package_type above, which
+                    # already refused an unclassifiable package.
+                    desc_entry.package = package_name
+                    desc_entry.package_type = package_type
                     # The restart just gave us a live, freshly-connected tool
                     # list for this server -- regenerate `tools`/`generated_at`
                     # from it too, not just `version`. Otherwise the entry

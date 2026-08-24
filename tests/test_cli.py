@@ -2379,6 +2379,22 @@ class TestCheckVersionsIdentityGate:
             "a cache for old-pkg against a config for new-pkg was not "
             f"reported at all (output: {out!r})"
         )
+        # Presence alone is not enough: BOTH report groups contain the server
+        # name, so `"srv" in out` passes whichever group it lands in. A
+        # classifiable identity mismatch at an equal version is ACTIONABLE --
+        # `--force` regenerates it -- so it belongs in the stale group WITH the
+        # remedy, not in the "could not confirm" group where the remedy is
+        # deliberately withheld. Verified by mutation: routing an equal-version
+        # pair into the unverifiable group leaves the whole suite green without
+        # these two assertions (ah board review, correctness seat).
+        assert "srv: 1.0.0 -> 1.0.0" in out, (
+            "an identity mismatch at an equal version must be reported in the "
+            f"stale group with its versions (output: {out!r})"
+        )
+        assert "pmcp refresh --force" in out, (
+            "the stale group must keep the remedy that actually settles it "
+            f"(output: {out!r})"
+        )
 
 
 class TestCheckVersionsUnverifiableDisplay:

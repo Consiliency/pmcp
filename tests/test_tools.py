@@ -5207,6 +5207,45 @@ class TestUpdateServerVersionRepair:
         assert cache.servers["playwright"].version == "0.2.0"
 
     @pytest.mark.asyncio
+    async def test_update_server_relabels_the_entry_with_the_package_it_describes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """On success, the entry records WHICH package the new version is.
+
+        `update_server` is a third write site for package identity, alongside
+        `refresh_server`'s constructor and `save_descriptions_cache`'s dict.
+        Writing `version`/`tools` without `package`/`package_type` re-opens the
+        defect the identity gate exists to close: the entry would carry the NEW
+        package's version and live tool list under the OLD package's label, so
+        `_same_package` would later CONFIRM identity against the stale label and
+        the freshness short-circuit would serve the wrong package's
+        descriptions. It also strands a pre-2.4 entry as permanently
+        unverifiable -- `package_type` would stay `None` even though
+        `update_server` has just classified the package (ah board review,
+        correctness seat).
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        # A legacy entry: written before the cache carried a package type.
+        assert cache.servers["playwright"].package_type is None
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        entry = cache.servers["playwright"]
+        assert entry.package == "@playwright/mcp"
+        assert entry.package_type == "npm", (
+            "a legacy entry stays permanently unverifiable if update_server "
+            "does not record the package type it just detected"
+        )
+
+    @pytest.mark.asyncio
     async def test_update_server_persists_version_across_restart(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):

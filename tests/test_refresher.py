@@ -617,8 +617,17 @@ class TestUpToDateShortCircuit:
         self, temp_dir: Path
     ) -> None:
         """A cached release vs an unorderable fetched version must refresh."""
+        # `package_type` is load-bearing, not decoration. Without it the
+        # identity gate refuses on an unknown type and the short-circuit's
+        # `and` chain never reaches `compare_versions` -- this test would still
+        # pass, but for the identity reason, pinning nothing about the version
+        # comparison it exists to guard. Verified by mutation: with the type
+        # omitted, rewriting the short-circuit to `!= "newer"` (so an
+        # incomparable pair reads as up to date -- the exact
+        # Consiliency/pmcp#156/#164 fail-open) leaves the whole suite green.
         existing = GeneratedServerDescriptions(
             package="srv",
+            package_type="npm",
             version="1.0.0",
             generated_at="2025-01-01T00:00:00Z",
             capability_summary="stale summary",
@@ -662,21 +671,30 @@ class TestUpToDateShortCircuit:
     async def test_incomparable_pair_does_not_short_circuit(
         self, temp_dir: Path
     ) -> None:
-        """A cached npm version vs a fetched digest must refresh, not skip.
+        """A cached tag vs a fetched digest must refresh, not skip.
 
         The case two unary orderability guards let through: `1.0.0` and
         `abcdef123456` are each orderable, so both guards passed, but the pair
         is incomparable, the comparator failed closed, and the negation
-        reported "up to date" -- returning the stale npm cache for what is now
-        a docker server. `refresh_all` reuses a cache entry by server NAME and
-        never checks that the package still matches, which is what makes this
-        reachable.
+        reported "up to date".
+
+        Both sides are deliberately the SAME package and the SAME ecosystem, so
+        that `_same_package` CONFIRMS identity and the short-circuit's `and`
+        chain actually reaches `compare_versions`. This test originally paired
+        an npm cache against a docker config; the identity gate added in
+        UPDPATH now refuses that pair on ecosystem alone, which would leave
+        this test passing for the identity reason and pinning nothing about the
+        incomparable-version path it exists to guard. That cross-ecosystem case
+        has its own coverage in `TestPackageIdentityGate`; this one keeps the
+        version-comparison guard load-bearing. Verified by mutation -- rewriting
+        the short-circuit to `!= "newer"` fails this test.
         """
         existing = GeneratedServerDescriptions(
             package="srv",
+            package_type="docker",
             version="1.0.0",
             generated_at="2025-01-01T00:00:00Z",
-            capability_summary="stale npm summary",
+            capability_summary="stale summary from a tagged build",
             tools=[],
         )
         server = ServerConfig(

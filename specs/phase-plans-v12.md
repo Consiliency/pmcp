@@ -203,12 +203,66 @@ Close the two remaining correctness gaps in the update path: a refresh short-cir
   (as the plan predicted) and one in
   `TestShortCircuitUsesCompareVersions::test_short_circuit_is_a_single_compare_versions_call`
   (which the plan named but listed under a different class) — and every one of
-  them was a pure insertion. `TestUpToDateShortCircuit` genuinely needed
-  nothing: both of its tests assert the short-circuit does *not* fire, so an
-  extra always-`False` conjunct cannot change their outcome. That also means
+  them was a pure insertion. `TestUpToDateShortCircuit` stayed **green** with no
+  fixture change: both of its tests assert the short-circuit does *not* fire, so
+  an extra always-`False` conjunct cannot change their outcome. That also means
   those two tests do **not** discriminate a degenerate gate; the one that does
   is `test_short_circuit_is_a_single_compare_versions_call`'s `result is
   existing`, exactly as the plan said.
+- **Correction (pre-merge board): "needed nothing" was true for staying green
+  and false for staying load-bearing — the phase hollowed out two pre-existing
+  regression guards.** `TestUpToDateShortCircuit`'s fixtures carried no
+  `package_type`, so under the new gate `_same_package` refused on the unknown
+  type and the short-circuit's `and` chain **never reached
+  `compare_versions`**. Both tests still passed, but for the identity reason,
+  pinning nothing about the version comparison they exist to guard — the
+  unorderable/incomparable fail-open of Consiliency/pmcp#156 and #164.
+
+  Demonstrated, not argued: rewriting the short-circuit to
+  `compare_versions(...) != "newer"` — so an `incomparable` pair reads as up to
+  date, which is precisely that fail-open — left the **entire suite green**
+  (172 passed across the two files). A phase whose purpose is to close a
+  fail-open had silently removed the only coverage of a different one, and
+  neither the lane, the orchestrator, nor the plan-stage board caught it; the
+  adversarial seat of the pre-merge board did.
+
+  Fixed by making both fixtures confirm identity so the version path is
+  actually exercised: `package_type="npm"` for the unorderable case, and the
+  incomparable case rebuilt as a **same-ecosystem** docker pair (a cached tag
+  against a fetched digest) — the original npm-cache-vs-docker-config pairing is
+  now refused on ecosystem alone by the very gate this phase added, so it could
+  never have reached `compare_versions` again. That cross-ecosystem case keeps
+  its own coverage in `TestPackageIdentityGate`. Both tests now fail under the
+  mutant and pass without it.
+
+  **The general lesson, which outlives this phase:** adding an early conjunct to
+  an existing condition can silently retire every test downstream of it. Those
+  tests keep passing, so nothing signals the loss. When a gate is inserted ahead
+  of an existing check, every test that reached the old check through the new
+  gate's position must be re-proved load-bearing by mutation, not by re-running
+  it green.
+- **A third write site for package identity was missed until the pre-merge
+  board.** `gateway.update_server` mutates the cached entry in place
+  (`tools/handlers.py`), setting `version`, `tools` and `generated_at` but not
+  `package` or `package_type`. Two consequences, both closed here. A legacy
+  entry passing through `update_server` stayed permanently unverifiable even
+  though `update_server` had just classified its package. Worse, the entry could
+  end up carrying the **new** package's version and live tool list under the
+  **old** package's label — after which `_same_package` would *confirm* identity
+  against the stale label and the short-circuit would serve the wrong package's
+  descriptions, which is the exact defect this phase exists to close, reachable
+  in three operator steps (swap the config, `update_server`, revert). Fixed by
+  writing `package` and `package_type` alongside the version, pinned by
+  `test_update_server_relabels_the_entry_with_the_package_it_describes`. The
+  lane's audit found two write sites and the plan repeated it; the count was
+  three.
+- **The CLI split's group boundary was unpinned.** The test asserting a swap is
+  reported checked only that the server name appeared in the output — and the
+  name appears in *both* groups, so it passed whichever group the entry landed
+  in. A classifiable identity mismatch at an equal version is actionable
+  (`--force` settles it) and must sit in the stale group *with* the remedy;
+  routing it to the "could not confirm" group left the suite green. Now pinned
+  on the rendered line and the remedy's presence.
 - **EC-UPDPATH-4 was docstring-only, as planned, and the docstring is now pinned
   by a test.** `handlers.py`'s diff for this phase is the `update_server`
   docstring and nothing else. `test_update_server_docstring_states_both_probe_window_env_contracts`
