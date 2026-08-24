@@ -256,6 +256,37 @@ Close the two remaining correctness gaps in the update path: a refresh short-cir
   `test_update_server_relabels_the_entry_with_the_package_it_describes`. The
   lane's audit found two write sites and the plan repeated it; the count was
   three.
+- **The fix for the third write site was itself a hollow pin, and a second
+  board round caught it.** `test_update_server_relabels_the_entry_...` asserted
+  `entry.package == "@playwright/mcp"` against a fixture whose package was
+  *already* `@playwright/mcp` — the value `detect_package_type` returns there —
+  so the assertion held whether or not the assignment ran. Deleting
+  `desc_entry.package = package_name` left it green. Two seats found this
+  independently, one commit after this very amendment recorded the lesson about
+  green not being evidence. The test now starts the entry under a different
+  package, and each assignment is pinned by its own mutant.
+- **Relabelling turned out to be the wrong repair; the entry is now dropped
+  instead.** `update_server` deliberately preserves `capability_summary` on a
+  version bump, on the reasoning that it only feeds startup MCP-instructions
+  text and being "one refresh cycle behind" is a small, non-functional gap.
+  That reasoning does not survive a relabel: once `package` **and** `version`
+  both name the new package, the freshness short-circuit CONFIRMS identity and
+  never regenerates the entry, so the old package's summary would be served
+  under the new package's label *permanently*. A genuine package change now
+  deletes the entry and lets the next refresh rebuild it wholesale — this
+  phase's own rule applied to itself: cannot confirm the cache describes this
+  package → refresh, never patch around it. A same-package version bump is
+  unchanged and still backfills `package_type`.
+- **A known limitation, filed rather than fixed: Consiliency/pmcp#180.**
+  `detect_package_type` collapses distinct packages for some legal command
+  forms — `registry:5000/old-image` and `registry:5000/new-image` both resolve
+  to `("docker", "registry")`, and `npm exec old-pkg` / `new-pkg` both to
+  `("npm", "exec")`. For those forms `_same_package` confirms identity across a
+  real swap, so EC-UPDPATH-1/3/6 do **not** hold there. The defect is
+  pre-existing and only became consequential when this phase started comparing
+  package names; `detect_package_type` backs every version lookup in the
+  codebase, so re-parsing it has blast radius well beyond this phase and was
+  deliberately deferred to its own plan and review round.
 - **The CLI split's group boundary was unpinned.** The test asserting a swap is
   reported checked only that the server name appeared in the output — and the
   name appears in *both* groups, so it passed whichever group the entry landed

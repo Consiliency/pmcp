@@ -5233,55 +5233,72 @@ class GatewayTools:
                     and server_name in self._descriptions_cache.servers
                 ):
                     desc_entry = self._descriptions_cache.servers[server_name]
-                    desc_entry.version = latest_version
-                    # Re-label the entry with the package it now describes, not
-                    # just the version. This is a THIRD write site for package
-                    # identity alongside refresh_server's constructor and
-                    # save_descriptions_cache's dict, and omitting it re-opens
-                    # the exact defect the identity gate closes: an entry whose
-                    # `package` still names the OLD package while its version
-                    # and tools come from the NEW one. `_same_package` would
-                    # then CONFIRM identity against the stale label and the
-                    # short-circuit would serve the new package's descriptions
-                    # under the old package's name. It also strands a legacy
-                    # entry as permanently unverifiable, since `package_type`
-                    # would stay None even though we have just classified it.
-                    # Both are in scope from detect_package_type above, which
-                    # already refused an unclassifiable package.
-                    desc_entry.package = package_name
-                    desc_entry.package_type = package_type
-                    # The restart just gave us a live, freshly-connected tool
-                    # list for this server -- regenerate `tools`/`generated_at`
-                    # from it too, not just `version`. Otherwise the entry
-                    # would claim tools were "generated" for a version they
-                    # weren't (GeneratedServerDescriptions.version is
-                    # documented as "Package version when generated"), and a
-                    # package update that changed tool signatures/descriptions
-                    # or added/removed tools would keep serving the pre-update
-                    # tool list to offline catalog_search. This regenerates
-                    # from the connection `restart_server` already made --
-                    # no extra stdio round-trip, unlike refresher.refresh_server.
-                    # `capability_summary` is deliberately left as-is: it only
-                    # feeds GatewayServer.initialize()'s startup MCP-instructions
-                    # text (computed once, not read live by catalog_search or
-                    # invoke), so leaving it one refresh cycle behind is a much
-                    # smaller, non-functional gap than a stale `tools` list was.
-                    live_tools = [
-                        t
-                        for t in self._client_manager.get_all_tools()
-                        if t.server_name == server_name
-                    ]
-                    desc_entry.tools = [
-                        PrebuiltToolInfo(
-                            name=t.tool_name,
-                            description=t.description,
-                            short_description=t.short_description,
-                            tags=t.tags,
-                            risk_hint=t.risk_hint.value,
-                        )
-                        for t in live_tools
-                    ]
-                    desc_entry.generated_at = datetime.now(timezone.utc).isoformat()
+                    if desc_entry.package != package_name:
+                        # A genuine PACKAGE change, not an update of this
+                        # entry. Every field describes a different package, so
+                        # patching them one by one leaves a permanently MIXED
+                        # entry: `capability_summary` is deliberately preserved
+                        # on a version bump (see below), but once `package` and
+                        # `version` are both rewritten the freshness
+                        # short-circuit CONFIRMS identity and never regenerates
+                        # the entry -- so the old package's summary would be
+                        # served under the new package's label forever, not
+                        # merely one refresh cycle behind. Drop it and let the
+                        # next refresh rebuild it wholesale: this phase's own
+                        # rule applied here -- cannot confirm the cache
+                        # describes this package -> refresh, never patch around
+                        # it (ah board review, red-team seat).
+                        del self._descriptions_cache.servers[server_name]
+                    else:
+                        desc_entry.version = latest_version
+                        # Re-label the entry with the package it now describes, not
+                        # just the version. This is a THIRD write site for package
+                        # identity alongside refresh_server's constructor and
+                        # save_descriptions_cache's dict, and omitting it re-opens
+                        # the exact defect the identity gate closes: an entry whose
+                        # `package` still names the OLD package while its version
+                        # and tools come from the NEW one. `_same_package` would
+                        # then CONFIRM identity against the stale label and the
+                        # short-circuit would serve the new package's descriptions
+                        # under the old package's name. It also strands a legacy
+                        # entry as permanently unverifiable, since `package_type`
+                        # would stay None even though we have just classified it.
+                        # Both are in scope from detect_package_type above, which
+                        # already refused an unclassifiable package.
+                        desc_entry.package = package_name
+                        desc_entry.package_type = package_type
+                        # The restart just gave us a live, freshly-connected tool
+                        # list for this server -- regenerate `tools`/`generated_at`
+                        # from it too, not just `version`. Otherwise the entry
+                        # would claim tools were "generated" for a version they
+                        # weren't (GeneratedServerDescriptions.version is
+                        # documented as "Package version when generated"), and a
+                        # package update that changed tool signatures/descriptions
+                        # or added/removed tools would keep serving the pre-update
+                        # tool list to offline catalog_search. This regenerates
+                        # from the connection `restart_server` already made --
+                        # no extra stdio round-trip, unlike refresher.refresh_server.
+                        # `capability_summary` is deliberately left as-is: it only
+                        # feeds GatewayServer.initialize()'s startup MCP-instructions
+                        # text (computed once, not read live by catalog_search or
+                        # invoke), so leaving it one refresh cycle behind is a much
+                        # smaller, non-functional gap than a stale `tools` list was.
+                        live_tools = [
+                            t
+                            for t in self._client_manager.get_all_tools()
+                            if t.server_name == server_name
+                        ]
+                        desc_entry.tools = [
+                            PrebuiltToolInfo(
+                                name=t.tool_name,
+                                description=t.description,
+                                short_description=t.short_description,
+                                tags=t.tags,
+                                risk_hint=t.risk_hint.value,
+                            )
+                            for t in live_tools
+                        ]
+                        desc_entry.generated_at = datetime.now(timezone.utc).isoformat()
                     if self._descriptions_cache_path is not None:
                         try:
                             save_descriptions_cache(

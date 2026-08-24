@@ -5207,26 +5207,66 @@ class TestUpdateServerVersionRepair:
         assert cache.servers["playwright"].version == "0.2.0"
 
     @pytest.mark.asyncio
-    async def test_update_server_relabels_the_entry_with_the_package_it_describes(
+    async def test_update_server_drops_an_entry_whose_package_changed(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        """On success, the entry records WHICH package the new version is.
+        """A package CHANGE invalidates the entry; it is not patched in place.
 
         `update_server` is a third write site for package identity, alongside
         `refresh_server`'s constructor and `save_descriptions_cache`'s dict.
-        Writing `version`/`tools` without `package`/`package_type` re-opens the
-        defect the identity gate exists to close: the entry would carry the NEW
-        package's version and live tool list under the OLD package's label, so
-        `_same_package` would later CONFIRM identity against the stale label and
-        the freshness short-circuit would serve the wrong package's
-        descriptions. It also strands a pre-2.4 entry as permanently
-        unverifiable -- `package_type` would stay `None` even though
-        `update_server` has just classified the package (ah board review,
-        correctness seat).
+        Patching `version`/`package`/`tools` field-by-field across a package
+        change leaves a permanently MIXED entry: `capability_summary` is
+        deliberately preserved on a version bump, but once `package` and
+        `version` both name the new package the freshness short-circuit
+        CONFIRMS identity and never regenerates it -- so the old package's
+        summary is served under the new package's label forever, not one
+        refresh cycle behind. Dropping the entry is this phase's own rule
+        applied here: cannot confirm the cache describes this package ->
+        refresh (ah board review, red-team seat).
+
+        The entry must start labelled with a DIFFERENT package or this test
+        sees nothing: `_make_cache` uses `@playwright/mcp`, exactly what
+        `detect_package_type` returns here, so any assertion about that value
+        holds whether or not the code under test ran at all. An earlier version
+        of this test made precisely that mistake -- deleting the package
+        assignment left it green -- which is the hollow-pin failure mode this
+        change exists to close, found independently by two board seats.
         """
         self._make_manifest_with_playwright(monkeypatch)
         cache = self._make_cache(version="0.1.0")
-        # A legacy entry: written before the cache carried a package type.
+        cache.servers["playwright"].package = "@old-vendor/mcp"
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+            descriptions_cache=cache,
+        )
+        self._wire_success(gt, monkeypatch, latest_version="0.2.0")
+
+        result = await gt.update_server({"server_name": "playwright"})
+
+        assert result.ok is True
+        assert "playwright" not in cache.servers, (
+            "an entry describing a different package must be dropped for "
+            "wholesale regeneration, not patched into a mixed entry carrying "
+            "the old package's capability_summary under the new package's name"
+        )
+
+    @pytest.mark.asyncio
+    async def test_update_server_backfills_package_type_on_a_same_package_bump(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """A same-package version bump keeps the entry and records its type.
+
+        A cache written before the entry carried a package type reads as
+        unknown to `_same_package`, which forces a refresh every time. Since
+        `update_server` has just classified the package, this is the cheapest
+        place to backfill it -- and without it such an entry stays permanently
+        unverifiable.
+        """
+        self._make_manifest_with_playwright(monkeypatch)
+        cache = self._make_cache(version="0.1.0")
+        # Same package as configured, but legacy: no recorded type.
+        assert cache.servers["playwright"].package == "@playwright/mcp"
         assert cache.servers["playwright"].package_type is None
         gt = GatewayTools(
             client_manager=MockClientManager(),  # type: ignore
@@ -5239,7 +5279,7 @@ class TestUpdateServerVersionRepair:
 
         assert result.ok is True
         entry = cache.servers["playwright"]
-        assert entry.package == "@playwright/mcp"
+        assert entry.version == "0.2.0"
         assert entry.package_type == "npm", (
             "a legacy entry stays permanently unverifiable if update_server "
             "does not record the package type it just detected"
@@ -5467,6 +5507,17 @@ class TestUpdateServerVersionRepair:
             "pmcp.tools.handlers.load_configs", lambda **_: [configured_override]
         )
         cache = self._make_cache(version="0.1.0")
+        # Label the entry with the OVERRIDE's package, which is what is
+        # actually configured here. `_make_cache` uses the manifest's
+        # `@playwright/mcp`, and against the `different-playwright-fork`
+        # override that is a genuine package change -- which `update_server`
+        # now correctly responds to by DROPPING the entry for wholesale
+        # regeneration, leaving nothing for this version assertion to read.
+        # This test is about override resolution driving the probe, not about
+        # cache-identity handling (which
+        # `test_update_server_drops_an_entry_whose_package_changed` owns), so
+        # matching the label keeps it isolated to its own subject.
+        cache.servers["playwright"].package = "different-playwright-fork"
         client_manager = MockClientManager()
         gt = GatewayTools(
             client_manager=client_manager,  # type: ignore
