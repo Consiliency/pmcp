@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-08-24
+
 ### Fixed
 - **Catalog listings are now read to the end.** `tools/list`, `resources/list`
   and `prompts/list` were sent once with no cursor and whatever came back was
