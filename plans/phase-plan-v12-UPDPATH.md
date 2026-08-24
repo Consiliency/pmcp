@@ -367,3 +367,46 @@ automation:
   deliberately rotated; refusing would fail an update the operator wanted. A
   lane that finds the decision uncomfortable must stop and report rather than
   re-deciding it mid-execution.
+
+## Post-execution amendments (2026-08-24)
+
+Recorded by SL-3 after SL-1 and SL-2 merged. The full list of what execution
+discovered — including two operator-visible consequences this plan did not
+anticipate — is in `specs/phase-plans-v12.md` under
+"Post-execution amendments — UPDPATH (2026-08-24)". Only the points where **this
+document** was wrong or imprecise are repeated here.
+
+- **"Resolve identity before the short-circuit" was implemented as "resolve
+  before, compare inside."** The `detect_package_type` / `pkg_name` resolution
+  moved above the early return as this plan required, and exactly one call
+  remains in `refresh_server`. The `_same_package` **call**, however, is the
+  second conjunct of the existing `if version and … and compare_versions(…) ==
+  "not_newer"`, so `get_package_version` still runs before identity is
+  consulted. SL-1 reported that placing the guard ahead of the fetch broke
+  `TestUpToDateShortCircuit`'s call-count assertion, since a mismatch would then
+  skip the version lookup entirely. This plan read as though the guard would sit
+  ahead of the fetch; it does not, and nothing in EC-UPDPATH-1..3 requires it to.
+- **The `TestUpToDateShortCircuit` fixture warning was misplaced.** That class
+  needed no changes at all: both of its tests assert the short-circuit does
+  *not* fire, so an extra always-`False` conjunct cannot move their outcome —
+  which also means neither of them discriminates a degenerate gate. The
+  prediction was right for `TestCheckStaleness` (three fixtures gained
+  `package_type="npm"`), and the test this plan correctly identified as the one
+  that catches an always-`False` gate,
+  `test_short_circuit_is_a_single_compare_versions_call`, lives in
+  `TestShortCircuitUsesCompareVersions`, not in `TestUpToDateShortCircuit`; its
+  fixture needed `package_type="npm"` too. All four were pure insertions, so
+  `git diff --numstat -- tests/` reports zero deletions and the fixture work is
+  invisible unless you read the hunks.
+- **EC-3 needed state, not just a gated pair.** This plan named both of
+  `refresh_all`'s failure paths correctly but not what closing them costs:
+  setting `existing = None` stops the callee from short-circuiting and does
+  nothing about the final merge loop, which re-adds cached entries straight from
+  `existing_servers`. `refresh_all` keeps a `mismatched: set[str]` and excludes
+  those names from the merge.
+- **EC-7 needed no code path of its own** — the empty-`package` case falls out of
+  `_same_package`'s any-unknown arm for free.
+- **`roadmap_sha256` in this document's frontmatter is now stale** and was left
+  that way deliberately: it pins the roadmap as it stood when this plan was
+  written, and the closeout amendment above changed the roadmap. The v12 plans
+  that ran before this one carry a stale pin for the same reason.

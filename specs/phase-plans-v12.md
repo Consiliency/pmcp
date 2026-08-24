@@ -149,6 +149,88 @@ Close the two remaining correctness gaps in the update path: a refresh short-cir
 **Produces**
 - (none)
 
+### Post-execution amendments — UPDPATH (2026-08-24)
+
+- **EC-UPDPATH-7 needed no code path of its own.** The empty-`package` case falls
+  out of `_same_package` for free: the predicate rejects any of its four
+  arguments being `None`, `""` or `"unknown"` in one loop, and
+  `load_descriptions_cache` renders an absent `package` as `""`, so the same arm
+  that covers an absent `package_type` covers it. There is no empty-package
+  branch anywhere in `refresher.py`, and the criterion is pinned by
+  `TestUnknownPackageForcesRefresh::test_empty_cached_package_forces_refresh`
+  rather than by dedicated code.
+- **The gate landed *inside* the short-circuit conjunction, after the version
+  fetch — not strictly before it.** EC-UPDPATH-2 is satisfied in the sense that
+  matters: the `detect_package_type` / `pkg_name` resolution moved above the
+  early return (exactly one call remains in `refresh_server`), so the comparison
+  can consult identity at all. But the `_same_package` call is the second
+  conjunct of the existing `if version and … and compare_versions(…) ==
+  "not_newer"`, so `get_package_version` still runs first on every non-forced
+  path. SL-1 reported that gating *before* the fetch broke
+  `TestUpToDateShortCircuit`'s call-count assertion — an identity mismatch would
+  short-circuit past the fetch entirely and the version lookup would never
+  happen. As placed, the fetch is not skipped and no existing assertion moved.
+  A future lane that wants to save the fetch on a mismatch must expect that test
+  to need rewriting, not just the guard to move.
+- **Two operator-visible consequences the plan did not anticipate.** Both are in
+  the CHANGELOG under `[Unreleased]`:
+  1. `pmcp refresh --check-versions` now reports an **unclassifiable local
+     server** (`node /opt/srv.js`, `python -m thing`) as stale on **every** run,
+     printing `local: 1.0.0 -> unknown` and the "Run 'pmcp refresh --force' to
+     update." footer permanently — a refresh does not settle it, because the
+     next check still cannot classify the package. Such servers were previously
+     skipped in silence. This follows unavoidably from "cannot confirm
+     identity → refresh"; the plan chose that semantics deliberately but did not
+     trace it to this output.
+  2. `refresh_all` now **drops** an unclassifiable server's cached entry when
+     regeneration fails, where it previously retained it. The plan explicitly
+     sanctioned dropping on failure ("dropping the entry on a failed
+     regeneration is acceptable"), but reasoned about it only for a *confirmed*
+     mismatch. For a `node`/`python` server there is no evidence of a mismatch,
+     only an inability to confirm one, so a transient startup failure now costs
+     cached descriptions that were probably still accurate.
+- **EC-UPDPATH-3 needed a `refresh_all`-local record, not just a gated pair.**
+  Setting `existing = None` for a mismatched server stops the callee from
+  short-circuiting, but does nothing about the final merge loop, which re-adds
+  every cached entry missing from the new set straight from `existing_servers`.
+  `refresh_all` therefore keeps a `mismatched: set[str]` and excludes those names
+  from the merge. The plan named both failure paths correctly; what it did not
+  say is that closing them requires state the gate itself cannot carry.
+- **The plan's fixture-update prediction was right, and is easy to misread as
+  wrong.** `git diff --numstat main..HEAD -- tests/` shows **zero** deleted
+  lines, which looks like no existing test was touched. Four pre-existing
+  fixtures did need `package_type="npm"` added — three in `TestCheckStaleness`
+  (as the plan predicted) and one in
+  `TestShortCircuitUsesCompareVersions::test_short_circuit_is_a_single_compare_versions_call`
+  (which the plan named but listed under a different class) — and every one of
+  them was a pure insertion. `TestUpToDateShortCircuit` genuinely needed
+  nothing: both of its tests assert the short-circuit does *not* fire, so an
+  extra always-`False` conjunct cannot change their outcome. That also means
+  those two tests do **not** discriminate a degenerate gate; the one that does
+  is `test_short_circuit_is_a_single_compare_versions_call`'s `result is
+  existing`, exactly as the plan said.
+- **EC-UPDPATH-4 was docstring-only, as planned, and the docstring is now pinned
+  by a test.** `handlers.py`'s diff for this phase is the `update_server`
+  docstring and nothing else. `test_update_server_docstring_states_both_probe_window_env_contracts`
+  asserts both halves are stated, so an edit that collapses them back into a
+  single "live environment" sentence fails the suite rather than passing review.
+- **`docs/` was not created.** SL-3 owned `docs/**` and deliberately left it
+  absent; the probe-window environment contract landed in `README.md` under
+  "Subordinate MCP Updates", which is where a user will actually meet it.
+- **The docs-catalog rescan helper is absent on this host and its history is
+  already incomplete for v12.** `_shared/scaffold_docs_catalog.py` does not
+  exist, so SL-3 audited `.claude/docs-catalog.json` by hand. That was the right
+  outcome independently: the helper scans a fixed set of roots plus a
+  `KNOWN_FILES` list that does **not** include `SPEC_COMPLIANCE.md`, so a rescan
+  would have dropped that root-level entry — Consiliency/pmcp#171, confirmed
+  against the helper's source rather than assumed. Separately, both earlier v12
+  phases left `touched_by_phases` empty on the files they edited (TRISTATE and
+  FANOUT are absent from `CHANGELOG.md`'s list, and `specs/phase-plans-v12.md`
+  carried an empty list despite holding FANOUT's own amendment block), so that
+  field is not a reliable history for v12. UPDPATH's aliases were added; the
+  missing ones were **not** backfilled, because there is no way to verify from
+  the catalog alone which files each phase actually touched.
+
 ### Phase 3 — Downstream catalog reconciliation and fan-out (FANOUT)
 
 **Objective**

@@ -479,6 +479,32 @@ URL-mode gateway calls.
 - `pmcp update <server>` and `pmcp update --all` call the same gateway update workflow.
 - Update information is reported on request by `gateway.update_server`; the gateway does not volunteer unprompted "update available" notices. It cannot observe which package version a running server is actually executing, so a volunteered notice could be wrong in either direction (Consiliency/pmcp#150).
 
+**The environment across the update's probe window.** `gateway.update_server`
+probes for a new package version and then re-resolves the server config before
+restarting anything. Two different kinds of environment change behave
+differently across that window, and they are not one rule:
+
+- A **config-driven** change is **refused**. That means anything resolved into
+  the server's `env` — which includes every manifest credential, since a
+  manifest credential is resolved into the server config at load time. If it
+  changes while the probe is running, `update_server` returns `ok=False` and
+  does **not** restart: the package is fetched but not activated, and no version
+  is recorded. The guarantee is that *the config restarted onto is the config
+  that was probed* (Consiliency/pmcp#151). Your change is not lost — rotate a
+  credential mid-update and it applies on the **next** update, rather than to a
+  process that was probed with the old value.
+- A **genuinely ambient** variable — one set in the gateway's own environment
+  rather than in a server's config — is **live at spawn**. It can never cause a
+  refusal (both sides of the check derive from the same base environment, so an
+  ambient change affects them equally and cancels out), and the restarted server
+  receives the value in force when it is spawned, not the one in force when the
+  update began. This is the same behaviour as `gateway.connect_server`,
+  `gateway.refresh` and auto-reconnect: every spawn path reads the ambient
+  environment at spawn time.
+
+Freezing the ambient environment across an update is deliberately not done
+(Consiliency/pmcp#162).
+
 ### Feedback Telemetry
 
 - PMCP can emit failure feedback hints and generate GitHub issue payload previews for agents.
@@ -1412,6 +1438,9 @@ pmcp logs --tail 100            # Last 100 lines
 pmcp refresh
 pmcp refresh --server github    # Refresh specific server
 pmcp refresh --force            # Force reconnect all
+pmcp refresh --check-versions   # Report stale cached descriptions without refreshing
+                                # (honours --cache-dir; a local server whose package
+                                #  cannot be classified reports stale on every run)
 
 # Initialize config (interactive)
 pmcp init

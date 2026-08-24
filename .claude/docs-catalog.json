@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "last_updated": "2026-08-23T05:59:17+00:00",
+  "last_updated": "2026-08-24T12:16:05+00:00",
   "files": {
     ".claude/plans/ticklish-inventing-stearns.md": {
       "purpose": "markdown document",
@@ -12,7 +12,8 @@
         "P1",
         "P5",
         "P2",
-        "P3B"
+        "P3B",
+        "UPDPATH"
       ]
     },
     "CONTRIBUTING.md": {
@@ -27,7 +28,8 @@
       "touched_by_phases": [
         "P5",
         "P2",
-        "P3B"
+        "P3B",
+        "UPDPATH"
       ]
     },
     "SECURITY.md": {
@@ -133,6 +135,12 @@
     "plans/phase-plan-v12-TRISTATE.md": {
       "purpose": "per-phase lane plan",
       "touched_by_phases": []
+    },
+    "plans/phase-plan-v12-UPDPATH.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": [
+        "UPDPATH"
+      ]
     },
     "plans/phase-plan-v2-lifecycle.md": {
       "purpose": "per-phase lane plan",
@@ -324,7 +332,9 @@
     },
     "specs/phase-plans-v12.md": {
       "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
+      "touched_by_phases": [
+        "UPDPATH"
+      ]
     },
     "specs/phase-plans-v2.md": {
       "purpose": "multi-phase roadmap spec",
