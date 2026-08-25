@@ -75,13 +75,23 @@ class TestDetectPackageType:
         assert pkg_name == "my-mcp-server"
 
     def test_npm_command(self) -> None:
-        """Test detection with npm command picks first non-flag arg."""
-        # `npm exec` IS special-cased now -- see TestPackageIdentityCollisions.
-        # This case has no subcommand at all, so the first non-flag token is
-        # the package either way.
-        pkg_type, pkg_name = detect_package_type("npm", ["-y", "server-pkg"])
+        """`npm` reads its package from an allowlisted subcommand's operand.
+
+        This test previously asserted `npm -y server-pkg` -> `server-pkg`.
+        That is not a legal npm invocation -- npm requires a subcommand -- and
+        the assertion encoded the parser's old permissiveness: the first
+        non-flag token was taken as a package whatever it was, which is the
+        Consiliency/pmcp#183 hazard (`npm run mcp` -> package `mcp`, then
+        installed and executed via `npx -y`). A bare token now fails closed;
+        the real form is exercised here instead.
+        """
+        pkg_type, pkg_name = detect_package_type("npm", ["exec", "-y", "server-pkg"])
         assert pkg_type == "npm"
         assert pkg_name == "server-pkg"
+
+    def test_npm_without_a_subcommand_is_not_a_package(self) -> None:
+        """A bare `npm <token>` is not legal npm, so no identity is claimed."""
+        assert detect_package_type("npm", ["-y", "server-pkg"]) == ("unknown", None)
 
     def test_uvx_simple_package(self) -> None:
         """Test detection of uvx (PyPI) package."""
@@ -286,11 +296,15 @@ class TestNpmSubcommandSkipFiresOnce:
     def test_npx_does_not_skip_a_package_named_exec(self) -> None:
         assert detect_package_type("npx", ["-y", "exec"]) == ("npm", "exec")
 
-    def test_npm_with_no_subcommand_still_finds_the_package(self) -> None:
-        assert detect_package_type("npm", ["-y", "server-pkg"]) == (
-            "npm",
-            "server-pkg",
-        )
+    def test_npm_without_a_subcommand_yields_no_identity(self) -> None:
+        """Renamed and inverted from ..._still_finds_the_package.
+
+        `npm -y server-pkg` is not a legal npm invocation, and treating its
+        first token as a package is the Consiliency/pmcp#183 hazard in general
+        form. The allowlist now requires a recognised subcommand before
+        anything is read as a package.
+        """
+        assert detect_package_type("npm", ["-y", "server-pkg"]) == ("unknown", None)
 
     def test_npm_run_names_a_script_not_a_package(self) -> None:
         """`npm run <script>` has no recoverable package identity.
@@ -312,6 +326,52 @@ class TestNpmSubcommandSkipFiresOnce:
             "unknown",
             None,
         )
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            # script runners
+            ["run", "mcp"],
+            ["run-script", "mcp"],
+            ["start"],
+            ["test"],
+            ["stop"],
+            ["restart"],
+            # initializers (npm resolves `init foo`/`create foo` to create-foo)
+            ["init", "foo"],
+            ["create", "foo"],
+            # TYPOS and anything else unrecognised -- the allowlist is what
+            # makes these safe. Under the denylist that shipped first, every
+            # one of these resolved to a package named after the subcommand
+            # and would have been installed and executed.
+            ["rum", "mcp"],
+            ["urn", "mcp"],
+            ["innit", "foo"],
+            ["publish"],
+            ["audit"],
+            # ...and with a global flag in front.
+            ["--silent", "run", "mcp"],
+        ],
+    )
+    def test_a_subcommand_without_a_package_operand_fails_closed(
+        self, args: list[str]
+    ) -> None:
+        """Anything outside the allowlist yields no identity at all.
+
+        Consiliency/pmcp#183. `gateway.update_server` builds `npx -y
+        {name}@latest --help` from whatever comes back, and `npx -y` installs
+        without prompting -- so a subcommand that falls through as a package
+        name gets fetched and run from the public registry.
+
+        This is an ALLOWLIST, not a denylist of script runners. A denylist
+        shipped first and was wrong: with only `run` and `create` denied,
+        `npm start`, `npm test`, `npm run-script mcp`, `npm init foo` and
+        typos like `npm rum mcp` all still resolved to packages named after the
+        subcommand (ah board review, red-team seat). Failing closed costs only
+        the ability to auto-update an unusual launch form; failing open costs
+        arbitrary package execution.
+        """
+        assert detect_package_type("npm", args) == ("unknown", None)
 
     def test_npm_create_operand_is_not_the_package_npm_would_run(self) -> None:
         """`npm create foo` resolves to the package `create-foo`, not `foo`.

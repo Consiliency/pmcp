@@ -17,12 +17,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registry. Short generic script names (`run`, `start`, `dev`, `mcp`) are
   exactly the kind that can be registered and waited on.
 
-  `npm run <script>` and `npm create <initializer>` now report **no recoverable
-  package identity** rather than a wrong one, and `update_server` refuses on
-  that before constructing any probe — the same rule the identity gate follows:
-  cannot confirm, so do not act on a guess. (`npm create foo` was wrong in a
-  second way: npm resolves it to the package `create-foo`, so `foo` named a
-  different package than the one npm would run.)
+  npm package detection is now an **allowlist**: only `exec`, `x`, `install`,
+  `i`, `add` and `dlx` put a registry package in the next position. Every other
+  subcommand — `run`, `start`, `test`, `stop`, `restart`, `run-script`, `init`,
+  `create` — and every misspelling of one reports **no recoverable package
+  identity**, and `update_server` refuses on that before constructing any
+  probe. That is the same rule the identity gate follows: cannot confirm, so do
+  not act on a guess.
+
+  An allowlist rather than a denylist of script runners, because the
+  consequence of being wrong is asymmetric: failing closed costs only the
+  ability to auto-update a server launched by an unusual form, while failing
+  open costs arbitrary package execution. (`npm create foo` also shows why
+  synthesising a name is not safe: npm resolves it to the package `create-foo`,
+  so `foo` names a *different* package than the one npm would run.)
 
   Reaching this required a server configured with an affected form **and** an
   operator invoking `gateway.update_server` on it; it was not remotely

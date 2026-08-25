@@ -4885,6 +4885,11 @@ class TestUpdateServerVersionRepair:
         result = await gt.update_server({"server_name": "scripted"})
 
         assert result.ok is False
+        # The refusal must name the command line. Without it the message reads
+        # "could not determine package manager ... Supported managers: npm" --
+        # a contradiction from the user's side, since npm IS supported. The
+        # real reason is that this command line names no registry package.
+        assert "npm run mcp" in result.message
         assert probes == [], (
             "update_server executed a probe built from a package.json SCRIPT "
             f"name -- `npx -y mcp@latest` would install from the registry: {probes}"
