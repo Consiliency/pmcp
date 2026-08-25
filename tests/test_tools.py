@@ -5693,6 +5693,25 @@ class TestUpdateServerVersionRepair:
         assert detect("docker", "docker", ["run", "registry:5000/img"]) is None
         assert detect("docker", "docker", ["run", "registry:5000/img:2.0"]) == "2.0"
 
+        # docker digests: `@sha256:...` is an identity, not a version pin.
+        # Before Consiliency/pmcp#180's fix the tag scan ran on the whole
+        # reference, so `img@sha256:abc` reported a pin of "abc" -- a digest
+        # FRAGMENT presented as a version -- and `img:1.2@sha256:abc` reported
+        # "1.2@sha256:abc" rather than the actual pin "1.2".
+        assert detect("docker", "docker", ["run", "img@sha256:abc"]) is None
+        assert detect("docker", "docker", ["run", "img:1.2@sha256:abc"]) == "1.2"
+
+        # npm subcommands: the scan is SHARED with detect_package_type, so it
+        # skips a leading subcommand here too. Before that, `npm exec pkg@1.2`
+        # scanned to "exec", whose `_npm_tag` is None, so a REAL pin read as
+        # unpinned (Consiliency/pmcp#180).
+        assert detect("npm", "npm", ["exec", "pkg@1.2"]) == "1.2"
+        assert detect("npm", "npm", ["x", "pkg@1.2"]) == "1.2"
+        assert detect("npm", "npm", ["exec", "pkg@latest"]) is None
+        assert detect("npm", "npm", ["exec", "pkg"]) is None
+        # ...and `npx` still must not skip a package genuinely named `exec`.
+        assert detect("npm", "npx", ["-y", "exec@1.2"]) == "1.2"
+
         # cargo: pins via a separate --version flag, both spellings.
         assert detect("cargo", "cargo", ["install", "srv", "--version", "1.0"]) == "1.0"
         assert detect("cargo", "cargo", ["install", "srv", "--version=1.0"]) == "1.0"

@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Two different packages no longer share one identity for common `docker` and
+  `npm` command forms.** 2.4.0's identity gate decides whether a cached
+  description still describes the configured package by comparing the *name*
+  `detect_package_type` returns, so a name that was stable across two different
+  packages was read as a positive confirmation — and the freshness
+  short-circuit went on serving the wrong package's tool descriptions.
+
+  Two independent causes, both closed:
+
+  - **Docker references split on the first `:`,** so `registry:5000/old-image`
+    and `registry:5000/new-image` both resolved to the image `registry` — the
+    registry host, not an image at all. A colon only introduces a tag when it
+    appears in the final path segment; before the last `/` it is a registry
+    `host:port`. The correct rule already existed in this module as
+    `_docker_image_tag`, so the fix adds its paired complement rather than a
+    second, divergent implementation of the same rule.
+  - **`npm` subcommands were taken as the package name,** so `npm exec old-pkg`
+    and `npm exec new-pkg` both resolved to `exec`. A leading subcommand
+    (`exec`, `x`, `run`, `install`, `i`, `add`, `create`, `dlx`) is now skipped
+    — once, and only for `npm`, so `npm install i` still finds the real package
+    `i` and `npx -y exec` still finds a package genuinely named `exec`.
+
+  **Affected servers refresh once.** A docker server on a `host:port` registry
+  or an `npm exec` server now has a *different* package identity than the one
+  its cache entry recorded, so that entry fails the identity check once and is
+  regenerated — the same one-time migration 2.4.0's `package_type` addition
+  caused.
+- **A docker digest is no longer reported as a version pin.** `gateway.update_server`
+  read the tag from the whole reference, so `img@sha256:abc` reported a pin of
+  `abc` — a fragment of the digest presented as a version — and
+  `img:1.2@sha256:abc` reported `1.2@sha256:abc` instead of the actual pin
+  `1.2`. A `@digest` suffix is now stripped before the tag is read.
+- **A version pin on an `npm exec` server is now detected.** Pin detection
+  shares its argument scan with package detection, so it inherited the
+  subcommand bug: `npm exec pkg@1.2` scanned to `exec`, which carries no
+  version suffix, and a real pin was reported as unpinned.
+
+  **This narrows Consiliency/pmcp#180 rather than closing it.** Package identity
+  is still collapsed wherever a flag's *value* is taken as the package name —
+  `docker run --env-file X <image>`, `docker run --mount <spec> <image>`,
+  `npm exec --package=<pkg>`, and the `uvx`/`pip`/`cargo` equivalents. Those are
+  tracked on Consiliency/pmcp#182, and Consiliency/pmcp#183 tracks a related but
+  more serious consequence of a misparse.
+
 ## [2.4.0] - 2026-08-25
 
 ### Fixed
