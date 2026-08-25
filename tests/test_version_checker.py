@@ -219,9 +219,7 @@ class TestPackageIdentityCollisions:
         """
         old = detect_package_type("npm", ["exec", "old-pkg"])
         new = detect_package_type("npm", ["exec", "new-pkg"])
-        assert old != new, (
-            f"two different npm exec packages collapsed: {old} == {new}"
-        )
+        assert old != new, f"two different npm exec packages collapsed: {old} == {new}"
         assert old == ("npm", "old-pkg")
         assert new == ("npm", "new-pkg")
 
