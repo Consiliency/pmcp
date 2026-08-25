@@ -54,9 +54,38 @@ def _npm_tag(package: str) -> str | None:
     return tag if tag_sep and _name else None
 
 
-_NPM_SUBCOMMANDS = frozenset(
-    {"exec", "x", "run", "install", "i", "add", "create", "dlx"}
+# npm subcommands whose operand IS a registry package name -- an ALLOWLIST.
+#
+# This is deliberately an allowlist and not a denylist of script-running
+# subcommands, because the consequence of being wrong is asymmetric.
+# gateway.update_server builds its probe from whatever name comes back --
+# `npx -y {name}@latest --help` -- and `npx -y` INSTALLS WITHOUT PROMPTING
+# (Consiliency/pmcp#183). So an unrecognised subcommand that falls through as
+# a package name gets fetched and executed from the public registry.
+#
+# A denylist shipped first and was wrong for exactly that reason (ah board
+# review, red-team seat): with only `run` and `create` denied, `npm start`,
+# `npm test`, `npm stop`, `npm restart`, `npm run-script mcp` and `npm init foo`
+# all still resolved to packages named after the SUBCOMMAND -- and so did
+# typos like `npm rum mcp`. Every npm subcommand that is not listed below, and
+# every misspelling of one, would have been installed and run.
+#
+# Failing closed costs only the ability to auto-update a server launched by an
+# unusual form; failing open costs arbitrary package execution. Adding a
+# subcommand here is a deliberate act that says "the token after this really is
+# a registry package".
+_NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND = frozenset(
+    {"exec", "x", "install", "i", "add", "dlx"}
 )
+
+# Retained under its historical name for the skip logic below: the operand of a
+# subcommand NOT in the allowlist is not a package, so identity is
+# unrecoverable and `("unknown", None)` is the honest answer -- the same rule
+# the identity gate follows, cannot confirm -> do not act on a guess.
+# `npm create foo` is a good illustration of why synthesising is not safe
+# either: npm resolves it to the package `create-foo`, so `foo` names a
+# DIFFERENT package than the one npm would run.
+_NPM_SUBCOMMANDS = _NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND
 
 
 def _npm_package_arg(args: list[str], command: str) -> str | None:
@@ -108,8 +137,20 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
             # Only the first non-flag token can be the subcommand; whatever
             # follows is a candidate package even if it repeats the word.
             skip_subcommand = False
-            if arg in _NPM_SUBCOMMANDS:
+            if arg in _NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND:
                 continue
+            # ANY other subcommand -- `run`, `start`, `test`, `init`,
+            # `run-script`, or a typo like `rum` -- does not put a registry
+            # package in the next position, so there is no identity to
+            # recover. Fail CLOSED (None -> "unknown") rather than handing
+            # back a token that gateway.update_server would install and
+            # execute via `npx -y` (Consiliency/pmcp#183).
+            #
+            # Note this refuses the subcommand form even when the FIRST token
+            # is itself a plausible package name: `npm somepkg` is not a legal
+            # npm invocation anyway (npm requires a subcommand), so nothing
+            # real is lost.
+            return None
         # Found package name (might have @version or @dist-tag suffix)
         pkg = _strip_npm_tag(arg)
         # Handle scoped packages like @playwright/mcp

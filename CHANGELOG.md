@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`gateway.update_server` no longer installs and executes a registry package
+  derived from a misparsed command.** The update probe is built from the parsed
+  package name — `npx -y {name}@latest --help` — and `npx -y` installs without
+  prompting. A server configured as `npm run mcp` names a **script** in the
+  local `package.json`, not a registry package, but the parser returned it as
+  one, so pmcp fetched and ran whatever occupied that name on the public
+  registry. Short generic script names (`run`, `start`, `dev`, `mcp`) are
+  exactly the kind that can be registered and waited on.
+
+  npm package detection is now an **allowlist**: only `exec`, `x`, `install`,
+  `i`, `add` and `dlx` put a registry package in the next position. Every other
+  subcommand — `run`, `start`, `test`, `stop`, `restart`, `run-script`, `init`,
+  `create` — and every misspelling of one reports **no recoverable package
+  identity**, and `update_server` refuses on that before constructing any
+  probe. That is the same rule the identity gate follows: cannot confirm, so do
+  not act on a guess.
+
+  An allowlist rather than a denylist of script runners, because the
+  consequence of being wrong is asymmetric: failing closed costs only the
+  ability to auto-update a server launched by an unusual form, while failing
+  open costs arbitrary package execution. (`npm create foo` also shows why
+  synthesising a name is not safe: npm resolves it to the package `create-foo`,
+  so `foo` names a *different* package than the one npm would run.)
+
+  Reaching this required a server configured with an affected form **and** an
+  operator invoking `gateway.update_server` on it; it was not remotely
+  triggerable. `npx -y run` still resolves normally — the refusal is scoped to
+  npm subcommands whose operand is not a package, not to those names.
+
 ### Fixed
 - **Two different packages no longer share one identity for common `docker` and
   `npm` command forms.** 2.4.0's identity gate decides whether a cached

@@ -5038,13 +5038,23 @@ class GatewayTools:
 
         package_type, package_name = detect_package_type(command, args)
         if package_type == "unknown" or not package_name:
+            # Name the actual command line. Without it, a server launched as
+            # `npm run mcp` reads "could not determine package manager" and
+            # then "Supported managers: npm (npx)" -- which looks like a
+            # contradiction, since npm plainly IS supported. The real reason is
+            # narrower: that command line names no *registry package* to update
+            # (a package.json script is not one), so there is nothing for this
+            # tool to fetch (ah board review, correctness seat).
+            invocation = " ".join([command, *args]).strip() if command else ""
+            detail = f" from `{invocation}`" if invocation else ""
             return UpdateServerOutput(
                 ok=False,
                 server=server_name,
                 package_type="unknown",
                 message=(
-                    f"Could not determine package manager for '{server_name}'. "
-                    "Supported managers: npm (npx), pypi (uvx/pip), cargo, docker."
+                    f"Could not determine a registry package to update for "
+                    f"'{server_name}'{detail}. Supported managers: npm (npx), "
+                    "pypi (uvx/pip), cargo, docker."
                 ),
             )
 
