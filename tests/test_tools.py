@@ -4839,6 +4839,57 @@ class TestUpdateServerVersionRepair:
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
         return manifest
 
+    @pytest.mark.asyncio
+    async def test_update_server_never_probes_a_script_name(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """`npm run <script>` must not become an installed registry package.
+
+        Consiliency/pmcp#183. `update_server` builds its probe from the parsed
+        package name -- `npx -y {name}@latest --help` -- and `npx -y` installs
+        without prompting. A `npm run mcp` server names a SCRIPT in the local
+        package.json, not a registry package, so parsing it as one made pmcp
+        install and execute whatever occupied that name on the public registry.
+        Short generic script names (`run`, `start`, `dev`, `mcp`) are exactly
+        what an attacker can register and wait on.
+
+        The fix is to recover no identity at all rather than a wrong one:
+        `detect_package_type` returns `("unknown", None)`, which the existing
+        guard refuses on before any probe is constructed. This test asserts the
+        *consequence* -- that nothing is executed -- not merely the parse,
+        because the parse being right is only useful if it reaches the refusal.
+        """
+        manifest = self._make_manifest_with_playwright(monkeypatch)
+        manifest.servers["scripted"] = ServerConfig(
+            name="scripted",
+            description="Runs a package.json script",
+            keywords=[],
+            install={},
+            command="npm",
+            args=["run", "mcp"],
+            requires_api_key=False,
+        )
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        probes: list[list[str]] = []
+
+        async def _record_probe(cmd, env=None):
+            probes.append(cmd)
+            return (True, "ok")
+
+        monkeypatch.setattr(gt, "_run_update_probe_command", _record_probe)
+
+        result = await gt.update_server({"server_name": "scripted"})
+
+        assert result.ok is False
+        assert probes == [], (
+            "update_server executed a probe built from a package.json SCRIPT "
+            f"name -- `npx -y mcp@latest` would install from the registry: {probes}"
+        )
+
     def _make_cache(self, version: str = "0.1.0") -> DescriptionsCache:
         return DescriptionsCache(
             generated_at="2024-01-01T00:00:00",

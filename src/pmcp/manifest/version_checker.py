@@ -58,6 +58,28 @@ _NPM_SUBCOMMANDS = frozenset(
     {"exec", "x", "run", "install", "i", "add", "create", "dlx"}
 )
 
+# npm subcommands whose operand is NOT a registry package name.
+#
+# `npm run <script>` runs a script defined in the local package.json -- the
+# token is a script name, and there is generally no registry package by that
+# name at all. Returning it as a package makes gateway.update_server build
+# `npx -y <script>@latest --help` and, because `npx -y` installs without
+# prompting, INSTALL AND EXECUTE whatever happens to occupy that name on the
+# public registry (Consiliency/pmcp#183). Short generic script names -- `run`,
+# `start`, `dev`, `mcp` -- are exactly the kind an attacker can register and
+# wait on.
+#
+# `npm create <initializer>` is also not a direct name: `npm create foo`
+# resolves to the package `create-foo`, so reporting `foo` names a DIFFERENT
+# package than the one npm would run.
+#
+# For both, the honest answer is that identity cannot be recovered from the
+# command line, which is what `("unknown", None)` means. update_server already
+# refuses cleanly on that (handlers.py, the `package_type == "unknown"` guard)
+# rather than guessing -- the same rule the identity gate follows: cannot
+# confirm -> do not act on a guess.
+_NPM_SUBCOMMANDS_WITHOUT_A_PACKAGE_OPERAND = frozenset({"run", "create"})
+
 
 def _npm_package_arg(args: list[str], command: str) -> str | None:
     """Return the raw npm/npx package token from *args*, or ``None``.
@@ -108,6 +130,13 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
             # Only the first non-flag token can be the subcommand; whatever
             # follows is a candidate package even if it repeats the word.
             skip_subcommand = False
+            if arg in _NPM_SUBCOMMANDS_WITHOUT_A_PACKAGE_OPERAND:
+                # `npm run <script>` / `npm create <initializer>`: whatever
+                # follows is NOT a registry package name, so there is no
+                # package identity to recover here. Say so (None -> "unknown")
+                # instead of handing back a script name that a caller would
+                # install and execute (Consiliency/pmcp#183).
+                return None
             if arg in _NPM_SUBCOMMANDS:
                 continue
         # Found package name (might have @version or @dist-tag suffix)

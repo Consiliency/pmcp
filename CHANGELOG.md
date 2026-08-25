@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **`gateway.update_server` no longer installs and executes a registry package
+  derived from a misparsed command.** The update probe is built from the parsed
+  package name — `npx -y {name}@latest --help` — and `npx -y` installs without
+  prompting. A server configured as `npm run mcp` names a **script** in the
+  local `package.json`, not a registry package, but the parser returned it as
+  one, so pmcp fetched and ran whatever occupied that name on the public
+  registry. Short generic script names (`run`, `start`, `dev`, `mcp`) are
+  exactly the kind that can be registered and waited on.
+
+  `npm run <script>` and `npm create <initializer>` now report **no recoverable
+  package identity** rather than a wrong one, and `update_server` refuses on
+  that before constructing any probe — the same rule the identity gate follows:
+  cannot confirm, so do not act on a guess. (`npm create foo` was wrong in a
+  second way: npm resolves it to the package `create-foo`, so `foo` named a
+  different package than the one npm would run.)
+
+  Reaching this required a server configured with an affected form **and** an
+  operator invoking `gateway.update_server` on it; it was not remotely
+  triggerable. `npx -y run` still resolves normally — the refusal is scoped to
+  npm subcommands whose operand is not a package, not to those names.
+
 ### Fixed
 - **Two different packages no longer share one identity for common `docker` and
   `npm` command forms.** 2.4.0's identity gate decides whether a cached

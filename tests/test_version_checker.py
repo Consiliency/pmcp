@@ -292,6 +292,47 @@ class TestNpmSubcommandSkipFiresOnce:
             "server-pkg",
         )
 
+    def test_npm_run_names_a_script_not_a_package(self) -> None:
+        """`npm run <script>` has no recoverable package identity.
+
+        Consiliency/pmcp#183. The operand is a script in the local
+        package.json, so there is generally no registry package by that name.
+        Returning it as one made gateway.update_server build
+        `npx -y <script>@latest --help` -- and `npx -y` installs without
+        prompting, so pmcp installed and executed whatever occupied that name
+        on the public registry.
+
+        `("unknown", None)` is the honest answer, and update_server already
+        refuses on it before constructing any probe.
+        """
+        assert detect_package_type("npm", ["run", "mcp"]) == ("unknown", None)
+        assert detect_package_type("npm", ["run", "start"]) == ("unknown", None)
+        # ...including when a global flag precedes the subcommand.
+        assert detect_package_type("npm", ["--silent", "run", "mcp"]) == (
+            "unknown",
+            None,
+        )
+
+    def test_npm_create_operand_is_not_the_package_npm_would_run(self) -> None:
+        """`npm create foo` resolves to the package `create-foo`, not `foo`.
+
+        Reporting `foo` names a DIFFERENT package than the one npm runs, which
+        is the same wrong-identity hazard as the script case.
+        """
+        assert detect_package_type("npm", ["create", "foo"]) == ("unknown", None)
+
+    def test_npx_can_still_run_packages_named_run_or_create(self) -> None:
+        """The refusal is npm-subcommand-scoped, not a name blocklist.
+
+        `npx -y run` names a real registry package called `run`; nothing about
+        Consiliency/pmcp#183 should make that unresolvable.
+        """
+        assert detect_package_type("npx", ["-y", "run"]) == ("npm", "run")
+        assert detect_package_type("npx", ["-y", "create"]) == ("npm", "create")
+        # And the operand position is still a package for the other
+        # subcommands -- only `run`/`create` name something else.
+        assert detect_package_type("npm", ["exec", "run"]) == ("npm", "run")
+
     def test_a_leading_flag_does_not_consume_the_subcommand_skip(self) -> None:
         """npm accepts global flags before the subcommand.
 
