@@ -35,11 +35,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its cache entry recorded, so that entry fails the identity check once and is
   regenerated — the same one-time migration 2.4.0's `package_type` addition
   caused.
-- **A docker digest is no longer reported as a version pin.** `gateway.update_server`
+- **A docker digest is now recognised as the pin it is.** `gateway.update_server`
   read the tag from the whole reference, so `img@sha256:abc` reported a pin of
   `abc` — a fragment of the digest presented as a version — and
-  `img:1.2@sha256:abc` reported `1.2@sha256:abc` instead of the actual pin
-  `1.2`. A `@digest` suffix is now stripped before the tag is read.
+  `img:1.2@sha256:abc` reported `1.2@sha256:abc` instead of a usable value. A
+  digest is the *tightest* pin docker offers, so it is now reported whole and
+  checked before the tag: `img@sha256:…`, `img:1.2@sha256:…` and
+  `img:latest@sha256:…` all report the digest. That last form matters — a
+  `latest` tag must not discard a real digest pin. Previously such a server
+  could be "updated": pmcp would pull `image:latest`, restart the unchanged
+  digest-pinned configuration, and record the registry's newest digest while
+  still running the old immutable image.
 - **A version pin on an `npm exec` server is now detected.** Pin detection
   shares its argument scan with package detection, so it inherited the
   subcommand bug: `npm exec pkg@1.2` scanned to `exec`, which carries no

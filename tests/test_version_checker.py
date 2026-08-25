@@ -292,6 +292,27 @@ class TestNpmSubcommandSkipFiresOnce:
             "server-pkg",
         )
 
+    def test_a_leading_flag_does_not_consume_the_subcommand_skip(self) -> None:
+        """npm accepts global flags before the subcommand.
+
+        The skip is one-shot, so it must fire on the first non-flag token, not
+        the first argv token. Spending it on `--silent` would leave `exec` to
+        be read as the package -- reopening the #180 collapse for every form
+        that carries a leading flag.
+
+        This ordering was already correct but *unpinned*: swapping the flag
+        skip and the subcommand check passed the entire suite, because every
+        other test here puts the subcommand first (ah board review, adversarial
+        seat, reported as a surviving mutant).
+        """
+        old = detect_package_type("npm", ["--silent", "exec", "old-pkg"])
+        new = detect_package_type("npm", ["--silent", "exec", "new-pkg"])
+        assert old != new, (
+            f"a leading flag reopened the npm exec collapse: {old} == {new}"
+        )
+        assert old == ("npm", "old-pkg")
+        assert new == ("npm", "new-pkg")
+
 
 class TestCompareVersionsOrdering:
     """Detailed classification cases for `compare_versions`.

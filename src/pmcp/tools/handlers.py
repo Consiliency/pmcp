@@ -76,6 +76,7 @@ from pmcp.manifest.registry import (
 from pmcp.manifest.refresher import save_descriptions_cache
 from pmcp.manifest.version_checker import (
     _docker_image_arg,
+    _docker_image_digest,
     _docker_image_tag,
     _npm_package_arg,
     _npm_tag,
@@ -326,6 +327,19 @@ def _detect_effective_version_pin(
         raw_image = _docker_image_arg(args)
         if raw_image is None:
             return None
+        # A DIGEST is the tightest pin docker has -- immutable content
+        # identity, stronger than any tag -- so it must be checked first and
+        # independently of the tag. `_docker_image_tag` deliberately returns
+        # None for a digest-only reference (a digest is not a tag), so reading
+        # the tag alone would report `img@sha256:...` as UNPINNED. update_server
+        # would then pull `image:latest`, restart the unchanged digest-pinned
+        # config, and record the registry's newest digest -- announcing an
+        # update while still running the old immutable image (ah board review,
+        # red-team seat). `image:latest@sha256:...` is the same trap wearing a
+        # tag that the `== "latest"` test would otherwise discard.
+        digest = _docker_image_digest(raw_image)
+        if digest:
+            return digest
         tag = _docker_image_tag(raw_image)
         return None if not tag or tag == "latest" else tag
     if package_type == "cargo":

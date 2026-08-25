@@ -95,11 +95,17 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
     for arg in args:
         if arg == "-y":
             continue
-        # Skip flags
+        # Skip flags. This MUST precede the subcommand check: npm accepts
+        # global flags before the subcommand (`npm --silent exec pkg`), so
+        # spending the one-shot skip on a flag token would leave `exec` to be
+        # read as the package and reopen the #180 collapse for every form
+        # carrying a leading flag. The ordering is already correct; the test
+        # below exists because nothing PINNED it (ah board review, adversarial
+        # seat: a surviving mutant, not a live defect).
         if arg.startswith("-"):
             continue
         if skip_subcommand:
-            # Only the FIRST non-flag token can be the subcommand; whatever
+            # Only the first non-flag token can be the subcommand; whatever
             # follows is a candidate package even if it repeats the word.
             skip_subcommand = False
             if arg in _NPM_SUBCOMMANDS:
@@ -425,11 +431,35 @@ def _docker_image_tag(image_ref: str) -> str | None:
     because ``_docker_image_name`` is this function's complement and the two
     must agree about where a reference divides -- an identity gate compares the
     name, so a divergence lets two different images confirm as one package.
+
+    **A caller deciding whether a reference is PINNED must not read this
+    function alone** -- ask ``_docker_image_digest`` too. A digest-only
+    reference has no tag, so this correctly returns ``None``, and a caller
+    treating ``None`` as "unpinned" would conclude that the most tightly
+    pinned form docker has is not pinned at all (ah board review, red-team
+    seat).
     """
     base = image_ref.partition("@")[0] or image_ref
     last_segment = base.rsplit("/", 1)[-1]
     name, sep, tag = last_segment.partition(":")
     return tag if sep and name and tag else None
+
+
+def _docker_image_digest(image_ref: str) -> str | None:
+    """Return the ``@digest`` on a docker image reference, or ``None``.
+
+    The third member of the reference-splitting family, beside
+    ``_docker_image_name`` and ``_docker_image_tag``. A digest is an immutable
+    content identity -- the TIGHTEST pin docker offers, stronger than any tag --
+    so a caller asking "is this reference pinned?" must consult this as well as
+    the tag. Reading the tag alone reports a digest-only reference as unpinned,
+    which would let gateway.update_server pull ``image:latest``, restart the
+    unchanged digest-pinned config, and record the registry's newest digest as
+    though it had updated -- announcing an update while still running the old
+    immutable image (ah board review, red-team seat).
+    """
+    _name, sep, digest = image_ref.partition("@")
+    return digest if sep and digest else None
 
 
 def _docker_image_name(image_ref: str) -> str:
