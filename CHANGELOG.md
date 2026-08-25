@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-08-25
+
 ### Security
 - **`gateway.update_server` no longer installs and executes a registry package
   derived from a misparsed command.** The update probe is built from the parsed
