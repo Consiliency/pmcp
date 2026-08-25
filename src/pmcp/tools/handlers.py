@@ -304,7 +304,13 @@ def _detect_effective_version_pin(
     than an inline suffix, so it needs its own scan.
     """
     if package_type == "npm":
-        raw = _npm_package_arg(args)
+        # `command` is passed for the same reason detect_package_type passes
+        # it: the scan is shared so the two cannot disagree about which
+        # argument is "the package", and it can only be right for both `npm`
+        # (subcommand first) and `npx` (package first) if it knows which it is
+        # reading. Before this, `npm exec pkg@1.2` scanned to `exec`, whose
+        # `_npm_tag` is None, so a REAL pin was reported as unpinned.
+        raw = _npm_package_arg(args, command)
         if raw is None:
             return None
         tag = _npm_tag(raw)

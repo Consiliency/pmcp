@@ -64,6 +64,39 @@ port (`registry:5000/img:1.2.3`) does not read as a tag of `5000`."* It is what
 **not** a new rule — it is making `detect_package_type` use the rule the file
 already has, which is why this plan no longer introduces a second helper.
 
+**This change NARROWS #180; it does not close it.** *(Board finding, verified —
+and it falsifies a premise this plan previously stated.)* An earlier draft said
+"the *selection* of the image token is sound — only the tag-stripping is wrong."
+That is false. `_docker_image_arg`'s `_value_flags` table
+(`version_checker.py:336-359`) is incomplete, and `_npm_package_arg` discards
+option tokens wholesale, so ordinary command forms still collapse two packages
+to one identity **after** everything in this plan lands:
+
+```
+docker run --env-file .env old-image        -> ('docker', '.env')
+docker run --env-file .env new-image        -> ('docker', '.env')
+docker run --mount type=bind,src=/a A / B   -> both ('docker', 'type=bind,src=/a')
+npm exec --package=old-pkg -- shared-bin    -> ('npm', 'exec')
+npm exec --package=new-pkg -- shared-bin    -> ('npm', 'exec')
+```
+
+These are not exotic: `--env-file` and `--mount` are everyday `docker run`
+options, and `--package=` is the documented way to name an npm exec target.
+Moved to **Consiliency/pmcp#182** (broadened for this), because closing them
+needs either an exhaustive per-ecosystem flag table or a fail-closed contract —
+a parser redesign, not this bounded fix.
+
+**Consequence for closeout: the PR must NOT close #180.** It narrows it. A
+"fixed" label here would mark a still-open hole as closed.
+
+**A more serious class, filed as Consiliency/pmcp#183.** `update_server` builds
+its probe from the parsed name — `npx -y {package_name}@latest --help`
+(`handlers.py:5049`) — and `npx -y` installs without prompting. So
+`npm run mcp`, where `mcp` is a **local script**, parses to package `run` and
+pmcp installs and executes whatever `run` is on the npm registry. That is
+unintended package execution rather than a mislabelled cache entry, so it is
+out of scope here and tracked on its own.
+
 **Scope correction (board finding, verified).** An earlier draft of this plan
 claimed the `pip`/`cargo` branches "are not implicated" and that `uvx` was fine.
 **That was false.** Every excluded branch collides, by the same root cause —
@@ -105,8 +138,10 @@ is a normal pattern), so #182 should not sit long.
 - `detect_package_type` docker branch — **modify** — replace
   `raw.split(":")[0]` with `_docker_image_name(raw)`.
 - `_npm_package_arg` — **modify** — skip **one leading** npm subcommand token
-  (`exec`, `run`, `install`, `i`, `add`, `create`, `dlx`), and only when
-  `command == "npm"`.
+  (`exec`, `x`, `run`, `install`, `i`, `add`, `create`, `dlx`), and only when
+  `command == "npm"`. **`x` is not optional** — it is the documented `npm exec`
+  alias, and omitting it leaves `npm x old-pkg` / `npm x new-pkg` colliding
+  exactly as `npm exec` does today (two seats raised this independently).
   - **Skip-once, leading-only — not the docker loop's shape.** Docker skips
     subcommand tokens *anywhere* in `args` (`version_checker.py:361-366`).
     Copying that here would swallow real packages: `npm install i` → `None`
@@ -253,15 +288,24 @@ automation:
 
 ## Acceptance criteria
 
+**The mutation proof must name the single test node, never the class.** *(Board
+finding.)* Reverting the docker branch also reddens the `localhost` regression
+test, so a red **class** proves nothing about whether the collision test itself
+is load-bearing — which is precisely how the two prior hollow tests survived.
+Run one node id at a time against the reverted parser.
+
 - [ ] `detect_package_type("docker", ["run","registry:5000/old-image"])` and
       `...new-image` return **different** package names — proven by
-      `uv run pytest tests/test_version_checker.py::TestDetectPackageType -q`
-      and by reverting the docker branch to `raw.split(":")[0]` to confirm the
-      test fails, with that output recorded.
+      `uv run pytest "tests/test_version_checker.py::TestDetectPackageType::<docker-collision-test>" -q`
+      **alone**, against a parser reverted to `raw.split(":")[0]`, with that
+      output recorded in the handoff.
 - [ ] `detect_package_type("npm", ["exec","old-pkg"])` and `...new-pkg` return
-      **different** package names, while `npx -y exec` → `exec`,
-      `npm install i` → `i`, and `npm exec exec` → `exec` all hold — same
-      command, same recorded-mutation requirement.
+      **different** package names, and `npm x old-pkg` / `npm x new-pkg` do too,
+      while `npx -y exec` → `exec`, `npm install i` → `i`, and
+      `npm exec exec` → `exec` all hold — same single-node mutation requirement.
+- [ ] The PR **narrows** #180 rather than closing it, and says so: the forms in
+      #182 (`docker run --env-file`, `--mount`, `npm exec --package=`) still
+      collide after this change.
 - [ ] **Digest forms resolve correctly, not merely differently:**
       `img:1.2@sha256:abc` → `img` (unchanged from today — the first draft of
       this plan regressed it), `img@sha256:abc` → `img`, and
