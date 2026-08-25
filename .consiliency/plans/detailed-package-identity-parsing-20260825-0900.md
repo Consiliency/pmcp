@@ -48,37 +48,89 @@ Two distinct root causes, and they are **not** the same bug:
    the tag-stripping is wrong. Confirmed still-correct forms that must not
    regress: `img:1.2` → `img`, `ghcr.io/org/img:v2` → `ghcr.io/org/img`,
    `mcp/server:latest` → `mcp/server`.
-2. **npm** — `_npm_package_arg` (`version_checker.py:~?`, search the symbol)
-   skips only `-y` and flags. It has **no subcommand skip at all**, so `exec`,
-   `run` etc. are taken as the package. This is an asymmetry with the docker
-   branch, which does skip its subcommands.
+2. **npm** — `_npm_package_arg` (`version_checker.py:57`) skips only `-y` and
+   flags. It has **no subcommand skip at all**, so `exec`, `run` etc. are taken
+   as the package. This is an asymmetry with the docker branch, which does skip
+   its subcommands.
 
 The third finding (`localhost:5000/a/b:tag`) is not in the issue text; it is the
 same docker root cause with a different registry host, and is included here.
 
-**Scope discipline.** `uvx --from thing other` → `("pypi", "thing")` is
-**correct** (`--from` names the package) and is out of scope. `pip`/`cargo`
-branches are not implicated. This plan touches the two branches with measured
-collisions and nothing else.
+**The correct docker rule already exists in this file.** `_docker_image_tag`
+(`version_checker.py:377`) splits the **last path segment** on its **first**
+colon, with a docstring that names this exact case: *"a registry host with a
+port (`registry:5000/img:1.2.3`) does not read as a tag of `5000`."* It is what
+`update_server`'s pin detection uses (`handlers.py:323`). So the docker fix is
+**not** a new rule — it is making `detect_package_type` use the rule the file
+already has, which is why this plan no longer introduces a second helper.
+
+**Scope correction (board finding, verified).** An earlier draft of this plan
+claimed the `pip`/`cargo` branches "are not implicated" and that `uvx` was fine.
+**That was false.** Every excluded branch collides, by the same root cause —
+value-carrying flags whose values are not skipped:
+
+```
+uvx   --python 3.12 pkg-a / pkg-b        -> both ('pypi', '3.12')
+uvx   --with requests srv-a / srv-b      -> both ('pypi', 'requests')
+pip   install --index-url URL pkg-a/b    -> both ('pypi', 'URL')
+cargo run --features full srv-a/b        -> both ('cargo', 'full')
+```
+
+`uvx --from thing other` → `thing` is correct only by luck: `--from`'s value
+*is* the package. That one safe flag is what made the branch look sound.
+Filed as **Consiliency/pmcp#182** rather than folded in — expanding this plan
+from two branches to five, with a new shared `_value_flags` design, would turn a
+bounded fix into a parser redesign and discard the review that scoping bought.
+`uvx` is arguably the *most* consequential case (common MCP launcher, `--with`
+is a normal pattern), so #182 should not sit long.
 
 ## Changes
 
 ### `src/pmcp/manifest/version_checker.py` (modify)
 
-- `_split_docker_reference` — **add** — new module-private helper returning
-  `(name, tag_or_none)` for an OCI reference, splitting on the last `:` **only
-  when it occurs after the last `/`**. Extracted rather than inlined so the rule
-  has one home and one test surface; the docker branch and any future caller
-  that wants the tag both read it from here.
+- `_docker_image_name` — **add** — module-private helper returning the image
+  **name** from an OCI reference, defined immediately beside the existing
+  `_docker_image_tag` (`version_checker.py:377`) as its paired inverse — the
+  same design as `_strip_npm_tag`/`_npm_tag` (`version_checker.py:25-54`). It
+  must be **the exact complement** of `_docker_image_tag`: strip any `@digest`
+  first (`@` cannot appear in an OCI name, so `partition("@")` is unambiguous),
+  then split the last path segment on its **first** colon. Two independent homes
+  for this rule is the failure class the file's own docstrings exist to prevent.
+  - *Board finding, verified:* an earlier draft of this plan specified "split on
+    the last `:` when it occurs after the last `/`". Run against
+    `img:1.2@sha256:abc` that yields `img:1.2@sha256` where today's code
+    correctly yields `img` — **a regression**, because the last colon belongs to
+    the digest. It also diverged from `_docker_image_tag`, which returns
+    `1.2@sha256:abc` for the same input. Digest-first is what reconciles them.
 - `detect_package_type` docker branch — **modify** — replace
-  `raw.split(":")[0]` with `_split_docker_reference(raw)[0]`.
-- `_npm_package_arg` — **modify** — skip a leading npm **subcommand** token
-  (`exec`, `run`, `install`, `i`, `add`, `create`, `dlx`) the same way the docker
-  path already skips its own subcommands. Only when `command == "npm"`; `npx`
-  takes a package directly and must not gain a skip that would swallow a package
-  legitimately named `exec`. **This changes `_npm_package_arg`'s signature** — it
-  needs to know which command it is scanning for. Its other caller is
-  `update_server`'s pin detection (see Dependencies).
+  `raw.split(":")[0]` with `_docker_image_name(raw)`.
+- `_npm_package_arg` — **modify** — skip **one leading** npm subcommand token
+  (`exec`, `run`, `install`, `i`, `add`, `create`, `dlx`), and only when
+  `command == "npm"`.
+  - **Skip-once, leading-only — not the docker loop's shape.** Docker skips
+    subcommand tokens *anywhere* in `args` (`version_checker.py:361-366`).
+    Copying that here would swallow real packages: `npm install i` → `None`
+    (`i` is a genuine npm package) and `npm exec exec` → `None`. The plan text
+    previously said both "leading" and "the same way the docker path does";
+    those contradict, and leading-only is correct.
+  - `npx` must not gain the skip: it takes a package directly, so `npx -y exec`
+    must still resolve to `exec`.
+  - **This changes `_npm_package_arg`'s signature** — it needs the command it is
+    scanning for. Do **not** give it a defaulted parameter: a defaulted call site
+    would silently keep the old behaviour, which is the opposite of what a shared
+    scan needs. Its other caller is `update_server`'s pin detection (see
+    Dependencies).
+
+### `src/pmcp/tools/handlers.py` (modify)
+
+- `_detect_effective_version_pin` npm branch — **modify** — pass `command`
+  through to `_npm_package_arg` (`handlers.py:307`). The function already
+  receives `command` (`handlers.py:272`), so no plumbing is needed.
+  - **This is a behaviour change, not a mechanical update.** Today
+    `npm exec pkg@1.2` pin-detects on `exec`, so `_npm_tag("exec")` returns
+    `None` and **a real pin is missed**. After the fix the pin is found. That is
+    a fix, and it needs its own test and a CHANGELOG line — an earlier draft of
+    this plan wrongly said "no behavioural change intended here."
 
 ### `tests/test_version_checker.py` (modify)
 
@@ -88,28 +140,48 @@ collisions and nothing else.
   that only asserts one form's new value would pass against a parser that
   collapsed both to something else, so **assert the inequality**, not just the
   value.
-- `TestDetectPackageType` — **add** — regression cases that must not move:
-  `img:1.2`→`img`, `ghcr.io/org/img:v2`→`ghcr.io/org/img`,
-  `mcp/server:latest`→`mcp/server`, `localhost:5000/a/b:tag`→`localhost:5000/a/b`,
-  `npx -y @scope/pkg@1.2.3`→`@scope/pkg`, `uvx --from thing other`→`thing`.
-- `TestDetectPackageType` — **add** — `npx` must still accept a package named
-  `exec` (`npx -y exec` → `exec`), pinning that the subcommand skip is
-  npm-only.
+- `TestDetectPackageType` — **add** — **fix** cases (currently wrong, must be RED
+  first): `localhost:5000/a/b:tag` → `localhost:5000/a/b`, and
+  `img:1.2@sha256:abc` → `img`. *An earlier draft filed the `localhost` case
+  under "must not move", which is wrong — it resolves to `localhost` today, and
+  an executor honouring "resolves exactly as before" literally would enshrine
+  the bug.*
+- `TestDetectPackageType` — **add** — genuine regression cases that must not
+  move: `img:1.2`→`img`, `ghcr.io/org/img:v2`→`ghcr.io/org/img`,
+  `mcp/server:latest`→`mcp/server`, `npx -y @scope/pkg@1.2.3`→`@scope/pkg`,
+  `uvx --from thing other`→`thing`, and `registry:5000` (bare host:port, no
+  path) → `registry` — with no `/`, that genuinely *is* image `registry` tag
+  `5000` under the OCI grammar, so it is correct today and must stay.
+- `TestDetectPackageType` — **add** — skip-once pins: `npx -y exec` → `exec`
+  (skip is npm-only) **and** `npm install i` → `i` / `npm exec exec` → `exec`
+  (skip fires once, not repeatedly).
+- `TestDetectPackageType` — **add** — `_docker_image_name` and
+  `_docker_image_tag` are complements: for each docker form in this class,
+  assert the name and tag together reconstruct the reference's meaning, so the
+  two helpers cannot drift apart.
 
 ### `tests/test_tools.py` (modify)
 
-- `TestUpdateServerPinDetection` (or the existing pin-detection class — search
-  `_npm_package_arg` / pin) — **modify** — only if the signature change requires
-  a call-site update in a test. No behavioural change intended here.
+- The pin-detection class (search `_detect_effective_version_pin` / pin) —
+  **add** — `npm exec pkg@1.2` now detects the pin `1.2` where it previously
+  returned `None`. This is a real behaviour fix and needs its own assertion,
+  proved RED first. Also pin the docker digest form, since `_docker_image_name`
+  landing beside `_docker_image_tag` touches that path.
 
 ## Documentation impact
 
-- `CHANGELOG.md` — **add** — a `### Fixed` bullet under `[Unreleased]`. This is
-  user-visible twice over: a docker server on a `host:port` registry and an
-  `npm exec` server both get a *different* package identity than before, so
-  their cached entries fail `_same_package` once and refresh. State that
-  one-time refresh explicitly, the same way 2.4.0 documented the `package_type`
-  migration.
+- `CHANGELOG.md` — **add** — a `### Fixed` bullet under `[Unreleased]` covering
+  **three** user-visible effects: (a) a docker server on a `host:port` registry
+  and (b) an `npm exec` server each get a *different* package identity than
+  before, so their cached entries fail `_same_package` once and refresh — state
+  that one-time refresh explicitly, as 2.4.0 did for the `package_type`
+  migration; and (c) `npm exec pkg@1.2` now has its version pin **detected**
+  where it was previously missed, which changes `update_server`'s behaviour for
+  those servers.
+- Note the limitation that remains: **Consiliency/pmcp#182** — uvx/pip/cargo
+  collide identically via unskipped flag values, and `uvx --with` is a more
+  realistic trigger than anything fixed here. The CHANGELOG should not imply the
+  identity gate is now total.
 - `README.md` — **none**. The parser is internal; no documented behaviour
   changes.
 - No other cross-cutting doc applies — no `ARCHITECTURE.md`/`docs/**` in this
@@ -117,7 +189,10 @@ collisions and nothing else.
 
 ## Dependencies & order
 
-1. `_split_docker_reference` must exist before the docker branch calls it.
+1. `_docker_image_name` must exist, defined beside `_docker_image_tag`, before
+   the docker branch calls it. Write them as a reconciled pair in one edit — if
+   they are touched separately they can drift, which is the whole reason this
+   plan stopped introducing a second independent helper.
 2. **`_npm_package_arg`'s signature change is the one cross-file hazard.** It is
    deliberately shared: its docstring says `update_server`'s pin detection uses
    *the exact same scan* so the two cannot disagree about which argument is "the
@@ -151,15 +226,20 @@ uv run ruff format --check src/ tests/
 uv run mypy src/pmcp --exclude baml_client
 ```
 
-**Mutation proof required, not optional.** For each new collision test, revert
-the corresponding parser line and confirm that test fails. A collision test that
-passes against the *old* parser is proving nothing — this repo has shipped that
-exact class of hollow test twice in the last two phases, both times caught only
-by a board.
+**Mutation proof required, and its output must be recorded.** For each new
+collision test, revert the corresponding parser line and confirm that test
+fails, then restore. A collision test that passes against the *old* parser is
+proving nothing — this repo has shipped that exact class of hollow test twice in
+the last two phases, both times caught only by a board, and in one of those the
+hollow test was written *by the same agent that had just documented the failure
+mode*. Performing the proof is not sufficient: **paste the failing output into
+the handoff**, per test, so the evidence outlives the session that produced it.
 
-Edge cases to exercise: a bare `:` with nothing after it; an image with a digest
-(`img@sha256:…`) rather than a tag; `npm` with no subcommand at all
-(`npm ['pkg']`); an npm package legitimately named `exec`.
+Edge cases to exercise: a bare `:` with nothing after it (`img:`); a digest with
+no tag (`img@sha256:…`); **tag and digest together (`img:1.2@sha256:…` — the
+form that broke the first draft of this plan)**; a bare `host:port` with no path
+(`registry:5000`, which correctly stays `registry`); `npm` with no subcommand
+(`npm ['pkg']`); an npm package legitimately named `exec` or `i`.
 
 ## Automation
 
@@ -176,16 +256,29 @@ automation:
 - [ ] `detect_package_type("docker", ["run","registry:5000/old-image"])` and
       `...new-image` return **different** package names — proven by
       `uv run pytest tests/test_version_checker.py::TestDetectPackageType -q`
-      and by reverting `_split_docker_reference`'s use to confirm the test fails.
+      and by reverting the docker branch to `raw.split(":")[0]` to confirm the
+      test fails, with that output recorded.
 - [ ] `detect_package_type("npm", ["exec","old-pkg"])` and `...new-pkg` return
-      **different** package names, while `npx -y exec` still resolves to `exec` —
-      same command, same mutation requirement.
+      **different** package names, while `npx -y exec` → `exec`,
+      `npm install i` → `i`, and `npm exec exec` → `exec` all hold — same
+      command, same recorded-mutation requirement.
+- [ ] **Digest forms resolve correctly, not merely differently:**
+      `img:1.2@sha256:abc` → `img` (unchanged from today — the first draft of
+      this plan regressed it), `img@sha256:abc` → `img`, and
+      `registry:5000/img@sha256:abc` → `registry:5000/img`.
+- [ ] `_docker_image_name` and `_docker_image_tag` are complements — for every
+      docker form under test, name and tag agree about where the reference
+      splits. Proven by the paired assertions in `TestDetectPackageType`, which
+      is what stops the two rules drifting as they had begun to.
 - [ ] Every pre-existing form resolves exactly as before: `img:1.2`,
-      `ghcr.io/org/img:v2`, `mcp/server:latest`, `npx -y @scope/pkg@1.2.3`,
-      `uvx --from thing other` — proven by the regression cases in
-      `TestDetectPackageType`.
-- [ ] Every `_npm_package_arg` caller is updated together — proven by
-      `grep -rn '_npm_package_arg' src/ tests/` showing no call site passing the
-      old signature, plus `uv run mypy src/pmcp --exclude baml_client` clean.
-- [ ] Full suite, ruff, and mypy green; `CHANGELOG.md` records the fix and the
-      one-time refresh it causes for affected servers.
+      `ghcr.io/org/img:v2`, `mcp/server:latest`, `registry:5000`,
+      `npx -y @scope/pkg@1.2.3`, `uvx --from thing other`.
+- [ ] `npm exec pkg@1.2` now pin-detects `1.2` where it previously returned
+      `None` — proven by a test in `tests/test_tools.py`, RED first.
+- [ ] Every `_npm_package_arg` caller is updated together, with **no defaulted
+      parameter** — proven by `grep -rn '_npm_package_arg' src/ tests/` showing
+      both call sites passing the command explicitly, plus
+      `uv run mypy src/pmcp --exclude baml_client` clean.
+- [ ] Full suite, ruff, and mypy green; `CHANGELOG.md` records all three
+      user-visible effects and does not imply the identity gate is now total
+      (Consiliency/pmcp#182 remains open).
