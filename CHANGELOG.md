@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-08-25
+
 ### Fixed
 - **A cached description is now checked against the package that is actually
   configured, not just against its version.** All three refresh sites —
