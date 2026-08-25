@@ -54,7 +54,12 @@ def _npm_tag(package: str) -> str | None:
     return tag if tag_sep and _name else None
 
 
-def _npm_package_arg(args: list[str]) -> str | None:
+_NPM_SUBCOMMANDS = frozenset(
+    {"exec", "x", "run", "install", "i", "add", "create", "dlx"}
+)
+
+
+def _npm_package_arg(args: list[str], command: str) -> str | None:
     """Return the raw npm/npx package token from *args*, or ``None``.
 
     "Raw" means *before* ``_strip_npm_tag`` removes any ``@tag``/``@version``
@@ -63,13 +68,48 @@ def _npm_package_arg(args: list[str]) -> str | None:
     detection) can get it from the exact same scan ``detect_package_type``
     itself uses, instead of re-implementing the scan a second time and
     risking it picking a different argument as "the package".
+
+    *command* is REQUIRED, and deliberately not defaulted. ``npm`` takes a
+    subcommand before the package (``npm exec pkg``) while ``npx`` takes the
+    package directly (``npx pkg``), so the scan cannot be correct for both
+    without knowing which it is reading. A default would let one of the two
+    call sites keep the old behaviour silently while type-checking clean --
+    the exact drift this function's shared-scan design exists to prevent.
+
+    The subcommand skip fires **once, on the first non-flag token, for ``npm``
+    only**:
+
+    * Once, not repeatedly, because ``i`` and ``exec`` are also real package
+      names: a loop that skipped subcommand tokens anywhere -- the shape the
+      docker branch uses for its own subcommands -- would turn
+      ``npm install i`` and ``npm exec exec`` into ``None``.
+    * ``npm`` only, because ``npx -y exec`` genuinely names a package called
+      ``exec``.
+
+    Known limitation, tracked on Consiliency/pmcp#182: option tokens are
+    discarded wholesale, so ``npm exec --package=<pkg> -- <bin>`` still yields
+    the binary rather than ``<pkg>``, and two packages exposing the same binary
+    still confirm as one identity.
     """
+    skip_subcommand = command == "npm"
     for arg in args:
         if arg == "-y":
             continue
-        # Skip flags
+        # Skip flags. This MUST precede the subcommand check: npm accepts
+        # global flags before the subcommand (`npm --silent exec pkg`), so
+        # spending the one-shot skip on a flag token would leave `exec` to be
+        # read as the package and reopen the #180 collapse for every form
+        # carrying a leading flag. The ordering is already correct; the test
+        # below exists because nothing PINNED it (ah board review, adversarial
+        # seat: a surviving mutant, not a live defect).
         if arg.startswith("-"):
             continue
+        if skip_subcommand:
+            # Only the first non-flag token can be the subcommand; whatever
+            # follows is a candidate package even if it repeats the word.
+            skip_subcommand = False
+            if arg in _NPM_SUBCOMMANDS:
+                continue
         # Found package name (might have @version or @dist-tag suffix)
         pkg = _strip_npm_tag(arg)
         # Handle scoped packages like @playwright/mcp
@@ -277,7 +317,7 @@ def detect_package_type(
     """
     if command in ("npx", "npm"):
         # Find npm package in args (usually after -y flag)
-        raw = _npm_package_arg(args)
+        raw = _npm_package_arg(args, command)
         if raw is not None:
             return ("npm", _strip_npm_tag(raw))
 
@@ -316,8 +356,11 @@ def detect_package_type(
     elif command == "docker":
         raw = _docker_image_arg(args)
         if raw is not None:
-            # Strip the tag: docker run [options] image[:tag] [cmd...]
-            image = raw.split(":")[0]
+            # Strip tag and digest via the shared splitter, NOT `split(":")[0]`
+            # -- that took the FIRST colon, so `registry:5000/img` read as the
+            # image `registry` and two different images on the same host:port
+            # registry confirmed as one package (Consiliency/pmcp#180).
+            image = _docker_image_name(raw)
             if image:
                 return ("docker", image)
 
@@ -379,10 +422,76 @@ def _docker_image_tag(image_ref: str) -> str | None:
 
     Only the final path segment can carry a tag, so a registry host with a
     port (``registry:5000/img:1.2.3``) does not read as a tag of ``5000``.
+
+    A ``@digest`` suffix is stripped before the tag is read, so a digest is
+    never reported as a tag. Without that, ``img@sha256:abc`` returned ``abc``
+    and gateway.update_server's pin detection reported a *digest fragment as a
+    version pin*, while ``img:1.2@sha256:abc`` returned ``1.2@sha256:abc``
+    instead of ``1.2``. Both are fixed here rather than only in the name half,
+    because ``_docker_image_name`` is this function's complement and the two
+    must agree about where a reference divides -- an identity gate compares the
+    name, so a divergence lets two different images confirm as one package.
+
+    **A caller deciding whether a reference is PINNED must not read this
+    function alone** -- ask ``_docker_image_digest`` too. A digest-only
+    reference has no tag, so this correctly returns ``None``, and a caller
+    treating ``None`` as "unpinned" would conclude that the most tightly
+    pinned form docker has is not pinned at all (ah board review, red-team
+    seat).
     """
-    last_segment = image_ref.rsplit("/", 1)[-1]
+    base = image_ref.partition("@")[0] or image_ref
+    last_segment = base.rsplit("/", 1)[-1]
     name, sep, tag = last_segment.partition(":")
     return tag if sep and name and tag else None
+
+
+def _docker_image_digest(image_ref: str) -> str | None:
+    """Return the ``@digest`` on a docker image reference, or ``None``.
+
+    The third member of the reference-splitting family, beside
+    ``_docker_image_name`` and ``_docker_image_tag``. A digest is an immutable
+    content identity -- the TIGHTEST pin docker offers, stronger than any tag --
+    so a caller asking "is this reference pinned?" must consult this as well as
+    the tag. Reading the tag alone reports a digest-only reference as unpinned,
+    which would let gateway.update_server pull ``image:latest``, restart the
+    unchanged digest-pinned config, and record the registry's newest digest as
+    though it had updated -- announcing an update while still running the old
+    immutable image (ah board review, red-team seat).
+    """
+    _name, sep, digest = image_ref.partition("@")
+    return digest if sep and digest else None
+
+
+def _docker_image_name(image_ref: str) -> str:
+    """Return the image NAME from a docker reference, without tag or digest.
+
+    The paired complement of ``_docker_image_tag`` -- same scan, same split
+    point, opposite half -- in the exact sense ``_strip_npm_tag``/``_npm_tag``
+    are paired. Written together so the two can never disagree about where a
+    reference divides; ``detect_package_type`` reads the name from here and
+    gateway.update_server's pin detection reads the tag from there, and an
+    identity gate compares the name, so a divergence would let two different
+    images confirm as the same package.
+
+    Two rules, in order, and the order matters:
+
+    * **Digest first.** ``@`` cannot appear in an OCI image name, so it is an
+      unambiguous separator -- unlike ``:``. A ``name:tag@sha256:...`` reference
+      contains three colons and the LAST one belongs to the digest, so any rule
+      that reaches for the last colon splits in the wrong place. (An earlier
+      draft of this fix did exactly that and regressed
+      ``img:1.2@sha256:abc`` from ``img`` to ``img:1.2@sha256``.)
+    * **Then the tag**, on the FIRST colon of the final path segment only --
+      identical to ``_docker_image_tag``. This is what stops
+      ``registry:5000/img`` reading as image ``registry``: before the last
+      ``/`` a colon is a registry ``host:port``, not a tag separator.
+    """
+    base = image_ref.partition("@")[0] or image_ref
+    prefix, sep, last_segment = base.rpartition("/")
+    name, tag_sep, tag = last_segment.partition(":")
+    if tag_sep and name and tag:
+        last_segment = name
+    return f"{prefix}{sep}{last_segment}"
 
 
 async def get_package_version(

@@ -5693,6 +5693,45 @@ class TestUpdateServerVersionRepair:
         assert detect("docker", "docker", ["run", "registry:5000/img"]) is None
         assert detect("docker", "docker", ["run", "registry:5000/img:2.0"]) == "2.0"
 
+        # docker digests: a digest is the TIGHTEST pin docker has -- immutable
+        # content identity, stronger than any tag -- so it must be reported as
+        # the pin, whole and unmangled.
+        #
+        # Two ways to get this wrong, both of which shipped in review drafts of
+        # Consiliency/pmcp#180. Running the tag scan over the whole reference
+        # returned a digest FRAGMENT as a version ("abc"); stripping the digest
+        # and reading only the tag returned None, which reads as UNPINNED and
+        # would let update_server pull `image:latest`, restart the unchanged
+        # digest-pinned config, and record the registry's newest digest --
+        # announcing an update while still running the old image.
+        assert detect("docker", "docker", ["run", "img@sha256:abc"]) == "sha256:abc"
+        assert detect("docker", "docker", ["run", "img:1.2@sha256:abc"]) == "sha256:abc"
+        # ...and a `latest` tag must not discard a real digest pin.
+        assert (
+            detect("docker", "docker", ["run", "img:latest@sha256:abc"]) == "sha256:abc"
+        )
+
+        # npm subcommands: the scan is SHARED with detect_package_type, so it
+        # skips a leading subcommand here too. Before that, `npm exec pkg@1.2`
+        # scanned to "exec", whose `_npm_tag` is None, so a REAL pin read as
+        # unpinned (Consiliency/pmcp#180).
+        assert detect("npm", "npm", ["exec", "pkg@1.2"]) == "1.2"
+        assert detect("npm", "npm", ["x", "pkg@1.2"]) == "1.2"
+        assert detect("npm", "npm", ["exec", "pkg@latest"]) is None
+        assert detect("npm", "npm", ["exec", "pkg"]) is None
+        # ...and `npx` still must not skip a package genuinely named `exec`.
+        #
+        # `exec@1.2` alone CANNOT enforce that: the skip matches the RAW token
+        # against `_NPM_SUBCOMMANDS`, and `exec@1.2` is not in the set, so a
+        # call site hardcoded to "npm" returns the same `1.2` and the guard
+        # passes under the mutant it was written to catch -- a hollow
+        # assertion (ah board review, correctness seat). The bare `exec` token
+        # is what discriminates: with `npx` it is the package (no pin on it),
+        # with a wrongly-hardcoded "npm" it is skipped and the pin is read off
+        # the FOLLOWING token instead.
+        assert detect("npm", "npx", ["-y", "exec@1.2"]) == "1.2"
+        assert detect("npm", "npx", ["-y", "exec", "pkg@1.2"]) is None
+
         # cargo: pins via a separate --version flag, both spellings.
         assert detect("cargo", "cargo", ["install", "srv", "--version", "1.0"]) == "1.0"
         assert detect("cargo", "cargo", ["install", "srv", "--version=1.0"]) == "1.0"

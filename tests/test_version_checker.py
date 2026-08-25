@@ -10,6 +10,8 @@ import pytest
 
 from pmcp.manifest.version_checker import (
     _digest_identity,
+    _docker_image_name,
+    _docker_image_tag,
     _parse_version,
     _semver_parse,
     _USER_AGENT,
@@ -74,7 +76,9 @@ class TestDetectPackageType:
 
     def test_npm_command(self) -> None:
         """Test detection with npm command picks first non-flag arg."""
-        # Note: npm exec is treated as package name since code doesn't special-case it
+        # `npm exec` IS special-cased now -- see TestPackageIdentityCollisions.
+        # This case has no subcommand at all, so the first non-flag token is
+        # the package either way.
         pkg_type, pkg_name = detect_package_type("npm", ["-y", "server-pkg"])
         assert pkg_type == "npm"
         assert pkg_name == "server-pkg"
@@ -168,6 +172,146 @@ class TestDetectPackageType:
         pkg_type, pkg_name = detect_package_type("npx", ["-y", "--quiet"])
         assert pkg_type == "unknown"
         assert pkg_name is None
+
+
+class TestPackageIdentityCollisions:
+    """Two different packages must never share one identity.
+
+    Consiliency/pmcp#180. 2.4.0's identity gate decides whether a cached
+    description still describes the configured package by comparing the NAMES
+    this module returns, so a name that is stable across two DIFFERENT packages
+    is not a cosmetic parsing wart -- `_same_package` reads it as a positive
+    confirmation and the freshness short-circuit serves the wrong package's
+    tool descriptions.
+
+    Every test here asserts INEQUALITY of a real pair, not a single expected
+    value. A value assertion passes against a parser that collapses both forms
+    onto some other shared name; only the inequality is falsified by the
+    collision itself. All of these are RED against the pre-fix parser, which
+    returned an equal name for each pair.
+
+    Scope: these are the two collisions Consiliency/pmcp#180 measured.
+    `docker run --env-file X <img>`, `--mount`, and `npm exec --package=<pkg>`
+    still collide (Consiliency/pmcp#182) -- a flag's VALUE being taken as the
+    package -- and that is deliberately not fixed here.
+    """
+
+    def test_docker_registry_host_port_distinguishes_images(self) -> None:
+        """`registry:5000/A` and `registry:5000/B` are different packages.
+
+        RED before the fix: the branch split on the FIRST colon, so both
+        returned `("docker", "registry")` -- the registry host, not an image.
+        """
+        old = detect_package_type("docker", ["run", "registry:5000/old-image"])
+        new = detect_package_type("docker", ["run", "registry:5000/new-image"])
+        assert old != new, (
+            "two different images on one host:port registry collapsed to a "
+            f"single identity: {old} == {new}"
+        )
+        assert old == ("docker", "registry:5000/old-image")
+        assert new == ("docker", "registry:5000/new-image")
+
+    def test_npm_exec_distinguishes_packages(self) -> None:
+        """`npm exec A` and `npm exec B` are different packages.
+
+        RED before the fix: with no subcommand skip the first non-flag token
+        was `exec`, so both returned `("npm", "exec")`.
+        """
+        old = detect_package_type("npm", ["exec", "old-pkg"])
+        new = detect_package_type("npm", ["exec", "new-pkg"])
+        assert old != new, f"two different npm exec packages collapsed: {old} == {new}"
+        assert old == ("npm", "old-pkg")
+        assert new == ("npm", "new-pkg")
+
+    def test_npm_x_alias_distinguishes_packages(self) -> None:
+        """`x` is npm's documented `exec` alias and must skip identically."""
+        old = detect_package_type("npm", ["x", "old-pkg"])
+        new = detect_package_type("npm", ["x", "new-pkg"])
+        assert old != new, f"npm x packages collapsed: {old} == {new}"
+        assert old == ("npm", "old-pkg")
+
+
+class TestDockerReferenceSplitting:
+    """`_docker_image_name` and `_docker_image_tag` are complements.
+
+    They must agree about where a reference divides. An identity gate compares
+    the name and pin detection reads the tag, so a divergence means the two
+    disagree about which package is configured. They are written as a pair for
+    this reason, the same way `_strip_npm_tag`/`_npm_tag` are.
+    """
+
+    @pytest.mark.parametrize(
+        "ref,name,tag",
+        [
+            # The #180 case: before the last `/`, a colon is a host:port.
+            ("registry:5000/old-image", "registry:5000/old-image", None),
+            ("localhost:5000/a/b:tag", "localhost:5000/a/b", "tag"),
+            # Ordinary tagged forms -- unchanged by the fix.
+            ("img:1.2", "img", "1.2"),
+            ("ghcr.io/org/img:v2", "ghcr.io/org/img", "v2"),
+            ("mcp/server:latest", "mcp/server", "latest"),
+            # No `/` at all: per the OCI grammar this really IS image
+            # `registry` tagged `5000`, so it must NOT change.
+            ("registry:5000", "registry", "5000"),
+            # Digests. `@` cannot appear in a name, so it is stripped FIRST --
+            # the colon inside `sha256:` belongs to the digest, and a rule that
+            # reached for the last colon would yield `img:1.2@sha256` here.
+            ("img@sha256:abc", "img", None),
+            ("img:1.2@sha256:abc", "img", "1.2"),
+            ("registry:5000/img@sha256:abc", "registry:5000/img", None),
+            # Degenerate.
+            ("myimage", "myimage", None),
+        ],
+    )
+    def test_name_and_tag_agree(self, ref: str, name: str, tag: str | None) -> None:
+        assert _docker_image_name(ref) == name
+        assert _docker_image_tag(ref) == tag
+
+
+class TestNpmSubcommandSkipFiresOnce:
+    """The npm subcommand skip must not eat real package names.
+
+    `i` and `exec` are genuine npm packages, so a skip that fired repeatedly --
+    the shape the docker branch uses for its own subcommands -- would resolve
+    these to `None`. And `npx` takes a package directly, so it must not skip
+    at all.
+    """
+
+    def test_npm_install_of_a_package_named_i(self) -> None:
+        assert detect_package_type("npm", ["install", "i"]) == ("npm", "i")
+
+    def test_npm_exec_of_a_package_named_exec(self) -> None:
+        assert detect_package_type("npm", ["exec", "exec"]) == ("npm", "exec")
+
+    def test_npx_does_not_skip_a_package_named_exec(self) -> None:
+        assert detect_package_type("npx", ["-y", "exec"]) == ("npm", "exec")
+
+    def test_npm_with_no_subcommand_still_finds_the_package(self) -> None:
+        assert detect_package_type("npm", ["-y", "server-pkg"]) == (
+            "npm",
+            "server-pkg",
+        )
+
+    def test_a_leading_flag_does_not_consume_the_subcommand_skip(self) -> None:
+        """npm accepts global flags before the subcommand.
+
+        The skip is one-shot, so it must fire on the first non-flag token, not
+        the first argv token. Spending it on `--silent` would leave `exec` to
+        be read as the package -- reopening the #180 collapse for every form
+        that carries a leading flag.
+
+        This ordering was already correct but *unpinned*: swapping the flag
+        skip and the subcommand check passed the entire suite, because every
+        other test here puts the subcommand first (ah board review, adversarial
+        seat, reported as a surviving mutant).
+        """
+        old = detect_package_type("npm", ["--silent", "exec", "old-pkg"])
+        new = detect_package_type("npm", ["--silent", "exec", "new-pkg"])
+        assert old != new, (
+            f"a leading flag reopened the npm exec collapse: {old} == {new}"
+        )
+        assert old == ("npm", "old-pkg")
+        assert new == ("npm", "new-pkg")
 
 
 class TestCompareVersionsOrdering:
