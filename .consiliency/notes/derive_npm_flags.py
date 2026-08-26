@@ -53,7 +53,11 @@ Classification, after the drop:
 SHORTHANDS EXPAND; ARITY COMES FROM THE EXPANSION'S LENGTH
 ----------------------------------------------------------
   length >= 2  a value is baked in (`silent` -> ['--loglevel','silent'])
-               => boolean-arity, consumes nothing.
+               => SKIP: consumes nothing, ever. NOT the same as boolean --
+               a real boolean consumes a literal `true`/`false` and one of
+               these does not, so collapsing the two is fail-OPEN:
+                 --silent true TAIL -> remain ["true","TAIL"]
+                 --global true TAIL -> remain ["TAIL"]
   length == 1  a pure rename (`reg` -> ['--registry'], `y` -> ['--yes'])
                => the target's arity.
 
@@ -80,11 +84,12 @@ REPO = pathlib.Path(__file__).resolve().parents[2]
 # dropping `null` is what keeps `--yes` usable.
 _NOT_A_VALUE_TYPE = frozenset({"null", "Array"})
 
-BOOLEAN, VALUE, CONDITIONAL, UNINTERPRETABLE = (
+BOOLEAN, VALUE, CONDITIONAL, UNINTERPRETABLE, SKIP = (
     "boolean",
     "value",
     "conditional",
     "uninterpretable",
+    "skip",
 )
 
 # `--package` is handled as a KNOWN-POSITIVE by the scanner (its value IS the
@@ -194,6 +199,24 @@ def build(schema: dict) -> tuple[dict[str, str], list[str], list[str], list[str]
     union_with_boolean: list[str] = []
     unreadable: list[str] = []
 
+    def record(flag: str, cls: str) -> None:
+        """Write one entry, refusing to silently reclassify an existing one.
+
+        Definitions, `short` aliases and shorthands are written in that order,
+        so a plain `classes[flag] = cls` would let a later source overwrite an
+        earlier one. That is the fail-OPEN drift direction -- it yields a
+        WRONG entry rather than a missing one -- and it would pass `--verify`
+        silently because the generator and the table would agree with each
+        other while both disagreeing with npm. Empty on 11.19.0; this exists
+        so a future npm cannot make it non-empty quietly.
+        """
+        previous = classes.get(flag)
+        if previous is not None and previous != cls:
+            raise SystemExit(
+                f"conflicting classification for {flag}: {previous} vs {cls}"
+            )
+        classes[flag] = cls
+
     name_class: dict[str, str] = {}
     for name, info in defs.items():
         cls = classify(info["type"])
@@ -221,18 +244,27 @@ def build(schema: dict) -> tuple[dict[str, str], list[str], list[str], list[str]
         if name in _POSITIVE:
             continue
         if cls in (BOOLEAN, VALUE):
-            classes[f"--{name}"] = cls
+            record(f"--{name}", cls)
             for short in info["short"]:
-                classes[f"-{short}"] = cls
-                classes[f"--{short}"] = cls
+                record(f"-{short}", cls)
+                record(f"--{short}", cls)
         if cls == BOOLEAN:
             # `--no-X` negates a boolean and, like the boolean itself,
             # consumes only a literal true/false. Verified against nopt.
-            classes[f"--no-{name}"] = cls
+            record(f"--no-{name}", cls)
 
     for key, expansion in schema["shorthands"].items():
         if len(expansion) >= 2:
-            cls = BOOLEAN  # a value is baked into the expansion
+            # A value is baked into the expansion, so by the time npm parses
+            # argv there is no flag left awaiting one. Crucially this is NOT
+            # the same as BOOLEAN: a real boolean consumes a literal
+            # `true`/`false`, and a baked-value shorthand does not. Verified:
+            #   --silent true TAIL -> remain ["true","TAIL"]   (no consume)
+            #   --global true TAIL -> remain ["TAIL"]          (consumes)
+            # Collapsing the two let `npx --silent true <arg>` read <arg> as
+            # the package when npm's package is `true` -- a wrong identity,
+            # and `--silent true X` / `--silent false X` collapse onto X.
+            cls = SKIP  # a value is baked into the expansion
         else:
             target = expansion[0].lstrip("-")
             if target.startswith("no-"):
@@ -241,9 +273,9 @@ def build(schema: dict) -> tuple[dict[str, str], list[str], list[str], list[str]
                 cls = BOOLEAN if name_class.get(target[3:]) == BOOLEAN else CONDITIONAL
             else:
                 cls = name_class.get(target, CONDITIONAL)
-        if cls in (BOOLEAN, VALUE):
-            classes[f"-{key}"] = cls
-            classes[f"--{key}"] = cls
+        if cls in (BOOLEAN, VALUE, SKIP):
+            record(f"-{key}", cls)
+            record(f"--{key}", cls)
 
     return classes, conditional, union_with_boolean, unreadable
 
@@ -298,7 +330,11 @@ def read_committed_tables(source: pathlib.Path) -> dict[str, set[str]]:
             continue
         names = [t.id for t in node.targets if isinstance(t, ast.Name)]
         for name in names:
-            if name not in ("_NPM_VALUE_FLAGS", "_NPM_BOOLEAN_FLAGS"):
+            if name not in (
+                "_NPM_VALUE_FLAGS",
+                "_NPM_BOOLEAN_FLAGS",
+                "_NPM_SKIP_FLAGS",
+            ):
                 continue
             call = node.value
             if (
@@ -308,9 +344,14 @@ def read_committed_tables(source: pathlib.Path) -> dict[str, set[str]]:
             ):
                 raise SystemExit(f"{name} is not a literal frozenset(...)")
             found[name] = {
-                ast.literal_eval(element) for element in call.args[0].elts  # type: ignore[attr-defined]
+                ast.literal_eval(element)
+                for element in call.args[0].elts  # type: ignore[attr-defined]
             }
-    missing = {"_NPM_VALUE_FLAGS", "_NPM_BOOLEAN_FLAGS"} - found.keys()
+    missing = {
+        "_NPM_VALUE_FLAGS",
+        "_NPM_BOOLEAN_FLAGS",
+        "_NPM_SKIP_FLAGS",
+    } - found.keys()
     if missing:
         raise SystemExit(f"not module-level literals in {source}: {sorted(missing)}")
     return found
@@ -324,7 +365,8 @@ def emit(classes: dict[str, str]) -> str:
 
     return (
         f"_NPM_VALUE_FLAGS = frozenset(\n    {block(VALUE)}\n)\n\n\n"
-        f"_NPM_BOOLEAN_FLAGS = frozenset(\n    {block(BOOLEAN)}\n)\n"
+        f"_NPM_BOOLEAN_FLAGS = frozenset(\n    {block(BOOLEAN)}\n)\n\n\n"
+        f"_NPM_SKIP_FLAGS = frozenset(\n    {block(SKIP)}\n)\n"
     )
 
 
@@ -332,14 +374,19 @@ def main() -> int:
     schema = read_schema()
     classes, conditional, union, unreadable = build(schema)
 
-    print(f"npm {schema['npm_version']}: "
-          f"{len(schema['definitions'])} definitions, "
-          f"{len(schema['shorthands'])} shorthands", file=sys.stderr)
+    print(
+        f"npm {schema['npm_version']}: "
+        f"{len(schema['definitions'])} definitions, "
+        f"{len(schema['shorthands'])} shorthands",
+        file=sys.stderr,
+    )
 
     # REQUIRED REPORTING. An unlisted flag refuses, which is safe -- but the
     # set must be reviewed rather than accidental.
-    print(f"\nCONDITIONAL ARITY -> left unlisted, scanner refuses ({len(conditional)}):",
-          file=sys.stderr)
+    print(
+        f"\nCONDITIONAL ARITY -> left unlisted, scanner refuses ({len(conditional)}):",
+        file=sys.stderr,
+    )
     for entry in conditional:
         print(f"  {entry}", file=sys.stderr)
     print(f"\nVALUE flags carrying a Boolean member ({len(union)}):", file=sys.stderr)
@@ -350,8 +397,11 @@ def main() -> int:
         print(f"  {entry}", file=sys.stderr)
 
     mismatches = check_against_nopt(schema)
-    print(f"\nnopt cross-check: {len(mismatches)} mismatch(es) over "
-          f"{len(schema['definitions'])} definitions", file=sys.stderr)
+    print(
+        f"\nnopt cross-check: {len(mismatches)} mismatch(es) over "
+        f"{len(schema['definitions'])} definitions",
+        file=sys.stderr,
+    )
     for entry in mismatches:
         print(f"  {entry}", file=sys.stderr)
 
@@ -364,10 +414,21 @@ def main() -> int:
     print(f"\nverifying tables in {source}", file=sys.stderr)
     failures = list(mismatches)
     for label, live, committed in (
-        ("value", {f for f, c in classes.items() if c == VALUE},
-         committed_tables["_NPM_VALUE_FLAGS"]),
-        ("boolean", {f for f, c in classes.items() if c == BOOLEAN},
-         committed_tables["_NPM_BOOLEAN_FLAGS"]),
+        (
+            "value",
+            {f for f, c in classes.items() if c == VALUE},
+            committed_tables["_NPM_VALUE_FLAGS"],
+        ),
+        (
+            "boolean",
+            {f for f, c in classes.items() if c == BOOLEAN},
+            committed_tables["_NPM_BOOLEAN_FLAGS"],
+        ),
+        (
+            "skip",
+            {f for f, c in classes.items() if c == SKIP},
+            committed_tables["_NPM_SKIP_FLAGS"],
+        ),
     ):
         for flag in sorted(live - committed):
             failures.append(f"{label}: {flag} in live npm, MISSING from table")
@@ -376,11 +437,11 @@ def main() -> int:
 
     # A flag in both tables would let the boolean branch win or lose by table
     # order rather than by npm's schema; either way it is not a classification.
-    overlap = committed_tables["_NPM_VALUE_FLAGS"] & committed_tables[
-        "_NPM_BOOLEAN_FLAGS"
-    ]
-    for flag in sorted(overlap):
-        failures.append(f"{flag} is in BOTH committed tables")
+    names = ("_NPM_VALUE_FLAGS", "_NPM_BOOLEAN_FLAGS", "_NPM_SKIP_FLAGS")
+    for i, left in enumerate(names):
+        for right in names[i + 1 :]:
+            for flag in sorted(committed_tables[left] & committed_tables[right]):
+                failures.append(f"{flag} is in BOTH {left} and {right}")
 
     if failures:
         print(f"\nFAIL: {len(failures)} discrepanc(ies)", file=sys.stderr)
@@ -389,7 +450,8 @@ def main() -> int:
         return 1
     print(
         f"\nOK: {len(committed_tables['_NPM_VALUE_FLAGS'])} value + "
-        f"{len(committed_tables['_NPM_BOOLEAN_FLAGS'])} boolean entries "
+        f"{len(committed_tables['_NPM_BOOLEAN_FLAGS'])} boolean + "
+        f"{len(committed_tables['_NPM_SKIP_FLAGS'])} skip entries "
         f"match live npm {schema['npm_version']}",
         file=sys.stderr,
     )

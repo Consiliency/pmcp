@@ -404,10 +404,21 @@ _NPM_POSITIVE_FLAGS = frozenset({"--package"})
 #                           `always` as the package.
 #
 # Shorthands are expanded rather than hand-aliased, with arity from the
-# expansion's LENGTH: >= 2 bakes a value in (`silent` -> `--loglevel silent`,
-# boolean-arity), == 1 is a rename inheriting the target's arity (`reg` ->
-# `--registry`, `y` -> `--yes`). This is why `npm --silent exec pkg` resolves
-# and why no `-y` special case is needed any more.
+# expansion's LENGTH: >= 2 bakes a value in (`silent` -> `--loglevel silent`),
+# == 1 is a rename inheriting the target's arity (`reg` -> `--registry`,
+# `y` -> `--yes`). This is why `npm --silent exec pkg` resolves and why no
+# `-y` special case is needed any more.
+#
+# A baked-value shorthand goes in `_NPM_SKIP_FLAGS`, NOT the boolean table.
+# The two differ on exactly one input, and it is the fail-OPEN direction:
+#
+#     --silent true TAIL  -> npm leaves ["true","TAIL"]   does NOT consume
+#     --global true TAIL  -> npm leaves ["TAIL"]          consumes
+#
+# A real boolean is still awaiting a value when npm parses argv; a baked-value
+# shorthand is not. Collapsing them made `npx --silent true <arg>` report
+# `<arg>` when npm's package is `true`, and collapsed `--silent true X` with
+# `--silent false X` onto the single identity `X`.
 #
 # The generator cross-checks all 181 declared classifications against npm's
 # real parser (`nopt`) and reports 0 mismatches on 11.19.0. Re-run
@@ -559,10 +570,7 @@ _NPM_BOOLEAN_FLAGS = frozenset(
         "--bin-links",
         "--bypass-2fa",
         "--commit-hooks",
-        "--d",
         "--dangerously-allow-all-scripts",
-        "--dd",
-        "--ddd",
         "--desc",
         "--description",
         "--dev",
@@ -690,12 +698,9 @@ _NPM_BOOLEAN_FLAGS = frozenset(
         "--production",
         "--progress",
         "--provenance",
-        "--q",
-        "--quiet",
         "--read-only",
         "--readonly",
         "--rebuild-bundle",
-        "--s",
         "--save",
         "--save-bundle",
         "--save-dev",
@@ -706,7 +711,6 @@ _NPM_BOOLEAN_FLAGS = frozenset(
         "--shrinkwrap",
         "--sign-git-commit",
         "--sign-git-tag",
-        "--silent",
         "--strict-allow-scripts",
         "--strict-peer-deps",
         "--strict-ssl",
@@ -715,7 +719,6 @@ _NPM_BOOLEAN_FLAGS = frozenset(
         "--update-notifier",
         "--usage",
         "--v",
-        "--verbose",
         "--version",
         "--versions",
         "--workspaces",
@@ -732,9 +735,6 @@ _NPM_BOOLEAN_FLAGS = frozenset(
         "-P",
         "-S",
         "-a",
-        "-d",
-        "-dd",
-        "-ddd",
         "-desc",
         "-f",
         "-g",
@@ -747,15 +747,32 @@ _NPM_BOOLEAN_FLAGS = frozenset(
         "-no",
         "-p",
         "-porcelain",
-        "-q",
-        "-quiet",
         "-readonly",
-        "-s",
-        "-silent",
         "-v",
-        "-verbose",
         "-ws",
         "-y",
+    }
+)
+
+
+_NPM_SKIP_FLAGS = frozenset(
+    {
+        "--d",
+        "--dd",
+        "--ddd",
+        "--q",
+        "--quiet",
+        "--s",
+        "--silent",
+        "--verbose",
+        "-d",
+        "-dd",
+        "-ddd",
+        "-q",
+        "-quiet",
+        "-s",
+        "-silent",
+        "-verbose",
     }
 )
 
@@ -1151,6 +1168,12 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
         if arg.startswith("-") and arg != "-":
             if arg in _NPM_VALUE_FLAGS:
                 index += 1  # its value is the next token, never the package
+                continue
+            if arg in _NPM_SKIP_FLAGS:
+                # A shorthand with its value already baked in: nothing is
+                # awaiting a value, so it never consumes -- not even a literal
+                # `true`/`false`, which is the ONE input separating this from
+                # the boolean table below.
                 continue
             if arg in _NPM_BOOLEAN_FLAGS:
                 following = args[index + 1] if index + 1 < len(args) else None

@@ -2249,3 +2249,47 @@ class TestNpmPinnedOrderingSurvives:
         self, command: str, args: list[str], expected: str
     ) -> None:
         assert detect_package_type(command, args) == ("npm", expected)
+
+
+class TestNpmBakedValueShorthandDoesNotConsume:
+    """A baked-value shorthand is NOT a boolean, and the difference is a bug.
+
+    `--silent` expands to `--loglevel silent` before npm parses argv, so by
+    then nothing is awaiting a value and it consumes nothing. A real boolean
+    like `--global` IS awaiting one and takes a literal `true`/`false`.
+    Measured against npm's own parser:
+
+        --silent true TAIL  -> remain ["true","TAIL"]   does NOT consume
+        --global true TAIL  -> remain ["TAIL"]          consumes
+
+    Classing them together made `npx --silent true <arg>` report `<arg>` as
+    the package when npm's package is literally `true` -- and collapsed
+    `--silent true X` with `--silent false X` onto the single identity `X`,
+    which is the #180 collapse reintroduced through the fix for it.
+    """
+
+    def test_baked_value_shorthand_leaves_true_as_the_package(self) -> None:
+        assert detect_package_type("npx", ["--silent", "true", "arg"]) == (
+            "npm",
+            "true",
+        )
+
+    def test_baked_value_shorthand_does_not_collapse_true_and_false(self) -> None:
+        got_a = detect_package_type("npx", ["--silent", "true", "X"])
+        got_b = detect_package_type("npx", ["--silent", "false", "X"])
+        assert got_a == ("npm", "true")
+        assert got_b == ("npm", "false")
+        assert got_a != got_b
+
+    def test_real_boolean_still_consumes_the_literal(self) -> None:
+        """The other side of the split must not regress."""
+        assert detect_package_type("npx", ["--global", "true", "pkg"]) == (
+            "npm",
+            "pkg",
+        )
+
+    def test_baked_value_shorthand_still_skips_an_ordinary_token(self) -> None:
+        assert detect_package_type("npm", ["--silent", "exec", "pkg"]) == (
+            "npm",
+            "pkg",
+        )
