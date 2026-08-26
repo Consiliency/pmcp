@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-08-26
+
+### Fixed
+- **2.5.1 regressed six npm flag spellings that 2.5.0 handled correctly.** 2.5.1
+  added a table of the boolean flags that take a literal `null` as their *value*
+  rather than as the package name — `null` is a real published npm package, so
+  the distinction decides a server's identity, and `refresher.py`'s freshness
+  gate treats a matching identity as **positive confirmation** that a cached
+  tool description still describes the configured package. That table was
+  written by hand with 12 entries. npm has five nullable boolean definitions
+  (`yes`, `optional`, `production`, `workspaces`, `expect-results`) but
+  **eighteen** spellings for them, because `y`, `ws`, `n` and `no` are
+  shorthands — `n` and `no` both expand to `--no-yes` — and each is legal in
+  both its `-x` and `--x` form. The six that were missing are **`--y`, `-ws`,
+  `-n`, `--n`, `-no`, `--no`**: under 2.5.1 each of these read the following
+  `null` as the package name, so `npm exec -n null server-a` and
+  `npm exec -n null server-b` both resolved to the package `null` and could be
+  served each other's cached tool descriptions. 2.5.0 resolved all six
+  correctly.
+- **The set is now generated, not hand-listed.**
+  `.consiliency/notes/derive_npm_flags.py` derives it from npm's own
+  `@npmcli/config` definitions: a spelling is nullable iff its resolution
+  target, after shorthand expansion and after stripping a leading `no-`, is a
+  definition whose declared type includes `null`. It was the fourth defect in
+  this parser traceable to hand-transcribing npm's behaviour.
+- **`--verify` now covers this table**, which previously had no drift
+  protection at all. Each definition is probed with a literal `null`, and every
+  one of npm's 442 enumerable flag spellings is run through npm's own parser as
+  `npm exec <flag> null zz` — a definition-level check alone would not have
+  caught a spelling omission. The new check rejects the shipped 2.5.1 table
+  with exactly six mismatches.
+
+  This does **not** close the broader gap tracked in
+  Consiliency/pmcp#195: attached values (`--global=pkg`), npx's own `-p=`
+  rewriting, and npx's `-n` removal are still unhandled.
+
 ## [2.5.1] - 2026-08-26
 
 ### Fixed
