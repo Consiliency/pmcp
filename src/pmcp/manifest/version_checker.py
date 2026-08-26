@@ -1106,8 +1106,8 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
     Inverting the default was previously believed to break the pinned ordering
     below -- a leading global flag such as ``npm --silent exec <pkg>`` must be
     skipped, not refused. It does not, because ``--silent`` is not unknown:
-    it is one of npm's 40 **shorthands**, and ``_NPM_BOOLEAN_FLAGS`` is
-    generated with every shorthand expanded. The ordering holds by
+    it is one of npm's 40 **shorthands**, and the generated tables expand all
+    40 of them (``--silent`` lands in ``_NPM_SKIP_FLAGS``). The ordering holds by
     construction rather than by the fail-open default, which is what made the
     default removable. The hand-coded ``-y`` special case this scan used to
     carry is likewise retired into the generated table (``y`` -> ``--yes``).
