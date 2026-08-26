@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pmcp.manifest import version_checker
 from pmcp.manifest.version_checker import (
     _digest_identity,
     _docker_image_name,
@@ -2352,6 +2353,13 @@ class TestNpmBakedValueShorthandDoesNotConsume:
             "pkg",
         )
 
+    def test_baked_value_shorthand_still_skips_an_ordinary_token(self) -> None:
+        """Not consuming a literal must not become not skipping at all."""
+        assert detect_package_type("npm", ["--silent", "exec", "pkg"]) == (
+            "npm",
+            "pkg",
+        )
+
 
 class TestNpxBooleanLiterals:
     """npx parses boolean switches differently from npm, so pmcp refuses.
@@ -2379,16 +2387,61 @@ class TestNpxBooleanLiterals:
 
 
 class TestOnlyNullableBooleansConsumeNull:
-    """`null` is a real published npm package, and only 5 flags consume it.
+    """`null` is a real published npm package: 5 definitions, 18 spellings.
 
     Verified against nopt: `npm exec --yes null zz` leaves `zz` (nullable
     consumes), while `npm exec --global null zz` leaves `null zz` -- so `null`
-    is the package. A blanket rule applying `null` to all ~198 boolean entries
-    minted a wrong identity for the other ~193 (ah board review).
+    is the package. A blanket rule applying `null` to all 198 boolean entries
+    minted a wrong identity for the other 180 (ah board review).
+
+    The opposite error shipped in 2.5.1: the table was hand-written with 12 of
+    the 18 spellings, so `--y -ws -n --n -no --no` each read the `null` as the
+    package. The 5 nullable definitions (`yes`, `optional`, `production`,
+    `workspaces`, `expect-results`) reach 18 spellings because `y`, `ws`, `n`
+    and `no` are shorthands -- `n` and `no` BOTH expand to `--no-yes` -- and
+    every short alias/shorthand key is legal in both `-x` and `--x` form.
+    The table is generated now; these pins are what keeps a regeneration
+    honest on a host without npm.
     """
 
     def test_nullable_boolean_consumes_null(self) -> None:
         assert detect_package_type("npm", ["exec", "--yes", "null", "zz"]) == (
+            "npm",
+            "zz",
+        )
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "-y",
+            "--y",
+            "--yes",
+            "-n",
+            "--n",
+            "-no",
+            "--no",
+            "-ws",
+            "--ws",
+            "--workspaces",
+            "--no-yes",
+            "--optional",
+            "--no-optional",
+            "--production",
+            "--no-production",
+            "--expect-results",
+            "--no-expect-results",
+            "--no-workspaces",
+        ],
+    )
+    def test_every_nullable_spelling_consumes_null(self, flag: str) -> None:
+        """All 18, one per spelling. 2.5.1 failed six of these.
+
+        Cross-checked against nopt with npm's own definitions and shorthands:
+        `nopt(types, shorthands, ["exec", flag, "null", "zz"]).argv.remain` is
+        `["exec", "zz"]` for every flag here, i.e. the `null` is the flag's
+        value and `zz` is the package.
+        """
+        assert detect_package_type("npm", ["exec", flag, "null", "zz"]) == (
             "npm",
             "zz",
         )
@@ -2399,14 +2452,45 @@ class TestOnlyNullableBooleansConsumeNull:
             "null",
         )
 
+    @pytest.mark.parametrize("flag", ["-g", "--global", "-f", "--force", "--no-global"])
+    def test_non_nullable_spellings_leave_null_as_the_package(self, flag: str) -> None:
+        """The other direction: over-broad is just as wrong as too narrow.
+
+        nopt leaves `["exec", "null", "zz"]` for each of these, so the package
+        really is `null` and consuming it would collapse two configs.
+        """
+        assert detect_package_type("npm", ["exec", flag, "null", "zz"]) == (
+            "npm",
+            "null",
+        )
+
+    def test_nullable_spellings_do_not_collapse_two_configs(self) -> None:
+        """The identity consequence, stated directly.
+
+        Under 2.5.1 both of these resolved to `null`, so the freshness gate
+        would confirm one server's cached tools against the other's config.
+        """
+        got_a = detect_package_type("npm", ["exec", "-n", "null", "server-a"])
+        got_b = detect_package_type("npm", ["exec", "-n", "null", "server-b"])
+        assert got_a == ("npm", "server-a")
+        assert got_b == ("npm", "server-b")
+        assert got_a != got_b
+
+    def test_nullable_table_is_a_subset_of_the_boolean_table(self) -> None:
+        """A nullable entry outside the boolean table is unreachable.
+
+        `_npm_package_arg` only consults the nullable table from inside the
+        boolean branch, so an entry missing from `_NPM_BOOLEAN_FLAGS` would be
+        dead. `derive_npm_flags.py --verify` pins the same property against a
+        live npm; this pins it without one.
+        """
+        assert (
+            version_checker._NPM_NULLABLE_BOOLEAN_FLAGS
+            <= version_checker._NPM_BOOLEAN_FLAGS
+        )
+
     def test_true_and_false_are_consumed_by_any_boolean(self) -> None:
         assert detect_package_type("npm", ["exec", "--global", "false", "a"]) == (
             "npm",
             "a",
-        )
-
-    def test_baked_value_shorthand_still_skips_an_ordinary_token(self) -> None:
-        assert detect_package_type("npm", ["--silent", "exec", "pkg"]) == (
-            "npm",
-            "pkg",
         )
