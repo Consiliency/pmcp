@@ -57,7 +57,68 @@ observed") was therefore falsified by its own value of 20 on day one. Raised to
 ## Why actionlint is mandatory here, not optional
 
 `release.yml` cannot be exercised pre-merge -- it triggers only on tag push --
-so actionlint is the *only* Actions-schema validation on the release path
-before a tag is cut. The plan's original invocation was also fail-open
+so actionlint is the only Actions-*schema* validation on the release path
+before a tag is cut. It is not sufficient on its own: see c3 below, where a
+deleted job passes actionlint cleanly and only the job-set comparison catches
+it. The plan's original invocation was also fail-open
 (`command -v actionlint && actionlint ... || echo skipped` swallows a non-zero
 actionlint into the `||` branch), which is the same defect class as B above.
+
+---
+
+## Corrections and additions from the implementation pass
+
+The implementer re-ran the whole matrix against the committed state and found
+three things this document got wrong or missed. All re-verified independently
+before being recorded.
+
+### C is caught by check #2, NOT by check #1
+
+My instruction to the implementer said all three bypasses must make **check #1**
+exit non-zero. That is wrong for C. Measured:
+
+    c  (publish over-indented into build)   check1=0  check2=1  actionlint=1
+    c2 (terminal job over-indented)         check1=0  check2=1  actionlint=1
+    c3 (terminal job DELETED outright)      check1=0  check2=1  actionlint=0
+
+Check #1 counts jobs that *survive parsing*; a swallowed job is not one, so its
+absence cannot make a presence-check fail. The bypass is genuinely closed --
+just by a different check than I claimed. The body of this document already
+attributes C to the job-set comparison, so only the instruction was wrong.
+
+### c3 is the finding that matters: check #2 is the SOLE guard
+
+Deleting a terminal job outright yields a **perfectly valid workflow**.
+Verified: check #1 exits 0, **actionlint exits 0**, and only the job-set
+comparison against `main` exits 1.
+
+actionlint caught c and c2 only because over-indentation is a *syntax* error
+(`unexpected key "publish" for "job" section`, plus `job "github-release" needs
+job "publish" which does not exist`). Deletion is not a syntax error, so nothing
+schema-level sees it.
+
+So for `release.yml` -- which triggers on tag push only and therefore never
+appears in PR checks -- the job-set comparison is the *only* thing standing
+between a dropped `publish` job and a silently broken release. That is the
+argument for its fail-rather-than-print form, stated more strongly than this
+document originally did.
+
+### The actionlint invocation had the same extension gap as bypass A
+
+`actionlint .github/workflows/*.yml` never schema-checks a `.yaml` workflow.
+Verified with a `sneaky.yaml` carrying a bogus `with:` key:
+
+    actionlint .github/workflows/*.yml   -> exit 0   (never looked)
+    actionlint                           -> exit 3   (discovers both)
+
+Check #1 was widened to both extensions but the actionlint line was not -- the
+same gap, one layer down. **Use bare `actionlint`**, which discovers both
+extensions itself, rather than globbing.
+
+### Known-inert exemption
+
+Check #1 skips jobs carrying `uses:` (a reusable-workflow call cannot take
+`timeout-minutes`). No job in any of the five workflows is such a call today, so
+the exemption is currently untested against real input. It is correct to have --
+without it, a future `uses:` job would force invalid YAML to satisfy the check --
+but it would silently exempt any future job that gains a `uses:` key.
