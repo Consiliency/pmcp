@@ -99,6 +99,14 @@ are kept as explicit positive cases, not as an exhaustion attempt.
 - `detect_package_type` cargo branch — **modify** — keep `-p`/`--package`/
   `--bin` as known-positive (their value *is* the package); any other bare flag
   before the candidate yields unknown.
+- `_npm_package_arg` — **modify.** *Board finding: the original change list
+  omitted this entirely, so the seventh collision would have shipped unfixed.*
+  It currently skips `--package=old` as a flag and `--` as a flag, then returns
+  `bin` (verified). Treating `--package=old` as merely "self-delimiting, so keep
+  scanning" does **not** extract `old` — the scanner must read the value out of
+  `--package=<pkg>` / `-p <pkg>` and return it as the package. This is the only
+  one of the seven where identity is genuinely **recoverable**; the other six
+  are refusals.
 - `_docker_image_arg` — **modify** — keep `_value_flags` as a fast path for the
   flags it already lists, and add the same ambiguity rule for anything not in
   it, so `--env-file` and `--mount` stop consuming the image. Do **not** simply
@@ -140,11 +148,23 @@ are kept as explicit positive cases, not as an exhaustion attempt.
 
   Two consequences for the design:
 
-  1. **`--from` must be honoured wherever it appears**, not only as the first
-     flag. A naive left-to-right ambiguity rule would hit the bare `--python`
-     first and return unknown — breaking the documented form rather than fixing
-     it. Scan for `--from` (and `--from=`) across the whole argv before applying
-     the ambiguity rule.
+  1. **`--from` must be honoured wherever it appears in uvx's OWN argv** — but
+     the scan must **stop at the tool-name / `--` boundary**. *Board finding.*
+     uv passes everything after the tool name through to the tool, so an
+     unbounded scan would mistake a *server's own* later `--from` argument for
+     uvx's package identity. A naive left-to-right ambiguity rule is equally
+     wrong in the other direction: it hits the bare `--python` first and returns
+     unknown, breaking the documented form rather than fixing it.
+  2. **The `=` spelling has a pin hazard that must be closed in the same
+     change.** *Board finding, verified:* `_detect_effective_version_pin`
+     (`handlers.py:319`) skips every `-`-prefixed token, so
+     `--from=index-it-mcp==1.2.0` reports **no pin** while the spaced form
+     `--from index-it-mcp==1.2.0` correctly reports `1.2.0`. If the detector
+     starts recognising the `=` spelling for *identity* without pin detection
+     learning it too, `update_server` will classify the package, see no pin, and
+     probe for **latest** — updating a server the operator explicitly pinned.
+     Identity and pin must share one boundary-aware uvx scan, exactly as
+     `_npm_package_arg` is shared between the two.
   2. With that, the README form resolves correctly to `index-it-mcp` and needs
      **no doc change** — the fix repairs it instead of degrading it. Verify this
      exact string in the acceptance criteria rather than assuming.
@@ -203,9 +223,17 @@ automation:
 
 ## Acceptance criteria
 
-- [ ] All seven pairs in the table resolve to **different** identities — proven
-      by `TestValueFlagCollisions`, each node mutation-proved with recorded
-      output, all seven RED today.
+- [ ] **Six ambiguous pairs resolve to exactly `("unknown", None)`** — NOT to
+      "different identities". *Board finding: the original criterion was
+      logically impossible.* It demanded those pairs be simultaneously unknown
+      **and** unequal, but two unknowns are equal, so no implementation could
+      satisfy it. The real safety property is that **unknown never confirms
+      identity**, which `_same_package` (`refresher.py:213`) already enforces —
+      assert the exact unknown tuple, not inequality.
+- [ ] **The one recoverable pair — `npm exec --package=old/new -- bin` — resolves
+      to `old` and `new` respectively**, asserted by exact name *and* inequality.
+      `--package=` is self-delimiting, so identity here is genuinely recoverable
+      rather than merely refused.
 - [ ] Ambiguous forms yield `("unknown", None)`, never a wrong name — proven by
       `TestValueFlagsFailClosed`.
 - [ ] Every known-positive form is unchanged: `uvx --from pkg`, `cargo -p pkg`,
