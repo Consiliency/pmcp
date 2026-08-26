@@ -96,22 +96,56 @@ npm exec pkg           -> pkg     npm exec exec    -> exec
 
 *Rewritten after board review — the two-way boolean/value split was falsified.*
 
-**Step 1 — expand shorthands first.** `--silent` becomes `--loglevel silent`,
-`-q` becomes `--loglevel warn`. All 40 come from `shorthands`, so no alias is
-hand-listed and none is missed. This is also what keeps the pinned
-`npm --silent exec pkg` → `pkg` working, by construction rather than by a
-special case.
+**Step 1 — expand shorthands first**, with arity taken from the expansion's
+*length*, a rule verified against npm's parser:
+
+| expansion | arity |
+|---|---|
+| length ≥ 2 — a value is baked in (`silent` → `["--loglevel","silent"]`, `q` → `["--loglevel","warn"]`) | **boolean-arity**: consumes nothing |
+| length 1 — a pure rename (`reg` → `["--registry"]`, `w` → `["--workspace"]`, `y` → `["--yes"]`, `g` → `["--global"]`) | **the target's arity** |
+
+All 40 come from `shorthands`, plus the 19 `short` fields on definitions, so no
+alias is hand-listed and none is missed. *Board finding: the config dump omits
+shorthands **wholesale**, not just `--silent` — a 40-fold larger hole than the
+original plan admitted, but closed by a second mechanical read of the same
+module rather than by curation.* This subsumes the existing hand-coded `-y`
+special case, which should be retired into it, and makes the pinned
+`npm --silent exec pkg` → `pkg` hold by construction.
 
 **Step 2 — classify the expanded flag by its declared `type`**, which is a
 *set*, not a scalar:
 
-| declared type | behaviour |
+**`null` in a type list means "unset", not a value type — drop it first.**
+Without that, `yes`, `optional`, `production`, `workspaces` and
+`expect-results` (all `null|Boolean`) read as mixed, and `--yes`/`-y` — a real
+MCP launch form — would be refused. Measured: naive `x != Boolean` gives 7
+mixed; dropping `null` gives the correct classification.
+
+| declared type (after dropping `null`) | behaviour |
 |---|---|
 | `Boolean` alone | skip; the next token is still a candidate |
-| any non-Boolean member (`String`, `Number`, `Url`, `Path`, an enum, an Array) | **consumes the next token** |
-| union with Boolean (`always\|Boolean`) | **consumes the next token** — this is the case that broke the original model |
+| no Boolean member (`String`, `Url`, `Path`, an enum, an Array, `false\|{}`) | **consumes the next token** |
+| Boolean **and** a non-Boolean member | **unlisted → refuse** — arity is conditional and no single class is right |
 | `--package` | known-positive: its value **is** the package |
 | not in `definitions` at all | **`("unknown", None)`** |
+
+**The conditional set is exactly `{color, browser}` — verified against npm's own
+parser (`nopt` + npm's type map), not from the type strings.** A board seat
+proposed `{browser, color, proxy}`; `proxy` is `null|false|{}` with no `Boolean`
+member and **always consumes**, including `--proxy a` where it swallows the
+package, so it is a *value* flag and mis-grouping it would have left that form
+refusing unnecessarily:
+
+```
+--proxy http://p a  -> remain ["exec","a"]     consumes
+--proxy false a     -> remain ["exec","a"]     consumes
+--proxy a           -> remain ["exec"]         consumes the package
+--color always a    -> remain ["exec","a"]     consumes
+--color a           -> remain ["exec","a"]     does NOT consume  <- conditional
+--browser a         -> remain ["exec"]         consumes
+```
+
+`browser` (`null|Boolean|String`) is genuinely mixed and stays unlisted.
 
 **A Boolean flag still consumes a literal `true`/`false`.** npm's parser
 accepts `--global false`, so a bare `true`/`false` following a Boolean flag is
@@ -242,10 +276,19 @@ automation:
 
 - [ ] **Five** pairs satisfy `d(a) != d(b)` **or** `d(a) == ("unknown", None)`,
       each pair's exact value pinned — the three originally reproduced, plus
-      `npm exec --global false a/b` and `npm exec --color always a/b`. *Board
-      finding: those last two survive the plan's original two-way model, so an
-      acceptance set without them can pass while the safety residual stays
-      open.* RED today, mutation-proved per node with recorded output.
+      `npm exec --global false a/b` and `npm exec --color always a/b`.
+
+      *These last two are the acceptance set's whole point.* A board seat
+      **implemented the original plan faithfully in a copy** and demonstrated
+      that all three original collision checks pass, the pinned orderings pass,
+      the fails-closed check passes — **and `npm exec --color always a/b` still
+      returns `('npm','always')` for both**. The suite was structurally blind to
+      the exact entry the method got wrong. An acceptance set that cannot see
+      the defect its own method manufactures is not an acceptance set.
+
+      `--color always` pins to `("unknown", None)` under the corrected table
+      (conditional arity → unlisted → refuse). RED today, mutation-proved per
+      node with recorded output.
 - [ ] **`npm --silent exec pkg` → `pkg`** still holds. `--silent` is absent
       from `npm config list --json` (it aliases `--loglevel=silent`), so this
       is the single most likely regression and gets its own criterion.
@@ -262,9 +305,22 @@ automation:
       and anything whose `type` it cannot interpret. #182 removed ten
       memory-drafted entries; none may be reintroduced.
 - [ ] **All 40 shorthands expand**, verified against `shorthands` rather than
-      hand-listed — `--silent` → `--loglevel silent`, `-q` → `--loglevel warn`.
-      This is what makes `npm --silent exec pkg` → `pkg` hold by construction
-      instead of by special case.
+      hand-listed, with arity from expansion length (≥2 ⇒ boolean, 1 ⇒ target's
+      arity). `--silent` → `--loglevel silent`, `-q` → `--loglevel warn`,
+      `-w` → `--workspace` (consumes), `-y` → `--yes` (boolean). This makes
+      `npm --silent exec pkg` → `pkg` hold by construction, and the existing
+      hand-coded `-y` special case is **retired into it**, not left alongside.
+- [ ] **The conditional-arity set is derived and pinned as exactly
+      `{color, browser}`** — verified against npm's own parser, not from type
+      strings. `proxy` is `null|false|{}` with no Boolean member and **always**
+      consumes (including `--proxy a`, swallowing the package), so it is a
+      value flag; a board seat grouped it as mixed, which would have refused a
+      form that is unambiguous. Any future flag the generator classifies as
+      conditional must be reported, not silently unlisted.
+- [ ] **`null` is dropped from type lists before classifying.** It means
+      "unset", not a value type. Without this, `yes`, `optional`, `production`,
+      `workspaces` and `expect-results` read as conditional and `--yes`/`-y` —
+      a real MCP launch form — is refused.
 - [ ] Every manifest server still resolves (98/98 at 2.5.0) — proven by a scan,
       not assumed.
 - [ ] Full suite, ruff, mypy green; CHANGELOG records the fix **and** the
