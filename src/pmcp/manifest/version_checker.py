@@ -117,15 +117,30 @@ _NPM_SUBCOMMANDS = _NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND
 # collision (unsafe, invisible).
 #
 # **The honest residual: a WRONG entry still fails open.** Classify a flag as
-# boolean when it actually takes a value and that value becomes the package
+# boolean when it actually takes a value, and that value becomes the package
 # name. `docker run --pull <policy>` is the live example -- it reads like a
-# boolean and is not. So these tables were transcribed from each tool's own
-# `--help` output and verified entry by entry against it, never bulk-imported
-# from memory; memory got `--pull`, uv's `--quiet`/`--verbose` (repeatable
-# counters, printed as `-q, --quiet...`) and pip's `--platform` wrong in
-# drafting. They are deliberately kept SMALL -- limited to what real MCP
-# launch configs use -- because fail-closed makes an omission cheap while
-# every extra entry is one more chance at a wrong arity.
+# boolean and is not.
+#
+# So every entry below was transcribed from the tool's own `--help` and then
+# checked back against it MECHANICALLY, one entry at a time (296 entries; the
+# script lives in the #182 working notes, not in the suite, because help text
+# is version-specific and CI has none of these CLIs). Drafting from memory got
+# `--pull`, uv's `--quiet`/`--verbose` (repeatable counters, printed as
+# `-q, --quiet...`) and pip's `--platform` wrong, which is why the claim is
+# mechanical rather than asserted.
+#
+# Three entries are exempt, each for a stated reason: `-it`/`-ti` are combined
+# short booleans docker only ever documents separately, and npm prints a bare
+# `--package` in its option list with the metavar only in its usage block.
+# **Ten entries that could not be verified were REMOVED rather than kept** --
+# removal is fail-closed, so it costs auto-update for an unusual config and
+# never correctness. Among them, pip's `--break-system-packages` and
+# `--dry-run` are real modern-pip booleans absent from the pip 22.0.2 used to
+# verify; re-add them against a newer pip rather than from memory.
+#
+# The tables are deliberately kept SMALL -- limited to what real MCP launch
+# configs use -- because fail-closed makes an omission cheap while every extra
+# entry is one more chance at a wrong arity.
 
 # uv (`uvx` == `uv tool run`), verified against `uv tool run --help`.
 _UVX_VALUE_FLAGS = frozenset(
@@ -162,7 +177,6 @@ _UVX_VALUE_FLAGS = frozenset(
         "--fork-strategy",
         "--keyring-provider",
         "--link-mode",
-        "--python-preference",
         "--python-platform",
         "--allow-insecure-host",
         "--cache-dir",
@@ -187,7 +201,6 @@ _UVX_BOOLEAN_FLAGS = frozenset(
         "--no-cache",
         "-n",
         "--offline",
-        "--native-tls",
         "--refresh",
         "--reinstall",
         "--upgrade",
@@ -207,8 +220,6 @@ _UVX_BOOLEAN_FLAGS = frozenset(
         "--no-env-file",
         "--help",
         "-h",
-        "--version",
-        "-V",
     }
 )
 # `--from` names the package to install when it differs from the command being
@@ -256,8 +267,6 @@ _PIP_VALUE_FLAGS = frozenset(
         "--install-option",
         "--use-feature",
         "--use-deprecated",
-        "--report",
-        "--python",
     }
 )
 _PIP_BOOLEAN_FLAGS = frozenset(
@@ -274,7 +283,6 @@ _PIP_BOOLEAN_FLAGS = frozenset(
         "--no-index",
         "--no-build-isolation",
         "--use-pep517",
-        "--check-build-dependencies",
         "--compile",
         "--no-compile",
         "--no-warn-script-location",
@@ -284,8 +292,6 @@ _PIP_BOOLEAN_FLAGS = frozenset(
         "--isolated",
         "--no-clean",
         "--prefer-binary",
-        "--break-system-packages",
-        "--dry-run",
         "--no-input",
         "--no-color",
         "--disable-pip-version-check",
@@ -396,7 +402,6 @@ _DOCKER_BOOLEAN_FLAGS = frozenset(
         "--sig-proxy",
         "--no-healthcheck",
         "--oom-kill-disable",
-        "--disable-content-trust",
         "--use-api-socket",
         "--quiet",
         "-q",
@@ -404,6 +409,99 @@ _DOCKER_BOOLEAN_FLAGS = frozenset(
     }
 )
 _DOCKER_SUBCOMMANDS = frozenset({"run", "exec", "start", "create", "pull", "push"})
+
+_DOCKER_VALUE_FLAGS = frozenset(
+    {
+        "-e",
+        "--env",
+        "-v",
+        "--volume",
+        "-p",
+        "--publish",
+        "--name",
+        "--network",
+        "-u",
+        "--user",
+        "--entrypoint",
+        "-w",
+        "--workdir",
+        "--label",
+        "-l",
+        "--memory",
+        "-m",
+        "--cpus",
+        "--add-host",
+        "--dns",
+        "--hostname",
+        "-h",
+        # The two omissions #182 measured.
+        "--env-file",
+        "--mount",
+        # `--pull <policy>` reads like a boolean and is NOT one -- the
+        # live example of the residual hazard that a WRONG entry still
+        # fails open, so its value would become the image name.
+        "--pull",
+        "--device",
+        "--tmpfs",
+        "--sysctl",
+        "--ulimit",
+        "--cap-add",
+        "--cap-drop",
+        "--security-opt",
+        "--restart",
+        "--platform",
+        "--gpus",
+        "--runtime",
+        "--isolation",
+        "--log-driver",
+        "--log-opt",
+        "--label-file",
+        "--health-cmd",
+        "--health-interval",
+        "--health-retries",
+        "--health-start-period",
+        "--health-timeout",
+        "--shm-size",
+        "--pid",
+        "--ipc",
+        "--userns",
+        "--uts",
+        "--cgroupns",
+        "--cgroup-parent",
+        "--stop-signal",
+        "--stop-timeout",
+        "--volumes-from",
+        "--volume-driver",
+        "--link",
+        "--expose",
+        "--group-add",
+        "--cidfile",
+        "--detach-keys",
+        "--annotation",
+        "--domainname",
+        "--mac-address",
+        "--ip",
+        "--ip6",
+        "--dns-option",
+        "--dns-search",
+        "--network-alias",
+        "--memory-reservation",
+        "--memory-swap",
+        "--memory-swappiness",
+        "--oom-score-adj",
+        "--pids-limit",
+        "--storage-opt",
+        "--blkio-weight",
+        "--cpu-shares",
+        "-c",
+        "--cpu-period",
+        "--cpu-quota",
+        "--cpuset-cpus",
+        "--cpuset-mems",
+        "--attach",
+        "-a",
+    }
+)
 
 
 def _takes_a_value_ambiguously(arg: str) -> bool:
@@ -918,101 +1016,9 @@ def _docker_image_arg(args: list[str]) -> str | None:
     class -- what closes it is that an *unlisted* bare flag now refuses
     instead of falling through to "take the next token as the image".
     """
-    _value_flags = frozenset(
-        {
-            "-e",
-            "--env",
-            "-v",
-            "--volume",
-            "-p",
-            "--publish",
-            "--name",
-            "--network",
-            "-u",
-            "--user",
-            "--entrypoint",
-            "-w",
-            "--workdir",
-            "--label",
-            "-l",
-            "--memory",
-            "-m",
-            "--cpus",
-            "--add-host",
-            "--dns",
-            "--hostname",
-            "-h",
-            # The two omissions #182 measured.
-            "--env-file",
-            "--mount",
-            # `--pull <policy>` reads like a boolean and is NOT one -- the
-            # live example of the residual hazard that a WRONG entry still
-            # fails open, so its value would become the image name.
-            "--pull",
-            "--device",
-            "--tmpfs",
-            "--sysctl",
-            "--ulimit",
-            "--cap-add",
-            "--cap-drop",
-            "--security-opt",
-            "--restart",
-            "--platform",
-            "--gpus",
-            "--runtime",
-            "--isolation",
-            "--log-driver",
-            "--log-opt",
-            "--label-file",
-            "--health-cmd",
-            "--health-interval",
-            "--health-retries",
-            "--health-start-period",
-            "--health-timeout",
-            "--shm-size",
-            "--pid",
-            "--ipc",
-            "--userns",
-            "--uts",
-            "--cgroupns",
-            "--cgroup-parent",
-            "--stop-signal",
-            "--stop-timeout",
-            "--volumes-from",
-            "--volume-driver",
-            "--link",
-            "--expose",
-            "--group-add",
-            "--cidfile",
-            "--detach-keys",
-            "--annotation",
-            "--domainname",
-            "--mac-address",
-            "--ip",
-            "--ip6",
-            "--dns-option",
-            "--dns-search",
-            "--network-alias",
-            "--memory-reservation",
-            "--memory-swap",
-            "--memory-swappiness",
-            "--oom-score-adj",
-            "--pids-limit",
-            "--storage-opt",
-            "--blkio-weight",
-            "--cpu-shares",
-            "-c",
-            "--cpu-period",
-            "--cpu-quota",
-            "--cpuset-cpus",
-            "--cpuset-mems",
-            "--attach",
-            "-a",
-        }
-    )
     raw, _ = _scan_for_package_token(
         args,
-        value_flags=_value_flags,
+        value_flags=_DOCKER_VALUE_FLAGS,
         boolean_flags=_DOCKER_BOOLEAN_FLAGS,
         subcommands=_DOCKER_SUBCOMMANDS,
     )
