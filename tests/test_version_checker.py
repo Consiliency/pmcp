@@ -711,6 +711,61 @@ class TestDockerReferenceSplitting:
         assert _docker_image_tag(ref) == tag
 
 
+class TestNpmBoardRoundTwo:
+    """Two collisions the first implementation left open, found by the board.
+
+    Both verified against npm's own parser (`nopt` + npm's type map), not
+    against the type strings, and both were live: `_same_package` confirms the
+    false identity in each case.
+    """
+
+    def test_nullable_boolean_consumes_a_literal_null(self) -> None:
+        """`--yes null A` -- npm consumes `null` as the flag's value.
+
+        The generator drops `null` from a type list (correctly -- it means
+        "unset"), but the SCANNER must still consume a literal `null` token
+        after a nullable boolean, exactly as it does `true`/`false`. Without
+        it both forms resolved to the package `null`. Affects `--yes`,
+        `--optional`, `--production`, `--workspaces`, `--expect-results`.
+        """
+        a = detect_package_type("npm", ["exec", "--yes", "null", "A"])
+        b = detect_package_type("npm", ["exec", "--yes", "null", "B"])
+        assert a != b, f"nullable boolean swallowed the package: {a}"
+        assert a == ("npm", "A")
+        assert b == ("npm", "B")
+
+    def test_attached_baked_value_shorthand_yields_its_baked_value(self) -> None:
+        """`--silent=true X` is NOT `--silent X`.
+
+        npm expands the shorthand and the ATTACHED value becomes a positional:
+        nopt leaves `["true", "X"]`, so the package is `true`, not `X`.
+        Reading it as `X` collapsed `--silent=true X` and `--silent=false X`
+        into one identity despite naming different packages.
+        """
+        t = detect_package_type("npm", ["exec", "--silent=true", "X"])
+        f = detect_package_type("npm", ["exec", "--silent=false", "X"])
+        assert t != f, f"attached baked value collapsed two packages: {t}"
+        assert t == ("npm", "true")
+        assert f == ("npm", "false")
+
+    def test_spaced_baked_value_shorthand_still_consumes_nothing(self) -> None:
+        """The spaced form is unchanged -- this is the distinction, not a fix.
+
+        `--silent` bakes its value in, so it consumes nothing and the next
+        token IS the package; `--global` is a real boolean that swallows a
+        literal `true`.
+        """
+        assert detect_package_type("npm", ["--silent", "exec", "pkg"]) == ("npm", "pkg")
+        assert detect_package_type("npx", ["--silent", "true", "arg"]) == (
+            "npm",
+            "true",
+        )
+        assert detect_package_type("npm", ["exec", "--global", "true", "a"]) == (
+            "npm",
+            "a",
+        )
+
+
 class TestNpmSubcommandSkipFiresOnce:
     """The npm subcommand skip must not eat real package names.
 

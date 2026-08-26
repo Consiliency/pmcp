@@ -755,6 +755,12 @@ _NPM_BOOLEAN_FLAGS = frozenset(
 )
 
 
+# Literals npm's parser accepts as a boolean flag's VALUE. `null` matters: a
+# nullable boolean (`--yes`, `--optional`, `--production`, `--workspaces`,
+# `--expect-results`) consumes it, so omitting it made `--yes null A` and
+# `--yes null B` both resolve to the package `null` (ah board review).
+_NPM_BOOLEAN_LITERALS = frozenset({"true", "false", "null"})
+
 _NPM_SKIP_FLAGS = frozenset(
     {
         "--d",
@@ -1169,6 +1175,19 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
             if arg in _NPM_VALUE_FLAGS:
                 index += 1  # its value is the next token, never the package
                 continue
+            attached_name = arg.split("=", 1)[0] if "=" in arg else None
+            if attached_name in _NPM_SKIP_FLAGS:
+                # `--silent=true X` is NOT `--silent X`. npm expands the
+                # shorthand and its ATTACHED value becomes a positional, so
+                # nopt leaves `["true", "X"]` -- the package is `true`, not
+                # `X`. Verified against npm's own parser. Reading it as `X`
+                # made `--silent=true X` and `--silent=false X` both resolve to
+                # `X`, colliding two genuinely different packages (ah board
+                # review, red-team seat).
+                _, _, baked = arg.partition("=")
+                if baked:
+                    return baked
+                continue
             if arg in _NPM_SKIP_FLAGS:
                 # A shorthand with its value already baked in: nothing is
                 # awaiting a value, so it never consumes -- not even a literal
@@ -1177,9 +1196,14 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
                 continue
             if arg in _NPM_BOOLEAN_FLAGS:
                 following = args[index + 1] if index + 1 < len(args) else None
-                # npm's parser takes a literal `true`/`false` after a boolean
-                # flag as that flag's value; anything else is a positional.
-                if following in ("true", "false"):
+                # npm's parser takes a literal `true`/`false` -- and, for a
+                # NULLABLE boolean, a literal `null` -- after a boolean flag as
+                # that flag's value; anything else is a positional. Verified
+                # against nopt: `npm exec --yes null A` leaves `A`, so omitting
+                # `null` made `--yes null A` and `--yes null B` both resolve to
+                # the package `null`, a false identity the gate then CONFIRMS
+                # (ah board review, red-team seat).
+                if following in _NPM_BOOLEAN_LITERALS:
                     index += 1
                 continue
             # Unclassified. `--flag=value` is self-delimiting so it cannot
