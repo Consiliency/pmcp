@@ -2337,10 +2337,72 @@ class TestNpmBakedValueShorthandDoesNotConsume:
         assert got_a != got_b
 
     def test_real_boolean_still_consumes_the_literal(self) -> None:
-        """The other side of the split must not regress."""
-        assert detect_package_type("npx", ["--global", "true", "pkg"]) == (
+        """The other side of the split must not regress -- under `npm`.
+
+        This test previously used `npx` and asserted `pkg`, which **pinned the
+        wrong behaviour**. Confirmed against the real binary:
+        `npx --offline --global true zz` fetches `registry.npmjs.org/true`, so
+        the package is `true`. npx-cli.js pre-scans argv and inserts `--`
+        before the first positional, so a plain-name boolean switch never
+        consumes a literal under npx (ah board review, correctness seat).
+        The npx case is now covered by `TestNpxBooleanLiterals` below.
+        """
+        assert detect_package_type("npm", ["exec", "--global", "true", "pkg"]) == (
             "npm",
             "pkg",
+        )
+
+
+class TestNpxBooleanLiterals:
+    """npx parses boolean switches differently from npm, so pmcp refuses.
+
+    `bin/npx-cli.js` pre-scans argv and inserts `--` ahead of the first
+    positional, so a plain-name boolean switch consumes nothing -- while the
+    `--no-` family still does, because the pre-scan does not recognise `no-X`
+    as a switch. Rather than model a rule that differs per spelling, refuse:
+    a refusal can never mint a wrong identity, and a real config carrying a
+    bare `true`/`false`/`null` after a boolean is vanishingly rare.
+    """
+
+    def test_npx_refuses_a_literal_after_a_boolean(self) -> None:
+        assert detect_package_type("npx", ["--global", "true", "zz"]) == (
+            "unknown",
+            None,
+        )
+        assert detect_package_type("npx", ["--yes", "null", "zz"]) == ("unknown", None)
+
+    def test_npx_boolean_without_a_literal_still_resolves(self) -> None:
+        """The refusal is scoped to the literal, not to boolean flags."""
+        assert detect_package_type("npx", ["-y", "pkg"]) == ("npm", "pkg")
+        assert detect_package_type("npx", ["-y", "exec"]) == ("npm", "exec")
+        assert detect_package_type("npx", ["--global", "pkg"]) == ("npm", "pkg")
+
+
+class TestOnlyNullableBooleansConsumeNull:
+    """`null` is a real published npm package, and only 5 flags consume it.
+
+    Verified against nopt: `npm exec --yes null zz` leaves `zz` (nullable
+    consumes), while `npm exec --global null zz` leaves `null zz` -- so `null`
+    is the package. A blanket rule applying `null` to all ~198 boolean entries
+    minted a wrong identity for the other ~193 (ah board review).
+    """
+
+    def test_nullable_boolean_consumes_null(self) -> None:
+        assert detect_package_type("npm", ["exec", "--yes", "null", "zz"]) == (
+            "npm",
+            "zz",
+        )
+
+    def test_non_nullable_boolean_does_not_consume_null(self) -> None:
+        assert detect_package_type("npm", ["exec", "--global", "null", "zz"]) == (
+            "npm",
+            "null",
+        )
+
+    def test_true_and_false_are_consumed_by_any_boolean(self) -> None:
+        assert detect_package_type("npm", ["exec", "--global", "false", "a"]) == (
+            "npm",
+            "a",
         )
 
     def test_baked_value_shorthand_still_skips_an_ordinary_token(self) -> None:

@@ -759,7 +759,30 @@ _NPM_BOOLEAN_FLAGS = frozenset(
 # nullable boolean (`--yes`, `--optional`, `--production`, `--workspaces`,
 # `--expect-results`) consumes it, so omitting it made `--yes null A` and
 # `--yes null B` both resolve to the package `null` (ah board review).
-_NPM_BOOLEAN_LITERALS = frozenset({"true", "false", "null"})
+_NPM_BOOLEAN_LITERALS = frozenset({"true", "false"})
+
+# Booleans whose declared type is `null|Boolean` -- these, and ONLY these, also
+# consume a literal `null`. Verified against nopt: `npm exec --yes null zz`
+# leaves `zz`, but `npm exec --global null zz` leaves `null zz`, so `null` is
+# the package for every NON-nullable boolean. A blanket `null` rule therefore
+# minted a wrong identity across the other ~180 boolean entries -- and `null`
+# is a real published npm package (ah board review, correctness seat).
+_NPM_NULLABLE_BOOLEAN_FLAGS = frozenset(
+    {
+        "--expect-results",
+        "--no-expect-results",
+        "--no-optional",
+        "--no-production",
+        "--no-workspaces",
+        "--no-yes",
+        "--optional",
+        "--production",
+        "--workspaces",
+        "--ws",
+        "--yes",
+        "-y",
+    }
+)
 
 _NPM_SKIP_FLAGS = frozenset(
     {
@@ -1196,6 +1219,25 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
                 continue
             if arg in _NPM_BOOLEAN_FLAGS:
                 following = args[index + 1] if index + 1 < len(args) else None
+                if command == "npx":
+                    # npx-cli.js pre-scans argv and inserts `--` before the
+                    # first positional, so a plain-name boolean switch never
+                    # consumes a following literal under npx. Confirmed against
+                    # the real binary: `npx --offline --global true zz` fetches
+                    # registry.npmjs.org/true -- the package is `true`, not the
+                    # trailing token. The `--no-` family behaves differently
+                    # again (the pre-scan does not recognise `no-X` as a switch,
+                    # so nopt still consumes), so rather than model a rule that
+                    # differs per spelling, REFUSE: a refusal can never mint a
+                    # wrong identity, and a real config with a bare
+                    # true/false/null after a boolean is vanishingly rare
+                    # (ah board review, correctness seat).
+                    if following in ("true", "false", "null"):
+                        return None
+                    # Otherwise a boolean switch consumes nothing under npx --
+                    # the next token is still a package candidate. (`npx -y pkg`
+                    # must keep resolving to `pkg`.)
+                    continue
                 # npm's parser takes a literal `true`/`false` -- and, for a
                 # NULLABLE boolean, a literal `null` -- after a boolean flag as
                 # that flag's value; anything else is a positional. Verified
@@ -1203,7 +1245,10 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
                 # `null` made `--yes null A` and `--yes null B` both resolve to
                 # the package `null`, a false identity the gate then CONFIRMS
                 # (ah board review, red-team seat).
-                if following in _NPM_BOOLEAN_LITERALS:
+                literals = _NPM_BOOLEAN_LITERALS
+                if arg in _NPM_NULLABLE_BOOLEAN_FLAGS:
+                    literals = literals | {"null"}
+                if following in literals:
                     index += 1
                 continue
             # Unclassified. `--flag=value` is self-delimiting so it cannot
