@@ -1135,6 +1135,19 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
         # carrying a leading flag. The ordering is already correct; the test
         # below exists because nothing PINNED it (ah board review, adversarial
         # seat: a surviving mutant, not a live defect).
+        if arg == "--":
+            # `--` does NOT end the search here, unlike in
+            # `_scan_for_package_token`. npm exec's FIRST documented usage is
+            # `npm exec -- <pkg>[@<version>] [args...]`, so the token after
+            # `--` is the package spec itself. Refusing it -- which the
+            # fail-closed default below would otherwise do -- regressed a form
+            # that resolved correctly before #180.
+            #
+            # The other documented shape, `npm exec --package=<pkg> -- <cmd>`,
+            # never reaches this line: `packages` is non-empty by then and the
+            # branch above has already taken over, which is what keeps `<cmd>`
+            # from being read as a package.
+            continue
         if arg.startswith("-") and arg != "-":
             if arg in _NPM_VALUE_FLAGS:
                 index += 1  # its value is the next token, never the package

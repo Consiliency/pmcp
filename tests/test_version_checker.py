@@ -2227,3 +2227,25 @@ class TestNpmPinnedOrderingSurvives:
         self, command: str, args: list[str], expected: str
     ) -> None:
         assert detect_package_type(command, args) == ("npm", expected)
+
+    @pytest.mark.parametrize(
+        ("command", "args", "expected"),
+        [
+            # npm exec's FIRST documented usage: `npm exec -- <pkg> [args...]`.
+            # The token after `--` IS the package spec, so `--` must not end
+            # the scan the way it does for uvx/pip/cargo/docker. Fail-closed
+            # refusal here would be a REGRESSION -- this resolved before #180.
+            ("npm", ["exec", "--", "pkg"], "pkg"),
+            ("npm", ["exec", "--", "pkg", "arg"], "pkg"),
+            ("npx", ["--", "pkg"], "pkg"),
+            ("npm", ["exec", "--loglevel", "silly", "--", "pkg"], "pkg"),
+            # The other documented shape: with `--package` given, the token
+            # after `--` is the COMMAND, not a package, and must not win.
+            ("npm", ["exec", "--package=pkg", "--", "bin"], "pkg"),
+            ("npm", ["exec", "--package", "pkg", "--", "bin"], "pkg"),
+        ],
+    )
+    def test_double_dash_form_still_resolves(
+        self, command: str, args: list[str], expected: str
+    ) -> None:
+        assert detect_package_type(command, args) == ("npm", expected)
