@@ -241,6 +241,320 @@ class TestPackageIdentityCollisions:
         assert old == ("npm", "old-pkg")
 
 
+class TestValueFlagCollisions:
+    """A flag's VALUE must never be mistaken for the package it precedes.
+
+    Consiliency/pmcp#182. `detect_package_type` skipped flags but not the
+    tokens those flags CARRY, so the first "non-flag" token was routinely a
+    flag's argument. Two different servers then produced one identity, and
+    2.4.0's identity gate reads an equal name as a POSITIVE confirmation --
+    serving the wrong package's tool descriptions indefinitely.
+
+    Each test asserts INEQUALITY of a real pair *and* pins both exact values.
+    The inequality is what the collision falsifies; the exact values stop a
+    parser that merely collapses the pair onto some third shared name from
+    passing. All seven were RED on `main` @ 75eb9c7, each returning the flag's
+    value as the package name.
+    """
+
+    def test_uvx_python_version_is_not_the_package(self) -> None:
+        """RED before: both sides returned `("pypi", "3.12")` -- the Python
+        version, read off `--python`, as the package name."""
+        a = detect_package_type("uvx", ["--python", "3.12", "pkg-a"])
+        b = detect_package_type("uvx", ["--python", "3.12", "pkg-b"])
+        assert a != b, f"`--python`'s value collapsed two packages: {a} == {b}"
+        assert a == ("pypi", "pkg-a")
+        assert b == ("pypi", "pkg-b")
+
+    def test_uvx_with_dependency_is_not_the_package(self) -> None:
+        """RED before: both returned `("pypi", "requests")` -- an injected
+        dependency named by `--with`, not the server being run."""
+        a = detect_package_type("uvx", ["--with", "requests", "srv-a"])
+        b = detect_package_type("uvx", ["--with", "requests", "srv-b"])
+        assert a != b, f"`--with`'s value collapsed two packages: {a} == {b}"
+        assert a == ("pypi", "srv-a")
+        assert b == ("pypi", "srv-b")
+
+    def test_pip_index_url_is_not_the_package(self) -> None:
+        """RED before: both returned `("pypi", "https://x")` -- an index URL
+        as a package name, which no registry lookup could ever resolve."""
+        a = detect_package_type("pip", ["install", "--index-url", "https://x", "pkg-a"])
+        b = detect_package_type("pip", ["install", "--index-url", "https://x", "pkg-b"])
+        assert a != b, f"`--index-url`'s value collapsed two packages: {a} == {b}"
+        assert a == ("pypi", "pkg-a")
+        assert b == ("pypi", "pkg-b")
+
+    def test_cargo_features_is_not_the_crate(self) -> None:
+        """RED before: both returned `("cargo", "full")` -- a feature name."""
+        a = detect_package_type("cargo", ["run", "--features", "full", "srv-a"])
+        b = detect_package_type("cargo", ["run", "--features", "full", "srv-b"])
+        assert a != b, f"`--features`'s value collapsed two crates: {a} == {b}"
+        assert a == ("cargo", "srv-a")
+        assert b == ("cargo", "srv-b")
+
+    def test_docker_env_file_is_not_the_image(self) -> None:
+        """RED before: both returned `("docker", ".env")`.
+
+        `--env-file` was simply missing from `_docker_image_arg`'s value-flag
+        table -- the most careful branch in the file, and still incomplete.
+        """
+        a = detect_package_type("docker", ["run", "--env-file", ".env", "img-a"])
+        b = detect_package_type("docker", ["run", "--env-file", ".env", "img-b"])
+        assert a != b, f"`--env-file`'s value collapsed two images: {a} == {b}"
+        assert a == ("docker", "img-a")
+        assert b == ("docker", "img-b")
+
+    def test_docker_mount_spec_is_not_the_image(self) -> None:
+        """RED before: both returned `("docker", "type=bind,src=/a")`."""
+        a = detect_package_type(
+            "docker", ["run", "--mount", "type=bind,src=/a", "img-a"]
+        )
+        b = detect_package_type(
+            "docker", ["run", "--mount", "type=bind,src=/a", "img-b"]
+        )
+        assert a != b, f"`--mount`'s value collapsed two images: {a} == {b}"
+        assert a == ("docker", "img-a")
+        assert b == ("docker", "img-b")
+
+    def test_npm_exec_package_flag_names_the_package(self) -> None:
+        """RED before: both returned `("npm", "bin")` -- the BINARY.
+
+        The seventh collision, and the only one of the seven where identity is
+        genuinely RECOVERABLE rather than merely refusable: `--package` is
+        known-positive, so its value IS the package. Treating `--package=old`
+        as merely "self-delimiting, so keep scanning" still returns `bin`;
+        the scanner has to read the value back OUT of the flag.
+        """
+        a = detect_package_type("npm", ["exec", "--package=old", "--", "bin"])
+        b = detect_package_type("npm", ["exec", "--package=new", "--", "bin"])
+        assert a != b, f"two packages exposing one binary collapsed: {a} == {b}"
+        assert a == ("npm", "old")
+        assert b == ("npm", "new")
+
+    def test_npm_exec_package_flag_spaced_spelling(self) -> None:
+        """npm documents both `--package=<pkg>` and `--package <pkg>`."""
+        a = detect_package_type("npm", ["exec", "--package", "old", "--", "bin"])
+        b = detect_package_type("npm", ["exec", "--package", "new", "--", "bin"])
+        assert a != b, f"spaced `--package` collapsed two packages: {a} == {b}"
+        assert a == ("npm", "old")
+        assert b == ("npm", "new")
+
+
+class TestValueFlagsFailClosed:
+    """An UNLISTED bare flag yields `("unknown", None)`, never a guess.
+
+    This is the inversion that makes the classification safe, and it is the
+    opposite of the denylist Consiliency/pmcp#183 rejected. Docker's
+    `_value_flags` table failed OPEN: the default for an unlisted flag was
+    "skip it and take the next token as the image", so an omission silently
+    produced a WRONG identity. Here an omission costs auto-update for one odd
+    config -- safe, loud, and fixable by adding an entry -- instead of a silent
+    collision that no one can see.
+
+    `_same_package` (refresher.py) already resolves `"unknown"` to "cannot
+    confirm -> refresh", so a refusal degrades gracefully to more work rather
+    than to wrong output.
+    """
+
+    def test_uvx_unlisted_flag_refuses(self) -> None:
+        assert detect_package_type("uvx", ["--not-a-real-uv-flag", "pkg"]) == (
+            "unknown",
+            None,
+        )
+
+    def test_pip_unlisted_flag_refuses(self) -> None:
+        assert detect_package_type(
+            "pip", ["install", "--not-a-real-pip-flag", "p"]
+        ) == (
+            "unknown",
+            None,
+        )
+
+    def test_cargo_unlisted_flag_refuses(self) -> None:
+        assert detect_package_type(
+            "cargo", ["run", "--not-a-real-cargo-flag", "s"]
+        ) == (
+            "unknown",
+            None,
+        )
+
+    def test_docker_unlisted_flag_refuses(self) -> None:
+        assert detect_package_type(
+            "docker", ["run", "--not-a-real-docker-flag", "i"]
+        ) == (
+            "unknown",
+            None,
+        )
+
+    def test_unlisted_flag_with_attached_value_is_self_delimiting(self) -> None:
+        """`--unlisted=value` is SAFE to skip and must not refuse.
+
+        The hazard an unlisted flag creates is that it might consume the next
+        token. A `--flag=value` spelling carries its value inside the token,
+        so it cannot; refusing here would cost auto-update for no safety gain.
+        """
+        assert detect_package_type("uvx", ["--not-a-real-uv-flag=x", "pkg"]) == (
+            "pypi",
+            "pkg",
+        )
+
+    def test_two_different_unlisted_forms_do_not_confirm_each_other(self) -> None:
+        """The safety property: unknown never CONFIRMS an identity.
+
+        Two refusals ARE equal to each other -- that is unavoidable and is
+        exactly why the class property is "different, or unknown" rather than
+        "always different". `_same_package` rejects `"unknown"` on either side
+        before any comparison happens, so equality here can never be read as a
+        positive confirmation.
+        """
+        a = detect_package_type("uvx", ["--not-a-real-uv-flag", "pkg-a"])
+        b = detect_package_type("uvx", ["--not-a-real-uv-flag", "pkg-b"])
+        assert a == b == ("unknown", None)
+        from pmcp.manifest.refresher import _same_package
+
+        assert _same_package(a[1] or "", a[0], b[1], b[0]) is False
+
+
+class TestKnownPositiveValueFlags:
+    """Forms that resolved correctly BEFORE the fix must be untouched.
+
+    A rejected earlier design -- "any bare flag before the candidate makes
+    identity unrecoverable" -- broke every one of the docker cases below, and
+    `docker run -it --rm <image>` is the canonical shape in this repo's own
+    README (`README.md:1528`). `-it` is a COMBINED short boolean that no
+    value-table derived from `docker run --help` would ever list, since docker
+    only documents `-i` and `-t` separately. These tests exist to keep that
+    regression from being reintroduced.
+    """
+
+    def test_uvx_boolean_flag_still_finds_package(self) -> None:
+        assert detect_package_type("uvx", ["--quiet", "my-package", "--arg"]) == (
+            "pypi",
+            "my-package",
+        )
+
+    def test_docker_short_boolean_flags_still_find_image(self) -> None:
+        assert detect_package_type(
+            "docker", ["run", "-i", "--rm", "mcp/server:latest"]
+        ) == (
+            "docker",
+            "mcp/server",
+        )
+
+    def test_docker_env_flag_still_finds_image(self) -> None:
+        assert detect_package_type(
+            "docker", ["run", "-e", "KEY=val", "--rm", "ghcr.io/org/mcp"]
+        ) == ("docker", "ghcr.io/org/mcp")
+
+    def test_docker_combined_short_booleans_still_find_image(self) -> None:
+        """`-it` is one token docker never documents; it must be listed by hand."""
+        assert detect_package_type("docker", ["run", "-it", "--rm", "img"]) == (
+            "docker",
+            "img",
+        )
+
+    def test_uvx_from_after_the_package_does_not_win(self) -> None:
+        """A LEFT-TO-RIGHT scan, not a whole-argv `--from` hunt.
+
+        An earlier draft scanned all of argv for `--from` to rescue the README
+        pin form. Measured, that turns this case from `mypkg` into `other`: a
+        fail-open misidentification INTRODUCED by the fix, which would
+        re-collide `uvx a --from x` with `uvx b --from x` through the new path.
+        The positional wins because it comes first.
+        """
+        assert detect_package_type("uvx", ["mypkg", "--from", "other"]) == (
+            "pypi",
+            "mypkg",
+        )
+
+    def test_known_positive_forms_unchanged(self) -> None:
+        assert detect_package_type("uvx", ["--from", "pkg", "tool"]) == ("pypi", "pkg")
+        assert detect_package_type("cargo", ["run", "-p", "pkg"]) == ("cargo", "pkg")
+        assert detect_package_type("cargo", ["run", "--bin", "b"]) == ("cargo", "b")
+        assert detect_package_type("pip", ["install", "pkg"]) == ("pypi", "pkg")
+        assert detect_package_type("npx", ["-y", "pkg"]) == ("npm", "pkg")
+        assert detect_package_type("docker", ["run", "img"]) == ("docker", "img")
+
+    def test_scan_stops_at_the_double_dash_separator(self) -> None:
+        """Everything after `--` belongs to the SERVED tool, not to uvx.
+
+        uv passes those through verbatim, so a server's own `--from` argument
+        must never be mistaken for uvx's package identity.
+        """
+        assert detect_package_type(
+            "uvx", ["--from", "pkg", "tool", "--", "--from", "x"]
+        ) == (
+            "pypi",
+            "pkg",
+        )
+        assert detect_package_type("uvx", ["--", "--python", "3.12", "x"]) == (
+            "unknown",
+            None,
+        )
+
+    def test_readme_documented_pin_form_resolves_to_the_package(self) -> None:
+        """`README.md:1133` recommends this exact shape for a FIRST-PARTY server.
+
+        RED before the fix, which returned `("pypi", "3.12")` -- so #182 was
+        never hypothetical for uvx: the repo mis-identified a config it
+        recommends in its own README. With `--python` classified as a value
+        flag, a plain left-to-right scan consumes `3.12` and `--from` then
+        yields the package, with no whole-argv scan needed.
+        """
+        assert detect_package_type(
+            "uvx", ["--python", "3.12", "--from", "index-it-mcp==1.2.0", "index-it-mcp"]
+        ) == ("pypi", "index-it-mcp")
+
+    def test_from_value_is_normalized_to_its_pep508_base_name(self) -> None:
+        """`--from`'s value is a PEP 508 requirement, not a bare package name.
+
+        This repairs a LIVE defect rather than introducing a behaviour change:
+        `manifest.yaml:352-357` ships `--from browser-use[cli]`, and a PyPI
+        lookup for `browser-use[cli]` returns None while `browser-use` returns
+        a real version -- so that first-party entry's version checks have been
+        silently failing. Stripping the extra repairs them.
+        """
+        assert detect_package_type(
+            "uvx", ["--from", "browser-use[cli]", "browser-use"]
+        ) == (
+            "pypi",
+            "browser-use",
+        )
+        assert detect_package_type("uvx", ["--from", "index-it-mcp==1.2.0", "x"]) == (
+            "pypi",
+            "index-it-mcp",
+        )
+        assert detect_package_type("uvx", ["--from", "pkg>=1.0", "x"]) == (
+            "pypi",
+            "pkg",
+        )
+
+    def test_from_url_value_keeps_the_whole_url_as_identity(self) -> None:
+        """A VCS URL is its own identity -- distinct URLs are distinct packages.
+
+        Normalizing it to a PEP 508 name would be wrong (there is no name to
+        take), and refusing would be needlessly lossy. Keeping the URL keeps
+        the gate correct: two different repos never confirm as one, and the
+        PyPI lookup fails closed to None, which the gate already reads as
+        "cannot confirm -> refresh".
+        """
+        a = detect_package_type("uvx", ["--from", "git+https://x/y", "tool"])
+        b = detect_package_type("uvx", ["--from", "git+https://x/z", "tool"])
+        assert a == ("pypi", "git+https://x/y")
+        assert a != b, (
+            f"two different git sources collapsed to one identity: {a} == {b}"
+        )
+
+    def test_positional_uvx_token_is_left_raw(self) -> None:
+        """Only `--from` values are normalized.
+
+        `uvx pkg==1.2.3` keeps its inline pin in the name so the existing
+        "pinned server" refusal path in gateway.update_server still fires on
+        the failed PyPI lookup it was written around (handlers.py:289-294).
+        """
+        assert detect_package_type("uvx", ["pkg==1.2.3"]) == ("pypi", "pkg==1.2.3")
+
+
 class TestDockerReferenceSplitting:
     """`_docker_image_name` and `_docker_image_tag` are complements.
 

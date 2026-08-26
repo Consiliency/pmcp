@@ -80,6 +80,7 @@ from pmcp.manifest.version_checker import (
     _docker_image_tag,
     _npm_package_arg,
     _npm_tag,
+    _uvx_package_arg,
     detect_package_type,
     get_package_version,
 )
@@ -317,12 +318,20 @@ def _detect_effective_version_pin(
         tag = _npm_tag(raw)
         return None if not tag or tag == "latest" else tag
     if package_type == "pypi" and command == "uvx":
-        for arg in args:
-            if arg.startswith("-"):
-                continue
-            if "==" in arg:
-                _, _, version = arg.partition("==")
-                return version or None
+        # Shares `_uvx_package_arg` with detect_package_type for the same
+        # reason the npm branch shares `_npm_package_arg`: two independent
+        # scans disagreeing about which token is "the package" is how a real
+        # pin gets missed. The previous scan skipped every `-`-prefixed token
+        # and read `==` off the first bare one, which was wrong twice over
+        # (Consiliency/pmcp#182): `--from=pkg==1.2.0` is a single `-`-prefixed
+        # token, so a REAL pin read as unpinned and update_server would have
+        # probed for latest and moved a server the operator had pinned; and
+        # `--with requests==2.0 pkg` reported an injected DEPENDENCY's version
+        # as the server's own pin, refusing an update that was never pinned.
+        raw, _from_flag = _uvx_package_arg(args)
+        if raw is not None and "==" in raw:
+            _, _, version = raw.partition("==")
+            return version or None
     if package_type == "docker":
         raw_image = _docker_image_arg(args)
         if raw_image is None:

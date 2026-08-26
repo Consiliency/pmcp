@@ -88,6 +88,458 @@ _NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND = frozenset(
 _NPM_SUBCOMMANDS = _NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND
 
 
+# ---------------------------------------------------------------------------
+# Flag classification (Consiliency/pmcp#182)
+# ---------------------------------------------------------------------------
+#
+# The bug this closes: the scans below skipped *flags* but not the *values
+# those flags carry*, so the first "non-flag" token was routinely a flag's
+# argument. `uvx --python 3.12 pkg-a` and `uvx --python 3.12 pkg-b` both
+# resolved to `("pypi", "3.12")`, and 2.4.0's identity gate reads an equal name
+# as a POSITIVE confirmation -- serving pkg-a's cached tool descriptions for
+# pkg-b indefinitely.
+#
+# Every flag is classified into exactly one of three kinds, and **anything
+# unlisted defaults to refusing**:
+#
+#   value    -- consumes the next token; that token is NOT the package
+#   boolean  -- takes nothing; the next token is still a candidate
+#   positive -- its value IS the package (`uvx --from`, `cargo -p`)
+#   unlisted -- `("unknown", None)`
+#
+# **Why this is not the denylist Consiliency/pmcp#183 rejected.** Docker's
+# `_value_flags` table below has the same shape, and it failed OPEN: the
+# default for an unlisted flag was "skip it and take the next token as the
+# image", so an omission silently produced a WRONG identity -- which is exactly
+# how `--env-file` and `--mount` became two of the seven collisions. Inverting
+# the default is the entire point. An omission now costs auto-update for one
+# odd config (safe, loud, fixable by adding an entry) instead of a silent
+# collision (unsafe, invisible).
+#
+# **The honest residual: a WRONG entry still fails open.** Classify a flag as
+# boolean when it actually takes a value and that value becomes the package
+# name. `docker run --pull <policy>` is the live example -- it reads like a
+# boolean and is not. So these tables were transcribed from each tool's own
+# `--help` output and verified entry by entry against it, never bulk-imported
+# from memory; memory got `--pull`, uv's `--quiet`/`--verbose` (repeatable
+# counters, printed as `-q, --quiet...`) and pip's `--platform` wrong in
+# drafting. They are deliberately kept SMALL -- limited to what real MCP
+# launch configs use -- because fail-closed makes an omission cheap while
+# every extra entry is one more chance at a wrong arity.
+
+# uv (`uvx` == `uv tool run`), verified against `uv tool run --help`.
+_UVX_VALUE_FLAGS = frozenset(
+    {
+        "--python",
+        "-p",
+        "--with",
+        "--with-editable",
+        "--with-requirements",
+        "--index",
+        "--index-url",
+        "-i",
+        "--extra-index-url",
+        "--default-index",
+        "--find-links",
+        "-f",
+        "--constraints",
+        "-c",
+        "--overrides",
+        "--build-constraints",
+        "-b",
+        "--config-setting",
+        "-C",
+        "--exclude-newer",
+        "--refresh-package",
+        "--reinstall-package",
+        "--upgrade-package",
+        "-P",
+        "--no-binary-package",
+        "--no-build-package",
+        "--resolution",
+        "--prerelease",
+        "--index-strategy",
+        "--fork-strategy",
+        "--keyring-provider",
+        "--link-mode",
+        "--python-preference",
+        "--python-platform",
+        "--allow-insecure-host",
+        "--cache-dir",
+        "--config-file",
+        "--directory",
+        "--project",
+        "--env-file",
+        "--color",
+    }
+)
+_UVX_BOOLEAN_FLAGS = frozenset(
+    {
+        # `-q, --quiet...` / `-v, --verbose...` -- the trailing `...` marks a
+        # repeatable COUNTER, not a value. Reading them as value flags would
+        # eat the package in `uvx --quiet my-package`, which is a documented
+        # form and a pinned test.
+        "--quiet",
+        "-q",
+        "--verbose",
+        "-v",
+        "--isolated",
+        "--no-cache",
+        "-n",
+        "--offline",
+        "--native-tls",
+        "--refresh",
+        "--reinstall",
+        "--upgrade",
+        "-U",
+        "--no-config",
+        "--no-index",
+        "--no-progress",
+        "--no-sources",
+        "--no-binary",
+        "--no-build",
+        "--no-build-isolation",
+        "--compile-bytecode",
+        "--managed-python",
+        "--no-managed-python",
+        "--no-python-downloads",
+        "--system-certs",
+        "--no-env-file",
+        "--help",
+        "-h",
+        "--version",
+        "-V",
+    }
+)
+# `--from` names the package to install when it differs from the command being
+# run -- so its value IS the identity.
+_UVX_POSITIVE_FLAGS = frozenset({"--from"})
+
+# pip, verified against `pip install --help`.
+_PIP_VALUE_FLAGS = frozenset(
+    {
+        "--index-url",
+        "-i",
+        "--extra-index-url",
+        "--find-links",
+        "-f",
+        "--constraint",
+        "-c",
+        "--requirement",
+        "-r",
+        "--editable",
+        "-e",
+        "--target",
+        "-t",
+        "--prefix",
+        "--root",
+        "--src",
+        # These four read like booleans and are not (`--platform <platform>`).
+        "--platform",
+        "--python-version",
+        "--implementation",
+        "--abi",
+        "--proxy",
+        "--cert",
+        "--client-cert",
+        "--trusted-host",
+        "--log",
+        "--cache-dir",
+        "--timeout",
+        "--retries",
+        "--progress-bar",
+        "--exists-action",
+        "--upgrade-strategy",
+        "--no-binary",
+        "--only-binary",
+        "--global-option",
+        "--install-option",
+        "--use-feature",
+        "--use-deprecated",
+        "--report",
+        "--python",
+    }
+)
+_PIP_BOOLEAN_FLAGS = frozenset(
+    {
+        "--upgrade",
+        "-U",
+        "--user",
+        "--pre",
+        "--no-deps",
+        "--force-reinstall",
+        "--ignore-installed",
+        "--ignore-requires-python",
+        "--no-cache-dir",
+        "--no-index",
+        "--no-build-isolation",
+        "--use-pep517",
+        "--check-build-dependencies",
+        "--compile",
+        "--no-compile",
+        "--no-warn-script-location",
+        "--no-warn-conflicts",
+        "--require-hashes",
+        "--require-virtualenv",
+        "--isolated",
+        "--no-clean",
+        "--prefer-binary",
+        "--break-system-packages",
+        "--dry-run",
+        "--no-input",
+        "--no-color",
+        "--disable-pip-version-check",
+        "--no-python-version-warning",
+        "--quiet",
+        "-q",
+        "--verbose",
+        "-v",
+        "--debug",
+        "--help",
+        "-h",
+        "--version",
+        "-V",
+    }
+)
+_PIP_SUBCOMMANDS = frozenset({"install", "upgrade", "update"})
+
+# cargo, verified against `cargo run --help` and `cargo install --help`.
+_CARGO_VALUE_FLAGS = frozenset(
+    {
+        "--features",
+        "-F",
+        "--target",
+        "--target-dir",
+        "--manifest-path",
+        "--profile",
+        "--jobs",
+        "-j",
+        "--message-format",
+        "--color",
+        "--config",
+        "-Z",
+        "--example",
+        "--git",
+        "--branch",
+        "--tag",
+        "--rev",
+        "--path",
+        "--root",
+        "--registry",
+        "--index",
+        # `cargo install --version <ver>` -- a pin, never the crate name.
+        "--version",
+    }
+)
+_CARGO_BOOLEAN_FLAGS = frozenset(
+    {
+        "--release",
+        "-r",
+        "--all-features",
+        "--no-default-features",
+        "--offline",
+        "--locked",
+        "--frozen",
+        "--timings",
+        "--keep-going",
+        "--ignore-rust-version",
+        "--unit-graph",
+        "--bins",
+        "--examples",
+        "--force",
+        "-f",
+        "--debug",
+        "--dry-run",
+        "-n",
+        "--list",
+        "--no-track",
+        "--quiet",
+        "-q",
+        "--verbose",
+        "-v",
+        "--help",
+        "-h",
+    }
+)
+# `-p`/`--package`/`--bin` all name the thing being built or run.
+_CARGO_POSITIVE_FLAGS = frozenset({"-p", "--package", "--bin"})
+_CARGO_SUBCOMMANDS = frozenset({"run", "install", "build", "test", "check"})
+
+# npm. `--package` is the ONLY spelling: verified against `npm exec --help`,
+# whose options line reads `[--package <package-spec> ...]`. There is no `-p`
+# alias -- in npm `-p` means `--parseable` -- so listing one would be a WRONG
+# entry, which is the failure direction that stays open.
+_NPM_POSITIVE_FLAGS = frozenset({"--package"})
+
+# docker, verified against `docker run --help`.
+_DOCKER_BOOLEAN_FLAGS = frozenset(
+    {
+        "-i",
+        "--interactive",
+        "-t",
+        "--tty",
+        "-d",
+        "--detach",
+        # Combined short booleans. docker documents only `-i` and `-t`
+        # separately, so no table derived from `--help` can ever contain these
+        # -- they must be listed by hand. `docker run -it --rm <image>` is the
+        # canonical MCP shape and this repo's own README uses it (`:1528`);
+        # a design that refused it broke essentially every real docker server.
+        "-it",
+        "-ti",
+        "--rm",
+        "--init",
+        "--privileged",
+        "--read-only",
+        "--publish-all",
+        "-P",
+        "--sig-proxy",
+        "--no-healthcheck",
+        "--oom-kill-disable",
+        "--disable-content-trust",
+        "--use-api-socket",
+        "--quiet",
+        "-q",
+        "--help",
+    }
+)
+_DOCKER_SUBCOMMANDS = frozenset({"run", "exec", "start", "create", "pull", "push"})
+
+
+def _takes_a_value_ambiguously(arg: str) -> bool:
+    """Whether *arg* is a flag that might silently swallow the next token.
+
+    One home for the fail-closed rule. True for a token that starts with ``-``
+    and is **not** in the ``--flag=value`` form -- meaning its arity cannot be
+    read off the token itself, so the following token may be its value or may
+    be the package, and nothing here can tell which.
+
+    A ``--flag=value`` spelling is *self-delimiting*: the value rides inside
+    the token, so an unrecognised one cannot consume anything and is safe to
+    skip. Refusing on it would cost auto-update for no safety gain at all.
+
+    Callers apply this only **after** consulting their ecosystem's three
+    tables; a classified flag is never ambiguous by definition.
+    """
+    return arg.startswith("-") and arg != "-" and "=" not in arg
+
+
+def _scan_for_package_token(
+    args: list[str],
+    *,
+    value_flags: frozenset[str] = frozenset(),
+    boolean_flags: frozenset[str] = frozenset(),
+    positive_flags: frozenset[str] = frozenset(),
+    subcommands: frozenset[str] = frozenset(),
+) -> tuple[str | None, bool]:
+    """Left-to-right scan for the package token in *args*.
+
+    Returns ``(token, came_from_a_positive_flag)``. A ``None`` token means the
+    caller must report ``("unknown", None)`` -- either nothing was found or
+    something unclassifiable was hit.
+
+    **Left-to-right, deliberately.** An earlier draft scanned the whole of
+    argv for ``--from`` to rescue the README's documented pin form. Measured,
+    that turns ``uvx mypkg --from other`` from ``mypkg`` into ``other`` -- a
+    fail-open misidentification *introduced by the fix*, which would re-collide
+    ``uvx a --from x`` with ``uvx b --from x`` through the new path. With
+    ``--python`` classified as a value flag the plain scan resolves the README
+    form anyway, so no such hunt is needed.
+
+    The scan stops at ``--``: everything after it belongs to the tool being
+    run, not to the runner, and a served tool's own ``--from`` argument must
+    never be mistaken for the runner's package identity.
+    """
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg == "--":
+            # End of the runner's own arguments.
+            return (None, False)
+        if arg.startswith("-") and arg != "-":
+            name, separator, attached = arg.partition("=")
+            if separator:
+                if name in positive_flags:
+                    return (attached or None, True)
+                # Self-delimiting, so it cannot swallow the next token --
+                # safe to skip whether or not it is a flag we know.
+                index += 1
+                continue
+            if arg in positive_flags:
+                following = args[index + 1] if index + 1 < len(args) else None
+                # A positive flag with nothing usable after it names no
+                # package; guessing at the token after a missing value is how
+                # a flag's value became an identity in the first place.
+                if following is None or following.startswith("-"):
+                    return (None, False)
+                return (following, True)
+            if arg in value_flags:
+                index += 2
+                continue
+            if arg in boolean_flags:
+                index += 1
+                continue
+            if _takes_a_value_ambiguously(arg):
+                return (None, False)
+            index += 1
+            continue
+        if arg in subcommands:
+            index += 1
+            continue
+        return (arg, False)
+    return (None, False)
+
+
+# A PEP 508 requirement ends its NAME at the first character that can begin an
+# extras group, a version specifier, an environment marker, or a URL.
+_PEP508_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:[\[<>=!~;@,(].*)?$")
+
+
+def _pep508_base_name(requirement: str) -> str:
+    """The bare package name inside a PEP 508 *requirement*.
+
+    ``browser-use[cli]`` -> ``browser-use``; ``index-it-mcp==1.2.0`` ->
+    ``index-it-mcp``; ``pkg>=1.0`` -> ``pkg``.
+
+    Applied only to ``--from`` values, which are requirements rather than bare
+    names. This **repairs a live defect** rather than introducing a behaviour
+    change: `manifest.yaml` ships ``--from browser-use[cli]``, and a PyPI
+    lookup for ``browser-use[cli]`` returns None while ``browser-use`` returns
+    a real version -- so that first-party entry's version checks have been
+    silently failing.
+
+    Anything that is not a plain requirement name -- most importantly a
+    ``git+https://...`` URL -- is returned **unchanged**. A VCS URL is its own
+    identity: there is no name to extract, distinct URLs are distinct
+    packages so the gate stays correct, and the PyPI lookup fails closed to
+    None, which the gate already reads as "cannot confirm -> refresh".
+    """
+    match = _PEP508_NAME.match(requirement.strip())
+    return match.group(1) if match else requirement
+
+
+def _uvx_package_arg(args: list[str]) -> tuple[str | None, bool]:
+    """Return ``(raw uvx package token, came_from_--from)``.
+
+    "Raw" means before ``_pep508_base_name`` normalisation -- shared between
+    ``detect_package_type`` and gateway.update_server's pin detection for
+    exactly the reason ``_npm_package_arg`` is shared: two independent scans
+    disagreeing about which argument is "the package" is how a real pin got
+    missed. Before this existed, pin detection skipped every ``-``-prefixed
+    token and read ``==`` off the first bare one, so
+    ``--from=index-it-mcp==1.2.0`` reported **no pin** (identity resolved
+    fine, so update_server would have probed for latest and updated a server
+    the operator had explicitly pinned), while ``--with requests==2.0 pkg``
+    reported an injected dependency's version as the server's own pin.
+    """
+    return _scan_for_package_token(
+        args,
+        value_flags=_UVX_VALUE_FLAGS,
+        boolean_flags=_UVX_BOOLEAN_FLAGS,
+        positive_flags=_UVX_POSITIVE_FLAGS,
+    )
+
+
 def _npm_package_arg(args: list[str], command: str) -> str | None:
     """Return the raw npm/npx package token from *args*, or ``None``.
 
@@ -115,14 +567,39 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
     * ``npm`` only, because ``npx -y exec`` genuinely names a package called
       ``exec``.
 
-    Known limitation, tracked on Consiliency/pmcp#182: option tokens are
-    discarded wholesale, so ``npm exec --package=<pkg> -- <bin>`` still yields
-    the binary rather than ``<pkg>``, and two packages exposing the same binary
-    still confirm as one identity.
+    ``--package`` is read as **known-positive** (Consiliency/pmcp#182): its
+    value IS the package, so it is extracted rather than skipped. Before that,
+    ``npm exec --package=<pkg> -- <bin>`` returned the BINARY, and two
+    different packages exposing the same binary name confirmed as one
+    identity. Note that merely treating ``--package=old`` as "self-delimiting,
+    so keep scanning" does not fix it -- the scan still reaches ``<bin>``; the
+    value has to be read back out of the flag.
+
+    Known limitation, deliberately left open: unlike the other four
+    ecosystems this scan does **not** fail closed on an unrecognised flag, so
+    ``npm exec --loglevel silly <pkg>`` still reads ``silly`` as the package.
+    Inverting the default here would break the pinned ordering below, where a
+    leading global flag such as ``npm --silent exec <pkg>`` must be skipped
+    rather than refused. Tracked as a residual of #182.
     """
     skip_subcommand = command == "npm"
-    for arg in args:
+    packages: list[str] = []
+    for index, arg in enumerate(args):
         if arg == "-y":
+            continue
+        name, separator, attached = arg.partition("=")
+        if separator and name in _NPM_POSITIVE_FLAGS:
+            if attached:
+                packages.append(attached)
+            continue
+        if arg in _NPM_POSITIVE_FLAGS:
+            following = args[index + 1] if index + 1 < len(args) else None
+            if following is not None and not following.startswith("-"):
+                packages.append(following)
+            continue
+        if packages:
+            # A `--package` value outranks any later positional, which is the
+            # command npm runs FROM that package, not a package itself.
             continue
         # Skip flags. This MUST precede the subcommand check: npm accepts
         # global flags before the subcommand (`npm --silent exec pkg`), so
@@ -156,6 +633,11 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
         # Handle scoped packages like @playwright/mcp
         if pkg.startswith("@") or not pkg.startswith("-"):
             return arg
+    if packages:
+        # npm allows `--package` to be repeated. One package is an identity;
+        # several DIFFERENT ones are not, and picking the first would be a
+        # guess of exactly the kind this change exists to stop.
+        return packages[0] if len(set(packages)) == 1 else None
     return None
 
 
@@ -363,36 +845,33 @@ def detect_package_type(
             return ("npm", _strip_npm_tag(raw))
 
     elif command == "uvx":
-        # First non-flag argument is the package
-        for arg in args:
-            if not arg.startswith("-"):
-                return ("pypi", arg)
+        raw, from_positive_flag = _uvx_package_arg(args)
+        if raw is not None:
+            # Only a `--from` value is a PEP 508 requirement; a bare positional
+            # is left raw so `uvx pkg==1.2.3` keeps its inline pin in the name
+            # and the existing "pinned server" refusal path still fires.
+            return ("pypi", _pep508_base_name(raw) if from_positive_flag else raw)
 
     elif command in ("pip", "pip3"):
-        # pip install {package} or pip install --upgrade {package}
-        for arg in args:
-            if arg in ("install", "upgrade", "update", "--upgrade", "-U"):
-                continue
-            if arg.startswith("-"):
-                continue
-            return ("pypi", arg)
+        raw, _ = _scan_for_package_token(
+            args,
+            value_flags=_PIP_VALUE_FLAGS,
+            boolean_flags=_PIP_BOOLEAN_FLAGS,
+            subcommands=_PIP_SUBCOMMANDS,
+        )
+        if raw is not None:
+            return ("pypi", raw)
 
     elif command == "cargo":
-        # cargo run -p package OR cargo run --bin binary OR cargo install package
-        i = 0
-        while i < len(args):
-            arg = args[i]
-            if arg in ("-p", "--package", "--bin"):
-                if i + 1 < len(args) and not args[i + 1].startswith("-"):
-                    return ("cargo", args[i + 1])
-                i += 2
-                continue
-            if arg in ("run", "install", "build", "test", "check"):
-                i += 1
-                continue
-            if not arg.startswith("-"):
-                return ("cargo", arg)
-            i += 1
+        raw, _ = _scan_for_package_token(
+            args,
+            value_flags=_CARGO_VALUE_FLAGS,
+            boolean_flags=_CARGO_BOOLEAN_FLAGS,
+            positive_flags=_CARGO_POSITIVE_FLAGS,
+            subcommands=_CARGO_SUBCOMMANDS,
+        )
+        if raw is not None:
+            return ("cargo", raw)
 
     elif command == "docker":
         raw = _docker_image_arg(args)
@@ -416,46 +895,114 @@ def _docker_image_arg(args: list[str]) -> str | None:
     ``_npm_package_arg`` was: gateway.update_server's pin detection needs the
     untouched token, and re-implementing this scan separately would risk the
     two disagreeing about which argument is "the image".
+
+    The value table below was the most careful branch in this file and was
+    **still incomplete twice**: ``--env-file`` and ``--mount`` were missing, so
+    ``docker run --env-file .env <image>`` resolved to ``.env`` and any two
+    images launched that way confirmed as one package
+    (Consiliency/pmcp#182). Completing the table would not have closed the
+    class -- what closes it is that an *unlisted* bare flag now refuses
+    instead of falling through to "take the next token as the image".
     """
-    _value_flags = {
-        "-e",
-        "--env",
-        "-v",
-        "--volume",
-        "-p",
-        "--publish",
-        "--name",
-        "--network",
-        "-u",
-        "--user",
-        "--entrypoint",
-        "-w",
-        "--workdir",
-        "--label",
-        "-l",
-        "--memory",
-        "-m",
-        "--cpus",
-        "--add-host",
-        "--dns",
-        "--hostname",
-        "-h",
-    }
-    skip_next = False
-    for arg in args:
-        if skip_next:
-            skip_next = False
-            continue
-        if arg in ("run", "exec", "start", "create", "pull", "push"):
-            continue
-        if arg in _value_flags:
-            skip_next = True
-            continue
-        if arg.startswith("-"):
-            continue
-        # First positional arg after the subcommand is the image reference.
-        return arg
-    return None
+    _value_flags = frozenset(
+        {
+            "-e",
+            "--env",
+            "-v",
+            "--volume",
+            "-p",
+            "--publish",
+            "--name",
+            "--network",
+            "-u",
+            "--user",
+            "--entrypoint",
+            "-w",
+            "--workdir",
+            "--label",
+            "-l",
+            "--memory",
+            "-m",
+            "--cpus",
+            "--add-host",
+            "--dns",
+            "--hostname",
+            "-h",
+            # The two omissions #182 measured.
+            "--env-file",
+            "--mount",
+            # `--pull <policy>` reads like a boolean and is NOT one -- the
+            # live example of the residual hazard that a WRONG entry still
+            # fails open, so its value would become the image name.
+            "--pull",
+            "--device",
+            "--tmpfs",
+            "--sysctl",
+            "--ulimit",
+            "--cap-add",
+            "--cap-drop",
+            "--security-opt",
+            "--restart",
+            "--platform",
+            "--gpus",
+            "--runtime",
+            "--isolation",
+            "--log-driver",
+            "--log-opt",
+            "--label-file",
+            "--health-cmd",
+            "--health-interval",
+            "--health-retries",
+            "--health-start-period",
+            "--health-timeout",
+            "--shm-size",
+            "--pid",
+            "--ipc",
+            "--userns",
+            "--uts",
+            "--cgroupns",
+            "--cgroup-parent",
+            "--stop-signal",
+            "--stop-timeout",
+            "--volumes-from",
+            "--volume-driver",
+            "--link",
+            "--expose",
+            "--group-add",
+            "--cidfile",
+            "--detach-keys",
+            "--annotation",
+            "--domainname",
+            "--mac-address",
+            "--ip",
+            "--ip6",
+            "--dns-option",
+            "--dns-search",
+            "--network-alias",
+            "--memory-reservation",
+            "--memory-swap",
+            "--memory-swappiness",
+            "--oom-score-adj",
+            "--pids-limit",
+            "--storage-opt",
+            "--blkio-weight",
+            "--cpu-shares",
+            "-c",
+            "--cpu-period",
+            "--cpu-quota",
+            "--cpuset-cpus",
+            "--cpuset-mems",
+            "--attach",
+            "-a",
+        }
+    )
+    raw, _ = _scan_for_package_token(
+        args,
+        value_flags=_value_flags,
+        boolean_flags=_DOCKER_BOOLEAN_FLAGS,
+        subcommands=_DOCKER_SUBCOMMANDS,
+    )
+    return raw
 
 
 def _docker_image_tag(image_ref: str) -> str | None:

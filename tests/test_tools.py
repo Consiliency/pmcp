@@ -4840,6 +4840,60 @@ class TestUpdateServerVersionRepair:
         return manifest
 
     @pytest.mark.asyncio
+    async def test_update_server_never_probes_an_unclassifiable_flag_form(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """An UNLISTED bare flag must reach the refusal, not a probe.
+
+        Consiliency/pmcp#182. The fail-closed default is only worth anything if
+        `("unknown", None)` actually stops `update_server` before it builds a
+        probe, so this asserts the *consequence* rather than the parse --
+        mirroring the #183 model above.
+
+        The flag has to be genuinely unclassifiable. A `--python 3.12` server
+        no longer qualifies: under the three-way classification `--python` is a
+        known value flag, so that form now resolves to its real package name
+        and would sail past this refusal. (The plan's change list still
+        described `--python` as yielding no identity -- stale text from the
+        rejected pure-fail-closed draft.)
+        """
+        manifest = self._make_manifest_with_playwright(monkeypatch)
+        manifest.servers["odd-flags"] = ServerConfig(
+            name="odd-flags",
+            description="Launched with a flag pmcp cannot classify",
+            keywords=[],
+            install={},
+            command="uvx",
+            args=["--not-a-real-uv-flag", "some-package"],
+            requires_api_key=False,
+        )
+        gt = GatewayTools(
+            client_manager=MockClientManager(),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        probes: list[list[str]] = []
+
+        async def _record_probe(cmd, env=None):
+            probes.append(cmd)
+            return (True, "ok")
+
+        monkeypatch.setattr(gt, "_run_update_probe_command", _record_probe)
+
+        result = await gt.update_server({"server_name": "odd-flags"})
+
+        assert result.ok is False
+        # All four assertions are load-bearing. `probes == []` ALONE passes
+        # whenever update_server refuses for any unrelated earlier reason, so
+        # on its own it does not pin what it claims (ah board review).
+        assert result.package_type == "unknown"
+        assert "uvx --not-a-real-uv-flag some-package" in result.message
+        assert probes == [], (
+            "update_server built a probe from a command line whose package is "
+            f"unidentifiable -- an unlisted flag's value could be anything: {probes}"
+        )
+
+    @pytest.mark.asyncio
     async def test_update_server_never_probes_a_script_name(
         self, monkeypatch: pytest.MonkeyPatch
     ):
@@ -5796,6 +5850,34 @@ class TestUpdateServerVersionRepair:
         # pypi/uvx inline == pin.
         assert detect("pypi", "uvx", ["srv==1.2.3"]) == "1.2.3"
         assert detect("pypi", "uvx", ["srv"]) is None
+
+        # Consiliency/pmcp#182: identity and pin must read the SAME uvx token.
+        #
+        # Before this, pin detection skipped every `-`-prefixed token and then
+        # looked for `==` in the first bare one. That produced two distinct
+        # defects, in opposite directions:
+        #
+        #  1. `--from=<pkg>==<ver>` reported NO pin, because the whole thing is
+        #     one `-`-prefixed token. Identity resolved fine, so update_server
+        #     would classify the package, see no pin, and probe for LATEST --
+        #     updating a server the operator explicitly pinned.
+        #  2. `--with requests==2.0 pkg` reported `2.0` -- an injected
+        #     DEPENDENCY's version reported as the server's pin, refusing an
+        #     update that was never actually pinned.
+        #
+        # Both are fixed by sharing `_uvx_package_arg`, exactly as npm shares
+        # `_npm_package_arg` between the two.
+        assert detect("pypi", "uvx", ["--from", "index-it-mcp==1.2.0", "x"]) == "1.2.0"
+        assert detect("pypi", "uvx", ["--from=index-it-mcp==1.2.0", "x"]) == "1.2.0"
+        assert detect("pypi", "uvx", ["--python", "3.12", "srv==1.2.3"]) == "1.2.3"
+        assert detect("pypi", "uvx", ["--with", "requests==2.0", "pkg"]) is None
+        # An unclassifiable form has no package, so it has no pin either.
+        assert detect("pypi", "uvx", ["--not-a-real-uv-flag", "srv==1.2.3"]) is None
+
+        # npm `--package` carries its own tag, and the shared scan means pin
+        # detection reads it for free.
+        assert detect("npm", "npm", ["exec", "--package=pkg@1.2", "--", "bin"]) == "1.2"
+        assert detect("npm", "npm", ["exec", "--package=pkg", "--", "bin"]) is None
 
 
 class TestInvokeErrorPaths:
