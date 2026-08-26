@@ -49,8 +49,8 @@ it is left untouched so this change adds a rule rather than relitigating one.
 - `build` job — **add** `timeout-minutes: 20` — 4m10s observed; the job that stalled.
 - `publish` job — **add** `timeout-minutes: 10` — 19s observed; PyPI upload.
 - `github-release` job — **add** `timeout-minutes: 10` — 8s observed.
-- `on:` block — **add** `workflow_dispatch` with a required `tag` input — see
-  *Recovery* below.
+- `on:` block — **unchanged.** `workflow_dispatch` was proposed and is
+  **struck** — see *Recovery* below.
 
 ### `.github/workflows/test.yml` (modify)
 
@@ -66,25 +66,40 @@ it is left untouched so this change adds a rule rather than relitigating one.
 
 - `notify-worker` job — **add** `timeout-minutes: 10`.
 
-## Recovery: why `workflow_dispatch` is in scope
+## Recovery: `workflow_dispatch` is STRUCK
 
-`release.yml` currently triggers **only** on `push: tags: v*`. When a release run
-fails, the options are `gh run rerun` (worked this time) or deleting and
-re-pushing the tag — which rewrites a ref that consumers may already have
-fetched. `gh run rerun` is not guaranteed: it is unavailable once a run ages out
-of retention, and re-running a *cancelled* run is not a documented-stable path.
+*Board finding, two seats independently, both verified against the workflow.*
 
-Adding `workflow_dispatch` with an explicit `tag` input gives a first-class
-recovery route that never rewrites a published ref.
+The proposal was to add `workflow_dispatch` with a required `tag` input. **It is
+dropped**, and not only for the security widening I flagged — the specified
+change was also simply **incorrect**:
 
-**The security consideration, stated plainly:** `workflow_dispatch` on a
-publishing workflow means anyone with write access can trigger a PyPI publish
-for an arbitrary ref. That is a real widening. Mitigations already in place —
-the `publish` job is bound to `environment: release`, and PyPI trusted
-publishing scopes to this repo+workflow. If the reviewer judges the widening
-unjustified, **drop this item and keep the timeouts**; the timeouts are the fix
-for #187 and stand alone. This is the one part of the plan I am least sure of
-and most want argued.
+- `actions/checkout@v7` at `release.yml:12` and `:63` pins **no ref**.
+- Both tag derivations read `GITHUB_REF_NAME` (`release.yml:73`, `:96`).
+
+Under `workflow_dispatch`, `GITHUB_REF_NAME` is the ref chosen in the *"Use
+workflow from"* dropdown — **not** a workflow input. So dispatching with
+`tag=v2.4.1` from `main` would check out `main`, build and publish **main's**
+artifacts, then try to create a GitHub Release named `main`. The required input
+would be silently ignored. Writing an input and never wiring it is the same
+class of defect as a hollow test: it looks like it constrains something.
+
+The failure mode is the bad one: **PyPI publish can succeed while the GitHub
+release step fails**, leaving a half-published version. And the mitigations I
+offered do not hold — PyPI trusted publishing scoped to repo+workflow does
+**not** restrict to tag events, and `environment: release` only gates if that
+environment has required reviewers, which this plan never verified.
+
+Recovery already exists and is what actually unblocked v2.4.1: `gh run rerun`
+on the failed tag-push run. And the timeouts themselves are the real recovery
+improvement — they convert a 6-hour silent hang into a ~20-minute red X, which
+is what surfaces the stall in the first place.
+
+A correct dispatch path would check out `refs/tags/${{ inputs.tag }}`, use
+`inputs.tag` everywhere in place of `GITHUB_REF_NAME`, assert `pyproject`
+version == tag, handle an already-published PyPI version on partial recovery,
+and keep environment protection. That is a separate design and out of scope for
+#187.
 
 ## Documentation impact
 
@@ -124,8 +139,16 @@ for f in sorted(pathlib.Path('.github/workflows').glob('*.yml')):
     print(f.name, '->', sorted((d.get('jobs') or {}).keys()))
 "
 
-# 3. actionlint if available (do not install it just for this).
-command -v actionlint >/dev/null && actionlint .github/workflows/*.yml || echo "actionlint absent, skipped"
+# 3. actionlint — Actions-SCHEMA validation, which a generic YAML load cannot
+#    replace. NOTE the shape: `cmd && actionlint || echo skipped` is FAIL-OPEN,
+#    because the `||` branch also swallows a non-zero actionlint. Any finding
+#    would print "skipped" and exit 0. Branch explicitly instead (board finding,
+#    red-team seat — same shape as the hollow assertions in #184/#185).
+if command -v actionlint >/dev/null 2>&1; then
+  actionlint .github/workflows/*.yml   # non-zero here MUST fail the run
+else
+  echo "actionlint absent — schema not validated, say so in the PR"
+fi
 
 # 4. The repo suite must be untouched by a CI-only change.
 uv run pytest tests/ -q
@@ -166,6 +189,12 @@ automation:
 - [ ] `pipeline-bootstrap.yml`'s existing `timeout-minutes: 30` is unchanged —
       proven by `git diff main -- .github/workflows/pipeline-bootstrap.yml`
       being empty.
-- [ ] The `workflow_dispatch` decision is explicit: either implemented with the
-      security widening documented in the PR body, or dropped with the reason
-      recorded. Not silently omitted.
+- [ ] `workflow_dispatch` is **not** added, and the PR body records why —
+      proven by `git diff main -- .github/workflows/release.yml` showing no
+      change to the `on:` block. The board found the specified version was not
+      merely a security widening but incorrect: an unwired `tag` input against
+      `GITHUB_REF_NAME` would publish the dispatched *ref*, not the requested
+      tag.
+- [ ] `actionlint` was run and **passed**, or its absence is stated in the PR —
+      proven by the explicit `if/else` in Verification, not the fail-open
+      `&& … || echo` form. A non-zero actionlint must fail, not print "skipped".
