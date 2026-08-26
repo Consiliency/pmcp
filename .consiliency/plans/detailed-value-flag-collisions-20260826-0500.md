@@ -129,11 +129,25 @@ are kept as explicit positive cases, not as an exhaustion attempt.
   affected servers refresh once; a server launched with an ambiguous flag form
   can no longer be auto-updated (state this plainly, it is the cost); and the
   identity gate now actually holds for the forms #180 left open.
-- `README.md` — **check, likely modify.** It documents pinning as
-  `"args": ["--python", "3.12", "--from", …]`. If that exact form now yields
-  unknown, the README is recommending a config this change degrades — either the
-  form must stay supported via `--from`, or the README must change. **Resolve
-  this before implementing; do not leave it to discovery.**
+- `README.md` — **resolved before implementing, and it changes the design.**
+  The README documents (`README.md:1133-1137`) a first-party pin form:
+
+      uvx --python 3.12 --from index-it-mcp==1.2.0 index-it-mcp
+
+  Measured on `main` today, that resolves to **`('pypi', '3.12')`** — the Python
+  *version* as the package name. So #182 is not hypothetical for uvx: it already
+  mis-identifies a config this repo recommends in its own README.
+
+  Two consequences for the design:
+
+  1. **`--from` must be honoured wherever it appears**, not only as the first
+     flag. A naive left-to-right ambiguity rule would hit the bare `--python`
+     first and return unknown — breaking the documented form rather than fixing
+     it. Scan for `--from` (and `--from=`) across the whole argv before applying
+     the ambiguity rule.
+  2. With that, the README form resolves correctly to `index-it-mcp` and needs
+     **no doc change** — the fix repairs it instead of degrading it. Verify this
+     exact string in the acceptance criteria rather than assuming.
 - **#180 can close** if all its remaining forms are covered. Verify rather than
   assume — that issue was already narrowed once.
 
@@ -200,8 +214,12 @@ automation:
       the existing suite staying green.
 - [ ] `update_server` refuses rather than probing for an ambiguous server —
       proven by a **no-probe-executed** assertion, not a parse assertion.
-- [ ] The README pinning example is reconciled: either it still resolves, or the
-      README is updated. Decided explicitly, not discovered.
+- [ ] The README's documented pin form resolves to the package, not the Python
+      version — `detect_package_type("uvx", ["--python","3.12","--from",
+      "index-it-mcp==1.2.0","index-it-mcp"])` must yield `index-it-mcp`, where
+      today it yields `3.12`. RED today; this is a first-party config the repo
+      recommends in its own README (`README.md:1133`), so it is a real
+      user-facing defect, not a constructed one.
 - [ ] Full suite, ruff, mypy green; CHANGELOG records the fix **and** the
       auto-update cost.
 - [ ] **#180's status is settled explicitly** — closed if genuinely covered, or
