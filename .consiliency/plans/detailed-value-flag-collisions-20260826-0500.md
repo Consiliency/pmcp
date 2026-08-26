@@ -254,25 +254,40 @@ automation:
 
 ## Acceptance criteria
 
-- [ ] **Six ambiguous pairs resolve to exactly `("unknown", None)`** — NOT to
-      "different identities". *Board finding: the original criterion was
-      logically impossible.* It demanded those pairs be simultaneously unknown
-      **and** unequal, but two unknowns are equal, so no implementation could
-      satisfy it. The real safety property is that **unknown never confirms
-      identity**, which `_same_package` (`refresher.py:213`) already enforces —
-      assert the exact unknown tuple, not inequality.
-- [ ] **The one recoverable pair — `npm exec --package=old/new -- bin` — resolves
-      to `old` and `new` respectively**, asserted by exact name *and* inequality.
-      `--package=` is self-delimiting, so identity here is genuinely recoverable
-      rather than merely refused.
-- [ ] Ambiguous forms yield `("unknown", None)`, never a wrong name — proven by
-      `TestValueFlagsFailClosed`.
+- [ ] **The class property, stated so it is satisfiable:** for every pair,
+      `d(a) != d(b)` **or** `d(a) == ("unknown", None)`, **and** each pair's
+      exact expected value is pinned. *Board finding: the original criterion was
+      logically impossible* — it demanded pairs be simultaneously unknown **and**
+      unequal, and two unknowns are equal. The safety property is that unknown
+      never *confirms* identity, which `_same_package` (`refresher.py:199-229`)
+      already enforces. Under the three-way design most pairs now resolve to
+      real, **different** names rather than being refused.
+- [ ] **`npm exec --package=old/new -- bin` resolves to `old` and `new`** — by
+      exact name and inequality. `--package` is known-positive: its value IS the
+      package, so `_npm_package_arg` must read the value out of it. Treating
+      `--package=old` as merely self-delimiting still returns `bin`, verified.
+- [ ] **These four currently-green forms resolve exactly as today** —
+      `uvx --quiet my-package --arg` → `my-package`,
+      `docker run -i --rm mcp/server:latest` → `mcp/server`,
+      `docker run -e KEY=val --rm ghcr.io/org/mcp` → `ghcr.io/org/mcp`,
+      `docker run -it --rm img` → `img`. The rejected fail-closed design broke
+      all four; `-it` is the canonical shape in this repo's own README (`:1528`).
+- [ ] `uvx mypkg --from other` still yields `mypkg`, not `other` — the fail-open
+      misidentification a whole-argv `--from` scan would have introduced.
 - [ ] Every known-positive form is unchanged: `uvx --from pkg`, `cargo -p pkg`,
       `cargo --bin b`, `pip install pkg`, `npx -y pkg`, `docker run img`, and
       every `#180`/`#183` form — proven by `TestKnownPositiveValueFlags` plus
       the existing suite staying green.
-- [ ] `update_server` refuses rather than probing for an ambiguous server —
-      proven by a **no-probe-executed** assertion, not a parse assertion.
+- [ ] `update_server` refuses rather than probing for a genuinely unclassifiable
+      server — proven by **all four** of `ok is False`,
+      `package_type == "unknown"`, the message naming the command line, and
+      `probes == []`. *Board finding:* a bare `probes == []` passes when
+      update_server refuses for any unrelated earlier reason, so it does not pin
+      what it claims. Mirror `tests/test_tools.py:4885-4896`, the #183 model.
+- [ ] **`--from` value normalization is decided explicitly, not discovered** —
+      the manifest carries `--from browser-use[cli]`, so pick PEP-508 base name
+      (strips extras; changes that identity, one-time refresh, and makes its
+      PyPI lookups resolvable) or `==`-strip only, and pin `git+https://…` too.
 - [ ] The README's documented pin form resolves to the package, not the Python
       version — `detect_package_type("uvx", ["--python","3.12","--from",
       "index-it-mcp==1.2.0","index-it-mcp"])` must yield `index-it-mcp`, where
