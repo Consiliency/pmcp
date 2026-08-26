@@ -24,29 +24,66 @@ globals enumerated, and that enumeration is this plan's real content.
 Context is in session from #180/#182/#183; the branch was read directly
 (`_npm_package_arg`, `src/pmcp/manifest/version_checker.py`).
 
-**npm exposes its own config schema, so the enumeration can be mechanical.**
-`npm config list --json` returns **181 keys with typed default values**, from
-which arity follows: a `bool` default is a boolean flag, anything else takes a
-value. Measured: 70 boolean-typed, 111 value-typed. Spot-checked against known
-truth — `loglevel`→value, `registry`→value, `global`→bool, `prefix`→value,
-`workspace`→value: all correct.
+**npm exposes its real option schema — but NOT via `npm config list --json`.**
+*This section was rewritten after board review; the original source and arity
+model were both wrong. See **Rejected** below.*
 
-This matters because #182 found **ten entries drafted from memory** across the
-other four ecosystems that could not be verified against real `--help`; all ten
-were removed. npm has ~181 flags — far past what recall can cover — so a
-mechanically-derived table is not a nicety here, it is the only defensible
-method.
+The authoritative source is npm's installed config package:
 
-**Two limits of that source, found before planning rather than during:**
+```
+@npmcli/config/lib/definitions/index.js
+  -> definitions  (181 entries, each carrying a real `type`)
+  -> shorthands   (40 entries, each EXPANDING to its underlying flags)
+```
 
-1. **`--silent` is absent from the config dump entirely.** It is an alias for
-   `--loglevel=silent`, not a config key. Aliases must come from a second
-   source (`npm help npm`'s option list, or npm's documented alias table), or
-   `npm --silent exec pkg` — a currently-pinned form — regresses.
-2. **41 keys have `null` defaults**, where boolean-vs-value is not inferable
-   from the default alone. These must be classified from a second source or
-   left **unlisted**, which under a fail-closed default means "refuse". Leaving
-   them unlisted is safe; guessing is not.
+`type` is the actual arity declaration, not an inference from a default value.
+Measured on npm 11.19.0:
+
+```
+color      type = always|Boolean      <- union: boolean AND value-accepting
+global     type = Boolean
+loglevel   type = silent|error|warn|notice|http|info|verbose|silly
+package    type = String|Array
+```
+
+`shorthands` solves the alias problem outright rather than by hand-listing:
+
+```
+shorthands.silent = ["--loglevel","silent"]
+shorthands.q      = ["--loglevel","warn"]
+```
+
+So `--silent` is not a missing key needing a second source — it is a shorthand
+that *expands*, and expansion is the correct model for all 40.
+
+### Rejected: `npm config list --json` + arity-from-default-type
+
+*Board finding, verified — the original plan was built on this and it is
+unsound two ways.*
+
+1. **The arity model was wrong.** The plan defined boolean flags as consuming
+   nothing. npm's parser (`nopt`) consumes a following `true`/`false`, and a
+   union type like `always|Boolean` accepts a value. Verified: under the
+   original design both of these **still collide**, which is the exact defect
+   the phase exists to close:
+
+   ```
+   npm exec --global false a / b   -> both ('npm','false')
+   npm exec --color always a / b   -> both ('npm','always')
+   ```
+
+   `npm exec --color always --help` exits 0, so this is a legal form.
+
+2. **The source was not a schema.** `config list --json` emits the *active
+   merged configuration*, not the definition set: it omits private entries
+   (`_auth`, `password`), adds host-specific ones (`npm-version`, a user-scoped
+   registry), and changes with the environment — `NPM_CONFIG_COLOR=always`
+   flips `color` from boolean to string. Removing the user config took the
+   count 181 → 180. **The same generator would classify differently on
+   different hosts**, which is disqualifying for a committed table.
+
+The 41 `null`-default keys the original plan planned to leave unlisted are also
+a non-issue under the real source: `type` is declared regardless of default.
 
 **The pinned ordering that must survive** (`tests/test_version_checker.py`):
 
@@ -55,30 +92,45 @@ npm --silent exec pkg  -> pkg     npm install i    -> i
 npm exec pkg           -> pkg     npm exec exec    -> exec
 ```
 
-## Design: extend #182's three-way classification to npm
+## Design: expand shorthands, then classify by npm's declared `type`
 
-Same shape as the other four ecosystems, same fail-closed default:
+*Rewritten after board review — the two-way boolean/value split was falsified.*
 
-| kind | behaviour |
+**Step 1 — expand shorthands first.** `--silent` becomes `--loglevel silent`,
+`-q` becomes `--loglevel warn`. All 40 come from `shorthands`, so no alias is
+hand-listed and none is missed. This is also what keeps the pinned
+`npm --silent exec pkg` → `pkg` working, by construction rather than by a
+special case.
+
+**Step 2 — classify the expanded flag by its declared `type`**, which is a
+*set*, not a scalar:
+
+| declared type | behaviour |
 |---|---|
-| **known-value** | consumes the next token (`--loglevel`, `--registry`, `--prefix`, `--workspace`, …) |
-| **known-boolean** | skip; next token still a candidate (`--global`, `--silent`, `--save-dev`, …) |
-| **known-positive** | its value **is** the package (`--package`) — already implemented |
-| *unlisted bare flag* | **`("unknown", None)`** |
+| `Boolean` alone | skip; the next token is still a candidate |
+| any non-Boolean member (`String`, `Number`, `Url`, `Path`, an enum, an Array) | **consumes the next token** |
+| union with Boolean (`always\|Boolean`) | **consumes the next token** — this is the case that broke the original model |
+| `--package` | known-positive: its value **is** the package |
+| not in `definitions` at all | **`("unknown", None)`** |
 
-`--flag=value` stays self-delimiting and safe, as elsewhere.
+**A Boolean flag still consumes a literal `true`/`false`.** npm's parser
+accepts `--global false`, so a bare `true`/`false` following a Boolean flag is
+its value, not a positional. Verified: without this, `npm exec --global false a`
+and `... b` both resolve to `('npm','false')`.
 
-**Table provenance is the deliverable, not the table.** Generate it with a
-committed script that reads `npm config list --json`, plus an explicit,
-individually-justified alias list for the handful the dump omits. Anything
-neither derivable nor justified stays **unlisted** — costing auto-update for
-that form, never correctness.
+The rule for anything ambiguous is unchanged from #182: **fail closed**. An
+omission costs auto-update for one form; a wrong entry serves the wrong
+package's descriptions.
 
-**The honest residual, same as #182's:** a *wrong* entry still fails open.
-Classify a value-flag as boolean and its value becomes the package. Mechanical
-derivation is what makes wrong entries unlikely; it does not make them
-impossible, so each classification the script cannot derive must be pinned by
-its own test.
+**Table provenance is the deliverable, not the table.** A committed generator
+reads `@npmcli/config`'s `definitions` and `shorthands` and emits the sets.
+Nothing is hand-listed — #182 removed ten memory-drafted entries across four
+ecosystems for exactly this reason, and npm's 181 flags are far past recall.
+
+**The honest residual:** a wrong entry still fails open, and npm's schema is
+version-specific — a future npm could add a flag this table does not know,
+which then refuses (safe) or, if the type declaration changes meaning,
+misclassifies (unsafe). The verifier exists to make that drift detectable.
 
 ## Changes
 
@@ -96,17 +148,25 @@ its own test.
 ### `.consiliency/notes/derive_npm_flags.py` (create)
 
 - Generator + verifier, mirroring `verify_tables.py` from #182 — reads
-  `npm config list --json`, emits the two sets, and **re-verifies** a committed
-  table against live npm so drift is detectable later. Deliberately not a
-  pytest: npm's flags are version-specific and CI has no npm.
-- It must **print** the keys it could not classify (the 41 `null`-default ones
-  and any alias-only flags) rather than silently omitting them, so the
-  unlisted set is a reviewed decision rather than an accident.
+  `@npmcli/config`'s **`definitions` and `shorthands`**, not
+  `npm config list --json`, and re-verifies a committed table against live npm
+  so drift is detectable. Deliberately not a pytest: npm's schema is
+  version-specific and CI has no npm.
+- It must **print** every flag it classifies as consuming a value *because of a
+  union with Boolean* (`always|Boolean`), since that class is what falsified
+  the first design and is the least obvious to a reader.
+- It must **print** anything in `definitions` whose `type` it cannot interpret,
+  rather than silently omitting it — an unlisted flag refuses, which is safe,
+  but the set must be reviewed rather than accidental.
 
 ### `tests/test_version_checker.py` (modify)
 
 - `TestNpmValueFlagCollisions` — **add** — inequality assertions for the three
-  reproduced pairs. All RED today.
+  reproduced pairs, **plus the two the board found surviving the original
+  design**: `npm exec --global false a/b` (Boolean consuming a literal
+  `true`/`false`) and `npm exec --color always a/b` (a `Boolean` union that
+  accepts a value). All five RED today; the last two would have shipped
+  colliding.
 - `TestNpmFailsClosed` — **add** — an unlisted bare flag yields
   `("unknown", None)`.
 - `TestNpmPinnedOrderingSurvives` — **add** — the four forms above, plus
@@ -180,20 +240,31 @@ automation:
 
 ## Acceptance criteria
 
-- [ ] The three reproduced pairs satisfy `d(a) != d(b)` **or**
-      `d(a) == ("unknown", None)`, with each pair's exact value pinned — RED
-      today, mutation-proved per node with recorded output.
+- [ ] **Five** pairs satisfy `d(a) != d(b)` **or** `d(a) == ("unknown", None)`,
+      each pair's exact value pinned — the three originally reproduced, plus
+      `npm exec --global false a/b` and `npm exec --color always a/b`. *Board
+      finding: those last two survive the plan's original two-way model, so an
+      acceptance set without them can pass while the safety residual stays
+      open.* RED today, mutation-proved per node with recorded output.
 - [ ] **`npm --silent exec pkg` → `pkg`** still holds. `--silent` is absent
       from `npm config list --json` (it aliases `--loglevel=silent`), so this
       is the single most likely regression and gets its own criterion.
 - [ ] `npm install i` → `i`, `npm exec exec` → `exec`, `npm exec pkg` → `pkg`
       unchanged; `npx -y exec` → `exec` unchanged.
 - [ ] An unlisted bare flag yields `("unknown", None)`, never a wrong name.
-- [ ] **The table is generated, not recalled**, and the generator is committed.
-      It must print the keys it could not classify — the 41 `null`-default ones
-      and any alias-only flags — so the unlisted set is reviewed rather than
-      accidental. #182 removed ten memory-drafted entries; none may be
-      reintroduced here.
+- [ ] **The table is generated from `@npmcli/config`'s `definitions` and
+      `shorthands`**, not from `npm config list --json` and not from recall,
+      and the generator is committed. *Board finding: `config list --json` is
+      the active merged config, not a schema — it omits private keys, adds
+      host-specific ones, and `NPM_CONFIG_COLOR=always` flips `color` from
+      boolean to string, so the same generator classifies differently on
+      different hosts.* The generator must print every union-with-Boolean flag
+      and anything whose `type` it cannot interpret. #182 removed ten
+      memory-drafted entries; none may be reintroduced.
+- [ ] **All 40 shorthands expand**, verified against `shorthands` rather than
+      hand-listed — `--silent` → `--loglevel silent`, `-q` → `--loglevel warn`.
+      This is what makes `npm --silent exec pkg` → `pkg` hold by construction
+      instead of by special case.
 - [ ] Every manifest server still resolves (98/98 at 2.5.0) — proven by a scan,
       not assumed.
 - [ ] Full suite, ruff, mypy green; CHANGELOG records the fix **and** the
