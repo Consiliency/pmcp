@@ -139,9 +139,10 @@ positional, since everything after the tool name belongs to the served tool.
   one of the seven where identity is genuinely **recoverable**; the other six
   are refusals.
 - `_docker_image_arg` — **modify** — keep `_value_flags` as a fast path for the
-  flags it already lists, and add the same ambiguity rule for anything not in
-  it, so `--env-file` and `--mount` stop consuming the image. Do **not** simply
-  add those two to the set.
+  flags it already lists, **add `--env-file` and `--mount` to it**, classify
+  `-i -t -it -d --rm --init` as known-boolean, and default any *unlisted* bare
+  flag to unknown. The point is not to complete the table — it is that an
+  omission now costs auto-update rather than a silent collision.
 
 ### `tests/test_version_checker.py` (modify)
 
@@ -284,10 +285,19 @@ automation:
       `probes == []`. *Board finding:* a bare `probes == []` passes when
       update_server refuses for any unrelated earlier reason, so it does not pin
       what it claims. Mirror `tests/test_tools.py:4885-4896`, the #183 model.
-- [ ] **`--from` value normalization is decided explicitly, not discovered** —
-      the manifest carries `--from browser-use[cli]`, so pick PEP-508 base name
-      (strips extras; changes that identity, one-time refresh, and makes its
-      PyPI lookups resolvable) or `==`-strip only, and pin `git+https://…` too.
+- [ ] **`--from` normalization: PEP 508 base name — DECIDED, and it fixes a live
+      defect.** `browser-use[cli]` → `browser-use`, `index-it-mcp==1.2.0` →
+      `index-it-mcp`. Measured: `manifest.yaml:352-357` ships
+      `--from browser-use[cli]`, and a PyPI lookup for `browser-use[cli]`
+      returns **None** while `browser-use` returns `0.13.8` — so that
+      first-party entry's version checks are **silently failing today**.
+      Stripping extras repairs it. Cost: browser-use's cached identity changes,
+      so it refreshes once — the same one-time migration 2.4.0 and 2.4.1 made.
+- [ ] **A `git+https://…` value is its own identity** — the URL string, not
+      `unknown`. Distinct URLs are distinct identities, so the gate stays
+      correct and two repos never confirm as one; the PyPI lookup fails closed
+      to `None`, which the gate already reads as *cannot confirm → refresh*.
+      No new code path. Pin `--from git+https://x/y` explicitly.
 - [ ] The README's documented pin form resolves to the package, not the Python
       version — `detect_package_type("uvx", ["--python","3.12","--from",
       "index-it-mcp==1.2.0","index-it-mcp"])` must yield `index-it-mcp`, where
