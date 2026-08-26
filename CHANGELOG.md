@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-08-26
+
 ### Fixed
 - **A command-line flag's *value* is no longer mistaken for the package name.**
   Package detection skipped flags but not the tokens those flags carry, so the
