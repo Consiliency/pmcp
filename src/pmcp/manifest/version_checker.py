@@ -454,15 +454,29 @@ def _scan_for_package_token(
     while index < len(args):
         arg = args[index]
         if arg == "--":
-            # End of the runner's own arguments.
+            # End of the runner's own arguments: everything after belongs to
+            # the tool being run.
+            #
+            # Measured as REDUNDANT rather than load-bearing, and kept
+            # deliberately. `--` also satisfies `_takes_a_value_ambiguously`
+            # below, so removing this branch changes no observable result --
+            # no test can distinguish the two, and none pretends to. It stays
+            # because it states the boundary explicitly at the point where a
+            # reader looks for it, and because it keeps the boundary correct
+            # if `--` is ever added to one of the tables above.
             return (None, False)
         if arg.startswith("-") and arg != "-":
             name, separator, attached = arg.partition("=")
             if separator:
                 if name in positive_flags:
                     return (attached or None, True)
-                # Self-delimiting, so it cannot swallow the next token --
-                # safe to skip whether or not it is a flag we know.
+                # Ask the predicate rather than re-deciding here, so the
+                # fail-closed rule has exactly ONE home. A `--flag=value`
+                # spelling is self-delimiting -- it cannot swallow the next
+                # token -- so the predicate returns False and the token is
+                # skipped whether or not it is a flag we know.
+                if _takes_a_value_ambiguously(arg):
+                    return (None, False)
                 index += 1
                 continue
             if arg in positive_flags:

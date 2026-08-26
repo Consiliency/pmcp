@@ -332,12 +332,36 @@ class TestValueFlagCollisions:
         assert b == ("npm", "new")
 
     def test_npm_exec_package_flag_spaced_spelling(self) -> None:
-        """npm documents both `--package=<pkg>` and `--package <pkg>`."""
+        """npm documents both `--package=<pkg>` and `--package <pkg>`.
+
+        **This case does not discriminate the fix, and is kept as a plain
+        regression guard rather than as evidence.** Mutation-proved: with
+        `--package` removed from the known-positive set entirely, the spaced
+        spelling still resolves correctly, because skipping `--package` as an
+        ordinary flag leaves its value as the first bare token anyway. Only
+        the `=` spelling above and the repeated-flag refusal below actually
+        pin the extraction.
+        """
         a = detect_package_type("npm", ["exec", "--package", "old", "--", "bin"])
         b = detect_package_type("npm", ["exec", "--package", "new", "--", "bin"])
         assert a != b, f"spaced `--package` collapsed two packages: {a} == {b}"
         assert a == ("npm", "old")
         assert b == ("npm", "new")
+
+    def test_npm_repeated_package_flags_refuse(self) -> None:
+        """npm allows `--package` more than once; several are not an identity.
+
+        One package is an identity. Two DIFFERENT ones are not, and returning
+        the first would be exactly the guess this change exists to stop -- the
+        two configs would then confirm as one package on the strength of a
+        coin flip. Repeating the SAME package is still an identity.
+        """
+        assert detect_package_type(
+            "npm", ["exec", "--package", "a", "--package", "b", "--", "bin"]
+        ) == ("unknown", None)
+        assert detect_package_type(
+            "npm", ["exec", "--package", "a", "--package", "a", "--", "bin"]
+        ) == ("npm", "a")
 
 
 class TestValueFlagsFailClosed:
@@ -480,6 +504,14 @@ class TestKnownPositiveValueFlags:
 
         uv passes those through verbatim, so a server's own `--from` argument
         must never be mistaken for uvx's package identity.
+
+        **Pins the behaviour, not the `--` branch.** Mutation-proved: deleting
+        the explicit `--` terminator changes nothing observable, because `--`
+        also trips the fail-closed default and refuses there instead. The
+        assertions below are still worth keeping -- they are what would catch
+        a future change that made tokens after `--` reachable -- but no test
+        can distinguish the two implementations, and this one does not claim
+        to.
         """
         assert detect_package_type(
             "uvx", ["--from", "pkg", "tool", "--", "--from", "x"]
@@ -500,6 +532,13 @@ class TestKnownPositiveValueFlags:
         recommends in its own README. With `--python` classified as a value
         flag, a plain left-to-right scan consumes `3.12` and `--from` then
         yields the package, with no whole-argv scan needed.
+
+        What this pins is `--python`'s classification, which is the half that
+        was broken. It does NOT pin `--from`'s: mutation-proved, ignoring
+        `--from` entirely still yields `index-it-mcp` here, because the
+        README's form ends with a positional that happens to equal the
+        `--from` base name. `--from` is pinned by
+        `test_known_positive_forms_unchanged` and the normalization test.
         """
         assert detect_package_type(
             "uvx", ["--python", "3.12", "--from", "index-it-mcp==1.2.0", "index-it-mcp"]
