@@ -2489,6 +2489,42 @@ class TestOnlyNullableBooleansConsumeNull:
             <= version_checker._NPM_BOOLEAN_FLAGS
         )
 
+    def test_nullable_table_is_pinned_to_the_exact_derived_set(self) -> None:
+        """The table is pinned by VALUE, not just by shape.
+
+        Every other check here is one-directional: the parametrized spellings
+        prove each of the 18 consumes `null`, and the subset check proves none
+        is unreachable. An *extra* entry passes both -- and an extra entry is a
+        wrong identity in the other direction, since a non-nullable flag would
+        then swallow a `null` that npm treats as the package.
+
+        Pinned as a literal so a table change has to be a deliberate edit here
+        too. `derive_npm_flags.py --verify` re-derives it against a live npm;
+        this pins it without one (board review, adversarial seat).
+        """
+        assert version_checker._NPM_NULLABLE_BOOLEAN_FLAGS == frozenset(
+            {
+                "--expect-results",
+                "--n",
+                "--no",
+                "--no-expect-results",
+                "--no-optional",
+                "--no-production",
+                "--no-workspaces",
+                "--no-yes",
+                "--optional",
+                "--production",
+                "--workspaces",
+                "--ws",
+                "--y",
+                "--yes",
+                "-n",
+                "-no",
+                "-ws",
+                "-y",
+            }
+        )
+
     def test_true_and_false_are_consumed_by_any_boolean(self) -> None:
         assert detect_package_type("npm", ["exec", "--global", "false", "a"]) == (
             "npm",

@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [2.5.2] - 2026-08-26
 
 ### Fixed
-- **2.5.1 regressed six npm flag spellings that 2.5.0 handled correctly.** 2.5.1
+- **Six npm flag spellings read a literal `null` as the package name.** 2.5.1
   added a table of the boolean flags that take a literal `null` as their *value*
   rather than as the package name — `null` is a real published npm package, so
   the distinction decides a server's identity, and `refresher.py`'s freshness
@@ -24,8 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-n`, `--n`, `-no`, `--no`**: under 2.5.1 each of these read the following
   `null` as the package name, so `npm exec -n null server-a` and
   `npm exec -n null server-b` both resolved to the package `null` and could be
-  served each other's cached tool descriptions. 2.5.0 resolved all six
-  correctly.
+  served each other's cached tool descriptions.
+
+  **Not a regression between releases** — 2.4.1, 2.5.0 and 2.5.1 all resolve
+  these six to `null`; verified by running each released version's
+  `detect_package_type` directly. The blanket rule that briefly handled them
+  correctly existed only on `main` between two unreleased commits, so no shipped
+  version was ever right about them. 2.5.2 is the first.
 - **The set is now generated, not hand-listed.**
   `.consiliency/notes/derive_npm_flags.py` derives it from npm's own
   `@npmcli/config` definitions: a spelling is nullable iff its resolution
