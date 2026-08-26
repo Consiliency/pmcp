@@ -122,3 +122,74 @@ Check #1 skips jobs carrying `uses:` (a reusable-workflow call cannot take
 the exemption is currently untested against real input. It is correct to have --
 without it, a future `uses:` job would force invalid YAML to satisfy the check --
 but it would silently exempt any future job that gains a `uses:` key.
+
+---
+
+## Implementation-board round: check 0, and seven mutants the others miss
+
+Four seats on the code. grok AGREE, gemini AGREE, codex DISAGREE, fable
+PARTIALLY AGREE. Two findings were live; both are now closed.
+
+### The plan shipped the PROVEN-WEAK verification block
+
+Both dissenting seats found the same thing, and it is the sharpest finding of
+the round: this PR's *plan* still carried check #1 as `glob("*.yml")`
+presence-only, check #2 as print-only, and `actionlint` with the extension gap
+— **the exact three bypasses this evidence file proves are exploitable**, sitting
+one file away. The PR would have shipped the weak script as the canonical
+runnable procedure while the proof of its weakness travelled beside it.
+
+Fixed: the plan's Verification block is replaced with the hardened forms, with a
+note forbidding reintroduction of the weak variants, and its stale table row
+(`test` → 20, "4–5m") corrected to 25 / 5.35m p100.
+
+### Check 0 — audit the diff SHAPE — is stronger than 1–3 combined
+
+The correctness seat's contribution, and it changes what this change is guarded
+by. Checks 1–3 cover exactly *{job-name set} × {timeout presence and value}*.
+Every other byte of `release.yml` is unguarded. Seven mutants pass all three:
+
+| mutant | consequence |
+|---|---|
+| `environment: release` dropped | silent; publish runs unprotected |
+| `needs: publish` → `needs: build` | silent; GH release no longer gated on PyPI |
+| tag pattern `"v*"` → `"V*"` | **silent forever** — no run, so no red X ever |
+| `on:` tags filter deleted | fires on every branch push |
+| publish `needs: build` dropped | loud, but next-tag-only |
+| `build` 20 → 3 (below p100) | job killed on next tag push |
+| `maintenance.yml` deleted outright | c3, one level up |
+
+The tag-pattern case is the worst and is precisely #187's motivating failure:
+corrupt the pattern and **nothing runs at all**, so unlike a broken job there is
+never a red X to notice.
+
+Verified here: check 0 (`every changed line matches ^\+\s+timeout-minutes: \d+$,
+nothing removed`) **catches all three** of the silent release.yml mutants that
+checks 1–3 miss. It is now the first check in the plan, and it subsumes 1 and 2
+for a purely-additive change like this one.
+
+### Floor raised 1 → 10
+
+The red-team seat found that accepting any int in 1..30 leaves a live mutant:
+`build` 20 → 1 passes the predicate, preserves the job set, and passes
+actionlint, while killing a 4m10s job after one minute. Verified. The floor now
+matches the plan's own stated sizing rule ("floored at 10 minutes"), and every
+delivered value is ≥10, so the constraint is consistent with the change today.
+
+    build 20 -> 1, floor 10:  ['release.yml:build -> 1']  exit 1
+
+### CI evidence, the criterion that could not be checked pre-push
+
+Now satisfied: PR #188 reports **11/11 green**, and its check-name set is
+**identical** to a `main` PR's (diffed against #186) — so no job was silently
+disabled. Live durations under the new caps: `test` legs 3–4m against 25,
+everything else <1m against 10.
+
+### Known and deliberately not fixed here
+
+None of these checks runs in CI — they were executed by hand against this diff,
+so a future PR touching `release.yml` inherits no protection. A persistent guard
+(an `actionlint` job plus a release.yml drift check against the merge base)
+belongs in its own issue, not appended untested to this one. The `uses:`
+exemption in check 1 also remains inert: no job in the five workflows is a
+reusable-workflow call today.
