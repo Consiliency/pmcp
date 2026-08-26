@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **A command-line flag's *value* is no longer mistaken for the package name.**
+  Package detection skipped flags but not the tokens those flags carry, so the
+  first "non-flag" argument was routinely a flag's argument. `uvx --python 3.12
+  pkg-a` and `uvx --python 3.12 pkg-b` both resolved to `3.12`, and because
+  2.4.0's identity gate compares exactly this name to decide whether a cached
+  description still describes the configured package, an equal name read as a
+  **positive confirmation** — serving one package's tool descriptions for a
+  different package indefinitely. Seven forms were affected: uvx `--python` and
+  `--with`, pip `--index-url`, cargo `--features`, docker `--env-file` and
+  `--mount`, and `npm exec --package=<pkg> -- <bin>` (which returned the
+  *binary*, so two packages exposing the same binary confirmed as one).
+
+  Flags are now classified per ecosystem as value-taking, boolean, or
+  *positive* (`uvx --from`, `cargo -p`, `npm --package` — where the value **is**
+  the package), with tables transcribed from each tool's own `--help`.
+
+  Three user-visible consequences:
+
+  1. **Affected servers refresh once.** Their cached identity changes, the same
+     one-time migration 2.4.0 and 2.4.1 made.
+  2. **A server launched with a flag pmcp does not recognise can no longer be
+     auto-updated.** This is the cost, and it is deliberate: anything unlisted
+     now reports no identity rather than guessing. An omission costs
+     auto-update for one unusual config — visible, and fixable by adding the
+     flag — where the previous "take the next token" default produced a silent
+     collision instead. `gateway.update_server` refuses such a server by name
+     and command line rather than probing.
+  3. **The identity gate now actually holds for the forms #180 left open.**
+
+- **`uvx --from` values are read as PEP 508 requirements.** `browser-use[cli]`
+  resolves to `browser-use` and `index-it-mcp==1.2.0` to `index-it-mcp`. This
+  repairs a live defect: the bundled manifest ships `--from browser-use[cli]`,
+  and a PyPI lookup for that literal string returns nothing, so that entry's
+  version checks had been silently failing. A `git+https://…` value keeps the
+  whole URL as its identity — distinct URLs are distinct packages.
+
+- **`gateway.update_server` no longer misreads a uvx version pin.** Pin
+  detection now shares one scan with package detection instead of skipping
+  every `-`-prefixed token and reading `==` off the first bare one. That was
+  wrong in both directions: `--from=pkg==1.2.0` reported *no pin*, so an
+  explicitly pinned server could have been moved to the latest version, while
+  `--with requests==2.0 pkg` reported an injected dependency's version as the
+  server's own pin and refused an update that was never pinned.
+
+  The README's documented pin form — `uvx --python 3.12 --from
+  index-it-mcp==1.2.0 index-it-mcp` — previously identified the package as
+  `3.12`; it now resolves correctly and needs no configuration change.
+
 ## [2.4.1] - 2026-08-25
 
 ### Security
