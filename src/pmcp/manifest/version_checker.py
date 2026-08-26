@@ -692,7 +692,9 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
     ``npm exec --loglevel silly <pkg>`` still reads ``silly`` as the package.
     Inverting the default here would break the pinned ordering below, where a
     leading global flag such as ``npm --silent exec <pkg>`` must be skipped
-    rather than refused. Tracked as a residual of #182.
+    rather than refused. Tracked on Consiliency/pmcp#180, which stays OPEN
+    for this residual -- NOT on #182, which the change carrying this note
+    closes on merge and would leave this pointer dangling.
     """
     skip_subcommand = command == "npm"
     packages: list[str] = []

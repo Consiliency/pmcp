@@ -364,6 +364,55 @@ class TestValueFlagCollisions:
         ) == ("npm", "a")
 
 
+class TestPositiveFlagGuardArms:
+    """The known-positive branch's guards, each arm pinned separately.
+
+    `--from`/`-p`/`--package`/`--bin` name the package in the NEXT token, so
+    the branch guards two ways it can fail to be one: the flag trails at end of
+    argv (nothing follows), or what follows is itself flag-shaped. Both arms
+    were *correct but unpinned* -- a board seat killed the suite's ability to
+    see them by deleting the `startswith("-")` arm and running all 364 tests
+    green, after which `uvx --from --offline a` and `... b` both resolved to
+    `('pypi', '--offline')`. Verified end-to-end: `_same_package` returns True
+    on that pair, so the mutant's collision passes the identity gate.
+
+    Not reachable from a launchable config -- real uv rejects both forms -- but
+    an unpinned guard is exactly the shape this module keeps being corrected
+    for, so it is pinned rather than argued away.
+    """
+
+    def test_positive_flag_followed_by_a_flag_refuses(self) -> None:
+        """The value of `--from` cannot be another flag."""
+        assert detect_package_type("uvx", ["--from", "--offline", "pkg"]) == (
+            "unknown",
+            None,
+        )
+
+    def test_positive_flag_at_end_of_argv_refuses(self) -> None:
+        """`--from` with nothing after it names no package.
+
+        NON-DISCRIMINATING, and labelled so rather than implying a proof.
+        The guard's `following is None` arm is UNREACHABLE: when a positive
+        flag trails, the loop simply ends and the function falls through to
+        `("unknown", None)` anyway. Deleting that arm leaves this test -- and
+        every other -- green, verified. The arm is defensive, not load-bearing;
+        this test pins the observable behaviour, not the branch.
+        """
+        assert detect_package_type("uvx", ["--from"]) == ("unknown", None)
+        assert detect_package_type("cargo", ["run", "--bin"]) == ("unknown", None)
+
+    def test_positive_flag_with_an_empty_attached_value_refuses(self) -> None:
+        """`--from=` attaches an empty value, which is not a package name."""
+        assert detect_package_type("uvx", ["--from=", "pkg"]) == ("unknown", None)
+
+    def test_cargo_shares_the_same_guard_arms(self) -> None:
+        """cargo's `-p`/`--bin` run through the same branch."""
+        assert detect_package_type("cargo", ["run", "-p", "--offline"]) == (
+            "unknown",
+            None,
+        )
+
+
 class TestValueFlagsFailClosed:
     """An UNLISTED bare flag yields `("unknown", None)`, never a guess.
 
