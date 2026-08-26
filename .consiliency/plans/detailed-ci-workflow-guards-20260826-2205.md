@@ -1,183 +1,242 @@
 # Detailed plan: run #187's workflow guards in CI
 
+> **Revision 2 (2026-08-26, post-board).** Four seats reviewed revision 1: two
+> DISAGREE, two PARTIALLY AGREE. Revision 1's errors are recorded inline as
+> `WAS WRONG` notes rather than deleted — several rules below exist only because
+> of them.
+
 ## Task
 
 Close Consiliency/pmcp#189. `release.yml` triggers only on tag push, so it never
-appears in PR checks. Every guard that protected #188's change to it —
-diff-shape audit, timeout validation, job-set comparison, `actionlint` — was run
-by hand, once, against that one diff. The next PR touching it inherits none of
-them, on the one file where a mistake is invisible until a release breaks.
+appears in PR checks. Every guard that protected #188's change to it was run by
+hand, once. The next PR touching it inherits none of them, on the one file where
+a mistake is invisible until a release breaks.
 
 ## Research summary
 
-`.github/workflows/` holds five files: `test.yml`, `release.yml`, `docker.yml`,
-`maintenance.yml`, `pipeline-bootstrap.yml`. Only `test.yml` runs on
-`pull_request` (`test.yml:3-13`, `branches: [main]`), so it is the only place a
-new guard job can live and still gate a PR.
+`.github/workflows/` holds five files. Only `test.yml` runs on `pull_request`
+(`test.yml:3-13`), so a PR-gating job must live there.
 
-`test.yml` already contains the exact shape this work needs. The `changelog` job
+`test.yml` already encodes the decisions this work needs: the `changelog` job
 (`test.yml:200-`) is gated `if: github.event_name == 'pull_request'`, declares an
-explicit job-level `permissions:` block (with the load-bearing comment that a
-job-level block *replaces* the repo default for every scope, so `contents: read`
-must be repeated), and uses `fetch-depth: 0` because `actions/checkout` defaults
-to a depth-1 clone that does not contain the PR base ref a three-dot diff needs.
-The new job copies all three of those decisions rather than rediscovering them.
+explicit job-level `permissions:` block (a job-level block *replaces* the repo
+default for every scope, so `contents: read` must be repeated), and uses
+`fetch-depth: 0` because `actions/checkout` defaults to a depth-1 clone.
 
-`actionlint` is present on this host at `/usr/local/bin/actionlint`, so the
-mutation matrix below can be produced locally before CI ever runs it.
+`yaml.safe_load` on the real `release.yml` yields keys `['name', True, 'jobs']` —
+verified. `"on" in doc` is **False**; `True in doc` is **True**. A guard written
+as `doc["on"]` inside a `try` passes vacuously.
 
-#189 records seven mutants that pass every naive check. The important one is the
-tag-pattern corruption `"v*"` → `"V*"`: the workflow becomes valid, no run is
-triggered at tag push, and there is therefore never a red X. A version sits
-tagged-but-unshipped indefinitely. That mutant is invisible to `actionlint`, to a
-timeout check, and to a job-set comparison — all three see a perfectly good file.
+`actionlint` (1.7.12, present at `/usr/local/bin/actionlint`) caught **0 of 7**
+of #189's mutants and 0 of 7 additional ones — verified by a seat that ran them.
+It catches the syntax class only (over-indentation → `unexpected key "publish"`).
+Its value is schema validation; the plan frames it that way and claims no more.
 
-**The design consequence:** the issue proposes a *diff-shape* assertion for this
-class, but a diff test only fires when the line is touched in a way the pattern
-notices, and it goes stale the moment the file is legitimately reformatted. A
-**structural invariant check on the file's parsed content** is strictly stronger:
-it asserts what `release.yml` must always be true of, independent of how a diff
-reached that state, and it fails identically whether the mutation arrived by
-edit, by merge, or by the file being deleted outright.
+Current `release.yml` shape: `needs: build` (scalar, not a list), `environment:
+release`, `github-release` `needs: publish`, and the publish step on
+`pypa/gh-action-pypi-publish@release/v1` — a **mutable tag, not a SHA pin**.
+Verified via `gh api`: the `release` environment has `"protection_rules": []` and
+`deployment_branch_policy: null`, and branch protection's
+`required_status_checks.contexts` is `[test (3.10), test (3.11), test (3.12),
+install-smoke, min-version-smoke, lint, typecheck, changelog]`.
+
+**WAS WRONG (rev 1):** "structural invariants are *strictly stronger* than the
+issue's diff-shape assertion." Disproven. A seat applied six mutants that pass
+both the invariants and actionlint — `continue-on-error: true` on publish (tag
+push reports **green** while the PyPI upload failed), an `if:` on publish, the
+publish action repointed to a fork, widened `permissions:`, workflow-level
+`concurrency` with `cancel-in-progress`, and an added `exfil` job. Every one is a
+changed line a diff-shape check flags. The approaches are **incomparable**:
+invariants catch bad states however reached; diff-shape catches changes the
+allowlist never anticipated. Do both.
 
 ## Changes
 
 ### `scripts/check_workflows.py` (create)
 
-- `release_invariants(doc)` — add — assert on the *parsed* `release.yml`:
-  - triggers on `push` with a `tags` filter containing exactly `v*` (catches
-    `V*`, catches a deleted `tags:` filter, catches a deleted `on: push`);
-  - `publish` declares `needs: build` and an `environment:` (catches both
-    silent-publish mutants);
-  - `github-release` declares `needs: publish` (catches the regate-on-build
-    mutant, which would publish a release for a failed upload);
-  - every job declares `timeout-minutes`, and each is `>= 5` (a floor that
-    catches a fat-fingered `1`; the true p100 is not knowable statically and the
-    plan does not pretend otherwise — see Non-goals).
-  - the file existing at all is the first assertion, which is what catches
-    deletion.
-- `job_set_drift(paths, base_ref)` — add — for every changed file under
-  `.github/workflows/`, parse the base-ref version via `git show` and the head
-  version from disk, and fail on any job name present in base and absent in head.
-  This is the only guard against silent job deletion: #189 verified that
-  deleting a terminal job outright leaves a file both `actionlint` and a
-  presence check accept.
-- `main()` — add — `--base-ref` argument; runs invariants unconditionally and
-  drift only for changed workflow files; prints one line per finding and exits
-  non-zero on any.
-- Parse with `yaml.safe_load`. **Read the `on:` key as both `"on"` and `True`** —
-  YAML 1.1 parses a bare `on` as the boolean `True`, so a naive `doc["on"]`
-  raises `KeyError` on every real workflow and an invariant written that way
-  would pass vacuously if wrapped in a `try`. This is the single most likely way
-  to write a guard that guards nothing.
+- `release_invariants(doc)` — add — on the *parsed* `release.yml`:
+  - the file exists (this is what catches outright deletion);
+  - `push.tags` contains exactly `v*`;
+  - `publish` has `needs: build` and **`environment == "release"` by name**, not
+    merely present. `environment: dev` passes a presence check and ships;
+    GitHub auto-creates unprotected environments. Record in the evidence file
+    that this environment carries **no GitHub-side protection rules today**, so
+    the invariant guards a name, not a gate.
+  - `github-release` has `needs: publish`;
+  - **no `continue-on-error` and no `if:` on `publish` or `github-release`** —
+    the `continue-on-error` mutant is the nastiest of the eight: a tag push
+    reports green while the upload failed.
+  - accept both `needs: X` and `needs: [X]`. The real file uses the scalar form;
+    rejecting the list form is a false positive on a legitimate edit.
+- `timeout_invariants(doc, path)` — add — **applies to every workflow file, not
+  just `release.yml`**, and uses #187's hardened predicate verbatim:
+  `isinstance(v, int) and not isinstance(v, bool) and 10 <= v <= 30`, skipping
+  jobs with `uses:` (a reusable-workflow call cannot carry `timeout-minutes`).
+  **WAS WRONG (rev 1):** a floor of `>= 5` on `release.yml` only. Three seats
+  caught it. `.consiliency/evidence/bypass-proofs-187.md:20-31` records
+  `timeout-minutes: 360` as a closed bypass — it is valid, preserves the job set,
+  and **recreates the six-hour default #187 exists to fix**. A floor with no
+  ceiling reopens it. The floor was separately raised 1 → 10 at
+  `bypass-proofs-187.md:175-179`; `>= 5` regressed both ends. Every delivered
+  value across all five files is in 10..30 (verified: 30, 25, 10×5, 20, 10, 10,
+  20, 10), so the predicate fits the tree as it stands.
+- `job_set_drift(paths, base_ref)` — add — for each changed file under
+  `.github/workflows/`, parse the base version via `git show` and the head
+  version from disk; fail on any job name present in base and absent in head.
+  A rename is a removal plus an addition and must fail. A newly added workflow
+  file has no base version — pass, do not crash.
+- `main()` — add — `--base-ref`. Invariants always run. **On a `push` event, use
+  `github.event.before` as the base** rather than skipping drift.
+  **WAS WRONG (rev 1):** drift was skipped with no base ref, so a direct-to-main
+  push deleting `maintenance.yml` or one of its jobs passed everything. An empty
+  `--base-ref` must parse as `None`, not consume the next argument.
+- Read the `on:` key as **both `"on"` and `True`** (YAML 1.1). Under a `.get`
+  idiom this fails closed rather than vacuously — but `TestOnKeyParsing` stays,
+  because the `try`-wrapped variant does not.
 
 ### `.github/workflows/test.yml` (modify)
 
-- `workflows` job — add — `runs-on: ubuntu-latest`, `timeout-minutes: 10`,
-  explicit `permissions: {contents: read}`, `actions/checkout@v7` with
-  `fetch-depth: 0`. Three steps:
-  1. install `actionlint` (pinned release download, checksum-verified — an
-     unpinned installer on the path that validates the release pipeline is its
-     own supply-chain hole);
-  2. run bare `actionlint` with **no glob** — #189 verified `*.yml` silently
-     leaves a `.yaml` workflow unchecked — from the repo root, since it exits 3
-     outside a git project root;
-  3. run `scripts/check_workflows.py --base-ref <merge base>`.
-- Not gated on `pull_request` only: unlike `changelog`, the invariant half is
-  meaningful on `push: [main]` too, and a direct-to-main workflow edit is exactly
-  the case with no PR to check. Drift-checking is skipped when there is no base
-  ref; invariants still run.
+- `workflows` job — add — `timeout-minutes: 10`, explicit
+  `permissions: {contents: read}`, `actions/checkout@v7` with `fetch-depth: 0`.
+  (A seat flagged `checkout@v7` as nonexistent; **rejected** — the repo uses v7
+  in every job and all 11 checks passed on it today. Stale model knowledge.)
+  Steps:
+  1. `astral-sh/setup-uv@v7` + `uv sync`. **WAS WRONG (rev 1):** the job was
+     modelled on `changelog`, which runs no Python packages, and had no Python
+     setup at all. `check_workflows.py` imports `yaml`, which is not on a stock
+     `ubuntu-latest` image, so step 3 would raise `ModuleNotFoundError` — the
+     guard dead on arrival while local `uv run` still passed and AC2 looked
+     green. This is the single most likely way to ship a guard that guards
+     nothing.
+  2. install `actionlint` at an **explicitly named version with an explicitly
+     named checksum** (rev 1 said "pinned, checksum-verified" but named neither,
+     making the criterion unenforceable), then run it bare — **no glob**: `*.yml`
+     leaves a `.yaml` workflow unchecked, and it exits 3 outside a git root.
+  3. `uv run python scripts/check_workflows.py --base-ref …`.
+- `release-diff-ack` job — add — any PR whose diff touches `.github/workflows/release.yml`
+  fails unless the PR carries a `release-change-approved` label. This is the
+  tripwire for the whole unguarded remainder (the six mutants above and the ones
+  nobody has thought of), mirroring the existing `changelog`/`skip-changelog`
+  pattern. It covers by *acknowledgement* what an allowlist cannot cover by
+  enumeration.
+
+### Repo settings — required, and not a file change
+
+**WAS WRONG (rev 1):** the plan implied the drift check protects itself. It does
+not. GitHub runs `pull_request` jobs from the PR branch's own workflow file, so a
+PR that deletes the `workflows` job means the job never runs — the drift check
+cannot fire because it *is* what was deleted. No red X, ever. Branch protection's
+required contexts currently do not include it.
+
+- Add `workflows` and `release-diff-ack` to
+  `required_status_checks.contexts` via `gh api` after merge. A required context
+  that never reports blocks the merge as "Expected".
+- Add `CODEOWNERS` covering `.github/` and `scripts/check_workflows.py`.
+- **State the residuals plainly** in the evidence file rather than implying
+  closure: GitHub counts an `if:`-skipped job as *satisfying* a required check,
+  so `if: false` on the guard merges green; and the PR can keep the job name
+  while gutting its steps or editing `check_workflows.py` to `exit 0`, since the
+  script runs from the PR branch. CODEOWNERS review is the only backstop for
+  those, which makes it load-bearing, not optional.
 
 ### `tests/test_workflow_guards.py` (create)
 
-- `TestReleaseInvariants` — add — one test per mutant from #189's matrix. Each
-  loads the real `release.yml`, applies the mutation **in memory**, and asserts
-  `release_invariants` reports it. A mutant that the check misses fails the test.
-- `TestJobSetDrift` — add — synthetic base/head pairs: job removed (fail), job
-  added (pass), job renamed (fail — a rename is a removal plus an addition and
-  must not be waved through), file unchanged (pass).
-- `TestOnKeyParsing` — add — assert the `on`/`True` handling directly, so the
-  YAML 1.1 trap above can never regress into a vacuous check.
+- `TestReleaseInvariants` — add — one test per statically decidable mutant,
+  including the eight-mutant set above (`continue-on-error`, `if:` on publish,
+  `environment: dev`, forked action, widened permissions, added job).
+- `TestTimeoutInvariants` — add — `360`, `"not a number"`, `True`, `1`, and a
+  legitimate `10`/`20`/`25`/`30`, across all five workflow files.
+- `TestJobSetDrift` — add — job removed (fail), added (pass), renamed (fail),
+  file unchanged (pass), new file with no base (pass, no crash).
+- `TestOnKeyParsing` — add.
 
 ### `.consiliency/evidence/mutation-189.md` (create)
 
-- Mutation matrix — add — for all seven mutants in #189: the exact edit, the
-  command run, and the before/after exit codes. Records which are **caught**,
-  and states plainly which is **not** (see Non-goals) rather than implying full
-  coverage.
+Mutation matrix: exact edit, command, before/after exit codes, for every mutant —
+**including the ones not covered**, named individually.
 
 ## Documentation impact
 
-- `CHANGELOG.md` — add — a `### Added` entry under `[Unreleased]`: workflow
-  guards now run in CI; names what is checked and what is not.
-- `CONTRIBUTING.md` — modify **only if** it documents the CI job list; check
-  before editing. If it does not enumerate jobs, no change.
+- `CHANGELOG.md` — add — `### Added`: workflow guards now run in CI; names what
+  is checked, what is acknowledged by label, and what is not covered.
+- `CONTRIBUTING.md` — verified it does not enumerate CI jobs. No change.
 
 ## Dependencies & order
 
-1. `scripts/check_workflows.py` first — the tests and the CI job both call it.
-2. `tests/test_workflow_guards.py` second, before wiring CI: the mutation tests
-   are what prove the script is worth wiring.
-3. `test.yml` job third.
-4. Evidence file last, recording results from the finished script.
-
-No external dependency beyond `actionlint` (downloaded in-job) and `pyyaml`,
-which the project already depends on.
+1. `scripts/check_workflows.py`.
+2. `tests/test_workflow_guards.py` — the mutation tests are what prove the script
+   is worth wiring.
+3. `test.yml` jobs.
+4. Branch-protection contexts + CODEOWNERS (post-merge, `gh api`).
+5. Evidence file, recording real results.
 
 ## Verification
 
 ```bash
-# The guard catches every mutant it claims to
 uv run pytest -q tests/test_workflow_guards.py -v
+uv run python scripts/check_workflows.py --base-ref origin/main   # must exit 0
 
-# The guard passes on the real, correct tree (no false positive)
-uv run python scripts/check_workflows.py --base-ref origin/main
-
-# Each #189 mutant, applied for real, then reverted
-for m in tag-case tags-deleted env-dropped needs-publish-to-build \
-         needs-build-dropped timeout-1 job-deleted; do
-  ./scripts/_mutate_workflow.sh "$m"          # scratch helper, not committed
-  uv run python scripts/check_workflows.py --base-ref origin/main; echo "$m -> $?"
-  git checkout -- .github/workflows/
+# Mutants must be COMMITTED on a scratch branch, not left in the working tree.
+# WAS WRONG (rev 1): the loop mutated the working tree while drift uses a
+# three-dot diff that only sees committed changes, so drift never ran at all --
+# every catch came from the invariants reading disk, and `job-deleted` passed via
+# "publish job missing", masking drift's total silence.
+git switch -c scratch-mutants
+for m in tag-case tags-deleted env-dropped env-renamed needs-publish-to-build \
+         needs-build-dropped timeout-360 timeout-1 continue-on-error if-on-publish \
+         job-deleted file-deleted maintenance-deleted changelog-job-deleted; do
+  ./scripts/_mutate_workflow.sh "$m" && git commit -qam "mutant: $m"
+  uv run python scripts/check_workflows.py --base-ref main; echo "$m -> $?"
+  git reset -q --soft HEAD~1 && git stash -q
 done
 
-# actionlint agrees the tree is clean, and is genuinely reached
 actionlint && echo "actionlint clean"
-
 uv run ruff check . && uv run ruff format --check . && uv run mypy src/
 ```
 
-Edge cases: a workflow with no `jobs:` key; a workflow that is invalid YAML
-(must report, not traceback); `--base-ref` pointing at a ref that does not exist;
-a PR that *adds* a new workflow file (no base version to compare — must pass, not
-crash); `release.yml` deleted entirely.
+Edge cases: a workflow with no `jobs:`; invalid YAML (report, do not traceback);
+a `--base-ref` that does not exist; a PR adding a new workflow file;
+`release.yml` deleted entirely.
 
 ## Acceptance criteria
 
-- [ ] Each of the seven mutants in #189's table is applied to the real
-      `.github/workflows/` tree and `scripts/check_workflows.py` exits non-zero
-      for six of them, with the exit codes recorded in
-      `.consiliency/evidence/mutation-189.md`. A mutant that is only asserted
-      in-memory does not count — the check must fail against a mutated file on
-      disk.
-- [ ] `scripts/check_workflows.py --base-ref origin/main` exits 0 on the
-      unmutated tree, proving the guard is not a blanket failure.
-- [ ] `TestOnKeyParsing` fails if the `on`/`True` YAML 1.1 handling is removed —
-      verified by deleting that handling and observing red, not by reading it.
-- [ ] Deleting `.github/workflows/release.yml` outright causes a non-zero exit,
-      proving the "a file nobody notices is gone" case is covered.
+- [ ] Every statically decidable mutant listed in `TestReleaseInvariants` and
+      `TestTimeoutInvariants` is applied **as a commit on a scratch branch** and
+      `check_workflows.py` exits non-zero, with real exit codes recorded in
+      `.consiliency/evidence/mutation-189.md`. Includes `timeout-360`, which
+      revision 1's floor let through.
+- [ ] **Drift is proven live, independently of the invariants:** `maintenance.yml`
+      deleted, and the `changelog` job deleted from `test.yml`, both committed,
+      each exit non-zero **via `job_set_drift`** — asserted by the reported
+      reason, not just the exit code. **WAS WRONG (rev 1):** a seat verified that
+      replacing `job_set_drift` with `return []` passed all four original
+      criteria, because the invariants alone caught every case criterion 1 named.
+      Drift — which #187's own evidence calls the sole guard against silent job
+      deletion — could have shipped dead with the suite green.
+- [ ] `check_workflows.py --base-ref origin/main` exits 0 on the unmutated tree,
+      proving the guard is not a blanket failure.
+- [ ] The `test.yml` step invoking the checker is asserted to contain no `|| true`
+      and no `continue-on-error` — the fail-open pattern
+      `bypass-proofs-187.md` records as having already happened once here.
+- [ ] `TestOnKeyParsing` fails if the `on`/`True` handling is removed — verified
+      by deleting it and observing red.
+- [ ] A PR touching `release.yml` without the `release-change-approved` label
+      fails `release-diff-ack`.
 
 ## Non-goals
 
-- **Detecting a timeout set below a job's real p100.** The seventh mutant in
-  #189's table is not statically decidable — the p100 depends on runner load and
-  dependency resolution time. The check enforces presence and a `>= 5` floor and
-  the evidence file states this mutant as **not covered**. Claiming otherwise
-  would be exactly the vacuous-guard failure this issue exists to fix.
-- Replacing `actionlint` with a hand-rolled schema check.
-- Extending the invariants to `docker.yml` / `maintenance.yml` beyond the shared
-  timeout and job-set-drift checks; only `release.yml` has the invisible-failure
-  property that motivates the specific invariants.
+- **A timeout below a job's real p100** (e.g. `build` 20 → 12, above the floor
+  but below a future p100). Not statically decidable; named here as the single
+  uncovered mutant. **WAS WRONG (rev 1):** the uncovered case was implied to be
+  `timeout-1`, which produced an internally impossible contract — the loop ran
+  seven mutants all of which the checker catches, while acceptance demanded six
+  and the non-goals claimed a seventh was uncovered. Two seats flagged the
+  contradiction, and both warned the dangerous resolution is *weakening the
+  floor* so one mutant stays green and the evidence can say "six of seven".
+- Environment protection rules configured in GitHub settings — invisible to any
+  file check. Recorded in the evidence file as unguarded.
+- SHA-pinning `pypa/gh-action-pypi-publish` (currently `@release/v1`). Worth
+  doing; out of scope here, and it needs its own issue.
 
 ## Execution Policy
 
