@@ -20,6 +20,7 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     strategy:
       matrix:
         python-version: ["3.10", "3.11", "3.12"]
@@ -55,6 +56,7 @@ jobs:
   # missing version constraint.
   install-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -91,6 +93,7 @@ jobs:
   # This job installs pinned at exactly the declared floor and proves it works.
   min-version-smoke:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -166,6 +169,7 @@ jobs:
 
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 
@@ -195,6 +199,7 @@ jobs:
   # no-op there via the `if:` below.
   changelog:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     if: github.event_name == 'pull_request'
     # A job-level permissions: block replaces the repo default for every
     # scope, not just the one named — so contents: read has to be repeated
@@ -270,6 +275,7 @@ jobs:
 
   typecheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
 

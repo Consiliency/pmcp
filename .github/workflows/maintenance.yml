@@ -9,6 +9,7 @@ on:
 jobs:
   notify-worker:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: Notify maintenance worker
         continue-on-error: true

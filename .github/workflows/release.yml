@@ -8,6 +8,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -37,6 +38,7 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment: release
     permissions:
       id-token: write  # Required for trusted publishing
@@ -56,6 +58,7 @@ jobs:
   github-release:
     needs: publish
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: write
 
