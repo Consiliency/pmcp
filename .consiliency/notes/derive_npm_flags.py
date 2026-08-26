@@ -275,6 +275,47 @@ def check_against_nopt(schema: dict) -> list[str]:
     return bad
 
 
+def read_committed_tables(source: pathlib.Path) -> dict[str, set[str]]:
+    """Parse the two tables out of version_checker.py with `ast`.
+
+    Deliberately NOT `import pmcp.manifest.version_checker`: that pulls in
+    aiohttp/packaging/semver, so the verifier would only run inside the
+    project venv -- on a host that happens to have the npm being checked. A
+    drift check should run wherever npm does.
+
+    Reading them as literals also PINS a property worth pinning: these must be
+    module-level constants, not something rebuilt per call. #182 found
+    `_docker_image_arg` carrying a function-local table that was rebuilt on
+    every call and invisible to its verifier; this raises rather than silently
+    finding nothing if that shape comes back.
+    """
+    import ast
+
+    tree = ast.parse(source.read_text())
+    found: dict[str, set[str]] = {}
+    for node in tree.body:  # module level ONLY -- not ast.walk
+        if not isinstance(node, ast.Assign):
+            continue
+        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        for name in names:
+            if name not in ("_NPM_VALUE_FLAGS", "_NPM_BOOLEAN_FLAGS"):
+                continue
+            call = node.value
+            if (
+                not isinstance(call, ast.Call)
+                or not isinstance(call.func, ast.Name)
+                or call.func.id != "frozenset"
+            ):
+                raise SystemExit(f"{name} is not a literal frozenset(...)")
+            found[name] = {
+                ast.literal_eval(element) for element in call.args[0].elts  # type: ignore[attr-defined]
+            }
+    missing = {"_NPM_VALUE_FLAGS", "_NPM_BOOLEAN_FLAGS"} - found.keys()
+    if missing:
+        raise SystemExit(f"not module-level literals in {source}: {sorted(missing)}")
+    return found
+
+
 def emit(classes: dict[str, str]) -> str:
     def block(cls: str) -> str:
         entries = sorted(f for f, c in classes.items() if c == cls)
@@ -318,24 +359,26 @@ def main() -> int:
         print(emit(classes))
         return 0
 
-    sys.path.insert(0, str(REPO / "src"))
-    from pmcp.manifest import version_checker as vc
-
-    print(f"\nverifying tables in {vc.__file__}", file=sys.stderr)
+    source = REPO / "src" / "pmcp" / "manifest" / "version_checker.py"
+    committed_tables = read_committed_tables(source)
+    print(f"\nverifying tables in {source}", file=sys.stderr)
     failures = list(mismatches)
     for label, live, committed in (
-        ("value", {f for f, c in classes.items() if c == VALUE}, vc._NPM_VALUE_FLAGS),
+        ("value", {f for f, c in classes.items() if c == VALUE},
+         committed_tables["_NPM_VALUE_FLAGS"]),
         ("boolean", {f for f, c in classes.items() if c == BOOLEAN},
-         vc._NPM_BOOLEAN_FLAGS),
+         committed_tables["_NPM_BOOLEAN_FLAGS"]),
     ):
         for flag in sorted(live - committed):
             failures.append(f"{label}: {flag} in live npm, MISSING from table")
         for flag in sorted(committed - live):
             failures.append(f"{label}: {flag} in table, absent from live npm")
 
-    # A flag classified one way here and the other way in the table is the
-    # fail-OPEN direction if the table says boolean; report both directions.
-    overlap = vc._NPM_VALUE_FLAGS & vc._NPM_BOOLEAN_FLAGS
+    # A flag in both tables would let the boolean branch win or lose by table
+    # order rather than by npm's schema; either way it is not a classification.
+    overlap = committed_tables["_NPM_VALUE_FLAGS"] & committed_tables[
+        "_NPM_BOOLEAN_FLAGS"
+    ]
     for flag in sorted(overlap):
         failures.append(f"{flag} is in BOTH committed tables")
 
@@ -345,8 +388,9 @@ def main() -> int:
             print(f"  {entry}", file=sys.stderr)
         return 1
     print(
-        f"\nOK: {len(vc._NPM_VALUE_FLAGS)} value + "
-        f"{len(vc._NPM_BOOLEAN_FLAGS)} boolean entries match live npm",
+        f"\nOK: {len(committed_tables['_NPM_VALUE_FLAGS'])} value + "
+        f"{len(committed_tables['_NPM_BOOLEAN_FLAGS'])} boolean entries "
+        f"match live npm {schema['npm_version']}",
         file=sys.stderr,
     )
     return 0

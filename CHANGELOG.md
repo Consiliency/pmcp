@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **npm no longer reads a flag's *value* as the package name.** npm was the last
+  of the five ecosystems still failing *open* on an unrecognised flag: the scan
+  skipped anything starting `-` and took the next bare token, so
+  `npm exec --loglevel silly server-a` and `… server-b` both resolved to
+  `silly`. Because 2.4.0's identity gate treats a matching name as a **positive
+  confirmation**, two unrelated servers collapsed into one identity and one was
+  served the other's cached tool descriptions. `--registry`, `--global false`
+  and `--color always` collided the same way.
+
+  npm's flag arity is now generated from npm's own config schema
+  (`@npmcli/config`'s `definitions` and `shorthands`, 181 flags and 40
+  shorthands) rather than transcribed by hand, and an unlisted flag makes the
+  scan report no identity instead of guessing. Shorthands are expanded from
+  npm's own map, so `npm --silent exec <pkg>` keeps resolving and the previous
+  hand-coded `-y` special case is retired. Two flags whose arity depends on the
+  *next token's content* — `--color` and `--browser` — are deliberately
+  unlisted and therefore refused.
+
+  **The cost, deliberately:** a server launched with a flag npm's own schema
+  does not describe can no longer be auto-updated. `gateway.update_server`
+  refuses it by name and command line rather than probing. An omission costs
+  auto-update for one unusual config — visible, and fixable by adding the flag
+  — where the previous "take the next token" default produced a silent
+  collision instead. No bundled manifest server is affected: all 98 launchable
+  entries resolve exactly as before.
+
 ## [2.5.0] - 2026-08-26
 
 ### Fixed

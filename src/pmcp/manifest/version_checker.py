@@ -377,6 +377,388 @@ _CARGO_SUBCOMMANDS = frozenset({"run", "install", "build", "test", "check"})
 # entry, which is the failure direction that stays open.
 _NPM_POSITIVE_FLAGS = frozenset({"--package"})
 
+# npm flag arity, GENERATED -- see `.consiliency/notes/derive_npm_flags.py`.
+#
+# Source: `@npmcli/config/lib/definitions/index.js` (npm 11.19.0), which
+# declares each flag's `type`, plus its `shorthands` map. Deliberately NOT
+# `npm config list --json`: that emits the active MERGED configuration, so it
+# omits private keys, adds host-specific ones, drops all 40 shorthands, and
+# under `NPM_CONFIG_COLOR=always` reports `color` as a string rather than a
+# boolean -- the same generator would classify differently on different hosts.
+#
+# Classification, after dropping `null` ("unset") and `Array` ("may repeat")
+# from each type list:
+#
+#   Boolean alone        -> boolean-arity. Consumes nothing EXCEPT a literal
+#                           `true`/`false`, which npm's parser does take as
+#                           the flag's value (`npm exec --global false` is a
+#                           legal form). The scanner implements that below.
+#   no Boolean member    -> consumes the next token. `--proxy` lives here:
+#                           `null|false|{url}` has no Boolean member and it
+#                           always consumes, including `--proxy <pkg>`.
+#   Boolean AND non-Bool -> CONDITIONAL arity, so no single class is right.
+#                           Left out of BOTH tables, which makes the scanner
+#                           refuse. On npm 11.19.0 that set is exactly
+#                           `{color, browser}`; `--color always <pkg>` is why
+#                           it exists, since a boolean/value split reads
+#                           `always` as the package.
+#
+# Shorthands are expanded rather than hand-aliased, with arity from the
+# expansion's LENGTH: >= 2 bakes a value in (`silent` -> `--loglevel silent`,
+# boolean-arity), == 1 is a rename inheriting the target's arity (`reg` ->
+# `--registry`, `y` -> `--yes`). This is why `npm --silent exec pkg` resolves
+# and why no `-y` special case is needed any more.
+#
+# The generator cross-checks all 181 declared classifications against npm's
+# real parser (`nopt`) and reports 0 mismatches on 11.19.0. Re-run
+# `derive_npm_flags.py --verify` against a newer npm to detect drift: a flag
+# npm adds later is absent here and therefore REFUSED, which costs
+# auto-update but never mints a wrong identity.
+#
+# `--package` is in neither table -- it is a KNOWN-POSITIVE handled above.
+_NPM_VALUE_FLAGS = frozenset(
+    {
+        "--C",
+        "--L",
+        "--_auth",
+        "--access",
+        "--allow-directory",
+        "--allow-file",
+        "--allow-git",
+        "--allow-remote",
+        "--allow-scripts",
+        "--also",
+        "--audit-level",
+        "--auth-type",
+        "--before",
+        "--c",
+        "--ca",
+        "--cache",
+        "--cache-max",
+        "--cache-min",
+        "--cafile",
+        "--call",
+        "--cert",
+        "--cidr",
+        "--cpu",
+        "--depth",
+        "--diff",
+        "--diff-dst-prefix",
+        "--diff-src-prefix",
+        "--diff-unified",
+        "--editor",
+        "--enjoy-by",
+        "--expect-result-count",
+        "--expires",
+        "--fetch-retries",
+        "--fetch-retry-factor",
+        "--fetch-retry-maxtimeout",
+        "--fetch-retry-mintimeout",
+        "--fetch-timeout",
+        "--git",
+        "--globalconfig",
+        "--heading",
+        "--https-proxy",
+        "--include",
+        "--init-author-email",
+        "--init-author-name",
+        "--init-author-url",
+        "--init-license",
+        "--init-module",
+        "--init-type",
+        "--init-version",
+        "--init.author.email",
+        "--init.author.name",
+        "--init.author.url",
+        "--init.license",
+        "--init.module",
+        "--init.version",
+        "--install-strategy",
+        "--key",
+        "--libc",
+        "--local-address",
+        "--location",
+        "--lockfile-version",
+        "--loglevel",
+        "--logs-dir",
+        "--logs-max",
+        "--m",
+        "--maxsockets",
+        "--message",
+        "--min-release-age",
+        "--min-release-age-exclude",
+        "--name",
+        "--node-gyp",
+        "--node-options",
+        "--noproxy",
+        "--omit",
+        "--only",
+        "--orgs",
+        "--orgs-permission",
+        "--os",
+        "--otp",
+        "--pack-destination",
+        "--packages",
+        "--packages-and-scopes-permission",
+        "--password",
+        "--prefix",
+        "--preid",
+        "--provenance-file",
+        "--proxy",
+        "--reg",
+        "--registry",
+        "--replace-registry-host",
+        "--save-prefix",
+        "--sbom-format",
+        "--sbom-type",
+        "--scope",
+        "--scopes",
+        "--script-shell",
+        "--searchexclude",
+        "--searchlimit",
+        "--searchopts",
+        "--searchstaleness",
+        "--shell",
+        "--tag",
+        "--tag-version-prefix",
+        "--token-description",
+        "--umask",
+        "--user-agent",
+        "--userconfig",
+        "--viewer",
+        "--w",
+        "--which",
+        "--workspace",
+        "-C",
+        "-L",
+        "-c",
+        "-enjoy-by",
+        "-m",
+        "-reg",
+        "-w",
+    }
+)
+
+
+_NPM_BOOLEAN_FLAGS = frozenset(
+    {
+        "--?",
+        "--B",
+        "--D",
+        "--E",
+        "--H",
+        "--O",
+        "--P",
+        "--S",
+        "--a",
+        "--all",
+        "--allow-same-version",
+        "--allow-scripts-pending",
+        "--allow-scripts-pin",
+        "--audit",
+        "--bin-links",
+        "--bypass-2fa",
+        "--commit-hooks",
+        "--d",
+        "--dangerously-allow-all-scripts",
+        "--dd",
+        "--ddd",
+        "--desc",
+        "--description",
+        "--dev",
+        "--diff-ignore-all-space",
+        "--diff-name-only",
+        "--diff-no-prefix",
+        "--diff-text",
+        "--dry-run",
+        "--engine-strict",
+        "--expect-results",
+        "--f",
+        "--force",
+        "--foreground-scripts",
+        "--format-package-lock",
+        "--fund",
+        "--g",
+        "--git-tag-version",
+        "--global",
+        "--global-style",
+        "--h",
+        "--help",
+        "--if-present",
+        "--ignore-scripts",
+        "--include-attestations",
+        "--include-staged",
+        "--include-workspace-root",
+        "--init-private",
+        "--install-links",
+        "--iwr",
+        "--json",
+        "--l",
+        "--legacy-bundling",
+        "--legacy-peer-deps",
+        "--link",
+        "--local",
+        "--long",
+        "--n",
+        "--no",
+        "--no-all",
+        "--no-allow-same-version",
+        "--no-allow-scripts-pending",
+        "--no-allow-scripts-pin",
+        "--no-audit",
+        "--no-bin-links",
+        "--no-bypass-2fa",
+        "--no-commit-hooks",
+        "--no-dangerously-allow-all-scripts",
+        "--no-description",
+        "--no-dev",
+        "--no-diff-ignore-all-space",
+        "--no-diff-name-only",
+        "--no-diff-no-prefix",
+        "--no-diff-text",
+        "--no-dry-run",
+        "--no-engine-strict",
+        "--no-expect-results",
+        "--no-force",
+        "--no-foreground-scripts",
+        "--no-format-package-lock",
+        "--no-fund",
+        "--no-git-tag-version",
+        "--no-global",
+        "--no-global-style",
+        "--no-if-present",
+        "--no-ignore-scripts",
+        "--no-include-attestations",
+        "--no-include-staged",
+        "--no-include-workspace-root",
+        "--no-init-private",
+        "--no-install-links",
+        "--no-json",
+        "--no-legacy-bundling",
+        "--no-legacy-peer-deps",
+        "--no-link",
+        "--no-long",
+        "--no-offline",
+        "--no-omit-lockfile-registry-resolved",
+        "--no-optional",
+        "--no-package-lock",
+        "--no-package-lock-only",
+        "--no-packages-all",
+        "--no-parseable",
+        "--no-prefer-dedupe",
+        "--no-prefer-offline",
+        "--no-prefer-online",
+        "--no-production",
+        "--no-progress",
+        "--no-provenance",
+        "--no-read-only",
+        "--no-rebuild-bundle",
+        "--no-save",
+        "--no-save-bundle",
+        "--no-save-dev",
+        "--no-save-exact",
+        "--no-save-optional",
+        "--no-save-peer",
+        "--no-save-prod",
+        "--no-shrinkwrap",
+        "--no-sign-git-commit",
+        "--no-sign-git-tag",
+        "--no-strict-allow-scripts",
+        "--no-strict-peer-deps",
+        "--no-strict-ssl",
+        "--no-timing",
+        "--no-unicode",
+        "--no-update-notifier",
+        "--no-usage",
+        "--no-version",
+        "--no-versions",
+        "--no-workspaces",
+        "--no-workspaces-update",
+        "--no-yes",
+        "--offline",
+        "--omit-lockfile-registry-resolved",
+        "--optional",
+        "--p",
+        "--package-lock",
+        "--package-lock-only",
+        "--packages-all",
+        "--parseable",
+        "--porcelain",
+        "--prefer-dedupe",
+        "--prefer-offline",
+        "--prefer-online",
+        "--production",
+        "--progress",
+        "--provenance",
+        "--q",
+        "--quiet",
+        "--read-only",
+        "--readonly",
+        "--rebuild-bundle",
+        "--s",
+        "--save",
+        "--save-bundle",
+        "--save-dev",
+        "--save-exact",
+        "--save-optional",
+        "--save-peer",
+        "--save-prod",
+        "--shrinkwrap",
+        "--sign-git-commit",
+        "--sign-git-tag",
+        "--silent",
+        "--strict-allow-scripts",
+        "--strict-peer-deps",
+        "--strict-ssl",
+        "--timing",
+        "--unicode",
+        "--update-notifier",
+        "--usage",
+        "--v",
+        "--verbose",
+        "--version",
+        "--versions",
+        "--workspaces",
+        "--workspaces-update",
+        "--ws",
+        "--y",
+        "--yes",
+        "-?",
+        "-B",
+        "-D",
+        "-E",
+        "-H",
+        "-O",
+        "-P",
+        "-S",
+        "-a",
+        "-d",
+        "-dd",
+        "-ddd",
+        "-desc",
+        "-f",
+        "-g",
+        "-h",
+        "-help",
+        "-iwr",
+        "-l",
+        "-local",
+        "-n",
+        "-no",
+        "-p",
+        "-porcelain",
+        "-q",
+        "-quiet",
+        "-readonly",
+        "-s",
+        "-silent",
+        "-v",
+        "-verbose",
+        "-ws",
+        "-y",
+    }
+)
+
 # docker, verified against `docker run --help`.
 _DOCKER_BOOLEAN_FLAGS = frozenset(
     {
@@ -696,20 +1078,42 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
     so keep scanning" does not fix it -- the scan still reaches ``<bin>``; the
     value has to be read back out of the flag.
 
-    Known limitation, deliberately left open: unlike the other four
-    ecosystems this scan does **not** fail closed on an unrecognised flag, so
-    ``npm exec --loglevel silly <pkg>`` still reads ``silly`` as the package.
-    Inverting the default here would break the pinned ordering below, where a
-    leading global flag such as ``npm --silent exec <pkg>`` must be skipped
-    rather than refused. Tracked on Consiliency/pmcp#180, which stays OPEN
-    for this residual -- NOT on #182, which the change carrying this note
-    closes on merge and would leave this pointer dangling.
+    Unrecognised flags **fail closed** (Consiliency/pmcp#180). npm was the
+    last of the five ecosystems still failing open here: the scan skipped
+    anything starting ``-`` and took the next bare token, so a flag's VALUE
+    became the package name and ``npm exec --loglevel silly a`` and
+    ``... silly b`` both resolved to ``silly``. v2.4.0's gate reads a matching
+    identity as a POSITIVE confirmation, so that served one server the other's
+    tool descriptions.
+
+    Inverting the default was previously believed to break the pinned ordering
+    below -- a leading global flag such as ``npm --silent exec <pkg>`` must be
+    skipped, not refused. It does not, because ``--silent`` is not unknown:
+    it is one of npm's 40 **shorthands**, and ``_NPM_BOOLEAN_FLAGS`` is
+    generated with every shorthand expanded. The ordering holds by
+    construction rather than by the fail-open default, which is what made the
+    default removable. The hand-coded ``-y`` special case this scan used to
+    carry is likewise retired into the generated table (``y`` -> ``--yes``).
+
+    Two arity rules here are npm-specific and neither is guessable from the
+    flag token:
+
+    * A **boolean** flag still consumes a literal ``true``/``false`` --
+      ``npm exec --global false --help`` exits 0, so ``false`` is the flag's
+      value there, not a positional. Without this, ``npm exec --global false
+      a`` and ``... b`` both resolve to ``false``.
+    * A **conditionally-arity** flag (``color``, ``browser``: declared with
+      Boolean *and* a non-Boolean member) is in neither table, so it lands on
+      the refusal below. ``npm exec --color always <pkg>`` is the case that
+      matters: ``always`` is a legal value, so a boolean/value split reads it
+      as the package.
     """
     skip_subcommand = command == "npm"
     packages: list[str] = []
-    for index, arg in enumerate(args):
-        if arg == "-y":
-            continue
+    index = -1
+    while index + 1 < len(args):
+        index += 1
+        arg = args[index]
         name, separator, attached = arg.partition("=")
         if separator and name in _NPM_POSITIVE_FLAGS:
             if attached:
@@ -724,14 +1128,29 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
             # A `--package` value outranks any later positional, which is the
             # command npm runs FROM that package, not a package itself.
             continue
-        # Skip flags. This MUST precede the subcommand check: npm accepts
+        # Classify flags. This MUST precede the subcommand check: npm accepts
         # global flags before the subcommand (`npm --silent exec pkg`), so
         # spending the one-shot skip on a flag token would leave `exec` to be
         # read as the package and reopen the #180 collapse for every form
         # carrying a leading flag. The ordering is already correct; the test
         # below exists because nothing PINNED it (ah board review, adversarial
         # seat: a surviving mutant, not a live defect).
-        if arg.startswith("-"):
+        if arg.startswith("-") and arg != "-":
+            if arg in _NPM_VALUE_FLAGS:
+                index += 1  # its value is the next token, never the package
+                continue
+            if arg in _NPM_BOOLEAN_FLAGS:
+                following = args[index + 1] if index + 1 < len(args) else None
+                # npm's parser takes a literal `true`/`false` after a boolean
+                # flag as that flag's value; anything else is a positional.
+                if following in ("true", "false"):
+                    index += 1
+                continue
+            # Unclassified. `--flag=value` is self-delimiting so it cannot
+            # swallow anything and is safe to skip; a bare unknown flag might
+            # be hiding the package in its value slot, so refuse.
+            if _takes_a_value_ambiguously(arg):
+                return None
             continue
         if skip_subcommand:
             # Only the first non-flag token can be the subcommand; whatever

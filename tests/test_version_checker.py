@@ -2075,3 +2075,155 @@ class TestOrdinalReversal:
             ("202612180000", None),
         ]:
             assert compare_versions(value, value, pkg_type) == "not_newer"
+
+
+class TestNpmValueFlagCollisions:
+    """Two different npm servers must never collapse into one identity.
+
+    npm was the last ecosystem still failing OPEN on an unrecognised flag
+    (Consiliency/pmcp#180): the scan skipped anything starting `-` and took
+    the next bare token, so a flag's VALUE became the package name. v2.4.0's
+    gate reads a matching identity as a POSITIVE confirmation, so this served
+    one server the other's tool descriptions.
+
+    The last two pairs are the ones a naive boolean/value split misses, and
+    they are the point of this class. A board seat implemented an earlier
+    design faithfully, and its suite passed -- all three registry/loglevel
+    pairs green, pinned orderings green, fails-closed green -- while
+    `npm exec --color always a/b` still returned `('npm','always')` for both.
+    An acceptance set that cannot see the defect its own method manufactures
+    is not an acceptance set.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "args_a", "args_b", "expected"),
+        [
+            # A value flag whose value is an enum member.
+            (
+                "npm",
+                ["exec", "--loglevel", "silly", "a"],
+                ["exec", "--loglevel", "silly", "b"],
+                [("npm", "a"), ("npm", "b")],
+            ),
+            # A value flag whose value is a URL.
+            (
+                "npm",
+                ["exec", "--registry", "https://r", "a"],
+                ["exec", "--registry", "https://r", "b"],
+                [("npm", "a"), ("npm", "b")],
+            ),
+            # Same, reached through npx, where there is no subcommand to skip.
+            (
+                "npx",
+                ["-y", "--registry", "https://r", "a"],
+                ["-y", "--registry", "https://r", "b"],
+                [("npm", "a"), ("npm", "b")],
+            ),
+            # A BOOLEAN flag followed by a literal `true`/`false`. npm's
+            # parser takes that as the flag's value -- `npm exec --global
+            # false --help` exits 0 -- so a design where "boolean consumes
+            # nothing" leaves this colliding on `false`.
+            (
+                "npm",
+                ["exec", "--global", "false", "a"],
+                ["exec", "--global", "false", "b"],
+                [("npm", "a"), ("npm", "b")],
+            ),
+            # A Boolean UNION (`color` is `always|Boolean`): arity depends on
+            # the next token's content, so no single class is right and the
+            # flag is left unlisted. Refusing is the fail-CLOSED direction;
+            # what matters is that the two no longer share an identity.
+            (
+                "npm",
+                ["exec", "--color", "always", "a"],
+                ["exec", "--color", "always", "b"],
+                [("unknown", None), ("unknown", None)],
+            ),
+        ],
+    )
+    def test_pair_does_not_collide(
+        self,
+        command: str,
+        args_a: list[str],
+        args_b: list[str],
+        expected: list[tuple[str, str | None]],
+    ) -> None:
+        got_a = detect_package_type(command, args_a)
+        got_b = detect_package_type(command, args_b)
+        # Pin the EXACT values, not just inequality: a pair can stop colliding
+        # by both becoming wrong in different ways.
+        assert [got_a, got_b] == expected
+        assert got_a != got_b or got_a == ("unknown", None)
+
+
+class TestNpmFailsClosed:
+    """An unlisted npm flag yields no identity rather than a wrong one."""
+
+    def test_unlisted_bare_flag_refuses(self) -> None:
+        assert detect_package_type("npm", ["exec", "--not-a-real-npm-flag", "a"]) == (
+            "unknown",
+            None,
+        )
+
+    def test_unlisted_flag_cannot_collide(self) -> None:
+        args = ["exec", "--not-a-real-npm-flag", "{}"]
+        assert detect_package_type("npm", [*args, "a"]) == ("unknown", None)
+        assert detect_package_type("npm", [*args, "b"]) == ("unknown", None)
+
+    def test_self_delimiting_unlisted_flag_still_resolves(self) -> None:
+        """`--flag=value` cannot swallow the next token, so refusing costs
+        safety nothing and auto-update something."""
+        assert detect_package_type("npm", ["exec", "--zzz=1", "a"]) == ("npm", "a")
+
+    def test_conditional_arity_flag_refuses(self) -> None:
+        """`--color` is `always|Boolean`; unlisted by construction."""
+        assert detect_package_type("npm", ["exec", "--color", "a"]) == (
+            "unknown",
+            None,
+        )
+
+
+class TestNpmPinnedOrderingSurvives:
+    """The forms the fix must not regress.
+
+    `npm --silent exec pkg` gets called out because `--silent` is a SHORTHAND
+    (`--loglevel silent`), absent from `npm config list --json` entirely. Any
+    table built from the config dump rather than from `shorthands` breaks
+    exactly here, which makes it the single most likely regression.
+    """
+
+    @pytest.mark.parametrize(
+        ("command", "args", "expected"),
+        [
+            ("npm", ["--silent", "exec", "pkg"], "pkg"),
+            ("npm", ["exec", "pkg"], "pkg"),
+            ("npm", ["install", "i"], "i"),
+            ("npm", ["exec", "exec"], "exec"),
+            ("npx", ["-y", "exec"], "exec"),
+            ("npx", ["-y", "pkg"], "pkg"),
+        ],
+    )
+    def test_form_still_resolves(
+        self, command: str, args: list[str], expected: str
+    ) -> None:
+        assert detect_package_type(command, args) == ("npm", expected)
+
+    @pytest.mark.parametrize(
+        ("command", "args", "expected"),
+        [
+            # Every shorthand class, resolved through `shorthands` rather than
+            # hand-listed: expansion length >= 2 bakes in a value (boolean
+            # arity), length 1 is a rename that inherits the target's arity.
+            ("npm", ["-q", "exec", "pkg"], "pkg"),  # -> --loglevel warn
+            ("npm", ["-s", "exec", "pkg"], "pkg"),  # -> --loglevel silent
+            ("npm", ["-g", "exec", "pkg"], "pkg"),  # -> --global   (boolean)
+            ("npm", ["--local", "exec", "pkg"], "pkg"),  # -> --no-global
+            ("npm", ["--reg", "https://r", "exec", "pkg"], "pkg"),  # -> --registry
+            ("npm", ["exec", "-w", "ws", "pkg"], "pkg"),  # -> --workspace (value)
+            ("npx", ["-y", "--package", "pkg", "--", "bin"], "pkg"),
+        ],
+    )
+    def test_shorthand_expands(
+        self, command: str, args: list[str], expected: str
+    ) -> None:
+        assert detect_package_type(command, args) == ("npm", expected)
