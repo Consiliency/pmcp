@@ -7,26 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-- **A literal `null` after an npm boolean flag no longer mints a wrong package
-  identity.** npm's parser consumes `null` after only the five *nullable*
-  booleans (`--yes`, `--optional`, `--production`, `--workspaces`,
-  `--expect-results`); after any other boolean, `null` is the package — and
-  `null` is a real published npm package. A blanket rule applied it to all ~198
-  boolean entries, so `npm exec --global null pkg-a` and `... pkg-b` both
-  resolved to `null` and the identity gate confirmed them as one package.
-- **`npx` no longer guesses when a boolean flag is followed by a literal.**
-  `npx` pre-scans its arguments and inserts `--` before the first positional, so
-  a boolean switch consumes nothing there — the opposite of `npm`. Confirmed
-  against the real binary: `npx --global true pkg` runs the package `true`.
-  Because the `--no-` family behaves differently again, these forms now report
-  no identity rather than a modelled guess, which refreshes rather than
-  confirming a wrong one.
-
-  Known remaining gap, tracked separately: the same class survives in rarer
-  spellings — an attached value (`--global=pkg`), nopt's abbreviation matching
-  (`-n`, `--y`), and `npx`'s own rewriting of `-p=` and removal of `-n`. No
-  server in the bundled manifest uses any of them.
+## [2.5.1] - 2026-08-26
 
 ### Fixed
 - **npm no longer reads a flag's *value* as the package name.** npm was the last
@@ -54,6 +35,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — where the previous "take the next token" default produced a silent
   collision instead. No bundled manifest server is affected: all 98 launchable
   entries resolve exactly as before.
+
+  Two places where the boolean rule is subtler than "a switch takes no value":
+
+  - **`null` is a real published npm package.** npm's parser consumes a literal
+    `null` after only the five *nullable* booleans (`--yes`, `--optional`,
+    `--production`, `--workspaces`, `--expect-results`); after any other
+    boolean, `null` is the package. The rule is scoped to those five, so
+    `npm exec --global null pkg-a` and `… pkg-b` stay distinct.
+  - **`npx` behaves the opposite way to `npm`.** It pre-scans its arguments and
+    inserts `--` before the first positional, so a boolean switch there consumes
+    nothing — verified against the real binary: `npx --global true pkg` runs the
+    package `true`. Because the `--no-` family differs again, `npx` reports no
+    identity for these forms rather than a modelled guess.
+
+  Known remaining gap, tracked in
+  [#195](https://github.com/Consiliency/pmcp/issues/195): the same class
+  survives in rarer spellings — an attached value (`--global=pkg`), nopt's
+  abbreviation matching (`-n`, `--y`), and `npx`'s own rewriting of `-p=` and
+  removal of `-n`. No server in the bundled manifest uses any of them.
 
 ## [2.5.0] - 2026-08-26
 
