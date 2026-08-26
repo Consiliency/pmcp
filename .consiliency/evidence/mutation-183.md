@@ -61,3 +61,55 @@ invocation (npm requires a subcommand), so those assertions had encoded the
 parser's old permissiveness -- the general form of this very defect. They are
 now inverted, with the reason in their docstrings, rather than the guard being
 relaxed to keep them green.
+
+---
+
+# Board round on #182 (PR #190) — two real defects, two false alarms
+
+Four seats. grok AGREE, gemini AGREE, codex DISAGREE, fable PARTIALLY AGREE.
+Every finding checked against source before acting; two were real, two were not.
+
+## REAL — a collision the fix itself introduced (red-team seat)
+
+`_pep508_base_name` listed `@` among the name terminators, so a PEP 508
+**direct reference** truncated to its bare name:
+
+    pkg @ git+https://x/y  ->  ('pypi', 'pkg')
+    pkg @ git+https://x/z  ->  ('pypi', 'pkg')     COLLIDES
+
+Two different repositories, one identity — the exact defect class this change
+exists to close, newly created by the fix for it. It also violated this plan's
+own acceptance criterion that distinct URLs keep distinct identities; the test
+covered only the *bare* URL form and missed the standard named one.
+
+Fixed by removing `@` from the terminator set. Verified after: the two repos
+resolve distinctly, and extras/version normalization still works
+(`browser-use[cli]` -> `browser-use`, `index-it-mcp==1.2.0` -> `index-it-mcp`).
+
+## REAL — the 21st mutant, and my fix for it had a hollow spot (correctness seat)
+
+Deleting the `following.startswith("-")` arm left **all 364 tests green** while
+`uvx --from --offline a` and `... b` both resolved to `('pypi','--offline')`.
+Verified end-to-end: `_same_package('--offline','pypi','--offline','pypi')`
+returns **True**, so the mutant's collision passes the identity gate.
+
+Then — mutation-proving my own patch rather than trusting it — the third mutant
+(dropping the `following is None` arm) **passed all four new tests**. My
+end-of-argv case used `["--from"]`, which returns before ever reaching the
+guard. Probed five inputs for one that distinguishes the arm; none does. It is
+genuinely **unreachable**: a trailing positive flag ends the loop and falls
+through to unknown anyway. The test now says so rather than implying a proof.
+
+## NOT REAL — and the disclosures are why
+
+- *"Missing body in `test_readme_documented_pin_form_resolves_to_the_package`"*
+  — it has a full assertion body. The seat read the docstring as the whole
+  test. That docstring already discloses which half the test pins.
+- *"Unreachable fallthrough in `_scan_for_package_token`"* — the `--` branch is
+  already labelled in-code as measured-redundant-but-kept, with the reasoning
+  inline.
+
+Both false alarms landed on spots the implementer had *already* labelled as
+non-discriminating. Writing "this does not pin what it looks like it pins"
+directly into the code did not stop a reviewer flagging it — but it made the
+claim checkable in seconds instead of requiring a fresh investigation.

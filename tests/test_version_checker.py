@@ -364,6 +364,37 @@ class TestValueFlagCollisions:
         ) == ("npm", "a")
 
 
+class TestDirectReferencesStayDistinct:
+    """A PEP 508 *direct reference* names a source, and sources differ.
+
+    `pkg @ git+https://x/y` and `pkg @ git+https://x/z` are different
+    repositories. An earlier form of `_pep508_base_name` listed `@` among the
+    name terminators, so both truncated to `pkg` -- collapsing two repos into
+    one identity, which the gate would then CONFIRM. That is the exact defect
+    class this change exists to close, newly introduced by the fix for it
+    (ah board review, red-team seat).
+
+    Verified: before the fix both resolved to `('pypi', 'pkg')`.
+    """
+
+    def test_named_direct_references_to_different_repos_are_different(self) -> None:
+        y = detect_package_type("uvx", ["--from", "pkg @ git+https://x/y", "tool"])
+        z = detect_package_type("uvx", ["--from", "pkg @ git+https://x/z", "tool"])
+        assert y != z, f"two different repositories collapsed to one identity: {y}"
+        assert y == ("pypi", "pkg @ git+https://x/y")
+
+    def test_normalization_still_strips_extras_and_versions(self) -> None:
+        """The `@` carve-out must not disable the rest of the rule."""
+        assert detect_package_type("uvx", ["--from", "browser-use[cli]", "t"]) == (
+            "pypi",
+            "browser-use",
+        )
+        assert detect_package_type("uvx", ["--from", "index-it-mcp==1.2.0", "t"]) == (
+            "pypi",
+            "index-it-mcp",
+        )
+
+
 class TestPositiveFlagGuardArms:
     """The known-positive branch's guards, each arm pinned separately.
 

@@ -604,7 +604,7 @@ def _scan_for_package_token(
 
 # A PEP 508 requirement ends its NAME at the first character that can begin an
 # extras group, a version specifier, an environment marker, or a URL.
-_PEP508_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:[\[<>=!~;@,(].*)?$")
+_PEP508_NAME = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)\s*(?:[\[<>=!~;,(].*)?$")
 
 
 def _pep508_base_name(requirement: str) -> str:
@@ -625,6 +625,15 @@ def _pep508_base_name(requirement: str) -> str:
     identity: there is no name to extract, distinct URLs are distinct
     packages so the gate stays correct, and the PyPI lookup fails closed to
     None, which the gate already reads as "cannot confirm -> refresh".
+
+    ``@`` is deliberately NOT a name terminator, unlike the other PEP 508
+    separators. A *direct reference* (``pkg @ git+https://x/y``) names a
+    specific source, so truncating at ``@`` would return ``pkg`` for BOTH
+    ``pkg @ git+https://x/y`` and ``pkg @ .../z`` -- collapsing two different
+    repositories into one identity, which is the exact defect class this
+    change exists to close, newly introduced by the fix for it (ah board
+    review, red-team seat). A direct reference is returned whole and is its
+    own identity, exactly like a bare URL.
     """
     match = _PEP508_NAME.match(requirement.strip())
     return match.group(1) if match else requirement
