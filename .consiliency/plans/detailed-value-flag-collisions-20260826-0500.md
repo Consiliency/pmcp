@@ -53,35 +53,66 @@ incomplete twice.
 docker flags named in the issue and leave the class open — precisely the
 "fix the instance, not the class" error the last three rounds caught.
 
-## The design: `--flag=value` is safe, bare `--flag value` is not
+## The design: three-way flag classification, fail-closed default
 
-An argv scanner cannot know whether `--foo bar` means "flag `--foo` with value
-`bar`" or "boolean flag `--foo`, then positional `bar`" without a per-tool table
-of which flags take values. That table is the thing that keeps being incomplete.
+*This section was rewritten after board review. The original — "any bare
+`--flag` before the candidate makes identity unrecoverable" — was verified to
+break more than it fixed; see **Rejected** below.*
 
-What it *can* know, without any table:
+Per ecosystem, classify each flag into one of three kinds, and **default an
+unlisted bare flag to unknown**:
 
-- `--flag=value` is **self-delimiting**. The value cannot be mistaken for a
-  positional, so a token after it is genuinely positional.
-- A bare `--flag` is **ambiguous**. The next token may or may not belong to it.
+| kind | behaviour | examples |
+|---|---|---|
+| **known-value** | consumes the next token | uvx `--python`, `--with`, `--index-url`; docker's existing `_value_flags` **plus** `--env-file`, `--mount`; cargo `--features`, `--target`; pip `--index-url`, `-i` |
+| **known-boolean** | skip, next token is still a candidate | uvx `--quiet`, `--verbose`; docker `-i`, `-t`, `-it`, `-d`, `--rm`, `--init` |
+| **known-positive** | its value **is** the package | uvx `--from`; cargo `-p`, `--package`, `--bin`; npm `--package` |
+| *unlisted bare flag* | **`("unknown", None)`** | anything not classified |
 
-So: **when a bare `--flag` precedes the candidate token, identity is not
-recoverable** — return `("unknown", None)`. Under the identity gate, unknown
-means *cannot confirm → refresh*, which is safe; and `update_server` already
-refuses cleanly on unknown before building any probe (`handlers.py`, the
-`package_type == "unknown"` guard), which is the #183 outcome.
+**Why this is not the denylist #183 rejected.** Docker's `_value_flags` failed
+open because the *default* for an unlisted flag was "skip it and take the next
+token as the image" — an omission silently produced a wrong identity. Inverting
+the default is the whole point: an omission now costs *auto-update for one odd
+config* (safe, loud, fixable by adding an entry) instead of a *silent collision*
+(unsafe, invisible). Same table, opposite failure direction.
 
-**The cost, stated plainly:** a server launched as `uvx --python 3.12 pkg`
-becomes unverifiable and refreshes every time, and `update_server` will refuse
-to auto-update it. That is a real regression in convenience for a legitimate
-config. It is accepted because the alternative is what ships today: two
-different packages sharing one identity, with the wrong descriptions served
-indefinitely and no signal. Failing closed is loud and recoverable; failing open
-is silent.
+**The honest residual:** a *wrong* entry still fails open. Classify `--pull` as
+boolean when it actually takes a value and that value becomes the image. So
+entries must be verified individually against each tool's documentation and
+pinned by a test — never bulk-imported from memory.
 
-**Known-safe value flags stay enumerated** where the value *is* the package —
-`uvx --from`, `pip --index-url` is not one, `cargo -p/--package/--bin`. These
-are kept as explicit positive cases, not as an exhaustion attempt.
+### Rejected: pure fail-closed on any bare flag
+
+*Board finding, verified.* It would have broken the canonical configs:
+
+```
+uvx    --quiet my-package --arg            -> my-package        (would become unknown)
+docker run -i --rm mcp/server:latest       -> mcp/server        (would become unknown)
+docker run -e KEY=val --rm ghcr.io/org/mcp -> ghcr.io/org/mcp   (would become unknown)
+docker run -it --rm img                    -> img               (would become unknown)
+```
+
+`docker run -i --rm <image>` is *the* canonical docker MCP shape — this repo's
+own README uses `docker run -it --rm` (`README.md:1528`) — and `-it` is a
+combined short boolean no value-table would match. Under the rejected rule
+essentially every real docker server became permanently unverifiable and
+un-auto-updatable, and three currently-green tests
+(`tests/test_version_checker.py:101-107`, `:121-127`, `:131-137`) would have
+turned red, contradicting this plan's own "existing suite stays green"
+criterion. That regression dwarfs the collisions it closed.
+
+### It also dissolves the `--from` hazard
+
+With `--python` classified as known-value, a plain **left-to-right** scan
+resolves the README form deterministically: `--python` consumes `3.12`, then
+`--from` yields the package. **No whole-argv `--from` scan is needed**, which
+removes the hazard the board found — measured, `uvx mypkg --from other` today
+correctly yields `mypkg`, and a global scan would have returned `other`: a
+fail-open misidentification *introduced by the fix*, re-colliding
+`uvx a --from x` with `uvx b --from x` through the new path.
+
+Scans must still terminate at a `--` separator and at the first unambiguous
+positional, since everything after the tool name belongs to the served tool.
 
 ## Changes
 
