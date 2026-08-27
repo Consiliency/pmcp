@@ -1,5 +1,11 @@
 # Detailed plan: run #187's workflow guards in CI
 
+> **Revision 5 (2026-08-27).** Rev 4 boarded 2 DISAGREE / 1 AGREE. Three real
+> defects: the `continue-on-error` invariant was job-level only while the same
+> mutant works at **step** level; deleted-file drift **crashes** instead of
+> reporting, killing the one guard #187 calls the sole defence against silent job
+> deletion; and the mutation-helper contract was internally impossible again.
+>
 > **Revision 4 (2026-08-27).** Rev 3 boarded 2 AGREE / 1 DISAGREE. The DISAGREE
 > found a real new mutant — workflow-level `permissions: write-all` bypasses the
 > job-level check entirely — plus four contract gaps. All five folded in below.
@@ -74,9 +80,12 @@ allowlist never anticipated. Do both.
     that this environment carries **no GitHub-side protection rules today**, so
     the invariant guards a name, not a gate.
   - `github-release` has `needs: publish`;
-  - **no `continue-on-error` and no `if:` on `publish` or `github-release`** —
-    the `continue-on-error` mutant is the nastiest of the eight: a tag push
-    reports green while the upload failed.
+  - **no `continue-on-error` and no `if:` on `publish` or `github-release`, at
+    JOB level *and on every STEP within them*.** The job-level check alone is
+    bypassed by the identical mutant one level down: `continue-on-error: true`
+    on the "Publish to PyPI" step makes a tag push report **green while the
+    upload failed** — the nastiest mutant in the set, still open in rev 4. The
+    invariant must walk `jobs.<id>.steps[]`.
   - accept both `needs: X` and `needs: [X]`. The real file uses the scalar form;
     rejecting the list form is a false positive on a legitimate edit.
   - **the job set is exactly `{build, publish, github-release}`** — an added job
@@ -122,6 +131,17 @@ allowlist never anticipated. Do both.
   version from disk; fail on any job name present in base and absent in head.
   A rename is a removal plus an addition and must fail. A newly added workflow
   file has no base version — pass, do not crash.
+
+  **A DELETED file is the case rev 4 got wrong.** `maintenance.yml` deleted is
+  not on disk, so reading the head version raises and the checker exits with a
+  traceback — and AC2 explicitly says a crash does not count, because the reason
+  must name the removed jobs. The release/timeout invariants cannot cover for it:
+  they only see surviving files. So the mutant #187 calls *the sole guard against
+  silent job deletion* would ship dead while AC1's `release.yml` cases still went
+  red. Specify: a changed path whose **head blob is absent** has an empty job
+  set, and the failure reason names every job removed from that path. And
+  `paths` must come from `git diff` **including deletions** (`--diff-filter=ACMRD`),
+  not a glob of the worktree — a glob cannot see a file that is gone.
 - `main()` — add — `--base-ref`. Invariants always run. The base is resolved
   **per event**, and the table is part of the spec because getting it wrong
   silently disables drift on the path that gates merges:
@@ -222,10 +242,21 @@ required contexts currently do not include it.
 
 The verification loop and the evidence matrix both invoke this; rev 3 referenced
 it without creating it, so the specified evidence could not be produced as
-written. It takes a mutant name, applies that edit to the real workflow tree, and
-exits non-zero on an unknown name. Its mutant list must be exactly the set named
-in `TestReleaseInvariants` + `TestTimeoutInvariants`, including the three rev 3
-added (forked action, widened permissions at **both** levels, added job).
+written. It takes a mutant name, applies that edit to the real workflow tree, and exits
+non-zero on an unknown name. **Its set is the explicit UNION of every mutation
+case any criterion requires** — `TestReleaseInvariants` + `TestTimeoutInvariants`
++ the drift cases (`maintenance-deleted`, `changelog-job-deleted`) + the step-level
+and both-level-permissions cases. **WAS WRONG (rev 4):** it said "exactly the set
+named in TestReleaseInvariants + TestTimeoutInvariants" while the mandatory loop
+invoked it for two drift-only mutants — accepting them violated the stated set,
+rejecting them made AC2's commits impossible. That is the *fourth* consecutive
+revision to ship an internally impossible mutation contract; the union rule
+exists to end it.
+
+The verification loop and this list are **the same list**, generated from one
+source. Rev 4's loop omitted the four mutants rev 3 and rev 4 had just added
+(forked action, widened permissions at each level, added job), so the loop would
+have certified a checker that never saw them.
 
 ### `.consiliency/evidence/mutation-189.md` (create)
 
@@ -318,8 +349,14 @@ a `--base-ref` that does not exist; a PR adding a new workflow file;
       and a re-run replays the frozen payload, so a label applied to an already
       failed PR would never be seen — the exact trap the existing `changelog`
       job documents at `test.yml:220-228`.
-- [ ] The installed `actionlint` binary matches the pinned v1.7.12 digest
-      recorded in the evidence file.
+- [ ] The downloaded `actionlint_1.7.12_linux_amd64.tar.gz` matches the recorded
+      **archive** digest, asserted before extraction. **WAS WRONG (rev 4):** the
+      Changes section verified the archive while the criterion asserted the
+      installed *executable* against "that same recorded digest" — they are
+      different byte streams, and a seat confirmed the real values differ
+      (archive `8aca8d…` vs installed binary `c872d6…`), so the criterion could
+      never pass. A separate `actionlint --version` assertion covers the
+      installed artifact.
 
 ## Non-goals
 
