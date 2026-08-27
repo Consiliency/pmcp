@@ -120,28 +120,32 @@ check that never runs.
 ## Documentation impact
 
 - `CHANGELOG.md` — add — a `### Fixed` entry under `[Unreleased]`: `--verify` no
-  longer reports host-enumerated config types as table drift, and now prints what
-  it exempted.
+  longer reports host-enumerated config types as table drift. It normalises them
+  to their stable classification and says so; it does **not** exempt them from the
+  comparison.
 - No README change: `derive_npm_flags.py` is a maintainer tool, not user-facing.
 
 ## Dependencies & order
 
-1. `_is_host_enumerated` + `classify` change.
-2. Tests, including the two-fake-interface-sets case.
-3. `--verify` reporting.
-4. Regenerate the tables and confirm they are **byte-identical** to what is
+1. Node-side `hostEnumerated` emission in `read_schema` — nothing else can be
+   built until the raw-member signal survives into Python.
+2. `classify(..., host_enumerated=...)`.
+3. Tests, including the **`[null]`** case, all mocking `read_schema()`.
+4. `--verify` normalization note.
+5. Regenerate the tables and confirm they are **byte-identical** to what is
    committed — if the classification change alters any committed table, that is a
    real finding and must be investigated before proceeding, not absorbed.
 
 ## Verification
 
 ```bash
-uv run python .consiliency/notes/derive_npm_flags.py --verify     # exit 0, prints exemptions
+uv run python .consiliency/notes/derive_npm_flags.py --verify   # exit 0, names normalised flags
 uv run pytest -q tests/test_version_checker.py -k host_independent
 
-# The real test: simulate another machine. Monkeypatch the definitions so
-# local-address carries a DIFFERENT address set, and assert --verify still
-# passes and the committed tables are unchanged.
+# The real test: simulate the host that filed the bug. Patch the schema so
+# local-address is [null] -- an enumeration FAILURE, not a different address
+# set -- and assert classify() is still VALUE, --verify still exits 0, and the
+# committed tables are unchanged. Repeat with one address and with fifty.
 uv run python - <<'PY'   # (spelled out in the test, this is the manual form)
 # ... patch definitions -> local-address type = [null, "10.0.0.5", "fe80::1"]
 # ... assert classify() == VALUE and no drift failure is emitted
@@ -151,11 +155,12 @@ uv run pytest -q                      # full suite
 uv run ruff check . && uv run ruff format --check . && uv run mypy src/
 ```
 
-Edge cases: a type with **only** `null` and addresses; a host with no network
-interfaces at all (the enumeration collapses to `[null]`); an IPv6 address with a
-zone suffix (`fe80::1%eth0`) — Python's `ipaddress` rejects the zone form, so the
-predicate must strip a `%…` suffix before parsing or it will miss link-local
-members and re-open the false positive.
+Edge cases: `local-address: [null]` (enumeration failure — the reported case);
+a single-address host; a container with only a loopback; and `net.isIP` on a
+link-local address carrying a `%zone` suffix, which it rejects — which is why
+`typeDescription` is the primary signal and the `isIP` scan only a backstop.
+Rev 1 planned to strip `%…` in Python, which was moot since no raw member ever
+reached Python at all.
 
 ## Acceptance criteria
 
