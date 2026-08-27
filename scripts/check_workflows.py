@@ -72,8 +72,22 @@ EXPECTED_USES = {
     ],
 }
 # Jobs whose execution must not be made conditional or best-effort, at job
-# level *or* step level.
-PROTECTED_JOBS = ("publish", "github-release")
+# level *or* step level. `build` is in the set: an `if:` that skips it skips
+# `publish` through `needs`, and the tag push concludes **green** — the same
+# silence class `tag-case` headlines — while `continue-on-error` on it lets a
+# failed build's artifact publish anyway.
+PROTECTED_JOBS = ("build", "publish", "github-release")
+
+# Workflow files permitted to be tag-triggered, i.e. to declare `on.push.tags`.
+# An allowlist, like the others, and for the same reason: a *new* tag-triggered
+# workflow file is silent across every other layer here. It is not `release.yml`,
+# so the release invariants never look at it; it is a new file with no base
+# version, so drift passes it; and `release-diff-ack` greps for `release.yml`
+# specifically, so the label is never demanded. It would run arbitrary code at
+# tag push with whatever permissions it grants itself.
+# `docker.yml` is tag-triggered today — it builds and pushes the release image
+# on `v*` — and carries `packages: write`. Adding a file here must be deliberate.
+TAG_TRIGGERED_WORKFLOWS = {"release.yml", "docker.yml"}
 
 # Timeouts: a floor stops a job being throttled to death, a ceiling stops the
 # six-hour default being re-created by a large value. Both ends are load
@@ -143,15 +157,56 @@ def release_invariants(doc: Any) -> list[str]:
     if not isinstance(doc, dict):
         return [f"{tag} {RELEASE_PATH} did not parse as a mapping"]
 
+    # The trigger set must be EXACTLY {push: {tags: ["v*"]}}. Checking only that
+    # `push.tags` contains "v*" is an allowlist of one key, not a constraint on
+    # the trigger set: it permits ADDITIONAL events and filters alongside it.
+    # That is the worst possible miss on this file. `publish` carries
+    # `id-token: write` and the `release` environment has no protection rules,
+    # so adding `pull_request:` or `push.branches` makes the trusted-publishing
+    # path reachable from any same-repository PR and from every ordinary push to
+    # main — GitHub evaluates the workflow at the triggering ref, and combined
+    # branch/tag filters fire for either ref type. PyPI's own trusted-publisher
+    # model calls this out: unintended triggers in a trusted workflow require
+    # environment approval protections, which this repo does not have.
+    # `workflow_dispatch` belongs in the same set; it was struck as dangerous
+    # here during #187.
     on = get_on(doc)
-    push = on.get("push") if isinstance(on, dict) else None
-    tags = push.get("tags") if isinstance(push, dict) else None
-    if _as_list(tags) != EXPECTED_TAGS:
+    if not isinstance(on, dict):
         reasons.append(
-            f"{tag} on.push.tags is {tags!r}, expected {EXPECTED_TAGS!r} — a tag "
-            "filter that does not match the release tags means the publish "
-            "never runs and never reports a failure"
+            f"{tag} the trigger block is {on!r}, expected exactly "
+            f"{{'push': {{'tags': {EXPECTED_TAGS!r}}}}}"
         )
+    else:
+        extra_events = sorted(str(event) for event in on if event != "push")
+        if extra_events:
+            reasons.append(
+                f"{tag} extra trigger event(s): {', '.join(extra_events)} — the "
+                "release workflow must trigger on tag push and nothing else. "
+                "`publish` holds id-token: write against an environment with no "
+                "protection rules, so any other trigger makes trusted publishing "
+                "reachable from that event"
+            )
+        push = on.get("push")
+        if not isinstance(push, dict):
+            reasons.append(
+                f"{tag} on.push is {push!r}, expected a mapping with only `tags`"
+            )
+        else:
+            extra_filters = sorted(str(key) for key in push if key != "tags")
+            if extra_filters:
+                reasons.append(
+                    f"{tag} on.push carries {', '.join(extra_filters)} alongside "
+                    "tags — a branch or path filter fires on ordinary pushes to "
+                    "that branch, not only on tag pushes, and reaches the same "
+                    "trusted-publishing path"
+                )
+            if _as_list(push.get("tags")) != EXPECTED_TAGS:
+                reasons.append(
+                    f"{tag} on.push.tags is {push.get('tags')!r}, expected "
+                    f"{EXPECTED_TAGS!r} — a tag filter that does not match the "
+                    "release tags means the publish never runs and never reports "
+                    "a failure"
+                )
 
     if "permissions" in doc:
         reasons.append(
@@ -249,6 +304,35 @@ def release_invariants(doc: Any) -> list[str]:
     return reasons
 
 
+def tag_trigger_invariants(doc: Any, path: str | Path) -> list[str]:
+    """Only an allowlisted workflow file may be tag-triggered.
+
+    The release path is not one file, it is *every file that runs at tag push*.
+    A brand-new `release-notes.yml` with `on: push: tags: ["v*"]` and
+    `permissions: contents: write` passes the release invariants (it is not
+    `release.yml`), passes drift (a new file has no base version), and never
+    trips `release-diff-ack` (which greps for `release.yml`). It would run
+    arbitrary code on every release, unreviewed by any of them.
+    """
+    name = Path(path).name
+    if name in TAG_TRIGGERED_WORKFLOWS:
+        return []
+    on = get_on(doc)
+    if not isinstance(on, dict):
+        return []
+    push = on.get("push")
+    if not isinstance(push, dict) or not _as_list(push.get("tags")):
+        return []
+    return [
+        f"[release] {path} declares on.push.tags: {push['tags']!r} — it would run "
+        f"at tag push, on the release path, but it is not one of "
+        f"{sorted(TAG_TRIGGERED_WORKFLOWS)}. The release invariants only inspect "
+        "release.yml, drift passes any new file, and release-diff-ack greps for "
+        "release.yml specifically, so nothing else here would see it. Add it to "
+        "TAG_TRIGGERED_WORKFLOWS deliberately if it belongs on that path."
+    ]
+
+
 def timeout_invariants(doc: Any, path: str | Path) -> list[str]:
     """Every job in every workflow must carry a sane ``timeout-minutes``.
 
@@ -293,8 +377,28 @@ def timeout_invariants(doc: Any, path: str | Path) -> list[str]:
 # --- drift -------------------------------------------------------------------
 
 
+class GitError(RuntimeError):
+    """A git command failed.
+
+    Never swallowed into an empty result. "The command failed" and "the answer
+    is empty" are different facts, and conflating them is how a guard exits 0
+    with its protection silently disabled.
+    """
+
+
 def _git(args: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+
+
+def _git_checked(args: list[str]) -> str:
+    result = _git(args)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip().splitlines()
+        first = detail[0] if detail else "no output"
+        raise GitError(
+            f"`git {' '.join(args)}` failed (exit {result.returncode}): {first}"
+        )
+    return result.stdout
 
 
 def _base_resolves(base_ref: str) -> bool:
@@ -320,8 +424,16 @@ def changed_workflow_paths(base_ref: str) -> list[str]:
     cannot see a file that is gone, and a deleted workflow is precisely the
     case drift exists to catch. ``--no-renames`` makes a rename show up as a
     delete plus an add, so the removed jobs are reported.
+
+    Raises ``GitError`` rather than returning ``[]`` on failure. A base that
+    resolves but shares no history with HEAD makes ``git diff A...B`` exit 128
+    with "no merge base"; reading that as "nothing changed" passes every
+    subsequent check vacuously, on exactly the histories where drift matters —
+    divergent or rewritten history, shallow clones, force-pushed bases. This is
+    a *different* case from an unresolvable ref, and it defeats the same
+    fail-closed property.
     """
-    result = _git(
+    stdout = _git_checked(
         [
             "diff",
             "--name-only",
@@ -332,9 +444,21 @@ def changed_workflow_paths(base_ref: str) -> list[str]:
             str(WORKFLOW_DIR),
         ]
     )
-    if result.returncode != 0:
-        return []
-    return [line for line in result.stdout.splitlines() if line.strip()]
+    return [line for line in stdout.splitlines() if line.strip()]
+
+
+def _base_workflow_paths(base_ref: str) -> set[str]:
+    """Workflow paths that exist in the base tree.
+
+    A positive membership test, deliberately. Inferring "the path is absent at
+    the base" from a non-zero ``git cat-file -e`` is the same defect as above
+    wearing a different hat: any other git failure would then read as "this file
+    is new", and drift would pass on a file whose jobs had in fact been deleted.
+    """
+    stdout = _git_checked(
+        ["ls-tree", "-r", "--name-only", base_ref, "--", str(WORKFLOW_DIR)]
+    )
+    return {line for line in stdout.splitlines() if line.strip()}
 
 
 def job_set_drift(paths: list[str], base_ref: str) -> list[str]:
@@ -351,18 +475,24 @@ def job_set_drift(paths: list[str], base_ref: str) -> list[str]:
             "missing fetch-depth: 0?)"
         ]
 
+    try:
+        base_paths = _base_workflow_paths(base_ref)
+    except GitError as exc:
+        return [f"[drift] {exc} — refusing to pass with drift detection disabled"]
+
     reasons: list[str] = []
     for path in paths:
         blob = f"{base_ref}:{path}"
-        if _git(["cat-file", "-e", blob]).returncode != 0:
-            # The base resolves and the path is absent there: a genuinely new
-            # workflow file. Nothing can have been removed from it.
+        if path not in base_paths:
+            # The base resolves, the base tree was read, and this path is not in
+            # it: a genuinely new workflow file. Nothing can have been removed.
             continue
-        shown = _git(["show", blob])
-        if shown.returncode != 0:
-            reasons.append(f"[drift] could not read {blob}: {shown.stderr.strip()}")
+        try:
+            shown_stdout = _git_checked(["show", blob])
+        except GitError as exc:
+            reasons.append(f"[drift] {exc}")
             continue
-        base_jobs, err = _job_names(shown.stdout, blob)
+        base_jobs, err = _job_names(shown_stdout, blob)
         if err:
             reasons.append(err)
             continue
@@ -443,6 +573,7 @@ def main(argv: list[str] | None = None) -> int:
             failures.append(err)
             continue
         failures.extend(timeout_invariants(doc, path))
+        failures.extend(tag_trigger_invariants(doc, path))
 
     # 3. job-set drift — only against a base.
     if base_ref is None:
@@ -450,10 +581,24 @@ def main(argv: list[str] | None = None) -> int:
             "drift: SKIPPED — no --base-ref given (schedule/workflow_dispatch "
             "have no base to diff against); invariants ran"
         )
+    elif not _base_resolves(base_ref):
+        # Reported before the diff is attempted, so this stays distinguishable
+        # from a diff that fails for some other reason. They are different
+        # faults and must not be conflated behind one message.
+        print(f"drift: base {base_ref} does NOT resolve")
+        failures.extend(job_set_drift([], base_ref))
     else:
-        paths = changed_workflow_paths(base_ref)
-        print(f"drift: base {base_ref}, changed workflow paths: {paths or 'none'}")
-        failures.extend(job_set_drift(paths, base_ref))
+        try:
+            paths = changed_workflow_paths(base_ref)
+        except GitError as exc:
+            # Never "no paths changed". A failed diff is a failed diff.
+            print(f"drift: base {base_ref}, FAILED to list changed paths")
+            failures.append(
+                f"[drift] {exc} — refusing to pass with drift detection disabled"
+            )
+        else:
+            print(f"drift: base {base_ref}, changed workflow paths: {paths or 'none'}")
+            failures.extend(job_set_drift(paths, base_ref))
 
     if failures:
         for reason in failures:

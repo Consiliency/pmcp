@@ -41,12 +41,19 @@ MUTANTS="$(
 	cat <<'TSV'
 tag-case|1|[release]|release.yml: tag filter "v*" -> "V*"; workflow stays valid and simply never runs at tag push
 tags-deleted|1|[release]|release.yml: push.tags replaced by push.branches; the release trigger is gone
+trigger-pull-request-added|1|[release]|release.yml: pull_request added ALONGSIDE the tag trigger; trusted publishing (id-token: write, no environment protection rules) becomes reachable from any same-repo PR
+trigger-push-branches-added|1|[release]|release.yml: push.branches [main] added alongside push.tags; combined filters fire for either ref type, so every ordinary push to main reaches the publish path
+trigger-workflow-dispatch-added|1|[release]|release.yml: workflow_dispatch added; struck as dangerous during #187, and it makes the publish path manually reachable from any branch
+trigger-paths-filter-added|1|[release]|release.yml: a paths filter added under push alongside tags
 env-dropped|1|[release]|release.yml: environment: release removed from publish
 env-renamed|1|[release]|release.yml: environment: release -> dev; GitHub auto-creates it, so a presence check passes
 needs-build-dropped|1|[release]|release.yml: publish no longer needs build; an untested artifact can publish
 needs-publish-to-build|1|[release]|release.yml: github-release needs build instead of publish; a release without a publish
 continue-on-error-job|1|[release]|release.yml: continue-on-error: true on the publish JOB; tag push reports green with no publish
 continue-on-error-step|1|[release]|release.yml: continue-on-error: true on the Publish to PyPI STEP; the job-level rule bypassed one level down
+if-on-build-job|1|[release]|release.yml: an if: expression on the BUILD job; skipping it skips publish through needs and the tag push concludes green
+continue-on-error-build-job|1|[release]|release.yml: continue-on-error: true on the build job; a failed build's artifact publishes anyway
+new-tag-triggered-workflow|1|[release]|a NEW tag-triggered workflow file (release-notes.yml, contents: write) that is not release.yml: silent to the release invariants, to drift (no base version) and to release-diff-ack (which greps for release.yml)
 if-on-publish-job|1|[release]|release.yml: an if: expression on the publish JOB; a skipped job reports success
 if-on-publish-step|1|[release]|release.yml: an if: expression on the Publish to PyPI STEP
 forked-action|1|[release]|release.yml: pypa/gh-action-pypi-publish repointed at a fork, with the release environment in scope
@@ -160,6 +167,38 @@ tags-deleted)
     branches: [main]
 '
 	;;
+trigger-pull-request-added)
+	replace "$RELEASE" 'on:
+  push:
+' 'on:
+  pull_request: {}
+  push:
+'
+	;;
+trigger-push-branches-added)
+	replace "$RELEASE" '  push:
+    tags:
+' '  push:
+    branches: [main]
+    tags:
+'
+	;;
+trigger-workflow-dispatch-added)
+	replace "$RELEASE" 'on:
+  push:
+' 'on:
+  workflow_dispatch:
+  push:
+'
+	;;
+trigger-paths-filter-added)
+	replace "$RELEASE" '  push:
+    tags:
+' '  push:
+    paths: ["**"]
+    tags:
+'
+	;;
 env-dropped)
 	replace "$RELEASE" '    environment: release
 ' ''
@@ -208,6 +247,40 @@ if-on-publish-step)
         if: ${{ github.actor != '"'"'nobody'"'"' }}
         uses: pypa/gh-action-pypi-publish@release/v1
 '
+	;;
+if-on-build-job)
+	replace "$RELEASE" '  build:
+    runs-on: ubuntu-latest
+' '  build:
+    if: ${{ github.actor != '"'"'nobody'"'"' }}
+    runs-on: ubuntu-latest
+'
+	;;
+continue-on-error-build-job)
+	replace "$RELEASE" '  build:
+    runs-on: ubuntu-latest
+' '  build:
+    continue-on-error: true
+    runs-on: ubuntu-latest
+'
+	;;
+new-tag-triggered-workflow)
+	cat >"${REPO_ROOT}/.github/workflows/release-notes.yml" <<'YAML'
+name: Release notes
+on:
+  push:
+    tags:
+      - "v*"
+jobs:
+  notes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Do something at tag push
+        run: echo "arbitrary code at tag push"
+YAML
 	;;
 forked-action)
 	replace "$RELEASE" 'uses: pypa/gh-action-pypi-publish@release/v1' \

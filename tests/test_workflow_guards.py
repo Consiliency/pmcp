@@ -61,11 +61,27 @@ def _on(doc: dict[str, Any]) -> dict[str, Any]:
     return cw.get_on(doc)
 
 
+# The exact expression scripts/_mutate_workflow.sh injects for the `if:`
+# mutants. Asserted against the shell source in TestMutationHelperContract, so
+# the in-memory mutation and the committed one cannot drift apart.
+_IF_EXPR = "${{ github.actor != 'nobody' }}"
+
 # Each key is a mutant name in scripts/_mutate_workflow.sh; the callable is the
 # same edit applied to the parsed document.
 RELEASE_MUTANTS: dict[str, Any] = {
     "tag-case": lambda d: _on(d)["push"].update({"tags": ["V*"]}),
     "tags-deleted": lambda d: _on(d).update({"push": {"branches": ["main"]}}),
+    # The trigger set is a SET, not one key with an allowlist. `publish` holds
+    # id-token: write against an environment with no protection rules, so an
+    # extra trigger makes trusted publishing reachable from that event.
+    "trigger-pull-request-added": lambda d: _on(d).update({"pull_request": {}}),
+    "trigger-workflow-dispatch-added": lambda d: _on(d).update(
+        {"workflow_dispatch": None}
+    ),
+    "trigger-push-branches-added": lambda d: _on(d)["push"].update(
+        {"branches": ["main"]}
+    ),
+    "trigger-paths-filter-added": lambda d: _on(d)["push"].update({"paths": ["**"]}),
     "env-dropped": lambda d: _publish(d).pop("environment"),
     "env-renamed": lambda d: _publish(d).update({"environment": "dev"}),
     "needs-build-dropped": lambda d: _publish(d).pop("needs"),
@@ -76,8 +92,15 @@ RELEASE_MUTANTS: dict[str, Any] = {
     "continue-on-error-step": lambda d: _pypi_step(d).update(
         {"continue-on-error": True}
     ),
-    "if-on-publish-job": lambda d: _publish(d).update({"if": "${{ success() }}"}),
-    "if-on-publish-step": lambda d: _pypi_step(d).update({"if": "${{ success() }}"}),
+    # The expression must be the SAME STRING the shell helper injects; these two
+    # had diverged (`${{ success() }}` here vs github.actor there), which is
+    # exactly the drift the single-source rule exists to prevent.
+    "if-on-publish-job": lambda d: _publish(d).update({"if": _IF_EXPR}),
+    "if-on-publish-step": lambda d: _pypi_step(d).update({"if": _IF_EXPR}),
+    "if-on-build-job": lambda d: d["jobs"]["build"].update({"if": _IF_EXPR}),
+    "continue-on-error-build-job": lambda d: d["jobs"]["build"].update(
+        {"continue-on-error": True}
+    ),
     "forked-action": lambda d: _pypi_step(d).update(
         {"uses": "attacker-fork/gh-action-pypi-publish@release/v1"}
     ),
@@ -109,6 +132,17 @@ DRIFT_MUTANTS = (
     "maintenance-deleted",
     "changelog-job-deleted",
     "workflows-job-deleted",
+)
+
+# Every mutant these tests exercise. Asserted EQUAL to the helper's expected-1
+# rows — in BOTH directions — by TestMutationHelperContract, because the
+# evidence matrix is generated from that TSV: a phantom row there would
+# otherwise appear in the matrix with nothing exercising it.
+TESTED_MUTANTS = (
+    set(RELEASE_MUTANTS)
+    | set(TIMEOUT_MUTANTS)
+    | set(DRIFT_MUTANTS)
+    | {"file-deleted", "timeout-deleted", "new-tag-triggered-workflow"}
 )
 
 
@@ -152,6 +186,47 @@ class TestReleaseInvariants:
         reasons = cw.release_invariants(doc)
         assert any("step" in r and "continue-on-error" in r for r in reasons)
 
+    def test_an_extra_trigger_event_is_caught_even_with_the_tag_filter_intact(
+        self,
+    ) -> None:
+        # The trigger block below keeps `push.tags: ["v*"]` untouched, so a
+        # check that only looks for "v*" in push.tags passes it. It also makes
+        # `publish` — id-token: write, against an environment whose
+        # protection_rules are [] — reachable from any same-repository PR and
+        # from every ordinary push to main.
+        doc = release_doc()
+        _on(doc).update({"pull_request": {}})
+        _on(doc)["push"].update({"branches": ["main"]})
+        assert cw._as_list(_on(doc)["push"]["tags"]) == ["v*"], (
+            "this test is only meaningful while the tag filter is still correct"
+        )
+        reasons = cw.release_invariants(doc)
+        assert any("extra trigger event" in r for r in reasons)
+        assert any("branches" in r for r in reasons)
+        assert all(r.startswith("[release]") for r in reasons)
+
+    @pytest.mark.parametrize(
+        "trigger",
+        [
+            {"push": {"tags": ["v*"]}, "pull_request": {}},
+            {"push": {"tags": ["v*"]}, "workflow_dispatch": None},
+            {"push": {"tags": ["v*"], "branches": ["main"]}},
+            {"push": {"tags": ["v*"], "paths": ["**"]}},
+            {"push": {"tags": ["v*", "release-*"]}},
+        ],
+    )
+    def test_the_trigger_set_must_be_exactly_a_tag_push(self, trigger: Any) -> None:
+        doc = release_doc()
+        doc.pop(True)
+        doc["on"] = trigger
+        assert cw.release_invariants(doc), f"{trigger!r} passed unnoticed"
+
+    def test_the_committed_trigger_set_is_the_only_accepted_one(self) -> None:
+        doc = release_doc()
+        doc.pop(True)
+        doc["on"] = {"push": {"tags": ["v*"]}}
+        assert cw.release_invariants(doc) == []
+
     def test_a_workflow_level_permissions_block_is_caught(self) -> None:
         # It leaves every job's permissions map untouched while widening the
         # build job, so a job-level-only check passes it.
@@ -160,6 +235,47 @@ class TestReleaseInvariants:
         assert any(
             "workflow-level permissions" in r for r in cw.release_invariants(doc)
         )
+
+
+class TestTagTriggerInvariants:
+    """The release path is not one file — it is every file that runs at tag push."""
+
+    @pytest.mark.parametrize("path", sorted(WORKFLOW_DIR.glob("*.y*ml")))
+    def test_every_committed_workflow_passes(self, path: Path) -> None:
+        doc = yaml.safe_load(path.read_text())
+        assert cw.tag_trigger_invariants(doc, path) == []
+
+    def test_a_new_tag_triggered_workflow_is_rejected(self) -> None:
+        # mutant: new-tag-triggered-workflow. It passes the release invariants
+        # (it is not release.yml), passes drift (a new file has no base
+        # version) and never trips release-diff-ack (which greps for
+        # release.yml) — so this is the only layer that can see it.
+        doc = yaml.safe_load(
+            'name: Release notes\non:\n  push:\n    tags:\n      - "v*"\n'
+            "jobs:\n  notes:\n    timeout-minutes: 10\n"
+        )
+        reasons = cw.tag_trigger_invariants(doc, ".github/workflows/release-notes.yml")
+        assert reasons and reasons[0].startswith("[release]")
+        assert "on.push.tags" in reasons[0]
+
+    def test_the_allowlisted_files_are_permitted(self) -> None:
+        # docker.yml really is tag-triggered today: it pushes the release image.
+        doc = yaml.safe_load('on:\n  push:\n    tags:\n      - "v*"\njobs: {}\n')
+        assert cw.tag_trigger_invariants(doc, ".github/workflows/docker.yml") == []
+        assert cw.tag_trigger_invariants(doc, ".github/workflows/release.yml") == []
+
+    def test_a_new_workflow_without_a_tag_trigger_is_fine(self) -> None:
+        doc = yaml.safe_load("on:\n  pull_request:\njobs: {}\n")
+        assert cw.tag_trigger_invariants(doc, ".github/workflows/anything.yml") == []
+
+    def test_the_allowlist_matches_the_committed_tree(self) -> None:
+        tag_triggered = set()
+        for path in cw.workflow_files():
+            on = cw.get_on(yaml.safe_load(path.read_text()))
+            push = on.get("push") if isinstance(on, dict) else None
+            if isinstance(push, dict) and cw._as_list(push.get("tags")):
+                tag_triggered.add(path.name)
+        assert tag_triggered == cw.TAG_TRIGGERED_WORKFLOWS
 
 
 class TestTimeoutInvariants:
@@ -301,6 +417,56 @@ class TestJobSetDrift:
         )
         assert reasons and "does not resolve" in reasons[0]
 
+    def test_a_failing_git_diff_is_never_read_as_no_changes(self, repo: Path) -> None:
+        # A base that RESOLVES but shares no history with HEAD makes
+        # `git diff A...B` exit 128 with "no merge base". Returning [] there
+        # passes every subsequent check vacuously — a different fault from an
+        # unresolvable ref, and it defeats the same fail-closed property on
+        # exactly the histories where drift matters: divergent or rewritten
+        # history, shallow clones, force-pushed bases.
+        tree = _run(["git", "write-tree"], repo).stdout.strip()
+        orphan = _run(
+            ["git", "commit-tree", tree, "-m", "no merge base"], repo
+        ).stdout.strip()
+        assert cw._base_resolves(orphan), "the orphan must be a resolvable commit"
+        with pytest.raises(cw.GitError) as excinfo:
+            cw.changed_workflow_paths(orphan)
+        assert "no merge base" in str(excinfo.value)
+
+    def test_the_two_drift_faults_are_reported_distinctly(
+        self, repo: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        # They must not be conflated behind one message: one means "fetch more
+        # history", the other means "this base shares no history with HEAD".
+        tree = _run(["git", "write-tree"], repo).stdout.strip()
+        orphan = _run(
+            ["git", "commit-tree", tree, "-m", "no merge base"], repo
+        ).stdout.strip()
+
+        assert cw.main(["--base-ref", "definitely-not-a-ref"]) == 1
+        unresolvable = capsys.readouterr().out
+        assert "does not resolve to a commit" in unresolvable
+        assert "no merge base" not in unresolvable
+
+        assert cw.main(["--base-ref", orphan]) == 1
+        no_base = capsys.readouterr().out
+        assert "no merge base" in no_base
+        assert "does not resolve to a commit" not in no_base
+
+    def test_a_failing_base_tree_read_is_not_read_as_a_new_file(
+        self, repo: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The same defect wearing a different hat: inferring "this path is new"
+        # from a non-zero git invocation would make drift pass on a file whose
+        # jobs had in fact been deleted.
+        def boom(args: list[str]) -> str:
+            raise cw.GitError("`git ls-tree` failed (exit 128): simulated")
+
+        monkeypatch.setattr(cw, "_git_checked", boom)
+        reasons = cw.job_set_drift([".github/workflows/test.yml"], "HEAD")
+        assert reasons and reasons[0].startswith("[drift]")
+        assert "simulated" in reasons[0]
+
     def test_a_missing_base_and_a_new_file_are_distinguished(self, repo: Path) -> None:
         (repo / ".github/workflows/new.yml").write_text(
             "name: New\non:\n  push:\njobs:\n  fresh:\n    timeout-minutes: 10\n"
@@ -373,6 +539,21 @@ class TestCheckerEntryPoint:
     ) -> None:
         monkeypatch.chdir(REPO_ROOT)
         assert cw.main(["--base-ref", "definitely-not-a-ref"]) == 1
+
+    def test_a_base_with_no_merge_base_exits_non_zero(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(REPO_ROOT)
+        tree = subprocess.run(
+            ["git", "write-tree"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+        orphan = subprocess.run(
+            ["git", "commit-tree", tree, "-m", "no merge base"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        assert cw.main(["--base-ref", orphan]) == 1
 
     def test_both_workflow_extensions_are_globbed(
         self, monkeypatch: pytest.MonkeyPatch
@@ -537,17 +718,32 @@ class TestMutationHelperContract:
         names = [row[0] for row in self._rows()]
         assert len(names) == len(set(names))
 
-    @pytest.mark.parametrize(
-        "mutant",
-        sorted(set(RELEASE_MUTANTS) | set(TIMEOUT_MUTANTS) | set(DRIFT_MUTANTS))
-        + ["file-deleted", "timeout-deleted"],
-    )
+    @pytest.mark.parametrize("mutant", sorted(TESTED_MUTANTS))
     def test_every_mutant_these_tests_exercise_is_in_the_helper(
         self, mutant: str
     ) -> None:
         rows = {row[0]: row for row in self._rows()}
         assert mutant in rows, f"{mutant} is tested here but the helper cannot apply it"
         assert rows[mutant][1] == "1", f"{mutant} must be expected to fail the checker"
+
+    def test_the_inclusion_is_bidirectional(self) -> None:
+        # One-directional (suite ⊆ helper) is not enough: a phantom row appended
+        # to the TSV would still pass while nothing here ever exercised it, and
+        # the evidence matrix is generated from that TSV.
+        expected_to_fail = {row[0] for row in self._rows() if row[1] == "1"}
+        assert expected_to_fail == TESTED_MUTANTS, (
+            "helper rows and tested mutants have diverged: "
+            f"only in helper={sorted(expected_to_fail - TESTED_MUTANTS)}, "
+            f"only in tests={sorted(TESTED_MUTANTS - expected_to_fail)}"
+        )
+
+    def test_the_if_expression_matches_the_shell_helper(self) -> None:
+        # The tests re-implement each mutant in Python, so "single source"
+        # covers names, exit codes and tags — not the edit itself. This pins the
+        # one value where the two had already drifted apart.
+        source = MUTATE_SH.read_text()
+        assert "github.actor != " in source
+        assert "nobody" in _IF_EXPR and "github.actor != " in _IF_EXPR
 
     @pytest.mark.parametrize("mutant", DRIFT_MUTANTS)
     def test_the_drift_only_mutants_declare_drift_as_their_catcher(
