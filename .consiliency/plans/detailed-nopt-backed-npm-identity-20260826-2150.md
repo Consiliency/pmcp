@@ -1,5 +1,11 @@
 # Detailed plan: name an npm package only when npm's own parser makes it certain
 
+> **Revision 4 (2026-08-27).** Rev 3 boarded PARTIALLY AGREE with **six blocking
+> findings, four of them verified confident-wrong answers**. The root cause was
+> structural: rev 3's gate was a *denylist of unusual things*, so every round
+> found another unusual thing. Rev 4 flips it to an **allowlist of plain things**
+> — see "Step 1". That is a class fix, not a fourth round of instances.
+>
 > **Revision 3 (2026-08-27).** Rev 1 and rev 2 were both boarded; each round found
 > new blocking defects, and the surface kept growing (workspace bin resolution,
 > `.npmrc`, per-server `cwd`, `libnpmexec` skew *within* npm 11.x). The operator
@@ -15,11 +21,23 @@ narrow, fail-closed resolver that uses npm's own parser (`nopt` +
 
 > **Can we name this server's package with certainty?**
 
-If yes, return it. If anything at all is unusual, **refuse**. Refusal is safe and
-cheap: `_same_package` (`refresher.py:199`) returns False on an unknown side, so
-a refusal forces a refresh and falls back to the coarse `command + args`
-identity, which is unique per config and never collides. It does not block a
-server from launching.
+If yes, return it. Otherwise **refuse**.
+
+**Why refusal is safe — corrected.** Rev 3 said the coarse `command + args`
+fallback identity is "unique per config and never collides." **That is false**,
+and a seat verified it: two refused servers with identical argv and different env
+*do* share the coarse string. Refusal is safe for a different reason — a refusal
+yields `("unknown", None)` (`version_checker.py:1553`), the cache stores
+`package_type="unknown"`, and `_same_package` treats `"unknown"` as
+unidentified (`refresher.py:226-229`), so **every** comparison fails closed
+regardless of the coarse string. The poisoned *type*, not the string, is what
+makes it safe.
+
+**The honest cost of refusing**, also verified: a refused server re-connects and
+regenerates its descriptions on **every** refresh cycle and is listed
+permanently stale by `check_staleness` (`refresher.py:512`). That is a cost, not
+a correctness problem, and it is why the allowlist is drawn to cover the plain
+shape rather than drawn as tightly as possible.
 
 **Why narrow.** Five defects in this parser (#180 → #192 → #194 → #195 → the
 2.5.2 nullable-spelling fix) were all in the rules *around* the tables. Three
@@ -101,19 +119,32 @@ resolver would mint identity for a server that can never launch.
 
 ## The resolution contract
 
-### Step 1 — Gate. Refuse before parsing if any of these hold
+### Step 1 — Refuse unless everything is on an allowlist
 
-Cheap, purely local, and each closes a class the board proved is real:
+**WAS WRONG (rev 3):** this was a denylist — "refuse if `npm_config_*` in env, or
+`cwd` set, or `--call`, or …". Four verified holes followed, each producing a
+*confident wrong answer*, because every `npm_config_*` option is equally
+settable as a **command-line flag** and the denylist covered only env:
 
-| Condition | Why |
+- `npx --userconfig $RC probe` → fetched `rc-pkg` (the rc file's `package=`).
+- `npx --prefix $DIR probe` → same, via `$DIR/.npmrc`.
+- `npx --registry=… probe` → same *name*, different registry namespace; and
+  `update_server` builds its probe **without** the server's flags
+  (`handlers.py:~5069`), so a private-registry name gets probed against public
+  npmjs.org, where it is squattable.
+
+nopt returns the parsed config keys directly, so the allowlist is nearly free
+and closes keys npm has not invented yet:
+
+| Requirement | Rationale |
 |---|---|
-| command is not bare `npx`/`npm` | a full path never reaches this branch today |
-| any `npm_config_*` key in effective env, **case-insensitive** | npm matches `/^npm_config_/i`; `NPM_CONFIG_PACKAGE` verified to win over argv |
-| the server sets `cwd` | project `.npmrc` and workspace/local bin resolution both key off it (F3) |
-| `--call` / `-c` present with a non-empty value | the tool surface is the shell string, not a package (F6); the definition default is `''`, so test the value, not the key |
-| two or more *distinct* `--package` values | npm installs both; the union is the tool surface |
-| any workspace flag (`--workspace`, `-w`, `--workspaces`, `-ws`) | selects a bin from the workspace, not the registry |
-| the child's spawn-time self-test failed | see "Drift" |
+| command is bare `npx`/`npm` | a full path never reaches this branch |
+| **every parsed nopt config key is in `{yes, package}`** | anything else may redirect resolution. 78 of 79 shipped servers parse to `{yes}` alone, so the allowlist costs nothing |
+| server env sets **no** key matching `npm_config_*` (case-insensitive), `PATH`, `NODE_PATH`, `NODE_OPTIONS`, `PREFIX`, or `NVM_*` | npm matches `/^npm_config_/i`; and a server-set `PATH` selects *which npm runs* — verified: npm 11.6.2 and 11.19.0 disagree on `npx --name foo probe` (`foo` vs `probe`) |
+| the **effective** cwd (server `cwd`, else the pmcp process's own `os.getcwd()`) contains no `package.json` and no `.npmrc` in its project-root walk | **WAS WRONG (rev 3):** it gated only *server* `cwd` and claimed the project case closed. Verified false — with pmcp's own cwd inside a node project, `npx probe` resolved via that project's `.npmrc`, and with `node_modules/.bin/<name>` present npx ran the **local bin with no registry fetch at all** |
+| the spawn-time self-test passed, and the `npx-cli.js` hash matches | see "Drift" |
+
+Anything else: `REFUSED`.
 
 ### Step 2 — Parse
 
@@ -130,8 +161,20 @@ A single `--package` value outranks the positional (this is #182).
 
 ### Step 3 — Validate
 
-Run the candidate through the host's own `npm-package-arg`. Empty spec, or no
-valid name, → refuse (F2).
+Run the candidate through the host's own `npm-package-arg` and **require
+`type in {"tag", "version", "range"}`**.
+
+**WAS WRONG (rev 3):** "empty spec, or no valid name, → refuse" was not enough.
+Verified: `npx -y myalias-zz@npm:left-pad` runs **`left-pad`**, but npa returns
+`{type: "alias", name: "myalias-zz"}` — a perfectly valid name — and
+`_strip_npm_tag` yields `myalias-zz`. So an alias mints a confident wrong
+identity, version checks query a squattable name, and swapping the alias target
+(`a@npm:x` → `a@npm:y`) leaves the identity unchanged so `_same_package`
+confirms TRUE and serves x's descriptions for y. That is the #180 class,
+reopened through the "certain" path. `git`, `remote`, `file` and `directory`
+specs already refuse under the old wording because npa gives them
+`name: undefined`; `alias` is the one type with a name that is not the package
+npm fetches.
 
 Return the spec **raw**, tag intact — `_strip_npm_tag` stays in
 `detect_package_type`, because `handlers.py:306-330` needs the suffix to tell a
@@ -167,8 +210,14 @@ The child runs a small **invariant corpus at spawn** — the step-2/3 cases —
 against the host's own nopt and definitions. Any failure ⇒ the resolver reports
 `UNAVAILABLE`-with-reason for its whole lifetime **and logs once at WARNING**, so
 a future npm that changes resolution degrades loudly to the tables instead of
-answering wrongly. The `npx-cli.js` hash stays as a free tripwire but is
-documented as *not* the guard.
+answering wrongly. The `npx-cli.js` hash stays as a tripwire **with a specified firing action**: a
+mismatch produces the same `UNAVAILABLE`-with-reason + WARNING as a failed
+self-test. Rev 3 called it a tripwire but never said what it does on mismatch,
+which made it decorative. It matters because the self-test *is* tautological with
+respect to the ported pre-scan — port and expectations are frozen by the same
+author — so the hash is the only thing that can detect pre-scan drift. The
+self-test's expected values are frozen literals, never recomputed from the code
+under test.
 
 The child also re-stats the npm root's `package.json` version per resolve and
 respawns on change, so an in-place npm upgrade cannot leave a require-cached
@@ -222,10 +271,24 @@ parser answering with stale definitions.
 
 ### Call sites (modify)
 
-`refresher.py:259`, `:420`, `:499`; `handlers.py:~5048` (`update_server`) and
-`:315` (pin detection); `version_checker.py:1654` (`get_package_version`). Each
-already has the server config in hand; each must pass its effective env
-(`sanitized_subprocess_env` overlay) and `cwd`.
+**WAS WRONG (rev 3):** it listed six call sites and said each "already has the
+server config in hand." A seat applied the signatures in a scratch copy and ran
+mypy: the six surface, but two of them are inside *other* functions that have no
+config in hand, so the change cascades:
+
+- `version_checker.py:1673` sits inside `get_package_version(command, args,
+  timeout)` → that signature must grow too → its callers at `refresher.py:266`,
+  `:291`, `:503` (three sites rev 3 never listed; the ones it did list are
+  different calls) → and ~10 `fake_get_package_version(command, args,
+  timeout=5.0)` monkeypatches in `tests/test_tools.py`.
+- `handlers.py:315` sits inside `_detect_effective_version_pin(package_type,
+  command, args)` → that signature and its caller at `~:5070` grow.
+
+`mypy src/` never sees the test fakes — those fail at pytest runtime only. The
+implementer must treat the closure above as the work item, not the six.
+
+Each converted site passes its effective env (the `sanitized_subprocess_env`
+overlay) and the effective cwd.
 
 ### `pyproject.toml` (modify)
 
@@ -276,20 +339,31 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src/
 
 ## Acceptance criteria
 
-- [ ] **All 79 manifest npm servers resolve to the same package the real binary
-      runs**, proven by `differential_npm_corpus.py --against-binary` reporting
-      zero disagreements — and the run must show a non-zero resolved count, so a
-      refuse-everything implementation cannot pass. (F1 would have made all 79
-      resolve to `exec`; this is the criterion that catches it.)
+- [ ] **All 79 manifest npm servers resolve** to the same package the real binary
+      runs, with zero disagreements — *and* every form on this required-to-resolve
+      list also resolves (not refuses), matching the binary: `npx -y <pkg>`,
+      `npx <pkg>`, `npm exec <pkg>`, `npm exec --package=<pkg> -- <bin>`,
+      `npx -y <pkg>@1.2.3`, `npx -y @scope/<pkg>`.
+      **WAS WRONG (rev 3):** "zero disagreements AND a non-zero resolved count"
+      is satisfied by a regex that resolves one form and refuses everything else,
+      because a refusal is not a disagreement. Naming the list is what makes the
+      criterion bite.
 - [ ] Every named corpus form yields a **recorded three-way verdict**
       (resolver / tables / binary), with "binary made no fetch" and "binary
       crashed" as first-class expected outcomes. Membership in the corpus is not
       enough — rev 2's wording passed if a form was present but never compared.
-- [ ] **A `REFUSED` result never reaches the table scan**, proven by a **call
-      counter on the table-scan entry point asserting zero invocations**, for at
-      least one input per step-1 gate, each chosen so the un-poisoned tables
-      return a *non-None wrong* answer. Rev 2's monkeypatch wording was shown to
-      pass against an implementation where the scan demonstrably ran (F5).
+- [ ] **A `REFUSED` result never reaches the table scan**, asserted on the
+      **result**: for every input that trips an allowlist requirement, and for
+      which the un-poisoned tables return a non-`None` *wrong* answer X,
+      `_npm_package_arg(...) is None` and `detect_package_type(...) ==
+      ("unknown", None)`.
+      **WAS WRONG (rev 3):** it specified a monkeypatched call counter *and
+      dropped rev 2's result assertion*. A seat then passed it with an
+      implementation whose REFUSED path calls the scan through a def-time alias
+      and returns the scan's wrong answer — the counter saw zero because the
+      monkeypatch has exactly the def-time blindness rev 3 claimed to close, and
+      nothing checked the result. Assert the result; a counter may supplement it
+      only if instrumented *inside* the scan function rather than monkeypatched.
 - [ ] With the resolver active, `npm run mcp`, `npm start`, `npm test`,
       `npm -y server-pkg` and `npm dlx x` return `("unknown", None)`; `npm exec
       --package=pkg -- bin` returns `pkg`; `npm exec pkg@1.2.3` returns raw
@@ -309,11 +383,13 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src/
 
 - Workspace / local / global **bin** resolution (`libnpmexec` searches these
   before the registry). Refused via the workspace-flag and `cwd` gates.
-- `.npmrc` at project, user, or global level. The project case is refused via the
-  `cwd` gate; **user and global `.npmrc` remain unguarded** — a `package=` or
-  `registry=` line there changes resolution and the resolver cannot see it. This
-  is the one known hole left open, and it is stated here rather than discovered
-  later.
+- `.npmrc` at user or global level. **WAS WRONG (rev 3):** it claimed the project
+  case was "refused via the `cwd` gate" — false, because that gate read only the
+  *server's* `cwd` while npm resolves from the *process* cwd when none is set.
+  Rev 4's effective-cwd requirement closes the project case. **User and global
+  `.npmrc` remain unguarded**: a `package=` or `registry=` line there changes
+  resolution and the resolver cannot see it. That is the one known hole left
+  open, stated here rather than discovered later.
 - Auto-update for any refused config. It degrades to coarse identity; it does not
   break.
 
