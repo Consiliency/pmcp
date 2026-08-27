@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The release-path workflow guards now run in CI.** `release.yml` triggers
+  only on tag push — the tag push *is* the publish — so it never appeared in a
+  PR check, and every guard that protected the last change to it was run by
+  hand, once. Two new `test.yml` jobs close that:
+
+  `workflows` runs `scripts/check_workflows.py`, which asserts by **invariant**
+  that `release.yml`'s trigger set is **exactly** `push.tags: ["v*"]` — no other
+  event and no branch or path filter alongside it, since `publish` holds
+  `id-token: write` against an environment with no protection rules, so any
+  extra trigger makes trusted publishing reachable from it — and that no
+  workflow file other than `release.yml`/`docker.yml` is tag-triggered at all;
+  the `build → publish → github-release` ordering; `environment: release` **by
+  name**; no `if:` or `continue-on-error` at job *or* step level on any of the
+  three jobs (skipping `build` skips `publish` through `needs`, and the tag push
+  still concludes green); the
+  exact committed `permissions:` maps at both workflow and job level, the exact
+  committed `uses:` references, and exactly the three expected jobs; that every
+  job in every workflow carries a `timeout-minutes` of 10–30 (a bare
+  `timeout-minutes: 360` re-creates the six-hour default); and by **drift**
+  that no job present in the PR base has disappeared from any changed workflow,
+  including one deleted outright. Drift **fails closed**: a base ref that does
+  not resolve, and a `git diff` that fails for any other reason (a base sharing
+  no history with HEAD exits 128), are failures, never "nothing changed". It
+  also runs a digest-pinned actionlint.
+
+  `release-diff-ack` covers by **acknowledgement** what an allowlist cannot
+  cover by enumeration: any PR touching `release.yml` fails unless it carries a
+  `release-change-approved` label, read live from the API rather than from the
+  event payload frozen at trigger time.
+
+  **Not covered, deliberately:** a timeout above the 10-minute floor but below a
+  job's real p100; environment protection rules, which live in GitHub settings
+  and are invisible to any file check; and `if:`-skipping the guard job itself,
+  which GitHub counts as *satisfying* a required check. Per-mutant exit codes,
+  including the ones that stay green, are in
+  `.consiliency/evidence/mutation-189.md`.
+
+  Because the `uses:` and `permissions:` allowlists are exact, a legitimate
+  edit to `release.yml` — bumping an action, granting a scope — must update the
+  constants in `scripts/check_workflows.py` in the same PR. That is intended.
+
 ## [2.5.2] - 2026-08-26
 
 ### Fixed
