@@ -126,6 +126,13 @@ class GatewayDiagnosticsInfo(BaseModel):
     auth_state_semantics: dict[AuthState, AuthStateSemanticsInfo] = Field(
         default_factory=lambda: DEFAULT_AUTH_STATE_SEMANTICS.copy()
     )
+    # State of the npm package-identity resolver (Consiliency/pmcp#195). When
+    # it refuses for its process lifetime -- an unrecognised `npx-cli.js`, a
+    # failed self-test, an `npm_config_*` in the gateway's own environment --
+    # every npm/npx server silently loses auto-update and version reporting.
+    # That is announced by exactly one WARNING, which is easy to miss in a
+    # gateway that runs for days, so it is answerable here on demand.
+    npm_identity: str | None = None
 
 
 class AuthMetadataInfo(BaseModel):

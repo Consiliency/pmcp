@@ -934,6 +934,56 @@ class TestIdentityInputsAreRequired:
             assert parameters[name].default is inspect.Parameter.empty
 
 
+class TestHealthReportsResolverState:
+    """A fleet-wide loss of npm identity must be answerable, not just logged.
+
+    Sticky refusal is announced by exactly one WARNING at whatever moment the
+    first npm server was resolved. In a gateway that runs for days that line is
+    long gone from anyone's attention, so `gateway.health` carries the state.
+    """
+
+    def test_summary_never_spawns(self, tmp_path: Path) -> None:
+        instance = NpmResolver(helper=tmp_path / "does-not-exist.js")
+        try:
+            assert "not started" in instance.status_summary()
+            assert instance.spawn_attempts == 0
+        finally:
+            instance.close()
+
+    def test_summary_names_a_sticky_refusal(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("npm_config_package", "evil-pkg")
+        instance = NpmResolver()
+        try:
+            assert instance.resolve("npx", ["-y", "p"], {}, None).is_refused
+            summary = instance.status_summary()
+            assert summary.startswith("DISABLED")
+            assert "npm_config_package" in summary
+        finally:
+            instance.close()
+
+    def test_summary_names_the_fallback(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        empty = tmp_path / "emptybin"
+        empty.mkdir()
+        monkeypatch.setenv("PATH", str(empty))
+        instance = NpmResolver()
+        try:
+            assert instance.resolve("npx", ["-y", "p"], {}, None).is_unavailable
+            assert instance.status_summary().startswith("fallback to flag tables")
+        finally:
+            instance.close()
+
+    @requires_node
+    def test_summary_names_the_npm_version_when_active(
+        self, resolver: NpmResolver
+    ) -> None:
+        _live(resolver)
+        assert resolver.status_summary().startswith("active (npm ")
+
+
 # ---------------------------------------------------------------------------
 # Packaging
 # ---------------------------------------------------------------------------

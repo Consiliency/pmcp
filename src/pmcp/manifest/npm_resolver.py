@@ -504,6 +504,29 @@ class NpmResolver:
             return _refused("npm resolver child sent an unusable spec")
         return NpmResolution(status="IDENTITY", spec=spec)
 
+    # -- introspection -----------------------------------------------------
+
+    def status_summary(self) -> str:
+        """One line for gateway.health. **Never spawns.**
+
+        A fleet-wide loss of npm identity is otherwise visible only as a single
+        WARNING at whatever moment the first npm server was resolved, which is
+        easy to miss in a long-running gateway's log. Reporting it in
+        gateway.health makes it answerable on demand.
+
+        Deliberately reports only what is already known: forcing a spawn here
+        would make a diagnostic call start a subprocess, and would report a
+        healthy resolver on a gateway that has never resolved anything.
+        """
+        with self._lock:
+            if self._sticky is not None:
+                if self._sticky.is_unavailable:
+                    return f"fallback to flag tables ({self._sticky.reason})"
+                return f"DISABLED, refusing every query ({self._sticky.reason})"
+            if self._proc is None or self._proc.poll() is not None:
+                return "not started (no npm/npx server resolved yet)"
+            return f"active (npm {self._npm_version})"
+
     # -- teardown ----------------------------------------------------------
 
     def close(self) -> None:

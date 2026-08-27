@@ -74,6 +74,7 @@ from pmcp.manifest.registry import (
     load_registry_cache,
 )
 from pmcp.manifest.refresher import save_descriptions_cache
+from pmcp.manifest.npm_resolver import get_resolver
 from pmcp.manifest.version_checker import (
     _docker_image_arg,
     _docker_image_digest,
@@ -2600,6 +2601,7 @@ class GatewayTools:
         diagnostics.protocol_version_visible = any(
             server.protocol_version for server in servers
         )
+        diagnostics.npm_identity = get_resolver().status_summary()
 
         servers.sort(key=lambda server: server.name)
         return HealthOutput(
