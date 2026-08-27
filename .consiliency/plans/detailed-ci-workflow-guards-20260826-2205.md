@@ -1,5 +1,9 @@
 # Detailed plan: run #187's workflow guards in CI
 
+> **Revision 4 (2026-08-27).** Rev 3 boarded 2 AGREE / 1 DISAGREE. The DISAGREE
+> found a real new mutant — workflow-level `permissions: write-all` bypasses the
+> job-level check entirely — plus four contract gaps. All five folded in below.
+>
 > **Revision 3 (2026-08-27).** Rev 1 was boarded (2 DISAGREE, 2 PARTIALLY AGREE)
 > and rev 2 was boarded again (2 DISAGREE, 1 AGREE, 1 seat unavailable). Rev 2's
 > central defect was that its *repair* of rev 1 created a fresh
@@ -81,9 +85,13 @@ allowlist never anticipated. Do both.
     remainder. Note this is stricter than `job_set_drift`, which allows additions
     generally; `release.yml` earns the stricter rule because it is the file with
     no PR-time feedback.
-  - **`permissions:` on each job equals the committed map exactly** —
-    `publish: {id-token: write}`, `github-release: {contents: write}`, `build`
-    unset. Widening is otherwise invisible.
+  - **`permissions:` equals the committed map exactly at BOTH levels** —
+    job-level (`publish: {id-token: write}`, `github-release: {contents: write}`,
+    `build` unset) **and workflow-level (absent)**. Checking only the job level
+    is a concrete bypass: workflow-level `permissions: write-all` leaves every
+    job map untouched while widening `build`, because a workflow-level block
+    applies to any job that does not override it. Found by the red-team seat on
+    rev 3; add it as a committed mutant in the matrix.
   - **every `uses:` equals the committed reference exactly.** This pins
     `pypa/gh-action-pypi-publish@release/v1` against being repointed to a fork.
     It does not make `@release/v1` safe — that is a mutable tag, called out under
@@ -156,10 +164,15 @@ allowlist never anticipated. Do both.
      guard dead on arrival while local `uv run` still passed and AC2 looked
      green. This is the single most likely way to ship a guard that guards
      nothing.
-  2. install `actionlint` at an **explicitly named version with an explicitly
-     named checksum** (rev 1 said "pinned, checksum-verified" but named neither,
-     making the criterion unenforceable), then run it bare — **no glob**: `*.yml`
-     leaves a `.yaml` workflow unchecked, and it exits 3 outside a git root.
+  2. install `actionlint` **v1.7.12**, downloading
+     `actionlint_1.7.12_linux_amd64.tar.gz` from the GitHub release and verifying
+     it against the digest recorded in `.consiliency/evidence/mutation-189.md`
+     (the implementer records the digest there when pinning; an acceptance
+     criterion asserts the installed binary matches). Rev 1 said "pinned,
+     checksum-verified" and rev 3 still named neither version nor digest in the
+     Changes section — the red-team seat correctly called that a repeat of the
+     defect it claims to fix. Then run it bare — **no glob**: `*.yml` leaves a
+     `.yaml` workflow unchecked, and it exits 3 outside a git root.
   3. `uv run python scripts/check_workflows.py --base-ref …`.
 - `release-diff-ack` job — add — any PR whose diff touches `.github/workflows/release.yml`
   fails unless the PR carries a `release-change-approved` label. This is the
@@ -204,6 +217,15 @@ required contexts currently do not include it.
 - `TestJobSetDrift` — add — job removed (fail), added (pass), renamed (fail),
   file unchanged (pass), new file with no base (pass, no crash).
 - `TestOnKeyParsing` — add.
+
+### `scripts/_mutate_workflow.sh` (create)
+
+The verification loop and the evidence matrix both invoke this; rev 3 referenced
+it without creating it, so the specified evidence could not be produced as
+written. It takes a mutant name, applies that edit to the real workflow tree, and
+exits non-zero on an unknown name. Its mutant list must be exactly the set named
+in `TestReleaseInvariants` + `TestTimeoutInvariants`, including the three rev 3
+added (forked action, widened permissions at **both** levels, added job).
 
 ### `.consiliency/evidence/mutation-189.md` (create)
 
@@ -285,8 +307,19 @@ a `--base-ref` that does not exist; a PR adding a new workflow file;
       `bypass-proofs-187.md` records as having already happened once here.
 - [ ] `TestOnKeyParsing` fails if the `on`/`True` handling is removed — verified
       by deleting it and observing red.
-- [ ] A PR touching `release.yml` without the `release-change-approved` label
-      fails `release-diff-ack`.
+- [ ] `release-diff-ack` is proven in **all three** directions, not just the
+      negative one: a PR that does not touch `release.yml` passes; a PR that
+      touches it **without** the label fails; and a PR that touches it **with**
+      the label passes, including the label-applied-then-rerun path. Rev 3 had
+      only the negative case, which an implementation that always fails on any
+      `release.yml` change satisfies.
+- [ ] The job reads **live** labels via the API, not
+      `github.event.pull_request.labels`. That context is frozen at trigger time
+      and a re-run replays the frozen payload, so a label applied to an already
+      failed PR would never be seen — the exact trap the existing `changelog`
+      job documents at `test.yml:220-228`.
+- [ ] The installed `actionlint` binary matches the pinned v1.7.12 digest
+      recorded in the evidence file.
 
 ## Non-goals
 
