@@ -1,312 +1,323 @@
-# Detailed plan: resolve npm package identity by calling npm's own parser
+# Detailed plan: name an npm package only when npm's own parser makes it certain
 
-> **Revision 2 (2026-08-26, post-board).** Four seats reviewed revision 1; three
-> found blocking defects, and two of them independently found the same one. This
-> revision is the amended plan. Revision 1's errors are recorded inline as
-> `WAS WRONG` notes rather than deleted — they are the reason several rules below
-> exist, and removing them invites their reintroduction.
+> **Revision 3 (2026-08-27).** Rev 1 and rev 2 were both boarded; each round found
+> new blocking defects, and the surface kept growing (workspace bin resolution,
+> `.npmrc`, per-server `cwd`, `libnpmexec` skew *within* npm 11.x). The operator
+> chose to **narrow the scope and fail closed** rather than keep modelling npm.
+> Rev 1/rev 2 errors are kept inline as `WAS WRONG` — they are why these rules
+> exist.
 
 ## Task
 
-Close Consiliency/pmcp#195 by deriving npm package identity from npm's *actual*
-argument parser (`nopt` + `@npmcli/config`) instead of hand-modelled flag tables.
+Close Consiliency/pmcp#195. Replace the hand-modelled npm flag tables with a
+narrow, fail-closed resolver that uses npm's own parser (`nopt` +
+`@npmcli/config`) to answer exactly one question:
 
-Chosen over patching the four known-remaining spellings because three consecutive
-board rounds each surfaced a *new* form (#180 → #192 → #194 → #195), and a fourth
-round has now surfaced a fifth (the six nullable spellings hotfixed in 2.5.2).
-The tables verify clean against nopt; every defect has been in the rules *around*
-them. That does not converge by adding rows.
+> **Can we name this server's package with certainty?**
 
-**WAS WRONG (rev 1): "exact by construction."** Verified false. Package identity
-is not a pure function of argv — `npm_config_package=env-pkg npx plainbin` really
-runs `env-pkg`. See "Identity inputs" below. The claim is dropped; the goal is
-*exact given a stated input set, and refusal outside it*.
+If yes, return it. If anything at all is unusual, **refuse**. Refusal is safe and
+cheap: `_same_package` (`refresher.py:199`) returns False on an unknown side, so
+a refusal forces a refresh and falls back to the coarse `command + args`
+identity, which is unique per config and never collides. It does not block a
+server from launching.
+
+**Why narrow.** Five defects in this parser (#180 → #192 → #194 → #195 → the
+2.5.2 nullable-spelling fix) were all in the rules *around* the tables. Three
+board rounds on rev 1/rev 2 each found a further way a *confident* answer is
+wrong. Chasing full fidelity means re-implementing npm's resolution order —
+workspace/local/global bin search, three levels of `.npmrc`, cwd, `libnpmexec`
+version skew — which is the same hand-modelling at larger scale.
+
+**Measured cost of narrowing: essentially zero.** Of the manifest's 79 npm-family
+servers, **78 use the plain `npx -y <pkg>` shape**. None sets `cwd`, none sets
+`npm_config_*`, none uses `--call`, multiple `--package`, or workspace flags.
 
 ## Research summary
 
-All measured on this host (node v24.13.0, npm 11.19.0) or by a board seat that
-ran the real binary against a dead registry (`npm_config_registry=http://127.0.0.1:9`,
-so the fetch URL in the error names exactly which package npm resolved).
+Measured on this host (node v24.13.0, npm 11.19.0) or by board seats running the
+real binary against a dead registry (`npm_config_registry=http://127.0.0.1:9`, so
+the fetch URL in npm's error names the resolved package without installing).
 
-**nopt is authoritative and reachable.** `nopt(types, shorthands, argv, 0).argv.remain`
-returns the positional list; `types[k] = definitions[k].type` matches npm's own
-`getTypesFromDefinitions` (`@npmcli/config/lib/index.js:1017`) exactly. npm
-additionally installs `invalidHandler`/`unknownHandler`/`abbrevHandler`, all
-verified warning-only — they cannot change `remain`. A raw nopt call is
-outcome-equivalent to npm's parse.
+**nopt is authoritative.** `types[k] = definitions[k].type` matches npm's own
+`getTypesFromDefinitions` (`@npmcli/config/lib/index.js:1017`); npm's
+`invalidHandler`/`unknownHandler`/`abbrevHandler` are all warning-only and cannot
+change `remain`. Two nopt majors (8.1.0, 9.0.0) parse the whole edge set
+identically.
 
-**Real-binary differentials confirm the pipeline**, including the npm/npx split
-that no single rule can model: `npx --y null probe-y` fetches the literal package
-`null`, while `npm exec --y null probe-npmy` fetches `probe-npmy`. Also
-`npx --frobnicate valpkg realbin` fetches **valpkg** — an unknown flag does *not*
-consume its value. The shipped fail-closed tables over-refuse this class; the
-resolver is strictly more accurate on it.
+**The resolver beats the shipped tables where they over-refuse:**
+`npx --pack zz bin` → `zz`, `npx --yes=maybe tok bin2` → `maybe`,
+`npx --frobnicate valpkg realbin` → `valpkg` (an unknown flag does *not* consume
+its value). All confirmed against the real binary.
 
-**Persistent child is the only viable shape.** 79 one-shot resolves = 4.02 s of
-blocking work; persistent = 43 ms startup + 39 ms for all 79 (~0.5 ms each).
-`detect_package_type` is **synchronous** and called from inside async coroutines
-(`refresher.py:259`, `:420`) and a sync loop (`:499`), so 4 s is disqualifying.
+**Persistent child is the only viable shape.** 79 one-shot resolves = 4.02 s;
+persistent = 43 ms startup + ~0.5 ms/query. `detect_package_type` is
+**synchronous** and called from inside async coroutines (`refresher.py:259`,
+`:420`) and a sync loop (`:499`).
 
-**Blast radius.** `detect_package_type` (`version_checker.py:1475`) is imported by
-`refresher.py:22` and `handlers.py:84`; `_npm_package_arg` (`version_checker.py:1092`)
-is shared with `update_server`'s pin detection so the two can never disagree.
-79 of 98 launchable manifest servers are `npx`.
+## Findings that shaped this revision
 
-## The three rules this plan exists to not break
+Each was verified by a board seat running it.
 
-Board findings, each verified. These are stated first because revision 1 broke
-two of them.
+**F1 — `remain[0]` is `"exec"`, not the package.** `npx-cli.js:7` does
+`process.argv.splice(2, 0, 'exec')` and the pre-scan loop starts at `i = 3` *on
+that basis*. A faithful port yields `remain = ["exec", "probe-a"]` for
+`npx -y probe-a`. **`exec` is a real published package** (registry returns HTTP
+200), so rev 2's rule would have made `update_server` probe
+`npx -y exec@latest --help` for all 79 npx servers — the #183 class, at fleet
+scale.
 
-### R1 — Three outcomes, never two
+**F2 — an invalid spec becomes the package `undefined`.** `npm exec -- --flag-thing`
+and `npx --package="" somebin` both fetch `/undefined` from the real binary, and
+**`undefined` exists on the registry**. Rev 2's rules 1 and 4 would mint
+`--flag-thing` and `""` respectively — the latter collapsing every such server
+onto one degenerate key.
 
-**WAS WRONG (rev 1):** `resolve()` returned `str | None`, and `_npm_package_arg`
-fell back to the tables on *any* `None`. Two seats independently showed this is
-self-contradicting: the plan demands drift *refuse* identity, but a refusal
-returning `None` then hits the table scan, which maps both
-`npx --global=zz-a shared-bin` and the `zz-b` form to `shared-bin` — the exact
-collision the phase exists to close. Fail-open, reintroduced on the primary path.
+**F3 — `.npmrc` is an identity input the resolver never sees.** A server `cwd`
+containing a project root with `.npmrc` setting `package=rcfile-pkg` makes
+`npx plainbin` fetch `rcfile-pkg`. User and global `.npmrc` apply regardless of
+cwd. Rev 2's env rule gives zero protection against this.
+
+**F4 — the npm-major ceiling guards at the wrong granularity.**
+`npx --name foo probe-a` fetches `probe-a` on npm 11.19.0 but `foo` on npm
+11.6.2 — 22 config definitions were added *within* major 11, several
+value-consuming, and nopt itself went 8.1.0 → 9.0.0 inside an npm minor.
+`npx-cli.js` is hash-identical across both, confirming rev 2's own point that the
+hash never fires.
+
+**F5 — rev 2's acceptance criterion 3 was satisfiable by a broken
+implementation.** A seat wrote a `_npm_package_arg` whose REFUSED path calls the
+table scan through a def-time import binding, plus the test exactly as worded —
+**it passed.** Two stacked holes: monkeypatching the module attribute misses the
+def-time binding, and the chosen refusal case is one the tables *also* refuse, so
+`is None` held while the table scan demonstrably ran.
+
+**F6 — `--call` was unreachable.** Rev 2 ordered `--package` (rule 1) before
+`--call` (rule 3), so `npx --package=p --call='echo hi'` returned `p` and never
+reached the refusal. npm's own documented shape.
+
+**F7 — `dlx` is not an npm subcommand.** `npm dlx probe` → `Unknown command`. It
+sits in the allowlist at `version_checker.py:78` (it is pnpm/yarn), so the
+resolver would mint identity for a server that can never launch.
+
+## The resolution contract
+
+### Step 1 — Gate. Refuse before parsing if any of these hold
+
+Cheap, purely local, and each closes a class the board proved is real:
+
+| Condition | Why |
+|---|---|
+| command is not bare `npx`/`npm` | a full path never reaches this branch today |
+| any `npm_config_*` key in effective env, **case-insensitive** | npm matches `/^npm_config_/i`; `NPM_CONFIG_PACKAGE` verified to win over argv |
+| the server sets `cwd` | project `.npmrc` and workspace/local bin resolution both key off it (F3) |
+| `--call` / `-c` present with a non-empty value | the tool surface is the shell string, not a package (F6); the definition default is `''`, so test the value, not the key |
+| two or more *distinct* `--package` values | npm installs both; the union is the tool surface |
+| any workspace flag (`--workspace`, `-w`, `--workspaces`, `-ws`) | selects a bin from the workspace, not the registry |
+| the child's spawn-time self-test failed | see "Drift" |
+
+### Step 2 — Parse
+
+Build argv as npx itself does — `["exec", *args]` — run the pre-scan for `npx`
+only, then `nopt`. Identity is the first `remain` token **after the leading
+`"exec"`**; if absent, refuse (F1).
+
+For `npm`, the first remain token must be in
+`_NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND` **minus `dlx`** (F7); otherwise refuse.
+This preserves #183: `npm run mcp`, `npm start`, `npm test`, `npm create foo`,
+`npm rum mcp` and bare `npm -y pkg` all refuse.
+
+A single `--package` value outranks the positional (this is #182).
+
+### Step 3 — Validate
+
+Run the candidate through the host's own `npm-package-arg`. Empty spec, or no
+valid name, → refuse (F2).
+
+Return the spec **raw**, tag intact — `_strip_npm_tag` stays in
+`detect_package_type`, because `handlers.py:306-330` needs the suffix to tell a
+pinned server from an unpinned one.
+
+### Step 4 — Tri-state, and what falls back
 
 | Outcome | Meaning | `_npm_package_arg` does |
 |---|---|---|
-| `Identity(spec)` | nopt named a package | return `spec` **raw**, tag intact |
-| `REFUSED` | helper ran; no recoverable identity, or an untrustworthy input | return `None` — **never scan the tables** |
-| `UNAVAILABLE` | no node, spawn failed, sticky-unavailable | fall through to the tables |
+| `Identity(spec)` | steps 1–3 all passed | return `spec` raw |
+| `REFUSED` | any gate tripped, or an in-flight request timed out / the child died / the response failed schema | return `None` — **never scan the tables** |
+| `UNAVAILABLE` | **spawn** failed: no node, no npm root | fall through to the tables |
 
-A sentinel type, not `None`. `REFUSED` and `UNAVAILABLE` must be
-distinguishable at the type level so a future edit cannot silently merge them.
+**WAS WRONG (rev 1):** `str | None` with fallback on any `None`. That
+contradicted the plan's own refusal rule — a refusal hit the table scan and
+reminted the collision.
 
-### R2 — nopt resolves flags, not npm semantics
+**WAS WRONG (rev 2):** it said both "on timeout or parse error, mark unavailable"
+and "sticky is reserved for spawn failure." Resolved: an input-caused child death
+(OOM/abort — the in-child `try`/`catch` cannot contain those, and real npx dies
+at `npx-cli.js:89` on `--__proto__=evil`) must classify as `REFUSED` for the
+in-flight request, with the *child* moving to respawn-once. Sticky
+`UNAVAILABLE` is only ever set by a failed spawn.
 
-**WAS WRONG (rev 1):** the `remain`+`package` → identity mapping was left
-unspecified. A naive "skip the first token" reopens two closed issues:
+## Drift — behavioural, not version-based
 
-- `npm run mcp` → remain `["run","mcp"]` → `mcp` → `update_server` builds
-  `npx -y mcp@latest --help` (`handlers.py:~5069`) and **installs and executes a
-  package named after a script**. That is #183, closed nine hours ago by the
-  subcommand allowlist at `version_checker.py:77`. Same for `npm start`,
-  `npm test`, `npm create foo` (npm resolves that to `create-foo`, a *different*
-  package), and typos like `npm rum mcp`.
-- `npm exec --package=x bin` → remain `["exec","bin"]`, package `["x"]`. Taking
-  remain yields `bin` and reopens #182.
+**WAS WRONG (rev 1):** SHA-256 pin on `npx-cli.js`. Byte-identical 10.8.2 →
+11.19.0; never fires.
+**WAS WRONG (rev 2):** npm-major ceiling. F4 proves parse behaviour changes
+within a major.
 
-The mapping is specified once, here, and pinned by tests on the resolver-active
-path:
+The child runs a small **invariant corpus at spawn** — the step-2/3 cases —
+against the host's own nopt and definitions. Any failure ⇒ the resolver reports
+`UNAVAILABLE`-with-reason for its whole lifetime **and logs once at WARNING**, so
+a future npm that changes resolution degrades loudly to the tables instead of
+answering wrongly. The `npx-cli.js` hash stays as a free tripwire but is
+documented as *not* the guard.
 
-1. `package` non-empty and all entries identical → that spec.
-2. `package` has two or more *distinct* specs → `REFUSED`. Verified: `npx
-   --package=aa --package=bb somebin` installs both; the union is the tool
-   surface, so no single name is the identity.
-3. `call` present → `REFUSED`. Verified: `npx --package=p --call='echo hi'` runs
-   the shell string, not a binary from `p`; two servers sharing `p` with
-   different `--call` have different tool surfaces.
-4. Else `command == "npm"`: first remain token must be in
-   `_NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND`; otherwise `REFUSED`. Identity is
-   the next remain token, or `REFUSED` if absent.
-5. Else `command == "npx"`: identity is `remain[0]` after the pre-scan.
-6. Return the **raw** spec including any `@tag`/`@version`. `_strip_npm_tag`
-   stays in `detect_package_type`. A stripped return makes a pinned server look
-   unpinned to `handlers.py:306-330` and eligible to be moved to `@latest`.
-
-### R3 — Existing regression tests run on BOTH paths
-
-**WAS WRONG (rev 1):** "force the resolver unavailable via the fixture so
-[existing npm table tests] keep testing the fallback they were written for."
-On a node-ful host the resolver is the *primary* path, so the whole #182/#183
-regression set would have stopped covering production. The suite would be green
-while `npm run mcp` resolved to a package again.
-
-Every existing npm identity test is **parametrized over both paths**
-(resolver-active and resolver-unavailable) rather than pinned to one. At minimum
-these must be asserted with the resolver **active**: `npm run mcp`, `npm start`,
-`npm test`, `npm -y server-pkg` (no subcommand) → `("unknown", None)`;
-`npm exec --package=pkg -- bin` → `pkg`; `npm exec pkg@1.2.3` → raw `pkg@1.2.3`.
-
-## Identity inputs, and what is excluded
-
-**Verified:** `npm_config_package=env-pkg-xq npx plainbin-xq` fetches `env-pkg-xq`.
-Two servers with identical argv and different env run different packages. pmcp
-ships per-server env (`extra_env` #108, `server_env` #109), so this is part of
-the config model, not hypothetical.
-
-The resolve request therefore carries the server's effective identity-bearing
-npm env — `npm_config_package`, `npm_config_registry` — alongside argv. When any
-`npm_config_*` key that can change resolution is present and not modelled,
-return `REFUSED`. Naming the exclusion is mandatory: a corpus generated as
-"every flag class × attached/spaced × shorthand" cannot generate this case, so
-it would never have been caught by the acceptance suite.
+The child also re-stats the npm root's `package.json` version per resolve and
+respawns on change, so an in-place npm upgrade cannot leave a require-cached
+parser answering with stale definitions.
 
 ## Changes
 
 ### `src/pmcp/manifest/_npm_resolve.js` (create)
 
-- `resolveNpmRoot()` — add — realpath the invoked `npx`/`npm` on `PATH` and walk
-  to its `lib/node_modules`; fall back to `npm root -g`. Verified correct on this
-  host, which has two npm trees (`~/.npm-global` 11.19.0 and `/usr/lib` 11.6.2) —
-  the walk picks the one PATH's `npx` belongs to. For volta/asdf shims the walk
-  fails and the fallback is right. Note `detect_package_type` only enters the npm
-  branch for bare `npx`/`npm`, which bounds this.
-- `loadParser()` — add — require `nopt` and `@npmcli/config/lib/definitions` from
-  that root; `types[k] = definitions[k].type`.
-- `npxPreScan(argv, definitions, shorthands)` — add — faithful port of
-  `npx-cli.js` lines 63–124, `switches` recomputed from the host's `definitions`
-  exactly as npx-cli does.
-- **Per-request `try`/`catch` returning an error response** — add — mandatory,
-  not defensive style. Verified: `--__proto__=evil` and `--constructor` *throw
-  inside nopt* (`shorthands[arg].split is not a function` — Object.prototype
-  members leak into the shorthand lookup). Without containment, one poisoned
-  `.mcp.json` kills the child and, via sticky-unavailable, disables the resolver
-  for the whole process. A contained child answers the next query correctly —
-  verified.
-- Report the resolved **npm version** in every response — add. See the drift
-  section: this, not the file hash, is the real guard.
-- NDJSON request/response over stdin/stdout. Argv arrives as parsed JSON, never
-  interpolated into a shell or a `-e` program.
-
-### Drift detection — replaced, not kept
-
-**WAS WRONG (rev 1):** a SHA-256 pin on `npx-cli.js` described as "the mechanism
-that makes the one remaining hand-modelled component fail loudly." Verified
-false twice over. `npx-cli.js` is **byte-identical from npm 10.8.2 through
-11.19.0** — across a major bump the pin never fires. And there are *two*
-hand-modelled components: the pre-scan port and the `remain`→identity mapping in
-R2, which re-implements `lib/commands/exec.js` semantics and which the hash
-guards not at all.
-
-- Keep the `npx-cli.js` hash as a cheap tripwire (it costs nothing) but **do not
-  present it as the guard**.
-- **The guard is an npm-major-version ceiling.** The child reports its npm
-  version; Python refuses identity (R1 `REFUSED`, which V7-style analysis
-  confirms is safe — `_same_package` at `refresher.py:199` returns False on an
-  unknown side, so refusal forces a refresh and the coarse
-  `command + args` identity, never a collision) when the major exceeds the
-  version the differential corpus was last run against. npm's own
-  "will stop working in the next major version" warnings announce exactly the
-  parse-adjacent changes that land outside `npx-cli.js`.
+- `resolveNpmRoot()` — realpath the invoked `npx`/`npm` on `PATH`, walk to
+  `lib/node_modules`; fall back to `npm root -g`. Verified correct on a host with
+  two npm trees.
+- `loadParser()` — require `nopt`, `@npmcli/config/lib/definitions`, and
+  `npm-package-arg` from that root.
+- `npxPreScan(argv, definitions, shorthands)` — port of `npx-cli.js` 63–124 with
+  `switches` recomputed from the host's `definitions`, applied to
+  `["exec", *args]` with the same index basis (F1).
+- `selfTest()` — the invariant corpus, run once at spawn.
+- **Per-request `try`/`catch`** — mandatory. `--__proto__=evil` and
+  `--constructor` throw inside nopt (Object.prototype leaking into the shorthand
+  lookup); a contained child answers the next query correctly, verified.
+- Exit on stdin `end`, so a parent crash cannot orphan the child.
+- NDJSON over stdin/stdout. Argv arrives as parsed JSON — never a shell string,
+  never interpolated into `-e`.
 
 ### `src/pmcp/manifest/npm_resolver.py` (create)
 
-- `NpmResolver` — add — lazy spawn; `subprocess.Popen` with an explicit argv
-  list, `shell=False`; a `threading.Lock` around write+read (adequate for the
-  sync loop at `refresher.py:499` and the coroutine callers; no reentrancy path
-  exists since the memo lookup does not recurse).
-- **Read timeout: 1.0 s, implemented with a reader thread or `select`**, not a
-  blocking `readline`. Revision 1 named neither the value nor the mechanism; a
-  blocking pipe read cannot implement a timeout, so "a per-query read timeout"
-  was unimplementable as written.
-- On timeout or parse error: terminate the child and mark unavailable **before
-  releasing the lock**, so a later query cannot read an orphaned response off the
-  pipe and attribute it to the wrong request.
-- `resolve(command, args, env)` — add — returns the R1 tri-state. Memoized on
-  `(command, tuple(args), relevant_env)`.
-- **No idle reaper.** Revision 1 had one *and* sticky-unavailable; a reaper kill
-  is indistinguishable from a crash at the pipe, so the feature would die after
-  the first idle period. Either the child lives for the process (chosen: ~40 MB,
-  and it is spawned only if an npm-family server exists at all) or a reaper must
-  set "respawn on next use" — a distinct state from sticky-unavailable. Sticky
-  is reserved for *spawn* failure, which is the case it exists for.
-- Module-level singleton + `reset_for_tests()`.
+- `NpmResolver` — lazy spawn, `Popen` with an explicit argv list and
+  `shell=False`, a `threading.Lock` around write+read, **1.0 s timeout via a
+  reader thread or `select`** (a blocking `readline` cannot implement one —
+  rev 2 named neither value nor mechanism). On timeout/death: terminate and mark
+  respawn-once **before releasing the lock**, so a later query cannot read an
+  orphaned response and attribute it to the wrong request.
+- `resolve(command, args, env, cwd)` — returns the tri-state. Memoized on
+  `(command, args, relevant_env, cwd)`.
+- No idle reaper (rev 1 had one *and* sticky-unavailable, so the feature died
+  after the first idle period).
 
 ### `src/pmcp/manifest/version_checker.py` (modify)
 
-- `_npm_package_arg` (`:1092`) — modify — R1 tri-state dispatch. `UNAVAILABLE`
-  alone falls through to the table scan.
-- Flag-table docstrings (`:380`–`:430`) — modify — restate as the *fallback*
-  classification.
-- The four flag tables — unchanged. They are the node-less path and the
-  differential baseline.
+- `detect_package_type(command, args, env=..., cwd=...)` and
+  `_npm_package_arg(args, command, env, cwd)` — **modify the signatures.**
+  **WAS WRONG (rev 2):** env was declared an identity input but no production
+  signature carried it, so `resolve(..., env)` could not implement the exclusion
+  and every caller would have passed nothing. Two seats caught it independently.
+  Env/cwd are **required** parameters, not defaulted — a defaulted `None` is the
+  same silent fail-open this plan exists to remove, and making them required
+  turns every unconverted call site into a type error rather than a wrong answer.
+- Flag-table docstrings — restate as the node-less fallback.
+- The four flag tables — unchanged.
+
+### Call sites (modify)
+
+`refresher.py:259`, `:420`, `:499`; `handlers.py:~5048` (`update_server`) and
+`:315` (pin detection); `version_checker.py:1654` (`get_package_version`). Each
+already has the server config in hand; each must pass its effective env
+(`sanitized_subprocess_env` overlay) and `cwd`.
 
 ### `pyproject.toml` (modify)
 
-- package-data / `force-include` for `_npm_resolve.js` — add. `install-smoke`
-  must prove it survives a wheel install; a missing data file is the
-  shipped-broken class this repo has hit twice.
+package-data / `force-include` for `_npm_resolve.js`; `install-smoke` proves it
+survives a wheel install.
 
 ### Tests
 
-- `tests/test_npm_resolver.py` (create) — child protocol (malformed line,
-  timeout, crashed child, absent node, `--__proto__` poisoning); sticky-spawn
-  counter; tri-state distinctness.
-- `tests/test_version_checker.py` (modify) — parametrize the existing npm
-  identity suite over both paths per R3; add the R2 mapping cases and the four
-  #195 forms on the **resolver-active** path.
+- `tests/test_npm_resolver.py` — child protocol; each gate in step 1; tri-state
+  distinctness; sticky-vs-respawn; `--__proto__` containment; self-test failure.
+- `tests/test_version_checker.py` — **parametrize the existing npm identity suite
+  over both paths.** **WAS WRONG (rev 2):** it moved them onto the fallback
+  fixture, so on any node-ful host the #182/#183 regression set would have
+  stopped covering production.
 
 ### `.consiliency/notes/differential_npm_corpus.py` (create)
 
-Compares resolver vs fallback table vs **the real binary**. Required corpus
-content — an enumeration, because "generated forms" is what let #192/#194/#195
-each survive their predecessor's tests:
-
-- every flag class × attached/spaced × shorthand/abbreviation × npm/npx;
-- **every historical form** from #180, #182, #183, #192, #194, #195, 2.5.2;
-- the R2 mapping cases (subcommands, multi-`--package`, `--call`);
-- the env cases from "Identity inputs";
-- a randomized fuzz component with a fixed seed.
+Compares resolver vs fallback tables vs **the real binary**. Must contain, by
+name: every historical form (#180, #182, #183, #192, #194, #195, 2.5.2); every
+step-1 gate; F1's `npx -y pkg`; F2's `npm exec -- --flag-thing` and
+`--package=""`; F6's `--package` + `--call`; F7's `npm dlx x`; `npx --` and
+`npx -y` with no operand; scoped names; plus a fixed-seed fuzz component.
 
 ## Documentation impact
 
-- `CHANGELOG.md` — add — `### Fixed`: npm identity now comes from npm's own
-  parser; states the node-less fallback and the refusal cases plainly.
-- `README.md` — modify — one sentence in the version-check section: npm identity
-  uses the host's own npm parser when node is available, and auto-update
-  coverage is reduced without it.
+- `CHANGELOG.md` — `### Fixed`: npm identity now comes from npm's own parser
+  where it is certain, and is **refused** otherwise; states the refusal gates and
+  the node-less fallback plainly, and that refusal reduces auto-update coverage
+  for unusual configs rather than guessing.
+- `README.md` — one sentence in the version-check section.
 
 ## Dependencies & order
 
-1. `_npm_resolve.js` — defines the wire contract.
-2. `npm_resolver.py` — tri-state + lifecycle.
-3. `version_checker.py` integration — fallback wired before any existing test is
-   touched.
-4. Test parametrization (R3) — **before** the corpus, so the regression set is
-   already covering both paths when the corpus runs.
-5. Packaging + `install-smoke`.
-6. Differential corpus — acceptance evidence, not a development aid.
-
-Node is not a hard requirement; a config whose command is `npx` implies node on
-that host, so the fallback is near-unreachable for the configs that matter.
+1. `_npm_resolve.js` (wire contract). 2. `npm_resolver.py`. 3. Signature change +
+call sites — **before** any test edit, so an unconverted caller fails to compile.
+4. Test parametrization. 5. Packaging + `install-smoke`. 6. Differential corpus.
 
 ## Verification
 
 ```bash
-uv run pytest -q                       # both paths, parametrized
+uv run pytest -q
 env PATH=/usr/bin:/bin uv run pytest -q tests/test_version_checker.py -k npm
 uv run python .consiliency/notes/differential_npm_corpus.py --against-binary
-uv build && python -m venv /tmp/vw && /tmp/vw/bin/pip install -q dist/pmcp-*.whl \
-  && /tmp/vw/bin/python -c "from pmcp.manifest.npm_resolver import get_resolver; ..."
+uv build && python -m venv /tmp/vw && /tmp/vw/bin/pip install -q dist/pmcp-*.whl && \
+  /tmp/vw/bin/python -c "from pmcp.manifest.npm_resolver import get_resolver; ..."
 uv run ruff check . && uv run ruff format --check . && uv run mypy src/
 ```
 
-Edge cases: node absent; node present, npm absent; `npx` from a different prefix
-than `npm root -g`; a hung child; a child killed mid-session; `--__proto__=evil`;
-npm major above the tested ceiling; 200 concurrent resolves from threads.
-
 ## Acceptance criteria
 
-- [ ] Zero disagreements against the real binary over the differential corpus,
-      **where the corpus provably contains every historical form** (#180, #182,
-      #183, #192, #194, #195, 2.5.2), the R2 mapping cases, and the env cases —
-      asserted by a test that fails if any named form is absent from the
-      generated set. A corpus that omits the failing form is how the last three
-      fixes each passed their own suite.
-- [ ] With the resolver **active**, `npm run mcp`, `npm start`, `npm test` and
-      `npm -y server-pkg` return `("unknown", None)`, and
-      `npm exec --package=pkg -- bin` returns `pkg` — proven on the
-      resolver-active parametrization, not the fallback fixture.
-- [ ] `REFUSED` and `UNAVAILABLE` are distinguishable at the type level, and a
-      `REFUSED` result never reaches the table scan — proven by a test that makes
-      the tables return a *known-wrong* answer and asserts `detect_package_type`
-      still returns `None`.
-- [ ] npx-cli drift refuses **end-to-end**: the resolver is pointed at a fixture
-      npm root whose `npx-cli.js` differs by one byte, and `detect_package_type`
-      refuses. Injecting `npx_cli_drift: true` into a response does not count —
-      that passes even if the hash is never computed.
+- [ ] **All 79 manifest npm servers resolve to the same package the real binary
+      runs**, proven by `differential_npm_corpus.py --against-binary` reporting
+      zero disagreements — and the run must show a non-zero resolved count, so a
+      refuse-everything implementation cannot pass. (F1 would have made all 79
+      resolve to `exec`; this is the criterion that catches it.)
+- [ ] Every named corpus form yields a **recorded three-way verdict**
+      (resolver / tables / binary), with "binary made no fetch" and "binary
+      crashed" as first-class expected outcomes. Membership in the corpus is not
+      enough — rev 2's wording passed if a form was present but never compared.
+- [ ] **A `REFUSED` result never reaches the table scan**, proven by a **call
+      counter on the table-scan entry point asserting zero invocations**, for at
+      least one input per step-1 gate, each chosen so the un-poisoned tables
+      return a *non-None wrong* answer. Rev 2's monkeypatch wording was shown to
+      pass against an implementation where the scan demonstrably ran (F5).
+- [ ] With the resolver active, `npm run mcp`, `npm start`, `npm test`,
+      `npm -y server-pkg` and `npm dlx x` return `("unknown", None)`; `npm exec
+      --package=pkg -- bin` returns `pkg`; `npm exec pkg@1.2.3` returns raw
+      `pkg@1.2.3`.
+- [ ] Passing an unconverted call site (no env/cwd) is a **type error**, not a
+      silent pass — proven by `mypy` failing on a deliberately reverted caller.
+- [ ] A failing spawn-time self-test degrades to the tables **and logs once at
+      WARNING** — proven end-to-end against a fixture npm root, not by injecting
+      a flag into a response.
 - [ ] With node removed from `PATH`, all 98 manifest entries resolve exactly as
-      2.5.2 does — proven by a recorded before/after diff of the 98 pairs.
-- [ ] One spawn attempt across ≥50 resolves on a node-less host; ≤1 across ≥50 on
-      a healthy host; a hung child stalls the caller at most once, bounded by the
-      1.0 s timeout.
+      2.5.2 does — recorded before/after diff of the 98 pairs.
+- [ ] One spawn attempt across ≥50 resolves on a node-less host; a hung child
+      stalls a caller at most once, bounded by the 1.0 s timeout.
 - [ ] The helper `.js` works after installing the built wheel into a clean venv.
+
+## Non-goals, named rather than implied
+
+- Workspace / local / global **bin** resolution (`libnpmexec` searches these
+  before the registry). Refused via the workspace-flag and `cwd` gates.
+- `.npmrc` at project, user, or global level. The project case is refused via the
+  `cwd` gate; **user and global `.npmrc` remain unguarded** — a `package=` or
+  `registry=` line there changes resolution and the resolver cannot see it. This
+  is the one known hole left open, and it is stated here rather than discovered
+  later.
+- Auto-update for any refused config. It degrades to coarse identity; it does not
+  break.
 
 ## Execution Policy
 
-- execute: effort=high, reason=subprocess lifecycle plus a semantics port on the
-  path that mints security-relevant package identity
+- execute: effort=high, reason=subprocess lifecycle and a signature change across
+  six call sites on the path that mints security-relevant package identity
