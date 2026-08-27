@@ -1,5 +1,11 @@
 # Detailed plan: stop `--verify` reporting host-enumerated types as drift
 
+> **Revision 2 (2026-08-27).** Rev 1 boarded **3 DISAGREE** and they were right on
+> all three counts. Rev 1's detector could never have fired, its normalization
+> produced UNINTERPRETABLE on the very host that filed the bug, its headline test
+> was vacuous, and it specified two mutually contradictory strategies. Corrected
+> below; rev 1's errors are kept as `WAS WRONG` because each one is a trap.
+
 ## Task
 
 Close Consiliency/pmcp#193. `.consiliency/notes/derive_npm_flags.py --verify` is green on
@@ -37,38 +43,79 @@ the *classification* (`local-address` takes a value) is stable everywhere.
 
 ### `.consiliency/notes/derive_npm_flags.py` (modify)
 
-- `_is_host_enumerated(type_labels)` — add — returns True when a type's members
-  include a **host fact**, detected by property rather than by name:
-  any member that parses as an IPv4 or IPv6 address via Python's `ipaddress`
-  module. Today that selects exactly `local-address` and leaves `audit-level`,
-  `lockfile-version` and `loglevel` alone — verified above. Detecting by
-  *shape* means a future npm type built from hostnames or interface names is
-  caught by extending this one predicate, not by editing a name list.
-- `classify(type_labels)` (`:217`) — modify — when `_is_host_enumerated` is
-  true, classify from the **stable** part of the type only: drop the
-  address-shaped members, then classify what remains. `local-address` is a value
-  flag on every host; this makes that answer machine-independent instead of
-  depending on which interfaces happen to be up.
-- `--verify` comparison (`:558-585`) — modify — record host-enumerated flags in a
-  `skipped_host_enumerated` list and **print them**, with the reason and the
-  member count seen on this host. Silence is what made the original failure
-  confusing; the generator already prints its conditional-arity exemptions, so
-  this matches an existing convention rather than inventing one.
-- Module docstring (`:86-95`) — modify — state that member lists are not
-  comparable across hosts and that classification is what `--verify` pins.
+**WAS WRONG (rev 1), three ways:**
+
+1. *The predicate was blind.* Rev 1 detected host-enumerated types in Python by
+   parsing members with `ipaddress`. But `read_schema`'s node-side serializer maps
+   **every string or number member to the literal `'<literal>'`**
+   (`derive_npm_flags.py:~134`), so no real IP string ever reaches Python. The
+   predicate could not have fired once, and synthetic tests feeding it raw IP
+   strings would have bypassed the production contract entirely.
+2. *It targeted the wrong case.* npm's `getLocalAddresses()` **catches and returns
+   `[null]`** when `networkInterfaces()` throws
+   (`@npmcli/config/lib/definitions/definitions.js:65-71`). The host that filed
+   this bug therefore has `local-address: [null]` — **no addresses at all** — which
+   an IP-presence test cannot see. Worse, rev 1's "drop the address members and
+   classify the remainder" also leaves `[null]`, and `classify()` strips `null` and
+   returns UNINTERPRETABLE — so rev 1 would have produced the reported failure
+   rather than fixing it, and the tables could not regenerate byte-identical.
+3. *It specified two contradictory strategies.* Normalizing `classify()` to a
+   stable `VALUE` makes an exemption unnecessary; exempting the flag from
+   `--verify` removes it from the comparison and would **hide a future genuine
+   arity change** — the opposite of this check's purpose. Rev 1 did both.
+
+**Corrected design — detect where the raw members live, normalize, and keep
+verifying:**
+
+- `read_schema`'s node-side script (`:~128-165`) — modify — emit a per-definition
+  boolean `hostEnumerated`, computed in **JavaScript, where the raw type array is
+  still intact**, as either of:
+  - `typeDescription === 'IP Address'` — npm's own label for this class. Verified
+    stable and host-independent, and verified *not* to match the fixed
+    enumerations: `audit-level`, `loglevel` and `lockfile-version` all carry
+    enumerated descriptions listing their literals.
+  - a `net.isIP()` scan over the raw members returning true for any of them —
+    a second, independent signal for a future host-derived type npm does not
+    label.
+
+  Either alone is sufficient; both are cheap. If npm renames the label *and* the
+  member list is `[null]`, detection stops and the flag falls back to member-based
+  classification, which on that host is UNINTERPRETABLE → a **loud red verify**,
+  not a silent wrong answer. That is the correct failure direction and is stated
+  here so the next reader does not mistake it for a gap.
+- `classify(type_labels, *, host_enumerated=False)` (`:217`) — modify — when
+  `host_enumerated` is true, return `VALUE` **regardless of members, including the
+  bare `[null]` case**. `local-address` takes a value on every host; the member
+  list is a host fact and carries no classification information.
+- `--verify` — modify — **`local-address` stays in the comparison.** No skip list,
+  no exemption. What is printed instead is a one-line note that the flag was
+  *normalized* as host-enumerated, so the exemption-shaped behaviour is visible
+  without removing anything from the check.
+  **WAS WRONG (rev 1):** a `skipped_host_enumerated` list. Once classification is
+  stable there is nothing to skip, and skipping would blind the check to a real
+  arity change on the one flag most likely to drift.
+- Module docstring — modify — the host-independence discussion belongs at
+  `:22-24` / `:42-53`; rev 1 cited `:86-95`, which is the nullable-spelling
+  paragraph.
 
 ### `tests/test_version_checker.py` (modify)
 
+`tests/test_version_checker.py` does **not** import the generator; load it with
+the `importlib.util.spec_from_file_location` pattern already used in
+`tests/test_workflow_guards.py`. **CI has no npm**, so every test here must mock
+`read_schema()` rather than shelling out — otherwise it is a maintainer-only
+check that never runs.
+
 - `TestVerifyIsHostIndependent` — add:
-  - `_is_host_enumerated` is True for a synthetic type carrying IPv4 and IPv6
-    literals, and **False** for `audit-level`, `lockfile-version`, `loglevel`
-    member lists copied verbatim from npm — so a future edit cannot quietly
-    start exempting fixed enumerations.
-  - `classify` returns the same class for a `local-address`-shaped type built
-    with **two different fake interface sets**. This is the actual bug: same
-    npm, different machine, different answer.
-  - The exemption is **reported**, not silent — assert the printed output names
-    the skipped flag.
+  - `classify(..., host_enumerated=True)` returns `VALUE` for **`[null]`** (the
+    enumeration-failure host), for a one-address list, and for a
+    fifty-address list. All three must be `VALUE` — not merely equal to each
+    other. **WAS WRONG (rev 1):** the test compared two non-empty address sets,
+    which the *current* code already classifies identically; it would have passed
+    against unchanged code.
+  - `hostEnumerated` is true for `local-address` and **false** for `audit-level`,
+    `loglevel` and `lockfile-version`, using their real `typeDescription` strings.
+  - `--verify` output names the normalized flag.
 
 ## Documentation impact
 
@@ -112,19 +159,21 @@ members and re-open the false positive.
 
 ## Acceptance criteria
 
-- [ ] `--verify` exits 0 **and produces identical failure output** under two
-      different simulated interface sets — proven by running it twice with the
-      `local-address` type patched to different address lists, and diffing.
-      Running it once on this machine proves nothing, which is the whole bug.
-- [ ] `_is_host_enumerated` is False for `audit-level`, `lockfile-version` and
-      `loglevel` with their real member lists — so the exemption cannot silently
-      widen to fixed enumerations.
-- [ ] Regenerating the tables produces output **byte-identical** to the committed
-      `_NPM_VALUE_FLAGS` / `_NPM_BOOLEAN_FLAGS` / `_NPM_SKIP_FLAGS` /
-      `_NPM_NULLABLE_BOOLEAN_FLAGS`.
-- [ ] `--verify` **prints** every exempted flag with its reason; asserted by a
-      test on the output, not by reading the code.
-- [ ] Link-local members with a `%zone` suffix are still detected as host facts.
+- [ ] With `local-address`'s type patched to **`[null]`**, to one address, and to
+      fifty addresses, `classify` returns **`VALUE`** in all three and `--verify`
+      exits 0 with **identical** output. The `[null]` case is the one that filed
+      this bug and is non-negotiable; rev 1's two-non-empty-lists test passed
+      against unchanged code.
+- [ ] `local-address` is still **present in the `--verify` comparison** — proven
+      by patching its live classification to `BOOLEAN` and asserting `--verify`
+      goes red. An exemption would pass a naive "no false positives" check while
+      blinding the tool to real drift.
+- [ ] `hostEnumerated` is false for `audit-level`, `loglevel` and
+      `lockfile-version` with their real `typeDescription` values.
+- [ ] Regenerating produces output **byte-identical** to the four committed
+      tables.
+- [ ] Every test mocks `read_schema()` and passes with **no npm on PATH**, so the
+      checks run in CI rather than only on a maintainer's machine.
 
 ## Non-goals
 
