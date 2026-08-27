@@ -567,6 +567,8 @@ class TestMutationHelperContract:
             "timeout-below-p100",
             "concurrency-added",
             "guard-self-disabled",
+            "guard-self-disabled-nonconstant",
+            "guard-step-gutted",
         ],
     )
     def test_the_uncovered_cases_are_listed_as_expected_green(

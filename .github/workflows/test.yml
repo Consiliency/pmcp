@@ -352,8 +352,10 @@ jobs:
 
       # Run it BARE, with no glob: `actionlint *.yml` leaves a .yaml workflow
       # unchecked (bypass-proofs-187.md §A), and actionlint exits 3 outside a
-      # git root. This is schema validation only — it caught 0 of the 14
-      # mutants in mutation-189.md, which is exactly why the next step exists.
+      # git root. This is schema validation only: it caught 4 of the 30 mutants
+      # in mutation-189.md — a dangling `needs:`, two ill-typed timeouts and a
+      # literal `if: false` — and none of the ones that leave the workflow both
+      # valid and silent. That is why the next step exists.
       - name: Run actionlint
         run: actionlint
 
