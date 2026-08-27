@@ -1192,6 +1192,66 @@ class TestOnlyConfirmedAbsenceIsUnavailable:
         finally:
             instance.close()
 
+    def test_a_parent_side_spawn_failure_self_heals(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Permission denied is transient; it must not be permanent.
+
+        Making a parent-side spawn failure sticky turned a repairable condition
+        into a fleet-wide loss of auto-update for the process lifetime. It
+        refuses and backs off on the cooldown instead, which re-arms (board
+        review on the diff, follow-up b).
+        """
+        real = shutil.which("node")  # captured BEFORE PATH is replaced
+        assert real is not None
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        node = bindir / "node"
+        node.write_text("#!/bin/sh\nexit 0\n")
+        node.chmod(0o644)
+        monkeypatch.setenv("PATH", str(bindir))
+        instance = NpmResolver()
+        try:
+            assert instance.resolve("npx", ["-y", "p"], {}, None).is_refused
+            assert instance._sticky is None, "a transient failure must not stick"
+            # Repair the cause and clear the cooldown; the next query recovers.
+            node.unlink()
+            os.symlink(real, node)
+            instance._last_spawn_at = 0.0
+            recovered = instance.resolve("npx", ["-y", "left-pad"], {}, None)
+            # The spawn now SUCCEEDS -- a child was created and answered. (That
+            # child then reports npm absent, because this PATH holds only node;
+            # what matters here is that the resolver tried again at all.)
+            assert instance.spawn_attempts == 2
+            assert instance.spawn_count == 1
+            assert not recovered.is_refused, recovered
+        finally:
+            instance.close()
+
+    def test_the_warning_for_a_node_less_host_does_not_claim_identity_is_off(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog
+    ) -> None:
+        """Sticky UNAVAILABLE still MINTS identities -- from the flag tables.
+
+        One message cannot be true of both sticky states, and the REFUSED
+        wording ("servers will report package_type='unknown'") is simply false
+        here (board review on the diff, follow-up c).
+        """
+        empty = tmp_path / "emptybin"
+        empty.mkdir()
+        monkeypatch.setenv("PATH", str(empty))
+        instance = NpmResolver()
+        try:
+            with caplog.at_level(logging.WARNING, logger="pmcp.manifest.npm_resolver"):
+                assert instance.resolve("npx", ["-y", "p"], {}, None).is_unavailable
+            warnings = [r.getMessage() for r in caplog.records]
+            assert len(warnings) == 1, warnings
+            assert "falls back to pmcp's own flag tables" in warnings[0]
+            assert "DISABLED" not in warnings[0]
+            assert "package_type='unknown'" not in warnings[0]
+        finally:
+            instance.close()
+
     def test_node_genuinely_absent_is_unavailable(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

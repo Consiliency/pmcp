@@ -116,6 +116,12 @@ def _gate_relevant_env(env: Mapping[str, str] | None) -> dict[str, str]:
         return {}
     relevant = {}
     for key, value in env.items():
+        if not isinstance(key, str):
+            # An environment key that is not a string cannot reach a subprocess
+            # (`os.environ` rejects it), so it cannot redirect npm. Skipping is
+            # safe, and it keeps the gate from raising on a caller -- or a test
+            # double -- that hands it something odd.
+            continue
         lowered = key.lower()
         if key.upper() in _ENV_GATE_EXACT or lowered.startswith(_ENV_GATE_PREFIXES):
             relevant[key] = value
@@ -256,23 +262,46 @@ class NpmResolver:
         # did.
         self.spawn_attempts = 0
         self.spawn_count = 0
+        # Set by `_spawn`: False when the failure was the PARENT's (permission,
+        # resource limit, missing helper) and so may be transient.
+        self._spawn_failure_is_durable = True
 
     # -- lifecycle ---------------------------------------------------------
 
-    def _warn_once(self, message: str) -> None:
-        if not self._warned:
-            self._warned = True
+    def _warn_once(self, outcome: NpmResolution) -> None:
+        """One WARNING per process, and it must describe the RIGHT outcome.
+
+        The two sticky states have opposite consequences and a single message
+        cannot be true of both (board review on the diff): a sticky REFUSED
+        reports every npm server as `unknown`, while a sticky UNAVAILABLE falls
+        back to the flag tables, which keep MINTING identities -- just the
+        pre-2.5.2 ones, with the defects this change exists to remove.
+        """
+        if self._warned:
+            return
+        self._warned = True
+        if outcome.is_unavailable:
             logger.warning(
-                "npm package identity is DISABLED for this process: %s. "
-                "npm/npx servers will report package_type='unknown', which "
-                "means their descriptions refresh every cycle and "
-                "gateway.update_server cannot name a package for them. "
-                "THIS DOES NOT RECOVER ON ITS OWN -- a disabled resolver keeps "
-                "no child process, so nothing re-checks the host; fix the cause "
-                "and RESTART THE GATEWAY. Current state is also reported as "
-                "gateway.health -> gateway_diagnostics.npm_identity.",
-                message,
+                "npm is not installed, so npm package identity falls back to "
+                "pmcp's own flag tables: %s. Identities are still produced, but "
+                "by the pre-2.5.2 hand-written parser rather than by npm, so an "
+                "unusual npm/npx command line can be misread. Install node and "
+                "npm, then restart the gateway, to get identity from npm's own "
+                "parser. Current state is reported as gateway.health -> "
+                "gateway_diagnostics.npm_identity.",
+                outcome.reason,
             )
+            return
+        logger.warning(
+            "npm package identity is DISABLED for this process: %s. npm/npx "
+            "servers will report package_type='unknown', which means their "
+            "descriptions refresh every cycle and gateway.update_server cannot "
+            "name a package for them. THIS DOES NOT RECOVER ON ITS OWN -- a "
+            "disabled resolver keeps no child process, so nothing re-checks the "
+            "host; fix the cause and RESTART THE GATEWAY. Current state is also "
+            "reported as gateway.health -> gateway_diagnostics.npm_identity.",
+            outcome.reason,
+        )
 
     def _terminate(self) -> None:
         """Kill the child. Call with the lock held."""
@@ -308,6 +337,7 @@ class NpmResolver:
             # confidently to `probe` -- a private-registry name that
             # gateway.update_server would then probe against public npmjs.org,
             # where it is squattable (board review on the diff).
+            self._spawn_failure_is_durable = False
             return _refused(f"packaged helper script is missing: {self._helper}")
         self._last_spawn_at = time.monotonic()
         self.spawn_attempts += 1
@@ -332,6 +362,7 @@ class NpmResolver:
             # reproduced with a non-executable `node`, which fell back and
             # resolved `npx --registry https://private.invalid probe` to
             # `probe` (board review on the diff).
+            self._spawn_failure_is_durable = False
             return _refused(f"node is present but could not be spawned: {exc}")
         self.spawn_count += 1
         self._generation += 1
@@ -377,25 +408,25 @@ class NpmResolver:
             # Inside the cooldown after a death: refuse cheaply rather than
             # spawn-storm. Not sticky -- the next window re-arms.
             return _refused("npm resolver child is cooling down after a failure")
+        self._spawn_failure_is_durable = True
         outcome = self._spawn()
         if outcome is None:
             return None
-        if outcome.is_unavailable or self._sticky_worthy(outcome):
+        if outcome.is_unavailable or self._spawn_failure_is_durable:
+            # Durable = the CHILD told us something about the host: a failed
+            # self-test, an unrecognised `npx-cli.js`, a parser that will not
+            # load, an npm it could not locate, a handshake that never came.
+            # Those will still be true on the next query.
+            #
+            # A PARENT-side spawn failure is not durable. Permission denied, a
+            # resource limit or a missing helper file can all be repaired under
+            # a running gateway, and making them permanent turned a transient
+            # condition into a fleet-wide loss of auto-update for the process
+            # lifetime (board review on the diff). Those refuse for this query
+            # and back off on the cooldown, which re-arms.
             self._sticky = outcome
-            self._warn_once(outcome.reason or outcome.status)
+            self._warn_once(outcome)
         return outcome
-
-    @staticmethod
-    def _sticky_worthy(outcome: NpmResolution) -> bool:
-        """A startup REFUSED is durable; an in-flight one is not.
-
-        A refusal produced while *starting* the child -- failed self-test,
-        unrecognised ``npx-cli.js``, a parser that will not load, a handshake
-        that never came -- says something about the host that will still be
-        true on the next query. An in-flight refusal says something about one
-        argv.
-        """
-        return outcome.is_refused
 
     # -- the query ---------------------------------------------------------
 
@@ -447,7 +478,7 @@ class NpmResolver:
             process_gate = _process_env_is_plain()
             if process_gate is not None and self._sticky is None:
                 self._sticky = _refused(process_gate)
-                self._warn_once(process_gate)
+                self._warn_once(self._sticky)
             if self._sticky is not None:
                 return self._sticky
             outcome = self._ensure_child()
