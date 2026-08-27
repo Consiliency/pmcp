@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-08-27
+
 ### Added
 - **The release-path workflow guards now run in CI.** `release.yml` triggers
   only on tag push — the tag push *is* the publish — so it never appeared in a
