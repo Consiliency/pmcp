@@ -1,9 +1,16 @@
 # Detailed plan: run #187's workflow guards in CI
 
-> **Revision 2 (2026-08-26, post-board).** Four seats reviewed revision 1: two
-> DISAGREE, two PARTIALLY AGREE. Revision 1's errors are recorded inline as
-> `WAS WRONG` notes rather than deleted — several rules below exist only because
-> of them.
+> **Revision 3 (2026-08-27).** Rev 1 was boarded (2 DISAGREE, 2 PARTIALLY AGREE)
+> and rev 2 was boarded again (2 DISAGREE, 1 AGREE, 1 seat unavailable). Rev 2's
+> central defect was that its *repair* of rev 1 created a fresh
+> internally-impossible contract. Errors from both are kept inline as `WAS WRONG`
+> rather than deleted — most rules here exist only because of them.
+>
+> One seat finding is **rejected**: `actions/checkout@v7` was reported as
+> nonexistent. The repo uses v7 in every job and all 11 checks passed on it. A
+> second is **partly rejected**: `.github/CODEOWNERS` was reported absent; it
+> exists. Its substantive point — that CODEOWNERS gates nothing without a review
+> requirement — is correct and is now recorded accurately.
 
 ## Task
 
@@ -68,6 +75,28 @@ allowlist never anticipated. Do both.
     reports green while the upload failed.
   - accept both `needs: X` and `needs: [X]`. The real file uses the scalar form;
     rejecting the list form is a false positive on a legitimate edit.
+  - **the job set is exactly `{build, publish, github-release}`** — an added job
+    (an `exfil` step with the release environment in scope) is a real mutant and
+    is statically decidable, so it belongs here rather than in the label-ack
+    remainder. Note this is stricter than `job_set_drift`, which allows additions
+    generally; `release.yml` earns the stricter rule because it is the file with
+    no PR-time feedback.
+  - **`permissions:` on each job equals the committed map exactly** —
+    `publish: {id-token: write}`, `github-release: {contents: write}`, `build`
+    unset. Widening is otherwise invisible.
+  - **every `uses:` equals the committed reference exactly.** This pins
+    `pypa/gh-action-pypi-publish@release/v1` against being repointed to a fork.
+    It does not make `@release/v1` safe — that is a mutable tag, called out under
+    Non-goals — but it does make a *change* to it fail.
+
+  **WAS WRONG (rev 2):** `TestReleaseInvariants` and AC1 required the checker to
+  fail on a forked action, widened permissions, and an added job, while
+  `release_invariants()` checked none of them and `job_set_drift` explicitly
+  passes additions. Two seats independently flagged the contract as
+  unsatisfiable: an implementer following Changes fails AC1, one following AC1
+  invents invariants the plan never specified, and the cheap way out is deleting
+  the tests. This is the same class of internally-impossible contract rev 1 had,
+  reintroduced by rev 1's own repair.
 - `timeout_invariants(doc, path)` — add — **applies to every workflow file, not
   just `release.yml`**, and uses #187's hardened predicate verbatim:
   `isinstance(v, int) and not isinstance(v, bool) and 10 <= v <= 30`, skipping
@@ -85,11 +114,30 @@ allowlist never anticipated. Do both.
   version from disk; fail on any job name present in base and absent in head.
   A rename is a removal plus an addition and must fail. A newly added workflow
   file has no base version — pass, do not crash.
-- `main()` — add — `--base-ref`. Invariants always run. **On a `push` event, use
-  `github.event.before` as the base** rather than skipping drift.
-  **WAS WRONG (rev 1):** drift was skipped with no base ref, so a direct-to-main
-  push deleting `maintenance.yml` or one of its jobs passed everything. An empty
-  `--base-ref` must parse as `None`, not consume the next argument.
+- `main()` — add — `--base-ref`. Invariants always run. The base is resolved
+  **per event**, and the table is part of the spec because getting it wrong
+  silently disables drift on the path that gates merges:
+
+  | event | base |
+  |---|---|
+  | `pull_request` | `github.event.pull_request.base.sha` |
+  | `push` | `github.event.before` |
+  | `schedule` / `workflow_dispatch` | none — invariants only, drift skipped, and **said so in the log** |
+
+  **WAS WRONG (rev 2):** it specified only `github.event.before`, which is a
+  PushEvent field and is unset on `pull_request`. Following the only wiring given,
+  every PR would have run with an empty base and skipped drift entirely —
+  recreating rev 1's own `WAS WRONG` on the merge path. The other naive fill-in
+  is equally broken: `--base-ref origin/main` on a push *to* main compares the
+  just-pushed tip against itself.
+
+  An empty `--base-ref` parses as `None`, never consuming the next argument.
+
+- **Drift fails closed on an unresolvable base.** Distinguish *"the base commit
+  resolves and the path is absent"* (a genuinely new workflow file — pass) from
+  *"the base commit does not resolve"* (a shallow clone, a bad ref, a fetch
+  failure — **fail**). A naive implementation treats both as "new file" and
+  silently disables all drift protection.
 - Read the `on:` key as **both `"on"` and `True`** (YAML 1.1). Under a `.get`
   idiom this fails closed rather than vacuously — but `TestOnKeyParsing` stays,
   because the `try`-wrapped variant does not.
@@ -131,7 +179,14 @@ required contexts currently do not include it.
 - Add `workflows` and `release-diff-ack` to
   `required_status_checks.contexts` via `gh api` after merge. A required context
   that never reports blocks the merge as "Expected".
-- Add `CODEOWNERS` covering `.github/` and `scripts/check_workflows.py`.
+- `.github/CODEOWNERS` **already exists** and already covers these paths via
+  `*  @ViperJuice`. One seat reported it absent; that is wrong. But its own
+  comment is accurate — *"Advisory, not a merge gate"* — and `gh api` confirms
+  `required_pull_request_reviews` is **null**, so it gates nothing today.
+  Making it load-bearing needs `require_code_owner_reviews: true` **and** a
+  review requirement enabled in branch protection. That is a settings change on
+  the operator's repository, so it is surfaced for a decision rather than folded
+  into a merge.
 - **State the residuals plainly** in the evidence file rather than implying
   closure: GitHub counts an `if:`-skipped job as *satisfying* a required check,
   so `if: false` on the guard merges green; and the PR can keep the job name
@@ -215,6 +270,16 @@ a `--base-ref` that does not exist; a PR adding a new workflow file;
       deletion — could have shipped dead with the suite green.
 - [ ] `check_workflows.py --base-ref origin/main` exits 0 on the unmutated tree,
       proving the guard is not a blanket failure.
+- [ ] **Drift fails closed on an unresolvable base ref** — a run against a
+      nonexistent base commit exits non-zero, while a run whose base resolves but
+      whose workflow path is genuinely new exits zero. A single implementation
+      that treats both as "new file" silently disables all drift protection and
+      must not pass.
+- [ ] **The base ref is correct on `pull_request`** — asserted against the
+      wiring in `test.yml`, not just the script. Rev 2's wiring named only
+      `github.event.before`, which is unset on `pull_request`, so every PR would
+      have skipped drift while the script itself remained correct. A script-level
+      test cannot catch that; assert the workflow expression.
 - [ ] The `test.yml` step invoking the checker is asserted to contain no `|| true`
       and no `continue-on-error` — the fail-open pattern
       `bypass-proofs-187.md` records as having already happened once here.
