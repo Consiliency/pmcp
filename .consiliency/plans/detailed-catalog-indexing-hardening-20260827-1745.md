@@ -58,8 +58,8 @@ Verified in this worktree:
   the surprise; making the code uniform is cheaper to hold in the head than an
   exception written down in two places.
 - `input_schema = tool.get("inputSchema", {})` (`:616`) — modify — treat a
-  missing `inputSchema` as **unparseable**, via the existing `_required_identity`
-  mechanism, so the entry is skipped and logged like any other unparseable entry.
+  missing `inputSchema` as **unparseable**, so the entry is skipped and logged
+  like any other unparseable entry (see the helper note below).
   **Item 4.** This is the deliberate decision #175 asks for: MCP requires
   `inputSchema` on a tool, and manufacturing an accept-anything schema
   misrepresents the tool to every caller. Consistent with #172's ruling on
@@ -112,23 +112,24 @@ Verified in this worktree:
 - `TestAdoptProcessRemovesFirst` — add — index, adopt, assert no stale entry
   survives. **Item 2.**
 - `TestMissingInputSchemaIsUnparseable` — add — **Item 4.**
-- `TestZeroToolLimitIsRejected` — add — `LimitsPolicy(max_tools_per_server=0)`
-  raises. **Item 3.**
+- `TestZeroLimitLogsAccurately` — add — with `max_tools_per_server=0`, the
+  emitted message names the zero limit and does **not** say the entries were
+  unparseable; `LimitsPolicy(max_tools_per_server=0)` still validates. **Item 3.**
 
 ## Documentation impact
 
 - `CHANGELOG.md` — add — one `### Fixed` entry naming all five; item 4 is a
   behaviour change (a tool without `inputSchema` is now skipped rather than
   accepted with a permissive schema) and must be called out as such, not buried.
-- No README change: none of this is user-facing configuration except the `ge=1`
-  bound, which only rejects a value that never worked.
+- No README change: none of this alters user-facing configuration. The policy
+  schema is deliberately left untouched (see item 3 and #202).
 
 ## Dependencies & order
 
 1. Item 1's test **first, against unchanged code** — confirm it passes, then
    apply the boundary mutation and confirm it fails. A test written after the
    fix cannot prove it would have caught the bug.
-2. Items 3 and 5 (independent, mechanical).
+2. Items 3 (log wording only) and 5 (independent, mechanical).
 3. Item 2 (`adopt_process`), then item 4 (`inputSchema`) — item 4 is the only
    behaviour change and belongs last so a bisect lands on it cleanly.
 
