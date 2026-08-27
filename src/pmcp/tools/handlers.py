@@ -13,7 +13,7 @@ import shutil
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Any, Literal, cast
 from urllib.request import urlopen
 from urllib.parse import urlencode
@@ -273,8 +273,16 @@ def _detect_effective_version_pin(
     package_type: Literal["npm", "pypi", "cargo", "docker", "unknown"],
     command: str,
     args: list[str],
+    env: Mapping[str, str] | None,
+    cwd: str | None,
 ) -> str | None:
     """Return the pinned version/tag *args* explicitly locks to, or ``None``.
+
+    *env* (the server's environment OVERLAY) and *cwd* are threaded through to
+    ``_npm_package_arg`` and are REQUIRED for the same reason they are there: on
+    the npm path they are identity inputs, and a defaulted ``None`` would let a
+    caller that has a server's ``env``/``cwd`` in hand forget to pass them and
+    still type-check.
 
     Used by gateway.update_server: a server pinned to a concrete version
     cannot be moved to ``@latest`` by this tool while the pin stands (the
@@ -312,7 +320,7 @@ def _detect_effective_version_pin(
         # (subcommand first) and `npx` (package first) if it knows which it is
         # reading. Before this, `npm exec pkg@1.2` scanned to `exec`, whose
         # `_npm_tag` is None, so a REAL pin was reported as unpinned.
-        raw = _npm_package_arg(args, command)
+        raw = _npm_package_arg(args, command, env, cwd)
         if raw is None:
             return None
         tag = _npm_tag(raw)
@@ -5041,11 +5049,22 @@ class GatewayTools:
         if isinstance(resolved_config.config, LocalMcpServerConfig):
             command = resolved_config.config.command
             args = resolved_config.config.args
+            # `LocalMcpServerConfig` is the type that carries a `cwd`, and its
+            # `env` is this server's own declared OVERLAY -- exactly what the
+            # npm identity gate needs. (`sanitized_subprocess_env` merges this
+            # overlay onto `os.environ` for the probe below; the merged result
+            # must NOT be passed here, since every process has PATH and HOME and
+            # the gate would refuse every npm server.)
+            server_env: Mapping[str, str] | None = resolved_config.config.env
+            server_cwd = resolved_config.config.cwd
         else:
             # Remote servers have no local package for this tool to update.
             command, args = "", []
+            server_env, server_cwd = None, None
 
-        package_type, package_name = detect_package_type(command, args)
+        package_type, package_name = detect_package_type(
+            command, args, server_env, server_cwd
+        )
         if package_type == "unknown" or not package_name:
             # Name the actual command line. Without it, a server launched as
             # `npm run mcp` reads "could not determine package manager" and
@@ -5067,7 +5086,9 @@ class GatewayTools:
                 ),
             )
 
-        pinned_to = _detect_effective_version_pin(package_type, command, args)
+        pinned_to = _detect_effective_version_pin(
+            package_type, command, args, server_env, server_cwd
+        )
         if pinned_to is not None:
             source_desc = _CONFIG_SOURCE_LABELS.get(
                 resolved_config.source, f"the {resolved_config.source} config"
@@ -5239,7 +5260,9 @@ class GatewayTools:
             )
 
         refresh_result = await self.refresh({"reason": f"update_server:{server_name}"})
-        latest_version, _ = await get_package_version(command, args, timeout=5.0)
+        latest_version, _ = await get_package_version(
+            command, args, server_env, server_cwd, timeout=5.0
+        )
 
         # gateway.refresh() is a diff-based reconcile (_refresh_config_unchanged):
         # it deliberately leaves a server whose command/args are unchanged

@@ -256,7 +256,21 @@ async def refresh_server(
     # below: the short-circuit cannot consult identity unless identity has
     # already been resolved, which is why this resolution moved up here rather
     # than being duplicated (Consiliency/pmcp#178, EC-UPDPATH-2).
-    pkg_type, pkg_name = detect_package_type(server_config.command, server_config.args)
+    pkg_type, pkg_name = detect_package_type(
+        server_config.command,
+        server_config.args,
+        # The manifest's `ServerConfig` carries `extra_env` and NO `cwd`, so the
+        # overlay is `extra_env` and the effective cwd is this process's.
+        # `extra_env` is the right thing to pass rather than the merged
+        # `sanitized_subprocess_env` result: the gate asks whether THIS SERVER'S
+        # configuration can redirect npm's resolution, and a merged environment
+        # always carries PATH and HOME, which would refuse every npm server on
+        # every host. The credential this server also receives at spawn cannot
+        # match the gate's key patterns (`npm_config_*`, PATH, HOME, NODE_PATH,
+        # NODE_OPTIONS, PREFIX, NVM_*), so omitting it changes no answer.
+        server_config.extra_env,
+        None,
+    )
     if not pkg_name:
         pkg_name = f"{server_config.command} {' '.join(server_config.args)}"
 
@@ -264,7 +278,10 @@ async def refresh_server(
     if existing_cache and not force:
         # Get current package version
         version, fetched_type = await get_package_version(
-            server_config.command, server_config.args
+            server_config.command,
+            server_config.args,
+            server_config.extra_env,
+            None,
         )
 
         # Identity before freshness: a version comparison is only meaningful
@@ -288,7 +305,9 @@ async def refresh_server(
     logger.info(f"Refreshing descriptions for {server_name}...")
 
     # Get version
-    version, _ = await get_package_version(server_config.command, server_config.args)
+    version, _ = await get_package_version(
+        server_config.command, server_config.args, server_config.extra_env, None
+    )
     version = version or "unknown"
 
     try:
@@ -418,7 +437,10 @@ async def refresh_all(
         existing = existing_servers.get(name)
         if existing is not None:
             cfg_type, cfg_name = detect_package_type(
-                server_config.command, server_config.args
+                server_config.command,
+                server_config.args,
+                server_config.extra_env,
+                None,
             )
             if not _same_package(
                 existing.package, existing.package_type, cfg_name, cfg_type
@@ -497,11 +519,11 @@ async def check_staleness(
             continue
 
         cfg_type, cfg_name = detect_package_type(
-            server_config.command, server_config.args
+            server_config.command, server_config.args, server_config.extra_env, None
         )
 
         version, pkg_type = await get_package_version(
-            server_config.command, server_config.args
+            server_config.command, server_config.args, server_config.extra_env, None
         )
 
         # NOTE the inverted polarity relative to `refresh_server`. There, a

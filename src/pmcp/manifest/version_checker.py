@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Mapping
 from typing import Literal
 from urllib.parse import quote
 
@@ -13,6 +14,7 @@ from packaging.version import InvalidVersion, Version
 from semver import Version as SemverVersion
 
 from pmcp import __version__
+from pmcp.manifest.npm_resolver import get_resolver
 
 logger = logging.getLogger(__name__)
 
@@ -1089,8 +1091,38 @@ def _uvx_package_arg(args: list[str]) -> tuple[str | None, bool]:
     )
 
 
-def _npm_package_arg(args: list[str], command: str) -> str | None:
+def _npm_package_arg(
+    args: list[str],
+    command: str,
+    env: Mapping[str, str] | None,
+    cwd: str | None,
+) -> str | None:
     """Return the raw npm/npx package token from *args*, or ``None``.
+
+    Asks **npm's own parser** first (``pmcp.manifest.npm_resolver``), and only
+    reaches the hand-written flag tables below when npm is not installed at all.
+    The three outcomes are not interchangeable:
+
+    * ``IDENTITY`` -- npm's nopt, npm's config definitions, npm's
+      ``npm-package-arg`` and a faithful port of the ``npx-cli.js`` pre-scan all
+      agree on the package. Return it raw.
+    * ``REFUSED`` -- a gate tripped, or the child timed out / died / broke
+      protocol. Return ``None``. **The table scan is not reached.** Falling back
+      here would remint exactly the confident wrong answers this change removes:
+      ``npx --userconfig /tmp/rc probe`` and ``npx --registry http://x probe``
+      both scan to ``probe`` while npm fetches something else entirely.
+    * ``UNAVAILABLE`` -- the child could not be spawned: no node, or no npm
+      root. That teaches us nothing *about npm*, only that it is absent, so the
+      tables are both the honest answer and the pre-#195 behaviour.
+
+    *env* is the server's environment **OVERLAY** and *cwd* its declared working
+    directory (``None`` = this process's). Both are REQUIRED and deliberately
+    undefaulted: an ``npm_config_package`` in the overlay or a project
+    ``.npmrc`` in scope changes which package npm fetches, so a call site that
+    cannot supply them cannot get a trustworthy answer -- and a defaulted
+    ``None`` would let it silently ask anyway.
+
+    Everything from here down describes the **node-less fallback tables**.
 
     "Raw" means *before* ``_strip_npm_tag`` removes any ``@tag``/``@version``
     suffix -- factored out of ``detect_package_type``'s npm branch so a
@@ -1154,6 +1186,39 @@ def _npm_package_arg(args: list[str], command: str) -> str | None:
       matters: ``always`` is a legal value, so a boolean/value split reads it
       as the package.
     """
+    resolution = get_resolver().resolve(command, args, env, cwd)
+    if resolution.is_identity:
+        return resolution.spec
+    if resolution.is_refused:
+        logger.debug(
+            "npm identity refused for %s %s: %s", command, args, resolution.reason
+        )
+        return None
+    logger.debug(
+        "npm resolver unavailable (%s); using the flag tables", resolution.reason
+    )
+    return _npm_package_arg_from_tables(args, command)
+
+
+# Instrumented INSIDE the scan rather than exposed for monkeypatching. A test
+# that patches the module attribute misses a def-time binding, and an
+# implementation whose REFUSED path called the scan through such a binding
+# passed a call-counter assertion while demonstrably running the scan. A counter
+# incremented on the first line of the scan itself cannot be fooled that way.
+# It supplements the result assertions; it does not replace them.
+_table_scan_calls = 0
+
+
+def _npm_package_arg_from_tables(args: list[str], command: str) -> str | None:
+    """The node-less fallback scan. See ``_npm_package_arg`` for the contract.
+
+    **This is reached only when npm is not installed.** It is retained
+    unchanged, defects and all, because on a node-less host it is strictly
+    better than nothing and it is what pmcp shipped through 2.5.2.
+    """
+    global _table_scan_calls
+    _table_scan_calls += 1
+
     skip_subcommand = command == "npm"
     packages: list[str] = []
     index = -1
@@ -1473,7 +1538,10 @@ async def get_docker_version(image_name: str, timeout: float = 10.0) -> str | No
 
 
 def detect_package_type(
-    command: str, args: list[str]
+    command: str,
+    args: list[str],
+    env: Mapping[str, str] | None,
+    cwd: str | None,
 ) -> tuple[Literal["npm", "pypi", "cargo", "docker", "unknown"], str | None]:
     """
     Detect package type and name from server command/args.
@@ -1481,13 +1549,22 @@ def detect_package_type(
     Args:
         command: The server command (e.g., "npx", "uvx")
         args: Command arguments
+        env: The server's environment OVERLAY (its own declared variables), not
+            a merged environment. REQUIRED and undefaulted -- see
+            ``_npm_package_arg``. ``None`` means "this server declares none";
+            passing a merged ``os.environ`` copy would refuse every npm server
+            on every host, since every process has ``PATH`` and ``HOME``.
+        cwd: The server's declared working directory, or ``None`` for this
+            process's. Also REQUIRED: npm resolves a project ``.npmrc`` from the
+            *process* cwd when a server declares none, so a defaulted ``None``
+            hides a real identity input.
 
     Returns:
         Tuple of (package_type, package_name) or ("unknown", None)
     """
     if command in ("npx", "npm"):
         # Find npm package in args (usually after -y flag)
-        raw = _npm_package_arg(args, command)
+        raw = _npm_package_arg(args, command, env, cwd)
         if raw is not None:
             return ("npm", _strip_npm_tag(raw))
 
@@ -1638,7 +1715,11 @@ def _docker_image_name(image_ref: str) -> str:
 
 
 async def get_package_version(
-    command: str, args: list[str], timeout: float = 10.0
+    command: str,
+    args: list[str],
+    env: Mapping[str, str] | None,
+    cwd: str | None,
+    timeout: float = 10.0,
 ) -> tuple[str | None, Literal["npm", "pypi", "cargo", "docker", "unknown"]]:
     """
     Get the latest version for a package based on its command type.
@@ -1646,12 +1727,18 @@ async def get_package_version(
     Args:
         command: The server command (e.g., "npx", "uvx", "cargo", "docker")
         args: Command arguments
+        env: The server's environment OVERLAY -- see ``detect_package_type``.
+            Positioned BEFORE ``timeout`` deliberately: a caller written against
+            the old ``(command, args, timeout=...)`` signature then fails to
+            type-check and to run, instead of silently passing ``timeout`` as
+            ``env`` or omitting an identity input.
+        cwd: The server's declared working directory, or ``None``.
         timeout: Request timeout
 
     Returns:
         Tuple of (version, package_type)
     """
-    pkg_type, pkg_name = detect_package_type(command, args)
+    pkg_type, pkg_name = detect_package_type(command, args, env, cwd)
 
     if pkg_type == "npm" and pkg_name:
         version = await get_npm_version(pkg_name, timeout)
