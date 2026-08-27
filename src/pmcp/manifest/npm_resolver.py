@@ -95,9 +95,7 @@ _RESPAWN_COOLDOWN = 60.0
 # `/x/.npmrc` containing `package=other` redirects resolution entirely.
 # `PREFIX`/`NVM_*` relocate the npm installation; `NODE_PATH`/`NODE_OPTIONS`
 # change what the parser itself loads.
-_ENV_GATE_EXACT = frozenset(
-    {"PATH", "HOME", "NODE_PATH", "NODE_OPTIONS", "PREFIX"}
-)
+_ENV_GATE_EXACT = frozenset({"PATH", "HOME", "NODE_PATH", "NODE_OPTIONS", "PREFIX"})
 _ENV_GATE_PREFIXES = ("npm_config_", "nvm_")
 
 
@@ -351,7 +349,7 @@ class NpmResolver:
 
     def _ensure_child(self) -> NpmResolution | None:
         """Lock held. ``None`` when a live child is available."""
-        if self._sticky is not None:
+        if self._sticky is not None:  # pragma: no cover - `resolve` checks first
             return self._sticky
         if self._proc is not None and self._proc.poll() is None:
             return None
@@ -425,6 +423,11 @@ class NpmResolver:
             if process_gate is not None and self._sticky is None:
                 self._sticky = _refused(process_gate)
                 self._warn_once(process_gate)
+            if self._sticky is not None:
+                # Before the memo lookup, not after: a sticky refusal must win
+                # over an answer this resolver produced while it was still
+                # healthy.
+                return self._sticky
             hit = self._memo.get(key)
             if hit is not None:
                 return hit
@@ -432,9 +435,22 @@ class NpmResolver:
             if outcome is not None:
                 return outcome
             result = self._query_locked(command, args)
-            if result.is_identity or result.is_refused:
-                # UNAVAILABLE is never memoised: it is either sticky (and
-                # returned before we get here) or a transient spawn state.
+            # Memoise only an answer the child SURVIVED giving. `_query_locked`
+            # tears the child down on a timeout, a death, a protocol violation
+            # and on STALE -- which drops the memo -- and then returns REFUSED
+            # for that one request. Writing that REFUSED back into the fresh
+            # memo would make one transient stall permanently disable identity
+            # for that argv: a gateway re-queries the same fixed server set
+            # every refresh cycle, so the entry would be re-served for the
+            # process lifetime even after a healthy respawn. The STALE reason
+            # string literally says "retry after respawn", which a memo hit
+            # makes impossible.
+            #
+            # A gate or parse refusal leaves the child alive and is a fact about
+            # the argv, so it memoises. UNAVAILABLE never does: it is either
+            # sticky (returned above) or a transient spawn state.
+            child_survived = self._proc is not None
+            if child_survived and (result.is_identity or result.is_refused):
                 self._memo[key] = result
             return result
 

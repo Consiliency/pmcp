@@ -651,6 +651,32 @@ class TestHungChild:
             instance.close()
 
     @requires_node
+    def test_a_transport_failure_is_not_memoised(self, hung_helper: Path) -> None:
+        """A refusal the child did not survive must never enter the memo.
+
+        `_query_locked` tears the child down on a timeout, a death, a protocol
+        violation and on STALE, then returns REFUSED for that one request.
+        Memoising it would make a single transient stall permanently disable
+        identity for that argv: a gateway re-queries the same fixed server set
+        every refresh cycle, so the entry would be re-served for the process
+        lifetime even after a healthy respawn -- and STALE's own reason string
+        asks for exactly the retry a memo hit makes impossible.
+        """
+        instance = NpmResolver(helper=hung_helper)
+        try:
+            assert instance.resolve("npx", ["-y", "p"], {}, None).is_refused
+            assert instance._memo == {}
+        finally:
+            instance.close()
+
+    @requires_node
+    def test_a_gate_refusal_IS_memoised(self, resolver: NpmResolver) -> None:
+        """The other side of the split: the child survived, so it is a fact."""
+        _live(resolver)
+        assert resolver.resolve("npx", ["--registry", "http://x", "p"], {}, None)
+        assert any("registry" in str(k) for k in resolver._memo)
+
+    @requires_node
     def test_a_hung_child_never_poisons_the_tables(
         self, hung_helper: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
