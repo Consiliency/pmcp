@@ -129,6 +129,13 @@ pmcp = "pmcp.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pmcp"]
+# `_npm_resolve.js` is not a Python file, and the npm identity resolver is
+# dead without it -- `NpmResolver` reports UNAVAILABLE and every npm server
+# silently falls back to the flag tables. hatchling happens to include it via
+# `packages` today; naming it explicitly means a future change to the include
+# rules cannot drop it silently. The `install-smoke` CI job proves it survives
+# a real wheel install by RESOLVING a package through it.
+artifacts = ["src/pmcp/manifest/_npm_resolve.js"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
