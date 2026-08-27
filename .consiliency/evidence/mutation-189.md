@@ -47,33 +47,48 @@ killed by the wrong check is a loop failure rather than a pass.
 
 | mutant | checker | actionlint | pytest | reason |
 |---|---|---|---|---|
-| *(none: unmutated tree)* | **0** | 0 | 0 | — |
+| *(none: unmutated tree)* | 0 | 0 | 0 | — |
 | `tag-case` | **1** | 0 | 1 | `[release]` |
 | `tags-deleted` | **1** | 0 | 1 | `[release]` |
+| `trigger-pull-request-added` | **1** | 0 | 1 | `[release]` |
+| `trigger-push-branches-added` | **1** | 0 | 1 | `[release]` |
+| `trigger-workflow-dispatch-added` | **1** | 0 | 1 | `[release]` |
+| `trigger-paths-filter-added` | **1** | 0 | 1 | `[release]` |
 | `env-dropped` | **1** | 0 | 1 | `[release]` |
 | `env-renamed` | **1** | 0 | 1 | `[release]` |
 | `needs-build-dropped` | **1** | 0 | 1 | `[release]` |
 | `needs-publish-to-build` | **1** | 0 | 1 | `[release]` |
 | `continue-on-error-job` | **1** | 0 | 1 | `[release]` |
 | `continue-on-error-step` | **1** | 0 | 1 | `[release]` |
+| `if-on-build-job` | **1** | 0 | 1 | `[release]` |
+| `continue-on-error-build-job` | **1** | 0 | 1 | `[release]` |
+| `new-tag-triggered-workflow` | **1** | 0 | 1 | `[release]` |
 | `if-on-publish-job` | **1** | 0 | 1 | `[release]` |
 | `if-on-publish-step` | **1** | 0 | 1 | `[release]` |
 | `forked-action` | **1** | 0 | 1 | `[release]` |
 | `permissions-job-widened` | **1** | 0 | 1 | `[release]` |
 | `permissions-workflow-level` | **1** | 0 | 1 | `[release]` |
 | `job-added` | **1** | 0 | 1 | `[release]` |
-| `job-deleted` | **1** | 1 | 1 | `[release]` + `[drift]` |
-| `file-deleted` | **1** | 0 | 2 | `[release]` + `[drift]` |
+| `job-deleted` | **1** | 1 | 1 | `[release]`+`[drift]` |
+| `file-deleted` | **1** | 0 | 2 | `[release]`+`[drift]` |
 | `timeout-360` | **1** | 0 | 1 | `[timeout]` |
 | `timeout-1` | **1** | 0 | 1 | `[timeout]` |
 | `timeout-string` | **1** | 1 | 1 | `[timeout]` |
 | `timeout-bool` | **1** | 1 | 1 | `[timeout]` |
 | `timeout-deleted` | **1** | 0 | 1 | `[timeout]` |
-| `maintenance-deleted` | **1** | 0 | **0** | `[drift]` only |
-| `changelog-job-deleted` | **1** | 0 | **0** | `[drift]` only |
-| `workflows-job-deleted` | **1** | 0 | 1 | `[drift]` only |
+| `maintenance-deleted` | **1** | 0 | 0 | `[drift]` |
+| `changelog-job-deleted` | **1** | 0 | 0 | `[drift]` |
+| `workflows-job-deleted` | **1** | 0 | 1 | `[drift]` |
 
-25 of 25 killed, each by the check that is supposed to kill it. The exact edits
+Two notes on reading this table. The `pytest` column is the *guard test file*,
+not a targeted assertion per mutant — `file-deleted` shows **2** because
+deleting `release.yml` makes the test module fail at import (it parses the real
+file at module scope), which is a collection crash rather than a test that
+names the defect. The checker column is the targeted one. And `maintenance-deleted`
+and `changelog-job-deleted` show pytest **0** because the drift tests run
+against a synthetic repository, so only the checker sees those.
+
+31 of 31 killed, each by the check that is supposed to kill it. (An earlier revision of this file said "25 of 25" while the helper listed 24 expected-1 rows; the count is now generated from the loop's own results file rather than transcribed.) The exact edits
 are in `scripts/_mutate_workflow.sh`; `--list` prints a one-line description of
 each.
 
@@ -104,9 +119,54 @@ Two things the table cannot show, recorded here instead:
   make the reference safe. SHA-pinning is out of scope for this change and
   needs its own issue.
 
+### The trigger set is a SET, not one key with an allowlist
+
+The original implementation checked that `on.push.tags` contained `v*` and
+permitted anything alongside it. That is an allowlist of one key, not a
+constraint on the trigger set, and on this file it is the worst possible miss:
+`publish` carries `id-token: write` and `gh api` confirms the `release`
+environment has `"protection_rules": []`, so an extra trigger makes the
+**trusted-publishing path reachable from that event**. GitHub evaluates the
+workflow at the triggering ref, and combined branch/tag filters fire for either
+ref type. PyPI's own trusted-publisher model calls this out: unintended triggers
+in a trusted workflow require environment approval protections, which this repo
+does not have.
+
+Reproduced with the tag filter left completely intact:
+
+```yaml
+on:
+  pull_request: {}
+  push:
+    branches: [main]
+    tags:
+      - "v*"          # untouched
+```
+
+```
+before the fix:  workflow guards: OK                                   EXIT=0   <- WRONG
+                 actionlint                                            EXIT=0
+after the fix:   FAIL [release] extra trigger event(s): pull_request …
+                 FAIL [release] on.push carries branches alongside tags …
+                                                                       EXIT=1
+```
+
+The invariant is now that the trigger block is exactly
+`{push: {tags: ["v*"]}}` — no other top-level event, no `branches`/`paths`
+filter under `push`. Four committed mutants cover it individually:
+`trigger-pull-request-added`, `trigger-push-branches-added`,
+`trigger-workflow-dispatch-added` (struck as dangerous during #187) and
+`trigger-paths-filter-added`.
+
+The same review pass found `build` outside the `if:`/`continue-on-error` sweep.
+An `if:` that skips `build` skips `publish` through `needs`, and the tag push
+concludes **green** — the same silence class `tag-case` headlines. `build` is
+now in `PROTECTED_JOBS`; mutants `if-on-build-job` and
+`continue-on-error-build-job`.
+
 ### actionlint: the "before" column, read honestly
 
-actionlint 1.7.12 killed **4 of 30** mutants, and the four are exactly the
+actionlint 1.7.12 killed **4 of 37** mutants, and the four are exactly the
 schema class:
 
 ```
@@ -205,6 +265,40 @@ workflow file and passes — the two are distinguished by
 `git rev-parse --verify <base>^{commit}` before any path lookup
 (`TestJobSetDrift::test_a_missing_base_and_a_new_file_are_distinguished`).
 
+### …and on a `git diff` that fails for any other reason
+
+A **different** fault, and the one the original implementation got wrong: the
+changed-paths helper turned any non-zero `git diff` into an empty path list, and
+`job_set_drift([], base)` then passed because the base *resolved*. A base commit
+that resolves but shares no history with HEAD makes `git diff A...B` exit 128 —
+which is the shape of divergent or rewritten history, shallow clones and
+force-pushed bases, i.e. exactly the histories where drift matters.
+
+```
+$ ORPHAN=$(git commit-tree $(git write-tree) -m "no merge base")
+
+before the fix:
+  drift: base 879b8bc…, changed workflow paths: none
+  workflow guards: OK                                                   EXIT=0   <- WRONG
+
+after the fix:
+  drift: base 9e128c1…, FAILED to list changed paths
+  FAIL [drift] `git diff --name-only --no-renames --diff-filter=ACMRD 9e128c1…...HEAD
+       -- .github/workflows` failed (exit 128): fatal: 9e128c1…...HEAD: no merge base
+       — refusing to pass with drift detection disabled                 EXIT=1
+```
+
+The two faults are reported **distinctly** — one means "fetch more history", the
+other means "this base shares no history with HEAD" — and a test asserts each
+message does *not* contain the other's
+(`TestJobSetDrift::test_the_two_drift_faults_are_reported_distinctly`).
+
+The same "non-zero read as absent/empty" pattern appeared once more, wearing a
+different hat: the base-blob existence check inferred "this path is new" from a
+non-zero `git cat-file -e`, so any other git failure would have made drift pass
+on a file whose jobs had in fact been deleted. It is now a positive
+`git ls-tree` membership test whose own failure is a `[drift]` failure.
+
 ## The `on:` key is `True`, not `"on"`
 
 YAML 1.1 reads a bare `on:` as the boolean `True`. `yaml.safe_load` on the real
@@ -230,8 +324,20 @@ FAILED TestOnKeyParsing::test_a_quoted_on_key_passes_too
 ## `release-diff-ack`, all three directions
 
 `check_workflows.py` is an allowlist: it catches bad states it knows how to
-name. `release-diff-ack` is the tripwire for the remainder — the mutants above
-that stay green, and the ones nobody has thought of.
+name. `release-diff-ack` is the tripwire for the remainder **within
+`release.yml` itself** — the mutants above that stay green, such as
+`concurrency-added`, and the ones nobody has thought of.
+
+**It is not a tripwire for anything outside that one file.** An earlier revision
+of this document called it "the tripwire for the remainder" full stop; that was
+false as written. Its grep is exactly `\.github/workflows/release\.yml`, so a
+*new* tag-triggered workflow — `release-notes.yml` with `contents: write`, which
+runs arbitrary code on every release — leaves it green, because `release.yml` is
+untouched. Measured before the fix: checker **0**, actionlint **0**,
+`release-diff-ack` **green**, pytest **112 passed** (the glob parametrize even
+picked the new file up and passed it). That hole is now closed by an invariant,
+not by this job: only `release.yml` and `docker.yml` may declare `on.push.tags`
+(mutant `new-tag-triggered-workflow`, checker exit **1**).
 
 This is a **local simulation, not a live CI run**: the shipped step body is
 extracted from `.github/workflows/test.yml` with PyYAML (so it is the real
@@ -264,6 +370,14 @@ already-failed PR would never be seen. E is the reason the fallback branches on
 the lookup's **exit status** and never on emptiness — a successful lookup
 returning zero labels is authoritative, and resurrecting a removed label from
 the frozen payload would bypass the guard entirely.
+
+One corner the fallback cannot cover, named rather than left implicit: if the
+label is removed after the trigger **and** the live lookup then fails, D's
+fallback resurrects the acknowledgement from the frozen payload and the job
+passes. That is inherent to having a fallback at all — the alternative is
+false-blocking a genuinely labelled PR whenever the API is briefly unavailable,
+which is the failure this repo already hit once (Consiliency/pmcp#156 item 4).
+It requires an API failure and a removal in the same window.
 
 ## Live CI — the half that cannot be proven locally
 
