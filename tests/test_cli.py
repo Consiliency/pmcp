@@ -13,6 +13,8 @@ import yaml
 
 from pmcp.cli import async_main, parse_args, setup_logging
 from pmcp.manifest.loader import Manifest, ServerConfig
+from pmcp.manifest import version_checker
+from pmcp.manifest.npm_resolver import NpmResolution
 
 
 class TestParseArgs:
@@ -2419,6 +2421,36 @@ class TestCheckVersionsUnverifiableDisplay:
     FORCE_FOOTER = "refresh --force"
     UNVERIFIABLE_HEADING = "could not be confirmed"
 
+    @pytest.fixture(autouse=True)
+    def _pin_the_npm_identity_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Make npm identity independent of what the host's `/tmp` contains.
+
+        Consiliency/pmcp#195. `detect_package_type` now asks npm's own parser,
+        and one of its refusal gates is npm's own local-prefix rule: walking up
+        from the effective cwd, a `package.json` or `node_modules` in ANY
+        ancestor means a project `.npmrc` (or a local bin) can redirect
+        resolution, so identity refuses. These tests `chdir` into `tmp_path`,
+        which pytest puts under `/tmp` -- and a stray `/tmp/package.json`, which
+        this suite does not control, silently flips `npx -y some-pkg` from
+        resolving to refusing and moves `pkg` from the stale group to the
+        unverifiable one.
+
+        The subject of this class is the DISPLAY split, not npm identity, so the
+        identity path is pinned to the node-less tables. The resolver path is
+        covered where it belongs, in `tests/test_version_checker.py`, which runs
+        from the repository root.
+        """
+
+        class _NodeLess:
+            def resolve(
+                self, command: str, args: list[str], env: object, cwd: str | None
+            ) -> NpmResolution:
+                return NpmResolution(
+                    status="UNAVAILABLE", reason="test: node-less host"
+                )
+
+        monkeypatch.setattr(version_checker, "get_resolver", lambda: _NodeLess())
+
     @staticmethod
     def _manifest(*names: str) -> Manifest:
         """A manifest of *names* drawn from a fixed two-server cast.
@@ -2489,7 +2521,11 @@ class TestCheckVersionsUnverifiableDisplay:
 
     @staticmethod
     async def _fake_version(
-        command: str, args: list[str], timeout: float = 10.0
+        command: str,
+        args: list[str],
+        env: object = None,
+        cwd: str | None = None,
+        timeout: float = 10.0,
     ) -> tuple[str | None, str]:
         """Stand in for the network: npm resolves, anything else does not."""
         if command == "npx":

@@ -372,11 +372,12 @@ function resolveOne (parser, command, args) {
   // positional while npm actually fetches `/undefined`.
   if (Object.prototype.hasOwnProperty.call(parsed, 'package')) {
     const pkgs = parsed.package
-    if (!Array.isArray(pkgs) || pkgs.length !== 1) {
-      // npm allows `--package` to be repeated. One is an identity; several are
-      // not, and picking the first would be exactly the guess this exists to
-      // stop.
-      return REFUSE('--package must appear exactly once')
+    if (!Array.isArray(pkgs) || pkgs.length === 0 || new Set(pkgs).size !== 1) {
+      // npm allows `--package` to be repeated. ONE DISTINCT package is an
+      // identity; several are not, and picking the first would be exactly the
+      // guess this exists to stop. Repeating the SAME package is still one
+      // identity, so it is compared as a set rather than by length.
+      return REFUSE('--package must name exactly one distinct package')
     }
     // A single `--package` value outranks the positional (Consiliency/pmcp#182):
     // in `npm exec --package=<pkg> -- <bin>` the positional is the BINARY npm
@@ -457,6 +458,7 @@ const SELF_TEST = [
   ['npx', ['--'], null],
   ['npx', ['--package='], null],
   ['npx', ['--package=a', '--package=b', 'bin'], null],
+  ['npx', ['--package=a', '--package=a', 'bin'], 'a'],
   ['npx', ['--pack', 'zz', 'bin'], null],
   ['npx', ['--userconfig', '/tmp/rc', 'probe'], null],
   ['npx', ['--registry', 'http://x', 'probe'], null],

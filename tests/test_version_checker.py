@@ -28,26 +28,136 @@ from pmcp.manifest.version_checker import (
     VersionComparison,
 )
 from pmcp import __version__
+from pmcp.manifest import version_checker
+from pmcp.manifest.npm_resolver import NpmResolution, get_resolver
+
+
+def detect(
+    command: str,
+    args: list[str],
+    env: dict[str, str] | None = None,
+    cwd: str | None = None,
+) -> tuple[str, str | None]:
+    """`detect_package_type` with the identity inputs defaulted, for brevity.
+
+    The defaults live HERE and never in production: `detect_package_type`'s
+    `env`/`cwd` are undefaulted precisely so an unconverted production call site
+    is a type error. A test that means "this server declares no env overlay and
+    no cwd" is stating a fact, not forgetting an argument.
+    """
+    return detect_package_type(command, args, env, cwd)
+
+
+class _UnavailableResolver:
+    """Stands in for the resolver on a host with no node and no npm.
+
+    Forcing the fallback by patching the resolver rather than by mangling
+    `PATH` keeps the fixture deterministic: `PATH` state is a property of the
+    machine the suite happens to run on, and a fixture that depends on it tests
+    a different thing on every host.
+    """
+
+    def resolve(
+        self,
+        command: str,
+        args: list[str],
+        env: object,
+        cwd: str | None,
+    ) -> NpmResolution:
+        return NpmResolution(status="UNAVAILABLE", reason="test: node-less host")
+
+
+class _NpmIdentityPath:
+    """One of the two production paths through `_npm_package_arg`."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    @property
+    def resolver_active(self) -> bool:
+        return self.name == "resolver"
+
+    def detect(
+        self,
+        command: str,
+        args: list[str],
+        env: dict[str, str] | None = None,
+        cwd: str | None = None,
+    ) -> tuple[str, str | None]:
+        return detect_package_type(command, args, env, cwd)
+
+    def expect(
+        self,
+        *,
+        resolver: tuple[str, str | None],
+        tables: tuple[str, str | None],
+    ) -> tuple[str, str | None]:
+        """The expected answer for the path under test.
+
+        Used only where the two paths genuinely differ. Spelling BOTH sides at
+        the call site is the point: it makes each divergence a reviewed,
+        documented fact rather than an implicit "whatever the code does".
+        """
+        return resolver if self.resolver_active else tables
+
+
+@pytest.fixture(params=["resolver", "tables"])
+def npm_path(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> _NpmIdentityPath:
+    """Run an npm identity assertion under BOTH production paths.
+
+    Consiliency/pmcp#195. npm identity now comes from npm's own parser where
+    npm is installed, and from the flag tables where it is not. Both are
+    production; an earlier draft moved the whole #182/#183 regression set onto
+    the fallback fixture, which would have stopped covering production on every
+    node-ful host -- i.e. on every host that matters.
+
+    Where the two paths give different answers they are asserted separately, and
+    the difference is always in the same direction: the resolver refuses where
+    the tables guess.
+    """
+    if request.param == "tables":
+        monkeypatch.setattr(
+            version_checker, "get_resolver", lambda: _UnavailableResolver()
+        )
+        return _NpmIdentityPath("tables")
+
+    probe = get_resolver().resolve("npx", ["-y", "left-pad"], {}, None)
+    if probe.is_unavailable:
+        # No node/npm here. Genuinely untestable, not a soft failure.
+        pytest.skip(f"npm resolver unavailable on this host: {probe.reason}")
+    if not probe.is_identity:
+        # REFUSED on the plainest possible form means the drift tripwire fired:
+        # an unrecognised `npx-cli.js`, a failed self-test, or a parser that
+        # would not load. That is the tripwire WORKING, and it must be loud --
+        # skipping here would hide a host on which npm identity is disabled.
+        pytest.fail(
+            f"the npm resolver refused `npx -y left-pad`: {probe.reason}. "
+            "npm identity is disabled on this host; investigate rather than "
+            "skip."
+        )
+    return _NpmIdentityPath("resolver")
 
 
 class TestDetectPackageType:
     """Tests for detect_package_type function."""
 
-    def test_npx_simple_package(self) -> None:
+    def test_npx_simple_package(self, npm_path: _NpmIdentityPath) -> None:
         """Test detection of simple npx package."""
-        pkg_type, pkg_name = detect_package_type("npx", ["-y", "playwright-mcp"])
+        pkg_type, pkg_name = npm_path.detect("npx", ["-y", "playwright-mcp"])
         assert pkg_type == "npm"
         assert pkg_name == "playwright-mcp"
 
-    def test_npx_scoped_package(self) -> None:
+    def test_npx_scoped_package(self, npm_path: _NpmIdentityPath) -> None:
         """Test detection of scoped npm package."""
-        pkg_type, pkg_name = detect_package_type("npx", ["-y", "@playwright/mcp"])
+        pkg_type, pkg_name = npm_path.detect("npx", ["-y", "@playwright/mcp"])
         assert pkg_type == "npm"
         assert pkg_name == "@playwright/mcp"
 
-    def test_npx_package_with_latest(self) -> None:
+    def test_npx_package_with_latest(self, npm_path: _NpmIdentityPath) -> None:
         """Test detection strips @latest suffix."""
-        pkg_type, pkg_name = detect_package_type("npx", ["-y", "some-package@latest"])
+        pkg_type, pkg_name = npm_path.detect("npx", ["-y", "some-package@latest"])
         assert pkg_type == "npm"
         assert pkg_name == "some-package"
 
@@ -62,19 +172,22 @@ class TestDetectPackageType:
         ],
     )
     def test_npx_package_strips_arbitrary_tag_or_version(
-        self, arg: str, expected: str
+        self,
+        arg: str,
+        expected: str,
+        npm_path: _NpmIdentityPath,
     ) -> None:
-        pkg_type, pkg_name = detect_package_type("npx", ["-y", arg])
+        pkg_type, pkg_name = npm_path.detect("npx", ["-y", arg])
         assert pkg_type == "npm"
         assert pkg_name == expected
 
-    def test_npx_without_y_flag(self) -> None:
+    def test_npx_without_y_flag(self, npm_path: _NpmIdentityPath) -> None:
         """Test detection works without -y flag."""
-        pkg_type, pkg_name = detect_package_type("npx", ["my-mcp-server"])
+        pkg_type, pkg_name = npm_path.detect("npx", ["my-mcp-server"])
         assert pkg_type == "npm"
         assert pkg_name == "my-mcp-server"
 
-    def test_npm_command(self) -> None:
+    def test_npm_command(self, npm_path: _NpmIdentityPath) -> None:
         """`npm` reads its package from an allowlisted subcommand's operand.
 
         This test previously asserted `npm -y server-pkg` -> `server-pkg`.
@@ -85,43 +198,43 @@ class TestDetectPackageType:
         installed and executed via `npx -y`). A bare token now fails closed;
         the real form is exercised here instead.
         """
-        pkg_type, pkg_name = detect_package_type("npm", ["exec", "-y", "server-pkg"])
+        pkg_type, pkg_name = npm_path.detect("npm", ["exec", "-y", "server-pkg"])
         assert pkg_type == "npm"
         assert pkg_name == "server-pkg"
 
-    def test_npm_without_a_subcommand_is_not_a_package(self) -> None:
+    def test_npm_without_a_subcommand_is_not_a_package(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """A bare `npm <token>` is not legal npm, so no identity is claimed."""
-        assert detect_package_type("npm", ["-y", "server-pkg"]) == ("unknown", None)
+        assert npm_path.detect("npm", ["-y", "server-pkg"]) == ("unknown", None)
 
     def test_uvx_simple_package(self) -> None:
         """Test detection of uvx (PyPI) package."""
-        pkg_type, pkg_name = detect_package_type("uvx", ["mcp-server-git"])
+        pkg_type, pkg_name = detect("uvx", ["mcp-server-git"])
         assert pkg_type == "pypi"
         assert pkg_name == "mcp-server-git"
 
     def test_uvx_with_flags(self) -> None:
         """Test uvx detection skips flags."""
-        pkg_type, pkg_name = detect_package_type(
-            "uvx", ["--quiet", "my-package", "--arg"]
-        )
+        pkg_type, pkg_name = detect("uvx", ["--quiet", "my-package", "--arg"])
         assert pkg_type == "pypi"
         assert pkg_name == "my-package"
 
     def test_unknown_command(self) -> None:
         """Test unknown command returns unknown type."""
-        pkg_type, pkg_name = detect_package_type("python", ["-m", "mymodule"])
+        pkg_type, pkg_name = detect("python", ["-m", "mymodule"])
         assert pkg_type == "unknown"
         assert pkg_name is None
 
     def test_docker_command(self) -> None:
         """Test docker command detects image name."""
-        pkg_type, pkg_name = detect_package_type("docker", ["run", "myimage"])
+        pkg_type, pkg_name = detect("docker", ["run", "myimage"])
         assert pkg_type == "docker"
         assert pkg_name == "myimage"
 
     def test_docker_run_with_flags(self) -> None:
         """Test docker run strips flags and finds image."""
-        pkg_type, pkg_name = detect_package_type(
+        pkg_type, pkg_name = detect(
             "docker", ["run", "-i", "--rm", "mcp/server:latest"]
         )
         assert pkg_type == "docker"
@@ -129,7 +242,7 @@ class TestDetectPackageType:
 
     def test_docker_run_with_env_flag(self) -> None:
         """Test docker run skips -e VALUE and finds image."""
-        pkg_type, pkg_name = detect_package_type(
+        pkg_type, pkg_name = detect(
             "docker", ["run", "-e", "KEY=val", "--rm", "ghcr.io/org/mcp"]
         )
         assert pkg_type == "docker"
@@ -137,49 +250,43 @@ class TestDetectPackageType:
 
     def test_cargo_run_with_package_flag(self) -> None:
         """Test cargo run -p package detects package."""
-        pkg_type, pkg_name = detect_package_type(
-            "cargo", ["run", "-p", "my-mcp-server"]
-        )
+        pkg_type, pkg_name = detect("cargo", ["run", "-p", "my-mcp-server"])
         assert pkg_type == "cargo"
         assert pkg_name == "my-mcp-server"
 
     def test_cargo_run_with_bin_flag(self) -> None:
         """Test cargo run --bin binary detects binary name."""
-        pkg_type, pkg_name = detect_package_type(
-            "cargo", ["run", "--bin", "mcp-binary"]
-        )
+        pkg_type, pkg_name = detect("cargo", ["run", "--bin", "mcp-binary"])
         assert pkg_type == "cargo"
         assert pkg_name == "mcp-binary"
 
     def test_cargo_install(self) -> None:
         """Test cargo install package detects package."""
-        pkg_type, pkg_name = detect_package_type("cargo", ["install", "mcp-tool"])
+        pkg_type, pkg_name = detect("cargo", ["install", "mcp-tool"])
         assert pkg_type == "cargo"
         assert pkg_name == "mcp-tool"
 
     def test_pip_install(self) -> None:
         """Test pip install detects PyPI package."""
-        pkg_type, pkg_name = detect_package_type("pip", ["install", "mcp-server-git"])
+        pkg_type, pkg_name = detect("pip", ["install", "mcp-server-git"])
         assert pkg_type == "pypi"
         assert pkg_name == "mcp-server-git"
 
     def test_pip3_install_upgrade(self) -> None:
         """Test pip3 install --upgrade detects package."""
-        pkg_type, pkg_name = detect_package_type(
-            "pip3", ["install", "--upgrade", "my-mcp-server"]
-        )
+        pkg_type, pkg_name = detect("pip3", ["install", "--upgrade", "my-mcp-server"])
         assert pkg_type == "pypi"
         assert pkg_name == "my-mcp-server"
 
-    def test_empty_args(self) -> None:
+    def test_empty_args(self, npm_path: _NpmIdentityPath) -> None:
         """Test npx with empty args."""
-        pkg_type, pkg_name = detect_package_type("npx", [])
+        pkg_type, pkg_name = npm_path.detect("npx", [])
         assert pkg_type == "unknown"
         assert pkg_name is None
 
-    def test_only_flags(self) -> None:
+    def test_only_flags(self, npm_path: _NpmIdentityPath) -> None:
         """Test npx with only flags."""
-        pkg_type, pkg_name = detect_package_type("npx", ["-y", "--quiet"])
+        pkg_type, pkg_name = npm_path.detect("npx", ["-y", "--quiet"])
         assert pkg_type == "unknown"
         assert pkg_name is None
 
@@ -212,8 +319,8 @@ class TestPackageIdentityCollisions:
         RED before the fix: the branch split on the FIRST colon, so both
         returned `("docker", "registry")` -- the registry host, not an image.
         """
-        old = detect_package_type("docker", ["run", "registry:5000/old-image"])
-        new = detect_package_type("docker", ["run", "registry:5000/new-image"])
+        old = detect("docker", ["run", "registry:5000/old-image"])
+        new = detect("docker", ["run", "registry:5000/new-image"])
         assert old != new, (
             "two different images on one host:port registry collapsed to a "
             f"single identity: {old} == {new}"
@@ -221,22 +328,24 @@ class TestPackageIdentityCollisions:
         assert old == ("docker", "registry:5000/old-image")
         assert new == ("docker", "registry:5000/new-image")
 
-    def test_npm_exec_distinguishes_packages(self) -> None:
+    def test_npm_exec_distinguishes_packages(self, npm_path: _NpmIdentityPath) -> None:
         """`npm exec A` and `npm exec B` are different packages.
 
         RED before the fix: with no subcommand skip the first non-flag token
         was `exec`, so both returned `("npm", "exec")`.
         """
-        old = detect_package_type("npm", ["exec", "old-pkg"])
-        new = detect_package_type("npm", ["exec", "new-pkg"])
+        old = npm_path.detect("npm", ["exec", "old-pkg"])
+        new = npm_path.detect("npm", ["exec", "new-pkg"])
         assert old != new, f"two different npm exec packages collapsed: {old} == {new}"
         assert old == ("npm", "old-pkg")
         assert new == ("npm", "new-pkg")
 
-    def test_npm_x_alias_distinguishes_packages(self) -> None:
+    def test_npm_x_alias_distinguishes_packages(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """`x` is npm's documented `exec` alias and must skip identically."""
-        old = detect_package_type("npm", ["x", "old-pkg"])
-        new = detect_package_type("npm", ["x", "new-pkg"])
+        old = npm_path.detect("npm", ["x", "old-pkg"])
+        new = npm_path.detect("npm", ["x", "new-pkg"])
         assert old != new, f"npm x packages collapsed: {old} == {new}"
         assert old == ("npm", "old-pkg")
 
@@ -260,8 +369,8 @@ class TestValueFlagCollisions:
     def test_uvx_python_version_is_not_the_package(self) -> None:
         """RED before: both sides returned `("pypi", "3.12")` -- the Python
         version, read off `--python`, as the package name."""
-        a = detect_package_type("uvx", ["--python", "3.12", "pkg-a"])
-        b = detect_package_type("uvx", ["--python", "3.12", "pkg-b"])
+        a = detect("uvx", ["--python", "3.12", "pkg-a"])
+        b = detect("uvx", ["--python", "3.12", "pkg-b"])
         assert a != b, f"`--python`'s value collapsed two packages: {a} == {b}"
         assert a == ("pypi", "pkg-a")
         assert b == ("pypi", "pkg-b")
@@ -269,8 +378,8 @@ class TestValueFlagCollisions:
     def test_uvx_with_dependency_is_not_the_package(self) -> None:
         """RED before: both returned `("pypi", "requests")` -- an injected
         dependency named by `--with`, not the server being run."""
-        a = detect_package_type("uvx", ["--with", "requests", "srv-a"])
-        b = detect_package_type("uvx", ["--with", "requests", "srv-b"])
+        a = detect("uvx", ["--with", "requests", "srv-a"])
+        b = detect("uvx", ["--with", "requests", "srv-b"])
         assert a != b, f"`--with`'s value collapsed two packages: {a} == {b}"
         assert a == ("pypi", "srv-a")
         assert b == ("pypi", "srv-b")
@@ -278,16 +387,16 @@ class TestValueFlagCollisions:
     def test_pip_index_url_is_not_the_package(self) -> None:
         """RED before: both returned `("pypi", "https://x")` -- an index URL
         as a package name, which no registry lookup could ever resolve."""
-        a = detect_package_type("pip", ["install", "--index-url", "https://x", "pkg-a"])
-        b = detect_package_type("pip", ["install", "--index-url", "https://x", "pkg-b"])
+        a = detect("pip", ["install", "--index-url", "https://x", "pkg-a"])
+        b = detect("pip", ["install", "--index-url", "https://x", "pkg-b"])
         assert a != b, f"`--index-url`'s value collapsed two packages: {a} == {b}"
         assert a == ("pypi", "pkg-a")
         assert b == ("pypi", "pkg-b")
 
     def test_cargo_features_is_not_the_crate(self) -> None:
         """RED before: both returned `("cargo", "full")` -- a feature name."""
-        a = detect_package_type("cargo", ["run", "--features", "full", "srv-a"])
-        b = detect_package_type("cargo", ["run", "--features", "full", "srv-b"])
+        a = detect("cargo", ["run", "--features", "full", "srv-a"])
+        b = detect("cargo", ["run", "--features", "full", "srv-b"])
         assert a != b, f"`--features`'s value collapsed two crates: {a} == {b}"
         assert a == ("cargo", "srv-a")
         assert b == ("cargo", "srv-b")
@@ -298,25 +407,23 @@ class TestValueFlagCollisions:
         `--env-file` was simply missing from `_docker_image_arg`'s value-flag
         table -- the most careful branch in the file, and still incomplete.
         """
-        a = detect_package_type("docker", ["run", "--env-file", ".env", "img-a"])
-        b = detect_package_type("docker", ["run", "--env-file", ".env", "img-b"])
+        a = detect("docker", ["run", "--env-file", ".env", "img-a"])
+        b = detect("docker", ["run", "--env-file", ".env", "img-b"])
         assert a != b, f"`--env-file`'s value collapsed two images: {a} == {b}"
         assert a == ("docker", "img-a")
         assert b == ("docker", "img-b")
 
     def test_docker_mount_spec_is_not_the_image(self) -> None:
         """RED before: both returned `("docker", "type=bind,src=/a")`."""
-        a = detect_package_type(
-            "docker", ["run", "--mount", "type=bind,src=/a", "img-a"]
-        )
-        b = detect_package_type(
-            "docker", ["run", "--mount", "type=bind,src=/a", "img-b"]
-        )
+        a = detect("docker", ["run", "--mount", "type=bind,src=/a", "img-a"])
+        b = detect("docker", ["run", "--mount", "type=bind,src=/a", "img-b"])
         assert a != b, f"`--mount`'s value collapsed two images: {a} == {b}"
         assert a == ("docker", "img-a")
         assert b == ("docker", "img-b")
 
-    def test_npm_exec_package_flag_names_the_package(self) -> None:
+    def test_npm_exec_package_flag_names_the_package(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """RED before: both returned `("npm", "bin")` -- the BINARY.
 
         The seventh collision, and the only one of the seven where identity is
@@ -325,13 +432,15 @@ class TestValueFlagCollisions:
         as merely "self-delimiting, so keep scanning" still returns `bin`;
         the scanner has to read the value back OUT of the flag.
         """
-        a = detect_package_type("npm", ["exec", "--package=old", "--", "bin"])
-        b = detect_package_type("npm", ["exec", "--package=new", "--", "bin"])
+        a = npm_path.detect("npm", ["exec", "--package=old", "--", "bin"])
+        b = npm_path.detect("npm", ["exec", "--package=new", "--", "bin"])
         assert a != b, f"two packages exposing one binary collapsed: {a} == {b}"
         assert a == ("npm", "old")
         assert b == ("npm", "new")
 
-    def test_npm_exec_package_flag_spaced_spelling(self) -> None:
+    def test_npm_exec_package_flag_spaced_spelling(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """npm documents both `--package=<pkg>` and `--package <pkg>`.
 
         **This case does not discriminate the fix, and is kept as a plain
@@ -342,13 +451,15 @@ class TestValueFlagCollisions:
         the `=` spelling above and the repeated-flag refusal below actually
         pin the extraction.
         """
-        a = detect_package_type("npm", ["exec", "--package", "old", "--", "bin"])
-        b = detect_package_type("npm", ["exec", "--package", "new", "--", "bin"])
+        a = npm_path.detect("npm", ["exec", "--package", "old", "--", "bin"])
+        b = npm_path.detect("npm", ["exec", "--package", "new", "--", "bin"])
         assert a != b, f"spaced `--package` collapsed two packages: {a} == {b}"
         assert a == ("npm", "old")
         assert b == ("npm", "new")
 
-    def test_npm_repeated_package_flags_refuse(self) -> None:
+    def test_npm_repeated_package_flags_refuse(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """npm allows `--package` more than once; several are not an identity.
 
         One package is an identity. Two DIFFERENT ones are not, and returning
@@ -356,10 +467,10 @@ class TestValueFlagCollisions:
         two configs would then confirm as one package on the strength of a
         coin flip. Repeating the SAME package is still an identity.
         """
-        assert detect_package_type(
+        assert npm_path.detect(
             "npm", ["exec", "--package", "a", "--package", "b", "--", "bin"]
         ) == ("unknown", None)
-        assert detect_package_type(
+        assert npm_path.detect(
             "npm", ["exec", "--package", "a", "--package", "a", "--", "bin"]
         ) == ("npm", "a")
 
@@ -378,18 +489,18 @@ class TestDirectReferencesStayDistinct:
     """
 
     def test_named_direct_references_to_different_repos_are_different(self) -> None:
-        y = detect_package_type("uvx", ["--from", "pkg @ git+https://x/y", "tool"])
-        z = detect_package_type("uvx", ["--from", "pkg @ git+https://x/z", "tool"])
+        y = detect("uvx", ["--from", "pkg @ git+https://x/y", "tool"])
+        z = detect("uvx", ["--from", "pkg @ git+https://x/z", "tool"])
         assert y != z, f"two different repositories collapsed to one identity: {y}"
         assert y == ("pypi", "pkg @ git+https://x/y")
 
     def test_normalization_still_strips_extras_and_versions(self) -> None:
         """The `@` carve-out must not disable the rest of the rule."""
-        assert detect_package_type("uvx", ["--from", "browser-use[cli]", "t"]) == (
+        assert detect("uvx", ["--from", "browser-use[cli]", "t"]) == (
             "pypi",
             "browser-use",
         )
-        assert detect_package_type("uvx", ["--from", "index-it-mcp==1.2.0", "t"]) == (
+        assert detect("uvx", ["--from", "index-it-mcp==1.2.0", "t"]) == (
             "pypi",
             "index-it-mcp",
         )
@@ -414,7 +525,7 @@ class TestPositiveFlagGuardArms:
 
     def test_positive_flag_followed_by_a_flag_refuses(self) -> None:
         """The value of `--from` cannot be another flag."""
-        assert detect_package_type("uvx", ["--from", "--offline", "pkg"]) == (
+        assert detect("uvx", ["--from", "--offline", "pkg"]) == (
             "unknown",
             None,
         )
@@ -429,16 +540,16 @@ class TestPositiveFlagGuardArms:
         every other -- green, verified. The arm is defensive, not load-bearing;
         this test pins the observable behaviour, not the branch.
         """
-        assert detect_package_type("uvx", ["--from"]) == ("unknown", None)
-        assert detect_package_type("cargo", ["run", "--bin"]) == ("unknown", None)
+        assert detect("uvx", ["--from"]) == ("unknown", None)
+        assert detect("cargo", ["run", "--bin"]) == ("unknown", None)
 
     def test_positive_flag_with_an_empty_attached_value_refuses(self) -> None:
         """`--from=` attaches an empty value, which is not a package name."""
-        assert detect_package_type("uvx", ["--from=", "pkg"]) == ("unknown", None)
+        assert detect("uvx", ["--from=", "pkg"]) == ("unknown", None)
 
     def test_cargo_shares_the_same_guard_arms(self) -> None:
         """cargo's `-p`/`--bin` run through the same branch."""
-        assert detect_package_type("cargo", ["run", "-p", "--offline"]) == (
+        assert detect("cargo", ["run", "-p", "--offline"]) == (
             "unknown",
             None,
         )
@@ -461,31 +572,25 @@ class TestValueFlagsFailClosed:
     """
 
     def test_uvx_unlisted_flag_refuses(self) -> None:
-        assert detect_package_type("uvx", ["--not-a-real-uv-flag", "pkg"]) == (
+        assert detect("uvx", ["--not-a-real-uv-flag", "pkg"]) == (
             "unknown",
             None,
         )
 
     def test_pip_unlisted_flag_refuses(self) -> None:
-        assert detect_package_type(
-            "pip", ["install", "--not-a-real-pip-flag", "p"]
-        ) == (
+        assert detect("pip", ["install", "--not-a-real-pip-flag", "p"]) == (
             "unknown",
             None,
         )
 
     def test_cargo_unlisted_flag_refuses(self) -> None:
-        assert detect_package_type(
-            "cargo", ["run", "--not-a-real-cargo-flag", "s"]
-        ) == (
+        assert detect("cargo", ["run", "--not-a-real-cargo-flag", "s"]) == (
             "unknown",
             None,
         )
 
     def test_docker_unlisted_flag_refuses(self) -> None:
-        assert detect_package_type(
-            "docker", ["run", "--not-a-real-docker-flag", "i"]
-        ) == (
+        assert detect("docker", ["run", "--not-a-real-docker-flag", "i"]) == (
             "unknown",
             None,
         )
@@ -497,7 +602,7 @@ class TestValueFlagsFailClosed:
         token. A `--flag=value` spelling carries its value inside the token,
         so it cannot; refusing here would cost auto-update for no safety gain.
         """
-        assert detect_package_type("uvx", ["--not-a-real-uv-flag=x", "pkg"]) == (
+        assert detect("uvx", ["--not-a-real-uv-flag=x", "pkg"]) == (
             "pypi",
             "pkg",
         )
@@ -511,8 +616,8 @@ class TestValueFlagsFailClosed:
         before any comparison happens, so equality here can never be read as a
         positive confirmation.
         """
-        a = detect_package_type("uvx", ["--not-a-real-uv-flag", "pkg-a"])
-        b = detect_package_type("uvx", ["--not-a-real-uv-flag", "pkg-b"])
+        a = detect("uvx", ["--not-a-real-uv-flag", "pkg-a"])
+        b = detect("uvx", ["--not-a-real-uv-flag", "pkg-b"])
         assert a == b == ("unknown", None)
         from pmcp.manifest.refresher import _same_package
 
@@ -532,27 +637,25 @@ class TestKnownPositiveValueFlags:
     """
 
     def test_uvx_boolean_flag_still_finds_package(self) -> None:
-        assert detect_package_type("uvx", ["--quiet", "my-package", "--arg"]) == (
+        assert detect("uvx", ["--quiet", "my-package", "--arg"]) == (
             "pypi",
             "my-package",
         )
 
     def test_docker_short_boolean_flags_still_find_image(self) -> None:
-        assert detect_package_type(
-            "docker", ["run", "-i", "--rm", "mcp/server:latest"]
-        ) == (
+        assert detect("docker", ["run", "-i", "--rm", "mcp/server:latest"]) == (
             "docker",
             "mcp/server",
         )
 
     def test_docker_env_flag_still_finds_image(self) -> None:
-        assert detect_package_type(
+        assert detect(
             "docker", ["run", "-e", "KEY=val", "--rm", "ghcr.io/org/mcp"]
         ) == ("docker", "ghcr.io/org/mcp")
 
     def test_docker_combined_short_booleans_still_find_image(self) -> None:
         """`-it` is one token docker never documents; it must be listed by hand."""
-        assert detect_package_type("docker", ["run", "-it", "--rm", "img"]) == (
+        assert detect("docker", ["run", "-it", "--rm", "img"]) == (
             "docker",
             "img",
         )
@@ -566,18 +669,18 @@ class TestKnownPositiveValueFlags:
         re-collide `uvx a --from x` with `uvx b --from x` through the new path.
         The positional wins because it comes first.
         """
-        assert detect_package_type("uvx", ["mypkg", "--from", "other"]) == (
+        assert detect("uvx", ["mypkg", "--from", "other"]) == (
             "pypi",
             "mypkg",
         )
 
-    def test_known_positive_forms_unchanged(self) -> None:
-        assert detect_package_type("uvx", ["--from", "pkg", "tool"]) == ("pypi", "pkg")
-        assert detect_package_type("cargo", ["run", "-p", "pkg"]) == ("cargo", "pkg")
-        assert detect_package_type("cargo", ["run", "--bin", "b"]) == ("cargo", "b")
-        assert detect_package_type("pip", ["install", "pkg"]) == ("pypi", "pkg")
-        assert detect_package_type("npx", ["-y", "pkg"]) == ("npm", "pkg")
-        assert detect_package_type("docker", ["run", "img"]) == ("docker", "img")
+    def test_known_positive_forms_unchanged(self, npm_path: _NpmIdentityPath) -> None:
+        assert detect("uvx", ["--from", "pkg", "tool"]) == ("pypi", "pkg")
+        assert detect("cargo", ["run", "-p", "pkg"]) == ("cargo", "pkg")
+        assert detect("cargo", ["run", "--bin", "b"]) == ("cargo", "b")
+        assert detect("pip", ["install", "pkg"]) == ("pypi", "pkg")
+        assert npm_path.detect("npx", ["-y", "pkg"]) == ("npm", "pkg")
+        assert detect("docker", ["run", "img"]) == ("docker", "img")
 
     def test_scan_stops_at_the_double_dash_separator(self) -> None:
         """Everything after `--` belongs to the SERVED tool, not to uvx.
@@ -593,13 +696,11 @@ class TestKnownPositiveValueFlags:
         can distinguish the two implementations, and this one does not claim
         to.
         """
-        assert detect_package_type(
-            "uvx", ["--from", "pkg", "tool", "--", "--from", "x"]
-        ) == (
+        assert detect("uvx", ["--from", "pkg", "tool", "--", "--from", "x"]) == (
             "pypi",
             "pkg",
         )
-        assert detect_package_type("uvx", ["--", "--python", "3.12", "x"]) == (
+        assert detect("uvx", ["--", "--python", "3.12", "x"]) == (
             "unknown",
             None,
         )
@@ -620,7 +721,7 @@ class TestKnownPositiveValueFlags:
         `--from` base name. `--from` is pinned by
         `test_known_positive_forms_unchanged` and the normalization test.
         """
-        assert detect_package_type(
+        assert detect(
             "uvx", ["--python", "3.12", "--from", "index-it-mcp==1.2.0", "index-it-mcp"]
         ) == ("pypi", "index-it-mcp")
 
@@ -633,17 +734,15 @@ class TestKnownPositiveValueFlags:
         a real version -- so that first-party entry's version checks have been
         silently failing. Stripping the extra repairs them.
         """
-        assert detect_package_type(
-            "uvx", ["--from", "browser-use[cli]", "browser-use"]
-        ) == (
+        assert detect("uvx", ["--from", "browser-use[cli]", "browser-use"]) == (
             "pypi",
             "browser-use",
         )
-        assert detect_package_type("uvx", ["--from", "index-it-mcp==1.2.0", "x"]) == (
+        assert detect("uvx", ["--from", "index-it-mcp==1.2.0", "x"]) == (
             "pypi",
             "index-it-mcp",
         )
-        assert detect_package_type("uvx", ["--from", "pkg>=1.0", "x"]) == (
+        assert detect("uvx", ["--from", "pkg>=1.0", "x"]) == (
             "pypi",
             "pkg",
         )
@@ -657,8 +756,8 @@ class TestKnownPositiveValueFlags:
         PyPI lookup fails closed to None, which the gate already reads as
         "cannot confirm -> refresh".
         """
-        a = detect_package_type("uvx", ["--from", "git+https://x/y", "tool"])
-        b = detect_package_type("uvx", ["--from", "git+https://x/z", "tool"])
+        a = detect("uvx", ["--from", "git+https://x/y", "tool"])
+        b = detect("uvx", ["--from", "git+https://x/z", "tool"])
         assert a == ("pypi", "git+https://x/y")
         assert a != b, (
             f"two different git sources collapsed to one identity: {a} == {b}"
@@ -671,7 +770,7 @@ class TestKnownPositiveValueFlags:
         "pinned server" refusal path in gateway.update_server still fires on
         the failed PyPI lookup it was written around (handlers.py:289-294).
         """
-        assert detect_package_type("uvx", ["pkg==1.2.3"]) == ("pypi", "pkg==1.2.3")
+        assert detect("uvx", ["pkg==1.2.3"]) == ("pypi", "pkg==1.2.3")
 
 
 class TestDockerReferenceSplitting:
@@ -719,7 +818,9 @@ class TestNpmBoardRoundTwo:
     false identity in each case.
     """
 
-    def test_nullable_boolean_consumes_a_literal_null(self) -> None:
+    def test_nullable_boolean_consumes_a_literal_null(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """`--yes null A` -- npm consumes `null` as the flag's value.
 
         The generator drops `null` from a type list (correctly -- it means
@@ -728,13 +829,15 @@ class TestNpmBoardRoundTwo:
         it both forms resolved to the package `null`. Affects `--yes`,
         `--optional`, `--production`, `--workspaces`, `--expect-results`.
         """
-        a = detect_package_type("npm", ["exec", "--yes", "null", "A"])
-        b = detect_package_type("npm", ["exec", "--yes", "null", "B"])
+        a = npm_path.detect("npm", ["exec", "--yes", "null", "A"])
+        b = npm_path.detect("npm", ["exec", "--yes", "null", "B"])
         assert a != b, f"nullable boolean swallowed the package: {a}"
         assert a == ("npm", "A")
         assert b == ("npm", "B")
 
-    def test_attached_baked_value_shorthand_yields_its_baked_value(self) -> None:
+    def test_attached_baked_value_shorthand_yields_its_baked_value(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """`--silent=true X` is NOT `--silent X`.
 
         npm expands the shorthand and the ATTACHED value becomes a positional:
@@ -742,28 +845,53 @@ class TestNpmBoardRoundTwo:
         Reading it as `X` collapsed `--silent=true X` and `--silent=false X`
         into one identity despite naming different packages.
         """
-        t = detect_package_type("npm", ["exec", "--silent=true", "X"])
-        f = detect_package_type("npm", ["exec", "--silent=false", "X"])
-        assert t != f, f"attached baked value collapsed two packages: {t}"
-        assert t == ("npm", "true")
-        assert f == ("npm", "false")
+        t = npm_path.detect("npm", ["exec", "--silent=true", "X"])
+        f = npm_path.detect("npm", ["exec", "--silent=false", "X"])
+        # `--silent` is npm's shorthand for `--loglevel silent`, so npm's own
+        # parser reports a `loglevel` config key. That key is outside the
+        # step-1 allowlist -- it cannot redirect resolution, but the allowlist
+        # is an allowlist of PLAIN things, not a denylist of dangerous ones,
+        # and three board rounds on a denylist each found another way for a
+        # confident answer to be wrong. The resolver therefore refuses; the
+        # tables keep their 2.5.2 answer. Both are safe: refusing costs
+        # auto-update for one unusual launch form, and no npm-family server in
+        # manifest.yaml carries a leading shorthand.
+        assert t == npm_path.expect(resolver=("unknown", None), tables=("npm", "true"))
+        assert f == npm_path.expect(resolver=("unknown", None), tables=("npm", "false"))
+        # The property under test holds on BOTH paths: the two forms name
+        # different packages, so they must never confirm each other. Two
+        # `("unknown", None)`s are equal but `_same_package` reads "unknown" as
+        # unidentified, so they still cannot confirm.
+        assert t != f or t == ("unknown", None)
 
-    def test_spaced_baked_value_shorthand_still_consumes_nothing(self) -> None:
+    def test_spaced_baked_value_shorthand_still_consumes_nothing(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """The spaced form is unchanged -- this is the distinction, not a fix.
 
         `--silent` bakes its value in, so it consumes nothing and the next
         token IS the package; `--global` is a real boolean that swallows a
         literal `true`.
         """
-        assert detect_package_type("npm", ["--silent", "exec", "pkg"]) == ("npm", "pkg")
-        assert detect_package_type("npx", ["--silent", "true", "arg"]) == (
-            "npm",
-            "true",
+        # `--silent` is npm's shorthand for `--loglevel silent`, so npm's own
+        # parser reports a `loglevel` config key. That key is outside the
+        # step-1 allowlist -- it cannot redirect resolution, but the allowlist
+        # is an allowlist of PLAIN things, not a denylist of dangerous ones,
+        # and three board rounds on a denylist each found another way for a
+        # confident answer to be wrong. The resolver therefore refuses; the
+        # tables keep their 2.5.2 answer. Both are safe: refusing costs
+        # auto-update for one unusual launch form, and no npm-family server in
+        # manifest.yaml carries a leading shorthand.
+        assert npm_path.detect("npm", ["--silent", "exec", "pkg"]) == npm_path.expect(
+            resolver=("unknown", None), tables=("npm", "pkg")
         )
-        assert detect_package_type("npm", ["exec", "--global", "true", "a"]) == (
-            "npm",
-            "a",
+        assert npm_path.detect("npx", ["--silent", "true", "arg"]) == npm_path.expect(
+            resolver=("unknown", None), tables=("npm", "true")
         )
+        # `--global` is a real npm config key, and equally outside the allowlist.
+        assert npm_path.detect(
+            "npm", ["exec", "--global", "true", "a"]
+        ) == npm_path.expect(resolver=("unknown", None), tables=("npm", "a"))
 
 
 class TestNpmSubcommandSkipFiresOnce:
@@ -775,16 +903,20 @@ class TestNpmSubcommandSkipFiresOnce:
     at all.
     """
 
-    def test_npm_install_of_a_package_named_i(self) -> None:
-        assert detect_package_type("npm", ["install", "i"]) == ("npm", "i")
+    def test_npm_install_of_a_package_named_i(self, npm_path: _NpmIdentityPath) -> None:
+        assert npm_path.detect("npm", ["install", "i"]) == ("npm", "i")
 
-    def test_npm_exec_of_a_package_named_exec(self) -> None:
-        assert detect_package_type("npm", ["exec", "exec"]) == ("npm", "exec")
+    def test_npm_exec_of_a_package_named_exec(self, npm_path: _NpmIdentityPath) -> None:
+        assert npm_path.detect("npm", ["exec", "exec"]) == ("npm", "exec")
 
-    def test_npx_does_not_skip_a_package_named_exec(self) -> None:
-        assert detect_package_type("npx", ["-y", "exec"]) == ("npm", "exec")
+    def test_npx_does_not_skip_a_package_named_exec(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
+        assert npm_path.detect("npx", ["-y", "exec"]) == ("npm", "exec")
 
-    def test_npm_without_a_subcommand_yields_no_identity(self) -> None:
+    def test_npm_without_a_subcommand_yields_no_identity(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """Renamed and inverted from ..._still_finds_the_package.
 
         `npm -y server-pkg` is not a legal npm invocation, and treating its
@@ -792,9 +924,11 @@ class TestNpmSubcommandSkipFiresOnce:
         form. The allowlist now requires a recognised subcommand before
         anything is read as a package.
         """
-        assert detect_package_type("npm", ["-y", "server-pkg"]) == ("unknown", None)
+        assert npm_path.detect("npm", ["-y", "server-pkg"]) == ("unknown", None)
 
-    def test_npm_run_names_a_script_not_a_package(self) -> None:
+    def test_npm_run_names_a_script_not_a_package(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """`npm run <script>` has no recoverable package identity.
 
         Consiliency/pmcp#183. The operand is a script in the local
@@ -807,10 +941,10 @@ class TestNpmSubcommandSkipFiresOnce:
         `("unknown", None)` is the honest answer, and update_server already
         refuses on it before constructing any probe.
         """
-        assert detect_package_type("npm", ["run", "mcp"]) == ("unknown", None)
-        assert detect_package_type("npm", ["run", "start"]) == ("unknown", None)
+        assert npm_path.detect("npm", ["run", "mcp"]) == ("unknown", None)
+        assert npm_path.detect("npm", ["run", "start"]) == ("unknown", None)
         # ...including when a global flag precedes the subcommand.
-        assert detect_package_type("npm", ["--silent", "run", "mcp"]) == (
+        assert npm_path.detect("npm", ["--silent", "run", "mcp"]) == (
             "unknown",
             None,
         )
@@ -842,7 +976,9 @@ class TestNpmSubcommandSkipFiresOnce:
         ],
     )
     def test_a_subcommand_without_a_package_operand_fails_closed(
-        self, args: list[str]
+        self,
+        args: list[str],
+        npm_path: _NpmIdentityPath,
     ) -> None:
         """Anything outside the allowlist yields no identity at all.
 
@@ -859,29 +995,35 @@ class TestNpmSubcommandSkipFiresOnce:
         the ability to auto-update an unusual launch form; failing open costs
         arbitrary package execution.
         """
-        assert detect_package_type("npm", args) == ("unknown", None)
+        assert npm_path.detect("npm", args) == ("unknown", None)
 
-    def test_npm_create_operand_is_not_the_package_npm_would_run(self) -> None:
+    def test_npm_create_operand_is_not_the_package_npm_would_run(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """`npm create foo` resolves to the package `create-foo`, not `foo`.
 
         Reporting `foo` names a DIFFERENT package than the one npm runs, which
         is the same wrong-identity hazard as the script case.
         """
-        assert detect_package_type("npm", ["create", "foo"]) == ("unknown", None)
+        assert npm_path.detect("npm", ["create", "foo"]) == ("unknown", None)
 
-    def test_npx_can_still_run_packages_named_run_or_create(self) -> None:
+    def test_npx_can_still_run_packages_named_run_or_create(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """The refusal is npm-subcommand-scoped, not a name blocklist.
 
         `npx -y run` names a real registry package called `run`; nothing about
         Consiliency/pmcp#183 should make that unresolvable.
         """
-        assert detect_package_type("npx", ["-y", "run"]) == ("npm", "run")
-        assert detect_package_type("npx", ["-y", "create"]) == ("npm", "create")
+        assert npm_path.detect("npx", ["-y", "run"]) == ("npm", "run")
+        assert npm_path.detect("npx", ["-y", "create"]) == ("npm", "create")
         # And the operand position is still a package for the other
         # subcommands -- only `run`/`create` name something else.
-        assert detect_package_type("npm", ["exec", "run"]) == ("npm", "run")
+        assert npm_path.detect("npm", ["exec", "run"]) == ("npm", "run")
 
-    def test_a_leading_flag_does_not_consume_the_subcommand_skip(self) -> None:
+    def test_a_leading_flag_does_not_consume_the_subcommand_skip(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """npm accepts global flags before the subcommand.
 
         The skip is one-shot, so it must fire on the first non-flag token, not
@@ -894,13 +1036,21 @@ class TestNpmSubcommandSkipFiresOnce:
         other test here puts the subcommand first (ah board review, adversarial
         seat, reported as a surviving mutant).
         """
-        old = detect_package_type("npm", ["--silent", "exec", "old-pkg"])
-        new = detect_package_type("npm", ["--silent", "exec", "new-pkg"])
-        assert old != new, (
-            f"a leading flag reopened the npm exec collapse: {old} == {new}"
+        old = npm_path.detect("npm", ["--silent", "exec", "old-pkg"])
+        new = npm_path.detect("npm", ["--silent", "exec", "new-pkg"])
+        # Outside the resolver's step-1 allowlist: npm's own parser reports a
+        # config key other than `yes`/`package`, so with npm installed this
+        # refuses. The tables keep their 2.5.2 answer for a node-less host.
+        assert old == npm_path.expect(
+            resolver=("unknown", None), tables=("npm", "old-pkg")
         )
-        assert old == ("npm", "old-pkg")
-        assert new == ("npm", "new-pkg")
+        assert new == npm_path.expect(
+            resolver=("unknown", None), tables=("npm", "new-pkg")
+        )
+        # The property survives on both paths: two refusals are equal, but
+        # `_same_package` reads "unknown" as unidentified, so they cannot
+        # confirm each other.
+        assert old != new or old == ("unknown", None)
 
 
 class TestCompareVersionsOrdering:
@@ -1488,7 +1638,9 @@ class TestGetPackageVersion:
             new_callable=AsyncMock,
             return_value="1.0.0",
         ):
-            version, pkg_type = await get_package_version("npx", ["-y", "my-package"])
+            version, pkg_type = await get_package_version(
+                "npx", ["-y", "my-package"], None, None
+            )
             assert version == "1.0.0"
             assert pkg_type == "npm"
 
@@ -1500,14 +1652,18 @@ class TestGetPackageVersion:
             new_callable=AsyncMock,
             return_value="2.0.0",
         ):
-            version, pkg_type = await get_package_version("uvx", ["my-package"])
+            version, pkg_type = await get_package_version(
+                "uvx", ["my-package"], None, None
+            )
             assert version == "2.0.0"
             assert pkg_type == "pypi"
 
     @pytest.mark.asyncio
     async def test_unknown_package(self) -> None:
         """Test unknown package type returns unknown."""
-        version, pkg_type = await get_package_version("python", ["-m", "mymodule"])
+        version, pkg_type = await get_package_version(
+            "python", ["-m", "mymodule"], None, None
+        )
         assert version is None
         assert pkg_type == "unknown"
 
@@ -1519,7 +1675,9 @@ class TestGetPackageVersion:
             new_callable=AsyncMock,
             return_value=None,
         ):
-            version, pkg_type = await get_package_version("npx", ["-y", "my-package"])
+            version, pkg_type = await get_package_version(
+                "npx", ["-y", "my-package"], None, None
+            )
             assert version is None
             assert pkg_type == "npm"
 
@@ -1532,7 +1690,7 @@ class TestGetPackageVersion:
             return_value="1.5.0",
         ):
             version, pkg_type = await get_package_version(
-                "cargo", ["run", "-p", "my-crate"]
+                "cargo", ["run", "-p", "my-crate"], None, None
             )
             assert version == "1.5.0"
             assert pkg_type == "cargo"
@@ -1546,7 +1704,7 @@ class TestGetPackageVersion:
             return_value="abcdef123456",
         ):
             version, pkg_type = await get_package_version(
-                "docker", ["run", "-i", "--rm", "mcp/server:latest"]
+                "docker", ["run", "-i", "--rm", "mcp/server:latest"], None, None
             )
             assert version == "abcdef123456"
             assert pkg_type == "docker"
@@ -1560,7 +1718,7 @@ class TestGetPackageVersion:
             return_value="3.0.0",
         ):
             version, pkg_type = await get_package_version(
-                "pip", ["install", "my-mcp-server"]
+                "pip", ["install", "my-mcp-server"], None, None
             )
             assert version == "3.0.0"
             assert pkg_type == "pypi"
@@ -2148,10 +2306,18 @@ class TestNpmValueFlagCollisions:
     `npm exec --color always a/b` still returned `('npm','always')` for both.
     An acceptance set that cannot see the defect its own method manufactures
     is not an acceptance set.
+
+    **Every one of these flags is outside the resolver's step-1 allowlist**, so
+    with npm installed the answer is `("unknown", None)` for both members of
+    each pair rather than two distinct names. The property this class exists to
+    pin -- two different servers never confirm as one package -- holds either
+    way: `_same_package` reads `"unknown"` as unidentified, so two refusals
+    cannot confirm each other. The table answers are pinned as the node-less
+    behaviour, unchanged from 2.5.2.
     """
 
     @pytest.mark.parametrize(
-        ("command", "args_a", "args_b", "expected"),
+        ("command", "args_a", "args_b", "expected", "resolver_expected"),
         [
             # A value flag whose value is an enum member.
             (
@@ -2159,6 +2325,7 @@ class TestNpmValueFlagCollisions:
                 ["exec", "--loglevel", "silly", "a"],
                 ["exec", "--loglevel", "silly", "b"],
                 [("npm", "a"), ("npm", "b")],
+                [("unknown", None), ("unknown", None)],
             ),
             # A value flag whose value is a URL.
             (
@@ -2166,6 +2333,7 @@ class TestNpmValueFlagCollisions:
                 ["exec", "--registry", "https://r", "a"],
                 ["exec", "--registry", "https://r", "b"],
                 [("npm", "a"), ("npm", "b")],
+                [("unknown", None), ("unknown", None)],
             ),
             # Same, reached through npx, where there is no subcommand to skip.
             (
@@ -2173,6 +2341,7 @@ class TestNpmValueFlagCollisions:
                 ["-y", "--registry", "https://r", "a"],
                 ["-y", "--registry", "https://r", "b"],
                 [("npm", "a"), ("npm", "b")],
+                [("unknown", None), ("unknown", None)],
             ),
             # A BOOLEAN flag followed by a literal `true`/`false`. npm's
             # parser takes that as the flag's value -- `npm exec --global
@@ -2183,6 +2352,7 @@ class TestNpmValueFlagCollisions:
                 ["exec", "--global", "false", "a"],
                 ["exec", "--global", "false", "b"],
                 [("npm", "a"), ("npm", "b")],
+                [("unknown", None), ("unknown", None)],
             ),
             # A Boolean UNION (`color` is `always|Boolean`): arity depends on
             # the next token's content, so no single class is right and the
@@ -2193,6 +2363,7 @@ class TestNpmValueFlagCollisions:
                 ["exec", "--color", "always", "a"],
                 ["exec", "--color", "always", "b"],
                 [("unknown", None), ("unknown", None)],
+                [("unknown", None), ("unknown", None)],
             ),
         ],
     )
@@ -2202,37 +2373,48 @@ class TestNpmValueFlagCollisions:
         args_a: list[str],
         args_b: list[str],
         expected: list[tuple[str, str | None]],
+        resolver_expected: list[tuple[str, str | None]],
+        npm_path: _NpmIdentityPath,
     ) -> None:
-        got_a = detect_package_type(command, args_a)
-        got_b = detect_package_type(command, args_b)
+        want = resolver_expected if npm_path.resolver_active else expected
+        got_a = npm_path.detect(command, args_a)
+        got_b = npm_path.detect(command, args_b)
         # Pin the EXACT values, not just inequality: a pair can stop colliding
         # by both becoming wrong in different ways.
-        assert [got_a, got_b] == expected
+        assert [got_a, got_b] == want
         assert got_a != got_b or got_a == ("unknown", None)
 
 
 class TestNpmFailsClosed:
     """An unlisted npm flag yields no identity rather than a wrong one."""
 
-    def test_unlisted_bare_flag_refuses(self) -> None:
-        assert detect_package_type("npm", ["exec", "--not-a-real-npm-flag", "a"]) == (
+    def test_unlisted_bare_flag_refuses(self, npm_path: _NpmIdentityPath) -> None:
+        assert npm_path.detect("npm", ["exec", "--not-a-real-npm-flag", "a"]) == (
             "unknown",
             None,
         )
 
-    def test_unlisted_flag_cannot_collide(self) -> None:
+    def test_unlisted_flag_cannot_collide(self, npm_path: _NpmIdentityPath) -> None:
         args = ["exec", "--not-a-real-npm-flag", "{}"]
-        assert detect_package_type("npm", [*args, "a"]) == ("unknown", None)
-        assert detect_package_type("npm", [*args, "b"]) == ("unknown", None)
+        assert npm_path.detect("npm", [*args, "a"]) == ("unknown", None)
+        assert npm_path.detect("npm", [*args, "b"]) == ("unknown", None)
 
-    def test_self_delimiting_unlisted_flag_still_resolves(self) -> None:
+    def test_self_delimiting_unlisted_flag_still_resolves(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """`--flag=value` cannot swallow the next token, so refusing costs
         safety nothing and auto-update something."""
-        assert detect_package_type("npm", ["exec", "--zzz=1", "a"]) == ("npm", "a")
+        assert npm_path.detect("npm", ["exec", "--zzz=1", "a"]) == npm_path.expect(
+            # npm's parser reports an unknown flag as a boolean config key, and
+            # the allowlist admits only `yes`/`package` -- so `--zzz=1` refuses
+            # with npm installed. Cheap: nothing in manifest.yaml carries one.
+            resolver=("unknown", None),
+            tables=("npm", "a"),
+        )
 
-    def test_conditional_arity_flag_refuses(self) -> None:
+    def test_conditional_arity_flag_refuses(self, npm_path: _NpmIdentityPath) -> None:
         """`--color` is `always|Boolean`; unlisted by construction."""
-        assert detect_package_type("npm", ["exec", "--color", "a"]) == (
+        assert npm_path.detect("npm", ["exec", "--color", "a"]) == (
             "unknown",
             None,
         )
@@ -2245,65 +2427,108 @@ class TestNpmPinnedOrderingSurvives:
     (`--loglevel silent`), absent from `npm config list --json` entirely. Any
     table built from the config dump rather than from `shorthands` breaks
     exactly here, which makes it the single most likely regression.
+
+    Each row carries BOTH answers. Where they differ the resolver refuses,
+    because npm's own parser reports a config key outside the step-1 allowlist
+    (`--silent`/`-q`/`-s` -> `loglevel`, `-g`/`--local` -> `global`,
+    `--reg` -> `registry`, `-w` -> `workspace`, `--loglevel` -> `loglevel`).
+    That is the allowlist working as designed: it admits the plain shape all 79
+    npm-family manifest servers use and refuses everything else rather than
+    modelling it.
     """
 
     @pytest.mark.parametrize(
-        ("command", "args", "expected"),
+        ("command", "args", "expected", "resolver_expected"),
         [
-            ("npm", ["--silent", "exec", "pkg"], "pkg"),
-            ("npm", ["exec", "pkg"], "pkg"),
-            ("npm", ["install", "i"], "i"),
-            ("npm", ["exec", "exec"], "exec"),
-            ("npx", ["-y", "exec"], "exec"),
-            ("npx", ["-y", "pkg"], "pkg"),
+            ("npm", ["--silent", "exec", "pkg"], "pkg", None),
+            ("npm", ["exec", "pkg"], "pkg", "pkg"),
+            ("npm", ["install", "i"], "i", "i"),
+            ("npm", ["exec", "exec"], "exec", "exec"),
+            ("npx", ["-y", "exec"], "exec", "exec"),
+            ("npx", ["-y", "pkg"], "pkg", "pkg"),
         ],
     )
     def test_form_still_resolves(
-        self, command: str, args: list[str], expected: str
+        self,
+        command: str,
+        args: list[str],
+        expected: str,
+        resolver_expected: str | None,
+        npm_path: _NpmIdentityPath,
     ) -> None:
-        assert detect_package_type(command, args) == ("npm", expected)
+        assert npm_path.detect(command, args) == npm_path.expect(
+            resolver=("npm", resolver_expected)
+            if resolver_expected
+            else ("unknown", None),
+            tables=("npm", expected),
+        )
 
     @pytest.mark.parametrize(
-        ("command", "args", "expected"),
+        ("command", "args", "expected", "resolver_expected"),
         [
             # Every shorthand class, resolved through `shorthands` rather than
             # hand-listed: expansion length >= 2 bakes in a value (boolean
             # arity), length 1 is a rename that inherits the target's arity.
-            ("npm", ["-q", "exec", "pkg"], "pkg"),  # -> --loglevel warn
-            ("npm", ["-s", "exec", "pkg"], "pkg"),  # -> --loglevel silent
-            ("npm", ["-g", "exec", "pkg"], "pkg"),  # -> --global   (boolean)
-            ("npm", ["--local", "exec", "pkg"], "pkg"),  # -> --no-global
-            ("npm", ["--reg", "https://r", "exec", "pkg"], "pkg"),  # -> --registry
-            ("npm", ["exec", "-w", "ws", "pkg"], "pkg"),  # -> --workspace (value)
-            ("npx", ["-y", "--package", "pkg", "--", "bin"], "pkg"),
+            ("npm", ["-q", "exec", "pkg"], "pkg", None),  # -> --loglevel warn
+            ("npm", ["-s", "exec", "pkg"], "pkg", None),  # -> --loglevel silent
+            ("npm", ["-g", "exec", "pkg"], "pkg", None),  # -> --global   (boolean)
+            ("npm", ["--local", "exec", "pkg"], "pkg", None),  # -> --no-global
+            # -> --registry
+            ("npm", ["--reg", "https://r", "exec", "pkg"], "pkg", None),
+            # -> --workspace (value)
+            ("npm", ["exec", "-w", "ws", "pkg"], "pkg", None),
+            # `--package` IS on the allowlist, so this one resolves on both.
+            ("npx", ["-y", "--package", "pkg", "--", "bin"], "pkg", "pkg"),
         ],
     )
     def test_shorthand_expands(
-        self, command: str, args: list[str], expected: str
+        self,
+        command: str,
+        args: list[str],
+        expected: str,
+        resolver_expected: str | None,
+        npm_path: _NpmIdentityPath,
     ) -> None:
-        assert detect_package_type(command, args) == ("npm", expected)
+        assert npm_path.detect(command, args) == npm_path.expect(
+            resolver=("npm", resolver_expected)
+            if resolver_expected
+            else ("unknown", None),
+            tables=("npm", expected),
+        )
 
     @pytest.mark.parametrize(
-        ("command", "args", "expected"),
+        ("command", "args", "expected", "resolver_expected"),
         [
             # npm exec's FIRST documented usage: `npm exec -- <pkg> [args...]`.
             # The token after `--` IS the package spec, so `--` must not end
             # the scan the way it does for uvx/pip/cargo/docker. Fail-closed
             # refusal here would be a REGRESSION -- this resolved before #180.
-            ("npm", ["exec", "--", "pkg"], "pkg"),
-            ("npm", ["exec", "--", "pkg", "arg"], "pkg"),
-            ("npx", ["--", "pkg"], "pkg"),
-            ("npm", ["exec", "--loglevel", "silly", "--", "pkg"], "pkg"),
+            ("npm", ["exec", "--", "pkg"], "pkg", "pkg"),
+            ("npm", ["exec", "--", "pkg", "arg"], "pkg", "pkg"),
+            ("npx", ["--", "pkg"], "pkg", "pkg"),
+            # `--loglevel` is outside the step-1 allowlist, so the resolver
+            # refuses this row while the tables still resolve it.
+            ("npm", ["exec", "--loglevel", "silly", "--", "pkg"], "pkg", None),
             # The other documented shape: with `--package` given, the token
             # after `--` is the COMMAND, not a package, and must not win.
-            ("npm", ["exec", "--package=pkg", "--", "bin"], "pkg"),
-            ("npm", ["exec", "--package", "pkg", "--", "bin"], "pkg"),
+            ("npm", ["exec", "--package=pkg", "--", "bin"], "pkg", "pkg"),
+            ("npm", ["exec", "--package", "pkg", "--", "bin"], "pkg", "pkg"),
         ],
     )
     def test_double_dash_form_still_resolves(
-        self, command: str, args: list[str], expected: str
+        self,
+        command: str,
+        args: list[str],
+        expected: str,
+        resolver_expected: str | None,
+        npm_path: _NpmIdentityPath,
     ) -> None:
-        assert detect_package_type(command, args) == ("npm", expected)
+        assert npm_path.detect(command, args) == npm_path.expect(
+            resolver=("npm", resolver_expected)
+            if resolver_expected
+            else ("unknown", None),
+            tables=("npm", expected),
+        )
 
 
 class TestNpmBakedValueShorthandDoesNotConsume:
@@ -2323,20 +2548,32 @@ class TestNpmBakedValueShorthandDoesNotConsume:
     which is the #180 collapse reintroduced through the fix for it.
     """
 
-    def test_baked_value_shorthand_leaves_true_as_the_package(self) -> None:
-        assert detect_package_type("npx", ["--silent", "true", "arg"]) == (
-            "npm",
-            "true",
+    def test_baked_value_shorthand_leaves_true_as_the_package(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
+        assert npm_path.detect("npx", ["--silent", "true", "arg"]) == npm_path.expect(
+            resolver=("unknown", None), tables=("npm", "true")
         )
 
-    def test_baked_value_shorthand_does_not_collapse_true_and_false(self) -> None:
-        got_a = detect_package_type("npx", ["--silent", "true", "X"])
-        got_b = detect_package_type("npx", ["--silent", "false", "X"])
-        assert got_a == ("npm", "true")
-        assert got_b == ("npm", "false")
-        assert got_a != got_b
+    def test_baked_value_shorthand_does_not_collapse_true_and_false(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
+        got_a = npm_path.detect("npx", ["--silent", "true", "X"])
+        got_b = npm_path.detect("npx", ["--silent", "false", "X"])
+        # Outside the resolver's step-1 allowlist: npm's own parser reports a
+        # config key other than `yes`/`package`, so with npm installed this
+        # refuses. The tables keep their 2.5.2 answer for a node-less host.
+        assert got_a == npm_path.expect(
+            resolver=("unknown", None), tables=("npm", "true")
+        )
+        assert got_b == npm_path.expect(
+            resolver=("unknown", None), tables=("npm", "false")
+        )
+        assert got_a != got_b or got_a == ("unknown", None)
 
-    def test_real_boolean_still_consumes_the_literal(self) -> None:
+    def test_real_boolean_still_consumes_the_literal(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """The other side of the split must not regress -- under `npm`.
 
         This test previously used `npx` and asserted `pkg`, which **pinned the
@@ -2347,10 +2584,9 @@ class TestNpmBakedValueShorthandDoesNotConsume:
         consumes a literal under npx (ah board review, correctness seat).
         The npx case is now covered by `TestNpxBooleanLiterals` below.
         """
-        assert detect_package_type("npm", ["exec", "--global", "true", "pkg"]) == (
-            "npm",
-            "pkg",
-        )
+        assert npm_path.detect(
+            "npm", ["exec", "--global", "true", "pkg"]
+        ) == npm_path.expect(resolver=("unknown", None), tables=("npm", "pkg"))
 
 
 class TestNpxBooleanLiterals:
@@ -2364,18 +2600,35 @@ class TestNpxBooleanLiterals:
     bare `true`/`false`/`null` after a boolean is vanishingly rare.
     """
 
-    def test_npx_refuses_a_literal_after_a_boolean(self) -> None:
-        assert detect_package_type("npx", ["--global", "true", "zz"]) == (
+    def test_npx_refuses_a_literal_after_a_boolean(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
+        assert npm_path.detect("npx", ["--global", "true", "zz"]) == (
             "unknown",
             None,
         )
-        assert detect_package_type("npx", ["--yes", "null", "zz"]) == ("unknown", None)
+        # `npx --yes null zz` is the one case in this file where the RESOLVER
+        # resolves and the tables refuse. The npx pre-scan inserts `--` ahead of
+        # the first positional, so `--yes` never reaches `null` as a value and
+        # `null` -- a real published package -- is what npm runs. The tables
+        # refuse here on the blanket "npx + boolean + literal" rule that exists
+        # because the `--no-` spelling behaves differently; npm's own parser
+        # needs no such rule.
+        assert npm_path.detect("npx", ["--yes", "null", "zz"]) == npm_path.expect(
+            resolver=("npm", "null"), tables=("unknown", None)
+        )
 
-    def test_npx_boolean_without_a_literal_still_resolves(self) -> None:
+    def test_npx_boolean_without_a_literal_still_resolves(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
         """The refusal is scoped to the literal, not to boolean flags."""
-        assert detect_package_type("npx", ["-y", "pkg"]) == ("npm", "pkg")
-        assert detect_package_type("npx", ["-y", "exec"]) == ("npm", "exec")
-        assert detect_package_type("npx", ["--global", "pkg"]) == ("npm", "pkg")
+        assert npm_path.detect("npx", ["-y", "pkg"]) == ("npm", "pkg")
+        assert npm_path.detect("npx", ["-y", "exec"]) == ("npm", "exec")
+        assert npm_path.detect("npx", ["--global", "pkg"]) == npm_path.expect(
+            # `global` is a real npm config key and outside the allowlist.
+            resolver=("unknown", None),
+            tables=("npm", "pkg"),
+        )
 
 
 class TestOnlyNullableBooleansConsumeNull:
@@ -2387,26 +2640,29 @@ class TestOnlyNullableBooleansConsumeNull:
     minted a wrong identity for the other ~193 (ah board review).
     """
 
-    def test_nullable_boolean_consumes_null(self) -> None:
-        assert detect_package_type("npm", ["exec", "--yes", "null", "zz"]) == (
+    def test_nullable_boolean_consumes_null(self, npm_path: _NpmIdentityPath) -> None:
+        assert npm_path.detect("npm", ["exec", "--yes", "null", "zz"]) == (
             "npm",
             "zz",
         )
 
-    def test_non_nullable_boolean_does_not_consume_null(self) -> None:
-        assert detect_package_type("npm", ["exec", "--global", "null", "zz"]) == (
-            "npm",
-            "null",
-        )
+    def test_non_nullable_boolean_does_not_consume_null(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
+        assert npm_path.detect(
+            "npm", ["exec", "--global", "null", "zz"]
+        ) == npm_path.expect(resolver=("unknown", None), tables=("npm", "null"))
 
-    def test_true_and_false_are_consumed_by_any_boolean(self) -> None:
-        assert detect_package_type("npm", ["exec", "--global", "false", "a"]) == (
-            "npm",
-            "a",
-        )
+    def test_true_and_false_are_consumed_by_any_boolean(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
+        assert npm_path.detect(
+            "npm", ["exec", "--global", "false", "a"]
+        ) == npm_path.expect(resolver=("unknown", None), tables=("npm", "a"))
 
-    def test_baked_value_shorthand_still_skips_an_ordinary_token(self) -> None:
-        assert detect_package_type("npm", ["--silent", "exec", "pkg"]) == (
-            "npm",
-            "pkg",
+    def test_baked_value_shorthand_still_skips_an_ordinary_token(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
+        assert npm_path.detect("npm", ["--silent", "exec", "pkg"]) == npm_path.expect(
+            resolver=("unknown", None), tables=("npm", "pkg")
         )
