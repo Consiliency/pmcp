@@ -124,13 +124,46 @@ function whichRealpath (name) {
   return null
 }
 
+function isNpmRoot (dir) {
+  try {
+    if (!fs.existsSync(path.join(dir, 'bin', 'npx-cli.js'))) {
+      return false
+    }
+    const manifest = JSON.parse(fs.readFileSync(path.join(dir, 'package.json'), 'utf8'))
+    return manifest && manifest.name === 'npm'
+  } catch {
+    return false
+  }
+}
+
 // Walk up from a realpath'd npm/npx entry point to the npm package root, i.e.
 // the directory that holds `package.json`, `bin/npx-cli.js` and `node_modules`.
+//
+// Two layouts, both real and both checked at every level:
+//
+//   1. `<root>/bin/npx-cli.js` -- the usual case, where `PATH`'s `npx` is a
+//      symlink straight at it, so walking up one level lands on `<root>`.
+//   2. `<prefix>/bin/npx` beside `<prefix>/lib/node_modules/npm` -- npm's own
+//      global-install layout. Some distributions ship `<prefix>/bin/npx` as a
+//      *copy* of `npx-cli.js` rather than a symlink, and then no amount of
+//      walking up from it ever reaches the npm package. Verified on the GitHub
+//      Actions runner's bundled node20 tree (npm 10.8.2), where the previous
+//      code found nothing and the resolver fell back to the flag tables.
+//
+// The prefix form is checked **only against the entry point's own prefix**, not
+// at every level of the walk. Checking it at every level attributes an
+// unrelated npm to the entry point: on the development host for this change,
+// `/lib/node_modules/npm` exists (a system npm 11.6.2), so a stray `npx` in a
+// temp directory walked up to `/` and adopted it -- naming a parser that has
+// nothing to do with the binary that would actually run.
 function rootFromEntryPoint (entry) {
   let dir = path.dirname(entry)
+  const viaPrefix = path.join(path.dirname(dir), 'lib', 'node_modules', 'npm')
+  if (isNpmRoot(viaPrefix)) {
+    return viaPrefix
+  }
   for (let i = 0; i < 6; i++) {
-    if (fs.existsSync(path.join(dir, 'bin', 'npx-cli.js')) &&
-        fs.existsSync(path.join(dir, 'package.json'))) {
+    if (isNpmRoot(dir)) {
       return dir
     }
     const parent = path.dirname(dir)
@@ -145,6 +178,11 @@ function rootFromEntryPoint (entry) {
 function resolveNpmRoot () {
   const npxEntry = whichRealpath('npx')
   const npmEntry = whichRealpath('npm')
+  // Whether npm is INSTALLED is a different question from whether we can find
+  // its parser. `UNAVAILABLE` -- the one state permitted to fall back to the
+  // flag tables -- means "npm is absent", so an npm we can see but cannot
+  // locate must REFUSE instead.
+  const sawEntryPoint = Boolean(npxEntry || npmEntry)
   const npxRoot = npxEntry ? rootFromEntryPoint(npxEntry) : null
   const npmRoot = npmEntry ? rootFromEntryPoint(npmEntry) : null
 
@@ -152,11 +190,11 @@ function resolveNpmRoot () {
   // `npm exec <pkg>` are parsed by different programs, and this helper answers
   // for both. Refuse rather than pick one.
   if (npxRoot && npmRoot && npxRoot !== npmRoot) {
-    return { root: null, split: [npxRoot, npmRoot] }
+    return { root: null, split: [npxRoot, npmRoot], sawEntryPoint }
   }
   const found = npxRoot || npmRoot
   if (found) {
-    return { root: found, split: null }
+    return { root: found, split: null, sawEntryPoint }
   }
 
   // Fall back to `npm root -g`, which names `<prefix>/lib/node_modules`.
@@ -167,13 +205,13 @@ function resolveNpmRoot () {
       timeout: 5000,
     }).trim()
     const candidate = path.join(out, 'npm')
-    if (fs.existsSync(path.join(candidate, 'bin', 'npx-cli.js'))) {
-      return { root: fs.realpathSync(candidate), split: null }
+    if (isNpmRoot(candidate)) {
+      return { root: fs.realpathSync(candidate), split: null, sawEntryPoint }
     }
   } catch {
     // no npm at all
   }
-  return { root: null, split: null }
+  return { root: null, split: null, sawEntryPoint }
 }
 
 // ---------------------------------------------------------------------------
@@ -553,7 +591,12 @@ function readNpmVersion (npmRoot) {
 }
 
 function main () {
-  const { root: npmRoot, split } = resolveNpmRoot()
+  // A parent that dies mid-answer leaves this process writing to a closed
+  // pipe. Without a handler node throws an unhandled EPIPE and prints a stack
+  // trace; exiting quietly is the same outcome without the noise.
+  process.stdout.on('error', () => process.exit(0))
+
+  const { root: npmRoot, split, sawEntryPoint } = resolveNpmRoot()
 
   if (split) {
     // Two npm installations on PATH: `npx` and `npm` would be parsed by
@@ -563,10 +606,22 @@ function main () {
     return
   }
   if (!npmRoot) {
+    if (sawEntryPoint) {
+      // npm IS on PATH; we simply could not locate the package its parser
+      // lives in. That is not absence, so it must not reach the flag tables --
+      // the same fail-open the missing-helper and unspawnable-node cases were
+      // just corrected for (board review on the diff).
+      emit({
+        handshake: 1,
+        status: 'REFUSED',
+        reason: 'npm is on PATH but its package root could not be located',
+      })
+      return
+    }
     // UNAVAILABLE is reserved for exactly this: we learned nothing about npm,
     // only that it is not here. The caller falls back to the flag tables, which
     // is the pre-#195 behaviour and the only thing a node-less host can do.
-    emit({ handshake: 1, status: 'UNAVAILABLE', reason: 'npm root not found' })
+    emit({ handshake: 1, status: 'UNAVAILABLE', reason: 'npm is not installed' })
     return
   }
 

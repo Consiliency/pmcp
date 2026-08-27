@@ -763,7 +763,9 @@ def _fixture_npm_root(
     """
     root = tmp_path / "npmroot" / "npm"
     (root / "bin").mkdir(parents=True)
-    (root / "package.json").write_text(json.dumps({"version": "99.0.0"}))
+    # `name: "npm"` matters: `isNpmRoot` checks it, so a directory that merely
+    # has a `package.json` and a `bin/npx-cli.js` is not mistaken for npm.
+    (root / "package.json").write_text(json.dumps({"name": "npm", "version": "99.0.0"}))
     real = Path(
         subprocess.run(
             [
@@ -976,7 +978,7 @@ class TestNoMemoisation:
             assert first.status == "IDENTITY", first.reason
 
             manifest = root / "package.json"
-            manifest.write_text(json.dumps({"version": "99.0.1"}))
+            manifest.write_text(json.dumps({"name": "npm", "version": "99.0.1"}))
 
             second = instance.resolve("npx", ["-y", "left-pad"], {}, None)
             assert second.is_refused, second
@@ -1034,6 +1036,35 @@ class TestOnlyConfirmedAbsenceIsUnavailable:
         try:
             result = self._assert_refuses_without_tables(instance, monkeypatch)
             assert "could not be spawned" in (result.reason or "")
+        finally:
+            instance.close()
+
+    def test_npm_on_path_but_unlocatable_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """npm we can SEE but cannot locate is not npm that is absent.
+
+        Found on the GitHub Actions runner's bundled node20 tree: it ships
+        `<prefix>/bin/npx` as a *copy* of `npx-cli.js` rather than a symlink, so
+        walking up from it never reaches the npm package. The resolver reported
+        `UNAVAILABLE` and fell straight through to the flag tables -- the same
+        fail-open as the missing-helper case. `rootFromEntryPoint` now also
+        checks npm's own global layout (`<prefix>/lib/node_modules/npm`), and
+        when even that fails with an npm entry point on PATH, it REFUSES.
+        """
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        node = shutil.which("node")
+        assert node is not None
+        os.symlink(node, bindir / "node")
+        # An `npx` that is a plain file with no npm package anywhere near it.
+        (bindir / "npx").write_text("#!/usr/bin/env node\n")
+        (bindir / "npx").chmod(0o755)
+        monkeypatch.setenv("PATH", str(bindir))
+        instance = NpmResolver()
+        try:
+            result = self._assert_refuses_without_tables(instance, monkeypatch)
+            assert "could not be located" in (result.reason or "")
         finally:
             instance.close()
 
