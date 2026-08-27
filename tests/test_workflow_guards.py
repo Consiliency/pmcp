@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -315,6 +316,42 @@ def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True, check=False)
 
 
+def _orphan_commit(cwd: Path) -> str:
+    """A commit that RESOLVES but shares no history with HEAD.
+
+    `git commit-tree` takes its committer from the environment, and a CI runner
+    has no global git identity — `actions/checkout` does not set one — so the
+    identity is supplied explicitly rather than inherited. Without this the test
+    passed on a developer machine and failed on the runner, which is the same
+    class of "green locally, dead in CI" this whole change exists to prevent.
+    """
+    identity = {
+        "GIT_AUTHOR_NAME": "workflow guard test",
+        "GIT_AUTHOR_EMAIL": "test@example.com",
+        "GIT_COMMITTER_NAME": "workflow guard test",
+        "GIT_COMMITTER_EMAIL": "test@example.com",
+    }
+    env = {**os.environ, **identity}
+    tree = subprocess.run(
+        ["git", "write-tree"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    ).stdout.strip()
+    # Unreachable from any ref, so git gc collects it; nothing is written to the
+    # working tree or the index.
+    return subprocess.run(
+        ["git", "commit-tree", tree, "-m", "no merge base"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    ).stdout.strip()
+
+
 @pytest.fixture
 def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A throwaway git repo with two workflow files committed."""
@@ -424,10 +461,7 @@ class TestJobSetDrift:
         # unresolvable ref, and it defeats the same fail-closed property on
         # exactly the histories where drift matters: divergent or rewritten
         # history, shallow clones, force-pushed bases.
-        tree = _run(["git", "write-tree"], repo).stdout.strip()
-        orphan = _run(
-            ["git", "commit-tree", tree, "-m", "no merge base"], repo
-        ).stdout.strip()
+        orphan = _orphan_commit(repo)
         assert cw._base_resolves(orphan), "the orphan must be a resolvable commit"
         with pytest.raises(cw.GitError) as excinfo:
             cw.changed_workflow_paths(orphan)
@@ -438,10 +472,7 @@ class TestJobSetDrift:
     ) -> None:
         # They must not be conflated behind one message: one means "fetch more
         # history", the other means "this base shares no history with HEAD".
-        tree = _run(["git", "write-tree"], repo).stdout.strip()
-        orphan = _run(
-            ["git", "commit-tree", tree, "-m", "no merge base"], repo
-        ).stdout.strip()
+        orphan = _orphan_commit(repo)
 
         assert cw.main(["--base-ref", "definitely-not-a-ref"]) == 1
         unresolvable = capsys.readouterr().out
@@ -544,15 +575,7 @@ class TestCheckerEntryPoint:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.chdir(REPO_ROOT)
-        tree = subprocess.run(
-            ["git", "write-tree"], capture_output=True, text=True, check=True
-        ).stdout.strip()
-        orphan = subprocess.run(
-            ["git", "commit-tree", tree, "-m", "no merge base"],
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout.strip()
+        orphan = _orphan_commit(REPO_ROOT)
         assert cw.main(["--base-ref", orphan]) == 1
 
     def test_both_workflow_extensions_are_globbed(

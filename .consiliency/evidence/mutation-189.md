@@ -432,6 +432,16 @@ release.yml is untouched — no acknowledgement required.
 Directions B, C, C2, D and E remain **local simulations** of the shipped step
 body; this PR does not touch `release.yml`, so only A could be live.
 
+The runner also caught one of my own tests being environment-dependent, which is
+worth recording because it is the exact class this change exists to prevent.
+`test_a_base_with_no_merge_base_exits_non_zero` builds an orphan commit with
+`git commit-tree`, which takes its committer from the environment —
+`actions/checkout` sets no git identity, so it exited 128 on the runner while
+passing on a developer machine with a global `user.email`. The identity is now
+supplied explicitly, and the suite is re-verified under
+`HOME=/tmp/nogitidentity GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null`
+(146 passed). Green locally is not green.
+
 One incidental finding worth recording: the first push of this branch produced
 **no Actions run at all**, because the PR was in a conflicting state and GitHub
 cannot build the `refs/pull/N/merge` ref for a conflicting PR. There is no red
