@@ -66,9 +66,9 @@ workflows-job-deleted|1|[drift]|test.yml: this guard's own job deleted (see the 
 needs-as-list|0|-|release.yml: needs: build -> needs: [build]; a legitimate equivalent form that must NOT false-positive
 timeout-below-p100|0|-|NOT COVERED: release.yml build timeout-minutes 20 -> 12, above the floor but potentially below a future p100
 concurrency-added|0|-|NOT COVERED by invariant: workflow-level concurrency with cancel-in-progress on release.yml; release-diff-ack covers it by label
-guard-self-disabled|0|-|NOT COVERED: if: false on this guard's own job in test.yml; GitHub counts a skipped job as satisfying a required check
-guard-self-disabled-nonconstant|0|-|NOT COVERED: an always-false but NON-constant if: on the same job; actionlint's if-cond rule only sees the literal
-guard-step-gutted|0|-|NOT COVERED by check_workflows.py: the checker step's command replaced by a no-op; the script runs from the PR branch
+guard-self-disabled|0|-|NOT COVERED by the checker: if: false on this guard's own job; GitHub counts a skipped job as satisfying a required check. Caught by the test job, not by this script
+guard-self-disabled-nonconstant|0|-|NOT COVERED by the checker: an always-false but NON-constant if: on the same job; actionlint's if-cond rule only sees the literal. Caught by the test job
+guard-step-gutted|0|-|NOT COVERED by the checker: the checker step's command replaced by a no-op, since the script runs from the PR branch. Caught by the test job
 TSV
 )"
 
