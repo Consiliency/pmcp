@@ -1,5 +1,11 @@
 # Detailed plan: name an npm package only when npm's own parser makes it certain
 
+> **Revision 5 (2026-08-27).** The rev-3 CLI seats returned late with findings
+> rev 4 had not covered — two DISAGREE. The worst: a self-test failure was
+> specified to fall back to the tables, which is a **fail-open** in exactly the
+> situation that proves the host parser cannot be trusted. Also two of the plan's
+> own verification commands were verified to prove nothing.
+>
 > **Revision 4 (2026-08-27).** Rev 3 boarded PARTIALLY AGREE with **six blocking
 > findings, four of them verified confident-wrong answers**. The root cause was
 > structural: rev 3's gate was a *denylist of unusual things*, so every round
@@ -207,10 +213,16 @@ in-flight request, with the *child* moving to respawn-once. Sticky
 within a major.
 
 The child runs a small **invariant corpus at spawn** — the step-2/3 cases —
-against the host's own nopt and definitions. Any failure ⇒ the resolver reports
-`UNAVAILABLE`-with-reason for its whole lifetime **and logs once at WARNING**, so
-a future npm that changes resolution degrades loudly to the tables instead of
-answering wrongly. The `npx-cli.js` hash stays as a tripwire **with a specified firing action**: a
+against the host's own nopt and definitions. Any failure ⇒ the resolver returns
+**`REFUSED` for every query** for its whole lifetime, and logs once at WARNING.
+
+**WAS WRONG (rev 3 and rev 4):** this said `UNAVAILABLE`-with-reason, which
+means *fall back to the tables*. The red-team seat correctly called that a
+fail-open: a failed self-test is precisely the evidence that the host's parser
+behaves in a way this code does not model, and responding by consulting the
+known-incomplete 2.5.2 tables is the worst available choice. `UNAVAILABLE` is
+reserved for **spawn** failure — the case where we learned nothing about npm,
+only that node is missing. A hash mismatch takes the same `REFUSED` path. The `npx-cli.js` hash stays as a tripwire **with a specified firing action**: a
 mismatch produces the same `UNAVAILABLE`-with-reason + WARNING as a failed
 self-test. Rev 3 called it a tripwire but never said what it does on mismatch,
 which made it decorative. It matters because the self-test *is* tautological with
@@ -240,6 +252,24 @@ parser answering with stale definitions.
   `--constructor` throw inside nopt (Object.prototype leaking into the shorthand
   lookup); a contained child answers the next query correctly, verified.
 - Exit on stdin `end`, so a parent crash cannot orphan the child.
+- **Emit a `{"ready": true, "npmVersion": …, "selfTest": …}` handshake record
+  before accepting any query**, and the parent must consume it before its first
+  write. The self-test runs at spawn over the same NDJSON stdout as queries, so
+  without a handshake the first `resolve()` can read a self-test line as its own
+  answer — a wrong `Identity`, the same mis-attribution class as the timeout case
+  the plan already names. Terminate the child before releasing the lock on a
+  **protocol violation** too, not only on hang or death.
+- Resolve `nopt`, `definitions` and `npm-package-arg` with
+  `createRequire(<resolved npx-cli.js path>)` so the modules always come from the
+  same npm installation the pre-scan was read from.
+- The per-request `try`/`catch` must wrap **the pre-scan as well as nopt** (real
+  npx dies inside the pre-scan at `npx-cli.js:89` on `--__proto__=evil`), and a
+  poisoned argv must produce `REFUSED` for that request **without** flipping the
+  process to sticky `UNAVAILABLE`.
+- `npxPreScan`'s `switches` set must be live `definitions` **plus npx-cli's own
+  hardcoded extras** (`quiet`, `q`, `help`, `h`, `version`, `v`, `no-install`).
+  Dropping them lets a later `--package=` outrank the positional because no `--`
+  is inserted.
 - NDJSON over stdin/stdout. Argv arrives as parsed JSON — never a shell string,
   never interpolated into `-e`.
 
@@ -252,7 +282,10 @@ parser answering with stale definitions.
   respawn-once **before releasing the lock**, so a later query cannot read an
   orphaned response and attribute it to the wrong request.
 - `resolve(command, args, env, cwd)` — returns the tri-state. Memoized on
-  `(command, args, relevant_env, cwd)`.
+  `(command, tuple(args), frozenset(gate_relevant_env.items()), cwd)` — a raw
+  dict is unhashable, and "relevant_env" must be defined as *exactly the keys the
+  gate inspects*, or two configs differing only in an ungated key share a cache
+  entry.
 - No idle reaper (rev 1 had one *and* sticky-unavailable, so the feature died
   after the first idle period).
 
@@ -288,7 +321,12 @@ config in hand, so the change cascades:
 implementer must treat the closure above as the work item, not the six.
 
 Each converted site passes its effective env (the `sanitized_subprocess_env`
-overlay) and the effective cwd.
+overlay) and the effective cwd. **Note which type actually carries cwd:** the
+manifest's `ServerConfig` has `extra_env` and **no** `cwd`, so the refresher path
+passes `cwd=None` and the gate falls back to the process cwd;
+`LocalMcpServerConfig` is the type that carries one. `get_package_version` is
+also called independently at `handlers.py:5242`, after update probing — that
+caller is part of the closure too.
 
 ### `pyproject.toml` (modify)
 
@@ -330,10 +368,21 @@ call sites — **before** any test edit, so an unconverted caller fails to compi
 
 ```bash
 uv run pytest -q
-env PATH=/usr/bin:/bin uv run pytest -q tests/test_version_checker.py -k npm
+# NOT `PATH=/usr/bin:/bin` -- verified on this host that path still contains
+# node, npm and npx (and excludes uv, so the command is not even runnable).
+# Build a genuinely node-less PATH that still has uv:
+NODELESS=$(mktemp -d) && ln -s "$(command -v uv)" "$NODELESS/uv" && \
+  env PATH="$NODELESS" uv run pytest -q tests/test_version_checker.py -k npm
 uv run python .consiliency/notes/differential_npm_corpus.py --against-binary
+# The smoke must ACTUALLY EXERCISE the packaged .js and assert an identity.
+# `...` is a valid Python no-op: rev 3's version imported the lazy resolver and
+# never loaded the helper, so the criterion was unproven.
 uv build && python -m venv /tmp/vw && /tmp/vw/bin/pip install -q dist/pmcp-*.whl && \
-  /tmp/vw/bin/python -c "from pmcp.manifest.npm_resolver import get_resolver; ..."
+  /tmp/vw/bin/python -c "
+from pmcp.manifest.npm_resolver import get_resolver
+r = get_resolver().resolve('npx', ['-y', 'left-pad'], env={}, cwd=None)
+assert r.is_identity and r.spec == 'left-pad', r
+print('helper OK:', r.spec)"
 uv run ruff check . && uv run ruff format --check . && uv run mypy src/
 ```
 
@@ -344,6 +393,17 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src/
       list also resolves (not refuses), matching the binary: `npx -y <pkg>`,
       `npx <pkg>`, `npm exec <pkg>`, `npm exec --package=<pkg> -- <bin>`,
       `npx -y <pkg>@1.2.3`, `npx -y @scope/<pkg>`.
+      **The dead-registry env goes to the binary only.** The corpus observes npm
+      via `npm_config_registry=http://127.0.0.1:9`, but the gate refuses any
+      `npm_config_*` — so feeding that env to `resolve()` makes the child refuse
+      every input and the criterion unsatisfiable (or invites an implementer to
+      punch a hole in the gate). AC1 counts the **child's `Identity` results**,
+      not combined `detect_package_type` answers.
+      **Also required:** at least one case where the **tables are wrong and the
+      resolver matches the binary** (`npx --pack zz bin`, `npx --yes=maybe tok`,
+      `npx --frobnicate valpkg realbin`). Without it the 79 plain manifest
+      servers can go green on the tables alone, proving nothing about the
+      resolver.
       **WAS WRONG (rev 3):** "zero disagreements AND a non-zero resolved count"
       is satisfied by a regex that resolves one form and refuses everything else,
       because a refusal is not a disagreement. Naming the list is what makes the
@@ -357,6 +417,12 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src/
       which the un-poisoned tables return a non-`None` *wrong* answer X,
       `_npm_package_arg(...) is None` and `detect_package_type(...) ==
       ("unknown", None)`.
+      Required for the gates where the 2.5.2 tables *do* return a non-`None`
+      wrong answer — verified: `--userconfig /tmp/rc probe` and
+      `--registry http://x probe` both yield `('npm','probe')`, as does the
+      alias case. **Not** required for two-distinct-`--package`, where the tables
+      already return `('unknown', None)`; rev 4 demanded it for *every* gate,
+      which the red-team seat showed no implementation can satisfy.
       **WAS WRONG (rev 3):** it specified a monkeypatched call counter *and
       dropped rev 2's result assertion*. A seat then passed it with an
       implementation whose REFUSED path calls the scan through a def-time alias
