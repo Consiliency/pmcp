@@ -247,7 +247,11 @@ class NpmResolver:
         self._warned = False
         self._memo: dict[tuple[object, ...], NpmResolution] = {}
         self._npm_version: str | None = None
-        self._spawn_attempted = False
+        # Attempts, not successes. On a node-less host `Popen` raises and no
+        # child is ever created, so counting successes would make "exactly one
+        # spawn attempt across 50 resolves" trivially true whatever the code
+        # did.
+        self.spawn_attempts = 0
         self.spawn_count = 0
 
     # -- lifecycle ---------------------------------------------------------
@@ -296,7 +300,7 @@ class NpmResolver:
         if not self._helper.is_file():
             return _unavailable(f"helper script missing: {self._helper}")
         self._last_spawn_at = time.monotonic()
-        self._spawn_attempted = True
+        self.spawn_attempts += 1
         try:
             proc = subprocess.Popen(
                 ["node", str(self._helper)],
@@ -353,7 +357,7 @@ class NpmResolver:
             return None
         if self._proc is not None:
             self._terminate()
-        if self._spawn_attempted and (
+        if self.spawn_attempts and (
             time.monotonic() - self._last_spawn_at < _RESPAWN_COOLDOWN
         ):
             # Inside the cooldown after a death: refuse cheaply rather than
