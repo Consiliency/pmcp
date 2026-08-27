@@ -478,6 +478,7 @@ URL-mode gateway calls.
 - `gateway.update_server` is the phase-1 update path for subordinate MCPs.
 - `pmcp update <server>` and `pmcp update --all` call the same gateway update workflow.
 - Update information is reported on request by `gateway.update_server`; the gateway does not volunteer unprompted "update available" notices. It cannot observe which package version a running server is actually executing, so a volunteered notice could be wrong in either direction (Consiliency/pmcp#150).
+- **npm package identity comes from npm's own parser, or not at all.** For an `npx`/`npm` server the gateway asks the host npm's own `nopt`, config definitions and `npm-package-arg` which package that command line would run, and **refuses** rather than guess when anything could redirect resolution — a `cwd` inside a node project, an `npm_config_*` variable in the server's env or the gateway's own, or any flag beyond `--yes`/`--package`. A refused server keeps working; it just loses auto-update and version reporting, and refreshes its cached descriptions every cycle. Where node is not installed the gateway falls back to its own flag tables, which is the pre-2.5.2 behaviour (Consiliency/pmcp#195).
 
 **The environment across the update's probe window.** `gateway.update_server`
 probes for a new package version and then re-resolves the server config before

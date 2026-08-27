@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **npm package identity now comes from npm's own parser where it is certain, and
+  is refused otherwise.** The hand-written npm flag tables have been repaired five
+  times (Consiliency/pmcp#180 → #192 → #194 → #195 → the 2.5.2 nullable-boolean
+  spelling), and every defect was in the rules *around* the tables rather than a
+  missing entry — so every repair produced a *confident wrong answer*, which the
+  freshness gate reads as positive confirmation that a cached tool description
+  still describes the configured package.
+
+  For an `npx`/`npm` server the gateway now asks the host npm's own `nopt`, its
+  own `@npmcli/config` definitions and its own `npm-package-arg`, through a
+  faithful port of npm's `npx-cli.js` pre-scan, and accepts the answer only when
+  nothing in the invocation could redirect resolution. It **refuses** when:
+
+  - the parsed configuration contains any key beyond `--yes` and `--package`
+    (`--registry`, `--userconfig`, `--prefix`, `--cache`, `--call`, `--workspace`,
+    a shorthand such as `--silent` that expands to `--loglevel`, or an unknown
+    flag) — this is an allowlist of plain shapes, not a denylist of dangerous
+    ones;
+  - the server's environment **overlay**, or the gateway's own process
+    environment, sets `npm_config_*` (case-insensitive), `PATH`, `HOME`,
+    `NODE_PATH`, `NODE_OPTIONS`, `PREFIX` or `NVM_*`;
+  - walking up from the effective working directory, npm would set a local
+    prefix (a `package.json` or `node_modules` in any ancestor), because a
+    project `.npmrc` can rename the package and a local `node_modules/.bin` entry
+    means npm never reaches the registry at all;
+  - `npm-package-arg` reports anything but a registry spec — notably an **alias**
+    (`npx -y myalias@npm:left-pad` really runs `left-pad`, and the alias name is a
+    squattable different package);
+  - the npm subcommand has no package operand (`npm run`, `npm start`, `npm test`,
+    `npm create`, a typo, bare `npm -y pkg`, and now `npm dlx`, which is
+    pnpm/yarn spelling and is not an npm command at all);
+  - the spawn-time self-test against the host's own parser fails, `bin/npx-cli.js`
+    is not one this port was verified against, or npm's parser cannot be loaded.
+    A failed self-test **refuses** — it does not fall back to the tables, because
+    a failed self-test is precisely the evidence that the tables' model of npm is
+    wrong. One WARNING is logged.
+
+  Refusing costs auto-update coverage for an unusual configuration: the server
+  keeps running, but its package is reported as `unknown`, so its descriptions
+  refresh every cycle and `gateway.update_server` cannot name a package for it.
+  Measured cost on the shipped manifest: **zero** — all 79 npm-family servers use
+  the plain `npx -y <pkg>` shape and all 79 resolve to the same package the real
+  `npx` binary fetches.
+
+  Where node is not installed the flag tables remain in use unchanged, which is
+  the behaviour every release through 2.5.1 shipped.
+
+  **Known residual:** a `package=` or `registry=` line in a **user or global**
+  `.npmrc` changes what npm resolves and the gateway cannot see it. Project-level
+  `.npmrc` is covered by the local-prefix refusal, and `npm_config_*` in the
+  gateway's own environment is covered by the process-environment check; the
+  user/global rc file is the one input that remains unguarded.
+
+  `detect_package_type`, `_npm_package_arg`, `get_package_version` and
+  `gateway.update_server`'s pin detection all take the server's environment
+  overlay and working directory as **required** parameters now, since both are
+  identity inputs.
+
 ## [2.5.1] - 2026-08-26
 
 ### Fixed
