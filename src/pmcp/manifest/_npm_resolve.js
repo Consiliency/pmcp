@@ -95,6 +95,21 @@ const NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND = new Set([
   'add',
 ])
 
+// npm honours the `package` config for `exec`/`x` ONLY, and those are also the
+// only subcommands whose trailing positionals are arguments to a binary rather
+// than more packages. The install family differs on both counts, and treating
+// it like `exec` produced three separate wrong answers (board review on the
+// diff, correctness seat):
+//
+//   npm install pkg-real --package=pkg-other -> 'pkg-other'  (npm fetches pkg-real)
+//   npm install --package                    -> 'true'       (npm fetches nothing)
+//   npm install a b                          -> 'a'  ┐ two different configs
+//   npm install a c                          -> 'a'  ┘ collapsed onto ONE identity
+//
+// The last is the #180 collision class exactly: `_same_package` would confirm
+// one server's cached tool descriptions against the other's config.
+const NPM_EXEC_SUBCOMMANDS = new Set(['exec', 'x'])
+
 // npa types whose `name` is the package npm actually fetches. `alias` is
 // excluded deliberately and is the reason this is an allowlist rather than a
 // "has a name" check: `npx -y myalias@npm:left-pad` RUNS `left-pad`, but npa
@@ -437,6 +452,21 @@ function resolveOne (parser, command, args) {
   }
 
   // Step 2b -- WHERE THE NAME COMES FROM.
+  //
+  // `npm install` takes a LIST of packages and does not read the `package`
+  // config at all, so exactly one positional and no `--package` is the only
+  // shape that names one package. Anything else refuses.
+  if (command === 'npm' && !NPM_EXEC_SUBCOMMANDS.has(remain[0])) {
+    if (Object.prototype.hasOwnProperty.call(parsed, 'package')) {
+      return REFUSE(`npm ${remain[0]} does not read --package`)
+    }
+    if (remain.length !== 2) {
+      return REFUSE(
+        `npm ${remain[0]} names ${remain.length - 1} packages, not one`
+      )
+    }
+  }
+
   let candidate = null
   // `package` is typed `[String, Array]`, so nopt always yields a LIST. Test it
   // by KEY PRESENCE, never by truthiness: `npx --package=""` parses to
@@ -544,6 +574,18 @@ const SELF_TEST = [
   ['npm', ['test'], null],
   ['npm', ['create', 'foo'], null],
   ['npm', ['dlx', 'x'], null],
+  // The install family: a package LIST, and no `--package` config.
+  ['npm', ['install', 'a'], 'a'],
+  ['npm', ['install', 'a', 'b'], null],
+  ['npm', ['install', 'a', '--package=b'], null],
+  ['npm', ['install', '--package'], null],
+  ['npm', ['install'], null],
+  ['npm', ['i', 'a', 'b'], null],
+  ['npm', ['add', 'a', 'b'], null],
+  // ...while exec's trailing positionals are ARGUMENTS to the binary, so these
+  // must keep resolving.
+  ['npm', ['exec', 'pkg-one', 'pkg-two'], 'pkg-one'],
+  ['npx', ['-y', 'pkg-one', 'pkg-two'], 'pkg-one'],
   // `--package` must not short-circuit the subcommand allowlist (#183).
   ['npm', ['run', '--package=pkg-a', '--', 'bin'], null],
   ['npm', ['start', '--package=pkg-a'], null],

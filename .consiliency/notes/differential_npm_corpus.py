@@ -246,6 +246,32 @@ def named_cases() -> list[Case]:
         Case("gate-prefix", "npx", ("--prefix", "/dev/null", "probe-a"), "gate"),
         Case("gate-cache", "npx", ("--cache", "/dev/null", "probe-a"), "gate"),
         Case("gate-workspace", "npm", ("exec", "-w", "ws", "probe-a"), "gate"),
+        # -- the install family: a package LIST, and no `--package` config ----
+        Case("install-one", "npm", ("install", "pkg-a"), "install family"),
+        Case("install-two", "npm", ("install", "pkg-a", "pkg-b"), "install family"),
+        Case("install-two-alt", "npm", ("install", "pkg-a", "pkg-c"), "install family"),
+        Case(
+            "install-package-flag",
+            "npm",
+            ("install", "pkg-a", "--package=pkg-b"),
+            "install family",
+        ),
+        Case("install-bare-package", "npm", ("install", "--package"), "install family"),
+        Case("install-none", "npm", ("install",), "install family"),
+        Case("i-two", "npm", ("i", "pkg-a", "pkg-b"), "install family"),
+        Case("add-two", "npm", ("add", "pkg-a", "pkg-b"), "install family"),
+        # ...and the control cases, where trailing positionals are ARGUMENTS.
+        Case(
+            "req-exec-two-positionals",
+            "npm",
+            ("exec", "probe-req", "arg-two"),
+            "required",
+        ),
+        Case(
+            "req-npx-two-positionals", "npx", ("-y", "probe-req", "arg-two"), "required"
+        ),
+        # A legal npa range containing a space; npm fetches `pkg-a`.
+        Case("req-spaced-range", "npx", ("-y", "probe-req@>=1.0 <2.0"), "required"),
         # -- step-3 npa validation --------------------------------------------
         Case("npa-alias", "npx", ("-y", "myalias-zz@npm:left-pad"), "npa alias"),
         Case("npa-git", "npx", ("-y", "github:owner/repo"), "npa git"),

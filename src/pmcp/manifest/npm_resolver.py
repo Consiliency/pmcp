@@ -215,7 +215,14 @@ def _unavailable(reason: str) -> NpmResolution:
     return NpmResolution(status="UNAVAILABLE", reason=reason)
 
 
-_SPEC_SHAPE = re.compile(r"^[^\s]+$")
+# A control character in a spec would mean the child sent something that is not
+# a package spec at all. Whitespace is deliberately ALLOWED: `pkg@>=1.0 <2.0` is
+# a legal npa range and npm fetches `pkg` from it. Rejecting it here used to
+# tear down a HEALTHY child, and the next server in the same refresh cycle then
+# got "cooling down after a failure" -- one such config entry disabled npm
+# identity fleet-wide for the cooldown window, on every cycle (board review on
+# the diff).
+_SPEC_SHAPE = re.compile(r"^[^\x00-\x1f\x7f]+$")
 
 
 class NpmResolver:
@@ -475,11 +482,17 @@ class NpmResolver:
             self._terminate()
             return _refused("npm resolver child sent malformed JSON")
         if not isinstance(response, dict) or response.get("id") != request_id:
-            # A protocol violation is a desynchronised stream: whatever comes
-            # next belongs to some other request. Terminate.
+            # THIS is a desynchronised stream: we just read someone else's
+            # answer, so whatever comes next belongs to some other request
+            # again. Terminate.
             self._terminate()
             return _refused("npm resolver child response did not match the request")
 
+        # From here down the id matched and the JSON parsed, so the stream is
+        # framed correctly and the child is healthy. A record this parent does
+        # not like is a refusal for THIS query only -- never a teardown.
+        # Terminating here punished every LATER server for one server's odd
+        # spec, which is a blast radius out of all proportion to the cause.
         status = response.get("status")
         if status == "STALE":
             # npm was upgraded in place under a running gateway. The child has
@@ -489,12 +502,10 @@ class NpmResolver:
         if status == "REFUSED":
             return _refused(str(response.get("reason") or "refused"))
         if status != "IDENTITY":
-            self._terminate()
             return _refused(f"npm resolver child sent an unknown status: {status!r}")
 
         spec = response.get("spec")
         if not isinstance(spec, str) or not _SPEC_SHAPE.match(spec):
-            self._terminate()
             return _refused("npm resolver child sent an unusable spec")
         return NpmResolution(status="IDENTITY", spec=spec)
 

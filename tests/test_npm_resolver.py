@@ -518,6 +518,98 @@ class TestTheRequiredToResolveList:
         assert result.status == "IDENTITY", result.reason
         assert result.spec == "pkg-a"
 
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["install", "pkg-real", "--package=pkg-other"],
+            ["install", "--package"],
+            ["install", "a", "b"],
+            ["install"],
+            ["i", "a", "b"],
+            ["add", "a", "b"],
+        ],
+    )
+    @requires_node
+    def test_the_install_family_names_a_list_not_a_package(
+        self, resolver: NpmResolver, monkeypatch: pytest.MonkeyPatch, args: list[str]
+    ) -> None:
+        """npm reads `--package` for `exec`/`x` ONLY, and installs a LIST.
+
+        Three separate wrong answers came from treating the install family like
+        `exec` (board review on the diff, correctness seat):
+
+            npm install pkg-real --package=pkg-other -> 'pkg-other'
+                                                        (npm fetches pkg-real)
+            npm install --package                    -> 'true'
+                                                        (npm fetches nothing)
+            npm install a b                          -> 'a'
+            npm install a c                          -> 'a'
+
+        The last pair is the Consiliency/pmcp#180 collision exactly: two
+        different configurations, one identity, and `_same_package` would
+        confirm one server's cached tool descriptions against the other's.
+        """
+        _live(resolver)
+        monkeypatch.setattr(version_checker, "get_resolver", lambda: resolver)
+        before = version_checker._table_scan_calls
+        assert detect_package_type("npm", args, None, None) == ("unknown", None)
+        assert version_checker._table_scan_calls == before
+
+    @requires_node
+    def test_two_install_lists_sharing_a_first_package_do_not_collide(
+        self, resolver: NpmResolver, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Stated as the collision it is, not just as a refusal."""
+        _live(resolver)
+        monkeypatch.setattr(version_checker, "get_resolver", lambda: resolver)
+        first = detect_package_type("npm", ["install", "a", "b"], None, None)
+        second = detect_package_type("npm", ["install", "a", "c"], None, None)
+        assert first == second == ("unknown", None)
+        # Equal, but `_same_package` reads "unknown" as unidentified, so they
+        # still cannot confirm each other. That is the whole point of refusing.
+
+    @pytest.mark.parametrize(
+        ("command", "args", "spec"),
+        [
+            ("npm", ["install", "a"], "a"),
+            ("npm", ["i", "a"], "a"),
+            ("npm", ["add", "a"], "a"),
+            # `exec`'s trailing positionals are ARGUMENTS to the binary, not
+            # more packages, so these must keep resolving.
+            ("npm", ["exec", "pkg-one", "pkg-two"], "pkg-one"),
+            ("npx", ["-y", "pkg-one", "pkg-two"], "pkg-one"),
+        ],
+    )
+    @requires_node
+    def test_the_control_cases_still_resolve(
+        self, resolver: NpmResolver, command: str, args: list[str], spec: str
+    ) -> None:
+        _live(resolver)
+        result = resolver.resolve(command, args, {}, None)
+        assert result.status == "IDENTITY", result.reason
+        assert result.spec == spec
+
+    @requires_node
+    def test_a_legal_spec_with_a_space_resolves_and_spares_the_child(
+        self, resolver: NpmResolver
+    ) -> None:
+        """`pkg@>=1.0 <2.0` is a legal npa range and npm fetches `pkg`.
+
+        The parent's spec-shape check used to reject whitespace and TERMINATE
+        the child for it. The child was healthy -- the id matched and the JSON
+        parsed -- so the next server in the same refresh cycle got
+        `REFUSED "cooling down after a failure"`, and one such entry in a
+        manifest disabled npm identity fleet-wide for the cooldown window on
+        every cycle (board review on the diff).
+        """
+        _live(resolver)
+        spaced = resolver.resolve("npx", ["-y", "pkg@>=1.0 <2.0"], {}, None)
+        assert spaced.status == "IDENTITY", spaced.reason
+        assert spaced.spec == "pkg@>=1.0 <2.0"
+        # The next server is unaffected -- no teardown, no cooldown.
+        assert resolver.resolve("npx", ["-y", "left-pad"], {}, None).spec == "left-pad"
+        assert resolver.spawn_attempts == 1
+
     @requires_node
     def test_the_package_flag_outranks_the_positional(
         self, resolver: NpmResolver, monkeypatch: pytest.MonkeyPatch
@@ -725,6 +817,38 @@ class TestHungChild:
             # 19 further callers, none of which may wait on the child again --
             # the cooldown answers them immediately.
             assert rest_elapsed < 0.5, rest_elapsed
+            assert instance.spawn_attempts == 1
+        finally:
+            instance.close()
+
+    @requires_node
+    def test_an_unusable_record_refuses_without_terminating(
+        self, tmp_path: Path
+    ) -> None:
+        """Teardown is for a DESYNCHRONISED stream, not for a record we dislike.
+
+        A helper that echoes the request id but sends a spec the parent cannot
+        use: the framing is intact, so the query refuses and the child lives.
+        """
+        helper = tmp_path / "badspec.js"
+        helper.write_text(
+            'process.stdout.write(JSON.stringify({handshake:1,status:"OK",'
+            'npmVersion:"1.2.3",npmRoot:"/x",npxCliSha256:"z"})+"\\n");\n'
+            "require('readline').createInterface({input: process.stdin})\n"
+            "  .on('line', (l) => {\n"
+            "    const id = JSON.parse(l).id;\n"
+            '    process.stdout.write(JSON.stringify({id, status:"IDENTITY",'
+            'spec: id === 1 ? "bad\\u0007spec" : "left-pad"})+"\\n");\n'
+            "  });\n"
+        )
+        instance = NpmResolver(helper=helper)
+        try:
+            first = instance.resolve("npx", ["-y", "a"], {}, None)
+            assert first.is_refused, first
+            assert "unusable spec" in (first.reason or "")
+            # Still alive, still answering, no cooldown.
+            second = instance.resolve("npx", ["-y", "b"], {}, None)
+            assert second.status == "IDENTITY", second.reason
             assert instance.spawn_attempts == 1
         finally:
             instance.close()
