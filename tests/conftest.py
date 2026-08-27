@@ -1,4 +1,31 @@
-"""Shared pytest fixtures for MCP Gateway tests."""
+"""Shared pytest fixtures for MCP Gateway tests.
+
+READ THIS IF A TEST ASSERTS AN npm/npx PACKAGE IDENTITY
+=======================================================
+
+`detect_package_type` asks the host npm's own parser (Consiliency/pmcp#195) and
+**refuses** rather than guess when anything could redirect npm's resolution. One
+of those refusal gates is npm's own local-prefix rule: walking up from the
+process's working directory, a `package.json` or a `node_modules` in ANY ancestor
+means a project `.npmrc` -- or a `node_modules/.bin` entry, which npm runs
+without ever reaching the registry -- could change which package runs.
+
+pytest puts `tmp_path` under the system temp directory, and **that directory is
+not ours**. A `/tmp/package.json` or `/tmp/node_modules` (both present on the
+development host for #195, the latter holding real executables) silently flips
+every `monkeypatch.chdir(tmp_path)` test from resolving to refusing.
+
+The failure mode is nasty in one direction only: a test that asserts a REFUSAL
+passes for the wrong reason and looks green forever. So:
+
+* a test asserting a refusal must not rely on cwd unless cwd IS its subject;
+* a test asserting a RESOLVED identity from a `chdir`-ed temp directory must pin
+  the identity path explicitly (see
+  `tests/test_cli.py::TestCheckVersionsUnverifiableDisplay`) or run from the
+  repository root, which this suite does control;
+* `tests/test_npm_resolver.py` states the local-prefix property as *which*
+  directory the walk reports, so it holds under an ambient prefix too.
+"""
 
 from __future__ import annotations
 

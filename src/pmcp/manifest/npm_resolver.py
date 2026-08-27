@@ -261,7 +261,11 @@ class NpmResolver:
                 "npm package identity is DISABLED for this process: %s. "
                 "npm/npx servers will report package_type='unknown', which "
                 "means their descriptions refresh every cycle and "
-                "gateway.update_server cannot name a package for them.",
+                "gateway.update_server cannot name a package for them. "
+                "THIS DOES NOT RECOVER ON ITS OWN -- a disabled resolver keeps "
+                "no child process, so nothing re-checks the host; fix the cause "
+                "and RESTART THE GATEWAY. Current state is also reported as "
+                "gateway.health -> gateway_diagnostics.npm_identity.",
                 message,
             )
 
