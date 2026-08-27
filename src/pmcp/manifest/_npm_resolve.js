@@ -365,6 +365,40 @@ function resolveOne (parser, command, args) {
     }
   }
 
+  // Step 2a -- WHICH SUBCOMMAND. This runs FIRST and UNCONDITIONALLY, before
+  // `--package` is even looked at.
+  //
+  // **It used to run only in the `--package`-absent branch, and that reopened
+  // Consiliency/pmcp#183 in full** (board review on the diff, correctness
+  // seat). Measured on the broken code:
+  //
+  //     npm run   --package=pkg-a -- bin  ->  ('npm', 'pkg-a')   WRONG
+  //     npm start --package=pkg-a         ->  ('npm', 'pkg-a')   WRONG
+  //     npm test  --package=pkg-a         ->  ('npm', 'pkg-a')   WRONG
+  //     npm dlx   --package=pkg-a -- bin  ->  ('npm', 'pkg-a')   WRONG
+  //     npm rum   --package=pkg-a -- bin  ->  ('npm', 'pkg-a')   WRONG
+  //     npm       --package=pkg-a         ->  ('npm', 'pkg-a')   WRONG
+  //
+  // `npm run` does not run a registry package; `handlers.py` would then have
+  // fetched and executed `pkg-a@latest --help` off the public registry, which
+  // is the #183 hazard exactly. `--package` says which package a command comes
+  // FROM; it cannot turn a script runner into a package installer. The two
+  // questions -- "does this subcommand name a package at all" and "where does
+  // the name come from" -- are independent, and the first gates the second.
+  if (command === 'npm') {
+    if (remain.length < 1 || !NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND.has(remain[0])) {
+      // `npm run mcp`, `npm start`, `npm test`, `npm create foo`, a typo like
+      // `npm rum mcp`, bare `npm -y pkg`, and `npm dlx x` all land here.
+      return REFUSE(`npm subcommand has no package operand: ${remain[0]}`)
+    }
+  } else if (remain[0] !== 'exec') {
+    // Structural tripwire: `npxPreScan` always builds `[node, npm-cli.js,
+    // 'exec', ...]` and nopt slices at 2, so `remain[0]` is `'exec'` unless the
+    // port has drifted.
+    return REFUSE('npx pre-scan did not yield the expected leading "exec"')
+  }
+
+  // Step 2b -- WHERE THE NAME COMES FROM.
   let candidate = null
   // `package` is typed `[String, Array]`, so nopt always yields a LIST. Test it
   // by KEY PRESENCE, never by truthiness: `npx --package=""` parses to
@@ -383,22 +417,7 @@ function resolveOne (parser, command, args) {
     // in `npm exec --package=<pkg> -- <bin>` the positional is the BINARY npm
     // runs FROM that package, not a package.
     candidate = pkgs[0]
-  } else if (command === 'npx') {
-    if (remain[0] !== 'exec') {
-      return REFUSE('npx pre-scan did not yield the expected leading "exec"')
-    }
-    if (remain.length < 2) {
-      return REFUSE('no package operand')
-    }
-    candidate = remain[1]
   } else {
-    if (remain.length < 1 || !NPM_SUBCOMMANDS_WITH_A_PACKAGE_OPERAND.has(remain[0])) {
-      // `npm run mcp`, `npm start`, `npm test`, `npm create foo`, a typo like
-      // `npm rum mcp`, bare `npm -y pkg`, and `npm dlx x` all land here
-      // (Consiliency/pmcp#183). None of them puts a registry package in the next
-      // position, so there is no identity to recover.
-      return REFUSE(`npm subcommand has no package operand: ${remain[0]}`)
-    }
     if (remain.length < 2) {
       return REFUSE('no package operand')
     }
@@ -487,6 +506,15 @@ const SELF_TEST = [
   ['npm', ['test'], null],
   ['npm', ['create', 'foo'], null],
   ['npm', ['dlx', 'x'], null],
+  // `--package` must not short-circuit the subcommand allowlist (#183).
+  ['npm', ['run', '--package=pkg-a', '--', 'bin'], null],
+  ['npm', ['start', '--package=pkg-a'], null],
+  ['npm', ['test', '--package=pkg-a'], null],
+  ['npm', ['dlx', '--package=pkg-a', '--', 'bin'], null],
+  ['npm', ['rum', '--package=pkg-a', '--', 'bin'], null],
+  ['npm', ['--package=pkg-a'], null],
+  // ...while npx has no subcommand, so this one must still resolve.
+  ['npx', ['--package=pkg-a', '--', 'bin'], 'pkg-a'],
   ['npm', ['-y', 'server-pkg'], null],
   ['npm', ['exec', '--', '--flag-thing'], null],
 ]

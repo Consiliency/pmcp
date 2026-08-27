@@ -472,6 +472,52 @@ class TestTheRequiredToResolveList:
         monkeypatch.setattr(version_checker, "get_resolver", lambda: resolver)
         assert detect_package_type("npm", args, None, None) == ("unknown", None)
 
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["run", "--package=pkg-a", "--", "bin"],
+            ["start", "--package=pkg-a"],
+            ["test", "--package=pkg-a"],
+            ["create", "--package=pkg-a", "--", "bin"],
+            ["dlx", "--package=pkg-a", "--", "bin"],
+            ["rum", "--package=pkg-a", "--", "bin"],
+            ["--package=pkg-a"],
+        ],
+    )
+    @requires_node
+    def test_package_does_not_short_circuit_the_subcommand_allowlist(
+        self, resolver: NpmResolver, monkeypatch: pytest.MonkeyPatch, args: list[str]
+    ) -> None:
+        """Consiliency/pmcp#183, reopened by the `--package` rule and closed again.
+
+        The subcommand check used to run only in the `--package`-ABSENT branch,
+        so `--package` bypassed it entirely. Measured on the broken code, every
+        one of these minted `('npm', 'pkg-a')` -- and `handlers.py` would then
+        have fetched and executed `pkg-a@latest --help` off the public registry
+        for a server whose command line runs a package.json SCRIPT (board review
+        on the diff, correctness seat).
+
+        `--package` says which package a command comes FROM. It cannot turn a
+        script runner into a package installer, so the two questions -- "does
+        this subcommand name a package at all" and "where does the name come
+        from" -- are independent, and the first gates the second.
+        """
+        _live(resolver)
+        monkeypatch.setattr(version_checker, "get_resolver", lambda: resolver)
+        before = version_checker._table_scan_calls
+        assert detect_package_type("npm", args, None, None) == ("unknown", None)
+        assert version_checker._table_scan_calls == before
+
+    @requires_node
+    def test_npx_has_no_subcommand_so_package_still_wins(
+        self, resolver: NpmResolver
+    ) -> None:
+        """The guard is npm-scoped: npx takes the package directly."""
+        _live(resolver)
+        result = resolver.resolve("npx", ["--package=pkg-a", "--", "bin"], {}, None)
+        assert result.status == "IDENTITY", result.reason
+        assert result.spec == "pkg-a"
+
     @requires_node
     def test_the_package_flag_outranks_the_positional(
         self, resolver: NpmResolver, monkeypatch: pytest.MonkeyPatch
@@ -684,32 +730,6 @@ class TestHungChild:
             instance.close()
 
     @requires_node
-    def test_a_transport_failure_is_not_memoised(self, hung_helper: Path) -> None:
-        """A refusal the child did not survive must never enter the memo.
-
-        `_query_locked` tears the child down on a timeout, a death, a protocol
-        violation and on STALE, then returns REFUSED for that one request.
-        Memoising it would make a single transient stall permanently disable
-        identity for that argv: a gateway re-queries the same fixed server set
-        every refresh cycle, so the entry would be re-served for the process
-        lifetime even after a healthy respawn -- and STALE's own reason string
-        asks for exactly the retry a memo hit makes impossible.
-        """
-        instance = NpmResolver(helper=hung_helper)
-        try:
-            assert instance.resolve("npx", ["-y", "p"], {}, None).is_refused
-            assert instance._memo == {}
-        finally:
-            instance.close()
-
-    @requires_node
-    def test_a_gate_refusal_IS_memoised(self, resolver: NpmResolver) -> None:
-        """The other side of the split: the child survived, so it is a fact."""
-        _live(resolver)
-        assert resolver.resolve("npx", ["--registry", "http://x", "p"], {}, None)
-        assert any("registry" in str(k) for k in resolver._memo)
-
-    @requires_node
     def test_a_hung_child_never_poisons_the_tables(
         self, hung_helper: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -731,7 +751,9 @@ class TestHungChild:
 # ---------------------------------------------------------------------------
 
 
-def _fixture_npm_root(tmp_path: Path, nopt_source: str) -> Path:
+def _fixture_npm_root(
+    tmp_path: Path, nopt_source: str | None = None, real_parser: bool = False
+) -> Path:
     """Build a real-shaped npm installation whose `nopt` is *nopt_source*.
 
     Proven end-to-end against an npm root, not by injecting a flag into a
@@ -760,6 +782,14 @@ def _fixture_npm_root(tmp_path: Path, nopt_source: str) -> Path:
     # self-test is what fails.
     shutil.copy(real, root / "bin" / "npx-cli.js")
 
+    if real_parser:
+        # Symlink the HOST npm's own node_modules, so this fixture is a fully
+        # working npm whose only fiction is its `package.json` version -- which
+        # is exactly the input the drift re-stat reads.
+        os.symlink(real.parent.parent / "node_modules", root / "node_modules")
+        return root
+
+    assert nopt_source is not None, "a fake root needs a nopt_source"
     modules = root / "node_modules"
     (modules / "nopt").mkdir(parents=True)
     (modules / "nopt" / "package.json").write_text(
@@ -898,38 +928,136 @@ class TestSelfTestFailureRefuses:
 # ---------------------------------------------------------------------------
 
 
-class TestMemoisation:
-    @requires_node
-    def test_the_memo_is_dropped_with_the_child(self, resolver: NpmResolver) -> None:
-        """A memo hit never reaches the child.
+class TestNoMemoisation:
+    """Every query reaches the child, so the drift defence is unconditional.
 
-        So the child's per-resolve npm-version re-stat would never fire again
-        and a stale `Identity` would be served for the process lifetime. The
-        memo therefore dies with the child.
-        """
+    An earlier version cached answers. The cache was dropped with the child and
+    on a handshake npm-version change -- but both fire only at lifecycle
+    boundaries, and a cache HIT never reaches the child, so the child's
+    per-resolve re-stat of npm's own `package.json` could not fire either. An
+    in-place npm upgrade mid-session would then have left a stale identity
+    served indefinitely from cache, by a resolver whose entire purpose is not
+    answering from a stale model (board review on the diff).
+    """
+
+    def test_the_resolver_holds_no_cache_at_all(self) -> None:
+        instance = NpmResolver()
+        try:
+            assert not hasattr(instance, "_memo")
+        finally:
+            instance.close()
+
+    @requires_node
+    def test_a_repeated_query_is_asked_again(self, resolver: NpmResolver) -> None:
+        """Same argv twice: two requests on the wire, not one answered from cache."""
         _live(resolver)
+        first = resolver._next_id
         assert resolver.resolve("npx", ["-y", "aaa"], {}, None).spec == "aaa"
-        assert resolver._memo
-        with resolver._lock:
-            resolver._terminate()
-        assert not resolver._memo
+        assert resolver.resolve("npx", ["-y", "aaa"], {}, None).spec == "aaa"
+        assert resolver._next_id == first + 2
 
     @requires_node
-    def test_two_configs_differing_only_in_a_gated_key_do_not_share_an_entry(
-        self, resolver: NpmResolver
+    def test_an_in_place_npm_upgrade_is_noticed_on_the_next_query(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The memo key is exactly the keys the gate inspects.
+        """The end-to-end proof, and the reason the cache had to go.
 
-        Keying on nothing would let a config with `npm_config_package` set reuse
-        a plain config's `IDENTITY` -- a wrong answer served from cache.
+        Resolve once against a fixture npm; bump that npm's own `package.json`
+        version in place; resolve the SAME argv again. The child re-stats per
+        resolve, so the second query comes back `STALE` and the child is torn
+        down. With a cache in front of it the second query never reached the
+        child and the stale answer stood.
         """
-        _live(resolver)
-        plain = resolver.resolve("npx", ["-y", "probe"], {}, None)
-        gated = resolver.resolve(
-            "npx", ["-y", "probe"], {"npm_config_package": "evil"}, None
-        )
-        assert plain.is_identity
-        assert gated.is_refused
+        root = _fixture_npm_root(tmp_path, real_parser=True)
+        monkeypatch.setenv("PATH", str(_bin_with_fixture_npm(tmp_path, root)))
+        instance = NpmResolver()
+        try:
+            first = instance.resolve("npx", ["-y", "left-pad"], {}, None)
+            assert first.status == "IDENTITY", first.reason
+
+            manifest = root / "package.json"
+            manifest.write_text(json.dumps({"version": "99.0.1"}))
+
+            second = instance.resolve("npx", ["-y", "left-pad"], {}, None)
+            assert second.is_refused, second
+            assert "npm changed under the resolver" in (second.reason or "")
+        finally:
+            instance.close()
+
+
+class TestOnlyConfirmedAbsenceIsUnavailable:
+    """`UNAVAILABLE` is the ONLY state that may consult the 2.5.2 tables.
+
+    So it must mean exactly one thing: node/npm is not here. Two failures used
+    to be misfiled under it, and both were reproduced falling through to the
+    tables and resolving `npx --registry https://private.invalid probe` to
+    `probe` -- a private-registry name that gateway.update_server would then
+    probe against public npmjs.org, where it is squattable (board review on the
+    diff).
+    """
+
+    PRIVATE = ["--registry", "https://private.invalid", "probe"]
+
+    def _assert_refuses_without_tables(
+        self, instance: NpmResolver, monkeypatch: pytest.MonkeyPatch
+    ) -> NpmResolution:
+        monkeypatch.setattr(version_checker, "get_resolver", lambda: instance)
+        result = instance.resolve("npx", self.PRIVATE, {}, None)
+        assert result.is_refused, result
+        before = version_checker._table_scan_calls
+        assert detect_package_type("npx", self.PRIVATE, None, None) == ("unknown", None)
+        assert version_checker._table_scan_calls == before
+        return result
+
+    def test_a_missing_packaged_helper_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A broken install is not a node-less host."""
+        instance = NpmResolver(helper=tmp_path / "not-shipped.js")
+        try:
+            result = self._assert_refuses_without_tables(instance, monkeypatch)
+            assert "helper script is missing" in (result.reason or "")
+        finally:
+            instance.close()
+
+    def test_node_present_but_unspawnable_refuses(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Permission denied, a resource limit, ETXTBSY -- none means npm is absent."""
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        node = bindir / "node"
+        node.write_text("#!/bin/sh\nexit 0\n")
+        node.chmod(0o644)  # present, not executable
+        monkeypatch.setenv("PATH", str(bindir))
+        instance = NpmResolver()
+        try:
+            result = self._assert_refuses_without_tables(instance, monkeypatch)
+            assert "could not be spawned" in (result.reason or "")
+        finally:
+            instance.close()
+
+    def test_node_genuinely_absent_is_unavailable(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """...and this one, alone, may use the tables."""
+        empty = tmp_path / "emptybin"
+        empty.mkdir()
+        monkeypatch.setenv("PATH", str(empty))
+        instance = NpmResolver()
+        try:
+            monkeypatch.setattr(version_checker, "get_resolver", lambda: instance)
+            result = instance.resolve("npx", self.PRIVATE, {}, None)
+            assert result.is_unavailable, result
+            assert "node is not installed" in (result.reason or "")
+            before = version_checker._table_scan_calls
+            assert detect_package_type("npx", self.PRIVATE, None, None) == (
+                "npm",
+                "probe",
+            )
+            assert version_checker._table_scan_calls == before + 1
+        finally:
+            instance.close()
 
 
 # ---------------------------------------------------------------------------

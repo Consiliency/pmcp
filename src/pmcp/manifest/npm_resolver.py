@@ -108,10 +108,9 @@ def _gate_relevant_env(env: Mapping[str, str] | None) -> dict[str, str]:
     npm server on every host. The identity question is "does *this server's
     configuration* redirect npm's resolution", and only the overlay can.
 
-    Memoisation keys on exactly this subset. Keying on the whole overlay would
-    make two configs differing only in an ungated key miss each other's cache
-    entry (harmless but wasteful); keying on nothing would make two configs
-    differing only in a GATED key share one (a wrong answer).
+    Factored out so the gate has exactly one definition of "keys that can
+    redirect npm". It was also the memo key before the memo was removed; see
+    ``NpmResolver.resolve``.
     """
     if not env:
         return {}
@@ -243,7 +242,6 @@ class NpmResolver:
         # and this code cannot model it), not that a request went wrong.
         self._sticky: NpmResolution | None = None
         self._warned = False
-        self._memo: dict[tuple[object, ...], NpmResolution] = {}
         self._npm_version: str | None = None
         # Attempts, not successes. On a node-less host `Popen` raises and no
         # child is ever created, so counting successes would make "exactly one
@@ -270,15 +268,9 @@ class NpmResolver:
             )
 
     def _terminate(self) -> None:
-        """Kill the child and drop the memo. Call with the lock held."""
+        """Kill the child. Call with the lock held."""
         proc, self._proc = self._proc, None
         reader, self._reader = self._reader, None
-        # Every memoised answer was produced by the child being torn down. A
-        # memo hit never reaches the child, so the per-resolve npm-version
-        # re-stat would never fire again and a stale IDENTITY would be served
-        # indefinitely. Dropping the memo with the child keeps the drift
-        # defence live.
-        self._memo.clear()
         if reader is not None:
             reader.stop()
         if proc is not None:
@@ -300,7 +292,16 @@ class NpmResolver:
     def _spawn(self) -> NpmResolution | None:
         """Start the child and consume its handshake. Lock held. ``None`` = ok."""
         if not self._helper.is_file():
-            return _unavailable(f"helper script missing: {self._helper}")
+            # A missing packaged helper is a BROKEN INSTALL, not a node-less
+            # host. `UNAVAILABLE` means "we learned nothing about npm, only that
+            # it is absent", and that is the one state permitted to consult the
+            # 2.5.2 flag tables. Routing a broken install there was fail-OPEN
+            # and reproduced: with the helper missing,
+            # `npx --registry https://private.invalid probe` resolved
+            # confidently to `probe` -- a private-registry name that
+            # gateway.update_server would then probe against public npmjs.org,
+            # where it is squattable (board review on the diff).
+            return _refused(f"packaged helper script is missing: {self._helper}")
         self._last_spawn_at = time.monotonic()
         self.spawn_attempts += 1
         try:
@@ -313,10 +314,18 @@ class NpmResolver:
                 shell=False,
                 bufsize=1,
             )
+        except FileNotFoundError as exc:
+            # node is not installed. This is the ONE spawn failure that learns
+            # nothing about npm, so it is the one that falls back to the tables.
+            return _unavailable(f"node is not installed: {exc}")
         except OSError as exc:
-            # node is not installed. This is the ONE case that learns nothing
-            # about npm, so it is the one case that falls back to the tables.
-            return _unavailable(f"cannot spawn node: {exc}")
+            # node IS on PATH but could not be executed: permission denied, a
+            # resource limit, ETXTBSY, a bad interpreter. None of these is
+            # evidence that npm is absent, so none may reach the tables --
+            # reproduced with a non-executable `node`, which fell back and
+            # resolved `npx --registry https://private.invalid probe` to
+            # `probe` (board review on the diff).
+            return _refused(f"node is present but could not be spawned: {exc}")
         self.spawn_count += 1
         self._generation += 1
         self._proc = proc
@@ -344,11 +353,7 @@ class NpmResolver:
             return _refused(str(handshake.get("reason") or "child refused at startup"))
 
         version = handshake.get("npmVersion")
-        if version != self._npm_version:
-            # npm changed under us (or this is the first spawn). Nothing
-            # memoised against the old parser may survive.
-            self._memo.clear()
-            self._npm_version = version if isinstance(version, str) else None
+        self._npm_version = version if isinstance(version, str) else None
         return None
 
     def _ensure_child(self) -> NpmResolution | None:
@@ -402,6 +407,22 @@ class NpmResolver:
         undefaulted: a defaulted ``None`` is the same silent fail-open this
         module exists to remove, and requiring them turns every unconverted call
         site into a type error rather than a wrong answer.
+
+        **There is deliberately no memoisation.** An earlier version cached
+        answers per ``(command, args, gated env, cwd)``. The cache was correct
+        about spawn and teardown -- it was dropped with the child and on an
+        npm-version change at handshake -- but both of those fire only at
+        lifecycle boundaries. With a healthy long-lived child, a cache HIT never
+        reaches the child, so the child's per-resolve re-stat of npm's own
+        ``package.json`` could not fire either, and an in-place npm upgrade
+        mid-session would have left a stale identity served indefinitely from
+        cache by a resolver whose whole purpose is to not answer from a stale
+        model (board review on the diff).
+
+        Removing it rather than adding a second timer keeps the drift defence
+        unconditional: **every** query now re-stats. The measured cost is
+        ~0.5 ms per query -- about 40 ms across a full 79-server refresh -- which
+        is not load-bearing next to the network calls those refreshes make.
         """
         if command not in ("npx", "npm"):
             return _refused(f"command is not a bare npx/npm: {command!r}")
@@ -415,48 +436,17 @@ class NpmResolver:
             if gate is not None:
                 return _refused(gate)
 
-        key: tuple[object, ...] = (
-            command,
-            tuple(args),
-            frozenset(_gate_relevant_env(env).items()),
-            cwd,
-        )
-
         with self._lock:
             process_gate = _process_env_is_plain()
             if process_gate is not None and self._sticky is None:
                 self._sticky = _refused(process_gate)
                 self._warn_once(process_gate)
             if self._sticky is not None:
-                # Before the memo lookup, not after: a sticky refusal must win
-                # over an answer this resolver produced while it was still
-                # healthy.
                 return self._sticky
-            hit = self._memo.get(key)
-            if hit is not None:
-                return hit
             outcome = self._ensure_child()
             if outcome is not None:
                 return outcome
-            result = self._query_locked(command, args)
-            # Memoise only an answer the child SURVIVED giving. `_query_locked`
-            # tears the child down on a timeout, a death, a protocol violation
-            # and on STALE -- which drops the memo -- and then returns REFUSED
-            # for that one request. Writing that REFUSED back into the fresh
-            # memo would make one transient stall permanently disable identity
-            # for that argv: a gateway re-queries the same fixed server set
-            # every refresh cycle, so the entry would be re-served for the
-            # process lifetime even after a healthy respawn. The STALE reason
-            # string literally says "retry after respawn", which a memo hit
-            # makes impossible.
-            #
-            # A gate or parse refusal leaves the child alive and is a fact about
-            # the argv, so it memoises. UNAVAILABLE never does: it is either
-            # sticky (returned above) or a transient spawn state.
-            child_survived = self._proc is not None
-            if child_survived and (result.is_identity or result.is_refused):
-                self._memo[key] = result
-            return result
+            return self._query_locked(command, args)
 
     def _query_locked(self, command: str, args: list[str]) -> NpmResolution:
         proc = self._proc
@@ -493,7 +483,7 @@ class NpmResolver:
         status = response.get("status")
         if status == "STALE":
             # npm was upgraded in place under a running gateway. The child has
-            # exited; the memo went with it.
+            # exited and the next query respawns against the new npm.
             self._terminate()
             return _refused("npm changed under the resolver; retry after respawn")
         if status == "REFUSED":

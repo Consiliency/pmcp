@@ -149,6 +149,46 @@ def named_cases() -> list[Case]:
         Case("183-create", "npm", ("create", "foo"), "#183"),
         Case("183-typo", "npm", ("rum", "mcp"), "#183"),
         Case("183-bare", "npm", ("-y", "server-pkg"), "#183"),
+        # #183 reopened by the `--package` rule: the subcommand allowlist used
+        # to be skipped entirely when `--package` was present, so every one of
+        # these minted `pkg-a` for a command line that runs a package.json
+        # SCRIPT (board review on the diff).
+        Case(
+            "183-run-package",
+            "npm",
+            ("run", "--package=pkg-a", "--", "bin"),
+            "#183+--package",
+        ),
+        Case(
+            "183-start-package", "npm", ("start", "--package=pkg-a"), "#183+--package"
+        ),
+        Case("183-test-package", "npm", ("test", "--package=pkg-a"), "#183+--package"),
+        Case(
+            "183-create-package",
+            "npm",
+            ("create", "--package=pkg-a", "--", "bin"),
+            "#183+--package",
+        ),
+        Case(
+            "183-dlx-package",
+            "npm",
+            ("dlx", "--package=pkg-a", "--", "bin"),
+            "#183+--package",
+        ),
+        Case(
+            "183-typo-package",
+            "npm",
+            ("rum", "--package=pkg-a", "--", "bin"),
+            "#183+--package",
+        ),
+        Case("183-nosub-package", "npm", ("--package=pkg-a",), "#183+--package"),
+        # ...while npx has no subcommand, so this one must still RESOLVE.
+        Case(
+            "req-npx-package-only",
+            "npx",
+            ("--package=probe-req", "--", "bin"),
+            "required",
+        ),
         # -- #192 / #194 / 2.5.2: boolean arity and baked-value shorthands ----
         Case(
             "192-global-true",
@@ -566,6 +606,12 @@ def main() -> int:
     print(f"manifest npm servers     : {len(manifest_rows)}")
     print(f"  ...resolving           : {len(manifest_identities)}")
     print(f"  ...matching the binary : {len(manifest_match)}")
+    required_rows = manifest_rows + [
+        row for row in rows if row.case.label.startswith("req-")
+    ]
+    required_ok = [row for row in required_rows if row.verdict == "MATCH"]
+    print(f"AC1 required-to-resolve  : {len(required_rows)}")
+    print(f"  ...IDENTITY & matching : {len(required_ok)}")
     print(f"UNSAFE rows              : {len(unsafe)}")
 
     if options.json:
@@ -592,13 +638,48 @@ def main() -> int:
     if unsafe:
         print("\nFAIL: unsafe rows above (marked !!).")
         return 1
-    if options.against_binary and not beats:
-        # Without a single case where the tables are WRONG and the resolver is
-        # right, the 79 plain manifest servers could go green on the tables
-        # alone -- proving nothing about the resolver.
-        print("\nFAIL: no case where the resolver beats the tables.")
-        return 1
-    print("\nPASS: zero unsafe rows.")
+
+    # AC1 has a POSITIVE half, and "zero unsafe rows" does not enforce it: a
+    # refusal is always judged safe, so a resolver that refused EVERY input
+    # scored zero unsafe rows and passed -- which is the one outcome AC1 names
+    # as unacceptable ("all 79 manifest npm servers resolve ... and every form
+    # on this required-to-resolve list also resolves (not refuses), matching the
+    # binary"). Enforced here rather than left to the eye (board review on the
+    # diff).
+    if options.against_binary:
+        required = manifest_rows + [
+            row for row in rows if row.case.label.startswith("req-")
+        ]
+        if not required:
+            print("\nFAIL: the required-to-resolve set is empty.")
+            return 1
+        not_resolving = [row for row in required if row.resolver[0] != "IDENTITY"]
+        not_matching = [
+            row
+            for row in required
+            if row.resolver[0] == "IDENTITY" and row.verdict != "MATCH"
+        ]
+        if not_resolving or not_matching:
+            print("\nFAIL: rows that AC1 requires to resolve did not.")
+            for row in not_resolving:
+                print(f"  refused : {row.case.label}: {row.resolver[1]}")
+            for row in not_matching:
+                print(f"  mismatch: {row.case.label}: {row.verdict}")
+            return 1
+        if not beats:
+            # Without a single case where the tables are WRONG and the resolver
+            # is right, the 79 plain manifest servers could go green on the
+            # tables alone -- proving nothing about the resolver.
+            print("\nFAIL: no case where the resolver beats the tables.")
+            return 1
+        print(
+            f"\nPASS: zero unsafe rows; {len(required)} required rows all "
+            f"IDENTITY and matching the binary ({len(manifest_rows)} manifest + "
+            f"{len(required) - len(manifest_rows)} required-to-resolve); "
+            f"{len(beats)} rows where the resolver beats the tables."
+        )
+        return 0
+    print("\nPASS: zero unsafe rows (binary oracle not run).")
     return 0
 
 
