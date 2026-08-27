@@ -292,3 +292,174 @@ jobs:
 
       - name: Run mypy
         run: uv run mypy src/pmcp --exclude baml_client
+
+  # release.yml triggers ONLY on tag push — the tag push IS the publish — so it
+  # never appears in PR checks, and every guard that protected #188's change to
+  # it was run by hand, once. The nastiest mutant is silent: changing the tag
+  # filter "v*" to "V*" leaves a workflow that is still valid, still passes
+  # actionlint, and simply never runs at tag push. There is no red X anywhere;
+  # a version just sits tagged-but-unshipped. This job runs the structural
+  # guards at PR time instead. See scripts/check_workflows.py and
+  # .consiliency/evidence/mutation-189.md for what is and is not covered.
+  workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A job-level permissions: block replaces the repo default for every scope,
+    # not just the one named — so contents: read has to be repeated here or
+    # actions/checkout below loses read access.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # job_set_drift compares each changed workflow against its BASE
+          # revision with a three-dot diff. The default depth-1 clone does not
+          # contain the base commit, and check_workflows.py fails CLOSED on a
+          # base it cannot resolve — so without this the job goes red rather
+          # than silently passing with drift detection disabled.
+          fetch-depth: 0
+
+      # check_workflows.py imports yaml, which is NOT on a stock ubuntu-latest
+      # image. Without a Python setup the guard dies with ModuleNotFoundError
+      # while `uv run` still passes locally — a guard that guards nothing.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Install actionlint
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          # sha256 of the ARCHIVE, asserted before extraction. This is not the
+          # digest of the extracted binary — they are different byte streams
+          # (archive 8aca8d…, binary c872d6…). The --version assertion below
+          # covers the installed artifact separately.
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          cd /tmp
+          curl -fsSL -o actionlint.tar.gz \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz"
+          echo "${ACTIONLINT_SHA256}  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+          test "$(actionlint --version | head -n1)" = "${ACTIONLINT_VERSION}"
+
+      # Run it BARE, with no glob: `actionlint *.yml` leaves a .yaml workflow
+      # unchecked (bypass-proofs-187.md §A), and actionlint exits 3 outside a
+      # git root. This is schema validation only — it caught 0 of the 14
+      # mutants in mutation-189.md, which is exactly why the next step exists.
+      - name: Run actionlint
+        run: actionlint
+
+      - name: Resolve the drift base
+        id: drift-base
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          # pull_request: the PR's base sha. `github.event.before` is a
+          # PushEvent field and is UNSET on pull_request — wiring that here
+          # would leave every PR running with an empty base and drift silently
+          # skipped, on the one path that gates merges.
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          # push: the previous tip of the branch. `origin/main` would compare a
+          # push to main against itself.
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          case "$EVENT_NAME" in
+            pull_request) BASE="$PR_BASE_SHA" ;;
+            push)         BASE="$PUSH_BEFORE" ;;
+            # schedule / workflow_dispatch have no base to diff against:
+            # invariants run, drift is skipped, and the script says so.
+            *)            BASE="" ;;
+          esac
+          # The all-zero sha is GitHub's sentinel for "no previous commit" (the
+          # first push of a branch). That is *no base*, which is not the same
+          # as a base that fails to resolve — the checker fails closed on the
+          # latter, deliberately, so the sentinel is mapped here instead.
+          if [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
+            BASE=""
+          fi
+          echo "drift base for ${EVENT_NAME}: '${BASE}'"
+          echo "base=${BASE}" >> "$GITHUB_OUTPUT"
+
+      # No `|| true` and no continue-on-error: this step must be able to fail
+      # the job. bypass-proofs-187.md records that fail-open pattern having
+      # already happened once on this very check.
+      - name: Check workflow invariants and job-set drift
+        run: uv run python scripts/check_workflows.py --base-ref "${{ steps.drift-base.outputs.base }}"
+
+  # check_workflows.py is an allowlist: it catches bad states it knows how to
+  # name. It cannot catch the mutants nobody has thought of — a workflow-level
+  # `concurrency` with cancel-in-progress, an added step, a rewritten awk
+  # extraction. This job is the tripwire for that remainder: any PR touching
+  # release.yml must carry an explicit acknowledgement label. It covers by
+  # ACKNOWLEDGEMENT what an allowlist cannot cover by enumeration, and mirrors
+  # the changelog/skip-changelog pattern above.
+  release-diff-ack:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    # Replaces the repo default for every scope: contents: read is repeated so
+    # actions/checkout keeps read access, pull-requests: read is for the live
+    # label lookup below.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Needed for the three-dot diff against the PR base.
+          fetch-depth: 0
+
+      - name: Require an acknowledgement label for release.yml changes
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Frozen at trigger time — the fallback below, not the primary
+          # source. Passed as env rather than interpolated into the script body
+          # so a label's text can never be parsed as shell.
+          PAYLOAD_LABELS_JSON: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          CHANGED=$(git diff --name-only "origin/${GITHUB_BASE_REF}...HEAD")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          if ! echo "$CHANGED" | grep -qx '\.github/workflows/release\.yml'; then
+            echo "release.yml is untouched — no acknowledgement required."
+            exit 0
+          fi
+
+          # Query live labels via the API instead of
+          # github.event.pull_request.labels. That context is frozen in the
+          # event payload at the moment the workflow was triggered; a "Re-run
+          # jobs" replays that same frozen payload rather than re-fetching it,
+          # so a label applied to an already-failed PR would never be seen.
+          # Reading live here means "apply the label, then re-run" works, which
+          # is the whole intended workflow for this job.
+          # Use the PULLS endpoint, not /issues/<n>/labels: this job grants
+          # `pull-requests: read`, and the issues endpoint needs `issues: read`
+          # (it returned HTTP 422 for the changelog job, killing the step under
+          # `bash -e` before the check ever ran).
+          # Branch on the EXIT STATUS, never on emptiness: a successful lookup
+          # returning zero labels is authoritative — it means the label was
+          # removed, and falling back to the frozen payload there would
+          # resurrect a deleted acknowledgement and bypass this guard.
+          if LABELS=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}" --jq '.labels[].name'); then
+            echo "Live label lookup succeeded."
+          else
+            echo "Live label lookup FAILED — falling back to the event payload."
+            LABELS=$(printf '%s' "$PAYLOAD_LABELS_JSON" | jq -r '.[]?' 2>/dev/null || true)
+          fi
+          echo "Current labels: $LABELS"
+
+          if echo "$LABELS" | grep -qx 'release-change-approved'; then
+            echo "release-change-approved label present — acknowledged."
+            exit 0
+          fi
+
+          echo "::error::This PR changes .github/workflows/release.yml, which triggers only on tag push and therefore never appears in PR checks — a mistake in it is invisible until a release breaks. Review the diff, then apply the 'release-change-approved' label and re-run this check."
+          exit 1
