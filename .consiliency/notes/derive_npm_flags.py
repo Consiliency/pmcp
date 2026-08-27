@@ -33,6 +33,8 @@ classifying:
            `production`, `workspaces` and `expect-results` are all
            `null|Boolean`, so without the drop they read as conditional and
            `--yes`/`-y` -- a real MCP launch form -- would be refused.
+           The drop is for CLASSIFICATION only; the fourth table below needs
+           the bit back, so it is read off the RAW type labels.
   `Array`  "may repeat". Measured inert on npm 11.19.0 (no definition changes
            class either way, and none is `Boolean|Array`); the generator
            reports it if that ever stops being true.
@@ -63,6 +65,26 @@ SHORTHANDS EXPAND; ARITY COMES FROM THE EXPANSION'S LENGTH
 
 This subsumes the hand-coded `-y` special case `_npm_package_arg` used to
 carry, and makes `npm --silent exec pkg` -> `pkg` hold by construction.
+
+THE FOURTH TABLE: WHICH BOOLEAN SPELLINGS ALSO CONSUME A LITERAL `null`
+-----------------------------------------------------------------------
+A boolean flag consumes a literal `true`/`false` as its value. A boolean whose
+declared type ALSO carries `null` consumes a literal `null` as well, and `null`
+is a real published npm package -- so the wrong answer in either direction
+mints a wrong package identity. The rule, applied to the boolean table:
+
+  a spelling is nullable iff its resolution target -- after shorthand
+  expansion and after stripping a leading `no-` -- is a definition whose RAW
+  declared type includes `null`.
+
+On npm 11.19.0 that is five definitions (`yes`, `optional`, `production`,
+`workspaces`, `expect-results`) but EIGHTEEN spellings, because `y`, `ws`,
+`n` and `no` are shorthands (`n` and `no` both expand to `--no-yes`) and every
+short alias/shorthand key is emitted in both its `-x` and `--x` form. A
+hand-written version of this table shipped in 2.5.1 with twelve entries and so
+got `--y -ws -n --n -no --no` wrong. Hence: generated, and cross-checked at
+the SPELLING level against nopt (`--verify`), because the definition-level
+probe alone would not have caught a spelling omission.
 
 Deliberately NOT a pytest: npm's schema is version-specific and CI has no npm.
 Behaviour is pinned by the pure unit tests in tests/test_version_checker.py;
@@ -131,7 +153,11 @@ const definitions = {};
 for (const [k, v] of Object.entries(m.definitions)) {
   const t = Array.isArray(v.type) ? v.type : [v.type];
   const lit = t.find((x) => typeof x === 'string' || typeof x === 'number');
-  const probes = ['zzarbitrary', 'true', 'false'];
+  // `null` is in the probe list because a nullable boolean takes it as its
+  // VALUE while every other boolean leaves it as the package name -- and
+  // `null` is a real published package, so this is the probe that keeps the
+  // nullable table honest instead of merely internally consistent.
+  const probes = ['zzarbitrary', 'true', 'false', 'null'];
   if (lit !== undefined) probes.push(String(lit));
   definitions[k] = {
     type: t.map(label),
@@ -139,10 +165,33 @@ for (const [k, v] of Object.entries(m.definitions)) {
     probes: Object.fromEntries(probes.map((p) => [p, consumes(k, p)])),
   };
 }
+
+// The same question asked of every SPELLING rather than every definition:
+// does `npm exec <spelling> null zz` resolve to `zz` (null consumed) or to
+// `null` (null is the package)? The 2.5.1 defect was a spelling omission with
+// a correct definition set, so a definition-level probe would have missed it.
+const nullSpellings = {};
+const probeSpelling = (flag) => {
+  nullSpellings[flag] = !remain(['exec', flag, 'null', 'zz']).includes('null');
+};
+for (const [k, v] of Object.entries(m.definitions)) {
+  probeSpelling('--' + k);
+  probeSpelling('--no-' + k);
+  for (const s of (v.short === undefined ? [] : [].concat(v.short))) {
+    probeSpelling('-' + s);
+    probeSpelling('--' + s);
+  }
+}
+for (const key of Object.keys(m.shorthands)) {
+  probeSpelling('-' + key);
+  probeSpelling('--' + key);
+}
+
 console.log(JSON.stringify({
   npm_version: require(path.join(root, 'package.json')).version,
   definitions,
   shorthands: m.shorthands,
+  null_spellings: nullSpellings,
 }));
 """
 
@@ -191,15 +240,18 @@ def expected_arity(cls: str, probe_results: dict[str, bool]) -> bool | None:
     return None
 
 
-def build(schema: dict) -> tuple[dict[str, str], list[str], list[str], list[str]]:
-    """Return (flag -> class, conditional names, union-with-Boolean, unreadable)."""
+def build(
+    schema: dict,
+) -> tuple[dict[str, str], dict[str, bool], list[str], list[str], list[str]]:
+    """Return (flag -> class, flag -> nullable, conditional, union, unreadable)."""
     defs = schema["definitions"]
     classes: dict[str, str] = {}
+    nullable: dict[str, bool] = {}
     conditional: list[str] = []
     union_with_boolean: list[str] = []
     unreadable: list[str] = []
 
-    def record(flag: str, cls: str) -> None:
+    def record(flag: str, cls: str, takes_null: bool = False) -> None:
         """Write one entry, refusing to silently reclassify an existing one.
 
         Definitions, `short` aliases and shorthands are written in that order,
@@ -209,13 +261,30 @@ def build(schema: dict) -> tuple[dict[str, str], list[str], list[str], list[str]
         silently because the generator and the table would agree with each
         other while both disagreeing with npm. Empty on 11.19.0; this exists
         so a future npm cannot make it non-empty quietly.
+
+        The same applies to nullability, which is written twice for `-y`/`--y`
+        (once from `yes`'s `short`, once from the `y` shorthand): agreeing
+        today is not a reason to let a future npm disagree in silence.
         """
         previous = classes.get(flag)
         if previous is not None and previous != cls:
             raise SystemExit(
                 f"conflicting classification for {flag}: {previous} vs {cls}"
             )
+        previous_null = nullable.get(flag)
+        if previous_null is not None and previous_null != takes_null:
+            raise SystemExit(
+                f"conflicting nullability for {flag}: {previous_null} vs {takes_null}"
+            )
         classes[flag] = cls
+        nullable[flag] = takes_null
+
+    # Nullability is read off the RAW type labels, BEFORE `classify` drops
+    # `null` as a non-value marker: the drop is what makes `--yes` a boolean
+    # at all, and this table is precisely the bit the drop throws away.
+    name_nullable: dict[str, bool] = {
+        name: "null" in info["type"] for name, info in defs.items()
+    }
 
     name_class: dict[str, str] = {}
     for name, info in defs.items():
@@ -243,15 +312,19 @@ def build(schema: dict) -> tuple[dict[str, str], list[str], list[str], list[str]
             union_with_boolean.append(f"{name}: type={'|'.join(info['type'])}")
         if name in _POSITIVE:
             continue
+        # Only a BOOLEAN can be nullable: a VALUE flag consumes the next token
+        # whatever it is, so `null` is never a special case for it.
+        takes_null = cls == BOOLEAN and name_nullable[name]
         if cls in (BOOLEAN, VALUE):
-            record(f"--{name}", cls)
+            record(f"--{name}", cls, takes_null)
             for short in info["short"]:
-                record(f"-{short}", cls)
-                record(f"--{short}", cls)
+                record(f"-{short}", cls, takes_null)
+                record(f"--{short}", cls, takes_null)
         if cls == BOOLEAN:
             # `--no-X` negates a boolean and, like the boolean itself,
-            # consumes only a literal true/false. Verified against nopt.
-            record(f"--no-{name}", cls)
+            # consumes only a literal true/false -- plus `null` when the base
+            # definition is nullable. Verified against nopt.
+            record(f"--no-{name}", cls, takes_null)
 
     for key, expansion in schema["shorthands"].items():
         if len(expansion) >= 2:
@@ -265,19 +338,26 @@ def build(schema: dict) -> tuple[dict[str, str], list[str], list[str], list[str]
             # the package when npm's package is `true` -- a wrong identity,
             # and `--silent true X` / `--silent false X` collapse onto X.
             cls = SKIP  # a value is baked into the expansion
+            base = None
         else:
             target = expansion[0].lstrip("-")
             if target.startswith("no-"):
                 # `--no-global`, `--no-yes`: boolean-arity iff the base is a
                 # boolean. Otherwise unlisted -- `--no-color` refuses, safely.
-                cls = BOOLEAN if name_class.get(target[3:]) == BOOLEAN else CONDITIONAL
+                base = target[3:]
+                cls = BOOLEAN if name_class.get(base) == BOOLEAN else CONDITIONAL
             else:
+                base = target
                 cls = name_class.get(target, CONDITIONAL)
+        # `n` and `no` both expand to `--no-yes`, so stripping the `no-` is
+        # what makes `-n`/`--n`/`-no`/`--no` inherit `yes`'s nullability --
+        # the four spellings 2.5.1's hand-written table missed outright.
+        takes_null = cls == BOOLEAN and bool(base) and name_nullable.get(base, False)
         if cls in (BOOLEAN, VALUE, SKIP):
-            record(f"-{key}", cls)
-            record(f"--{key}", cls)
+            record(f"-{key}", cls, takes_null)
+            record(f"--{key}", cls, takes_null)
 
-    return classes, conditional, union_with_boolean, unreadable
+    return classes, nullable, conditional, union_with_boolean, unreadable
 
 
 def check_against_nopt(schema: dict) -> list[str]:
@@ -285,15 +365,18 @@ def check_against_nopt(schema: dict) -> list[str]:
 
     This is the check that makes "verified against npm's parser" true rather
     than asserted. A BOOLEAN flag is predicted to consume a probe iff the probe
-    is exactly `true`/`false`; a VALUE flag is predicted to consume every
-    probe; a CONDITIONAL flag makes no prediction because it is unlisted.
+    is exactly `true`/`false` -- or `null`, when the declared type carries
+    `null`; a VALUE flag is predicted to consume every probe; a CONDITIONAL
+    flag makes no prediction because it is unlisted.
     """
     bad: list[str] = []
     for name, info in schema["definitions"].items():
         cls = classify(info["type"])
         for probe, observed in info["probes"].items():
             if cls == BOOLEAN:
-                predicted = probe in ("true", "false")
+                predicted = probe in ("true", "false") or (
+                    probe == "null" and "null" in info["type"]
+                )
             elif cls == VALUE:
                 predicted = True
             else:
@@ -307,8 +390,55 @@ def check_against_nopt(schema: dict) -> list[str]:
     return bad
 
 
+_TABLE_NAMES = (
+    "_NPM_VALUE_FLAGS",
+    "_NPM_BOOLEAN_FLAGS",
+    "_NPM_NULLABLE_BOOLEAN_FLAGS",
+    "_NPM_SKIP_FLAGS",
+)
+
+# The nullable table is a SUBSET of the boolean table by construction, so it is
+# excluded from the pairwise-disjointness check below and gets a containment
+# check instead.
+_DISJOINT_NAMES = (
+    "_NPM_VALUE_FLAGS",
+    "_NPM_BOOLEAN_FLAGS",
+    "_NPM_SKIP_FLAGS",
+)
+
+
+def check_null_spellings(
+    schema: dict, classes: dict[str, str], live_nullable: set[str]
+) -> list[str]:
+    """The derived nullable table must equal what nopt does, SPELLING by SPELLING.
+
+    `check_against_nopt` asks the question of each definition; this asks it of
+    each spelling, which is where 2.5.1 went wrong -- the five nullable
+    definitions were right and six of their eighteen spellings were missing.
+    Restricted to the boolean table on purpose: a VALUE flag consumes `null`
+    like it consumes anything else, and a spelling that is not in any table
+    makes the scanner refuse rather than predict.
+    """
+    observed = schema["null_spellings"]
+    booleans = {f for f, c in classes.items() if c == BOOLEAN}
+    bad: list[str] = []
+    for flag in sorted(booleans):
+        if flag not in observed:
+            # Every boolean spelling this generator emits is enumerable in the
+            # node probe; if one is not, the two enumerations have drifted.
+            bad.append(f"{flag}: boolean table entry never probed against nopt")
+            continue
+        predicted = flag in live_nullable
+        if predicted != observed[flag]:
+            bad.append(
+                f"npm exec {flag} null zz: derived nullable={predicted}, "
+                f"nopt consumes null={observed[flag]}"
+            )
+    return bad
+
+
 def read_committed_tables(source: pathlib.Path) -> dict[str, set[str]]:
-    """Parse the two tables out of version_checker.py with `ast`.
+    """Parse the four tables out of version_checker.py with `ast`.
 
     Deliberately NOT `import pmcp.manifest.version_checker`: that pulls in
     aiohttp/packaging/semver, so the verifier would only run inside the
@@ -330,11 +460,7 @@ def read_committed_tables(source: pathlib.Path) -> dict[str, set[str]]:
             continue
         names = [t.id for t in node.targets if isinstance(t, ast.Name)]
         for name in names:
-            if name not in (
-                "_NPM_VALUE_FLAGS",
-                "_NPM_BOOLEAN_FLAGS",
-                "_NPM_SKIP_FLAGS",
-            ):
+            if name not in _TABLE_NAMES:
                 continue
             call = node.value
             if (
@@ -347,32 +473,38 @@ def read_committed_tables(source: pathlib.Path) -> dict[str, set[str]]:
                 ast.literal_eval(element)
                 for element in call.args[0].elts  # type: ignore[attr-defined]
             }
-    missing = {
-        "_NPM_VALUE_FLAGS",
-        "_NPM_BOOLEAN_FLAGS",
-        "_NPM_SKIP_FLAGS",
-    } - found.keys()
+    missing = set(_TABLE_NAMES) - found.keys()
     if missing:
         raise SystemExit(f"not module-level literals in {source}: {sorted(missing)}")
     return found
 
 
-def emit(classes: dict[str, str]) -> str:
-    def block(cls: str) -> str:
-        entries = sorted(f for f, c in classes.items() if c == cls)
-        body = "\n".join(f'        "{e}",' for e in entries)
+def nullable_table(classes: dict[str, str], nullable: dict[str, bool]) -> set[str]:
+    """The boolean spellings that also consume a literal `null`."""
+    return {f for f, c in classes.items() if c == BOOLEAN and nullable.get(f)}
+
+
+def emit(classes: dict[str, str], nullable: dict[str, bool]) -> str:
+    def render(entries: set[str] | list[str]) -> str:
+        body = "\n".join(f'        "{e}",' for e in sorted(entries))
         return "{\n" + body + "\n    }"
+
+    def block(cls: str) -> str:
+        return render([f for f, c in classes.items() if c == cls])
 
     return (
         f"_NPM_VALUE_FLAGS = frozenset(\n    {block(VALUE)}\n)\n\n\n"
         f"_NPM_BOOLEAN_FLAGS = frozenset(\n    {block(BOOLEAN)}\n)\n\n\n"
+        "_NPM_NULLABLE_BOOLEAN_FLAGS = frozenset(\n    "
+        f"{render(nullable_table(classes, nullable))}\n)\n\n\n"
         f"_NPM_SKIP_FLAGS = frozenset(\n    {block(SKIP)}\n)\n"
     )
 
 
 def main() -> int:
     schema = read_schema()
-    classes, conditional, union, unreadable = build(schema)
+    classes, nullable, conditional, union, unreadable = build(schema)
+    live_nullable = nullable_table(classes, nullable)
 
     print(
         f"npm {schema['npm_version']}: "
@@ -405,14 +537,25 @@ def main() -> int:
     for entry in mismatches:
         print(f"  {entry}", file=sys.stderr)
 
+    null_mismatches = check_null_spellings(schema, classes, live_nullable)
+    print(
+        f"\nnullable spellings: {len(live_nullable)} derived, "
+        f"{len(null_mismatches)} mismatch(es) over "
+        f"{len(schema['null_spellings'])} spellings probed with a literal `null`",
+        file=sys.stderr,
+    )
+    for entry in null_mismatches:
+        print(f"  {entry}", file=sys.stderr)
+    print(f"  derived: {' '.join(sorted(live_nullable))}", file=sys.stderr)
+
     if "--verify" not in sys.argv:
-        print(emit(classes))
+        print(emit(classes, nullable))
         return 0
 
     source = REPO / "src" / "pmcp" / "manifest" / "version_checker.py"
     committed_tables = read_committed_tables(source)
     print(f"\nverifying tables in {source}", file=sys.stderr)
-    failures = list(mismatches)
+    failures = list(mismatches) + null_mismatches
     for label, live, committed in (
         (
             "value",
@@ -423,6 +566,11 @@ def main() -> int:
             "boolean",
             {f for f, c in classes.items() if c == BOOLEAN},
             committed_tables["_NPM_BOOLEAN_FLAGS"],
+        ),
+        (
+            "nullable",
+            live_nullable,
+            committed_tables["_NPM_NULLABLE_BOOLEAN_FLAGS"],
         ),
         (
             "skip",
@@ -437,11 +585,22 @@ def main() -> int:
 
     # A flag in both tables would let the boolean branch win or lose by table
     # order rather than by npm's schema; either way it is not a classification.
-    names = ("_NPM_VALUE_FLAGS", "_NPM_BOOLEAN_FLAGS", "_NPM_SKIP_FLAGS")
-    for i, left in enumerate(names):
-        for right in names[i + 1 :]:
+    for i, left in enumerate(_DISJOINT_NAMES):
+        for right in _DISJOINT_NAMES[i + 1 :]:
             for flag in sorted(committed_tables[left] & committed_tables[right]):
                 failures.append(f"{flag} is in BOTH {left} and {right}")
+
+    # The nullable table is exempt from the disjointness check because it is a
+    # SUBSET of the boolean table -- so pin that instead. A nullable entry that
+    # is not a boolean entry is dead code: `_npm_package_arg` only consults it
+    # from inside the boolean branch, so it would never be reached.
+    for flag in sorted(
+        committed_tables["_NPM_NULLABLE_BOOLEAN_FLAGS"]
+        - committed_tables["_NPM_BOOLEAN_FLAGS"]
+    ):
+        failures.append(
+            f"{flag} is in _NPM_NULLABLE_BOOLEAN_FLAGS but not _NPM_BOOLEAN_FLAGS"
+        )
 
     if failures:
         print(f"\nFAIL: {len(failures)} discrepanc(ies)", file=sys.stderr)
@@ -450,7 +609,8 @@ def main() -> int:
         return 1
     print(
         f"\nOK: {len(committed_tables['_NPM_VALUE_FLAGS'])} value + "
-        f"{len(committed_tables['_NPM_BOOLEAN_FLAGS'])} boolean + "
+        f"{len(committed_tables['_NPM_BOOLEAN_FLAGS'])} boolean "
+        f"({len(committed_tables['_NPM_NULLABLE_BOOLEAN_FLAGS'])} of them nullable) + "
         f"{len(committed_tables['_NPM_SKIP_FLAGS'])} skip entries "
         f"match live npm {schema['npm_version']}",
         file=sys.stderr,

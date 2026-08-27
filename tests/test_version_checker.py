@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from pmcp.manifest import version_checker
 from pmcp.manifest.version_checker import (
     _digest_identity,
     _docker_image_name,
@@ -28,7 +29,6 @@ from pmcp.manifest.version_checker import (
     VersionComparison,
 )
 from pmcp import __version__
-from pmcp.manifest import version_checker
 from pmcp.manifest.npm_resolver import NpmResolution, get_resolver
 
 
@@ -2588,6 +2588,18 @@ class TestNpmBakedValueShorthandDoesNotConsume:
             "npm", ["exec", "--global", "true", "pkg"]
         ) == npm_path.expect(resolver=("unknown", None), tables=("npm", "pkg"))
 
+    def test_baked_value_shorthand_still_skips_an_ordinary_token(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
+        """Not consuming a literal must not become not skipping at all.
+
+        `--silent` expands to `--loglevel silent`, a config key outside the
+        step-1 allowlist, so the resolver refuses where the tables resolve.
+        """
+        assert npm_path.detect("npm", ["--silent", "exec", "pkg"]) == npm_path.expect(
+            resolver=("unknown", None), tables=("npm", "pkg")
+        )
+
 
 class TestNpxBooleanLiterals:
     """npx parses boolean switches differently from npm, so pmcp refuses.
@@ -2632,12 +2644,21 @@ class TestNpxBooleanLiterals:
 
 
 class TestOnlyNullableBooleansConsumeNull:
-    """`null` is a real published npm package, and only 5 flags consume it.
+    """`null` is a real published npm package: 5 definitions, 18 spellings.
 
     Verified against nopt: `npm exec --yes null zz` leaves `zz` (nullable
     consumes), while `npm exec --global null zz` leaves `null zz` -- so `null`
-    is the package. A blanket rule applying `null` to all ~198 boolean entries
-    minted a wrong identity for the other ~193 (ah board review).
+    is the package. A blanket rule applying `null` to all 198 boolean entries
+    minted a wrong identity for the other 180 (ah board review).
+
+    The opposite error shipped in 2.5.1: the table was hand-written with 12 of
+    the 18 spellings, so `--y -ws -n --n -no --no` each read the `null` as the
+    package. The 5 nullable definitions (`yes`, `optional`, `production`,
+    `workspaces`, `expect-results`) reach 18 spellings because `y`, `ws`, `n`
+    and `no` are shorthands -- `n` and `no` BOTH expand to `--no-yes` -- and
+    every short alias/shorthand key is legal in both `-x` and `--x` form.
+    The table is generated now; these pins are what keeps a regeneration
+    honest on a host without npm.
     """
 
     def test_nullable_boolean_consumes_null(self, npm_path: _NpmIdentityPath) -> None:
@@ -2665,4 +2686,138 @@ class TestOnlyNullableBooleansConsumeNull:
     ) -> None:
         assert npm_path.detect("npm", ["--silent", "exec", "pkg"]) == npm_path.expect(
             resolver=("unknown", None), tables=("npm", "pkg")
+        )
+
+    # -- Consiliency/pmcp#195 note on everything below ---------------------
+    #
+    # These arrived with the 2.5.2 nullable-spelling fix and pin the FLAG
+    # TABLES, which are now the node-less fallback. They run on both paths, and
+    # where the two differ the difference is stated: npm's own parser reports a
+    # config key for `-ws`/`--workspaces`/`--optional`/`--production`/
+    # `--expect-results` (and their `--no-` spellings), and those keys are
+    # outside the step-1 allowlist, so the resolver refuses. `yes` IS
+    # allowlisted, so every `yes` spelling still resolves on both paths.
+    #
+    # The table-shape assertions (subset, exact set) are path-independent and
+    # keep their original form.
+
+    _NULLABLE_SPELLINGS_THE_RESOLVER_ALSO_RESOLVES = frozenset(
+        {"-y", "--y", "--yes", "--no-yes", "-n", "--n", "-no", "--no"}
+    )
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "-y",
+            "--y",
+            "--yes",
+            "-n",
+            "--n",
+            "-no",
+            "--no",
+            "-ws",
+            "--ws",
+            "--workspaces",
+            "--no-yes",
+            "--optional",
+            "--no-optional",
+            "--production",
+            "--no-production",
+            "--expect-results",
+            "--no-expect-results",
+            "--no-workspaces",
+        ],
+    )
+    def test_every_nullable_spelling_consumes_null(
+        self, flag: str, npm_path: _NpmIdentityPath
+    ) -> None:
+        """All 18, one per spelling. 2.5.1 failed six of these.
+
+        Cross-checked against nopt with npm's own definitions and shorthands:
+        `nopt(types, shorthands, ["exec", flag, "null", "zz"]).argv.remain` is
+        `["exec", "zz"]` for every flag here, i.e. the `null` is the flag's
+        value and `zz` is the package.
+        """
+        resolves = flag in self._NULLABLE_SPELLINGS_THE_RESOLVER_ALSO_RESOLVES
+        assert npm_path.detect("npm", ["exec", flag, "null", "zz"]) == npm_path.expect(
+            resolver=("npm", "zz") if resolves else ("unknown", None),
+            tables=("npm", "zz"),
+        )
+
+    @pytest.mark.parametrize("flag", ["-g", "--global", "-f", "--force", "--no-global"])
+    def test_non_nullable_spellings_leave_null_as_the_package(
+        self, flag: str, npm_path: _NpmIdentityPath
+    ) -> None:
+        """The other direction: over-broad is just as wrong as too narrow.
+
+        nopt leaves `["exec", "null", "zz"]` for each of these, so the package
+        really is `null` and consuming it would collapse two configs. The
+        resolver refuses instead -- `global`/`force` are config keys outside the
+        allowlist -- which is the safe direction of the same distinction.
+        """
+        assert npm_path.detect("npm", ["exec", flag, "null", "zz"]) == npm_path.expect(
+            resolver=("unknown", None), tables=("npm", "null")
+        )
+
+    def test_nullable_spellings_do_not_collapse_two_configs(
+        self, npm_path: _NpmIdentityPath
+    ) -> None:
+        """The identity consequence, stated directly.
+
+        Under 2.5.1 both of these resolved to `null`, so the freshness gate
+        would confirm one server's cached tools against the other's config.
+        """
+        got_a = npm_path.detect("npm", ["exec", "-n", "null", "server-a"])
+        got_b = npm_path.detect("npm", ["exec", "-n", "null", "server-b"])
+        assert got_a == ("npm", "server-a")
+        assert got_b == ("npm", "server-b")
+        assert got_a != got_b
+
+    def test_nullable_table_is_a_subset_of_the_boolean_table(self) -> None:
+        """A nullable entry outside the boolean table is unreachable.
+
+        `_npm_package_arg_from_tables` only consults the nullable table from
+        inside the boolean branch, so an entry missing from
+        `_NPM_BOOLEAN_FLAGS` would be dead. `derive_npm_flags.py --verify` pins
+        the same property against a live npm; this pins it without one.
+        """
+        assert (
+            version_checker._NPM_NULLABLE_BOOLEAN_FLAGS
+            <= version_checker._NPM_BOOLEAN_FLAGS
+        )
+
+    def test_nullable_table_is_pinned_to_the_exact_derived_set(self) -> None:
+        """The table is pinned by VALUE, not just by shape.
+
+        Every other check here is one-directional: the parametrized spellings
+        prove each of the 18 consumes `null`, and the subset check proves none
+        is unreachable. An *extra* entry passes both -- and an extra entry is a
+        wrong identity in the other direction, since a non-nullable flag would
+        then swallow a `null` that npm treats as the package.
+
+        Pinned as a literal so a table change has to be a deliberate edit here
+        too. `derive_npm_flags.py --verify` re-derives it against a live npm;
+        this pins it without one (board review, adversarial seat).
+        """
+        assert version_checker._NPM_NULLABLE_BOOLEAN_FLAGS == frozenset(
+            {
+                "--expect-results",
+                "--n",
+                "--no",
+                "--no-expect-results",
+                "--no-optional",
+                "--no-production",
+                "--no-workspaces",
+                "--no-yes",
+                "--optional",
+                "--production",
+                "--workspaces",
+                "--ws",
+                "--y",
+                "--yes",
+                "-n",
+                "-no",
+                "-ws",
+                "-y",
+            }
         )

@@ -7,6 +7,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The release-path workflow guards now run in CI.** `release.yml` triggers
+  only on tag push — the tag push *is* the publish — so it never appeared in a
+  PR check, and every guard that protected the last change to it was run by
+  hand, once. Two new `test.yml` jobs close that:
+
+  `workflows` runs `scripts/check_workflows.py`, which asserts by **invariant**
+  that `release.yml`'s trigger set is **exactly** `push.tags: ["v*"]` — no other
+  event and no branch or path filter alongside it, since `publish` holds
+  `id-token: write` against an environment with no protection rules, so any
+  extra trigger makes trusted publishing reachable from it — and that no
+  workflow file other than `release.yml`/`docker.yml` is tag-triggered at all;
+  the `build → publish → github-release` ordering; `environment: release` **by
+  name**; no `if:` or `continue-on-error` at job *or* step level on any of the
+  three jobs (skipping `build` skips `publish` through `needs`, and the tag push
+  still concludes green); the
+  exact committed `permissions:` maps at both workflow and job level, the exact
+  committed `uses:` references, and exactly the three expected jobs; that every
+  job in every workflow carries a `timeout-minutes` of 10–30 (a bare
+  `timeout-minutes: 360` re-creates the six-hour default); and by **drift**
+  that no job present in the PR base has disappeared from any changed workflow,
+  including one deleted outright. Drift **fails closed**: a base ref that does
+  not resolve, and a `git diff` that fails for any other reason (a base sharing
+  no history with HEAD exits 128), are failures, never "nothing changed". It
+  also runs a digest-pinned actionlint.
+
+  `release-diff-ack` covers by **acknowledgement** what an allowlist cannot
+  cover by enumeration: any PR touching `release.yml` fails unless it carries a
+  `release-change-approved` label, read live from the API rather than from the
+  event payload frozen at trigger time.
+
+  **Not covered, deliberately:** a timeout above the 10-minute floor but below a
+  job's real p100; environment protection rules, which live in GitHub settings
+  and are invisible to any file check; and `if:`-skipping the guard job itself,
+  which GitHub counts as *satisfying* a required check. Per-mutant exit codes,
+  including the ones that stay green, are in
+  `.consiliency/evidence/mutation-189.md`.
+
+  Because the `uses:` and `permissions:` allowlists are exact, a legitimate
+  edit to `release.yml` — bumping an action, granting a scope — must update the
+  constants in `scripts/check_workflows.py` in the same PR. That is intended.
+
+
 ### Fixed
 - **npm package identity now comes from npm's own parser where it is certain, and
   is refused otherwise.** The hand-written npm flag tables have been repaired five
@@ -65,6 +108,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `gateway.update_server`'s pin detection all take the server's environment
   overlay and working directory as **required** parameters now, since both are
   identity inputs.
+## [2.5.2] - 2026-08-26
+
+### Fixed
+- **Six npm flag spellings read a literal `null` as the package name.** 2.5.1
+  added a table of the boolean flags that take a literal `null` as their *value*
+  rather than as the package name — `null` is a real published npm package, so
+  the distinction decides a server's identity, and `refresher.py`'s freshness
+  gate treats a matching identity as **positive confirmation** that a cached
+  tool description still describes the configured package. That table was
+  written by hand with 12 entries. npm has five nullable boolean definitions
+  (`yes`, `optional`, `production`, `workspaces`, `expect-results`) but
+  **eighteen** spellings for them, because `y`, `ws`, `n` and `no` are
+  shorthands — `n` and `no` both expand to `--no-yes` — and each is legal in
+  both its `-x` and `--x` form. The six that were missing are **`--y`, `-ws`,
+  `-n`, `--n`, `-no`, `--no`**: under 2.5.1 each of these read the following
+  `null` as the package name, so `npm exec -n null server-a` and
+  `npm exec -n null server-b` both resolved to the package `null` and could be
+  served each other's cached tool descriptions.
+
+  **Not a regression between releases** — 2.4.1, 2.5.0 and 2.5.1 all resolve
+  these six to `null`; verified by running each released version's
+  `detect_package_type` directly. The blanket rule that briefly handled them
+  correctly existed only on `main` between two unreleased commits, so no shipped
+  version was ever right about them. 2.5.2 is the first.
+- **The set is now generated, not hand-listed.**
+  `.consiliency/notes/derive_npm_flags.py` derives it from npm's own
+  `@npmcli/config` definitions: a spelling is nullable iff its resolution
+  target, after shorthand expansion and after stripping a leading `no-`, is a
+  definition whose declared type includes `null`. It was the fourth defect in
+  this parser traceable to hand-transcribing npm's behaviour.
+- **`--verify` now covers this table**, which previously had no drift
+  protection at all. Each definition is probed with a literal `null`, and every
+  one of npm's 442 enumerable flag spellings is run through npm's own parser as
+  `npm exec <flag> null zz` — a definition-level check alone would not have
+  caught a spelling omission. The new check rejects the shipped 2.5.1 table
+  with exactly six mismatches.
+
+  This does **not** close the broader gap tracked in
+  Consiliency/pmcp#195: attached values (`--global=pkg`), npx's own `-p=`
+  rewriting, and npx's `-n` removal are still unhandled.
 
 ## [2.5.1] - 2026-08-26
 
