@@ -1,5 +1,11 @@
 # Detailed plan: name an npm package only when npm's own parser makes it certain
 
+> **Revision 6 (2026-08-27) — final; implement from this.** Rev 5 boarded 3
+> DISAGREE. Its gate, read literally, would have **refused every npm server on
+> every host** (twice over). Those are fail-safe defects that surface on the
+> first test run, unlike the fail-dangerous ones of rounds 1–3 — so this revision
+> goes to implementation and the **diff** gets boarded, not the plan.
+>
 > **Revision 5 (2026-08-27).** The rev-3 CLI seats returned late with findings
 > rev 4 had not covered — two DISAGREE. The worst: a self-test failure was
 > specified to fall back to the tables, which is a **fail-open** in exactly the
@@ -146,8 +152,8 @@ and closes keys npm has not invented yet:
 |---|---|
 | command is bare `npx`/`npm` | a full path never reaches this branch |
 | **every parsed nopt config key is in `{yes, package}`** | anything else may redirect resolution. 78 of 79 shipped servers parse to `{yes}` alone, so the allowlist costs nothing |
-| server env sets **no** key matching `npm_config_*` (case-insensitive), `PATH`, `NODE_PATH`, `NODE_OPTIONS`, `PREFIX`, or `NVM_*` | npm matches `/^npm_config_/i`; and a server-set `PATH` selects *which npm runs* — verified: npm 11.6.2 and 11.19.0 disagree on `npx --name foo probe` (`foo` vs `probe`) |
-| the **effective** cwd (server `cwd`, else the pmcp process's own `os.getcwd()`) contains no `package.json` and no `.npmrc` in its project-root walk | **WAS WRONG (rev 3):** it gated only *server* `cwd` and claimed the project case closed. Verified false — with pmcp's own cwd inside a node project, `npx probe` resolved via that project's `.npmrc`, and with `node_modules/.bin/<name>` present npx ran the **local bin with no registry fetch at all** |
+| the server's **env OVERLAY** sets no key matching `npm_config_*` (case-insensitive), `PATH`, `HOME`, `NODE_PATH`, `NODE_OPTIONS`, `PREFIX`, or `NVM_*` | npm matches `/^npm_config_/i`; a server-set `PATH` selects *which npm runs* (11.6.2 vs 11.19.0 disagree on `npx --name foo probe`); and `HOME` relocates `~/.npmrc`, so `HOME=/x` with `/x/.npmrc` containing `package=other` redirects resolution entirely |
+| walking up from the **effective** cwd (server `cwd`, else `os.getcwd()`), npm would set **no local prefix** — i.e. no ancestor contains `package.json` **or** a `node_modules` directory | This is npm's own rule, read from `@npmcli/config/lib/index.js:695-716`: `hasPackageJson \|\| await dirExists(p, 'node_modules')`. Verified: with pmcp's cwd inside a node project, `npx probe` resolved via that project's `.npmrc`; with `node_modules/.bin/<name>` present, npx ran the **local bin with no registry fetch at all** |
 | the spawn-time self-test passed, and the `npx-cli.js` hash matches | see "Drift" |
 
 Anything else: `REFUSED`.
@@ -222,7 +228,8 @@ fail-open: a failed self-test is precisely the evidence that the host's parser
 behaves in a way this code does not model, and responding by consulting the
 known-incomplete 2.5.2 tables is the worst available choice. `UNAVAILABLE` is
 reserved for **spawn** failure — the case where we learned nothing about npm,
-only that node is missing. A hash mismatch takes the same `REFUSED` path. The `npx-cli.js` hash stays as a tripwire **with a specified firing action**: a
+only that node is missing. A hash mismatch takes the same `REFUSED` path — there is no `UNAVAILABLE`-with-reason state; that phrasing was
+rev 3's and is gone. The `npx-cli.js` hash stays as a tripwire **with a specified firing action**: a
 mismatch produces the same `UNAVAILABLE`-with-reason + WARNING as a failed
 self-test. Rev 3 called it a tripwire but never said what it does on mismatch,
 which made it decorative. It matters because the self-test *is* tautological with
@@ -344,6 +351,14 @@ survives a wheel install.
 
 ### `.consiliency/notes/differential_npm_corpus.py` (create)
 
+**Safety first — the harness must be hermetic.** A dead registry stops npm
+*fetching* but **not executing**: `libnpmexec` runs a matching local or global
+binary and returns into execution *before* any registry fetch. Running all 79
+manifest names plus fuzz cases against an ordinary environment would **launch
+installed server code**. Each oracle invocation runs with an empty temporary
+`cwd`, a temporary `HOME`, a temporary `prefix` and `cache`, and a bounded
+process-tree kill on exit.
+
 Compares resolver vs fallback tables vs **the real binary**. Must contain, by
 name: every historical form (#180, #182, #183, #192, #194, #195, 2.5.2); every
 step-1 gate; F1's `npx -y pkg`; F2's `npm exec -- --flag-thing` and
@@ -436,9 +451,14 @@ uv run ruff check . && uv run ruff format --check . && uv run mypy src/
       `pkg@1.2.3`.
 - [ ] Passing an unconverted call site (no env/cwd) is a **type error**, not a
       silent pass — proven by `mypy` failing on a deliberately reverted caller.
-- [ ] A failing spawn-time self-test degrades to the tables **and logs once at
-      WARNING** — proven end-to-end against a fixture npm root, not by injecting
-      a flag into a response.
+- [ ] A failing spawn-time self-test **refuses** — `_npm_package_arg(...) is
+      None`, `detect_package_type(...) == ("unknown", None)`, the table scan is
+      **not** reached, and exactly one WARNING is logged. Proven end-to-end
+      against a fixture npm root, not by injecting a flag into a response.
+      **WAS WRONG (rev 5):** the Drift section was corrected to refuse but this
+      criterion still said "degrades to the tables" — the same fail-open, left
+      behind in the acceptance contract by the repair that removed it from the
+      design.
 - [ ] With node removed from `PATH`, all 98 manifest entries resolve exactly as
       2.5.2 does — recorded before/after diff of the 98 pairs.
 - [ ] One spawn attempt across ≥50 resolves on a node-less host; a hung child
