@@ -294,13 +294,14 @@ def timeout_invariants(doc: Any, path: str | Path) -> list[str]:
 
 
 def _git(args: list[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", *args], capture_output=True, text=True, check=False
-    )
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=False)
 
 
 def _base_resolves(base_ref: str) -> bool:
-    return _git(["rev-parse", "--verify", "--quiet", f"{base_ref}^{{commit}}"]).returncode == 0
+    return (
+        _git(["rev-parse", "--verify", "--quiet", f"{base_ref}^{{commit}}"]).returncode
+        == 0
+    )
 
 
 def _job_names(text: str, label: str) -> tuple[set[str], str | None]:
