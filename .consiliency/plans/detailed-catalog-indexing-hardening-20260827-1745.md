@@ -1,5 +1,9 @@
 # Detailed plan: close the five catalog-indexing findings
 
+> **Revision 2 (2026-08-27).** Boarded 2 AGREE / 1 DISAGREE. Rev 1's item 3 would
+> have introduced a **fail-open security regression**, and its item 4 named a
+> helper that rejects every valid tool. Both corrected below.
+
 ## Task
 
 Close Consiliency/pmcp#175 — five findings split out of #173 so that issue could
@@ -59,15 +63,40 @@ Verified in this worktree:
   **Item 4.** This is the deliberate decision #175 asks for: MCP requires
   `inputSchema` on a tool, and manufacturing an accept-anything schema
   misrepresents the tool to every caller. Consistent with #172's ruling on
-  manufactured identities. *If the board prefers the default, the alternative is
-  to keep it and say so in the docstring — but it must not stay undecided.*
+  manufactured identities. The board agreed it should ship as skip-and-log rather
+  than as a documented default.
+
+  **Do NOT call `_required_identity(tool, "inputSchema")`.** Verified: that helper
+  requires `isinstance(value, str) and value` (`manager.py:530-534`), and an
+  `inputSchema` is an **object** — a literal call would reject every valid tool
+  in the catalog. Add a sibling required-**object** check that raises inside the
+  same per-entry `try`, so the existing skip-and-log path handles it unchanged.
+
+  **Fixture fallout, on the change list rather than discovered at runtime:**
+  `tests/mcp2x/test_catalog_publishers.py` indexes `{"name": "t1"}` with no
+  `inputSchema` at lines **130, 140, 193, 218, 278, 310** and asserts `== 1`.
+  Those fixtures need a valid `inputSchema`, as do the new item 1 and item 5
+  fixtures — otherwise item 4 silently zeroes their counts and the failure looks
+  like a bug in items 1 and 5.
 
 ### `src/pmcp/types.py` (modify)
 
-- `LimitsPolicy.max_tools_per_server` (`:960`) — modify — `Field(default=100, ge=1)`.
-  At `0` every non-empty listing classifies as "all entries unparseable" and logs
-  exactly that, which is untrue — the entries were fine, the limit was zero.
-  Behaviourally inert today; the log actively misleads. **Item 3.**
+- **Item 3 — do NOT add `Field(ge=1)`.** Fix the *log*, not the schema: when the
+  limit truncates a listing to zero entries, say that the limit is zero rather
+  than "all entries unparseable".
+
+  **WAS WRONG (rev 1).** Verified: `PolicyManager._load_policy(..., fatal=False)`
+  — the auto-discovery path — swallows **any** validation exception and leaves
+  `self._policy` as the default `GatewayPolicy()`, which is **allow-all**
+  (`policy/policy.py:59-77`). So adding `ge=1` would make every policy file
+  containing `max_tools_per_server: 0` schema-invalid, silently discarding that
+  file **in its entirety** — allow/deny lists, limits and redaction all reverting
+  to permissive defaults. That converts a cosmetic log fix into a security
+  regression, which is a spectacularly bad trade.
+
+  The underlying fail-open is filed separately as **#202**; it is not this
+  change's to fix, and folding it in would hide it. Any future tightening of the
+  policy schema carries the same risk until #202 is resolved.
 
 ### `tests/test_client_manager.py` (modify)
 
@@ -112,7 +141,9 @@ uv run pytest -q tests/test_client_manager.py
 #   restore, expect GREEN. Record both exit codes.
 uv run pytest -q
 uv run ruff check . && uv run ruff format --check . && uv run mypy src/
-uv run python -c "…assert all 98 manifest servers still resolve…"
+# (Rev 1 listed a 98-server manifest check here. That is npm identity
+# resolution, unrelated to catalog indexing, and is not coverage for dropped
+# tools — removed rather than left as false reassurance.)
 ```
 
 Edge cases: a listing that is entirely duplicates; `adopt_process` on a name with
@@ -125,10 +156,16 @@ listing exactly at the limit.
       recorded before/after exit codes. Item 1 exists because that mutation
       survived nine others; a test that does not kill it has not closed the
       finding.
-- [ ] For a listing with duplicate identities, the count returned by each
-      `_index_*` equals `len(self._tools)` for that server — asserted directly,
-      so the `_index_resources` docstring's claim becomes true.
-- [ ] `LimitsPolicy(max_tools_per_server=0)` raises `ValidationError`.
+- [ ] For a listing with duplicate identities, each `_index_*` returns a count
+      equal to the number of that server's entries in **its own** catalog —
+      `_index_tools` against `_tools`, `_index_resources` against `_resources`,
+      `_index_prompts` against `_prompts`. **WAS WRONG (rev 1):** the criterion
+      compared all three against `self._tools`, so it could not prove the guarantee
+      for resources or prompts at all.
+- [ ] With `max_tools_per_server=0`, the log says the limit is zero and does
+      **not** claim the entries were unparseable — asserted on the emitted
+      message. `LimitsPolicy(max_tools_per_server=0)` must still **validate**,
+      since rejecting it is what triggers #202's fail-open.
 - [ ] `adopt_process` leaves no entry that a prior index put there — asserted on
       catalog contents, not by checking that the method was called.
 - [ ] A tool dict without `inputSchema` is skipped and logged as unparseable,
