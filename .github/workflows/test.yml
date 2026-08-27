@@ -28,6 +28,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The npm identity resolver (Consiliency/pmcp#195) drives the HOST npm's
+      # own parser, so the resolver-active half of the identity suite only runs
+      # where node and npm exist. Pinned rather than left to the runner image:
+      # `bin/npx-cli.js` is byte-identical across npm 10.8.2 .. 11.19.0 and the
+      # resolver refuses an `npx-cli.js` it does not recognise, so an image that
+      # silently moved to a different npm major would turn that half of the
+      # suite from covering production into skipping.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
@@ -60,6 +71,17 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # The npm identity resolver (Consiliency/pmcp#195) drives the HOST npm's
+      # own parser, so the resolver-active half of the identity suite only runs
+      # where node and npm exist. Pinned rather than left to the runner image:
+      # `bin/npx-cli.js` is byte-identical across npm 10.8.2 .. 11.19.0 and the
+      # resolver refuses an `npx-cli.js` it does not recognise, so an image that
+      # silently moved to a different npm major would turn that half of the
+      # suite from covering production into skipping.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Install uv
         uses: astral-sh/setup-uv@v7
         with:
@@ -84,6 +106,34 @@ jobs:
           # Import the modules a real startup touches, so a renamed or removed
           # upstream symbol fails here rather than in a user's service log.
           /tmp/fresh/bin/python -c "import pmcp.client.manager, pmcp.server, pmcp.config.loader"
+
+      # `_npm_resolve.js` is not a Python file, and npm package identity is dead
+      # without it: `NpmResolver` reports UNAVAILABLE and every npm/npx server
+      # silently drops back to the flag tables -- the exact fail-open
+      # Consiliency/pmcp#195 removed, and invisible in every other job because
+      # they all run from the source tree.
+      #
+      # This step must ACTUALLY RESOLVE a package through the installed helper.
+      # Importing the module and asserting nothing would pass with the .js file
+      # missing entirely. Note the `cd`: npm's own local-prefix rule means a
+      # `package.json` or `node_modules` in any ancestor of the working
+      # directory makes the resolver refuse, and the repository checkout is the
+      # directory this suite controls.
+      - name: The packaged npm resolver must resolve, not just import
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          node --version
+          /tmp/fresh/bin/python - <<'PY'
+          from pmcp.manifest import npm_resolver
+
+          print("installed helper:", npm_resolver._HELPER)
+          assert npm_resolver._HELPER.is_file(), "the wheel did not ship _npm_resolve.js"
+          result = npm_resolver.get_resolver().resolve(
+              "npx", ["-y", "left-pad"], env={}, cwd=None
+          )
+          assert result.is_identity and result.spec == "left-pad", result
+          print("helper OK:", result.spec)
+          PY
 
   # install-smoke proves the CEILING: the unpinned resolve still works. It says
   # nothing about the FLOOR, because a fresh resolve always picks the newest

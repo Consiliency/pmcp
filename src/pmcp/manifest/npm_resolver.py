@@ -1,0 +1,640 @@
+"""Name an npm/npx server's package via npm's own parser, or refuse.
+
+Consiliency/pmcp#195. ``version_checker._npm_package_arg`` models npm's flag
+grammar by hand, and that model has been repaired five times (#180 -> #192 ->
+#194 -> #195 -> the 2.5.2 nullable-spelling fix). Every defect was in the rules
+*around* the tables, and every one produced a **confident wrong answer** --
+which ``refresher._same_package`` reads as POSITIVE CONFIRMATION that a cached
+tool description still describes the configured package, so one server gets
+served another server's tool descriptions.
+
+This module drives ``_npm_resolve.js``, a persistent node child that uses the
+host npm's own ``nopt``, its own ``@npmcli/config`` definitions, its own
+``npm-package-arg``, and a faithful port of the ``npx-cli.js`` pre-scan.
+
+**Tri-state, and it matters which is which.**
+
+============ ===================================== ==========================
+Outcome      Meaning                               ``_npm_package_arg`` does
+============ ===================================== ==========================
+``IDENTITY`` every gate passed                     return the spec raw
+``REFUSED``  a gate tripped, or the request timed   return ``None`` --
+             out / the child died / the response    **never scan the tables**
+             failed schema
+``UNAVAILABLE`` **spawn** failed: no node, no npm  fall through to the tables
+             root
+============ ===================================== ==========================
+
+``UNAVAILABLE`` is reserved for the case where we learned *nothing about npm*,
+only that it is not installed -- there the flag tables are the only thing a host
+can do, and they are the pre-#195 behaviour. ``REFUSED`` is everything else:
+falling back to the known-incomplete tables in a situation that proves the
+host's parser is not modelled by this code is fail-OPEN, and is the exact
+failure this change exists to remove.
+
+**Why refusing is safe.** A refusal yields ``("unknown", None)`` from
+``detect_package_type``; the cache stores ``package_type="unknown"``; and
+``refresher._same_package`` treats ``"unknown"`` as unidentified, so *every*
+comparison fails closed. (It is emphatically **not** safe because the coarse
+``command + args`` fallback string is unique -- it is not: two refused servers
+with identical argv and different env share that string. The poisoned *type*,
+not the string, is what makes refusal safe.)
+
+**The honest cost.** A refused server re-connects and regenerates its
+descriptions on every refresh cycle and is listed permanently stale by
+``check_staleness``. That is a cost, not a correctness problem, and it is why
+the allowlist is drawn to cover the plain shape rather than as tightly as
+possible. Measured: all 79 npm-family servers in ``manifest.yaml`` use the plain
+``npx -y <pkg>`` shape and resolve.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import queue
+import re
+import subprocess
+import threading
+import time
+from collections.abc import Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+logger = logging.getLogger(__name__)
+
+_HELPER = Path(__file__).with_name("_npm_resolve.js")
+
+# A single in-flight query is bounded at 1.0 s. `detect_package_type` is
+# synchronous and is called from inside async coroutines, so an unbounded read
+# would stall the event loop. A blocking `readline()` cannot implement a
+# timeout, hence the reader thread below.
+_QUERY_TIMEOUT = 1.0
+
+# Handshake budget. The child runs its self-test corpus before emitting the
+# handshake; measured at ~43 ms on a warm host, so 10 s is enormous slack and
+# exists only so a pathological host cannot hang startup forever.
+_HANDSHAKE_TIMEOUT = 10.0
+
+# A dead child re-arms after this long. A one-shot "respawn once, ever" budget
+# strands a days-running gateway after two transient child deaths, which is a
+# silent fleet-wide loss of auto-update behind a single WARNING. Time-based
+# means a transient failure costs one cooldown window, not the process lifetime.
+_RESPAWN_COOLDOWN = 60.0
+
+# ---------------------------------------------------------------------------
+# Step 1 (parent half): the gates that need no parser
+# ---------------------------------------------------------------------------
+
+# npm reads any environment variable matching `/^npm_config_/i` as a config
+# option -- verified: `env npm_config_package=evil-pkg npx -y probe` fetches
+# `evil-pkg`. `PATH` selects WHICH npm runs (npm 11.6.2 and 11.19.0 disagree on
+# `npx --name foo probe`). `HOME` relocates `~/.npmrc`, so `HOME=/x` with
+# `/x/.npmrc` containing `package=other` redirects resolution entirely.
+# `PREFIX`/`NVM_*` relocate the npm installation; `NODE_PATH`/`NODE_OPTIONS`
+# change what the parser itself loads.
+_ENV_GATE_EXACT = frozenset({"PATH", "HOME", "NODE_PATH", "NODE_OPTIONS", "PREFIX"})
+_ENV_GATE_PREFIXES = ("npm_config_", "nvm_")
+
+
+def _gate_relevant_env(env: Mapping[str, str] | None) -> dict[str, str]:
+    """The subset of a server's env OVERLAY that the step-1 gate inspects.
+
+    **Overlay, not merged environment.** ``sanitized_subprocess_env`` returns
+    ``os.environ`` plus the server's own keys, and ``os.environ`` always carries
+    ``PATH`` and ``HOME`` -- so gating the merged environment would refuse every
+    npm server on every host. The identity question is "does *this server's
+    configuration* redirect npm's resolution", and only the overlay can.
+
+    Factored out so the gate has exactly one definition of "keys that can
+    redirect npm". It was also the memo key before the memo was removed; see
+    ``NpmResolver.resolve``.
+    """
+    if not env:
+        return {}
+    relevant = {}
+    for key, value in env.items():
+        if not isinstance(key, str):
+            # An environment key that is not a string cannot reach a subprocess
+            # (`os.environ` rejects it), so it cannot redirect npm. Skipping is
+            # safe, and it keeps the gate from raising on a caller -- or a test
+            # double -- that hands it something odd.
+            continue
+        lowered = key.lower()
+        if key.upper() in _ENV_GATE_EXACT or lowered.startswith(_ENV_GATE_PREFIXES):
+            relevant[key] = value
+    return relevant
+
+
+def _env_overlay_is_plain(env: Mapping[str, str] | None) -> str | None:
+    """``None`` if the overlay sets no resolution-redirecting key, else a reason."""
+    relevant = _gate_relevant_env(env)
+    if relevant:
+        return f"server env sets {sorted(relevant)!r}, which can redirect npm"
+    return None
+
+
+def _process_env_is_plain() -> str | None:
+    """``None`` if the GATEWAY's own environment cannot redirect npm.
+
+    The overlay gate is not enough: an ``npm_config_*`` variable exported into
+    pmcp's own process environment redirects resolution for every server at
+    once, invisibly. Verified:
+    ``env npm_config_package=evil-pkg npm_config_registry=http://127.0.0.1:9
+    npx -y probe`` fetches ``http://127.0.0.1:9/evil-pkg``.
+
+    ``PATH``/``HOME`` are deliberately NOT checked here -- every process has
+    them, and the child resolves npm through the very ``PATH`` this process
+    runs with, so they are inputs to the answer rather than distortions of it.
+    """
+    for key in os.environ:
+        if key.lower().startswith("npm_config_") or key.upper() == "NODE_OPTIONS":
+            return f"gateway environment sets {key!r}, which can redirect npm"
+    return None
+
+
+def _has_local_prefix(cwd: str | None) -> str | None:
+    """``None`` if npm would set no local prefix from *cwd*, else a reason.
+
+    npm's own rule, read from ``@npmcli/config/lib/index.js:695-716``:
+    ``hasPackageJson || await dirExists(p, 'node_modules')``, walking up from
+    the working directory. A local prefix brings a project ``.npmrc`` into
+    scope -- verified: with the working directory inside a node project whose
+    ``.npmrc`` sets ``package=rcfile-pkg``, ``npx plainbin`` resolved to
+    ``rcfile-pkg``. Worse, with ``node_modules/.bin/<name>`` present, npx ran
+    the LOCAL bin with no registry fetch at all, so the registry name is not
+    the package that runs.
+
+    The walk starts at the **effective** cwd -- the server's own ``cwd`` if it
+    declares one, else this process's. Reading only the server's ``cwd`` was
+    wrong: npm resolves from the *process* cwd when a server declares none, so
+    running the gateway from inside a node project reopened the whole class.
+    """
+    try:
+        start = Path(cwd).resolve() if cwd else Path.cwd()
+    except OSError as exc:  # pragma: no cover - unreadable cwd
+        return f"cannot resolve the effective cwd: {exc}"
+    for directory in (start, *start.parents):
+        if (directory / "package.json").exists() or (
+            directory / "node_modules"
+        ).is_dir():
+            return (
+                f"npm would set a local prefix at {directory} "
+                "(a project .npmrc or a local bin can redirect resolution)"
+            )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Tri-state result
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NpmResolution:
+    """The resolver's answer. Exactly one of the three states."""
+
+    status: Literal["IDENTITY", "REFUSED", "UNAVAILABLE"]
+    spec: str | None = None
+    reason: str | None = None
+
+    @property
+    def is_identity(self) -> bool:
+        return self.status == "IDENTITY"
+
+    @property
+    def is_refused(self) -> bool:
+        return self.status == "REFUSED"
+
+    @property
+    def is_unavailable(self) -> bool:
+        return self.status == "UNAVAILABLE"
+
+
+def _refused(reason: str) -> NpmResolution:
+    return NpmResolution(status="REFUSED", reason=reason)
+
+
+def _unavailable(reason: str) -> NpmResolution:
+    return NpmResolution(status="UNAVAILABLE", reason=reason)
+
+
+# A control character in a spec would mean the child sent something that is not
+# a package spec at all. Whitespace is deliberately ALLOWED: `pkg@>=1.0 <2.0` is
+# a legal npa range and npm fetches `pkg` from it. Rejecting it here used to
+# tear down a HEALTHY child, and the next server in the same refresh cycle then
+# got "cooling down after a failure" -- one such config entry disabled npm
+# identity fleet-wide for the cooldown window, on every cycle (board review on
+# the diff).
+_SPEC_SHAPE = re.compile(r"^[^\x00-\x1f\x7f]+$")
+
+
+class NpmResolver:
+    """A lazily spawned, persistent node child that names npm packages.
+
+    Persistent because one-shot is unaffordable: 79 one-shot resolves measured
+    4.02 s, while a persistent child costs 43 ms of startup plus ~0.5 ms per
+    query. ``detect_package_type`` is synchronous and is called from inside
+    async coroutines, so seconds of blocking would stall the event loop.
+    """
+
+    def __init__(self, helper: Path | None = None) -> None:
+        self._helper = helper or _HELPER
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen[str] | None = None
+        self._reader: _LineReader | None = None
+        self._next_id = 0
+        self._last_spawn_at = 0.0
+        self._generation = 0
+        # Sticky states, set once and never cleared. A sticky resolver keeps NO
+        # child, so the per-resolve npm-version re-stat cannot fire and recovery
+        # needs a gateway restart. That is deliberate: both sticky states mean
+        # the host told us something durable (npm is absent; or npm is present
+        # and this code cannot model it), not that a request went wrong.
+        self._sticky: NpmResolution | None = None
+        self._warned = False
+        self._npm_version: str | None = None
+        # Attempts, not successes. On a node-less host `Popen` raises and no
+        # child is ever created, so counting successes would make "exactly one
+        # spawn attempt across 50 resolves" trivially true whatever the code
+        # did.
+        self.spawn_attempts = 0
+        self.spawn_count = 0
+        # Set by `_spawn`: False when the failure was the PARENT's (permission,
+        # resource limit, missing helper) and so may be transient.
+        self._spawn_failure_is_durable = True
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def _warn_once(self, outcome: NpmResolution) -> None:
+        """One WARNING per process, and it must describe the RIGHT outcome.
+
+        The two sticky states have opposite consequences and a single message
+        cannot be true of both (board review on the diff): a sticky REFUSED
+        reports every npm server as `unknown`, while a sticky UNAVAILABLE falls
+        back to the flag tables, which keep MINTING identities -- just the
+        pre-2.5.2 ones, with the defects this change exists to remove.
+        """
+        if self._warned:
+            return
+        self._warned = True
+        if outcome.is_unavailable:
+            logger.warning(
+                "npm is not installed, so npm package identity falls back to "
+                "pmcp's own flag tables: %s. Identities are still produced, but "
+                "by the pre-2.5.2 hand-written parser rather than by npm, so an "
+                "unusual npm/npx command line can be misread. Install node and "
+                "npm, then restart the gateway, to get identity from npm's own "
+                "parser. Current state is reported as gateway.health -> "
+                "gateway_diagnostics.npm_identity.",
+                outcome.reason,
+            )
+            return
+        logger.warning(
+            "npm package identity is DISABLED for this process: %s. npm/npx "
+            "servers will report package_type='unknown', which means their "
+            "descriptions refresh every cycle and gateway.update_server cannot "
+            "name a package for them. THIS DOES NOT RECOVER ON ITS OWN -- a "
+            "disabled resolver keeps no child process, so nothing re-checks the "
+            "host; fix the cause and RESTART THE GATEWAY. Current state is also "
+            "reported as gateway.health -> gateway_diagnostics.npm_identity.",
+            outcome.reason,
+        )
+
+    def _terminate(self) -> None:
+        """Kill the child. Call with the lock held."""
+        proc, self._proc = self._proc, None
+        reader, self._reader = self._reader, None
+        if reader is not None:
+            reader.stop()
+        if proc is not None:
+            try:
+                proc.kill()
+            except OSError:  # pragma: no cover - already reaped
+                pass
+            try:
+                proc.wait(timeout=2.0)
+            except Exception:  # pragma: no cover - stubborn child
+                pass
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except OSError:  # pragma: no cover
+                    pass
+
+    def _spawn(self) -> NpmResolution | None:
+        """Start the child and consume its handshake. Lock held. ``None`` = ok."""
+        if not self._helper.is_file():
+            # A missing packaged helper is a BROKEN INSTALL, not a node-less
+            # host. `UNAVAILABLE` means "we learned nothing about npm, only that
+            # it is absent", and that is the one state permitted to consult the
+            # 2.5.2 flag tables. Routing a broken install there was fail-OPEN
+            # and reproduced: with the helper missing,
+            # `npx --registry https://private.invalid probe` resolved
+            # confidently to `probe` -- a private-registry name that
+            # gateway.update_server would then probe against public npmjs.org,
+            # where it is squattable (board review on the diff).
+            self._spawn_failure_is_durable = False
+            return _refused(f"packaged helper script is missing: {self._helper}")
+        self._last_spawn_at = time.monotonic()
+        self.spawn_attempts += 1
+        try:
+            proc = subprocess.Popen(
+                ["node", str(self._helper)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                shell=False,
+                bufsize=1,
+            )
+        except FileNotFoundError as exc:
+            # node is not installed. This is the ONE spawn failure that learns
+            # nothing about npm, so it is the one that falls back to the tables.
+            return _unavailable(f"node is not installed: {exc}")
+        except OSError as exc:
+            # node IS on PATH but could not be executed: permission denied, a
+            # resource limit, ETXTBSY, a bad interpreter. None of these is
+            # evidence that npm is absent, so none may reach the tables --
+            # reproduced with a non-executable `node`, which fell back and
+            # resolved `npx --registry https://private.invalid probe` to
+            # `probe` (board review on the diff).
+            self._spawn_failure_is_durable = False
+            return _refused(f"node is present but could not be spawned: {exc}")
+        self.spawn_count += 1
+        self._generation += 1
+        self._proc = proc
+        self._reader = _LineReader(proc)
+
+        line = self._reader.read(_HANDSHAKE_TIMEOUT)
+        if line is None:
+            self._terminate()
+            return _refused("child produced no handshake")
+        try:
+            handshake = json.loads(line)
+        except ValueError:
+            self._terminate()
+            return _refused("child handshake was not JSON")
+        if not isinstance(handshake, dict) or handshake.get("handshake") != 1:
+            self._terminate()
+            return _refused("child handshake failed schema")
+
+        status = handshake.get("status")
+        if status == "UNAVAILABLE":
+            self._terminate()
+            return _unavailable(str(handshake.get("reason") or "npm not found"))
+        if status != "OK":
+            self._terminate()
+            return _refused(str(handshake.get("reason") or "child refused at startup"))
+
+        version = handshake.get("npmVersion")
+        self._npm_version = version if isinstance(version, str) else None
+        return None
+
+    def _ensure_child(self) -> NpmResolution | None:
+        """Lock held. ``None`` when a live child is available."""
+        if self._sticky is not None:  # pragma: no cover - `resolve` checks first
+            return self._sticky
+        if self._proc is not None and self._proc.poll() is None:
+            return None
+        if self._proc is not None:
+            self._terminate()
+        if self.spawn_attempts and (
+            time.monotonic() - self._last_spawn_at < _RESPAWN_COOLDOWN
+        ):
+            # Inside the cooldown after a death: refuse cheaply rather than
+            # spawn-storm. Not sticky -- the next window re-arms.
+            return _refused("npm resolver child is cooling down after a failure")
+        self._spawn_failure_is_durable = True
+        outcome = self._spawn()
+        if outcome is None:
+            return None
+        if outcome.is_unavailable or self._spawn_failure_is_durable:
+            # Durable = the CHILD told us something about the host: a failed
+            # self-test, an unrecognised `npx-cli.js`, a parser that will not
+            # load, an npm it could not locate, a handshake that never came.
+            # Those will still be true on the next query.
+            #
+            # A PARENT-side spawn failure is not durable. Permission denied, a
+            # resource limit or a missing helper file can all be repaired under
+            # a running gateway, and making them permanent turned a transient
+            # condition into a fleet-wide loss of auto-update for the process
+            # lifetime (board review on the diff). Those refuse for this query
+            # and back off on the cooldown, which re-arms.
+            self._sticky = outcome
+            self._warn_once(outcome)
+        return outcome
+
+    # -- the query ---------------------------------------------------------
+
+    def resolve(
+        self,
+        command: str,
+        args: list[str],
+        env: Mapping[str, str] | None,
+        cwd: str | None,
+    ) -> NpmResolution:
+        """Name the package *command*/*args* would run, or refuse.
+
+        *env* is the server's environment **OVERLAY**, not a merged
+        environment; *cwd* is the server's declared working directory, or
+        ``None`` to mean "this process's". Both are REQUIRED and deliberately
+        undefaulted: a defaulted ``None`` is the same silent fail-open this
+        module exists to remove, and requiring them turns every unconverted call
+        site into a type error rather than a wrong answer.
+
+        **There is deliberately no memoisation.** An earlier version cached
+        answers per ``(command, args, gated env, cwd)``. The cache was correct
+        about spawn and teardown -- it was dropped with the child and on an
+        npm-version change at handshake -- but both of those fire only at
+        lifecycle boundaries. With a healthy long-lived child, a cache HIT never
+        reaches the child, so the child's per-resolve re-stat of npm's own
+        ``package.json`` could not fire either, and an in-place npm upgrade
+        mid-session would have left a stale identity served indefinitely from
+        cache by a resolver whose whole purpose is to not answer from a stale
+        model (board review on the diff).
+
+        Removing it rather than adding a second timer keeps the drift defence
+        unconditional: **every** query now re-stats. The measured cost is
+        ~0.5 ms per query -- about 40 ms across a full 79-server refresh -- which
+        is not load-bearing next to the network calls those refreshes make.
+        """
+        if command not in ("npx", "npm"):
+            return _refused(f"command is not a bare npx/npm: {command!r}")
+
+        # Parent-side gates first: they need no child, so a refusal here costs
+        # nothing and a node-less host never even attempts a spawn for them.
+        for gate in (
+            _env_overlay_is_plain(env),
+            _has_local_prefix(cwd),
+        ):
+            if gate is not None:
+                return _refused(gate)
+
+        with self._lock:
+            process_gate = _process_env_is_plain()
+            if process_gate is not None and self._sticky is None:
+                self._sticky = _refused(process_gate)
+                self._warn_once(self._sticky)
+            if self._sticky is not None:
+                return self._sticky
+            outcome = self._ensure_child()
+            if outcome is not None:
+                return outcome
+            return self._query_locked(command, args)
+
+    def _query_locked(self, command: str, args: list[str]) -> NpmResolution:
+        proc = self._proc
+        reader = self._reader
+        assert proc is not None and reader is not None and proc.stdin is not None
+        self._next_id += 1
+        request_id = self._next_id
+        payload = json.dumps({"id": request_id, "command": command, "args": args})
+        try:
+            proc.stdin.write(payload + "\n")
+            proc.stdin.flush()
+        except (BrokenPipeError, ValueError, OSError) as exc:
+            self._terminate()
+            return _refused(f"npm resolver child died before the query: {exc}")
+
+        line = reader.read(_QUERY_TIMEOUT)
+        if line is None:
+            # Timeout or death. Terminate and drop the child BEFORE releasing
+            # the lock, so a later query cannot read an orphaned response and
+            # attribute it to the wrong request.
+            self._terminate()
+            return _refused("npm resolver child timed out or died")
+        try:
+            response = json.loads(line)
+        except ValueError:
+            self._terminate()
+            return _refused("npm resolver child sent malformed JSON")
+        if not isinstance(response, dict) or response.get("id") != request_id:
+            # THIS is a desynchronised stream: we just read someone else's
+            # answer, so whatever comes next belongs to some other request
+            # again. Terminate.
+            self._terminate()
+            return _refused("npm resolver child response did not match the request")
+
+        # From here down the id matched and the JSON parsed, so the stream is
+        # framed correctly and the child is healthy. A record this parent does
+        # not like is a refusal for THIS query only -- never a teardown.
+        # Terminating here punished every LATER server for one server's odd
+        # spec, which is a blast radius out of all proportion to the cause.
+        status = response.get("status")
+        if status == "STALE":
+            # npm was upgraded in place under a running gateway. The child has
+            # exited and the next query respawns against the new npm.
+            self._terminate()
+            return _refused("npm changed under the resolver; retry after respawn")
+        if status == "REFUSED":
+            return _refused(str(response.get("reason") or "refused"))
+        if status != "IDENTITY":
+            return _refused(f"npm resolver child sent an unknown status: {status!r}")
+
+        spec = response.get("spec")
+        if not isinstance(spec, str) or not _SPEC_SHAPE.match(spec):
+            return _refused("npm resolver child sent an unusable spec")
+        return NpmResolution(status="IDENTITY", spec=spec)
+
+    # -- introspection -----------------------------------------------------
+
+    def status_summary(self) -> str:
+        """One line for gateway.health. **Never spawns.**
+
+        A fleet-wide loss of npm identity is otherwise visible only as a single
+        WARNING at whatever moment the first npm server was resolved, which is
+        easy to miss in a long-running gateway's log. Reporting it in
+        gateway.health makes it answerable on demand.
+
+        Deliberately reports only what is already known: forcing a spawn here
+        would make a diagnostic call start a subprocess, and would report a
+        healthy resolver on a gateway that has never resolved anything.
+        """
+        with self._lock:
+            if self._sticky is not None:
+                if self._sticky.is_unavailable:
+                    return f"fallback to flag tables ({self._sticky.reason})"
+                return f"DISABLED, refusing every query ({self._sticky.reason})"
+            if self._proc is None or self._proc.poll() is not None:
+                return "not started (no npm/npx server resolved yet)"
+            return f"active (npm {self._npm_version})"
+
+    # -- teardown ----------------------------------------------------------
+
+    def close(self) -> None:
+        with self._lock:
+            self._terminate()
+
+
+class _LineReader:
+    """A bounded-wait line reader over a child's stdout.
+
+    A blocking ``readline()`` cannot implement a timeout, so the read happens
+    on a daemon thread and the caller waits on a queue instead.
+    """
+
+    def __init__(self, proc: subprocess.Popen[str]) -> None:
+        self._queue: queue.Queue[str | None] = queue.Queue()
+        self._stdout = proc.stdout
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._pump, name="npm-resolver-reader", daemon=True
+        )
+        self._thread.start()
+
+    def _pump(self) -> None:
+        stream = self._stdout
+        if stream is None:  # pragma: no cover - Popen always gives one
+            self._queue.put(None)
+            return
+        try:
+            for line in stream:
+                if self._stopped.is_set():
+                    return
+                self._queue.put(line)
+        except (ValueError, OSError):  # pragma: no cover - closed under us
+            pass
+        finally:
+            self._queue.put(None)
+
+    def read(self, timeout: float) -> str | None:
+        """The next line, or ``None`` on timeout or child exit."""
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def stop(self) -> None:
+        self._stopped.set()
+
+
+_resolver: NpmResolver | None = None
+_resolver_lock = threading.Lock()
+
+
+def get_resolver() -> NpmResolver:
+    """The process-wide resolver.
+
+    One child per process, spawned lazily on the first npm/npx server and kept
+    for the process lifetime. There is deliberately **no idle reaper**: an
+    earlier design had one *and* a sticky-unavailable state, so the feature died
+    permanently after the first idle period.
+    """
+    global _resolver
+    with _resolver_lock:
+        if _resolver is None:
+            _resolver = NpmResolver()
+        return _resolver
+
+
+def reset_resolver_for_tests() -> None:
+    """Drop the process-wide resolver. Tests only."""
+    global _resolver
+    with _resolver_lock:
+        if _resolver is not None:
+            _resolver.close()
+        _resolver = None

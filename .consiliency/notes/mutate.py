@@ -26,7 +26,8 @@ HD = MUT / "src/pmcp/tools/handlers.py"
 MUTATIONS = [
     (
         "uvx --python reclassified value -> boolean",
-        VC, "append",
+        VC,
+        "append",
         '_UVX_VALUE_FLAGS = _UVX_VALUE_FLAGS - {"--python"}\n'
         '_UVX_BOOLEAN_FLAGS = _UVX_BOOLEAN_FLAGS | {"--python"}\n',
         "tests/test_version_checker.py::TestValueFlagCollisions"
@@ -34,7 +35,8 @@ MUTATIONS = [
     ),
     (
         "uvx --with reclassified value -> boolean",
-        VC, "append",
+        VC,
+        "append",
         '_UVX_VALUE_FLAGS = _UVX_VALUE_FLAGS - {"--with"}\n'
         '_UVX_BOOLEAN_FLAGS = _UVX_BOOLEAN_FLAGS | {"--with"}\n',
         "tests/test_version_checker.py::TestValueFlagCollisions"
@@ -42,7 +44,8 @@ MUTATIONS = [
     ),
     (
         "pip --index-url reclassified value -> boolean",
-        VC, "append",
+        VC,
+        "append",
         '_PIP_VALUE_FLAGS = _PIP_VALUE_FLAGS - {"--index-url"}\n'
         '_PIP_BOOLEAN_FLAGS = _PIP_BOOLEAN_FLAGS | {"--index-url"}\n',
         "tests/test_version_checker.py::TestValueFlagCollisions"
@@ -50,7 +53,8 @@ MUTATIONS = [
     ),
     (
         "cargo --features reclassified value -> boolean",
-        VC, "append",
+        VC,
+        "append",
         '_CARGO_VALUE_FLAGS = _CARGO_VALUE_FLAGS - {"--features"}\n'
         '_CARGO_BOOLEAN_FLAGS = _CARGO_BOOLEAN_FLAGS | {"--features"}\n',
         "tests/test_version_checker.py::TestValueFlagCollisions"
@@ -58,7 +62,8 @@ MUTATIONS = [
     ),
     (
         "docker --env-file reclassified value -> boolean",
-        VC, "append",
+        VC,
+        "append",
         '_DOCKER_VALUE_FLAGS = _DOCKER_VALUE_FLAGS - {"--env-file"}\n'
         '_DOCKER_BOOLEAN_FLAGS = _DOCKER_BOOLEAN_FLAGS | {"--env-file"}\n',
         "tests/test_version_checker.py::TestValueFlagCollisions"
@@ -66,7 +71,8 @@ MUTATIONS = [
     ),
     (
         "docker --mount reclassified value -> boolean",
-        VC, "append",
+        VC,
+        "append",
         '_DOCKER_VALUE_FLAGS = _DOCKER_VALUE_FLAGS - {"--mount"}\n'
         '_DOCKER_BOOLEAN_FLAGS = _DOCKER_BOOLEAN_FLAGS | {"--mount"}\n',
         "tests/test_version_checker.py::TestValueFlagCollisions"
@@ -74,48 +80,64 @@ MUTATIONS = [
     ),
     (
         "npm --package no longer known-positive (pre-fix skip)",
-        VC, "append",
+        VC,
+        "append",
         "_NPM_POSITIVE_FLAGS = frozenset()\n",
         "tests/test_version_checker.py::TestValueFlagCollisions"
         "::test_npm_exec_package_flag_names_the_package",
     ),
     (
         "npm repeated --package no longer refuses (returns the first)",
-        VC, "replace",
-        ("        return packages[0] if len(set(packages)) == 1 else None\n",
-         "        return packages[0]\n"),
+        VC,
+        "replace",
+        (
+            "        return packages[0] if len(set(packages)) == 1 else None\n",
+            "        return packages[0]\n",
+        ),
         "tests/test_version_checker.py::TestValueFlagCollisions"
         "::test_npm_repeated_package_flags_refuse",
     ),
     (
         "fail-closed default removed (unlisted flag skipped again)",
-        VC, "replace",
-        ('    return arg.startswith("-") and arg != "-" and "=" not in arg\n',
-         "    return False\n"),
+        VC,
+        "replace",
+        (
+            '    return arg.startswith("-") and arg != "-" and "=" not in arg\n',
+            "    return False\n",
+        ),
         "tests/test_version_checker.py::TestValueFlagsFailClosed"
         "::test_uvx_unlisted_flag_refuses",
     ),
     (
         "fail-closed default removed -- docker arm",
-        VC, "replace",
-        ('    return arg.startswith("-") and arg != "-" and "=" not in arg\n',
-         "    return False\n"),
+        VC,
+        "replace",
+        (
+            '    return arg.startswith("-") and arg != "-" and "=" not in arg\n',
+            "    return False\n",
+        ),
         "tests/test_version_checker.py::TestValueFlagsFailClosed"
         "::test_docker_unlisted_flag_refuses",
     ),
     (
         "fail-closed default removed -- update_server no-probe consequence",
-        VC, "replace",
-        ('    return arg.startswith("-") and arg != "-" and "=" not in arg\n',
-         "    return False\n"),
+        VC,
+        "replace",
+        (
+            '    return arg.startswith("-") and arg != "-" and "=" not in arg\n',
+            "    return False\n",
+        ),
         "tests/test_tools.py::TestUpdateServerVersionRepair"
         "::test_update_server_never_probes_an_unclassifiable_flag_form",
     ),
     (
         "`--flag=value` no longer treated as self-delimiting",
-        VC, "replace",
-        ('    return arg.startswith("-") and arg != "-" and "=" not in arg\n',
-         '    return arg.startswith("-") and arg != "-"\n'),
+        VC,
+        "replace",
+        (
+            '    return arg.startswith("-") and arg != "-" and "=" not in arg\n',
+            '    return arg.startswith("-") and arg != "-"\n',
+        ),
         "tests/test_version_checker.py::TestValueFlagsFailClosed"
         "::test_unlisted_flag_with_attached_value_is_self_delimiting",
     ),
@@ -126,30 +148,38 @@ MUTATIONS = [
     # proof that does not exist.
     (
         "PEP 508 normalization removed",
-        VC, "replace",
-        ("    return match.group(1) if match else requirement\n",
-         "    return requirement\n"),
+        VC,
+        "replace",
+        (
+            "    return match.group(1) if match else requirement\n",
+            "    return requirement\n",
+        ),
         "tests/test_version_checker.py::TestKnownPositiveValueFlags"
         "::test_from_value_is_normalized_to_its_pep508_base_name",
     ),
     (
         "PEP 508 applied to URLs too (git+https identity destroyed)",
-        VC, "replace",
-        ("    return match.group(1) if match else requirement\n",
-         '    return requirement.split("/")[0]\n'),
+        VC,
+        "replace",
+        (
+            "    return match.group(1) if match else requirement\n",
+            '    return requirement.split("/")[0]\n',
+        ),
         "tests/test_version_checker.py::TestKnownPositiveValueFlags"
         "::test_from_url_value_keeps_the_whole_url_as_identity",
     ),
     (
         "docker `-it` combined short boolean removed",
-        VC, "append",
+        VC,
+        "append",
         '_DOCKER_BOOLEAN_FLAGS = _DOCKER_BOOLEAN_FLAGS - {"-it"}\n',
         "tests/test_version_checker.py::TestKnownPositiveValueFlags"
         "::test_docker_combined_short_booleans_still_find_image",
     ),
     (
         "uvx --from downgraded known-positive -> value flag",
-        VC, "append",
+        VC,
+        "append",
         "_UVX_POSITIVE_FLAGS = frozenset()\n"
         '_UVX_VALUE_FLAGS = _UVX_VALUE_FLAGS | {"--from"}\n',
         "tests/test_version_checker.py::TestKnownPositiveValueFlags"
@@ -160,7 +190,8 @@ MUTATIONS = [
         # the half that was actually broken. `--from`'s classification is NOT
         # observable through this form -- see the test's docstring.
         "uvx --python reclassified -> README pin form misidentified as 3.12",
-        VC, "append",
+        VC,
+        "append",
         '_UVX_VALUE_FLAGS = _UVX_VALUE_FLAGS - {"--python"}\n'
         '_UVX_BOOLEAN_FLAGS = _UVX_BOOLEAN_FLAGS | {"--python"}\n',
         "tests/test_version_checker.py::TestKnownPositiveValueFlags"
@@ -168,7 +199,8 @@ MUTATIONS = [
     ),
     (
         "uvx --quiet reclassified boolean -> value (rejected design)",
-        VC, "append",
+        VC,
+        "append",
         '_UVX_BOOLEAN_FLAGS = _UVX_BOOLEAN_FLAGS - {"--quiet"}\n'
         '_UVX_VALUE_FLAGS = _UVX_VALUE_FLAGS | {"--quiet"}\n',
         "tests/test_version_checker.py::TestKnownPositiveValueFlags"
@@ -176,26 +208,32 @@ MUTATIONS = [
     ),
     (
         "uvx positional normalized too (inline pin lost)",
-        VC, "replace",
-        ('            return ("pypi", _pep508_base_name(raw) '
-         "if from_positive_flag else raw)\n",
-         '            return ("pypi", _pep508_base_name(raw))\n'),
+        VC,
+        "replace",
+        (
+            '            return ("pypi", _pep508_base_name(raw) '
+            "if from_positive_flag else raw)\n",
+            '            return ("pypi", _pep508_base_name(raw))\n',
+        ),
         "tests/test_version_checker.py::TestKnownPositiveValueFlags"
         "::test_positional_uvx_token_is_left_raw",
     ),
     (
         "uvx pin detection un-shared (back to independent scan)",
-        HD, "replace",
-        ("        raw, _from_flag = _uvx_package_arg(args)\n"
-         '        if raw is not None and "==" in raw:\n'
-         '            _, _, version = raw.partition("==")\n'
-         "            return version or None\n",
-         "        for arg in args:\n"
-         '            if arg.startswith("-"):\n'
-         "                continue\n"
-         '            if "==" in arg:\n'
-         '                _, _, version = arg.partition("==")\n'
-         "                return version or None\n"),
+        HD,
+        "replace",
+        (
+            "        raw, _from_flag = _uvx_package_arg(args)\n"
+            '        if raw is not None and "==" in raw:\n'
+            '            _, _, version = raw.partition("==")\n'
+            "            return version or None\n",
+            "        for arg in args:\n"
+            '            if arg.startswith("-"):\n'
+            "                continue\n"
+            '            if "==" in arg:\n'
+            '                _, _, version = arg.partition("==")\n'
+            "                return version or None\n",
+        ),
         "tests/test_tools.py::TestUpdateServerVersionRepair"
         "::test_detect_effective_version_pin_matrix",
     ),
@@ -208,9 +246,11 @@ def purge() -> None:
 
 
 PY = str(REPO / ".venv/bin/python")
-ENV = {**__import__("os").environ,
-       "PYTHONDONTWRITEBYTECODE": "1",
-       "PYTHONPATH": str(MUT / "src")}
+ENV = {
+    **__import__("os").environ,
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "PYTHONPATH": str(MUT / "src"),
+}
 
 
 def check_provenance() -> None:
@@ -221,7 +261,10 @@ def check_provenance() -> None:
     """
     proc = subprocess.run(
         [PY, "-c", "import pmcp.manifest.version_checker as m; print(m.__file__)"],
-        cwd=MUT, capture_output=True, text=True, env=ENV,
+        cwd=MUT,
+        capture_output=True,
+        text=True,
+        env=ENV,
     )
     resolved = proc.stdout.strip()
     expected = str(MUT / "src/pmcp/manifest/version_checker.py")
@@ -237,11 +280,19 @@ def run(node: str) -> tuple[bool, str]:
     purge()
     proc = subprocess.run(
         [PY, "-m", "pytest", node, "-q", "-p", "no:randomly", "--no-header", "-x"],
-        cwd=MUT, capture_output=True, text=True, env=ENV,
+        cwd=MUT,
+        capture_output=True,
+        text=True,
+        env=ENV,
     )
-    tail = [ln for ln in proc.stdout.splitlines()
-            if ln.startswith(("FAILED", "ERROR", "assert", "E "))
-            or " passed" in ln or " failed" in ln or " error" in ln]
+    tail = [
+        ln
+        for ln in proc.stdout.splitlines()
+        if ln.startswith(("FAILED", "ERROR", "assert", "E "))
+        or " passed" in ln
+        or " failed" in ln
+        or " error" in ln
+    ]
     return proc.returncode == 0, " | ".join(tail[-3:])[:260]
 
 
@@ -279,8 +330,10 @@ def main() -> int:
             old, new = payload
             text = originals[path]
             if old not in text:
-                print(f"  SKIP  {label}\n        (anchor not found -- mutation "
-                      f"did not apply, treat as UNPROVEN)")
+                print(
+                    f"  SKIP  {label}\n        (anchor not found -- mutation "
+                    f"did not apply, treat as UNPROVEN)"
+                )
                 survivors.append((label, node, "anchor not found"))
                 continue
             path.write_text(text.replace(old, new, 1))
@@ -300,8 +353,10 @@ def main() -> int:
     print()
     print("=" * 78)
     if survivors:
-        print(f"{len(survivors)} SURVIVING MUTANT(S) -- these tests do not pin "
-              "what they claim:")
+        print(
+            f"{len(survivors)} SURVIVING MUTANT(S) -- these tests do not pin "
+            "what they claim:"
+        )
         for label, node, detail in survivors:
             print(f"  - {label}\n      {node}\n      {detail}")
         return 1

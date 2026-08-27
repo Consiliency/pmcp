@@ -644,7 +644,7 @@ class TestUpToDateShortCircuit:
 
         calls: list[tuple] = []
 
-        async def fake_version(command, args, timeout=None):
+        async def fake_version(command, args, env=None, cwd=None, timeout=None):
             calls.append((command, tuple(args)))
             return ("nightly", "npm")
 
@@ -707,7 +707,7 @@ class TestUpToDateShortCircuit:
         )
         calls: list[tuple] = []
 
-        async def fake_version(command, args, timeout=None):
+        async def fake_version(command, args, env=None, cwd=None, timeout=None):
             calls.append((command, tuple(args)))
             return ("abcdef123456", "docker")
 
@@ -762,7 +762,7 @@ class TestShortCircuitUsesCompareVersions:
             args=["srv"],
         )
 
-        async def fake_version(command, args, timeout=None):
+        async def fake_version(command, args, env=None, cwd=None, timeout=None):
             return ("1.0.0", "npm")
 
         calls: list[tuple] = []
@@ -955,7 +955,13 @@ def _manifest(servers: dict[str, ServerConfig]) -> Manifest:
     )
 
 
-async def _equal_version(command: str, args: list[str], timeout: float | None = None):
+async def _equal_version(
+    command: str,
+    args: list[str],
+    env: object = None,
+    cwd: str | None = None,
+    timeout: float | None = None,
+):
     """Every package resolves to the same npm version -- so only identity can
     distinguish the cached entry from the configured one."""
     return ("1.0.0", "npm")
@@ -1221,7 +1227,7 @@ class TestPackageIdentityGate:
             async def __aexit__(self, *exc):
                 return False
 
-        async def fake_version(command, args, timeout=None):
+        async def fake_version(command, args, env=None, cwd=None, timeout=None):
             return ("2.0.0", "npm")
 
         with patch(

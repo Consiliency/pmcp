@@ -4371,7 +4371,9 @@ class TestCapabilityAndProvision:
             ),
         )
 
-        async def fake_get_package_version(command, args, timeout=5.0):
+        async def fake_get_package_version(
+            command, args, env=None, cwd=None, timeout=5.0
+        ):
             return ("1.2.3", "npm")
 
         monkeypatch.setattr(
@@ -4993,7 +4995,9 @@ class TestUpdateServerVersionRepair:
             ),
         )
 
-        async def fake_get_package_version(command, args, timeout=5.0):
+        async def fake_get_package_version(
+            command, args, env=None, cwd=None, timeout=5.0
+        ):
             return (latest_version, "npm")
 
         monkeypatch.setattr(
@@ -5105,7 +5109,9 @@ class TestUpdateServerVersionRepair:
 
         monkeypatch.setattr(gt, "refresh", _tracking_refresh)
 
-        async def fake_get_package_version(command, args, timeout=5.0):
+        async def fake_get_package_version(
+            command, args, env=None, cwd=None, timeout=5.0
+        ):
             return ("0.2.0", "npm")
 
         monkeypatch.setattr(
@@ -5225,7 +5231,9 @@ class TestUpdateServerVersionRepair:
 
         monkeypatch.setattr(gt, "refresh", _tracking_refresh)
 
-        async def fake_get_package_version(command, args, timeout=5.0):
+        async def fake_get_package_version(
+            command, args, env=None, cwd=None, timeout=5.0
+        ):
             return ("0.2.0", "npm")
 
         monkeypatch.setattr(
@@ -5268,7 +5276,9 @@ class TestUpdateServerVersionRepair:
             descriptions_cache=cache,
         )
 
-        async def fake_get_package_version(command, args, timeout=5.0):
+        async def fake_get_package_version(
+            command, args, env=None, cwd=None, timeout=5.0
+        ):
             return ("0.2.0", "npm")
 
         monkeypatch.setattr(
@@ -5647,7 +5657,9 @@ class TestUpdateServerVersionRepair:
             ),
         )
 
-        async def fake_get_package_version(command, args, timeout=5.0):
+        async def fake_get_package_version(
+            command, args, env=None, cwd=None, timeout=5.0
+        ):
             # The manifest's bare "@playwright/mcp" would resolve to a
             # DIFFERENT (wrong) answer than the .mcp.json override -- if
             # this is ever called with the manifest's args, the config
@@ -5713,7 +5725,9 @@ class TestUpdateServerVersionRepair:
 
         monkeypatch.setattr(gt, "_run_update_probe_command", _fake_probe)
 
-        async def fake_get_package_version(command, args, timeout=5.0):
+        async def fake_get_package_version(
+            command, args, env=None, cwd=None, timeout=5.0
+        ):
             return ("9.9.9", "npm")  # upstream's real latest -- must be ignored
 
         monkeypatch.setattr(
@@ -5771,7 +5785,9 @@ class TestUpdateServerVersionRepair:
 
         monkeypatch.setattr(gt, "_run_update_probe_command", _fake_probe)
 
-        async def fake_get_package_version(command, args, timeout=5.0):
+        async def fake_get_package_version(
+            command, args, env=None, cwd=None, timeout=5.0
+        ):
             return ("sha256:beefbeef", "docker")  # must be ignored
 
         monkeypatch.setattr(
@@ -5791,17 +5807,32 @@ class TestUpdateServerVersionRepair:
         from pmcp.tools.handlers import _detect_effective_version_pin as detect
 
         # npm: explicit version pins, @latest is not a pin, bare is not a pin.
-        assert detect("npm", "npx", ["-y", "@playwright/mcp@1.2.3"]) == "1.2.3"
-        assert detect("npm", "npx", ["-y", "@playwright/mcp@latest"]) is None
-        assert detect("npm", "npx", ["-y", "@playwright/mcp"]) is None
+        assert (
+            detect("npm", "npx", ["-y", "@playwright/mcp@1.2.3"], None, None) == "1.2.3"
+        )
+        assert (
+            detect("npm", "npx", ["-y", "@playwright/mcp@latest"], None, None) is None
+        )
+        assert detect("npm", "npx", ["-y", "@playwright/mcp"], None, None) is None
 
         # docker: only the final path segment can carry a tag, so a registry
         # host with a port must not read as a pin of "5000".
-        assert detect("docker", "docker", ["run", "acme/server:1.2.3"]) == "1.2.3"
-        assert detect("docker", "docker", ["run", "acme/server:latest"]) is None
-        assert detect("docker", "docker", ["run", "acme/server"]) is None
-        assert detect("docker", "docker", ["run", "registry:5000/img"]) is None
-        assert detect("docker", "docker", ["run", "registry:5000/img:2.0"]) == "2.0"
+        assert (
+            detect("docker", "docker", ["run", "acme/server:1.2.3"], None, None)
+            == "1.2.3"
+        )
+        assert (
+            detect("docker", "docker", ["run", "acme/server:latest"], None, None)
+            is None
+        )
+        assert detect("docker", "docker", ["run", "acme/server"], None, None) is None
+        assert (
+            detect("docker", "docker", ["run", "registry:5000/img"], None, None) is None
+        )
+        assert (
+            detect("docker", "docker", ["run", "registry:5000/img:2.0"], None, None)
+            == "2.0"
+        )
 
         # docker digests: a digest is the TIGHTEST pin docker has -- immutable
         # content identity, stronger than any tag -- so it must be reported as
@@ -5814,21 +5845,28 @@ class TestUpdateServerVersionRepair:
         # would let update_server pull `image:latest`, restart the unchanged
         # digest-pinned config, and record the registry's newest digest --
         # announcing an update while still running the old image.
-        assert detect("docker", "docker", ["run", "img@sha256:abc"]) == "sha256:abc"
-        assert detect("docker", "docker", ["run", "img:1.2@sha256:abc"]) == "sha256:abc"
+        assert (
+            detect("docker", "docker", ["run", "img@sha256:abc"], None, None)
+            == "sha256:abc"
+        )
+        assert (
+            detect("docker", "docker", ["run", "img:1.2@sha256:abc"], None, None)
+            == "sha256:abc"
+        )
         # ...and a `latest` tag must not discard a real digest pin.
         assert (
-            detect("docker", "docker", ["run", "img:latest@sha256:abc"]) == "sha256:abc"
+            detect("docker", "docker", ["run", "img:latest@sha256:abc"], None, None)
+            == "sha256:abc"
         )
 
         # npm subcommands: the scan is SHARED with detect_package_type, so it
         # skips a leading subcommand here too. Before that, `npm exec pkg@1.2`
         # scanned to "exec", whose `_npm_tag` is None, so a REAL pin read as
         # unpinned (Consiliency/pmcp#180).
-        assert detect("npm", "npm", ["exec", "pkg@1.2"]) == "1.2"
-        assert detect("npm", "npm", ["x", "pkg@1.2"]) == "1.2"
-        assert detect("npm", "npm", ["exec", "pkg@latest"]) is None
-        assert detect("npm", "npm", ["exec", "pkg"]) is None
+        assert detect("npm", "npm", ["exec", "pkg@1.2"], None, None) == "1.2"
+        assert detect("npm", "npm", ["x", "pkg@1.2"], None, None) == "1.2"
+        assert detect("npm", "npm", ["exec", "pkg@latest"], None, None) is None
+        assert detect("npm", "npm", ["exec", "pkg"], None, None) is None
         # ...and `npx` still must not skip a package genuinely named `exec`.
         #
         # `exec@1.2` alone CANNOT enforce that: the skip matches the RAW token
@@ -5839,17 +5877,23 @@ class TestUpdateServerVersionRepair:
         # is what discriminates: with `npx` it is the package (no pin on it),
         # with a wrongly-hardcoded "npm" it is skipped and the pin is read off
         # the FOLLOWING token instead.
-        assert detect("npm", "npx", ["-y", "exec@1.2"]) == "1.2"
-        assert detect("npm", "npx", ["-y", "exec", "pkg@1.2"]) is None
+        assert detect("npm", "npx", ["-y", "exec@1.2"], None, None) == "1.2"
+        assert detect("npm", "npx", ["-y", "exec", "pkg@1.2"], None, None) is None
 
         # cargo: pins via a separate --version flag, both spellings.
-        assert detect("cargo", "cargo", ["install", "srv", "--version", "1.0"]) == "1.0"
-        assert detect("cargo", "cargo", ["install", "srv", "--version=1.0"]) == "1.0"
-        assert detect("cargo", "cargo", ["install", "srv"]) is None
+        assert (
+            detect("cargo", "cargo", ["install", "srv", "--version", "1.0"], None, None)
+            == "1.0"
+        )
+        assert (
+            detect("cargo", "cargo", ["install", "srv", "--version=1.0"], None, None)
+            == "1.0"
+        )
+        assert detect("cargo", "cargo", ["install", "srv"], None, None) is None
 
         # pypi/uvx inline == pin.
-        assert detect("pypi", "uvx", ["srv==1.2.3"]) == "1.2.3"
-        assert detect("pypi", "uvx", ["srv"]) is None
+        assert detect("pypi", "uvx", ["srv==1.2.3"], None, None) == "1.2.3"
+        assert detect("pypi", "uvx", ["srv"], None, None) is None
 
         # Consiliency/pmcp#182: identity and pin must read the SAME uvx token.
         #
@@ -5867,17 +5911,38 @@ class TestUpdateServerVersionRepair:
         #
         # Both are fixed by sharing `_uvx_package_arg`, exactly as npm shares
         # `_npm_package_arg` between the two.
-        assert detect("pypi", "uvx", ["--from", "index-it-mcp==1.2.0", "x"]) == "1.2.0"
-        assert detect("pypi", "uvx", ["--from=index-it-mcp==1.2.0", "x"]) == "1.2.0"
-        assert detect("pypi", "uvx", ["--python", "3.12", "srv==1.2.3"]) == "1.2.3"
-        assert detect("pypi", "uvx", ["--with", "requests==2.0", "pkg"]) is None
+        assert (
+            detect("pypi", "uvx", ["--from", "index-it-mcp==1.2.0", "x"], None, None)
+            == "1.2.0"
+        )
+        assert (
+            detect("pypi", "uvx", ["--from=index-it-mcp==1.2.0", "x"], None, None)
+            == "1.2.0"
+        )
+        assert (
+            detect("pypi", "uvx", ["--python", "3.12", "srv==1.2.3"], None, None)
+            == "1.2.3"
+        )
+        assert (
+            detect("pypi", "uvx", ["--with", "requests==2.0", "pkg"], None, None)
+            is None
+        )
         # An unclassifiable form has no package, so it has no pin either.
-        assert detect("pypi", "uvx", ["--not-a-real-uv-flag", "srv==1.2.3"]) is None
+        assert (
+            detect("pypi", "uvx", ["--not-a-real-uv-flag", "srv==1.2.3"], None, None)
+            is None
+        )
 
         # npm `--package` carries its own tag, and the shared scan means pin
         # detection reads it for free.
-        assert detect("npm", "npm", ["exec", "--package=pkg@1.2", "--", "bin"]) == "1.2"
-        assert detect("npm", "npm", ["exec", "--package=pkg", "--", "bin"]) is None
+        assert (
+            detect("npm", "npm", ["exec", "--package=pkg@1.2", "--", "bin"], None, None)
+            == "1.2"
+        )
+        assert (
+            detect("npm", "npm", ["exec", "--package=pkg", "--", "bin"], None, None)
+            is None
+        )
 
 
 class TestInvokeErrorPaths:
@@ -6699,7 +6764,11 @@ class TestUpdateServerAmbientEnvironment:
         monkeypatch.setattr(gt, "refresh", _tracking_refresh)
 
         async def _fake_get_package_version(
-            command: str, args: list[str], timeout: float = 5.0
+            command: str,
+            args: list[str],
+            env: object = None,
+            cwd: str | None = None,
+            timeout: float = 5.0,
         ) -> tuple[str | None, str]:
             return ("0.2.0", "npm")
 
@@ -6807,7 +6876,11 @@ class TestUpdateServerAmbientEnvironment:
         monkeypatch.setattr(gt, "refresh", _stub_refresh)
 
         async def _fake_get_package_version(
-            command: str, args: list[str], timeout: float = 5.0
+            command: str,
+            args: list[str],
+            env: object = None,
+            cwd: str | None = None,
+            timeout: float = 5.0,
         ) -> tuple[str | None, str]:
             return ("0.2.0", "npm")
 

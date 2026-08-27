@@ -128,8 +128,10 @@ def main() -> int:
             # value and positive flags must take a value; boolean must not.
             expected = kind in ("value", "positive")
             if takes != expected and (tool, flag) in JUSTIFIED_ARITY:
-                print(f"  ARITY-OK   {tool:6s} {kind:8s} {flag:24s} "
-                      f"{JUSTIFIED_ARITY[(tool, flag)]}")
+                print(
+                    f"  ARITY-OK   {tool:6s} {kind:8s} {flag:24s} "
+                    f"{JUSTIFIED_ARITY[(tool, flag)]}"
+                )
             elif takes != expected:
                 mismatches.append(
                     f"{tool} {kind:8s} {flag:24s} "

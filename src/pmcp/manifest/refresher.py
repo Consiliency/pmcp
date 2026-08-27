@@ -16,7 +16,12 @@ from pathlib import Path
 
 import yaml
 
-from pmcp.manifest.loader import Manifest, ServerConfig, load_manifest
+from pmcp.manifest.loader import (
+    credential_lookup_keys,
+    load_manifest,
+    Manifest,
+    ServerConfig,
+)
 from pmcp.manifest.version_checker import (
     compare_versions,
     detect_package_type,
@@ -229,6 +234,38 @@ def _same_package(
     return cached_package == configured_package and cached_type == configured_type
 
 
+def _identity_env_overlay(server_config: ServerConfig) -> dict[str, str]:
+    """The env-key overlay the npm identity gate must see for *server_config*.
+
+    Consiliency/pmcp#195. The manifest's `ServerConfig` carries `extra_env` and
+    NO `cwd`, so the overlay is `extra_env` and the effective cwd is this
+    process's. `extra_env` is the right thing to pass rather than the merged
+    `sanitized_subprocess_env` result: the gate asks whether THIS SERVER'S
+    configuration can redirect npm's resolution, and a merged environment always
+    carries PATH and HOME, which would refuse every npm server on every host.
+
+    **The credential variable's NAME is included, and that is not decorative.**
+    An earlier version of this call site asserted that a credential name "cannot
+    match the gate's key patterns" and passed `extra_env` alone. That claim was
+    false: `env_var` and `secret_key` are manifest-controlled strings, and a name
+    like `npm_config_registry` passes `validate_env_var_name` and would be
+    injected into the server's environment at spawn -- redirecting npm's
+    resolution without the gate ever seeing it (board review on the diff).
+
+    Only the KEYS matter to the gate, so the values are empty: this must never
+    read a secret's value, and it does not need to.
+    """
+    overlay: dict[str, str] = {
+        key: value
+        for key, value in dict(server_config.extra_env).items()
+        if isinstance(key, str)
+    }
+    for key in credential_lookup_keys(server_config):
+        if isinstance(key, str):
+            overlay.setdefault(key, "")
+    return overlay
+
+
 async def refresh_server(
     server_config: ServerConfig,
     existing_cache: GeneratedServerDescriptions | None = None,
@@ -256,7 +293,12 @@ async def refresh_server(
     # below: the short-circuit cannot consult identity unless identity has
     # already been resolved, which is why this resolution moved up here rather
     # than being duplicated (Consiliency/pmcp#178, EC-UPDPATH-2).
-    pkg_type, pkg_name = detect_package_type(server_config.command, server_config.args)
+    pkg_type, pkg_name = detect_package_type(
+        server_config.command,
+        server_config.args,
+        _identity_env_overlay(server_config),
+        None,
+    )
     if not pkg_name:
         pkg_name = f"{server_config.command} {' '.join(server_config.args)}"
 
@@ -264,7 +306,10 @@ async def refresh_server(
     if existing_cache and not force:
         # Get current package version
         version, fetched_type = await get_package_version(
-            server_config.command, server_config.args
+            server_config.command,
+            server_config.args,
+            _identity_env_overlay(server_config),
+            None,
         )
 
         # Identity before freshness: a version comparison is only meaningful
@@ -288,7 +333,12 @@ async def refresh_server(
     logger.info(f"Refreshing descriptions for {server_name}...")
 
     # Get version
-    version, _ = await get_package_version(server_config.command, server_config.args)
+    version, _ = await get_package_version(
+        server_config.command,
+        server_config.args,
+        _identity_env_overlay(server_config),
+        None,
+    )
     version = version or "unknown"
 
     try:
@@ -418,7 +468,10 @@ async def refresh_all(
         existing = existing_servers.get(name)
         if existing is not None:
             cfg_type, cfg_name = detect_package_type(
-                server_config.command, server_config.args
+                server_config.command,
+                server_config.args,
+                _identity_env_overlay(server_config),
+                None,
             )
             if not _same_package(
                 existing.package, existing.package_type, cfg_name, cfg_type
@@ -497,11 +550,17 @@ async def check_staleness(
             continue
 
         cfg_type, cfg_name = detect_package_type(
-            server_config.command, server_config.args
+            server_config.command,
+            server_config.args,
+            _identity_env_overlay(server_config),
+            None,
         )
 
         version, pkg_type = await get_package_version(
-            server_config.command, server_config.args
+            server_config.command,
+            server_config.args,
+            _identity_env_overlay(server_config),
+            None,
         )
 
         # NOTE the inverted polarity relative to `refresh_server`. There, a
