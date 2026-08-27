@@ -502,6 +502,39 @@ class TestTheRequiredToResolveList:
     @pytest.mark.parametrize(
         ("command", "args"),
         [
+            ("npm", ["exec", "--", "--flag-thing"]),
+            ("npm", ["exec", "--", "-x"]),
+            ("npx", ["--", "--flag-thing"]),
+        ],
+    )
+    @requires_node
+    def test_a_leading_dash_operand_refuses_on_every_npm(
+        self, resolver: NpmResolver, command: str, args: list[str]
+    ) -> None:
+        """The npm majors DISAGREE about what this names, so it cannot be named.
+
+        Measured against both real binaries with a dead registry:
+
+            npm 10.9.4   `npm exec -- --flag-thing` fetches `/--flag-thing`
+                         (npa 12: `{type: 'range', name: '--flag-thing'}`)
+            npm 11.19.0  the same argv fetches `/undefined`
+                         (npa 13: `{type: 'tag', name: undefined}`)
+
+        Two installed npms, two different packages, one command line. Refusing
+        is the only answer that is true on both -- and it is what lets the
+        spawn-time self-test be an INVARIANT rather than a description of
+        whichever npm the author had. Without this rule the self-test passed on
+        npm 11 and failed on npm 10, which disabled the whole resolver on every
+        npm 10 host (caught by CI, not by this machine).
+        """
+        _live(resolver)
+        result = resolver.resolve(command, args, {}, None)
+        assert result.is_refused, result
+        assert 'starts with "-"' in (result.reason or "")
+
+    @pytest.mark.parametrize(
+        ("command", "args"),
+        [
             ("npm", ["exec", "--", "--flag-thing"]),  # npm fetches `/undefined`
             ("npx", ["--package="]),  # ditto, and `undefined` exists
             ("npx", ["-y"]),

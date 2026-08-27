@@ -409,6 +409,24 @@ function resolveOne (parser, command, args) {
     return REFUSE('empty package spec')
   }
 
+  // A leading `-` is refused BEFORE npa sees it, because the npm majors
+  // disagree about what such a token names and npa is where they disagree.
+  // Measured against both real binaries with a dead registry:
+  //
+  //   npm 10.9.4: `npm exec -- --flag-thing` fetches `/--flag-thing`
+  //               (npa 12 returns `{type:'range', name:'--flag-thing'}`)
+  //   npm 11.19.0: the same argv fetches `/undefined`
+  //               (npa 13 returns `{type:'tag', name:undefined}`)
+  //
+  // Two installed npms, two different packages, same command line. That is
+  // precisely an identity we cannot state with certainty, so it refuses --
+  // and refusing keeps the answer the SAME on both, which is what lets the
+  // spawn-time self-test be an invariant rather than a description of
+  // whichever npm the author happened to have.
+  if (candidate.startsWith('-')) {
+    return REFUSE('package operand starts with "-"; npm majors disagree on it')
+  }
+
   // Step 3 -- validate through the host's own npm-package-arg.
   let spec
   try {
