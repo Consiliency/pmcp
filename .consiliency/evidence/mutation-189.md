@@ -265,6 +265,67 @@ the lookup's **exit status** and never on emptiness — a successful lookup
 returning zero labels is authoritative, and resurrecting a removed label from
 the frozen payload would bypass the guard entirely.
 
+## Live CI — the half that cannot be proven locally
+
+Everything above ran on this machine. The single most likely way to ship a guard
+that guards nothing is for it to die on the runner while `uv run` still passes
+locally — a missing `yaml` on a stock `ubuntu-latest` image, a base ref that is
+empty on a real `pull_request` event, a download that fails its digest check.
+PR #198, run `33048605049`, `pull_request` on `fix/189-ci-workflow-guards`:
+
+```
+SUCCESS  build            SUCCESS  release-diff-ack
+SUCCESS  changelog        SUCCESS  test (3.10)
+SUCCESS  install-smoke    SUCCESS  test (3.11)
+SUCCESS  lint             SUCCESS  test (3.12)
+SUCCESS  min-version-smoke SUCCESS typecheck
+SUCCESS  notify-worker    SUCCESS  workflows
+```
+
+`workflows` and `release-diff-ack` **appear as check names**. That is the
+assertion, not just their colour: a job that silently never ran is simply
+absent from this list and produces no red X anywhere — the same check-name-set
+evidence #188 used.
+
+From the `workflows` job log:
+
+```
+Install actionlint    actionlint.tar.gz: OK          <- archive digest, before extraction
+Resolve the drift base  drift base for pull_request: '0edaaf47874cdf2f714098b95ad346df006bf815'
+Check workflow ...      drift: base 0edaaf47874cdf2f714098b95ad346df006bf815,
+                        changed workflow paths: ['.github/workflows/test.yml']
+Check workflow ...      workflow guards: OK
+```
+
+`0edaaf47…` is exactly `gh pr view 198 --json baseRefOid`. Drift **ran** on a
+real `pull_request` event against the real base and read a real changed path —
+which a script-level test cannot establish, because the failure mode being ruled
+out is in the workflow expression, not in the script.
+
+From the `release-diff-ack` job log (direction A, live):
+
+```
+Changed files:
+.consiliency/evidence/mutation-189.md
+.consiliency/plans/detailed-ci-workflow-guards-20260826-2205.md
+.github/workflows/test.yml
+CHANGELOG.md
+scripts/_mutate_workflow.sh
+scripts/check_workflows.py
+release.yml is untouched — no acknowledgement required.
+```
+
+Directions B, C, C2, D and E remain **local simulations** of the shipped step
+body; this PR does not touch `release.yml`, so only A could be live.
+
+One incidental finding worth recording: the first push of this branch produced
+**no Actions run at all**, because the PR was in a conflicting state and GitHub
+cannot build the `refs/pull/N/merge` ref for a conflicting PR. There is no red
+X for that either — the checks simply do not exist. It is the same failure shape
+this whole change is about, one level up, and it is another reason the two jobs
+need to be *required* contexts: a required context that never reports blocks the
+merge as "Expected", whereas an absent optional check blocks nothing.
+
 ## Residuals — what still has no automated backstop
 
 Stated plainly rather than implied closed:
