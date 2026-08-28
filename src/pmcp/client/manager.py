@@ -534,6 +534,40 @@ def _required_identity(entry: Any, key: str) -> str:
     return value
 
 
+def _required_object(entry: Any, key: str) -> dict[str, Any]:
+    """The object-valued field a catalog entry cannot be indexed without.
+
+    `_required_identity`'s rule, for a field whose value is an object rather
+    than a string. It exists as a sibling and not as a flag on that helper
+    because that one requires `isinstance(value, str) and value`: called for
+    `inputSchema` it would reject every valid tool in the catalog.
+
+    `tool.get("inputSchema", {})` manufactured an accept-anything schema for a
+    tool that declared none -- and `{}` is not "we do not know", it is "any
+    arguments at all are valid", which is published to every caller and to
+    every model reading the catalog. MCP requires `inputSchema` on a tool, so a
+    tool without one is a tool we could not read, and #172 already settled what
+    to do with those: skip it and say so, rather than invent the missing value.
+
+    Raised inside the parser's per-entry `try`, so the entry lands in the
+    existing skip-and-log path and a listing of nothing but such entries lands
+    in `_reconcile_once`'s offered-but-none-parseable rule -- prior entries
+    kept, nothing published.
+
+    An explicitly empty `{}` is accepted: the server said "any arguments", and
+    that is an answer. `null`, a string, a list and an absent field are not.
+    """
+    if not isinstance(entry, dict):
+        raise TypeError(f"catalog entry is {type(entry).__name__}, not an object")
+    value = entry.get(key)
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"catalog entry has no usable `{key}`: expected an object, got "
+            f"{type(value).__name__}"
+        )
+    return value
+
+
 def _listing_entries(name: str, kind: str, result: Any) -> list[dict[str, Any]] | None:
     """The entries a `*/list` reply offered, or `None` if it offered none readably.
 
@@ -663,7 +697,7 @@ def _parse_tool_entries(
             tool_name = _required_identity(tool, "name")
             tool_id = make_tool_id(name, tool_name)
             description = tool.get("description", "")
-            input_schema = tool.get("inputSchema", {})
+            input_schema = _required_object(tool, "inputSchema")
             output_schema = tool.get("outputSchema")
 
             tool_info = ToolInfo(

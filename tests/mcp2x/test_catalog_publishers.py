@@ -127,7 +127,7 @@ def test_client_manager_with_no_catalog_events_constructs_with_a_null_sink() -> 
     # And every existing call still works: a no-op index on a fresh manager
     # neither raises nor is a `_NullCatalogEventSink` special case.
     assert manager._index_tools("s", []) == 0
-    assert manager._index_tools("s", [{"name": "t1"}]) == 1
+    assert manager._index_tools("s", [{"name": "t1", "inputSchema": {}}]) == 1
 
 
 # --- _index_tools / _index_resources / _index_prompts ----------------------
@@ -137,7 +137,9 @@ def test_index_tools_records_exactly_one_note_for_one_tool() -> None:
     sink = _RecordingSink()
     manager = ClientManager(catalog_events=sink)
 
-    indexed = manager._index_tools("s", [{"name": "t1", "description": "d"}])
+    indexed = manager._index_tools(
+        "s", [{"name": "t1", "description": "d", "inputSchema": {}}]
+    )
 
     assert indexed == 1
     assert sink.calls == ["tools"]
@@ -190,7 +192,7 @@ def test_index_resources_and_prompts_with_nothing_indexed_record_nothing() -> No
 def test_remove_server_indexes_records_all_three_kinds_that_were_present() -> None:
     sink = _RecordingSink()
     manager = ClientManager(catalog_events=sink)
-    manager._index_tools("s", [{"name": "t1"}])
+    manager._index_tools("s", [{"name": "t1", "inputSchema": {}}])
     manager._index_resources("s", [{"uri": "file:///a", "name": "r1"}])
     manager._index_prompts("s", [{"name": "p1"}])
     sink.calls.clear()
@@ -215,7 +217,7 @@ def test_remove_server_indexes_only_notes_kinds_that_actually_shrank() -> None:
     resources or prompts changed too."""
     sink = _RecordingSink()
     manager = ClientManager(catalog_events=sink)
-    manager._index_tools("s", [{"name": "t1"}])
+    manager._index_tools("s", [{"name": "t1", "inputSchema": {}}])
     sink.calls.clear()
 
     manager._remove_server_indexes("s")
@@ -275,7 +277,7 @@ async def test_refresh_with_empty_config_publishes_all_three_list_changed_events
     published: list[ServerEvent] = []
     bus.subscribe(published.append)
 
-    manager._index_tools("s", [{"name": "t1"}])
+    manager._index_tools("s", [{"name": "t1", "inputSchema": {}}])
     manager._index_resources("s", [{"uri": "file:///a", "name": "r1"}])
     manager._index_prompts("s", [{"name": "p1"}])
     await sink.flush()
@@ -307,7 +309,7 @@ async def test_note_during_a_suspended_publish_via_index_methods_is_not_stranded
     sink = BusCatalogEventSink(bus)
     manager = ClientManager(catalog_events=sink)
 
-    manager._index_tools("s", [{"name": "t1"}])
+    manager._index_tools("s", [{"name": "t1", "inputSchema": {}}])
     await bus.entered.wait()  # the drain is now suspended inside publish()
 
     manager._index_prompts("s", [{"name": "p1"}])  # lands in the lost-wakeup window

@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A downstream tool that declares no `inputSchema` is now skipped instead of
+  indexed.** This is a behaviour change, and the only one in this set. The
+  indexer used to substitute `{}` for a missing `inputSchema` — and `{}` is not
+  "we do not know", it is "any arguments at all are valid", published under the
+  server's name to every caller and every model reading the catalog. MCP
+  requires `inputSchema` on a tool, so a tool without one is a tool we could not
+  read, and such an entry now takes the same route as any other unparseable
+  entry: skipped, logged, costing only itself. A listing in which *no* tool
+  parses is treated as a failed listing, so the server's previous tools are kept
+  rather than reported removed. An explicitly empty `inputSchema: {}` is still
+  accepted — the server said "any arguments", and that is an answer; only the
+  absence, and any non-object value such as `null`, is unreadable. A server that
+  omits `inputSchema` therefore loses that tool from the catalog where it
+  previously appeared with a permissive schema. (#175)
+
+### Fixed
+- **`_index_tools`/`_index_resources`/`_index_prompts` no longer overstate the
+  catalog.** `_index_resources` documented that "the count returned is what was
+  actually indexed, not what was offered", while all three returned the length
+  of the parsed list. Two entries sharing an identity are two list items and one
+  catalog key, so the count was wrong by exactly the number of collisions. The
+  count is now of entries that actually landed, and each collision is logged at
+  DEBUG naming the id. (#175)
+- **`adopt_process` now clears the server's catalog entries before indexing**,
+  like every other path into the indexers. Adopting a server previously indexed
+  under the same name left the earlier listing's tools in the catalog beside the
+  new ones — entries the adopted process does not serve, still routable. (#175)
+- **A `max_tools_per_server` of `0` is no longer reported as a malformed
+  listing.** A zero limit empties the parse result before any entry is examined,
+  so reconciliation announced "Every tools entry in the listing was
+  unparseable" — blaming the downstream for a decision the gateway's own policy
+  file made. Both that message and the parser's truncation warning now name the
+  limit. Deliberately *not* fixed by adding a schema bound: `LimitsPolicy` still
+  accepts `0`, because policy auto-discovery swallows validation errors and
+  falls back to an allow-all default, so rejecting the value would silently
+  discard the operator's entire policy file (#202). (#175)
+
+### Added
+- The truncation boundary at `max_tools_per_server` is now pinned by tests at
+  `limit - 1`, `limit` and `limit + 1`. Mutating the guard from `>=` to `>` —
+  which lets a server put one more tool in the catalog than the bound allows —
+  previously survived the whole of `tests/test_client_manager.py`. (#175)
+
 ## [2.6.0] - 2026-08-27
 
 ### Added

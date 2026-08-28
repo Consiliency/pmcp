@@ -29,6 +29,7 @@ from pmcp.client.manager import (
     _infer_risk_hint,
     _remote_headers,
     _required_identity,
+    _required_object,
     _terminate_process_tree,
     _truncate_description,
 )
@@ -6271,3 +6272,111 @@ class TestAdoptProcessRemovesStaleIndexesFirst:
         await self._adopt(manager, "srv", [{"name": "fresh", "inputSchema": {}}])
 
         assert set(manager._tools) == {"srv::fresh"}
+
+
+class TestMissingInputSchemaIsUnparseable:
+    """#175 item 4: a tool that declares no `inputSchema` is not indexed.
+
+    `tool.get("inputSchema", {})` manufactured a schema the server never sent,
+    and `{}` does not mean "we do not know" -- it means "any arguments at all
+    are valid", which is then published to every caller and every model reading
+    the catalog. MCP requires `inputSchema` on a tool, so a tool without one is
+    a tool we could not read, and #172 already settled what happens to those:
+    skip it and say so, rather than invent the missing value.
+
+    This is the only behaviour change in #175 and is called out as such in the
+    changelog: a downstream that omitted `inputSchema` used to be accepted with
+    a permissive schema and is now skipped.
+    """
+
+    def test_a_tool_without_an_input_schema_is_skipped_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = ClientManager()
+
+        with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+            indexed = manager._index_tools("srv", [{"name": "schemaless"}])
+
+        assert indexed == 0
+        assert manager._tools == {}
+        assert any(
+            "unparseable tool" in record.message and "schemaless" in record.message
+            for record in caplog.records
+        ), [record.message for record in caplog.records]
+
+    def test_a_tool_with_an_input_schema_is_indexed_unchanged(self) -> None:
+        """The other half: nothing about a well-formed tool moved."""
+        manager = ClientManager()
+        schema = {"type": "object", "properties": {"q": {"type": "string"}}}
+
+        indexed = manager._index_tools(
+            "srv", [{"name": "ok", "description": "d", "inputSchema": schema}]
+        )
+
+        tool = manager.get_tool("srv::ok")
+        assert indexed == 1
+        assert tool is not None
+        assert tool.input_schema == schema
+
+    def test_an_explicitly_empty_schema_is_still_an_answer(self) -> None:
+        """`{}` is the server saying "any arguments", which is a thing it is
+        entitled to say. Only the *absence* is unreadable -- rejecting `{}`
+        would drop tools that are behaving correctly."""
+        manager = ClientManager()
+
+        assert manager._index_tools("srv", [{"name": "any", "inputSchema": {}}]) == 1
+        assert set(manager._tools) == {"srv::any"}
+
+    @pytest.mark.parametrize(
+        "schema", [None, "not-a-dict", ["not", "a", "dict"], 3, True]
+    )
+    def test_a_non_object_schema_is_unparseable_too(self, schema: Any) -> None:
+        """`inputSchema: null` is distinct from absent and just as unusable;
+        so is any other non-object. Before this, `null` reached
+        `_schema_dialect` and only failed there by accident of a `.get` call."""
+        manager = ClientManager()
+
+        assert (
+            manager._index_tools("srv", [{"name": "bad", "inputSchema": schema}]) == 0
+        )
+        assert manager._tools == {}
+
+    def test_a_schemaless_tool_costs_only_itself(self) -> None:
+        """Per-entry, like every other parse failure: the tools either side of
+        it are still indexed."""
+        manager = ClientManager()
+
+        indexed = manager._index_tools(
+            "srv",
+            [
+                {"name": "before", "inputSchema": {}},
+                {"name": "schemaless"},
+                {"name": "after", "inputSchema": {}},
+            ],
+        )
+
+        assert indexed == 2
+        assert set(manager._tools) == {"srv::before", "srv::after"}
+
+    def test_required_object_rejects_every_non_object(self) -> None:
+        """The helper directly, so the rule is pinned independently of the
+        parser that calls it -- and so the next reader can see why it is not
+        `_required_identity`, which requires a non-empty *string* and would
+        reject every valid tool."""
+        assert _required_object({"inputSchema": {}}, "inputSchema") == {}
+        assert _required_object({"inputSchema": {"type": "object"}}, "inputSchema") == {
+            "type": "object"
+        }
+        for entry in (
+            {},
+            {"inputSchema": None},
+            {"inputSchema": ""},
+            {"inputSchema": "{}"},
+            {"inputSchema": []},
+            {"inputSchema": 0},
+        ):
+            with pytest.raises((TypeError, ValueError)):
+                _required_object(entry, "inputSchema")
+        for entry in ("a string", 3, None, ["a"]):
+            with pytest.raises(TypeError):
+                _required_object(entry, "inputSchema")
