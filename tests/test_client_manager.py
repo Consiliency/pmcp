@@ -35,6 +35,7 @@ from pmcp.client.manager import (
 from pmcp.env_store import write_env_file
 from pmcp.remote_auth import MissingRemoteHeaderAuthError
 from pmcp.types import (
+    LimitsPolicy,
     LocalMcpServerConfig,
     McpTaskInfo,
     McpTaskRecord,
@@ -5937,3 +5938,243 @@ class TestToolLimitIsEnforced:
         assert set(manager._tools) == {f"srv::t{i}" for i in range(self.LIMIT)}
         assert "srv::t5" not in manager._tools
         assert any("truncating" in record.message for record in caplog.records)
+
+
+class TestDuplicateIdentitiesAreNotDoubleCounted:
+    """#175 item 5: the count is of entries that landed, not entries offered.
+
+    `_index_resources`' docstring promised exactly this -- "the count returned
+    is what was actually indexed, not what was offered, so a caller reporting
+    it is not overstating the catalog" -- while the code returned
+    `len(entries)`. Two entries sharing an identity are two list items and one
+    catalog key, so the promise was false precisely when identities collide,
+    and a documented guarantee contradicted by the code is worse than an
+    undocumented gap.
+
+    Each kind is asserted against **its own** catalog: `_index_tools` against
+    `_tools`, `_index_resources` against `_resources`, `_index_prompts` against
+    `_prompts`. Comparing all three to `_tools` would prove nothing for the
+    other two.
+    """
+
+    def test_duplicate_tools_are_counted_once_and_the_last_one_wins(self) -> None:
+        manager = ClientManager()
+
+        indexed = manager._index_tools(
+            "srv",
+            [
+                {"name": "dup", "description": "first", "inputSchema": {}},
+                {"name": "dup", "description": "second", "inputSchema": {}},
+                {"name": "solo", "description": "only", "inputSchema": {}},
+            ],
+        )
+
+        assert set(manager._tools) == {"srv::dup", "srv::solo"}
+        assert indexed == len(manager._tools) == 2
+        assert manager._tools["srv::dup"].description == "second"
+
+    def test_duplicate_resources_are_counted_once(self) -> None:
+        manager = ClientManager()
+
+        indexed = manager._index_resources(
+            "srv",
+            [
+                {"uri": "mem://dup", "name": "first"},
+                {"uri": "mem://dup", "name": "second"},
+                {"uri": "mem://solo"},
+            ],
+        )
+
+        assert set(manager._resources) == {"srv::mem://dup", "srv::mem://solo"}
+        assert indexed == len(manager._resources) == 2
+        assert manager._resources["srv::mem://dup"].name == "second"
+
+    def test_duplicate_prompts_are_counted_once(self) -> None:
+        manager = ClientManager()
+
+        indexed = manager._index_prompts(
+            "srv",
+            [
+                {"name": "dup", "title": "first"},
+                {"name": "dup", "title": "second"},
+                {"name": "solo"},
+            ],
+        )
+
+        assert set(manager._prompts) == {"srv::dup", "srv::solo"}
+        assert indexed == len(manager._prompts) == 2
+        assert manager._prompts["srv::dup"].title == "second"
+
+    def test_a_listing_that_is_entirely_duplicates_counts_one(self) -> None:
+        """The edge the plan calls out. One key lands, so the count is one --
+        and it is emphatically not zero, which would route the listing into
+        `_reconcile_once`'s offered-but-none-parseable rule and preserve a
+        stale catalog on the strength of a duplicate."""
+        manager = ClientManager()
+
+        indexed = manager._index_tools(
+            "srv",
+            [
+                {"name": "same", "inputSchema": {}},
+                {"name": "same", "inputSchema": {}},
+                {"name": "same", "inputSchema": {}},
+            ],
+        )
+
+        assert indexed == len(manager._tools) == 1
+
+    def test_the_collision_is_logged_so_it_is_diagnosable(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The honest count makes last-write-wins visible; the log is what
+        makes it diagnosable. Logged at DEBUG, naming the colliding id."""
+        manager = ClientManager()
+
+        with caplog.at_level("DEBUG", logger="pmcp.client.manager"):
+            manager._index_tools(
+                "srv",
+                [
+                    {"name": "dup", "inputSchema": {}},
+                    {"name": "dup", "inputSchema": {}},
+                ],
+            )
+
+        assert any(
+            "srv::dup" in record.message and record.levelname == "DEBUG"
+            for record in caplog.records
+        )
+
+    def test_duplicates_publish_once_not_twice(self) -> None:
+        """The publish gate keys off the count, so it must not have moved: a
+        listing that indexed something still publishes exactly one note."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+
+        manager._index_tools(
+            "srv",
+            [
+                {"name": "dup", "inputSchema": {}},
+                {"name": "dup", "inputSchema": {}},
+            ],
+        )
+
+        assert (sink.tools, sink.resources, sink.prompts) == (1, 0, 0)
+
+
+class TestZeroLimitLogsAccurately:
+    """#175 item 3: `max_tools_per_server: 0` must not be reported as a
+    downstream that sent garbage.
+
+    A zero limit empties `_parse_tool_entries`' result before a single entry is
+    examined, so `_reconcile_once`'s offered-but-none-parseable branch fired
+    and announced "Every tools entry in the listing was unparseable" -- an
+    accusation aimed at the server for a decision this gateway's own policy
+    file made. The operator's next move is to fix the policy, and the log has
+    to point there.
+
+    Deliberately fixed in the *log* and not in the schema. `LimitsPolicy` gets
+    no `Field(ge=1)`: `PolicyManager._load_policy(..., fatal=False)` -- the
+    auto-discovery path -- swallows any validation exception and leaves the
+    default allow-all `GatewayPolicy` in place, so making `0` schema-invalid
+    would silently discard the operator's *entire* policy file, allow and deny
+    lists and redaction included. That fail-open is #202 and is not this
+    change's to fix; the test below pins that `0` still validates, so a future
+    tightening cannot land here unnoticed.
+    """
+
+    @staticmethod
+    def _managed(name: str) -> ManagedClient:
+        status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=MagicMock(), status=status)
+        managed.config.name = name
+        return managed
+
+    @staticmethod
+    def _wire(manager: ClientManager, tools: list[dict[str, Any]]) -> None:
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            kind = method.split("/")[0]
+            return {kind: list(tools) if kind == "tools" else []}
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+
+    def test_a_zero_limit_still_validates_on_the_policy_schema(self) -> None:
+        """Rejecting it is what triggers #202's fail-open, so it must not be
+        rejected."""
+        assert LimitsPolicy(max_tools_per_server=0).max_tools_per_server == 0
+
+    @pytest.mark.asyncio
+    async def test_zero_limit_names_the_limit_and_blames_no_one(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = ClientManager(max_tools_per_server=0)
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(manager, [{"name": "alpha", "inputSchema": {}}])
+
+        with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+
+            async def _wait() -> None:
+                while manager._reconcile_tasks:
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(_wait(), 5.0)
+
+        messages = [record.message for record in caplog.records]
+        assert any("max_tools_per_server is 0" in message for message in messages), (
+            f"no message named the zero limit: {messages}"
+        )
+        assert not any("unparseable" in message for message in messages), (
+            f"a zero limit was reported as a malformed listing: {messages}"
+        )
+
+    def test_a_positive_limit_still_reports_truncation_the_old_way(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The zero-limit wording is a special case, not a replacement: an
+        ordinary overrun must still say it truncated."""
+        manager = ClientManager(max_tools_per_server=1)
+
+        with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+            manager._index_tools(
+                "srv",
+                [
+                    {"name": "a", "inputSchema": {}},
+                    {"name": "b", "inputSchema": {}},
+                ],
+            )
+
+        assert any("truncating" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_unparseable_listing_still_says_unparseable(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The other half of the same guarantee: the accusation is still made
+        when it is true."""
+        manager = ClientManager(max_tools_per_server=100)
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(manager, [{"name": ""}, {"nope": True}])
+
+        with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+
+            async def _wait() -> None:
+                while manager._reconcile_tasks:
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(_wait(), 5.0)
+
+        messages = [record.message for record in caplog.records]
+        assert any("unparseable" in message for message in messages), messages

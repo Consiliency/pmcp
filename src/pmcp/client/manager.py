@@ -582,6 +582,44 @@ def _schema_dialect(*schemas: dict[str, Any] | None) -> str:
     return DEFAULT_SCHEMA_DIALECT
 
 
+_CatalogEntryT = TypeVar("_CatalogEntryT")
+
+
+def _apply_entries(
+    catalog: dict[str, _CatalogEntryT],
+    name: str,
+    kind: str,
+    entries: list[tuple[str, _CatalogEntryT]],
+) -> int:
+    """Write parsed entries into `catalog` and return how many actually landed.
+
+    `len(entries)` is the wrong number and `_index_resources` documents the
+    right one: "the count returned is what was actually indexed, not what was
+    offered, so a caller reporting it is not overstating the catalog." Two
+    entries that share an identity are two list items but one dict key -- the
+    second overwrites the first -- so the list length overstates the catalog by
+    exactly the collisions, and a promise contradicted by the code is worse
+    than no promise, because a reader trusts it. Counting distinct identities
+    makes the sentence true. (#175 item 5.)
+
+    The collision is logged rather than silently absorbed. Last-write-wins is
+    the downstream's bug, not ours, and the honest count makes it *visible* --
+    the log is what makes it *diagnosable*. DEBUG because a server can only
+    reach here by offering a duplicate, and the operator who cares is already
+    looking.
+    """
+    seen: set[str] = set()
+    for entry_id, entry in entries:
+        if entry_id in seen:
+            logger.debug(
+                f"[{name}] Duplicate {kind} id {entry_id!r} in one listing; "
+                "the later entry wins and the count reflects one entry, not two"
+            )
+        seen.add(entry_id)
+        catalog[entry_id] = entry
+    return len(seen)
+
+
 def _parse_tool_entries(
     name: str, tools: list[dict[str, Any]], limit: int
 ) -> list[tuple[str, ToolInfo]]:
@@ -606,7 +644,18 @@ def _parse_tool_entries(
     }
     for tool in tools:
         if len(entries) >= limit:
-            logger.warning(f"Server {name} has more than {limit} tools, truncating")
+            if limit < 1:
+                # "has more than 0 tools, truncating" is true and useless: it
+                # reads as a server that overran a bound, when what happened is
+                # that the bound admits nothing. Name the limit instead -- the
+                # operator's next move is to fix their policy file, and the log
+                # should point at it. (#175 item 3.)
+                logger.warning(
+                    f"Server {name} offered {len(tools)} tools but "
+                    f"max_tools_per_server is {limit}, so none were indexed"
+                )
+            else:
+                logger.warning(f"Server {name} has more than {limit} tools, truncating")
             break
 
         try:
@@ -1607,15 +1656,17 @@ class ClientManager:
         anything -- hand the result straight in, so each listing is parsed once
         and each unparseable entry is logged once. Callers with a raw listing
         omit it and this method parses for them.
+
+        The write and the count both live in `_apply_entries`: the count is of
+        entries that actually landed, so duplicate identities in one listing --
+        one catalog key, whatever the list length -- are counted once.
         """
         entries = (
             _parse_tool_entries(name, tools, self._max_tools_per_server)
             if parsed is None
             else parsed
         )
-        for tool_id, tool_info in entries:
-            self._tools[tool_id] = tool_info
-        indexed = len(entries)
+        indexed = _apply_entries(self._tools, name, "tool", entries)
         if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_tools_changed()
         return indexed
@@ -1632,12 +1683,11 @@ class ClientManager:
         Per-entry, for the reason spelled out on `_index_tools`, and `parsed`
         for the reason spelled out there too. The count returned is what was
         actually indexed, not what was offered, so a caller reporting it is not
-        overstating the catalog.
+        overstating the catalog -- a promise this docstring made before the
+        code kept it, and `_apply_entries` is where it is now kept.
         """
         entries = _parse_resource_entries(name, resources) if parsed is None else parsed
-        for resource_id, resource_info in entries:
-            self._resources[resource_id] = resource_info
-        indexed = len(entries)
+        indexed = _apply_entries(self._resources, name, "resource", entries)
         if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_resources_changed()
         return indexed
@@ -1652,12 +1702,11 @@ class ClientManager:
         """Index one server's prompts, skipping any entry we cannot parse.
 
         Per-entry, for the reason spelled out on `_index_tools`. The count
-        returned is what was actually indexed, not what was offered.
+        returned is what was actually indexed, not what was offered -- see
+        `_apply_entries`, which is where that is made true.
         """
         entries = _parse_prompt_entries(name, prompts) if parsed is None else parsed
-        for prompt_id, prompt_info in entries:
-            self._prompts[prompt_id] = prompt_info
-        indexed = len(entries)
+        indexed = _apply_entries(self._prompts, name, "prompt", entries)
         if indexed and not self._catalog_publishing_suppressed(name):
             self._catalog_events.note_prompts_changed()
         return indexed
@@ -2074,11 +2123,28 @@ class ClientManager:
                 usable[kind] = False
                 continue
             if offered and not parsed:
-                logger.warning(
-                    f"[{name}] Every {kind} entry in the listing was unparseable "
-                    f"({len(offered)} offered); keeping the previous {kind} "
-                    "rather than reporting them removed"
-                )
+                if kind == "tools" and self._max_tools_per_server < 1:
+                    # #175 item 3. A zero limit empties the parse result before
+                    # a single entry is looked at, so the generic message below
+                    # would accuse the downstream of sending garbage for a
+                    # decision this gateway's own policy made. Deliberately no
+                    # `Field(ge=1)` on the schema instead: `_load_policy(...,
+                    # fatal=False)` swallows validation errors and falls back to
+                    # the allow-all default, so rejecting the value would
+                    # silently discard the operator's entire policy file (#202).
+                    logger.warning(
+                        f"[{name}] max_tools_per_server is "
+                        f"{self._max_tools_per_server}, so none of the "
+                        f"{len(offered)} tools offered could be indexed; "
+                        "keeping the previous tools rather than reporting "
+                        "them removed"
+                    )
+                else:
+                    logger.warning(
+                        f"[{name}] Every {kind} entry in the listing was "
+                        f"unparseable ({len(offered)} offered); keeping the "
+                        f"previous {kind} rather than reporting them removed"
+                    )
                 usable[kind] = False
                 continue
             usable[kind] = True
