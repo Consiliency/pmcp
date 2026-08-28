@@ -3028,12 +3028,19 @@ class TestVerifyIsHostIndependent:
         """
         _write_tables(tmp_path, _NPM_SCHEMA)
         rc, err = _run_verify(
-            monkeypatch, tmp_path, _schema_with_local_address(_ENUMERATION_FAILED)
+            monkeypatch, tmp_path, _schema_with_local_address(_FIFTY_ADDRESSES)
         )
         assert rc == 0, err
         assert "HOST-ENUMERATED type -> normalised to value, still verified (1):" in err
         assert "  --local-address\n" in err
-        assert "51" not in err.split("nopt cross-check")[0].split("HOST-ENUMERATED")[1]
+
+        # Asserted on the FIFTY-address host on purpose: a count leak is only
+        # visible where the count is distinctive. `_ENUMERATION_FAILED` has one
+        # member, so "no 51 in the output" would hold there whatever the code
+        # did. The count that leaked would be 51 members, or 50 addresses.
+        section = err.split("HOST-ENUMERATED type")[1].split("\n\n")[0]
+        assert "51" not in section
+        assert "50" not in section
 
     def test_local_address_is_still_in_the_comparison(
         self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
