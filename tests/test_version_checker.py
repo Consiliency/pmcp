@@ -3073,3 +3073,72 @@ class TestVerifyIsHostIndependent:
         assert rc == 1
         assert "value: --local-address in table, absent from live npm" in err
         assert "boolean: --local-address in live npm, MISSING from table" in err
+
+    def test_the_recording_still_agrees_with_the_committed_tables(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fixture is an oracle, so something has to keep it honest.
+
+        Every test above mocks `read_schema()` with a recording of npm 11.19.0.
+        Nothing else in the suite notices if that recording goes stale -- so a
+        maintainer who regenerates the tables against a newer npm and forgets
+        to re-record would leave CI green forever against a frozen npm while
+        the real one had moved. This runs the REAL `--verify` path against the
+        REAL `src/pmcp/manifest/version_checker.py`, fed by the recording, and
+        goes red the moment the two stop describing the same npm.
+
+        What it deliberately does NOT do is make the tables version-proof.
+        Skew between the recorded npm and a live one is caught only by running
+        `--verify` against a live npm, and that redness is a real signal.
+        """
+        rc, err = _run_verify(monkeypatch, _REPO_ROOT, copy.deepcopy(_NPM_SCHEMA))
+        assert rc == 0, err
+        assert "match live npm" in err
+
+    def test_record_schema_reproduces_the_committed_fixture(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--record-schema` generates the oracle, so it is tested too.
+
+        Round-tripping the committed fixture back through the recorder pins
+        three things at once: the CLI flag dispatches, the writer's exact
+        serialisation (indent, key order, trailing newline), and that nobody
+        hand-edited the fixture into a shape `--record-schema` would not
+        produce -- which would make the oracle a fiction.
+        """
+        recorded = {k: v for k, v in _NPM_SCHEMA.items() if k != "_README"}
+        monkeypatch.setattr(dnf, "read_schema", lambda: copy.deepcopy(recorded))
+        monkeypatch.setattr(dnf, "npm_root", _no_npm)
+        dest = tmp_path / "nested" / "schema.json"
+        monkeypatch.setattr(
+            sys, "argv", ["derive_npm_flags.py", "--record-schema", str(dest)]
+        )
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            assert dnf.main() == 0
+
+        assert dest.read_text() == _SCHEMA_FIXTURE.read_text()
+
+    def test_recorded_probe_keys_carry_no_machine_address(self) -> None:
+        """A re-record on a laptop must not commit that laptop's LAN address.
+
+        The node script probes each definition with the first literal member of
+        its `type`, which for a host-enumerated flag is one of the recording
+        machine's own addresses. Masking the KEY keeps the fixture stable
+        across recording hosts; the probe RESULT is untouched, so the nopt
+        cross-check still reads real data.
+        """
+        info = _NPM_SCHEMA["definitions"]["local-address"]
+        assert dnf._MASKED_PROBE in info["probes"]
+        assert not any(dnf._is_ip_literal(probe) for probe in info["probes"])
+        # Fixed enumerations are not masked -- `loglevel` keeps its real
+        # `silent` probe, which is the member that reveals a conditional flag.
+        assert "silent" in _NPM_SCHEMA["definitions"]["loglevel"]["probes"]
+
+    def test_record_schema_without_a_path_is_refused(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(dnf, "npm_root", _no_npm)
+        monkeypatch.setattr(sys, "argv", ["derive_npm_flags.py", "--record-schema"])
+        with pytest.raises(SystemExit, match="needs a destination path"):
+            dnf.main()

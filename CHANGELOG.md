@@ -30,7 +30,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   blind the check to a real arity change on the flag most likely to drift, so
   `--verify` reports which flags it normalised instead — without printing the
   member count, which is the host fact. The committed tables are unchanged;
-  this fixes the comparison, not the data. (#193)
+  this fixes the comparison, not the data.
+
+  **Scope, so the next red `--verify` is not waved off as another false
+  positive:** this makes the *comparison logic* host-independent, not the
+  tables' *freshness*. Version skew — tables derived from one npm, checked
+  against a newer one — still turns `--verify` red, correctly and by design.
+  That is the signal the check exists to produce. What is gone is only the
+  redness that two machines running the *same* npm could disagree about. A CI
+  test now also holds the recorded schema fixture and the committed tables to
+  each other, so regenerating one without the other cannot pass silently.
+  (#193)
 
 ## [2.6.0] - 2026-08-27
 

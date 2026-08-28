@@ -136,6 +136,7 @@ Usage:
                                                   # freeze read_schema() output
 """
 
+import ipaddress
 import json
 import pathlib
 import subprocess
@@ -598,6 +599,10 @@ def emit(classes: dict[str, str], nullable: dict[str, bool]) -> str:
     )
 
 
+# Stands in for a recorded probe token that is one of the recording machine's
+# own addresses. Only the KEY is masked; the probe result it maps to is real.
+_MASKED_PROBE = "<host-address>"
+
 _FIXTURE_README = (
     "RECORDED OUTPUT of read_schema() in .consiliency/notes/derive_npm_flags.py, "
     "captured against a real npm on a maintainer machine. CI has no npm and no "
@@ -606,8 +611,39 @@ _FIXTURE_README = (
     "--record-schema tests/fixtures/npm/schema.json. Ignored by the generator, "
     "which reads only npm_version/definitions/shorthands/null_spellings. NOTE "
     "local-address's `type` here is this machine's address list reduced to "
-    "'<literal>' labels; its LENGTH is a host fact and the tests patch it."
+    "'<literal>' labels; its LENGTH is a host fact and the tests patch it. Its "
+    "recorded PROBE keys are masked to " + _MASKED_PROBE + " for the same reason: "
+    "the node script probes with the type's first literal member, which for a "
+    "host-enumerated flag is one of the recording machine's own addresses."
 )
+
+
+def _mask_host_addresses(schema: dict) -> dict:
+    """Replace a host-enumerated flag's address-valued PROBE key with a constant.
+
+    The node script probes each definition with the first literal member of its
+    `type`; for `local-address` that is whatever `os.networkInterfaces()` put
+    first, so a re-record on a laptop would commit that machine's LAN address
+    into the repo. The probe RESULT is what the nopt cross-check reads, and it
+    is preserved -- only the key's spelling is normalised, which also stops a
+    re-record from churning the fixture on every host.
+    """
+    for info in schema["definitions"].values():
+        if not _host_enumerated(info):
+            continue
+        info["probes"] = {
+            (_MASKED_PROBE if _is_ip_literal(probe) else probe): consumed
+            for probe, consumed in info["probes"].items()
+        }
+    return schema
+
+
+def _is_ip_literal(token: str) -> bool:
+    try:
+        ipaddress.ip_address(token.split("%", 1)[0])
+    except ValueError:
+        return False
+    return True
 
 
 def record_schema(dest: pathlib.Path) -> int:
@@ -616,8 +652,14 @@ def record_schema(dest: pathlib.Path) -> int:
     The tests this feeds are the ones that would otherwise only ever run on a
     maintainer's machine -- and a check that never runs in CI is the same
     ignored check that #193 is about.
+
+    What this recording CANNOT pin is npm's own version: it freezes npm 11.19.0
+    and the CI tests check the committed tables against that. Version skew --
+    tables recorded on one npm, a real npm that has since moved -- is still
+    caught only by running `--verify` against a live npm, which is the whole
+    point of that mode and is deliberately unchanged.
     """
-    payload = {"_README": _FIXTURE_README, **read_schema()}
+    payload = {"_README": _FIXTURE_README, **_mask_host_addresses(read_schema())}
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     print(f"recorded {dest} ({dest.stat().st_size} bytes)", file=sys.stderr)
@@ -626,9 +668,10 @@ def record_schema(dest: pathlib.Path) -> int:
 
 def main() -> int:
     if "--record-schema" in sys.argv:
-        return record_schema(
-            pathlib.Path(sys.argv[sys.argv.index("--record-schema") + 1])
-        )
+        argv_rest = sys.argv[sys.argv.index("--record-schema") + 1 :]
+        if not argv_rest:
+            raise SystemExit("--record-schema needs a destination path")
+        return record_schema(pathlib.Path(argv_rest[0]))
 
     schema = read_schema()
     classes, nullable, conditional, union, unreadable = build(schema)
