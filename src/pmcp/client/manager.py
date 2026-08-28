@@ -3227,6 +3227,15 @@ class ClientManager:
 
         logger.info(f"Adopting process for MCP server: {name}")
 
+        # #175 item 2. Every other path into the indexers clears this server's
+        # entries first -- `_connect_stdio` (:2126), `_reconcile_once` (:2094)
+        # and `_cleanup_client` (:3126). This one did not, so adopting a server
+        # that had been indexed under the same name left the previous listing's
+        # entries in the catalog beside the new one: tools the adopted process
+        # does not serve, still routable, until something else removed them.
+        # Uniform beats an exception documented in two places.
+        self._remove_server_indexes(name)
+
         # Initialize status
         status = ServerStatus(
             name=name,

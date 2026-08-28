@@ -6178,3 +6178,96 @@ class TestZeroLimitLogsAccurately:
 
         messages = [record.message for record in caplog.records]
         assert any("unparseable" in message for message in messages), messages
+
+
+class TestAdoptProcessRemovesStaleIndexesFirst:
+    """#175 item 2: `adopt_process` must clear the server's catalog entries
+    before it indexes, like every other path into the indexers.
+
+    `_connect_stdio`, `_reconcile_once` and `_cleanup_client` all remove this
+    server's entries first. `adopt_process` did not, so adopting a server that
+    had already been indexed under the same name left the previous listing's
+    tools in the catalog alongside the new ones -- entries the adopted process
+    does not serve, still routable, until something unrelated removed them.
+
+    Asserted on catalog *contents*, not on whether `_remove_server_indexes` was
+    called: a test that only checks the call passes just as happily if the
+    removal runs after the index.
+    """
+
+    @staticmethod
+    def _process() -> Any:
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.stdout = MagicMock()
+        process.stderr = None
+        return process
+
+    @staticmethod
+    def _config(name: str) -> Any:
+        config = MagicMock()
+        config.name = name
+        return config
+
+    async def _adopt(
+        self, manager: ClientManager, name: str, tools: list[dict[str, Any]]
+    ) -> None:
+        async def fake_listings(managed: ManagedClient) -> dict[str, Any]:
+            return {"tools": list(tools), "resources": [], "prompts": []}
+
+        with (
+            patch.object(manager, "_read_stdout", new=AsyncMock(return_value=None)),
+            patch.object(manager, "_read_stderr", new=AsyncMock(return_value=None)),
+            patch.object(manager, "_send_initialize", new=AsyncMock(return_value=None)),
+            patch.object(manager, "_fetch_server_listings", new=fake_listings),
+        ):
+            await manager.adopt_process(name, self._process(), self._config(name))
+
+    @pytest.mark.asyncio
+    async def test_a_prior_listings_tools_do_not_survive_the_adopt(self) -> None:
+        manager = ClientManager()
+        manager._index_tools("srv", [{"name": "stale", "inputSchema": {}}])
+        assert set(manager._tools) == {"srv::stale"}
+
+        await self._adopt(manager, "srv", [{"name": "fresh", "inputSchema": {}}])
+
+        assert set(manager._tools) == {"srv::fresh"}, (
+            "adopt_process indexed on top of the previous catalog"
+        )
+        assert manager._servers["srv"].tool_count == 1
+
+    @pytest.mark.asyncio
+    async def test_resources_and_prompts_are_cleared_too(self) -> None:
+        """The removal is per server, not per kind -- an adopt that replaced
+        only the tools would leave a stale resource just as routable."""
+        manager = ClientManager()
+        manager._index_resources("srv", [{"uri": "mem://stale"}])
+        manager._index_prompts("srv", [{"name": "stale"}])
+
+        await self._adopt(manager, "srv", [{"name": "fresh", "inputSchema": {}}])
+
+        assert manager._resources == {}
+        assert manager._prompts == {}
+
+    @pytest.mark.asyncio
+    async def test_another_servers_entries_are_untouched(self) -> None:
+        """`_remove_server_indexes` is per-server-name, and the adopt must not
+        widen that: clearing the catalog wholesale would be a much worse bug
+        than the one being fixed."""
+        manager = ClientManager()
+        manager._index_tools("other", [{"name": "keep", "inputSchema": {}}])
+
+        await self._adopt(manager, "srv", [{"name": "fresh", "inputSchema": {}}])
+
+        assert set(manager._tools) == {"other::keep", "srv::fresh"}
+
+    @pytest.mark.asyncio
+    async def test_adopting_a_name_with_no_prior_index_is_unchanged(self) -> None:
+        """The edge the plan calls out: removing nothing must not be an error
+        and must not stop the fresh listing being indexed."""
+        manager = ClientManager()
+
+        await self._adopt(manager, "srv", [{"name": "fresh", "inputSchema": {}}])
+
+        assert set(manager._tools) == {"srv::fresh"}
