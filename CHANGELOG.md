@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`derive_npm_flags.py --verify` no longer reports host-enumerated npm config
+  types as table drift.** The npm flag tables are the node-less fallback for
+  npm package identity, and `--verify` is what keeps them honest against a real
+  npm — but it was green on one machine and red on another with identical npm
+  and identical source. npm builds `local-address`'s declared `type` from
+  `os.networkInterfaces()`, so its 51 members here are facts about *this*
+  machine; and when `networkInterfaces()` throws, npm's `getLocalAddresses()`
+  catches it and returns exactly `[null]`, which the member rule stripped to
+  nothing and reported as `value: --local-address in table, absent from live
+  npm`. A drift check with false positives gets ignored, and an ignored check
+  is how real drift ships.
+
+  Detection now happens in the node script, the only place the raw members
+  still exist — the serializer maps every string member to `'<literal>'`, so no
+  Python-side predicate could tell 51 addresses from `loglevel`'s 8 fixed
+  words. It uses npm's own `typeDescription === 'IP Address'` label (the one
+  signal that survives the `[null]` case) with a `net.isIP` member scan as an
+  independent backstop, and `classify()` then returns `value` regardless of the
+  members. The flag is **not** exempted from the comparison: skipping it would
+  blind the check to a real arity change on the flag most likely to drift, so
+  `--verify` reports which flags it normalised instead — without printing the
+  member count, which is the host fact. The committed tables are unchanged;
+  this fixes the comparison, not the data. (#193)
+
 ## [2.6.0] - 2026-08-27
 
 ### Added
