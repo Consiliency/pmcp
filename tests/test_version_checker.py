@@ -4,6 +4,14 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
+import copy
+import importlib.util
+import io
+import json
+import pathlib
+import sys
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -2821,3 +2829,240 @@ class TestOnlyNullableBooleansConsumeNull:
                 "-y",
             }
         )
+
+
+# ---------------------------------------------------------------------------
+# `.consiliency/notes/derive_npm_flags.py --verify` must not depend on the host
+# ---------------------------------------------------------------------------
+
+_TESTS_DIR = pathlib.Path(__file__).resolve().parent
+_REPO_ROOT = _TESTS_DIR.parent
+_GENERATOR = _REPO_ROOT / ".consiliency" / "notes" / "derive_npm_flags.py"
+
+# A RECORDED `read_schema()` from a real npm 11.19.0. CI has neither npm nor
+# node, so a test that shelled out would never run there -- and #193 is a bug
+# in a check that only ever ran on one maintainer's machine. Refresh with
+# `derive_npm_flags.py --record-schema tests/fixtures/npm/schema.json`.
+_SCHEMA_FIXTURE = _TESTS_DIR / "fixtures" / "npm" / "schema.json"
+
+
+def _load_generator() -> Any:
+    """Import the generator by path -- it is a maintainer script, not a module.
+
+    Same `spec_from_file_location` shape as tests/test_workflow_guards.py uses
+    for scripts/check_workflows.py.
+    """
+    spec = importlib.util.spec_from_file_location("derive_npm_flags", _GENERATOR)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+dnf = _load_generator()
+_NPM_SCHEMA = json.loads(_SCHEMA_FIXTURE.read_text())
+
+# The three shapes `local-address`'s declared type takes across machines. Every
+# string member is already `'<literal>'` by the time Python sees it -- the node
+# serializer maps it -- so the ONLY thing that varies host to host is how many
+# there are, and whether there are any at all.
+#
+# `["null"]` is not a synthetic edge case: npm's `getLocalAddresses()` catches a
+# `networkInterfaces()` throw and returns exactly `[null]`, and that host is the
+# one that filed #193. The member rule strips `null` and calls the remainder
+# UNINTERPRETABLE, which is the false drift report.
+_ENUMERATION_FAILED = ["null"]
+_ONE_ADDRESS = ["null", "<literal>"]
+_FIFTY_ADDRESSES = ["null"] + ["<literal>"] * 50
+
+
+def _no_npm() -> str:
+    """Tripwire: these tests must never reach a real npm."""
+    raise AssertionError(
+        "shelled out to npm -- this test would then be maintainer-only and "
+        "would never run in CI, which is the failure mode #193 is about"
+    )
+
+
+def _schema_with_local_address(type_labels: list[str]) -> dict:
+    """The recorded schema, with only the host-varying member list replaced."""
+    schema = copy.deepcopy(_NPM_SCHEMA)
+    schema["definitions"]["local-address"]["type"] = list(type_labels)
+    return schema
+
+
+def _write_tables(repo: pathlib.Path, schema: dict) -> pathlib.Path:
+    """Generate the four tables from `schema` into a stand-in version_checker."""
+    classes, nullable, *_ = dnf.build(schema)
+    source = repo / "src" / "pmcp" / "manifest" / "version_checker.py"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(dnf.emit(classes, nullable))
+    return source
+
+
+def _run_verify(
+    monkeypatch: pytest.MonkeyPatch, repo: pathlib.Path, schema: dict
+) -> tuple[int, str]:
+    """Run `main() --verify` against `schema` and the tables under `repo`."""
+    monkeypatch.setattr(dnf, "REPO", repo)
+    monkeypatch.setattr(dnf, "read_schema", lambda: schema)
+    monkeypatch.setattr(dnf, "npm_root", _no_npm)
+    monkeypatch.setattr(sys, "argv", ["derive_npm_flags.py", "--verify"])
+    err = io.StringIO()
+    with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+        rc = dnf.main()
+    return rc, err.getvalue()
+
+
+class TestVerifyIsHostIndependent:
+    """#193: `--verify` was green on one machine and red on another.
+
+    npm builds `local-address`'s declared `type` from `os.networkInterfaces()`,
+    so its members are facts about the machine. Its CLASS is not: it consumes
+    the next token everywhere. A drift check with false positives gets ignored,
+    and an ignored check is how real drift ships.
+    """
+
+    @pytest.mark.parametrize(
+        "type_labels",
+        [_ENUMERATION_FAILED, _ONE_ADDRESS, _FIFTY_ADDRESSES],
+        ids=["enumeration-failed", "one-address", "fifty-addresses"],
+    )
+    def test_host_enumerated_is_value_whatever_the_host_reports(
+        self, type_labels: list[str]
+    ) -> None:
+        """VALUE for all three -- not merely equal to each other.
+
+        Comparing two non-empty address lists would pass against the unfixed
+        code, which already classifies those two identically. The bare `["null"]`
+        is the case that fails, and it is asserted here by name.
+        """
+        assert dnf.classify(type_labels, host_enumerated=True) == dnf.VALUE
+
+    def test_the_bug_is_the_enumeration_failing_not_a_different_address_set(
+        self,
+    ) -> None:
+        """Pins WHY a member-inspecting fix cannot work.
+
+        On the host that filed #193 there is no address to find: the member
+        rule sees `["null"]`, strips it, and reports UNINTERPRETABLE -- which
+        is the drift line that was reported. Two non-empty address lists, by
+        contrast, already agreed before this fix.
+        """
+        assert dnf.classify(_ENUMERATION_FAILED) == dnf.UNINTERPRETABLE
+        assert dnf.classify(_ONE_ADDRESS) == dnf.VALUE
+        assert dnf.classify(_FIFTY_ADDRESSES) == dnf.VALUE
+
+    def test_recorded_npm_marks_only_local_address_as_host_enumerated(self) -> None:
+        info = _NPM_SCHEMA["definitions"]["local-address"]
+        assert info["typeDescription"] == "IP Address"
+        assert info["hostEnumerated"] is True
+        assert dnf.host_enumerated_flags(_NPM_SCHEMA) == ["local-address"]
+
+    @pytest.mark.parametrize(
+        "name,type_description",
+        [
+            (
+                "audit-level",
+                'null, "info", "low", "moderate", "high", "critical", or "none"',
+            ),
+            (
+                "loglevel",
+                '"silent", "error", "warn", "notice", "http", "info", '
+                '"verbose", or "silly"',
+            ),
+            ("lockfile-version", 'null, 1, 2, 3, "1", "2", or "3"'),
+        ],
+    )
+    def test_fixed_enumerations_are_not_host_enumerated(
+        self, name: str, type_description: str
+    ) -> None:
+        """ "Many members" is not the signal; "members that are host facts" is.
+
+        These three are the only other definitions with more than six type
+        members, and they are byte-identical on every host. Asserted against
+        npm's REAL `typeDescription` strings, recorded in the fixture, so this
+        cannot drift into agreeing with a hand-written guess.
+        """
+        info = _NPM_SCHEMA["definitions"][name]
+        assert info["typeDescription"] == type_description
+        assert info["hostEnumerated"] is False
+        assert len(info["type"]) >= 7
+
+    def test_verify_is_byte_identical_across_host_address_counts(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The headline criterion: three hosts, one answer.
+
+        The committed tables are generated ONCE, from the unpatched recording,
+        and the same path is reused for all three runs -- `main()` prints the
+        source path, so a per-run tmpdir would defeat the comparison for the
+        wrong reason.
+        """
+        tables = _write_tables(tmp_path, _NPM_SCHEMA)
+        expected_tables = tables.read_text()
+
+        outputs: list[str] = []
+        for type_labels in (_ENUMERATION_FAILED, _ONE_ADDRESS, _FIFTY_ADDRESSES):
+            schema = _schema_with_local_address(type_labels)
+            rc, err = _run_verify(monkeypatch, tmp_path, schema)
+            assert rc == 0, err
+            outputs.append(err)
+
+            # Not just the report -- the emitted tables themselves must not
+            # move, or "no drift" would be true only of what we chose to print.
+            classes, nullable, *_ = dnf.build(schema)
+            assert dnf.emit(classes, nullable) == expected_tables
+
+        assert outputs[1] == outputs[0]
+        assert outputs[2] == outputs[0]
+
+    def test_verify_names_the_flag_it_normalised(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The exemption-shaped behaviour is reported, not hidden.
+
+        And the note carries no member COUNT: that is the host fact, and
+        printing it would put the #193 divergence straight back into the
+        output it is meant to have removed.
+        """
+        _write_tables(tmp_path, _NPM_SCHEMA)
+        rc, err = _run_verify(
+            monkeypatch, tmp_path, _schema_with_local_address(_ENUMERATION_FAILED)
+        )
+        assert rc == 0, err
+        assert "HOST-ENUMERATED type -> normalised to value, still verified (1):" in err
+        assert "  --local-address\n" in err
+        assert "51" not in err.split("nopt cross-check")[0].split("HOST-ENUMERATED")[1]
+
+    def test_local_address_is_still_in_the_comparison(
+        self, tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Normalising the class must not become exempting the flag.
+
+        An exemption would pass every test above -- no false positive can come
+        from a flag that is never compared -- while blinding the tool to a real
+        arity change on the flag most likely to drift. So: keep the recording
+        exactly as npm reported it, corrupt the LIVE classification of whatever
+        is host-enumerated to BOOLEAN, and require `--verify` to notice.
+
+        Patching the classification rather than the schema is what makes this
+        discriminating: a skip list keyed on `hostEnumerated` would still be
+        skipping this flag here, and would stay green.
+        """
+        _write_tables(tmp_path, _NPM_SCHEMA)
+        real_classify = dnf.classify
+
+        def misclassify(
+            type_labels: list[str], *, host_enumerated: bool = False
+        ) -> str:
+            if host_enumerated:
+                return dnf.BOOLEAN
+            return real_classify(type_labels, host_enumerated=False)
+
+        monkeypatch.setattr(dnf, "classify", misclassify)
+        rc, err = _run_verify(monkeypatch, tmp_path, copy.deepcopy(_NPM_SCHEMA))
+
+        assert rc == 1
+        assert "value: --local-address in table, absent from live npm" in err
+        assert "boolean: --local-address in live npm, MISSING from table" in err
