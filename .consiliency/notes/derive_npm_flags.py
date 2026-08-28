@@ -124,11 +124,16 @@ probe alone would not have caught a spelling omission.
 
 Deliberately NOT a pytest: npm's schema is version-specific and CI has no npm.
 Behaviour is pinned by the pure unit tests in tests/test_version_checker.py;
-this script is what keeps those pins honest against a real npm.
+this script is what keeps those pins honest against a real npm. Its own
+classification logic IS pytested there, against a RECORDED `read_schema()`
+(`--record-schema`, frozen in tests/fixtures/npm/schema.json) rather than a
+live one -- a maintainer-only check is an unrun check.
 
 Usage:
     python3 .consiliency/notes/derive_npm_flags.py            # emit the tables
     python3 .consiliency/notes/derive_npm_flags.py --verify   # check committed
+    python3 .consiliency/notes/derive_npm_flags.py --record-schema PATH
+                                                  # freeze read_schema() output
 """
 
 import json
@@ -593,7 +598,38 @@ def emit(classes: dict[str, str], nullable: dict[str, bool]) -> str:
     )
 
 
+_FIXTURE_README = (
+    "RECORDED OUTPUT of read_schema() in .consiliency/notes/derive_npm_flags.py, "
+    "captured against a real npm on a maintainer machine. CI has no npm and no "
+    "node, so tests that would otherwise be maintainer-only mock read_schema() "
+    "with this. Regenerate with: python3 .consiliency/notes/derive_npm_flags.py "
+    "--record-schema tests/fixtures/npm/schema.json. Ignored by the generator, "
+    "which reads only npm_version/definitions/shorthands/null_spellings. NOTE "
+    "local-address's `type` here is this machine's address list reduced to "
+    "'<literal>' labels; its LENGTH is a host fact and the tests patch it."
+)
+
+
+def record_schema(dest: pathlib.Path) -> int:
+    """Freeze `read_schema()` to JSON so the CI tests can run without npm.
+
+    The tests this feeds are the ones that would otherwise only ever run on a
+    maintainer's machine -- and a check that never runs in CI is the same
+    ignored check that #193 is about.
+    """
+    payload = {"_README": _FIXTURE_README, **read_schema()}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    print(f"recorded {dest} ({dest.stat().st_size} bytes)", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
+    if "--record-schema" in sys.argv:
+        return record_schema(
+            pathlib.Path(sys.argv[sys.argv.index("--record-schema") + 1])
+        )
+
     schema = read_schema()
     classes, nullable, conditional, union, unreadable = build(schema)
     live_nullable = nullable_table(classes, nullable)
