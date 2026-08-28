@@ -5878,3 +5878,62 @@ class TestUnreadableListingIsNotAnEmptyOne:
         for entry in ("a string", 3, None, ["a"]):
             with pytest.raises(TypeError):
                 _required_identity(entry, "name")
+
+
+class TestToolLimitIsEnforced:
+    """#175 item 1: the truncation boundary itself, pinned.
+
+    Nothing in this file asserted how many tools land when a server offers more
+    than `max_tools_per_server`, and it showed: mutating the guard
+    `len(entries) >= limit` to `> limit` was the sole survivor of nine mutants
+    run against this file. That off-by-one lets a server put `limit + 1` tools
+    in the catalog -- the guard is a resource bound, so one more than the bound
+    every time is exactly the kind of drift a bound exists to stop.
+
+    The assertions are therefore *exact* counts at `limit - 1`, `limit` and
+    `limit + 1`. "Fewer than offered" would pass under the mutant at
+    `limit + 1`, which is the only case that distinguishes `>=` from `>`.
+    """
+
+    LIMIT = 5
+
+    @staticmethod
+    def _listing(count: int) -> list[dict[str, Any]]:
+        """`inputSchema` on every entry: #175 item 4 makes a tool without one
+        unparseable, and a fixture that omitted it would report zero indexed
+        here for a reason that has nothing to do with the limit."""
+        return [
+            {
+                "name": f"t{i}",
+                "description": f"tool {i}",
+                "inputSchema": {"type": "object"},
+            }
+            for i in range(count)
+        ]
+
+    @pytest.mark.parametrize("offered", [LIMIT - 1, LIMIT, LIMIT + 1])
+    def test_no_more_than_the_limit_is_ever_indexed(self, offered: int) -> None:
+        manager = ClientManager(max_tools_per_server=self.LIMIT)
+
+        indexed = manager._index_tools("srv", self._listing(offered))
+
+        expected = min(offered, self.LIMIT)
+        assert indexed == expected
+        assert len(manager._tools) == expected
+        assert set(manager._tools) == {f"srv::t{i}" for i in range(expected)}
+
+    def test_truncation_keeps_the_first_entries_and_says_so(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The entries kept are the leading ones, and the drop is not silent --
+        a bound that discards tools without a word is indistinguishable from a
+        downstream that never offered them."""
+        manager = ClientManager(max_tools_per_server=self.LIMIT)
+
+        with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+            indexed = manager._index_tools("srv", self._listing(self.LIMIT + 3))
+
+        assert indexed == self.LIMIT
+        assert set(manager._tools) == {f"srv::t{i}" for i in range(self.LIMIT)}
+        assert "srv::t5" not in manager._tools
+        assert any("truncating" in record.message for record in caplog.records)
