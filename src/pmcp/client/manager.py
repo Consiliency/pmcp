@@ -3271,12 +3271,23 @@ class ClientManager:
         logger.info(f"Adopting process for MCP server: {name}")
 
         # #175 item 2. Every other path into the indexers clears this server's
-        # entries first -- `_connect_stdio` (:2126), `_reconcile_once` (:2094)
-        # and `_cleanup_client` (:3126). This one did not, so adopting a server
-        # that had been indexed under the same name left the previous listing's
-        # entries in the catalog beside the new one: tools the adopted process
-        # does not serve, still routable, until something else removed them.
-        # Uniform beats an exception documented in two places.
+        # entries first. The two this one is modelled on are the connect and
+        # cleanup paths -- `_connect_stdio`, `_connect_remote_stream` and
+        # `_cleanup_client` -- which remove unconditionally, up front, exactly
+        # as here. `_reconcile_once` also removes before it indexes, but it is
+        # not the precedent for this line and should not be read as one: it
+        # fetches first and removes inside a synchronous apply block, per kind,
+        # only for the kinds whose re-listing actually succeeded. That is a
+        # different rule for a different situation (a live server whose prior
+        # catalog must survive a failed listing), and copying it here would be
+        # wrong.
+        #
+        # Without this, adopting a server that had been indexed under the same
+        # name left the previous listing's entries in the catalog beside the
+        # new one: tools the adopted process does not serve, still routable,
+        # until something else removed them. Uniform beats an exception
+        # documented in two places. Deliberately no line numbers -- the ones
+        # this comment first carried were stale within a single change.
         self._remove_server_indexes(name)
 
         # Initialize status

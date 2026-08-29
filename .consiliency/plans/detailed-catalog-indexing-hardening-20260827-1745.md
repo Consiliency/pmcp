@@ -141,7 +141,13 @@ uv run pytest -q tests/test_client_manager.py
 #   flip `>= limit` to `> limit` in the truncation, run the new test, expect RED,
 #   restore, expect GREEN. Record both exit codes.
 uv run pytest -q
-uv run ruff check . && uv run ruff format --check . && uv run mypy src/
+uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv run mypy src/
+# Scoped to `src/ tests/`, matching CI's `lint` job. The repo-wide form was
+# over-broad: `ruff format --check .` is red on
+# `diagnostics/issue-79-1b/repro_client.py` and `slow_server.py`, which are
+# known pre-existing debt untouched by this change. Reformatting them from a
+# catalog-indexing PR would be scope creep and would muddy the diff, so the
+# check is scoped rather than the files rewritten.
 # (Rev 1 listed a 98-server manifest check here. That is npm identity
 # resolution, unrelated to catalog indexing, and is not coverage for dropped
 # tools — removed rather than left as false reassurance.)
