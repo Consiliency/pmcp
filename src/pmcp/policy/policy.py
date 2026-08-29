@@ -77,7 +77,26 @@ class PolicyManager:
         self._compile_redaction_patterns()
 
     def _load_policy(self, policy_path: Path, *, fatal: bool) -> None:
-        """Load policy from file."""
+        """Load policy from file.
+
+        Reading/parsing and validating are separate steps because an
+        auto-discovered policy treats them differently (Consiliency/pmcp#202):
+
+        * a file that cannot be read, or that the parser *rejects*, could be
+          anything -- a half-written file, an unrelated ``.json`` dropped at the
+          repo root, a merge conflict. That warns and continues, which is the
+          long-standing deliberate behaviour.
+        * a file that parses without raising but is not a valid policy is
+          unmistakably *a policy with a mistake in it*. Falling back to
+          ``GatewayPolicy()`` there is indefensible -- that default is allow-all,
+          so a restrictive policy on disk would stop applying. That refuses to
+          start.
+
+        Note that "parses without raising" includes a list root, a scalar root
+        and an empty YAML file: ``yaml.safe_load`` returns ``list``, ``str`` and
+        ``None`` for those without raising. They are schema-invalid, not
+        unparseable, so they are fatal.
+        """
         try:
             content = policy_path.read_text()
 
@@ -85,17 +104,35 @@ class PolicyManager:
                 data = yaml.safe_load(content)
             else:
                 data = json.loads(content)
-
-            if not isinstance(data, dict):
-                raise ValueError("policy root must be an object")
-            self._policy = GatewayPolicy.model_validate(data)
-            logger.info(f"Loaded policy from {policy_path}")
         except Exception as e:
             if fatal:
                 raise ValueError(
                     f"Failed to load explicit policy {policy_path}: {e}"
                 ) from e
-            logger.warning(f"Failed to load policy from {policy_path}: {e}")
+            logger.warning(
+                f"Could not parse policy file {policy_path}: {e}. "
+                "No policy is in effect: the gateway is running unrestricted."
+            )
+            return
+
+        try:
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"policy root must be an object, got {type(data).__name__}"
+                )
+            policy = GatewayPolicy.model_validate(data)
+        except Exception as e:
+            if fatal:
+                raise ValueError(
+                    f"Failed to load explicit policy {policy_path}: {e}"
+                ) from e
+            raise ValueError(
+                f"Invalid policy file {policy_path}: {e}. "
+                "Refusing to start rather than fall back to an unrestricted gateway."
+            ) from e
+
+        self._policy = policy
+        logger.info(f"Loaded policy from {policy_path}")
 
     def _compile_redaction_patterns(self) -> None:
         """Compile redaction regex patterns."""
