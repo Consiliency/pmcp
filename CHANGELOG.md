@@ -14,6 +14,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously survived the whole of `tests/test_client_manager.py`. (#175)
 
 ### Changed
+- **A policy file found by auto-discovery that parses but is not a valid policy
+  now terminates startup instead of being discarded.** This can stop a gateway
+  that starts today, and that is the point: the discarded policy was replaced by
+  the default `GatewayPolicy()`, and that default is **allow-all** — every field
+  is a `default_factory`, so a policy with one mistake in it did not degrade to a
+  partial policy, it degraded to no policy. Allow/deny lists, limits and
+  redaction all silently reverted to permissive behind a single warning line that
+  did not say so. The condition is exact: the file exists, `yaml.safe_load` /
+  `json.loads` returned **without raising**, and the result is not a valid
+  `GatewayPolicy` — which includes a list root, a scalar root and an empty YAML
+  file, all of which parse cleanly and fail only the object schema. A file the
+  parser *rejects*, or one that cannot be read at all, still warns and continues
+  as before: it could be a half-written file, an unrelated `.json` at the repo
+  root, or a merge conflict, and that fallback is deliberate. The surviving
+  warning now states plainly that no policy is in effect. Explicit `--policy` /
+  `PMCP_POLICY` is unchanged — it was already fatal for every mode. (#202)
+- **The default policy search paths now follow the working directory.** The two
+  project-local entries in `DEFAULT_POLICY_PATHS` were joined with `Path.cwd()`
+  at module import, freezing the directory as of first import; a gateway that
+  changed directory before constructing its `PolicyManager` looked for a policy
+  somewhere else, found none, and ran unrestricted — by that road with no warning
+  at all, since "no policy file" is legitimately silent. They are resolved at
+  construction now. The module attribute remains patchable for tests, and
+  absolute entries pass through unchanged. (#202)
 - **A downstream tool that declares no `inputSchema` is now skipped instead of
   indexed.** This is a behaviour change, and the only one in this set. The
   indexer used to substitute `{}` for a missing `inputSchema` — and `{}` is not

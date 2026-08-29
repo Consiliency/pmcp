@@ -1336,8 +1336,17 @@ redaction:
 
 An explicitly requested policy (`--policy` or `PMCP_POLICY`) is a fail-closed
 boundary: a missing, unreadable, malformed, or schema-invalid file terminates
-startup. Best-effort fallback applies only to automatically discovered default
-locations when the operator did not request a policy.
+startup.
+
+An automatically discovered policy at a default location is fail-closed too,
+with one deliberate exception. A discovered file that **parses but is not a valid
+policy** — including a list root, a scalar root, or an empty file, all of which
+parse cleanly and fail only the schema — terminates startup exactly like an
+explicit one, because falling back would replace it with the default allow-all
+policy and silently unrestrict the gateway. Best-effort fallback now covers only
+a file that cannot be read or cannot be parsed at all, which could be anything
+rather than a policy; that case warns, says that no policy is in effect, and
+continues.
 
 #### Scoped advisor research
 
