@@ -143,8 +143,8 @@ one. Rev 1 said "modify only if it documents auto-discovery" — it does.
   today can refuse to start after this. Name the exact condition (an
   auto-discovered file that parses but fails validation) and say that an
   unparseable file still warns and continues.
-- `README.md` — modify **only if** it documents policy auto-discovery; check
-  before editing.
+- `README.md` — modify — see the dedicated section above. It **does** document
+  the best-effort fallback (~:1337-1340) and that sentence becomes false.
 
 ## Dependencies & order
 
@@ -166,11 +166,14 @@ uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/ && uv ru
 #   `git archive` export of main, expect RED, then against this branch, GREEN.
 ```
 
-Edge cases: a default path that exists but is unreadable (permissions); a YAML
-file whose root is a list; an empty file (`yaml.safe_load` → `None`); a file
-whose suffix is `.json` but whose content is YAML; two default paths where the
-first is invalid and the second is valid — the loop `break`s at the first
-*existing* path, so the second is never reached, and that should stay true.
+Edge cases: a default path that exists but is unreadable (permissions — a
+`read_text` raise, so warn-path); a file whose suffix is `.json` but whose
+content is YAML; two default paths where the first is invalid and the second is
+valid — the loop `break`s at the first *existing* path, so the second is never
+reached, and **that stays true**: an invalid file at the higher-priority path
+must fail closed rather than silently falling through to a lower-priority
+policy. (List roots, scalar roots and empty files are no longer edge cases here —
+they are first-class fatal cases with their own acceptance criterion.)
 
 ## Acceptance criteria
 
