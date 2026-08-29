@@ -1336,8 +1336,24 @@ redaction:
 
 An explicitly requested policy (`--policy` or `PMCP_POLICY`) is a fail-closed
 boundary: a missing, unreadable, malformed, or schema-invalid file terminates
-startup. Best-effort fallback applies only to automatically discovered default
-locations when the operator did not request a policy.
+startup.
+
+An automatically discovered policy at a default location is fail-closed too,
+with one deliberate exception. A discovered file that **parses but is not a valid
+policy** terminates startup exactly like an explicit one, because falling back
+would replace it with the default allow-all policy and silently unrestrict the
+gateway. Best-effort fallback now covers only a file that cannot be read, or that
+the parser **rejects outright** — which could be anything rather than a policy;
+that case warns, says that no policy is in effect, and continues.
+
+The line between the two is drawn by the parser, not by the file's shape, so it
+falls in different places for the two formats. In a `.yaml` file a list root, a
+scalar root and an **empty file** all load cleanly — `yaml.safe_load` returns a
+`list`, a `str` and `None` — and so all three are fatal. In a `.json` file, a
+document whose root is valid JSON but not an object (`[]`, `42`, `null`) is
+likewise fatal, but an **empty `.json` file is not valid JSON at all**, so it
+takes the warn-and-continue path. If you are testing this behaviour, use an empty
+`.yaml` file to see the refusal.
 
 #### Scoped advisor research
 

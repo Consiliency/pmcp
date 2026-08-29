@@ -84,9 +84,17 @@ def _make_ctx() -> ServerRequestContext[Any, Any]:
     )
 
 
-def test_explicit_policy_failures_are_fatal_but_default_discovery_is_best_effort(
+def test_explicit_policy_failures_are_fatal_but_an_unparseable_default_is_not(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Best-effort discovery survives, but only for a file the parser *rejects*.
+
+    Renamed from ``..._but_default_discovery_is_best_effort``: since
+    Consiliency/pmcp#202 an auto-discovered file that *parses* but is not a valid
+    policy terminates startup, so the old name asserted something broader than
+    the code does. The unparseable case below is unchanged and still pins the
+    deliberate fallback; ``tests/test_policy_fail_open.py`` covers the other side.
+    """
     missing = tmp_path / "missing.json"
     with pytest.raises(ValueError, match="explicit policy"):
         PolicyManager(missing)
