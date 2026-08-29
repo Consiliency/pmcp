@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The truncation boundary at `max_tools_per_server` is now pinned by tests at
+  `limit - 1`, `limit` and `limit + 1`. Mutating the guard from `>=` to `>` —
+  which lets a server put one more tool in the catalog than the bound allows —
+  previously survived the whole of `tests/test_client_manager.py`. (#175)
+
 ### Changed
 - **A downstream tool that declares no `inputSchema` is now skipped instead of
   indexed.** This is a behaviour change, and the only one in this set. The
@@ -24,6 +30,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously appeared with a permissive schema. (#175)
 
 ### Fixed
+- **`derive_npm_flags.py --verify` no longer reports host-enumerated npm config
+  types as table drift.** The npm flag tables are the node-less fallback for
+  npm package identity, and `--verify` is what keeps them honest against a real
+  npm — but it was green on one machine and red on another with identical npm
+  and identical source. npm builds `local-address`'s declared `type` from
+  `os.networkInterfaces()`, so its 51 members here are facts about *this*
+  machine; and when `networkInterfaces()` throws, npm's `getLocalAddresses()`
+  catches it and returns exactly `[null]`, which the member rule stripped to
+  nothing and reported as `value: --local-address in table, absent from live
+  npm`. A drift check with false positives gets ignored, and an ignored check
+  is how real drift ships.
+
+  Detection now happens in the node script, the only place the raw members
+  still exist — the serializer maps every string member to `'<literal>'`, so no
+  Python-side predicate could tell 51 addresses from `loglevel`'s 8 fixed
+  words. It uses npm's own `typeDescription === 'IP Address'` label (the one
+  signal that survives the `[null]` case) with a `net.isIP` member scan as an
+  independent backstop, and `classify()` then returns `value` regardless of the
+  members. The flag is **not** exempted from the comparison: skipping it would
+  blind the check to a real arity change on the flag most likely to drift, so
+  `--verify` reports which flags it normalised instead — without printing the
+  member count, which is the host fact. The committed tables are unchanged;
+  this fixes the comparison, not the data.
+
+  **Scope, so the next red `--verify` is not waved off as another false
+  positive:** this makes the *comparison logic* host-independent, not the
+  tables' *freshness*. Version skew — tables derived from one npm, checked
+  against a newer one — still turns `--verify` red, correctly and by design.
+  That is the signal the check exists to produce. What is gone is only the
+  redness that two machines running the *same* npm could disagree about. A CI
+  test now also holds the recorded schema fixture and the committed tables to
+  each other, so regenerating one without the other cannot pass silently.
+  (#193)
 - **`_index_tools`/`_index_resources`/`_index_prompts` no longer overstate the
   catalog.** `_index_resources` documented that "the count returned is what was
   actually indexed, not what was offered", while all three returned the length
@@ -44,12 +83,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   accepts `0`, because policy auto-discovery swallows validation errors and
   falls back to an allow-all default, so rejecting the value would silently
   discard the operator's entire policy file (#202). (#175)
-
-### Added
-- The truncation boundary at `max_tools_per_server` is now pinned by tests at
-  `limit - 1`, `limit` and `limit + 1`. Mutating the guard from `>=` to `>` —
-  which lets a server put one more tool in the catalog than the bound allows —
-  previously survived the whole of `tests/test_client_manager.py`. (#175)
 
 ## [2.6.0] - 2026-08-27
 
