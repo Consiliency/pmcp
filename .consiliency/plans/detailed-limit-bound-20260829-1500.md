@@ -1,5 +1,9 @@
 # Detailed plan: bound `max_tools_per_server`, and stop the code arguing against it
 
+> **Revision 2 (2026-08-29).** Boarded 3 AGREE, no blocking defects. Three
+> corrections applied, one of them a **misattributed citation of mine** that
+> argued the opposite of what the source says.
+
 ## Task
 
 Close Consiliency/pmcp#207. Add `Field(ge=1)` to
@@ -17,11 +21,17 @@ would have silently discarded an operator's whole policy file. #202 made a
 discovered policy that *parses but fails validation* terminate startup, so a
 schema bound can no longer silently unrestrict anything.
 
-**`0` is not a meaningful setting.** `manager.py:107` states the limit "is a
-runaway guard, not a catalog-size limit". At `0`, `_parse_tool_entries` empties
-its result before examining a single entry. There is no supported "disable tool
-indexing" semantic that `0` expresses — it is a mistake, which is what makes it
-boundable.
+**`0` is not a meaningful setting.** At `0`, `_parse_tool_entries` empties its
+result before examining a single entry, and no documented semantic assigns `0` a
+"disable tool indexing" meaning.
+
+**WAS WRONG (rev 1):** it supported this by citing `manager.py:107` — "the cap is
+a runaway guard, not a catalog-size limit". That sentence is about
+`_MAX_LISTING_PAGES = 500`, **not** `max_tools_per_server`, and the same passage
+describes `max_tools_per_server`'s default of 100 as a *legitimate catalog size*
+— the opposite of the point it was quoted for. The conclusion survives on
+`_parse_tool_entries`; the citation does not, and is removed rather than
+reworded.
 
 **Two independent axes.** `LimitsPolicy.max_tools_per_server` (`types.py:960`) is
 the policy/schema surface. `ClientManager.__init__`'s `max_tools_per_server: int = 100`
@@ -53,7 +63,8 @@ a gateway that indexes no tools at all, but "plausibly zero" is not "none".
 
 ### `src/pmcp/types.py` (modify)
 
-- `LimitsPolicy.max_tools_per_server` (`:960`) — modify — `Field(default=100, ge=1)`.
+- `LimitsPolicy.max_tools_per_server` (`:973` — rev 1 said `:960`, which is the
+  docstring) — modify — `Field(default=100, ge=1)`.
 - `LimitsPolicy` docstring (`:957-970`) — modify — it currently says the field
   **deliberately carries no `Field(ge=1)`** and explains why, citing the
   swallow-and-fall-back-to-allow-all behaviour. That reason is now false. Replace
@@ -66,6 +77,9 @@ a gateway that indexes no tools at all, but "plausibly zero" is not "none".
 
 - The comment at `:2174-2177` — modify — same correction. It currently justifies
   the missing bound by the fail-open.
+- The comment at `:683-687` — modify — it tells the operator to "fix their policy
+  file", which after the bound is unreachable via a policy file; that path is
+  constructor-only.
 - `:2169`'s `< 1` guard and the "so none were indexed" log at `:690` —
   **unchanged**. They remain reachable through the constructor axis, and the log
   fix from #175 is correct independently of whether the schema accepts `0`.
@@ -86,13 +100,22 @@ a gateway that indexes no tools at all, but "plausibly zero" is not "none".
 ### `tests/test_policy_fail_open.py` or a sibling (modify/create)
 
 - Add the end-to-end consequence: a **discovered policy file** containing
-  `max_tools_per_server: 0` now makes `PolicyManager()` raise. This is the
+  `max_tools_per_server: 0` now makes `PolicyManager()` raise **`ValueError`** —
+  `PolicyManager` wraps pydantic errors, so this test must follow
+  `test_policy_fail_open.py`'s existing `ValueError` / `Invalid policy file`
+  pattern and its `_discovery_paths` helper. Only the schema-level test in
+  `test_client_manager.py` sees a raw `ValidationError`, and it needs the pydantic
+  import. This is the
   interaction between #207 and #202, and neither issue's tests cover it alone —
   #207's tests are schema-level and #202's use a different invalid key.
 
 ## Documentation impact
 
-- `CHANGELOG.md` — add — under `### Changed`, not `### Fixed`: a policy file with
+- `CHANGELOG.md` — add — in a **fresh `[Unreleased]`** section. **2.7.0 is now
+  cut**, so #175's and #202's entries — including the sentence saying
+  `LimitsPolicy` still accepts `0` and that the bound is left to a follow-up —
+  sit under `## [2.7.0]` as shipped history. Leave them; they were true of that
+  release. Under `### Changed`, not `### Fixed`: a policy file with
   `max_tools_per_server: 0` is now rejected, and via #202 that terminates
   startup. Name the value explicitly so an affected operator can search for it.
 - `README.md` — modify **only if** it documents `max_tools_per_server` or shows a
