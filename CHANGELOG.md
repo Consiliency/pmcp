@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-08-29
+
 ### Added
 - The truncation boundary at `max_tools_per_server` is now pinned by tests at
   `limit - 1`, `limit` and `limit + 1`. Mutating the guard from `>=` to `>` —
