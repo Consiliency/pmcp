@@ -29,12 +29,14 @@ from pmcp.client.manager import (
     _infer_risk_hint,
     _remote_headers,
     _required_identity,
+    _required_object,
     _terminate_process_tree,
     _truncate_description,
 )
 from pmcp.env_store import write_env_file
 from pmcp.remote_auth import MissingRemoteHeaderAuthError
 from pmcp.types import (
+    LimitsPolicy,
     LocalMcpServerConfig,
     McpTaskInfo,
     McpTaskRecord,
@@ -5878,3 +5880,503 @@ class TestUnreadableListingIsNotAnEmptyOne:
         for entry in ("a string", 3, None, ["a"]):
             with pytest.raises(TypeError):
                 _required_identity(entry, "name")
+
+
+class TestToolLimitIsEnforced:
+    """#175 item 1: the truncation boundary itself, pinned.
+
+    Nothing in this file asserted how many tools land when a server offers more
+    than `max_tools_per_server`, and it showed: mutating the guard
+    `len(entries) >= limit` to `> limit` was the sole survivor of nine mutants
+    run against this file. That off-by-one lets a server put `limit + 1` tools
+    in the catalog -- the guard is a resource bound, so one more than the bound
+    every time is exactly the kind of drift a bound exists to stop.
+
+    The assertions are therefore *exact* counts at `limit - 1`, `limit` and
+    `limit + 1`. "Fewer than offered" would pass under the mutant at
+    `limit + 1`, which is the only case that distinguishes `>=` from `>`.
+    """
+
+    LIMIT = 5
+
+    @staticmethod
+    def _listing(count: int) -> list[dict[str, Any]]:
+        """`inputSchema` on every entry: #175 item 4 makes a tool without one
+        unparseable, and a fixture that omitted it would report zero indexed
+        here for a reason that has nothing to do with the limit."""
+        return [
+            {
+                "name": f"t{i}",
+                "description": f"tool {i}",
+                "inputSchema": {"type": "object"},
+            }
+            for i in range(count)
+        ]
+
+    @pytest.mark.parametrize("offered", [LIMIT - 1, LIMIT, LIMIT + 1])
+    def test_no_more_than_the_limit_is_ever_indexed(self, offered: int) -> None:
+        manager = ClientManager(max_tools_per_server=self.LIMIT)
+
+        indexed = manager._index_tools("srv", self._listing(offered))
+
+        expected = min(offered, self.LIMIT)
+        assert indexed == expected
+        assert len(manager._tools) == expected
+        assert set(manager._tools) == {f"srv::t{i}" for i in range(expected)}
+
+    def test_truncation_keeps_the_first_entries_and_says_so(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The entries kept are the leading ones, and the drop is not silent --
+        a bound that discards tools without a word is indistinguishable from a
+        downstream that never offered them."""
+        manager = ClientManager(max_tools_per_server=self.LIMIT)
+
+        with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+            indexed = manager._index_tools("srv", self._listing(self.LIMIT + 3))
+
+        assert indexed == self.LIMIT
+        assert set(manager._tools) == {f"srv::t{i}" for i in range(self.LIMIT)}
+        assert "srv::t5" not in manager._tools
+        assert any("truncating" in record.message for record in caplog.records)
+
+
+class TestDuplicateIdentitiesAreNotDoubleCounted:
+    """#175 item 5: the count is of entries that landed, not entries offered.
+
+    `_index_resources`' docstring promised exactly this -- "the count returned
+    is what was actually indexed, not what was offered, so a caller reporting
+    it is not overstating the catalog" -- while the code returned
+    `len(entries)`. Two entries sharing an identity are two list items and one
+    catalog key, so the promise was false precisely when identities collide,
+    and a documented guarantee contradicted by the code is worse than an
+    undocumented gap.
+
+    Each kind is asserted against **its own** catalog: `_index_tools` against
+    `_tools`, `_index_resources` against `_resources`, `_index_prompts` against
+    `_prompts`. Comparing all three to `_tools` would prove nothing for the
+    other two.
+    """
+
+    def test_duplicate_tools_are_counted_once_and_the_last_one_wins(self) -> None:
+        manager = ClientManager()
+
+        indexed = manager._index_tools(
+            "srv",
+            [
+                {"name": "dup", "description": "first", "inputSchema": {}},
+                {"name": "dup", "description": "second", "inputSchema": {}},
+                {"name": "solo", "description": "only", "inputSchema": {}},
+            ],
+        )
+
+        assert set(manager._tools) == {"srv::dup", "srv::solo"}
+        assert indexed == len(manager._tools) == 2
+        assert manager._tools["srv::dup"].description == "second"
+
+    def test_duplicate_resources_are_counted_once(self) -> None:
+        manager = ClientManager()
+
+        indexed = manager._index_resources(
+            "srv",
+            [
+                {"uri": "mem://dup", "name": "first"},
+                {"uri": "mem://dup", "name": "second"},
+                {"uri": "mem://solo"},
+            ],
+        )
+
+        assert set(manager._resources) == {"srv::mem://dup", "srv::mem://solo"}
+        assert indexed == len(manager._resources) == 2
+        assert manager._resources["srv::mem://dup"].name == "second"
+
+    def test_duplicate_prompts_are_counted_once(self) -> None:
+        manager = ClientManager()
+
+        indexed = manager._index_prompts(
+            "srv",
+            [
+                {"name": "dup", "title": "first"},
+                {"name": "dup", "title": "second"},
+                {"name": "solo"},
+            ],
+        )
+
+        assert set(manager._prompts) == {"srv::dup", "srv::solo"}
+        assert indexed == len(manager._prompts) == 2
+        assert manager._prompts["srv::dup"].title == "second"
+
+    def test_a_listing_that_is_entirely_duplicates_counts_one(self) -> None:
+        """The edge the plan calls out. One key lands, so the count is one --
+        and it is emphatically not zero, which would route the listing into
+        `_reconcile_once`'s offered-but-none-parseable rule and preserve a
+        stale catalog on the strength of a duplicate."""
+        manager = ClientManager()
+
+        indexed = manager._index_tools(
+            "srv",
+            [
+                {"name": "same", "inputSchema": {}},
+                {"name": "same", "inputSchema": {}},
+                {"name": "same", "inputSchema": {}},
+            ],
+        )
+
+        assert indexed == len(manager._tools) == 1
+
+    def test_the_collision_is_logged_so_it_is_diagnosable(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The honest count makes last-write-wins visible; the log is what
+        makes it diagnosable. Logged at DEBUG, naming the colliding id."""
+        manager = ClientManager()
+
+        with caplog.at_level("DEBUG", logger="pmcp.client.manager"):
+            manager._index_tools(
+                "srv",
+                [
+                    {"name": "dup", "inputSchema": {}},
+                    {"name": "dup", "inputSchema": {}},
+                ],
+            )
+
+        assert any(
+            "srv::dup" in record.message and record.levelname == "DEBUG"
+            for record in caplog.records
+        )
+
+    def test_duplicates_publish_once_not_twice(self) -> None:
+        """The publish gate keys off the count, so it must not have moved: a
+        listing that indexed something still publishes exactly one note."""
+        sink = _RecordingSink()
+        manager = ClientManager(catalog_events=cast(Any, sink))
+
+        manager._index_tools(
+            "srv",
+            [
+                {"name": "dup", "inputSchema": {}},
+                {"name": "dup", "inputSchema": {}},
+            ],
+        )
+
+        assert (sink.tools, sink.resources, sink.prompts) == (1, 0, 0)
+
+
+class TestZeroLimitLogsAccurately:
+    """#175 item 3: `max_tools_per_server: 0` must not be reported as a
+    downstream that sent garbage.
+
+    A zero limit empties `_parse_tool_entries`' result before a single entry is
+    examined, so `_reconcile_once`'s offered-but-none-parseable branch fired
+    and announced "Every tools entry in the listing was unparseable" -- an
+    accusation aimed at the server for a decision this gateway's own policy
+    file made. The operator's next move is to fix the policy, and the log has
+    to point there.
+
+    Deliberately fixed in the *log* and not in the schema. `LimitsPolicy` gets
+    no `Field(ge=1)`: `PolicyManager._load_policy(..., fatal=False)` -- the
+    auto-discovery path -- swallows any validation exception and leaves the
+    default allow-all `GatewayPolicy` in place, so making `0` schema-invalid
+    would silently discard the operator's *entire* policy file, allow and deny
+    lists and redaction included. That fail-open is #202 and is not this
+    change's to fix; the test below pins that `0` still validates, so a future
+    tightening cannot land here unnoticed.
+    """
+
+    @staticmethod
+    def _managed(name: str) -> ManagedClient:
+        status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+        managed = ManagedClient(config=MagicMock(), process=MagicMock(), status=status)
+        managed.config.name = name
+        return managed
+
+    @staticmethod
+    def _wire(manager: ClientManager, tools: list[dict[str, Any]]) -> None:
+        async def fake_send(
+            managed: ManagedClient,
+            method: str,
+            params: dict[str, Any],
+            *args: Any,
+            **kwargs: Any,
+        ) -> dict[str, Any]:
+            kind = method.split("/")[0]
+            return {kind: list(tools) if kind == "tools" else []}
+
+        manager._send_request = fake_send  # type: ignore[method-assign]
+
+    def test_a_zero_limit_still_validates_on_the_policy_schema(self) -> None:
+        """Rejecting it is what triggers #202's fail-open, so it must not be
+        rejected."""
+        assert LimitsPolicy(max_tools_per_server=0).max_tools_per_server == 0
+
+    @pytest.mark.asyncio
+    async def test_zero_limit_names_the_limit_and_blames_no_one(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = ClientManager(max_tools_per_server=0)
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(manager, [{"name": "alpha", "inputSchema": {}}])
+
+        with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+
+            async def _wait() -> None:
+                while manager._reconcile_tasks:
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(_wait(), 5.0)
+
+        messages = [record.message for record in caplog.records]
+        assert any("max_tools_per_server is 0" in message for message in messages), (
+            f"no message named the zero limit: {messages}"
+        )
+        assert not any("unparseable" in message for message in messages), (
+            f"a zero limit was reported as a malformed listing: {messages}"
+        )
+
+    def test_a_positive_limit_still_reports_truncation_the_old_way(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The zero-limit wording is a special case, not a replacement: an
+        ordinary overrun must still say it truncated."""
+        manager = ClientManager(max_tools_per_server=1)
+
+        with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+            manager._index_tools(
+                "srv",
+                [
+                    {"name": "a", "inputSchema": {}},
+                    {"name": "b", "inputSchema": {}},
+                ],
+            )
+
+        assert any("truncating" in record.message for record in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_unparseable_listing_still_says_unparseable(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The other half of the same guarantee: the accusation is still made
+        when it is true."""
+        manager = ClientManager(max_tools_per_server=100)
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(manager, [{"name": ""}, {"nope": True}])
+
+        with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+            manager._handle_downstream_notification(
+                "srv", managed, "notifications/tools/list_changed"
+            )
+
+            async def _wait() -> None:
+                while manager._reconcile_tasks:
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(_wait(), 5.0)
+
+        messages = [record.message for record in caplog.records]
+        assert any("unparseable" in message for message in messages), messages
+
+
+class TestAdoptProcessRemovesStaleIndexesFirst:
+    """#175 item 2: `adopt_process` must clear the server's catalog entries
+    before it indexes, like every other path into the indexers.
+
+    `_connect_stdio`, `_reconcile_once` and `_cleanup_client` all remove this
+    server's entries first. `adopt_process` did not, so adopting a server that
+    had already been indexed under the same name left the previous listing's
+    tools in the catalog alongside the new ones -- entries the adopted process
+    does not serve, still routable, until something unrelated removed them.
+
+    Asserted on catalog *contents*, not on whether `_remove_server_indexes` was
+    called: a test that only checks the call passes just as happily if the
+    removal runs after the index.
+    """
+
+    @staticmethod
+    def _process() -> Any:
+        process = MagicMock()
+        process.returncode = None
+        process.stdin = MagicMock()
+        process.stdout = MagicMock()
+        process.stderr = None
+        return process
+
+    @staticmethod
+    def _config(name: str) -> Any:
+        config = MagicMock()
+        config.name = name
+        return config
+
+    async def _adopt(
+        self, manager: ClientManager, name: str, tools: list[dict[str, Any]]
+    ) -> None:
+        async def fake_listings(managed: ManagedClient) -> dict[str, Any]:
+            return {"tools": list(tools), "resources": [], "prompts": []}
+
+        with (
+            patch.object(manager, "_read_stdout", new=AsyncMock(return_value=None)),
+            patch.object(manager, "_read_stderr", new=AsyncMock(return_value=None)),
+            patch.object(manager, "_send_initialize", new=AsyncMock(return_value=None)),
+            patch.object(manager, "_fetch_server_listings", new=fake_listings),
+        ):
+            await manager.adopt_process(name, self._process(), self._config(name))
+
+    @pytest.mark.asyncio
+    async def test_a_prior_listings_tools_do_not_survive_the_adopt(self) -> None:
+        manager = ClientManager()
+        manager._index_tools("srv", [{"name": "stale", "inputSchema": {}}])
+        assert set(manager._tools) == {"srv::stale"}
+
+        await self._adopt(manager, "srv", [{"name": "fresh", "inputSchema": {}}])
+
+        assert set(manager._tools) == {"srv::fresh"}, (
+            "adopt_process indexed on top of the previous catalog"
+        )
+        assert manager._servers["srv"].tool_count == 1
+
+    @pytest.mark.asyncio
+    async def test_resources_and_prompts_are_cleared_too(self) -> None:
+        """The removal is per server, not per kind -- an adopt that replaced
+        only the tools would leave a stale resource just as routable."""
+        manager = ClientManager()
+        manager._index_resources("srv", [{"uri": "mem://stale"}])
+        manager._index_prompts("srv", [{"name": "stale"}])
+
+        await self._adopt(manager, "srv", [{"name": "fresh", "inputSchema": {}}])
+
+        assert manager._resources == {}
+        assert manager._prompts == {}
+
+    @pytest.mark.asyncio
+    async def test_another_servers_entries_are_untouched(self) -> None:
+        """`_remove_server_indexes` is per-server-name, and the adopt must not
+        widen that: clearing the catalog wholesale would be a much worse bug
+        than the one being fixed."""
+        manager = ClientManager()
+        manager._index_tools("other", [{"name": "keep", "inputSchema": {}}])
+
+        await self._adopt(manager, "srv", [{"name": "fresh", "inputSchema": {}}])
+
+        assert set(manager._tools) == {"other::keep", "srv::fresh"}
+
+    @pytest.mark.asyncio
+    async def test_adopting_a_name_with_no_prior_index_is_unchanged(self) -> None:
+        """The edge the plan calls out: removing nothing must not be an error
+        and must not stop the fresh listing being indexed."""
+        manager = ClientManager()
+
+        await self._adopt(manager, "srv", [{"name": "fresh", "inputSchema": {}}])
+
+        assert set(manager._tools) == {"srv::fresh"}
+
+
+class TestMissingInputSchemaIsUnparseable:
+    """#175 item 4: a tool that declares no `inputSchema` is not indexed.
+
+    `tool.get("inputSchema", {})` manufactured a schema the server never sent,
+    and `{}` does not mean "we do not know" -- it means "any arguments at all
+    are valid", which is then published to every caller and every model reading
+    the catalog. MCP requires `inputSchema` on a tool, so a tool without one is
+    a tool we could not read, and #172 already settled what happens to those:
+    skip it and say so, rather than invent the missing value.
+
+    This is the only behaviour change in #175 and is called out as such in the
+    changelog: a downstream that omitted `inputSchema` used to be accepted with
+    a permissive schema and is now skipped.
+    """
+
+    def test_a_tool_without_an_input_schema_is_skipped_and_logged(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        manager = ClientManager()
+
+        with caplog.at_level("WARNING", logger="pmcp.client.manager"):
+            indexed = manager._index_tools("srv", [{"name": "schemaless"}])
+
+        assert indexed == 0
+        assert manager._tools == {}
+        assert any(
+            "unparseable tool" in record.message and "schemaless" in record.message
+            for record in caplog.records
+        ), [record.message for record in caplog.records]
+
+    def test_a_tool_with_an_input_schema_is_indexed_unchanged(self) -> None:
+        """The other half: nothing about a well-formed tool moved."""
+        manager = ClientManager()
+        schema = {"type": "object", "properties": {"q": {"type": "string"}}}
+
+        indexed = manager._index_tools(
+            "srv", [{"name": "ok", "description": "d", "inputSchema": schema}]
+        )
+
+        tool = manager.get_tool("srv::ok")
+        assert indexed == 1
+        assert tool is not None
+        assert tool.input_schema == schema
+
+    def test_an_explicitly_empty_schema_is_still_an_answer(self) -> None:
+        """`{}` is the server saying "any arguments", which is a thing it is
+        entitled to say. Only the *absence* is unreadable -- rejecting `{}`
+        would drop tools that are behaving correctly."""
+        manager = ClientManager()
+
+        assert manager._index_tools("srv", [{"name": "any", "inputSchema": {}}]) == 1
+        assert set(manager._tools) == {"srv::any"}
+
+    @pytest.mark.parametrize(
+        "schema", [None, "not-a-dict", ["not", "a", "dict"], 3, True]
+    )
+    def test_a_non_object_schema_is_unparseable_too(self, schema: Any) -> None:
+        """`inputSchema: null` is distinct from absent and just as unusable;
+        so is any other non-object. Before this, `null` reached
+        `_schema_dialect` and only failed there by accident of a `.get` call."""
+        manager = ClientManager()
+
+        assert (
+            manager._index_tools("srv", [{"name": "bad", "inputSchema": schema}]) == 0
+        )
+        assert manager._tools == {}
+
+    def test_a_schemaless_tool_costs_only_itself(self) -> None:
+        """Per-entry, like every other parse failure: the tools either side of
+        it are still indexed."""
+        manager = ClientManager()
+
+        indexed = manager._index_tools(
+            "srv",
+            [
+                {"name": "before", "inputSchema": {}},
+                {"name": "schemaless"},
+                {"name": "after", "inputSchema": {}},
+            ],
+        )
+
+        assert indexed == 2
+        assert set(manager._tools) == {"srv::before", "srv::after"}
+
+    def test_required_object_rejects_every_non_object(self) -> None:
+        """The helper directly, so the rule is pinned independently of the
+        parser that calls it -- and so the next reader can see why it is not
+        `_required_identity`, which requires a non-empty *string* and would
+        reject every valid tool."""
+        assert _required_object({"inputSchema": {}}, "inputSchema") == {}
+        assert _required_object({"inputSchema": {"type": "object"}}, "inputSchema") == {
+            "type": "object"
+        }
+        for entry in (
+            {},
+            {"inputSchema": None},
+            {"inputSchema": ""},
+            {"inputSchema": "{}"},
+            {"inputSchema": []},
+            {"inputSchema": 0},
+        ):
+            with pytest.raises((TypeError, ValueError)):
+                _required_object(entry, "inputSchema")
+        for entry in ("a string", 3, None, ["a"]):
+            with pytest.raises(TypeError):
+                _required_object(entry, "inputSchema")
