@@ -143,6 +143,33 @@ def test_unparseable_discovered_policy_warns_and_continues(
     assert any("No policy is in effect" in message for message in warnings)
 
 
+def test_empty_json_is_a_parse_failure_unlike_empty_yaml(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The split is drawn by the parser, so it lands differently per format.
+
+    `yaml.safe_load("")` returns `None` -- it parses, so it is fatal (covered by
+    `test_non_mapping_discovered_policy_refuses_to_start`). `json.loads("")`
+    *raises*, so an empty `.json` takes the warn path instead. README documents
+    this asymmetry; without this test that documented claim is unpinned, and a
+    reader who tests the fix with an empty `.json` and sees only a warning would
+    conclude it does not work.
+    """
+    policy_file = tmp_path / ".mcp-gateway-policy.json"
+    policy_file.write_text("")
+    _discovery_paths(monkeypatch, policy_file)
+
+    with caplog.at_level(logging.WARNING, logger="pmcp.policy.policy"):
+        manager = PolicyManager()
+
+    assert manager.is_server_allowed("deny-me") is True
+    assert any(
+        "No policy is in effect" in r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    )
+
+
 def test_unreadable_discovered_policy_warns_and_continues(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:

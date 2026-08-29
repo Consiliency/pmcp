@@ -104,9 +104,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unparseable" — blaming the downstream for a decision the gateway's own policy
   file made. Both that message and the parser's truncation warning now name the
   limit. Deliberately *not* fixed by adding a schema bound: `LimitsPolicy` still
-  accepts `0`, because policy auto-discovery swallows validation errors and
-  falls back to an allow-all default, so rejecting the value would silently
-  discard the operator's entire policy file (#202). (#175)
+  accepts `0`, because at the time policy auto-discovery swallowed validation
+  errors and fell back to an allow-all default, so rejecting the value would
+  have silently discarded the operator's entire policy file. #202 — see the
+  entry above, which ships in this same release — has since made that case
+  fatal, so `Field(ge=1)` is now safe to add; it is left to a follow-up rather
+  than folded in here. (#175)
 
 ## [2.6.0] - 2026-08-27
 
