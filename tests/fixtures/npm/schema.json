@@ -1,0 +1,3335 @@
+{
+  "_README": "RECORDED OUTPUT of read_schema() in .consiliency/notes/derive_npm_flags.py, captured against a real npm on a maintainer machine. CI has no npm and no node, so tests that would otherwise be maintainer-only mock read_schema() with this. Regenerate with: python3 .consiliency/notes/derive_npm_flags.py --record-schema tests/fixtures/npm/schema.json. Ignored by the generator, which reads only npm_version/definitions/shorthands/null_spellings. NOTE local-address's `type` here is this machine's address list reduced to '<literal>' labels; its LENGTH is a host fact and the tests patch it. Its recorded PROBE keys are masked to <host-address> for the same reason: the node script probes with the type's first literal member, which for a host-enumerated flag is one of the recording machine's own addresses.",
+  "definitions": {
+    "_auth": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "access": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "restricted": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "null, \"restricted\", \"public\", or \"private\""
+    },
+    "all": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "a"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "allow-directory": {
+      "hostEnumerated": false,
+      "probes": {
+        "all": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"all\", \"none\", or \"root\""
+    },
+    "allow-file": {
+      "hostEnumerated": false,
+      "probes": {
+        "all": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"all\", \"none\", or \"root\""
+    },
+    "allow-git": {
+      "hostEnumerated": false,
+      "probes": {
+        "all": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"all\", \"none\", or \"root\""
+    },
+    "allow-remote": {
+      "hostEnumerated": false,
+      "probes": {
+        "all": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"all\", \"none\", or \"root\""
+    },
+    "allow-same-version": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "allow-scripts": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String",
+        "Array"
+      ],
+      "typeDescription": "String (can be set multiple times)"
+    },
+    "allow-scripts-pending": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "allow-scripts-pin": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "also": {
+      "hostEnumerated": false,
+      "probes": {
+        "dev": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "null, \"dev\", or \"development\""
+    },
+    "audit": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "audit-level": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "info": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "null, \"info\", \"low\", \"moderate\", \"high\", \"critical\", or \"none\""
+    },
+    "auth-type": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "legacy": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"legacy\" or \"web\""
+    },
+    "before": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Date"
+      ],
+      "typeDescription": "null or Date"
+    },
+    "bin-links": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "browser": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Boolean",
+        "String"
+      ],
+      "typeDescription": "null, Boolean, or String"
+    },
+    "bypass-2fa": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "ca": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String",
+        "Array"
+      ],
+      "typeDescription": "null or String (can be set multiple times)"
+    },
+    "cache": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "path"
+      ],
+      "typeDescription": "Path"
+    },
+    "cache-max": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "cache-min": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "cafile": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "path"
+      ],
+      "typeDescription": "Path"
+    },
+    "call": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [
+        "c"
+      ],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "cert": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "cidr": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String",
+        "Array"
+      ],
+      "typeDescription": "null or String (can be set multiple times)"
+    },
+    "color": {
+      "hostEnumerated": false,
+      "probes": {
+        "always": true,
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "Boolean"
+      ],
+      "typeDescription": "\"always\" or Boolean"
+    },
+    "commit-hooks": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "cpu": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "dangerously-allow-all-scripts": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "depth": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Number"
+      ],
+      "typeDescription": "null or Number"
+    },
+    "description": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "dev": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "diff": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String",
+        "Array"
+      ],
+      "typeDescription": "String (can be set multiple times)"
+    },
+    "diff-dst-prefix": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "diff-ignore-all-space": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "diff-name-only": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "diff-no-prefix": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "diff-src-prefix": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "diff-text": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "diff-unified": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "dry-run": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "editor": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "engine-strict": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "expect-result-count": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Number"
+      ],
+      "typeDescription": "null or Number"
+    },
+    "expect-results": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Boolean"
+      ],
+      "typeDescription": "null or Boolean"
+    },
+    "expires": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Number"
+      ],
+      "typeDescription": "null or Number"
+    },
+    "fetch-retries": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "fetch-retry-factor": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "fetch-retry-maxtimeout": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "fetch-retry-mintimeout": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "fetch-timeout": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "force": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "f"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "foreground-scripts": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "format-package-lock": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "fund": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "git": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "git-tag-version": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "global": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "g"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "global-style": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "globalconfig": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "path"
+      ],
+      "typeDescription": "Path"
+    },
+    "heading": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "https-proxy": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "url"
+      ],
+      "typeDescription": "null or URL"
+    },
+    "if-present": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "ignore-scripts": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "include": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "prod": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Array",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"prod\", \"dev\", \"optional\", or \"peer\" (can be set multiple times)"
+    },
+    "include-attestations": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "include-staged": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "include-workspace-root": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "init-author-email": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "init-author-name": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "init-author-url": {
+      "hostEnumerated": false,
+      "probes": {
+        "": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "url"
+      ],
+      "typeDescription": "\"\" or URL"
+    },
+    "init-license": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "init-module": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "path"
+      ],
+      "typeDescription": "Path"
+    },
+    "init-private": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "init-type": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "init-version": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Semver"
+      ],
+      "typeDescription": "SemVer string"
+    },
+    "init.author.email": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "init.author.name": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "init.author.url": {
+      "hostEnumerated": false,
+      "probes": {
+        "": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "url"
+      ],
+      "typeDescription": "\"\" or URL"
+    },
+    "init.license": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "init.module": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "path"
+      ],
+      "typeDescription": "Path"
+    },
+    "init.version": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Semver"
+      ],
+      "typeDescription": "SemVer string"
+    },
+    "install-links": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "install-strategy": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "hoisted": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"hoisted\", \"nested\", \"shallow\", or \"linked\""
+    },
+    "json": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "key": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "legacy-bundling": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "legacy-peer-deps": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "libc": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "link": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "local-address": {
+      "hostEnumerated": true,
+      "probes": {
+        "<host-address>": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "IP Address"
+    },
+    "location": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "global": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [
+        "L"
+      ],
+      "type": [
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"global\", \"user\", or \"project\""
+    },
+    "lockfile-version": {
+      "hostEnumerated": false,
+      "probes": {
+        "1": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "null, 1, 2, 3, \"1\", \"2\", or \"3\""
+    },
+    "loglevel": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "silent": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"silent\", \"error\", \"warn\", \"notice\", \"http\", \"info\", \"verbose\", or \"silly\""
+    },
+    "logs-dir": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "path"
+      ],
+      "typeDescription": "null or Path"
+    },
+    "logs-max": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "long": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "l"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "maxsockets": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "message": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [
+        "m"
+      ],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "min-release-age": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Number"
+      ],
+      "typeDescription": "null or Number"
+    },
+    "min-release-age-exclude": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Array",
+        "String"
+      ],
+      "typeDescription": "String (can be set multiple times)"
+    },
+    "name": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "node-gyp": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "path"
+      ],
+      "typeDescription": "Path"
+    },
+    "node-options": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "noproxy": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String",
+        "Array"
+      ],
+      "typeDescription": "String (can be set multiple times)"
+    },
+    "offline": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "omit": {
+      "hostEnumerated": false,
+      "probes": {
+        "dev": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Array",
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"dev\", \"optional\", or \"peer\" (can be set multiple times)"
+    },
+    "omit-lockfile-registry-resolved": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "only": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "prod": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "null, \"prod\", or \"production\""
+    },
+    "optional": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Boolean"
+      ],
+      "typeDescription": "null or Boolean"
+    },
+    "orgs": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String",
+        "Array"
+      ],
+      "typeDescription": "null or String (can be set multiple times)"
+    },
+    "orgs-permission": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "read-only": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "null, \"read-only\", \"read-write\", or \"no-access\""
+    },
+    "os": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "otp": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "pack-destination": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "package": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String",
+        "Array"
+      ],
+      "typeDescription": "String (can be set multiple times)"
+    },
+    "package-lock": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "package-lock-only": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "packages": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String",
+        "Array"
+      ],
+      "typeDescription": "null or String (can be set multiple times)"
+    },
+    "packages-all": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "packages-and-scopes-permission": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "read-only": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "null, \"read-only\", \"read-write\", or \"no-access\""
+    },
+    "parseable": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "p"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "password": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "prefer-dedupe": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "prefer-offline": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "prefer-online": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "prefix": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [
+        "C"
+      ],
+      "type": [
+        "path"
+      ],
+      "typeDescription": "Path"
+    },
+    "preid": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "production": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Boolean"
+      ],
+      "typeDescription": "null or Boolean"
+    },
+    "progress": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "provenance": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "provenance-file": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "path"
+      ],
+      "typeDescription": "Path"
+    },
+    "proxy": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "false",
+        "url"
+      ],
+      "typeDescription": "null, false, or URL"
+    },
+    "read-only": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "rebuild-bundle": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "registry": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "url"
+      ],
+      "typeDescription": "URL"
+    },
+    "replace-registry-host": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "npmjs": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "<literal>",
+        "<literal>",
+        "String"
+      ],
+      "typeDescription": "\"npmjs\", \"never\", \"always\", or String"
+    },
+    "save": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "S"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "save-bundle": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "B"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "save-dev": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "D"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "save-exact": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "E"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "save-optional": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "O"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "save-peer": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "save-prefix": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "save-prod": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "P"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "sbom-format": {
+      "hostEnumerated": false,
+      "probes": {
+        "cyclonedx": true,
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"cyclonedx\" or \"spdx\""
+    },
+    "sbom-type": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "library": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "<literal>",
+        "<literal>",
+        "<literal>"
+      ],
+      "typeDescription": "\"library\", \"application\", or \"framework\""
+    },
+    "scope": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "scopes": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String",
+        "Array"
+      ],
+      "typeDescription": "null or String (can be set multiple times)"
+    },
+    "script-shell": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "searchexclude": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "searchlimit": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "searchopts": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "searchstaleness": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Number"
+      ],
+      "typeDescription": "Number"
+    },
+    "shell": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "shrinkwrap": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "sign-git-commit": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "sign-git-tag": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "strict-allow-scripts": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "strict-peer-deps": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "strict-ssl": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "tag": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "tag-version-prefix": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "timing": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "token-description": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "String"
+      ],
+      "typeDescription": "null or String"
+    },
+    "umask": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "Umask"
+      ],
+      "typeDescription": "Octal numeric string in range 0000..0777 (0..511)"
+    },
+    "unicode": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "update-notifier": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "usage": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "?",
+        "H",
+        "h"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "user-agent": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "userconfig": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "path"
+      ],
+      "typeDescription": "Path"
+    },
+    "version": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "v"
+      ],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "versions": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "viewer": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "String"
+      ],
+      "typeDescription": "String"
+    },
+    "which": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Number"
+      ],
+      "typeDescription": "null or Number"
+    },
+    "workspace": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": true
+      },
+      "short": [
+        "w"
+      ],
+      "type": [
+        "String",
+        "Array"
+      ],
+      "typeDescription": "String (can be set multiple times)"
+    },
+    "workspaces": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "null",
+        "Boolean"
+      ],
+      "typeDescription": "null or Boolean"
+    },
+    "workspaces-update": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": false,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [],
+      "type": [
+        "Boolean"
+      ],
+      "typeDescription": "Boolean"
+    },
+    "yes": {
+      "hostEnumerated": false,
+      "probes": {
+        "false": true,
+        "null": true,
+        "true": true,
+        "zzarbitrary": false
+      },
+      "short": [
+        "y"
+      ],
+      "type": [
+        "null",
+        "Boolean"
+      ],
+      "typeDescription": "null or Boolean"
+    }
+  },
+  "npm_version": "11.19.0",
+  "null_spellings": {
+    "--?": false,
+    "--B": false,
+    "--C": true,
+    "--D": false,
+    "--E": false,
+    "--H": false,
+    "--L": true,
+    "--O": false,
+    "--P": false,
+    "--S": false,
+    "--_auth": true,
+    "--a": false,
+    "--access": true,
+    "--all": false,
+    "--allow-directory": true,
+    "--allow-file": true,
+    "--allow-git": true,
+    "--allow-remote": true,
+    "--allow-same-version": false,
+    "--allow-scripts": true,
+    "--allow-scripts-pending": false,
+    "--allow-scripts-pin": false,
+    "--also": true,
+    "--audit": false,
+    "--audit-level": true,
+    "--auth-type": true,
+    "--before": true,
+    "--bin-links": false,
+    "--browser": true,
+    "--bypass-2fa": false,
+    "--c": true,
+    "--ca": true,
+    "--cache": true,
+    "--cache-max": true,
+    "--cache-min": true,
+    "--cafile": true,
+    "--call": true,
+    "--cert": true,
+    "--cidr": true,
+    "--color": false,
+    "--commit-hooks": false,
+    "--cpu": true,
+    "--d": false,
+    "--dangerously-allow-all-scripts": false,
+    "--dd": false,
+    "--ddd": false,
+    "--depth": true,
+    "--desc": false,
+    "--description": false,
+    "--dev": false,
+    "--diff": true,
+    "--diff-dst-prefix": true,
+    "--diff-ignore-all-space": false,
+    "--diff-name-only": false,
+    "--diff-no-prefix": false,
+    "--diff-src-prefix": true,
+    "--diff-text": false,
+    "--diff-unified": true,
+    "--dry-run": false,
+    "--editor": true,
+    "--engine-strict": false,
+    "--enjoy-by": true,
+    "--expect-result-count": true,
+    "--expect-results": true,
+    "--expires": true,
+    "--f": false,
+    "--fetch-retries": true,
+    "--fetch-retry-factor": true,
+    "--fetch-retry-maxtimeout": true,
+    "--fetch-retry-mintimeout": true,
+    "--fetch-timeout": true,
+    "--force": false,
+    "--foreground-scripts": false,
+    "--format-package-lock": false,
+    "--fund": false,
+    "--g": false,
+    "--git": true,
+    "--git-tag-version": false,
+    "--global": false,
+    "--global-style": false,
+    "--globalconfig": true,
+    "--h": false,
+    "--heading": true,
+    "--help": false,
+    "--https-proxy": true,
+    "--if-present": false,
+    "--ignore-scripts": false,
+    "--include": true,
+    "--include-attestations": false,
+    "--include-staged": false,
+    "--include-workspace-root": false,
+    "--init-author-email": true,
+    "--init-author-name": true,
+    "--init-author-url": true,
+    "--init-license": true,
+    "--init-module": true,
+    "--init-private": false,
+    "--init-type": true,
+    "--init-version": true,
+    "--init.author.email": true,
+    "--init.author.name": true,
+    "--init.author.url": true,
+    "--init.license": true,
+    "--init.module": true,
+    "--init.version": true,
+    "--install-links": false,
+    "--install-strategy": true,
+    "--iwr": false,
+    "--json": false,
+    "--key": true,
+    "--l": false,
+    "--legacy-bundling": false,
+    "--legacy-peer-deps": false,
+    "--libc": true,
+    "--link": false,
+    "--local": false,
+    "--local-address": true,
+    "--location": true,
+    "--lockfile-version": true,
+    "--loglevel": true,
+    "--logs-dir": true,
+    "--logs-max": true,
+    "--long": false,
+    "--m": true,
+    "--maxsockets": true,
+    "--message": true,
+    "--min-release-age": true,
+    "--min-release-age-exclude": true,
+    "--n": true,
+    "--name": true,
+    "--no": true,
+    "--no-_auth": true,
+    "--no-access": true,
+    "--no-all": false,
+    "--no-allow-directory": false,
+    "--no-allow-file": false,
+    "--no-allow-git": false,
+    "--no-allow-remote": false,
+    "--no-allow-same-version": false,
+    "--no-allow-scripts": true,
+    "--no-allow-scripts-pending": false,
+    "--no-allow-scripts-pin": false,
+    "--no-also": true,
+    "--no-audit": false,
+    "--no-audit-level": true,
+    "--no-auth-type": false,
+    "--no-before": true,
+    "--no-bin-links": false,
+    "--no-browser": true,
+    "--no-bypass-2fa": false,
+    "--no-ca": true,
+    "--no-cache": false,
+    "--no-cache-max": false,
+    "--no-cache-min": false,
+    "--no-cafile": false,
+    "--no-call": false,
+    "--no-cert": true,
+    "--no-cidr": true,
+    "--no-color": false,
+    "--no-commit-hooks": false,
+    "--no-cpu": true,
+    "--no-dangerously-allow-all-scripts": false,
+    "--no-depth": true,
+    "--no-description": false,
+    "--no-dev": false,
+    "--no-diff": true,
+    "--no-diff-dst-prefix": false,
+    "--no-diff-ignore-all-space": false,
+    "--no-diff-name-only": false,
+    "--no-diff-no-prefix": false,
+    "--no-diff-src-prefix": false,
+    "--no-diff-text": false,
+    "--no-diff-unified": false,
+    "--no-dry-run": false,
+    "--no-editor": false,
+    "--no-engine-strict": false,
+    "--no-expect-result-count": true,
+    "--no-expect-results": true,
+    "--no-expires": true,
+    "--no-fetch-retries": false,
+    "--no-fetch-retry-factor": false,
+    "--no-fetch-retry-maxtimeout": false,
+    "--no-fetch-retry-mintimeout": false,
+    "--no-fetch-timeout": false,
+    "--no-force": false,
+    "--no-foreground-scripts": false,
+    "--no-format-package-lock": false,
+    "--no-fund": false,
+    "--no-git": false,
+    "--no-git-tag-version": false,
+    "--no-global": false,
+    "--no-global-style": false,
+    "--no-globalconfig": false,
+    "--no-heading": false,
+    "--no-https-proxy": true,
+    "--no-if-present": false,
+    "--no-ignore-scripts": false,
+    "--no-include": false,
+    "--no-include-attestations": false,
+    "--no-include-staged": false,
+    "--no-include-workspace-root": false,
+    "--no-init-author-email": false,
+    "--no-init-author-name": false,
+    "--no-init-author-url": false,
+    "--no-init-license": false,
+    "--no-init-module": false,
+    "--no-init-private": false,
+    "--no-init-type": false,
+    "--no-init-version": false,
+    "--no-init.author.email": false,
+    "--no-init.author.name": false,
+    "--no-init.author.url": false,
+    "--no-init.license": false,
+    "--no-init.module": false,
+    "--no-init.version": false,
+    "--no-install-links": false,
+    "--no-install-strategy": false,
+    "--no-json": false,
+    "--no-key": true,
+    "--no-legacy-bundling": false,
+    "--no-legacy-peer-deps": false,
+    "--no-libc": true,
+    "--no-link": false,
+    "--no-local-address": true,
+    "--no-location": false,
+    "--no-lockfile-version": true,
+    "--no-loglevel": false,
+    "--no-logs-dir": true,
+    "--no-logs-max": false,
+    "--no-long": false,
+    "--no-maxsockets": false,
+    "--no-message": false,
+    "--no-min-release-age": true,
+    "--no-min-release-age-exclude": true,
+    "--no-name": true,
+    "--no-node-gyp": false,
+    "--no-node-options": true,
+    "--no-noproxy": true,
+    "--no-offline": false,
+    "--no-omit": false,
+    "--no-omit-lockfile-registry-resolved": false,
+    "--no-only": true,
+    "--no-optional": true,
+    "--no-orgs": true,
+    "--no-orgs-permission": true,
+    "--no-os": true,
+    "--no-otp": true,
+    "--no-pack-destination": false,
+    "--no-package": true,
+    "--no-package-lock": false,
+    "--no-package-lock-only": false,
+    "--no-packages": true,
+    "--no-packages-all": false,
+    "--no-packages-and-scopes-permission": true,
+    "--no-parseable": false,
+    "--no-password": true,
+    "--no-prefer-dedupe": false,
+    "--no-prefer-offline": false,
+    "--no-prefer-online": false,
+    "--no-prefix": false,
+    "--no-preid": false,
+    "--no-production": true,
+    "--no-progress": false,
+    "--no-provenance": false,
+    "--no-provenance-file": false,
+    "--no-proxy": true,
+    "--no-read-only": false,
+    "--no-rebuild-bundle": false,
+    "--no-registry": false,
+    "--no-replace-registry-host": true,
+    "--no-save": false,
+    "--no-save-bundle": false,
+    "--no-save-dev": false,
+    "--no-save-exact": false,
+    "--no-save-optional": false,
+    "--no-save-peer": false,
+    "--no-save-prefix": false,
+    "--no-save-prod": false,
+    "--no-sbom-format": false,
+    "--no-sbom-type": false,
+    "--no-scope": false,
+    "--no-scopes": true,
+    "--no-script-shell": true,
+    "--no-searchexclude": false,
+    "--no-searchlimit": false,
+    "--no-searchopts": false,
+    "--no-searchstaleness": false,
+    "--no-shell": false,
+    "--no-shrinkwrap": false,
+    "--no-sign-git-commit": false,
+    "--no-sign-git-tag": false,
+    "--no-strict-allow-scripts": false,
+    "--no-strict-peer-deps": false,
+    "--no-strict-ssl": false,
+    "--no-tag": false,
+    "--no-tag-version-prefix": false,
+    "--no-timing": false,
+    "--no-token-description": true,
+    "--no-umask": false,
+    "--no-unicode": false,
+    "--no-update-notifier": false,
+    "--no-usage": false,
+    "--no-user-agent": false,
+    "--no-userconfig": false,
+    "--no-version": false,
+    "--no-versions": false,
+    "--no-viewer": false,
+    "--no-which": true,
+    "--no-workspace": true,
+    "--no-workspaces": true,
+    "--no-workspaces-update": false,
+    "--no-yes": true,
+    "--node-gyp": true,
+    "--node-options": true,
+    "--noproxy": true,
+    "--offline": false,
+    "--omit": true,
+    "--omit-lockfile-registry-resolved": false,
+    "--only": true,
+    "--optional": true,
+    "--orgs": true,
+    "--orgs-permission": true,
+    "--os": true,
+    "--otp": true,
+    "--p": false,
+    "--pack-destination": true,
+    "--package": true,
+    "--package-lock": false,
+    "--package-lock-only": false,
+    "--packages": true,
+    "--packages-all": false,
+    "--packages-and-scopes-permission": true,
+    "--parseable": false,
+    "--password": true,
+    "--porcelain": false,
+    "--prefer-dedupe": false,
+    "--prefer-offline": false,
+    "--prefer-online": false,
+    "--prefix": true,
+    "--preid": true,
+    "--production": true,
+    "--progress": false,
+    "--provenance": false,
+    "--provenance-file": true,
+    "--proxy": true,
+    "--q": false,
+    "--quiet": false,
+    "--read-only": false,
+    "--readonly": false,
+    "--rebuild-bundle": false,
+    "--reg": true,
+    "--registry": true,
+    "--replace-registry-host": true,
+    "--s": false,
+    "--save": false,
+    "--save-bundle": false,
+    "--save-dev": false,
+    "--save-exact": false,
+    "--save-optional": false,
+    "--save-peer": false,
+    "--save-prefix": true,
+    "--save-prod": false,
+    "--sbom-format": true,
+    "--sbom-type": true,
+    "--scope": true,
+    "--scopes": true,
+    "--script-shell": true,
+    "--searchexclude": true,
+    "--searchlimit": true,
+    "--searchopts": true,
+    "--searchstaleness": true,
+    "--shell": true,
+    "--shrinkwrap": false,
+    "--sign-git-commit": false,
+    "--sign-git-tag": false,
+    "--silent": false,
+    "--strict-allow-scripts": false,
+    "--strict-peer-deps": false,
+    "--strict-ssl": false,
+    "--tag": true,
+    "--tag-version-prefix": true,
+    "--timing": false,
+    "--token-description": true,
+    "--umask": true,
+    "--unicode": false,
+    "--update-notifier": false,
+    "--usage": false,
+    "--user-agent": true,
+    "--userconfig": true,
+    "--v": false,
+    "--verbose": false,
+    "--version": false,
+    "--versions": false,
+    "--viewer": true,
+    "--w": true,
+    "--which": true,
+    "--workspace": true,
+    "--workspaces": true,
+    "--workspaces-update": false,
+    "--ws": true,
+    "--y": true,
+    "--yes": true,
+    "-?": false,
+    "-B": false,
+    "-C": true,
+    "-D": false,
+    "-E": false,
+    "-H": false,
+    "-L": true,
+    "-O": false,
+    "-P": false,
+    "-S": false,
+    "-a": false,
+    "-c": true,
+    "-d": false,
+    "-dd": false,
+    "-ddd": false,
+    "-desc": false,
+    "-enjoy-by": true,
+    "-f": false,
+    "-g": false,
+    "-h": false,
+    "-help": false,
+    "-iwr": false,
+    "-l": false,
+    "-local": false,
+    "-m": true,
+    "-n": true,
+    "-no": true,
+    "-p": false,
+    "-porcelain": false,
+    "-q": false,
+    "-quiet": false,
+    "-readonly": false,
+    "-reg": true,
+    "-s": false,
+    "-silent": false,
+    "-v": false,
+    "-verbose": false,
+    "-w": true,
+    "-ws": true,
+    "-y": true
+  },
+  "shorthands": {
+    "?": [
+      "--usage"
+    ],
+    "B": [
+      "--save-bundle"
+    ],
+    "C": [
+      "--prefix"
+    ],
+    "D": [
+      "--save-dev"
+    ],
+    "E": [
+      "--save-exact"
+    ],
+    "H": [
+      "--usage"
+    ],
+    "L": [
+      "--location"
+    ],
+    "O": [
+      "--save-optional"
+    ],
+    "P": [
+      "--save-prod"
+    ],
+    "S": [
+      "--save"
+    ],
+    "a": [
+      "--all"
+    ],
+    "c": [
+      "--call"
+    ],
+    "d": [
+      "--loglevel",
+      "info"
+    ],
+    "dd": [
+      "--loglevel",
+      "verbose"
+    ],
+    "ddd": [
+      "--loglevel",
+      "silly"
+    ],
+    "desc": [
+      "--description"
+    ],
+    "enjoy-by": [
+      "--before"
+    ],
+    "f": [
+      "--force"
+    ],
+    "g": [
+      "--global"
+    ],
+    "h": [
+      "--usage"
+    ],
+    "help": [
+      "--usage"
+    ],
+    "iwr": [
+      "--include-workspace-root"
+    ],
+    "l": [
+      "--long"
+    ],
+    "local": [
+      "--no-global"
+    ],
+    "m": [
+      "--message"
+    ],
+    "n": [
+      "--no-yes"
+    ],
+    "no": [
+      "--no-yes"
+    ],
+    "p": [
+      "--parseable"
+    ],
+    "porcelain": [
+      "--parseable"
+    ],
+    "q": [
+      "--loglevel",
+      "warn"
+    ],
+    "quiet": [
+      "--loglevel",
+      "warn"
+    ],
+    "readonly": [
+      "--read-only"
+    ],
+    "reg": [
+      "--registry"
+    ],
+    "s": [
+      "--loglevel",
+      "silent"
+    ],
+    "silent": [
+      "--loglevel",
+      "silent"
+    ],
+    "v": [
+      "--version"
+    ],
+    "verbose": [
+      "--loglevel",
+      "verbose"
+    ],
+    "w": [
+      "--workspace"
+    ],
+    "ws": [
+      "--workspaces"
+    ],
+    "y": [
+      "--yes"
+    ]
+  }
+}

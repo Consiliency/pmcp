@@ -21,7 +21,8 @@ preference. It emits the *active merged configuration*, not the definition set:
 
 The same generator would therefore classify differently on different hosts. The
 definitions module, by contrast, declares each flag's `type` -- the real arity
-declaration, independent of environment and of any default value.
+declaration, independent of any default value. Independent of the environment
+too, with ONE measured exception handled under HOST-ENUMERATED TYPES below.
 
 WHAT `type` MEANS, AND THE TWO MEMBERS THAT ARE NOT VALUE TYPES
 --------------------------------------------------------------
@@ -51,6 +52,41 @@ Classification, after the drop:
   Boolean AND non-Bool  -> CONDITIONAL: arity depends on the next token's
                            content, so no single class is right. Left UNLISTED,
                            which makes the scanner refuse. Fail closed.
+
+HOST-ENUMERATED TYPES: MEMBERS THAT ARE MACHINE FACTS (#193)
+------------------------------------------------------------
+One definition's `type` is not declared -- it is enumerated from the host.
+`local-address` is `null` plus every address `os.networkInterfaces()` reports,
+51 members on this machine and a different set on the next one. Classifying off
+the members therefore made `--verify` green on one machine and red on another
+with identical npm and identical source, and a drift check with false positives
+gets ignored -- which is how real drift ships.
+
+The failure is not merely "a different address list". `getLocalAddresses()`
+CATCHES a `networkInterfaces()` throw and returns exactly `[null]`; the member
+rule above strips `null` and calls the remainder UNINTERPRETABLE, which is the
+report #193 was filed with. So an IP-presence test cannot detect this class --
+on the very host that has the bug there is no IP to find.
+
+The fix normalises the CLASS and changes nothing else:
+
+  * detection happens in the NODE script, the only place the raw members still
+    exist -- the serializer maps every string member to '<literal>', so no
+    Python-side predicate can tell 51 addresses from `loglevel`'s 8 fixed
+    words. Signals: `typeDescription === 'IP Address'` (npm's own label, and
+    the one that survives the `[null]` case) or a `net.isIP` member scan.
+  * `classify(..., host_enumerated=True)` returns VALUE regardless of members.
+    `--local-address` consumes the next token on every host; only the member
+    list varies, and it carries no classification information.
+  * the flag is NOT exempted from `--verify`. Skipping it would blind the check
+    to a real arity change on the flag most likely to drift; `--verify` reports
+    which flags it normalised instead, so the behaviour is visible without
+    removing anything from the comparison.
+
+If npm ever renames the label AND the enumeration fails on the same host,
+detection stops and the flag falls back to member classification --
+UNINTERPRETABLE, i.e. a loud red verify rather than a silent wrong answer.
+That is the correct direction and is stated here so it is not read as a gap.
 
 SHORTHANDS EXPAND; ARITY COMES FROM THE EXPANSION'S LENGTH
 ----------------------------------------------------------
@@ -88,13 +124,19 @@ probe alone would not have caught a spelling omission.
 
 Deliberately NOT a pytest: npm's schema is version-specific and CI has no npm.
 Behaviour is pinned by the pure unit tests in tests/test_version_checker.py;
-this script is what keeps those pins honest against a real npm.
+this script is what keeps those pins honest against a real npm. Its own
+classification logic IS pytested there, against a RECORDED `read_schema()`
+(`--record-schema`, frozen in tests/fixtures/npm/schema.json) rather than a
+live one -- a maintainer-only check is an unrun check.
 
 Usage:
     python3 .consiliency/notes/derive_npm_flags.py            # emit the tables
     python3 .consiliency/notes/derive_npm_flags.py --verify   # check committed
+    python3 .consiliency/notes/derive_npm_flags.py --record-schema PATH
+                                                  # freeze read_schema() output
 """
 
+import ipaddress
 import json
 import pathlib
 import subprocess
@@ -125,6 +167,7 @@ _POSITIVE = frozenset({"package"})
 # than trusted -- the type strings alone are what falsified an earlier design.
 _NODE = r"""
 const path = require('path');
+const net = require('net');
 const root = process.argv[1];
 const defsPath = path.join(
   root, 'node_modules', '@npmcli', 'config', 'lib', 'definitions', 'index.js');
@@ -149,6 +192,24 @@ const remain = (argv) => nopt(types, m.shorthands, argv, 0).argv.remain;
 // member, since that is exactly where a conditional flag reveals itself.
 const consumes = (flag, probe) => !remain(['--' + flag, probe, 'TAIL']).includes(probe);
 
+// Is this definition's `type` enumerated from the HOST rather than declared?
+// This question can only be answered HERE. `label` below maps every string or
+// number member to the literal '<literal>', so by the time the type array
+// reaches Python no real address survives and no Python-side predicate can
+// distinguish `local-address`'s 51 machine addresses from `loglevel`'s 8 fixed
+// words. Two independent signals, either sufficient:
+//   * npm's own `typeDescription` label for the class ('IP Address'). Primary,
+//     because it is the one signal that still holds when the enumeration FAILS:
+//     `getLocalAddresses()` catches a `networkInterfaces()` throw and returns
+//     exactly `[null]`, and a member scan sees nothing at all in that case.
+//   * a `net.isIP` scan over the raw members, as a backstop for a future
+//     host-derived type npm does not label. Note `net.isIP` rejects a
+//     link-local address carrying a `%zone` suffix, which is the other reason
+//     the label is primary rather than the scan.
+const hostEnumerated = (v, t) =>
+  v.typeDescription === 'IP Address' ||
+  t.some((x) => typeof x === 'string' && net.isIP(x) !== 0);
+
 const definitions = {};
 for (const [k, v] of Object.entries(m.definitions)) {
   const t = Array.isArray(v.type) ? v.type : [v.type];
@@ -161,6 +222,11 @@ for (const [k, v] of Object.entries(m.definitions)) {
   if (lit !== undefined) probes.push(String(lit));
   definitions[k] = {
     type: t.map(label),
+    // Emitted so the CI-side tests -- which have neither npm nor node -- can
+    // assert on the real strings that drive the detection above, instead of
+    // on a hand-written guess at what they say.
+    typeDescription: v.typeDescription === undefined ? null : v.typeDescription,
+    hostEnumerated: hostEnumerated(v, t),
     short: v.short === undefined ? [] : [].concat(v.short),
     probes: Object.fromEntries(probes.map((p) => [p, consumes(k, p)])),
   };
@@ -214,8 +280,40 @@ def read_schema() -> dict:
     return json.loads(out.stdout)
 
 
-def classify(type_labels: list[str]) -> str:
-    """npm's declared `type` -> one of BOOLEAN / VALUE / CONDITIONAL."""
+def _host_enumerated(info: dict) -> bool:
+    """The node side's verdict for one definition, defaulting to False.
+
+    `.get` rather than `[...]` so a schema recorded before this field existed
+    still classifies by members instead of raising.
+    """
+    return bool(info.get("hostEnumerated", False))
+
+
+def host_enumerated_flags(schema: dict) -> list[str]:
+    """Definition names whose `type` npm builds from this machine."""
+    return sorted(
+        name for name, info in schema["definitions"].items() if _host_enumerated(info)
+    )
+
+
+def classify(type_labels: list[str], *, host_enumerated: bool = False) -> str:
+    """npm's declared `type` -> one of BOOLEAN / VALUE / CONDITIONAL.
+
+    `host_enumerated` short-circuits to VALUE REGARDLESS of the members,
+    including the bare `["null"]` case. A host-enumerated type's members are
+    facts about the machine -- `local-address` is npm's own network addresses
+    -- so they carry no classification information and vary between two hosts
+    running identical npm. The classification does not vary: `--local-address`
+    consumes the next token everywhere.
+
+    The `["null"]` case is not hypothetical and is why this cannot be a
+    member-filtering rule: `getLocalAddresses()` catches a
+    `networkInterfaces()` failure and returns exactly `[null]`, which the
+    member rule below strips to nothing and calls UNINTERPRETABLE. That is
+    precisely the false drift report Consiliency/pmcp#193 filed.
+    """
+    if host_enumerated:
+        return VALUE
     members = [t for t in type_labels if t not in _NOT_A_VALUE_TYPE]
     has_boolean = "Boolean" in members
     others = [t for t in members if t != "Boolean"]
@@ -288,7 +386,7 @@ def build(
 
     name_class: dict[str, str] = {}
     for name, info in defs.items():
-        cls = classify(info["type"])
+        cls = classify(info["type"], host_enumerated=_host_enumerated(info))
         name_class[name] = cls
         if cls == UNINTERPRETABLE:
             unreadable.append(f"{name}: type={info['type']}")
@@ -371,7 +469,7 @@ def check_against_nopt(schema: dict) -> list[str]:
     """
     bad: list[str] = []
     for name, info in schema["definitions"].items():
-        cls = classify(info["type"])
+        cls = classify(info["type"], host_enumerated=_host_enumerated(info))
         for probe, observed in info["probes"].items():
             if cls == BOOLEAN:
                 predicted = probe in ("true", "false") or (
@@ -501,7 +599,80 @@ def emit(classes: dict[str, str], nullable: dict[str, bool]) -> str:
     )
 
 
+# Stands in for a recorded probe token that is one of the recording machine's
+# own addresses. Only the KEY is masked; the probe result it maps to is real.
+_MASKED_PROBE = "<host-address>"
+
+_FIXTURE_README = (
+    "RECORDED OUTPUT of read_schema() in .consiliency/notes/derive_npm_flags.py, "
+    "captured against a real npm on a maintainer machine. CI has no npm and no "
+    "node, so tests that would otherwise be maintainer-only mock read_schema() "
+    "with this. Regenerate with: python3 .consiliency/notes/derive_npm_flags.py "
+    "--record-schema tests/fixtures/npm/schema.json. Ignored by the generator, "
+    "which reads only npm_version/definitions/shorthands/null_spellings. NOTE "
+    "local-address's `type` here is this machine's address list reduced to "
+    "'<literal>' labels; its LENGTH is a host fact and the tests patch it. Its "
+    "recorded PROBE keys are masked to " + _MASKED_PROBE + " for the same reason: "
+    "the node script probes with the type's first literal member, which for a "
+    "host-enumerated flag is one of the recording machine's own addresses."
+)
+
+
+def _mask_host_addresses(schema: dict) -> dict:
+    """Replace a host-enumerated flag's address-valued PROBE key with a constant.
+
+    The node script probes each definition with the first literal member of its
+    `type`; for `local-address` that is whatever `os.networkInterfaces()` put
+    first, so a re-record on a laptop would commit that machine's LAN address
+    into the repo. The probe RESULT is what the nopt cross-check reads, and it
+    is preserved -- only the key's spelling is normalised, which also stops a
+    re-record from churning the fixture on every host.
+    """
+    for info in schema["definitions"].values():
+        if not _host_enumerated(info):
+            continue
+        info["probes"] = {
+            (_MASKED_PROBE if _is_ip_literal(probe) else probe): consumed
+            for probe, consumed in info["probes"].items()
+        }
+    return schema
+
+
+def _is_ip_literal(token: str) -> bool:
+    try:
+        ipaddress.ip_address(token.split("%", 1)[0])
+    except ValueError:
+        return False
+    return True
+
+
+def record_schema(dest: pathlib.Path) -> int:
+    """Freeze `read_schema()` to JSON so the CI tests can run without npm.
+
+    The tests this feeds are the ones that would otherwise only ever run on a
+    maintainer's machine -- and a check that never runs in CI is the same
+    ignored check that #193 is about.
+
+    What this recording CANNOT pin is npm's own version: it freezes npm 11.19.0
+    and the CI tests check the committed tables against that. Version skew --
+    tables recorded on one npm, a real npm that has since moved -- is still
+    caught only by running `--verify` against a live npm, which is the whole
+    point of that mode and is deliberately unchanged.
+    """
+    payload = {"_README": _FIXTURE_README, **_mask_host_addresses(read_schema())}
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    print(f"recorded {dest} ({dest.stat().st_size} bytes)", file=sys.stderr)
+    return 0
+
+
 def main() -> int:
+    if "--record-schema" in sys.argv:
+        argv_rest = sys.argv[sys.argv.index("--record-schema") + 1 :]
+        if not argv_rest:
+            raise SystemExit("--record-schema needs a destination path")
+        return record_schema(pathlib.Path(argv_rest[0]))
+
     schema = read_schema()
     classes, nullable, conditional, union, unreadable = build(schema)
     live_nullable = nullable_table(classes, nullable)
@@ -527,6 +698,20 @@ def main() -> int:
     print(f"\nUNINTERPRETABLE type ({len(unreadable)}):", file=sys.stderr)
     for entry in unreadable:
         print(f"  {entry}", file=sys.stderr)
+
+    # NOT an exemption. These flags stay in the comparison below; what is
+    # normalised is their CLASS, which is host-independent even though their
+    # declared members are not. Deliberately prints no member count -- that is
+    # the host fact, and printing it would make this line differ between two
+    # machines running identical npm, which is the bug being fixed.
+    normalised = host_enumerated_flags(schema)
+    print(
+        f"\nHOST-ENUMERATED type -> normalised to {VALUE}, still verified "
+        f"({len(normalised)}):",
+        file=sys.stderr,
+    )
+    for name in normalised:
+        print(f"  --{name}", file=sys.stderr)
 
     mismatches = check_against_nopt(schema)
     print(
