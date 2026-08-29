@@ -1,5 +1,12 @@
 # Detailed plan: an auto-discovered policy that is a policy must not fail open
 
+> **Revision 2 (2026-08-29).** Boarded 2 AGREE / 1 DISAGREE. The DISAGREE was
+> right and the two AGREEs endorsed the error: rev 1 classified a non-mapping
+> root as a *parse* failure, but a list, a scalar and an empty file all **parse
+> successfully** — they are only invalid against the object-shaped schema. That
+> contradicted rev 1's own rule and its own acceptance criterion, and left a
+> fail-open for a policy file that is accidentally a list.
+
 ## Task
 
 Close Consiliency/pmcp#202. A policy file at a default location that fails to load
@@ -13,6 +20,11 @@ is discarded, and the gateway falls back to `GatewayPolicy()` — which is
 | does not exist | no policy, silent | unchanged — legitimately "no policy" |
 | exists, cannot be parsed at all | warn, allow-all | **unchanged** — see below |
 | parses as a document, fails schema validation | warn, allow-all | **refuse to start** |
+
+"Parses as a document" means `yaml.safe_load`/`json.loads` returned **without
+raising** — including when it returns a list, a scalar, or `None` for an empty
+file. Verified: all three parse cleanly and differ from a valid policy only by
+failing the object schema. They therefore belong on the **fatal** side.
 
 ## Research summary
 
@@ -71,11 +83,20 @@ file" is legitimately silent.
 - `_load_policy` (`:59`) — modify — separate *parse* from *validate* so the
   caller can tell them apart. Read + parse in one `try`; `model_validate` in a
   second. On the auto-discovery path:
-  - parse failure (including `read_text` failure and the non-mapping root) →
-    warn and continue, exactly as today;
+  - parse failure — `read_text` raising, or the parser raising — → warn and
+    continue, exactly as today;
   - **validation failure → raise**, with a message naming the path and the
     validation error, distinct from the explicit-policy message so the two are
-    not confused in a log.
+    not confused in a log. **The non-mapping root check belongs here**, on the
+    fatal side, not with the parse failures.
+
+  **WAS WRONG (rev 1):** it put the non-mapping root with the parse failures.
+  Verified: `yaml.safe_load` returns a `list` for a list root, a `str` for a
+  scalar, and `None` for an empty file — all *without raising*. Classifying them
+  as parse failures contradicted this plan's own stated rule and its own
+  schema-invalid acceptance criterion, and would have left a policy file that is
+  accidentally a list still yielding allow-all. Two of three seats endorsed the
+  error; only the red-team seat caught it.
 - The `except` message (`:78`) — modify — the current warning says "Failed to
   load policy from …". Once the two cases diverge it must say which one happened
   and, for the surviving warn-path, state plainly that **no policy is in effect**.
@@ -89,10 +110,22 @@ file" is legitimately silent.
   (best-effort applies to *unparseable*, not to *invalid*), because the current
   name will otherwise assert something broader than the code does.
 
+### `README.md` (modify)
+
+Lines ~1337-1340 currently read: *"Best-effort fallback applies only to
+automatically discovered default locations when the operator did not request a
+policy."* That becomes **false** for schema-invalid files. Narrow it to say
+best-effort now covers only a file that cannot be parsed, and that a discovered
+file which parses but is not a valid policy terminates startup like an explicit
+one. Rev 1 said "modify only if it documents auto-discovery" — it does.
+
 ### `tests/test_policy_fail_open.py` (create)
 
 - A schema-invalid file at a default path → `PolicyManager()` **raises**, and the
   message names the path.
+- **A list root, a scalar root, and an empty file** at a default path each
+  → `PolicyManager()` **raises**. These are the cases rev 1 mislabelled; without
+  them the fix is not proven for the shapes most likely to occur by accident.
 - An unparseable file at a default path → does **not** raise, and the warning
   says no policy is in effect.
 - A **valid** file at a default path → loads, and a deny rule in it is actually
@@ -144,7 +177,10 @@ first is invalid and the second is valid — the loop `break`s at the first
 - [ ] A **schema-invalid** file at a default path makes `PolicyManager()` raise,
       and the error names the path. Proven by a test that fails against `main`.
 - [ ] An **unparseable** file at a default path still does not raise — the
-      existing tested intent, asserted by the original test's own case.
+      existing tested intent, asserted by the original test's own case. This
+      means a file the parser *rejects*, not one that parses to a non-mapping.
+- [ ] A **list root**, a **scalar root** and an **empty file** at a default path
+      each raise. Rev 1 would have let all three through.
 - [ ] A **valid** file at a default path still loads *and enforces*, proven by a
       deny rule actually denying. A change that refuses everything must not pass.
 - [ ] `Path.cwd()` is read at construction: `chdir` after import into a directory
@@ -164,6 +200,12 @@ first is invalid and the second is valid — the loop `break`s at the first
   at all; that is not in question here.
 - Auditing other fail-open fallbacks elsewhere in the codebase. If any exist they
   deserve their own issue rather than being swept in.
+- Updating the comments that currently describe the old behaviour
+  (`types.py:957-970`, `client/manager.py:2174-2177`,
+  `test_client_manager.py:6076-6083`). They become inaccurate once validation is
+  fatal, and — worth recording — **`Field(ge=1)` on `max_tools_per_server`
+  becomes safe to add after this change**, which is the #175 item that had to be
+  dropped. Both belong in a follow-up so this diff stays on one subject.
 
 ## Execution Policy
 
