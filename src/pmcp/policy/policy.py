@@ -28,12 +28,32 @@ DEFAULT_REDACTION_PATTERNS = [
     r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
 ]
 
+# Search order for an auto-discovered policy. The project-local entries are kept
+# RELATIVE on purpose: they are resolved against `Path.cwd()` when a
+# `PolicyManager` is constructed, not when this module is imported. Storing them
+# pre-joined froze the working directory as of import, so a gateway that changed
+# directory before constructing its manager looked for a policy in the wrong
+# place and silently found none -- an unrestricted gateway with no warning at all
+# (Consiliency/pmcp#202).
+#
+# The list stays a module attribute so `monkeypatch.setattr` on
+# `pmcp.policy.policy.DEFAULT_POLICY_PATHS` remains a working test seam; absolute
+# entries pass through the resolver unchanged.
 DEFAULT_POLICY_PATHS = [
-    Path.cwd() / ".mcp-gateway-policy.yaml",
-    Path.cwd() / ".mcp-gateway-policy.json",
+    Path(".mcp-gateway-policy.yaml"),
+    Path(".mcp-gateway-policy.json"),
     Path.home() / ".claude" / "gateway-policy.yaml",
     Path.home() / ".claude" / "gateway-policy.json",
 ]
+
+
+def _default_policy_paths() -> list[Path]:
+    """Resolve `DEFAULT_POLICY_PATHS` against the *current* working directory.
+
+    Read the module attribute at call time so a monkeypatched list is honoured.
+    """
+    cwd = Path.cwd()
+    return [path if path.is_absolute() else cwd / path for path in DEFAULT_POLICY_PATHS]
 
 
 class PolicyManager:
@@ -49,7 +69,7 @@ class PolicyManager:
             self._load_policy(policy_path, fatal=True)
         else:
             # Try default locations
-            for default_path in DEFAULT_POLICY_PATHS:
+            for default_path in _default_policy_paths():
                 if default_path.exists():
                     self._load_policy(default_path, fatal=False)
                     break
