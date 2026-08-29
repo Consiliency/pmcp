@@ -682,9 +682,13 @@ def _parse_tool_entries(
             if limit < 1:
                 # "has more than 0 tools, truncating" is true and useless: it
                 # reads as a server that overran a bound, when what happened is
-                # that the bound admits nothing. Name the limit instead -- the
-                # operator's next move is to fix their policy file, and the log
-                # should point at it. (#175 item 3.)
+                # that the bound admits nothing. Name the limit instead, so the
+                # reader can see the gateway made this decision. (#175 item 3.)
+                #
+                # Since #207 a policy file cannot produce this: `LimitsPolicy`
+                # bounds the field at `ge=1`. The caller here is
+                # `ClientManager`'s constructor parameter, which is deliberately
+                # unbounded, so this stays reachable programmatically.
                 logger.warning(
                     f"Server {name} offered {len(tools)} tools but "
                     f"max_tools_per_server is {limit}, so none were indexed"
@@ -2170,11 +2174,13 @@ class ClientManager:
                     # #175 item 3. A zero limit empties the parse result before
                     # a single entry is looked at, so the generic message below
                     # would accuse the downstream of sending garbage for a
-                    # decision this gateway's own policy made. Deliberately no
-                    # `Field(ge=1)` on the schema instead: `_load_policy(...,
-                    # fatal=False)` swallows validation errors and falls back to
-                    # the allow-all default, so rejecting the value would
-                    # silently discard the operator's entire policy file (#202).
+                    # decision this gateway made itself.
+                    #
+                    # `LimitsPolicy` now bounds the field at `ge=1` (#207), so a
+                    # policy file can no longer reach here -- #202 made such a
+                    # file terminate startup. `self._max_tools_per_server` comes
+                    # from the constructor parameter, which is deliberately left
+                    # unbounded, so this branch still guards a live path.
                     logger.warning(
                         f"[{name}] max_tools_per_server is "
                         f"{self._max_tools_per_server}, so none of the "
