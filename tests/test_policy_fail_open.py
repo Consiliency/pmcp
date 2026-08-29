@@ -200,7 +200,9 @@ def test_no_policy_file_anywhere_is_silent(
         manager = PolicyManager()
 
     assert manager.is_gateway_tool_allowed("gateway.provision") is True
-    assert [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING] == []
+    assert [
+        r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING
+    ] == []
 
 
 # === Path.cwd() is read at construction, not at import ===
