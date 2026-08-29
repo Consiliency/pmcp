@@ -957,20 +957,26 @@ class PromptPolicy(BaseModel):
 class LimitsPolicy(BaseModel):
     """Resource limits policy.
 
-    **`max_tools_per_server` deliberately carries no `Field(ge=1)`.** A zero
-    limit indexes no tools, which #175 item 3 first proposed to reject at the
-    schema. It must not be: `PolicyManager._load_policy(..., fatal=False)` --
-    the auto-discovery path -- swallows any validation exception and leaves the
-    default allow-all `GatewayPolicy` in place, so a bound here would make a
-    policy file containing `max_tools_per_server: 0` schema-invalid and silently
-    discard **the whole file** -- allowlist, denylist, limits and redaction all
-    reverting to permissive. A cosmetic log fix is not worth a fail-open. The
-    misleading log was fixed in `_reconcile_once` instead; the underlying
-    fail-open is #202, and any future tightening of this schema carries the same
-    risk until it is resolved.
+    **`max_tools_per_server` is bounded at `ge=1`, and could not be until
+    #202.** A zero limit indexes no tools, and #175 item 3 first proposed
+    rejecting it here -- then withdrew the proposal as a security regression.
+    At the time `PolicyManager._load_policy(..., fatal=False)` -- the
+    auto-discovery path -- discarded any validation failure and left the default
+    allow-all `GatewayPolicy` in place, so a bound here would have made a policy
+    file containing `max_tools_per_server: 0` schema-invalid and silently thrown
+    away **the whole file** -- allowlist, denylist, limits and redaction all
+    reverting to permissive. #202 made a discovered policy that parses but fails
+    validation terminate startup, so a bound can no longer quietly unrestrict
+    anything, and #207 added this one.
+
+    That history is kept because the hazard is not obvious from the code: any
+    future tightening of this schema is safe only for as long as #202's
+    fail-closed behaviour holds. Note also that `ClientManager.__init__`'s
+    `max_tools_per_server` parameter is a separate, deliberately unbounded axis
+    -- see its `< 1` guard in `pmcp.client.manager`.
     """
 
-    max_tools_per_server: int = 100
+    max_tools_per_server: int = Field(default=100, ge=1)
     max_output_bytes: int = 50000  # 50KB
     max_output_tokens: int = 4000
 
