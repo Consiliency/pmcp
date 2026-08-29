@@ -33,7 +33,7 @@ describes `max_tools_per_server`'s default of 100 as a *legitimate catalog size*
 `_parse_tool_entries`; the citation does not, and is removed rather than
 reworded.
 
-**Two independent axes.** `LimitsPolicy.max_tools_per_server` (`types.py:960`) is
+**Two independent axes.** `LimitsPolicy.max_tools_per_server` (`types.py:973`) is
 the policy/schema surface. `ClientManager.__init__`'s `max_tools_per_server: int = 100`
 (`manager.py:936`) is a separate constructor parameter, and
 `manager.py:2169` guards `< 1` — so it already handles zero *and negatives*
@@ -124,7 +124,8 @@ a gateway that indexes no tools at all, but "plausibly zero" is not "none".
 ## Dependencies & order
 
 1. The `ge=1` bound and the inverted schema test.
-2. The three comment corrections.
+2. The four comment corrections — `types.py` docstring, `manager.py:2174-2177`,
+   `manager.py:683-687`, and the `TestZeroLimitLogsAccurately` docstring.
 3. The end-to-end discovered-policy test.
 4. CHANGELOG.
 
