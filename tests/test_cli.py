@@ -2666,3 +2666,203 @@ class TestCheckVersionsUnverifiableDisplay:
         assert "All cached descriptions are up to date." in out, out
         assert self.UNVERIFIABLE_HEADING not in out, out
         assert self.FORCE_FOOTER not in out, out
+
+
+# --- #211: the CLI must not present a relayed URL as one pmcp checked -------
+
+
+async def _run_cli_auth(
+    func_name: str, args: argparse.Namespace, payload: dict
+) -> None:
+    from pmcp import cli as cli_module
+
+    call_tool = AsyncMock(
+        return_value={"content": [{"type": "text", "text": json.dumps(payload)}]}
+    )
+    with patch(
+        "pmcp.client.manager.ClientManager.connect_all", new=AsyncMock(return_value=[])
+    ):
+        with patch("pmcp.client.manager.ClientManager.call_tool", new=call_tool):
+            with patch(
+                "pmcp.client.manager.ClientManager.disconnect_all", new=AsyncMock()
+            ):
+                await getattr(cli_module, func_name)(args)
+
+
+def _connect_args(as_json: bool) -> argparse.Namespace:
+    return argparse.Namespace(
+        command="auth",
+        auth_command="connect",
+        server_name="remote-auth",
+        credential=None,
+        env_var=None,
+        scope="user",
+        no_provision=False,
+        policy=None,
+        log_level="warn",
+        json=as_json,
+    )
+
+
+def _provision_payload(url: str, *, url_verified: bool) -> dict:
+    next_step = (
+        "Open the URL out of band, complete consent."
+        if url_verified
+        else (
+            "PMCP has not verified where this URL points -- it checks the URL's "
+            "form and rejects private address literals, but it does not resolve "
+            "host names. Confirm the destination yourself before opening it. "
+            "Once confirmed, open the URL out of band, complete consent."
+        )
+    )
+    return {
+        "ok": False,
+        "server": "remote-auth",
+        "message": "URL-mode elicitation required.",
+        "auth_required": True,
+        "auth_state": "elicitation_required",
+        "next_step": next_step,
+        "url_elicitations": [
+            {
+                "elicitation_id": "consent-1",
+                "url": url,
+                "url_verified": url_verified,
+                "next_step": next_step,
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_cli_marks_an_unverified_elicitation_url_in_human_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both halves of the operator-facing surface, asserted on emitted text.
+
+    The URL line carries its own qualifier rather than relying on `next_step`
+    alone, so a later edit to the instruction cannot silently un-qualify the URL
+    an operator is looking at.
+    """
+    await _run_cli_auth(
+        "run_auth_connect",
+        _connect_args(as_json=False),
+        _provision_payload("https://auth.vendor.com/consent", url_verified=False),
+    )
+
+    out = capsys.readouterr().out
+    assert "https://auth.vendor.com/consent" in out
+    assert "(destination not verified by pmcp)" in out
+    assert "not verified where this URL points" in out
+
+
+@pytest.mark.asyncio
+async def test_cli_json_output_carries_the_unverified_signal_and_text(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    await _run_cli_auth(
+        "run_auth_connect",
+        _connect_args(as_json=True),
+        _provision_payload("https://auth.vendor.com/consent", url_verified=False),
+    )
+
+    out = capsys.readouterr().out
+    payload = json.loads(out)["provision"]
+    assert payload["url_elicitations"][0]["url_verified"] is False
+    assert "not verified where this URL points" in payload["next_step"]
+
+
+@pytest.mark.asyncio
+async def test_cli_does_not_qualify_a_verified_elicitation_url(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    await _run_cli_auth(
+        "run_auth_connect",
+        _connect_args(as_json=False),
+        _provision_payload("https://93.184.216.34/consent", url_verified=True),
+    )
+
+    out = capsys.readouterr().out
+    assert "https://93.184.216.34/consent" in out
+    assert "not verified" not in out
+
+
+@pytest.mark.asyncio
+async def test_cli_treats_a_missing_url_verified_field_as_unverified(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An older gateway that omits the field must not read as a clean bill."""
+    payload = _provision_payload("https://auth.vendor.com/consent", url_verified=False)
+    del payload["url_elicitations"][0]["url_verified"]
+
+    await _run_cli_auth("run_auth_connect", _connect_args(as_json=False), payload)
+
+    assert "(destination not verified by pmcp)" in capsys.readouterr().out
+
+
+@pytest.mark.asyncio
+async def test_cli_acknowledge_qualifies_without_blaming_the_server(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The acknowledge path echoes a URL the *operator* supplied.
+
+    So the copy has to stay provenance-neutral: "came from the server" would be
+    a false statement on this path.
+    """
+    args = argparse.Namespace(
+        command="auth",
+        auth_command="acknowledge",
+        server_name="remote-auth",
+        elicitation_id="consent-1",
+        elicitation_url="https://auth.vendor.com/consent",
+        policy=None,
+        log_level="warn",
+        json=False,
+        credential=None,
+    )
+    payload = {
+        "ok": True,
+        "server": "remote-auth",
+        "message": "Recorded URL-mode elicitation acknowledgement.",
+        "next_step": "Retry gateway.provision(server_name='remote-auth')",
+        "url_elicitation": {
+            "elicitation_id": "consent-1",
+            "url": "https://auth.vendor.com/consent",
+            "url_verified": False,
+        },
+    }
+
+    await _run_cli_auth("run_auth_acknowledge", args, payload)
+
+    out = capsys.readouterr().out
+    assert "(destination not verified by pmcp)" in out
+    assert "came from the server" not in out
+
+
+def test_auth_evidence_summary_flags_an_unverified_elicitation() -> None:
+    from pmcp.cli import _format_auth_evidence
+
+    summary = _format_auth_evidence(
+        {
+            "auth_state": "elicitation_required",
+            "url_elicitations": [
+                {"elicitation_id": "consent-1", "url_verified": False}
+            ],
+        }
+    )
+
+    assert summary is not None
+    assert "url_destination=unverified" in summary
+
+
+def test_auth_evidence_summary_is_quiet_for_a_verified_elicitation() -> None:
+    from pmcp.cli import _format_auth_evidence
+
+    summary = _format_auth_evidence(
+        {
+            "auth_state": "elicitation_required",
+            "url_elicitations": [{"elicitation_id": "consent-1", "url_verified": True}],
+        }
+    )
+
+    assert summary is not None
+    assert "url_destination" not in summary

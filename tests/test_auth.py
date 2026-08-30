@@ -17,6 +17,7 @@ from pmcp.auth import (
     ResourceServerAuthError,
     ResourceServerJWKSUnavailable,
     fetch_json_metadata,
+    is_verified_public_auth_url,
     normalize_auth_metadata,
     parse_url_elicitation_error,
     parse_www_authenticate,
@@ -36,12 +37,15 @@ from pmcp.remote_auth import (
 )
 from pmcp.types import (
     DEFAULT_AUTH_STATE_SEMANTICS,
+    AuthChallengeInfo,
     AuthConnectInput,
+    AuthMetadataInfo,
     GatewayAuditEvent,
     GatewayDiagnosticsInfo,
     InvokeOutput,
     ProvisionOutput,
     ServerHealthInfo,
+    UrlElicitationInfo,
 )
 from pmcp.types import AuthState
 
@@ -524,19 +528,59 @@ def test_sanitize_url_elicitation_url_accepts_https_and_redacts_query_secrets() 
     assert "refresh-secret" not in url
 
 
-def test_sanitize_url_elicitation_url_allows_loopback_http() -> None:
+def test_sanitize_url_elicitation_url_allows_loopback_http_for_operator() -> None:
+    """Operator provenance keeps loopback HTTP -- local OAuth needs it.
+
+    This is the surviving half of the original
+    `test_sanitize_url_elicitation_url_allows_loopback_http`. Removing loopback
+    globally to close #211 would have broken the frozen local-consent flow at
+    `gateway.auth_connect`, where the operator types the redirect URL.
+    """
     assert (
-        sanitize_url_elicitation_url("http://localhost:3000/cb?code=secret")
+        sanitize_url_elicitation_url(
+            "http://localhost:3000/cb?code=secret", provenance="operator"
+        )
         == "http://localhost:3000/cb?code=%5BREDACTED%5D"
     )
     assert (
-        sanitize_url_elicitation_url("http://127.0.0.1/cb?token=secret")
+        sanitize_url_elicitation_url(
+            "http://127.0.0.1/cb?token=secret", provenance="operator"
+        )
         == "http://127.0.0.1/cb?token=%5BREDACTED%5D"
     )
     assert (
-        sanitize_url_elicitation_url("http://[::1]/cb?refresh_token=secret")
+        sanitize_url_elicitation_url(
+            "http://[::1]/cb?refresh_token=secret", provenance="operator"
+        )
         == "http://[::1]/cb?refresh_token=%5BREDACTED%5D"
     )
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://localhost:3000/cb?code=secret",
+        "http://127.0.0.1/cb?token=secret",
+        "http://[::1]/cb?refresh_token=secret",
+    ],
+)
+def test_sanitize_url_elicitation_url_refuses_loopback_http_from_remote(
+    url: str,
+) -> None:
+    """#211: the same URL is refused when a downstream server supplied it.
+
+    A loopback `http://` URL in a server's error payload is an attempt to point
+    the operator at something on the operator's own machine. The inverse of the
+    operator case above -- the provenance is the whole difference.
+    """
+    with pytest.raises(ValueError):
+        sanitize_url_elicitation_url(url, provenance="remote")
+
+
+def test_sanitize_url_elicitation_url_defaults_to_the_strict_remote_policy() -> None:
+    """A caller that forgets `provenance` must lose loopback, not keep it."""
+    with pytest.raises(ValueError):
+        sanitize_url_elicitation_url("http://127.0.0.1/cb")
 
 
 @pytest.mark.parametrize(
@@ -983,11 +1027,13 @@ def test_fetch_json_metadata_uses_safe_request_headers(
 
     monkeypatch.setattr("pmcp.auth.urlopen", fake_urlopen)
 
-    data, error = fetch_json_metadata("https://auth.example/meta?token=secret")
+    # A verified public literal -- since #211 this is the only shape that gets
+    # fetched at all, so the happy path has to use one.
+    data, error = fetch_json_metadata("https://93.184.216.34/meta?token=secret")
 
     assert data == {"issuer": "https://issuer.example"}
     assert error is None
-    assert seen["url"] == "https://auth.example/meta?token=%5BREDACTED%5D"
+    assert seen["url"] == "https://93.184.216.34/meta?token=%5BREDACTED%5D"
     assert seen["accept"] == "application/json"
     assert seen["authorization"] is None
     assert seen["cookie"] is None
@@ -999,6 +1045,46 @@ def test_fetch_json_metadata_rejects_non_public_urls() -> None:
     assert data is None
     assert error is not None
     assert "secret" not in error
+
+
+@pytest.mark.parametrize(
+    ("url", "why"),
+    [
+        ("http://127.0.0.1/x", "loopback HTTP -- reached urlopen before #211"),
+        ("http://localhost/x", "loopback by name"),
+        (
+            "https://metadata.google.internal/x",
+            "unresolved hostname -- reached urlopen before #211",
+        ),
+        ("https://auth.vendor.com/.well-known/x", "an ordinary unresolved name"),
+        ("https://10.0.0.1/x", "private literal -- already rejected on main"),
+    ],
+)
+def test_fetch_json_metadata_refuses_unverified_hosts_without_opening_them(
+    monkeypatch: pytest.MonkeyPatch, url: str, why: str
+) -> None:
+    """#211: a refused fetch must never reach the network.
+
+    `fetch_json_metadata` is the fail-closed side: pmcp retrieves this URL
+    itself, so "accepted but unresolved" is not good enough the way it is on a
+    relay path. Asserting on the return value alone is not sufficient -- an
+    implementation that fetched first and judged afterwards would still return
+    an error while the request had already left. So the opener is patched with
+    one that fails the test if it is called at all.
+    """
+    calls: list[object] = []
+
+    def forbidden_urlopen(request: object, timeout: float) -> object:
+        calls.append(request)
+        raise AssertionError(f"fetch_json_metadata opened a refused URL: {url}")
+
+    monkeypatch.setattr("pmcp.auth.urlopen", forbidden_urlopen)
+
+    data, error = fetch_json_metadata(url)
+
+    assert calls == [], why
+    assert data is None
+    assert error is not None
 
 
 def test_parse_www_authenticate_handles_quoted_edges_and_safe_metadata() -> None:
@@ -1073,3 +1159,181 @@ def test_env_store_rejects_injection_before_write(tmp_path: Path) -> None:
         write_env_file(env_path, {"GOOD=bad": "secret"})
 
     assert not env_path.exists()
+
+
+# --- #211: pmcp must not present a relayed URL as one it verified ----------
+#
+# The fix is deliberately *not* "reject unverifiable names". Two board rounds
+# established that doing so would refuse a well-behaved server's
+# `https://auth.vendor.com/...` and kill URL-mode elicitation outright.
+# Rejecting is right for a fetch and wrong for a relay. So these tests pin the
+# other half: the URL still goes through, pmcp just stops vouching for it.
+
+
+def _elicitation_payload(url: str) -> dict[str, object]:
+    return {
+        "error": {
+            "code": -32042,
+            "data": {"elicitationId": "el-1", "url": url, "message": "consent"},
+        }
+    }
+
+
+def test_downstream_elicitation_relays_a_vendor_name_and_marks_it_unverified() -> None:
+    """The feature survives: a name is relayed, but not vouched for."""
+    parsed = parse_url_elicitation_error(
+        _elicitation_payload("https://auth.vendor.com/consent")
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].url == "https://auth.vendor.com/consent"
+    assert parsed[0].url_verified is False
+
+
+def test_downstream_elicitation_marks_a_public_literal_verified() -> None:
+    """The signal has to distinguish, not label everything unverified."""
+    parsed = parse_url_elicitation_error(
+        _elicitation_payload("https://93.184.216.34/consent")
+    )
+
+    assert len(parsed) == 1
+    assert parsed[0].url_verified is True
+
+
+def test_downstream_elicitation_rejects_loopback_http() -> None:
+    """#211: this payload was accepted and shown to the operator before."""
+    assert (
+        parse_url_elicitation_error(_elicitation_payload("http://127.0.0.1/cb")) == []
+    )
+
+
+def test_url_elicitation_next_step_carries_the_caveat_for_a_name() -> None:
+    """`next_step` is the string an agent follows, so the caveat lives there.
+
+    A JSON `url_verified: false` beside an unqualified "Open the URL" is not a
+    fix: the agent reads the instruction. This asserts on the emitted text.
+    """
+    parsed = parse_url_elicitation_error(
+        _elicitation_payload("https://metadata.google.internal/consent")
+    )
+
+    next_step = parsed[0].next_step
+    assert next_step is not None
+    assert "not verified where this URL points" in next_step
+    assert "does not resolve host names" in next_step
+    # The actionable instruction must survive the qualification.
+    assert "gateway.auth_connect" in next_step
+    assert "consent_acknowledged=true" in next_step
+
+
+def test_url_elicitation_next_step_is_unqualified_for_a_verified_literal() -> None:
+    parsed = parse_url_elicitation_error(
+        _elicitation_payload("https://93.184.216.34/consent")
+    )
+
+    next_step = parsed[0].next_step
+    assert next_step is not None
+    assert "not verified" not in next_step
+    assert next_step.startswith("Open the URL out of band")
+
+
+def test_url_elicitation_info_defaults_to_unverified() -> None:
+    """Constructed without the signal, the type must under-claim.
+
+    A default of "verified" would reintroduce the vouch at every call site this
+    change missed.
+    """
+    info = UrlElicitationInfo(elicitation_id="el-1", url="https://auth.vendor.com/x")
+
+    assert info.url_verified is False
+
+
+def test_auth_challenge_marks_an_unresolved_name_unverified() -> None:
+    """`parse_www_authenticate` relays a header field from a remote server."""
+    parsed = parse_www_authenticate(
+        'Bearer resource_metadata="https://metadata.google.internal/meta"'
+    )
+
+    assert parsed is not None
+    assert parsed.resource_metadata_url == "https://metadata.google.internal/meta"
+    assert parsed.resource_metadata_url_verified is False
+    assert '"resource_metadata_url_verified":false' in parsed.model_dump_json()
+
+
+def test_auth_challenge_marks_a_public_literal_verified() -> None:
+    parsed = parse_www_authenticate(
+        'Bearer resource_metadata="https://93.184.216.34/meta"'
+    )
+
+    assert parsed is not None
+    assert parsed.resource_metadata_url_verified is True
+
+
+def test_auth_challenge_info_defaults_to_unverified() -> None:
+    assert AuthChallengeInfo(scheme="Bearer").resource_metadata_url_verified is False
+
+
+def test_auth_metadata_reports_a_literal_and_a_name_differently() -> None:
+    """A single object-level flag cannot pass this.
+
+    `AuthMetadataInfo` carries five independent URLs. One bool would have to
+    describe a public literal and an unresolved name at once, and would be a
+    lie about one of them whichever way it fell.
+    """
+    metadata = normalize_auth_metadata(
+        protected_resource_metadata_url="https://93.184.216.34/pr",
+        authorization_server_metadata_url="https://auth.vendor.com/as",
+    )
+
+    assert metadata.protected_resource_metadata_url == "https://93.184.216.34/pr"
+    assert metadata.authorization_server_metadata_url == "https://auth.vendor.com/as"
+    assert metadata.url_verified("protected_resource_metadata_url") is True
+    assert metadata.url_verified("authorization_server_metadata_url") is False
+    assert metadata.verified_urls == ["protected_resource_metadata_url"]
+    assert any(
+        "authorization_server_metadata_url is relayed unverified" in diagnostic
+        for diagnostic in metadata.diagnostics
+    )
+
+
+def test_auth_metadata_url_fields_stay_plain_strings() -> None:
+    """transport/http.py interpolates one of these into a WWW-Authenticate
+    header, so wrapping them would be a silent contract break."""
+    metadata = normalize_auth_metadata(
+        protected_resource_metadata_url="https://auth.vendor.com/pr"
+    )
+
+    assert isinstance(metadata.protected_resource_metadata_url, str)
+    assert f'resource_metadata="{metadata.protected_resource_metadata_url}"' == (
+        'resource_metadata="https://auth.vendor.com/pr"'
+    )
+
+
+def test_auth_metadata_defaults_to_no_verified_urls() -> None:
+    assert AuthMetadataInfo().verified_urls == []
+    assert AuthMetadataInfo().url_verified("protected_resource_metadata_url") is False
+
+
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://93.184.216.34/x", True),
+        ("https://[2606:4700::1111]/x", True),
+        ("https://auth.vendor.com/x", False),
+        ("https://metadata.google.internal/x", False),
+        # Name-shaped but numeric: #210 classifies it as the literal it is.
+        ("https://0xA9FEA9FE/x", False),
+        ("https://169.254.169.254./x", False),
+        ("https://127.0.0.1/x", False),
+        ("http://93.184.216.34/x", False),
+        ("not-a-url", False),
+        ("https://[::1", False),
+    ],
+)
+def test_is_verified_public_auth_url(url: str, expected: bool) -> None:
+    """The predicate answers "did pmcp check this?", not "is this allowed?".
+
+    A DNS name is False even though `sanitize_public_auth_url` accepts it --
+    that gap between accepted and checked is the whole of #211.
+    """
+    assert is_verified_public_auth_url(url) is expected

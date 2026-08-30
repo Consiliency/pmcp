@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **PMCP no longer implies it verified where a server-supplied auth URL
+  points.** It never did: `_is_public_auth_host` classifies IP literals and
+  accepts a DNS name **without resolving it**, so
+  `https://metadata.google.internal/...` in an elicitation payload or a
+  `WWW-Authenticate` header was relayed to the operator — and to an agent —
+  looking like something PMCP had checked. Names are still relayed, because
+  refusing unresolvable ones would refuse a well-behaved server's
+  `https://auth.vendor.com/...` too; what changed is what PMCP claims about
+  them. `UrlElicitationInfo.url_verified`, `AuthMetadataInfo.verified_urls`
+  (per URL field, since those five URLs are independent) and
+  `AuthChallengeInfo.resource_metadata_url_verified` report whether PMCP itself
+  classified the host as a public literal, and all three default to
+  **unverified**. The qualification is threaded into the `next_step` string an
+  agent actually follows, and into `pmcp auth connect` / `pmcp auth acknowledge`
+  output in both human text and `--json`. `pmcp doctor` no longer reports a bare
+  `[OK] ... configured at <name>` for a host it did not verify
+  ([#211](https://github.com/Consiliency/pmcp/issues/211)).
+- **A downstream server can no longer hand back a loopback `http://` URL.**
+  `sanitize_url_elicitation_url` now splits by provenance: a URL parsed out of a
+  server's error payload loses loopback HTTP, while one the operator types into
+  `gateway.auth_connect` keeps it, because local OAuth redirects to
+  `http://127.0.0.1`. The default is the strict remote policy, so a call site
+  missed by a future change fails closed (#211).
+- **`fetch_json_metadata` now fails closed.** PMCP retrieves that URL itself, so
+  "accepted but unresolved" is not good enough there: the host must be one PMCP
+  verified as a public IP literal, and a refused URL is rejected before the
+  opener is reached rather than fetched and judged afterwards. `http://127.0.0.1/x`
+  and unresolved names previously both reached `urlopen` (#211).
+
 ## [2.7.2] - 2026-08-30
 
 ### Fixed

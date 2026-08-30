@@ -6966,3 +6966,163 @@ def test_update_server_docstring_states_both_probe_window_env_contracts() -> Non
         "docstring does not explain WHY an ambient change cannot refuse "
         "(both guard sides derive from one stripped_base, so it cancels out)"
     )
+
+
+# --- #211: the operator path keeps loopback HTTP; the relay path loses it ---
+
+
+def _elicitation_tools() -> GatewayTools:
+    return GatewayTools(
+        client_manager=MockClientManager(),  # type: ignore[arg-type]
+        policy_manager=PolicyManager(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_auth_connect_still_accepts_operator_loopback_http_url() -> None:
+    """The frozen local-OAuth contract survives the #211 split.
+
+    `sanitize_url_elicitation_url` is shared between the downstream payload path
+    and this one, so tightening it globally would have broken the local consent
+    flow: a local authorization server redirects to `http://127.0.0.1`, and this
+    URL is typed by the operator, not relayed by a server.
+    """
+    result = await _elicitation_tools().auth_connect(
+        {
+            "server_name": "remote-auth",
+            "auth_mode": "url_elicitation",
+            "elicitation_id": "consent-1",
+            "elicitation_url": "http://127.0.0.1:8765/cb?code=secret",
+            "consent_acknowledged": True,
+        }
+    )
+
+    assert result.ok is True
+    assert result.url_elicitation is not None
+    assert result.url_elicitation.url == "http://127.0.0.1:8765/cb?code=%5BREDACTED%5D"
+
+
+@pytest.mark.asyncio
+async def test_auth_connect_marks_an_operator_supplied_name_unverified() -> None:
+    """Operator provenance relaxes loopback, not verification.
+
+    Nothing about the operator typing the URL tells pmcp where the name points,
+    so the acknowledgement echo is qualified too -- and provenance-neutrally,
+    since saying it "came from the server" would be false here.
+    """
+    result = await _elicitation_tools().auth_connect(
+        {
+            "server_name": "remote-auth",
+            "auth_mode": "url_elicitation",
+            "elicitation_id": "consent-1",
+            "elicitation_url": "https://auth.vendor.com/consent",
+            "consent_acknowledged": True,
+        }
+    )
+
+    assert result.ok is True
+    assert result.url_elicitation is not None
+    assert result.url_elicitation.url_verified is False
+    next_step = result.url_elicitation.next_step or ""
+    assert "not verified where this URL points" in next_step
+    assert "came from the server" not in next_step
+    assert "gateway.provision" in next_step
+
+
+@pytest.mark.asyncio
+async def test_auth_connect_leaves_a_verified_literal_unqualified() -> None:
+    result = await _elicitation_tools().auth_connect(
+        {
+            "server_name": "remote-auth",
+            "auth_mode": "url_elicitation",
+            "elicitation_id": "consent-1",
+            "elicitation_url": "https://93.184.216.34/consent",
+            "consent_acknowledged": True,
+        }
+    )
+
+    assert result.url_elicitation is not None
+    assert result.url_elicitation.url_verified is True
+    assert "not verified" not in (result.url_elicitation.next_step or "")
+
+
+@pytest.mark.asyncio
+async def test_invoke_relays_an_unverified_elicitation_url_with_a_caveat() -> None:
+    """The gateway output an agent consumes must carry the qualification.
+
+    `InvokeOutput.next_step` is copied from the elicitation, and that string is
+    what an agent follows -- a `url_verified: false` field beside an
+    unqualified "Open the URL" instruction does not close #211.
+    """
+    tool = ToolInfo(
+        tool_id="remote-auth::login",
+        server_name="remote-auth",
+        tool_name="login",
+        description="Login",
+        short_description="Login",
+        input_schema={},
+        tags=[],
+        risk_hint=RiskHint.LOW,
+    )
+    client_manager = MockClientManager([tool])
+
+    async def raise_elicitation(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(
+            '{"error":{"code":-32042,"data":{"elicitationId":"consent-1",'
+            '"url":"https://metadata.google.internal/consent"}}}'
+        )
+
+    client_manager.call_tool = raise_elicitation  # type: ignore[method-assign]
+    gateway_tools = GatewayTools(
+        client_manager=client_manager,  # type: ignore[arg-type]
+        policy_manager=PolicyManager(),
+    )
+
+    result = await gateway_tools.invoke(
+        {"tool_id": "remote-auth::login", "arguments": {}}
+    )
+
+    assert result.url_elicitations
+    assert result.url_elicitations[0].url_verified is False
+    assert result.url_elicitations[0].url == "https://metadata.google.internal/consent"
+    # The instruction an agent follows, on the top-level output as well.
+    assert result.next_step is not None
+    assert "not verified where this URL points" in result.next_step
+    serialized = result.model_dump_json()
+    assert '"url_verified":false' in serialized
+
+
+@pytest.mark.asyncio
+async def test_invoke_refuses_a_relayed_loopback_http_elicitation() -> None:
+    """#211: this payload used to be relayed to the operator as valid."""
+    tool = ToolInfo(
+        tool_id="remote-auth::login",
+        server_name="remote-auth",
+        tool_name="login",
+        description="Login",
+        short_description="Login",
+        input_schema={},
+        tags=[],
+        risk_hint=RiskHint.LOW,
+    )
+    client_manager = MockClientManager([tool])
+
+    async def raise_elicitation(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError(
+            '{"error":{"code":-32042,"data":{"elicitationId":"consent-1",'
+            '"url":"http://127.0.0.1/cb"}}}'
+        )
+
+    client_manager.call_tool = raise_elicitation  # type: ignore[method-assign]
+    gateway_tools = GatewayTools(
+        client_manager=client_manager,  # type: ignore[arg-type]
+        policy_manager=PolicyManager(),
+    )
+
+    result = await gateway_tools.invoke(
+        {"tool_id": "remote-auth::login", "arguments": {}}
+    )
+
+    assert result.ok is False
+    assert not result.url_elicitations
+    assert "127.0.0.1" not in result.model_dump_json()

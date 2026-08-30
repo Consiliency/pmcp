@@ -176,7 +176,13 @@ literals** — private, CGNAT, link-local, loopback, multicast, site-local, and
 unspecified — including IPv4 addresses embedded in IPv6 literals and legacy
 numeric forms such as `2852039166`. This is a filter on literals only: a DNS
 name is accepted **without being resolved**, so a name that points at an
-internal address still passes
+internal address still passes. PMCP therefore no longer presents such a URL as
+one it checked: a server-supplied URL is **relayed unverified and presented as
+such** — `UrlElicitationInfo.url_verified`, `AuthMetadataInfo.verified_urls`,
+and `AuthChallengeInfo.resource_metadata_url_verified` all default to
+unverified, and the caveat is carried in the `next_step` an agent follows and in
+CLI output. Where PMCP *fetches* a URL itself it fails closed instead, requiring
+a verified public literal
 ([#211](https://github.com/Consiliency/pmcp/issues/211)). PMCP is still not an
 Authorization Server and does not provide dynamic client registration, SSO,
 RBAC, billing, or a complete multi-tenant identity service.
