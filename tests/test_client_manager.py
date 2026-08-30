@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx2
 import pytest
+from pydantic import ValidationError
 
 from pmcp.client.manager import (
     _MAX_LISTING_PAGES,
@@ -6063,24 +6064,23 @@ class TestDuplicateIdentitiesAreNotDoubleCounted:
 
 
 class TestZeroLimitLogsAccurately:
-    """#175 item 3: `max_tools_per_server: 0` must not be reported as a
+    """#175 item 3: a zero `max_tools_per_server` must not be reported as a
     downstream that sent garbage.
 
     A zero limit empties `_parse_tool_entries`' result before a single entry is
     examined, so `_reconcile_once`'s offered-but-none-parseable branch fired
     and announced "Every tools entry in the listing was unparseable" -- an
-    accusation aimed at the server for a decision this gateway's own policy
-    file made. The operator's next move is to fix the policy, and the log has
-    to point there.
+    accusation aimed at the server for a decision this gateway made itself. The
+    log has to name the limit instead.
 
-    Deliberately fixed in the *log* and not in the schema. `LimitsPolicy` gets
-    no `Field(ge=1)`: `PolicyManager._load_policy(..., fatal=False)` -- the
-    auto-discovery path -- swallows any validation exception and leaves the
-    default allow-all `GatewayPolicy` in place, so making `0` schema-invalid
-    would silently discard the operator's *entire* policy file, allow and deny
-    lists and redaction included. That fail-open is #202 and is not this
-    change's to fix; the test below pins that `0` still validates, so a future
-    tightening cannot land here unnoticed.
+    **The reachable path is the constructor, not a policy file.** #207 added
+    `Field(ge=1)` to `LimitsPolicy.max_tools_per_server`, so a policy file can
+    no longer carry `0` -- via #202 such a file terminates startup. But
+    `ClientManager.__init__`'s `max_tools_per_server` parameter is a separate
+    axis and is deliberately left unbounded (a programmatic API, guarded
+    defensively at the use site), so every case below is still reachable and the
+    log wording still has to be right. The schema test that follows pins the
+    bound from the other side.
     """
 
     @staticmethod
@@ -6104,10 +6104,22 @@ class TestZeroLimitLogsAccurately:
 
         manager._send_request = fake_send  # type: ignore[method-assign]
 
-    def test_a_zero_limit_still_validates_on_the_policy_schema(self) -> None:
-        """Rejecting it is what triggers #202's fail-open, so it must not be
-        rejected."""
-        assert LimitsPolicy(max_tools_per_server=0).max_tools_per_server == 0
+    def test_a_zero_limit_is_rejected_by_the_policy_schema(self) -> None:
+        """#207: `0` indexes nothing, so the schema refuses it.
+
+        Only safe since #202 -- before it, auto-discovery discarded a policy
+        that failed validation and fell back to allow-all, so this bound would
+        have silently unrestricted the gateway instead of rejecting one value.
+        `-1` is covered too: the old field accepted it as well.
+        """
+        with pytest.raises(ValidationError):
+            LimitsPolicy(max_tools_per_server=0)
+        with pytest.raises(ValidationError):
+            LimitsPolicy(max_tools_per_server=-1)
+
+        # The bound must not disturb the default or ordinary values.
+        assert LimitsPolicy().max_tools_per_server == 100
+        assert LimitsPolicy(max_tools_per_server=1).max_tools_per_server == 1
 
     @pytest.mark.asyncio
     async def test_zero_limit_names_the_limit_and_blames_no_one(

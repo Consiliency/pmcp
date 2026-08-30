@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A policy file setting `max_tools_per_server: 0` is now rejected, and via
+  #202 that terminates startup.** `LimitsPolicy.max_tools_per_server` is bounded
+  at `ge=1`; `0` — and any negative value — no longer validates. **This can stop
+  a gateway that starts today.** If your policy file (`.mcp-gateway-policy.yaml`
+  / `.json`, or `~/.claude/gateway-policy.yaml` / `.json`) contains the literal
+  line `max_tools_per_server: 0`, the gateway will refuse to start with
+  `Invalid policy file ...`; remove the line to take the default of `100`, or
+  set the number of tools you actually want indexed. Such a gateway indexed no
+  tools at all before, so the value is unlikely to be in deliberate use — but
+  the failure is a hard one and worth searching for. 2.7.0 shipped the log fix
+  for this value and deliberately left the bound out: at that time a discovered
+  policy that failed validation was discarded in favour of the allow-all
+  default, so rejecting one value would have silently discarded the operator's
+  entire policy file. #202, in the same release, made that case fatal, which is
+  what makes the bound safe to add. `ClientManager`'s `max_tools_per_server`
+  constructor parameter is a separate, programmatic axis and is unchanged — it
+  still accepts `0` and still logs that nothing was indexed. (#207)
+
 ## [2.7.0] - 2026-08-29
 
 ### Added

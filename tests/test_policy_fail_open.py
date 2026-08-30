@@ -70,6 +70,71 @@ def test_schema_invalid_discovered_policy_refuses_to_start(
     assert "explicit policy" not in str(excinfo.value)
 
 
+@pytest.mark.parametrize("limit", [0, -1])
+def test_discovered_policy_with_an_unusable_tool_limit_refuses_to_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: int
+) -> None:
+    """The #207 x #202 interaction, end to end.
+
+    #207 bounded `LimitsPolicy.max_tools_per_server` at `ge=1`. On its own that
+    is a schema fact; what makes it a *behaviour* change is #202, which turned a
+    discovered policy that parses-but-fails-validation into a startup refusal.
+    Neither issue's own tests cover the pair -- #207's are schema-level and
+    #202's use a different invalid key -- so a regression in either half (the
+    bound reverted, or discovered-policy validation made non-fatal again) would
+    show up here and nowhere else.
+
+    `PolicyManager` wraps the pydantic error in `ValueError`, so this is the
+    `Invalid policy file` path, not a raw `ValidationError`.
+    """
+    policy_file = tmp_path / ".mcp-gateway-policy.json"
+    policy_file.write_text(json.dumps({"limits": {"max_tools_per_server": limit}}))
+    _discovery_paths(monkeypatch, policy_file)
+
+    with pytest.raises(ValueError, match="Invalid policy file") as excinfo:
+        PolicyManager()
+
+    assert str(policy_file) in str(excinfo.value)
+    assert "max_tools_per_server" in str(excinfo.value)
+    assert "explicit policy" not in str(excinfo.value)
+
+
+def test_discovered_policy_with_empty_limits_still_loads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound must reject only the stated values, not an absent field.
+
+    `limits: {}` is the shape most likely to be caught by an over-broad bound:
+    it names the section without setting anything, and must keep the default.
+    """
+    policy_file = tmp_path / ".mcp-gateway-policy.yaml"
+    policy_file.write_text("servers:\n  denylist:\n    - deny-me\nlimits: {}\n")
+    _discovery_paths(monkeypatch, policy_file)
+
+    manager = PolicyManager()
+
+    assert manager.get_max_tools_per_server() == 100
+    assert manager.is_server_allowed("deny-me") is False
+
+
+def test_explicit_policy_with_an_unusable_tool_limit_is_fatal_too(
+    tmp_path: Path,
+) -> None:
+    """Same value, different path, different message.
+
+    An explicit `--policy` was already fatal for every failure mode, but it
+    reports as `explicit policy` rather than `Invalid policy file`, so an
+    operator grepping for one string would not find the other.
+    """
+    policy_file = tmp_path / "explicit.json"
+    policy_file.write_text(json.dumps({"limits": {"max_tools_per_server": 0}}))
+
+    with pytest.raises(ValueError, match="explicit policy") as excinfo:
+        PolicyManager(policy_file)
+
+    assert "max_tools_per_server" in str(excinfo.value)
+
+
 @pytest.mark.parametrize(
     ("label", "content"),
     [
