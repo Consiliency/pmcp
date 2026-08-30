@@ -756,11 +756,170 @@ def test_sanitize_public_auth_url_rejects_invalid_and_non_public_urls() -> None:
         "https://169.254.169.254/meta",
         "https://224.0.0.1/meta",
         "https://0.0.0.0/meta",
+        # #210: the two ranges the subtractive classifier let through.
+        "https://100.64.0.1/meta",
+        "https://[fec0::1]/meta",
         "ftp://auth.example/meta",
         "http://auth.example/meta",
     ]:
         with pytest.raises(ValueError):
             sanitize_public_auth_url(url)
+
+
+# --------------------------------------------------------------------------- #
+# Public-host classification matrix (#210)
+#
+# `_is_public_auth_host` classifies IP *literals* only. What follows is the
+# specification for that classification, not a sample of it.
+#
+# Every IPv6 format that can carry an IPv4 address in its low 32 bits is named
+# here with its RFC. The list is closed and standards-defined, which is what
+# makes enumerating it defensible -- but it must not live only in the
+# implementation. If a seventh embedding format is standardised, its absence
+# from this matrix is the visible gap that catches it. Do not shorten or
+# de-duplicate these labels.
+#
+#   RFC 4291  IPv4-mapped         ::ffff:0:0/96    unwrapped
+#   RFC 4291  IPv4-compatible     ::/96            unwrapped (deprecated form)
+#   RFC 6052  NAT64 well-known    64:ff9b::/96     unwrapped
+#   RFC 5214  ISATAP              ..:5efe:a.b.c.d  unwrapped by marker
+#   RFC 3056  6to4                2002::/16        already non-global
+#   RFC 4380  Teredo              2001::/32        already non-global
+#
+# The last two pass today only because neither prefix is global -- luck, not
+# design. They are pinned below so that stays true.
+# --------------------------------------------------------------------------- #
+
+_MUST_ACCEPT_HOSTS = [
+    ("8.8.8.8", "public IPv4"),
+    ("93.184.216.34", "public IPv4"),
+    ("2001:4860:4860::8888", "public IPv6"),
+    # Over-rejection traps: a rule adding `not is_reserved` fails both, because
+    # every IPv4-mapped address is is_reserved.
+    ("::ffff:8.8.8.8", "RFC 4291 IPv4-mapped, wrapping a public address"),
+    ("64:ff9b::808:808", "RFC 6052 NAT64, wrapping a public address"),
+]
+
+_MUST_REJECT_HOSTS = [
+    # --- Fixed by #210: ranges the subtractive classifier missed -------------
+    ("100.64.0.1", "RFC 6598 CGNAT shared address space"),
+    ("::ffff:100.64.0.1", "RFC 4291 IPv4-mapped, wrapping RFC 6598 CGNAT"),
+    ("fec0::1", "RFC 3879 deprecated IPv6 site-local"),
+    # --- Fixed by #210: IPv4 embedded in an IPv6 literal --------------------
+    ("64:ff9b::a00:5", "RFC 6052 NAT64, embedding 10.0.0.5"),
+    ("64:ff9b::7f00:1", "RFC 6052 NAT64, embedding 127.0.0.1"),
+    ("::10.0.0.5", "RFC 4291 IPv4-compatible, embedding 10.0.0.5"),
+    ("::127.0.0.1", "RFC 4291 IPv4-compatible, embedding 127.0.0.1"),
+    ("::0:5efe:a00:5", "RFC 5214 ISATAP, embedding 10.0.0.5"),
+    # --- Pinned, not fixed: these are already non-global ---------------------
+    ("2002:0a00:0005::1", "RFC 3056 6to4, embedding 10.0.0.5"),
+    ("2001:0:0:0:0:0:0a00:0005", "RFC 4380 Teredo"),
+    # --- Fixed by #210: legacy numeric forms, which ip_address() cannot parse
+    # and which the resolver reads directly -- no DNS lookup is involved.
+    ("2852039166", "legacy decimal -> 169.254.169.254 (cloud metadata)"),
+    ("0xA9FEA9FE", "legacy hex -> 169.254.169.254 (cloud metadata)"),
+    ("0xa9fea9fe", "legacy hex, lowercased by urlparse"),
+    ("0177.0.0.1", "legacy octal -> 127.0.0.1"),
+    ("167772161", "legacy decimal -> 10.0.0.1"),
+    ("2130706433", "legacy decimal -> 127.0.0.1"),
+    ("0xa9.0xfe.0xa9.0xfe", "dotted hex -> 169.254.169.254"),
+    ("0251.0376.0251.0376", "dotted octal -> 169.254.169.254"),
+    ("169.254.43518", "3-part inet_aton -> 169.254.169.254"),
+    ("169.16689662", "2-part inet_aton -> 169.254.169.254"),
+    ("0x7f.1", "2-part dotted hex -> 127.0.0.1"),
+    # glibc reads a leading zero as octal (8.0.0.1) but stricter resolvers read
+    # it as decimal (10.0.0.1). Ambiguous means rejected: over-rejection is the
+    # safe direction, and no must-accept host has a leading zero.
+    ("010.0.0.1", "ambiguous leading zero; the decimal reading is 10.0.0.1"),
+    ("5", "bare integer -> 0.0.0.5"),
+    # --- Already rejected before #210; must not regress ----------------------
+    ("224.0.0.1", "IPv4 multicast -- a bare is_global rule regresses this"),
+    ("ff02::1", "IPv6 multicast -- a bare is_global rule regresses this"),
+    ("169.254.169.254", "IPv4 link-local cloud metadata"),
+    ("10.0.0.5", "RFC 1918 private"),
+    ("::ffff:10.0.0.5", "RFC 4291 IPv4-mapped, wrapping RFC 1918"),
+    ("127.0.0.1", "loopback"),
+    ("localhost", "loopback name"),
+    ("fc00::1", "RFC 4193 unique local"),
+    ("2001:db8::1", "RFC 3849 documentation range"),
+    ("::", "unspecified"),
+]
+
+
+def _auth_url(host: str) -> str:
+    # An IPv6 literal must be bracketed, or urlparse reads the ':' as a port
+    # separator and the URL is rejected for a reason that has nothing to do
+    # with host classification.
+    return f"https://{f'[{host}]' if ':' in host else host}/meta"
+
+
+@pytest.mark.parametrize(
+    "host,rationale", _MUST_ACCEPT_HOSTS, ids=[h for h, _ in _MUST_ACCEPT_HOSTS]
+)
+def test_public_auth_url_accepts_public_ip_literals(host: str, rationale: str) -> None:
+    assert sanitize_public_auth_url(_auth_url(host)) == _auth_url(host), rationale
+
+
+@pytest.mark.parametrize(
+    "host,rationale", _MUST_REJECT_HOSTS, ids=[h for h, _ in _MUST_REJECT_HOSTS]
+)
+def test_public_auth_url_rejects_non_public_ip_literals(
+    host: str, rationale: str
+) -> None:
+    with pytest.raises(ValueError) as excinfo:
+        sanitize_public_auth_url(_auth_url(host))
+    # Guard against passing for the wrong reason -- a malformed URL raises the
+    # same exception type from a different branch.
+    assert "non-public IP literal" in str(excinfo.value), rationale
+
+
+def test_public_auth_url_error_message_does_not_claim_the_host_was_verified() -> None:
+    """The old message promised far more than the check performs (#210)."""
+    with pytest.raises(ValueError) as excinfo:
+        sanitize_public_auth_url("https://10.0.0.5/meta")
+    message = str(excinfo.value)
+    assert "must be public" not in message
+    assert "verified" not in message
+    assert "non-public IP literal" in message
+
+
+def test_public_auth_url_accepts_dns_names_unresolved_known_limitation_of_211() -> None:
+    """KNOWN LIMITATION, tracked by #211 -- not an assertion of correctness.
+
+    A DNS name is accepted without being resolved, so a name pointing at
+    169.254.169.254 passes this check. This test pins the limitation so that
+    closing #211 has to change it deliberately; #210 deliberately does not fix
+    it, because resolving here would introduce a TOCTOU gap of its own.
+    """
+    assert (
+        sanitize_public_auth_url("https://auth.example.com/meta")
+        == "https://auth.example.com/meta"
+    )
+
+
+def test_public_auth_url_still_accepts_non_numeric_hosts_after_canonicalisation() -> (
+    None
+):
+    """Canonicalising numeric hosts must not swallow the DNS path (#210)."""
+    for host in [
+        "auth.example.com",
+        "metadata.google.internal",
+        "1.example.com",  # a numeric label, but the host is not a number
+        "999.999.999.999",  # numeric-looking, but no valid reading exists
+        "0xdeadbeefcafe",  # exceeds 32 bits, so it is not an address
+        "1.2.3.4.5",  # too many parts for inet_aton
+    ]:
+        assert sanitize_public_auth_url(_auth_url(host)) == _auth_url(host)
+
+
+def test_public_auth_host_canonicalisation_rejects_python_int_quirks() -> None:
+    """`int()` accepts separators, signs, and non-ASCII digits; hosts must not.
+
+    Parsing with a bare `int(part)` would canonicalise these into literals and
+    reject them, or worse, mis-read them. They are hostnames, not addresses.
+    """
+    for host in ["1_0", "١٢٧", "+2852039166"]:
+        assert sanitize_public_auth_url(_auth_url(host)) == _auth_url(host)
 
 
 def test_normalize_auth_metadata_omits_invalid_urls_with_safe_diagnostics() -> None:

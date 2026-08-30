@@ -146,7 +146,9 @@ _OCTAL_PART = re.compile(r"0[0-7]*")
 _DECIMAL_PART = re.compile(r"[0-9]+")
 
 
-def _unwrap_embedded_v4(address: IPv4Address | IPv6Address) -> IPv4Address | IPv6Address:
+def _unwrap_embedded_v4(
+    address: IPv4Address | IPv6Address,
+) -> IPv4Address | IPv6Address:
     """Return the IPv4 address an IPv6 literal embeds, or the address unchanged."""
     if isinstance(address, IPv6Address):
         for network in _V4_EMBEDDING_NETWORKS:
