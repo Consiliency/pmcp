@@ -1,5 +1,8 @@
 # Detailed plan: stop vouching for URLs a downstream server supplied
 
+> **Revision 2 (2026-08-30).** Boarded 2 DISAGREE. Rev 1 named the wrong types
+> and would have broken a frozen operator contract. Both verified below.
+
 ## Task
 
 Close Consiliency/pmcp#211. `sanitize_public_auth_url` applies one permissiveness
@@ -55,25 +58,36 @@ validated**. So:
   restored from git with its trust decision made deliberately. **If it is kept**,
   it must reject anything that is not a verifiably-public literal, since it
   fetches.
-- `sanitize_url_elicitation_url` (`:485`) — modify — **stop passing
-  `allow_loopback_http=True`.** Verified: a downstream server can currently hand
-  back `http://127.0.0.1/cb` and have it accepted. A local-OAuth callback is the
-  *operator's* flow, not something a remote server should be able to induce.
-  If a legitimate local flow depends on this, that flow should pass an explicit
-  operator-side flag rather than inheriting the permission from an untrusted
-  payload — say so if the tests prove otherwise.
-- A `verified` signal on the returned value — add — the untrusted sanitisers
-  should return, alongside the URL, whether the host was verified as a public
-  literal or merely accepted as an unresolved name. Without this the callers
-  cannot present it honestly, which is the whole finding.
+- `sanitize_url_elicitation_url` (`:485`) — modify — **split it by provenance.**
+  **WAS WRONG (rev 1):** it said "stop passing `allow_loopback_http=True`",
+  full stop. Verified: this helper is **shared** between the downstream-payload
+  path (`auth.py:736`) and the **operator-supplied** acknowledgement path
+  (`handlers.py:4592`, `parsed.elicitation_url`). Removing loopback globally
+  would break the operator's local-OAuth flow, which `plans/phase-plan-v4-elicit.md`
+  records as a frozen contract. The remote path must lose loopback HTTP; the
+  operator path must keep it. Two policies, two call sites, regression tests for
+  both.
+- A `verified` signal on the returned value — add — whether the host was
+  verified as a public literal or merely accepted as an unresolved name. It must
+  **default to unverified**: a default of "verified" reintroduces vouching at any
+  call site the change misses.
 
 ### Presentation (modify)
 
-- `cli.py` — where `url_elicitations` are shown to the operator — must mark an
-  unverified host plainly: this URL came from the server and its destination was
-  not checked. Today the operator is told to open it, with no such distinction.
-- `AuthChallengeInfo.resource_metadata_url` and `AuthMetadataInfo` — carry the
-  same signal, so any consumer of the public dataclasses can tell the difference.
+- **`UrlElicitationInfo` (`types.py:163`) is the primary relay surface and rev 1
+  omitted it entirely.** Its docstring reads *"URL-mode elicitation details **safe
+  to display to users**"* — the type asserts precisely the claim this issue
+  disproves. It carries `url`, `message`, `next_step` and no verification field,
+  and `handlers.py:4610` constructs it with an unconditional open-the-URL
+  instruction. Add the signal here first; without it AC 3 cannot be met on the
+  surface that actually reaches an operator. Correct the docstring too.
+- `cli.py` — where `url_elicitations` are shown — must state that an unverified
+  URL came from the server and its destination was not checked, in **both** the
+  human text and `--json`.
+- **`AuthMetadataInfo` needs a PER-URL signal, not one object-level bool.** It
+  carries five independent URL fields; a single flag cannot be honest when one is
+  a public literal and another is a name. Rev 1 specified one signal per object.
+- `AuthChallengeInfo.resource_metadata_url` — same per-URL treatment.
 
 ## Documentation impact
 
@@ -106,15 +120,23 @@ tests fail locally in a way that reproduces on a clean `main` export
 
 ## Acceptance criteria
 
-- [ ] A downstream elicitation payload carrying `http://127.0.0.1/cb` is
-      **rejected** — proven by a test failing against `main`, where it is
-      currently accepted.
+- [ ] A **downstream** elicitation payload carrying `http://127.0.0.1/cb` is
+      **rejected**, proven by a test failing against `main`. **And the operator
+      path at `handlers.py:4592` still accepts it** — both directions, or the
+      change breaks a frozen contract. `test_sanitize_url_elicitation_url_allows_loopback_http`
+      inverts for the remote path only.
 - [ ] `https://auth.vendor.com/...` from a downstream server is **still
       accepted** — the feature must survive. A change that rejects names must not
       pass.
-- [ ] A relayed URL whose host is an unresolved name is marked **unverified**,
-      and the operator-facing output says so. Asserted on the emitted text, not
-      on a field's presence.
+- [ ] A relayed URL whose host is an unresolved name is marked **unverified** on
+      `UrlElicitationInfo`, and the gateway output, the CLI human text **and**
+      `--json` all say so. Asserted on emitted text, not on a field's presence.
+      Rev 1's criteria exercised only elicitation and CLI, which would let the
+      challenge and metadata surfaces stay misleading while every test passed.
+- [ ] `AuthMetadataInfo` with a **mix** — one public literal, one name — reports
+      them differently. A single object-level flag cannot pass this.
+- [ ] The signal defaults to **unverified** — proven by constructing the type
+      without it and asserting the unverified presentation.
 - [ ] A relayed URL whose host is a verified public literal is **not** marked
       unverified — so the signal distinguishes, rather than labelling everything.
 - [ ] `fetch_json_metadata` is either gone, or rejects a non-public literal.
