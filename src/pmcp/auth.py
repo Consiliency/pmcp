@@ -134,9 +134,15 @@ _V4_EMBEDDING_NETWORKS = (
     ip_network("::/96"),  # RFC 4291 IPv4-compatible (deprecated)
     ip_network("64:ff9b::/96"),  # RFC 6052 NAT64 well-known prefix
 )
-# RFC 5214 ISATAP interface identifier; RFC 3056 6to4 (2002::/16) and RFC 4380
-# Teredo (2001::/32) need no unwrapping because neither prefix is global.
-_ISATAP_MARKER = 0x5EFE
+# RFC 5214 §6.1: an ISATAP interface identifier is the full 32 bits
+# `00-00-5E-FE` -- or `02-00-5E-FE` with the u/g bit set -- immediately followed
+# by the IPv4 address in the low 32 bits. Matching only the `5efe` hextet is not
+# enough to identify ISATAP: `2606:4700::1234:5efe:a00:5` is an ordinary global
+# address that merely happens to carry `5efe` there, and unwrapping it would
+# reject a genuinely public host.
+# RFC 3056 6to4 (2002::/16) and RFC 4380 Teredo (2001::/32) need no unwrapping
+# because neither prefix is global.
+_ISATAP_INTERFACE_IDS = (0x00005EFE, 0x02005EFE)
 
 # inet_aton part grammar. A part is hex, octal, or decimal; a leading zero is
 # read as octal by glibc but as decimal by stricter resolvers, so both readings
@@ -154,7 +160,7 @@ def _unwrap_embedded_v4(
         for network in _V4_EMBEDDING_NETWORKS:
             if address in network:
                 return IPv4Address(int(address) & 0xFFFFFFFF)
-        if (int(address) >> 32) & 0xFFFF == _ISATAP_MARKER:
+        if ((int(address) >> 32) & 0xFFFFFFFF) in _ISATAP_INTERFACE_IDS:
             return IPv4Address(int(address) & 0xFFFFFFFF)
     return address
 

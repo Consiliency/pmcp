@@ -782,7 +782,11 @@ def test_sanitize_public_auth_url_rejects_invalid_and_non_public_urls() -> None:
 #   RFC 4291  IPv4-mapped         ::ffff:0:0/96    unwrapped
 #   RFC 4291  IPv4-compatible     ::/96            unwrapped (deprecated form)
 #   RFC 6052  NAT64 well-known    64:ff9b::/96     unwrapped
-#   RFC 5214  ISATAP              ..:5efe:a.b.c.d  unwrapped by marker
+#   RFC 5214  ISATAP              ..:0:5efe:a.b.c.d unwrapped by interface id
+#             -- the interface id is the full 32 bits 00-00-5E-FE, or
+#             02-00-5E-FE with the u/g bit set (RFC 5214 section 6.1). The
+#             `5efe` hextet alone does NOT identify ISATAP; see the
+#             over-rejection trap in _MUST_ACCEPT_HOSTS.
 #   RFC 3056  6to4                2002::/16        already non-global
 #   RFC 4380  Teredo              2001::/32        already non-global
 #
@@ -798,6 +802,15 @@ _MUST_ACCEPT_HOSTS = [
     # every IPv4-mapped address is is_reserved.
     ("::ffff:8.8.8.8", "RFC 4291 IPv4-mapped, wrapping a public address"),
     ("64:ff9b::808:808", "RFC 6052 NAT64, wrapping a public address"),
+    # Over-rejection trap for ISATAP: an ordinary global address that merely
+    # carries `5efe` in that hextet. Matching the marker alone rather than the
+    # full RFC 5214 interface identifier unwraps this to 10.0.0.5 and rejects a
+    # genuinely public host. No other must-accept host carries an incidental
+    # `5efe`, which is why the whole suite stayed green through that bug.
+    (
+        "2606:4700::1234:5efe:a00:5",
+        "global address with an incidental 5efe hextet -- NOT RFC 5214 ISATAP",
+    ),
 ]
 
 _MUST_REJECT_HOSTS = [
@@ -810,7 +823,9 @@ _MUST_REJECT_HOSTS = [
     ("64:ff9b::7f00:1", "RFC 6052 NAT64, embedding 127.0.0.1"),
     ("::10.0.0.5", "RFC 4291 IPv4-compatible, embedding 10.0.0.5"),
     ("::127.0.0.1", "RFC 4291 IPv4-compatible, embedding 127.0.0.1"),
-    ("::0:5efe:a00:5", "RFC 5214 ISATAP, embedding 10.0.0.5"),
+    ("::0:5efe:a00:5", "RFC 5214 ISATAP (00-00-5E-FE), embedding 10.0.0.5"),
+    ("::0:5efe:7f00:1", "RFC 5214 ISATAP (00-00-5E-FE), embedding 127.0.0.1"),
+    ("::200:5efe:a00:5", "RFC 5214 ISATAP with the u/g bit set (02-00-5E-FE)"),
     # --- Pinned, not fixed: these are already non-global ---------------------
     ("2002:0a00:0005::1", "RFC 3056 6to4, embedding 10.0.0.5"),
     ("2001:0:0:0:0:0:0a00:0005", "RFC 4380 Teredo"),
