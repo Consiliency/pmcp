@@ -22,6 +22,8 @@ from dotenv import load_dotenv
 from mcp.types import Tool
 from pmcp import __version__ as PMCP_VERSION
 from pmcp.auth import (
+    UNVERIFIED_URL_CAVEAT,
+    is_verified_public_auth_url,
     normalize_auth_metadata,
     parse_url_elicitation_error,
     parse_www_authenticate,
@@ -4589,7 +4591,13 @@ class GatewayTools:
             url_elicitation = None
             if parsed.elicitation_url:
                 try:
-                    safe_url = sanitize_url_elicitation_url(parsed.elicitation_url)
+                    # Operator provenance: this URL was typed into
+                    # gateway.auth_connect, not relayed from a server. Local
+                    # OAuth redirects to http://127.0.0.1, so loopback HTTP
+                    # stays allowed here and only here (#211).
+                    safe_url = sanitize_url_elicitation_url(
+                        parsed.elicitation_url, provenance="operator"
+                    )
                 except ValueError as e:
                     self._audit(
                         method="gateway.auth_connect",
@@ -4607,10 +4615,15 @@ class GatewayTools:
                         message=str(e),
                         auth_state="elicitation_required",
                     )
+                retry_step = f"Retry gateway.provision(server_name='{server_name}') or gateway.invoke."
+                url_verified = is_verified_public_auth_url(parsed.elicitation_url)
                 url_elicitation = UrlElicitationInfo(
                     elicitation_id=parsed.elicitation_id,
                     url=safe_url,
-                    next_step=f"Retry gateway.provision(server_name='{server_name}') or gateway.invoke.",
+                    url_verified=url_verified,
+                    next_step=retry_step
+                    if url_verified
+                    else f"{UNVERIFIED_URL_CAVEAT} {retry_step}",
                 )
             self._audit(
                 method="gateway.auth_connect",

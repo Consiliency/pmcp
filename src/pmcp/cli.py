@@ -962,6 +962,20 @@ def _sanitize_cli_payload(value: Any) -> Any:
     return value
 
 
+def _url_verification_suffix(elicitation: dict[str, Any]) -> str:
+    """Qualify a displayed elicitation URL that PMCP did not verify.
+
+    Deliberately provenance-neutral: this is printed both for a URL relayed by a
+    downstream server and, on the acknowledge path, for one the operator typed,
+    so it must not claim the URL "came from the server". Absent or false
+    ``url_verified`` both mean unverified -- an older gateway that does not send
+    the field must not be read as a clean bill of health (#211).
+    """
+    if elicitation.get("url_verified") is True:
+        return ""
+    return " (destination not verified by pmcp)"
+
+
 def _format_auth_evidence(
     payload: dict[str, Any],
     *,
@@ -997,6 +1011,11 @@ def _format_auth_evidence(
         ]
         if ids:
             parts.append("elicitations=" + ",".join(ids))
+        if any(
+            isinstance(item, dict) and item.get("url_verified") is not True
+            for item in url_elicitations
+        ):
+            parts.append("url_destination=unverified")
 
     next_step = payload.get("next_step")
     if not next_step and semantics:
@@ -2513,7 +2532,10 @@ async def run_auth_connect(args: argparse.Namespace) -> None:
             else:
                 print(first.get("message", "URL-mode elicitation required."))
                 if elicitation.get("url"):
-                    print(f"URL: {_redact_url_credentials(str(elicitation['url']))}")
+                    print(
+                        f"URL: {_redact_url_credentials(str(elicitation['url']))}"
+                        + _url_verification_suffix(elicitation)
+                    )
                 if elicitation.get("elicitation_id"):
                     print(f"Elicitation ID: {elicitation['elicitation_id']}")
                 next_step = elicitation.get("next_step") or first.get("next_step")
@@ -2602,7 +2624,10 @@ async def run_auth_acknowledge(args: argparse.Namespace) -> None:
             print(auth_result.get("message", "URL-mode elicitation acknowledged."))
             url_elicitation = auth_result.get("url_elicitation")
             if isinstance(url_elicitation, dict) and url_elicitation.get("url"):
-                print(f"URL: {_redact_url_credentials(str(url_elicitation['url']))}")
+                print(
+                    f"URL: {_redact_url_credentials(str(url_elicitation['url']))}"
+                    + _url_verification_suffix(url_elicitation)
+                )
             if auth_result.get("next_step"):
                 print(f"Next step: {auth_result['next_step']}")
     finally:
