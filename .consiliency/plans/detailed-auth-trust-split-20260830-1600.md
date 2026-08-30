@@ -100,8 +100,10 @@ validated**. So:
 
 ## Dependencies & order
 
-1. The `verified` signal, with unit tests — everything else reads it.
-2. The `allow_loopback_http` removal and its tests.
+1. The `verified` signal on `UrlElicitationInfo` first, defaulting to
+   unverified, with unit tests — it is the surface that reaches an operator.
+2. The provenance split on `sanitize_url_elicitation_url` — remote loses
+   loopback HTTP, operator keeps it — with regression tests both ways.
 3. `fetch_json_metadata` — delete or gate.
 4. Presentation changes.
 5. Docs.
