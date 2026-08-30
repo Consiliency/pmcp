@@ -239,10 +239,15 @@ def _is_public_auth_host(hostname: str) -> bool:
     """
     if hostname.lower() == "localhost":
         return False
+    # Only the parse is guarded: a ValueError escaping the classifier would
+    # otherwise be misread as "not a literal" and fail open.
+    address: IPv4Address | IPv6Address | None
     try:
-        return _is_public_ip(ip_address(hostname))
+        address = ip_address(hostname)
     except ValueError:
-        pass
+        address = None
+    if address is not None:
+        return _is_public_ip(address)
     numeric = _legacy_numeric_addresses(hostname)
     if numeric:
         return all(_is_public_ip(address) for address in numeric)
