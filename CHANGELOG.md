@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.2] - 2026-08-30
+
 ### Fixed
 - **The public auth-URL host check accepted several non-public hosts.** Two
   distinct defects in `_is_public_auth_host`, both reachable through auth
