@@ -1,5 +1,11 @@
 # Detailed plan: make the public-host check mean what it says
 
+> **Revision 2 (2026-08-30).** Boarded **2 DISAGREE / 1 AGREE**. The DISAGREEs
+> disproved rev 1's central claim — that no attacker-influenced path reaches a
+> fetch or a relay. Rev 1's severity table also **mislabelled a fetch as
+> display**. Scope changed on the operator's instruction: reject non-public names
+> on the untrusted paths, rather than only documenting the gap.
+
 ## Task
 
 Close Consiliency/pmcp#210. `_is_public_auth_host` returns `True` — "public",
@@ -7,90 +13,90 @@ therefore allowed — for **every hostname that is not an IP literal**, so a gat
 whose error reads *"Public auth URL host must be public"* admits
 `metadata.google.internal`.
 
-## Severity — corrected downward from the issue text
+## Severity — corrected, twice
 
-The issue was filed from reading, and said severity "depends on whether an
-attacker can influence the auth URL, which I have not established". Established
-now, and it is **lower** than the issue implies. This is hardening and honesty,
-not a live vulnerability. Recording that plainly matters more than the fix: an
-overstated finding wastes the next reader's time and erodes trust in the ones
-that are real.
+Rev 1 traced the call sites and concluded there was "no verified
+attacker-controlled path to a fetch or a relay today". **That was wrong**, and
+two seats showed why. Both corrections are verified here:
 
-Traced every call site:
+**1. `auth.py:639` is a fetch, not display.** `fetch_json_metadata` calls
+`sanitize_public_auth_url(url, allow_loopback_http=True)` and then **`urlopen`s
+the result**. Rev 1's table listed it under "redacted for display". It is
+currently called only from `tests/test_auth.py`, so it is a *latent* fetch
+primitive rather than a live path — but the classification was simply wrong, and
+a latent fetch behind a gate that does not check names is exactly the thing that
+becomes live when someone wires it up.
 
-| site | input provenance | what happens to it |
-|---|---|---|
-| `transport/http.py:281` | operator config (`resource_server_jwks_url`) | validated, then **fetched** via `AsyncJWKS` |
-| `auth.py:205` | same JWKS URL | stored redacted for display; `_raw_url` fetched |
-| `auth.py:468` | **untrusted** — a remote server's `WWW-Authenticate` header | stored on `AuthChallengeInfo` |
-| `auth.py:519` | operator config / manifest / registry entries | surfaced in public metadata |
-| `auth.py:366`, `:639` | elicitation URLs | redacted for display |
-| `cli_commands/doctor.py:80` | operator config | printed |
+**2. The untrusted URL is relayed, not inert.** Rev 1 argued
+`AuthChallengeInfo.resource_metadata_url` was inert because grep found no
+internal consumers. Being unread inside `src/` is not the same as being inert: it
+is a field on a public dataclass, and the sibling elicitation path
+(`sanitize_url_elicitation_url` → `url_elicitations`) carries a **downstream
+server's URL to the operator**, having passed a check that reports it as public.
+pmcp is the vouching party. That is a confused-deputy relay, and it is the exact
+thing the "must be public" wording promises against.
 
-Two findings from that trace:
+**3. The user-facing promise is broader than the code, in two files.**
+`README.md:168` and `SECURITY.md:39` both require the URL to be `https` **"on a
+public host"**. Rev 1 made the README conditional and did not mention
+`SECURITY.md` at all. Narrowing only the exception text would leave the same
+overstatement in the security policy.
 
-- **The only fetched URL is operator-supplied.** An operator can already point
-  their own gateway anywhere; a private DNS name there is a configuration choice,
-  not an attack. `AsyncJWKS._fetch` also already sets `allow_redirects=False`,
-  which is evidence this class was thought about.
-- **The genuinely untrusted value is inert.** `AuthChallengeInfo.resource_metadata_url`
-  is parsed from a remote header, sanitised — and then **never referenced again
-  anywhere in `src/`**. Verified by grep. It is not fetched and not relayed.
-
-So there is **no verified attacker-controlled path to a fetch or a relay today.**
-
-What remains is real but narrower: a validation boundary that explicitly handles
-"untrusted authorization metadata" (`auth.py:519`'s own docstring) makes a
-promise it does not keep, and one input class — `protected_resource_metadata_url`
-carried on **registry entries** (`manifest/registry.py:355`) — is remote-sourced,
-so the boundary is doing untrusted-input work even where today's code does not
-reach a fetch. *(Reasoned, not verified: I did not trace whether a registry
-entry's value can reach a client-visible header.)*
+**The remaining true part of rev 1:** the only *fetched* URL reachable in
+production today (`resource_server_jwks_url` → `AsyncJWKS`) is operator-supplied,
+and that fetch already sets `allow_redirects=False`. So the operator path is not
+where the risk is — which is what makes a trust-split the right shape.
 
 ## Changes
 
-**The fix is to make the guarantee honest, not to resolve DNS.** Resolution at
-validation time buys little here — the only fetched URL is operator-supplied —
-while adding a TOCTOU gap, a DNS lookup on a caller-supplied string, and a new
-failure mode to define. That is a poor trade for a gate that is not currently
-load-bearing against an attacker.
+**Split the gate by trust level.** The seam already exists and is currently
+pointed the wrong way: `sanitize_url_elicitation_url` (`auth.py:363`) is a named
+entry point for the untrusted elicitation path, and it delegates to
+`sanitize_public_auth_url(url, allow_loopback_http=True)` — *more* permissive
+than the operator path, not less.
+
+**No DNS resolution**, for the reasons rev 1 gave and the board upheld: TOCTOU,
+a lookup on caller-supplied input, and it is not real SSRF defence anyway
+(that needs connection-time IP pinning). The question is what a no-network rule
+can honestly assert.
 
 ### `src/pmcp/auth.py` (modify)
 
-- `_is_public_auth_host` (`:127`) — modify — keep the behaviour, fix the
-  **contract**. Rename to something that states what it checks, e.g.
-  `_is_non_public_ip_literal` inverted, or keep the name and add a docstring that
-  says: this rejects IP literals that are private, loopback, link-local,
-  multicast or unspecified, and **accepts any DNS name without resolving it**.
-  A reader must be able to learn the limit from the function, not by testing it.
-- `sanitize_public_auth_url` (`:143`) — modify — the raised message currently
-  reads *"Public auth URL host must be public."* Narrow it to what was actually
-  checked, e.g. *"Public auth URL host must not be a private, loopback,
-  link-local or multicast IP address."* The current wording is what makes a
-  reader believe a name was vetted.
-- The module docstring or a comment near the gate — add — state the deliberate
-  decision **not** to resolve, and why (TOCTOU, DNS lookup on caller-supplied
-  input, and that the only fetched URL is operator-supplied). Without this, the
-  next reader re-derives the question or "fixes" it by adding resolution.
+- `_public_host_verdict(hostname)` — add — returns a three-way result rather than
+  a bool: `PRIVATE_LITERAL` (an IP literal in a private/loopback/link-local/
+  multicast/unspecified range, or `localhost`), `PUBLIC_LITERAL`, or
+  `UNVERIFIED_NAME` (any DNS name — because without resolving, that is the
+  strongest honest statement). Rev 1's bug was collapsing the third case into
+  "public".
+- `sanitize_public_auth_url` (`:143`) — modify — take a `trust` argument.
+  **Operator paths** accept `UNVERIFIED_NAME` (unchanged behaviour — an operator
+  can already point their gateway anywhere). **Untrusted paths reject it.**
+- `sanitize_url_elicitation_url` (`:363`) — modify — pass the untrusted trust
+  level, and **stop passing `allow_loopback_http=True`**. A downstream server
+  should not be able to hand the operator a loopback URL that pmcp presents as
+  validated.
+- The `WWW-Authenticate` parse (`:468`) — modify — same untrusted level.
+- Error messages — modify — say which rule rejected the input, and never claim a
+  name was verified public.
 
-### `tests/test_auth.py` (modify)
-
-- `test_sanitize_public_auth_url_rejects_invalid_and_non_public_urls` (`:738`) —
-  extend — add the **accepted** cases as explicit, named assertions:
-  `metadata.google.internal`, `internal.corp` and a plain
-  `example.com` all pass. Today that behaviour is real but unwritten, so a future
-  change to resolution would silently alter it with nothing going red.
-  A test that pins a *limitation* is how the limitation stays a decision.
-- Add the rejected IP-literal cases if not already covered: `10.0.0.5`,
-  `127.0.0.1`, `169.254.169.254`, `localhost`. Verified all four currently reject.
+**The honest limit, to be stated in the code and the CHANGELOG:** rejecting
+`UNVERIFIED_NAME` on untrusted paths means those paths accept **only IP literals
+in public ranges**. That is strict — it will reject legitimate public hostnames
+from well-behaved downstream servers. That is a real cost and the board should
+weigh it; the alternative is an operator allowlist for the untrusted paths, which
+is more work and more configuration. **Do not soften this into a suffix denylist**
+(`.internal`, `.local`, `.corp`): a denylist fails open on a custom internal TLD,
+which is the same fail-open shape this repo has now fixed five times.
 
 ## Documentation impact
 
 - `CHANGELOG.md` — add — `### Changed`, one line: the error message narrowed to
   describe what is actually validated. No behaviour change, so not `### Fixed` —
   claiming a fix would overstate it exactly as the issue did.
-- `README.md` — modify **only if** it documents the public-URL requirement for
-  auth metadata; check before editing.
+- `README.md:168` — modify — **required**, not conditional. It says the URL must
+  be `https` "on a public host"; that is only true for IP literals.
+- `SECURITY.md:39` — modify — **required**. Same wording, in the security policy,
+  which is the worst place to overclaim. Rev 1 missed this file entirely.
 
 ## Dependencies & order
 
@@ -115,16 +121,25 @@ failure to this diff, and do not claim a green local suite that was not green.
 
 ## Acceptance criteria
 
-- [ ] `sanitize_public_auth_url` still **rejects** `10.0.0.5`, `127.0.0.1`,
-      `169.254.169.254` and `localhost`, and still **accepts**
-      `metadata.google.internal` and `example.com` — both directions asserted by
-      name, so the limitation is pinned rather than incidental.
-- [ ] The raised message no longer claims the host "must be public"; it names the
-      IP-literal classes actually rejected. Asserted on the message text.
-- [ ] `_is_public_auth_host`'s docstring states that a DNS name is accepted
-      unresolved, and the non-resolution decision is recorded with its reasons.
-- [ ] No behaviour change: the full test suite passes with no test modified other
-      than the additions above.
+- [ ] On an **untrusted** path (`sanitize_url_elicitation_url`, and the
+      `WWW-Authenticate` parse), `https://metadata.google.internal/...` and
+      `https://internal.corp/...` are **rejected**.
+      **WAS WRONG (rev 1):** it required these to be *accepted*, which two seats
+      independently objected to — pinning them would have codified an
+      attacker-influenced relay as intended behaviour.
+- [ ] On an **operator** path (`resource_server_jwks_url`, doctor), a public DNS
+      name such as `auth.example.com` is still **accepted** — this must not
+      become a blanket rejection that breaks every real deployment.
+- [ ] IP literals still behave as today on both paths: `10.0.0.5`, `127.0.0.1`,
+      `169.254.169.254`, `localhost` rejected; a public literal accepted.
+- [ ] `sanitize_url_elicitation_url` no longer permits loopback HTTP — asserted
+      directly, since rev 1 did not notice it was passing `allow_loopback_http=True`.
+- [ ] No error message claims a hostname "must be public" or was verified public.
+      Asserted on message text.
+- [ ] `README.md:168` and `SECURITY.md:39` no longer promise a public host
+      without qualification.
+- [ ] Full suite green, and the existing `test_auth.py` public-URL tests still
+      pass or are updated with a stated reason per change.
 
 ## Non-goals
 
