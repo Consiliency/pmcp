@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The public auth-URL host check accepted several non-public hosts.** Two
+  distinct defects in `_is_public_auth_host`, both reachable through auth
+  metadata, elicitation, and `resource_server_jwks_url`:
+  - The classifier subtracted a list of bad properties (`is_private`,
+    `is_loopback`, `is_link_local`, `is_multicast`, `is_unspecified`), and that
+    list had holes. RFC 6598 CGNAT (`100.64.0.0/10`) and deprecated RFC 3879
+    IPv6 site-local (`fec0::/10`) were classified as public, as were IPv4
+    addresses embedded in IPv6 literals — `64:ff9b::7f00:1` (RFC 6052 NAT64
+    carrying `127.0.0.1`), `::10.0.0.5` (RFC 4291 IPv4-compatible) and
+    `::0:5efe:a00:5` (RFC 5214 ISATAP). The check now unwraps every
+    IPv4-embedding IPv6 format and then classifies positively.
+  - **Legacy numeric host forms bypassed the check entirely.** `ip_address()`
+    raises on them, and the code read "raised" as "this is a DNS name, accept
+    it" — while a stock resolver reads `2852039166` and `0xA9FEA9FE` as
+    `169.254.169.254` and `0177.0.0.1` as `127.0.0.1`, with no DNS lookup
+    involved. Such hosts are now canonicalised (not resolved) and classified as
+    the literals they are.
+
+  Genuinely public addresses are unaffected, including public addresses carried
+  inside an embedding format (`::ffff:8.8.8.8`, `64:ff9b::808:808`) and addresses
+  that merely resemble one: ISATAP is matched on its full RFC 5214 §6.1
+  interface identifier (`00-00-5E-FE`, or `02-00-5E-FE` with the u/g bit set),
+  not on the `5efe` hextet alone, so an ordinary global address such as
+  `2606:4700::1234:5efe:a00:5` is still accepted.
+
+  Two limitations remain, both name-shaped and both tracked in #211: a DNS name
+  is accepted **without being resolved**, and so is a trailing-dot IPv4 such as
+  `169.254.169.254.`, which POSIX `inet_aton` also rejects as an address. The
+  DNS-name limitation is now stated in the docstring, `README.md` and
+  `SECURITY.md` instead of being implied away. The error message no longer claims
+  the host "must be public", since only IP literals are ever checked. (#210)
+
 ## [2.7.1] - 2026-08-30
 
 ### Changed

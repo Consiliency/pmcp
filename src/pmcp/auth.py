@@ -8,7 +8,8 @@ import time
 import asyncio
 from collections.abc import Mapping
 from dataclasses import dataclass
-from ipaddress import ip_address
+from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
+from itertools import product
 from typing import Any
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, quote, urlparse, urlunparse
@@ -124,20 +125,139 @@ def _is_loopback_host(hostname: str) -> bool:
         return False
 
 
+# Every IPv6 format that carries an IPv4 address in its low 32 bits. The set is
+# closed and RFC-specified, so enumerating it is defensible -- but the list must
+# not live only here. The matrix in tests/test_auth.py names each format with its
+# RFC so that a seventh format is a visible gap rather than a silent one.
+_V4_EMBEDDING_NETWORKS = (
+    ip_network("::ffff:0:0/96"),  # RFC 4291 IPv4-mapped
+    ip_network("::/96"),  # RFC 4291 IPv4-compatible (deprecated)
+    ip_network("64:ff9b::/96"),  # RFC 6052 NAT64 well-known prefix
+)
+# RFC 5214 §6.1: an ISATAP interface identifier is the full 32 bits
+# `00-00-5E-FE` -- or `02-00-5E-FE` with the u/g bit set -- immediately followed
+# by the IPv4 address in the low 32 bits. Matching only the `5efe` hextet is not
+# enough to identify ISATAP: `2606:4700::1234:5efe:a00:5` is an ordinary global
+# address that merely happens to carry `5efe` there, and unwrapping it would
+# reject a genuinely public host.
+# RFC 3056 6to4 (2002::/16) and RFC 4380 Teredo (2001::/32) need no unwrapping
+# because neither prefix is global.
+_ISATAP_INTERFACE_IDS = (0x00005EFE, 0x02005EFE)
+
+# inet_aton part grammar. A part is hex, octal, or decimal; a leading zero is
+# read as octal by glibc but as decimal by stricter resolvers, so both readings
+# are produced and the host is rejected if either one is non-public.
+_HEX_PART = re.compile(r"0[xX][0-9a-fA-F]+")
+_OCTAL_PART = re.compile(r"0[0-7]*")
+_DECIMAL_PART = re.compile(r"[0-9]+")
+
+
+def _unwrap_embedded_v4(
+    address: IPv4Address | IPv6Address,
+) -> IPv4Address | IPv6Address:
+    """Return the IPv4 address an IPv6 literal embeds, or the address unchanged."""
+    if isinstance(address, IPv6Address):
+        for network in _V4_EMBEDDING_NETWORKS:
+            if address in network:
+                return IPv4Address(int(address) & 0xFFFFFFFF)
+        if ((int(address) >> 32) & 0xFFFFFFFF) in _ISATAP_INTERFACE_IDS:
+            return IPv4Address(int(address) & 0xFFFFFFFF)
+    return address
+
+
+def _is_public_ip(address: IPv4Address | IPv6Address) -> bool:
+    """Classify an address positively, after unwrapping any embedded IPv4.
+
+    Classifying positively (what *is* public) rather than subtracting a list of
+    bad properties is deliberate: the subtractive form missed RFC 6598 CGNAT and
+    RFC 3879 site-local. `is_global` alone is not enough -- it is True for
+    ``fec0::1`` and, on Python 3.10, for multicast.
+    """
+    unwrapped = _unwrap_embedded_v4(address)
+    return bool(
+        unwrapped.is_global
+        and not getattr(unwrapped, "is_site_local", False)
+        and not unwrapped.is_multicast
+    )
+
+
+def _numeric_part_values(part: str) -> set[int]:
+    """Every integer a resolver could plausibly read one inet_aton part as."""
+    if _HEX_PART.fullmatch(part):
+        return {int(part, 16)}
+    values: set[int] = set()
+    if _DECIMAL_PART.fullmatch(part):
+        values.add(int(part, 10))
+    if _OCTAL_PART.fullmatch(part):
+        values.add(int(part, 8))
+    return values
+
+
+def _legacy_numeric_addresses(hostname: str) -> set[IPv4Address]:
+    """Read a host as a legacy numeric IPv4 literal, without resolving anything.
+
+    ``ip_address()`` rejects the inet_aton forms that every stock resolver still
+    accepts, so ``2852039166``, ``0xA9FEA9FE`` and ``0177.0.0.1`` reach
+    169.254.169.254 and 127.0.0.1 with no DNS lookup involved. Treating "did not
+    parse" as "must be a DNS name" therefore hands a literal the benefit of the
+    doubt owed only to a name.
+
+    Returns every reading; an empty set means the host is genuinely not numeric
+    and belongs on the name path.
+    """
+    parts = hostname.split(".")
+    if not 1 <= len(parts) <= 4:
+        return set()
+    readings: list[list[int]] = []
+    for part in parts:
+        values = _numeric_part_values(part)
+        if not values:
+            return set()
+        readings.append(sorted(values))
+
+    addresses: set[IPv4Address] = set()
+    for combination in product(*readings):
+        # inet_aton: every leading part is one byte and the final part fills the
+        # remaining low bytes, so `169.254.43518` and `5` are addresses too.
+        *head, tail = combination
+        if any(value > 0xFF for value in head):
+            continue
+        if tail >= 1 << (8 * (4 - len(head))):
+            continue
+        packed = tail
+        for index, value in enumerate(head):
+            packed |= value << (8 * (3 - index))
+        addresses.add(IPv4Address(packed))
+    return addresses
+
+
 def _is_public_auth_host(hostname: str) -> bool:
+    """Report whether an auth URL's host is a public IP literal or a DNS name.
+
+    Only IP literals are actually classified. **A DNS name is accepted without
+    being resolved**, so this function cannot tell that ``metadata.example.com``
+    points at 169.254.169.254. That limitation is real and tracked by #211; it is
+    stated here rather than implied because the caller's error message used to
+    claim more than this check performs.
+
+    Legacy numeric forms are *not* names: anything readable as a number is
+    canonicalised and classified as the literal it is.
+    """
     if hostname.lower() == "localhost":
         return False
+    # Only the parse is guarded: a ValueError escaping the classifier would
+    # otherwise be misread as "not a literal" and fail open.
+    address: IPv4Address | IPv6Address | None
     try:
         address = ip_address(hostname)
     except ValueError:
-        return True
-    return not (
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_multicast
-        or address.is_unspecified
-    )
+        address = None
+    if address is not None:
+        return _is_public_ip(address)
+    numeric = _legacy_numeric_addresses(hostname)
+    if numeric:
+        return all(_is_public_ip(address) for address in numeric)
+    return True
 
 
 def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> str:
@@ -160,7 +280,9 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> 
         allow_loopback_http and parsed.scheme == "http" and _is_loopback_host(hostname)
     ):
         if not _is_public_auth_host(hostname):
-            raise ValueError("Public auth URL host must be public.")
+            raise ValueError(
+                "Public auth URL host is a non-public IP literal or loopback name."
+            )
 
     return redact_auth_url(url)
 

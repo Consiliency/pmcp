@@ -36,7 +36,8 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   are only accepted for the operator-configured algorithm allowlist (default
   `RS256`/`ES256`); the token's own `alg` header is never trusted. The mode
   fails closed at startup without an issuer, JWKS URL, and audience, and the
-  JWKS URL must be `https` on a public host. JWKS is fetched asynchronously and
+  JWKS URL must be `https` and is rejected when its host is a non-public IP
+  literal (see the DNS-name limitation below). JWKS is fetched asynchronously and
   cached so validation never blocks the event loop; an unreachable JWKS endpoint
   returns `503` while an invalid or wrong-audience token returns `401`.
 - Timing oracle attacks on token comparison (`hmac.compare_digest`)
@@ -64,6 +65,15 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 
 ### Known limitations
 
+- **The auth-URL host check filters IP literals only**: a public auth metadata
+  or JWKS URL is rejected when its host is a non-public IP literal — private,
+  CGNAT, link-local, loopback, multicast, site-local or unspecified, including
+  IPv4 addresses embedded in IPv6 literals (RFC 4291 mapped and compatible,
+  RFC 6052 NAT64, RFC 3056 6to4, RFC 4380 Teredo, RFC 5214 ISATAP) and legacy
+  numeric forms such as `2852039166` or `0177.0.0.1`. **A DNS name is accepted
+  without being resolved**, so a name pointing at an internal address is not
+  caught. Tracked in
+  [#211](https://github.com/Consiliency/pmcp/issues/211).
 - **No mTLS**: clients are not authenticated by certificate; only Bearer token.
 - **No per-tool ACL on HTTP**: any valid token can invoke any tool. Tool-level policy is
   enforced at the MCP layer, not the HTTP layer.

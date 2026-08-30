@@ -165,15 +165,21 @@ audience is bound to the configured `resource_server_audience` (the server's
 canonical resource URI, per RFC 8707); it is never derived from the request
 Host header. `resource-server` mode fails closed at startup if the issuer,
 JWKS URL, or audience is missing, and `resource_server_jwks_url` must be an
-`https` URL on a public host. Token signatures are only accepted for the
-operator-configured `resource_server_allowed_algorithms` allowlist (default
-`RS256`/`ES256`); the token's own `alg` header is never trusted. JWKS is fetched
+`https` URL and is rejected when its host is a non-public IP literal. Token
+signatures are only accepted for the operator-configured
+`resource_server_allowed_algorithms` allowlist (default `RS256`/`ES256`); the
+token's own `alg` header is never trusted. JWKS is fetched
 asynchronously and cached, so validation never blocks the event loop; an
 unreachable JWKS endpoint returns `503` while an invalid token returns `401`.
-It rejects private, link-local, loopback, multicast, and unspecified hosts in
-public auth metadata URLs. PMCP is still not an Authorization Server and does
-not provide dynamic client registration, SSO, RBAC, billing, or a complete
-multi-tenant identity service.
+In public auth metadata URLs it rejects hosts written as non-public **IP
+literals** — private, CGNAT, link-local, loopback, multicast, site-local, and
+unspecified — including IPv4 addresses embedded in IPv6 literals and legacy
+numeric forms such as `2852039166`. This is a filter on literals only: a DNS
+name is accepted **without being resolved**, so a name that points at an
+internal address still passes
+([#211](https://github.com/Consiliency/pmcp/issues/211)). PMCP is still not an
+Authorization Server and does not provide dynamic client registration, SSO,
+RBAC, billing, or a complete multi-tenant identity service.
 
 Auth mode and OAuth resource-server parameters are configurable from the CLI or
 environment (CLI flags take precedence; env values are read only when the flag
