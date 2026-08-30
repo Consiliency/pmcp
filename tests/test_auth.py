@@ -912,11 +912,13 @@ def test_public_auth_url_still_accepts_non_numeric_hosts_after_canonicalisation(
         assert sanitize_public_auth_url(_auth_url(host)) == _auth_url(host)
 
 
-def test_public_auth_host_canonicalisation_rejects_python_int_quirks() -> None:
-    """`int()` accepts separators, signs, and non-ASCII digits; hosts must not.
+def test_public_auth_host_does_not_read_python_int_quirks_as_addresses() -> None:
+    """`int()` accepts separators, signs, and non-ASCII digits; the parser must not.
 
-    Parsing with a bare `int(part)` would canonicalise these into literals and
-    reject them, or worse, mis-read them. They are hostnames, not addresses.
+    `int("1_0")` is 10 and `int("١٢٧")` is 127, so canonicalising with a bare
+    `int(part)` would turn these hostnames into addresses. No resolver reads them
+    that way, so they stay on the name path. The parser matches ASCII character
+    classes before converting, which is what keeps that true.
     """
     for host in ["1_0", "١٢٧", "+2852039166"]:
         assert sanitize_public_auth_url(_auth_url(host)) == _auth_url(host)
