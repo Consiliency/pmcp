@@ -90,9 +90,14 @@ which is the same fail-open shape this repo has now fixed five times.
 
 ## Documentation impact
 
-- `CHANGELOG.md` — add — `### Changed`, one line: the error message narrowed to
-  describe what is actually validated. No behaviour change, so not `### Fixed` —
-  claiming a fix would overstate it exactly as the issue did.
+- `CHANGELOG.md` — add — `### Changed`. **Rev 2 is a behaviour change**, unlike
+  rev 1: a downstream server can no longer hand the operator a hostname-based URL
+  that pmcp presents as validated. State the cost explicitly — untrusted paths now
+  accept only public IP literals — so an operator seeing a legitimate server's URL
+  rejected can find out why.
+  **WAS WRONG (rev 1):** this bullet said "no behaviour change, so not
+  `### Fixed`". That reasoning was right for rev 1's scope and is wrong for this
+  one.
 - `README.md:168` — modify — **required**, not conditional. It says the URL must
   be `https` "on a public host"; that is only true for IP literals.
 - `SECURITY.md:39` — modify — **required**. Same wording, in the security policy,
@@ -100,11 +105,16 @@ which is the same fail-open shape this repo has now fixed five times.
 
 ## Dependencies & order
 
-1. Tests first, pinning both current behaviours — accepted names and rejected
-   literals — **against unchanged code**. They must pass before anything changes;
-   that is what makes them a description of today rather than of the edit.
-2. Docstring, message, and comment.
-3. CHANGELOG.
+1. `_public_host_verdict` and its unit tests — the three-way verdict is the
+   primitive everything else reads.
+2. The `trust` split on `sanitize_public_auth_url`, then the two untrusted
+   callers (`sanitize_url_elicitation_url`, the `WWW-Authenticate` parse),
+   including dropping `allow_loopback_http=True` from the elicitation path.
+3. Operator-path tests **first among the integration tests** — the largest risk in
+   rev 2 is over-rejection breaking real deployments, so prove `auth.example.com`
+   still passes before proving the internal names fail.
+4. Messages, docstrings, README and SECURITY.md.
+5. CHANGELOG.
 
 ## Verification
 
@@ -143,10 +153,11 @@ failure to this diff, and do not claim a green local suite that was not green.
 
 ## Non-goals
 
-- **Resolving hostnames.** Explicitly rejected above, with reasons. If a future
-  change makes an untrusted URL reachable by a fetch or a client-visible relay,
-  that decision should be revisited — and the recorded reasoning is what will
-  make that revisit possible.
+- **Resolving hostnames.** Still rejected, for the reasons above, and the board
+  upheld that. Note rev 1 justified this partly by claiming no untrusted URL was
+  relayed — that justification is gone; the remaining ones (TOCTOU, a lookup on
+  caller-supplied input, and that resolution is not real SSRF defence without
+  connection-time pinning) stand on their own.
 - Allowlisting auth hosts. Viable if the set is ever knowable; it is not today.
 - Auditing the `registry.py` provenance question named above. It is reasoned, not
   verified, and deserves its own look rather than a guess folded in here.
