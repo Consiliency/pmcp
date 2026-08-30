@@ -1,5 +1,12 @@
 # Detailed plan: fix the IP-literal classification, and stop the docs overclaiming
 
+> **Revision 5 (2026-08-30).** Rev 4's rule was still incomplete: I found two
+> more accepted bypasses by probing it — `::10.0.0.5` / `::127.0.0.1`
+> (IPv4-compatible IPv6) and `::0:5efe:a00:5` (ISATAP). **This is the fifth round
+> of "find another spelling", and that pattern is itself the finding** — see
+> "Why this keeps happening". Rev 5's rule is verified against 26 literals,
+> 0 mismatches.
+>
 > **Revision 4 (2026-08-30).** Rev 3 boarded 2 DISAGREE. Its prescribed recipe —
 > "prefer `is_global`" — **would have left `fec0::1` broken and regressed the
 > existing multicast test**. A rule I then drafted myself was wrong in both
@@ -51,13 +58,19 @@ written to replace it.
   The verified rule, 19 literals, 0 mismatches on Python 3.10:
 
   ```python
-  NAT64 = ip_network("64:ff9b::/96")
+  # Every IPv6 form that carries an IPv4 address in its low 32 bits.
+  _V4_EMBEDDING = [
+      ip_network("::ffff:0:0/96"),   # RFC 4291 IPv4-mapped
+      ip_network("::/96"),           # RFC 4291 IPv4-compatible (deprecated)
+      ip_network("64:ff9b::/96"),    # RFC 6052 NAT64 well-known prefix
+  ]
 
   def _unwrap(a):
       if isinstance(a, IPv6Address):
-          if a.ipv4_mapped is not None:
-              return a.ipv4_mapped
-          if a in NAT64:                      # embeds v4 in the low 32 bits
+          for net in _V4_EMBEDDING:
+              if a in net:
+                  return IPv4Address(int(a) & 0xFFFFFFFF)
+          if (int(a) >> 32) & 0xFFFF == 0x5EFE:   # RFC 5214 ISATAP
               return IPv4Address(int(a) & 0xFFFFFFFF)
       return a
 
@@ -66,6 +79,30 @@ written to replace it.
           and not getattr(addr, "is_site_local", False)
           and not addr.is_multicast)
   ```
+
+  **WAS WRONG (rev 4):** it unwrapped only `ipv4_mapped` and NAT64. Probing it
+  found `::10.0.0.5` and `::127.0.0.1` (IPv4-compatible) and `::0:5efe:a00:5`
+  (ISATAP) still **accepted**. 6to4 (`2002::/16`) and Teredo (`2001::/32`) happen
+  to be safe because both are already non-global — luck, not design, and worth a
+  test so it stays true.
+
+## Why this keeps happening
+
+Five rounds have each found another spelling of the same idea: *an IPv6 literal
+that carries an IPv4 address*. That is the identical failure mode as this repo's
+npm parser, which took five production fixes for the same reason — enumerating
+forms of a thing instead of modelling it.
+
+The difference, and the reason enumeration is defensible **here**: the set of
+IPv4-embedding IPv6 formats is closed and specified by RFCs (4291 mapped and
+compatible, 6052 NAT64, 3056 6to4, 4380 Teredo, 5214 ISATAP). It is a finite list
+with citations, not an open-ended vocabulary. The rule above covers all six —
+three by unwrapping, two because they are already non-global, one by pattern.
+
+What makes that safe to rely on is the **test**, not the code: the matrix must
+name every format and its RFC, so a seventh format added to the standards is a
+visible gap rather than a silent one. Do not let the list live only in the
+implementation.
 
   **WAS WRONG (rev 3):** "prefer `is_global`, falling back to an explicit check".
   `is_global` exists on every supported Python, so the fallback never runs — and
@@ -135,10 +172,16 @@ claim a green local suite that was not green.
 
 ## Acceptance criteria
 
-- [ ] **All five newly-rejected literals** fail against `main` and pass here:
+- [ ] **All eight newly-rejected literals** fail against `main` and pass here:
       `100.64.0.1`, `::ffff:100.64.0.1`, `fec0::1`, `64:ff9b::a00:5`,
-      `64:ff9b::7f00:1`. RED-on-main required for each — rev 3 named only the
-      first and third, and a fix satisfying rev 3 could still admit the other three.
+      `64:ff9b::7f00:1`, `::10.0.0.5`, `::127.0.0.1`, `::0:5efe:a00:5`.
+      RED-on-main required for each. Rev 3 named two of these and rev 4 named
+      five; a fix satisfying either could still admit the rest.
+- [ ] **6to4 and Teredo are asserted rejected** (`2002:0a00:0005::1`,
+      `2001:0:0:0:0:0:0a00:0005`) even though they pass today by being
+      non-global — so the behaviour is pinned rather than incidental.
+- [ ] **The test matrix names each embedding format with its RFC.** The list must
+      be readable as a specification, so a future format is a visible gap.
 - [ ] **All five must-accept literals** still pass: `8.8.8.8`, `93.184.216.34`,
       `2001:4860:4860::8888`, `::ffff:8.8.8.8`, and `64:ff9b::808:808`. The last
       two are the over-rejection traps — a rule using `is_reserved` fails both.
