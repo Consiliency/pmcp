@@ -1,5 +1,13 @@
 # Detailed plan: fix the IP-literal classification, and stop the docs overclaiming
 
+> **Revision 6 (2026-08-30).** The rev-4 board found a defect of a **different
+> class** than the five rounds before it: legacy numeric IPv4 forms
+> (`2852039166`, `0xA9FEA9FE`, `0177.0.0.1`) fail `ip_address()`, fall into the
+> "it's a DNS name" branch, and are **accepted** — while the resolver interprets
+> them directly as `169.254.169.254` and `127.0.0.1`. No DNS lookup is involved.
+> This is the most serious finding in the issue and it is **not** the deferred
+> #211 question.
+>
 > **Revision 5 (2026-08-30).** Rev 4's rule was still incomplete: I found two
 > more accepted bypasses by probing it — `::10.0.0.5` / `::127.0.0.1`
 > (IPv4-compatible IPv6) and `::0:5efe:a00:5` (ISATAP). **This is the fifth round
@@ -85,6 +93,30 @@ written to replace it.
   (ISATAP) still **accepted**. 6to4 (`2002::/16`) and Teredo (`2001::/32`) happen
   to be safe because both are already non-global — luck, not design, and worth a
   test so it stays true.
+
+### The numeric-form bypass — a second, distinct defect
+
+`_is_public_auth_host` treats *"`ip_address()` raised"* as *"this is a hostname,
+accept it"*. That conflates two very different things: a name whose target is
+unknowable without resolving (the #211 question), and **an IP address written in
+a form this code cannot parse**. Verified:
+
+```
+2852039166   ip_address() fails -> accepted   resolver -> 169.254.169.254
+0xA9FEA9FE   ip_address() fails -> accepted   resolver -> 169.254.169.254
+0177.0.0.1   ip_address() fails -> accepted   resolver -> 127.0.0.1
+167772161    ip_address() fails -> accepted   resolver -> 10.0.0.1
+10.0.0.1     ip_address() parses -> rejected
+```
+
+**Fix:** before deciding a host is a name, try to canonicalise it as a numeric
+address — decimal, hex, octal, and dotted variants — and if it resolves to one,
+classify it as a literal. A host that is *not* a name must not be granted a
+name's benefit of the doubt.
+
+**Do not fix this by resolving.** The correct rule is: if it can be read as a
+number, it is a literal, and literals go through the classifier. Only genuinely
+non-numeric hosts reach the accepted-unresolved path that #211 covers.
 
 ## Why this keeps happening
 
@@ -182,6 +214,12 @@ claim a green local suite that was not green.
       non-global — so the behaviour is pinned rather than incidental.
 - [ ] **The test matrix names each embedding format with its RFC.** The list must
       be readable as a specification, so a future format is a visible gap.
+- [ ] **Legacy numeric forms are rejected**: `2852039166`, `0xA9FEA9FE`,
+      `0177.0.0.1`, `167772161`, and the dotted-hex/octal variants. Each must
+      fail against `main`, where all are currently accepted. Two of them resolve
+      to the cloud-metadata address.
+- [ ] **A genuinely non-numeric host is still accepted** (`auth.example.com`), so
+      the canonicalisation does not swallow the DNS path that #211 covers.
 - [ ] **All five must-accept literals** still pass: `8.8.8.8`, `93.184.216.34`,
       `2001:4860:4860::8888`, `::ffff:8.8.8.8`, and `64:ff9b::808:808`. The last
       two are the over-rejection traps — a rule using `is_reserved` fails both.
