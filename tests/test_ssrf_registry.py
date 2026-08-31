@@ -135,12 +135,16 @@ def test_fetch_json_metadata_does_not_follow_redirect(monkeypatch) -> None:
 
     monkeypatch.setattr("pmcp.auth.urlopen", fake_urlopen)
 
-    data, error = fetch_json_metadata("https://auth.example/meta?token=secret")
+    # A verified public literal. Since #211 `fetch_json_metadata` refuses an
+    # unresolved name before the opener is reached, so a hostname here would
+    # short-circuit and never exercise the redirect handler this test is for.
+    data, error = fetch_json_metadata("https://93.184.216.34/meta?token=secret")
 
     assert data is None
     assert error is not None
     assert "secret" not in error
     # Only the initial public host is ever contacted.
+    assert seen["url"].startswith("https://93.184.216.34/")
     assert INTERNAL_HOST not in seen["url"]
 
 

@@ -136,7 +136,20 @@ class GatewayDiagnosticsInfo(BaseModel):
 
 
 class AuthMetadataInfo(BaseModel):
-    """Non-secret authorization metadata and discovery hints."""
+    """Non-secret authorization metadata and discovery hints.
+
+    The URL fields stay ``str | None``. ``transport/http.py`` interpolates
+    ``protected_resource_metadata_url`` straight into a ``WWW-Authenticate``
+    header, so wrapping them in a richer type would be a silent contract break.
+
+    ``verified_urls`` names the fields whose host PMCP verified as a public IP
+    literal. It is a per-field list rather than one object-level flag because
+    these five URLs are independent: a single bool cannot be honest when
+    ``oidc_issuer_url`` is a literal PMCP classified and
+    ``protected_resource_metadata_url`` is a name it never resolved (#211).
+    A field absent from the list is **unverified**, so the empty default
+    under-claims for every URL rather than vouching for any.
+    """
 
     protected_resource_metadata_url: str | None = None
     authorization_server_metadata_url: str | None = None
@@ -147,13 +160,25 @@ class AuthMetadataInfo(BaseModel):
     granted_scopes: list[str] = Field(default_factory=list)
     missing_scopes: list[str] = Field(default_factory=list)
     diagnostics: list[str] = Field(default_factory=list)
+    verified_urls: list[str] = Field(default_factory=list)
+
+    def url_verified(self, field_name: str) -> bool:
+        """Report whether PMCP verified where ``field_name``'s URL points."""
+        return field_name in self.verified_urls
 
 
 class AuthChallengeInfo(BaseModel):
-    """Parsed non-secret details from an authorization challenge."""
+    """Parsed non-secret details from an authorization challenge.
+
+    ``resource_metadata_url`` is relayed from a downstream server's
+    ``WWW-Authenticate`` header. ``resource_metadata_url_verified`` reports
+    whether PMCP verified its host as a public IP literal; it defaults to False
+    because PMCP does not resolve names and must not imply otherwise (#211).
+    """
 
     scheme: str | None = None
     resource_metadata_url: str | None = None
+    resource_metadata_url_verified: bool = False
     scope: str | None = None
     missing_scopes: list[str] = Field(default_factory=list)
     error: str | None = None
@@ -161,10 +186,22 @@ class AuthChallengeInfo(BaseModel):
 
 
 class UrlElicitationInfo(BaseModel):
-    """URL-mode elicitation details safe to display to users."""
+    """URL-mode elicitation details, carrying how far PMCP checked the URL.
+
+    This used to say the details were "safe to display to users", which claimed
+    more than PMCP performs. PMCP validates the URL's form and refuses private,
+    loopback, and legacy-numeric address literals — but it does **not** resolve
+    host names, so it cannot tell that ``metadata.example.com`` points at a link
+    local address (#211).
+
+    ``url_verified`` distinguishes the two cases: True only when PMCP itself
+    classified the host as a public IP literal. It defaults to False so that a
+    construction which forgets it under-claims rather than vouches.
+    """
 
     elicitation_id: str
     url: str
+    url_verified: bool = False
     message: str | None = None
     next_step: str | None = None
 

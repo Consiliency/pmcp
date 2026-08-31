@@ -72,8 +72,17 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   RFC 6052 NAT64, RFC 3056 6to4, RFC 4380 Teredo, RFC 5214 ISATAP) and legacy
   numeric forms such as `2852039166` or `0177.0.0.1`. **A DNS name is accepted
   without being resolved**, so a name pointing at an internal address is not
-  caught. Tracked in
-  [#211](https://github.com/Consiliency/pmcp/issues/211).
+  caught. PMCP does not resolve names deliberately: a lookup is
+  TOCTOU-vulnerable and is not SSRF defence without connection-time IP pinning.
+  What it does instead is stop claiming otherwise — **a server-supplied URL is
+  relayed unverified and presented as such**, via
+  `UrlElicitationInfo.url_verified`, `AuthMetadataInfo.verified_urls` (one entry
+  per URL field), and `AuthChallengeInfo.resource_metadata_url_verified`, all
+  defaulting to unverified, with the caveat carried in the `next_step` string an
+  agent follows and in `pmcp auth` output. Paths where PMCP fetches the URL
+  itself fail closed and require a verified public literal, and a URL from a
+  downstream server's payload may not be loopback `http://`
+  ([#211](https://github.com/Consiliency/pmcp/issues/211)).
 - **No mTLS**: clients are not authenticated by certificate; only Bearer token.
 - **No per-tool ACL on HTTP**: any valid token can invoke any tool. Tool-level policy is
   enforced at the MCP layer, not the HTTP layer.

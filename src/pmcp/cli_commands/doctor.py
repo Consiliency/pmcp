@@ -6,6 +6,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from pmcp.auth import (
+    is_verified_public_auth_url,
     redact_auth_url,
     sanitize_auth_diagnostic,
     sanitize_public_auth_url,
@@ -87,11 +88,21 @@ def collect_remote_header_diagnostics(
                     )
                 )
             else:
+                # `sanitize_public_auth_url` succeeding means the URL's form is
+                # valid and its host is not a private address literal -- not
+                # that pmcp knows where it points. Reporting a bare `[OK] ...
+                # configured at <name>` claimed the latter (#211).
+                qualifier = (
+                    ""
+                    if is_verified_public_auth_url(metadata_url)
+                    else " (host not verified; pmcp does not resolve names)"
+                )
                 checks.append(
                     (
                         "remote",
                         "ok",
-                        f"{server_name}: {metadata_key} configured at {safe_metadata_url}.",
+                        f"{server_name}: {metadata_key} configured at "
+                        f"{safe_metadata_url}{qualifier}.",
                     )
                 )
 

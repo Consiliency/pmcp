@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 from itertools import product
-from typing import Any
+from typing import Any, Literal
 from urllib.error import HTTPError
 from urllib.parse import parse_qsl, quote, urlparse, urlunparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener
@@ -260,6 +260,66 @@ def _is_public_auth_host(hostname: str) -> bool:
     return True
 
 
+def _is_verified_public_auth_host(hostname: str) -> bool:
+    """Report whether PMCP itself classified this host as a public literal.
+
+    This is the honest half of :func:`_is_public_auth_host`. That function
+    returns True for a DNS name, because rejecting unresolvable names would
+    refuse every legitimate ``auth.vendor.com``. But "not rejected" is not
+    "checked", and presenting the two identically is the vouch #211 reports.
+
+    A name therefore returns **False** here: PMCP does not resolve names -- a
+    deliberate non-goal, since a lookup is TOCTOU-vulnerable and is not SSRF
+    defence without connection-time IP pinning -- so it does not know where one
+    points and must not imply that it does.
+    """
+    if hostname.lower() == "localhost":
+        return False
+    address: IPv4Address | IPv6Address | None
+    try:
+        address = ip_address(hostname)
+    except ValueError:
+        address = None
+    if address is not None:
+        return _is_public_ip(address)
+    numeric = _legacy_numeric_addresses(hostname)
+    if numeric:
+        return all(_is_public_ip(candidate) for candidate in numeric)
+    return False
+
+
+def is_verified_public_auth_url(url: str) -> bool:
+    """Report whether PMCP verified where an auth URL points.
+
+    True only for an absolute ``https://`` URL whose host PMCP classified as a
+    public IP literal. False for every DNS name, every non-public literal, and
+    every ``http://`` URL -- a cleartext hop's destination is not authenticated
+    even when the address is public.
+
+    Callers use this to decide what to *claim*, not what to accept: a relay path
+    keeps passing an unverified URL through, it just stops vouching for it.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        _ = parsed.port
+    except ValueError:
+        return False
+    if parsed.scheme != "https" or not parsed.netloc or not hostname:
+        return False
+    return _is_verified_public_auth_host(hostname)
+
+
+# One provenance-neutral sentence, used on both the downstream relay path and
+# the operator acknowledgement path. The acknowledge path echoes a URL the
+# operator typed, so the copy must not attribute it to "the server".
+UNVERIFIED_URL_CAVEAT = (
+    "PMCP has not verified where this URL points -- it checks the URL's form "
+    "and rejects private address literals, but it does not resolve host names. "
+    "Confirm the destination yourself before opening it."
+)
+
+
 def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) -> str:
     """Validate and redact a public absolute auth metadata or elicitation URL."""
     try:
@@ -482,10 +542,33 @@ def validate_resource_server_token(
     )
 
 
-def sanitize_url_elicitation_url(url: str) -> str:
-    """Validate and redact a URL-mode elicitation URL."""
+def sanitize_url_elicitation_url(
+    url: str, *, provenance: Literal["remote", "operator"] = "remote"
+) -> str:
+    """Validate and redact a URL-mode elicitation URL.
+
+    This helper is shared by two call sites whose inputs have very different
+    provenance, and one permissiveness cannot be right for both (#211):
+
+    ``remote`` (the default)
+        The URL came out of a downstream server's error payload. A loopback
+        ``http://`` URL from there is an attempt to steer the operator at
+        something on the operator's own machine, so it is refused.
+
+    ``operator``
+        The URL was typed by the operator into ``gateway.auth_connect``. Local
+        OAuth redirects back to ``http://127.0.0.1``, and refusing that would
+        break the frozen local-consent flow, so loopback HTTP stays allowed.
+
+    The default is the strict side deliberately: a call site this change misses
+    should lose loopback, not silently keep it. Returns ``str`` -- the frozen
+    IF-0-ELICIT-1 shape. Ask :func:`is_verified_public_auth_url` separately for
+    whether PMCP actually verified the destination.
+    """
     try:
-        return sanitize_public_auth_url(url, allow_loopback_http=True)
+        return sanitize_public_auth_url(
+            url, allow_loopback_http=provenance == "operator"
+        )
     except ValueError as exc:
         raise ValueError("Invalid URL-mode elicitation URL.") from exc
 
@@ -585,6 +668,7 @@ def parse_www_authenticate(header: str) -> AuthChallengeInfo | None:
     missing = params.get("missing_scope") or scope or ""
     missing_scopes = [part for part in missing.split() if part]
     resource_metadata_url = None
+    resource_metadata_url_verified = False
     if params.get("resource_metadata"):
         try:
             resource_metadata_url = sanitize_public_auth_url(
@@ -592,10 +676,15 @@ def parse_www_authenticate(header: str) -> AuthChallengeInfo | None:
             )
         except ValueError:
             resource_metadata_url = None
+        else:
+            resource_metadata_url_verified = is_verified_public_auth_url(
+                params["resource_metadata"]
+            )
 
     return AuthChallengeInfo(
         scheme=scheme,
         resource_metadata_url=resource_metadata_url,
+        resource_metadata_url_verified=resource_metadata_url_verified,
         scope=scope,
         missing_scopes=missing_scopes,
         error=params.get("error"),
@@ -633,18 +722,29 @@ def normalize_auth_metadata(
 ) -> AuthMetadataInfo:
     """Normalize untrusted authorization metadata into PMCP's public shape."""
     normalized_diagnostics = [sanitize_auth_diagnostic(d) for d in (diagnostics or [])]
+    # Per-field, not per-object: these five URLs are independent, so one flag
+    # cannot be honest about a mix of a literal and a name (#211).
+    verified_urls: list[str] = []
 
     def public_url(raw_url: str | None, field_name: str) -> str | None:
         if not raw_url:
             return None
         try:
-            return sanitize_public_auth_url(raw_url)
+            safe_url = sanitize_public_auth_url(raw_url)
         except ValueError as exc:
             normalized_diagnostics.append(
                 f"{field_name} ignored: {sanitize_auth_diagnostic(exc)} "
                 f"({redact_auth_url(raw_url)})"
             )
             return None
+        if is_verified_public_auth_url(raw_url):
+            verified_urls.append(field_name)
+        else:
+            normalized_diagnostics.append(
+                f"{field_name} is relayed unverified: PMCP did not resolve "
+                f"{safe_url} and cannot confirm where it points."
+            )
+        return safe_url
 
     metadata = metadata or {}
     scopes_supported = metadata.get("scopes_supported")
@@ -691,6 +791,7 @@ def normalize_auth_metadata(
         granted_scopes=granted_scopes or [],
         missing_scopes=missing_scopes or [],
         diagnostics=normalized_diagnostics,
+        verified_urls=verified_urls,
     )
 
 
@@ -733,20 +834,30 @@ def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
         if not isinstance(elicitation_id, str) or not isinstance(url, str):
             continue
         try:
-            safe_url = sanitize_url_elicitation_url(url)
+            safe_url = sanitize_url_elicitation_url(url, provenance="remote")
         except ValueError:
             continue
         message = entry.get("message")
+        verified = is_verified_public_auth_url(url)
+        # `next_step` is the string an agent actually follows, so the caveat has
+        # to live inside it. A `url_verified: false` field alongside an
+        # unqualified "Open the URL" instruction still gets the URL opened.
+        follow_up = (
+            "open the URL out of band, complete consent, then call "
+            f"gateway.auth_connect(auth_mode='url_elicitation', "
+            f"server_name='<server>', elicitation_id='{elicitation_id}', "
+            "consent_acknowledged=true)."
+        )
         parsed_entries.append(
             UrlElicitationInfo(
                 elicitation_id=elicitation_id,
                 url=safe_url,
+                url_verified=verified,
                 message=message if isinstance(message, str) else None,
                 next_step=(
-                    "Open the URL out of band, complete consent, then call "
-                    f"gateway.auth_connect(auth_mode='url_elicitation', "
-                    f"server_name='<server>', elicitation_id='{elicitation_id}', "
-                    "consent_acknowledged=true)."
+                    f"{follow_up[0].upper()}{follow_up[1:]}"
+                    if verified
+                    else f"{UNVERIFIED_URL_CAVEAT} Once confirmed, {follow_up}"
                 ),
             )
         )
@@ -756,11 +867,28 @@ def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
 def fetch_json_metadata(
     url: str, *, timeout: float = 5.0
 ) -> tuple[dict[str, object] | None, str | None]:
-    """Fetch public auth metadata without forwarding credentials."""
+    """Fetch public auth metadata without forwarding credentials.
+
+    This is the fail-closed side of #211. PMCP *retrieves* this URL itself, so
+    "accepted but unverified" is not good enough here the way it is on a relay
+    path: the host must be one PMCP classified as a public IP literal. Loopback
+    HTTP and unresolved names are both refused, and refused **before** the
+    opener is reached, so a rejected URL is never requested.
+
+    This gates the interface rather than removing it: ``fetch_json_metadata`` is
+    frozen by IF-0-SAFEURL-4 (``plans/phase-plan-v4-safeurl.md``), so deleting
+    it would break that freeze even though it has no production caller today.
+    """
     try:
-        safe_url = sanitize_public_auth_url(url, allow_loopback_http=True)
+        safe_url = sanitize_public_auth_url(url)
     except ValueError as exc:
         return None, sanitize_auth_diagnostic(exc)
+    if not is_verified_public_auth_url(url):
+        return None, (
+            f"{safe_url}: refused before fetching -- PMCP retrieves only URLs "
+            "whose host it verified as a public IP literal, and it does not "
+            "resolve host names."
+        )
     try:
         request = Request(safe_url, headers={"Accept": "application/json"})
         with urlopen(request, timeout=timeout) as response:
