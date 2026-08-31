@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.3] - 2026-08-31
+
 ### Changed
 - **PMCP no longer implies it verified where a server-supplied auth URL
   points.** It never did: `_is_public_auth_host` classifies IP literals and
