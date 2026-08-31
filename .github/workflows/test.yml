@@ -35,7 +35,7 @@ jobs:
       # resolver refuses an `npx-cli.js` it does not recognise, so an image that
       # silently moved to a different npm major would turn that half of the
       # suite from covering production into skipping.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
 
@@ -78,7 +78,7 @@ jobs:
       # resolver refuses an `npx-cli.js` it does not recognise, so an image that
       # silently moved to a different npm major would turn that half of the
       # suite from covering production into skipping.
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "22"
 
