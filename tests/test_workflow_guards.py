@@ -170,6 +170,13 @@ PIN_MUTANTS: dict[str, tuple[Path, str, str]] = {
         "uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0",
         "uses: actions/setup-node@v4",
     ),
+    # Valid YAML GitHub runs; invisible to the line scan. Only the
+    # parsed-inventory cross-check sees it.
+    "uses-quoted-key": (
+        REPO_ROOT / ".github" / "actions" / "pipeline-bootstrap-setup" / "action.yml",
+        "- uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0",
+        '- "uses": actions/setup-node@v4',
+    ),
 }
 
 # Every mutant these tests exercise. Asserted EQUAL to the helper's expected-1
@@ -439,6 +446,52 @@ class TestShaPinning:
     def test_step_level_forms(self, tmp_path: Path, uses: str, ok: bool) -> None:
         path = _write(tmp_path, ".github/workflows/x.yml", _wf(uses))
         assert (cw.all_uses_are_sha_pinned([path]) == []) is ok, uses
+
+    @pytest.mark.parametrize(
+        "step",
+        [
+            '- "uses": actions/checkout@v7',  # quoted key
+            "- uses : actions/checkout@v7",  # space before the colon
+            "- {uses: actions/checkout@v7}",  # flow mapping
+            "- uses: >-\n          actions/checkout@v7",  # block scalar
+            "- uses: 'actions/checkout@v7'",  # quoted value
+        ],
+    )
+    def test_a_uses_the_line_scan_cannot_see_fails_closed(
+        self, tmp_path: Path, step: str
+    ) -> None:
+        # All valid YAML that GitHub executes as a mutable-ref step. The raw
+        # scan sees none of them; the parsed inventory does, and the two must
+        # be equal. A guard that only reads lines would let these run unpinned.
+        body = (
+            "name: x\non:\n  push:\njobs:\n  j:\n    timeout-minutes: 10\n"
+            f"    steps:\n      {step}\n"
+        )
+        path = _write(tmp_path, ".github/workflows/x.yml", body)
+        assert [s.get("uses") for s in yaml.safe_load(body)["jobs"]["j"]["steps"]] == [
+            "actions/checkout@v7"
+        ]
+        reasons = cw.all_uses_are_sha_pinned([path])
+        assert any("inventory mismatch" in r for r in reasons), (step, reasons)
+
+    def test_a_quoted_value_with_a_valid_pin_still_fails_closed(
+        self, tmp_path: Path
+    ) -> None:
+        # Even a correct pin in a form the scan cannot read is refused: the
+        # convention is one spelling, so the comment is always visible.
+        path = _write(
+            tmp_path,
+            ".github/workflows/x.yml",
+            _wf(f"'actions/checkout@{_SHA}' # v7.0.1"),
+        )
+        assert cw.all_uses_are_sha_pinned([path]) != []
+
+    def test_the_inventories_agree_on_the_committed_tree(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(REPO_ROOT)
+        for path in cw.pin_scan_files():
+            assert cw._unseen_by_raw_scan(path) == [], path
 
     def test_a_same_repository_path_is_skipped(self, tmp_path: Path) -> None:
         path = _write(

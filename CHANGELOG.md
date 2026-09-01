@@ -17,11 +17,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `release/v1` already pointed at, and the composite's `setup-node@v4` to
   v4.4.0, the commit `v4` pointed at. `scripts/check_workflows.py` gains a
   raw-text invariant that fails CI on any remote `uses:` not in that form —
-  in workflows and in local actions, `.yml` and `.yaml` alike — and its exact
+  in workflows and in local actions, `.yml` and `.yaml` alike, and cross-checks
+  that inventory against the parsed document so a `uses:` spelled in a form the
+  line scan cannot see (`"uses":`, `{uses: …}`, a block scalar) fails rather than
+  runs unpinned — and its exact
   allowlist for `release.yml` now names commits, so a form-valid pin to the
   wrong commit (a moved digit, or a real older release with an honest comment)
   is rejected too. Dependabot gains an entry for the composite action's
-  directory, which its root entry had never scanned. Five new mutants prove
+  directory, which its root entry had never scanned. Six new mutants prove
   each of those catches (`.consiliency/evidence/mutation-217.md`); see
   [#217](https://github.com/Consiliency/pmcp/issues/217).
 - CI: `actions/setup-node` v4 → v7 in the workflows (Dependabot, #216).

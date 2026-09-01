@@ -76,6 +76,7 @@ sha-comment-dropped|1|[pin]|release.yml: the "# v7.0.1" comment stripped from th
 sha-moved|1|[release]|release.yml: one hex digit of the pypa SHA altered; form-valid, honest-looking comment, a commit that is not the release. Only the exact allowlist sees it
 pypa-rolled-back|1|[release]|release.yml: pypa pinned to v1.9.0's REAL commit with an honest "# v1.9.0" comment; 144 commits behind and below the GHSA-vxmw-7h4f-hqxh floor. Form-valid; only the exact allowlist sees it
 composite-tag-pinned|1|[pin]|.github/actions/pipeline-bootstrap-setup/action.yml: setup-node pin reverted to @v4; proves the composite (id-token: write in scope) is in the scan
+uses-quoted-key|1|[pin]|.github/actions/pipeline-bootstrap-setup/action.yml: the pin reverted to @v4 AND the key written as "uses":; valid YAML that GitHub runs and the line scan cannot see. Caught only by the parsed-inventory cross-check
 needs-as-list|0|-|release.yml: needs: build -> needs: [build]; a legitimate equivalent form that must NOT false-positive
 timeout-below-p100|0|-|NOT COVERED: release.yml build timeout-minutes 20 -> 12, above the floor but potentially below a future p100
 concurrency-added|0|-|NOT COVERED by invariant: workflow-level concurrency with cancel-in-progress on release.yml; release-diff-ack covers it by label
@@ -426,6 +427,10 @@ pypa-rolled-back)
 composite-tag-pinned)
 	replace "$COMPOSITE" 'uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0' \
 		'uses: actions/setup-node@v4'
+	;;
+uses-quoted-key)
+	replace "$COMPOSITE" '- uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0' \
+		'- "uses": actions/setup-node@v4'
 	;;
 guard-step-gutted)
 	replace "$TEST_WF" \

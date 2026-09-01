@@ -441,15 +441,77 @@ def remote_uses(paths: list[Path]) -> list[tuple[Path, int, str]]:
     return found
 
 
+def _parsed_uses(node: Any) -> list[str]:
+    """Every string ``uses:`` value the YAML parser sees, anywhere in ``node``.
+
+    Deliberately over-collects (a ``uses`` key under ``with:`` would count):
+    over-collection can only make the cross-check below fail, never pass.
+    """
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "uses" and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(_parsed_uses(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_parsed_uses(item))
+    return found
+
+
+_TRAILING_COMMENT = re.compile(r"\s+#.*$")
+
+
+def _unseen_by_raw_scan(path: Path) -> list[str]:
+    """Cross-check the raw-text inventory against the parsed one.
+
+    The raw scan is line-based, so it can see the comment the parser drops —
+    but it recognises only the canonical ``uses: value`` line. ``"uses":``,
+    ``uses :``, a flow mapping ``{uses: x}`` and a block scalar ``uses: >-``
+    are all valid YAML that GitHub runs and that the line scan does not see.
+    Requiring the two inventories to be EQUAL makes every such form fail
+    closed instead of running unpinned.
+    """
+    doc, err = _load(path)
+    if err:
+        return [err]
+    parsed = sorted(v for v in _parsed_uses(doc) if not v.startswith("./"))
+    raw = sorted(
+        _TRAILING_COMMENT.sub("", value) for _, _, value in remote_uses([path])
+    )
+    if parsed == raw:
+        return []
+    only_parsed = sorted(set(parsed) - set(raw))
+    only_raw = sorted(set(raw) - set(parsed))
+    detail = []
+    if only_parsed:
+        detail.append(f"seen by the parser but not the scan: {only_parsed}")
+    if only_raw:
+        detail.append(f"seen by the scan but not the parser: {only_raw}")
+    if not detail:
+        detail.append(f"parser counts {len(parsed)}, scan counts {len(raw)}")
+    return [
+        f"[pin] {path}: uses: inventory mismatch — {'; '.join(detail)}. Every "
+        "uses: must be a plain single-line `uses: owner/action@<sha> # <release>` "
+        "(unquoted key, no space before the colon, no flow mapping, no block "
+        "scalar), because only that form lets the scan see the release comment"
+    ]
+
+
 def all_uses_are_sha_pinned(paths: list[Path]) -> list[str]:
     """Every remote ``uses:`` must be ``owner/action@<40-hex-sha> # <release>``.
 
     Raw text, not parsed YAML: the parser drops the comment, and the comment is
     half of the convention — it is what Dependabot reads to propose the next
-    release and what a reviewer reads to know which one this is.
+    release and what a reviewer reads to know which one this is. The parsed
+    document is then used as a second inventory that the raw one must equal,
+    so a ``uses:`` spelled in a form the line scan cannot see fails closed.
     """
     reasons: list[str] = []
     tag = "[pin]"
+    for path in paths:
+        reasons.extend(_unseen_by_raw_scan(path))
     for path, lineno, value in remote_uses(paths):
         line = path.read_text().splitlines()[lineno - 1]
         if SHA_PINNED_USES.match(line):
