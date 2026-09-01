@@ -105,49 +105,49 @@ Base: the implementation commit. `helper` is `_mutate_workflow.sh`'s exit,
 | mutant | expected | helper | commit | checker | reason |
 |---|---|---|---|---|---|
 | *(none: unmutated tree)* | 0 | — | — | 0 | — |
-| `tag-case` | 1 | 0 | `71d0591` | **1** | `[release]` |
-| `tags-deleted` | 1 | 0 | `012aa87` | **1** | `[release]` |
-| `trigger-pull-request-added` | 1 | 0 | `88aec17` | **1** | `[release]` |
-| `trigger-push-branches-added` | 1 | 0 | `531135f` | **1** | `[release]` |
-| `trigger-workflow-dispatch-added` | 1 | 0 | `b6aa0ac` | **1** | `[release]` |
-| `trigger-paths-filter-added` | 1 | 0 | `d0300a9` | **1** | `[release]` |
-| `env-dropped` | 1 | 0 | `cc34cec` | **1** | `[release]` |
-| `env-renamed` | 1 | 0 | `dea8f64` | **1** | `[release]` |
-| `needs-build-dropped` | 1 | 0 | `f5fca3f` | **1** | `[release]` |
-| `needs-publish-to-build` | 1 | 0 | `452520b` | **1** | `[release]` |
-| `continue-on-error-job` | 1 | 0 | `edfd0f7` | **1** | `[release]` |
-| `continue-on-error-step` | 1 | 0 | `f6acee8` | **1** | `[release]` |
-| `if-on-build-job` | 1 | 0 | `dbe90c6` | **1** | `[release]` |
-| `continue-on-error-build-job` | 1 | 0 | `3f7fd30` | **1** | `[release]` |
-| `new-tag-triggered-workflow` | 1 | 0 | `d78d7c2` | **1** | `[release]` |
-| `if-on-publish-job` | 1 | 0 | `eca06df` | **1** | `[release]` |
-| `if-on-publish-step` | 1 | 0 | `0f80261` | **1** | `[release]` |
-| `forked-action` | 1 | 0 | `1fa72c5` | **1** | `[release]` |
-| `permissions-job-widened` | 1 | 0 | `93009de` | **1** | `[release]` |
-| `permissions-workflow-level` | 1 | 0 | `dbc0efb` | **1** | `[release]` |
-| `job-added` | 1 | 0 | `a36fdaa` | **1** | `[release]` |
-| `job-deleted` | 1 | 0 | `bb42751` | **1** | `[drift] [release]` |
-| `file-deleted` | 1 | 0 | `f29256d` | **1** | `[drift] [release]` |
-| `timeout-360` | 1 | 0 | `583eb9d` | **1** | `[timeout]` |
-| `timeout-1` | 1 | 0 | `35f8f2a` | **1** | `[timeout]` |
-| `timeout-string` | 1 | 0 | `d0195eb` | **1** | `[timeout]` |
-| `timeout-bool` | 1 | 0 | `a5ecf95` | **1** | `[timeout]` |
-| `timeout-deleted` | 1 | 0 | `a33022e` | **1** | `[timeout]` |
-| `maintenance-deleted` | 1 | 0 | `ce938c0` | **1** | `[drift]` |
-| `changelog-job-deleted` | 1 | 0 | `1c04129` | **1** | `[drift]` |
-| `workflows-job-deleted` | 1 | 0 | `2e7fc1e` | **1** | `[drift]` |
-| `tag-pinned-action` | 1 | 0 | `430c549` | **1** | `[pin]` |
-| `sha-comment-dropped` | 1 | 0 | `2dd6774` | **1** | `[pin]` |
-| `sha-moved` | 1 | 0 | `10b6f01` | **1** | `[release]` |
-| `pypa-rolled-back` | 1 | 0 | `b6b79b7` | **1** | `[release]` |
-| `composite-tag-pinned` | 1 | 0 | `45b0cf8` | **1** | `[pin]` |
-| `uses-quoted-key` | 1 | 0 | `8a3784e` | **1** | `[pin]` |
-| `needs-as-list` | 0 | 0 | `6930fca` | 0 | — |
-| `timeout-below-p100` | 0 | 0 | `b54e1c0` | 0 | — |
-| `concurrency-added` | 0 | 0 | `aada7f6` | 0 | — |
-| `guard-self-disabled` | 0 | 0 | `fafa2ba` | 0 | — |
-| `guard-self-disabled-nonconstant` | 0 | 0 | `a47eb2c` | 0 | — |
-| `guard-step-gutted` | 0 | 0 | `eff41d7` | 0 | — |
+| `tag-case` | 1 | 0 | `1a8fc37` | **1** | `[release]` |
+| `tags-deleted` | 1 | 0 | `e61def3` | **1** | `[release]` |
+| `trigger-pull-request-added` | 1 | 0 | `d447146` | **1** | `[release]` |
+| `trigger-push-branches-added` | 1 | 0 | `c59397d` | **1** | `[release]` |
+| `trigger-workflow-dispatch-added` | 1 | 0 | `308bdae` | **1** | `[release]` |
+| `trigger-paths-filter-added` | 1 | 0 | `645dee9` | **1** | `[release]` |
+| `env-dropped` | 1 | 0 | `0852603` | **1** | `[release]` |
+| `env-renamed` | 1 | 0 | `06bd9e3` | **1** | `[release]` |
+| `needs-build-dropped` | 1 | 0 | `a9c2b7a` | **1** | `[release]` |
+| `needs-publish-to-build` | 1 | 0 | `362d92a` | **1** | `[release]` |
+| `continue-on-error-job` | 1 | 0 | `92721fb` | **1** | `[release]` |
+| `continue-on-error-step` | 1 | 0 | `49f354a` | **1** | `[release]` |
+| `if-on-build-job` | 1 | 0 | `c8c1f75` | **1** | `[release]` |
+| `continue-on-error-build-job` | 1 | 0 | `8b44be0` | **1** | `[release]` |
+| `new-tag-triggered-workflow` | 1 | 0 | `560ec69` | **1** | `[release]` |
+| `if-on-publish-job` | 1 | 0 | `cc191d0` | **1** | `[release]` |
+| `if-on-publish-step` | 1 | 0 | `8ce1ab4` | **1** | `[release]` |
+| `forked-action` | 1 | 0 | `e18dcc1` | **1** | `[release]` |
+| `permissions-job-widened` | 1 | 0 | `7a8868f` | **1** | `[release]` |
+| `permissions-workflow-level` | 1 | 0 | `d9db91b` | **1** | `[release]` |
+| `job-added` | 1 | 0 | `692d0bf` | **1** | `[release]` |
+| `job-deleted` | 1 | 0 | `1f08ddf` | **1** | `[drift] [release]` |
+| `file-deleted` | 1 | 0 | `fa5b354` | **1** | `[drift] [release]` |
+| `timeout-360` | 1 | 0 | `5b86267` | **1** | `[timeout]` |
+| `timeout-1` | 1 | 0 | `229fa89` | **1** | `[timeout]` |
+| `timeout-string` | 1 | 0 | `8711df1` | **1** | `[timeout]` |
+| `timeout-bool` | 1 | 0 | `f0ce2ab` | **1** | `[timeout]` |
+| `timeout-deleted` | 1 | 0 | `2893c60` | **1** | `[timeout]` |
+| `maintenance-deleted` | 1 | 0 | `85b0e73` | **1** | `[drift]` |
+| `changelog-job-deleted` | 1 | 0 | `9a7ba65` | **1** | `[drift]` |
+| `workflows-job-deleted` | 1 | 0 | `ab2abf7` | **1** | `[drift]` |
+| `tag-pinned-action` | 1 | 0 | `b7167d5` | **1** | `[pin]` |
+| `sha-comment-dropped` | 1 | 0 | `d5f3ad6` | **1** | `[pin]` |
+| `sha-moved` | 1 | 0 | `565f36e` | **1** | `[release]` |
+| `pypa-rolled-back` | 1 | 0 | `59df6a3` | **1** | `[release]` |
+| `composite-tag-pinned` | 1 | 0 | `162da9a` | **1** | `[pin]` |
+| `uses-quoted-key` | 1 | 0 | `324809f` | **1** | `[pin]` |
+| `needs-as-list` | 0 | 0 | `6160bb0` | 0 | — |
+| `timeout-below-p100` | 0 | 0 | `77c0825` | 0 | — |
+| `concurrency-added` | 0 | 0 | `85906a0` | 0 | — |
+| `guard-self-disabled` | 0 | 0 | `e520571` | 0 | — |
+| `guard-self-disabled-nonconstant` | 0 | 0 | `b87295d` | 0 | — |
+| `guard-step-gutted` | 0 | 0 | `af579fd` | 0 | — |
 
 43 rows, 37 expected to fail, 6 expected green; every helper exit 0, every hash
 distinct, every expected failure reported by the expected check, every expected
