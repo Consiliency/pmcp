@@ -295,7 +295,9 @@ done < <(grep -rhE "uses:\s*[^./ ][^ ]*@[0-9a-f]{40}\s*#" .github/workflows/*.y*
 echo "checked $n pinned refs (expect 30)"; [ "$n" -eq 30 ] || fail=1
 # (b): multiset equality. Any line here is a pin that is not the commit its
 # original ref resolves to today (or an original ref that resolved to nothing).
-if d=$(diff <(printf '%s' "$expected") <(printf '%s' "$actual" | sort)); then echo "OK(b)    all $n pins equal their original refs' commits"
+# printf '%s\n' on the left: $(...) strips the trailing newline, `| sort` on the
+# right keeps it, and diff then flags the last line on a clean tree.
+if d=$(diff <(printf '%s\n' "$expected") <(printf '%s' "$actual" | sort)); then echo "OK(b)    all $n pins equal their original refs' commits"
 else echo "MISMATCH(b):"; echo "$d"; fail=1; fi
 exit "$fail"
 

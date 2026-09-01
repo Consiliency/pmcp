@@ -25,3 +25,18 @@ updates:
     labels:
       - "dependencies"
       - "github-actions"
+
+  # The local composite action has its own `uses:` (Consiliency/pmcp#217).
+  # `directory: "/"` above demonstrably never scanned it: it sat on
+  # setup-node@v4 through twenty Dependabot PRs while every workflow moved to v7.
+  - package-ecosystem: "github-actions"
+    directory: "/.github/actions/pipeline-bootstrap-setup"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
