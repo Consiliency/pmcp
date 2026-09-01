@@ -76,7 +76,7 @@ EXPECTED_USES = {
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     ],
     "publish": [
-        "actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
         # v1.14.2 == the release/v1 head on the day of pinning. Any re-pin must
         # stay >= 1.13.0: GHSA-vxmw-7h4f-hqxh (injectable expression expansions)
         # affects every earlier release.
@@ -84,7 +84,7 @@ EXPECTED_USES = {
     ],
     "github-release": [
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131",
+        "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
     ],
 }
 # Jobs whose execution must not be made conditional or best-effort, at job

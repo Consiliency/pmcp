@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each of those catches (`.consiliency/evidence/mutation-217.md`); see
   [#217](https://github.com/Consiliency/pmcp/issues/217).
 - CI: `actions/setup-node` v4 → v7 in the workflows (Dependabot, #216).
+- CI: pinned actions moved by Dependabot — the composite's `actions/setup-node`
+  v4.4.0 → v7.0.0 (#219), `actions/download-artifact` v7.0.0 → v8.0.1 on the
+  release path (#221; hash mismatches on download now error instead of warn),
+  `astral-sh/setup-uv` v7.6.0 → v10.0.1 (#220). Each release-path bump carries
+  its `EXPECTED_USES` update in the same PR.
 
 ## [2.7.3] - 2026-08-31
 
