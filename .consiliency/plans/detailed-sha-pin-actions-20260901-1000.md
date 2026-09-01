@@ -179,7 +179,9 @@ refused as non-unique; new anchors need step context.
 ### `tests/test_workflow_guards.py` (modify)
 
 - `TestShaPinning` — add — one test per new mutant plus: a correctly pinned ref
-  with comment **passes**; a job-level reusable-workflow `uses:` is **skipped**;
+  with comment **passes**; a job-level reusable workflow that is a `./` same-repo
+  path is **skipped**, and a **remote** one (`owner/repo/.github/workflows/x.yml@…`)
+  is **required to be SHA-pinned** — `@main` fails, `@<sha> # vX` passes;
   a subdirectory action `owner/repo/path@<sha> # v1` **passes**; a `docker://`
   `uses:` is reported (it is not pinnable by this scheme — decide: skip with a
   named reason, or fail; there are none today, so pin the decision by test).
@@ -255,7 +257,8 @@ uv run ruff check src/ tests/ scripts/ && uv run mypy src/
 ```
 
 Edge cases: annotated vs lightweight tags (both present); a `uses:` at job level
-for a reusable workflow (none today — skip pinned by test); `docker://` refs
+for a reusable workflow (none today — the **remote-must-pin / `./`-skip** split is
+pinned by test, not a blanket skip); `docker://` refs
 (none today — decision pinned by test); the composite action's `runs:` block
 must not be mistaken for a step list.
 
