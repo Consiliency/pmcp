@@ -1,5 +1,14 @@
 # Detailed plan: pin every GitHub Action to a commit SHA, and guard the convention
 
+> **Revision 3 (2026-09-01).** Rev 2 carried a **false premise of mine**: it said
+> `release/v1` is 144 commits ahead of pypa's newest release, v1.9.0. The tag
+> list was sorted lexically, so `v1.14.x` sorted before `v1.8`. The newest
+> release is **v1.14.2**, and `release/v1`'s head **is** v1.14.2 — same commit.
+> The 144 commits are between v1.9.0 and v1.14.2, i.e. five months of released
+> work that a v1.9.0 pin would have **rolled back**. The operator's "pin to the
+> release tag" decision was made on that error; it and "freeze today's head"
+> now resolve to the same commit, so there is no rollback and no fork.
+>
 > **Revision 2 (2026-09-01).** Rev 1 boarded 2 DISAGREE / 1 AGREE. Three defects,
 > each verified: (1) `EXPECTED_USES` with comments could **never match**, because
 > `yaml.safe_load` strips comments before `_collect_uses` runs — every correctly
@@ -37,13 +46,24 @@ is required or the composite's pin freezes forever.
 
 **`pypa/gh-action-pypi-publish@release/v1` is a branch, not a tag.**
 `git/ref/tags/release/v1` returns nothing usable; `git/ref/heads/release%2Fv1`
-resolves. Its head is **144 commits ahead of v1.9.0**, the newest release. So
-the repo has been publishing to PyPI with an *unreleased* build of the publish
-action on every tag push. Pinning to the branch head would freeze an unreleased
-commit with no version to name; the operator chose to pin to **`v1.9.0`**
-(annotated tag → commit `ec4db0b4ddc6…`, full SHA resolved at implementation).
-That is a **rollback of 144 commits on the publish path** and must be stated as
-a behaviour change, not hidden as a pin.
+resolves to `dc37677b2e1c…`. **That commit is exactly v1.14.2**, pypa's newest
+release (2026-07-29). So the branch is their stable channel pointing at the
+current release — not an unreleased build.
+
+**WAS WRONG (rev 2):** it claimed the head was 144 commits ahead of the newest
+release, v1.9.0, and that pinning meant choosing between an unreleased head
+and a rollback. Both halves were a version-sort artifact: `matching-refs/tags/v1`
+returns lexical order, in which `v1.14.2` precedes `v1.8.6`, so "the last five"
+were v1.8.x–v1.9.0. Verified with `compare/`: `v1.14.2...release/v1` is
+`identical, ahead_by=0`; `v1.9.0...v1.14.2` is `ahead_by=144`. **A v1.9.0 pin
+would have been a real 144-commit rollback of the publish action.** Pin to
+**v1.14.2** — which is both the release tag and today's head, so there is **no
+behaviour change** and the comment `# v1.14.2` is honest and Dependabot-trackable.
+
+**Version comparison must be numeric, not lexical.** Any "newest tag" step in
+implementation or verification uses `sort -V` or the releases API's
+`releases/latest`, never the raw tag list order. This mistake reached an
+operator decision; it must not reach the code.
 
 **Resolution procedure, corrected.** `git/ref/tags/<name>` with a slash in the
 name is a prefix match and returns garbage. Use `git/matching-refs/tags/<name>`
@@ -76,9 +96,11 @@ refused as non-unique; new anchors need step context.
   time with `git/matching-refs/tags/`, dereferencing annotated tags. **Do not
   copy SHAs from this plan.** The comment names the exact release (`# v7.0.0`),
   which is what Dependabot reads and what a human needs.
-- `pypa/gh-action-pypi-publish` — modify — pin to **v1.9.0**'s commit, comment
-  `# v1.9.0`. This changes what runs at publish: from an unreleased branch head
-  to the newest release. Say so in the PR body and the CHANGELOG.
+- `pypa/gh-action-pypi-publish` — modify — pin to **v1.14.2**'s commit
+  (`dc37677b2e1c…`, full SHA resolved at implementation and asserted equal to
+  the `release/v1` head), comment `# v1.14.2`. **No behaviour change**: this is
+  the commit that runs today. **WAS WRONG (rev 2):** v1.9.0, a 144-commit
+  rollback.
 - The composite action's `setup-node@v4` — modify — pin to v7's commit like its
   workflow siblings, comment `# v7.0.0`.
 
@@ -117,6 +139,10 @@ refused as non-unique; new anchors need step context.
   `upload-artifact` line (unique in the tree). Fails via the new invariant.
 - `sha-moved` — add — alters one hex digit of the pypa SHA in `release.yml`
   (unique). Fails via `EXPECTED_USES`.
+- `pypa-rolled-back` — add — replaces the pypa SHA with v1.9.0's commit
+  (`ec4db0b4ddc6…`) and its comment with `# v1.9.0`. A valid SHA, a
+  correct-looking comment, a real release — and 144 commits behind. Must fail
+  via `EXPECTED_USES`. This is the mutant that would have caught rev 2's error.
 - `composite-tag-pinned` — add — reverts the composite action's pin to `@v4`.
   Fails via the new invariant; proves the composite is in scope.
 - The evidence loop — modify — record **the helper's exit code and the commit
@@ -141,10 +167,11 @@ refused as non-unique; new anchors need step context.
 
 ## Documentation impact
 
-- `CHANGELOG.md` — add — `### Changed`, two bullets: every action is SHA-pinned
-  (name the count and the PyPI publish action explicitly); and **the PyPI publish
-  action moves from an unreleased `release/v1` head to the v1.9.0 release** —
-  a rollback of 144 upstream commits on the publish path, deliberate.
+- `CHANGELOG.md` — add — `### Changed`, one bullet: every action is SHA-pinned
+  (name the count, and that the PyPI publish action is pinned to v1.14.2, the
+  commit `release/v1` already pointed at — so nothing runs differently).
+  **WAS WRONG (rev 2):** a bullet announcing a 144-commit rollback that must not
+  happen.
 - `SECURITY.md` — add — a short supply-chain paragraph stating the pin
   convention and that Dependabot maintains it. **WAS WRONG (rev 1):** it pointed
   at `:39`, which is the JWKS sentence, not a release-path section.
@@ -213,8 +240,13 @@ must not be mistaken for a step list.
 - [ ] `EXPECTED_USES` contains **no comments** and matches the pinned
       `release.yml` — proven by the checker exiting 0 on it, which rev 1's form
       could never have done.
-- [ ] The pypa pin is `v1.9.0`'s commit, and the CHANGELOG states the 144-commit
-      rollback explicitly.
+- [ ] The pypa pin is **v1.14.2**'s commit **and equals the `release/v1` branch
+      head at implementation time** — asserted by resolving both and comparing,
+      so the "no behaviour change" claim is proven rather than assumed. If they
+      have diverged by then, stop and re-decide; do not silently pick one.
+- [ ] The resolution script determines "newest release" with `sort -V` or
+      `releases/latest`, never lexical tag order — asserted by a test feeding it
+      `v1.9.0, v1.14.2, v1.8.6` and requiring `v1.14.2`.
 - [ ] `dependabot.yml` has the composite-action directory entry.
 - [ ] Full suite green.
 
