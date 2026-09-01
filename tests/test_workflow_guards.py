@@ -67,6 +67,10 @@ def _on(doc: dict[str, Any]) -> dict[str, Any]:
 # the in-memory mutation and the committed one cannot drift apart.
 _IF_EXPR = "${{ github.actor != 'nobody' }}"
 
+# The committed pypa pin, SHA form (what the parser yields). Read from the
+# checker so the tests cannot drift from the allowlist they exercise.
+_PYPA_PIN = next(u for u in cw.EXPECTED_USES["publish"] if u.startswith("pypa/"))
+
 # Each key is a mutant name in scripts/_mutate_workflow.sh; the callable is the
 # same edit applied to the parsed document.
 RELEASE_MUTANTS: dict[str, Any] = {
@@ -102,8 +106,21 @@ RELEASE_MUTANTS: dict[str, Any] = {
     "continue-on-error-build-job": lambda d: d["jobs"]["build"].update(
         {"continue-on-error": True}
     ),
+    # SHA form kept, so the pin invariant passes and only the exact allowlist
+    # sees the owner change.
     "forked-action": lambda d: _pypi_step(d).update(
-        {"uses": "attacker-fork/gh-action-pypi-publish@release/v1"}
+        {"uses": "attacker-fork/" + _PYPA_PIN.split("/", 1)[1]}
+    ),
+    # Form-valid, honest-looking, wrong commit. The pin invariant cannot know
+    # which commit is right; EXPECTED_USES can.
+    "sha-moved": lambda d: _pypi_step(d).update(
+        {"uses": _PYPA_PIN[:-1] + ("4" if _PYPA_PIN[-1] != "4" else "5")}
+    ),
+    # A REAL older release with its real commit: 144 commits behind v1.14.2 and
+    # below the GHSA-vxmw-7h4f-hqxh floor (< 1.13.0). Nothing about its form is
+    # wrong; only the exact allowlist rejects it.
+    "pypa-rolled-back": lambda d: _pypi_step(d).update(
+        {"uses": "pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0"}
     ),
     "permissions-job-widened": lambda d: _publish(d)["permissions"].update(
         {"contents": "write"}
@@ -135,6 +152,33 @@ DRIFT_MUTANTS = (
     "workflows-job-deleted",
 )
 
+# Mutants of the FORM of a pin, caught by `all_uses_are_sha_pinned` on raw
+# text. Each is the same edit the shell helper makes, applied to a copy.
+PIN_MUTANTS: dict[str, tuple[Path, str, str]] = {
+    "tag-pinned-action": (
+        TEST_YML,
+        "- uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+        "- uses: actions/setup-node@v7",
+    ),
+    "sha-comment-dropped": (
+        RELEASE_YML,
+        "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
+        "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+    ),
+    "composite-tag-pinned": (
+        REPO_ROOT / ".github" / "actions" / "pipeline-bootstrap-setup" / "action.yml",
+        "uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0",
+        "uses: actions/setup-node@v4",
+    ),
+    # Valid YAML GitHub runs; invisible to the line scan. Only the
+    # parsed-inventory cross-check sees it.
+    "uses-quoted-key": (
+        REPO_ROOT / ".github" / "actions" / "pipeline-bootstrap-setup" / "action.yml",
+        "- uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0",
+        '- "uses": actions/setup-node@v4',
+    ),
+}
+
 # Every mutant these tests exercise. Asserted EQUAL to the helper's expected-1
 # rows — in BOTH directions — by TestMutationHelperContract, because the
 # evidence matrix is generated from that TSV: a phantom row there would
@@ -143,6 +187,7 @@ TESTED_MUTANTS = (
     set(RELEASE_MUTANTS)
     | set(TIMEOUT_MUTANTS)
     | set(DRIFT_MUTANTS)
+    | set(PIN_MUTANTS)
     | {"file-deleted", "timeout-deleted", "new-tag-triggered-workflow"}
 )
 
@@ -310,6 +355,204 @@ class TestTimeoutInvariants:
         # invalid YAML.
         doc = {"jobs": {"call": {"uses": "./.github/workflows/other.yml"}}}
         assert cw.timeout_invariants(doc, "x.yml") == []
+
+
+_SHA = "0123456789abcdef0123456789abcdef01234567"
+_COMPOSITE_YML = (
+    REPO_ROOT / ".github" / "actions" / "pipeline-bootstrap-setup" / "action.yml"
+)
+
+
+def _write(tmp_path: Path, rel: str, body: str) -> Path:
+    path = tmp_path / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body)
+    return path
+
+
+def _wf(uses: str) -> str:
+    return f"name: x\non:\n  push:\njobs:\n  j:\n    timeout-minutes: 10\n    steps:\n      - uses: {uses}\n"
+
+
+class TestShaPinning:
+    """Consiliency/pmcp#217: every remote `uses:` is `owner/action@<sha> # <release>`."""
+
+    def test_every_committed_file_passes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.chdir(REPO_ROOT)
+        assert cw.all_uses_are_sha_pinned(cw.pin_scan_files()) == []
+
+    def test_the_scan_covers_the_composite_action(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # It runs inside a job holding id-token: write and contents: write, and
+        # Dependabot's root entry had never scanned it.
+        monkeypatch.chdir(REPO_ROOT)
+        assert _COMPOSITE_YML.resolve() in {p.resolve() for p in cw.pin_scan_files()}
+
+    def test_the_committed_tree_has_thirty_remote_refs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Spelled twice on purpose, like EXPECTED_USES: a new remote action is a
+        # deliberate event. 29 in the workflows + 1 in the composite.
+        monkeypatch.chdir(REPO_ROOT)
+        assert len(cw.remote_uses(cw.pin_scan_files())) == 30
+
+    def test_expected_uses_is_sha_form_without_comments(self) -> None:
+        # yaml.safe_load strips comments before _collect_uses runs, so a value
+        # carrying `# vX` could never match; a mutable tag defeats the point.
+        for job, values in cw.EXPECTED_USES.items():
+            for value in values:
+                assert cw.re.fullmatch(r"[\w.-]+/[\w./-]+@[0-9a-f]{40}", value), (
+                    job,
+                    value,
+                )
+
+    def test_the_pypa_pin_is_at_or_above_the_advisory_floor(self) -> None:
+        # GHSA-vxmw-7h4f-hqxh: < 1.13.0 is vulnerable. Compared NUMERICALLY —
+        # a lexical comparison is how v1.9.0 once looked newer than v1.14.2.
+        line = next(
+            ln
+            for ln in RELEASE_YML.read_text().splitlines()
+            if "pypa/gh-action-pypi-publish@" in ln
+        )
+        comment = line.split("#", 1)[1].strip()
+        assert comment.startswith("v")
+        version = tuple(int(part) for part in comment[1:].split("."))
+        assert version >= (1, 13, 0), comment
+
+    @pytest.mark.parametrize("mutant", sorted(PIN_MUTANTS))
+    def test_mutant_is_rejected(self, mutant: str, tmp_path: Path) -> None:
+        source, old, new = PIN_MUTANTS[mutant]
+        text = source.read_text()
+        assert text.count(old) >= 1, f"{mutant}: anchor gone from {source.name}"
+        copy_path = _write(tmp_path, source.name, text.replace(old, new))
+        reasons = cw.all_uses_are_sha_pinned([copy_path])
+        assert reasons and all(r.startswith("[pin]") for r in reasons), reasons
+
+    @pytest.mark.parametrize(
+        ("uses", "ok"),
+        [
+            (f"actions/checkout@{_SHA} # v7.0.1", True),
+            (f"actions/checkout@{_SHA} #v7.0.1", True),
+            (f"owner/repo/sub/dir@{_SHA} # v1", True),  # subdirectory action
+            ("actions/checkout@v7", False),  # mutable tag
+            ("actions/checkout@main", False),  # branch
+            (f"actions/checkout@{_SHA}", False),  # no comment
+            (f"actions/checkout@{_SHA[:39]} # v7", False),  # 39 hex
+            (f"actions/checkout@{_SHA.upper()} # v7", False),  # not lowercase hex
+            ("docker://alpine:3.20", False),  # remote, not pinnable here
+        ],
+    )
+    def test_step_level_forms(self, tmp_path: Path, uses: str, ok: bool) -> None:
+        path = _write(tmp_path, ".github/workflows/x.yml", _wf(uses))
+        assert (cw.all_uses_are_sha_pinned([path]) == []) is ok, uses
+
+    @pytest.mark.parametrize(
+        "step",
+        [
+            '- "uses": actions/checkout@v7',  # quoted key
+            "- uses : actions/checkout@v7",  # space before the colon
+            "- {uses: actions/checkout@v7}",  # flow mapping
+            "- uses: >-\n          actions/checkout@v7",  # block scalar
+            "- uses: 'actions/checkout@v7'",  # quoted value
+        ],
+    )
+    def test_a_uses_the_line_scan_cannot_see_fails_closed(
+        self, tmp_path: Path, step: str
+    ) -> None:
+        # All valid YAML that GitHub executes as a mutable-ref step. The raw
+        # scan sees none of them; the parsed inventory does, and the two must
+        # be equal. A guard that only reads lines would let these run unpinned.
+        body = (
+            "name: x\non:\n  push:\njobs:\n  j:\n    timeout-minutes: 10\n"
+            f"    steps:\n      {step}\n"
+        )
+        path = _write(tmp_path, ".github/workflows/x.yml", body)
+        assert [s.get("uses") for s in yaml.safe_load(body)["jobs"]["j"]["steps"]] == [
+            "actions/checkout@v7"
+        ]
+        reasons = cw.all_uses_are_sha_pinned([path])
+        assert any("inventory mismatch" in r for r in reasons), (step, reasons)
+
+    def test_a_quoted_value_with_a_valid_pin_still_fails_closed(
+        self, tmp_path: Path
+    ) -> None:
+        # Even a correct pin in a form the scan cannot read is refused: the
+        # convention is one spelling, so the comment is always visible.
+        path = _write(
+            tmp_path,
+            ".github/workflows/x.yml",
+            _wf(f"'actions/checkout@{_SHA}' # v7.0.1"),
+        )
+        assert cw.all_uses_are_sha_pinned([path]) != []
+
+    def test_the_inventories_agree_on_the_committed_tree(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.chdir(REPO_ROOT)
+        for path in cw.pin_scan_files():
+            assert cw._unseen_by_raw_scan(path) == [], path
+
+    def test_a_same_repository_path_is_skipped(self, tmp_path: Path) -> None:
+        path = _write(
+            tmp_path, ".github/workflows/x.yml", _wf("./.github/actions/local")
+        )
+        assert cw.all_uses_are_sha_pinned([path]) == []
+        assert cw.remote_uses([path]) == []
+
+    @pytest.mark.parametrize(
+        ("uses", "ok"),
+        [
+            (f"owner/repo/.github/workflows/build.yml@{_SHA} # v1.2.3", True),
+            ("owner/repo/.github/workflows/build.yml@main", False),
+            ("./.github/workflows/build.yml", True),
+        ],
+    )
+    def test_job_level_reusable_workflows(
+        self, tmp_path: Path, uses: str, ok: bool
+    ) -> None:
+        # A remote reusable workflow is remote code and must be pinned; a
+        # same-repository one is reviewed like any file. NOT a blanket skip.
+        path = _write(
+            tmp_path,
+            ".github/workflows/x.yml",
+            f"name: x\non:\n  push:\njobs:\n  call:\n    uses: {uses}\n",
+        )
+        assert (cw.all_uses_are_sha_pinned([path]) == []) is ok, uses
+
+    def test_both_extensions_are_scanned_for_actions_and_workflows(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Renaming to .yaml keeps the file executable; it must not leave the scan.
+        monkeypatch.chdir(tmp_path)
+        _write(tmp_path, ".github/workflows/a.yaml", _wf("actions/checkout@v7"))
+        _write(
+            tmp_path,
+            ".github/actions/thing/action.yaml",
+            "name: t\nruns:\n  using: composite\n  steps:\n    - uses: actions/setup-node@v4\n",
+        )
+        reasons = cw.all_uses_are_sha_pinned(cw.pin_scan_files())
+        assert len(reasons) == 2, reasons
+        assert any("a.yaml" in r for r in reasons)
+        assert any("action.yaml" in r for r in reasons)
+
+    def test_a_composite_runs_block_is_scanned_as_steps(self, tmp_path: Path) -> None:
+        path = _write(
+            tmp_path,
+            ".github/actions/thing/action.yml",
+            f"name: t\nruns:\n  using: composite\n  steps:\n    - uses: actions/setup-node@{_SHA} # v4.4.0\n",
+        )
+        assert cw.remote_uses([path]) == [
+            (path, 5, f"actions/setup-node@{_SHA} # v4.4.0")
+        ]
+        assert cw.all_uses_are_sha_pinned([path]) == []
+
+    def test_the_reason_names_file_line_and_ref(self, tmp_path: Path) -> None:
+        path = _write(tmp_path, ".github/workflows/x.yml", _wf("actions/checkout@v7"))
+        (reason,) = cw.all_uses_are_sha_pinned([path])
+        assert reason.startswith("[pin]")
+        assert f"{path}:8" in reason
+        assert "actions/checkout@v7" in reason
 
 
 def _run(args: list[str], cwd: Path) -> subprocess.CompletedProcess[str]:
@@ -778,6 +1021,20 @@ class TestMutationHelperContract:
         # catch them.
         rows = {row[0]: row for row in self._rows()}
         assert rows[mutant][2] == "[drift]"
+
+    @pytest.mark.parametrize("mutant", sorted(PIN_MUTANTS))
+    def test_the_pin_mutants_declare_pin_as_their_catcher(self, mutant: str) -> None:
+        rows = {row[0]: row for row in self._rows()}
+        assert rows[mutant][2] == "[pin]"
+
+    @pytest.mark.parametrize("mutant", ["sha-moved", "pypa-rolled-back"])
+    def test_the_wrong_commit_mutants_are_caught_by_the_allowlist_not_the_form(
+        self, mutant: str
+    ) -> None:
+        # Both are form-valid pins; if the tag said [pin] the evidence would be
+        # claiming a catch the pin invariant cannot make.
+        rows = {row[0]: row for row in self._rows()}
+        assert rows[mutant][2] == "[release]"
 
     @pytest.mark.parametrize(
         "mutant",

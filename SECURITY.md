@@ -62,6 +62,17 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   credential as its relaxer. Every unset, malformed, self-referencing, or
   placeholder (`${VAR}`) relaxer value fails closed and the credential stays
   required (Consiliency/pmcp#114).
+- **Mutable CI dependencies**: every GitHub Action this repository runs — in
+  `.github/workflows/` and in the local composite action under
+  `.github/actions/` — is pinned to a full commit SHA with the release named in
+  a trailing comment (`owner/action@<sha> # vX.Y.Z`). A tag or branch is
+  mutable: whoever controls the action's repository controls what runs with
+  the job's permissions, and the release workflow holds `id-token: write` for
+  PyPI trusted publishing. `scripts/check_workflows.py` fails CI on any remote
+  `uses:` that is not in that form, and on any change to the release
+  workflow's exact action set; Dependabot maintains the pins, including a
+  dedicated entry for the composite action's directory
+  ([#217](https://github.com/Consiliency/pmcp/issues/217)).
 
 ### Known limitations
 

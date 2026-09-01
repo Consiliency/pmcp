@@ -7,8 +7,13 @@ breaks, and the worst mutants are silent — changing the tag filter ``v*`` to
 ``V*`` leaves a valid workflow that simply never runs, so there is no red X
 anywhere and a version sits tagged-but-unshipped.
 
-Three independent checks run here:
+Four independent checks run here:
 
+``all_uses_are_sha_pinned``
+    Every remote ``uses:`` in every workflow *and* in every local composite
+    action under ``.github/actions/`` must name a 40-hex commit SHA with a
+    trailing ``# <release>`` comment (Consiliency/pmcp#217). Checked on the
+    **raw text**, because ``yaml.safe_load`` drops comments.
 ``release_invariants``
     Asserts the *state* of ``release.yml`` against the committed shape.
 ``timeout_invariants``
@@ -25,15 +30,18 @@ uses one, granting a scope — must update the constants in this file in the
 same PR. That is intended: on the one workflow with no PR-time feedback, a
 change should be deliberate enough to be spelled twice.
 
-Note also what these constants do *not* buy: pinning
-``pypa/gh-action-pypi-publish@release/v1`` exactly makes a *change* to it
-fail, but ``@release/v1`` is a mutable tag, so the pin is not a supply-chain
-control. See ``.consiliency/evidence/mutation-189.md``.
+The ``uses:`` allowlist holds the **SHA form without the comment**, because
+the parser never sees the comment. An exact SHA in ``EXPECTED_USES`` is what
+rejects a *valid-looking* pin to the wrong commit — a moved digit, or a real
+older release with an honest comment (``pypa-rolled-back`` in
+``.consiliency/evidence/mutation-217.md``). The SHA-pin invariant rejects the
+*form* (a mutable tag, a missing comment); it cannot know which commit is right.
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -42,6 +50,7 @@ from typing import Any
 import yaml
 
 WORKFLOW_DIR = Path(".github/workflows")
+ACTIONS_DIR = Path(".github/actions")
 RELEASE_PATH = WORKFLOW_DIR / "release.yml"
 
 # --- committed shape of release.yml -----------------------------------------
@@ -56,19 +65,26 @@ EXPECTED_JOB_PERMISSIONS: dict[str, dict[str, str] | None] = {
     "publish": {"id-token": "write"},
     "github-release": {"contents": "write"},
 }
+# SHA form ONLY — no `# vX.Y.Z` here. `yaml.safe_load` strips the comment before
+# `_collect_uses` runs, so a value carrying one could never match anything.
+# The comment lives in release.yml and is enforced on raw text by
+# `all_uses_are_sha_pinned`; the commit is enforced here.
 EXPECTED_USES = {
     "build": [
-        "actions/checkout@v7",
-        "astral-sh/setup-uv@v7",
-        "actions/upload-artifact@v7",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78",
+        "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     ],
     "publish": [
-        "actions/download-artifact@v7",
-        "pypa/gh-action-pypi-publish@release/v1",
+        "actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131",
+        # v1.14.2 == the release/v1 head on the day of pinning. Any re-pin must
+        # stay >= 1.13.0: GHSA-vxmw-7h4f-hqxh (injectable expression expansions)
+        # affects every earlier release.
+        "pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33",
     ],
     "github-release": [
-        "actions/checkout@v7",
-        "actions/download-artifact@v7",
+        "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
+        "actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131",
     ],
 }
 # Jobs whose execution must not be made conditional or best-effort, at job
@@ -374,6 +390,148 @@ def timeout_invariants(doc: Any, path: str | Path) -> list[str]:
     return reasons
 
 
+# --- SHA pinning ----------------------------------------------------------------
+
+# A `uses:` line, at step level (`- uses:`) or job level (reusable workflow).
+_USES_LINE = re.compile(r"^\s*-?\s*uses:\s*(?P<value>\S.*?)\s*$")
+# The only accepted form for a remote reference: owner/repo[/path]@<40 hex>,
+# then a trailing `# <something>` naming the release. Subdirectory actions and
+# remote reusable workflows (`owner/repo/.github/workflows/x.yml@<sha>`) are
+# admitted by the path segment; they are remote code and must be pinned too.
+SHA_PINNED_USES = re.compile(
+    r"^\s*-?\s*uses:\s*[\w.-]+/[\w./-]+@[0-9a-f]{40}\s+#\s*\S+"
+)
+
+
+def action_files() -> list[Path]:
+    """Every local composite/JS action definition under ``.github/actions/``.
+
+    Both extensions: an ``action.yaml`` runs exactly like an ``action.yml``,
+    so renaming one would otherwise remove it from the scan while keeping it
+    executable.
+    """
+    if not ACTIONS_DIR.is_dir():
+        return []
+    found = set(ACTIONS_DIR.rglob("action.yml")) | set(ACTIONS_DIR.rglob("action.yaml"))
+    return sorted(found)
+
+
+def pin_scan_files() -> list[Path]:
+    return workflow_files() + action_files()
+
+
+def remote_uses(paths: list[Path]) -> list[tuple[Path, int, str]]:
+    """Every ``uses:`` value that refers to code outside this repository.
+
+    ``./path`` is same-repository code, reviewed like any other file, and is
+    the ONLY thing skipped. ``docker://`` is remote and is *not* skipped: it is
+    not pinnable by this scheme, so it is reported until the decision to admit
+    it (by digest) is made deliberately here rather than by default.
+    """
+    found: list[tuple[Path, int, str]] = []
+    for path in paths:
+        for lineno, line in enumerate(path.read_text().splitlines(), start=1):
+            match = _USES_LINE.match(line)
+            if not match:
+                continue
+            value = match.group("value")
+            if value.startswith("./"):
+                continue
+            found.append((path, lineno, value))
+    return found
+
+
+def _parsed_uses(node: Any) -> list[str]:
+    """Every string ``uses:`` value the YAML parser sees, anywhere in ``node``.
+
+    Deliberately over-collects (a ``uses`` key under ``with:`` would count):
+    over-collection can only make the cross-check below fail, never pass.
+    """
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "uses" and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(_parsed_uses(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_parsed_uses(item))
+    return found
+
+
+_TRAILING_COMMENT = re.compile(r"\s+#.*$")
+
+
+def _unseen_by_raw_scan(path: Path) -> list[str]:
+    """Cross-check the raw-text inventory against the parsed one.
+
+    The raw scan is line-based, so it can see the comment the parser drops —
+    but it recognises only the canonical ``uses: value`` line. ``"uses":``,
+    ``uses :``, a flow mapping ``{uses: x}`` and a block scalar ``uses: >-``
+    are all valid YAML that GitHub runs and that the line scan does not see.
+    Requiring the two inventories to be EQUAL makes every such form fail
+    closed instead of running unpinned.
+    """
+    doc, err = _load(path)
+    if err:
+        return [err]
+    parsed = sorted(v for v in _parsed_uses(doc) if not v.startswith("./"))
+    raw = sorted(
+        _TRAILING_COMMENT.sub("", value) for _, _, value in remote_uses([path])
+    )
+    if parsed == raw:
+        return []
+    only_parsed = sorted(set(parsed) - set(raw))
+    only_raw = sorted(set(raw) - set(parsed))
+    detail = []
+    if only_parsed:
+        detail.append(f"seen by the parser but not the scan: {only_parsed}")
+    if only_raw:
+        detail.append(f"seen by the scan but not the parser: {only_raw}")
+    if not detail:
+        detail.append(f"parser counts {len(parsed)}, scan counts {len(raw)}")
+    return [
+        f"[pin] {path}: uses: inventory mismatch — {'; '.join(detail)}. Every "
+        "uses: must be a plain single-line `uses: owner/action@<sha> # <release>` "
+        "(unquoted key, no space before the colon, no flow mapping, no block "
+        "scalar), because only that form lets the scan see the release comment"
+    ]
+
+
+def all_uses_are_sha_pinned(paths: list[Path]) -> list[str]:
+    """Every remote ``uses:`` must be ``owner/action@<40-hex-sha> # <release>``.
+
+    Raw text, not parsed YAML: the parser drops the comment, and the comment is
+    half of the convention — it is what Dependabot reads to propose the next
+    release and what a reviewer reads to know which one this is. The parsed
+    document is then used as a second inventory that the raw one must equal,
+    so a ``uses:`` spelled in a form the line scan cannot see fails closed.
+    """
+    reasons: list[str] = []
+    tag = "[pin]"
+    for path in paths:
+        reasons.extend(_unseen_by_raw_scan(path))
+    for path, lineno, value in remote_uses(paths):
+        line = path.read_text().splitlines()[lineno - 1]
+        if SHA_PINNED_USES.match(line):
+            continue
+        if value.startswith("docker://"):
+            reasons.append(
+                f"{tag} {path}:{lineno} uses {value!r} — a docker:// reference is "
+                "remote code this guard cannot pin by commit SHA; admit it by "
+                "digest deliberately, in this file, not by default"
+            )
+            continue
+        reasons.append(
+            f"{tag} {path}:{lineno} uses {value!r} — not pinned to a 40-hex commit "
+            "SHA with a trailing `# <release>` comment. A tag or branch is "
+            "mutable: whoever controls the action's repository controls what "
+            "runs here, with this job's permissions"
+        )
+    return reasons
+
+
 # --- drift -------------------------------------------------------------------
 
 
@@ -574,6 +732,10 @@ def main(argv: list[str] | None = None) -> int:
             continue
         failures.extend(timeout_invariants(doc, path))
         failures.extend(tag_trigger_invariants(doc, path))
+
+    # 2b. SHA pinning — raw text, every workflow AND every local action. Wired
+    # here, not only into pytest: the evidence loop runs this CLI.
+    failures.extend(all_uses_are_sha_pinned(pin_scan_files()))
 
     # 3. job-set drift — only against a base.
     if base_ref is None:

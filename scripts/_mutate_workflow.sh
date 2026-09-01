@@ -36,6 +36,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RELEASE="${REPO_ROOT}/.github/workflows/release.yml"
 TEST_WF="${REPO_ROOT}/.github/workflows/test.yml"
 MAINTENANCE="${REPO_ROOT}/.github/workflows/maintenance.yml"
+COMPOSITE="${REPO_ROOT}/.github/actions/pipeline-bootstrap-setup/action.yml"
 
 MUTANTS="$(
 	cat <<'TSV'
@@ -70,6 +71,12 @@ timeout-deleted|1|[timeout]|release.yml build: timeout-minutes removed, restorin
 maintenance-deleted|1|[drift]|maintenance.yml deleted; invisible to the release and timeout invariants, which only see surviving files
 changelog-job-deleted|1|[drift]|test.yml: the changelog job deleted; the file stays valid and every surviving job keeps its timeout
 workflows-job-deleted|1|[drift]|test.yml: this guard's own job deleted (see the residual note in mutation-189.md)
+tag-pinned-action|1|[pin]|test.yml: install-smoke's setup-node pin reverted to the mutable @v7 tag; whoever controls that tag controls what runs
+sha-comment-dropped|1|[pin]|release.yml: the "# v7.0.1" comment stripped from the upload-artifact pin; the SHA is exact but unreadable and Dependabot-untrackable
+sha-moved|1|[release]|release.yml: one hex digit of the pypa SHA altered; form-valid, honest-looking comment, a commit that is not the release. Only the exact allowlist sees it
+pypa-rolled-back|1|[release]|release.yml: pypa pinned to v1.9.0's REAL commit with an honest "# v1.9.0" comment; 144 commits behind and below the GHSA-vxmw-7h4f-hqxh floor. Form-valid; only the exact allowlist sees it
+composite-tag-pinned|1|[pin]|.github/actions/pipeline-bootstrap-setup/action.yml: setup-node pin reverted to @v4; proves the composite (id-token: write in scope) is in the scan
+uses-quoted-key|1|[pin]|.github/actions/pipeline-bootstrap-setup/action.yml: the pin reverted to @v4 AND the key written as "uses":; valid YAML that GitHub runs and the line scan cannot see. Caught only by the parsed-inventory cross-check
 needs-as-list|0|-|release.yml: needs: build -> needs: [build]; a legitimate equivalent form that must NOT false-positive
 timeout-below-p100|0|-|NOT COVERED: release.yml build timeout-minutes 20 -> 12, above the floor but potentially below a future p100
 concurrency-added|0|-|NOT COVERED by invariant: workflow-level concurrency with cancel-in-progress on release.yml; release-diff-ack covers it by label
@@ -141,6 +148,30 @@ start, end = starts[0], ends[0]
 if end <= start:
     sys.exit(f"end anchor precedes start anchor in {path}")
 path.write_text("".join(lines[:start] + lines[end:]))
+PY
+}
+
+# replace_after FILE MARKER OLD NEW -- MARKER must occur exactly once; OLD must
+# occur exactly once AFTER it. For an edit whose target line is byte-identical
+# in several jobs (setup-node in `test` and `install-smoke`), where the job
+# header is the only unique context.
+replace_after() {
+	MUT_FILE="$1" MUT_MARKER="$2" MUT_OLD="$3" MUT_NEW="$4" python3 - <<'PY'
+import os
+import pathlib
+import sys
+
+path = pathlib.Path(os.environ["MUT_FILE"])
+text = path.read_text()
+marker = os.environ["MUT_MARKER"]
+old = os.environ["MUT_OLD"]
+new = os.environ["MUT_NEW"]
+if text.count(marker) != 1:
+    sys.exit(f"marker matched {text.count(marker)} times (expected exactly 1) in {path}:\n{marker!r}")
+head, tail = text.split(marker, 1)
+if tail.count(old) != 1:
+    sys.exit(f"anchor matched {tail.count(old)} times after marker (expected exactly 1) in {path}:\n{old!r}")
+path.write_text(head + marker + tail.replace(old, new, 1))
 PY
 }
 
@@ -226,10 +257,10 @@ continue-on-error-job)
 	;;
 continue-on-error-step)
 	replace "$RELEASE" '      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 ' '      - name: Publish to PyPI
         continue-on-error: true
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 '
 	;;
 if-on-publish-job)
@@ -242,10 +273,10 @@ if-on-publish-job)
 	;;
 if-on-publish-step)
 	replace "$RELEASE" '      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 ' '      - name: Publish to PyPI
         if: ${{ github.actor != '"'"'nobody'"'"' }}
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
 '
 	;;
 if-on-build-job)
@@ -283,8 +314,10 @@ jobs:
 YAML
 	;;
 forked-action)
-	replace "$RELEASE" 'uses: pypa/gh-action-pypi-publish@release/v1' \
-		'uses: attacker-fork/gh-action-pypi-publish@release/v1'
+	# Keeps the SHA form and the comment, so the pin invariant passes and only
+	# the exact EXPECTED_USES allowlist can see the owner change.
+	replace "$RELEASE" 'uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2' \
+		'uses: attacker-fork/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2'
 	;;
 permissions-job-widened)
 	replace "$RELEASE" '      id-token: write  # Required for trusted publishing
@@ -372,6 +405,32 @@ guard-self-disabled-nonconstant)
     if: ${{ github.actor == '"'"'nobody-at-all'"'"' }}
     runs-on: ubuntu-latest
 '
+	;;
+tag-pinned-action)
+	replace_after "$TEST_WF" '  install-smoke:
+' '      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+' '      - uses: actions/setup-node@v7
+'
+	;;
+sha-comment-dropped)
+	replace "$RELEASE" 'uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1' \
+		'uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
+	;;
+sha-moved)
+	replace "$RELEASE" 'uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2' \
+		'uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba34 # v1.14.2'
+	;;
+pypa-rolled-back)
+	replace "$RELEASE" 'uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2' \
+		'uses: pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0 # v1.9.0'
+	;;
+composite-tag-pinned)
+	replace "$COMPOSITE" 'uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0' \
+		'uses: actions/setup-node@v4'
+	;;
+uses-quoted-key)
+	replace "$COMPOSITE" '- uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0' \
+		'- "uses": actions/setup-node@v4'
 	;;
 guard-step-gutted)
 	replace "$TEST_WF" \
