@@ -151,27 +151,71 @@ path.write_text("".join(lines[:start] + lines[end:]))
 PY
 }
 
-# replace_after FILE MARKER OLD NEW -- MARKER must occur exactly once; OLD must
-# occur exactly once AFTER it. For an edit whose target line is byte-identical
-# in several jobs (setup-node in `test` and `install-smoke`), where the job
-# header is the only unique context.
-replace_after() {
-	MUT_FILE="$1" MUT_MARKER="$2" MUT_OLD="$3" MUT_NEW="$4" python3 - <<'PY'
+# replace_re FILE PATTERN REPL -- PATTERN (Python re, MULTILINE) must match
+# exactly once; REPL may use \1 backrefs. For anchors that contain a pinned
+# `uses:` line: the SHA and release comment change on every Dependabot bump,
+# so a literal anchor would refuse (and silently strand the mutant) on the
+# first legitimate update. Match the FORM of the pin, never its value.
+replace_re() {
+	MUT_FILE="$1" MUT_PATTERN="$2" MUT_REPL="$3" python3 - <<'PY'
 import os
 import pathlib
+import re
+import sys
+
+path = pathlib.Path(os.environ["MUT_FILE"])
+text = path.read_text()
+pattern = re.compile(os.environ["MUT_PATTERN"], re.MULTILINE)
+found = len(pattern.findall(text))
+if found != 1:
+    sys.exit(f"regex anchor matched {found} times (expected exactly 1) in {path}:\n{pattern.pattern!r}")
+path.write_text(pattern.sub(os.environ["MUT_REPL"], text, count=1))
+PY
+}
+
+# replace_after_re FILE MARKER PATTERN REPL -- MARKER (literal) exactly once;
+# PATTERN exactly once after it.
+replace_after_re() {
+	MUT_FILE="$1" MUT_MARKER="$2" MUT_PATTERN="$3" MUT_REPL="$4" python3 - <<'PY'
+import os
+import pathlib
+import re
 import sys
 
 path = pathlib.Path(os.environ["MUT_FILE"])
 text = path.read_text()
 marker = os.environ["MUT_MARKER"]
-old = os.environ["MUT_OLD"]
-new = os.environ["MUT_NEW"]
+pattern = re.compile(os.environ["MUT_PATTERN"], re.MULTILINE)
 if text.count(marker) != 1:
     sys.exit(f"marker matched {text.count(marker)} times (expected exactly 1) in {path}:\n{marker!r}")
 head, tail = text.split(marker, 1)
-if tail.count(old) != 1:
-    sys.exit(f"anchor matched {tail.count(old)} times after marker (expected exactly 1) in {path}:\n{old!r}")
-path.write_text(head + marker + tail.replace(old, new, 1))
+found = len(pattern.findall(tail))
+if found != 1:
+    sys.exit(f"regex anchor matched {found} times after marker (expected exactly 1) in {path}:\n{pattern.pattern!r}")
+path.write_text(head + marker + pattern.sub(os.environ["MUT_REPL"], tail, count=1))
+PY
+}
+
+# flip_last_hex FILE PATTERN -- PATTERN (exactly once) must end in a capture
+# group holding a hex SHA; its last digit is changed. Form-valid, wrong commit.
+flip_last_hex() {
+	MUT_FILE="$1" MUT_PATTERN="$2" python3 - <<'PY'
+import os
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(os.environ["MUT_FILE"])
+text = path.read_text()
+pattern = re.compile(os.environ["MUT_PATTERN"], re.MULTILINE)
+matches = list(pattern.finditer(text))
+if len(matches) != 1:
+    sys.exit(f"regex anchor matched {len(matches)} times (expected exactly 1) in {path}:\n{pattern.pattern!r}")
+m = matches[0]
+sha = m.group(1)
+flipped = sha[:-1] + ("4" if sha[-1] != "4" else "5")
+start, end = m.span(1)
+path.write_text(text[:start] + flipped + text[end:])
 PY
 }
 
@@ -256,12 +300,8 @@ continue-on-error-job)
 '
 	;;
 continue-on-error-step)
-	replace "$RELEASE" '      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-' '      - name: Publish to PyPI
-        continue-on-error: true
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-'
+	replace_re "$RELEASE" '^(      - name: Publish to PyPI\n)(        uses: pypa/gh-action-pypi-publish@[0-9a-f]{40} # \S+\n)' \
+		'\1        continue-on-error: true\n\2'
 	;;
 if-on-publish-job)
 	replace "$RELEASE" '  publish:
@@ -272,12 +312,8 @@ if-on-publish-job)
 '
 	;;
 if-on-publish-step)
-	replace "$RELEASE" '      - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-' '      - name: Publish to PyPI
-        if: ${{ github.actor != '"'"'nobody'"'"' }}
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
-'
+	replace_re "$RELEASE" '^(      - name: Publish to PyPI\n)(        uses: pypa/gh-action-pypi-publish@[0-9a-f]{40} # \S+\n)' \
+		'\1        if: ${{ github.actor != '"'"'nobody'"'"' }}\n\2'
 	;;
 if-on-build-job)
 	replace "$RELEASE" '  build:
@@ -316,8 +352,8 @@ YAML
 forked-action)
 	# Keeps the SHA form and the comment, so the pin invariant passes and only
 	# the exact EXPECTED_USES allowlist can see the owner change.
-	replace "$RELEASE" 'uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2' \
-		'uses: attacker-fork/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2'
+	replace_re "$RELEASE" 'uses: pypa/gh-action-pypi-publish@([0-9a-f]{40} # \S+)' \
+		'uses: attacker-fork/gh-action-pypi-publish@\1'
 	;;
 permissions-job-widened)
 	replace "$RELEASE" '      id-token: write  # Required for trusted publishing
@@ -407,30 +443,26 @@ guard-self-disabled-nonconstant)
 '
 	;;
 tag-pinned-action)
-	replace_after "$TEST_WF" '  install-smoke:
-' '      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-' '      - uses: actions/setup-node@v7
-'
+	replace_after_re "$TEST_WF" '  install-smoke:
+' '- uses: actions/setup-node@[0-9a-f]{40} # \S+' '- uses: actions/setup-node@v7'
 	;;
 sha-comment-dropped)
-	replace "$RELEASE" 'uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1' \
-		'uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a'
+	replace_re "$RELEASE" '(uses: actions/upload-artifact@[0-9a-f]{40}) # \S+' '\1'
 	;;
 sha-moved)
-	replace "$RELEASE" 'uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2' \
-		'uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba34 # v1.14.2'
+	flip_last_hex "$RELEASE" 'uses: pypa/gh-action-pypi-publish@([0-9a-f]{40}) # \S+'
 	;;
 pypa-rolled-back)
-	replace "$RELEASE" 'uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2' \
+	# The rollback TARGET is deliberately literal: v1.9.0's real commit, below
+	# the GHSA-vxmw-7h4f-hqxh floor. The anchor is not.
+	replace_re "$RELEASE" 'uses: pypa/gh-action-pypi-publish@[0-9a-f]{40} # \S+' \
 		'uses: pypa/gh-action-pypi-publish@ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0 # v1.9.0'
 	;;
 composite-tag-pinned)
-	replace "$COMPOSITE" 'uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0' \
-		'uses: actions/setup-node@v4'
+	replace_re "$COMPOSITE" 'uses: actions/setup-node@[0-9a-f]{40} # \S+' 'uses: actions/setup-node@v4'
 	;;
 uses-quoted-key)
-	replace "$COMPOSITE" '- uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0' \
-		'- "uses": actions/setup-node@v4'
+	replace_re "$COMPOSITE" '- uses: actions/setup-node@[0-9a-f]{40} # \S+' '- "uses": actions/setup-node@v4'
 	;;
 guard-step-gutted)
 	replace "$TEST_WF" \

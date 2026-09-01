@@ -153,28 +153,32 @@ DRIFT_MUTANTS = (
 )
 
 # Mutants of the FORM of a pin, caught by `all_uses_are_sha_pinned` on raw
-# text. Each is the same edit the shell helper makes, applied to a copy.
+# text. Each is the same edit the shell helper makes, applied to a copy:
+# (file, regex locating the CURRENT pinned line, replacement). Regex, not a
+# literal: the SHA and comment change on every Dependabot bump, and a literal
+# anchor made the first such bump (#219) fail this suite.
+_PIN_RE = r"@[0-9a-f]{40} # \S+"
 PIN_MUTANTS: dict[str, tuple[Path, str, str]] = {
     "tag-pinned-action": (
         TEST_YML,
-        "- uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0",
+        "- uses: actions/setup-node" + _PIN_RE,
         "- uses: actions/setup-node@v7",
     ),
     "sha-comment-dropped": (
         RELEASE_YML,
-        "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1",
-        "uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
+        r"(uses: actions/upload-artifact@[0-9a-f]{40}) # \S+",
+        r"\1",
     ),
     "composite-tag-pinned": (
         REPO_ROOT / ".github" / "actions" / "pipeline-bootstrap-setup" / "action.yml",
-        "uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0",
+        "uses: actions/setup-node" + _PIN_RE,
         "uses: actions/setup-node@v4",
     ),
     # Valid YAML GitHub runs; invisible to the line scan. Only the
     # parsed-inventory cross-check sees it.
     "uses-quoted-key": (
         REPO_ROOT / ".github" / "actions" / "pipeline-bootstrap-setup" / "action.yml",
-        "- uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0",
+        "- uses: actions/setup-node" + _PIN_RE,
         '- "uses": actions/setup-node@v4',
     ),
 }
@@ -422,10 +426,14 @@ class TestShaPinning:
 
     @pytest.mark.parametrize("mutant", sorted(PIN_MUTANTS))
     def test_mutant_is_rejected(self, mutant: str, tmp_path: Path) -> None:
-        source, old, new = PIN_MUTANTS[mutant]
+        source, pattern, repl = PIN_MUTANTS[mutant]
         text = source.read_text()
-        assert text.count(old) >= 1, f"{mutant}: anchor gone from {source.name}"
-        copy_path = _write(tmp_path, source.name, text.replace(old, new))
+        mutated, count = cw.re.subn(pattern, repl, text, count=1)
+        # tag-pinned-action's line is byte-identical in two jobs; the helper
+        # scopes it under `install-smoke:`. Here any one occurrence will do,
+        # but the pattern must still FIND the pin.
+        assert count == 1, f"{mutant}: pin pattern not found in {source.name}"
+        copy_path = _write(tmp_path, source.name, mutated)
         reasons = cw.all_uses_are_sha_pinned([copy_path])
         assert reasons and all(r.startswith("[pin]") for r in reasons), reasons
 
@@ -1054,6 +1062,29 @@ class TestMutationHelperContract:
         # coverage that does not exist.
         rows = {row[0]: row for row in self._rows()}
         assert rows[mutant][1] == "0"
+
+    @pytest.mark.parametrize(
+        ("source", "allowed"),
+        [
+            # The one deliberate literal: the v1.9.0 rollback TARGET.
+            (MUTATE_SH, {"ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0"}),
+            # Same target, plus the synthetic fixture SHA and the all-zeros
+            # placeholder the CI-wiring tests use.
+            (
+                Path(__file__),
+                {"ec4db0b4ddc65acdf4bff5fa45ac92d78b56bdf0", _SHA, "0" * 40},
+            ),
+        ],
+    )
+    def test_no_pin_anchor_hardcodes_a_real_sha(
+        self, source: Path, allowed: set[str]
+    ) -> None:
+        # #219: the first Dependabot bump of the composite's pin changed the
+        # line two mutants and two tests anchored on by literal, and CI went
+        # red on a correct one-line update. Anchors match the FORM of a pin
+        # (`@<40 hex> # <release>`); only a mutation's *target* may be literal.
+        found = set(cw.re.findall(r"\b[0-9a-f]{40}\b", source.read_text()))
+        assert found <= allowed, sorted(found - allowed)
 
     def test_an_unknown_mutant_name_is_refused(self) -> None:
         result = subprocess.run(
