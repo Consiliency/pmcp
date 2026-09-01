@@ -1,5 +1,15 @@
 # Detailed plan: pin every GitHub Action to a commit SHA, and guard the convention
 
+> **Revision 4 (2026-09-01).** Rev 2's board (2 DISAGREE; one seat errored)
+> returned after rev 3. Its pypa finding matched rev 3's correction and added
+> **GHSA-vxmw-7h4f-hqxh** — `pypa/gh-action-pypi-publish < 1.13.0` is vulnerable
+> to injectable expression expansions, so the v1.9.0 pin would have been a
+> *vulnerable* rollback. Five further verified defects fixed below: the
+> verifier's `grep | while` subshell lost its failure flag; the reusable-workflow
+> exemption was a hole; `.yaml` forms were unguarded; the `tag-pinned-action`
+> anchor was not unique; and the verifier proved SHA↔comment but not
+> SHA↔*current target*, so a correct-looking rollback passed it.
+>
 > **Revision 3 (2026-09-01).** Rev 2 carried a **false premise of mine**: it said
 > `release/v1` is 144 commits ahead of pypa's newest release, v1.9.0. The tag
 > list was sorted lexically, so `v1.14.x` sorted before `v1.8`. The newest
@@ -60,6 +70,12 @@ would have been a real 144-commit rollback of the publish action.** Pin to
 **v1.14.2** — which is both the release tag and today's head, so there is **no
 behaviour change** and the comment `# v1.14.2` is honest and Dependabot-trackable.
 
+**And v1.9.0 was vulnerable.** GHSA-vxmw-7h4f-hqxh (low): injectable expression
+expansions in action steps, `pypa/gh-action-pypi-publish < 1.13.0`, patched in
+1.13.0. Verified via the advisories API. So rev 2's pin was not merely five
+months stale — it would have reintroduced a published advisory on the publish
+path. v1.14.2 is clear. Any future re-pin must stay `>= 1.13.0`.
+
 **Version comparison must be numeric, not lexical.** Any "newest tag" step in
 implementation or verification uses `sort -V` or the releases API's
 `releases/latest`, never the raw tag list order. This mistake reached an
@@ -115,13 +131,20 @@ refused as non-unique; new anchors need step context.
 - `EXPECTED_USES` (`:59`) — modify — to the **SHA form without comments**.
   **WAS WRONG (rev 1):** it put comments in; they can never match parsed YAML.
 - `all_uses_are_sha_pinned(paths)` — add — **operates on raw text, not parsed
-  YAML**, so it can see the comment. For every line matching `uses:` under
-  `.github/workflows/*.yml` **and** `.github/actions/**/action.yml`: skip a value
-  starting `./` (local path) or containing `.yml@` / `.yaml@` (reusable
-  workflow); otherwise require
-  `^\s*-?\s*uses:\s*[\w.-]+/[\w./-]+@[0-9a-f]{40}\s+#\s*\S+`. The `[\w./-]+`
-  admits subdirectory actions (`owner/repo/path@sha`). Reason text names file,
-  line, and ref.
+  YAML**, so it can see the comment. Scan `.github/workflows/*.yml` **and**
+  `*.yaml`, and `.github/actions/**/action.yml` **and** `action.yaml`.
+  **WAS WRONG (rev 2):** `*.yml` / `action.yml` only. GitHub runs both
+  extensions, `workflow_files()` (`check_workflows.py:~533`) already globs both
+  *with a docstring saying why*, and renaming the composite to `action.yaml`
+  would have kept it executable while removing it from the guard.
+  Skip **only** a value starting `./` (same-repository path). Otherwise require
+  `^\s*-?\s*uses:\s*[\w.-]+/[\w./-]+@[0-9a-f]{40}\s+#\s*\S+`, which admits
+  subdirectory actions and **remote reusable workflows**
+  (`owner/repo/.github/workflows/x.yml@<sha>`).
+  **WAS WRONG (rev 2):** it exempted any value containing `.yml@`/`.yaml@`. That
+  let `owner/repo/.github/workflows/build.yml@main` — mutable remote code — pass
+  the guard. Reusable workflows are SHA-pinnable and GitHub documents SHA as the
+  safest form. Reason text names file, line, and ref.
 - **Call it from `main()`.** **WAS WRONG (rev 1):** unstated. The evidence loop
   runs the CLI, not pytest; a tests-only function lets the new mutants survive.
 - Module docstring (`:22`) — modify — state the convention, and that comments are
@@ -133,8 +156,12 @@ refused as non-unique; new anchors need step context.
   `continue-on-error-step`, `if-on-publish-step`, `forked-action`.
   **WAS WRONG (rev 1):** only `forked-action`.
 - `tag-pinned-action` — add — reverts the `setup-node` pin in `test.yml`'s
-  `test` job to `@v7` (unique: use the step context, since `checkout` is not
-  unique). Fails via the new invariant.
+  `install-smoke` job to `@v7`. **WAS WRONG (rev 2):** "use the step context" —
+  the three-line `setup-node` block is **byte-identical** in the `test` and
+  `install-smoke` jobs (`test.yml:38-40` and `:81-83`), so a step-level anchor
+  matches twice and `replace()` refuses it. The anchor must include a line that
+  exists only in one job (the `install-smoke` job header, or its preceding
+  unique step). Fails via the new invariant.
 - `sha-comment-dropped` — add — strips the comment from `release.yml`'s
   `upload-artifact` line (unique in the tree). Fails via the new invariant.
 - `sha-moved` — add — alters one hex digit of the pypa SHA in `release.yml`
@@ -167,9 +194,12 @@ refused as non-unique; new anchors need step context.
 
 ## Documentation impact
 
-- `CHANGELOG.md` — add — `### Changed`, one bullet: every action is SHA-pinned
-  (name the count, and that the PyPI publish action is pinned to v1.14.2, the
-  commit `release/v1` already pointed at — so nothing runs differently).
+- `CHANGELOG.md` — add — `### Changed`: every action is SHA-pinned (name the
+  count, and that the PyPI publish action is pinned to v1.14.2, the commit
+  `release/v1` already pointed at — so nothing runs differently there). **A
+  second bullet**: the composite action's `setup-node` moves **v4 → v7** to match
+  its workflow siblings. That is a major-version bump, not a pin of the current
+  ref, and is the one place this change alters what runs.
   **WAS WRONG (rev 2):** a bullet announcing a 144-commit rollback that must not
   happen.
 - `SECURITY.md` — add — a short supply-chain paragraph stating the pin
@@ -195,11 +225,14 @@ refused as non-unique; new anchors need step context.
 uv run pytest -q tests/test_workflow_guards.py
 uv run python scripts/check_workflows.py --base-ref origin/main   # exit 0 after pinning
 
-# Every SHA must resolve to the release its comment names. Aggregate exit; a
-# MISMATCH is a failure, not a printout.
+# Every SHA must (a) resolve to the release its comment names AND (b) equal the
+# commit the ORIGINAL mutable ref points at today -- (b) is what proves "no
+# behaviour change"; (a) alone accepted a correct-looking rollback.
+# Aggregate exit. NOT `grep | while` -- under bash that loop is a subshell and
+# `fail=1` is lost. **WAS WRONG (rev 2)**: exactly that, with `exit "$fail"`
+# living only in a comment.
 fail=0
-grep -rnE "uses:\s*[^./ ][^ ]*@[0-9a-f]{40}\s*#" .github/workflows/*.yml .github/actions/*/action.yml \
-| while IFS= read -r line; do
+while IFS= read -r line; do
   ref=$(echo "$line" | sed -E 's/.*uses:\s*//; s/\s*#.*//'); tag=$(echo "$line" | sed -E 's/.*#\s*//; s/\s.*//')
   repo=${ref%@*}; sha=${ref#*@}
   got=$(gh api "repos/$repo/git/matching-refs/tags/$tag" 2>/dev/null \
@@ -207,9 +240,16 @@ grep -rnE "uses:\s*[^./ ][^ ]*@[0-9a-f]{40}\s*#" .github/workflows/*.yml .github
   typ=$(gh api "repos/$repo/git/matching-refs/tags/$tag" 2>/dev/null \
         | python3 -c "import sys,json;rs=[r for r in json.load(sys.stdin) if r['ref']=='refs/tags/$tag'];print(rs[0]['object']['type'] if rs else '')")
   [ "$typ" = tag ] && got=$(gh api "repos/$repo/git/tags/$got" -q .object.sha)
+  # PEEL annotated tags: the tag object's sha is NOT the commit. Pinning the tag
+  # object sha would pass a form check, agree with EXPECTED_USES, and break only
+  # on tag push. (setup-uv and every pypa release tag are annotated.)
   if [ "$got" = "$sha" ]; then echo "OK       $ref  # $tag"; else echo "MISMATCH $ref  # $tag -> $got"; fail=1; fi
-done
-# (run the loop in the current shell, not a pipe subshell, so $fail propagates; exit $fail)
+done < <(grep -rnE "uses:\s*[^./ ][^ ]*@[0-9a-f]{40}\s*#" .github/workflows/*.y*ml .github/actions/*/action.y*ml)
+exit "$fail"
+
+# Prove the loop FAILS CLOSED: run it once against a copy with one SHA altered
+# by a digit and require exit 1. Thirty OKs prove nothing about the mismatch
+# branch until that branch has been seen to fire.
 
 uv run ruff check src/ tests/ scripts/ && uv run mypy src/
 ```
@@ -226,17 +266,28 @@ must not be mistaken for a step list.
       that starts green has not seen the problem. Count is 30, not 29:
       rev 1 excluded the composite's ref.
 - [ ] After pinning, the checker exits 0, and the resolution loop reports
-      **30 OK, 0 MISMATCH with a non-zero aggregate exit on any mismatch** — a
-      pin whose SHA does not match its claimed release must not pass.
-      **WAS WRONG (rev 1):** its loop printed MISMATCH and exited 0.
+      **30 OK, 0 MISMATCH** — and, run against a copy with one SHA altered by a
+      digit, **exits 1**. Both directions. **WAS WRONG (rev 2):** the loop was a
+      `grep | while` subshell, so `fail=1` was lost and the exit was always 0;
+      the criterion demanded fail-closed but the script could not deliver it.
+- [ ] For **every** pinned ref, the pinned SHA equals the **peeled** commit that
+      the original mutable ref (`v7`, `release/v1`, …) resolves to at
+      implementation time — recorded per ref. This is the "no behaviour change"
+      proof, and it is the check that rejects a correct-looking rollback such as
+      `pypa-rolled-back`. The composite's `setup-node` is the one **declared
+      exception** (v4 → v7), recorded as such.
+- [ ] The pypa pin is `>= 1.13.0` (GHSA-vxmw-7h4f-hqxh) — asserted numerically.
 - [ ] The three re-anchored mutants (`continue-on-error-step`,
       `if-on-publish-step`, `forked-action`) each **still mutate** — evidence
       shows a commit hash differing from base — and still exit non-zero. Rev 1
       would have left all three as silent survivors.
 - [ ] The four new mutants each exit non-zero as committed scratch-branch
       mutants, with the same helper-exit + commit-hash evidence.
-- [ ] A correctly pinned ref with comment passes; a reusable-workflow `uses:` is
-      skipped; a subdirectory action passes. All three by synthetic fixture.
+- [ ] A correctly pinned ref with comment passes; a `./` local path is skipped;
+      a subdirectory action passes; a **remote reusable workflow** pinned to a SHA
+      passes and one pinned to `@main` **fails**; an `action.yaml` composite is
+      **scanned**. All by synthetic fixture. **WAS WRONG (rev 2):** reusable
+      workflows were exempted wholesale.
 - [ ] `EXPECTED_USES` contains **no comments** and matches the pinned
       `release.yml` — proven by the checker exiting 0 on it, which rev 1's form
       could never have done.
