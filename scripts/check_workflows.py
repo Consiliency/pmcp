@@ -72,7 +72,7 @@ EXPECTED_JOB_PERMISSIONS: dict[str, dict[str, str] | None] = {
 EXPECTED_USES = {
     "build": [
         "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
-        "astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78",
+        "astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d",
         "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a",
     ],
     "publish": [
