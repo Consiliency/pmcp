@@ -1,128 +1,166 @@
 # Detailed plan: pin every GitHub Action to a commit SHA, and guard the convention
 
+> **Revision 2 (2026-09-01).** Rev 1 boarded 2 DISAGREE / 1 AGREE. Three defects,
+> each verified: (1) `EXPECTED_USES` with comments could **never match**, because
+> `yaml.safe_load` strips comments before `_collect_uses` runs — every correctly
+> pinned `release.yml` would have failed; (2) **three** mutants anchor on
+> `@release/v1`, not one, and `replace()` refuses a non-unique anchor, so all
+> three would have become silent survivors; (3) the local composite action's own
+> `actions/setup-node@v4` runs with `id-token: write` and was wrongly out of
+> scope. Also: `release/v1` is a **branch**, 144 commits past pypa's newest
+> release — the operator chose to pin to the release tag instead.
+
 ## Task
 
-Close Consiliency/pmcp#217. All 30 `uses:` references in `.github/workflows/`
-resolve a **mutable tag**. Pin each to its commit SHA with the version kept as a
-trailing comment, and add a guard so the convention cannot regress.
+Close Consiliency/pmcp#217. Every `uses:` reference in `.github/workflows/`
+and in the local composite action resolves a **mutable tag** (or, for pypa, a
+**branch**). Pin each to a commit SHA with the version as a trailing comment,
+and add a guard so the convention cannot regress.
 
 ## Research summary
 
 Verified in this worktree.
 
-**The inventory.** 30 refs, 11 distinct actions, 0 SHA-pinned:
-`actions/checkout@v7` ×12, `astral-sh/setup-uv@v7` ×7,
-`actions/download-artifact@v7` ×2, `actions/setup-node@v7` ×2,
-`actions/upload-artifact@v7`, `docker/build-push-action@v7`,
-`docker/metadata-action@v6`, `docker/login-action@v4`,
-`docker/setup-buildx-action@v4`, and **`pypa/gh-action-pypi-publish@release/v1`**.
-`./.github/actions/pipeline-bootstrap-setup` is a local path — not a ref, not
-in scope.
+**The inventory, corrected.** 30 refs in `.github/workflows/`, of which 29 are
+remote actions and 1 is the local path `./.github/actions/pipeline-bootstrap-setup`.
+**Plus** that composite action's own `action.yml:7`: `actions/setup-node@v4`.
+It runs inside `pipeline-bootstrap.yml`'s job with **`id-token: write` and
+`contents: write`** (`:76-78`) — so it is not "repo-owned source reviewed like
+any file"; it is a mutable ref with credentials in scope. **30 remote refs total,
+0 SHA-pinned.** Rev 1 said 30 and excluded the composite; both were wrong.
 
-**The one that matters most.** `pypa/gh-action-pypi-publish@release/v1` runs in
-`release.yml`'s `publish` job with `id-token: write` — the PyPI trusted-publishing
-identity. `release/v1` is a floating ref by the action's own design. For this
-repo the tag push *is* the publish, so a moved ref runs new code with PyPI
-credentials in scope and **no diff, no PR, no review**.
+**Dependabot has never touched `.github/actions/`.** Twenty Dependabot PRs on
+this repo, zero under that path, and the composite still says `@v4` while every
+workflow moved to `@v7`. Dependabot's `github-actions` ecosystem with
+`directory: "/"` is evidently not scanning it here. A second `directory` entry
+is required or the composite's pin freezes forever.
 
-**Dependabot already handles SHA pins.** `.github/dependabot.yml` tracks
-`github-actions` weekly. Dependabot's native behaviour for a SHA-pinned action
-is to bump the SHA and maintain a trailing `# vX.Y.Z` comment. Pinning costs
-nothing in automation — *provided the comment convention is followed*, because
-Dependabot reads the comment to know which release line to track.
+**`pypa/gh-action-pypi-publish@release/v1` is a branch, not a tag.**
+`git/ref/tags/release/v1` returns nothing usable; `git/ref/heads/release%2Fv1`
+resolves. Its head is **144 commits ahead of v1.9.0**, the newest release. So
+the repo has been publishing to PyPI with an *unreleased* build of the publish
+action on every tag push. Pinning to the branch head would freeze an unreleased
+commit with no version to name; the operator chose to pin to **`v1.9.0`**
+(annotated tag → commit `ec4db0b4ddc6…`, full SHA resolved at implementation).
+That is a **rollback of 144 commits on the publish path** and must be stated as
+a behaviour change, not hidden as a pin.
 
-**The #189 guard already asserts `release.yml`'s refs exactly.**
-`EXPECTED_USES` at `scripts/check_workflows.py:59` lists each job's `uses:`
-values verbatim, and `_mutate_workflow.sh:285`'s `forked-action` mutant proves a
-repoint fails. Both are written against the current tag strings. Pinning
-`release.yml` therefore **requires updating both in the same PR**, or the
-`workflows` job goes red on the pinning PR itself.
+**Resolution procedure, corrected.** `git/ref/tags/<name>` with a slash in the
+name is a prefix match and returns garbage. Use `git/matching-refs/tags/<name>`
+and select the exact ref, or URL-encode. Annotated tags (`astral-sh/setup-uv@v7`
+is one; the pypa release tags all are) need a second dereference through
+`git/tags/<sha>`. 8 of the 10 distinct actions use lightweight tags.
 
-**The cost, which is the point.** After this, a Dependabot bump touching
-`release.yml` fails `workflows` until `EXPECTED_USES` is updated alongside it.
-That converts a one-file bot PR into a two-file human PR — for `release.yml`
-only. That is exactly the deliberate-change property #189 exists to enforce on
-that file, so it is accepted rather than worked around.
+**`yaml.safe_load` strips comments.** `_load` (`check_workflows.py:525-527`)
+and the `:413` path both parse with `safe_load`, so by the time `_collect_uses`
+(`:134`) sees a `uses:` value the `# vX.Y.Z` is gone. Any expected value that
+includes a comment can never match. The comment convention must be checked on
+**raw text**; the parsed `EXPECTED_USES` must hold the SHA form only.
+
+**`replace()` in `_mutate_workflow.sh:104-120` refuses an anchor that does not
+match exactly once.** After pinning, three mutants' anchors match zero times:
+`continue-on-error-step` (`:229,232`), `if-on-publish-step` (`:245,248`), and
+`forked-action` (`:286`). In the evidence loop (`mutate && commit; checker`) a
+refused helper never commits, the checker runs on the clean tree, exits 0, and
+the mutant is recorded as a **survivor** — while looking like a helper hiccup.
+Rev 1 updated only `forked-action`. And `actions/checkout` appears 8× in
+`test.yml` and 2× in `release.yml`, so any SHA-only anchor for a new mutant is
+refused as non-unique; new anchors need step context.
 
 ## Changes
 
-### `.github/workflows/*.yml` (modify — all five)
+### `.github/workflows/*.yml` and `.github/actions/pipeline-bootstrap-setup/action.yml` (modify)
 
-- Every `uses: owner/action@<tag>` — modify — to
-  `uses: owner/action@<40-hex-sha> # <tag>`. Resolve each SHA **at
-  implementation time** from the tag the file currently names, via
-  `gh api repos/<owner>/<action>/git/ref/tags/<tag>` (dereferencing an annotated
-  tag to its commit — `git/ref/tags/` can return a tag object, whose `object.sha`
-  must be followed once more). Do not copy SHAs from this plan or from memory;
-  a SHA that does not match the tag it claims is worse than the tag.
-- The trailing comment carries the **exact release** (`# v7.0.0`), not the
-  major (`# v7`), where the tag resolves to a specific release. Dependabot uses
-  it; a human reading the file needs it; and it makes drift visible.
-- `pypa/gh-action-pypi-publish@release/v1` — modify — pin to the commit
-  `release/v1` currently points at, comment `# release/v1 (<vX.Y.Z>)` naming the
-  release it corresponds to. This is the highest-value pin in the tree.
+- Every remote `uses: owner/action@<tag>` — modify — to
+  `uses: owner/action@<40-hex-sha> # <exact release>`. Resolve at implementation
+  time with `git/matching-refs/tags/`, dereferencing annotated tags. **Do not
+  copy SHAs from this plan.** The comment names the exact release (`# v7.0.0`),
+  which is what Dependabot reads and what a human needs.
+- `pypa/gh-action-pypi-publish` — modify — pin to **v1.9.0**'s commit, comment
+  `# v1.9.0`. This changes what runs at publish: from an unreleased branch head
+  to the newest release. Say so in the PR body and the CHANGELOG.
+- The composite action's `setup-node@v4` — modify — pin to v7's commit like its
+  workflow siblings, comment `# v7.0.0`.
+
+### `.github/dependabot.yml` (modify)
+
+- Add a second `github-actions` entry with
+  `directory: "/.github/actions/pipeline-bootstrap-setup"`. **WAS WRONG (rev 1):**
+  "no change" — Dependabot demonstrably does not scan that path here.
 
 ### `scripts/check_workflows.py` (modify)
 
-- `EXPECTED_USES` (`:59`) — modify — to the pinned forms, **including the
-  comment**, so that a pin whose comment has been silently dropped also fails.
-  The existing exact-match invariant then catches a moved SHA for free.
-- `all_uses_are_sha_pinned(paths)` — add — a new invariant across **every**
-  workflow file: each `uses:` that is not a local path (`./…`) or a reusable
-  workflow must match `^[\w.-]+/[\w.-]+@[0-9a-f]{40}\s+#\s*\S+`. Reason text
-  names the offending file, job, and ref. Without this the convention regresses
-  the first time someone pastes `@v4` from a README.
-- The module docstring (`:22`) — modify — state the pin convention and that
-  `EXPECTED_USES` now includes comments.
+- `EXPECTED_USES` (`:59`) — modify — to the **SHA form without comments**.
+  **WAS WRONG (rev 1):** it put comments in; they can never match parsed YAML.
+- `all_uses_are_sha_pinned(paths)` — add — **operates on raw text, not parsed
+  YAML**, so it can see the comment. For every line matching `uses:` under
+  `.github/workflows/*.yml` **and** `.github/actions/**/action.yml`: skip a value
+  starting `./` (local path) or containing `.yml@` / `.yaml@` (reusable
+  workflow); otherwise require
+  `^\s*-?\s*uses:\s*[\w.-]+/[\w./-]+@[0-9a-f]{40}\s+#\s*\S+`. The `[\w./-]+`
+  admits subdirectory actions (`owner/repo/path@sha`). Reason text names file,
+  line, and ref.
+- **Call it from `main()`.** **WAS WRONG (rev 1):** unstated. The evidence loop
+  runs the CLI, not pytest; a tests-only function lets the new mutants survive.
+- Module docstring (`:22`) — modify — state the convention, and that comments are
+  checked on raw text because the parser drops them.
 
 ### `scripts/_mutate_workflow.sh` (modify)
 
-- `forked-action` (`:285`) — modify — the mutant must repoint the **pinned**
-  string; today it replaces a tag string that will no longer exist, so the
-  mutant would silently stop mutating and the matrix would show it "killed"
-  because the sed matched nothing and the tree was unchanged. **Verify the sed
-  actually changed the file** before recording the exit code.
-- `tag-pinned-action` — add — reverts one ref in `test.yml` to `@v7`. Must
-  fail via the new invariant.
-- `sha-comment-dropped` — add — keeps the SHA but removes the `# vX.Y.Z`
-  comment on one ref. Must fail: a pin without its comment is unmaintainable.
-- `sha-moved` — add — changes one release.yml SHA by a digit. Must fail via
-  `EXPECTED_USES`, proving the exact-match still bites after pinning.
+- **All three** `@release/v1` anchors — modify — to the pinned string:
+  `continue-on-error-step`, `if-on-publish-step`, `forked-action`.
+  **WAS WRONG (rev 1):** only `forked-action`.
+- `tag-pinned-action` — add — reverts the `setup-node` pin in `test.yml`'s
+  `test` job to `@v7` (unique: use the step context, since `checkout` is not
+  unique). Fails via the new invariant.
+- `sha-comment-dropped` — add — strips the comment from `release.yml`'s
+  `upload-artifact` line (unique in the tree). Fails via the new invariant.
+- `sha-moved` — add — alters one hex digit of the pypa SHA in `release.yml`
+  (unique). Fails via `EXPECTED_USES`.
+- `composite-tag-pinned` — add — reverts the composite action's pin to `@v4`.
+  Fails via the new invariant; proves the composite is in scope.
+- The evidence loop — modify — record **the helper's exit code and the commit
+  hash** per mutant, not only the checker's exit. A helper that refused never
+  mutated, and its "kill" is fiction.
 
 ### `tests/test_workflow_guards.py` (modify)
 
-- `TestShaPinning` — add — one test per new mutant above, in memory, plus the
-  positive case: a correctly pinned ref with a comment passes.
-- `TestMutationHelperContract` — the helper list must gain the three new
-  mutants, and the bidirectional inclusion test will enforce it.
+- `TestShaPinning` — add — one test per new mutant plus: a correctly pinned ref
+  with comment **passes**; a job-level reusable-workflow `uses:` is **skipped**;
+  a subdirectory action `owner/repo/path@<sha> # v1` **passes**; a `docker://`
+  `uses:` is reported (it is not pinnable by this scheme — decide: skip with a
+  named reason, or fail; there are none today, so pin the decision by test).
+- `TestMutationHelperContract` gains the four new mutants via its bidirectional
+  check.
 
 ### `.consiliency/evidence/mutation-217.md` (create)
 
-- Extend the #189 matrix with the new rows and **real committed-mutant exit
-  codes**, including a check that each mutant's sed actually modified the tree.
+- The matrix, with per-mutant **helper exit, commit hash, checker exit, reason
+  tag**. Include a row proving the three re-anchored mutants still mutate (their
+  commit hash differs from base).
 
 ## Documentation impact
 
-- `CHANGELOG.md` — add — `### Changed`: every action is now SHA-pinned; name the
-  PyPI publish action explicitly, since that is the one an operator would want to
-  know about.
-- `SECURITY.md` — modify — the supply-chain section, if present, should state
-  the pin convention; if absent, add one sentence under the existing
-  release-path discussion (`:39` area). Check before editing.
-- `.github/dependabot.yml` — **no change**. Confirm in the PR body that the
-  existing `github-actions` entry handles SHA pins, so a reader does not assume
-  automation was lost.
+- `CHANGELOG.md` — add — `### Changed`, two bullets: every action is SHA-pinned
+  (name the count and the PyPI publish action explicitly); and **the PyPI publish
+  action moves from an unreleased `release/v1` head to the v1.9.0 release** —
+  a rollback of 144 upstream commits on the publish path, deliberate.
+- `SECURITY.md` — add — a short supply-chain paragraph stating the pin
+  convention and that Dependabot maintains it. **WAS WRONG (rev 1):** it pointed
+  at `:39`, which is the JWKS sentence, not a release-path section.
 
 ## Dependencies & order
 
-1. The new `all_uses_are_sha_pinned` invariant and its tests **first, against
-   unchanged workflows** — it must go RED on the current tree. That is the proof
-   the guard sees the problem before anything is pinned.
-2. Resolve SHAs and pin all five workflow files.
-3. Update `EXPECTED_USES` and the `forked-action` mutant in the same commit as
-   the `release.yml` pins — otherwise `workflows` is red between commits.
-4. New mutants, evidence matrix.
-5. Docs.
+1. `all_uses_are_sha_pinned` on raw text, wired into `main()`, with tests —
+   **RED against unchanged `main`, reporting 30 refs.** The guard must see the
+   problem before anything is pinned.
+2. Resolve every SHA with the corrected procedure; record the resolution output.
+3. Pin all five workflows **and** the composite action.
+4. **In the same commit as the `release.yml` pins:** update `EXPECTED_USES` and
+   all three `@release/v1` mutant anchors. Otherwise `workflows` is red between
+   commits and three mutants are silently dead.
+5. `dependabot.yml` entry, new mutants, evidence matrix.
+6. Docs.
 
 ## Verification
 
@@ -130,62 +168,66 @@ that file, so it is accepted rather than worked around.
 uv run pytest -q tests/test_workflow_guards.py
 uv run python scripts/check_workflows.py --base-ref origin/main   # exit 0 after pinning
 
-# Every SHA must resolve to the tag it claims -- assert it, do not eyeball it:
-grep -rhoE "uses:\s*\S+@[0-9a-f]{40}\s*#\s*\S+" .github/workflows/*.yml | while read -r line; do
-  ref=$(echo "$line" | sed -E 's/uses:\s*//; s/\s*#.*//'); tag=$(echo "$line" | sed -E 's/.*#\s*//')
+# Every SHA must resolve to the release its comment names. Aggregate exit; a
+# MISMATCH is a failure, not a printout.
+fail=0
+grep -rnE "uses:\s*[^./ ][^ ]*@[0-9a-f]{40}\s*#" .github/workflows/*.yml .github/actions/*/action.yml \
+| while IFS= read -r line; do
+  ref=$(echo "$line" | sed -E 's/.*uses:\s*//; s/\s*#.*//'); tag=$(echo "$line" | sed -E 's/.*#\s*//; s/\s.*//')
   repo=${ref%@*}; sha=${ref#*@}
-  got=$(gh api "repos/$repo/git/ref/tags/$tag" -q .object.sha 2>/dev/null)
-  # annotated tags: follow one level
-  [ "$(gh api "repos/$repo/git/ref/tags/$tag" -q .object.type)" = tag ] && got=$(gh api "repos/$repo/git/tags/$got" -q .object.sha)
-  [ "$got" = "$sha" ] && echo "OK   $ref" || echo "MISMATCH $ref (tag $tag -> $got)"
+  got=$(gh api "repos/$repo/git/matching-refs/tags/$tag" 2>/dev/null \
+        | python3 -c "import sys,json;rs=[r for r in json.load(sys.stdin) if r['ref']=='refs/tags/$tag'];print(rs[0]['object']['sha'] if rs else '')")
+  typ=$(gh api "repos/$repo/git/matching-refs/tags/$tag" 2>/dev/null \
+        | python3 -c "import sys,json;rs=[r for r in json.load(sys.stdin) if r['ref']=='refs/tags/$tag'];print(rs[0]['object']['type'] if rs else '')")
+  [ "$typ" = tag ] && got=$(gh api "repos/$repo/git/tags/$got" -q .object.sha)
+  if [ "$got" = "$sha" ]; then echo "OK       $ref  # $tag"; else echo "MISMATCH $ref  # $tag -> $got"; fail=1; fi
 done
+# (run the loop in the current shell, not a pipe subshell, so $fail propagates; exit $fail)
 
-# Mutants committed on a scratch branch; check each sed changed the tree.
 uv run ruff check src/ tests/ scripts/ && uv run mypy src/
 ```
 
-Edge cases: an annotated tag (two-level dereference — `actions/*` use these);
-an action whose tag was retagged upstream between resolution and merge (re-run
-the resolver script in CI's `workflows` job? — no: that is a network call in a
-guard, rejected; the guard asserts *form*, Dependabot asserts *currency*); a
-`uses:` at **job** level for a reusable workflow (none exist today — the
-invariant must skip `uses:` whose value contains `.yml@`, and a test must pin
-that skip so a future reusable workflow is not misreported).
+Edge cases: annotated vs lightweight tags (both present); a `uses:` at job level
+for a reusable workflow (none today — skip pinned by test); `docker://` refs
+(none today — decision pinned by test); the composite action's `runs:` block
+must not be mistaken for a step list.
 
 ## Acceptance criteria
 
 - [ ] `all_uses_are_sha_pinned` is **RED against unchanged `main`** and reports
-      all 29 non-local refs — proven by running the new invariant before any
-      workflow is edited. A guard that starts green has not seen the problem.
-- [ ] After pinning, the checker exits 0 on the tree, and the SHA-resolution
-      loop above reports **29 OK, 0 MISMATCH**. A pin whose SHA does not match
-      its claimed tag must not pass.
-- [ ] The three new mutants (`tag-pinned-action`, `sha-comment-dropped`,
-      `sha-moved`) each exit non-zero as **committed** scratch-branch mutants,
-      with evidence that each sed **actually modified the file** — the existing
-      `forked-action` mutant would otherwise silently stop mutating once its
-      target string is gone.
-- [ ] A correctly pinned ref with its comment **passes** the new invariant, and
-      a job-level reusable-workflow `uses:` is **skipped**, not flagged — proven
-      by a synthetic fixture.
-- [ ] `TestMutationHelperContract`'s bidirectional check passes with the new
-      mutants present, so the helper and the tests still name the same set.
-- [ ] Every remaining `uses:` in `.github/workflows/` is either a local path or
-      matches the pinned form — asserted by grep in the evidence file, count 29.
+      **30** refs across `.github/workflows/` and the composite action. A guard
+      that starts green has not seen the problem. Count is 30, not 29:
+      rev 1 excluded the composite's ref.
+- [ ] After pinning, the checker exits 0, and the resolution loop reports
+      **30 OK, 0 MISMATCH with a non-zero aggregate exit on any mismatch** — a
+      pin whose SHA does not match its claimed release must not pass.
+      **WAS WRONG (rev 1):** its loop printed MISMATCH and exited 0.
+- [ ] The three re-anchored mutants (`continue-on-error-step`,
+      `if-on-publish-step`, `forked-action`) each **still mutate** — evidence
+      shows a commit hash differing from base — and still exit non-zero. Rev 1
+      would have left all three as silent survivors.
+- [ ] The four new mutants each exit non-zero as committed scratch-branch
+      mutants, with the same helper-exit + commit-hash evidence.
+- [ ] A correctly pinned ref with comment passes; a reusable-workflow `uses:` is
+      skipped; a subdirectory action passes. All three by synthetic fixture.
+- [ ] `EXPECTED_USES` contains **no comments** and matches the pinned
+      `release.yml` — proven by the checker exiting 0 on it, which rev 1's form
+      could never have done.
+- [ ] The pypa pin is `v1.9.0`'s commit, and the CHANGELOG states the 144-commit
+      rollback explicitly.
+- [ ] `dependabot.yml` has the composite-action directory entry.
 - [ ] Full suite green.
 
 ## Non-goals
 
-- Pinning the local composite action `./.github/actions/pipeline-bootstrap-setup`
-  — it is repo-owned source, reviewed like any other file.
-- Changing Dependabot's cadence or grouping.
-- Verifying SHA currency inside the CI guard. That would put a network call on
-  the merge path; Dependabot owns currency, the guard owns form.
-- Pinning Docker base images in `docker.yml`'s Dockerfile — same class, separate
-  ecosystem, its own issue if wanted.
+- Verifying SHA currency inside the CI guard — a network call on the merge path.
+  Dependabot owns currency; the guard owns form.
+- Pinning `python:3.12-slim` in the `Dockerfile` by digest. Same class, different
+  ecosystem, its own issue.
+- Changing what the composite action *does*; only its one `uses:` is pinned.
 
 ## Execution Policy
 
-- execute: effort=medium, reason=mechanical edits across five files, but the
-  guard and mutant updates must land atomically with the release.yml pins or CI
-  is red mid-sequence, and a wrong SHA is a silent supply-chain failure
+- execute: effort=medium, reason=mechanical across seven files, but three
+  mutant anchors and the guard constants must land atomically with the
+  release.yml pins, and the pypa pin is a deliberate rollback on the publish path
