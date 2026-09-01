@@ -105,49 +105,49 @@ Base: the implementation commit. `helper` is `_mutate_workflow.sh`'s exit,
 | mutant | expected | helper | commit | checker | reason |
 |---|---|---|---|---|---|
 | *(none: unmutated tree)* | 0 | — | — | 0 | — |
-| `tag-case` | 1 | 0 | `3e339ad` | **1** | `[release]` |
-| `tags-deleted` | 1 | 0 | `07a838e` | **1** | `[release]` |
-| `trigger-pull-request-added` | 1 | 0 | `fa37b8b` | **1** | `[release]` |
-| `trigger-push-branches-added` | 1 | 0 | `ef8ed1a` | **1** | `[release]` |
-| `trigger-workflow-dispatch-added` | 1 | 0 | `e105218` | **1** | `[release]` |
-| `trigger-paths-filter-added` | 1 | 0 | `e3ce0fc` | **1** | `[release]` |
-| `env-dropped` | 1 | 0 | `916c3d2` | **1** | `[release]` |
-| `env-renamed` | 1 | 0 | `53b8ebd` | **1** | `[release]` |
-| `needs-build-dropped` | 1 | 0 | `81aa64e` | **1** | `[release]` |
-| `needs-publish-to-build` | 1 | 0 | `1d1a2e6` | **1** | `[release]` |
-| `continue-on-error-job` | 1 | 0 | `b834dfb` | **1** | `[release]` |
-| `continue-on-error-step` | 1 | 0 | `576dc00` | **1** | `[release]` |
-| `if-on-build-job` | 1 | 0 | `d81ecf0` | **1** | `[release]` |
-| `continue-on-error-build-job` | 1 | 0 | `7e220c8` | **1** | `[release]` |
-| `new-tag-triggered-workflow` | 1 | 0 | `4636780` | **1** | `[release]` |
-| `if-on-publish-job` | 1 | 0 | `aef994f` | **1** | `[release]` |
-| `if-on-publish-step` | 1 | 0 | `66b53dd` | **1** | `[release]` |
-| `forked-action` | 1 | 0 | `7caa446` | **1** | `[release]` |
-| `permissions-job-widened` | 1 | 0 | `75fb7c0` | **1** | `[release]` |
-| `permissions-workflow-level` | 1 | 0 | `3b3a383` | **1** | `[release]` |
-| `job-added` | 1 | 0 | `6a392ca` | **1** | `[release]` |
-| `job-deleted` | 1 | 0 | `1ae3523` | **1** | `[drift] [release]` |
-| `file-deleted` | 1 | 0 | `7a7feb1` | **1** | `[drift] [release]` |
-| `timeout-360` | 1 | 0 | `1422282` | **1** | `[timeout]` |
-| `timeout-1` | 1 | 0 | `1db916e` | **1** | `[timeout]` |
-| `timeout-string` | 1 | 0 | `9552665` | **1** | `[timeout]` |
-| `timeout-bool` | 1 | 0 | `aa5f6c6` | **1** | `[timeout]` |
-| `timeout-deleted` | 1 | 0 | `248fa75` | **1** | `[timeout]` |
-| `maintenance-deleted` | 1 | 0 | `3d08225` | **1** | `[drift]` |
-| `changelog-job-deleted` | 1 | 0 | `fec6b04` | **1** | `[drift]` |
-| `workflows-job-deleted` | 1 | 0 | `8ec7556` | **1** | `[drift]` |
-| `tag-pinned-action` | 1 | 0 | `4b83073` | **1** | `[pin]` |
-| `sha-comment-dropped` | 1 | 0 | `7ff6f57` | **1** | `[pin]` |
-| `sha-moved` | 1 | 0 | `4140843` | **1** | `[release]` |
-| `pypa-rolled-back` | 1 | 0 | `7cc269a` | **1** | `[release]` |
-| `composite-tag-pinned` | 1 | 0 | `7595c0d` | **1** | `[pin]` |
-| `uses-quoted-key` | 1 | 0 | `4d2886b` | **1** | `[pin]` |
-| `needs-as-list` | 0 | 0 | `0edbb5b` | 0 | — |
-| `timeout-below-p100` | 0 | 0 | `815da29` | 0 | — |
-| `concurrency-added` | 0 | 0 | `6d0edfe` | 0 | — |
-| `guard-self-disabled` | 0 | 0 | `6469415` | 0 | — |
-| `guard-self-disabled-nonconstant` | 0 | 0 | `96519f6` | 0 | — |
-| `guard-step-gutted` | 0 | 0 | `9cf53be` | 0 | — |
+| `tag-case` | 1 | 0 | `71d0591` | **1** | `[release]` |
+| `tags-deleted` | 1 | 0 | `012aa87` | **1** | `[release]` |
+| `trigger-pull-request-added` | 1 | 0 | `88aec17` | **1** | `[release]` |
+| `trigger-push-branches-added` | 1 | 0 | `531135f` | **1** | `[release]` |
+| `trigger-workflow-dispatch-added` | 1 | 0 | `b6aa0ac` | **1** | `[release]` |
+| `trigger-paths-filter-added` | 1 | 0 | `d0300a9` | **1** | `[release]` |
+| `env-dropped` | 1 | 0 | `cc34cec` | **1** | `[release]` |
+| `env-renamed` | 1 | 0 | `dea8f64` | **1** | `[release]` |
+| `needs-build-dropped` | 1 | 0 | `f5fca3f` | **1** | `[release]` |
+| `needs-publish-to-build` | 1 | 0 | `452520b` | **1** | `[release]` |
+| `continue-on-error-job` | 1 | 0 | `edfd0f7` | **1** | `[release]` |
+| `continue-on-error-step` | 1 | 0 | `f6acee8` | **1** | `[release]` |
+| `if-on-build-job` | 1 | 0 | `dbe90c6` | **1** | `[release]` |
+| `continue-on-error-build-job` | 1 | 0 | `3f7fd30` | **1** | `[release]` |
+| `new-tag-triggered-workflow` | 1 | 0 | `d78d7c2` | **1** | `[release]` |
+| `if-on-publish-job` | 1 | 0 | `eca06df` | **1** | `[release]` |
+| `if-on-publish-step` | 1 | 0 | `0f80261` | **1** | `[release]` |
+| `forked-action` | 1 | 0 | `1fa72c5` | **1** | `[release]` |
+| `permissions-job-widened` | 1 | 0 | `93009de` | **1** | `[release]` |
+| `permissions-workflow-level` | 1 | 0 | `dbc0efb` | **1** | `[release]` |
+| `job-added` | 1 | 0 | `a36fdaa` | **1** | `[release]` |
+| `job-deleted` | 1 | 0 | `bb42751` | **1** | `[drift] [release]` |
+| `file-deleted` | 1 | 0 | `f29256d` | **1** | `[drift] [release]` |
+| `timeout-360` | 1 | 0 | `583eb9d` | **1** | `[timeout]` |
+| `timeout-1` | 1 | 0 | `35f8f2a` | **1** | `[timeout]` |
+| `timeout-string` | 1 | 0 | `d0195eb` | **1** | `[timeout]` |
+| `timeout-bool` | 1 | 0 | `a5ecf95` | **1** | `[timeout]` |
+| `timeout-deleted` | 1 | 0 | `a33022e` | **1** | `[timeout]` |
+| `maintenance-deleted` | 1 | 0 | `ce938c0` | **1** | `[drift]` |
+| `changelog-job-deleted` | 1 | 0 | `1c04129` | **1** | `[drift]` |
+| `workflows-job-deleted` | 1 | 0 | `2e7fc1e` | **1** | `[drift]` |
+| `tag-pinned-action` | 1 | 0 | `430c549` | **1** | `[pin]` |
+| `sha-comment-dropped` | 1 | 0 | `2dd6774` | **1** | `[pin]` |
+| `sha-moved` | 1 | 0 | `10b6f01` | **1** | `[release]` |
+| `pypa-rolled-back` | 1 | 0 | `b6b79b7` | **1** | `[release]` |
+| `composite-tag-pinned` | 1 | 0 | `45b0cf8` | **1** | `[pin]` |
+| `uses-quoted-key` | 1 | 0 | `8a3784e` | **1** | `[pin]` |
+| `needs-as-list` | 0 | 0 | `6930fca` | 0 | — |
+| `timeout-below-p100` | 0 | 0 | `b54e1c0` | 0 | — |
+| `concurrency-added` | 0 | 0 | `aada7f6` | 0 | — |
+| `guard-self-disabled` | 0 | 0 | `fafa2ba` | 0 | — |
+| `guard-self-disabled-nonconstant` | 0 | 0 | `a47eb2c` | 0 | — |
+| `guard-step-gutted` | 0 | 0 | `eff41d7` | 0 | — |
 
 43 rows, 37 expected to fail, 6 expected green; every helper exit 0, every hash
 distinct, every expected failure reported by the expected check, every expected
@@ -171,6 +171,17 @@ green row green.
   killed by `EXPECTED_USES` and tagged `[release]`, not `[pin]`. The pin
   invariant does not and cannot catch these; the evidence says so rather than
   implying it.
+
+### Anchors match the form of a pin, not its value
+
+The first Dependabot bump of the composite's pin (#219, v4.4.0 → v7.0.0) went
+red: two mutants and two tests had anchored on the literal
+`@49933ea… # v4.4.0`. Every anchor that contains a pinned `uses:` line now
+matches `@<40 hex> # <release>` by regex (`replace_re`, `replace_after_re`,
+`flip_last_hex`), still exactly-once and fail-loud, and a contract test
+forbids any 40-hex literal in the helper or the tests other than the
+deliberate v1.9.0 rollback target. The matrix above was re-run after that
+change; every row still mutates and is still killed.
 
 ### Re-anchored mutants
 
