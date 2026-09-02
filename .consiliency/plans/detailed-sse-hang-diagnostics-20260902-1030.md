@@ -95,6 +95,27 @@ process: **107 passed, 3/3 runs**, ~17 s each. A full-suite run with coverage an
 also passes. Absence of a local repro is expected for a timing-dependent flake
 and is not evidence against it.
 
+**The measurement is already done** (`--durations=25`, full suite, this
+worktree, 2026-09-02): the slowest non-`live` items are
+`tests/test_progressive_disclosure.py::TestScenario7…::test_invoke_query_docs`
+and `…TestScenario8…::test_invoke_query_docs_conceptual` at **60.06 s each**
+(both land on exactly 60 s, which looks like an internal timeout rather than
+real work — noted, not in scope), then
+`test_subscriptions_e2e.py::test_connect_disconnect_refresh_each_deliver_all_three_kinds`
+at 19.06 s and `test_shutdown_handles_timeout` at 10.08 s. So: **`timeout = 600`**
+(10× the slowest) and **`faulthandler_timeout = 120`** (2× the slowest, and well
+below the kill). The implementer does not need to re-run the measurement; it must
+re-run only if it changes either number.
+
+**Host quirk, not a regression.** A full run *from this worktree* reports ~107
+failed / 106 errors in `test_version_checker.py`, `test_npm_resolver.py` and
+`test_tools.py`, because `/tmp/package.json` exists on this host and the npm
+identity resolver's `localPrefix` walk finds it (documented in
+`tests/conftest.py`). The same suite from `/home/viperjuice/code/pmcp` was
+**3386 passed, 3 skipped, 25 deselected in 7m40s, zero faulthandler dumps**.
+Compare like with like: the acceptance counts below mean *the same command from
+the same directory*, before and after.
+
 **Tooling facts.** pytest is **9.0.2**; `faulthandler_timeout` /
 `faulthandler_exit_on_timeout` are **built-in ini options** (no dependency).
 `pytest_timeout` is **not installed**, so the `timeout` marker declared in
@@ -115,11 +136,14 @@ touches none.
   continue**. This is the zero-risk half: it kills nothing, and on the next CI
   hit it prints the stack of the stuck await into the job log. Set in the ini
   file, not the CI command line, so a local run behaves like CI.
-- `[tool.pytest.ini_options]` — add `timeout` and `timeout_method = "thread"` —
-  the fail-fast half, via `pytest-timeout`. **Choose the value from a
-  measurement, not a guess**: run `--durations=25` on the full suite and set the
-  timeout to roughly 10× the slowest non-`live` test, floor 120 s. Record the
-  measured slowest test and the chosen number in a comment on the setting.
+- `[tool.pytest.ini_options]` — add `timeout = 600` and `timeout_method` — the
+  fail-fast half, via `pytest-timeout`. 600 s is 10× the measured slowest
+  non-`live` test (60.06 s, above); `faulthandler_timeout = 120` is 2× it, so the
+  stack dump lands 8 minutes before the kill and both sit inside the job's
+  `timeout-minutes: 25`. Put the measured test name and both numbers in a comment
+  on the setting, so the next person changing them knows what they were derived
+  from. `timeout_method` is chosen by the teardown-coverage proof below, not
+  assumed.
 - `[dependency-groups] dev` (or the existing test extra — match where
   `pytest-cov` lives, around `:109-112`) — add `pytest-timeout>=2.3`.
 
