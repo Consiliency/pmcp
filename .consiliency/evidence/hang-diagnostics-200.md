@@ -136,6 +136,136 @@ the committed settings, so the dump always precedes the kill and both precede th
 job cap. (`getini` returns a float for one and a string for the other, so an
 `isinstance(..., int)` check would have been invalid either way.)
 
+## The async blind spot, and the watchdog that closes it
+
+Everything above induces a **synchronous** hang (`time.sleep`), where a signal
+traceback names the offending line trivially. The hang this change is actually
+chasing is a **suspended coroutine**, and that is a different problem: a
+suspended coroutine's frames live in `Task` objects, not on any thread stack.
+Both `faulthandler` and `pytest-timeout` dump the *thread* stack. So they name
+nothing.
+
+Reproduced on this branch. A test awaiting an `Event` through a coroutine and an
+async generator, killed by `-o timeout=8 -o timeout_method=signal`, reports this
+and nothing more:
+
+```
+        ready = []
+        try:
+>           fd_event_list = self._selector.poll(timeout, max_ev)
+E           Failed: Timeout (>8.0s) from pytest-timeout.
+
+.../python3.14/selectors.py:452: Failed
+```
+
+`epoll.poll` — the stuck await is invisible. Without a fix, this PR would have
+converted a 25-minute silent cancel into a 700-second failure that **still could
+not tell `_tap()` from `connect_server()` from `disconnect_all()`**, which is the
+one question #200 exists to answer.
+
+`tests/runtime/_hang_watchdog.py` closes it. Same module, same command, with
+`-p tests.runtime._hang_watchdog`:
+
+```
+[async-stacks] test_async_induced.py::test_hangs_inside_an_async_generator has been running 2.0s (threshold 2.0s) -- see Consiliency/pmcp#200
+[async-stacks] 1 pending task(s) on <_UnixSelectorEventLoop running=True closed=False debug=False>:
+--- <Task pending name='Task-2' coro=<test_hangs_inside_an_async_generator() running at .../test_async_induced.py:15> wait_for=<Future pending cb=[Task.task_wakeup()]> ...>
+Stack for <Task pending name='Task-2' ...> (most recent call last):
+  File ".../test_async_induced.py", line 15, in test_hangs_inside_an_async_generator
+    await _drives_the_generator()
+    [await chain] (what print_stack cannot reach):
+      File ".../test_async_induced.py", line 15, in test_hangs_inside_an_async_generator
+        await _drives_the_generator()
+      File ".../test_async_induced.py", line 10, in _drives_the_generator
+        async for _ in _tap_like_generator():
+      File ".../test_async_induced.py", line 5, in _tap_like_generator
+        await asyncio.Event().wait()
+      File ".../python3.14/asyncio/locks.py", line 213, in wait
+        await fut
+      -- suspended on <_asyncio.FutureIter object at 0x75d1e5af82b0>
+```
+
+That is the whole point of the change, in one block: the exact coroutine, the
+exact generator, the exact awaited line.
+
+### Why `Task.print_stack()` alone was not enough
+
+For a **suspended** coroutine `Task.get_stack()` returns a *single* frame — the
+coroutine's own `cr_frame`, whose `f_back` is `None` because a suspended
+coroutine sits on nobody's stack. That is the `Stack for <Task pending ...>`
+section above, and on its own it names `test_hangs_inside_an_async_generator`
+and stops. Everything beneath it is reachable only by walking `cr_await` /
+`ag_await`, which is the `[await chain]` section.
+
+That walk is **required, not a refinement**: the prime suspect is `_tap()` at
+`test_emitter_harness.py:65`, an **async generator** wrapped around the SSE read
+stream. `print_stack()` reports the task that drives such a generator; only the
+`ag_frame`/`ag_await` branch names the generator itself. The mutant therefore
+hangs *through* an async generator and asserts on the generator's own function
+name, so that branch cannot ship as dead code.
+
+One extra hop was needed and is worth recording. `async for x in agen()`
+suspends on an `async_generator_asend`, whose only public attributes are
+`close`/`send`/`throw` — no `ag_frame`, no `ag_await` — so the walk dead-ended
+one hop short of the generator, printing `-- suspended on
+<async_generator_asend object>`. Probed directly: `gc.get_referents()` on that
+object returns exactly `[async_generator]`. `_step_through_opaque()` takes that
+single hop, narrowly (first referent carrying a coroutine/generator frame) and
+fully guarded.
+
+### Both directions
+
+| run | result |
+|---|---|
+| with `-p tests.runtime._hang_watchdog` | timeout fires, `[async-stacks]` present, chain names `_drives_the_generator` **and** `_tap_like_generator` |
+| without it | timeout fires, `[async-stacks]` absent, traceback ends at the selector, `_tap_like_generator` nowhere in the output |
+
+The negative run still *fails* — this is not "nothing happened" — it simply
+cannot say where. Asserted in
+`test_without_the_watchdog_an_async_hang_names_only_the_selector`.
+
+The subprocess proofs certify the plugin's logic but not the wiring, so
+`test_the_watchdog_is_wired_into_this_package` asserts, inside a normal run,
+that `pytest_runtest_logstart` recorded *this* item's nodeid and that the autouse
+async fixture handed the watchdog `asyncio.get_running_loop()`.
+
+### Design constraints, and why
+
+- **The loop must come from `asyncio.get_running_loop()` in an async fixture.**
+  A watchdog thread cannot reach a running loop on its own, and
+  `get_event_loop_policy().get_event_loop()` from a sync fixture raises
+  `RuntimeError('no running event loop')`. An autouse *async* fixture is safe
+  for this package's sync tests too — under `asyncio_mode = "auto"` they get a
+  loop as well; verified against a mixed sync/async module before relying on it.
+- **One session daemon thread, not a `threading.Timer` per test.** `Timer.start()`
+  spawns a thread; per-item would be ~3400 thread creations across the suite. The
+  thread starts lazily at the first `pytest_runtest_logstart`, so `--collect-only`
+  spawns nothing.
+- **Armed from `logstart`, cleared at `logfinish`**, so the window covers setup,
+  call **and teardown**. Teardown coverage is the point, for the same reason it
+  was for `timeout_method`.
+- **It can never fail.** Every path swallows; the worst case is silence. A
+  watchdog that can raise turns a diagnosable hang into a confusing error.
+  `asyncio.all_tasks()` snapshots a WeakSet the loop is mutating, so from another
+  thread it can raise `RuntimeError: Set changed size during iteration` — retried,
+  then abandoned quietly.
+- **60 s, strictly below `faulthandler_timeout = 120`**, so async stacks land
+  before the thread dump and long before the 700 s kill.
+
+### Scope: `tests/runtime/`, not `tests/`
+
+Registered in `tests/runtime/conftest.py`. Three reasons, one of them decisive:
+
+1. All five CI stalls happened in this package.
+2. The slowest item here is **26.16 s** against a 60 s threshold — >2× headroom.
+3. Decisive: at `tests/` scope the two progressive-disclosure tests at **60.22 s
+   and 60.25 s** sit right on the threshold and would trip a spurious dump on
+   essentially every run. A diagnostic that cries wolf every run is worse than
+   none, and lowering its value to fit them would forfeit the headroom in 1–2.
+
+A run of the whole package with the watchdog live produced **zero** dumps
+(`grep -c "async-stacks"` → 0 over `69 passed in 123.43s`).
+
 ## The two `run_fake_remote` mutants
 
 On unchanged `main`, `run_fake_remote`'s `finally` is `server.should_exit = True;

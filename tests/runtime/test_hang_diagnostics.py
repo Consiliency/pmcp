@@ -26,6 +26,12 @@ diagnostic fires, mutant-style (`.consiliency/evidence/mutation-217.md`):
     line in those five logs.
   * a subprocess run proving `faulthandler_timeout` dumps a stack and lets the
     session continue, and that the dump is scheduled strictly before the kill.
+  * an **async** hang — the shape the real one is believed to have — proving the
+    watchdog in `_hang_watchdog.py` names the awaiting coroutine. Both
+    `faulthandler` and `pytest-timeout` dump the *thread* stack, and a suspended
+    coroutine has no frames there, so those two alone bottom out in
+    `epoll.poll()` and name nothing. Proven in both directions, with and
+    without the plugin.
 
 The subprocess runs pass `-o timeout=… -o timeout_method=…` explicitly: a temp
 test file makes the temp directory the rootdir, so the project's
@@ -36,6 +42,7 @@ Linux's default method while CI ran another.
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import sys
 import time
@@ -45,7 +52,8 @@ from typing import Any
 import pytest
 from sse_starlette.sse import AppStatus
 
-from tests.runtime import fake_remote
+from tests.runtime import _hang_watchdog, fake_remote
+from tests.runtime._hang_watchdog import DUMP_SENTINEL
 from tests.runtime.harness import alloc_port
 
 # 2 x (SERVE_STOP_TIMEOUT + CANCEL_GRACE), the acceptance bound: the stop
@@ -343,3 +351,124 @@ def test_faulthandler_timeout_is_below_the_kill_timeout(
     # Both must fit inside the `test` job's `timeout-minutes: 25`, or the
     # 25-minute silent cancel this change exists to replace happens anyway.
     assert kill_timeout < 25 * 60
+
+
+# The shape the real hang is believed to have: a coroutine suspended on an
+# await, reached *through an async generator*. `_tap()` in
+# `test_emitter_harness.py:65` is an async generator wrapped around the SSE read
+# stream, and it is the prime suspect, so the generator hop is the part that
+# matters -- not merely nested coroutines.
+_ASYNC_HANG_MODULE = """
+import asyncio
+
+
+async def _tap_like_generator():
+    await asyncio.Event().wait()
+    yield 1
+
+
+async def _drives_the_generator():
+    async for _ in _tap_like_generator():
+        break
+
+
+async def test_hangs_inside_an_async_generator():
+    await _drives_the_generator()
+"""
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _run_async_hang(tmp_path: Path, *, with_watchdog: bool) -> str:
+    """Run the async-hang module in a subprocess, with or without the plugin.
+
+    cwd is the repo root, not `tmp_path`: `-p tests.runtime._hang_watchdog` is
+    an import path and would not resolve from the temp directory. The module
+    file still lives under `tmp_path`, so the temp dir is the rootdir and the
+    project ini does not load -- hence the explicit `-o` settings.
+    """
+    module = tmp_path / "test_async_induced.py"
+    module.write_text(_ASYNC_HANG_MODULE)
+    plugin = ["-p", "tests.runtime._hang_watchdog"] if with_watchdog else []
+    env = dict(os.environ, PMCP_ASYNC_STACK_DUMP_AFTER="2")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", str(module), *plugin]
+        + [
+            "-p",
+            "no:cacheprovider",
+            "-o",
+            "asyncio_mode=auto",
+            "-o",
+            "timeout=8",
+            "-o",
+            "timeout_method=signal",
+            "-q",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=_REPO_ROOT,
+        env=env,
+    )
+    return result.stdout + result.stderr
+
+
+def test_an_async_hang_names_the_awaiting_coroutine(tmp_path: Path) -> None:
+    """The gap this watchdog exists to close.
+
+    Without it, a suspended coroutine killed by pytest-timeout reports only
+    `epoll.poll()` -- which cannot tell `_tap()` from `connect_server()` from
+    `disconnect_all()`, and those are the exact three candidates #200 has.
+    """
+    output = _run_async_hang(tmp_path, with_watchdog=True)
+
+    assert "Timeout" in output, output
+    assert DUMP_SENTINEL in output, output
+    # The task's own coroutine -- what `Task.print_stack()` can reach.
+    assert "test_hangs_inside_an_async_generator" in output, output
+    # And the frames underneath it, which `print_stack()` cannot: a suspended
+    # coroutine's `cr_frame.f_back` is None, so the walk down `cr_await` /
+    # `ag_await` is the only way to these.
+    assert "_drives_the_generator" in output, output
+    assert "_tap_like_generator" in output, output
+    assert "[await chain]" in output, output
+
+
+def test_without_the_watchdog_an_async_hang_names_only_the_selector(
+    tmp_path: Path,
+) -> None:
+    """The negative half: prove the frames above came from the watchdog.
+
+    Same hang, same timeout, no plugin. pytest-timeout still fires -- so this is
+    not a case of nothing happening -- but the traceback bottoms out in the
+    selector and the awaiting coroutine is invisible.
+    """
+    output = _run_async_hang(tmp_path, with_watchdog=False)
+
+    assert "Timeout" in output, output
+    assert DUMP_SENTINEL not in output, output
+    assert "[await chain]" not in output, output
+    # The epitaph from the CI logs: the thread stack parked in the selector.
+    assert "select" in output or "poll" in output, output
+    # The frames that only the watchdog can reach are absent.
+    assert "_tap_like_generator" not in output, output
+
+
+async def test_the_watchdog_is_wired_into_this_package(
+    request: pytest.FixtureRequest,
+) -> None:
+    """The subprocess proofs certify the plugin's logic but not the wiring.
+
+    This asserts the `conftest.py` re-export is live in a normal run: the hook
+    recorded *this* item, and the autouse async fixture handed the watchdog the
+    loop this test is actually running on.
+    """
+    state = _hang_watchdog._current
+
+    assert state is not None
+    assert state["nodeid"] == request.node.nodeid
+    assert state["loop"] is asyncio.get_running_loop()
+    assert state["dumped"] is False
+    # Started lazily, on the first item rather than at import.
+    assert _hang_watchdog._thread is not None
+    assert _hang_watchdog._thread.daemon is True

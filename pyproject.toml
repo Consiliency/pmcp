@@ -159,12 +159,19 @@ addopts = "-m 'not live'"
 # timeout rather than real work -- noted, not in scope here.)
 #
 #   faulthandler_timeout = 120  -- 2x the slowest test. Zero-risk half: it
-#     kills nothing, it dumps every thread's stack and lets the run continue,
-#     which is what actually names the stuck await.
+#     kills nothing, it dumps every thread's stack and lets the run continue.
 #   timeout              = 700  -- >=10x the slowest test (10 x 60.25 = 602.5,
 #     so 600 would have been 9.96x and short of the bar). The fail-fast half,
 #     via pytest-timeout. The dump therefore lands ~9.7 minutes before the
 #     kill, and both sit well inside the `test` job's `timeout-minutes: 25`.
+#
+# Neither of these can see a *suspended coroutine*: its frames live in Task
+# objects, not on any thread stack, so both bottom out in `epoll.poll()` and
+# name nothing. `tests/runtime/_hang_watchdog.py` closes that at 60 s by
+# dumping the pending tasks and walking the await chain. Full order, each
+# strictly below the next:
+#
+#   60 s -> async stacks | 120 s -> thread stacks | 700 s -> kill | 25 min -> job cap
 #
 # Set here rather than on the CI command line so a local run behaves like CI.
 # `timeout_method` is not the platform default by accident: it is the value
