@@ -40,7 +40,12 @@ made splitting it fail:
      stream created afterwards — in any loop, against any server —
      terminates immediately. Fixed in `tests/runtime/fake_remote.py`'s
      `run_fake_remote` `finally:` block, which is the one place that resets
-     it.
+     it. (Version note, Consiliency/pmcp#200: the installed sse_starlette is
+     3.1.1, whose `AppStatus` has no `should_exit_event` — it keeps a
+     per-event-loop `_ShutdownState` in a `contextvars.ContextVar` and reads
+     the live server back out of `signal.getsignal(signal.SIGTERM).__self__`;
+     the class attribute above, and this reset, are still exactly as
+     described.)
 
 These two causes are unrelated — the earlier "two symptoms, one root"
 framing in this docstring was wrong. Both are fixed now, independently, and
