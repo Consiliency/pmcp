@@ -110,6 +110,9 @@ dev = [
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
     "pytest-mock>=3.0",
+    # Consiliency/pmcp#200: without this the `timeout` ini option below is
+    # inert and a stuck await is a 25-minute silent job cancel.
+    "pytest-timeout>=2.3",
     "ruff>=0.8.0",
     "mypy>=1.0",
     "types-PyYAML>=6.0",
@@ -141,6 +144,36 @@ artifacts = ["src/pmcp/manifest/_npm_resolve.js"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 addopts = "-m 'not live'"
+# Consiliency/pmcp#200 -- diagnostics for the intermittent runtime hang. Five
+# `test (3.x)` jobs in the week to 2026-09-01 stalled and were killed by the
+# job's `timeout-minutes: 25`; GitHub reports a timed-out job as *cancelled*,
+# so none of them produced a red X, a traceback, or one line of evidence about
+# which await was stuck. These two settings turn that into a fast, loud
+# failure. They do not fix the hang -- the root cause is still unknown.
+#
+# Both numbers derive from `pytest tests/ --durations=25` on 2026-09-02 (see
+# `.consiliency/evidence/hang-diagnostics-200.md`). The slowest non-`live`
+# tests are `test_progressive_disclosure.py::TestScenario8_LibraryConcepts
+# ::test_invoke_query_docs_conceptual` at 60.25 s and its Scenario7 sibling at
+# 60.22 s. (Both land on almost exactly 60 s, which looks like an internal
+# timeout rather than real work -- noted, not in scope here.)
+#
+#   faulthandler_timeout = 120  -- 2x the slowest test. Zero-risk half: it
+#     kills nothing, it dumps every thread's stack and lets the run continue,
+#     which is what actually names the stuck await.
+#   timeout              = 700  -- >=10x the slowest test (10 x 60.25 = 602.5,
+#     so 600 would have been 9.96x and short of the bar). The fail-fast half,
+#     via pytest-timeout. The dump therefore lands ~9.7 minutes before the
+#     kill, and both sit well inside the `test` job's `timeout-minutes: 25`.
+#
+# Set here rather than on the CI command line so a local run behaves like CI.
+# `timeout_method` is not the platform default by accident: it is the value
+# that `tests/runtime/test_hang_diagnostics.py` empirically proves also covers
+# *fixture teardown*, which is where the likeliest hang site is -- pytest
+# prints `PASSED` when the test function returns, before teardown runs.
+faulthandler_timeout = 120
+timeout = 700
+timeout_method = "signal"
 markers = [
     "live: opt-in live integration tests (require network and package managers)",
     "timeout(seconds): expected maximum runtime for slow opt-in tests",

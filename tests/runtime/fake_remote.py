@@ -40,6 +40,17 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 AUTH_HEADER = "authorization"
 
+# Bounds on `run_fake_remote`'s stop sequence (Consiliency/pmcp#200). uvicorn's
+# graceful drain here is unbounded -- the `uvicorn.Config` below is constructed
+# without `timeout_graceful_shutdown` -- so `await server.serve()`'s task could
+# never return, and did: five CI jobs died to a 25-minute silent cancel with no
+# traceback. A healthy stop in this harness is sub-second, so 10 s is ~20x the
+# observed cost and far below any pytest-level timeout. `CANCEL_GRACE` is what
+# a cancelled `serve()` gets to unwind before the stop sequence gives up on it
+# and says so out loud.
+SERVE_STOP_TIMEOUT = 10.0
+CANCEL_GRACE = 5.0
+
 # The three notification methods a real downstream can claim through the
 # SDK's typed `ServerSession` helpers -- anything else (including an
 # unrecognised method, EC-FANOUT-5's no-op case) has no typed helper and
@@ -254,13 +265,76 @@ async def run_fake_remote(
             emitter=app.state.fake_remote_emitter,
         )
     finally:
-        server.should_exit = True
-        await task
-        # sse_starlette.sse.AppStatus.should_exit is a process-global class
-        # attribute, latched True by its uvicorn-shutdown signal handler and
-        # never reset. Left alone, every SSE stream created afterwards — in
-        # any event loop, against any server — terminates immediately, which
-        # poisons whichever test runs next. This is the one site that resets
-        # it; nothing else in the repo should. It is cleared on entry too, so a
-        # server started elsewhere in this interpreter cannot poison this one.
-        AppStatus.should_exit = False
+        try:
+            server.should_exit = True
+            # Bounded, so a server that never stops fails this test in 15 s
+            # with a message instead of stalling the job for 25 minutes
+            # (Consiliency/pmcp#200).
+            #
+            # NOT `asyncio.wait_for`, which cannot bound a cancellation-
+            # resistant task: it cancels, then waits for the cancellation to
+            # *finish*, so a `serve()` that swallows `CancelledError` hangs it
+            # exactly as hard as the bare `await task` this replaces. Verified
+            # empirically -- such a coroutine survived `wait_for`, an outer
+            # `wait_for` guard, and `asyncio.run`'s own shutdown. `asyncio.wait`
+            # never awaits a pending task: it reports it and moves on, which is
+            # why the raise below happens whether or not the cancel took.
+            # `tests/runtime/test_hang_diagnostics.py` pins both mutants.
+            _, pending = await asyncio.wait({task}, timeout=SERVE_STOP_TIMEOUT)
+            if pending:
+                task.cancel()
+                _, pending = await asyncio.wait({task}, timeout=CANCEL_GRACE)
+                survived = bool(pending)
+                # Whether the task survived cancellation is the single most
+                # valuable fact for root-causing this, and no stack dump
+                # reports it -- an idle loop parked in `epoll.poll()` names
+                # nothing.
+                raise RuntimeError(
+                    f"fake remote on port {port} did not stop within "
+                    f"{SERVE_STOP_TIMEOUT}s of should_exit=True; "
+                    + (
+                        f"the serve() task SURVIVED cancellation after "
+                        f"{CANCEL_GRACE}s and is now orphaned"
+                        if survived
+                        else "the serve() task ended only once cancelled"
+                    )
+                    + f" [server.started={server.started!r} "
+                    f"server.should_exit={server.should_exit!r} "
+                    f"AppStatus.should_exit={AppStatus.should_exit!r}]"
+                    " -- see Consiliency/pmcp#200"
+                )
+            # Healthy path: surface whatever `serve()` itself raised, exactly
+            # as the previous bare `await task` did.
+            task.result()
+        finally:
+            # sse_starlette.sse.AppStatus.should_exit is a process-global class
+            # attribute, latched True by its uvicorn-shutdown signal handler and
+            # never reset. Left alone, every SSE stream created afterwards — in
+            # any event loop, against any server — terminates immediately, which
+            # poisons whichever test runs next. This is the one site that resets
+            # it; nothing else in the repo should. It is cleared on entry too, so
+            # a server started elsewhere in this interpreter cannot poison this
+            # one.
+            #
+            # The reset is unconditional and nested because the stop sequence
+            # above can now raise. Before Consiliency/pmcp#200 it sat after
+            # `await task`, so any exception on the way out would have skipped
+            # it and poisoned the next test with the very latch this harness
+            # exists to clear.
+            #
+            # The *mechanism* this comment used to describe was written against
+            # an older sse_starlette. Installed here is 3.1.1, where
+            # `vars(AppStatus)` is exactly
+            # `{should_exit, original_handler, handle_exit}`: there is no
+            # `should_exit_event`, so the fix floated in #200's early comment
+            # ("reset `should_exit_event = None`") cannot be written as stated.
+            # 3.1.1 keeps a per-event-loop `_ShutdownState` in a
+            # `contextvars.ContextVar`, and `_get_uvicorn_server()` reads
+            # `signal.getsignal(signal.SIGTERM).__self__` and polls *that*
+            # object's `should_exit`. Two consequences follow, both plausible
+            # and neither verified: a stale SIGTERM handler left by an earlier
+            # uvicorn server can make a later loop's watcher see
+            # `should_exit == True`, and a `_ShutdownState` registered on one
+            # loop is never signalled by a watcher on another. The reset below
+            # remains correct and necessary either way.
+            AppStatus.should_exit = False
