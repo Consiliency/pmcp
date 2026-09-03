@@ -203,13 +203,22 @@ class TestTheCallSitesAreWired:
         assert "ConnectionResetError" in error, error
         assert error != str(group)
 
-    def test_no_logged_exception_in_manager_is_interpolated_bare(self) -> None:
-        """Structural guard: a future edit must not reintroduce `{e}`.
+    def test_no_caught_exception_in_manager_is_stringified_bare(self) -> None:
+        """Structural guard: inside `except ... as e`, `e` may not become a
+        string except through a call.
 
-        Walks the AST for f-strings inside `except ... as <name>` handlers that
-        interpolate the bound name directly into a `logger.*` call. `str()` of
-        an exception group is the defect; `describe_exception(...)` is the fix,
-        so the bound name may only appear through a call.
+        **The first version of this guard only looked inside `logger.*` calls,
+        and that was a false green.** It passed while
+        `read_failure_reason = f"stdout read error: {e}"` (logged twice *and*
+        stored as `last_error`), four `last_error = str(e)` assignments, and the
+        error list `connect_server` returns to its caller all still rendered a
+        group as "unhandled errors in a TaskGroup". Those reach `pmcp status`,
+        `pmcp doctor`, health output and provision messages — further than any
+        log line.
+
+        So the rule is the broad one: within a handler that binds a name,
+        neither `f"...{name}..."` nor `str(name)` may appear anywhere.
+        `describe_exception(name)` is a `Call`, so the fix passes.
         """
         source = pathlib.Path(inspect.getsourcefile(manager_module) or "").read_text()
         tree = ast.parse(source)
@@ -220,29 +229,80 @@ class TestTheCallSitesAreWired:
                 continue
             bound = handler.name
             for node in ast.walk(handler):
-                if not isinstance(node, ast.Call):
-                    continue
-                func = node.func
-                if not (
-                    isinstance(func, ast.Attribute)
-                    and isinstance(func.value, ast.Name)
-                    and func.value.id == "logger"
+                if (
+                    isinstance(node, ast.FormattedValue)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == bound
                 ):
-                    continue
-                for fstring in ast.walk(node):
-                    if not isinstance(fstring, ast.FormattedValue):
-                        continue
-                    if (
-                        isinstance(fstring.value, ast.Name)
-                        and fstring.value.id == bound
-                    ):
-                        offenders.append(
-                            f"line {fstring.lineno}: logs `{{{bound}}}` directly"
-                        )
+                    offenders.append(
+                        f"line {node.lineno}: f-string interpolates `{{{bound}}}`"
+                    )
+                elif (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "str"
+                    and len(node.args) == 1
+                    and isinstance(node.args[0], ast.Name)
+                    and node.args[0].id == bound
+                ):
+                    offenders.append(f"line {node.lineno}: calls `str({bound})`")
 
         assert not offenders, (
-            "these logger calls interpolate a caught exception directly, so an "
-            "ExceptionGroup renders as 'unhandled errors in a TaskGroup' and "
-            "names nothing (Consiliency/pmcp#224). Use describe_exception():\n  "
-            + "\n  ".join(offenders)
+            "these render a caught exception directly, so an ExceptionGroup "
+            "becomes 'unhandled errors in a TaskGroup' and names nothing "
+            "(Consiliency/pmcp#224). Use describe_exception():\n  "
+            + "\n  ".join(sorted(set(offenders)))
         )
+
+    def test_the_guard_catches_an_indirect_interpolation(self) -> None:
+        """The guard must fail on the shape that defeated its first version.
+
+        A criterion that only passes is not a criterion: this feeds the guard's
+        own logic a handler that assigns `f"{e}"` to a local and only logs it
+        later, and requires a finding.
+        """
+        snippet = (
+            "try:\n"
+            "    pass\n"
+            "except Exception as e:\n"
+            "    reason = f'boom: {e}'\n"
+            "    logger.warning(reason)\n"
+        )
+        tree = ast.parse(snippet)
+        found = [
+            node
+            for handler in ast.walk(tree)
+            if isinstance(handler, ast.ExceptHandler) and handler.name
+            for node in ast.walk(handler)
+            if isinstance(node, ast.FormattedValue)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == handler.name
+        ]
+        assert found, "the guard would not catch an indirect interpolation"
+
+    async def test_last_error_names_the_cause_not_the_group(self) -> None:
+        """`last_error` reaches `pmcp status`, `pmcp doctor` and health output.
+
+        It was `str(e)` at four sites, so a user asking why a server is offline
+        was told "unhandled errors in a TaskGroup (1 sub-exception)".
+        """
+        manager = ClientManager()
+        group = await _group_from_anyio(ConnectionResetError("peer went away"))
+
+        async def _raise_group(*args: object, **kwargs: object) -> None:
+            raise group
+
+        manager._connect_singleflight = _raise_group  # type: ignore[method-assign]
+        config = MagicMock()
+        config.name = "remote"
+        manager._servers["remote"] = ServerStatus(
+            name="remote", status=ServerStatusEnum.ONLINE, tool_count=0
+        )
+
+        errors = await manager.connect_server(config)
+
+        assert errors and "ConnectionResetError" in errors[0], errors
+        assert "peer went away" in errors[0], errors
+        last_error = manager._servers["remote"].last_error or ""
+        assert "ConnectionResetError" in last_error, last_error
+        assert last_error != str(group)

@@ -1258,7 +1258,7 @@ class ClientManager:
             async with self._lifecycle_lock:
                 if server_name in self._servers:
                     self._servers[server_name].status = ServerStatusEnum.ERROR
-                    self._servers[server_name].last_error = str(e)
+                    self._servers[server_name].last_error = describe_exception(e)
             return False
         finally:
             async with self._lifecycle_lock:
@@ -1284,8 +1284,8 @@ class ClientManager:
             except Exception as e:
                 if config.name in self._servers:
                     self._servers[config.name].status = ServerStatusEnum.ERROR
-                    self._servers[config.name].last_error = str(e)
-                return [f"Failed to connect to {config.name}: {e}"]
+                    self._servers[config.name].last_error = describe_exception(e)
+                return [f"Failed to connect to {config.name}: {describe_exception(e)}"]
 
     def cancel_pending_requests(self, server: str) -> int:
         """Cancel pending requests for one server and return newly cancelled count."""
@@ -2399,7 +2399,7 @@ class ClientManager:
 
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
-            status.last_error = str(e)
+            status.last_error = describe_exception(e)
             for task in (managed.read_task, managed.stderr_task):
                 if task and not task.done():
                     task.cancel()
@@ -2710,7 +2710,7 @@ class ClientManager:
 
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
-            status.last_error = str(e)
+            status.last_error = describe_exception(e)
             if managed.read_task and not managed.read_task.done():
                 managed.read_task.cancel()
                 try:
@@ -2857,7 +2857,7 @@ class ClientManager:
                         continue
                     self._handle_stdout_line(name, managed, raw, now)
         except Exception as e:
-            read_failure_reason = f"stdout read error: {e}"
+            read_failure_reason = f"stdout read error: {describe_exception(e)}"
             logger.warning(f"[{name}] {read_failure_reason}")
         finally:
             # Mark server as offline when stdout closes
@@ -3428,7 +3428,7 @@ class ClientManager:
 
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
-            status.last_error = str(e)
+            status.last_error = describe_exception(e)
             await self._cleanup_client(name, managed)
             raise
 

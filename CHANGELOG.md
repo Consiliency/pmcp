@@ -22,8 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   3.10 raises `exceptiongroup.ExceptionGroup` from the backport. The rendered
   text goes through `sanitize_auth_diagnostic`, so flattening cannot widen
   secret exposure — most of these sites logged the raw exception before and are
-  redacted now. An AST guard fails CI if a future edit interpolates a caught
-  exception into a log call directly. See
+  redacted now. `last_error` (surfaced by `pmcp status`, `pmcp doctor` and
+  health output) and the error strings `connect_server` and `disconnect_server`
+  return to their callers were rendering the group string too, and are fixed as
+  well. An AST guard fails CI if a caught exception is interpolated into an
+  f-string or passed to `str()` anywhere inside its handler — not merely inside
+  a `logger` call, which was the guard's first, too-narrow form. One raw path
+  remains by design: a single `exc_info=` call site still attaches an
+  unsanitized traceback, tracked separately. See
   [#224](https://github.com/Consiliency/pmcp/issues/224).
 
 
