@@ -11,6 +11,7 @@ from pathlib import Path
 import random
 import re
 import signal
+import traceback
 import string
 import time
 from collections import deque
@@ -2596,14 +2597,27 @@ class ClientManager:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                # exc_info, not just the message: this is by construction the
-                # hardest path here to reproduce (needs a caller cancelled
+                # The traceback, not just the message: this is by construction
+                # the hardest path here to reproduce (needs a caller cancelled
                 # *while* a forced owner unwind is independently failing), so
-                # the traceback matters if it's ever seen again.
+                # the frames matter if it is ever seen again.
+                #
+                # Formatted and sanitised rather than passed as `exc_info=`.
+                # `exc_info` hands the raw exception to the logging machinery,
+                # which appends the unredacted exception tree *after* the
+                # sanitised message -- so a bearer token in a transport error
+                # reached the log in full despite the message above being
+                # clean. Redaction here is best-effort defence in depth
+                # (SECURITY.md), and it cannot be applied to text the logging
+                # framework formats on its own.
+                traceback_text = "".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+                )
                 logger.warning(
                     f"[{name}] remote transport failed to unwind while "
-                    f"escalating our caller's cancellation: {describe_exception(exc)}",
-                    exc_info=exc,
+                    f"escalating our caller's cancellation: "
+                    f"{describe_exception(exc)}\n"
+                    f"{sanitize_auth_diagnostic(traceback_text, max_length=None)}"
                 )
             raise
         # NOTE: no `except Exception` here, deliberately. A transport exit

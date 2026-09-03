@@ -20,6 +20,7 @@ import ast
 import inspect
 import logging
 import pathlib
+import traceback
 from unittest.mock import MagicMock
 
 import anyio
@@ -306,3 +307,47 @@ class TestTheCallSitesAreWired:
         last_error = manager._servers["remote"].last_error or ""
         assert "ConnectionResetError" in last_error, last_error
         assert last_error != str(group)
+
+    def test_no_raw_exception_reaches_the_log_via_exc_info(self) -> None:
+        """`exc_info=` hands the RAW exception to the logging machinery.
+
+        Python then appends the unredacted exception tree *after* the sanitised
+        message, so a bearer token in a transport error reached the log in full
+        while the message above it looked clean. `record.getMessage()` cannot
+        see that, which is why the first version of these tests missed it.
+        Formatting the traceback ourselves and sanitising it keeps the frames
+        and closes the hole.
+        """
+        source = pathlib.Path(inspect.getsourcefile(manager_module) or "").read_text()
+        tree = ast.parse(source)
+        offenders = [
+            f"line {kw.value.lineno}"
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "logger"
+            for kw in node.keywords
+            if kw.arg == "exc_info"
+        ]
+        assert not offenders, (
+            "logger calls passing exc_info attach an unsanitised traceback; "
+            "format it and pass it through sanitize_auth_diagnostic instead "
+            "(Consiliency/pmcp#224):\n  " + "\n  ".join(offenders)
+        )
+
+    def test_a_formatted_traceback_is_sanitised(self) -> None:
+        from pmcp.auth import sanitize_auth_diagnostic
+
+        try:
+            raise ConnectionError("Authorization: Bearer sk-tracebacksecret")
+        except ConnectionError as exc:
+            text = "".join(
+                traceback.format_exception(type(exc), exc, exc.__traceback__)
+            )
+        assert "sk-tracebacksecret" in text, "the fixture must contain the secret"
+        cleaned = sanitize_auth_diagnostic(text, max_length=None)
+        assert "sk-tracebacksecret" not in cleaned, cleaned
+        # The frames must survive redaction, or this trade was not worth making.
+        assert "Traceback (most recent call last)" in cleaned
+        assert "test_a_formatted_traceback_is_sanitised" in cleaned

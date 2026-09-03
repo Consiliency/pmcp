@@ -27,9 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   return to their callers were rendering the group string too, and are fixed as
   well. An AST guard fails CI if a caught exception is interpolated into an
   f-string or passed to `str()` anywhere inside its handler — not merely inside
-  a `logger` call, which was the guard's first, too-narrow form. One raw path
-  remains by design: a single `exc_info=` call site still attaches an
-  unsanitized traceback, tracked separately. See
+  a `logger` call, which was the guard's first, too-narrow form. The one
+  `exc_info=` call site is gone too: `exc_info` hands the raw exception to the
+  logging machinery, which appends the unredacted exception tree *after* the
+  sanitized message, so a bearer token in a transport error reached the log in
+  full. The traceback is now formatted in-process and sanitized, keeping the
+  frames. See
   [#224](https://github.com/Consiliency/pmcp/issues/224).
 
 
