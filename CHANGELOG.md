@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Downstream failures no longer log `unhandled errors in a TaskGroup` and
+  nothing else.** Every remote-transport path in `ClientManager` runs inside an
+  anyio task group, and `str(ExceptionGroup)` names neither the type nor the
+  message of what actually failed — so twenty log sites reported only that
+  string for any failure. A week of CI hangs
+  ([#200](https://github.com/Consiliency/pmcp/issues/200)) produced exactly it,
+  which is why the cause stayed unknown. `describe_exception()` flattens a
+  group to its leaf exceptions (`ConnectionResetError: peer went away`), and is
+  used at every site that logs a caught exception, including
+  `disconnect_server`'s returned error string. Detection is by duck-typing
+  `.exceptions`, because 3.11+ raises the builtin `BaseExceptionGroup` while
+  3.10 raises `exceptiongroup.ExceptionGroup` from the backport. The rendered
+  text goes through `sanitize_auth_diagnostic`, so flattening cannot widen
+  secret exposure — most of these sites logged the raw exception before and are
+  redacted now. `last_error` (surfaced by `pmcp status`, `pmcp doctor` and
+  health output) and the error strings `connect_server` and `disconnect_server`
+  return to their callers were rendering the group string too, and are fixed as
+  well. An AST guard fails CI if a caught exception is interpolated into an
+  f-string or passed to `str()` anywhere inside its handler — not merely inside
+  a `logger` call, which was the guard's first, too-narrow form. The one
+  `exc_info=` call site is gone too: `exc_info` hands the raw exception to the
+  logging machinery, which appends the unredacted exception tree *after* the
+  sanitized message, so a bearer token in a transport error reached the log in
+  full. The traceback is now formatted in-process and sanitized, keeping the
+  frames. See
+  [#224](https://github.com/Consiliency/pmcp/issues/224).
+
+
 ### Changed
 - **Every GitHub Action is pinned to a commit SHA.** All 30 remote `uses:`
   references — 29 across the five workflows and the one inside the local

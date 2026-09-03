@@ -11,13 +11,14 @@ from pathlib import Path
 import random
 import re
 import signal
+import traceback
 import string
 import time
 from collections import deque
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from types import ModuleType
-from typing import Any, TypeVar
+from typing import Any, Iterator, TypeVar
 
 import httpx2
 import mcp.types as mcp_types
@@ -63,6 +64,76 @@ except ImportError:
     HAS_RESOURCE = False
 
 logger = logging.getLogger(__name__)
+
+# --- exception-group flattening ------------------------------------------------
+
+# How many leaf exceptions to name before summarising the rest. A TaskGroup
+# failure carries one cause in practice; the cap exists so a pathological group
+# cannot push the useful part past `sanitize_auth_diagnostic`'s truncation.
+_MAX_DESCRIBED_LEAVES = 5
+_MAX_GROUP_DEPTH = 10
+
+
+def _iter_leaf_exceptions(
+    exc: BaseException, _depth: int = 0
+) -> Iterator[BaseException]:
+    """Yield the concrete exceptions inside an exception group, recursively.
+
+    Detected by duck-typing `.exceptions` rather than `isinstance`, because the
+    type differs by interpreter: 3.11+ raises the builtin `BaseExceptionGroup`,
+    while on 3.10 anyio raises `exceptiongroup.ExceptionGroup` from the
+    backport (verified: both expose `.exceptions`, and neither name is
+    importable on the other interpreter). Every element is checked to be a
+    `BaseException`, so an unrelated class that merely has an `exceptions`
+    attribute is not mistaken for a group.
+    """
+    nested = getattr(exc, "exceptions", None)
+    if (
+        _depth < _MAX_GROUP_DEPTH
+        and isinstance(nested, (tuple, list))
+        and nested
+        and all(isinstance(item, BaseException) for item in nested)
+    ):
+        for item in nested:
+            yield from _iter_leaf_exceptions(item, _depth + 1)
+    else:
+        yield exc
+
+
+def describe_exception(exc: BaseException) -> str:
+    """Render an exception for a log line, naming the cause inside a group.
+
+    `str(ExceptionGroup)` is `"unhandled errors in a TaskGroup (1 sub-exception)"`
+    -- it names neither the type nor the message of the thing that actually
+    failed. Every remote-transport path in this class runs inside an anyio task
+    group, so that string is what these call sites logged for *any* failure, and
+    a week of CI hangs (Consiliency/pmcp#200) produced exactly it and nothing
+    else. See #224.
+
+    The result goes through `sanitize_auth_diagnostic`, which redacts URLs,
+    bearer tokens and API keys. That is not optional: flattening *increases* how
+    much of an exception's text reaches the log, and these exceptions come from
+    an HTTP transport whose messages can carry a URL or an Authorization header.
+    Most of these call sites logged the raw exception before this change; all of
+    them are redacted now.
+    """
+    leaves = list(_iter_leaf_exceptions(exc))
+    if len(leaves) == 1 and leaves[0] is exc:
+        return sanitize_auth_diagnostic(exc)
+
+    shown = leaves[:_MAX_DESCRIBED_LEAVES]
+    rendered = "; ".join(
+        f"{type(leaf).__name__}: {leaf}" if str(leaf) else type(leaf).__name__
+        for leaf in shown
+    )
+    if len(leaves) > len(shown):
+        rendered += f"; ... and {len(leaves) - len(shown)} more"
+    plural = "" if len(leaves) == 1 else "s"
+    return sanitize_auth_diagnostic(
+        f"{type(exc).__name__}({len(leaves)} sub-exception{plural}): {rendered}"
+    )
+
+
 _TaskT = TypeVar("_TaskT", bound=asyncio.Task[Any])
 
 # The three catalog kinds, in the order reconciliation fetches and applies them.
@@ -370,7 +441,7 @@ def _get_memory_usage_mb() -> float:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) / 1024
     except Exception as e:
-        logger.debug(f"memory usage parse error: {e}")
+        logger.debug(f"memory usage parse error: {describe_exception(e)}")
     return 0.0
 
 
@@ -388,7 +459,7 @@ def _get_system_memory_pct() -> int:
             used_pct = int((total - available) * 100 / total)
             return used_pct
     except Exception as e:
-        logger.debug(f"system memory check error: {e}")
+        logger.debug(f"system memory check error: {describe_exception(e)}")
         return 0
 
 
@@ -725,7 +796,7 @@ def _parse_tool_entries(
             )
         except Exception as e:
             logger.warning(
-                f"[{name}] Skipping unparseable tool {_entry_label(tool)}: {e}"
+                f"[{name}] Skipping unparseable tool {_entry_label(tool)}: {describe_exception(e)}"
             )
             continue
 
@@ -766,7 +837,7 @@ def _parse_resource_entries(
         except Exception as e:
             logger.warning(
                 f"[{name}] Skipping unparseable resource "
-                f"{_entry_label(resource, key='uri')}: {e}"
+                f"{_entry_label(resource, key='uri')}: {describe_exception(e)}"
             )
             continue
 
@@ -817,7 +888,7 @@ def _parse_prompt_entries(
             )
         except Exception as e:
             logger.warning(
-                f"[{name}] Skipping unparseable prompt {_entry_label(prompt)}: {e}"
+                f"[{name}] Skipping unparseable prompt {_entry_label(prompt)}: {describe_exception(e)}"
             )
             continue
 
@@ -1184,11 +1255,11 @@ class ClientManager:
                 self._lazy_configs.pop(server_name, None)
             return True
         except Exception as e:
-            logger.error(f"Failed to lazy-start {server_name}: {e}")
+            logger.error(f"Failed to lazy-start {server_name}: {describe_exception(e)}")
             async with self._lifecycle_lock:
                 if server_name in self._servers:
                     self._servers[server_name].status = ServerStatusEnum.ERROR
-                    self._servers[server_name].last_error = str(e)
+                    self._servers[server_name].last_error = describe_exception(e)
             return False
         finally:
             async with self._lifecycle_lock:
@@ -1214,8 +1285,8 @@ class ClientManager:
             except Exception as e:
                 if config.name in self._servers:
                     self._servers[config.name].status = ServerStatusEnum.ERROR
-                    self._servers[config.name].last_error = str(e)
-                return [f"Failed to connect to {config.name}: {e}"]
+                    self._servers[config.name].last_error = describe_exception(e)
+                return [f"Failed to connect to {config.name}: {describe_exception(e)}"]
 
     def cancel_pending_requests(self, server: str) -> int:
         """Cancel pending requests for one server and return newly cancelled count."""
@@ -1310,8 +1381,9 @@ class ClientManager:
                 else:
                     await _terminate_process_tree(managed.process, name)
             except Exception as e:
-                logger.warning(f"Error disconnecting from {name}: {e}")
-                return (False, cancelled, str(e))
+                described = describe_exception(e)
+                logger.warning(f"Error disconnecting from {name}: {described}")
+                return (False, cancelled, described)
 
             await self._cancel_background_tasks(server_name=name)
             self._connect_tasks.pop(name, None)
@@ -1373,7 +1445,8 @@ class ClientManager:
                     delay = RETRY_DELAYS[attempt]
                     logger.warning(
                         f"Connection to {config.name} failed (attempt {attempt + 1}/"
-                        f"{MAX_CONNECTION_RETRIES}), retrying in {delay}s: {e}"
+                        f"{MAX_CONNECTION_RETRIES}), retrying in {delay}s: "
+                        f"{describe_exception(e)}"
                     )
                     await asyncio.sleep(delay)
 
@@ -1865,7 +1938,7 @@ class ClientManager:
                 except Exception as exc:
                     logger.warning(
                         f"[{managed.config.name}] {kind}/list page {page + 1} "
-                        f"failed ({exc}); discarding {len(collected)} entries "
+                        f"failed ({describe_exception(exc)}); discarding {len(collected)} entries "
                         f"already collected rather than publishing a partial "
                         f"listing"
                     )
@@ -2075,7 +2148,9 @@ class ClientManager:
             raise
         except Exception as e:  # pragma: no cover - defensive
             # Never let a reconcile surface as an unhandled task exception.
-            logger.warning(f"[{name}] Catalog reconciliation task failed: {e}")
+            logger.warning(
+                f"[{name}] Catalog reconciliation task failed: {describe_exception(e)}"
+            )
         finally:
             self._reconcile_reruns.discard(name)
             if self._reconcile_tasks.get(name) is asyncio.current_task():
@@ -2142,7 +2217,9 @@ class ClientManager:
             # The downstream announced a change and then failed to list. The
             # catalog has not been touched, so leaving it alone *is* the
             # rollback, and there is nothing to publish.
-            logger.warning(f"[{name}] Catalog reconciliation failed: {e}")
+            logger.warning(
+                f"[{name}] Catalog reconciliation failed: {describe_exception(e)}"
+            )
             return
 
         tools = listings["tools"]
@@ -2323,7 +2400,7 @@ class ClientManager:
 
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
-            status.last_error = str(e)
+            status.last_error = describe_exception(e)
             for task in (managed.read_task, managed.stderr_task):
                 if task and not task.done():
                     task.cancel()
@@ -2448,7 +2525,8 @@ class ClientManager:
         exc = task.exception()
         if exc is not None:
             logger.warning(
-                f"[{name}] remote transport owner exited unexpectedly: {exc}"
+                f"[{name}] remote transport owner exited unexpectedly: "
+                f"{describe_exception(exc)}"
             )
 
     async def _close_remote_transport(
@@ -2519,14 +2597,27 @@ class ClientManager:
             except asyncio.CancelledError:
                 pass
             except Exception as exc:
-                # exc_info, not just the message: this is by construction the
-                # hardest path here to reproduce (needs a caller cancelled
+                # The traceback, not just the message: this is by construction
+                # the hardest path here to reproduce (needs a caller cancelled
                 # *while* a forced owner unwind is independently failing), so
-                # the traceback matters if it's ever seen again.
+                # the frames matter if it is ever seen again.
+                #
+                # Formatted and sanitised rather than passed as `exc_info=`.
+                # `exc_info` hands the raw exception to the logging machinery,
+                # which appends the unredacted exception tree *after* the
+                # sanitised message -- so a bearer token in a transport error
+                # reached the log in full despite the message above being
+                # clean. Redaction here is best-effort defence in depth
+                # (SECURITY.md), and it cannot be applied to text the logging
+                # framework formats on its own.
+                traceback_text = "".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+                )
                 logger.warning(
                     f"[{name}] remote transport failed to unwind while "
-                    f"escalating our caller's cancellation: {exc}",
-                    exc_info=exc,
+                    f"escalating our caller's cancellation: "
+                    f"{describe_exception(exc)}\n"
+                    f"{sanitize_auth_diagnostic(traceback_text, max_length=None)}"
                 )
             raise
         # NOTE: no `except Exception` here, deliberately. A transport exit
@@ -2633,7 +2724,7 @@ class ClientManager:
 
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
-            status.last_error = str(e)
+            status.last_error = describe_exception(e)
             if managed.read_task and not managed.read_task.done():
                 managed.read_task.cancel()
                 try:
@@ -2660,7 +2751,7 @@ class ClientManager:
                     break
                 logger.debug(f"[{name}] stderr: {line.decode().strip()}")
         except Exception as e:
-            logger.debug(f"[{name}] stderr reader error: {e}")
+            logger.debug(f"[{name}] stderr reader error: {describe_exception(e)}")
 
     def _handle_stdout_line(
         self, name: str, managed: ManagedClient, line: bytes, now: float
@@ -2780,7 +2871,7 @@ class ClientManager:
                         continue
                     self._handle_stdout_line(name, managed, raw, now)
         except Exception as e:
-            read_failure_reason = f"stdout read error: {e}"
+            read_failure_reason = f"stdout read error: {describe_exception(e)}"
             logger.warning(f"[{name}] {read_failure_reason}")
         finally:
             # Mark server as offline when stdout closes
@@ -2856,7 +2947,7 @@ class ClientManager:
                     logger.info(f"[{name}] reconnected successfully")
                     return
                 except Exception as e:
-                    safe_error = sanitize_auth_diagnostic(e)
+                    safe_error = describe_exception(e)
                     logger.warning(
                         f"[{name}] reconnect attempt {attempt} failed: {safe_error}"
                     )
@@ -2918,7 +3009,7 @@ class ClientManager:
                     if msg_id is None and isinstance(method, str):
                         self._handle_downstream_notification(name, managed, method)
         except Exception as e:
-            logger.debug(f"[{name}] SSE read error: {e}")
+            logger.debug(f"[{name}] SSE read error: {describe_exception(e)}")
         finally:
             if managed.status.status == ServerStatusEnum.ONLINE:
                 logger.warning(f"Server {name} disconnected unexpectedly")
@@ -3151,7 +3242,9 @@ class ClientManager:
                 else:
                     await _terminate_process_tree(managed.process, name)
             except Exception as e:
-                logger.warning(f"Error disconnecting from {name}: {e}")
+                logger.warning(
+                    f"Error disconnecting from {name}: {describe_exception(e)}"
+                )
 
         # Reap servers concurrently: each _terminate_process_tree can cost up to
         # ~8s for a hung stdio server, and disconnect_all() runs under a bounded
@@ -3233,7 +3326,9 @@ class ClientManager:
             try:
                 await self._close_remote_transport(name, managed)
             except Exception as e:
-                logger.warning(f"[{name}] Error closing remote transport: {e}")
+                logger.warning(
+                    f"[{name}] Error closing remote transport: {describe_exception(e)}"
+                )
         else:
             await _terminate_process_tree(managed.process, name)
         self._clients.pop(name, None)
@@ -3347,7 +3442,7 @@ class ClientManager:
 
         except Exception as e:
             status.status = ServerStatusEnum.ERROR
-            status.last_error = str(e)
+            status.last_error = describe_exception(e)
             await self._cleanup_client(name, managed)
             raise
 
@@ -3763,7 +3858,7 @@ class ClientManager:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.debug(f"Health monitor error: {e}")
+                logger.debug(f"Health monitor error: {describe_exception(e)}")
 
     def _check_server_health(self, name: str, managed: ManagedClient) -> bool:
         """Check server transport health, preserving status error strings."""
