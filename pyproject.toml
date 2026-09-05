@@ -93,10 +93,13 @@ dependencies = [
     # `Requires-Dist: jsonschema>=4.20.0`, whose floor this matches.
     "jsonschema>=4.20.0,<5.0.0",
     "pydantic>=2.0",
-    "pyjwt[crypto]>=2.10.0",
+    "pyjwt[crypto]>=2.13.0",
     "pyyaml>=6.0",
-    "python-dotenv>=1.0.0",
-    "aiohttp>=3.9.0",
+    "python-dotenv>=1.2.2",
+    # >=3.14.2 excludes PYSEC-2026-3546/3547. aiohttp is the JWKS fetch
+    # client on the resource-server auth path, so its floor is a security
+    # boundary, not a convenience (Consiliency/pmcp#224).
+    "aiohttp>=3.14.2",
 ]
 
 [project.urls]
@@ -106,7 +109,7 @@ Issues = "https://github.com/Consiliency/pmcp/issues"
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.0",
+    "pytest>=9.0.3",
     "pytest-asyncio>=0.21",
     "pytest-cov>=4.0",
     "pytest-mock>=3.0",
@@ -118,7 +121,7 @@ dev = [
     "types-PyYAML>=6.0",
 ]
 http = [
-    "starlette>=0.27.0",
+    "starlette>=1.3.1",
     "uvicorn>=0.23.0",
     "sse-starlette>=1.6.0",
     "prometheus-client>=0.20",
