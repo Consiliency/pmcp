@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+- **Dependency advisories on the auth path are closed, and CI now fails on new
+  ones.** `pip-audit` reported nine advisories against the shipped lockfile; the
+  one that mattered most was **PYSEC-2026-176 in PyJWT 2.10.1, a verifier-side
+  algorithm allow-list bypass in `jwt.decode()`** — the exact call in
+  `src/pmcp/auth.py`, and the exact control SECURITY.md promises ("signatures are
+  only accepted for the operator-configured algorithm allowlist; the token's own
+  `alg` header is never trusted"). Also closed: PYSEC-2026-175 (`PyJWKClient`
+  passing its URI straight to `urllib.request.urlopen`) and PYSEC-2026-177 (an
+  unknown-`kid` token forcing a JWKS refetch), both adjacent to the auth work in
+  [#210](https://github.com/Consiliency/pmcp/issues/210) /
+  [#211](https://github.com/Consiliency/pmcp/issues/211); advisories in
+  `cryptography` (which performs the signature verification) and `aiohttp` (the
+  JWKS fetch client); plus `starlette`, `python-multipart`, `python-dotenv`,
+  `click` and `pytest`. `aiohttp`'s declared floor is raised to `>=3.14.2` and
+  PyJWT's to `>=2.13.0`, because a floor that admits a vulnerable range is not a
+  pin. A new blocking `audit` CI job runs `pip-audit --strict` against the
+  resolved environment, so the next advisory is a red X rather than something a
+  manual review finds months later. Found by the 2026-09-01 codebase review
+  (D-01); see [#224](https://github.com/Consiliency/pmcp/issues/224).
+
+
 ### Fixed
 - **Downstream failures no longer log `unhandled errors in a TaskGroup` and
   nothing else.** Every remote-transport path in `ClientManager` runs inside an

@@ -393,13 +393,18 @@ class TestShaPinning:
         monkeypatch.chdir(REPO_ROOT)
         assert _COMPOSITE_YML.resolve() in {p.resolve() for p in cw.pin_scan_files()}
 
-    def test_the_committed_tree_has_thirty_remote_refs(
+    def test_the_committed_tree_has_the_expected_remote_ref_count(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # Spelled twice on purpose, like EXPECTED_USES: a new remote action is a
-        # deliberate event. 29 in the workflows + 1 in the composite.
+        # deliberate event, and this guard is what makes it one. 31 in the
+        # workflows + 1 in the composite.
+        #
+        # Was 30 until the `audit` job (pip-audit, see #224) added a checkout
+        # and a setup-uv. Raising this number is the deliberate step; the guard
+        # firing on an unreviewed addition is the point.
         monkeypatch.chdir(REPO_ROOT)
-        assert len(cw.remote_uses(cw.pin_scan_files())) == 30
+        assert len(cw.remote_uses(cw.pin_scan_files())) == 32
 
     def test_expected_uses_is_sha_form_without_comments(self) -> None:
         # yaml.safe_load strips comments before _collect_uses runs, so a value

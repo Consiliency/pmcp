@@ -240,6 +240,50 @@ jobs:
       - name: Run ruff format check
         run: uv run ruff format --check src/ tests/
 
+  # PyJWT 2.10.1 sat in the lockfile carrying PYSEC-2026-176, a verifier-side
+  # algorithm allow-list bypass in `jwt.decode()` -- the exact call at
+  # src/pmcp/auth.py, and the exact control SECURITY.md promises ("signatures
+  # are only accepted for the operator-configured algorithm allowlist"). It was
+  # found by a manual review, not by CI, which is the gap this job closes.
+  #
+  # Blocking, not advisory. A dependency advisory against the auth path is not
+  # something to notice at leisure, and this repo's whole guard culture is
+  # fail-closed (#187, #189, #202, #217). The cost is that a newly published
+  # advisory can turn an unrelated PR red; the remedy is to fix or explicitly
+  # ignore it with a stated reason, which is the decision we want forced.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      # Audits the RESOLVED environment, not the declared floors: uv.lock is
+      # what ships and what an advisory is scored against.
+      #
+      # `--locked` on BOTH commands, and it is load-bearing. Without it `uv
+      # sync` and `uv run` silently RE-RESOLVE when uv.lock is stale against
+      # pyproject.toml -- so this job would audit a freshly resolved graph,
+      # report clean, and leave the vulnerable lock that actually ships
+      # untouched. A fail-closed audit that can pass on an environment nobody
+      # ships is worse than no audit. `--locked` makes lock drift a red X.
+      - name: Install dependencies (fail closed on lock drift)
+        run: uv sync --locked --all-extras --dev
+
+      # pip-audit itself is pinned, like every action SHA in this repo: an
+      # unpinned tool fetched at run time is the same supply-chain shape #217
+      # closed for actions. The advisory DATA is still fetched fresh, which is
+      # the part that must not be pinned.
+      - name: pip-audit (resolved environment)
+        run: uv run --locked --with pip-audit==2.9.0 pip-audit --progress-spinner off --strict
+
   # 2.0.1 and 2.1.0 both merged feature PRs against an empty [Unreleased]
   # block, so the maintainer had to hand-backfill CHANGELOG.md at release
   # time by reconstructing it from git log. This job catches it at PR time
