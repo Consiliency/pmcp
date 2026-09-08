@@ -157,14 +157,24 @@ def _resolve_version(requested: str, packument: dict[str, Any]) -> str | None:
     Three cases and no fourth: nothing requested resolves through
     ``dist-tags.latest``; a dist-tag resolves through ``dist-tags``; an exact
     SemVer 2.0.0 version is taken literally. A range names a set, and a set is
-    not something an approval can be about.
+    not something an approval can be about. Every path -- including a dist-tag's
+    target, which the registry controls -- must end at a concrete SemVer, or
+    this returns ``None``.
     """
     if requested == "" or _DIST_TAG_RE.match(requested):
         dist_tags = packument.get("dist-tags")
         if not isinstance(dist_tags, dict):
             return None
         version = dist_tags.get(requested or "latest")
-        return version if isinstance(version, str) else None
+        if not isinstance(version, str):
+            return None
+        # A dist-tag's TARGET is registry-supplied data and gets the same
+        # concrete-version check as a user-supplied one. Without this a
+        # packument whose `latest` points at `^1.0.0` yields an identity whose
+        # `resolved_version` is a range -- and a consumer pinning argv to
+        # `pkg@^1.0.0` re-resolves at every spawn, which is the exact
+        # check-then-use hole this primitive exists to close.
+        return version if semver.Version.is_valid(version) else None
     # `semver`, not a hand-rolled parse: every hand-written version comparison
     # in this package has been wrong at least once (see the dependency's note
     # in pyproject.toml).

@@ -331,3 +331,43 @@ def test_the_packument_fetch_refuses_redirects() -> None:
         isinstance(h, package_identity._NoRedirectHandler)
         for h in package_identity._OPENER.handlers
     )
+
+
+def test_a_dist_tag_pointing_at_a_range_resolves_to_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dist-tag's target is registry-controlled and gets the same check.
+
+    The user-supplied half of a spec was always refused when it named a range.
+    The tag half was not: a packument whose `latest` points at `^1.0.0` yielded
+    an identity whose `resolved_version` was that range. A consumer pinning argv
+    to `pkg@^1.0.0` then re-resolves at every spawn, which is the check-then-use
+    hole this primitive exists to close -- reached through registry data rather
+    than through the caller.
+    """
+    for target in ("^1.0.0", ">=1.0 <2.0", "1.x", "latest", "not-a-version"):
+        packument = {
+            "name": "evil-mcp",
+            "dist-tags": {"latest": target},
+            "versions": {target: {"dist": {"integrity": "sha512-deadbeef"}}},
+        }
+        monkeypatch.setattr(
+            package_identity,
+            "_fetch_packument",
+            lambda _name, _doc=packument: _doc,
+            raising=False,
+        )
+        assert resolve_package_identity("evil-mcp") is None, (
+            f"a dist-tag pointing at {target!r} must not resolve"
+        )
+
+    concrete = {
+        "name": "good-mcp",
+        "dist-tags": {"latest": "1.4.2"},
+        "versions": {"1.4.2": {"dist": {"integrity": "sha512-cafe"}}},
+    }
+    monkeypatch.setattr(
+        package_identity, "_fetch_packument", lambda _n: concrete, raising=False
+    )
+    resolved = resolve_package_identity("good-mcp")
+    assert resolved is not None and resolved.resolved_version == "1.4.2"

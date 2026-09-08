@@ -32,9 +32,12 @@ absolute path: re-approving replaces, it does not append a history.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
+import tempfile
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -184,11 +187,55 @@ def _write_store(path: Path, records: list[TrustRecord]) -> None:
         except OSError:
             pass
 
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as store_file:
-        json.dump(payload, store_file, indent=2)
-        store_file.write("\n")
+    # Write a sibling temp file and rename it into place. `os.replace` is
+    # atomic, so a reader never observes a half-written store and an
+    # interrupted write leaves the previous one intact rather than truncated.
+    fd, tmp_name = tempfile.mkstemp(dir=parent, prefix=".trust-", suffix=".tmp")
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as store_file:
+            json.dump(payload, store_file, indent=2)
+            store_file.write("\n")
+            store_file.flush()
+            os.fsync(store_file.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
+
+
+@contextlib.contextmanager
+def _store_lock(path: Path) -> Iterator[None]:
+    """Hold an exclusive lock for one read-modify-write of the store.
+
+    ``record`` and ``revoke`` both read every record, change one, and write the
+    whole set back. Without a lock two concurrent operations interleave into a
+    lost update: if ``record`` reads a snapshot containing an approval, a
+    ``revoke`` then removes it, and ``record`` writes its stale snapshot back,
+    **the revoked approval is silently restored**. An operator's decision to
+    withdraw trust must not be undone by a concurrent approve.
+
+    The lock is advisory and POSIX-only; where ``fcntl`` is unavailable this
+    degrades to no serialization rather than failing the operation, which
+    matches the store's read path -- callers that cannot get a guarantee still
+    get correct single-process behaviour.
+    """
+    parent = path.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import fcntl
+    except ImportError:  # pragma: no cover - non-POSIX
+        yield
+        return
+    fd = os.open(str(path) + ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
 
 
 def is_approved(path: Path, content: bytes) -> bool:
@@ -242,11 +289,16 @@ def record(path: Path, content: bytes, scope: str, decision: str) -> TrustRecord
         recorded_at=datetime.now(timezone.utc),
     )
 
-    records = [
-        rec for rec in _read_store(store) if rec.absolute_path != entry.absolute_path
-    ]
-    records.append(entry)
-    _write_store(store, records)
+    # Read and write under one lock: a concurrent revoke between the read and
+    # the write would otherwise be silently undone by this stale snapshot.
+    with _store_lock(store):
+        records = [
+            rec
+            for rec in _read_store(store)
+            if rec.absolute_path != entry.absolute_path
+        ]
+        records.append(entry)
+        _write_store(store, records)
     return entry
 
 
@@ -258,14 +310,14 @@ def revoke(path: Path) -> bool:
     explicitly. Raises ``TrustStoreError`` if the store is unusable.
     """
     store = trust_store_path()
-    records = _read_store(store)
     target = Path(path).resolve()
 
-    kept = [rec for rec in records if rec.absolute_path != target]
-    if len(kept) == len(records):
-        return False
-
-    _write_store(store, kept)
+    with _store_lock(store):
+        records = _read_store(store)
+        kept = [rec for rec in records if rec.absolute_path != target]
+        if len(kept) == len(records):
+            return False
+        _write_store(store, kept)
     return True
 
 

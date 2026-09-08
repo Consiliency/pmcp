@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import stat
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -222,3 +223,47 @@ def test_a_denied_record_is_not_approved(checkout: Path) -> None:
     record(target, b"payload", "user", "approved")
     assert len(list_records()) == 1
     assert is_approved(target, b"payload") is True
+
+
+def test_concurrent_record_and_revoke_do_not_resurrect_an_approval(
+    checkout: Path,
+) -> None:
+    """A revoke must not be undone by a concurrent approve's stale snapshot.
+
+    ``record`` and ``revoke`` each read every record, change one, and write the
+    whole set back. Unserialized, they interleave into a lost update: record
+    reads a snapshot containing A, revoke removes A, record writes its snapshot
+    back and A is approved again -- an operator's withdrawal silently reversed.
+    Both now hold an exclusive lock for the whole read-modify-write.
+
+    Falsifier: remove the `_store_lock` from either function and this resurrects
+    `victim` within a few iterations.
+    """
+    victim = _write(checkout / "victim.json", b"victim")
+    other = _write(checkout / "other.json", b"other")
+
+    for _ in range(40):
+        record(victim, b"victim", "user", "approved")
+        barrier = threading.Barrier(2)
+
+        def approve_other() -> None:
+            barrier.wait()
+            record(other, b"other", "user", "approved")
+
+        def revoke_victim() -> None:
+            barrier.wait()
+            revoke(victim)
+
+        threads = [
+            threading.Thread(target=approve_other),
+            threading.Thread(target=revoke_victim),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert not is_approved(victim, b"victim"), (
+            "a concurrent approve resurrected a revoked approval"
+        )
+        revoke(other)
