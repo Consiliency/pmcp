@@ -193,6 +193,17 @@ def _write_store(path: Path, records: list[TrustRecord]) -> None:
             store_file.flush()
             os.fsync(store_file.fileno())
         os.replace(tmp_name, path)
+        # fsync the DIRECTORY too, not just the file. `os.replace` is atomic
+        # against readers, but the rename itself is only durable once the
+        # directory entry is synced -- so a crash right after a revoke can leave
+        # the pre-revoke store on disk and resurrect the approval the operator
+        # just withdrew. That is the same invariant the lock protects against a
+        # race, reached through power loss instead.
+        dir_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
