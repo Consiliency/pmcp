@@ -267,3 +267,29 @@ def test_concurrent_record_and_revoke_do_not_resurrect_an_approval(
             "a concurrent approve resurrected a revoked approval"
         )
         revoke(other)
+
+
+def test_a_store_directory_pmcp_creates_is_not_group_or_world_accessible(
+    checkout: Path,
+) -> None:
+    """A directory PMCP creates for the store is 0o700, not the umask default.
+
+    The store file is 0o600, but the directory around it matters too: at the
+    common umask of 022 an untightened directory is 0o755, and at 002 it is
+    0o775 -- group-writable, so another account in the group can rename or
+    replace `trust.json` wholesale even though it cannot read the old one.
+
+    Falsifier: this caught a real regression. Adding the lock introduced a
+    second `mkdir` that ran before `_write_store`'s, so `_write_store` saw an
+    existing directory, skipped its chmod, and a fresh install silently got the
+    umask default. Give `_store_lock` and `_write_store` independent "did we
+    create it?" decisions again and this fails.
+    """
+    target = _write(checkout / "server.json", b"payload")
+    record(target, b"payload", "user", "approved")
+
+    store = trust_store_path()
+    assert store.stat().st_mode & 0o777 == 0o600
+    assert store.parent.stat().st_mode & 0o777 == 0o700, (
+        "the store directory must not be group- or world-accessible"
+    )

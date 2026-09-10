@@ -179,13 +179,7 @@ def _write_store(path: Path, records: list[TrustRecord]) -> None:
     }
 
     parent = path.parent
-    parent_created = not parent.exists()
-    parent.mkdir(parents=True, exist_ok=True)
-    if parent_created:
-        try:
-            os.chmod(parent, 0o700)
-        except OSError:
-            pass
+    _ensure_store_dir(parent)
 
     # Write a sibling temp file and rename it into place. `os.replace` is
     # atomic, so a reader never observes a half-written store and an
@@ -205,6 +199,26 @@ def _write_store(path: Path, records: list[TrustRecord]) -> None:
         raise
 
 
+def _ensure_store_dir(parent: Path) -> None:
+    """Create the store's directory, tightening it only if we created it.
+
+    Both ``_store_lock`` and ``_write_store`` need the directory to exist, and
+    whichever runs first is the one that created it. Deciding "did PMCP create
+    this?" independently in each is how a 0o700 became a 0o775: the lock's
+    ``mkdir`` ran first, so ``_write_store`` then saw an existing directory and
+    skipped the chmod, and a fresh install got the umask default instead. One
+    helper, one decision. As before, never tighten a directory the user already
+    had (mirrors ``env_store.write_env_file``).
+    """
+    if parent.exists():
+        return
+    parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(parent, 0o700)
+    except OSError:
+        pass
+
+
 @contextlib.contextmanager
 def _store_lock(path: Path) -> Iterator[None]:
     """Hold an exclusive lock for one read-modify-write of the store.
@@ -221,8 +235,7 @@ def _store_lock(path: Path) -> Iterator[None]:
     matches the store's read path -- callers that cannot get a guarantee still
     get correct single-process behaviour.
     """
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
+    _ensure_store_dir(path.parent)
     try:
         import fcntl
     except ImportError:  # pragma: no cover - non-POSIX
