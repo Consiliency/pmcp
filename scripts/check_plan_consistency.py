@@ -12,14 +12,44 @@ tells an executing lane which tests to write. The result is a plan whose own pha
 command fails collection, or worse, a lane contracted to write a test named after the
 unsafe rule that was replaced. Careful reading did not catch it three times; this does.
 
+It also verifies each plan's `roadmap_sha256:` frontmatter pin against the actual
+digest of the roadmap it names. That pin is the plan's trust contract; a stale one
+means the plan was written against a roadmap that no longer exists. This check was
+added after the registry cross-check above shipped WITHOUT it and duly reported
+"0 blocking" while all three pins were stale — the exact bug it was meant to prevent.
+
 Usage:
     python3 scripts/check_plan_consistency.py plans/phase-plan-v13-*.md
-Exits non-zero if any EC runs a node id no lane is contracted to write.
+Exits non-zero if any EC runs a node id no lane is contracted to write, or if any
+roadmap_sha256 pin is stale.
 """
 
+import hashlib
 import re
 import sys
 import pathlib
+
+
+def check_pin(path):
+    """Verify the plan's roadmap_sha256 against the roadmap it names."""
+    p = pathlib.Path(path)
+    s = p.read_text()
+    m = re.search(r"^roadmap:\s*(\S+)$", s, re.M)
+    d = re.search(r"^roadmap_sha256:\s*(\w+)$", s, re.M)
+    if not m or not d:
+        return 0  # not a pinned phase plan
+    roadmap = p.parent.parent / m.group(1)
+    if not roadmap.exists():
+        print(f"  [BLOCKING] {p.name} pins roadmap {m.group(1)} — file not found")
+        return 1
+    actual = hashlib.sha256(roadmap.read_bytes()).hexdigest()
+    if actual != d.group(1):
+        print(
+            f"  [BLOCKING] {p.name} roadmap_sha256 is STALE "
+            f"(pinned {d.group(1)[:12]}…, actual {actual[:12]}…)"
+        )
+        return 1
+    return 0
 
 
 def check(path):
@@ -53,7 +83,7 @@ def check(path):
         print(f"  [warn]     {lane_of[n]} writes {n} — no EC proves it")
     if not bad and lane >= ec:
         print("  consistent")
-    return bad
+    return bad + check_pin(path)
 
 
 total = sum(check(p) for p in sys.argv[1:])

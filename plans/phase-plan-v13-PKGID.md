@@ -2,7 +2,7 @@
 phase_loop_plan_version: 1
 phase: PKGID
 roadmap: specs/phase-plans-v13.md
-roadmap_sha256: 084b23212b9df39888f3772476dc7895bc99ff3d837d003a4c60cde4f2da2d14
+roadmap_sha256: 9b77ee0a3e9c1ff6d71f65ef6c36ccdc2714b506b4f62f74b746da5299891aa9
 ---
 
 # PHASE-3-PKGID: Provisioning binds to package identity
@@ -155,12 +155,22 @@ SL-4 — Documentation & spec reconciliation
 - **Owned files**: `src/pmcp/provision_gate.py`, `src/pmcp/package_approvals.py`, `src/pmcp/tools/handlers.py`, `src/pmcp/cli.py`, `tests/test_package_identity_gate.py`, `tests/test_package_approvals.py`
 - **Interfaces provided**: `ProvisionDecision`, `ProvisionSource`, `evaluate_provision`, `PackageApproval`, `approve_package`, `is_package_approved`, `revoke_package`, `list_package_approvals`, the `pmcp trust approve-package|list-packages|revoke-package` verbs
 - **Interfaces consumed**: `PackageIdentity`, `resolve_package_identity` (TRUST SL-2); `trust_store_path` (TRUST SL-1); `evaluate_package_policy`, `PackagePolicy` (SL-2); `parse_package_spec`, `is_valid_package_version` (SL-2, `validation.py`)
+  - **`resolve_package_identity` is SYNCHRONOUS and does blocking network I/O**
+    (`src/pmcp/manifest/package_identity.py:176`; `_OPENER.open(..., timeout=_FETCH_TIMEOUT)`
+    at `:120` with `_FETCH_TIMEOUT = 10.0` at `:58`), while every existing registry
+    lookup in `version_checker.py:1375-1530` is async/aiohttp. This lane calls it from
+    inside `async def register_discovered_server` (`handlers.py:5513`), so calling it
+    directly **blocks the event loop for up to 10 s** — the whole gateway, not just the
+    request. TRUST's signature is frozen and this lane does not own that file, so the
+    fix is caller-side: `anyio.to_thread.run_sync` (or `run_in_executor`), plus a
+    handler-level timeout — the 10 s socket timeout is not a request bound. Found while
+    executing TRUST SL-2; see the roadmap's Post-execution amendments for TRUST.
 - **Parallel-safe**: yes
 - **Tasks**:
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-1.1 | test | — | `tests/test_package_identity_gate.py`, `tests/test_package_approvals.py` | **exactly these names**: `test_a_configured_server_with_unpinned_argv_is_refused`,, because the acceptance criteria address them individually: `test_the_review_reproduction_does_not_spawn_npx_for_an_arbitrary_package`, `test_the_refusal_names_the_package_and_the_approval_command`, `test_discovered_provisioning_is_denied_without_opt_in`, `test_a_manifest_backed_server_provisions_unchanged`, `test_a_resolvable_registration_records_the_version_and_pins_the_install_argv`, `test_an_unresolvable_registration_is_refused_at_registration`, `test_a_resolved_version_that_fails_validation_is_refused`, `test_an_approved_package_provisions_after_the_refusal`, `test_a_store_read_failure_denies_rather_than_raises`, `test_source_is_taken_from_the_lookup_path_not_from_server_config`, `test_policy_denylist_blocks_an_approved_package`, `test_policy_package_allowlist_permits_provision_without_a_recorded_approval`, `test_package_denylist_beats_a_recorded_approval` | `uv run pytest -q tests/test_package_identity_gate.py tests/test_package_approvals.py` |
+| SL-1.1 | test | — | `tests/test_package_identity_gate.py`, `tests/test_package_approvals.py` | **exactly these names**, because the acceptance criteria address them individually: `test_a_configured_server_with_unpinned_argv_is_refused`, `test_the_review_reproduction_does_not_spawn_npx_for_an_arbitrary_package`, `test_the_refusal_names_the_package_and_the_approval_command`, `test_discovered_provisioning_is_denied_without_opt_in`, `test_a_manifest_backed_server_provisions_unchanged`, `test_a_resolvable_registration_records_the_version_and_pins_the_install_argv`, `test_an_unresolvable_registration_is_refused_at_registration`, `test_a_resolved_version_that_fails_validation_is_refused`, `test_an_approved_package_provisions_after_the_refusal`, `test_a_store_read_failure_denies_rather_than_raises`, `test_source_is_taken_from_the_lookup_path_not_from_server_config`, `test_policy_denylist_blocks_an_approved_package`, `test_policy_package_allowlist_permits_provision_without_a_recorded_approval`, `test_package_denylist_beats_a_recorded_approval` | `uv run pytest -q tests/test_package_identity_gate.py tests/test_package_approvals.py` |
 | SL-1.2 | impl | SL-1.1 | `src/pmcp/provision_gate.py`, `src/pmcp/package_approvals.py` | — | — |
 | SL-1.3 | impl | SL-1.1 | `src/pmcp/tools/handlers.py` | — | — |
 | SL-1.4 | impl | SL-1.1 | `src/pmcp/cli.py` | — | — |

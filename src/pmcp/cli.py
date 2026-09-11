@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
+from pmcp import trust_store
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.install import (
@@ -753,6 +754,47 @@ Environment overrides:
         "--json",
         action="store_true",
         help="Emit JSON output",
+    )
+
+    # Trust command
+    #
+    # The verb spelling is a contract, not a preference: refusal messages
+    # elsewhere print the runnable string `pmcp trust approve <absolute path>`,
+    # so an operator who copies one must land here (Consiliency/pmcp#230).
+    trust_parser = subparsers.add_parser(
+        "trust",
+        help="Approve, list, and revoke content PMCP is allowed to trust",
+        description="Manage the user-scoped trust store at ~/.config/pmcp/trust.json.",
+    )
+    trust_subparsers = trust_parser.add_subparsers(
+        dest="trust_command",
+        required=True,
+        help="Trust subcommands",
+    )
+
+    trust_approve_parser = trust_subparsers.add_parser(
+        "approve",
+        help="Approve a file's current content",
+    )
+    trust_approve_parser.add_argument(
+        "path",
+        type=Path,
+        help="File whose current content is approved",
+    )
+
+    trust_subparsers.add_parser(
+        "list",
+        help="List every recorded trust decision",
+    )
+
+    trust_revoke_parser = trust_subparsers.add_parser(
+        "revoke",
+        help="Drop the trust record for a path",
+    )
+    trust_revoke_parser.add_argument(
+        "path",
+        type=Path,
+        help="File whose trust record is dropped",
     )
 
     return parser.parse_args()
@@ -2442,6 +2484,76 @@ def run_capabilities(args: argparse.Namespace) -> None:
             print(capability["name"])
 
 
+#: Every `pmcp trust` record this CLI writes is user-scoped, because the store
+#: itself is: there is no project-scoped trust file to point a --scope flag at.
+_TRUST_SCOPE = "user"
+
+
+def _trust_fail(message: str) -> None:
+    """Report an operator-facing trust failure and exit non-zero."""
+    print(f"Error: {message}", file=sys.stderr)
+    sys.exit(1)
+
+
+def _format_trust_record(rec: trust_store.TrustRecord) -> str:
+    """One record as a line naming its decision, digest, time, and path."""
+    return (
+        f"{rec.decision:<8}  {rec.content_sha256[:12]}  "
+        f"{rec.recorded_at.isoformat()}  {rec.absolute_path}"
+    )
+
+
+def _run_trust_approve(args: argparse.Namespace) -> None:
+    """Approve the file's current bytes, replacing any earlier decision."""
+    path = Path(args.path)
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        _trust_fail(f"cannot read {path}: {exc}")
+        return
+
+    rec = trust_store.record(path, content, _TRUST_SCOPE, trust_store.APPROVED)
+    print(f"Approved {rec.absolute_path}")
+    print(f"  sha256 {rec.content_sha256}")
+
+
+def _run_trust_list(args: argparse.Namespace) -> None:
+    """Print every recorded decision, or say plainly that there are none."""
+    records = trust_store.list_records()
+    if not records:
+        print("No trust records.")
+        return
+    for rec in records:
+        print(_format_trust_record(rec))
+
+
+def _run_trust_revoke(args: argparse.Namespace) -> None:
+    """Drop the record for a path, reporting when there was nothing to drop."""
+    path = Path(args.path)
+    if not trust_store.revoke(path):
+        _trust_fail(f"no trust record for {Path(path).resolve()}")
+        return
+    print(f"Revoked {Path(path).resolve()}")
+
+
+def run_trust(args: argparse.Namespace) -> None:
+    """Dispatch `pmcp trust <verb>` over the user-scoped trust store."""
+    handlers = {
+        "approve": _run_trust_approve,
+        "list": _run_trust_list,
+        "revoke": _run_trust_revoke,
+    }
+    handler = handlers.get(args.trust_command)
+    if handler is None:
+        _trust_fail(f"Unknown trust subcommand: {args.trust_command}")
+        return
+
+    try:
+        handler(args)
+    except (trust_store.TrustStoreError, ValueError) as exc:
+        _trust_fail(str(exc))
+
+
 def _build_gateway_auth_client(args: argparse.Namespace) -> tuple[Any, Any]:
     from pmcp.client.manager import ClientManager
     from pmcp.policy.policy import PolicyManager
@@ -2655,6 +2767,8 @@ async def async_main(args: argparse.Namespace) -> None:
         run_guidance(args)  # Synchronous command
     elif args.command == "capabilities":
         run_capabilities(args)  # Synchronous command
+    elif args.command == "trust":
+        run_trust(args)  # Synchronous command
     elif args.command == "doctor":
         await run_doctor(args)
     elif args.command == "upgrade":

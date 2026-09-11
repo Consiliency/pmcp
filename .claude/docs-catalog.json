@@ -1,10 +1,15 @@
 {
   "version": 1,
-  "last_updated": "2026-08-24T12:16:05+00:00",
+  "last_updated": "2026-09-08T15:48:24+00:00",
   "files": {
-    ".claude/plans/ticklish-inventing-stearns.md": {
-      "purpose": "markdown document",
-      "touched_by_phases": []
+    "README.md": {
+      "purpose": "root project README",
+      "touched_by_phases": [
+        "P5",
+        "P2",
+        "P3B",
+        "UPDPATH"
+      ]
     },
     "CHANGELOG.md": {
       "purpose": "release changelog",
@@ -13,7 +18,8 @@
         "P5",
         "P2",
         "P3B",
-        "UPDPATH"
+        "UPDPATH",
+        "TRUST"
       ]
     },
     "CONTRIBUTING.md": {
@@ -21,15 +27,6 @@
       "touched_by_phases": [
         "P1",
         "P5"
-      ]
-    },
-    "README.md": {
-      "purpose": "root project README",
-      "touched_by_phases": [
-        "P5",
-        "P2",
-        "P3B",
-        "UPDPATH"
       ]
     },
     "SECURITY.md": {
@@ -46,6 +43,82 @@
         "P3B"
       ]
     },
+    ".claude/plans/ticklish-inventing-stearns.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "specs/README.md": {
+      "purpose": "root project README",
+      "touched_by_phases": []
+    },
+    "specs/active/pmcp-gateway-orchestration-plan.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v1.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v10.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v11.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": [
+        "P1",
+        "P2",
+        "P3B"
+      ]
+    },
+    "specs/phase-plans-v12.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": [
+        "UPDPATH"
+      ]
+    },
+    "specs/phase-plans-v13.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": [
+        "TRUST"
+      ]
+    },
+    "specs/phase-plans-v2.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v3.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v4.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v5.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v6.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v7.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v8.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/phase-plans-v9.md": {
+      "purpose": "multi-phase roadmap spec",
+      "touched_by_phases": []
+    },
+    "specs/tenant-code-mode-host-contract.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
     "plans/HANDOFF-agent-board-mcp-registration.md": {
       "purpose": "markdown document",
       "touched_by_phases": []
@@ -55,6 +128,10 @@
       "touched_by_phases": []
     },
     "plans/codebase-review-2026-06-15.md": {
+      "purpose": "markdown document",
+      "touched_by_phases": []
+    },
+    "plans/codebase-review-2026-09-01.md": {
       "purpose": "markdown document",
       "touched_by_phases": []
     },
@@ -140,6 +217,20 @@
       "purpose": "per-phase lane plan",
       "touched_by_phases": [
         "UPDPATH"
+      ]
+    },
+    "plans/phase-plan-v13-CONSENT.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v13-PKGID.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": []
+    },
+    "plans/phase-plan-v13-TRUST.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": [
+        "TRUST"
       ]
     },
     "plans/phase-plan-v2-lifecycle.md": {
@@ -303,72 +394,6 @@
       "touched_by_phases": []
     },
     "plans/v7-issue-tracker.md": {
-      "purpose": "markdown document",
-      "touched_by_phases": []
-    },
-    "specs/README.md": {
-      "purpose": "root project README",
-      "touched_by_phases": []
-    },
-    "specs/active/pmcp-gateway-orchestration-plan.md": {
-      "purpose": "markdown document",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v1.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v10.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v11.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": [
-        "P1",
-        "P2",
-        "P3B"
-      ]
-    },
-    "specs/phase-plans-v12.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": [
-        "UPDPATH"
-      ]
-    },
-    "specs/phase-plans-v2.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v3.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v4.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v5.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v6.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v7.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v8.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/phase-plans-v9.md": {
-      "purpose": "multi-phase roadmap spec",
-      "touched_by_phases": []
-    },
-    "specs/tenant-code-mode-host-contract.md": {
       "purpose": "markdown document",
       "touched_by_phases": []
     }

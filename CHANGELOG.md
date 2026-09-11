@@ -7,6 +7,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`pmcp trust approve|list|revoke`, and a user-scoped trust store at
+  `~/.config/pmcp/trust.json`.** The store records one decision per absolute
+  path — the file's SHA-256, the scope, the decision and when it was taken —
+  and answers one question: are *these bytes* approved to be applied as *this
+  path*? `is_approved(path, content)` hashes the content the caller is about to
+  use and never reads the path, so a file swapped between the check and the use
+  is not covered by the earlier approval; editing an approved file by one byte
+  makes it unapproved with no further action. `approve` records the file's
+  current bytes and replaces any earlier decision for that path (there is no
+  history); `list` prints decision, digest, timestamp and path; `revoke` drops
+  the record, returning the path to *absent*, and exits non-zero if there was
+  nothing to drop.
+  **Nothing consults the store yet, and this release changes no existing
+  behaviour.** These verbs and the record shape are the contract the
+  project-consent and package-identity work is written against, published ahead
+  of the code that will read them so those changes can be built in parallel; a
+  gateway that never runs `pmcp trust` behaves exactly as it did before, and
+  approving a file today gates nothing today.
+  Two properties are worth knowing before you rely on it. The store must live
+  **outside** the checkout it judges — a store path that resolves inside the
+  current repository, directly or through a symlink, is refused rather than
+  read, because a repository that ships its own approval record must not be
+  believed. And every read failure is a refusal: a missing, unreadable or
+  corrupt store makes `is_approved` answer `False` rather than raise, so a
+  broken file can never be mistaken for permission. The operator-facing verbs
+  do the opposite and fail loudly, because a silent failure there would hide
+  the broken store. The store file is created mode `0o600`.
+  Also added: `resolve_package_identity()`, which resolves an npm spec to
+  `(registry, name, resolved_version, integrity)` from the registry's metadata
+  document alone — no install, no `npx`, no subprocess — and returns nothing at
+  all for a range, an unknown dist-tag or any spec it cannot pin to one
+  concrete published version. It has no caller in this release either. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+
 ### Security
 - **The operator's project `.env` no longer reaches the servers PMCP spawns.**
   `pmcp`'s entry point loads `<project>/.env` into its own environment at

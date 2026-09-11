@@ -149,6 +149,75 @@ Wiring any consumer; changing provisioning or policy behaviour.
 - redaction posture: `metadata_only`
 - missing or malformed evidence routes to `blocker_class=contract_bug` (non-human).
 
+### Post-execution amendments — TRUST (2026-09-08)
+
+Recorded by SL-docs after SL-1, SL-2 and SL-3 landed and were merged. Both freeze
+gates shipped with exactly the signatures they declared, and no exit criterion had to
+be weakened — nothing below reopens a contract. What each gate got wrong is a detail
+it left implicit, and in both cases the phase that has to consume the gate is the one
+that pays. The third item is a defect in `plans/phase-plan-v13-TRUST.md`, not in this
+roadmap, recorded here because it is the file a later planner reads.
+
+1. **IF-0-TRUST-1 froze a `"denied"` decision that no shipped command can write.**
+   The gate fixes `decision` as the closed vocabulary `{"approved", "denied"}` and
+   requires `is_approved` to distinguish a `"denied"` record from an absent one, and
+   `src/pmcp/trust_store.py` implements precisely that: `DECISIONS` rejects any other
+   value at `record` time rather than storing it, and `is_approved` returns `False`
+   for a `"denied"` record even when the digest matches. But EC-TRUST-4 froze the CLI
+   as exactly `approve` / `list` / `revoke`, and `run_trust` (`src/pmcp/cli.py`)
+   dispatches those three and no more — so no operator surface constructs
+   `decision="denied"`, and `revoke` *deletes* the record rather than denying it.
+   **This is not a security hole.** Absence already refuses, so the reachable
+   behaviour is a strict subset of the frozen behaviour; the gap is a reserved
+   vocabulary value with no writer, not a permissive default. It is recorded because
+   a downstream lane reading IF-0-TRUST-1 would reasonably plan a "the operator
+   denied this" path and find nothing to call. **CONSENT and PKGID must treat
+   `"denied"` as reserved, not as available.** Whichever phase first needs an
+   explicit deny owns adding the verb — with its own CHANGELOG entry — or SEAL
+   documents the value as reserved when it writes the trust-model section of
+   `SECURITY.md`. TRUST did neither on purpose: shipping a verb whose records no
+   caller reads would have broken this phase's "wire no caller" rule.
+
+2. **IF-0-TRUST-2 froze a synchronous signature over blocking network I/O. Read this
+   before PKGID SL-1 is executed.** The gate declares
+   `resolve_package_identity(spec: str) -> PackageIdentity | None`, and the shipped
+   code honours it: `src/pmcp/manifest/package_identity.py:120` calls
+   `_OPENER.open(request, timeout=_FETCH_TIMEOUT)` over `urllib`, with
+   `_FETCH_TIMEOUT = 10.0` (`:58`). Every other registry lookup in this codebase is a
+   coroutine — `get_npm_version`, `get_pypi_version`, `get_cargo_version` and
+   `get_docker_version` (`src/pmcp/manifest/version_checker.py:1375-1530`) are all
+   `async def` over `aiohttp.ClientSession` — so the house pattern a PKGID lane will
+   assume by analogy is the one this function does not follow. That matters because
+   PKGID SL-1 owns `src/pmcp/tools/handlers.py` and its EC-PKGID-5 decision resolves
+   and pins **at registration**, inside `async def register_discovered_server`
+   (`handlers.py:5513`). Calling `resolve_package_identity` directly from that
+   coroutine blocks the gateway's event loop for up to ten seconds per registration —
+   no other downstream call is served meanwhile, and a slow or unreachable registry
+   turns one agent's registration into a gateway-wide stall.
+   The signature stays frozen and PKGID must **not** change it: that file belongs to
+   TRUST and an async rewrite would edit a merged phase's contract. The fix is
+   caller-side and belongs in PKGID's plan — hand the call to a thread
+   (`asyncio.get_running_loop().run_in_executor(None, resolve_package_identity, spec)`
+   or `anyio.to_thread.run_sync`) and give the enclosing handler its own timeout
+   rather than treating the 10 s socket timeout as the bound, since a redirect chain
+   can spend that timeout more than once. `plans/phase-plan-v13-PKGID.md` does not
+   mention any of this; it was found only by reading TRUST's merged code, after that
+   plan was written.
+
+3. **The TRUST phase plan names frozen tests in one lane and behaviours in another,
+   and says nowhere that it is doing so.** In `plans/phase-plan-v13-TRUST.md`, SL-1.1's
+   "Tests owned" cell reads "**exactly these names**, because the acceptance criteria
+   address them individually" and lists eight `test_*` identifiers, which the
+   EC-TRUST-2/3/5/6 criteria then cite by name. SL-2.1's cell for the same column
+   reads "identity resolves offline from a fixture; an unresolvable spec returns
+   `None` rather than raising; no subprocess is spawned" — behaviour descriptions, not
+   names. The asymmetry is defensible in substance (EC-TRUST-1 proves itself by naming
+   the whole file, so there was no name to freeze) but it is stated nowhere, and a lane
+   brief written from the plan read the two cells as carrying the same instruction. A
+   phase plan that mixes frozen test names with behaviour descriptions must say which
+   kind each cell is, in the cell — the reader cannot infer it from the column header,
+   which is identical for both.
+
 ### Phase 2 — Project-scoped configuration requires consent (CONSENT)
 
 **Objective**
@@ -215,6 +284,13 @@ gate in `tools/handlers.py`, **lane B** owns policy package identifiers in
 in `manifest/installer.py`. Lane A is the single-writer risk — `handlers.py` is large
 and touched by other work; serialise any other writer against it. Parallel-safe with
 CONSENT: no shared file, and both depend only on TRUST.
+
+**Before executing lane A, read TRUST → Post-execution amendments item 2.**
+`resolve_package_identity` is synchronous and performs blocking network I/O with a
+10 s socket timeout; `register_discovered_server` is a coroutine, so calling it
+directly there stalls the event loop. The fix is caller-side (a thread executor) and
+belongs to this phase — `plans/phase-plan-v13-PKGID.md` was written before the
+finding and does not carry it.
 
 **Non-goals**
 Sandboxing what does run; auditing PMCP's own dependencies.
