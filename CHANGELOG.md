@@ -43,6 +43,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
+- **A repository's own configuration files no longer configure PMCP until you
+  approve them, and an approved project policy can only *narrow* the operator's
+  policy.** The behaviour an existing operator will feel first is the policy one.
+  A checked-in `.mcp-gateway-policy.yaml` used to be discovered ahead of the
+  user's own policy and `PolicyManager` stopped at the first file it found, so a
+  project policy **replaced** `~/.claude/gateway-policy.yaml` outright — a
+  repository could allow a server the operator had denied (S-11). Both files are
+  now read, and every predicate is conjunctive: a server, tool or resource is
+  permitted only if the user policy permits it **and** the project policy does. A
+  project `allowlist` cannot re-admit what the user denied; a project limit can
+  lower the operator's effective limit but never raise one, and a limit the
+  project does not set leaves the operator's alone; a project redaction list
+  *extends* `DEFAULT_REDACTION_PATTERNS` rather than replacing them. A project
+  policy can still refuse what the user allows — that is the one thing a
+  repository is allowed to do to your policy.
+  The same gate now stands in front of all three repository-supplied sources:
+  `.pmcp/manifest.yaml`, the project `.mcp.json` and `.mcp-gateway-policy.yaml`.
+  Until you run `pmcp trust approve <absolute path>` each one is **ignored**, and
+  the skip is logged once at WARNING naming that exact command. An unapproved
+  manifest overlay can neither replace a shipped server's `command` (S-03) nor add
+  a server of its own, and a server it tried to add is not treated as
+  manifest-backed downstream, so it cannot collect an exemption meant for servers
+  PMCP ships. An unapproved project `.mcp.json` is not applied by any of its five
+  readers — servers, config sources, `disableAutoStart`, `autoStart` and
+  `allowPrivateRegistry` — all of which now pass through one choke point rather
+  than gating themselves.
+  **User-scoped and explicitly-configured sources are unaffected.** `~/.mcp.json`,
+  `~/.claude/.mcp.json`, `~/.claude/gateway-policy.yaml`, `$PMCP_MANIFEST_PATH`,
+  an explicit `--config` path and an explicit `--policy` path all apply with no
+  trust record at all, and an operator with no project files in their checkout
+  sees byte-identical behaviour to before. Approving nothing changes nothing for
+  them.
+  Approval is over **bytes, not paths**: editing a file you approved revokes the
+  approval by itself, with no `pmcp trust revoke` to remember. Each source is read
+  exactly once and the bytes that were judged are the bytes that get parsed, so a
+  file swapped between the check and the use is not covered by the earlier
+  approval. Every failure refuses — an unreadable source, an unreadable or corrupt
+  trust store, any error out of the store — because a store that cannot be
+  consulted has granted nothing. Found by the 2026-09-01 codebase review (S-03,
+  S-11); see [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **The operator's project `.env` no longer reaches the servers PMCP spawns.**
   `pmcp`'s entry point loads `<project>/.env` into its own environment at
   startup, and `_check_api_key_available` loads whole env files to answer a

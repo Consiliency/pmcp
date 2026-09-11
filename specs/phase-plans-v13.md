@@ -263,6 +263,174 @@ Package identity (PKGID owns it); any change to user- or env-scoped sources.
 - redaction posture: `metadata_only`
 - missing or malformed evidence routes to `blocker_class=contract_bug` (non-human).
 
+### Post-execution amendments — CONSENT (2026-09-11)
+
+Recorded by SL-docs after SL-1, SL-2, SL-3 and SL-4 landed, were merged, and a
+single-writer repair pass ran over the assembled branch. Every exit criterion
+shipped as written, and both freeze gates shipped with one recorded deviation
+between them (item 8); nothing below reopens a contract, and no criterion had to
+be weakened. What follows is what the plan and this roadmap got wrong about the
+*work*, and two findings a later phase inherits whether or not it reads them.
+Items 1 and 2 are the ones PKGID and SEAL pay for if they are not read.
+
+1. **EC-CONSENT-5's own defect note undercounts the damage, and the phase learned
+   the repair rule the hard way.** `plans/phase-plan-v13-CONSENT.md` records
+   (correctly) that the criterion's "passing unmodified" proof clause is
+   unsatisfiable, and names three suites that assert an *unapproved* project
+   source applies: `tests/test_manifest_overlay.py`, `tests/test_config_loader.py`,
+   `tests/test_policy_fail_open.py`, assigned to SL-2/3/4. **Three was the
+   lane-owned subset, not the blast radius.** Measured on the assembled branch:
+   the four lanes together broke **16 tests across six further files**, none of
+   them owned by any lane — `tests/test_secrets_command.py` (5),
+   `tests/test_credential_optionality_e2e.py` (5), `tests/test_registry.py` (2),
+   `tests/test_credential_gates_startup.py` (1), `tests/test_tools.py` (1),
+   `tests/test_phase4_e2e.py` (1). A grep for test files creating a
+   project-scoped source returns **18**, of which only 3 were lane-owned. Fifteen
+   of the sixteen were one mechanical class — a project fixture written without an
+   approval — repaired by recording the approval next to the fixture write; the
+   sixteenth was item 3 below wearing a disguise.
+   **The rule this phase arrived at, and which the next phase should plan for up
+   front: the owning lane repairs its OWN suite, and all cross-cutting fallout is
+   repaired in ONE single-writer pass after the lanes merge.** Not out of
+   tidiness — a file like `tests/test_tools.py` can break from more than one
+   lane's gate, so concurrent lanes editing it lose each other's updates, and the
+   interaction set is by construction invisible to any single lane working in an
+   isolated worktree. A phase that introduces a gate in front of an
+   already-widely-fixtured source must budget that pass as work, not treat it as
+   an overrun.
+
+2. **The acceptance criteria are structurally blind to a gate-then-reread (TOCTOU)
+   regression — the one defect the phase exists to prevent.** IF-0-CONSENT-1's
+   central rule is that `read_and_gate` reads the path **exactly once** and the
+   caller parses the bytes it was handed; re-opening the path after gating means
+   parsing bytes nobody approved. No required test in EC-CONSENT-1 through -7 can
+   see a violation: in every one of them the bytes on disk and the bytes that were
+   gated are identical, so a caller that re-opens the file observes nothing
+   different. Measured by SL-2 — mutating its loader to re-read after gating failed
+   exactly **one** test, an extra one the lane had added beyond the eight its plan
+   row required, and nothing else in the suite. All three consuming lanes did add
+   an equivalent guard (`test_the_parsed_bytes_are_the_gated_bytes_not_a_second_read`,
+   `test_an_approved_project_mcp_json_is_read_exactly_once`, and SL-4's, caught by
+   three of its tests), but by independent judgement, not because anything asked
+   them to. **Every future consumer of `read_and_gate` must be REQUIRED to prove
+   the one-read property, by a named test in its acceptance criteria** — PKGID and
+   SEAL included. A criterion that only checks the gate's verdict leaves the
+   window the gate was built to close entirely untested.
+
+3. **Phase assembly created an import cycle that no lane and no test run could
+   see.** Not fallout — a genuine defect introduced by the *merge*, and the
+   lesson generalises past this phase. SL-3 made `config/loader.py` import
+   `project_consent`, which imports `trust_store`, which already imported
+   `config.loader` at module scope:
+   `config.loader -> project_consent -> trust_store -> config.loader`. Each file
+   imported cleanly on its own branch; the cycle only closes with all three
+   present, so no lane could have found it, and `import pmcp.config.loader` in a
+   clean interpreter raised `ImportError` on the assembled branch — a hard failure
+   on a core module. **The test suite actively concealed it**: `tests/conftest.py`
+   imports `trust_store` at collection time, so the cycle is already resolved
+   before any test touches `config.loader`. It surfaced in exactly one place, a
+   test that spawns a subprocess, and presented as a process-reaping symptom
+   ("a hung probe leaves grandchildren alive") with no visible connection to
+   imports. Fixed by making the `find_project_root` import call-time in
+   `trust_store`; guarded by a regression test that spawns a **real subprocess per
+   module**, because an in-process import assertion proves nothing once conftest
+   has resolved the cycle. **Any phase that merges lanes which add cross-module
+   imports should run a clean-interpreter import of each touched module as an
+   assembly step.** A green suite is not evidence that the package imports.
+
+4. **The evidence path `tests/test_project_source_consent.py` does not exist and
+   was never creatable.** A single file cannot be disjointly owned by three
+   concurrent lanes. Phase 2's **Key files** entry and its **spec closeout
+   policy → evidence paths** entry should both be read as naming these four:
+   `tests/test_project_consent_gate.py` (the gate itself, SL-1),
+   `tests/test_project_source_consent_manifest.py` (SL-2),
+   `tests/test_project_source_consent_config.py` (SL-3) and
+   `tests/test_project_source_consent_policy.py` (SL-4). SEAL's closeout should
+   collect all four.
+
+5. **The phase decomposed into four implementation lanes, not the three this
+   roadmap's Scope notes prescribe** (five with SL-docs). The Scope notes assign
+   one loader per lane and assume the three consume IF-0-TRUST-1 directly. They
+   cannot: IF-0-CONSENT-1's "the single call every loader uses" is itself a new
+   file all three loaders import, so it is a lane — SL-1, `src/pmcp/project_consent.py`
+   — and the only DAG root. Lanes A/B/C became SL-2/SL-3/SL-4 and open together
+   once SL-1 lands. A roadmap that names a shared interface as a phase output
+   should count it as a lane.
+
+6. **Two IF-0-TRUST-1 assumptions this phase stated up front proved wrong, and
+   both were harmless only by luck.** (a) The plan assumed `pmcp trust approve`
+   records `scope="project"`. It records `scope="user"` — `_TRUST_SCOPE = "user"`
+   at `src/pmcp/cli.py:2489`, used at `:2515`. Harmless because `is_approved(path,
+   content)` takes no scope argument and never consults it, but every lane had
+   been briefed to assert on a value that was never there; all four briefs were
+   corrected to forbid asserting on `scope` at all. The two approval paths now
+   disagree in opposite directions — the test helper records `"project"`, the
+   shipped CLI records `"user"` — and nothing reads either. **Pick one before
+   `scope` acquires a consumer**; today it is descriptive metadata, and the first
+   phase to make it load-bearing inherits a field with two conflicting writers.
+   (b) TRUST gap 5 ("no frozen test seam for the store location") is resolved, but
+   not by the monkeypatch the plan assumed. Patching
+   `pmcp.trust_store.trust_store_path` would break TRUST's own suite:
+   `tests/test_trust_store.py` binds the name at import time, so its direct calls
+   would use the original while `record`/`is_approved` resolve the patched module
+   global — the two would disagree about where the store lives. The published seam
+   is an autouse HOME redirect in `tests/conftest.py` (SL-1), which is what TRUST's
+   tests already use and which keeps the store's checkout-residency check live
+   rather than stubbing it. No cross-phase write into `src/pmcp/trust_store.py` was
+   needed.
+
+7. **EC-CONSENT-2 undercounts the project `.mcp.json` read sites: there are five,
+   not four.** The plan groups them as consumers of `_iter_config_source_paths`;
+   `registry_allow_private_from_config` is not one — it builds its own candidate
+   list and appends the project `.mcp.json` directly. An implementer working from
+   the count leaves that reader fail-open, which is the `allowPrivateRegistry`
+   flag, set by an unapproved repository file. SL-3 routed all five through a
+   single helper, `_gate_project_config`, so the omission is structurally
+   impossible rather than merely tested for. **Prefer one choke point to N gates**
+   wherever a phase gates a source with more than one reader.
+
+8. **Accepted deviation from IF-0-CONSENT-1: `reason` is a `Literal`, not a bare
+   `str`.** `ConsentReason = Literal["approved", "no_record", "content_changed",
+   "unreadable"]`. `Literal` is a subtype of `str`, so every downstream `reason:
+   str` annotation and comparison still type-checks (verified). What it buys,
+   precisely: mypy rejects constructing a `ConsentDecision` with a reason outside
+   the vocabulary under this repo's current settings. What it does **not** buy:
+   catching a typo'd `==` comparison, which needs `--strict-equality`, and this
+   repo does not enable it. Recorded so the next reader does not overstate the
+   guarantee.
+
+9. **Two UX findings handed to SEAL, both out of scope here.** (a) The frozen
+   remediation string is unquoted, so a project path containing a space yields
+   `pmcp trust approve /path/with a space/.mcp.json` — a command that is not
+   runnable as printed. Not deviated from the freeze; SEAL should decide the
+   quoting rule. (b) `set_startup_policy` stays ungated by design — it is an
+   operator-initiated *write*, not passive trust — but it rewrites the project
+   `.mcp.json` through `_atomic_write_json`, which changes its bytes and therefore
+   silently revokes any approval the operator recorded for it. `pmcp startup add
+   --source project` invalidates the operator's own trust record and they get a
+   refusal on the next startup. Arguably correct (the bytes did change), but a
+   trap; it sits next to the existing "no bulk approve" note.
+
+10. **`plans/phase-plan-v13-CONSENT.md`'s Context line references have gone stale**
+    as a result of this phase's own work: `_load_overlay_file` no longer opens the
+    path, so `manifest/loader.py:696`, `:801` and `:806-809` no longer point where
+    the plan says (`servers.update(overlay_servers)` is now at `:848`). Expected
+    for a merged phase plan, recorded because the plan is still the document a
+    reviewer reads to check the criteria.
+
+11. **Five lane briefs, five factual errors — a plan-authoring lesson, in the
+    genre of TRUST amendment 3.** Every brief written from these plans by hand
+    carried at least one error the lane caught by reading the plan instead of
+    trusting the brief: TRUST SL-2 (claimed SL-2.1 freezes test *names*; it lists
+    descriptions — TRUST amendment 3); TRUST SL-4 (claimed the docs-catalog helper
+    was absent; it is installed); CONSENT SL-2, SL-3 and SL-4 (each transcribed
+    one fewer node id than its plan row lists — SL-4's omission was the redaction
+    test, the redaction rule's *only* falsifier, which would have shipped that rule
+    unproven). The mitigation that worked, and which every future brief should
+    carry verbatim: **"trust the document over this brief, and tell me when they
+    disagree."** The structural fix is to stop hand-transcribing node ids into
+    briefs and generate them from the plan row.
+
 ### Phase 3 — Provisioning binds to package identity (PKGID)
 
 **Objective**
