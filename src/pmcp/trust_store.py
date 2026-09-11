@@ -199,11 +199,24 @@ def _write_store(path: Path, records: list[TrustRecord]) -> None:
         # the pre-revoke store on disk and resurrect the approval the operator
         # just withdrew. That is the same invariant the lock protects against a
         # race, reached through power loss instead.
-        dir_fd = os.open(parent, os.O_RDONLY)
+        # Best effort, and deliberately so. Directory fsync is unsupported on
+        # some platforms and filesystems (macOS returns EINVAL, NFS and some
+        # overlay mounts ENOTSUP), and `os.open` on a directory fails outright
+        # on Windows. The replace has ALREADY succeeded by this point, so
+        # raising here would report a failed `record`/`revoke` for a write that
+        # landed -- telling an operator their revoke did not take when it did is
+        # worse than losing a durability guarantee the platform cannot give.
         try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
+            dir_fd = os.open(parent, os.O_RDONLY)
+        except OSError:
+            pass
+        else:
+            try:
+                os.fsync(dir_fd)
+            except OSError:
+                pass
+            finally:
+                os.close(dir_fd)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp_name)
@@ -223,11 +236,30 @@ def _ensure_store_dir(parent: Path) -> None:
     """
     if parent.exists():
         return
-    parent.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(parent, 0o700)
-    except OSError:
-        pass
+    # Create every missing component RESTRICTIVE AT CREATION, one at a time.
+    # `mkdir(parents=True, mode=0o700)` is not enough on two counts, both
+    # measured: the intermediates are created with the default mode because
+    # pathlib deliberately ignores `mode` for parents (mimicking `mkdir -p`), so
+    # a freshly created `~/.config` lands 0o775 under umask 002; and creating
+    # loosely and tightening afterwards leaves a window in which another account
+    # in the user's group can insert a forged `trust.json` that a later
+    # `record()` will read and carry forward. `mkdir`'s mode is applied by the
+    # kernel at creation and umask can only remove bits, never add them.
+    missing: list[Path] = []
+    probe = parent
+    while not probe.exists():
+        missing.append(probe)
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    for component in reversed(missing):
+        component.mkdir(mode=0o700, exist_ok=True)
+        try:
+            # Only for a pathological umask that stripped owner bits from the
+            # mode above; it can never loosen a directory beyond 0o700.
+            os.chmod(component, 0o700)
+        except OSError:
+            pass
 
 
 @contextlib.contextmanager

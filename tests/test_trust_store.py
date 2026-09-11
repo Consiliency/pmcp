@@ -9,6 +9,7 @@ checkout is the normal case -- that is what every CONSENT caller will do.
 from __future__ import annotations
 
 import json
+import os
 import stat
 import threading
 from datetime import datetime
@@ -293,3 +294,74 @@ def test_a_store_directory_pmcp_creates_is_not_group_or_world_accessible(
     assert store.parent.stat().st_mode & 0o777 == 0o700, (
         "the store directory must not be group- or world-accessible"
     )
+
+
+def test_every_directory_pmcp_creates_is_private_including_intermediates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No component is group- or world-accessible, even transiently.
+
+    Two measured facts drive this. `Path.mkdir(parents=True, mode=...)` ignores
+    `mode` for the intermediates it creates, so a freshly created `~/.config`
+    lands 0o775 under umask 002 while only the leaf is tightened. And creating
+    loosely then tightening leaves a window in which another account in the
+    user's group can insert a forged `trust.json` that a later `record()` reads
+    and carries forward -- the store file being 0o600 does not help, because the
+    attack replaces the file rather than reading it.
+
+    Falsifier: restore `parent.mkdir(parents=True)` plus a trailing chmod and
+    the intermediate assertion fails under this umask.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    checkout = tmp_path / "checkout"
+    (checkout / ".git").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(checkout)
+    monkeypatch.setattr(os, "umask", lambda _mask: 0o002, raising=False)
+    old_mask = os.umask(0o002)
+    try:
+        target = _write(checkout / "server.json", b"payload")
+        record(target, b"payload", "user", "approved")
+
+        store = trust_store_path()
+        assert store.parent.stat().st_mode & 0o777 == 0o700
+        # the intermediate PMCP created on the way down, e.g. ~/.config
+        intermediate = store.parent.parent
+        assert intermediate != home, "test must exercise a created intermediate"
+        assert intermediate.stat().st_mode & 0o777 == 0o700, (
+            f"{intermediate} was created group/world-accessible"
+        )
+    finally:
+        os.umask(old_mask)
+
+
+def test_a_directory_fsync_failure_does_not_fail_a_completed_write(
+    checkout: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Durability is best effort; the write already landed.
+
+    Directory fsync is unsupported on macOS (EINVAL), on NFS and some overlay
+    mounts (ENOTSUP), and `os.open` on a directory fails outright on Windows.
+    Because the fsync runs AFTER `os.replace`, raising would report a failed
+    `revoke` for a revoke that succeeded -- and an operator told their
+    withdrawal did not take, when it did, is the worst direction for this tool
+    to be wrong in.
+
+    Falsifier: drop the `except OSError` around the fsync and this raises
+    OSError(22) while `is_approved` already reads False.
+    """
+    target = _write(checkout / "server.json", b"payload")
+    record(target, b"payload", "user", "approved")
+
+    real_fsync = os.fsync
+
+    def fails_on_directories(fd: int) -> None:
+        if os.fstat(fd).st_mode & 0o170000 == 0o040000:
+            raise OSError(22, "Invalid argument")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fails_on_directories)
+
+    assert revoke(target) is True, "a completed revoke must not report failure"
+    assert not is_approved(target, b"payload")
