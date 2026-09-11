@@ -1,12 +1,37 @@
-"""Tests for config loader."""
+"""Tests for config loader.
+
+READ THIS IF A FIXTURE HERE WRITES A PROJECT ``.mcp.json``
+=========================================================
+
+Since CONSENT (Consiliency/pmcp#230) a *project-scoped* ``.mcp.json`` is applied only when
+the operator has approved its exact bytes, so a fixture that writes one and
+expects it to load must record that approval first -- ``approve_project_file``
+does precisely what ``pmcp trust approve`` does. Without it the file is refused
+and the test's real subject (precedence, path normalisation, manifest merging)
+is never reached.
+
+The asymmetry is deliberate and is itself evidence: the same bytes passed as
+``custom_config_path`` or as a ``user_config_paths`` entry need **no** approval,
+because those are the operator naming a file, not a repository shipping one.
+Tests below that pass ``tmp_path / "custom.mcp.json"`` record nothing on
+purpose. Two further cases deliberately record nothing:
+``test_startup_policy_preview_and_apply_preserves_unrelated_keys`` drives
+``set_startup_policy``, an operator-initiated *write* that is ungated by design,
+and ``test_load_configs_honors_runtime_home`` reads its file as user scope.
+
+If a test here starts failing with a "has not been approved" WARNING, the fix is
+an approval in its fixture -- never a weakening of the gate.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
 
 from pmcp.config.loader import (
     _manifest_server_to_config,
@@ -35,6 +60,9 @@ from pmcp.types import (
     ResolvedServerConfig,
     StartupPolicyOperation,
 )
+
+#: ``approve_project_file`` from `tests/conftest.py`, named for the signatures below.
+ApproveProjectFile = Callable[[Path], None]
 
 
 class TestConfiguredEntryCredentialInheritance:
@@ -240,7 +268,9 @@ class TestLoadConfigs:
 
         assert find_project_root(nested) is None
 
-    def test_loads_project_config(self, tmp_path: Path) -> None:
+    def test_loads_project_config(
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
+    ) -> None:
         # Create project config
         project_config = {
             "mcpServers": {
@@ -251,6 +281,7 @@ class TestLoadConfigs:
             }
         }
         (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+        approve_project_file(tmp_path / ".mcp.json")
 
         configs = load_configs(
             project_root=tmp_path,
@@ -289,7 +320,9 @@ class TestLoadConfigs:
         names = {c.name for c in load_configs(project_root=empty_project)}
         assert names == {"home-server"}
 
-    def test_merges_configs_with_precedence(self, tmp_path: Path) -> None:
+    def test_merges_configs_with_precedence(
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
+    ) -> None:
         # Create project config
         project_config = {
             "mcpServers": {
@@ -298,6 +331,7 @@ class TestLoadConfigs:
             }
         }
         (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+        approve_project_file(tmp_path / ".mcp.json")
 
         # Create user config
         user_dir = tmp_path / "user"
@@ -335,8 +369,11 @@ class TestLoadConfigs:
         )
         assert len(configs) == 0
 
-    def test_handles_invalid_json(self, tmp_path: Path) -> None:
+    def test_handles_invalid_json(
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
+    ) -> None:
         (tmp_path / ".mcp.json").write_text("invalid json {{{")
+        approve_project_file(tmp_path / ".mcp.json")
 
         configs = load_configs(
             project_root=tmp_path,
@@ -345,10 +382,14 @@ class TestLoadConfigs:
         assert len(configs) == 0
 
     def test_malformed_config_is_surfaced_but_startup_proceeds(
-        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+        self,
+        tmp_path: Path,
+        approve_project_file: ApproveProjectFile,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         # Malformed project config: its servers are silently dropped today.
         (tmp_path / ".mcp.json").write_text("invalid json {{{")
+        approve_project_file(tmp_path / ".mcp.json")
         # A valid user config that must still load despite the broken project file.
         user_path = tmp_path / "user.mcp.json"
         user_path.write_text(
@@ -371,7 +412,9 @@ class TestLoadConfigs:
             if record.levelno >= logging.WARNING
         )
 
-    def test_normalizes_relative_paths(self, tmp_path: Path) -> None:
+    def test_normalizes_relative_paths(
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
+    ) -> None:
         project_config = {
             "mcpServers": {
                 "test-server": {
@@ -381,6 +424,7 @@ class TestLoadConfigs:
             }
         }
         (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+        approve_project_file(tmp_path / ".mcp.json")
 
         configs = load_configs(
             project_root=tmp_path,
@@ -392,7 +436,9 @@ class TestLoadConfigs:
         assert cfg.command == str(tmp_path / "bin" / "server")
         assert cfg.cwd == str(tmp_path / "data")
 
-    def test_keeps_remote_entries(self, tmp_path: Path) -> None:
+    def test_keeps_remote_entries(
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
+    ) -> None:
         project_config = {
             "mcpServers": {
                 "gateway": {
@@ -406,6 +452,7 @@ class TestLoadConfigs:
             }
         }
         (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+        approve_project_file(tmp_path / ".mcp.json")
 
         configs = load_configs(
             project_root=tmp_path,
@@ -422,7 +469,7 @@ class TestLoadConfigs:
         assert local.config.command == "node"
 
     def test_remote_entries_preserve_optional_auth_metadata(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
     ) -> None:
         project_config = {
             "mcpServers": {
@@ -439,6 +486,7 @@ class TestLoadConfigs:
             }
         }
         (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+        approve_project_file(tmp_path / ".mcp.json")
 
         configs = load_configs(project_root=tmp_path, user_config_paths=[])
 
@@ -451,7 +499,9 @@ class TestLoadConfigs:
         assert cfg.declared_scopes == ["read"]
         assert cfg.supports_url_elicitation is True
 
-    def test_coerces_legacy_url_entry_to_remote(self, tmp_path: Path) -> None:
+    def test_coerces_legacy_url_entry_to_remote(
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
+    ) -> None:
         project_config = {
             "mcpServers": {
                 "gateway": {
@@ -461,6 +511,7 @@ class TestLoadConfigs:
             }
         }
         (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+        approve_project_file(tmp_path / ".mcp.json")
 
         configs = load_configs(
             project_root=tmp_path,
@@ -593,7 +644,7 @@ class TestLoadConfigs:
         assert resolved.config.env is None
 
     def test_merges_manifest_defaults_for_partial_server_config(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
     ) -> None:
         project_config = {
             "mcpServers": {
@@ -603,6 +654,7 @@ class TestLoadConfigs:
             }
         }
         (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+        approve_project_file(tmp_path / ".mcp.json")
 
         configs = load_configs(
             project_root=tmp_path,
@@ -622,7 +674,7 @@ class TestLoadConfigs:
         ]
 
     def test_skips_partial_server_without_manifest_default(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
     ) -> None:
         project_config = {
             "mcpServers": {
@@ -632,6 +684,7 @@ class TestLoadConfigs:
             }
         }
         (tmp_path / ".mcp.json").write_text(json.dumps(project_config))
+        approve_project_file(tmp_path / ".mcp.json")
 
         configs = load_configs(
             project_root=tmp_path,
@@ -726,11 +779,12 @@ class TestLoadAutoStartPolicy:
         assert resolution.skipped == []
 
     def test_loads_enabled_auto_start_from_all_config_sources(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
     ) -> None:
         (tmp_path / ".mcp.json").write_text(
             json.dumps({"autoStart": ["project-server", "shared-server"]})
         )
+        approve_project_file(tmp_path / ".mcp.json")
 
         user_config_path = tmp_path / "user.mcp.json"
         user_config_path.write_text(
@@ -756,7 +810,7 @@ class TestLoadAutoStartPolicy:
         }
 
     def test_auto_start_policy_lists_are_unioned_not_overridden(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
     ) -> None:
         (tmp_path / ".mcp.json").write_text(
             json.dumps(
@@ -768,6 +822,7 @@ class TestLoadAutoStartPolicy:
                 }
             )
         )
+        approve_project_file(tmp_path / ".mcp.json")
 
         user_config_path = tmp_path / "user.mcp.json"
         user_config_path.write_text(
@@ -797,11 +852,12 @@ class TestLoadAutoStartPolicy:
         assert enabled == {"project-server", "shared-server", "user-server"}
 
     def test_loads_disabled_auto_start_from_all_config_sources(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
     ) -> None:
         (tmp_path / ".mcp.json").write_text(
             json.dumps({"disableAutoStart": ["project-server", "shared-server"]})
         )
+        approve_project_file(tmp_path / ".mcp.json")
 
         user_config_path = tmp_path / "user.mcp.json"
         user_config_path.write_text(
@@ -827,7 +883,7 @@ class TestLoadAutoStartPolicy:
         }
 
     def test_source_aware_policy_reports_paths_and_conflicts(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file: ApproveProjectFile
     ) -> None:
         (tmp_path / ".mcp.json").write_text(
             json.dumps(
@@ -838,6 +894,7 @@ class TestLoadAutoStartPolicy:
                 }
             )
         )
+        approve_project_file(tmp_path / ".mcp.json")
 
         sources = load_config_sources(project_root=tmp_path, user_config_paths=[])
         policy = get_startup_policy(
