@@ -464,8 +464,8 @@ async def test_allow_draft_schema_includes_non_latest(monkeypatch) -> None:
 
 
 def test_config_field_enables_private_registry_without_the_env_var(
-    monkeypatch, tmp_path
-, approve_project_file) -> None:
+    monkeypatch, tmp_path, approve_project_file
+) -> None:
     """The config half of v9 PRIVREG's "env var + config field" (#139).
 
     Only the env var was ever built, so an operator whose gateway config lives
@@ -502,8 +502,8 @@ def test_config_field_enables_private_registry_without_the_env_var(
 
 
 def test_env_var_overrides_the_config_field_only_when_explicitly_set(
-    monkeypatch, tmp_path
-, approve_project_file) -> None:
+    monkeypatch, tmp_path, approve_project_file
+) -> None:
     """Absence of the env var is not a preference.
 
     Reading an unset `PMCP_REGISTRY_ALLOW_PRIVATE` as "false" would silently

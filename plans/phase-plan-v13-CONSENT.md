@@ -2,7 +2,7 @@
 phase_loop_plan_version: 1
 phase: CONSENT
 roadmap: specs/phase-plans-v13.md
-roadmap_sha256: 9b77ee0a3e9c1ff6d71f65ef6c36ccdc2714b506b4f62f74b746da5299891aa9
+roadmap_sha256: de1558b0ccd3170181389ab06ff4228e832312cf5270270e2e973e61dabff382
 ---
 
 # PHASE-2-CONSENT: Project-scoped configuration requires consent
