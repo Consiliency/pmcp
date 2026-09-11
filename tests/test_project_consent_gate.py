@@ -21,6 +21,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
+import subprocess
+import sys
+
 import pytest
 
 from pmcp import trust_store
@@ -251,3 +254,29 @@ def test_consent_decision_is_frozen(source: Path) -> None:
     assert isinstance(decision, ConsentDecision)
     with pytest.raises(Exception):  # noqa: B017 - dataclasses raises FrozenInstanceError
         decision.allowed = True  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["pmcp.config.loader", "pmcp.trust_store", "pmcp.project_consent"],
+)
+def test_each_consent_module_imports_first_in_a_clean_interpreter(module: str) -> None:
+    """No import cycle, whichever of the three is imported first.
+
+    CONSENT made `pmcp.config.loader` import `pmcp.project_consent`, which imports
+    `pmcp.trust_store`, which imported `pmcp.config.loader` at module scope — a
+    cycle that made `import pmcp.config.loader` fail outright in a clean
+    interpreter.
+
+    The suite could not see it: `tests/conftest.py` imports `trust_store` at
+    collection time, so by the time any test reaches `config.loader` the cycle is
+    already resolved. It surfaced only in a subprocess that imported
+    `config.loader` first. Hence a real subprocess per module here rather than an
+    in-process import, which would prove nothing.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"importing {module} first failed:\n{result.stderr}"

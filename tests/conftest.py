@@ -29,6 +29,7 @@ passes for the wrong reason and looks green forever. So:
 
 from __future__ import annotations
 
+import os
 import tempfile
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -117,13 +118,31 @@ def approve_project_file() -> Callable[[Path], None]:
     for exactly those bytes. Editing the file afterwards therefore revokes the
     approval, which is the property the consent lanes assert.
 
+    Pass ``home`` when the test drives code under a different HOME than the
+    autouse isolation provides; the approval is then recorded in that home.
+
     ``scope`` is descriptive metadata only -- ``is_approved(path, content)``
     takes no scope argument and never consults it -- so no test should assert
     on it. (`pmcp trust approve` itself records ``"user"``, `cli.py:2489`.)
     """
 
-    def approve(path: Path) -> None:
-        trust_store.record(path, path.read_bytes(), "project", trust_store.APPROVED)
+    def approve(path: Path, home: Path | None = None) -> None:
+        if home is None:
+            trust_store.record(path, path.read_bytes(), "project", trust_store.APPROVED)
+            return
+        # Some suites point HOME at a directory of their own (and some then hand
+        # that HOME to a subprocess). The store is resolved from HOME at call
+        # time, so an approval recorded under the autouse isolated home would be
+        # invisible to code running under theirs. Record it where they will look.
+        previous = os.environ.get("HOME")
+        os.environ["HOME"] = str(home)
+        try:
+            trust_store.record(path, path.read_bytes(), "project", trust_store.APPROVED)
+        finally:
+            if previous is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous
 
     return approve
 

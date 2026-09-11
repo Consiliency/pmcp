@@ -43,8 +43,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from pmcp.config.loader import find_project_root
-
 APPROVED = "approved"
 DENIED = "denied"
 
@@ -73,6 +71,15 @@ class TrustRecord:
 
 def _checkout_root() -> Path | None:
     """Resolved root of the checkout the process is working in, if any."""
+    # Imported here, not at module scope, to break an import cycle introduced
+    # when CONSENT landed: pmcp.config.loader now imports pmcp.project_consent,
+    # which imports this module, which needed pmcp.config.loader. At module
+    # scope that made `import pmcp.config.loader` fail outright in a clean
+    # interpreter (the test suite hid it, because conftest imports trust_store
+    # first and the cycle is already resolved by the time loader is reached).
+    # The residency check only needs the project root at call time.
+    from pmcp.config.loader import find_project_root
+
     root = find_project_root(Path.cwd())
     return root.resolve() if root else None
 

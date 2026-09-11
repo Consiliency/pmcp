@@ -465,7 +465,7 @@ async def test_allow_draft_schema_includes_non_latest(monkeypatch) -> None:
 
 def test_config_field_enables_private_registry_without_the_env_var(
     monkeypatch, tmp_path
-) -> None:
+, approve_project_file) -> None:
     """The config half of v9 PRIVREG's "env var + config field" (#139).
 
     Only the env var was ever built, so an operator whose gateway config lives
@@ -490,6 +490,10 @@ def test_config_field_enables_private_registry_without_the_env_var(
     (project / ".mcp.json").write_text(
         json.dumps({"mcpServers": {}, "allowPrivateRegistry": True})
     )
+    # A project-scoped .mcp.json is only read once the operator has approved it
+    # (CONSENT, see #230). This test is about the allowPrivateRegistry field, not
+    # about consent, so record the approval and keep testing its actual subject.
+    approve_project_file(project / ".mcp.json")
     value = registry_allow_private_from_config(
         project_root=project, user_config_paths=[]
     )
@@ -499,7 +503,7 @@ def test_config_field_enables_private_registry_without_the_env_var(
 
 def test_env_var_overrides_the_config_field_only_when_explicitly_set(
     monkeypatch, tmp_path
-) -> None:
+, approve_project_file) -> None:
     """Absence of the env var is not a preference.
 
     Reading an unset `PMCP_REGISTRY_ALLOW_PRIVATE` as "false" would silently
@@ -516,6 +520,7 @@ def test_env_var_overrides_the_config_field_only_when_explicitly_set(
     (project / ".mcp.json").write_text(
         json.dumps({"mcpServers": {}, "allowPrivateRegistry": True})
     )
+    approve_project_file(project / ".mcp.json")
     config_true = registry_allow_private_from_config(
         project_root=project, user_config_paths=[]
     )

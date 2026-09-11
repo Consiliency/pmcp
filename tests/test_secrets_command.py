@@ -228,7 +228,7 @@ class TestSecretsHandlers:
 
     @pytest.mark.asyncio
     async def test_run_secrets_check_reports_missing_required(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file
     ) -> None:
         """check reports missing keys from MCP config env refs."""
         home = tmp_path / "home"
@@ -257,6 +257,9 @@ class TestSecretsHandlers:
         }
         config_path.write_text(json.dumps(config))
 
+        # A project-scoped .mcp.json is read only once approved
+        # (CONSENT, #230); approve it in the home this test drives.
+        approve_project_file(project / ".mcp.json", home)
         with patch.dict("os.environ", {"HOME": str(home)}):
             args = argparse.Namespace(project=project)
             output = await run_secrets_check(args)
@@ -269,7 +272,7 @@ class TestSecretsHandlers:
 
     @pytest.mark.asyncio
     async def test_run_secrets_check_accepts_namespaced_storage_key(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file
     ) -> None:
         """A configured server matching a manifest api-key server with a
         secret_key is satisfied by the namespaced storage key — not falsely
@@ -299,6 +302,9 @@ class TestSecretsHandlers:
             )
         )
 
+        # A project-scoped .mcp.json is read only once approved
+        # (CONSENT, #230); approve it in the home this test drives.
+        approve_project_file(project / ".mcp.json", home)
         with patch.dict(
             "os.environ",
             {"HOME": str(home), "BRIGHTDATA_API_TOKEN": "bd-secret"},
@@ -315,7 +321,7 @@ class TestSecretsHandlers:
 
     @pytest.mark.asyncio
     async def test_run_secrets_check_reports_missing_namespaced_credential(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file
     ) -> None:
         """The credential requirement is intrinsic to a configured api-key server
         and must be reported missing when nothing is stored — even though the
@@ -339,6 +345,9 @@ class TestSecretsHandlers:
             )
         )
 
+        # A project-scoped .mcp.json is read only once approved
+        # (CONSENT, #230); approve it in the home this test drives.
+        approve_project_file(project / ".mcp.json", home)
         with patch.dict("os.environ", {"HOME": str(home)}, clear=False):
             os.environ.pop("API_TOKEN", None)
             os.environ.pop("BRIGHTDATA_API_TOKEN", None)
@@ -350,7 +359,7 @@ class TestSecretsHandlers:
 
     @pytest.mark.asyncio
     async def test_run_secrets_check_includes_remote_header_placeholders(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file
     ) -> None:
         home = tmp_path / "home"
         project = tmp_path / "project"
@@ -376,6 +385,9 @@ class TestSecretsHandlers:
             )
         )
 
+        # A project-scoped .mcp.json is read only once approved
+        # (CONSENT, #230); approve it in the home this test drives.
+        approve_project_file(project / ".mcp.json", home)
         with patch.dict("os.environ", {"HOME": str(home)}):
             args = argparse.Namespace(project=project)
             output = await run_secrets_check(args)
@@ -386,7 +398,7 @@ class TestSecretsHandlers:
 
     @pytest.mark.asyncio
     async def test_run_secrets_check_combines_local_and_remote_auth_requirements(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file
     ) -> None:
         home = tmp_path / "home"
         project = tmp_path / "project"
@@ -414,6 +426,9 @@ class TestSecretsHandlers:
             )
         )
 
+        # A project-scoped .mcp.json is read only once approved
+        # (CONSENT, #230); approve it in the home this test drives.
+        approve_project_file(project / ".mcp.json", home)
         with patch.dict("os.environ", {"HOME": str(home)}, clear=True):
             output = await run_secrets_check(argparse.Namespace(project=project))
 
@@ -439,7 +454,7 @@ class TestSecretDirectoryPermissions:
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
 
     def test_write_env_file_leaves_existing_parent_untouched(
-        self, tmp_path: Path
+        self, tmp_path: Path, approve_project_file
     ) -> None:
         """A pre-existing parent (e.g. a project root) is never chmod-ed."""
         os.chmod(tmp_path, 0o755)
