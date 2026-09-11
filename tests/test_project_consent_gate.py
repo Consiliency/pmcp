@@ -280,3 +280,54 @@ def test_each_consent_module_imports_first_in_a_clean_interpreter(module: str) -
         text=True,
     )
     assert result.returncode == 0, f"importing {module} first failed:\n{result.stderr}"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "payload$(id).json",
+        "payload`id`.json",
+        "payload;id.json",
+        "with space.json",
+        "quote'name.json",
+    ],
+)
+def test_the_remediation_is_shell_safe_for_a_repository_chosen_path(
+    tmp_path: Path, filename: str
+) -> None:
+    """A repository can choose the path the remediation names.
+
+    The project sources have fixed names, but `.mcp.json` may be a SYMLINK and
+    the decision path is resolved -- so a repo shipping `payload$(id).json` plus
+    a symlink to it makes the refusal print
+    `pmcp trust approve /checkout/payload$(id).json`. That line exists to be
+    copied into a shell, so an unquoted path turns a security warning into
+    command substitution from repository-controlled content. Reproduced before
+    the fix: pasting it ran `id`.
+
+    Falsifier: drop `shlex.quote` from `_refusal` and the metacharacter cases
+    fail, because the shell expands or splits the path.
+    """
+    target = tmp_path / filename
+    target.write_bytes(b"{}")
+    link = tmp_path / ".mcp.json"
+    link.symlink_to(target)
+
+    _content, decision = read_and_gate(link, "project_mcp_json")
+    assert decision.allowed is False
+
+    # Word-split the line the way a shell would and print one argument per
+    # line. The path must arrive as exactly ONE argument, byte-identical -- not
+    # expanded by command substitution, not split on whitespace.
+    echoed = subprocess.run(
+        ["bash", "-c", f'printf "%s\\n" {decision.remediation}'],
+        capture_output=True,
+        text=True,
+    )
+    assert echoed.returncode == 0
+    assert echoed.stdout.splitlines() == [
+        "pmcp",
+        "trust",
+        "approve",
+        str(target.resolve()),
+    ], f"the remediation was not shell-safe: {echoed.stdout!r}"

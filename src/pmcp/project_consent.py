@@ -41,6 +41,7 @@ would make consent decorative.
 from __future__ import annotations
 
 import logging
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -59,6 +60,13 @@ ProjectSourceKind = Literal["project_manifest", "project_mcp_json", "project_pol
 ConsentReason = Literal["approved", "no_record", "content_changed", "unreadable"]
 
 _APPROVE_COMMAND = "pmcp trust approve"
+# The path is shell-quoted because a REPOSITORY can choose it. The project
+# sources have fixed names, but `.mcp.json` may be a symlink and the decision
+# path is resolved, so a repo shipping `payload$(id).json` plus a symlink to it
+# makes the refusal print `pmcp trust approve /checkout/payload$(id).json`. That
+# line exists to be copied into a shell, so an unquoted path turns a security
+# warning into command substitution from repository-controlled content --
+# reproduced before this was added. shlex.quote leaves ordinary paths untouched.
 
 _KIND_LABELS: dict[ProjectSourceKind, str] = {
     "project_manifest": "project manifest overlay",
@@ -115,7 +123,7 @@ def _refusal(
         path=path,
         kind=kind,
         reason=reason,
-        remediation=f"{_APPROVE_COMMAND} {path}",
+        remediation=f"{_APPROVE_COMMAND} {shlex.quote(str(path))}",
     )
 
 
