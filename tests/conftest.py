@@ -59,7 +59,7 @@ _REAL_HOME = Path.home().resolve()
 
 @pytest.fixture(autouse=True)
 def isolate_trust_store(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[Path]:
     """Point the user-scoped trust store at a per-test home. **Autouse.**
 
@@ -81,9 +81,16 @@ def isolate_trust_store(
 
     Tests needing an approval record one explicitly; ``approve_project_file``
     below is the shorthand.
+
+    The fake home is a **sibling** of the test's own ``tmp_path``, never inside
+    it. Measured, not stylistic: with the home nested under ``tmp_path``,
+    `tests/test_registry.py::test_default_cache_path_is_not_cwd_relative`
+    started failing, because it uses ``tmp_path`` as its stand-in for the cwd
+    and asserts a ``~``-derived path does not sit under it. A home inside
+    ``tmp_path`` makes every home-derived path look cwd-relative to any test
+    asking that question.
     """
-    fake_home = tmp_path / "trust-home"
-    fake_home.mkdir(parents=True, exist_ok=True)
+    fake_home = tmp_path_factory.mktemp("trust-home")
     monkeypatch.setenv("HOME", str(fake_home))
 
     # Assert the redirect took effect BEFORE any test body runs. A silently
