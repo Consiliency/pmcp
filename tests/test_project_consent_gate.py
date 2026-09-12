@@ -18,10 +18,10 @@ here (or in any sibling lane) may touch the developer's real ``~/.config/pmcp``.
 from __future__ import annotations
 
 import logging
+import subprocess
 from pathlib import Path
 from typing import Any
 
-import subprocess
 import sys
 
 import pytest
@@ -331,3 +331,67 @@ def test_the_remediation_is_shell_safe_for_a_repository_chosen_path(
         "approve",
         str(target.resolve()),
     ], f"the remediation was not shell-safe: {echoed.stdout!r}"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    ["payload$(id).json", "payload`id`.json", "with space.json"],
+)
+def test_the_whole_refusal_line_is_safe_to_paste(
+    tmp_path: Path, filename: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The path appears TWICE on the warning line, and both must be safe.
+
+    `log_refusal` writes "Ignoring ... at <path>: ... To use it, run: <command>".
+    Quoting only the command half is not enough: operators copy whole lines, and
+    a shell expands an unquoted `$(id)` in the `at` half BEFORE the line fails as
+    a command, so the substitution runs either way. Reproduced before the fix.
+
+    Falsifier: interpolate `decision.path` raw in `log_refusal` and the
+    expansion assertion below fails.
+    """
+    target = tmp_path / filename
+    target.write_bytes(b"{}")
+    link = tmp_path / ".mcp.json"
+    link.symlink_to(target)
+
+    _content, decision = read_and_gate(link, "project_mcp_json")
+    with caplog.at_level(logging.WARNING, logger="pmcp.project_consent"):
+        log_refusal(decision, logging.getLogger("pmcp.project_consent"))
+    line = caplog.records[-1].getMessage()
+
+    echoed = subprocess.run(
+        ["bash", "-c", f"echo {line}"], capture_output=True, text=True
+    )
+    assert "uid=" not in echoed.stdout, f"the warning line expanded: {echoed.stdout!r}"
+    # The path must survive LITERALLY: quoting means the shell neither expands
+    # `$(...)` nor splits on the space, so the exact bytes come back out.
+    assert str(target.resolve()) in echoed.stdout
+
+
+@pytest.mark.parametrize("control", ["\r", "\n", "\x1b[2K", "\x7f"])
+def test_control_characters_cannot_forge_the_refusal_line(
+    tmp_path: Path, control: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A repository-chosen name must not be able to rewrite what is displayed.
+
+    `shlex.quote` is shell-correct but passes control characters through. A name
+    carrying CR plus an erase-line sequence can overwrite the real warning as it
+    is printed and show a different, attacker-chosen instruction; a newline can
+    add a second, fake "To use it, run:" line above the genuine one.
+
+    Falsifier: drop the control-character branch from `_operator_safe` and these
+    assertions fail — the raw control byte reaches the rendered line.
+    """
+    target = tmp_path / f"payload{control}X.json"
+    target.write_bytes(b"{}")
+    link = tmp_path / ".mcp.json"
+    link.symlink_to(target)
+
+    _content, decision = read_and_gate(link, "project_mcp_json")
+    with caplog.at_level(logging.WARNING, logger="pmcp.project_consent"):
+        log_refusal(decision, logging.getLogger("pmcp.project_consent"))
+    line = caplog.records[-1].getMessage()
+
+    assert control not in line, f"a control character reached the operator: {line!r}"
+    assert decision.remediation.count(control) == 0

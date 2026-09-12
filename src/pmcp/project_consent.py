@@ -115,6 +115,29 @@ def _resolve(path: Path) -> Path:
         return Path(path).absolute()
 
 
+def _operator_safe(value: str) -> str:
+    """Render a repository-controlled path for an operator-facing line.
+
+    Two distinct hazards, both reproduced before this existed:
+
+    * SHELL. The path reaches a line ending "To use it, run: ...", and operators
+      copy whole lines. An unquoted `payload$(id).json` is substituted by the
+      shell BEFORE the line fails as a command, so `id` runs either way.
+    * TERMINAL. `shlex.quote` is shell-correct but passes control characters
+      through untouched. A name carrying CR plus an erase-line sequence can
+      overwrite the real warning as it is printed and display a different,
+      attacker-chosen instruction.
+
+    A path containing control characters cannot be rendered both faithfully and
+    safely on one line, so honesty wins over pasteability for that case: it is
+    shown as an escaped Python literal. Ordinary paths are shell-quoted and
+    otherwise unchanged, which is why every existing assertion still holds.
+    """
+    if any(ch < " " or ch == "\x7f" for ch in value):
+        return repr(value)
+    return shlex.quote(value)
+
+
 def _refusal(
     path: Path, kind: ProjectSourceKind, reason: ConsentReason
 ) -> ConsentDecision:
@@ -123,7 +146,7 @@ def _refusal(
         path=path,
         kind=kind,
         reason=reason,
-        remediation=f"{_APPROVE_COMMAND} {shlex.quote(str(path))}",
+        remediation=f"{_APPROVE_COMMAND} {_operator_safe(str(path))}",
     )
 
 
@@ -219,7 +242,9 @@ def log_refusal(decision: ConsentDecision, logger: logging.Logger) -> None:
     logger.warning(
         "Ignoring %s at %s: %s. To use it, run: %s",
         _KIND_LABELS.get(decision.kind, "project configuration"),
-        decision.path,
+        # Same treatment as the remediation: this path is repository-controlled
+        # and sits on the same line the operator is invited to copy.
+        _operator_safe(str(decision.path)),
         _REASON_LABELS.get(decision.reason, "it was refused"),
         decision.remediation,
     )
