@@ -25,6 +25,7 @@ from unittest.mock import patch
 import pytest
 
 from pmcp.cli import run_init
+from pmcp import trust_store
 from pmcp.cli_commands.secrets import run_secrets_check
 from pmcp.config.loader import StartupSkipReason, resolve_startup_configs
 from pmcp.manifest.installer import MissingApiKeyError, check_api_key
@@ -151,6 +152,17 @@ async def _run_all_seven_gates(
         workdir / ".mcp.json",
         json.dumps({"mcpServers": {"firecrawl": {"command": "firecrawl-mcp"}}}),
     )
+    # A project-scoped .mcp.json is read only once the operator has approved it
+    # (CONSENT, see #230). These gates are about credential optionality, not
+    # about project-source trust, so record the approval and keep testing their
+    # actual subject. `_isolate` has already pointed HOME at the fake home, so
+    # this lands in the store the code under test will read.
+    trust_store.record(
+        workdir / ".mcp.json",
+        (workdir / ".mcp.json").read_bytes(),
+        "project",
+        trust_store.APPROVED,
+    )
     outcomes["secrets_check"] = await run_secrets_check(
         argparse.Namespace(project=workdir)
     )
@@ -267,6 +279,14 @@ server_env:
   firecrawl:
     FIRECRAWL_API_URL: "http://localhost:3002"
 """,
+        )
+        # A project-scoped overlay is applied only once the operator has
+        # approved it (CONSENT, see #230). This test is about two-party
+        # server_env precedence, not project-source trust, so record the
+        # approval; _isolate has already pointed HOME at the fake home.
+        overlay = workdir / ".pmcp" / "manifest.yaml"
+        trust_store.record(
+            overlay, overlay.read_bytes(), "project", trust_store.APPROVED
         )
 
         manifest = load_manifest()
