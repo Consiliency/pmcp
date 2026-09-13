@@ -133,7 +133,17 @@ def _operator_safe(value: str) -> str:
     shown as an escaped Python literal. Ordinary paths are shell-quoted and
     otherwise unchanged, which is why every existing assertion still holds.
     """
-    if any(ch < " " or ch == "\x7f" for ch in value):
+    # `not str.isprintable()`, not a hand-rolled C0 test. The first version
+    # checked `ch < " " or ch == "\x7f"` and missed six classes, all measured:
+    # C1 controls (U+0080-U+009F; CSI U+009B is an escape introducer on some
+    # terminals), bidi overrides and isolates (U+202E, U+2066-U+2069, which
+    # reorder what is displayed), zero-width characters, non-breaking and other
+    # non-ASCII spaces, and lone surrogates from a non-UTF-8 filename decoded
+    # with surrogateescape. `isprintable()` is False for every Unicode category
+    # a terminal can misrender (Cc, Cf, Cs, Co, Cn, Zl, Zp, and Zs other than
+    # U+0020), and it is the same rule `repr()` uses to decide what to escape --
+    # so the branch fires on exactly the strings `repr()` can make safe.
+    if not value.isprintable():
         return repr(value)
     return shlex.quote(value)
 

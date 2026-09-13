@@ -369,7 +369,21 @@ def test_the_whole_refusal_line_is_safe_to_paste(
     assert str(target.resolve()) in echoed.stdout
 
 
-@pytest.mark.parametrize("control", ["\r", "\n", "\x1b[2K", "\x7f"])
+@pytest.mark.parametrize(
+    "control",
+    [
+        "\r",  # C0: carriage return rewrites the line
+        "\n",  # C0: a second, fake instruction line
+        "\x1b[2K",  # C0 ESC: erase-line
+        "\x7f",  # DEL
+        "\x9b2K",  # C1 CSI: an escape introducer on some terminals
+        "\x85",  # C1 NEL
+        "\u202e",  # bidi right-to-left override (Trojan Source)
+        "\u2066",  # bidi isolate
+        "\u200b",  # zero-width space
+        "\xa0",  # non-breaking space
+    ],
+)
 def test_control_characters_cannot_forge_the_refusal_line(
     tmp_path: Path, control: str, caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -395,3 +409,26 @@ def test_control_characters_cannot_forge_the_refusal_line(
 
     assert control not in line, f"a control character reached the operator: {line!r}"
     assert decision.remediation.count(control) == 0
+
+
+def test_a_non_utf8_filename_cannot_reach_the_operator_raw() -> None:
+    """Lone surrogates from surrogateescape must be escaped, not passed through.
+
+    A filename that is not valid UTF-8 arrives in Python as lone surrogates
+    (`os.fsdecode` uses surrogateescape), and a terminal receives them as raw
+    undecodable bytes. The original C0-only check let them through. Tested on
+    the helper directly because creating such a name portably through the
+    filesystem in a test is awkward, and the property is the helper's.
+
+    Falsifier: restore the `ch < " " or ch == "\\x7f"` predicate and the raw
+    surrogate survives into the rendered string.
+    """
+    from pmcp.project_consent import _operator_safe
+
+    hostile = b"/checkout/payload\xff\xfe.json".decode("utf-8", "surrogateescape")
+    rendered = _operator_safe(hostile)
+    assert all(ch.isprintable() for ch in rendered), (
+        f"raw surrogate leaked: {rendered!r}"
+    )
+    # Ordinary paths are untouched by the escaping branch.
+    assert _operator_safe("/checkout/.mcp.json") == "/checkout/.mcp.json"
