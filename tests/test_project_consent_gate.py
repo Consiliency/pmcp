@@ -335,7 +335,20 @@ def test_the_remediation_is_shell_safe_for_a_repository_chosen_path(
 
 @pytest.mark.parametrize(
     "filename",
-    ["payload$(id).json", "payload`id`.json", "with space.json"],
+    [
+        "payload$(id).json",
+        "payload`id`.json",
+        "with space.json",
+        # COMBINED cases. Metacharacters and control characters were tested
+        # separately, so nothing caught that a control character used to switch
+        # rendering to repr(), and repr() picks DOUBLE quotes for a name holding
+        # ' but no " -- inside which bash expands $(id). These are the names
+        # that executed on paste.
+        "payload'\r$(id).json",
+        "pay'lo\"ad\r$(id).json",
+        "payload'\u202e$(id).json",
+        "p`id`\x1b[2K.json",
+    ],
 )
 def test_the_whole_refusal_line_is_safe_to_paste(
     tmp_path: Path, filename: str, caplog: pytest.LogCaptureFixture
@@ -364,9 +377,15 @@ def test_the_whole_refusal_line_is_safe_to_paste(
         ["bash", "-c", f"echo {line}"], capture_output=True, text=True
     )
     assert "uid=" not in echoed.stdout, f"the warning line expanded: {echoed.stdout!r}"
-    # The path must survive LITERALLY: quoting means the shell neither expands
-    # `$(...)` nor splits on the space, so the exact bytes come back out.
-    assert str(target.resolve()) in echoed.stdout
+    # The path must come back out WHOLE and UNEXPANDED. For a printable name that
+    # is the literal path; a name holding non-printable characters is rendered
+    # with those characters as backslash escapes (a real CR becomes the two
+    # characters `\r`), so compare against that rendering rather than the raw
+    # bytes, which by design never reach the operator.
+    rendered = "".join(
+        ch if ch.isprintable() else repr(ch)[1:-1] for ch in str(target.resolve())
+    )
+    assert rendered in echoed.stdout
 
 
 @pytest.mark.parametrize(

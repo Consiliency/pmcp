@@ -118,34 +118,27 @@ def _resolve(path: Path) -> Path:
 def _operator_safe(value: str) -> str:
     """Render a repository-controlled path for an operator-facing line.
 
-    Two distinct hazards, both reproduced before this existed:
+    Two hazards, and the order the defences are applied in is the whole point:
 
-    * SHELL. The path reaches a line ending "To use it, run: ...", and operators
-      copy whole lines. An unquoted `payload$(id).json` is substituted by the
-      shell BEFORE the line fails as a command, so `id` runs either way.
-    * TERMINAL. `shlex.quote` is shell-correct but passes control characters
-      through untouched. A name carrying CR plus an erase-line sequence can
-      overwrite the real warning as it is printed and display a different,
-      attacker-chosen instruction.
+    * TERMINAL. A name can carry characters a terminal misrenders -- C0/C1
+      controls (CR, ESC, CSI U+009B), bidi overrides (U+202E), zero-width
+      characters, non-ASCII spaces, lone surrogates from a non-UTF-8 name. These
+      can overwrite or reorder the warning as it prints. Each non-printable
+      character is replaced by its backslash escape, so the rendered text holds
+      only printable characters.
+    * SHELL. Operators copy whole lines, and the line ends "To use it, run:".
+      The escaped text is then ALWAYS passed through `shlex.quote`, which wraps it
+      in single quotes, inside which `$(...)`, backticks and `$VAR` are literal.
 
-    A path containing control characters cannot be rendered both faithfully and
-    safely on one line, so honesty wins over pasteability for that case: it is
-    shown as an escaped Python literal. Ordinary paths are shell-quoted and
-    otherwise unchanged, which is why every existing assertion still holds.
+    Escape first, quote last, unconditionally. An earlier version returned
+    `repr(value)` INSTEAD of quoting whenever a control character was present.
+    `repr()` is a Python literal, not shell quoting: for a name containing `'`
+    and no `"` it chooses double quotes, and bash expands `$(id)` inside double
+    quotes. So `payload'<CR>$(id).json` executed on paste -- the control-character
+    branch reintroduced the injection the helper exists to stop. Reproduced.
     """
-    # `not str.isprintable()`, not a hand-rolled C0 test. The first version
-    # checked `ch < " " or ch == "\x7f"` and missed six classes, all measured:
-    # C1 controls (U+0080-U+009F; CSI U+009B is an escape introducer on some
-    # terminals), bidi overrides and isolates (U+202E, U+2066-U+2069, which
-    # reorder what is displayed), zero-width characters, non-breaking and other
-    # non-ASCII spaces, and lone surrogates from a non-UTF-8 filename decoded
-    # with surrogateescape. `isprintable()` is False for every Unicode category
-    # a terminal can misrender (Cc, Cf, Cs, Co, Cn, Zl, Zp, and Zs other than
-    # U+0020), and it is the same rule `repr()` uses to decide what to escape --
-    # so the branch fires on exactly the strings `repr()` can make safe.
-    if not value.isprintable():
-        return repr(value)
-    return shlex.quote(value)
+    escaped = "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in value)
+    return shlex.quote(escaped)
 
 
 def _refusal(
