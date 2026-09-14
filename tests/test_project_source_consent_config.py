@@ -348,7 +348,7 @@ def test_a_refused_project_config_does_not_block_the_user_private_registry_optin
 
 
 def test_an_absent_project_mcp_json_warns_about_nothing(
-    tmp_path: Path, caplog: pytest.LogCaptureFixture
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The common case must stay silent.
 
@@ -358,6 +358,12 @@ def test_an_absent_project_mcp_json_warns_about_nothing(
     """
     user_path = tmp_path / "user.mcp.json"
     user_path.write_text(json.dumps({"mcpServers": {"u": {"command": "echo"}}}))
+    # `load_configs` merges manifest defaults via `load_manifest()`, whose project
+    # overlay walk starts from the REAL working directory, not `project_root`.
+    # Without this the test read any `.pmcp/manifest.yaml` above wherever pytest
+    # happened to be run -- green in CI, red on a developer machine with one in
+    # $HOME. That non-hermeticity is how the missing $HOME guard was found.
+    monkeypatch.chdir(tmp_path)
 
     with caplog.at_level(logging.WARNING):
         load_configs(project_root=tmp_path, user_config_paths=[user_path])
