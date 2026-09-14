@@ -60,24 +60,57 @@ def check_pin(path):
     return 0
 
 
+def _phase_aliases(plan_text, plan_path):
+    """The roadmap's phase aliases (TRUST, CONSENT, ...), read from its headings.
+
+    Used to recognise a cross-phase lane reference such as "(TRUST SL-2)". Reading
+    the real aliases, rather than treating any word before a lane id as an alias,
+    matters: a generic rule would also discard "from SL-2" or "via SL-2" in an
+    interfaces line and so HIDE a genuine in-phase dependency.
+    """
+    m = re.search(r"^roadmap:\s*(\S+)$", plan_text, re.M)
+    if not m:
+        return set()
+    roadmap = pathlib.Path(plan_path).parent.parent / m.group(1)
+    if not roadmap.exists():
+        return set()
+    return {
+        a.upper()
+        for a in re.findall(
+            r"^### Phase \S+ — .*\(([A-Za-z0-9]+)\)\s*$", roadmap.read_text(), re.M
+        )
+    }
+
+
 def check_dag(path):
-    """The Lane Index must declare every in-phase dependency a lane actually has.
+    """The Lane Index must agree with the dependencies each lane actually has.
 
     A plan states a lane's dependencies in three places: the Lane Index (which the
     executor reads to schedule waves), the lane's task table, and its "Interfaces
     consumed". They drifted: PKGID's SL-3 was corrected to consume
-    `is_valid_package_version` from SL-2 in its task table and interfaces, but its
-    Lane Index still said "Depends on: (none)" -- and SL-2's "Blocks" still omitted
-    SL-3. An executor would have dispatched SL-3 in the first wave, before the
-    validator it needs existed.
+    `is_valid_package_version` from SL-2 in its task table and interfaces, while
+    its Lane Index still said "Depends on: (none)" and SL-2's "Blocks" omitted
+    SL-3 -- so an executor would have dispatched SL-3 before its validator existed.
 
-    References qualified by another phase's alias (e.g. "(TRUST SL-2)") name that
-    phase's lanes, not this plan's, and are ignored.
+    Checks, each independently:
+      * every in-phase lane a lane consumes is under its Lane Index Depends on;
+      * every Depends on edge has the matching Blocks edge, and vice versa, so a
+        spurious Blocks entry is caught as well as a missing one;
+      * a plan that has lane sections but no Lane Index is reported, rather than
+        passing silently with nothing checked.
+
+    Known limit, deliberately: a dependency mentioned only in free prose (Scope,
+    Execution Notes) is not read, because reading prose would report lane ids that
+    merely appear in a sentence.
     """
     s = pathlib.Path(path).read_text()
-    index = {}
-    cur = None
+    name = pathlib.Path(path).name
+    has_lanes = bool(re.search(r"^### SL-\d+\b", s, re.M))
+
+    index, cur = {}, None
     for ln in s.splitlines():
+        if ln.startswith("## "):
+            cur = None
         m = re.match(r"^(SL-\d+) —", ln)
         if m:
             cur = m.group(1)
@@ -87,47 +120,77 @@ def check_dag(path):
             index[cur]["depends"] = set(re.findall(r"\bSL-\d+\b", d.group(1)))
         if cur and (b := re.match(r"^\s+Blocks:\s*(.*)$", ln)):
             index[cur]["blocks"] = set(re.findall(r"\bSL-\d+\b", b.group(1)))
-        if ln.startswith("## ") and index:
-            cur = None
+
+    if has_lanes and not index:
+        print(
+            f"  [BLOCKING] {name}: has lane sections but no Lane Index, so no"
+            " dependency could be checked and the executor has nothing to schedule"
+        )
+        return 1
     if not index:
         return 0
 
+    aliases = _phase_aliases(s, path)
+    alias_ref = (
+        re.compile(r"\b(?:" + "|".join(sorted(aliases)) + r")\b[\s,;:/]*SL-\d+\b", re.I)
+        if aliases
+        else None
+    )
+
     def in_phase_refs(text):
-        # drop anything like "TRUST SL-2" / "CONSENT SL-1": another phase's lane
-        text = re.sub(r"\b[A-Z]{2,}\s+SL-\d+\b", "", text)
+        if alias_ref:
+            text = alias_ref.sub("", text)
         return set(re.findall(r"\bSL-\d+\b", text))
 
     needed = {lane: set() for lane in index}
-    section = None
+    section, in_interfaces = None, False
     for ln in s.splitlines():
         m = re.match(r"^### (SL-\d+)\b", ln)
         if m:
-            section = m.group(1)
+            section, in_interfaces = m.group(1), False
             continue
         if ln.startswith("## "):
-            section = None
-        if section in needed and "**Interfaces consumed**" in ln:
+            section, in_interfaces = None, False
+        if section not in needed:
+            continue
+        if "**Interfaces consumed**" in ln:
+            in_interfaces = True
             needed[section] |= in_phase_refs(ln)
+            continue
+        if in_interfaces:
+            # A wrapped interfaces line continues until the next bullet, table
+            # row, heading or blank line.
+            if not ln.strip() or re.match(r"^\s*(- \*\*|\||#)", ln):
+                in_interfaces = False
+            else:
+                needed[section] |= in_phase_refs(ln)
+                continue
         row = re.match(r"^\|\s*(SL-\d+)\.\d+\s*\|[^|]*\|([^|]*)\|", ln)
         if row and row.group(1) in needed:
             needed[row.group(1)] |= in_phase_refs(row.group(2))
 
     bad = 0
-    name = pathlib.Path(path).name
     for lane, req in sorted(needed.items()):
         req.discard(lane)
-        missing = sorted(req - index[lane]["depends"])
-        for m in missing:
+        for m in sorted(req - index[lane]["depends"]):
             print(
                 f"  [BLOCKING] {name}: {lane} consumes {m} but its Lane Index"
                 f" does not list {m} under Depends on"
             )
             bad += 1
-        for dep in sorted(index[lane]["depends"] & set(index)):
+    for lane, edges in sorted(index.items()):
+        for dep in sorted(edges["depends"] & set(index)):
             if lane not in index[dep]["blocks"]:
                 print(
                     f"  [BLOCKING] {name}: {lane} depends on {dep} but {dep}'s"
                     f" Lane Index does not list {lane} under Blocks"
+                )
+                bad += 1
+        for blocked in sorted(edges["blocks"] & set(index)):
+            if lane not in index[blocked]["depends"]:
+                print(
+                    f"  [BLOCKING] {name}: {lane} lists {blocked} under Blocks but"
+                    f" {blocked} does not depend on {lane}"
                 )
                 bad += 1
     return bad
