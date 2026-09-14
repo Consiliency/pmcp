@@ -310,3 +310,71 @@ def test_env_scope_manifest_path_is_applied_without_any_trust_record(
     entry = load_manifest().get_server(ADDED_SERVER)
     assert entry is not None
     assert entry.command == SENTINEL_COMMAND
+
+
+def test_the_home_overlay_is_not_mistaken_for_a_project_overlay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Running from a subdirectory of $HOME must not gate the user's own overlay.
+
+    `~/.pmcp/manifest.yaml` is the USER-scoped overlay. The project walk started
+    at the working directory and climbed to the filesystem root, so from any
+    subdirectory of $HOME with no closer overlay it found that same file and
+    classified it as a PROJECT source -- and CONSENT then refused it on every
+    startup, telling the operator to `pmcp trust approve` their own home config.
+    `config.loader.find_project_root` already stops at $HOME for exactly this
+    reason; the manifest walk replicates it and had dropped the guard.
+
+    Found on a real startup from ~/code/pmcp. CI and the workspace worktrees
+    could not see it: neither runs with $HOME above the working directory.
+
+    Falsifier: delete the `current == home_root` check in `_find_project_manifest`
+    and this finds the home overlay and logs a refusal.
+    """
+    from pmcp.manifest.loader import _find_project_manifest
+
+    home = tmp_path / "home"
+    (home / ".pmcp").mkdir(parents=True)
+    (home / ".pmcp" / "manifest.yaml").write_text("servers: {}\n")
+    workdir = home / "code" / "project"
+    workdir.mkdir(parents=True)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(workdir)
+    monkeypatch.delenv("PMCP_MANIFEST_PATH", raising=False)
+
+    assert _find_project_manifest() is None, (
+        "the user's home overlay was discovered as a project overlay"
+    )
+    with caplog.at_level(logging.WARNING):
+        load_manifest()
+    assert not [
+        r
+        for r in caplog.records
+        if "Ignoring project manifest overlay" in r.getMessage()
+    ], "startup refused the operator's own home overlay"
+
+
+def test_a_real_project_overlay_below_home_is_still_found(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard stops AT $HOME, not before a genuine project inside it.
+
+    Falsifier: stop the walk at the first directory under $HOME instead of at
+    $HOME itself and the project's own overlay is missed.
+    """
+    from pmcp.manifest.loader import _find_project_manifest
+
+    home = tmp_path / "home"
+    project = home / "code" / "project"
+    (project / ".pmcp").mkdir(parents=True)
+    (project / ".pmcp" / "manifest.yaml").write_text("servers: {}\n")
+    nested = project / "src" / "pkg"
+    nested.mkdir(parents=True)
+
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(nested)
+
+    found = _find_project_manifest()
+    assert found is not None
+    assert found.resolve() == (project / ".pmcp" / "manifest.yaml").resolve()

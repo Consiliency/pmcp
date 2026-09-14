@@ -124,6 +124,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+- **Starting pmcp from inside your home directory no longer asks you to approve
+  your own `~/.pmcp/manifest.yaml`.** The project overlay search walks up from the
+  working directory, and from any subdirectory of `$HOME` with no closer overlay it
+  reached `$HOME` and treated `~/.pmcp/manifest.yaml` — your user-scoped overlay —
+  as a project one. Since project sources now need approval, every such startup
+  logged "Ignoring project manifest overlay … To use it, run: pmcp trust approve
+  ~/.pmcp/manifest.yaml". Your overlay was still applied through the user path, so
+  nothing was broken, but a false approval prompt on every launch is exactly the
+  kind that teaches you to approve without reading. The search now stops at
+  `$HOME`, matching the `.mcp.json` search, which already did. Neither `.mcp.json`
+  nor the gateway policy was affected. Regression from #242; see #230.
 - **Downstream failures no longer log `unhandled errors in a TaskGroup` and
   nothing else.** Every remote-transport path in `ClientManager` runs inside an
   anyio task group, and `str(ExceptionGroup)` names neither the type nor the

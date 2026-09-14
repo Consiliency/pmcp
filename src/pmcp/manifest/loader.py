@@ -621,17 +621,37 @@ def _find_project_manifest() -> Path | None:
 
     Replicates config.loader.find_project_root's marker-based walk locally to
     avoid a circular import (config/loader imports load_manifest). Stops at the
-    filesystem root and at the temp directory so test fixtures under tempdir do
-    not accidentally pick up an unrelated overlay.
+    filesystem root; at the temp directory, so test fixtures under tempdir do not
+    accidentally pick up an unrelated overlay; and at $HOME, whose
+    `.pmcp/manifest.yaml` is the user-scoped overlay rather than a project one.
+
+    Keep these stopping conditions in step with `find_project_root`. This docstring
+    once listed only the first two, and the code had drifted the same way: the
+    replica lost the $HOME stop its original has, which is what #243 fixes.
     """
     try:
         current = Path.cwd().resolve()
     except OSError:
         return None
     temp_root = Path(tempfile.gettempdir()).resolve()
+    home_root = Path.home().resolve()
 
     while current != current.parent:
         if current == temp_root:
+            return None
+        # $HOME's `.pmcp/manifest.yaml` IS the user-scoped overlay, already loaded
+        # (ungated) by `_overlay_manifest_paths`. Treating home as a project root
+        # double-attributes it -- and since CONSENT gates project sources, every
+        # startup from a subdirectory of $HOME with no closer overlay logged a
+        # refusal telling the operator to `pmcp trust approve` their OWN home
+        # config. That is the most common setup there is, and a false approval
+        # prompt trains operators to approve reflexively, which is the one habit
+        # consent depends on them not having.
+        #
+        # This walk replicates `config.loader.find_project_root` locally to avoid
+        # an import cycle, and that function already stops here with the same
+        # reason; the replica had dropped the guard. Keep the two in step.
+        if current == home_root:
             return None
         candidate = current / ".pmcp" / "manifest.yaml"
         if candidate.exists():
