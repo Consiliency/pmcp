@@ -141,15 +141,52 @@ def _operator_safe(value: str) -> str:
     return shlex.quote(escaped)
 
 
+def _approval_path(target: Path, source: Path | None) -> str:
+    """The path to NAME in a runnable `pmcp trust approve` command.
+
+    The remediation must be safe to paste AND exact: pasting it must approve the
+    file that was refused, not some other file. Escaping alone cannot give both.
+    A non-printable character is rendered as its backslash escape, so a target
+    containing a real CR renders exactly like a DIFFERENT printable file whose
+    name holds a literal backslash and `r` -- and pasting the rendered command
+    approves that other file. Reproduced before this existed.
+
+    In order:
+    * a printable target is named as-is (the normal case; unchanged);
+    * otherwise the unresolved SOURCE is named, e.g. `<checkout>/.mcp.json`.
+      `trust_store.record` resolves what it is given, so approving the source
+      records the correct target. A repository chooses the symlink target, not
+      the checkout directory, so the source is printable in practice.
+      `.absolute()`, never `.resolve()`, which would follow the symlink straight
+      back to the non-printable name;
+    * only if the source is non-printable too does the escaped target remain --
+      safe but not runnable, and by then the odd directory is the operator's own.
+
+    `source` is display text only: never opened, never resolved, so it cannot
+    open a second check-then-use window beside the gate's single resolution.
+    """
+    rendered = str(target)
+    if rendered.isprintable():
+        return rendered
+    if source is not None:
+        named = str(Path(source).absolute())
+        if named.isprintable():
+            return named
+    return rendered
+
+
 def _refusal(
-    path: Path, kind: ProjectSourceKind, reason: ConsentReason
+    path: Path,
+    kind: ProjectSourceKind,
+    reason: ConsentReason,
+    source: Path | None = None,
 ) -> ConsentDecision:
     return ConsentDecision(
         allowed=False,
         path=path,
         kind=kind,
         reason=reason,
-        remediation=f"{_APPROVE_COMMAND} {_operator_safe(str(path))}",
+        remediation=f"{_APPROVE_COMMAND} {_operator_safe(_approval_path(path, source))}",
     )
 
 
@@ -187,7 +224,19 @@ def gate_bytes(path: Path, content: bytes, kind: ProjectSourceKind) -> ConsentDe
 
     Never raises. Every failure answers ``allowed=False``.
     """
-    target = _resolve(path)
+    return _gate_resolved(_resolve(path), content, kind, source=path)
+
+
+def _gate_resolved(
+    target: Path, content: bytes, kind: ProjectSourceKind, *, source: Path
+) -> ConsentDecision:
+    """Judge ``content`` for a target that has ALREADY been resolved, once.
+
+    Split out of ``gate_bytes`` so ``read_and_gate`` can hand over the unresolved
+    source for the remediation text WITHOUT resolving the path a second time.
+    Re-resolving after the read would let a symlink retargeted in between make
+    the gate judge a different file from the one whose bytes were read.
+    """
     try:
         approved = trust_store.is_approved(target, content)
     except Exception:  # noqa: BLE001 - see module docstring: failures are refusals
@@ -203,7 +252,7 @@ def gate_bytes(path: Path, content: bytes, kind: ProjectSourceKind) -> ConsentDe
             reason="approved",
             remediation="",
         )
-    return _refusal(target, kind, _why_refused(target))
+    return _refusal(target, kind, _why_refused(target), source)
 
 
 def read_and_gate(
@@ -225,9 +274,9 @@ def read_and_gate(
     except Exception:  # noqa: BLE001 - unreadable is a refusal, not an error
         # Missing, a directory, no permission, a race that deleted it between
         # discovery and here: an absent answer is never assent.
-        return None, _refusal(target, kind, "unreadable")
+        return None, _refusal(target, kind, "unreadable", path)
 
-    decision = gate_bytes(target, content, kind)
+    decision = _gate_resolved(target, content, kind, source=path)
     return (content if decision.allowed else None), decision
 
 

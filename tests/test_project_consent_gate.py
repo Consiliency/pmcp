@@ -18,6 +18,7 @@ here (or in any sibling lane) may touch the developer's real ``~/.config/pmcp``.
 from __future__ import annotations
 
 import logging
+import shlex
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -451,3 +452,75 @@ def test_a_non_utf8_filename_cannot_reach_the_operator_raw() -> None:
     )
     # Ordinary paths are untouched by the escaping branch.
     assert _operator_safe("/checkout/.mcp.json") == "/checkout/.mcp.json"
+
+
+def test_pasting_the_remediation_approves_the_refused_file_not_a_decoy(
+    tmp_path: Path,
+) -> None:
+    """The printed command must approve the file that was refused.
+
+    Escaping a non-printable character makes a target containing a real CR
+    render exactly like a DIFFERENT printable file whose name holds a literal
+    backslash and `r`. A repository can ship both: the symlink points at the CR
+    file, and a decoy sits beside it. Pasting a remediation that named the
+    escaped target approved the decoy -- the refused file stayed refused and the
+    operator had approved something else. Reproduced before the fix.
+
+    Falsifier: make `_approval_path` return `str(target)` unconditionally and
+    the decoy is approved while the refused file is not.
+    """
+    decoy = tmp_path / "payload\\r.json"  # printable: backslash + r
+    hostile = tmp_path / "payload\r.json"  # real carriage return
+    decoy.write_bytes(b'{"decoy": true}')
+    hostile.write_bytes(b'{"hostile": true}')
+    link = tmp_path / ".mcp.json"
+    link.symlink_to(hostile)
+
+    _content, refused = read_and_gate(link, "project_mcp_json")
+    assert refused.allowed is False
+
+    # Approve with EXACTLY the argument the operator is told to run.
+    named = shlex.split(refused.remediation)[-1]
+    trust_store.record(
+        Path(named), Path(named).read_bytes(), "user", trust_store.APPROVED
+    )
+
+    _content, after = read_and_gate(link, "project_mcp_json")
+    assert after.allowed is True, "the refused file is still refused"
+    assert not trust_store.is_approved(decoy, decoy.read_bytes()), (
+        "pasting the remediation approved the decoy instead"
+    )
+
+
+def test_read_and_gate_resolves_the_path_exactly_once(tmp_path: Path) -> None:
+    """One resolution, so the bytes judged come from the file that was read.
+
+    The remediation needs the UNRESOLVED source to name a runnable path, and the
+    obvious way to get it is to let the gate resolve the path itself -- after the
+    read. A symlink retargeted in between would then make the gate judge a
+    different file from the one whose bytes were read. The source is threaded
+    through as display text instead.
+
+    Falsifier: have `read_and_gate` call `gate_bytes(path, ...)` with the
+    unresolved path and this counts two resolutions.
+    """
+    from pmcp import project_consent as pc
+
+    target = tmp_path / "real.json"
+    target.write_bytes(b"{}")
+    link = tmp_path / ".mcp.json"
+    link.symlink_to(target)
+
+    calls: list[Path] = []
+    original = pc._resolve
+
+    def counting(path: Path) -> Path:
+        calls.append(path)
+        return original(path)
+
+    pc._resolve = counting  # type: ignore[assignment]
+    try:
+        pc.read_and_gate(link, "project_mcp_json")
+    finally:
+        pc._resolve = original  # type: ignore[assignment]
+    assert len(calls) == 1, f"resolved {len(calls)} times: {calls}"
