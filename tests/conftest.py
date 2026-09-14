@@ -29,14 +29,16 @@ passes for the wrong reason and looks green forever. So:
 
 from __future__ import annotations
 
+import os
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from pmcp import trust_store
 from pmcp.env_store import reset_dotenv_keys
 from pmcp.policy.policy import PolicyManager
 from pmcp.types import (
@@ -47,6 +49,102 @@ from pmcp.types import (
     ServerStatusEnum,
     ToolInfo,
 )
+
+
+#: The developer's real home, captured at import time -- BEFORE any fixture has
+#: redirected ``HOME``. After the redirect ``Path.home()`` reports the fake one,
+#: so a check written against a live ``Path.home()`` would compare the fake home
+#: with itself and pass however broken the redirect was.
+_REAL_HOME = Path.home().resolve()
+
+
+@pytest.fixture(autouse=True)
+def isolate_trust_store(
+    tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[Path]:
+    """Point the user-scoped trust store at a per-test home. **Autouse.**
+
+    The store lives at ``~/.config/pmcp/trust.json`` (`trust_store.py`), so a
+    test that records an approval without this fixture writes a real, permanent
+    approval into the developer's own store -- the T-08 hazard the 2026-09-01
+    review flagged. Redirecting ``HOME`` is the seam, chosen over monkeypatching
+    ``trust_store.trust_store_path``: ``tests/test_trust_store.py`` imports that
+    function *by name*, so patching the module attribute would leave its direct
+    calls on the real function while ``record``/``is_approved`` (which look the
+    name up in module globals) used the patched one, and the two would disagree
+    about where the store is. ``HOME`` is also what TRUST's own suite already
+    uses, and it keeps the store's checkout-residency check live rather than
+    stubbing it out.
+
+    It deliberately **approves nothing**. An autouse approval would make every
+    refusal test in the consent lanes vacuously green -- the gate would be
+    agreeing with a fixture, not with an operator.
+
+    Tests needing an approval record one explicitly; ``approve_project_file``
+    below is the shorthand.
+
+    The fake home is a **sibling** of the test's own ``tmp_path``, never inside
+    it. Measured, not stylistic: with the home nested under ``tmp_path``,
+    `tests/test_registry.py::test_default_cache_path_is_not_cwd_relative`
+    started failing, because it uses ``tmp_path`` as its stand-in for the cwd
+    and asserts a ``~``-derived path does not sit under it. A home inside
+    ``tmp_path`` makes every home-derived path look cwd-relative to any test
+    asking that question.
+    """
+    fake_home = tmp_path_factory.mktemp("trust-home")
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    # Assert the redirect took effect BEFORE any test body runs. A silently
+    # ineffective redirect is the one failure mode that must never be quiet:
+    # it does not fail a test, it writes the operator's real trust store.
+    store = trust_store.trust_store_path()
+    if not store.is_relative_to(fake_home.resolve()) or store.is_relative_to(
+        _REAL_HOME
+    ):
+        raise RuntimeError(
+            f"Trust store isolation failed: trust_store_path() is {store}, "
+            f"expected somewhere under {fake_home}. Refusing to run a test that "
+            f"could write the real store under {_REAL_HOME}."
+        )
+
+    yield fake_home
+
+
+@pytest.fixture
+def approve_project_file() -> Callable[[Path], None]:
+    """Approve a project file's *current* bytes, the way an operator would.
+
+    Mirrors `pmcp trust approve`: read what is on disk now, record an approval
+    for exactly those bytes. Editing the file afterwards therefore revokes the
+    approval, which is the property the consent lanes assert.
+
+    Pass ``home`` when the test drives code under a different HOME than the
+    autouse isolation provides; the approval is then recorded in that home.
+
+    ``scope`` is descriptive metadata only -- ``is_approved(path, content)``
+    takes no scope argument and never consults it -- so no test should assert
+    on it. (`pmcp trust approve` itself records ``"user"``, `cli.py:2489`.)
+    """
+
+    def approve(path: Path, home: Path | None = None) -> None:
+        if home is None:
+            trust_store.record(path, path.read_bytes(), "project", trust_store.APPROVED)
+            return
+        # Some suites point HOME at a directory of their own (and some then hand
+        # that HOME to a subprocess). The store is resolved from HOME at call
+        # time, so an approval recorded under the autouse isolated home would be
+        # invisible to code running under theirs. Record it where they will look.
+        previous = os.environ.get("HOME")
+        os.environ["HOME"] = str(home)
+        try:
+            trust_store.record(path, path.read_bytes(), "project", trust_store.APPROVED)
+        finally:
+            if previous is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = previous
+
+    return approve
 
 
 @pytest.fixture(autouse=True)

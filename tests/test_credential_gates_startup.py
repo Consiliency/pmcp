@@ -384,7 +384,10 @@ class TestGate5SecretsCheck:
 
     @pytest.mark.asyncio
     async def test_required_server_still_reports_missing(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        approve_project_file,
     ) -> None:
         from pmcp.cli_commands.secrets import run_secrets_check
 
@@ -400,6 +403,10 @@ class TestGate5SecretsCheck:
                 {"mcpServers": {"cred-test": {"command": "cred-test-mcp", "args": []}}}
             ),
         )
+        # A project-scoped .mcp.json is only read once approved (CONSENT, #230).
+        # This test is about the secrets check, not consent, so approve it in the
+        # home the code under test will actually use.
+        approve_project_file(project / ".mcp.json", home)
 
         _pin_manifest_path(monkeypatch, overlay)
         with patch.dict("os.environ", {"HOME": str(home)}, clear=False):

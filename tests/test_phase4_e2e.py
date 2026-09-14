@@ -562,7 +562,9 @@ def test_phase4_doctor_warns_for_unreachable_http_health(tmp_path: Path) -> None
     assert "http://127.0.0.1:9/health" in result.stdout
 
 
-def test_phase4_secrets_reports_missing_and_success_paths(tmp_path: Path) -> None:
+def test_phase4_secrets_reports_missing_and_success_paths(
+    tmp_path: Path, approve_project_file
+) -> None:
     """pmcp secrets handles set/check/sync outcomes with stable exit codes."""
     home = tmp_path / "home"
     project = tmp_path / "project"
@@ -582,6 +584,11 @@ def test_phase4_secrets_reports_missing_and_success_paths(tmp_path: Path) -> Non
         }
     }
     (project / ".mcp.json").write_text(json.dumps(config))
+    # A project-scoped .mcp.json is read only once approved (CONSENT, see #230).
+    # This test drives `pmcp` in a SUBPROCESS under its own HOME, so the approval
+    # has to be recorded in that home rather than the autouse isolated one --
+    # the subprocess resolves the trust store from the HOME it is given.
+    approve_project_file(project / ".mcp.json", home)
 
     env = os.environ.copy()
     env["HOME"] = str(home)

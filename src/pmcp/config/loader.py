@@ -27,6 +27,7 @@ from pmcp.types import (
     StartupPolicyPreview,
     StartupPolicySource,
 )
+from pmcp.project_consent import ConsentDecision, log_refusal, read_and_gate
 from pmcp.remote_auth import build_remote_header_env_lookup, resolve_remote_headers
 
 if TYPE_CHECKING:
@@ -246,7 +247,24 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
     try:
         if not file_path.exists():
             return None
-        content = file_path.read_text()
+        content = file_path.read_bytes()
+    except Exception as e:
+        logger.warning(f"Failed to parse config file {file_path}: {e}")
+        return None
+    return parse_config_bytes(content, file_path)
+
+
+def parse_config_bytes(content: bytes, file_path: Path) -> McpConfigFile | None:
+    """Parse config bytes that are already in hand.
+
+    Split out of ``parse_json_file`` so a project-scoped reader can parse the
+    *exact bytes the consent gate judged* rather than re-opening the path.
+    Re-opening would apply content nobody approved -- the file can change
+    between the gate and the parse, which is the window
+    ``project_consent.read_and_gate`` exists to close. ``file_path`` is carried
+    for diagnostics only; nothing here touches the filesystem.
+    """
+    try:
         data = json.loads(content)
 
         raw_servers = data.get("mcpServers")
@@ -304,12 +322,76 @@ def _read_config_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     if not path.exists():
         return None, None
     try:
-        data = json.loads(path.read_text())
+        content = path.read_bytes()
+    except Exception as exc:
+        return None, f"invalid_json: {exc}"
+    return _config_object_from_bytes(content)
+
+
+def _config_object_from_bytes(
+    content: bytes,
+) -> tuple[dict[str, Any] | None, str | None]:
+    """The object form of config bytes already in hand. See ``parse_config_bytes``."""
+    try:
+        data = json.loads(content)
     except Exception as exc:
         return None, f"invalid_json: {exc}"
     if not isinstance(data, dict):
         return None, "config_root_not_object"
     return data, None
+
+
+#: Marker recorded on a ``LoadedConfigSource`` whose project file exists but was
+#: refused. It is surfaced through the existing ``invalid_source`` diagnostic so
+#: ``pmcp status`` can explain the silence; the file itself contributes nothing.
+PROJECT_SOURCE_NOT_APPROVED = "project_source_not_approved"
+
+
+def _gate_project_config(path: Path) -> tuple[bytes | None, ConsentDecision | None]:
+    """Read the project ``.mcp.json`` once, through the consent gate.
+
+    The single place every project-scoped reader in this module goes for its
+    bytes. It exists as one helper rather than five copies because the file is
+    read at five independent sites (``load_config_sources``,
+    ``registry_allow_private_from_config``, ``load_configs``,
+    ``load_disabled_auto_start``, ``load_enabled_auto_start``) and a gate on
+    one of them is not a gate: the repository would still be able to force an
+    auto-start or flip the private-registry opt-in through any reader that was
+    missed.
+
+    Returns ``(bytes, decision)`` when the operator has approved exactly these
+    bytes, and ``(None, decision)`` otherwise. A refusal is logged once, here,
+    so every reader produces the same actionable message.
+
+    The ``exists`` pre-check keeps the common case quiet: most checkouts have no
+    ``.mcp.json``, and the gate reports a missing file as ``unreadable`` -- a
+    refusal the operator can do nothing about and should not be warned about on
+    every startup. It is not a trust decision and cannot widen one: a file that
+    appears after the check is still read and gated exactly once, and one that
+    vanishes is simply absent. The returned decision is ``None`` for that absent
+    case, distinguishing "nothing to consent to" from "consent withheld".
+    """
+    if not path.exists():
+        return None, None
+    content, decision = read_and_gate(path, "project_mcp_json")
+    if not decision.allowed:
+        log_refusal(decision, logger)
+        return None, decision
+    return content, decision
+
+
+def _parse_gated_project_config(path: Path) -> McpConfigFile | None:
+    """The project config, or ``None`` when it is absent *or* unapproved.
+
+    Readers that only consume parsed content treat both the same way: an
+    unapproved project file must behave exactly as if it were not there, so its
+    servers, ``autoStart`` and ``disableAutoStart`` entries all fall away and
+    user/custom scope keeps its normal precedence.
+    """
+    content, _decision = _gate_project_config(path)
+    if content is None:
+        return None
+    return parse_config_bytes(content, path)
 
 
 REGISTRY_ALLOW_PRIVATE_CONFIG_KEY = "allowPrivateRegistry"
@@ -336,19 +418,32 @@ def registry_allow_private_from_config(
     time: a process-global toggle is exactly the shape that made
     `sse_starlette`'s `AppStatus.should_exit` latch so hard to diagnose.
     """
-    candidates: list[Path] = []
+    candidates: list[tuple[ConfigSourceName, Path]] = []
     if project_root is not None:
-        candidates.append(Path(project_root) / ".mcp.json")
+        candidates.append(("project", Path(project_root) / ".mcp.json"))
     candidates.extend(
-        list(user_config_paths)
-        if user_config_paths is not None
-        else default_user_config_paths()
+        ("user", path)
+        for path in (
+            list(user_config_paths)
+            if user_config_paths is not None
+            else default_user_config_paths()
+        )
     )
     if custom_config_path is not None:
-        candidates.append(Path(custom_config_path))
+        candidates.append(("custom", Path(custom_config_path)))
 
-    for path in candidates:
-        raw, error = _read_config_object(path)
+    for source, path in candidates:
+        if source == "project":
+            # An unapproved project file states no preference at all, so the
+            # scan continues to user and custom scope rather than stopping on
+            # it. Otherwise a repository could suppress the operator's own
+            # opt-in just by shipping the key.
+            content, _decision = _gate_project_config(path)
+            if content is None:
+                continue
+            raw, error = _config_object_from_bytes(content)
+        else:
+            raw, error = _read_config_object(path)
         if raw is None:
             if error is not None:
                 logger.warning(
@@ -393,6 +488,69 @@ def _parse_config_or_warn(path: Path) -> McpConfigFile | None:
     return config
 
 
+def _parse_project_config_or_warn(path: Path) -> McpConfigFile | None:
+    """``_parse_config_or_warn`` for the project file: gated, and read once.
+
+    An unapproved file gets the consent refusal and nothing else. Reporting it
+    as *malformed* as well would be two warnings for one file, and the wrong one
+    first -- the operator's next move is ``pmcp trust approve``, not a JSON fix.
+    An approved file that is malformed still reports as malformed, diagnosed
+    from the bytes already read rather than from a second open.
+    """
+    content, _decision = _gate_project_config(path)
+    if content is None:
+        return None
+    config = parse_config_bytes(content, path)
+    if config is None:
+        _raw, error = _config_object_from_bytes(content)
+        logger.warning(
+            f"Ignoring malformed config {path} "
+            f"({error or 'invalid_mcp_config'}); its servers are disabled"
+        )
+    return config
+
+
+def _load_project_source(path: Path) -> LoadedConfigSource:
+    """The project row of ``load_config_sources``, gated and read exactly once.
+
+    The ungated branch above reads each path twice -- once for ``raw_data`` and
+    once to parse. Doing that here would parse bytes the gate never saw, so both
+    forms are derived from the single read ``_gate_project_config`` performed.
+
+    A refused file keeps its row: an operator looking at ``pmcp status`` needs to
+    see *which* file was ignored, and ``exists`` stays truthful rather than
+    pretending the file is absent. What it loses is all of its content --
+    ``config`` and ``raw_data`` are ``None``, so every consumer of this row
+    behaves as if the file were not there.
+    """
+    exists = path.exists()
+    content, decision = _gate_project_config(path)
+    if content is None:
+        return LoadedConfigSource(
+            source="project",
+            path=path,
+            exists=exists,
+            config=None,
+            raw_data=None,
+            error=PROJECT_SOURCE_NOT_APPROVED if decision is not None else None,
+        )
+
+    raw_data, error = _config_object_from_bytes(content)
+    config = None
+    if raw_data is not None:
+        config = parse_config_bytes(content, path)
+        if config is None:
+            error = error or "invalid_mcp_config"
+    return LoadedConfigSource(
+        source="project",
+        path=path,
+        exists=exists,
+        config=config,
+        raw_data=raw_data,
+        error=error,
+    )
+
+
 def load_config_sources(
     project_root: Path | None = None,
     user_config_paths: Sequence[Path] | None = None,
@@ -405,6 +563,9 @@ def load_config_sources(
         user_config_paths=user_config_paths,
         custom_config_path=custom_config_path,
     ):
+        if source == "project":
+            sources.append(_load_project_source(path))
+            continue
         raw_data, error = _read_config_object(path)
         config = None
         if raw_data is not None:
@@ -796,7 +957,7 @@ def load_configs(
     resolved_project_root = project_root or find_project_root(Path.cwd())
     if resolved_project_root:
         project_config_path = resolved_project_root / ".mcp.json"
-        project_config = _parse_config_or_warn(project_config_path)
+        project_config = _parse_project_config_or_warn(project_config_path)
 
         if project_config and project_config.mcpServers:
             logger.info(f"Loaded project config from {project_config_path}")
@@ -877,10 +1038,13 @@ def load_disabled_auto_start(
     """Load disableAutoStart lists from all config sources."""
     disabled: set[str] = set()
 
-    # Check project config
+    # Check project config -- gated: a repository must not be able to switch
+    # off the operator's auto-start just by shipping a file.
     resolved_project_root = project_root or find_project_root(Path.cwd())
     if resolved_project_root:
-        project_config = parse_json_file(resolved_project_root / ".mcp.json")
+        project_config = _parse_gated_project_config(
+            resolved_project_root / ".mcp.json"
+        )
         if project_config and project_config.disableAutoStart:
             disabled.update(project_config.disableAutoStart)
 
@@ -921,10 +1085,13 @@ def load_enabled_auto_start(
     """Load autoStart lists from all config sources."""
     enabled: set[str] = set()
 
-    # Check project config
+    # Check project config -- gated: auto-start is the difference between a
+    # declared server and a server the operator's shell actually launches.
     resolved_project_root = project_root or find_project_root(Path.cwd())
     if resolved_project_root:
-        project_config = parse_json_file(resolved_project_root / ".mcp.json")
+        project_config = _parse_gated_project_config(
+            resolved_project_root / ".mcp.json"
+        )
         if project_config and project_config.autoStart:
             enabled.update(project_config.autoStart)
 

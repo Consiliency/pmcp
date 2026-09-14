@@ -13,6 +13,8 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from pmcp.project_consent import log_refusal, read_and_gate
+
 logger = logging.getLogger(__name__)
 
 Platform = Literal["mac", "wsl", "linux", "windows"]
@@ -676,17 +678,39 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
     return paths
 
 
-def _load_overlay_file(
-    path: Path,
-) -> tuple[
+_OverlayDocument = tuple[
     dict[str, ServerConfig], dict[str, CLIAlternative], dict[str, dict[str, str]]
-]:
-    """Parse an overlay manifest file, fail-soft.
+]
 
-    Returns ``(servers, cli_alternatives, server_env)`` parsed from ``path``. A
-    missing file, OSError, YAML error, or non-mapping top-level document logs a
-    warning naming the file and returns empty dicts. Each entry is parsed in its
-    own try/except so one malformed entry is skipped without dropping siblings.
+
+def _load_overlay_file(path: Path) -> _OverlayDocument:
+    """Read and parse an overlay manifest file, fail-soft.
+
+    For the **ungated** overlay sources only -- the user's own
+    ``~/.pmcp/manifest.yaml`` and ``$PMCP_MANIFEST_PATH``. The project overlay
+    must not come through here: it is read once by ``read_and_gate``, and
+    reading it again would parse bytes the operator never approved. See
+    ``load_manifest``.
+    """
+    try:
+        content = path.read_bytes()
+    except OSError as exc:
+        logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
+        return {}, {}, {}
+
+    return _parse_overlay_document(path, content)
+
+
+def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
+    """Parse overlay bytes, fail-soft. ``path`` is for messages only.
+
+    Returns ``(servers, cli_alternatives, server_env)``. A YAML error or a
+    non-mapping top-level document logs a warning naming the file and returns
+    empty dicts. Each entry is parsed in its own try/except so one malformed
+    entry is skipped without dropping siblings.
+
+    Takes bytes rather than a path so a gated caller can hand over the exact
+    bytes its consent decision was made about.
 
     ``server_env`` patches ``extra_env`` on a server that already exists, so an
     operator can point a shipped server at a self-hosted endpoint without
@@ -694,9 +718,8 @@ def _load_overlay_file(
     create a server: ``servers:`` remains whole-entry replace.
     """
     try:
-        with open(path, "r") as f:
-            data = yaml.safe_load(f)
-    except (OSError, yaml.YAMLError) as exc:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as exc:
         logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
         return {}, {}, {}
 
@@ -786,9 +809,29 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
     # Merge private/custom overlays over the shipped manifest (default path only).
     if apply_overlays:
         for label, overlay_path in _overlay_manifest_paths():
-            overlay_servers, overlay_clis, overlay_server_env = _load_overlay_file(
-                overlay_path
-            )
+            if label == "project":
+                # A repository-supplied overlay is gated: unapproved, it must
+                # contribute nothing at all -- not a replacement, not an
+                # insertion, not a server_env patch -- so that
+                # `get_server("<added>")`, the manifest-backed predicate in
+                # tools/handlers.py, still answers None for it. User and env
+                # scope are the operator's own files and stay ungated.
+                content, decision = read_and_gate(overlay_path, "project_manifest")
+                if content is None:
+                    # One WARNING for one refusal: returning before the parser
+                    # runs keeps an unreadable overlay from also logging
+                    # "Skipping unreadable manifest overlay".
+                    log_refusal(decision, logger)
+                    continue
+                # Parse the bytes the gate judged. Re-opening `overlay_path`
+                # here would apply content nobody approved.
+                overlay_servers, overlay_clis, overlay_server_env = (
+                    _parse_overlay_document(overlay_path, content)
+                )
+            else:
+                overlay_servers, overlay_clis, overlay_server_env = _load_overlay_file(
+                    overlay_path
+                )
             if overlay_servers or overlay_clis or overlay_server_env:
                 logger.info(
                     f"Applying manifest overlay ({label}) from {overlay_path}: "

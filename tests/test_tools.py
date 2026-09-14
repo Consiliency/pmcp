@@ -2617,7 +2617,7 @@ class TestHealth:
 
     @pytest.mark.asyncio
     async def test_conformance_config_status_and_startup_policy_admin(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, approve_project_file
     ) -> None:
         config_path = tmp_path / ".mcp.json"
         config_path.write_text(
@@ -2630,6 +2630,10 @@ class TestHealth:
                 }
             )
         )
+        # A project-scoped .mcp.json is read only once approved (CONSENT, #230).
+        # This test is about config_status/startup-policy conformance, not about
+        # project-source trust, so record the approval and keep testing that.
+        approve_project_file(config_path)
         monkeypatch.delenv("PMCP_TEST_KEY", raising=False)
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_manifest",

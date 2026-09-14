@@ -1,0 +1,526 @@
+"""Tests for the project-source consent gate (Consiliency/pmcp#230, IF-0-CONSENT-1).
+
+The gate is the single decision surface every project-source loader calls. Its
+whole value is that no loader hashes, reads twice, or formats a refusal on its
+own, so these tests assert the properties a loader is *relying* on:
+
+* absence is never assent, and a post-approval edit is never assent either;
+* **every** failure -- an unreadable source, a store that raises -- is a
+  refusal, because a caller might read an exception as permission;
+* ``read_and_gate`` opens the path **exactly once**, which is the entire TOCTOU
+  defence: a gate that read once and let the caller re-open would be checking
+  bytes nobody ever parses.
+
+Store isolation comes from the autouse fixture in ``tests/conftest.py``; no test
+here (or in any sibling lane) may touch the developer's real ``~/.config/pmcp``.
+"""
+
+from __future__ import annotations
+
+import logging
+import shlex
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import sys
+
+import pytest
+
+from pmcp import trust_store
+from pmcp.project_consent import (
+    ConsentDecision,
+    ProjectSourceKind,
+    gate_bytes,
+    log_refusal,
+    read_and_gate,
+)
+
+KINDS: tuple[ProjectSourceKind, ...] = (
+    "project_manifest",
+    "project_mcp_json",
+    "project_policy",
+)
+
+#: The closed reason vocabulary IF-0-CONSENT-1 freezes. A reason outside it is a
+#: contract break even when the boolean happens to be right: SL-2/3/4 branch on
+#: these strings, and a fifth value would reach them as an unhandled case.
+REASONS = {"approved", "no_record", "content_changed", "unreadable"}
+
+
+@pytest.fixture
+def source(tmp_path: Path) -> Path:
+    """A project-supplied file, in a checkout-shaped directory."""
+    path = tmp_path / "checkout" / ".pmcp" / "manifest.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"servers:\n  github:\n    command: npx\n")
+    return path
+
+
+def _approve(path: Path) -> None:
+    """Approve exactly the bytes currently on disk, as an operator would."""
+    trust_store.record(path, path.read_bytes(), "project", trust_store.APPROVED)
+
+
+def test_an_unrecorded_path_is_refused() -> None:
+    """No record is a refusal -- absence is never assent."""
+    # Built here rather than from the fixture so every kind gets its own file.
+    for kind in KINDS:
+        path = Path(__file__).parent / "does-not-matter.yaml"
+        decision = gate_bytes(path, b"anything at all", kind)
+
+        assert decision.allowed is False
+        assert decision.reason == "no_record"
+        assert decision.kind == kind
+        assert decision.remediation == f"pmcp trust approve {path.resolve()}"
+
+
+def test_an_unrecorded_path_is_refused_by_read_and_gate(source: Path) -> None:
+    """The read-and-gate entry point refuses an unrecorded file too."""
+    content, decision = read_and_gate(source, "project_manifest")
+
+    assert content is None
+    assert decision.allowed is False
+    assert decision.reason == "no_record"
+
+
+def test_content_change_after_approval_is_not_approved(source: Path) -> None:
+    """Approval binds bytes, not a path: one appended byte revokes it."""
+    _approve(source)
+
+    content, decision = read_and_gate(source, "project_manifest")
+    assert decision.allowed is True
+    assert decision.reason == "approved"
+    assert decision.remediation == ""
+    assert content == source.read_bytes()
+
+    source.write_bytes(source.read_bytes() + b"\n")
+
+    content, decision = read_and_gate(source, "project_manifest")
+    assert content is None
+    assert decision.allowed is False
+    # Distinguished from `no_record` on purpose: an operator who approved this
+    # file and then sees a refusal needs to know the file changed under them,
+    # not that their approval never landed.
+    assert decision.reason == "content_changed"
+    assert decision.remediation == f"pmcp trust approve {source.resolve()}"
+
+
+def test_an_unreadable_source_is_refused_not_raised(tmp_path: Path) -> None:
+    """An unreadable path is a refusal, never an exception."""
+    missing = tmp_path / "checkout" / ".mcp.json"
+    a_directory = tmp_path / "checkout" / "dir.json"
+    a_directory.mkdir(parents=True)
+
+    for path in (missing, a_directory):
+        content, decision = read_and_gate(path, "project_mcp_json")
+
+        assert content is None
+        assert decision.allowed is False
+        assert decision.reason == "unreadable"
+        assert decision.remediation == f"pmcp trust approve {path.resolve()}"
+
+
+def test_a_store_error_is_refused_not_raised(
+    source: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Any exception out of the trust store is a refusal.
+
+    ``is_approved`` promises never to raise, so this is defence in depth: the
+    gate must not rely on that promise, because a caller that saw the exception
+    would have been granted trust by a broken store.
+    """
+    _approve(source)  # would be allowed if the store answered
+
+    def explode(*_args: Any, **_kwargs: Any) -> bool:
+        raise RuntimeError("trust store is on fire")
+
+    monkeypatch.setattr(trust_store, "is_approved", explode)
+    monkeypatch.setattr(trust_store, "list_records", explode)
+
+    content, decision = read_and_gate(source, "project_manifest")
+
+    assert content is None
+    assert decision.allowed is False
+    assert decision.reason in REASONS
+    assert decision.remediation == f"pmcp trust approve {source.resolve()}"
+
+    assert gate_bytes(source, source.read_bytes(), "project_manifest").allowed is False
+
+
+def test_read_and_gate_opens_the_path_exactly_once(
+    source: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The TOCTOU guard: one read, gated, returned.
+
+    Counting is filtered to the target because the trust store opens its own
+    file during the same call. Only ``Path.open`` is counted -- ``read_bytes``
+    goes through it, so counting both would score one logical read as two and
+    the assertion would be untrue of a correct implementation.
+    """
+    _approve(source)
+    target = source.resolve()
+    opens: list[Path] = []
+    real_open = Path.open
+
+    def counting_open(self: Path, *args: Any, **kwargs: Any) -> Any:
+        if self.resolve() == target:
+            opens.append(self)
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+
+    content, decision = read_and_gate(source, "project_manifest")
+
+    assert decision.allowed is True
+    assert content == b"servers:\n  github:\n    command: npx\n"
+    assert len(opens) == 1, f"expected exactly one read of {target}, got {len(opens)}"
+
+
+def test_read_and_gate_returns_none_bytes_when_refused(
+    source: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bytes are returned only when allowed -- every refusal returns ``None``.
+
+    A gate that returned the bytes alongside ``allowed=False`` would let a
+    caller that checked the wrong field parse a file the operator refused.
+    """
+    content, decision = read_and_gate(source, "project_manifest")
+    assert decision.allowed is False and content is None
+
+    _approve(source)
+    content, decision = read_and_gate(source, "project_manifest")
+    assert decision.allowed is True and content == source.read_bytes()
+
+    monkeypatch.setattr(trust_store, "is_approved", lambda *_a, **_k: False)
+    content, decision = read_and_gate(source, "project_manifest")
+    assert decision.allowed is False and content is None
+
+
+def test_remediation_is_the_absolute_path_trust_approve_command(
+    source: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal names a command an operator can paste, from any cwd.
+
+    A relative path would name a command whose meaning depends on where the
+    operator happens to stand, so the gate always resolves.
+    """
+    monkeypatch.chdir(source.parent)
+    decision = gate_bytes(Path("manifest.yaml"), b"contents", "project_manifest")
+
+    assert decision.allowed is False
+    prefix = "pmcp trust approve "
+    assert decision.remediation.startswith(prefix)
+    named = Path(decision.remediation[len(prefix) :])
+    assert named.is_absolute()
+    assert named == source.resolve()
+    assert decision.path == source.resolve()
+
+    _approve(source)
+    allowed = gate_bytes(source, source.read_bytes(), "project_manifest")
+    assert allowed.allowed is True
+    # Empty only when allowed: there is nothing to remediate.
+    assert allowed.remediation == ""
+
+
+def test_log_refusal_emits_one_warning_naming_the_remediation(
+    source: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One WARNING per refusal, carrying the runnable command."""
+    logger = logging.getLogger("pmcp.test.consent")
+    _content, decision = read_and_gate(source, "project_manifest")
+
+    with caplog.at_level(logging.WARNING, logger="pmcp.test.consent"):
+        log_refusal(decision, logger)
+
+    records = [rec for rec in caplog.records if rec.name == "pmcp.test.consent"]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    message = records[0].getMessage()
+    assert f"pmcp trust approve {source.resolve()}" in message
+    assert str(source.resolve()) in message
+
+    caplog.clear()
+    _approve(source)
+    _content, allowed = read_and_gate(source, "project_manifest")
+    with caplog.at_level(logging.WARNING, logger="pmcp.test.consent"):
+        log_refusal(allowed, logger)
+    assert [rec for rec in caplog.records if rec.name == "pmcp.test.consent"] == []
+
+
+def test_consent_decision_is_frozen(source: Path) -> None:
+    """The decision a loader branches on cannot be edited after the fact."""
+    decision = gate_bytes(source, b"contents", "project_manifest")
+
+    assert isinstance(decision, ConsentDecision)
+    with pytest.raises(Exception):  # noqa: B017 - dataclasses raises FrozenInstanceError
+        decision.allowed = True  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["pmcp.config.loader", "pmcp.trust_store", "pmcp.project_consent"],
+)
+def test_each_consent_module_imports_first_in_a_clean_interpreter(module: str) -> None:
+    """No import cycle, whichever of the three is imported first.
+
+    CONSENT made `pmcp.config.loader` import `pmcp.project_consent`, which imports
+    `pmcp.trust_store`, which imported `pmcp.config.loader` at module scope — a
+    cycle that made `import pmcp.config.loader` fail outright in a clean
+    interpreter.
+
+    The suite could not see it: `tests/conftest.py` imports `trust_store` at
+    collection time, so by the time any test reaches `config.loader` the cycle is
+    already resolved. It surfaced only in a subprocess that imported
+    `config.loader` first. Hence a real subprocess per module here rather than an
+    in-process import, which would prove nothing.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", f"import {module}"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, f"importing {module} first failed:\n{result.stderr}"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "payload$(id).json",
+        "payload`id`.json",
+        "payload;id.json",
+        "with space.json",
+        "quote'name.json",
+    ],
+)
+def test_the_remediation_is_shell_safe_for_a_repository_chosen_path(
+    tmp_path: Path, filename: str
+) -> None:
+    """A repository can choose the path the remediation names.
+
+    The project sources have fixed names, but `.mcp.json` may be a SYMLINK and
+    the decision path is resolved -- so a repo shipping `payload$(id).json` plus
+    a symlink to it makes the refusal print
+    `pmcp trust approve /checkout/payload$(id).json`. That line exists to be
+    copied into a shell, so an unquoted path turns a security warning into
+    command substitution from repository-controlled content. Reproduced before
+    the fix: pasting it ran `id`.
+
+    Falsifier: drop `shlex.quote` from `_refusal` and the metacharacter cases
+    fail, because the shell expands or splits the path.
+    """
+    target = tmp_path / filename
+    target.write_bytes(b"{}")
+    link = tmp_path / ".mcp.json"
+    link.symlink_to(target)
+
+    _content, decision = read_and_gate(link, "project_mcp_json")
+    assert decision.allowed is False
+
+    # Word-split the line the way a shell would and print one argument per
+    # line. The path must arrive as exactly ONE argument, byte-identical -- not
+    # expanded by command substitution, not split on whitespace.
+    echoed = subprocess.run(
+        ["bash", "-c", f'printf "%s\\n" {decision.remediation}'],
+        capture_output=True,
+        text=True,
+    )
+    assert echoed.returncode == 0
+    assert echoed.stdout.splitlines() == [
+        "pmcp",
+        "trust",
+        "approve",
+        str(target.resolve()),
+    ], f"the remediation was not shell-safe: {echoed.stdout!r}"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "payload$(id).json",
+        "payload`id`.json",
+        "with space.json",
+        # COMBINED cases. Metacharacters and control characters were tested
+        # separately, so nothing caught that a control character used to switch
+        # rendering to repr(), and repr() picks DOUBLE quotes for a name holding
+        # ' but no " -- inside which bash expands $(id). These are the names
+        # that executed on paste.
+        "payload'\r$(id).json",
+        "pay'lo\"ad\r$(id).json",
+        "payload'\u202e$(id).json",
+        "p`id`\x1b[2K.json",
+    ],
+)
+def test_the_whole_refusal_line_is_safe_to_paste(
+    tmp_path: Path, filename: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The path appears TWICE on the warning line, and both must be safe.
+
+    `log_refusal` writes "Ignoring ... at <path>: ... To use it, run: <command>".
+    Quoting only the command half is not enough: operators copy whole lines, and
+    a shell expands an unquoted `$(id)` in the `at` half BEFORE the line fails as
+    a command, so the substitution runs either way. Reproduced before the fix.
+
+    Falsifier: interpolate `decision.path` raw in `log_refusal` and the
+    expansion assertion below fails.
+    """
+    target = tmp_path / filename
+    target.write_bytes(b"{}")
+    link = tmp_path / ".mcp.json"
+    link.symlink_to(target)
+
+    _content, decision = read_and_gate(link, "project_mcp_json")
+    with caplog.at_level(logging.WARNING, logger="pmcp.project_consent"):
+        log_refusal(decision, logging.getLogger("pmcp.project_consent"))
+    line = caplog.records[-1].getMessage()
+
+    echoed = subprocess.run(
+        ["bash", "-c", f"echo {line}"], capture_output=True, text=True
+    )
+    assert "uid=" not in echoed.stdout, f"the warning line expanded: {echoed.stdout!r}"
+    # The path must come back out WHOLE and UNEXPANDED. For a printable name that
+    # is the literal path; a name holding non-printable characters is rendered
+    # with those characters as backslash escapes (a real CR becomes the two
+    # characters `\r`), so compare against that rendering rather than the raw
+    # bytes, which by design never reach the operator.
+    rendered = "".join(
+        ch if ch.isprintable() else repr(ch)[1:-1] for ch in str(target.resolve())
+    )
+    assert rendered in echoed.stdout
+
+
+@pytest.mark.parametrize(
+    "control",
+    [
+        "\r",  # C0: carriage return rewrites the line
+        "\n",  # C0: a second, fake instruction line
+        "\x1b[2K",  # C0 ESC: erase-line
+        "\x7f",  # DEL
+        "\x9b2K",  # C1 CSI: an escape introducer on some terminals
+        "\x85",  # C1 NEL
+        "\u202e",  # bidi right-to-left override (Trojan Source)
+        "\u2066",  # bidi isolate
+        "\u200b",  # zero-width space
+        "\xa0",  # non-breaking space
+    ],
+)
+def test_control_characters_cannot_forge_the_refusal_line(
+    tmp_path: Path, control: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A repository-chosen name must not be able to rewrite what is displayed.
+
+    `shlex.quote` is shell-correct but passes control characters through. A name
+    carrying CR plus an erase-line sequence can overwrite the real warning as it
+    is printed and show a different, attacker-chosen instruction; a newline can
+    add a second, fake "To use it, run:" line above the genuine one.
+
+    Falsifier: drop the control-character branch from `_operator_safe` and these
+    assertions fail — the raw control byte reaches the rendered line.
+    """
+    target = tmp_path / f"payload{control}X.json"
+    target.write_bytes(b"{}")
+    link = tmp_path / ".mcp.json"
+    link.symlink_to(target)
+
+    _content, decision = read_and_gate(link, "project_mcp_json")
+    with caplog.at_level(logging.WARNING, logger="pmcp.project_consent"):
+        log_refusal(decision, logging.getLogger("pmcp.project_consent"))
+    line = caplog.records[-1].getMessage()
+
+    assert control not in line, f"a control character reached the operator: {line!r}"
+    assert decision.remediation.count(control) == 0
+
+
+def test_a_non_utf8_filename_cannot_reach_the_operator_raw() -> None:
+    """Lone surrogates from surrogateescape must be escaped, not passed through.
+
+    A filename that is not valid UTF-8 arrives in Python as lone surrogates
+    (`os.fsdecode` uses surrogateescape), and a terminal receives them as raw
+    undecodable bytes. The original C0-only check let them through. Tested on
+    the helper directly because creating such a name portably through the
+    filesystem in a test is awkward, and the property is the helper's.
+
+    Falsifier: restore the `ch < " " or ch == "\\x7f"` predicate and the raw
+    surrogate survives into the rendered string.
+    """
+    from pmcp.project_consent import _operator_safe
+
+    hostile = b"/checkout/payload\xff\xfe.json".decode("utf-8", "surrogateescape")
+    rendered = _operator_safe(hostile)
+    assert all(ch.isprintable() for ch in rendered), (
+        f"raw surrogate leaked: {rendered!r}"
+    )
+    # Ordinary paths are untouched by the escaping branch.
+    assert _operator_safe("/checkout/.mcp.json") == "/checkout/.mcp.json"
+
+
+def test_pasting_the_remediation_approves_the_refused_file_not_a_decoy(
+    tmp_path: Path,
+) -> None:
+    """The printed command must approve the file that was refused.
+
+    Escaping a non-printable character makes a target containing a real CR
+    render exactly like a DIFFERENT printable file whose name holds a literal
+    backslash and `r`. A repository can ship both: the symlink points at the CR
+    file, and a decoy sits beside it. Pasting a remediation that named the
+    escaped target approved the decoy -- the refused file stayed refused and the
+    operator had approved something else. Reproduced before the fix.
+
+    Falsifier: make `_approval_path` return `str(target)` unconditionally and
+    the decoy is approved while the refused file is not.
+    """
+    decoy = tmp_path / "payload\\r.json"  # printable: backslash + r
+    hostile = tmp_path / "payload\r.json"  # real carriage return
+    decoy.write_bytes(b'{"decoy": true}')
+    hostile.write_bytes(b'{"hostile": true}')
+    link = tmp_path / ".mcp.json"
+    link.symlink_to(hostile)
+
+    _content, refused = read_and_gate(link, "project_mcp_json")
+    assert refused.allowed is False
+
+    # Approve with EXACTLY the argument the operator is told to run.
+    named = shlex.split(refused.remediation)[-1]
+    trust_store.record(
+        Path(named), Path(named).read_bytes(), "user", trust_store.APPROVED
+    )
+
+    _content, after = read_and_gate(link, "project_mcp_json")
+    assert after.allowed is True, "the refused file is still refused"
+    assert not trust_store.is_approved(decoy, decoy.read_bytes()), (
+        "pasting the remediation approved the decoy instead"
+    )
+
+
+def test_read_and_gate_resolves_the_path_exactly_once(tmp_path: Path) -> None:
+    """One resolution, so the bytes judged come from the file that was read.
+
+    The remediation needs the UNRESOLVED source to name a runnable path, and the
+    obvious way to get it is to let the gate resolve the path itself -- after the
+    read. A symlink retargeted in between would then make the gate judge a
+    different file from the one whose bytes were read. The source is threaded
+    through as display text instead.
+
+    Falsifier: have `read_and_gate` call `gate_bytes(path, ...)` with the
+    unresolved path and this counts two resolutions.
+    """
+    from pmcp import project_consent as pc
+
+    target = tmp_path / "real.json"
+    target.write_bytes(b"{}")
+    link = tmp_path / ".mcp.json"
+    link.symlink_to(target)
+
+    calls: list[Path] = []
+    original = pc._resolve
+
+    def counting(path: Path) -> Path:
+        calls.append(path)
+        return original(path)
+
+    pc._resolve = counting  # type: ignore[assignment]
+    try:
+        pc.read_and_gate(link, "project_mcp_json")
+    finally:
+        pc._resolve = original  # type: ignore[assignment]
+    assert len(calls) == 1, f"resolved {len(calls)} times: {calls}"

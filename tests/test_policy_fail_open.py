@@ -17,12 +17,26 @@ A list root, a scalar root and an empty YAML file are the third case, not the
 second: `yaml.safe_load` returns `list`, `str` and `None` for them *without
 raising*. They are the shapes an accidental policy file most often takes, and
 they are exactly what an earlier revision of the fix would have let through.
+
+**Every discovered file here is project-scoped**, so since CONSENT
+(`IF-0-CONSENT-2`, Consiliency/pmcp#230) each one must be approved before it is read at all.
+The approvals below are what keep this module testing what it was written to
+test: without them every case would pass for the wrong reason -- the consent
+gate refusing the file before the #202 logic ever ran. Consent decides whether a
+project file is *read*; #202 decides what happens to one that is read and turns
+out to be wrong, and this file still pins the second question.
+
+The one case consent genuinely takes over is an unreadable file: the gate now
+fronts the read, so a permissions failure is a consent refusal rather than a
+parse warning. That case asserts the new contract, and the old one is preserved
+one scope over, on a user-scoped policy, which is never gated.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -38,8 +52,19 @@ _VALID_POLICY = {
 
 
 def _discovery_paths(monkeypatch: pytest.MonkeyPatch, *paths: Path) -> None:
-    """Point auto-discovery at `paths` and nothing else."""
+    """Point auto-discovery at `paths` and nothing else.
+
+    `USER_POLICY_PATHS` is left alone, so none of these paths is recognised as
+    operator-supplied and all of them are project-scoped -- which is what this
+    module has always been exercising, now named explicitly.
+    """
     monkeypatch.setattr("pmcp.policy.policy.DEFAULT_POLICY_PATHS", list(paths))
+
+
+def _user_discovery_path(monkeypatch: pytest.MonkeyPatch, path: Path) -> None:
+    """Discover `path` as a **user-scoped** policy: ungated, no trust record."""
+    monkeypatch.setattr("pmcp.policy.policy.USER_POLICY_PATHS", [path])
+    monkeypatch.setattr("pmcp.policy.policy.DEFAULT_POLICY_PATHS", [path])
 
 
 def _is_readable(path: Path) -> bool:
@@ -54,11 +79,14 @@ def _is_readable(path: Path) -> bool:
 
 
 def test_schema_invalid_discovered_policy_refuses_to_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     """The bug itself: valid JSON, invalid policy, previously -> allow-all."""
     policy_file = tmp_path / ".mcp-gateway-policy.json"
     policy_file.write_text(json.dumps({"gateway_tools": {"unknown": []}}))
+    approve_project_file(policy_file)
     _discovery_paths(monkeypatch, policy_file)
 
     with pytest.raises(ValueError, match="Invalid policy file") as excinfo:
@@ -72,7 +100,10 @@ def test_schema_invalid_discovered_policy_refuses_to_start(
 
 @pytest.mark.parametrize("limit", [0, -1])
 def test_discovered_policy_with_an_unusable_tool_limit_refuses_to_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit: int
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    limit: int,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     """The #207 x #202 interaction, end to end.
 
@@ -89,6 +120,7 @@ def test_discovered_policy_with_an_unusable_tool_limit_refuses_to_start(
     """
     policy_file = tmp_path / ".mcp-gateway-policy.json"
     policy_file.write_text(json.dumps({"limits": {"max_tools_per_server": limit}}))
+    approve_project_file(policy_file)
     _discovery_paths(monkeypatch, policy_file)
 
     with pytest.raises(ValueError, match="Invalid policy file") as excinfo:
@@ -100,7 +132,9 @@ def test_discovered_policy_with_an_unusable_tool_limit_refuses_to_start(
 
 
 def test_discovered_policy_with_empty_limits_still_loads(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     """The bound must reject only the stated values, not an absent field.
 
@@ -109,6 +143,7 @@ def test_discovered_policy_with_empty_limits_still_loads(
     """
     policy_file = tmp_path / ".mcp-gateway-policy.yaml"
     policy_file.write_text("servers:\n  denylist:\n    - deny-me\nlimits: {}\n")
+    approve_project_file(policy_file)
     _discovery_paths(monkeypatch, policy_file)
 
     manager = PolicyManager()
@@ -145,10 +180,15 @@ def test_explicit_policy_with_an_unusable_tool_limit_is_fatal_too(
     ],
 )
 def test_non_mapping_discovered_policy_refuses_to_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label: str, content: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    label: str,
+    content: str,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     policy_file = tmp_path / ".mcp-gateway-policy.yaml"
     policy_file.write_text(content)
+    approve_project_file(policy_file)
     _discovery_paths(monkeypatch, policy_file)
 
     with pytest.raises(ValueError, match="policy root must be an object") as excinfo:
@@ -157,11 +197,14 @@ def test_non_mapping_discovered_policy_refuses_to_start(
 
 
 def test_json_non_mapping_root_refuses_to_start(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     """`json.loads("[]")` parses; only the schema rejects it."""
     policy_file = tmp_path / ".mcp-gateway-policy.json"
     policy_file.write_text("[]")
+    approve_project_file(policy_file)
     _discovery_paths(monkeypatch, policy_file)
 
     with pytest.raises(ValueError, match="policy root must be an object"):
@@ -169,7 +212,9 @@ def test_json_non_mapping_root_refuses_to_start(
 
 
 def test_higher_priority_invalid_policy_does_not_fall_through(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     """Discovery `break`s at the first *existing* path -- and stays that way.
 
@@ -180,6 +225,8 @@ def test_higher_priority_invalid_policy_does_not_fall_through(
     first.write_text("servers:\n  denylist: not-a-list\n")
     second = tmp_path / ".mcp-gateway-policy.json"
     second.write_text(json.dumps(_VALID_POLICY))
+    approve_project_file(first)
+    approve_project_file(second)
     _discovery_paths(monkeypatch, first, second)
 
     with pytest.raises(ValueError, match="Invalid policy file") as excinfo:
@@ -191,10 +238,14 @@ def test_higher_priority_invalid_policy_does_not_fall_through(
 
 
 def test_unparseable_discovered_policy_warns_and_continues(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     policy_file = tmp_path / ".mcp-gateway-policy.json"
     policy_file.write_text("{")
+    approve_project_file(policy_file)
     _discovery_paths(monkeypatch, policy_file)
 
     with caplog.at_level(logging.WARNING, logger="pmcp.policy.policy"):
@@ -209,7 +260,10 @@ def test_unparseable_discovered_policy_warns_and_continues(
 
 
 def test_empty_json_is_a_parse_failure_unlike_empty_yaml(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     """The split is drawn by the parser, so it lands differently per format.
 
@@ -222,6 +276,7 @@ def test_empty_json_is_a_parse_failure_unlike_empty_yaml(
     """
     policy_file = tmp_path / ".mcp-gateway-policy.json"
     policy_file.write_text("")
+    approve_project_file(policy_file)
     _discovery_paths(monkeypatch, policy_file)
 
     with caplog.at_level(logging.WARNING, logger="pmcp.policy.policy"):
@@ -235,23 +290,67 @@ def test_empty_json_is_a_parse_failure_unlike_empty_yaml(
     )
 
 
-def test_unreadable_discovered_policy_warns_and_continues(
+def test_unreadable_project_policy_is_a_consent_refusal_and_continues(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A permissions failure is a `read_text` raise, so it takes the warn path."""
-    policy_file = tmp_path / ".mcp-gateway-policy.yaml"
-    policy_file.write_text(json.dumps(_VALID_POLICY))
-    policy_file.chmod(0o000)
-    if _is_readable(policy_file):
-        policy_file.chmod(0o644)
+    """A permissions failure now reports as a consent refusal, not a parse warning.
+
+    This is the one case in this module CONSENT genuinely takes over, and the
+    change is not avoidable by recording an approval: approving reads the file,
+    so a file that cannot be read cannot be approved either. The gate reads
+    before the parser ever runs, so `unreadable` is decided there.
+
+    What must not change is the consequence -- an unreadable project policy is
+    still not fatal, and the gateway still comes up. That half is asserted
+    exactly as before; only the wording of the warning moved, and it moved
+    towards naming a fix the operator can run.
+    """
+    locked = tmp_path / ".mcp-gateway-policy.yaml"
+    locked.write_text(json.dumps(_VALID_POLICY))
+    locked.chmod(0o000)
+    if _is_readable(locked):
+        locked.chmod(0o644)
         pytest.skip("running as a user that ignores file permissions (e.g. root)")
-    _discovery_paths(monkeypatch, policy_file)
+    _discovery_paths(monkeypatch, locked)
 
     try:
         with caplog.at_level(logging.WARNING, logger="pmcp.policy.policy"):
             manager = PolicyManager()
     finally:
-        policy_file.chmod(0o644)
+        locked.chmod(0o644)
+
+    assert manager.is_server_allowed("deny-me") is True
+    warnings = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert any("could not be read" in message for message in warnings), warnings
+    assert any(
+        f"pmcp trust approve {locked.resolve()}" in message for message in warnings
+    ), warnings
+
+
+def test_unreadable_user_policy_still_warns_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The coverage the test above used to carry, kept where it still applies.
+
+    A user-scoped policy is operator-supplied and never gated, so its read is
+    still the loader's own and a permissions failure still takes the
+    `Could not parse policy file ...` warn path. Without this, moving the
+    project case to the consent wording would have deleted the only test that
+    an unreadable *ungated* policy warns rather than raising.
+    """
+    locked = tmp_path / "gateway-policy.yaml"
+    locked.write_text(json.dumps(_VALID_POLICY))
+    locked.chmod(0o000)
+    if _is_readable(locked):
+        locked.chmod(0o644)
+        pytest.skip("running as a user that ignores file permissions (e.g. root)")
+    _user_discovery_path(monkeypatch, locked)
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="pmcp.policy.policy"):
+            manager = PolicyManager()
+    finally:
+        locked.chmod(0o644)
 
     assert manager.is_server_allowed("deny-me") is True
     assert any(
@@ -265,11 +364,14 @@ def test_unreadable_discovered_policy_warns_and_continues(
 
 
 def test_valid_discovered_policy_loads_and_enforces(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     """The criterion that guards the opposite failure: refusing too much."""
     policy_file = tmp_path / ".mcp-gateway-policy.yaml"
     policy_file.write_text(json.dumps(_VALID_POLICY))  # JSON is valid YAML
+    approve_project_file(policy_file)
     _discovery_paths(monkeypatch, policy_file)
 
     manager = PolicyManager()
@@ -301,7 +403,9 @@ def test_no_policy_file_anywhere_is_silent(
 
 
 def test_default_paths_follow_the_cwd_at_construction(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     """`DEFAULT_POLICY_PATHS` must not freeze `Path.cwd()` at import time.
 
@@ -313,7 +417,9 @@ def test_default_paths_follow_the_cwd_at_construction(
     """
     project = tmp_path / "project"
     project.mkdir()
-    (project / ".mcp-gateway-policy.yaml").write_text(json.dumps(_VALID_POLICY))
+    policy_file = project / ".mcp-gateway-policy.yaml"
+    policy_file.write_text(json.dumps(_VALID_POLICY))
+    approve_project_file(policy_file)
     monkeypatch.chdir(project)
 
     manager = PolicyManager()
@@ -323,7 +429,9 @@ def test_default_paths_follow_the_cwd_at_construction(
 
 
 def test_default_policy_paths_stays_a_patchable_module_attribute(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    approve_project_file: Callable[[Path], None],
 ) -> None:
     """The seam `tests/test_scoped_advisor_audit.py` relies on.
 
@@ -332,6 +440,7 @@ def test_default_policy_paths_stays_a_patchable_module_attribute(
     """
     policy_file = tmp_path / "elsewhere.yaml"
     policy_file.write_text(json.dumps(_VALID_POLICY))
+    approve_project_file(policy_file)
     _discovery_paths(monkeypatch, policy_file)
     monkeypatch.chdir(tmp_path)
 

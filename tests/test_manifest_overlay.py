@@ -87,8 +87,16 @@ servers:
     assert any(c.name == "my-private" for c in candidates)
 
 
-def test_project_overrides_user_overrides_shipped(monkeypatch, tmp_path):
-    """project > user > shipped for a same-named server (whole-entry replace)."""
+def test_project_overrides_user_overrides_shipped(
+    monkeypatch, tmp_path, approve_project_file
+):
+    """project > user > shipped for a same-named server (whole-entry replace).
+
+    The project overlay is approved first (Consiliency/pmcp#230, SL-2): a
+    repository-supplied overlay now needs the operator's consent before it
+    applies, so precedence is only observable once consent exists. What this
+    test asserts -- the *order* of the three sources -- is unchanged.
+    """
     # Pick a real shipped server name so we override the base too.
     shipped = load_manifest()
     shipped_name = next(iter(shipped.servers))
@@ -117,6 +125,7 @@ servers:
     args: []
 """,
     )
+    approve_project_file(project_dir / ".pmcp" / "manifest.yaml")
     monkeypatch.chdir(project_dir)
 
     manifest = load_manifest()
@@ -128,8 +137,14 @@ servers:
     assert manifest_user.servers[shipped_name].command == "user-command"
 
 
-def test_env_path_override_wins(monkeypatch, tmp_path):
-    """PMCP_MANIFEST_PATH wins over user and project overlays."""
+def test_env_path_override_wins(monkeypatch, tmp_path, approve_project_file):
+    """PMCP_MANIFEST_PATH wins over user and project overlays.
+
+    The project overlay is approved (Consiliency/pmcp#230, SL-2) so that env
+    still beats a project layer that is genuinely in play. Without the
+    approval this test would pass for the wrong reason -- the project overlay
+    would have been refused rather than outranked.
+    """
     shipped = load_manifest()
     shipped_name = next(iter(shipped.servers))
 
@@ -157,6 +172,7 @@ servers:
     args: []
 """,
     )
+    approve_project_file(project_dir / ".pmcp" / "manifest.yaml")
     monkeypatch.chdir(project_dir)
 
     env_manifest = tmp_path / "env-manifest.yaml"
@@ -412,8 +428,14 @@ servers:
     assert manifest.servers["sibling-entry"].command == "sibling-command"
 
 
-def test_server_env_precedence_across_sources(monkeypatch, tmp_path):
-    """Higher-precedence sources win per key; keys from both sources survive."""
+def test_server_env_precedence_across_sources(
+    monkeypatch, tmp_path, approve_project_file
+):
+    """Higher-precedence sources win per key; keys from both sources survive.
+
+    The project overlay is approved (Consiliency/pmcp#230, SL-2); a
+    ``server_env`` patch is gated exactly like a whole-entry replace.
+    """
     _write(
         Path.home() / ".pmcp" / "manifest.yaml",
         """
@@ -440,6 +462,7 @@ server_env:
     CONTESTED: "project"
 """,
     )
+    approve_project_file(project / ".pmcp" / "manifest.yaml")
     monkeypatch.chdir(project)
 
     entry = load_manifest().servers["multi-patched"]
