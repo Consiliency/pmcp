@@ -134,7 +134,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing was broken, but a false approval prompt on every launch is exactly the
   kind that teaches you to approve without reading. The search now stops at
   `$HOME`, matching the `.mcp.json` search, which already did. Neither `.mcp.json`
-  nor the gateway policy was affected. See #230.
+  nor the gateway policy was affected. Regression from #242; see #230.
 - **Downstream failures no longer log `unhandled errors in a TaskGroup` and
   nothing else.** Every remote-transport path in `ClientManager` runs inside an
   anyio task group, and `str(ExceptionGroup)` names neither the type nor the

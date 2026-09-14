@@ -621,8 +621,13 @@ def _find_project_manifest() -> Path | None:
 
     Replicates config.loader.find_project_root's marker-based walk locally to
     avoid a circular import (config/loader imports load_manifest). Stops at the
-    filesystem root and at the temp directory so test fixtures under tempdir do
-    not accidentally pick up an unrelated overlay.
+    filesystem root; at the temp directory, so test fixtures under tempdir do not
+    accidentally pick up an unrelated overlay; and at $HOME, whose
+    `.pmcp/manifest.yaml` is the user-scoped overlay rather than a project one.
+
+    Keep these stopping conditions in step with `find_project_root`. This docstring
+    once listed only the first two, and the code had drifted the same way: the
+    replica lost the $HOME stop its original has, which is what #243 fixes.
     """
     try:
         current = Path.cwd().resolve()
