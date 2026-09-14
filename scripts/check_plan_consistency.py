@@ -60,6 +60,79 @@ def check_pin(path):
     return 0
 
 
+def check_dag(path):
+    """The Lane Index must declare every in-phase dependency a lane actually has.
+
+    A plan states a lane's dependencies in three places: the Lane Index (which the
+    executor reads to schedule waves), the lane's task table, and its "Interfaces
+    consumed". They drifted: PKGID's SL-3 was corrected to consume
+    `is_valid_package_version` from SL-2 in its task table and interfaces, but its
+    Lane Index still said "Depends on: (none)" -- and SL-2's "Blocks" still omitted
+    SL-3. An executor would have dispatched SL-3 in the first wave, before the
+    validator it needs existed.
+
+    References qualified by another phase's alias (e.g. "(TRUST SL-2)") name that
+    phase's lanes, not this plan's, and are ignored.
+    """
+    s = pathlib.Path(path).read_text()
+    index = {}
+    cur = None
+    for ln in s.splitlines():
+        m = re.match(r"^(SL-\d+) —", ln)
+        if m:
+            cur = m.group(1)
+            index[cur] = {"depends": set(), "blocks": set()}
+            continue
+        if cur and (d := re.match(r"^\s+Depends on:\s*(.*)$", ln)):
+            index[cur]["depends"] = set(re.findall(r"\bSL-\d+\b", d.group(1)))
+        if cur and (b := re.match(r"^\s+Blocks:\s*(.*)$", ln)):
+            index[cur]["blocks"] = set(re.findall(r"\bSL-\d+\b", b.group(1)))
+        if ln.startswith("## ") and index:
+            cur = None
+    if not index:
+        return 0
+
+    def in_phase_refs(text):
+        # drop anything like "TRUST SL-2" / "CONSENT SL-1": another phase's lane
+        text = re.sub(r"\b[A-Z]{2,}\s+SL-\d+\b", "", text)
+        return set(re.findall(r"\bSL-\d+\b", text))
+
+    needed = {lane: set() for lane in index}
+    section = None
+    for ln in s.splitlines():
+        m = re.match(r"^### (SL-\d+)\b", ln)
+        if m:
+            section = m.group(1)
+            continue
+        if ln.startswith("## "):
+            section = None
+        if section in needed and "**Interfaces consumed**" in ln:
+            needed[section] |= in_phase_refs(ln)
+        row = re.match(r"^\|\s*(SL-\d+)\.\d+\s*\|[^|]*\|([^|]*)\|", ln)
+        if row and row.group(1) in needed:
+            needed[row.group(1)] |= in_phase_refs(row.group(2))
+
+    bad = 0
+    name = pathlib.Path(path).name
+    for lane, req in sorted(needed.items()):
+        req.discard(lane)
+        missing = sorted(req - index[lane]["depends"])
+        for m in missing:
+            print(
+                f"  [BLOCKING] {name}: {lane} consumes {m} but its Lane Index"
+                f" does not list {m} under Depends on"
+            )
+            bad += 1
+        for dep in sorted(index[lane]["depends"] & set(index)):
+            if lane not in index[dep]["blocks"]:
+                print(
+                    f"  [BLOCKING] {name}: {lane} depends on {dep} but {dep}'s"
+                    f" Lane Index does not list {lane} under Blocks"
+                )
+                bad += 1
+    return bad
+
+
 def check(path):
     s = pathlib.Path(path).read_text()
     lane, lane_of = set(), {}
@@ -101,7 +174,7 @@ def check(path):
         )
     if not bad and lane >= ec:
         print("  consistent")
-    return bad + check_pin(path)
+    return bad + check_pin(path) + check_dag(path)
 
 
 def brief(lane, path):

@@ -134,11 +134,11 @@ SL-1 — Provisioning gate, registration pinning, and operator surface
 
 SL-2 — Policy package identifiers and spec parsing
   Depends on: (none)
-  Blocks: SL-1, SL-4
+  Blocks: SL-1, SL-3, SL-4
   Parallel-safe: yes
 
 SL-3 — Install-spawn argv logging
-  Depends on: (none)
+  Depends on: SL-2
   Blocks: SL-4
   Parallel-safe: yes
 
