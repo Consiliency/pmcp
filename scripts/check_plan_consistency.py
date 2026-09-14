@@ -170,8 +170,31 @@ def check_dag(path):
             needed[row.group(1)] |= in_phase_refs(row.group(2))
 
     bad = 0
+    # A reference to a lane this plan does not define is an unresolvable
+    # prerequisite: an executor would wait on a lane that never runs. Report it
+    # FIRST. The reciprocity checks below intersect with the known lanes so they
+    # can look a partner up without a KeyError, and that intersection would
+    # otherwise silently drop exactly these references -- `Depends on: SL-2, SL-99`
+    # passed with SL-99 never mentioned.
+    known = set(index)
+    for lane, edges in sorted(index.items()):
+        for field, label in (("depends", "Depends on"), ("blocks", "Blocks")):
+            for ref in sorted(edges[field] - known):
+                print(
+                    f"  [BLOCKING] {name}: {lane} lists {ref} under {label},"
+                    f" but this plan defines no lane {ref}"
+                )
+                bad += 1
+    for lane, req in sorted(needed.items()):
+        for ref in sorted(req - known - {lane}):
+            print(
+                f"  [BLOCKING] {name}: {lane} consumes {ref}, but this plan"
+                f" defines no lane {ref}"
+            )
+            bad += 1
     for lane, req in sorted(needed.items()):
         req.discard(lane)
+        req &= known
         for m in sorted(req - index[lane]["depends"]):
             print(
                 f"  [BLOCKING] {name}: {lane} consumes {m} but its Lane Index"
@@ -235,9 +258,14 @@ def check(path):
             " i.e. the security properties. Every EC should name the tests that"
             " prove its rule."
         )
+    # Run every check BEFORE declaring the file consistent. This used to print
+    # "consistent" on the lane/EC result alone and then run the pin and DAG checks
+    # in the return expression, so a log could read "consistent" directly above a
+    # [BLOCKING] line. The exit code was right; the words were not.
+    bad += check_pin(path) + check_dag(path)
     if not bad and lane >= ec:
         print("  consistent")
-    return bad + check_pin(path) + check_dag(path)
+    return bad
 
 
 def brief(lane, path):
