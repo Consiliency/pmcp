@@ -31,7 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loads, with the same consequence as any other invalid policy file. A
   `packages.allowlist` match lets a discovered package provision without a
   recorded approval. A `packages.denylist` match refuses it even when an
-  approval is recorded. A project `.mcp-gateway-policy.yaml` can add a denial
+  approval is recorded, and also refuses a manifest-backed server whose npm
+  package it names. A project `.mcp-gateway-policy.yaml` can add a denial
   but its allowlist never grants on its own. See
   [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **`pmcp trust approve|list|revoke`, and a user-scoped trust store at
@@ -83,27 +84,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   package that does not resolve to exactly one valid version, or whose lookup
   times out, is refused at registration and nothing is stored.
   **Discovered servers are now default-deny.** `gateway.provision`,
-  `gateway.connect_server`, `gateway.restart_server` and `gateway.update_server`
-  refuse a discovered server until its exact `name@version` is approved with
+  `gateway.connect_server` and `gateway.restart_server` refuse a discovered
+  server until its exact `name@version` is approved with
   `pmcp trust approve-package <name>@<version>` or matched by a
   `packages.allowlist` entry in the operator's policy. A `packages.denylist`
   match beats both. The refusal names the package and prints the runnable
   approval command, and the registration response warns up front when
-  provisioning will be refused. The three lifecycle tools are gated as well as
+  provisioning will be refused. `provision` checks this **before** it asks for
+  the server's credential, so an agent is never prompted for a secret for a
+  package that will be refused. The lifecycle tools are gated as well as
   `provision` because `npx -y` fetches and runs the package when it spawns, so
   without the gate `register` followed by `connect_server` would run the package
   without `provision` ever being called. `gateway.disconnect_server` is not
   gated, so an already running server can still be stopped.
+  **`gateway.update_server` now refuses every discovered server**, approved or
+  not: an approval covers one exact version, and an update would fetch another.
+  To move a discovered server to a newer version, call
+  `gateway.register_discovered_server` again with the same name and package
+  (which resolves and pins the current version), approve that version, then
+  connect it.
   A refusal reports `auth_state="policy_denied"` only when a
   `packages.denylist` entry matched. Every other refusal from this gate (not
   approved, unresolvable identity, or argv not pinned to the approved version)
   reports `auth_state="unknown"`, because no policy denied it.
-  **Manifest-backed servers and `.mcp.json` servers are unchanged**, and
-  provision, connect, restart and update them exactly as before with no
-  approval. There is nothing to migrate: discovered registrations are held in
-  memory only and never survived a gateway restart, so the first provision of a
-  discovered server after upgrading is refused with the command that approves
-  it. Found by the 2026-09-01 codebase review (S-01); see
+  **Manifest-backed and `.mcp.json` servers need no approval**, and provision,
+  connect, restart and update exactly as before, **with one exception: a
+  `packages.denylist` entry now refuses a manifest-backed server whose npm
+  package it names** (the entry's `package` field, or the package argument of
+  its `npx` command or install command). Such a server is refused by
+  `provision`, `connect_server`, `restart_server` and `update_server`, with the
+  same `policy_denied` refusal. If evaluating the package policy raises an
+  error, those four tools now refuse a manifest server instead of proceeding. `.mcp.json`
+  servers are not checked against the package lists. There is nothing to
+  migrate: discovered registrations are held in memory only and never survived
+  a gateway restart, so the first provision of a discovered server after
+  upgrading is refused with the command that approves it. Found by the
+  2026-09-01 codebase review (S-01); see
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **A discovered server may now declare only credential-shaped environment
+  variable names.** `gateway.register_discovered_server` refuses, before it
+  contacts the registry, any `env_vars` entry that is not credential-shaped (it
+  must end in `_TOKEN`, `_KEY`, `_SECRET`, `_SECRETS`, `_PASSWORD`,
+  `_CREDENTIAL`, `_CREDENTIALS`, `_PAT`, `_DSN` or `_AUTH`), any name that
+  influences how code loads (`LD_PRELOAD`, `NODE_OPTIONS`, `PATH`, `PYTHON*`
+  and the rest of the existing list), and any name starting with `NPM_CONFIG_`,
+  `NODE_`, `COREPACK_`, `YARN_`, `PNPM_` or `BUN_` in any letter case, even when
+  it is credential-shaped (`NPM_CONFIG__AUTH`, `NODE_AUTH_TOKEN`).
+  `gateway.auth_connect` applies the same rule to a discovered server, both to
+  the name it declared and to an explicit `env_var` override. Before this, an
+  agent could register a package the operator had **already approved** under a
+  new server name with `env_vars=["npm_config_registry"]`, store an attacker's
+  registry URL through `auth_connect`, and have the pinned `npx -y name@version`
+  spawn receive it. npx then fetched that version from the attacker's registry:
+  the approved name and version, but different bytes. The stored value also
+  landed in the gateway's own environment. The old check was a blocklist, and
+  a blocklist cannot work here, because the declared name is chosen by the
+  agent. **Manifest-backed servers keep the previous rule**, so a shipped server
+  that declares a non-credential name such as `POSTGRES_URL` works as before. A
+  server that needs any other kind of variable should be configured in
+  `.mcp.json` rather than registered. Found by the PKGID phase review; see
   [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **A repository's own configuration files no longer configure PMCP until you
   approve them, and an approved project policy can only *narrow* the operator's
@@ -230,7 +269,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs.** `start_install`, the legacy `install_server` and `verify_installation`
   each log a rendered command line immediately before the subprocess is
   created, and still log it if the spawn then fails (for example
-  `FileNotFoundError`). Previously `start_install` logged
+  `FileNotFoundError`). Two other spawns that fetch and run a package log the
+  same way: starting a stdio server whose command is a package runner (`npx`,
+  `npx.cmd`, `npx.exe`, `uvx`, `pnpx` or `bunx`; any other command logs no
+  warning), and every `gateway.update_server` probe. Previously `start_install` logged
   `<args redacted>` at INFO, which hid exactly which package ran, and
   `install_server` logged the full argv verbatim at INFO, including any
   credential it carried.
@@ -243,7 +285,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indistinguishable from a package name. **Expect `<redacted>` in the package
   position for manifest installs**: the shipped manifest's install commands are
   not pinned to exact versions (for example `@playwright/mcp@latest`), so only
-  a pinned discovered server's install shows its package. See
+  a pinned discovered server's spawn shows its package. See
   [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **Every GitHub Action is pinned to a commit SHA.** All 30 remote `uses:`
   references — 29 across the five workflows and the one inside the local
