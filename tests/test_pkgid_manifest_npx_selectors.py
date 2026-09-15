@@ -283,10 +283,22 @@ def test_executable_names_are_normalized(executable: str, expected: str) -> None
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command", ["NPX.CMD", "npx.bat", "C:\\tools\\npx.cmd"])
+@pytest.mark.parametrize("site", ["args", "install"])
 async def test_a_windows_npx_spelling_is_read_for_the_denylist(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, site: str
 ) -> None:
-    server = _manifest_server("win", command=command, args=["-y", "denied-pkg"])
+    # Each site on its own: the other one does not name the package.
+    if site == "args":
+        server = _manifest_server(
+            "win", command=command, args=["-y", "denied-pkg"], install=["brew", "x"]
+        )
+    else:
+        server = _manifest_server(
+            "win",
+            command="installed-bin",
+            args=[],
+            install=[command, "-y", "denied-pkg"],
+        )
 
     provisioned, connected, manager, jobs = await _provision_and_connect(
         tmp_path, monkeypatch, server, DENIED
