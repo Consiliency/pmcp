@@ -30,6 +30,70 @@ def is_valid_package_name(name: str) -> bool:
     return bool(_PACKAGE_NAME_RE.fullmatch(name))
 
 
+def version_separator_index(spec: str) -> int:
+    """Index of the ``@`` separating a name from its version, or ``-1``.
+
+    A scoped name's leading ``@`` is not a separator, so the search starts after
+    index 0 for a spec that begins with one. Shared by ``parse_package_spec`` and
+    the policy schema, which must agree on where a name ends.
+    """
+    return spec.find("@", 1) if spec.startswith("@") else spec.find("@")
+
+
+def parse_package_spec(spec: str) -> tuple[str, str | None]:
+    """Split ``name[@version]`` into its name and requested version.
+
+    Splits **before** validating: ``is_valid_package_name`` rejects ``pkg@1.2.3``
+    because ``@`` is legal only as a scope prefix, so only the name half can be
+    validated. Raises ``ValueError`` when the name half is not a valid package
+    name, or when a trailing ``@`` names no version -- reading ``pkg@`` as "no
+    version requested" would stand in for ``latest``, a version nobody named.
+
+    The version half is returned as *requested*, unvalidated: it may be a
+    dist-tag such as ``latest``. Nothing it returns is fit for argv until
+    ``is_valid_package_version`` has accepted the *resolved* version.
+    """
+    at = version_separator_index(spec)
+    if at == -1:
+        name, version = spec, None
+    else:
+        name, version = spec[:at], spec[at + 1 :]
+        if not version:
+            raise ValueError(f"package spec {spec!r} has an empty version")
+    if not is_valid_package_name(name):
+        raise ValueError(f"package spec {spec!r} does not name a valid package")
+    return name, version
+
+
+# SemVer 2.0.0, spelled with explicit ASCII classes: ``\d`` would admit non-ASCII
+# digits. No leading zeros in numeric identifiers, no empty identifiers, and
+# nothing outside ``[0-9A-Za-z.+-]`` -- so no whitespace, shell metacharacter,
+# path separator or leading ``-``. An allowlist, deliberately: a denylist of
+# metacharacters is only as good as the author's memory of them.
+_NUMERIC = r"(?:0|[1-9][0-9]*)"
+_PRERELEASE_ID = r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+_BUILD_ID = r"[0-9A-Za-z-]+"
+_PACKAGE_VERSION_RE = re.compile(
+    rf"{_NUMERIC}\.{_NUMERIC}\.{_NUMERIC}"
+    rf"(?:-{_PRERELEASE_ID}(?:\.{_PRERELEASE_ID})*)?"
+    rf"(?:\+{_BUILD_ID}(?:\.{_BUILD_ID})*)?"
+)
+_MAX_PACKAGE_VERSION_LENGTH = 256
+
+
+def is_valid_package_version(version: str) -> bool:
+    """Return True if *version* is one concrete SemVer version, safe for argv.
+
+    The version this checks arrives in a registry response -- semi-trusted
+    network data -- and is then composed into ``["npx", "-y", f"{name}@{version}"]``.
+    Ranges and dist-tags are refused too: they pin nothing, so an approval of one
+    would re-resolve at every spawn.
+    """
+    if not version or len(version) > _MAX_PACKAGE_VERSION_LENGTH:
+        return False
+    return _PACKAGE_VERSION_RE.fullmatch(version) is not None
+
+
 # Environment variables that change how a subsequently spawned subprocess loads
 # or executes code. Storing any of these would let a caller achieve code
 # execution in the next provisioned server process, so they are rejected

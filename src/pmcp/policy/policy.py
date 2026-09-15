@@ -8,13 +8,14 @@ import json
 import logging
 import re
 from pathlib import Path
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 
 from pmcp.project_consent import log_refusal, read_and_gate
 from pmcp.types import (
     GatewayPolicy,
+    PackagePolicy,
     PromptPolicy,
     ResourcePolicy,
     ServerPolicy,
@@ -22,7 +23,16 @@ from pmcp.types import (
 )
 from pmcp.auth import sanitize_auth_diagnostic
 
+if TYPE_CHECKING:
+    # Annotation only. `pmcp.manifest`'s package `__init__` imports the loader and
+    # installer, so a runtime import here would put the whole manifest package on
+    # the import path of every policy consumer.
+    from pmcp.manifest.package_identity import PackageIdentity
+
 logger = logging.getLogger(__name__)
+
+#: A package verdict. Tri-state on purpose -- see `evaluate_package_policy`.
+PackageVerdict = Literal["denied", "allowed", "unspecified"]
 
 #: The four allow/deny sections share a shape but not a base class. Spelled out
 #: as a union rather than as `Any` so a fifth section added to `GatewayPolicy`
@@ -365,6 +375,59 @@ class PolicyManager:
         if self._project_policy is None:
             return True
         return self._section_allows(self._project_policy.servers, server_name)
+
+    def _package_verdict(
+        self, section: PackagePolicy, identity: PackageIdentity
+    ) -> PackageVerdict:
+        """Evaluate ONE policy's package lists. Deliberately not `_section_allows`.
+
+        `_section_allows` answers `True` when nothing matches; here nothing
+        matching is `"unspecified"`. An allowlist miss is `"unspecified"` too, not
+        `"denied"`: only an explicit denylist match may outrank a recorded
+        approval or the manifest exemption.
+
+        The glob is matched against the name alone. Matching `name@version` as
+        well would let a package author satisfy an allowlist through the
+        version they publish (`evil@1.0.0-mcp` against `*-mcp`).
+        """
+        if section.denylist and self._matches_any(identity.name, section.denylist):
+            return "denied"
+        if section.allowlist and self._matches_any(identity.name, section.allowlist):
+            return "allowed"
+        return "unspecified"
+
+    def evaluate_package_policy(
+        self, identity: PackageIdentity | None
+    ) -> PackageVerdict:
+        """The composed policy verdict for a resolved package (IF-0-PKGID-1).
+
+        **Tri-state, and `"unspecified"` is not permission.** A package no list
+        matches -- including every package under a policy with no `packages`
+        section -- is `"unspecified"`, which the provisioning gate refuses. The
+        boolean predicates above default to `True`; reading that default as an
+        allowlist match is how every discovered package would provision.
+
+        **Composed by an explicit rule, never by `and`** (IF-0-CONSENT-2). All
+        three verdicts are truthy strings, so `user and project` returns the
+        project's verdict and a project `"allowed"` would overturn a user
+        `"denied"`. Instead: if either side is `"denied"` the result is
+        `"denied"`; otherwise it is the user's verdict. A project `"allowed"`
+        never grants on its own -- it can only fail to deny. There is no shared
+        `compose` helper, so a tri-state verdict cannot be routed through the
+        boolean rule by accident.
+
+        `None` names nothing a list could match, so it is `"unspecified"`; what
+        an unresolvable identity means is the gate's decision, not policy's.
+        """
+        if identity is None:
+            return "unspecified"
+        user = self._package_verdict(self._policy.packages, identity)
+        if self._project_policy is None:
+            return user
+        project = self._package_verdict(self._project_policy.packages, identity)
+        if user == "denied" or project == "denied":
+            return "denied"
+        return user
 
     def is_tool_allowed(self, tool_id: str) -> bool:
         """Check if tool is allowed by both policies. See `is_server_allowed`."""
