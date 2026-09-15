@@ -598,8 +598,10 @@ class TestProducerInvariants:
 
     @pytest.mark.asyncio
     async def test_register_discovered_server_derives_from_env_vars(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, fake_npm_registry: dict[str, str]
     ) -> None:
+        fake_npm_registry["@example/discovered-mcp"] = "1.0.0"
+        fake_npm_registry["@example/discovered-mcp-nokey"] = "1.0.0"
         manifest = _manifest()
         tools = _gateway_tools(manifest, monkeypatch)
 

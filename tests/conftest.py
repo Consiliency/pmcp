@@ -39,6 +39,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pmcp import trust_store
+from pmcp.manifest import package_identity
 from pmcp.env_store import reset_dotenv_keys
 from pmcp.policy.policy import PolicyManager
 from pmcp.types import (
@@ -162,6 +163,55 @@ def _reset_dotenv_provenance() -> Iterator[None]:
     reset_dotenv_keys()
     yield
     reset_dotenv_keys()
+
+
+@pytest.fixture(autouse=True)
+def _no_live_npm_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]]:
+    """Fail any test whose package-identity lookup reaches the real npm registry.
+
+    ``gateway.register_discovered_server`` resolves the package against the
+    registry before it registers anything (Consiliency/pmcp#230). A test that
+    forgets to stub the lookup would otherwise pass or fail on whatever
+    registry.npmjs.org answered that day, and ``resolve_package_identity`` turns
+    a network error into a quiet ``None`` -- so a refusal assertion could pass
+    for the wrong reason offline. Only the opener's ``open`` is replaced, so
+    tests that inspect ``_OPENER``'s handlers still see the real ones; a test
+    that stubs ``_fetch_packument`` (see ``fake_npm_registry``) never gets here.
+    """
+    attempts: list[str] = []
+
+    def _refuse(request: Any, *args: Any, **kwargs: Any) -> Any:
+        attempts.append(getattr(request, "full_url", str(request)))
+        raise OSError("live npm registry lookups are disabled in tests")
+
+    monkeypatch.setattr(package_identity._OPENER, "open", _refuse)
+    yield attempts
+    assert attempts == [], (
+        f"a test reached the npm registry: {attempts}; "
+        "use the fake_npm_registry fixture"
+    )
+
+
+@pytest.fixture
+def fake_npm_registry(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    """An offline npm registry: set ``fake_npm_registry[name] = version``.
+
+    Names not in the mapping resolve to nothing, as an unknown package does.
+    """
+    known: dict[str, str] = {}
+
+    def _fetch(name: str) -> dict[str, Any] | None:
+        version = known.get(name)
+        if version is None:
+            return None
+        return {
+            "name": name,
+            "dist-tags": {"latest": version},
+            "versions": {version: {"dist": {"integrity": f"sha512-{name}"}}},
+        }
+
+    monkeypatch.setattr(package_identity, "_fetch_packument", _fetch)
+    return known
 
 
 # === Sample Data Factories ===

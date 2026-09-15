@@ -102,15 +102,17 @@ class TestPackageNameValidation:
             )
 
     @pytest.mark.asyncio
-    async def test_register_echoes_install_command(self):
+    async def test_register_echoes_install_command(self, fake_npm_registry):
+        fake_npm_registry["@scope/pkg"] = "1.2.3"
         gateway = _make_gateway()
         out = await gateway.register_discovered_server(
             {"package": "@scope/pkg", "server_name": "demo"}
         )
         assert out.ok is True
-        # The resolved list-argv command is surfaced for caller confirmation.
-        assert out.install_command == ["npx", "-y", "@scope/pkg"]
-        assert "npx -y @scope/pkg" in out.message
+        # The resolved list-argv command, pinned to the version the registry
+        # resolved (#230), is surfaced for caller confirmation.
+        assert out.install_command == ["npx", "-y", "@scope/pkg@1.2.3"]
+        assert "npx -y @scope/pkg@1.2.3" in out.message
 
 
 # ---------------------------------------------------------------------------
