@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shlex
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -18,6 +19,7 @@ from pmcp.manifest.loader import (
     credential_lookup_keys,
     requires_credential,
 )
+from pmcp.validation import is_valid_package_version, parse_package_spec
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,78 @@ HEARTBEAT_TIMEOUT = 120  # seconds
 
 # Time to wait before assuming uvx server is ready (they don't output startup messages)
 UVX_STARTUP_SECONDS = 3
+
+_REDACTED = "<redacted>"
+
+# Flag literals shown as themselves wherever they appear. Frozen: widening this set
+# widens what an install log line can disclose.
+_SHOWN_FLAGS = frozenset({"-y", "--yes", "--quiet"})
+# Shown by NAME only; its value -- the next argument, or the text after ``=`` --
+# is always redacted, because a registry URL can carry ``user:password@``.
+_REGISTRY_FLAG = "--registry"
+
+
+def _operator_safe(value: str) -> str:
+    """Render a manifest- or agent-supplied string for an operator's log line.
+
+    Each non-printable character (CR, LF, ESC, C1 controls such as U+009B, bidi
+    overrides, zero-width characters) is replaced by its backslash escape, so the
+    value cannot overwrite, split or reorder the line; the result is then always
+    shell-quoted, because operators copy log lines. Escape first, quote last.
+    """
+    escaped = "".join(ch if ch.isprintable() else repr(ch)[1:-1] for ch in value)
+    return shlex.quote(escaped)
+
+
+def _pinned_package_spec(arg: str) -> str | None:
+    """*arg* if it is a pinned ``name@resolved_version`` fit to show, else None."""
+    try:
+        _name, version = parse_package_spec(arg)
+    except ValueError:
+        return None
+    if version is None or not is_valid_package_version(version):
+        return None
+    return arg
+
+
+def _render_install_argv(argv: list[str]) -> str:
+    """The argv an install spawn is about to execute, secret-safe by construction.
+
+    Shown: the executable (escaped), the frozen flag literals, ``--registry``'s
+    name, and the package slot when it holds a pinned ``name@resolved_version``.
+    Everything else is ``<redacted>``.
+
+    The package slot is identified by POSITION -- the first argument after the
+    leading run of frozen flags (and ``--registry``'s value), which is where
+    registration pins the spec (``["npx", "-y", "name@version"]``) -- and never
+    by what an argument looks like. In ``npx -y pkg@1.2.3 --token abcdef0123456789``
+    the token is a valid package name, so a "looks like a package" rule would log
+    the credential. A credential ahead of the package takes the slot itself, and
+    then nothing but frozen literals is shown.
+    """
+    if not argv:
+        return ""
+    rendered = [_operator_safe(argv[0])]
+    slot_open = True
+    registry_value_next = False
+    for arg in argv[1:]:
+        if registry_value_next:
+            registry_value_next = False
+            rendered.append(_REDACTED)
+        elif arg in _SHOWN_FLAGS:
+            rendered.append(arg)
+        elif arg == _REGISTRY_FLAG:
+            rendered.append(arg)
+            registry_value_next = True
+        elif arg.startswith(_REGISTRY_FLAG + "="):
+            rendered.append(f"{_REGISTRY_FLAG}={_REDACTED}")
+        elif slot_open:
+            slot_open = False
+            spec = _pinned_package_spec(arg)
+            rendered.append(_operator_safe(spec) if spec is not None else _REDACTED)
+        else:
+            rendered.append(_REDACTED)
+    return " ".join(rendered)
 
 
 class InstallError(Exception):
@@ -124,11 +198,13 @@ class JobManager:
         )
         self._jobs[job_id] = job
 
-        logger.info(
-            f"Starting install job {job_id} for {server_config.name}: {install_cmd[0]} <args redacted>"
-        )
-
         try:
+            # Logged inside the try and ahead of the spawn, so a spawn that raises
+            # (e.g. FileNotFoundError) still leaves a record of what was attempted.
+            logger.warning(
+                f"Starting install job {job_id} for {_operator_safe(server_config.name)}: "
+                f"{_render_install_argv(install_cmd)}"
+            )
             # Start subprocess with stdin/stdout/stderr pipes
             # stdin is needed for JSON-RPC communication after server starts
             # stderr is separate so ClientManager can read it independently
@@ -602,10 +678,12 @@ async def install_server(
     if not install_cmd:
         raise InstallError(f"No install command for {server_config.name} on {platform}")
 
-    logger.info(f"Installing {server_config.name}: {' '.join(install_cmd)}")
-
     process: asyncio.subprocess.Process | None = None
     try:
+        logger.warning(
+            f"Installing {_operator_safe(server_config.name)}: "
+            f"{_render_install_argv(install_cmd)}"
+        )
         process = await asyncio.create_subprocess_exec(
             *install_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -648,10 +726,17 @@ async def verify_installation(server_config: ServerConfig) -> bool:
         # Try to start the server briefly. Sanitized env: this executes the
         # server's own package code, so it must not inherit other servers'
         # credentials from the gateway environment.
-        process = await asyncio.create_subprocess_exec(
+        verify_cmd = [
             server_config.command,
             *server_config.args[:1],  # Just first arg to test
             "--help",
+        ]
+        logger.warning(
+            f"Verifying installation of {_operator_safe(server_config.name)}: "
+            f"{_render_install_argv(verify_cmd)}"
+        )
+        process = await asyncio.create_subprocess_exec(
+            *verify_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=build_install_child_env(server_config),
