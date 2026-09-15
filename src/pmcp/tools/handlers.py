@@ -3461,9 +3461,11 @@ class GatewayTools:
             # resolves here before its probe spawns `npx <pkg>`, so without this
             # a registered-but-unapproved package runs with no `provision` call
             # at all. Before the credential check, so a refused package never
-            # prompts for auth. Not for disconnect: it spawns nothing, and
-            # refusing it would strand an unapproved server that is running.
-            if action != "disconnect":
+            # prompts for auth. Only for the discovered lookup: a manifest hit
+            # is exempt by rule 2 and its lifecycle behaviour stays untouched.
+            # Not for disconnect: it spawns nothing, and refusing it would strand
+            # an unapproved server that is running.
+            if source == "discovered" and action != "disconnect":
                 decision = evaluate_provision(
                     server_config,
                     identity,

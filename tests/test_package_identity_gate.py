@@ -1182,3 +1182,30 @@ async def test_the_lifecycle_gate_keeps_existing_denials_and_spares_disconnect(
     assert stopped.ok is True, stopped.message
     assert manager3.disconnected == ["internal-approved-tool"]
     assert spawns == []
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_server_lifecycle_does_not_consult_the_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spawns: list[tuple[Any, ...]],
+) -> None:
+    """Only the discovered lookup is gated; a manifest hit is left as it was."""
+    shipped = _config(["-y", "@shipped/server"], name="shipped")
+    gateway, _ = _gateway(
+        monkeypatch, _empty_policy(tmp_path), manifest_servers={"shipped": shipped}
+    )
+    manager = cast(_MinimalClientManager, gateway._client_manager)
+    consulted: list[str] = []
+
+    def spy(*args: Any, **kwargs: Any) -> ProvisionDecision:
+        consulted.append(kwargs["source"])
+        raise AssertionError("the lifecycle gate ran for a manifest server")
+
+    monkeypatch.setattr(handlers_module, "evaluate_provision", spy)
+
+    result = await gateway.connect_server({"server_name": "shipped"})
+
+    assert result.ok is True, result.message
+    assert consulted == []
+    assert [c.name for c in manager.connected] == ["shipped"]
