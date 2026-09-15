@@ -60,6 +60,165 @@ def check_pin(path):
     return 0
 
 
+def _phase_aliases(plan_text, plan_path):
+    """The roadmap's phase aliases (TRUST, CONSENT, ...), read from its headings.
+
+    Used to recognise a cross-phase lane reference such as "(TRUST SL-2)". Reading
+    the real aliases, rather than treating any word before a lane id as an alias,
+    matters: a generic rule would also discard "from SL-2" or "via SL-2" in an
+    interfaces line and so HIDE a genuine in-phase dependency.
+    """
+    m = re.search(r"^roadmap:\s*(\S+)$", plan_text, re.M)
+    if not m:
+        return set()
+    roadmap = pathlib.Path(plan_path).parent.parent / m.group(1)
+    if not roadmap.exists():
+        return set()
+    return {
+        a.upper()
+        for a in re.findall(
+            r"^### Phase \S+ — .*\(([A-Za-z0-9]+)\)\s*$", roadmap.read_text(), re.M
+        )
+    }
+
+
+def check_dag(path):
+    """The Lane Index must agree with the dependencies each lane actually has.
+
+    A plan states a lane's dependencies in three places: the Lane Index (which the
+    executor reads to schedule waves), the lane's task table, and its "Interfaces
+    consumed". They drifted: PKGID's SL-3 was corrected to consume
+    `is_valid_package_version` from SL-2 in its task table and interfaces, while
+    its Lane Index still said "Depends on: (none)" and SL-2's "Blocks" omitted
+    SL-3 -- so an executor would have dispatched SL-3 before its validator existed.
+
+    Checks, each independently:
+      * every in-phase lane a lane consumes is under its Lane Index Depends on;
+      * every Depends on edge has the matching Blocks edge, and vice versa, so a
+        spurious Blocks entry is caught as well as a missing one;
+      * a plan that has lane sections but no Lane Index is reported, rather than
+        passing silently with nothing checked.
+
+    Known limit, deliberately: a dependency mentioned only in free prose (Scope,
+    Execution Notes) is not read, because reading prose would report lane ids that
+    merely appear in a sentence.
+    """
+    s = pathlib.Path(path).read_text()
+    name = pathlib.Path(path).name
+    has_lanes = bool(re.search(r"^### SL-\d+\b", s, re.M))
+
+    index, cur = {}, None
+    for ln in s.splitlines():
+        if ln.startswith("## "):
+            cur = None
+        m = re.match(r"^(SL-\d+) —", ln)
+        if m:
+            cur = m.group(1)
+            index[cur] = {"depends": set(), "blocks": set()}
+            continue
+        if cur and (d := re.match(r"^\s+Depends on:\s*(.*)$", ln)):
+            index[cur]["depends"] = set(re.findall(r"\bSL-\d+\b", d.group(1)))
+        if cur and (b := re.match(r"^\s+Blocks:\s*(.*)$", ln)):
+            index[cur]["blocks"] = set(re.findall(r"\bSL-\d+\b", b.group(1)))
+
+    if has_lanes and not index:
+        print(
+            f"  [BLOCKING] {name}: has lane sections but no Lane Index, so no"
+            " dependency could be checked and the executor has nothing to schedule"
+        )
+        return 1
+    if not index:
+        return 0
+
+    aliases = _phase_aliases(s, path)
+    alias_ref = (
+        re.compile(r"\b(?:" + "|".join(sorted(aliases)) + r")\b[\s,;:/]*SL-\d+\b", re.I)
+        if aliases
+        else None
+    )
+
+    def in_phase_refs(text):
+        if alias_ref:
+            text = alias_ref.sub("", text)
+        return set(re.findall(r"\bSL-\d+\b", text))
+
+    needed = {lane: set() for lane in index}
+    section, in_interfaces = None, False
+    for ln in s.splitlines():
+        m = re.match(r"^### (SL-\d+)\b", ln)
+        if m:
+            section, in_interfaces = m.group(1), False
+            continue
+        if ln.startswith("## "):
+            section, in_interfaces = None, False
+        if section not in needed:
+            continue
+        if "**Interfaces consumed**" in ln:
+            in_interfaces = True
+            needed[section] |= in_phase_refs(ln)
+            continue
+        if in_interfaces:
+            # A wrapped interfaces line continues until the next bullet, table
+            # row, heading or blank line.
+            if not ln.strip() or re.match(r"^\s*(- \*\*|\||#)", ln):
+                in_interfaces = False
+            else:
+                needed[section] |= in_phase_refs(ln)
+                continue
+        row = re.match(r"^\|\s*(SL-\d+)\.\d+\s*\|[^|]*\|([^|]*)\|", ln)
+        if row and row.group(1) in needed:
+            needed[row.group(1)] |= in_phase_refs(row.group(2))
+
+    bad = 0
+    # A reference to a lane this plan does not define is an unresolvable
+    # prerequisite: an executor would wait on a lane that never runs. Report it
+    # FIRST. The reciprocity checks below intersect with the known lanes so they
+    # can look a partner up without a KeyError, and that intersection would
+    # otherwise silently drop exactly these references -- `Depends on: SL-2, SL-99`
+    # passed with SL-99 never mentioned.
+    known = set(index)
+    for lane, edges in sorted(index.items()):
+        for field, label in (("depends", "Depends on"), ("blocks", "Blocks")):
+            for ref in sorted(edges[field] - known):
+                print(
+                    f"  [BLOCKING] {name}: {lane} lists {ref} under {label},"
+                    f" but this plan defines no lane {ref}"
+                )
+                bad += 1
+    for lane, req in sorted(needed.items()):
+        for ref in sorted(req - known - {lane}):
+            print(
+                f"  [BLOCKING] {name}: {lane} consumes {ref}, but this plan"
+                f" defines no lane {ref}"
+            )
+            bad += 1
+    for lane, req in sorted(needed.items()):
+        req.discard(lane)
+        req &= known
+        for m in sorted(req - index[lane]["depends"]):
+            print(
+                f"  [BLOCKING] {name}: {lane} consumes {m} but its Lane Index"
+                f" does not list {m} under Depends on"
+            )
+            bad += 1
+    for lane, edges in sorted(index.items()):
+        for dep in sorted(edges["depends"] & set(index)):
+            if lane not in index[dep]["blocks"]:
+                print(
+                    f"  [BLOCKING] {name}: {lane} depends on {dep} but {dep}'s"
+                    f" Lane Index does not list {lane} under Blocks"
+                )
+                bad += 1
+        for blocked in sorted(edges["blocks"] & set(index)):
+            if lane not in index[blocked]["depends"]:
+                print(
+                    f"  [BLOCKING] {name}: {lane} lists {blocked} under Blocks but"
+                    f" {blocked} does not depend on {lane}"
+                )
+                bad += 1
+    return bad
+
+
 def check(path):
     s = pathlib.Path(path).read_text()
     lane, lane_of = set(), {}
@@ -99,9 +258,14 @@ def check(path):
             " i.e. the security properties. Every EC should name the tests that"
             " prove its rule."
         )
+    # Run every check BEFORE declaring the file consistent. This used to print
+    # "consistent" on the lane/EC result alone and then run the pin and DAG checks
+    # in the return expression, so a log could read "consistent" directly above a
+    # [BLOCKING] line. The exit code was right; the words were not.
+    bad += check_pin(path) + check_dag(path)
     if not bad and lane >= ec:
         print("  consistent")
-    return bad + check_pin(path)
+    return bad
 
 
 def brief(lane, path):
