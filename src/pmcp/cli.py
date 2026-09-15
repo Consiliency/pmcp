@@ -19,7 +19,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
-from pmcp import trust_store
+from pmcp import package_approvals, trust_store
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.install import (
@@ -37,6 +37,7 @@ from pmcp.config.loader import (
     set_startup_policy,
 )
 from pmcp.env_store import record_dotenv_keys
+from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
 from pmcp.types import StartupPolicyOperation
 
@@ -795,6 +796,31 @@ Environment overrides:
         "path",
         type=Path,
         help="File whose trust record is dropped",
+    )
+
+    # Package verbs (IF-0-PKGID-2). Same contract as above: a provisioning
+    # refusal prints the runnable `pmcp trust approve-package <name>@<version>`.
+    trust_approve_package_parser = trust_subparsers.add_parser(
+        "approve-package",
+        help="Approve one package at one exact version for provisioning",
+    )
+    trust_approve_package_parser.add_argument(
+        "spec",
+        help="Package and exact resolved version, e.g. @scope/server@1.2.3",
+    )
+
+    trust_subparsers.add_parser(
+        "list-packages",
+        help="List every recorded package approval",
+    )
+
+    trust_revoke_package_parser = trust_subparsers.add_parser(
+        "revoke-package",
+        help="Drop package approvals (one version, or every version)",
+    )
+    trust_revoke_package_parser.add_argument(
+        "spec",
+        help="Package name, or name@version to drop only that version",
     )
 
     return parser.parse_args()
@@ -2536,12 +2562,72 @@ def _run_trust_revoke(args: argparse.Namespace) -> None:
     print(f"Revoked {Path(path).resolve()}")
 
 
+def _exact_package_spec(spec: str) -> tuple[str, str]:
+    """Split ``name@version``, requiring one exact version.
+
+    A dist-tag or range is refused rather than resolved: an approval names the
+    bytes that run, and ``latest`` names whatever is published next. Refusals
+    always print a resolved version, so this costs an operator nothing.
+    """
+    name, version = parse_package_spec(spec)
+    if version is None or not is_valid_package_version(version):
+        raise ValueError(
+            f"{spec!r} does not name one exact version; use name@<version> as "
+            "printed in the provisioning refusal (ranges and dist-tags pin nothing)"
+        )
+    return name, version
+
+
+def _run_trust_approve_package(args: argparse.Namespace) -> None:
+    """Approve one package identity. Offline: no registry is consulted."""
+    from pmcp.manifest.package_identity import NPM_REGISTRY, PackageIdentity
+
+    name, version = _exact_package_spec(args.spec)
+    rec = package_approvals.approve_package(
+        PackageIdentity(
+            registry=NPM_REGISTRY, name=name, resolved_version=version, integrity=None
+        )
+    )
+    print(f"Approved {rec.registry} package {rec.name}@{rec.resolved_version}")
+
+
+def _run_trust_list_packages(args: argparse.Namespace) -> None:
+    """Print every package decision, or say plainly that there are none."""
+    records = package_approvals.list_package_approvals()
+    if not records:
+        print("No package approvals.")
+        return
+    for rec in records:
+        # Names and versions are re-validated when the store is read, so
+        # nothing printed here can carry a terminal control sequence.
+        print(
+            f"{rec.decision:<8}  {rec.recorded_at.isoformat()}  "
+            f"{rec.registry}:{rec.name}@{rec.resolved_version}  "
+            f"{rec.integrity or '-'}"
+        )
+
+
+def _run_trust_revoke_package(args: argparse.Namespace) -> None:
+    """Drop one version's approval, or every version's for a bare name."""
+    name, version = parse_package_spec(args.spec)
+    if version is not None and not is_valid_package_version(version):
+        raise ValueError(f"{args.spec!r} does not name one exact version")
+    label = f"{name}@{version}" if version else name
+    if not package_approvals.revoke_package(name, version):
+        _trust_fail(f"no package approval for {label}")
+        return
+    print(f"Revoked {label}")
+
+
 def run_trust(args: argparse.Namespace) -> None:
-    """Dispatch `pmcp trust <verb>` over the user-scoped trust store."""
+    """Dispatch `pmcp trust <verb>` over the user-scoped trust stores."""
     handlers = {
         "approve": _run_trust_approve,
         "list": _run_trust_list,
         "revoke": _run_trust_revoke,
+        "approve-package": _run_trust_approve_package,
+        "list-packages": _run_trust_list_packages,
+        "revoke-package": _run_trust_revoke_package,
     }
     handler = handlers.get(args.trust_command)
     if handler is None:
