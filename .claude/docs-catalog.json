@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "last_updated": "2026-09-11T22:09:34+00:00",
+  "last_updated": "2026-09-15T08:24:31+00:00",
   "files": {
     "README.md": {
       "purpose": "root project README",
@@ -8,7 +8,8 @@
         "P5",
         "P2",
         "P3B",
-        "UPDPATH"
+        "UPDPATH",
+        "PKGID"
       ]
     },
     "CHANGELOG.md": {
@@ -20,7 +21,8 @@
         "P3B",
         "UPDPATH",
         "TRUST",
-        "CONSENT"
+        "CONSENT",
+        "PKGID"
       ]
     },
     "CONTRIBUTING.md": {
@@ -82,7 +84,8 @@
       "purpose": "multi-phase roadmap spec",
       "touched_by_phases": [
         "TRUST",
-        "CONSENT"
+        "CONSENT",
+        "PKGID"
       ]
     },
     "specs/phase-plans-v2.md": {
@@ -229,7 +232,9 @@
     },
     "plans/phase-plan-v13-PKGID.md": {
       "purpose": "per-phase lane plan",
-      "touched_by_phases": []
+      "touched_by_phases": [
+        "PKGID"
+      ]
     },
     "plans/phase-plan-v13-TRUST.md": {
       "purpose": "per-phase lane plan",

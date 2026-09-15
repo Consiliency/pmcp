@@ -541,6 +541,210 @@ Sandboxing what does run; auditing PMCP's own dependencies.
 - redaction posture: `metadata_only`
 - missing or malformed evidence routes to `blocker_class=contract_bug` (non-human).
 
+### Post-execution amendments — PKGID (2026-09-15)
+
+Recorded by SL-docs after SL-1, SL-2 and SL-3 landed, were merged, and a
+single-writer repair pass ran over the assembled branch. Both freeze gates shipped
+with the signatures they declared, and S-01's reproduction fails closed at every
+door found (EC-PKGID-1). But the gate turned out to have **two doors, not one**
+(item 1), the frozen decision order was wrong until a lane read it before the
+implementation started (item 3), and items 8 and 9 are **open**: they are pending
+the phase review and are recorded as findings, not as decisions. Line references
+are to the assembled phase branch (`phase/v13-pkgid`, `ed5ee22`). **Items 1, 8 and
+9 are the ones EGRESS and SEAL pay for if they are not read.**
+
+1. **The lifecycle door: gating `provision` did not gate every install spawn.**
+   This roadmap's IF-0-PKGID-1 ("the single call `provision` uses") and the plan's
+   Context item 2 both assumed that one gate in front of `start_install` covered
+   every spawn that installs, because `start_install` has exactly one production
+   callsite (`src/pmcp/tools/handlers.py:4605`). It did not. `npx -y` fetches and
+   runs the package *when it spawns*, so every path that spawns a discovered config
+   is an install path. `connect_server`, `restart_server` and `update_server` all
+   reach a discovered config through `_resolve_lifecycle_config`
+   (`handlers.py:3365`; discovered lookup at `:3439-3442`), and before this phase
+   that branch checked only the agent-chosen server name (`:3445`).
+   `update_server` resolves there twice, before its probe (`:5185`) and in its
+   post-probe recheck (`:5333`), and the probe itself spawns `npx -y <pkg>@latest
+   --help` (`:5264`, spawned at `:3725`). So `register_discovered_server(name=<allowlisted>,
+   package=<arbitrary>)` followed by `connect_server(name=<allowlisted>)` ran the
+   package without `provision` ever being called. SL-1 found this; the operator
+   approved gating that resolver's discovered branch. The gate runs after the
+   name-policy denial and before the credential check (`:3468-3491`, credential
+   check at `:3493`). **Disconnect is not gated** (`action != "disconnect"`,
+   `:3468`): it spawns nothing, and refusing it would strand an unapproved server
+   that is already running. Manifest hits in the same resolver are not gated, so
+   manifest lifecycle behaviour is untouched. Proven by the four lifecycle tests
+   the plan's EC-PKGID-1 now names.
+   **Lesson for EGRESS and SEAL: enumerate SPAWN sites, not install callsites.** A
+   gate is placed in front of what executes, and "install" is a name for one
+   function, not for the set of things that fetch and run code. SEAL's adversarial
+   suite should drive the S-01 reproduction through all four tools, not only
+   `provision`.
+
+2. **`provision`'s `.mcp.json` ("configured") branch is not wired to the gate — an
+   operator decision.** That branch (`handlers.py:4266`) returns through
+   `ensure_connected` and never reaches `start_install`. `.mcp.json` servers also
+   lazy-start on `invoke`, so a refusal only in `provision` would block nothing.
+   And every non-npm configured server (uvx, node, docker) has no resolvable
+   identity, so it would be refused as `unresolvable_identity`. Project-sourced
+   `.mcp.json` is already consent-gated by CONSENT. The lifecycle resolver's
+   configured branch (`:3374`) likewise returns before the gate. IF-0-PKGID-1's
+   rules 3 and 4 for `source="configured"` are therefore implemented
+   (`src/pmcp/provision_gate.py:231-241`) and tested **at the `evaluate_provision`
+   level only**; no production caller passes `"configured"`. **A later phase that
+   wires a configured spawn path must wire rules 3 and 4 with it**, rather than
+   assume a configured server is already gated.
+
+3. **IF-0-PKGID-1's decision order was corrected BEFORE implementation.** As
+   planned, the unpinned-argv deny sat after both allow rules (a recorded approval,
+   a policy allow), which had already returned. So an approved or policy-allowed
+   server whose argv was an unpinned `npx -y pkg` was allowed before the pin check
+   could run. That reopens S-01 for exactly the servers an operator trusted: approve
+   `pkg@1.2.3`, and the spawn still re-resolves `latest`. SL-2 found it while
+   reading the freeze, before SL-1 (which implements the freeze literally) was
+   dispatched, and the plan was corrected in `07e1898`. It is now rule 4, ahead of
+   every allow (`provision_gate.py:240`, before `:244` and `:248`), and the freeze
+   says in words that it must stay there. The gate checks the pin structurally:
+   the first argument after the allowlisted leading flags must *be*
+   `name@resolved_version`, in `args` and in every platform's install argv
+   (`provision_gate.py:125-163`).
+
+4. **SL-2's choices where the plan was silent.** (a) An allowlist miss is
+   `"unspecified"`, not `"denied"` (`src/pmcp/policy/policy.py:379-397`). Only an
+   explicit denylist match may outrank a recorded approval, so a narrow allowlist
+   does not silently revoke approvals outside it. (b)
+   `evaluate_package_policy(None)` is `"unspecified"` (`policy.py:422-423`): no
+   identity names nothing a list could match, and what an unresolvable identity
+   means is the gate's decision. Item 8 is the consequence. (c) A version-bearing
+   policy entry (`pkg@1.2.3`) is **rejected when the policy loads**
+   (`src/pmcp/types.py:1015`) rather than accepted. Globs match the name alone
+   (so a publisher cannot satisfy `*-mcp` with version `1.0.0-mcp`), so such an
+   entry would match nothing, and a denylist entry that silently never matches is
+   a denial that fails open.
+
+5. **SL-3's findings.**
+   - **There was a second leaky log line.** The plan named only `start_install`'s
+     INFO `<args redacted>` line (the Execution Notes call SL-3's one destructive
+     change "one INFO log line"). But `install_server` also logged the full argv
+     verbatim at INFO (`' '.join(install_cmd)`), including any credential it
+     carried. Both are replaced (`src/pmcp/manifest/installer.py:204`, `:683`).
+   - **The spawn sites never receive a `PackageIdentity`.** `start_install`,
+     `install_server` and `verify_installation` take a `ServerConfig`, so the plan's
+     "the element the resolved `PackageIdentity` names" had nothing to read. The
+     package slot is identified structurally instead, as the first argument after
+     the leading frozen flags (and `--registry`'s value), and shown only if SL-2's
+     `parse_package_spec` and `is_valid_package_version` accept it as a pinned
+     `name@version` (`installer.py:54-102`).
+   - **`verify_installation` never names the package.** It spawns
+     `command, *args[:1], "--help"` (`installer.py:729-733`), which for a pinned
+     discovered server is `npx -y --help`. It has no production callers, and its
+     behaviour is unchanged; it now logs that argv like the others (`:734`).
+   - **The frozen flag literals are shown wherever they appear**, not only before
+     the package (`installer.py:36`). They are fixed literals and carry nothing.
+   - Measured against the shipped manifest: **none of its 412 platform install
+     argvs render a package** (all show `<redacted>` in the slot), because manifest
+     install commands are unpinned (`@playwright/mcp@latest`). Only a pinned
+     discovered server's install log names what runs. See item 9(a) for what that
+     means for EC-PKGID-4.
+
+6. **Registration now reaches the network, so the suite needed an isolation guard.**
+   The repair pass added an autouse fixture that fails any test whose identity
+   lookup opens the real npm registry (`tests/conftest.py:169`), plus a
+   `fake_npm_registry` fixture (`:196`). **Three existing tests had silently
+   started calling registry.npmjs.org** once registration resolved. They still
+   passed, because `resolve_package_identity` turns a network error into a quiet
+   `None`, so a refusal assertion could pass for the wrong reason offline. This is
+   CONSENT amendment 2's rule working as intended: the five out-of-lane breakages
+   were repaired in one single-writer pass after the lanes merged. It also means
+   PKGID wrote `tests/conftest.py`, which CONSENT SL-1 owns. That was safe only
+   because the two phases executed serially.
+
+7. **Process: every subagent in a session shares one scratchpad directory.** Two
+   parallel lanes' mutation-testing scripts collided there, and a lane commit
+   briefly captured a live mutant, `return spec in args`, a substring check that
+   reopens `["-p", "evil", "-y", "pkg@1.2.3"]` (`-p` installs a second package
+   first). It was caught and the commit amended before merge, so history carries
+   no trace of it. This item is recorded on the orchestrator's report, not
+   verified from the tree. **Lanes must use lane-unique scratch subdirectories, and
+   must assert the working tree matches `HEAD` before and after any mutation run.**
+   A mutation harness that restores files by path is a writer, and two of them in
+   one directory are two writers.
+
+8. **KNOWN GAPS — open, pending the phase review.**
+   - **A `packages.denylist` cannot block a manifest-backed server.** `provision`
+     and the lifecycle resolver pass `identity=None` for a manifest lookup
+     (`handlers.py:4376-4377`, `:3437-3438`), `evaluate_package_policy(None)` is
+     `"unspecified"` (`policy.py:422-423`), and rule 1 fires only for a non-`None`
+     identity (`provision_gate.py:224`). So a manifest server whose package an
+     operator denylists still provisions, via rule 2 (measured: `playwright` under
+     `packages.denylist: ["@playwright/*"]` returns `manifest_backed`). **This contradicts
+     IF-0-PKGID-1's own rationale**, which justifies the tri-state predicate by a
+     manifest server with a denylisted package that must be *denied*. It also
+     narrows this roadmap's EC-PKGID-2 ("`provision` checks the package, not only
+     the server name"): that holds for discovered servers only. Only 21 of the 107
+     shipped manifest entries even carry a `package` field to resolve.
+   - **In `provision`, the credential check runs BEFORE the package gate**
+     (`handlers.py:4396` vs `:4425`). An agent can therefore be asked for a
+     credential for a discovered package the gate will then refuse. The lifecycle resolver has the opposite, intended order (gate `:3468`,
+     credential `:3493`).
+   - **Operator approvals never bind integrity.** `pmcp trust approve-package` is
+     offline and records `integrity=None` (`src/pmcp/cli.py:2588`), and
+     `is_package_approved` compares digests only when both the record and the
+     identity carry one (`src/pmcp/package_approvals.py:326-331`). The digest check
+     is therefore inert for every approval the only shipped writer creates. A
+     version is still pinned, so this matters only if a registry serves different
+     bytes under a version already approved. (Found by SL-docs.)
+   - As with TRUST amendment 1, `package_approvals.py` reserves a `"denied"`
+     decision (`:51-55`) that no shipped verb writes, and `revoke-package` deletes a
+     record rather than denying it. Absence already refuses, so this is not a hole.
+
+9. **Where this roadmap's PKGID text is contradicted by what shipped** (original
+   text left unedited, as above).
+   - (a) **EC-PKGID-4 says "the exact argv is logged at WARNING before every
+     install spawn." Neither half holds as written.** *Exact*: by design the log
+     is a rendered argv, redacted except the executable, `-y`/`--yes`/`--quiet`,
+     `--registry`'s name and a pinned `name@version`, because a manifest install
+     argv can carry a credential. For manifest installs even the package is
+     `<redacted>` (item 5). *Every install spawn*: SL-3 covered the three
+     `installer.py` sites the plan scoped. But under item 1's own definition, the
+     client manager's spawn of a discovered server on connect or restart
+     (`src/pmcp/client/manager.py:2349`, logged at INFO with no argv at `:2338`)
+     and `update_server`'s `npx -y <pkg>@latest --help` probe (`handlers.py:3725`,
+     not logged) are install spawns too, and log no argv. **Open**: either the
+     criterion is narrowed to `installer.py`'s spawns, or those two sites log a
+     rendered argv.
+   - (b) **Scope notes assign "version pinning in `manifest/installer.py`" to lane
+     C.** The pin shipped at registration in `handlers.py` (`:5712`, `:5738`),
+     owned by SL-1, which is where the plan's EC-PKGID-5 decision put it. The lane
+     split also differed: SL-2 owned `policy.py`, `types.py` and `validation.py`;
+     SL-1 owned `handlers.py`, `cli.py` and the two new modules
+     `provision_gate.py` and `package_approvals.py`.
+   - (c) **Scope notes say "Parallel-safe with CONSENT: no shared file."** Already
+     contradicted by this roadmap's own DAG notes (`policy/policy.py` is written
+     by both), and PKGID's repair pass also wrote `tests/conftest.py` (item 6).
+     Serial execution, as the Execution Notes fix it, is what made both safe.
+   - (d) **EC-PKGID-3's opt-in is "config flag or recorded approval."** There is
+     no flag. The opt-ins shipped are a recorded approval or a `packages.allowlist`
+     entry in the operator's policy.
+   - (e) **Key files, evidence paths and the roadmap `## Verification` name only
+     `tests/test_package_identity_gate.py`.** The criteria are proven across four
+     files: that one, `tests/test_package_approvals.py`,
+     `tests/test_policy_package_identifiers.py` and
+     `tests/test_install_argv_logging.py`. Key files also omit
+     `src/pmcp/provision_gate.py`, `src/pmcp/package_approvals.py`,
+     `src/pmcp/cli.py` and `src/pmcp/types.py`. As with CONSENT amendment 5, SEAL's
+     closeout should collect all four test files.
+   - (f) **Resolved, not contradicted.** The Scope-notes warning that the plan did
+     not carry TRUST amendment 2 is stale: the plan's SL-1 carries it, and
+     registration resolves in a worker thread (`anyio.to_thread.run_sync`) under a
+     20 s handler bound (`handlers.py:202`, `:5663`). CONSENT amendment 1's request
+     to close PKGID's two unproven lane tests before execution was met:
+     `scripts/check_plan_consistency.py` reports `lane-contracted: 31   EC-proved
+     node ids: 31` for this plan. And the TRUST plan's "CONSENT and PKGID do not
+     write `cli.py`" note, which PKGID's plan asked SL-docs to correct, was already
+     corrected in `plans/phase-plan-v13-TRUST.md` on 2026-09-08; PKGID did write
+     it (`cli.py:801-824`, `:2565-2630`).
+
 ### Phase 4 — Outbound actions need explicit authority (EGRESS)
 
 **Objective**

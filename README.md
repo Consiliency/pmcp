@@ -411,7 +411,7 @@ compliance matrix and next-revision tracking checklist.
 | `gateway.submit_feedback` | Preview/submit technical PMCP feedback issues to GitHub |
 | `gateway.provision_status` | Check installation progress |
 | `gateway.search_registry` | Search the cached public MCP Registry metadata for external servers |
-| `gateway.register_discovered_server` | Register a registry result for provisioning |
+| `gateway.register_discovered_server` | Register a registry result for provisioning, pinned to its resolved npm version; provisioning needs operator approval (see [Discovered packages](#discovered-packages-need-an-operators-approval)) |
 
 ### Monitoring Tools
 
@@ -1335,6 +1335,12 @@ tools:
     - "*::delete_*"
     - "*::drop_*"
 
+packages:  # Discovered npm packages; globs match the package NAME only
+  allowlist:
+    - "@acme/*"  # Provision without a per-version approval
+  denylist:
+    - "*-evil-*"  # Refused even when an approval is recorded
+
 limits:
   max_tools_per_server: 100
   max_output_bytes: 50000
@@ -1366,6 +1372,51 @@ document whose root is valid JSON but not an object (`[]`, `42`, `null`) is
 likewise fatal, but an **empty `.json` file is not valid JSON at all**, so it
 takes the warn-and-continue path. If you are testing this behaviour, use an empty
 `.yaml` file to see the refusal.
+
+#### Discovered packages need an operator's approval
+
+A server registered with `gateway.register_discovered_server` runs an npm
+package an agent chose, so it does not start until an operator opts that package
+in. Registration resolves the package in the npm registry and pins the resolved
+version into the server's install command and its `args` (`npx -y
+name@version`); a package that does not resolve to one exact version is refused
+at registration. After that, `gateway.provision`, `gateway.connect_server`,
+`gateway.restart_server` and `gateway.update_server` refuse the server until one
+of these holds:
+
+- **The exact version is approved.** The refusal message prints the command to
+  run, for example:
+
+  ```bash
+  pmcp trust approve-package @acme/example-server@1.4.2
+  ```
+
+  Then provision again. The approval covers that one version: a registration that
+  resolves to a newer version needs a new approval.
+- **The operator's policy allowlists the package name** under
+  `packages.allowlist`, as in the example above.
+
+A `packages.denylist` match refuses the package in every case, including when an
+approval is recorded; such a refusal reports `auth_state="policy_denied"`, and
+every other package refusal reports `auth_state="unknown"`. Package globs match the
+name alone. A version-bearing entry such as `pkg@1.2.3` is rejected when the
+policy loads, because it could never match. A project `.mcp-gateway-policy.yaml`
+can deny a package but cannot allow one the operator's policy does not.
+Manifest-backed and `.mcp.json` servers are not affected by any of this.
+
+Approvals live in `~/.config/pmcp/package_approvals.json`, beside the trust
+store. Review and remove them with:
+
+```bash
+pmcp trust list-packages
+pmcp trust revoke-package @acme/example-server@1.4.2  # one version
+pmcp trust revoke-package @acme/example-server        # every version
+```
+
+Every install spawn logs its command at WARNING before it runs. Arguments are
+redacted except the executable, the flags `-y`, `--yes` and `--quiet`,
+`--registry` (its name, not its value) and a pinned `name@version`, so an operator
+can see which package ran without a credential reaching the log.
 
 #### Scoped advisor research
 
@@ -1486,6 +1537,14 @@ pmcp doctor --project /path/to/project
 # Manage project/user secrets
 pmcp secrets set API_TOKEN my-token --scope user
 pmcp secrets sync --from-scope user --to-scope project --overwrite
+
+# Approve, list and revoke trust decisions
+pmcp trust approve /abs/path/to/project/.mcp.json   # a project config file's current bytes
+pmcp trust list
+pmcp trust revoke /abs/path/to/project/.mcp.json
+pmcp trust approve-package @acme/example-server@1.4.2  # a discovered package, one exact version
+pmcp trust list-packages
+pmcp trust revoke-package @acme/example-server         # every version, or name@version for one
 ```
 
 ### `pmcp doctor` (Recommended before/after upgrades)
