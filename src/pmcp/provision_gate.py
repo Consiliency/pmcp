@@ -203,6 +203,12 @@ def _npx_selected_specs(args: list[str]) -> tuple[list[str], str | None]:
     the slot. The slot is taken by POSITION, as `_package_slot` takes it, and
     everything after it belongs to the server.
 
+    What the slot holds depends on whether a selector came first. Without one
+    it is the package spec, and is returned. With one it is the COMMAND npx
+    runs from the selected packages -- ``npx --package=pkg node server.js``
+    runs ``node`` and fetches no package of that name -- so it is neither a
+    package nor something unreadable, and is not returned.
+
     The second value is the first argument that could not be placed, or
     ``None``: any other option (``--registry X``, ``-c``, ``--call=...``) --
     pmcp does not know whether it swallows the next argument, so nothing after
@@ -224,13 +230,14 @@ def _npx_selected_specs(args: list[str]) -> tuple[list[str], str | None]:
             specs.append(arg[len(_NPX_PACKAGE_OPTION_PREFIX) :])
             index += 1
         elif arg == "--":
-            if index + 1 < len(args):
+            if index + 1 < len(args) and not specs:
                 specs.append(args[index + 1])
             return specs, None
         elif arg.startswith("-"):
             return specs, arg
         else:
-            specs.append(arg)
+            if not specs:
+                specs.append(arg)
             return specs, None
     return specs, None
 

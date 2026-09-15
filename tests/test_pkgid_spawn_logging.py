@@ -89,6 +89,11 @@ def _stdio(command: str, args: list[str]) -> ResolvedServerConfig:
         "bunx.exe",
         "npx.bat",
         "C:\\tools\\npx.cmd",
+        # POSIX spellings a UNC reading of the path would lose.
+        "//bin/npx",
+        "///usr//bin//uvx",
+        "\\\\srv\\share\\npx.exe",
+        "C:/tools/npx.CMD",
     ],
 )
 async def test_the_stdio_spawn_of_a_package_runner_logs_its_argv_before_spawning(

@@ -7,7 +7,6 @@ Kept dependency-free (stdlib only) so it can be imported from
 from __future__ import annotations
 
 import re
-from pathlib import PureWindowsPath
 
 # npm allows an optional ``@scope/`` prefix. Both the scope and the name must
 # start with a URL-safe character and contain only letters, digits, and
@@ -96,18 +95,23 @@ def is_valid_package_version(version: str) -> bool:
 
 
 _WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat")
+_PATH_SEPARATORS_RE = re.compile(r"[\\/]+")
 
 
 def normalized_executable_name(executable: str) -> str:
     """The name an executable is known by, whatever platform spelled it.
 
-    The last path component under EITHER separator (``PureWindowsPath`` splits
-    on ``/`` and ``\\``, so ``C:\\tools\\npx.cmd`` and ``/usr/bin/npx`` both
-    work on any host), lower-cased because Windows file names are
+    The last non-empty component after splitting on EITHER separator, so
+    ``C:\\tools\\npx.cmd`` and ``/usr/bin/npx`` both work on any host. Split
+    by hand rather than with a path class: ``PureWindowsPath("//bin/npx")``
+    reads a UNC share and names nothing, while Linux runs that path as
+    ``/bin/npx``. Then lower-cased, because Windows file names are
     case-insensitive, with ONE trailing ``.exe``/``.cmd``/``.bat`` removed:
-    ``npx.cmd.exe`` is ``npx.cmd``, not ``npx``.
+    ``npx.cmd.exe`` is ``npx.cmd``, not ``npx``. A value with no component
+    (``""``, ``"/"``) is ``""``, which names no executable.
     """
-    name = PureWindowsPath(executable).name.lower()
+    parts = [part for part in _PATH_SEPARATORS_RE.split(executable) if part]
+    name = parts[-1].lower() if parts else ""
     for suffix in _WINDOWS_EXECUTABLE_SUFFIXES:
         if name.endswith(suffix):
             return name[: -len(suffix)]

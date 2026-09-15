@@ -161,6 +161,83 @@ async def test_a_selector_after_the_package_slot_belongs_to_the_server(
 
 
 # ---------------------------------------------------------------------------
+# After a selector, the positional argument is the COMMAND
+# ---------------------------------------------------------------------------
+#
+# With `-p`/`--package` present, npx installs the selected packages and runs
+# the first positional as a command from them: `npx --package=pkg node x.js`
+# runs `node`, and fetches no package called `node`. Without a selector the
+# positional IS the package.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("args", "body"),
+    [
+        (
+            ["--package=allowed-pkg", "node", "server.js"],
+            "packages:\n  denylist:\n    - node\n",
+        ),
+        (
+            ["-y", "-p", "allowed-pkg", "--", "node", "x.js"],
+            "packages:\n  denylist:\n    - node\n",
+        ),
+        (["-p", "allowed-pkg", "./bin/server.js"], UNRELATED_DENYLIST),
+        (["-p", "allowed-pkg", "--", "./bin/server.js"], UNRELATED_DENYLIST),
+        (["-p", "allowed-pkg", "C:\\bin\\server.cmd"], UNRELATED_DENYLIST),
+    ],
+)
+async def test_the_command_after_a_selector_is_not_a_package(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str], body: str
+) -> None:
+    server = _manifest_server("selected", args=args)
+
+    provisioned, connected, manager, jobs = await _provision_and_connect(
+        tmp_path, monkeypatch, server, body
+    )
+
+    _assert_unchanged(provisioned, connected, manager, jobs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["-p", "denied-pkg", "some-bin"],
+        ["-p", "denied-pkg", "--", "some-bin"],
+        # No selector: the positional is the package, with or without `--`.
+        ["-y", "denied-pkg"],
+        ["-y", "--", "denied-pkg"],
+    ],
+)
+async def test_a_selected_or_positional_package_is_still_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, args: list[str]
+) -> None:
+    server = _manifest_server("selected", args=args)
+
+    provisioned, connected, manager, jobs = await _provision_and_connect(
+        tmp_path, monkeypatch, server, DENIED
+    )
+
+    _assert_refused(provisioned, connected, manager, jobs)
+    assert "denied-pkg" in provisioned.message
+
+
+@pytest.mark.asyncio
+async def test_a_positional_without_a_selector_that_names_nothing_is_undetermined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    server = _manifest_server("opaque", args=["-y", "--", "./local-package"])
+
+    provisioned, connected, manager, jobs = await _provision_and_connect(
+        tmp_path, monkeypatch, server, UNRELATED_DENYLIST
+    )
+
+    _assert_refused(provisioned, connected, manager, jobs)
+    assert "could not be determined" in provisioned.message
+
+
+# ---------------------------------------------------------------------------
 # An option pmcp cannot place: refused only under a denylist
 # ---------------------------------------------------------------------------
 
@@ -275,6 +352,16 @@ def test_no_shipped_manifest_entry_is_undetermined(tmp_path: Path) -> None:
         ("npx-helper.exe", "npx-helper"),
         ("npx.cmd.exe", "npx.cmd"),
         ("node.exe", "node"),
+        # POSIX collapses repeated separators; a UNC reading would lose these.
+        ("//bin/npx", "npx"),
+        ("///usr//bin//uvx", "uvx"),
+        ("\\\\srv\\share\\npx.exe", "npx"),
+        ("C:/tools/npx.CMD", "npx"),
+        ("C:\\tools/mixed\\NPX.bat", "npx"),
+        # Nothing to name matches nothing.
+        ("", ""),
+        ("/", ""),
+        ("//\\//", ""),
     ],
 )
 def test_executable_names_are_normalized(executable: str, expected: str) -> None:
@@ -282,7 +369,18 @@ def test_executable_names_are_normalized(executable: str, expected: str) -> None
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("command", ["NPX.CMD", "npx.bat", "C:\\tools\\npx.cmd"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "NPX.CMD",
+        "npx.bat",
+        "C:\\tools\\npx.cmd",
+        "//bin/npx",
+        "///usr//bin//npx",
+        "\\\\srv\\share\\npx.exe",
+        "C:/tools/npx.CMD",
+    ],
+)
 @pytest.mark.parametrize("site", ["args", "install"])
 async def test_a_windows_npx_spelling_is_read_for_the_denylist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, site: str
