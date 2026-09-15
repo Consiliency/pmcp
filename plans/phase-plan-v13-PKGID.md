@@ -46,8 +46,19 @@ is as stated, not larger.
    call. No file, no state store, no restore path. EC-PKGID-6's migration surface is
    therefore *empty of durable records* — see the criterion for what that means.
 2. **`start_install` has exactly one production callsite** (`handlers.py:4483`; all
-   other hits are `tests/`). A gate placed there covers every install spawn reachable
-   from the agent.
+   other hits are `tests/`). A gate placed there covers every `start_install` spawn — but
+   **not every spawn that installs.** *Amended during execution (SL-1 finding, confirmed
+   by the orchestrator, operator decision 2026-09-15):* `npx -y` fetches and runs the
+   package at spawn time, so any path that spawns a discovered config is an install path.
+   `connect_server`, `restart_server` and `update_server` (both its probe resolve and its
+   post-probe recheck; the probe itself spawns `npx <pkg> --help`) all obtain a
+   discovered config through `_resolve_lifecycle_config`'s discovered branch
+   (`handlers.py:3380-3386`), which checked only `is_server_allowed(server_name)`.
+   `register_discovered_server(name=<allowlisted>, package=<arbitrary>)` followed by
+   `connect_server(name=<allowlisted>)` therefore spawned an unapproved package with no
+   call to `provision` at all. SL-1 gates that discovered branch with
+   `evaluate_provision(source="discovered")` as well, after the existing name-policy
+   denial and before the credential check.
 3. **Three spawn sites exist in `installer.py`**: `:135` (`start_install`, live),
    `:609` (`install_server`, legacy — **no production callers**), `:651`
    (`verify_installation`, spawns the agent-supplied `server_config.command`).
@@ -99,14 +110,14 @@ extends neither's file.
   **lookup path that produced the config**, never by a field on `server_config` — the
   agent controls those fields.
   The policy predicate is deliberately **tri-state, not a bool**. A bool cannot carry
-  this order: rule 1 denies before the manifest exemption and rule 5 allows after it,
+  this order: rule 1 denies before the manifest exemption and rule 6 allows after it,
   so a manifest server with a denylisted package and a manifest server in no list
   would both return `False` while requiring opposite outcomes. Worse, a bool
   implemented in the house style of `is_server_allowed` (`policy.py:161-175`) returns
-  `True` when no section is configured, which rule 5 would read as an allowlist match
+  `True` when no section is configured, which rule 6 would read as an allowlist match
   — every discovered package allowed with no approval, two faithful lanes composing
   back into the exact S-01 hole this phase closes. `"unspecified"` falls through to
-  rule 6 and denies.
+  rule 7 and denies.
 - [ ] IF-0-PKGID-2 — *(plan-local extension of IF-0-PKGID-1; not a roadmap-declared gate)* the package-approval store, `src/pmcp/package_approvals.py`:
   `PackageApproval(registry: str, name: str, resolved_version: str, integrity: str | None, decision: str, recorded_at: datetime)`;
   `approve_package(identity) -> PackageApproval`, `is_package_approved(identity) -> bool`,
@@ -124,7 +135,7 @@ extends neither's file.
   execute *serially* — not that CONSENT goes first. Executed first, PKGID's
   `approve_package` tests would write **real approvals into the operator's
   `~/.config/pmcp/package_approvals.json`**, and those records then satisfy
-  `evaluate_provision` rule 4 and permit a real provision. SL-1 therefore declares an
+  `evaluate_provision` rule 5 and permit a real provision. SL-1 therefore declares an
   autouse fixture inside its own owned test files (`tests/test_package_approvals.py`,
   `tests/test_package_identity_gate.py`) that redirects the store to `tmp_path`,
   independent of execution order and of whether CONSENT has landed.
@@ -184,7 +195,7 @@ SL-4 — Documentation & spec reconciliation
 validates the version then pins `["npx","-y",f"{name}@{version}"]` into **both**
 `install` and `args`. **`source == "configured"` is pinned too, and this is not
 optional.** A `.mcp.json` server reaches `evaluate_provision` as `"configured"` and can
-be allowed by rule 4 (a recorded approval) or rule 5 (policy allowlist) — but nothing in
+be allowed by rule 5 (a recorded approval) or rule 6 (policy allowlist) — but nothing in
 the registration path rewrote its argv, so it can be approved at resolved version X and
 then spawn `npx -y pkg`, which resolves to Y. That is the same check-then-use gap the
 runtime-argv pin closes for discovered servers, reached by a different door. A configured
@@ -193,8 +204,18 @@ config whose argv is not version-pinned is therefore **refused** with reason
 the operator pins the version in `.mcp.json` (or re-registers) to proceed.
 `provision` calls `evaluate_provision` immediately before `start_install`
 (`:4483`) with `source` set from which lookup produced the config
-(`:4280` → `"manifest"`, `:4283` → `"discovered"`, the `.mcp.json` branch →
-`"configured"`). Refusals ride the **existing** `message` field of `ProvisionOutput`
+(`:4280` → `"manifest"`, `:4283` → `"discovered"`), and `_resolve_lifecycle_config`
+calls it in its discovered branch so `connect_server`, `restart_server` and
+`update_server` cannot spawn what `provision` refuses (see Context item 2).
+*Amended during execution (operator decision 2026-09-15):* **`provision`'s `.mcp.json`
+branch is not wired to the gate.** That branch returns through `ensure_connected` and
+never reaches `start_install`; `.mcp.json` servers also lazy-start on `invoke`, so a
+provision-only refusal would block nothing; and every non-npm configured server (uvx,
+node, docker) has no resolvable identity and would be refused as
+`unresolvable_identity`. Project-sourced `.mcp.json` is already consent-gated by CONSENT.
+The `"configured"` rules (3 and 4) are still implemented and tested at the
+`evaluate_provision` level so a later phase can wire a configured path that does spawn
+an npm package without re-deriving them. Refusals ride the **existing** `message` field of `ProvisionOutput`
 and `RegisterDiscoveredServerOutput`, and the pinned argv rides the existing
 `install_command` field — SL-1 adds no field to `types.py`, which SL-2 owns.
 
@@ -398,6 +419,8 @@ uv run python -c "import pmcp.provision_gate, pmcp.package_approvals"   # both i
 
 # The gate covers every reachable install spawn: exactly one production callsite.
 rg -n 'await \w+\.start_install\(' src/     # MUST be only handlers.py:4483
+# ...and every lifecycle spawn of a discovered config (connect/restart/update).
+rg -n 'evaluate_provision\(' src/pmcp/tools/handlers.py   # MUST include provision AND _resolve_lifecycle_config
 
 # PKGID does not touch CONSENT's loaders.
 git diff --name-only origin/main..HEAD -- src/pmcp/manifest/loader.py src/pmcp/config/loader.py
