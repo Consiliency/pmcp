@@ -174,7 +174,7 @@ class TestEnvVarAllowlist:
         gateway = _make_gateway()
         # Discovered servers never enter the manifest; the declared credential
         # variable must still be resolved from the discovered-server registry.
-        declared = "FAKE_SERVER_TOKEN_XYZ"
+        declared = "FAKE_SERVER_XYZ_TOKEN"
         gateway._discovered_server_configs["disc"] = ServerConfig(
             name="disc",
             description="d",

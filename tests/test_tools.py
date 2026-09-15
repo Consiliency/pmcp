@@ -4658,6 +4658,10 @@ class TestSearchRegistryAndRegister:
                 "env_vars": ["GITHUB_TOKEN"],
             }
         )
+        # The package gate runs before the credential check (#230), so an
+        # unapproved package is refused before any key is asked for. Approve
+        # the registered identity so this flow reaches the credential check.
+        approve_package(gateway_tools._discovered_server_identities["github-ext"])
 
         result = await gateway_tools.provision({"server_name": "github-ext"})
 

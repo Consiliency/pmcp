@@ -57,6 +57,7 @@ from pmcp.env_store import (
     set_env_value,
 )
 from pmcp.validation import (
+    discovered_env_var_allowed,
     env_var_allowed,
     is_valid_package_name,
     is_valid_package_version,
@@ -67,6 +68,7 @@ from pmcp.manifest.environment import CLIInfo, detect_platform, probe_clis
 from pmcp.templates.code_snippets_loader import get_code_snippet
 from pmcp.manifest.installer import (
     MissingApiKeyError,
+    _render_install_argv,
     get_job_manager,
     InstallError,
 )
@@ -429,6 +431,9 @@ def _detect_effective_version_pin(
 # Human-readable label for a ResolvedServerConfig.source, used in messages
 # that need to point an operator at the file a pin (or other override) came
 # from.
+#: Which of `_resolve_lifecycle_target`'s lookups produced a lifecycle config.
+_LifecycleLookup = Literal["configured", "manifest", "discovered", "running"]
+
 _CONFIG_SOURCE_LABELS: dict[str, str] = {
     "project": "the project .mcp.json",
     "user": "the user .mcp.json",
@@ -3370,6 +3375,29 @@ class GatewayTools:
         prior_status: str,
     ) -> tuple[ResolvedServerConfig | None, LifecycleServerOutput | None]:
         """Resolve a lifecycle target or return a structured failure output."""
+        config, failure, _lookup = self._resolve_lifecycle_target(
+            server_name, action=action, prior_status=prior_status
+        )
+        return (config, failure)
+
+    def _resolve_lifecycle_target(
+        self,
+        server_name: str,
+        *,
+        action: Literal["connect", "disconnect", "restart"],
+        prior_status: str,
+    ) -> tuple[
+        ResolvedServerConfig | None,
+        LifecycleServerOutput | None,
+        _LifecycleLookup | None,
+    ]:
+        """`_resolve_lifecycle_config`, plus WHICH lookup matched.
+
+        The lookup is returned rather than read back off the config because
+        the config cannot say: `manifest_server_to_config` stamps a discovered
+        config ``source="manifest"`` too, and every other field on a discovered
+        config was composed from agent input. ``None`` when nothing matched.
+        """
         configured_servers = self._load_all_configured_servers()
         if server_name in configured_servers:
             if not self._policy_manager.is_server_allowed(server_name):
@@ -3384,6 +3412,7 @@ class GatewayTools:
                         errors=[f"Server '{server_name}' is blocked by policy."],
                         auth_state="policy_denied",
                     ),
+                    "configured",
                 )
             configured = configured_servers[server_name]
             missing_env_vars = self._missing_remote_header_env_vars(configured)
@@ -3396,6 +3425,7 @@ class GatewayTools:
                         prior_status=prior_status,
                         missing_env_vars=missing_env_vars,
                     ),
+                    "configured",
                 )
             # Same class of bug as the provision() and startup-resolution
             # fixes (Consiliency/pmcp#114 board review finding 1): a
@@ -3428,8 +3458,9 @@ class GatewayTools:
                         auth_metadata=self._auth_metadata_for_server(manifest_server),
                         next_step=f"gateway.auth_connect(server_name='{server_name}')",
                     ),
+                    "configured",
                 )
-            return (configured, None)
+            return (configured, None, "configured")
 
         manifest = load_manifest()
         server_config = manifest.get_server(server_name)
@@ -3454,6 +3485,7 @@ class GatewayTools:
                         errors=[f"Server '{server_name}' is blocked by policy."],
                         auth_state="policy_denied",
                     ),
+                    source,
                 )
 
             # Package identity gate (IF-0-PKGID-1), the second door to it.
@@ -3461,11 +3493,12 @@ class GatewayTools:
             # resolves here before its probe spawns `npx <pkg>`, so without this
             # a registered-but-unapproved package runs with no `provision` call
             # at all. Before the credential check, so a refused package never
-            # prompts for auth. Only for the discovered lookup: a manifest hit
-            # is exempt by rule 2 and its lifecycle behaviour stays untouched.
+            # prompts for auth. Both lookups: a manifest hit is exempt by rule 2
+            # and can be refused only by rule 1, a packages.denylist naming one
+            # of its packages -- nothing else about manifest lifecycle changes.
             # Not for disconnect: it spawns nothing, and refusing it would strand
-            # an unapproved server that is running.
-            if source == "discovered" and action != "disconnect":
+            # a server that is running.
+            if action != "disconnect":
                 decision = evaluate_provision(
                     server_config,
                     identity,
@@ -3488,6 +3521,7 @@ class GatewayTools:
                             errors=[message],
                             auth_state=refusal_auth_state,
                         ),
+                        source,
                     )
 
             if requires_credential(server_config) and server_config.env_var:
@@ -3517,6 +3551,7 @@ class GatewayTools:
                             auth_metadata=self._auth_metadata_for_server(server_config),
                             next_step=f"gateway.auth_connect(server_name='{server_name}')",
                         ),
+                        source,
                     )
 
             resolved = manifest_server_to_config(server_config)
@@ -3530,9 +3565,10 @@ class GatewayTools:
                         prior_status=prior_status,
                         missing_env_vars=missing_env_vars,
                     ),
+                    source,
                 )
 
-            return (resolved, None)
+            return (resolved, None, source)
 
         if action == "disconnect" and self._client_manager.get_server_status(
             server_name
@@ -3544,6 +3580,7 @@ class GatewayTools:
                     config=LocalMcpServerConfig(command=""),
                 ),
                 None,
+                "running",
             )
 
         return (
@@ -3556,6 +3593,7 @@ class GatewayTools:
                 message=f"Server '{server_name}' is not known to PMCP.",
                 errors=[f"Unknown server: {server_name}"],
             ),
+            None,
         )
 
     def _keywords_for_config_server(self, config: ResolvedServerConfig) -> list[str]:
@@ -3722,6 +3760,12 @@ class GatewayTools:
         # process tree alive -- including grandchildren such as the Chrome that
         # @playwright/mcp launches, which then holds the profile SingletonLock
         # and breaks the next launch.
+        #
+        # The probe fetches and runs a package by construction (npx/uvx
+        # `--help`, cargo install, docker pull), so it is an install spawn
+        # (EC-PKGID-4): log the rendered, secret-safe argv at WARNING first, so
+        # a spawn that raises still leaves the record.
+        logger.warning(f"Running update probe: {_render_install_argv(command)}")
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
@@ -4392,6 +4436,31 @@ class GatewayTools:
                 feedback_hint=self._feedback_hint(),
             )
 
+        # Package identity gate (IF-0-PKGID-1): nothing below may connect or
+        # spawn for a config the gate refuses. Ahead of the credential check,
+        # as in the lifecycle resolver: an agent must not be asked for a secret
+        # for a package that will then be refused.
+        decision = evaluate_provision(
+            server_config, identity, source=source, policy=self._policy_manager
+        )
+        if not decision.allowed:
+            message, refusal_auth_state = _package_refusal(
+                "provision", server_name, decision
+            )
+            logger.warning(message)
+            self._record_feedback_event(
+                "provision_failure",
+                {"server": server_name, "reason": decision.reason},
+            )
+            return ProvisionOutput(
+                ok=False,
+                server=server_name,
+                status="failed",
+                message=message,
+                auth_state=refusal_auth_state,
+                feedback_hint=self._feedback_hint(),
+            )
+
         # Check API key if required
         if requires_credential(server_config) and server_config.env_var:
             auth_env_options = self._auth_env_options(
@@ -4419,29 +4488,6 @@ class GatewayTools:
                     next_step=f"gateway.auth_connect(server_name='{server_name}')",
                     feedback_hint=self._feedback_hint(),
                 )
-
-        # Package identity gate (IF-0-PKGID-1): nothing below may connect or
-        # spawn for a config the gate refuses.
-        decision = evaluate_provision(
-            server_config, identity, source=source, policy=self._policy_manager
-        )
-        if not decision.allowed:
-            message, refusal_auth_state = _package_refusal(
-                "provision", server_name, decision
-            )
-            logger.warning(message)
-            self._record_feedback_event(
-                "provision_failure",
-                {"server": server_name, "reason": decision.reason},
-            )
-            return ProvisionOutput(
-                ok=False,
-                server=server_name,
-                status="failed",
-                message=message,
-                auth_state=refusal_auth_state,
-                feedback_hint=self._feedback_hint(),
-            )
 
         # Remote manifest entries do not install packages; connect them directly.
         if server_config.url:
@@ -4814,9 +4860,14 @@ class GatewayTools:
         declared_storage_key = (
             credential_storage_key(server_config) if server_config else None
         )
+        # Which lookup supplied the declared name, never a field on the config:
+        # a discovered config's names are agent-chosen (see the allowlist check
+        # below).
+        from_discovered = False
         if declared_env_var is None:
             discovered = self._discovered_server_configs.get(server_name)
             if discovered is not None:
+                from_discovered = True
                 declared_env_var = discovered.env_var
                 declared_storage_key = credential_storage_key(discovered)
         # Persist under the (optionally namespaced) storage key so generic runtime
@@ -4864,7 +4915,16 @@ class GatewayTools:
         # server's declared storage key (or a credential-shaped name when none is
         # declared) is permitted; loader-influencing variables such as
         # LD_PRELOAD / NODE_OPTIONS / PATH / PYTHON* are refused outright.
-        if not env_var_allowed(env_var, declared_storage_key):
+        #
+        # A discovered server's names are held to the allowlist as well, the
+        # declared one included: registration refuses a disallowed name, but
+        # this door must not trust the config registration left, and with no
+        # declared name any credential-shaped override passed -- including
+        # NPM_CONFIG__AUTH, which the pinned `npx -y` spawn would then read
+        # (Consiliency/pmcp#230).
+        if not env_var_allowed(env_var, declared_storage_key) or (
+            from_discovered and not discovered_env_var_allowed(env_var)
+        ):
             self._audit(
                 method="gateway.auth_connect",
                 action="auth_connect",
@@ -5130,6 +5190,22 @@ class GatewayTools:
             ),
         )
 
+    def _discovered_update_refusal(self, server_name: str) -> UpdateServerOutput:
+        """Why `update_server` will not move a discovered server, and what will."""
+        message = (
+            f"Refused to update {operator_safe(server_name)}: it is a discovered "
+            "server, and a discovered server's package approval is for one exact "
+            "version, so gateway.update_server will not fetch another. To move it "
+            "to a newer version, call gateway.register_discovered_server again "
+            "with the same server_name and package -- registration resolves and "
+            "pins the current version -- then have an operator approve that "
+            "version with pmcp trust approve-package before connecting it."
+        )
+        logger.warning(message)
+        return UpdateServerOutput(
+            ok=False, server=server_name, package_type="unknown", message=message
+        )
+
     async def update_server(self, input_data: dict[str, Any]) -> UpdateServerOutput:
         """gateway.update_server - Update a subordinate MCP package and restart it.
 
@@ -5182,7 +5258,7 @@ class GatewayTools:
         # them, which is why the restart below re-resolves and verifies rather
         # than assuming this one still holds (Consiliency/pmcp#151).
         prior_status = self._status_value(server_name)
-        resolved_config, resolve_failure = self._resolve_lifecycle_config(
+        resolved_config, resolve_failure, lookup = self._resolve_lifecycle_target(
             server_name, action="restart", prior_status=prior_status
         )
         if resolve_failure is not None:
@@ -5199,6 +5275,15 @@ class GatewayTools:
                 package_type="unknown",
                 message=f"Server '{server_name}' could not be resolved.",
             )
+        # A discovered server is never moved by this tool, whatever its argv
+        # looks like. Its approval is for one exact version, and the probe
+        # below runs `<pkg>@latest` -- a version nobody approved. Pin detection
+        # refuses a registered (pinned) argv today, but nothing ties the two
+        # together, so a miss there would run unapproved code. Decided by the
+        # lookup that matched, never by a field on the config
+        # (Consiliency/pmcp#230).
+        if lookup == "discovered":
+            return self._discovered_update_refusal(server_name)
 
         if isinstance(resolved_config.config, LocalMcpServerConfig):
             command = resolved_config.config.command
@@ -5330,11 +5415,15 @@ class GatewayTools:
         # The guarantee is "the config restarted onto is the config that was
         # probed" -- NOT "the config on disk when the restart completes". An
         # edit landing after this check applies on the next update.
-        recheck_config, recheck_failure = self._resolve_lifecycle_config(
-            server_name,
-            action="restart",
-            prior_status=self._status_value(server_name),
+        recheck_config, recheck_failure, recheck_lookup = (
+            self._resolve_lifecycle_target(
+                server_name,
+                action="restart",
+                prior_status=self._status_value(server_name),
+            )
         )
+        if recheck_lookup == "discovered":
+            return self._discovered_update_refusal(server_name)
         if recheck_failure is not None or recheck_config is None:
             return UpdateServerOutput(
                 ok=False,
@@ -5651,6 +5740,34 @@ class GatewayTools:
                 message=(
                     f"Refused to register '{server_name}': "
                     f"unsafe package identifier {package!r}."
+                ),
+            )
+
+        # A discovered server may declare only credential-shaped names outside
+        # the package-manager and runtime families. Each declared name is what
+        # auth_connect stores and build_install_child_env injects into the
+        # pinned spawn, so `npm_config_registry` would point an approved
+        # `npx -y name@version` at a registry serving other bytes. Checked
+        # before resolution: a refused registration touches neither the
+        # registry nor the discovered-server tables.
+        disallowed = [
+            name for name in parsed.env_vars if not discovered_env_var_allowed(name)
+        ]
+        if disallowed:
+            names = ", ".join(operator_safe(name) for name in disallowed)
+            return RegisterDiscoveredServerOutput(
+                ok=False,
+                server_name=server_name,
+                registered=False,
+                message=(
+                    f"Refused to register {operator_safe(server_name)}: a "
+                    f"discovered server may not declare the environment "
+                    f"variable(s) {names}. Only credential-shaped names (ending "
+                    "in _TOKEN, _KEY, _SECRET(S), _PASSWORD, _CREDENTIAL(S), "
+                    "_PAT, _DSN or _AUTH) are accepted, and never one that configures "
+                    "a package manager or runtime (NPM_CONFIG_*, NODE_*, "
+                    "COREPACK_*, YARN_*, PNPM_*, BUN_*) or loads code. Nothing "
+                    "was registered."
                 ),
             )
 

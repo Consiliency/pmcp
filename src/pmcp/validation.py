@@ -158,3 +158,40 @@ def env_var_allowed(env_var: str, declared_env_var: str | None) -> bool:
     if declared_env_var is not None:
         return env_var == declared_env_var
     return bool(_CREDENTIAL_NAME_RE.fullmatch(env_var))
+
+
+# Package-manager and runtime configuration families. npm, corepack, yarn, pnpm
+# and bun read these from the environment at spawn, so a value in one of them
+# changes WHAT an approved `npx -y name@version` fetches -- the registry it asks
+# (`npm_config_registry`), the auth it presents (`NPM_CONFIG__AUTH`) or the
+# runtime flags node starts with. Matched case-insensitively: npm reads
+# `npm_config_*` in any case.
+_PACKAGE_MANAGER_ENV_PREFIXES = (
+    "NPM_CONFIG_",
+    "NODE_",
+    "COREPACK_",
+    "YARN_",
+    "PNPM_",
+    "BUN_",
+)
+
+
+def discovered_env_var_allowed(name: str) -> bool:
+    """May a DISCOVERED server declare, or be given, the env var *name*?
+
+    An allowlist, unlike ``env_var_allowed``'s blocklist: a discovered server's
+    declared names are agent-chosen, and the declared name is exactly what
+    ``auth_connect`` stores and ``build_install_child_env`` injects into the
+    pinned spawn. So only a credential-shaped name is admitted, never one
+    ``is_dangerous_env_var`` refuses, and never one in a package-manager or
+    runtime configuration family -- even when credential-shaped, as
+    ``NPM_CONFIG__AUTH`` and ``NODE_AUTH_TOKEN`` are.
+
+    Manifest-backed servers keep ``env_var_allowed``: their declared names are
+    shipped, and many (``POSTGRES_URL``) are not credential-shaped.
+    """
+    if not name or is_dangerous_env_var(name):
+        return False
+    if name.upper().startswith(_PACKAGE_MANAGER_ENV_PREFIXES):
+        return False
+    return bool(_CREDENTIAL_NAME_RE.fullmatch(name))

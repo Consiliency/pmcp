@@ -1185,27 +1185,100 @@ async def test_the_lifecycle_gate_keeps_existing_denials_and_spares_disconnect(
 
 
 @pytest.mark.asyncio
-async def test_a_manifest_server_lifecycle_does_not_consult_the_gate(
+async def test_a_manifest_server_lifecycle_consults_the_gate_only_for_the_denylist(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     spawns: list[tuple[Any, ...]],
 ) -> None:
-    """Only the discovered lookup is gated; a manifest hit is left as it was."""
+    """A manifest hit is gated too, and only a packages.denylist can refuse it.
+
+    Replaces `test_a_manifest_server_lifecycle_does_not_consult_the_gate`, which
+    pinned the pre-review design: the panel found a denylisted manifest package
+    still started (operator decision F2, Consiliency/pmcp#230).
+    """
     shipped = _config(["-y", "@shipped/server"], name="shipped")
+
+    # (1) No packages policy: consulted, manifest_backed, connected unchanged.
     gateway, _ = _gateway(
         monkeypatch, _empty_policy(tmp_path), manifest_servers={"shipped": shipped}
     )
     manager = cast(_MinimalClientManager, gateway._client_manager)
-    consulted: list[str] = []
+    decisions: list[ProvisionDecision] = []
+    real_gate = handlers_module.evaluate_provision
 
     def spy(*args: Any, **kwargs: Any) -> ProvisionDecision:
-        consulted.append(kwargs["source"])
-        raise AssertionError("the lifecycle gate ran for a manifest server")
+        decision = real_gate(*args, **kwargs)
+        decisions.append(decision)
+        return decision
 
     monkeypatch.setattr(handlers_module, "evaluate_provision", spy)
 
     result = await gateway.connect_server({"server_name": "shipped"})
 
     assert result.ok is True, result.message
-    assert consulted == []
+    assert decisions == [
+        ProvisionDecision(
+            allowed=True, reason="manifest_backed", remedy=None, identity=None
+        )
+    ]
     assert [c.name for c in manager.connected] == ["shipped"]
+    spawned = manager.connected[0].config
+    assert (spawned.command, spawned.args) == ("npx", ["-y", "@shipped/server"])
+
+    # (2) A denylist naming its package: refused, nothing connected or spawned.
+    (tmp_path / "denied").mkdir()
+    denied_policy = _write_policy(
+        tmp_path / "denied", 'packages:\n  denylist:\n    - "@shipped/*"\n'
+    )
+    gateway2, _ = _gateway(
+        monkeypatch, denied_policy, manifest_servers={"shipped": shipped}
+    )
+    manager2 = cast(_MinimalClientManager, gateway2._client_manager)
+
+    refused = await gateway2.connect_server({"server_name": "shipped"})
+
+    assert refused.ok is False
+    assert refused.auth_state == "policy_denied"
+    assert "@shipped/server" in refused.message
+    assert manager2.connected == []
+    assert spawns == []
+
+    # (3) Disconnect spawns nothing and stays ungated.
+    stopped = await gateway2.disconnect_server({"server_name": "shipped"})
+    assert stopped.ok is True, stopped.message
+    assert manager2.disconnected == ["shipped"]
+    assert spawns == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "predicate", ["evaluate_package_policy", "evaluate_package_name_policy"]
+)
+async def test_a_policy_that_raises_refuses_a_manifest_connect_rather_than_crashing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spawns: list[tuple[Any, ...]],
+    predicate: str,
+) -> None:
+    """Rule 8 now reaches manifest lifecycle: a policy bug refuses, never crashes.
+
+    The trade-off, deliberately accepted: before the manifest lookup was gated,
+    a policy-evaluation bug could not block a manifest server; now it does.
+    """
+    shipped = _config(["-y", "@shipped/server"], name="shipped")
+    policy = _empty_policy(tmp_path)
+    gateway, _ = _gateway(monkeypatch, policy, manifest_servers={"shipped": shipped})
+    manager = cast(_MinimalClientManager, gateway._client_manager)
+
+    def explode(*args: Any) -> str:
+        raise RuntimeError("policy unreadable")
+
+    monkeypatch.setattr(policy, predicate, explode)
+
+    result = await gateway.connect_server({"server_name": "shipped"})
+
+    assert result.ok is False
+    assert "Refused to connect" in result.message
+    assert result.errors == [result.message]
+    assert manager.connected == []
+    assert spawns == []
