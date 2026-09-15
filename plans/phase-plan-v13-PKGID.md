@@ -2,7 +2,7 @@
 phase_loop_plan_version: 1
 phase: PKGID
 roadmap: specs/phase-plans-v13.md
-roadmap_sha256: 7129dfe7e700a934003e40778081b8c11db83dc71e89208677f6437b9c9e3072
+roadmap_sha256: 450e29f3804c04d86ba27561e72b18075531eede6376e7518dccfc4129619451
 ---
 
 # PHASE-3-PKGID: Provisioning binds to package identity
@@ -46,8 +46,19 @@ is as stated, not larger.
    call. No file, no state store, no restore path. EC-PKGID-6's migration surface is
    therefore *empty of durable records* — see the criterion for what that means.
 2. **`start_install` has exactly one production callsite** (`handlers.py:4483`; all
-   other hits are `tests/`). A gate placed there covers every install spawn reachable
-   from the agent.
+   other hits are `tests/`). A gate placed there covers every `start_install` spawn — but
+   **not every spawn that installs.** *Amended during execution (SL-1 finding, confirmed
+   by the orchestrator, operator decision 2026-09-15):* `npx -y` fetches and runs the
+   package at spawn time, so any path that spawns a discovered config is an install path.
+   `connect_server`, `restart_server` and `update_server` (both its probe resolve and its
+   post-probe recheck; the probe itself spawns `npx <pkg> --help`) all obtain a
+   discovered config through `_resolve_lifecycle_config`'s discovered branch
+   (`handlers.py:3380-3386`), which checked only `is_server_allowed(server_name)`.
+   `register_discovered_server(name=<allowlisted>, package=<arbitrary>)` followed by
+   `connect_server(name=<allowlisted>)` therefore spawned an unapproved package with no
+   call to `provision` at all. SL-1 gates that discovered branch with
+   `evaluate_provision(source="discovered")` as well, after the existing name-policy
+   denial and before the credential check.
 3. **Three spawn sites exist in `installer.py`**: `:135` (`start_install`, live),
    `:609` (`install_server`, legacy — **no production callers**), `:651`
    (`verify_installation`, spawns the agent-supplied `server_config.command`).
@@ -71,18 +82,22 @@ extends neither's file.
   guess, and every step fails closed: (1) `evaluate_package_policy(identity) ==
   "denied"` denies regardless of source — deny always wins; (2) `source == "manifest"`
   allows, reason `manifest_backed`; (3) a non-manifest source with `identity is None`
-  denies, reason `unresolvable_identity`; (4) a recorded package approval for
-  `(registry, name, resolved_version)` allows, reason `package_approved`; (5)
-  `evaluate_package_policy(identity) == "allowed"` allows, reason `policy_allowed`;
-  (6) a non-manifest source whose `server_config.args` do not
-  name the same `name@resolved_version` the approval is being checked against denies,
-  reason `unpinned_configured_argv` — a `.mcp.json` server can be approved at version X
-  and still spawn `npx -y pkg`, re-resolving to Y, which is the discovered-path
-  check-then-use gap reached through a different door. It is a distinct reason because
-  its remedy is distinct: pin the version in `.mcp.json` (or re-register), **not** the
-  failed-registry-lookup remedy `unresolvable_identity` carries; (7) otherwise —
-  including `"unspecified"` — deny, reason `not_approved`; (7) **any** exception reading the store or the policy denies
-  rather than propagating — a caller must never be able to read a raise as
+  denies, reason `unresolvable_identity`; (4) a non-manifest source whose
+  `server_config.args` do not name that identity's exact `name@resolved_version`
+  denies, reason `unpinned_configured_argv` — a `.mcp.json` server can be approved at
+  version X and still spawn `npx -y pkg`, re-resolving to Y, which is the
+  discovered-path check-then-use gap reached through a different door. **This rule
+  MUST precede every allow rule.** An earlier revision placed it after the approval
+  and policy-allow rules, which already return allowed, so an approved or
+  policy-allowed configured server with unpinned argv was allowed before this check
+  could run — reopening the exact gap it exists to close. Its reason is distinct
+  because its remedy is: pin the version in `.mcp.json` (or re-register), **not** the
+  failed-registry-lookup remedy `unresolvable_identity` carries; (5) a recorded
+  package approval for `(registry, name, resolved_version)` allows, reason
+  `package_approved`; (6) `evaluate_package_policy(identity) == "allowed"` allows,
+  reason `policy_allowed`; (7) otherwise — including `"unspecified"` — deny, reason
+  `not_approved`; (8) **any** exception reading the store or the policy denies rather
+  than propagating — a caller must never be able to read a raise as
   permission. `reason` is that closed seven-value vocabulary. `remedy` is `None` when allowed, and otherwise
   **depends on the reason** — a single frozen string is unconstructible for two of the
   deny branches. `package_approved`-shaped refusals (`not_approved`) use the exact
@@ -95,14 +110,14 @@ extends neither's file.
   **lookup path that produced the config**, never by a field on `server_config` — the
   agent controls those fields.
   The policy predicate is deliberately **tri-state, not a bool**. A bool cannot carry
-  this order: rule 1 denies before the manifest exemption and rule 5 allows after it,
+  this order: rule 1 denies before the manifest exemption and rule 6 allows after it,
   so a manifest server with a denylisted package and a manifest server in no list
   would both return `False` while requiring opposite outcomes. Worse, a bool
   implemented in the house style of `is_server_allowed` (`policy.py:161-175`) returns
-  `True` when no section is configured, which rule 5 would read as an allowlist match
+  `True` when no section is configured, which rule 6 would read as an allowlist match
   — every discovered package allowed with no approval, two faithful lanes composing
   back into the exact S-01 hole this phase closes. `"unspecified"` falls through to
-  rule 6 and denies.
+  rule 7 and denies.
 - [ ] IF-0-PKGID-2 — *(plan-local extension of IF-0-PKGID-1; not a roadmap-declared gate)* the package-approval store, `src/pmcp/package_approvals.py`:
   `PackageApproval(registry: str, name: str, resolved_version: str, integrity: str | None, decision: str, recorded_at: datetime)`;
   `approve_package(identity) -> PackageApproval`, `is_package_approved(identity) -> bool`,
@@ -120,7 +135,7 @@ extends neither's file.
   execute *serially* — not that CONSENT goes first. Executed first, PKGID's
   `approve_package` tests would write **real approvals into the operator's
   `~/.config/pmcp/package_approvals.json`**, and those records then satisfy
-  `evaluate_provision` rule 4 and permit a real provision. SL-1 therefore declares an
+  `evaluate_provision` rule 5 and permit a real provision. SL-1 therefore declares an
   autouse fixture inside its own owned test files (`tests/test_package_approvals.py`,
   `tests/test_package_identity_gate.py`) that redirects the store to `tmp_path`,
   independent of execution order and of whether CONSENT has landed.
@@ -152,7 +167,7 @@ SL-4 — Documentation & spec reconciliation
 ### SL-1 — Provisioning gate, registration pinning, and operator surface
 
 - **Scope**: The single call `provision` consults before an install may spawn, the version pin recorded at registration, the approval store behind it, and the `pmcp trust` package verbs every refusal message names.
-- **Owned files**: `src/pmcp/provision_gate.py`, `src/pmcp/package_approvals.py`, `src/pmcp/tools/handlers.py`, `src/pmcp/cli.py`, `tests/test_package_identity_gate.py`, `tests/test_package_approvals.py`
+- **Owned files**: `src/pmcp/provision_gate.py`, `src/pmcp/package_approvals.py`, `src/pmcp/tools/handlers.py`, `src/pmcp/cli.py`, `tests/test_package_identity_gate.py`, `tests/test_package_approvals.py`, `tests/test_pkgid_panel_fixes.py` (panel-fix), `tests/test_pkgid_manifest_npx_selectors.py` (panel rounds 2-4, shared with SL-3's row SL-3.4)
 - **Interfaces provided**: `ProvisionDecision`, `ProvisionSource`, `evaluate_provision`, `PackageApproval`, `approve_package`, `is_package_approved`, `revoke_package`, `list_package_approvals`, the `pmcp trust approve-package|list-packages|revoke-package` verbs
 - **Interfaces consumed**: `PackageIdentity`, `resolve_package_identity` (TRUST SL-2); `trust_store_path` (TRUST SL-1); `evaluate_package_policy`, `PackagePolicy` (SL-2); `parse_package_spec`, `is_valid_package_version` (SL-2, `validation.py`)
   - **`resolve_package_identity` is SYNCHRONOUS and does blocking network I/O**
@@ -170,29 +185,49 @@ SL-4 — Documentation & spec reconciliation
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-1.1 | test | — | `tests/test_package_identity_gate.py`, `tests/test_package_approvals.py` | **exactly these names**, because the acceptance criteria address them individually: `test_a_configured_server_with_unpinned_argv_is_refused`, `test_the_review_reproduction_does_not_spawn_npx_for_an_arbitrary_package`, `test_the_refusal_names_the_package_and_the_approval_command`, `test_discovered_provisioning_is_denied_without_opt_in`, `test_a_manifest_backed_server_provisions_unchanged`, `test_a_resolvable_registration_records_the_version_and_pins_the_install_argv`, `test_an_unresolvable_registration_is_refused_at_registration`, `test_a_resolved_version_that_fails_validation_is_refused`, `test_an_approved_package_provisions_after_the_refusal`, `test_a_store_read_failure_denies_rather_than_raises`, `test_source_is_taken_from_the_lookup_path_not_from_server_config`, `test_policy_denylist_blocks_an_approved_package`, `test_policy_package_allowlist_permits_provision_without_a_recorded_approval`, `test_package_denylist_beats_a_recorded_approval` | `uv run pytest -q tests/test_package_identity_gate.py tests/test_package_approvals.py` |
+| SL-1.1 | test | — | `tests/test_package_identity_gate.py`, `tests/test_package_approvals.py` | **exactly these names**, because the acceptance criteria address them individually: `test_a_configured_server_with_unpinned_argv_is_refused`, `test_the_review_reproduction_does_not_spawn_npx_for_an_arbitrary_package`, `test_the_refusal_names_the_package_and_the_approval_command`, `test_discovered_provisioning_is_denied_without_opt_in`, `test_a_manifest_backed_server_provisions_unchanged`, `test_a_resolvable_registration_records_the_version_and_pins_the_install_argv`, `test_an_unresolvable_registration_is_refused_at_registration`, `test_a_resolved_version_that_fails_validation_is_refused`, `test_an_approved_package_provisions_after_the_refusal`, `test_a_store_read_failure_denies_rather_than_raises`, `test_source_is_taken_from_the_lookup_path_not_from_server_config`, `test_policy_denylist_blocks_an_approved_package`, `test_policy_package_allowlist_permits_provision_without_a_recorded_approval`, `test_package_denylist_beats_a_recorded_approval`, and — added during execution for the lifecycle door (Context item 2) — `test_connect_server_does_not_spawn_an_unapproved_discovered_package`, `test_restart_server_does_not_spawn_an_unapproved_discovered_package`, `test_update_server_does_not_probe_an_unapproved_discovered_package`, `test_an_approved_pinned_discovered_server_still_connects` | `uv run pytest -q tests/test_package_identity_gate.py tests/test_package_approvals.py` |
 | SL-1.2 | impl | SL-1.1 | `src/pmcp/provision_gate.py`, `src/pmcp/package_approvals.py` | — | — |
 | SL-1.3 | impl | SL-1.1 | `src/pmcp/tools/handlers.py` | — | — |
 | SL-1.4 | impl | SL-1.1 | `src/pmcp/cli.py` | — | — |
 | SL-1.5 | verify | SL-1.4 | `src/pmcp/provision_gate.py`, `src/pmcp/package_approvals.py`, `src/pmcp/tools/handlers.py`, `src/pmcp/cli.py` | all SL-1 tests | `uv run pytest -q tests/test_package_identity_gate.py tests/test_package_approvals.py tests/test_tools.py tests/test_provision_validation.py tests/test_trust_cli.py && uv run mypy src/` |
+| SL-1.6 | test | SL-1.5 | `tests/test_pkgid_panel_fixes.py`, `tests/test_package_identity_gate.py`, `tests/test_pkgid_manifest_npx_selectors.py` | **panel-fix (F1, F2, F4, F5), added after the phase panel; exactly these names**: `test_update_server_refuses_a_discovered_server_even_if_pin_detection_misses`, `test_update_server_names_a_discovered_server_as_discovered`, `test_an_unapproved_discovered_server_is_refused_before_its_credential_is_asked`, `test_an_allowed_server_with_a_missing_credential_still_asks_for_it`, `test_a_denylisted_manifest_package_is_refused_by_every_spawning_door`, `test_a_manifest_package_named_only_by_its_install_argv_is_refused`, `test_a_manifest_package_field_is_consulted`, `test_the_manifest_package_slot_is_found_by_position_not_by_shape`, `test_the_name_policy_and_the_identity_policy_agree`, `test_the_gate_denies_a_denylisted_manifest_config_without_an_identity`, `test_a_denylisted_manifest_server_is_refused_before_its_credential_is_asked`, `test_a_manifest_server_lifecycle_consults_the_gate_only_for_the_denylist`, `test_a_manifest_server_no_denylist_names_is_unchanged`, `test_a_manifest_server_that_names_no_npm_package_is_unchanged`, `test_update_server_still_probes_an_unpinned_manifest_server`, `test_update_server_still_refuses_a_pinned_manifest_server_as_before`, `test_a_policy_that_raises_refuses_a_manifest_connect_rather_than_crashing`, `test_the_discovered_env_var_predicate_is_an_allowlist`, `test_the_discovered_env_var_predicate_admits_credential_names`, `test_registration_refuses_the_panel_reproduction`, `test_registration_refuses_any_disallowed_declared_name`, `test_a_hostile_declared_name_is_rendered_inert_in_the_refusal`, `test_auth_connect_refuses_a_package_manager_override_for_a_discovered_server`, `test_auth_connect_refuses_a_disallowed_name_a_discovered_config_declares`, `test_the_auth_connect_rule_is_keyed_on_the_lookup_not_the_name`, `test_a_credential_shaped_discovered_env_var_works_end_to_end`, `test_a_manifest_server_keeps_a_non_credential_shaped_env_var`, and from panel rounds 2-4: `test_a_denylisted_package_named_by_a_selector_is_refused`, `test_a_selector_in_the_install_argv_alone_is_read`, `test_a_selector_entry_no_denylist_names_is_unchanged`, `test_a_selector_after_the_package_slot_belongs_to_the_server`, `test_the_command_after_a_selector_is_not_a_package`, `test_a_selected_or_positional_package_is_still_refused`, `test_a_positional_without_a_selector_that_names_nothing_is_undetermined`, `test_an_unplaceable_npx_option_is_refused_when_a_denylist_exists`, `test_an_unplaceable_npx_option_is_unchanged_without_a_denylist`, `test_either_policy_side_can_supply_the_denylist`, `test_an_unplaceable_option_hostile_to_a_terminal_is_rendered_inert`, `test_a_windows_npx_spelling_is_read_for_the_denylist`, `test_no_shipped_manifest_entry_is_undetermined`, `test_the_discovered_pin_check_still_refuses_selector_shapes` | `uv run pytest -q tests/test_pkgid_manifest_npx_selectors.py tests/test_pkgid_panel_fixes.py tests/test_package_identity_gate.py` |
 
 `handlers.py` edits are deliberately thin: `register_discovered_server` resolves and
 validates the version then pins `["npx","-y",f"{name}@{version}"]` into **both**
 `install` and `args`. **`source == "configured"` is pinned too, and this is not
 optional.** A `.mcp.json` server reaches `evaluate_provision` as `"configured"` and can
-be allowed by rule 4 (a recorded approval) or rule 5 (policy allowlist) — but nothing in
+be allowed by rule 5 (a recorded approval) or rule 6 (policy allowlist) — but nothing in
 the registration path rewrote its argv, so it can be approved at resolved version X and
 then spawn `npx -y pkg`, which resolves to Y. That is the same check-then-use gap the
 runtime-argv pin closes for discovered servers, reached by a different door. A configured
 config whose argv is not version-pinned is therefore **refused** with reason
-`unresolvable_identity` rather than approved against an identity its argv does not name;
+`unpinned_configured_argv` rather than approved against an identity its argv does not name;
 the operator pins the version in `.mcp.json` (or re-registers) to proceed.
 `provision` calls `evaluate_provision` immediately before `start_install`
 (`:4483`) with `source` set from which lookup produced the config
-(`:4280` → `"manifest"`, `:4283` → `"discovered"`, the `.mcp.json` branch →
-`"configured"`). Refusals ride the **existing** `message` field of `ProvisionOutput`
+(`:4280` → `"manifest"`, `:4283` → `"discovered"`), and `_resolve_lifecycle_config`
+calls it in its discovered branch so `connect_server`, `restart_server` and
+`update_server` cannot spawn what `provision` refuses (see Context item 2).
+*Amended during execution (operator decision 2026-09-15):* **`provision`'s `.mcp.json`
+branch is not wired to the gate.** That branch returns through `ensure_connected` and
+never reaches `start_install`; `.mcp.json` servers also lazy-start on `invoke`, so a
+provision-only refusal would block nothing; and every non-npm configured server (uvx,
+node, docker) has no resolvable identity and would be refused as
+`unresolvable_identity`. Project-sourced `.mcp.json` is already consent-gated by CONSENT.
+The `"configured"` rules (3 and 4) are still implemented and tested at the
+`evaluate_provision` level so a later phase can wire a configured path that does spawn
+an npm package without re-deriving them. Refusals ride the **existing** `message` field of `ProvisionOutput`
 and `RegisterDiscoveredServerOutput`, and the pinned argv rides the existing
 `install_command` field — SL-1 adds no field to `types.py`, which SL-2 owns.
+
+*Panel fixes (2026-09-15), row SL-1.6:* the phase panel's findings F1, F2, F4 and F5 were
+closed in one single-writer pass after the lanes merged (`03cd186`). It crossed lane
+boundaries on purpose — `src/pmcp/validation.py` and `src/pmcp/policy/policy.py` are
+SL-2's, `src/pmcp/client/manager.py` is no lane's — for the reason CONSENT amendment 2
+gives for a repair pass. What changed in this lane's contract: `provision` runs the
+gate before the credential check; the lifecycle resolver consults the gate for manifest
+hits too (rule 1 only), not for disconnect; `update_server` refuses a discovered server;
+and discovered env var names are an allowlist. See the roadmap's PKGID amendments.
 
 ### SL-2 — Policy package identifiers and spec parsing
 
@@ -205,10 +240,10 @@ and `RegisterDiscoveredServerOutput`, and the pinned argv rides the existing
 
 | Task ID | Type | Depends on | Files in scope | Tests owned | Test command |
 |---|---|---|---|---|---|
-| SL-2.1 | test | — | `tests/test_policy_package_identifiers.py` | **exactly these names**: `test_a_project_allowed_package_cannot_override_a_user_denied_package`, `test_a_policy_with_no_packages_section_returns_unspecified`, `test_evaluate_package_policy_denylist_beats_allowlist`, `test_evaluate_package_policy_matches_a_scoped_name_glob`, `test_a_registry_supplied_version_with_metacharacters_is_rejected`, `test_parse_package_spec_splits_a_scoped_name_from_its_version` | `uv run pytest -q tests/test_policy_package_identifiers.py` |
+| SL-2.1 | test | — | `tests/test_policy_package_identifiers.py` | **exactly these names**: `test_a_project_allowed_package_never_independently_grants`, `test_a_project_denied_package_is_denied_even_when_the_user_allows_it`, `test_a_project_allowed_package_cannot_override_a_user_denied_package`, `test_a_policy_with_no_packages_section_returns_unspecified`, `test_evaluate_package_policy_denylist_beats_allowlist`, `test_evaluate_package_policy_matches_a_scoped_name_glob`, `test_a_registry_supplied_version_with_metacharacters_is_rejected`, `test_parse_package_spec_splits_a_scoped_name_from_its_version` | `uv run pytest -q tests/test_policy_package_identifiers.py` |
 | SL-2.2 | impl | SL-2.1 | `src/pmcp/types.py`, `src/pmcp/validation.py` | — | — |
 | SL-2.3 | impl | SL-2.2 | `src/pmcp/policy/policy.py` | — | — |
-| SL-2.4 | verify | SL-2.3 | `src/pmcp/policy/policy.py`, `src/pmcp/types.py`, `src/pmcp/validation.py` | all SL-2 tests | `uv run pytest -q tests/test_policy_package_identifiers.py tests/test_policy.py tests/test_validation.py && uv run mypy src/` |
+| SL-2.4 | verify | SL-2.3 | `src/pmcp/policy/policy.py`, `src/pmcp/types.py`, `src/pmcp/validation.py` | all SL-2 tests | `uv run pytest -q tests/test_policy_package_identifiers.py tests/test_policy.py tests/test_provision_validation.py && uv run mypy src/` |
 
 `is_valid_package_name` (`validation.py:16-30`) rejects `@` outside a leading scope,
 so it rejects the composed spec `pkg@1.2.3`. Name and version are therefore validated
@@ -225,7 +260,7 @@ fail SL-2.4 at collection.
 ### SL-3 — Install-spawn argv logging
 
 - **Scope**: Log the exact argv at WARNING before every subprocess spawn in the installer, including the paths that subsequently fail.
-- **Owned files**: `src/pmcp/manifest/installer.py`, `tests/test_install_argv_logging.py`
+- **Owned files**: `src/pmcp/manifest/installer.py`, `tests/test_install_argv_logging.py`, `tests/test_pkgid_spawn_logging.py` (panel-fix)
 - **Interfaces provided**: (none — behaviour change only)
 - **Interfaces consumed**: `is_valid_package_version`, `PackageIdentity` (SL-2) — the rendered-argv contract validates the package spec, so this lane is **not** a parallel root
 - **Parallel-safe**: yes
@@ -236,6 +271,7 @@ fail SL-2.4 at collection.
 | SL-3.1 | test | SL-2 | `tests/test_install_argv_logging.py` | **exactly these names**: `test_start_install_logs_rendered_argv_at_warning`, `test_legacy_install_server_logs_rendered_argv_at_warning`, `test_verify_installation_logs_rendered_argv_at_warning`, `test_argv_is_logged_even_when_the_spawn_fails`, `test_a_credential_bearing_argument_is_redacted_but_the_package_identity_is_not` | `uv run pytest -q tests/test_install_argv_logging.py` |
 | SL-3.2 | impl | SL-3.1 | `src/pmcp/manifest/installer.py` | — | — |
 | SL-3.3 | verify | SL-3.2 | `src/pmcp/manifest/installer.py`, `tests/test_install_argv_logging.py` | all SL-3 tests | `uv run pytest -q tests/test_install_argv_logging.py tests/test_manifest.py tests/test_manifest_provision.py` |
+| SL-3.4 | test | SL-3.3 | `tests/test_pkgid_spawn_logging.py`, `tests/test_pkgid_manifest_npx_selectors.py` | **panel-fix (F3), added after the phase panel; exactly these names**: `test_the_stdio_spawn_of_a_package_runner_logs_its_argv_before_spawning`, `test_the_stdio_spawn_of_a_local_binary_emits_no_warning`, `test_the_update_probe_logs_its_argv_before_spawning`, `test_the_update_probe_redacts_a_credential_but_not_a_pinned_package`, and from panel rounds 2-4: `test_executable_names_are_normalized` | `uv run pytest -q tests/test_pkgid_manifest_npx_selectors.py tests/test_pkgid_spawn_logging.py` |
 
 Today `start_install` logs at INFO with the literal `<args redacted>`
 (`installer.py:126-128`). The blanket redaction is what makes an arbitrary package
@@ -261,6 +297,11 @@ argument that could carry a credential never is. Secrets otherwise
 live in the child env built by `build_install_child_env`, not in argv. Each site logs immediately before
 its `create_subprocess_exec` (`:135`, `:609`, `:651`), inside the `try` but ahead of
 the call, so a `FileNotFoundError` spawn still leaves a record.
+
+*Panel fixes (2026-09-15), row SL-3.4:* rounds 2-4 add `normalized_executable_name` (`src/pmcp/validation.py`), so a runner is recognised under any Windows or POSIX spelling; its test lives in the selectors file. F3 extends this lane's rendered-argv log to the
+two spawns outside `installer.py` that fetch and run a package — the client manager's
+stdio spawn of a package runner and `update_server`'s probe — reusing
+`_render_install_argv` unchanged.
 
 ### SL-docs — Documentation & spec reconciliation
 
@@ -321,7 +362,7 @@ the call, so a `FileNotFoundError` spawn still leaves a record.
 - **Cross-phase hazard — `src/pmcp/policy/policy.py` is NOT exclusively ours.**
   CONSENT lane C writes the same file (policy precedence and narrowing-only
   intersection) and is being planned concurrently. SL-2 adds `PackagePolicy`,
-  `GatewayPolicy.packages` and `is_package_allowed` **without restructuring policy
+  `GatewayPolicy.packages` and `evaluate_package_policy` **without restructuring policy
   load or merge order**, which is CONSENT lane C's subject. Execute SL-2 and CONSENT
   lane C serially against this file; whichever lands second rebases.
   `src/pmcp/types.py` is a 1444-line hub file — SL-2's edit is confined to the policy
@@ -343,12 +384,16 @@ the call, so a `FileNotFoundError` spawn still leaves a record.
 - **SL-0 re-exports**: not applicable — this phase adds no package `__init__.py`
   re-exports. If a later phase wants `pmcp.provision_gate` re-exported from a package
   `__init__`, use the `__getattr__` lazy form.
-- **Parallelism**: SL-2 and SL-3 are DAG roots sharing no files — run them
-  concurrently. SL-1 opens when SL-2's interfaces land and must not begin against a
-  guessed `is_package_allowed` signature.
+- **Parallelism**: SL-2 is the only root. SL-1 AND SL-3 both depend on it — SL-3
+  consumes `is_valid_package_version` and `PackageIdentity` from SL-2 — so run SL-2
+  alone, then SL-1 and SL-3 concurrently, then SL-4. An earlier revision of this note
+  said SL-2 and SL-3 were both roots to run concurrently; that was corrected in the
+  Lane Index but not here, and `check_dag` cannot catch it because it deliberately
+  does not read prose. Neither SL-1 nor SL-3 may begin against a guessed
+  `evaluate_package_policy` signature.
 - **Stale-base guidance** (copy verbatim): Lane teammates working in isolated
   worktrees do not see sibling-lane merges automatically. If a lane finds its worktree
-  base is pre-SL-2 (SL-1's only upstream dependency), it MUST stop and report rather
+  base is pre-SL-2 (the upstream of both SL-1 and SL-3), it MUST stop and report rather
   than committing — the orchestrator will re-spawn or rebase. Silent
   `git reset --hard` or `git checkout HEAD~N -- …` in a stale worktree produces
   commits that destroy peer-lane work on `--no-ff` merge.
@@ -369,11 +414,11 @@ the call, so a `FileNotFoundError` spawn still leaves a record.
 
 ## Acceptance Criteria
 
-- [ ] EC-PKGID-1 — proven by `uv run pytest -q tests/test_package_identity_gate.py::test_the_review_reproduction_does_not_spawn_npx_for_an_arbitrary_package tests/test_package_identity_gate.py::test_the_refusal_names_the_package_and_the_approval_command`, falsified by driving the review's exact reproduction: a policy with `servers.allowlist == ["internal-approved-tool"]`, then `register_discovered_server(server_name="internal-approved-tool", package="totally-arbitrary-evil-package")`, then `provision(server_name="internal-approved-tool")` with `JobManager.start_install` replaced by a recorder — assert the recorder was **never called**, `ProvisionOutput.ok is False`, and the message contains both `"totally-arbitrary-evil-package"` and `"pmcp trust approve-package"`. On unchanged `main` this fails: the recorder is called with `["npx","-y","totally-arbitrary-evil-package"]` and `ok=True, status="started"`.
-- [ ] EC-PKGID-2 — proven by `uv run pytest -q tests/test_policy_package_identifiers.py::test_parse_package_spec_splits_a_scoped_name_from_its_version tests/test_policy_package_identifiers.py::test_evaluate_package_policy_matches_a_scoped_name_glob tests/test_policy_package_identifiers.py::test_a_project_allowed_package_cannot_override_a_user_denied_package tests/test_package_identity_gate.py::test_policy_denylist_blocks_an_approved_package tests/test_package_identity_gate.py::test_policy_package_allowlist_permits_provision_without_a_recorded_approval tests/test_package_identity_gate.py::test_package_denylist_beats_a_recorded_approval tests/test_policy_package_identifiers.py::test_evaluate_package_policy_denylist_beats_allowlist tests/test_policy_package_identifiers.py::test_a_policy_with_no_packages_section_returns_unspecified`, falsified by a policy whose `servers.allowlist` permits the *name* while `packages.denylist` names the package, asserting provision is refused — deny wins over both the name allowlist and a recorded approval; and at the policy layer by asserting an unconfigured `packages` section returns `"unspecified"` rather than a default-allow `True`. Fails on `main`: `GatewayPolicy` has no `packages` section.
-- [ ] EC-PKGID-3 — proven by `uv run pytest -q tests/test_package_identity_gate.py::test_a_configured_server_with_unpinned_argv_is_refused tests/test_package_identity_gate.py::test_discovered_provisioning_is_denied_without_opt_in tests/test_package_identity_gate.py::test_a_manifest_backed_server_provisions_unchanged tests/test_package_identity_gate.py::test_source_is_taken_from_the_lookup_path_not_from_server_config`, falsified by provisioning a freshly discovered server with no approval and no policy entry and asserting refusal, while a manifest-backed name provisions with no approval at all; and by a discovered config carrying `declared_capabilities=["manifest"]` still being treated as `source="discovered"`. Fails on `main`: the first case succeeds today.
-- [ ] EC-PKGID-4 — proven by `uv run pytest -q tests/test_install_argv_logging.py::test_start_install_logs_rendered_argv_at_warning tests/test_install_argv_logging.py::test_legacy_install_server_logs_rendered_argv_at_warning tests/test_install_argv_logging.py::test_verify_installation_logs_rendered_argv_at_warning tests/test_install_argv_logging.py::test_argv_is_logged_even_when_the_spawn_fails tests/test_install_argv_logging.py::test_a_credential_bearing_argument_is_redacted_but_the_package_identity_is_not`, falsified with `caplog.at_level(logging.WARNING)` asserting the rendered argv appears at WARNING before the spawn — executable verbatim and `name@resolved_version` present — that it still appears when `create_subprocess_exec` raises `FileNotFoundError`, and that an argument outside the frozen safe shape (e.g. `--token=sk-live-…`) is rendered `<redacted>` while the package identity in the same argv is not. Fails on `main`: the only log is INFO and literally contains `<args redacted>` (`installer.py:126-128`).
-- [ ] EC-PKGID-5 — proven by `uv run pytest -q tests/test_package_identity_gate.py::test_a_resolvable_registration_records_the_version_and_pins_the_install_argv tests/test_package_identity_gate.py::test_an_unresolvable_registration_is_refused_at_registration tests/test_package_identity_gate.py::test_a_resolved_version_that_fails_validation_is_refused tests/test_policy_package_identifiers.py::test_a_registry_supplied_version_with_metacharacters_is_rejected`, falsified by asserting the **chosen** branch: a resolvable spec registers with `resolved_version` recorded and `install_command == ["npx","-y","pkg@<version>"]` for every platform key **and** the runtime `args == ["-y","pkg@<version>"]` (the argv `client/manager.py:2349` actually spawns), an unresolvable spec returns `registered=False` from `register_discovered_server` itself, and a registry-returned version failing `is_valid_package_version` is refused rather than composed into argv. Fails on `main`: registration stores `["npx","-y","pkg"]` unpinned and never resolves a version.
+- [ ] EC-PKGID-1 — proven by `uv run pytest -q tests/test_package_identity_gate.py::test_the_review_reproduction_does_not_spawn_npx_for_an_arbitrary_package tests/test_package_identity_gate.py::test_the_refusal_names_the_package_and_the_approval_command tests/test_package_identity_gate.py::test_connect_server_does_not_spawn_an_unapproved_discovered_package tests/test_package_identity_gate.py::test_restart_server_does_not_spawn_an_unapproved_discovered_package tests/test_package_identity_gate.py::test_update_server_does_not_probe_an_unapproved_discovered_package tests/test_package_identity_gate.py::test_an_approved_pinned_discovered_server_still_connects tests/test_pkgid_panel_fixes.py::test_update_server_refuses_a_discovered_server_even_if_pin_detection_misses tests/test_pkgid_panel_fixes.py::test_update_server_names_a_discovered_server_as_discovered tests/test_pkgid_panel_fixes.py::test_an_unapproved_discovered_server_is_refused_before_its_credential_is_asked tests/test_pkgid_panel_fixes.py::test_an_allowed_server_with_a_missing_credential_still_asks_for_it`, falsified by driving the review's exact reproduction: a policy with `servers.allowlist == ["internal-approved-tool"]`, then `register_discovered_server(server_name="internal-approved-tool", package="totally-arbitrary-evil-package")`, then `provision(server_name="internal-approved-tool")` with `JobManager.start_install` replaced by a recorder — assert the recorder was **never called**, `ProvisionOutput.ok is False`, and the message contains both `"totally-arbitrary-evil-package"` and `"pmcp trust approve-package"`. The same registration followed by `connect_server`, `restart_server` or `update_server` instead of `provision` must also refuse, with neither the client manager, `asyncio.create_subprocess_exec` nor the update probe called — those three tools reach a discovered config without `provision` (Context item 2). On unchanged `main` this fails: the recorder is called with `["npx","-y","totally-arbitrary-evil-package"]` and `ok=True, status="started"`. *Panel fixes (2026-09-15):* `update_server` refuses any server the discovered lookup produced, before any probe or restart, even with pin detection stubbed to miss, and names it as discovered rather than as "the manifest entry" (F5); and `provision` refuses an unapproved discovered server before it asks for that server's credential, while a server the gate allows still gets the credential prompt (F4).
+- [ ] EC-PKGID-2 — proven by `uv run pytest -q tests/test_policy_package_identifiers.py::test_a_project_allowed_package_never_independently_grants tests/test_policy_package_identifiers.py::test_a_project_denied_package_is_denied_even_when_the_user_allows_it tests/test_policy_package_identifiers.py::test_parse_package_spec_splits_a_scoped_name_from_its_version tests/test_policy_package_identifiers.py::test_evaluate_package_policy_matches_a_scoped_name_glob tests/test_policy_package_identifiers.py::test_a_project_allowed_package_cannot_override_a_user_denied_package tests/test_package_identity_gate.py::test_policy_denylist_blocks_an_approved_package tests/test_package_identity_gate.py::test_policy_package_allowlist_permits_provision_without_a_recorded_approval tests/test_package_identity_gate.py::test_package_denylist_beats_a_recorded_approval tests/test_policy_package_identifiers.py::test_evaluate_package_policy_denylist_beats_allowlist tests/test_policy_package_identifiers.py::test_a_policy_with_no_packages_section_returns_unspecified tests/test_pkgid_panel_fixes.py::test_a_denylisted_manifest_package_is_refused_by_every_spawning_door tests/test_pkgid_panel_fixes.py::test_a_manifest_package_named_only_by_its_install_argv_is_refused tests/test_pkgid_panel_fixes.py::test_a_manifest_package_field_is_consulted tests/test_pkgid_panel_fixes.py::test_the_manifest_package_slot_is_found_by_position_not_by_shape tests/test_pkgid_panel_fixes.py::test_the_name_policy_and_the_identity_policy_agree tests/test_pkgid_panel_fixes.py::test_the_gate_denies_a_denylisted_manifest_config_without_an_identity tests/test_pkgid_panel_fixes.py::test_a_denylisted_manifest_server_is_refused_before_its_credential_is_asked tests/test_package_identity_gate.py::test_a_manifest_server_lifecycle_consults_the_gate_only_for_the_denylist tests/test_pkgid_manifest_npx_selectors.py::test_a_denylisted_package_named_by_a_selector_is_refused tests/test_pkgid_manifest_npx_selectors.py::test_a_selector_in_the_install_argv_alone_is_read tests/test_pkgid_manifest_npx_selectors.py::test_a_selector_entry_no_denylist_names_is_unchanged tests/test_pkgid_manifest_npx_selectors.py::test_a_selector_after_the_package_slot_belongs_to_the_server tests/test_pkgid_manifest_npx_selectors.py::test_the_command_after_a_selector_is_not_a_package tests/test_pkgid_manifest_npx_selectors.py::test_a_selected_or_positional_package_is_still_refused tests/test_pkgid_manifest_npx_selectors.py::test_a_positional_without_a_selector_that_names_nothing_is_undetermined tests/test_pkgid_manifest_npx_selectors.py::test_an_unplaceable_npx_option_is_refused_when_a_denylist_exists tests/test_pkgid_manifest_npx_selectors.py::test_an_unplaceable_npx_option_is_unchanged_without_a_denylist tests/test_pkgid_manifest_npx_selectors.py::test_either_policy_side_can_supply_the_denylist tests/test_pkgid_manifest_npx_selectors.py::test_an_unplaceable_option_hostile_to_a_terminal_is_rendered_inert tests/test_pkgid_manifest_npx_selectors.py::test_a_windows_npx_spelling_is_read_for_the_denylist`, falsified by a policy whose `servers.allowlist` permits the *name* while `packages.denylist` names the package, asserting provision is refused — deny wins over both the name allowlist and a recorded approval; and at the policy layer by asserting an unconfigured `packages` section returns `"unspecified"` rather than a default-allow `True`. Fails on `main`: `GatewayPolicy` has no `packages` section. *Panel fixes (2026-09-15):* a `packages.denylist` also binds a **manifest** server (F2): the names are read structurally from the manifest config's `package` field and the npx package slot of `args` and of every install argv, with no registry lookup, and `provision`, `connect_server`, `restart_server` and `update_server` all refuse it (`disconnect_server` does not). *Panel rounds 2-4 (2026-09-15):* the manifest reader also reads npx package selectors (`-p X`, `--package X`, `--package=X`, `--`), treats the positional after a selector as the command rather than a package, recognises npx under Windows and POSIX spellings, and refuses an entry whose packages cannot be determined only while a `packages.denylist` is in force (G1, H1, H2, J1).
+- [ ] EC-PKGID-3 — proven by `uv run pytest -q tests/test_package_identity_gate.py::test_a_configured_server_with_unpinned_argv_is_refused tests/test_package_identity_gate.py::test_discovered_provisioning_is_denied_without_opt_in tests/test_package_identity_gate.py::test_a_manifest_backed_server_provisions_unchanged tests/test_package_identity_gate.py::test_source_is_taken_from_the_lookup_path_not_from_server_config tests/test_pkgid_panel_fixes.py::test_a_manifest_server_no_denylist_names_is_unchanged tests/test_pkgid_panel_fixes.py::test_a_manifest_server_that_names_no_npm_package_is_unchanged tests/test_pkgid_panel_fixes.py::test_update_server_still_probes_an_unpinned_manifest_server tests/test_pkgid_panel_fixes.py::test_update_server_still_refuses_a_pinned_manifest_server_as_before tests/test_package_identity_gate.py::test_a_policy_that_raises_refuses_a_manifest_connect_rather_than_crashing tests/test_pkgid_manifest_npx_selectors.py::test_no_shipped_manifest_entry_is_undetermined`, falsified by provisioning a freshly discovered server with no approval and no policy entry and asserting refusal, while a manifest-backed name provisions with no approval at all; and by a discovered config carrying `declared_capabilities=["manifest"]` still being treated as `source="discovered"`. Fails on `main`: the first case succeeds today. *Panel fixes (2026-09-15):* the manifest exemption survives F2 and F5 for every manifest server no denylist names — an allowlist miss, a non-npm command, and `update_server`'s probe and pin refusal all behave as before — with one recorded trade-off: a policy evaluation that raises now refuses a manifest `connect_server` (rule 8) instead of being skipped. These are regression guards for "a manifest-backed server is unaffected", which is why they sit here rather than with the F2/F5 refusals in EC-PKGID-1/2. *Panel rounds 2-4:* no shipped manifest entry is undetermined, so adding any denylist keeps every shipped server.
+- [ ] EC-PKGID-4 — proven by `uv run pytest -q tests/test_install_argv_logging.py::test_start_install_logs_rendered_argv_at_warning tests/test_install_argv_logging.py::test_legacy_install_server_logs_rendered_argv_at_warning tests/test_install_argv_logging.py::test_verify_installation_logs_rendered_argv_at_warning tests/test_install_argv_logging.py::test_argv_is_logged_even_when_the_spawn_fails tests/test_install_argv_logging.py::test_a_credential_bearing_argument_is_redacted_but_the_package_identity_is_not tests/test_pkgid_spawn_logging.py::test_the_stdio_spawn_of_a_package_runner_logs_its_argv_before_spawning tests/test_pkgid_spawn_logging.py::test_the_stdio_spawn_of_a_local_binary_emits_no_warning tests/test_pkgid_spawn_logging.py::test_the_update_probe_logs_its_argv_before_spawning tests/test_pkgid_spawn_logging.py::test_the_update_probe_redacts_a_credential_but_not_a_pinned_package tests/test_pkgid_manifest_npx_selectors.py::test_executable_names_are_normalized`, falsified with `caplog.at_level(logging.WARNING)` asserting the rendered argv appears at WARNING before the spawn — executable verbatim and `name@resolved_version` present — that it still appears when `create_subprocess_exec` raises `FileNotFoundError`, and that an argument outside the frozen safe shape (e.g. `--token=sk-live-…`) is rendered `<redacted>` while the package identity in the same argv is not. Fails on `main`: the only log is INFO and literally contains `<args redacted>` (`installer.py:126-128`). *Panel fixes (2026-09-15):* two spawns that fetch and run a package outside `installer.py` log the same rendered argv at WARNING before spawning (F3): the client manager's stdio spawn when the executable is a package runner (`npx`, `npx.cmd`, `npx.exe`, `uvx`, `pnpx`, `bunx`) and not otherwise, and `update_server`'s probe unconditionally. *Panel rounds 2-4:* runner names are normalized (drive prefix, either separator, case, one `.exe`/`.cmd`/`.bat`) before the check, so Windows and POSIX spellings of a runner log too (G2, H2, J1).
+- [ ] EC-PKGID-5 — proven by `uv run pytest -q tests/test_package_identity_gate.py::test_a_resolvable_registration_records_the_version_and_pins_the_install_argv tests/test_package_identity_gate.py::test_an_unresolvable_registration_is_refused_at_registration tests/test_package_identity_gate.py::test_a_resolved_version_that_fails_validation_is_refused tests/test_policy_package_identifiers.py::test_a_registry_supplied_version_with_metacharacters_is_rejected tests/test_pkgid_panel_fixes.py::test_the_discovered_env_var_predicate_is_an_allowlist tests/test_pkgid_panel_fixes.py::test_the_discovered_env_var_predicate_admits_credential_names tests/test_pkgid_panel_fixes.py::test_registration_refuses_the_panel_reproduction tests/test_pkgid_panel_fixes.py::test_registration_refuses_any_disallowed_declared_name tests/test_pkgid_panel_fixes.py::test_a_hostile_declared_name_is_rendered_inert_in_the_refusal tests/test_pkgid_panel_fixes.py::test_auth_connect_refuses_a_package_manager_override_for_a_discovered_server tests/test_pkgid_panel_fixes.py::test_auth_connect_refuses_a_disallowed_name_a_discovered_config_declares tests/test_pkgid_panel_fixes.py::test_the_auth_connect_rule_is_keyed_on_the_lookup_not_the_name tests/test_pkgid_panel_fixes.py::test_a_credential_shaped_discovered_env_var_works_end_to_end tests/test_pkgid_panel_fixes.py::test_a_manifest_server_keeps_a_non_credential_shaped_env_var tests/test_pkgid_manifest_npx_selectors.py::test_the_discovered_pin_check_still_refuses_selector_shapes`, falsified by asserting the **chosen** branch: a resolvable spec registers with `resolved_version` recorded and `install_command == ["npx","-y","pkg@<version>"]` for every platform key **and** the runtime `args == ["-y","pkg@<version>"]` (the argv `client/manager.py:2349` actually spawns), an unresolvable spec returns `registered=False` from `register_discovered_server` itself, and a registry-returned version failing `is_valid_package_version` is refused rather than composed into argv. Fails on `main`: registration stores `["npx","-y","pkg"]` unpinned and never resolves a version. *Panel fixes (2026-09-15):* the pin is only an identity if nothing the agent supplies can change what `npx -y name@version` fetches (F1). A discovered server may declare, and `auth_connect` may store for it, only a credential-shaped env var name outside the `NPM_CONFIG_`/`NODE_`/`COREPACK_`/`YARN_`/`PNPM_`/`BUN_` families (`validation.discovered_env_var_allowed`), so the panel's reproduction — register an approved package with `env_vars=["npm_config_registry"]`, store an attacker URL, spawn — is refused at registration and at `auth_connect`, keyed on the discovered lookup, while a manifest server keeps its non-credential-shaped name. Placed here rather than in EC-PKGID-1 because EC-PKGID-1's reproduction runs an *unapproved* package; F1 ran an **approved, pinned** one against different bytes, which breaks the binding this criterion asserts between the recorded `pkg@<version>` and what executes. *Panel rounds 2-4:* the discovered pin check stays strict — selector shapes and a Windows spelling of npx are still refused as unpinned for an approved identity — because that is the check that binds the recorded `pkg@<version>` to what runs.
 - [ ] EC-PKGID-6 — proven by `uv run pytest -q tests/test_package_identity_gate.py::test_an_approved_package_provisions_after_the_refusal tests/test_package_identity_gate.py::test_a_manifest_backed_server_provisions_unchanged tests/test_package_approvals.py::test_a_store_read_failure_denies_rather_than_raises`, falsified by the round trip: provision is refused, `approve_package(identity)` is recorded, the same provision then reaches `start_install` with the pinned argv. There is **nothing durable to migrate** — `_discovered_server_configs` is a process-local instance dict (`handlers.py:1126`) and `server.py:387-388` merely dispatches, so no persisted registration survives a restart today. Grandfathering is therefore the explicit recorded decision the operator makes once, prompted by a refusal that names the exact command (EC-PKGID-1), and manifest-backed servers — the only servers that *do* persist — are untouched by construction. Assumption 5 is satisfied in its letter: the change is loud, not silent. Regression evidence for the untouched operator is the suite-count comparison in `## Verification`.
 
 ## Verification
@@ -390,6 +435,8 @@ uv run python -c "import pmcp.provision_gate, pmcp.package_approvals"   # both i
 
 # The gate covers every reachable install spawn: exactly one production callsite.
 rg -n 'await \w+\.start_install\(' src/     # MUST be only handlers.py:4483
+# ...and every lifecycle spawn of a discovered config (connect/restart/update).
+rg -n 'evaluate_provision\(' src/pmcp/tools/handlers.py   # MUST include provision AND _resolve_lifecycle_config
 
 # PKGID does not touch CONSENT's loaders.
 git diff --name-only origin/main..HEAD -- src/pmcp/manifest/loader.py src/pmcp/config/loader.py

@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from pmcp.validation import is_valid_package_name
+from pmcp.validation import is_valid_package_name, version_separator_index
 
 # === Transport Types ===
 
@@ -991,6 +991,37 @@ class PromptPolicy(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class PackagePolicy(BaseModel):
+    """Package allow/deny policy, matched against a resolved package NAME.
+
+    Unlike the other sections this one is tri-state (see
+    `PolicyManager.evaluate_package_policy`): an allowlist match grants, a
+    denylist match denies, and a package in neither list is *unspecified* --
+    which a caller must treat as not approved, never as allowed.
+
+    Entries are name globs (`@acme/*`, `*-mcp`). A version-qualified entry such
+    as `pkg@1.2.3` is rejected rather than accepted: globs match the name alone,
+    so it would match nothing, and a denylist entry that silently never matches
+    is a denial that fails open.
+    """
+
+    allowlist: list[str] = Field(default_factory=list)  # Glob patterns (name)
+    denylist: list[str] = Field(default_factory=list)  # Glob patterns (name)
+
+    model_config = ConfigDict(extra="forbid")
+
+    @field_validator("allowlist", "denylist")
+    @classmethod
+    def _reject_version_qualified_entries(cls, value: list[str]) -> list[str]:
+        for entry in value:
+            if version_separator_index(entry) != -1:
+                raise ValueError(
+                    f"package pattern {entry!r} names a version; package "
+                    "patterns match the package name only"
+                )
+        return value
+
+
 class LimitsPolicy(BaseModel):
     """Resource limits policy.
 
@@ -1036,6 +1067,7 @@ class GatewayPolicy(BaseModel):
     tools: ToolPolicy = Field(default_factory=ToolPolicy)
     resources: ResourcePolicy = Field(default_factory=ResourcePolicy)
     prompts: PromptPolicy = Field(default_factory=PromptPolicy)
+    packages: PackagePolicy = Field(default_factory=PackagePolicy)
     limits: LimitsPolicy = Field(default_factory=LimitsPolicy)
     redaction: RedactionPolicy = Field(default_factory=RedactionPolicy)
 
