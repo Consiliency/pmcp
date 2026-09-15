@@ -18,6 +18,7 @@ from typing import Any, Literal, cast
 from urllib.request import urlopen
 from urllib.parse import urlencode
 
+import anyio
 from dotenv import load_dotenv
 from mcp.types import Tool
 from pmcp import __version__ as PMCP_VERSION
@@ -55,7 +56,11 @@ from pmcp.env_store import (
     sanitized_subprocess_env,
     set_env_value,
 )
-from pmcp.validation import env_var_allowed, is_valid_package_name
+from pmcp.validation import (
+    env_var_allowed,
+    is_valid_package_name,
+    is_valid_package_version,
+)
 from pmcp.identity import filter_self_references
 from pmcp.manifest.code_patterns_loader import get_code_hint
 from pmcp.manifest.environment import CLIInfo, detect_platform, probe_clis
@@ -66,6 +71,7 @@ from pmcp.manifest.installer import (
     InstallError,
 )
 from pmcp.manifest.loader import load_manifest
+from pmcp.manifest.package_identity import PackageIdentity, resolve_package_identity
 from pmcp.manifest.matcher import (
     _keyword_match_score,
     _manifest_keyword_weights,
@@ -92,6 +98,7 @@ from pmcp.manifest.version_checker import (
     get_package_version,
 )
 from pmcp.policy.policy import PolicyManager
+from pmcp.provision_gate import ProvisionSource, evaluate_provision, operator_safe
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     build_remote_header_env_lookup,
@@ -181,6 +188,24 @@ from pmcp.manifest.loader import (
 logger = logging.getLogger(__name__)
 
 FEEDBACK_TOKEN_LIMIT = 4000
+
+#: Bound on one registration's registry lookup, end to end. The resolver's own
+#: 10 s is a per-socket-operation timeout, not a request bound, and it runs in a
+#: worker thread: this is what keeps a slow or hostile registry from holding a
+#: gateway tool call open indefinitely.
+_REGISTRATION_RESOLVE_TIMEOUT_SECONDS = 20.0
+
+#: What a provisioning refusal says before the gate's remedy, per reason.
+_PROVISION_REFUSAL_SUMMARY = {
+    "denied": "its package is denied by policy.",
+    "unresolvable_identity": "its package has no resolved identity.",
+    "unpinned_configured_argv": (
+        "its command is not pinned to the package version that was resolved."
+    ),
+    "not_approved": (
+        "its package has not been approved by an operator. To approve it, run:"
+    ),
+}
 
 
 def _refresh_config_unchanged(
@@ -1124,6 +1149,10 @@ class GatewayTools:
         self._detected_cli_infos: dict[str, CLIInfo] = {}
         self._platform: str | None = None
         self._discovered_server_configs: dict[str, ServerConfig] = {}
+        # The registry identity each discovered config was pinned to at
+        # registration. Written only alongside its config, and only by
+        # register_discovered_server; `provision` gates on it (#230).
+        self._discovered_server_identities: dict[str, PackageIdentity] = {}
         # provision_status finalization is one-shot per job: the per-job lock
         # serializes the server_ready→adopt handoff (and the complete→refresh)
         # so concurrent polls cannot double-adopt or re-refresh a finished job.
@@ -4278,9 +4307,15 @@ class GatewayTools:
         # Load manifest
         manifest = load_manifest()
         server_config = manifest.get_server(server_name)
+        # The gate's `source` is WHICH LOOKUP found the config -- never a field
+        # on it, since a discovered config is composed from agent input.
+        source: ProvisionSource = "manifest"
+        identity: PackageIdentity | None = None
 
         if not server_config:
             server_config = self._discovered_server_configs.get(server_name)
+            source = "discovered"
+            identity = self._discovered_server_identities.get(server_name)
 
         if not server_config:
             return ProvisionOutput(
@@ -4320,6 +4355,31 @@ class GatewayTools:
                     next_step=f"gateway.auth_connect(server_name='{server_name}')",
                     feedback_hint=self._feedback_hint(),
                 )
+
+        # Package identity gate (IF-0-PKGID-1): nothing below may connect or
+        # spawn for a config the gate refuses.
+        decision = evaluate_provision(
+            server_config, identity, source=source, policy=self._policy_manager
+        )
+        if not decision.allowed:
+            message = (
+                f"Refused to provision {operator_safe(server_name)}: "
+                f"{_PROVISION_REFUSAL_SUMMARY.get(decision.reason, 'the provisioning gate refused it.')} "
+                f"{decision.remedy}"
+            )
+            logger.warning(message)
+            self._record_feedback_event(
+                "provision_failure",
+                {"server": server_name, "reason": decision.reason},
+            )
+            return ProvisionOutput(
+                ok=False,
+                server=server_name,
+                status="failed",
+                message=message,
+                auth_state="policy_denied",
+                feedback_hint=self._feedback_hint(),
+            )
 
         # Remote manifest entries do not install packages; connect them directly.
         if server_config.url:
@@ -5532,7 +5592,62 @@ class GatewayTools:
                 ),
             )
 
-        install_command = ["npx", "-y", package]
+        # Resolve and pin (EC-PKGID-5). `resolve_package_identity` is synchronous
+        # network I/O, so it runs in a worker thread under a handler-level bound:
+        # called directly it would stall the whole gateway's event loop.
+        timed_out = False
+        resolved: PackageIdentity | None = None
+        try:
+            with anyio.fail_after(_REGISTRATION_RESOLVE_TIMEOUT_SECONDS):
+                resolved = await anyio.to_thread.run_sync(
+                    resolve_package_identity, package, abandon_on_cancel=True
+                )
+        except TimeoutError:
+            timed_out = True
+        except Exception as exc:  # resolution fails closed; see package_identity
+            logger.warning("Package identity lookup raised for %r: %s", package, exc)
+
+        if resolved is None:
+            reason = (
+                f"timed out after {_REGISTRATION_RESOLVE_TIMEOUT_SECONDS:g}s"
+                if timed_out
+                else "did not resolve to one exact version"
+            )
+            return RegisterDiscoveredServerOutput(
+                ok=False,
+                server_name=server_name,
+                registered=False,
+                message=(
+                    f"Refused to register {operator_safe(server_name)}: the npm "
+                    f"registry lookup for {operator_safe(package)} {reason}. "
+                    "Nothing was registered; check the package name and retry."
+                ),
+            )
+
+        # Registry data is semi-trusted and about to become argv: validate the
+        # resolved name and version before composing them.
+        if (
+            resolved.name != package
+            or not is_valid_package_name(resolved.name)
+            or not is_valid_package_version(resolved.resolved_version)
+        ):
+            return RegisterDiscoveredServerOutput(
+                ok=False,
+                server_name=server_name,
+                registered=False,
+                message=(
+                    f"Refused to register {operator_safe(server_name)}: the npm "
+                    f"registry returned an identity for {operator_safe(package)} "
+                    "that is not one exact, valid version of that package. "
+                    "Nothing was registered."
+                ),
+            )
+
+        spec = f"{resolved.name}@{resolved.resolved_version}"
+        # Pinned in BOTH argv: `install` is what start_install runs, `args` is
+        # what the client manager spawns on every later start. Pinning only one
+        # would approve this version and run `latest`.
+        install_command = ["npx", "-y", spec]
 
         requires_api_key = len(parsed.env_vars) > 0
         # Primary env var used for availability checks and auth_connect prompt
@@ -5547,7 +5662,7 @@ class GatewayTools:
                 "or export them before calling gateway.provision."
             )
 
-        self._discovered_server_configs[server_name] = ServerConfig(
+        server_config = ServerConfig(
             name=server_name,
             description=parsed.description or f"Discovered MCP package: {package}",
             keywords=["mcp", "discovered", server_name, package],
@@ -5558,7 +5673,7 @@ class GatewayTools:
                 "windows": list(install_command),
             },
             command="npx",
-            args=["-y", package],
+            args=["-y", spec],
             requires_api_key=requires_api_key,
             env_var=env_var,
             env_instructions=env_instructions,
@@ -5568,10 +5683,25 @@ class GatewayTools:
                 "registered_discovery_metadata_is_read_only_until_provisioned"
             ],
         )
+        self._discovered_server_configs[server_name] = server_config
+        self._discovered_server_identities[server_name] = resolved
 
         self._record_feedback_event(
             "server_registered",
-            {"server_name": server_name, "package": package},
+            {"server_name": server_name, "package": spec},
+        )
+
+        # Tell the agent now, not at provision time, if an operator must act.
+        preview = evaluate_provision(
+            server_config,
+            resolved,
+            source="discovered",
+            policy=self._policy_manager,
+        )
+        approval_note = (
+            ""
+            if preview.allowed
+            else f" Provisioning will be refused until an operator acts: {preview.remedy}"
         )
 
         return RegisterDiscoveredServerOutput(
@@ -5579,9 +5709,10 @@ class GatewayTools:
             server_name=server_name,
             registered=True,
             message=(
-                f"Registered '{server_name}' (package: {package}). "
-                f"gateway.provision will run: {' '.join(install_command)}. "
-                "Call gateway.provision to install and start it."
+                f"Registered {operator_safe(server_name)} (package: {spec}, "
+                "version resolved from the npm registry). "
+                f"gateway.provision will run: {' '.join(install_command)}."
+                f"{approval_note}"
             ),
             install_command=install_command,
             next_step=f"gateway.provision(server_name='{server_name}')",
