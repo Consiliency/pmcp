@@ -98,7 +98,12 @@ from pmcp.manifest.version_checker import (
     get_package_version,
 )
 from pmcp.policy.policy import PolicyManager
-from pmcp.provision_gate import ProvisionSource, evaluate_provision, operator_safe
+from pmcp.provision_gate import (
+    ProvisionDecision,
+    ProvisionSource,
+    evaluate_provision,
+    operator_safe,
+)
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     build_remote_header_env_lookup,
@@ -106,6 +111,7 @@ from pmcp.remote_auth import (
 )
 from pmcp.types import (
     ArgInfo,
+    AuthState,
     AuthConnectInput,
     AuthConnectOutput,
     AuthEventKind,
@@ -206,6 +212,25 @@ _PROVISION_REFUSAL_SUMMARY = {
         "its package has not been approved by an operator. To approve it, run:"
     ),
 }
+
+
+def _package_refusal(
+    verb: str, server_name: str, decision: ProvisionDecision
+) -> tuple[str, AuthState]:
+    """The message and auth_state for a package-identity gate refusal.
+
+    Shared by `provision` and the lifecycle resolver so the two doors refuse in
+    the same words. ``policy_denied`` is reserved for an actual policy denylist
+    match; every other refusal is a missing operator decision or an unusable
+    identity, not a policy verdict, so it reports ``unknown``.
+    """
+    summary = _PROVISION_REFUSAL_SUMMARY.get(
+        decision.reason, "the provisioning gate refused it."
+    )
+    message = (
+        f"Refused to {verb} {operator_safe(server_name)}: {summary} {decision.remedy}"
+    )
+    return message, ("policy_denied" if decision.reason == "denied" else "unknown")
 
 
 def _refresh_config_unchanged(
@@ -3408,8 +3433,13 @@ class GatewayTools:
 
         manifest = load_manifest()
         server_config = manifest.get_server(server_name)
+        # As in `provision`: the gate's source is which lookup matched.
+        source: ProvisionSource = "manifest"
+        identity: PackageIdentity | None = None
         if server_config is None:
             server_config = self._discovered_server_configs.get(server_name)
+            source = "discovered"
+            identity = self._discovered_server_identities.get(server_name)
 
         if server_config is not None:
             if not self._policy_manager.is_server_allowed(server_name):
@@ -3425,6 +3455,38 @@ class GatewayTools:
                         auth_state="policy_denied",
                     ),
                 )
+
+            # Package identity gate (IF-0-PKGID-1), the second door to it.
+            # connect and restart spawn the config's argv, and update_server
+            # resolves here before its probe spawns `npx <pkg>`, so without this
+            # a registered-but-unapproved package runs with no `provision` call
+            # at all. Before the credential check, so a refused package never
+            # prompts for auth. Not for disconnect: it spawns nothing, and
+            # refusing it would strand an unapproved server that is running.
+            if action != "disconnect":
+                decision = evaluate_provision(
+                    server_config,
+                    identity,
+                    source=source,
+                    policy=self._policy_manager,
+                )
+                if not decision.allowed:
+                    message, refusal_auth_state = _package_refusal(
+                        action, server_name, decision
+                    )
+                    logger.warning(message)
+                    return (
+                        None,
+                        self._lifecycle_output(
+                            ok=False,
+                            server=server_name,
+                            action=action,
+                            prior_status=prior_status,
+                            message=message,
+                            errors=[message],
+                            auth_state=refusal_auth_state,
+                        ),
+                    )
 
             if requires_credential(server_config) and server_config.env_var:
                 auth_env_options = self._auth_env_options(
@@ -4362,10 +4424,8 @@ class GatewayTools:
             server_config, identity, source=source, policy=self._policy_manager
         )
         if not decision.allowed:
-            message = (
-                f"Refused to provision {operator_safe(server_name)}: "
-                f"{_PROVISION_REFUSAL_SUMMARY.get(decision.reason, 'the provisioning gate refused it.')} "
-                f"{decision.remedy}"
+            message, refusal_auth_state = _package_refusal(
+                "provision", server_name, decision
             )
             logger.warning(message)
             self._record_feedback_event(
@@ -4377,7 +4437,7 @@ class GatewayTools:
                 server=server_name,
                 status="failed",
                 message=message,
-                auth_state="policy_denied",
+                auth_state=refusal_auth_state,
                 feedback_hint=self._feedback_hint(),
             )
 

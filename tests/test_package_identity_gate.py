@@ -123,6 +123,7 @@ def registry(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
 class _MinimalClientManager:
     def __init__(self) -> None:
         self.connected: list[Any] = []
+        self.disconnected: list[str] = []
 
     def get_all_tools(self) -> list[Any]:
         return []
@@ -150,6 +151,26 @@ class _MinimalClientManager:
 
     async def connect_all(self, configs: Any, retry: bool = True) -> list[str]:
         self.connected.extend(configs)
+        return []
+
+    # Lifecycle surface. Each records the configs it would have spawned.
+    async def connect_server(self, config: Any) -> list[str]:
+        self.connected.append(config)
+        return []
+
+    async def restart_server(
+        self, config: Any, force: bool = False
+    ) -> tuple[bool, int, list[str]]:
+        self.connected.append(config)
+        return (True, 0, [])
+
+    async def disconnect_server(
+        self, name: str, force: bool = False
+    ) -> tuple[bool, int, str | None]:
+        self.disconnected.append(name)
+        return (True, 0, None)
+
+    def get_active_tasks(self, name: str | None = None) -> list[Any]:
         return []
 
 
@@ -979,3 +1000,185 @@ async def test_a_hung_registry_lookup_is_bounded_by_the_handler(
     assert "hung-mcp" in out.message
     assert "hung" not in gateway._discovered_server_configs
     assert jobs.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The lifecycle door: connect / restart / update resolve discovered configs too
+# ---------------------------------------------------------------------------
+#
+# `provision` is not the only tool that spawns a registered server. connect_server
+# and restart_server spawn the resolved argv, and update_server resolves through
+# the same `_resolve_lifecycle_config` before its probe spawns `npx <pkg>`.
+# Without the gate there, S-01 survives the provision fix intact: register, then
+# connect. Each test below arranges the review's shape -- the server NAME
+# allowlisted -- and asserts both the refusal and that nothing was spawned.
+
+
+@pytest.fixture
+def spawns(monkeypatch: pytest.MonkeyPatch) -> list[tuple[Any, ...]]:
+    """Record (and refuse) every subprocess spawn attempted during a test."""
+    calls: list[tuple[Any, ...]] = []
+
+    async def refuse_spawn(*args: Any, **kwargs: Any) -> Any:
+        calls.append(args)
+        raise AssertionError(f"a subprocess was spawned: {args}")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", refuse_spawn)
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", refuse_spawn)
+    return calls
+
+
+async def _registered_unapproved(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registry: dict[str, str],
+    *,
+    env_vars: list[str] | None = None,
+) -> tuple[GatewayTools, _MinimalClientManager]:
+    policy = _write_policy(
+        tmp_path, "servers:\n  allowlist:\n    - internal-approved-tool\n"
+    )
+    registry[EVIL] = EVIL_VERSION
+    gateway, _ = _gateway(monkeypatch, policy)
+    registered = await gateway.register_discovered_server(
+        {
+            "server_name": "internal-approved-tool",
+            "package": EVIL,
+            "env_vars": env_vars or [],
+        }
+    )
+    assert registered.registered is True
+    return gateway, cast(_MinimalClientManager, gateway._client_manager)
+
+
+@pytest.mark.asyncio
+async def test_connect_server_does_not_spawn_an_unapproved_discovered_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registry: dict[str, str],
+    spawns: list[tuple[Any, ...]],
+) -> None:
+    # A declared credential that is NOT set: the refusal must come from the
+    # package gate, before the credential check could prompt for auth.
+    monkeypatch.delenv("EVIL_TOKEN", raising=False)
+    gateway, manager = await _registered_unapproved(
+        tmp_path, monkeypatch, registry, env_vars=["EVIL_TOKEN"]
+    )
+
+    result = await gateway.connect_server({"server_name": "internal-approved-tool"})
+
+    assert result.ok is False
+    assert manager.connected == []
+    assert spawns == []
+    assert f"pmcp trust approve-package {EVIL}@{EVIL_VERSION}" in result.message
+    assert result.errors == [result.message]
+    assert result.auth_state == "unknown"  # not a policy verdict, not missing auth
+    assert result.missing_env_vars == []
+
+
+@pytest.mark.asyncio
+async def test_restart_server_does_not_spawn_an_unapproved_discovered_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registry: dict[str, str],
+    spawns: list[tuple[Any, ...]],
+) -> None:
+    gateway, manager = await _registered_unapproved(tmp_path, monkeypatch, registry)
+
+    result = await gateway.restart_server({"server_name": "internal-approved-tool"})
+
+    assert result.ok is False
+    assert manager.connected == []
+    assert spawns == []
+    assert EVIL in result.message
+    assert "pmcp trust approve-package" in result.message
+
+
+@pytest.mark.asyncio
+async def test_update_server_does_not_probe_an_unapproved_discovered_package(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registry: dict[str, str],
+    spawns: list[tuple[Any, ...]],
+) -> None:
+    gateway, manager = await _registered_unapproved(tmp_path, monkeypatch, registry)
+    probes: list[list[str]] = []
+
+    async def recording_probe(command: list[str], env: Any = None) -> tuple[bool, str]:
+        probes.append(command)
+        return (True, "")
+
+    monkeypatch.setattr(gateway, "_run_update_probe_command", recording_probe)
+
+    result = await gateway.update_server({"server_name": "internal-approved-tool"})
+
+    assert result.ok is False
+    assert result.restarted is False
+    assert probes == []
+    assert manager.connected == []
+    assert spawns == []
+    assert f"pmcp trust approve-package {EVIL}@{EVIL_VERSION}" in result.message
+
+
+@pytest.mark.asyncio
+async def test_an_approved_pinned_discovered_server_still_connects(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registry: dict[str, str],
+    spawns: list[tuple[Any, ...]],
+) -> None:
+    gateway, manager = await _registered_unapproved(tmp_path, monkeypatch, registry)
+    approve_package(_identity(EVIL, EVIL_VERSION))
+
+    result = await gateway.connect_server({"server_name": "internal-approved-tool"})
+
+    assert result.ok is True, result.message
+    assert len(manager.connected) == 1
+    spawned = manager.connected[0].config
+    assert spawned.command == "npx"
+    assert spawned.args == ["-y", f"{EVIL}@{EVIL_VERSION}"]
+
+
+@pytest.mark.asyncio
+async def test_the_lifecycle_gate_keeps_existing_denials_and_spares_disconnect(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    registry: dict[str, str],
+    spawns: list[tuple[Any, ...]],
+) -> None:
+    # A package denylist refusal is a policy verdict, and says so.
+    policy = _write_policy(tmp_path, f"packages:\n  denylist:\n    - {EVIL}\n")
+    registry[EVIL] = EVIL_VERSION
+    gateway, _ = _gateway(monkeypatch, policy)
+    await gateway.register_discovered_server({"server_name": "d", "package": EVIL})
+    denied = await gateway.connect_server({"server_name": "d"})
+    assert denied.ok is False
+    assert denied.auth_state == "policy_denied"
+    assert "denylist" in denied.message
+
+    # A server-name denial is still reported exactly as before the gate existed.
+    (tmp_path / "names").mkdir()
+    name_policy = _write_policy(
+        tmp_path / "names", "servers:\n  denylist:\n    - blocked\n"
+    )
+    gateway2, _ = _gateway(monkeypatch, name_policy)
+    manager2 = cast(_MinimalClientManager, gateway2._client_manager)
+    await gateway2.register_discovered_server(
+        {"server_name": "blocked", "package": EVIL}
+    )
+    blocked = await gateway2.connect_server({"server_name": "blocked"})
+    assert blocked.message == "Server 'blocked' is blocked by policy."
+    assert blocked.auth_state == "policy_denied"
+    assert manager2.connected == []
+
+    # Disconnect spawns nothing, so the gate does not stand in its way: an
+    # unapproved server that is somehow running can always be stopped.
+    gateway3, manager3 = await _registered_unapproved(
+        tmp_path / "names", monkeypatch, registry
+    )
+    stopped = await gateway3.disconnect_server(
+        {"server_name": "internal-approved-tool"}
+    )
+    assert stopped.ok is True, stopped.message
+    assert manager3.disconnected == ["internal-approved-tool"]
+    assert spawns == []
