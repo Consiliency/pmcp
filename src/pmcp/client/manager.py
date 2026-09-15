@@ -7,7 +7,7 @@ from contextlib import AsyncExitStack
 import json
 import logging
 import os
-from pathlib import Path, PurePath
+from pathlib import Path
 import random
 import re
 import signal
@@ -35,6 +35,7 @@ from pmcp.remote_auth import (
     resolve_remote_headers_for_tenant,
 )
 from pmcp.subscriptions import CatalogEventSink
+from pmcp.validation import normalized_executable_name
 from pmcp.types import (
     LocalMcpServerConfig,
     McpTaskInfo,
@@ -66,10 +67,10 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-#: Executables that fetch and run the package they are given at spawn time.
-_PACKAGE_RUNNER_EXECUTABLES = frozenset(
-    {"npx", "npx.cmd", "npx.exe", "uvx", "pnpx", "bunx"}
-)
+#: Executables that fetch and run the package they are given at spawn time,
+#: by NORMALIZED name (`normalized_executable_name`), so ``UVX.EXE``,
+#: ``pnpx.cmd`` and ``C:\\tools\\npx.cmd`` are runners without being listed.
+_PACKAGE_RUNNER_EXECUTABLES = frozenset({"npx", "uvx", "pnpx", "bunx"})
 
 # --- exception-group flattening ------------------------------------------------
 
@@ -2348,7 +2349,10 @@ class ClientManager:
         # still leaves the record. Any other executable is a local binary: it
         # installs nothing, and warning on every start would bury the ones
         # that do.
-        if PurePath(local_config.command).name in _PACKAGE_RUNNER_EXECUTABLES:
+        if (
+            normalized_executable_name(local_config.command)
+            in _PACKAGE_RUNNER_EXECUTABLES
+        ):
             logger.warning(
                 f"Spawning {_operator_safe(name)}: "
                 f"{_render_install_argv([local_config.command, *local_config.args])}"

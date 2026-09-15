@@ -73,7 +73,23 @@ def _stdio(command: str, args: list[str]) -> ResolvedServerConfig:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "command",
-    ["npx", "npx.cmd", "npx.exe", "/usr/local/bin/npx", "uvx", "pnpx", "bunx"],
+    [
+        "npx",
+        "npx.cmd",
+        "npx.exe",
+        "/usr/local/bin/npx",
+        "uvx",
+        "pnpx",
+        "bunx",
+        # Windows spellings: one .exe/.cmd/.bat suffix, any case, either
+        # path separator.
+        "uvx.exe",
+        "UVX.EXE",
+        "pnpx.cmd",
+        "bunx.exe",
+        "npx.bat",
+        "C:\\tools\\npx.cmd",
+    ],
 )
 async def test_the_stdio_spawn_of_a_package_runner_logs_its_argv_before_spawning(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, command: str
@@ -81,24 +97,34 @@ async def test_the_stdio_spawn_of_a_package_runner_logs_its_argv_before_spawning
     seen: list[list[logging.LogRecord]] = []
     _refusing_spawn(monkeypatch, caplog, MANAGER_LOGGER, seen)
     manager = ClientManager()
+    argv = ["-y", "@scope/pkg@1.2.3", f"--token={SECRET}"]
 
     with caplog.at_level(logging.WARNING, logger=MANAGER_LOGGER):
         with pytest.raises(_SpawnRefused):
-            await manager._connect_stdio(
-                _stdio(command, ["-y", "@scope/pkg@1.2.3", f"--token={SECRET}"])
-            )
+            await manager._connect_stdio(_stdio(command, argv))
 
     assert len(seen) == 1, "the spawn was not reached"
     messages = [r.getMessage() for r in seen[0]]
     assert len(messages) == 1, messages
     assert "spawn-logging" in messages[0]
-    assert f"{command} -y @scope/pkg@1.2.3 <redacted>" in messages[0]
+    rendered = _render_install_argv([command, *argv])
+    assert rendered.endswith(" -y @scope/pkg@1.2.3 <redacted>")
+    assert messages[0].endswith(rendered)
     assert SECRET not in caplog.text
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "command", ["/opt/servers/local-mcp", "python3", "node", "npx-helper"]
+    "command",
+    [
+        "/opt/servers/local-mcp",
+        "python3",
+        "node",
+        "npx-helper",
+        "npx-helper.exe",
+        "node.exe",
+        "npx.cmd.exe",
+    ],
 )
 async def test_the_stdio_spawn_of_a_local_binary_emits_no_warning(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, command: str

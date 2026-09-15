@@ -421,6 +421,19 @@ class PolicyManager:
             return "unspecified"
         return self.evaluate_package_name_policy(identity.name)
 
+    def has_package_denylist(self) -> bool:
+        """Does either policy carry a non-empty ``packages.denylist``?
+
+        The provisioning gate asks this when a manifest entry's packages cannot
+        be read: with a denylist in force that entry cannot be checked against
+        it, and is refused; with none, nothing is lost by not reading it.
+        """
+        if self._policy.packages.denylist:
+            return True
+        return bool(
+            self._project_policy is not None and self._project_policy.packages.denylist
+        )
+
     def evaluate_package_name_policy(self, name: str) -> PackageVerdict:
         """The composed policy verdict for a package NAME, with no identity.
 

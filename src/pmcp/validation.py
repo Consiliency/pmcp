@@ -7,6 +7,7 @@ Kept dependency-free (stdlib only) so it can be imported from
 from __future__ import annotations
 
 import re
+from pathlib import PureWindowsPath
 
 # npm allows an optional ``@scope/`` prefix. Both the scope and the name must
 # start with a URL-safe character and contain only letters, digits, and
@@ -92,6 +93,25 @@ def is_valid_package_version(version: str) -> bool:
     if not version or len(version) > _MAX_PACKAGE_VERSION_LENGTH:
         return False
     return _PACKAGE_VERSION_RE.fullmatch(version) is not None
+
+
+_WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat")
+
+
+def normalized_executable_name(executable: str) -> str:
+    """The name an executable is known by, whatever platform spelled it.
+
+    The last path component under EITHER separator (``PureWindowsPath`` splits
+    on ``/`` and ``\\``, so ``C:\\tools\\npx.cmd`` and ``/usr/bin/npx`` both
+    work on any host), lower-cased because Windows file names are
+    case-insensitive, with ONE trailing ``.exe``/``.cmd``/``.bat`` removed:
+    ``npx.cmd.exe`` is ``npx.cmd``, not ``npx``.
+    """
+    name = PureWindowsPath(executable).name.lower()
+    for suffix in _WINDOWS_EXECUTABLE_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
 
 
 # Environment variables that change how a subsequently spawned subprocess loads

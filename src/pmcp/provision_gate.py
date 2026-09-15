@@ -44,6 +44,7 @@ from pmcp.package_approvals import is_package_approved
 from pmcp.validation import (
     is_valid_package_name,
     is_valid_package_version,
+    normalized_executable_name,
     parse_package_spec,
 )
 
@@ -79,6 +80,10 @@ APPROVE_PACKAGE_COMMAND = "pmcp trust approve-package"
 #: carries anything else before the package slot is not pinned to the identity.
 _NPX_LEADING_FLAGS = frozenset({"-y", "--yes", "-q", "--quiet"})
 _NPX_EXECUTABLES = frozenset({"npx", "npx.cmd", "npx.exe"})
+#: npx's package selectors. Each installs the package it names before anything
+#: runs, and may be repeated; ``--package=X`` is the joined spelling.
+_NPX_PACKAGE_OPTIONS = frozenset({"-p", "--package"})
+_NPX_PACKAGE_OPTION_PREFIX = "--package="
 
 
 @dataclass(frozen=True)
@@ -179,6 +184,57 @@ def _config_runs_exactly(server_config: ServerConfig, spec: str) -> bool:
     return True
 
 
+def _is_npx_named(executable: str) -> bool:
+    """Is *executable* npx under any platform spelling (``NPX.CMD``, ``npx.bat``)?
+
+    For READING a trusted manifest entry's packages only, where recognising
+    more spellings can only add names a denylist may match. The pin check keeps
+    the strict `_is_npx`: there a wider match would accept argv as pinned.
+    """
+    return normalized_executable_name(executable) == "npx"
+
+
+def _npx_selected_specs(args: list[str]) -> tuple[list[str], str | None]:
+    """Every package spec an `npx` argument list selects, and what stopped it.
+
+    Read left to right until the positional slot: the allowlisted leading flags
+    are skipped; ``-p X``, ``--package X`` and ``--package=X`` each select X,
+    any number of times; ``--`` ends the options, and the argument after it is
+    the slot. The slot is taken by POSITION, as `_package_slot` takes it, and
+    everything after it belongs to the server.
+
+    The second value is the first argument that could not be placed, or
+    ``None``: any other option (``--registry X``, ``-c``, ``--call=...``) --
+    pmcp does not know whether it swallows the next argument, so nothing after
+    it can be read -- a selector with no value, or one whose value begins with
+    ``-``. What was selected before it is still returned.
+    """
+    specs: list[str] = []
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in _NPX_LEADING_FLAGS:
+            index += 1
+        elif arg in _NPX_PACKAGE_OPTIONS:
+            if index + 1 >= len(args) or args[index + 1].startswith("-"):
+                return specs, arg
+            specs.append(args[index + 1])
+            index += 2
+        elif arg.startswith(_NPX_PACKAGE_OPTION_PREFIX):
+            specs.append(arg[len(_NPX_PACKAGE_OPTION_PREFIX) :])
+            index += 1
+        elif arg == "--":
+            if index + 1 < len(args):
+                specs.append(args[index + 1])
+            return specs, None
+        elif arg.startswith("-"):
+            return specs, arg
+        else:
+            specs.append(arg)
+            return specs, None
+    return specs, None
+
+
 def _spec_name(spec: str) -> str | None:
     try:
         name, _version = parse_package_spec(spec)
@@ -187,53 +243,73 @@ def _spec_name(spec: str) -> str | None:
     return name
 
 
-def _manifest_package_names(server_config: ServerConfig) -> list[str]:
-    """The npm package names a manifest config names, in order, once each.
+def _manifest_package_names(
+    server_config: ServerConfig,
+) -> tuple[list[str], str | None]:
+    """The npm package names a manifest config names, and what hid the rest.
 
-    Read from three places: the ``package`` field; the package slot of
-    ``args`` when the command is npx; and the package slot of every platform
-    ``install`` argv whose executable is npx. The slot is found by POSITION, as
-    `_runs_exactly` finds it -- never by what an argument looks like, so an
-    argument the server receives after its package is not mistaken for one. A
-    slot that is not a valid package spec names nothing. Only a manifest
-    config is read this way: its fields are shipped, not agent-composed.
+    Names, in order and once each, from: the ``package`` field; and, for
+    ``args`` when the command is npx and for every platform ``install`` argv
+    whose executable is npx, every spec `_npx_selected_specs` reads -- the
+    package selectors and the positional slot. Only a manifest config is read
+    this way: its fields are shipped, not agent-composed.
+
+    The second value is the first npx argument that stopped the reading, or
+    that selected something that is not a valid package spec (``github:x/y``,
+    ``./dir``) -- in either case npx may fetch a package no name here stands
+    for. ``None`` when every selected package was named. The ``package`` field
+    is metadata rather than argv, so an unparseable one names nothing and hides
+    nothing.
     """
     specs: list[str] = []
-    if server_config.package:
-        specs.append(server_config.package)
-    if _is_npx(server_config.command):
-        slot = _package_slot(list(server_config.args))
-        if slot is not None:
-            specs.append(slot)
+    undetermined: str | None = None
+
+    def read(npx_args: list[str]) -> None:
+        nonlocal undetermined
+        selected, stopped_at = _npx_selected_specs(npx_args)
+        for spec in selected:
+            if _spec_name(spec) is None and undetermined is None:
+                undetermined = spec
+        specs.extend(selected)
+        if stopped_at is not None and undetermined is None:
+            undetermined = stopped_at
+
+    if _is_npx_named(server_config.command):
+        read(list(server_config.args))
     for argv in server_config.install.values():
-        if argv and _is_npx(argv[0]):
-            slot = _package_slot(list(argv[1:]))
-            if slot is not None:
-                specs.append(slot)
+        if argv and _is_npx_named(argv[0]):
+            read(list(argv[1:]))
+
     names: list[str] = []
-    for spec in specs:
+    for spec in ([server_config.package] if server_config.package else []) + specs:
         name = _spec_name(spec)
         if name is not None and name not in names:
             names.append(name)
-    return names
+    return names, undetermined
 
 
-def _denied_manifest_package(
-    server_config: ServerConfig, policy: PolicyManager
-) -> str | None:
-    """The first package name of a manifest config that policy denies, if any.
+def _manifest_denial(server_config: ServerConfig, policy: PolicyManager) -> str | None:
+    """The remedy for refusing a manifest config under rule 1, or ``None``.
 
-    A policy object without the name-level predicate answers ``"unspecified"``
-    for every name, which is exactly what it answered before names were read:
-    `PolicyManager` always has it, and a predicate that is present and raises
-    still fails closed through rule 8.
+    Refused when policy denies any package name the config names, or -- only
+    when a ``packages.denylist`` is in force -- when some package npx would
+    fetch could not be named, since that one cannot be checked against it.
+    Without a denylist an unreadable entry loses nothing, and is left alone.
+
+    A policy object without the name-level predicates answers as it did before
+    names were read: every name ``"unspecified"``, no denylist. `PolicyManager`
+    always has both, and a predicate that is present and raises still fails
+    closed through rule 8.
     """
+    names, undetermined = _manifest_package_names(server_config)
     evaluate_name = getattr(policy, "evaluate_package_name_policy", None)
-    if evaluate_name is None:
-        return None
-    for name in _manifest_package_names(server_config):
-        if evaluate_name(name) == "denied":
-            return name
+    if evaluate_name is not None:
+        for name in names:
+            if evaluate_name(name) == "denied":
+                return _denied_remedy(name)
+    has_denylist = getattr(policy, "has_package_denylist", None)
+    if undetermined is not None and has_denylist is not None and has_denylist():
+        return _undetermined_remedy(undetermined)
     return None
 
 
@@ -261,6 +337,19 @@ def _denied_remedy(name: str) -> str:
         "remove it from the denylist in the operator's policy file "
         "(~/.claude/gateway-policy.yaml, or an approved project "
         ".mcp-gateway-policy.yaml)."
+    )
+
+
+def _undetermined_remedy(argument: str) -> str:
+    # No name, so nothing to take off a denylist; say what hid it instead.
+    return (
+        "The packages this manifest entry's npx command would fetch could not be "
+        f"determined: pmcp cannot place the argument {operator_safe(argument)}. "
+        "A packages.denylist is in force in the gateway policy, and it cannot be "
+        "checked against a package that cannot be named. To start this server, "
+        "remove that argument from the entry, or remove the packages.denylist "
+        "from the operator's policy file (~/.claude/gateway-policy.yaml, or an "
+        "approved project .mcp-gateway-policy.yaml)."
     )
 
 
@@ -302,9 +391,9 @@ def _evaluate(
     # manifest package provisioned through rule 2. The names come from the
     # trusted config and need no registry lookup.
     if source == "manifest":
-        denied_name = _denied_manifest_package(server_config, policy)
-        if denied_name is not None:
-            return _deny("denied", _denied_remedy(denied_name), identity)
+        manifest_remedy = _manifest_denial(server_config, policy)
+        if manifest_remedy is not None:
+            return _deny("denied", manifest_remedy, identity)
 
     # (2) Only a manifest LOOKUP exempts; nothing on the config can claim it.
     if source == "manifest":
