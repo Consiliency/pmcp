@@ -376,9 +376,7 @@ class PolicyManager:
             return True
         return self._section_allows(self._project_policy.servers, server_name)
 
-    def _package_verdict(
-        self, section: PackagePolicy, identity: PackageIdentity
-    ) -> PackageVerdict:
+    def _package_verdict(self, section: PackagePolicy, name: str) -> PackageVerdict:
         """Evaluate ONE policy's package lists. Deliberately not `_section_allows`.
 
         `_section_allows` answers `True` when nothing matches; here nothing
@@ -390,9 +388,9 @@ class PolicyManager:
         well would let a package author satisfy an allowlist through the
         version they publish (`evil@1.0.0-mcp` against `*-mcp`).
         """
-        if section.denylist and self._matches_any(identity.name, section.denylist):
+        if section.denylist and self._matches_any(name, section.denylist):
             return "denied"
-        if section.allowlist and self._matches_any(identity.name, section.allowlist):
+        if section.allowlist and self._matches_any(name, section.allowlist):
             return "allowed"
         return "unspecified"
 
@@ -421,10 +419,21 @@ class PolicyManager:
         """
         if identity is None:
             return "unspecified"
-        user = self._package_verdict(self._policy.packages, identity)
+        return self.evaluate_package_name_policy(identity.name)
+
+    def evaluate_package_name_policy(self, name: str) -> PackageVerdict:
+        """The composed policy verdict for a package NAME, with no identity.
+
+        For the package names a trusted manifest config spells out, where there
+        is no resolved version to build a `PackageIdentity` from -- and none is
+        needed, since globs match the name alone. `evaluate_package_policy`
+        delegates here, so the two cannot drift: the same lists, the same
+        denied-wins composition described there.
+        """
+        user = self._package_verdict(self._policy.packages, name)
         if self._project_policy is None:
             return user
-        project = self._package_verdict(self._project_policy.packages, identity)
+        project = self._package_verdict(self._project_policy.packages, name)
         if user == "denied" or project == "denied":
             return "denied"
         return user

@@ -8,7 +8,9 @@ resolved identity instead, and on nothing the agent can relabel.
 
 **The decision order is frozen**, and every step fails closed:
 
-1. the composed package policy says ``"denied"`` -> deny (``denied``);
+1. the composed package policy says ``"denied"`` -> deny (``denied``) -- for
+   the resolved identity, or, for a manifest lookup (which has none), for any
+   package name the trusted manifest config names;
 2. the config came from the shipped manifest -> allow (``manifest_backed``);
 3. no usable identity -> deny (``unresolvable_identity``);
 4. the argv does not run exactly ``name@resolved_version`` -> deny
@@ -39,7 +41,11 @@ from pathlib import PurePath
 from typing import TYPE_CHECKING, Literal
 
 from pmcp.package_approvals import is_package_approved
-from pmcp.validation import is_valid_package_name, is_valid_package_version
+from pmcp.validation import (
+    is_valid_package_name,
+    is_valid_package_version,
+    parse_package_spec,
+)
 
 if TYPE_CHECKING:
     # Annotation only, as in `pmcp.policy.policy`: the manifest package's
@@ -122,6 +128,19 @@ def _identity_is_argv_safe(identity: PackageIdentity) -> bool:
     )
 
 
+def _package_slot(args: list[str]) -> str | None:
+    """The package slot of an `npx` argument list, or ``None`` if it has none.
+
+    Structural: the first argument that is not an allowlisted leading flag.
+    Anything after it belongs to the server, whatever it looks like.
+    """
+    for arg in args:
+        if arg in _NPX_LEADING_FLAGS:
+            continue
+        return arg
+    return None
+
+
 def _runs_exactly(args: list[str], spec: str) -> bool:
     """Is *spec* the package slot of an `npx` argument list?
 
@@ -131,11 +150,8 @@ def _runs_exactly(args: list[str], spec: str) -> bool:
     ``["-p", "evil", "-y", "pkg@1.2.3"]`` installs ``evil`` first; neither is
     pinned to ``pkg@1.2.3``.
     """
-    for arg in args:
-        if arg in _NPX_LEADING_FLAGS:
-            continue
-        return arg == spec
-    return False
+    slot = _package_slot(args)
+    return slot is not None and slot == spec
 
 
 def _is_npx(executable: str) -> bool:
@@ -163,6 +179,64 @@ def _config_runs_exactly(server_config: ServerConfig, spec: str) -> bool:
     return True
 
 
+def _spec_name(spec: str) -> str | None:
+    try:
+        name, _version = parse_package_spec(spec)
+    except ValueError:
+        return None
+    return name
+
+
+def _manifest_package_names(server_config: ServerConfig) -> list[str]:
+    """The npm package names a manifest config names, in order, once each.
+
+    Read from three places: the ``package`` field; the package slot of
+    ``args`` when the command is npx; and the package slot of every platform
+    ``install`` argv whose executable is npx. The slot is found by POSITION, as
+    `_runs_exactly` finds it -- never by what an argument looks like, so an
+    argument the server receives after its package is not mistaken for one. A
+    slot that is not a valid package spec names nothing. Only a manifest
+    config is read this way: its fields are shipped, not agent-composed.
+    """
+    specs: list[str] = []
+    if server_config.package:
+        specs.append(server_config.package)
+    if _is_npx(server_config.command):
+        slot = _package_slot(list(server_config.args))
+        if slot is not None:
+            specs.append(slot)
+    for argv in server_config.install.values():
+        if argv and _is_npx(argv[0]):
+            slot = _package_slot(list(argv[1:]))
+            if slot is not None:
+                specs.append(slot)
+    names: list[str] = []
+    for spec in specs:
+        name = _spec_name(spec)
+        if name is not None and name not in names:
+            names.append(name)
+    return names
+
+
+def _denied_manifest_package(
+    server_config: ServerConfig, policy: PolicyManager
+) -> str | None:
+    """The first package name of a manifest config that policy denies, if any.
+
+    A policy object without the name-level predicate answers ``"unspecified"``
+    for every name, which is exactly what it answered before names were read:
+    `PolicyManager` always has it, and a predicate that is present and raises
+    still fails closed through rule 8.
+    """
+    evaluate_name = getattr(policy, "evaluate_package_name_policy", None)
+    if evaluate_name is None:
+        return None
+    for name in _manifest_package_names(server_config):
+        if evaluate_name(name) == "denied":
+            return name
+    return None
+
+
 def _deny(
     reason: str, remedy: str, identity: PackageIdentity | None
 ) -> ProvisionDecision:
@@ -177,11 +251,12 @@ def _allow(reason: str, identity: PackageIdentity | None) -> ProvisionDecision:
     )
 
 
-def _denied_remedy(identity: PackageIdentity) -> str:
+def _denied_remedy(name: str) -> str:
     # Rule 1 outranks every approval, so offering `approve-package` here would
-    # advertise a command that cannot work.
+    # advertise a command that cannot work. Takes a NAME: a manifest denial has
+    # no identity.
     return (
-        f"Package {operator_safe(identity.name)} is on a packages.denylist in the "
+        f"Package {operator_safe(name)} is on a packages.denylist in the "
         "gateway policy, which overrides any recorded approval. To allow it, "
         "remove it from the denylist in the operator's policy file "
         "(~/.claude/gateway-policy.yaml, or an approved project "
@@ -222,7 +297,14 @@ def _evaluate(
 
     # (1) Deny always wins -- over the manifest exemption and any approval.
     if identity is not None and verdict == "denied":
-        return _deny("denied", _denied_remedy(identity), identity)
+        return _deny("denied", _denied_remedy(identity.name), identity)
+    # A manifest lookup carries no identity, so without this a denylisted
+    # manifest package provisioned through rule 2. The names come from the
+    # trusted config and need no registry lookup.
+    if source == "manifest":
+        denied_name = _denied_manifest_package(server_config, policy)
+        if denied_name is not None:
+            return _deny("denied", _denied_remedy(denied_name), identity)
 
     # (2) Only a manifest LOOKUP exempts; nothing on the config can claim it.
     if source == "manifest":
