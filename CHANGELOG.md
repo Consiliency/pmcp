@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`pmcp trust approve-package|list-packages|revoke-package`, and a `packages:`
+  section in the gateway policy.** These are the two ways an operator opts a
+  discovered package in (see *Security* below). `pmcp trust approve-package
+  <name>@<version>` records an approval for that one package at that one exact
+  version in `~/.config/pmcp/package_approvals.json`, beside the trust store and
+  under the same rules: it must live outside the checkout, it is written mode
+  `0o600`, and any read failure refuses rather than grants. The version must be
+  one exact SemVer version, the one a refusal message prints; a range or a
+  dist-tag such as `latest` is refused, because it names whatever is published
+  next. Approving is offline and consults no registry. `pmcp trust
+  list-packages` prints every record (decision, time, `registry:name@version`,
+  integrity), and `pmcp trust revoke-package <name>` drops every version's
+  approval while `pmcp trust revoke-package <name>@<version>` drops just that
+  one; it exits non-zero if there was nothing to drop. **A version bump is a new
+  package** and needs its own approval.
+  The policy's new `packages:` section takes `allowlist` and `denylist` globs,
+  and they match the package **name only**, never `name@version`, so a package
+  author cannot satisfy `*-mcp` by publishing version `1.0.0-mcp`. A
+  version-bearing entry such as `evil-pkg@1.2.3` would therefore match nothing,
+  so instead of being accepted it makes the policy schema-invalid when it
+  loads, with the same consequence as any other invalid policy file. A
+  `packages.allowlist` match lets a discovered package provision without a
+  recorded approval. A `packages.denylist` match refuses it even when an
+  approval is recorded. A project `.mcp-gateway-policy.yaml` can add a denial
+  but its allowlist never grants on its own. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **`pmcp trust approve|list|revoke`, and a user-scoped trust store at
   `~/.config/pmcp/trust.json`.** The store records one decision per absolute
   path — the file's SHA-256, the scope, the decision and when it was taken —
@@ -43,6 +69,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
+- **A discovered server no longer runs an agent-chosen package without an
+  operator's approval, and its registration is pinned to one resolved version.**
+  Before this release, `gateway.register_discovered_server` stored whatever
+  `package` the agent named, unpinned, and policy checked only the *server
+  name*. Allowlisting `internal-approved-tool` therefore let an agent register
+  that name with `package="totally-arbitrary-evil-package"` and have
+  `gateway.provision` run `npx -y totally-arbitrary-evil-package` (S-01).
+  Registration now looks the package up in the npm registry first, in a worker
+  thread under a 20-second bound, and writes the resolved `name@version` into
+  **both** the install command and the server's `args`, so every later start
+  runs the version that was resolved rather than re-resolving `latest`. A
+  package that does not resolve to exactly one valid version, or whose lookup
+  times out, is refused at registration and nothing is stored.
+  **Discovered servers are now default-deny.** `gateway.provision`,
+  `gateway.connect_server`, `gateway.restart_server` and `gateway.update_server`
+  refuse a discovered server until its exact `name@version` is approved with
+  `pmcp trust approve-package <name>@<version>` or matched by a
+  `packages.allowlist` entry in the operator's policy. A `packages.denylist`
+  match beats both. The refusal names the package and prints the runnable
+  approval command, and the registration response warns up front when
+  provisioning will be refused. The three lifecycle tools are gated as well as
+  `provision` because `npx -y` fetches and runs the package when it spawns, so
+  without the gate `register` followed by `connect_server` would run the package
+  without `provision` ever being called. `gateway.disconnect_server` is not
+  gated, so an already running server can still be stopped.
+  A refusal reports `auth_state="policy_denied"` only when a
+  `packages.denylist` entry matched. Every other refusal from this gate (not
+  approved, unresolvable identity, or argv not pinned to the approved version)
+  reports `auth_state="unknown"`, because no policy denied it.
+  **Manifest-backed servers and `.mcp.json` servers are unchanged**, and
+  provision, connect, restart and update them exactly as before with no
+  approval. There is nothing to migrate: discovered registrations are held in
+  memory only and never survived a gateway restart, so the first provision of a
+  discovered server after upgrading is refused with the command that approves
+  it. Found by the 2026-09-01 codebase review (S-01); see
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **A repository's own configuration files no longer configure PMCP until you
   approve them, and an approved project policy can only *narrow* the operator's
   policy.** The behaviour an existing operator will feel first is the policy one.
@@ -164,6 +226,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Changed
+- **Every install spawn now logs the command it runs, at WARNING, before it
+  runs.** `start_install`, the legacy `install_server` and `verify_installation`
+  each log a rendered command line immediately before the subprocess is
+  created, and still log it if the spawn then fails (for example
+  `FileNotFoundError`). Previously `start_install` logged
+  `<args redacted>` at INFO, which hid exactly which package ran, and
+  `install_server` logged the full argv verbatim at INFO, including any
+  credential it carried.
+  The rendering is secret-safe by construction rather than by guessing what a
+  secret looks like. It shows the executable, the flag literals `-y`, `--yes` and
+  `--quiet` wherever they appear, `--registry` by name (never its value, which
+  can carry `user:password@`), and the package argument only when it is a pinned
+  `name@version`. Every other argument is `<redacted>`. The package argument is
+  found by its position, not by its shape, because a bare token is
+  indistinguishable from a package name. **Expect `<redacted>` in the package
+  position for manifest installs**: the shipped manifest's install commands are
+  not pinned to exact versions (for example `@playwright/mcp@latest`), so only
+  a pinned discovered server's install shows its package. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **Every GitHub Action is pinned to a commit SHA.** All 30 remote `uses:`
   references — 29 across the five workflows and the one inside the local
   composite action `.github/actions/pipeline-bootstrap-setup` — now read
