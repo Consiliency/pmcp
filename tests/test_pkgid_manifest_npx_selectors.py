@@ -362,6 +362,11 @@ def test_no_shipped_manifest_entry_is_undetermined(tmp_path: Path) -> None:
         ("", ""),
         ("/", ""),
         ("//\\//", ""),
+        # A drive-relative Windows path: the drive is not part of the name.
+        ("C:npx.cmd", "npx"),
+        ("c:NPX", "npx"),
+        ("D:uvx.exe", "uvx"),
+        ("C:", ""),
     ],
 )
 def test_executable_names_are_normalized(executable: str, expected: str) -> None:
@@ -379,6 +384,7 @@ def test_executable_names_are_normalized(executable: str, expected: str) -> None
         "///usr//bin//npx",
         "\\\\srv\\share\\npx.exe",
         "C:/tools/npx.CMD",
+        "C:npx.cmd",
     ],
 )
 @pytest.mark.parametrize("site", ["args", "install"])

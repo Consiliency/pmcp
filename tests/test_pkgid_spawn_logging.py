@@ -94,6 +94,8 @@ def _stdio(command: str, args: list[str]) -> ResolvedServerConfig:
         "///usr//bin//uvx",
         "\\\\srv\\share\\npx.exe",
         "C:/tools/npx.CMD",
+        "C:npx.cmd",
+        "D:uvx.exe",
     ],
 )
 async def test_the_stdio_spawn_of_a_package_runner_logs_its_argv_before_spawning(

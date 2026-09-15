@@ -257,9 +257,11 @@ def _manifest_package_names(
 
     Names, in order and once each, from: the ``package`` field; and, for
     ``args`` when the command is npx and for every platform ``install`` argv
-    whose executable is npx, every spec `_npx_selected_specs` reads -- the
-    package selectors and the positional slot. Only a manifest config is read
-    this way: its fields are shipped, not agent-composed.
+    whose executable is npx, every spec `_npx_selected_specs` reads: every
+    package selector's value, and the positional slot only when no selector
+    came before it -- after a selector the slot is the command npx runs, not a
+    package. Only a manifest config is read this way: its fields are shipped,
+    not agent-composed.
 
     The second value is the first npx argument that stopped the reading, or
     that selected something that is not a valid package spec (``github:x/y``,

@@ -96,12 +96,15 @@ def is_valid_package_version(version: str) -> bool:
 
 _WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat")
 _PATH_SEPARATORS_RE = re.compile(r"[\\/]+")
+_WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
 
 
 def normalized_executable_name(executable: str) -> str:
     """The name an executable is known by, whatever platform spelled it.
 
-    The last non-empty component after splitting on EITHER separator, so
+    One leading drive prefix is removed first, so a drive-relative path such
+    as ``C:npx.cmd`` names ``npx`` (and ``C:`` alone names nothing). Then the
+    last non-empty component after splitting on EITHER separator, so
     ``C:\\tools\\npx.cmd`` and ``/usr/bin/npx`` both work on any host. Split
     by hand rather than with a path class: ``PureWindowsPath("//bin/npx")``
     reads a UNC share and names nothing, while Linux runs that path as
@@ -110,7 +113,8 @@ def normalized_executable_name(executable: str) -> str:
     ``npx.cmd.exe`` is ``npx.cmd``, not ``npx``. A value with no component
     (``""``, ``"/"``) is ``""``, which names no executable.
     """
-    parts = [part for part in _PATH_SEPARATORS_RE.split(executable) if part]
+    path = _WINDOWS_DRIVE_PREFIX_RE.sub("", executable, count=1)
+    parts = [part for part in _PATH_SEPARATORS_RE.split(path) if part]
     name = parts[-1].lower() if parts else ""
     for suffix in _WINDOWS_EXECUTABLE_SUFFIXES:
         if name.endswith(suffix):
