@@ -110,12 +110,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Manifest-backed and `.mcp.json` servers need no approval**, and provision,
   connect, restart and update exactly as before, **with one exception: a
   `packages.denylist` entry now refuses a manifest-backed server whose npm
-  package it names** (the entry's `package` field, or the package argument of
-  its `npx` command or install command). Such a server is refused by
+  package it names** (the entry's `package` field, or a package its `npx`
+  command or install command runs: the package argument, or any package chosen
+  with `-p`, `--package` or `--package=`; after such a selector the next
+  argument is the command npx runs, not a package). Such a server is refused by
   `provision`, `connect_server`, `restart_server` and `update_server`, with the
-  same `policy_denied` refusal. If evaluating the package policy raises an
-  error, those four tools now refuse a manifest server instead of proceeding. `.mcp.json`
-  servers are not checked against the package lists. There is nothing to
+  same `policy_denied` refusal. **While any `packages.denylist` is in force,
+  a manifest entry whose npx packages cannot be determined is refused the same
+  way**: one with an npx option pmcp cannot interpret (such as `--registry` or
+  `-c`), a selector with no value, or a selected package that is not a plain
+  npm spec (such as `github:owner/repo` or `./dir`). The refusal message names
+  the argument. Without a denylist those entries behave as before, and no
+  shipped manifest entry is affected. If evaluating the package policy raises
+  an error, those four tools now refuse a manifest server instead of
+  proceeding. `.mcp.json` servers are not checked against the package lists. There is nothing to
   migrate: discovered registrations are held in memory only and never survived
   a gateway restart, so the first provision of a discovered server after
   upgrading is refused with the command that approves it. Found by the
@@ -271,8 +279,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   created, and still log it if the spawn then fails (for example
   `FileNotFoundError`). Two other spawns that fetch and run a package log the
   same way: starting a stdio server whose command is a package runner (`npx`,
-  `npx.cmd`, `npx.exe`, `uvx`, `pnpx` or `bunx`; any other command logs no
-  warning), and every `gateway.update_server` probe. Previously `start_install` logged
+  `uvx`, `pnpx` or `bunx`, recognised under Windows and POSIX spellings alike:
+  any directory, either path separator, a drive prefix, any letter case and one
+  `.exe`, `.cmd` or `.bat` suffix; any other command logs no warning), and every
+  `gateway.update_server` probe. Previously `start_install` logged
   `<args redacted>` at INFO, which hid exactly which package ran, and
   `install_server` logged the full argv verbatim at INFO, including any
   credential it carried.

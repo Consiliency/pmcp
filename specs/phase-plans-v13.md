@@ -546,12 +546,13 @@ Sandboxing what does run; auditing PMCP's own dependencies.
 Recorded by SL-docs after SL-1, SL-2 and SL-3 landed, were merged, and a
 single-writer repair pass ran over the assembled branch. It was then revised after
 the phase panel's five findings (F1-F5) were fixed in one further single-writer pass
-(`03cd186`, merged at `a60accf`). Both freeze gates shipped with the signatures they
-declared, and S-01's reproduction fails closed at every door found (EC-PKGID-1). But
+(`03cd186`, merged at `a60accf`), and again after three narrow panel rounds on
+the manifest reader (item 12; last fix `8f65da0`). Both freeze gates shipped with
+the signatures they declared, and S-01's reproduction fails closed at every door found (EC-PKGID-1). But
 the gate turned out to have **two doors, not one** (item 1), the frozen decision
 order was wrong until a lane read it before the implementation started (item 3), and
 the panel reproduced a way to run **different bytes under an approved pin** (item 8).
-Each gap in item 9 is marked resolved or open. Line references are to `a60accf`.
+Each gap in item 9 is marked resolved or open. Line references are to `8f65da0`.
 **Items 1, 8 and 9 are the ones EGRESS and SEAL pay for if they are not read.**
 
 1. **The lifecycle door: gating `provision` did not gate every install spawn.**
@@ -593,7 +594,7 @@ Each gap in item 9 is marked resolved or open. Line references are to `a60accf`.
    `.mcp.json` is already consent-gated by CONSENT. The lifecycle resolver's
    configured branch (`:3402`) likewise returns before the gate. IF-0-PKGID-1's
    rules 3 and 4 for `source="configured"` are therefore implemented
-   (`src/pmcp/provision_gate.py:313-323`) and tested **at the `evaluate_provision`
+   (`src/pmcp/provision_gate.py:411-421`) and tested **at the `evaluate_provision`
    level only**; no production caller passes `"configured"`. **A later phase that
    wires a configured spawn path must wire rules 3 and 4 with it**, rather than
    assume a configured server is already gated. The same holds for the package
@@ -607,11 +608,11 @@ Each gap in item 9 is marked resolved or open. Line references are to `a60accf`.
    `pkg@1.2.3`, and the spawn still re-resolves `latest`. SL-2 found it while
    reading the freeze, before SL-1 (which implements the freeze literally) was
    dispatched, and the plan was corrected in `07e1898`. It is now rule 4, ahead of
-   every allow (`provision_gate.py:322`, before `:326` and `:330`), and the freeze
+   every allow (`provision_gate.py:420`, before `:424` and `:428`), and the freeze
    says in words that it must stay there. The gate checks the pin structurally:
    the first argument after the allowlisted leading flags must *be*
    `name@resolved_version`, in `args` and in every platform's install argv
-   (`provision_gate.py:131-179`).
+   (`provision_gate.py:136-184`).
 
 4. **SL-2's choices where the plan was silent.** (a) An allowlist miss is
    `"unspecified"`, not `"denied"` (`src/pmcp/policy/policy.py:379-395`). Only an
@@ -693,10 +694,10 @@ Each gap in item 9 is marked resolved or open. Line references are to `a60accf`.
    over agent-chosen names has to anticipate every variable any package manager
    reads, in any letter case, and `npm_config_registry` was not on it.
    **The fix is an allowlist for discovered servers**
-   (`validation.discovered_env_var_allowed`, `src/pmcp/validation.py:179-197`): a
+   (`validation.discovered_env_var_allowed`, `src/pmcp/validation.py:207-225`): a
    name must be credential-shaped, must not be one `is_dangerous_env_var` refuses,
    and must not start, case-insensitively, with `NPM_CONFIG_`, `NODE_`,
-   `COREPACK_`, `YARN_`, `PNPM_` or `BUN_` (`:169`), which excludes
+   `COREPACK_`, `YARN_`, `PNPM_` or `BUN_` (`:197`), which excludes
    credential-shaped names such as `NPM_CONFIG__AUTH` and `NODE_AUTH_TOKEN` too.
    It is enforced at registration, before the registry is contacted
    (`handlers.py:5753-5771`), and in `auth_connect` for both the declared name and
@@ -715,11 +716,43 @@ Each gap in item 9 is marked resolved or open. Line references are to `a60accf`.
      rule 1 fired only for a non-`None` identity, so a denylisted manifest package
      provisioned through rule 2. That contradicted IF-0-PKGID-1's own rationale and
      narrowed EC-PKGID-2 to discovered servers. Rule 1 now also reads, for a
-     manifest lookup, the package names the trusted config spells out: its
-     `package` field and the npx package slot of `args` and of each install argv,
-     found by position, with no network (`provision_gate.py:190-237`, applied at
-     `:304-307`). They are checked through
-     `PolicyManager.evaluate_package_name_policy` (`policy.py:424`), which
+     manifest lookup, the package names the trusted config spells out, with no
+     network (`_manifest_package_names`, `provision_gate.py:253`; `_manifest_denial`,
+     `:300`; applied at `:402-406`). As first shipped (F2) that was the `package`
+     field and the positional package slot of `args` and of each install argv.
+     Three narrow panel rounds then hardened the reader (item 12):
+     - **G1 — npx package selectors.** `npx -y -p denied-pkg bin` put `-p` in the
+       slot, which names nothing, so `denied-pkg` was never checked.
+       `_npx_selected_specs` (`:197`) now reads every `-p X`, `--package X` and
+       `--package=X`, any number of them, and `--`. An entry is **undetermined**
+       when its npx argv holds an option pmcp cannot place (`--registry X`, `-c`,
+       `--call=...`), a selector with no value or with a value starting with `-`,
+       or a selected spec that does not parse (`github:x/y`, `./dir`). An
+       undetermined entry is refused, with reason `denied`, **only when a
+       `packages.denylist` is in force** on either policy side
+       (`PolicyManager.has_package_denylist`, `policy.py:424`); with no denylist
+       nothing changes. Measured: no shipped manifest entry is undetermined, and
+       `test_no_shipped_manifest_entry_is_undetermined` asserts it. The refusal
+       summary still reads "denied by policy", because the reason vocabulary is
+       closed; the remedy (`_undetermined_remedy`, `:352`) says the packages could
+       not be determined and names the argument.
+     - **H1 — after a selector, the positional is the command.** `npx
+       --package=allowed-pkg node server.js` runs `node` from the selected package
+       and fetches nothing named `node`, but was recorded as a package, so it was
+       refused under a denylist of `[node]`, and a command path made the entry
+       undetermined. The positional is now recorded only when no selector preceded
+       it; the same rule applies to the argument after `--`.
+     - **G2, H2, J1 — executable spellings.** The reader recognises npx through
+       `validation.normalized_executable_name` (`validation.py:102`): one leading
+       `X:` drive prefix is stripped (J1: `C:npx.cmd` had normalized to `c:npx`;
+       `C:` alone names nothing), the name is split by hand on both `/` and `\`
+       (H2: `PureWindowsPath('//bin/npx').name` is `''`, so that POSIX spelling
+       escaped the reader), lower-cased, and one `.exe`/`.cmd`/`.bat` removed.
+       The discovered-server pin check `_is_npx` (`provision_gate.py:162`) is
+       deliberately left strict: registration only ever writes `npx`, so a wider
+       match there could only accept argv as pinned.
+     Names are checked through
+     `PolicyManager.evaluate_package_name_policy` (`policy.py:437`), which
      `evaluate_package_policy` now delegates to, so the two cannot drift. The
      lifecycle resolver consults the gate for manifest hits as well (`:3501`),
      still not for disconnect. Only 21 of the 107 shipped manifest entries carry a
@@ -728,12 +761,6 @@ Each gap in item 9 is marked resolved or open. Line references are to `a60accf`.
      `connect_server`, `restart_server` and `update_server` for a manifest server
      through rule 8. Before F2 the resolver never consulted the gate for a
      manifest hit, so that could not happen.
-     **Limitation, recorded:** the slot is the first argument after the
-     allowlisted leading flags, so an argv such as `npx -y -p denied-pkg bin`
-     puts `-p` in the slot, which is not a valid package spec, and `denied-pkg`
-     is never checked (measured: `_manifest_package_names` returns `[]` and the
-     gate answers `manifest_backed`). No shipped manifest entry uses `-p` or
-     `--package`; a manifest overlay could.
    - **RESOLVED (F4): `provision` asked for a credential before running the gate.**
      The gate now runs first (`handlers.py:4443`, credential check at `:4465`),
      matching the lifecycle resolver.
@@ -779,8 +806,9 @@ Each gap in item 9 is marked resolved or open. Line references are to `a60accf`.
       definition, two spawns outside `installer.py` fetch and run a package. Both
       now log the same rendered argv at WARNING first: the client manager's stdio
       spawn when the executable is a package runner, `npx`/`npx.cmd`/`npx.exe`/
-      `uvx`/`pnpx`/`bunx` (`src/pmcp/client/manager.py:70`, logged at
-      `:2351-2355`, spawned at `:2364`), and `update_server`'s probe, unconditionally
+      `uvx`/`pnpx`/`bunx` under any Windows or POSIX spelling, matched by
+      `normalized_executable_name` (G2, H2, J1; `src/pmcp/client/manager.py:73`,
+      logged at `:2352-2359`, spawned at `:2368`), and `update_server`'s probe, unconditionally
       (`handlers.py:3768`). Other stdio executables log no warning, because a local
       binary installs nothing. *Exact* — **contradicted by design, still.** The log
       is a rendered argv, redacted except the executable, `-y`/`--yes`/`--quiet`,
@@ -803,25 +831,41 @@ Each gap in item 9 is marked resolved or open. Line references are to `a60accf`.
       entry in the operator's policy. "A manifest-backed server is unaffected" also
       now has one exception: a `packages.denylist` entry naming its package (item 9).
     - (e) **Key files, evidence paths and the roadmap `## Verification` name only
-      `tests/test_package_identity_gate.py`.** The criteria are proven across six
+      `tests/test_package_identity_gate.py`.** The criteria are proven across seven
       files: that one, `tests/test_package_approvals.py`,
       `tests/test_policy_package_identifiers.py`, `tests/test_install_argv_logging.py`,
-      and the panel-fix files `tests/test_pkgid_panel_fixes.py` and
-      `tests/test_pkgid_spawn_logging.py`. Key files also omit
+      and the panel-fix files `tests/test_pkgid_panel_fixes.py`,
+      `tests/test_pkgid_spawn_logging.py` and
+      `tests/test_pkgid_manifest_npx_selectors.py`. Key files also omit
       `src/pmcp/provision_gate.py`, `src/pmcp/package_approvals.py`,
       `src/pmcp/cli.py`, `src/pmcp/types.py` and `src/pmcp/client/manager.py`. As
-      with CONSENT amendment 5, SEAL's closeout should collect all six test files.
+      with CONSENT amendment 5, SEAL's closeout should collect all seven test files.
     - (f) **Resolved, not contradicted.** The Scope-notes warning that the plan did
       not carry TRUST amendment 2 is stale: the plan's SL-1 carries it, and
       registration resolves in a worker thread (`anyio.to_thread.run_sync`) under a
       20 s handler bound (`handlers.py:204`, `:5780`). CONSENT amendment 1's request
       to close PKGID's unproven lane tests was met, and still holds after the panel
       fixes were added: `scripts/check_plan_consistency.py` reports
-      `lane-contracted: 62   EC-proved node ids: 62` for this plan. And the TRUST
+      `lane-contracted: 77   EC-proved node ids: 77` for this plan. And the TRUST
       plan's "CONSENT and PKGID do not write `cli.py`" note, which PKGID's plan
       asked SL-docs to correct, was already corrected in
       `plans/phase-plan-v13-TRUST.md` on 2026-09-08; PKGID did write it
       (`cli.py:801-824`, `:2565-2630`).
+
+12. **Process: three narrow panel rounds on manifest-parsing corners, then a
+    deliberate stop.** After F1-F5, three further panels, each narrowed to the
+    changed code, ran against the manifest reader and the runner-name check. Each
+    round's red-team finding was reproduced before it was fixed: round 2 found G1
+    and G2 (`01a5589`, with `3e49f1b` splitting the Windows-spelling test per
+    site), round 3 found H1 and H2 (`0ce2afe`), round 4 found J1 (`8f65da0`).
+    **No seat in rounds 2-4 found a way for an agent to run an unapproved
+    package**: every finding concerned how an operator-shipped manifest entry is
+    read against a `packages.denylist`, or whether its spawn is logged. After the
+    third narrow panel the operator chose to fix J1 and open the PR without a
+    fourth. Recorded so a reader does not mistake the stop for a clean panel: the
+    reader is a hand-written model of npx's argument grammar, and it fails closed
+    only under a denylist. SEAL should treat further corners there as expected, not
+    as a regression.
 
 ### Phase 4 — Outbound actions need explicit authority (EGRESS)
 

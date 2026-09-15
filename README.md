@@ -1416,10 +1416,15 @@ a server that needs any other variable in `.mcp.json` instead.
 
 Manifest-backed and `.mcp.json` servers need no approval and keep their env var
 rules. The one exception is the denylist: a `packages.denylist` entry also refuses
-a **manifest-backed** server whose npm package it names (its `package` field, or the
-package argument of its `npx` command or install command), at `gateway.provision`,
+a **manifest-backed** server whose npm package it names (its `package` field, or a
+package its `npx` command or install command runs, including one chosen with `-p` or
+`--package`), at `gateway.provision`,
 `gateway.connect_server`, `gateway.restart_server` and `gateway.update_server`.
-`.mcp.json` servers are not checked against the package lists.
+While any `packages.denylist` is in force, a manifest entry whose npx packages pmcp
+cannot determine (an unrecognised npx option such as `--registry` or `-c`, or a
+package selected as `github:owner/repo` or `./dir`) is refused too, and the refusal
+names the argument; without a denylist it starts as before. `.mcp.json` servers
+are not checked against the package lists.
 
 Approvals live in `~/.config/pmcp/package_approvals.json`, beside the trust
 store. Review and remove them with:
@@ -1431,8 +1436,8 @@ pmcp trust revoke-package @acme/example-server        # every version
 ```
 
 Every install spawn logs its command at WARNING before it runs. That includes
-starting a stdio server whose command is `npx`, `npx.cmd`, `npx.exe`, `uvx`, `pnpx`
-or `bunx`, and every `gateway.update_server` probe. Arguments are redacted except
+starting a stdio server whose command is `npx`, `uvx`, `pnpx` or `bunx`, in any
+Windows or POSIX spelling (such as `C:\tools\npx.cmd` or `UVX.EXE`), and every `gateway.update_server` probe. Arguments are redacted except
 the executable, the flags `-y`, `--yes` and `--quiet`, `--registry` (its name, not
 its value) and a pinned `name@version`, so an operator can see which package ran
 without a credential reaching the log.
