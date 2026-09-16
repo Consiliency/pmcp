@@ -108,11 +108,22 @@ class _JobManager:
 
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], ServerConfig]] = []
+        # SEAL SL-0: the project root production hands start_install. Recorded
+        # alongside `calls` rather than widened into it, so the 2-tuple equality
+        # assertions below keep their shape; a double that accepted the argument
+        # and dropped it could not notice a wrong root.
+        self.project_roots: list[Path | None] = []
 
-    async def start_install(self, server_config: ServerConfig, platform: str) -> str:
+    async def start_install(
+        self,
+        server_config: ServerConfig,
+        platform: str,
+        project_root: Path | None = None,
+    ) -> str:
         self.calls.append(
             (list(server_config.install.get(platform) or []), server_config)
         )
+        self.project_roots.append(project_root)
         return f"job-{len(self.calls)}"
 
 
