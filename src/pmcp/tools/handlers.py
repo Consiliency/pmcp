@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -9,14 +10,11 @@ import json
 import asyncio
 import time
 import platform
-import shutil
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Mapping
 from typing import Any, Literal, cast
-from urllib.request import urlopen
-from urllib.parse import urlencode
 
 import anyio
 from dotenv import load_dotenv
@@ -53,8 +51,16 @@ from pmcp.config.loader import (
 from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.env_store import (
     record_dotenv_keys,
+    record_pmcp_introduced_keys,
     sanitized_subprocess_env,
     set_env_value,
+)
+from pmcp.feedback_egress import (
+    FeedbackProgress,
+    browser_issue_url,
+    browser_search_url,
+    evaluate_feedback_egress,
+    submit_feedback_issue,
 )
 from pmcp.validation import (
     discovered_env_var_allowed,
@@ -202,6 +208,13 @@ FEEDBACK_TOKEN_LIMIT = 4000
 #: worker thread: this is what keeps a slow or hostile registry from holding a
 #: gateway tool call open indefinitely.
 _REGISTRATION_RESOLVE_TIMEOUT_SECONDS = 20.0
+
+#: Bound on one feedback submission, end to end. A per-socket timeout is not a
+#: request bound -- it restarts on every connect/send/recv, so a peer that returns
+#: one byte just under the threshold holds the call open forever. The transport
+#: runs in a worker thread under this bound, and `feedback_egress`'s per-phase
+#: budgets sum below it so nothing starts that cannot finish inside it.
+_FEEDBACK_SUBMIT_TIMEOUT_SECONDS = 20.0
 
 #: What a provisioning refusal says before the gate's remedy, per reason.
 _PROVISION_REFUSAL_SUMMARY = {
@@ -866,8 +879,12 @@ def get_gateway_tool_definitions() -> list[Tool]:
         Tool(
             name="gateway.submit_feedback",
             description=(
-                "Prepare and optionally submit a PMCP feedback issue to GitHub. "
-                "By default returns an exact preview payload; set confirm_submission=true to submit."
+                "Prepare a PMCP feedback issue for GitHub. Returns an exact "
+                "preview payload and a browser URL an operator can open. pmcp "
+                "posts nothing itself unless the operator has enabled submission "
+                "(`pmcp guidance --feedback-submission on`) and exported "
+                "PMCP_FEEDBACK_TOKEN; confirm_submission=true records the user's "
+                "consent and is not by itself authority to post."
             ),
             input_schema={
                 "type": "object",
@@ -3809,6 +3826,10 @@ class GatewayTools:
             "Technical failure detected. If your framework supports ask-user/question tools, "
             "ask consent before submission. Then call gateway.submit_feedback with the exact "
             "title/description payload you will send and show it verbatim to the user first. "
+            "It returns the payload and a browser URL; confirm_submission=true is the "
+            "user's consent and is not what lets pmcp post, which an operator enables "
+            "with `pmcp guidance --feedback-submission on` plus an exported "
+            "PMCP_FEEDBACK_TOKEN. "
             "Warning: submission may use model tokens and sends technical data to GitHub. "
             "Do not include personal data, credentials, or secrets."
         )
@@ -4970,6 +4991,13 @@ class GatewayTools:
                 env_var=env_var,
             )
         os.environ[env_var] = parsed.credential
+        # Recorded in the SAME statement group as the write, with no await between:
+        # no other task may observe the environment write without the record. Store
+        # membership is not durable evidence -- `set_env_value` is a read-modify-write
+        # over a `read_env_file` that returns {} for a file it cannot read, so any
+        # later auth_connect, for any unrelated server, can drop this key from the
+        # file while the variable it planted stays here (Consiliency/pmcp#230).
+        record_pmcp_introduced_keys([env_var])
 
         self._audit(
             method="gateway.auth_connect",
@@ -4993,16 +5021,61 @@ class GatewayTools:
         )
 
     async def submit_feedback(self, input_data: dict[str, Any]) -> SubmitFeedbackOutput:
-        """gateway.submit_feedback - Prepare/submit PMCP feedback issue."""
+        """gateway.submit_feedback - Prepare/submit PMCP feedback issue.
+
+        The outbound-action gate is consulted before anything else, and it resolves the
+        destination first, so no unvalidated repository can appear in *any* output --
+        a refusal included, and the browser URL the agent is told to open included.
+        There is no ambient-credential fallback and no `gh` fallback: both authenticate
+        from whatever identity the host happens to be carrying, and a post pmcp cannot
+        attribute is one this gateway will not make (Consiliency/pmcp#230).
+        """
         parsed = SubmitFeedbackInput.model_validate(input_data)
-        repository = os.environ.get("PMCP_FEEDBACK_REPO", "ViperJuice/pmcp")
 
         warning = (
             "Submission sends technical telemetry to GitHub and may consume model tokens. "
             "Send technical data only; never include personal data or secrets."
         )
 
-        if not self._telemetry_enabled():
+        decision = evaluate_feedback_egress(
+            telemetry_enabled=self._telemetry_enabled(),
+            submission_enabled=bool(
+                self._guidance_config
+                and self._guidance_config.enable_feedback_submission
+            ),
+            confirm_submission=parsed.confirm_submission,
+            environ=os.environ,
+            project_root=self._project_root,
+        )
+        repository = decision.repository
+        remedy = decision.remedy or ""
+
+        # Refusals that build NO payload and record NO event. Each one refuses to
+        # discuss this submission at all, so there is nothing to preview and nowhere to
+        # point; `repository_visibility` is "unknown" because no request was made, and
+        # a claim about a repository pmcp did not ask about is not a fact.
+        refusals = {
+            "untrusted_repository_override": (
+                "Refused to submit: the feedback destination was introduced by pmcp "
+                "itself rather than exported by you."
+            ),
+            "invalid_repository": (
+                "Refused to submit: the feedback destination is not owner/repo shaped."
+            ),
+            "telemetry_disabled": (
+                "Feedback telemetry is disabled in guidance config "
+                "(enable_telemetry=false)."
+            ),
+            "untrusted_token": (
+                "Refused to submit: the feedback credential was introduced by pmcp "
+                "itself rather than exported by you."
+            ),
+            "gate_error": (
+                "Refused to submit: pmcp could not establish this submission's "
+                "authority."
+            ),
+        }
+        if decision.reason in refusals:
             return SubmitFeedbackOutput(
                 ok=False,
                 submitted=False,
@@ -5011,183 +5084,149 @@ class GatewayTools:
                 issue_title=parsed.title,
                 issue_body=parsed.description,
                 warning=warning,
-                message="Feedback telemetry is disabled in guidance config (enable_telemetry=false).",
+                message=f"{refusals[decision.reason]} {remedy}".strip(),
             )
-
-        self._record_feedback_event(
-            "feedback_prepare",
-            {
-                "issue_type": parsed.issue_type,
-                "subordinate_server": parsed.subordinate_server,
-                "failed_tool_call": parsed.failed_tool_call,
-            },
-        )
 
         issue_title, issue_body = self._build_feedback_issue(parsed, repository)
 
-        if not parsed.confirm_submission:
+        if not decision.submit_allowed:
+            # submission_not_enabled / not_confirmed / no_feedback_token: pmcp will not
+            # post, but the payload and where to put it are exactly what the operator
+            # needs, so both are built and the prepare event is recorded. The word
+            # "consent" stays in the submission_not_enabled text deliberately.
+            previews = {
+                "submission_not_enabled": (
+                    "Preview generated; pmcp will not post it. Ask the user for "
+                    "consent using your question tool, show this exact issue payload, "
+                    "and open issue_url to submit it by hand. To let pmcp submit, an "
+                    "operator runs:"
+                ),
+                "not_confirmed": "Preview generated.",
+                "no_feedback_token": (
+                    "Preview generated; pmcp has no operator-supplied credential to "
+                    "post with, so open issue_url to submit it by hand."
+                ),
+            }
+            self._record_feedback_event(
+                "feedback_prepare",
+                {
+                    "issue_type": parsed.issue_type,
+                    "subordinate_server": parsed.subordinate_server,
+                    "failed_tool_call": parsed.failed_tool_call,
+                },
+            )
             return SubmitFeedbackOutput(
                 ok=True,
                 submitted=False,
                 repository=repository,
-                repository_visibility="public",
+                repository_visibility="unknown",
                 issue_title=issue_title,
                 issue_body=issue_body,
+                issue_url=browser_issue_url(repository, issue_title, issue_body),
                 warning=warning,
-                message=(
-                    "Preview generated. Ask the user for consent using your question tool, "
-                    "show this exact issue payload, then call again with confirm_submission=true."
-                ),
+                message=f"{previews[decision.reason]} {remedy}".strip(),
             )
 
-        token = os.environ.get("PMCP_FEEDBACK_TOKEN") or os.environ.get("GITHUB_TOKEN")
-        if token:
-            try:
-                from urllib.request import Request
-
-                repo_visibility = "unknown"
-                try:
-                    repo_req = Request(
-                        f"https://api.github.com/repos/{repository}",
-                        headers={
-                            "Accept": "application/vnd.github+json",
-                            "Authorization": f"Bearer {token}",
-                            "X-GitHub-Api-Version": "2022-11-28",
-                        },
-                        method="GET",
-                    )
-                    with urlopen(repo_req, timeout=5) as repo_resp:  # nosec B310
-                        repo_info = json.loads(repo_resp.read().decode("utf-8"))
-                    private_flag = bool(repo_info.get("private"))
-                    repo_visibility = "private" if private_flag else "public"
-                except Exception:
-                    repo_visibility = "unknown"
-
-                issue_api = f"https://api.github.com/repos/{repository}/issues"
-                payload = json.dumps(
-                    {
-                        "title": issue_title,
-                        "body": issue_body,
-                        "labels": [
+        # Allowed. `token` is populated on exactly this branch.
+        assert decision.token is not None
+        progress = FeedbackProgress()
+        deadline = time.monotonic() + _FEEDBACK_SUBMIT_TIMEOUT_SECONDS
+        try:
+            with anyio.fail_after(_FEEDBACK_SUBMIT_TIMEOUT_SECONDS):
+                result = await anyio.to_thread.run_sync(
+                    functools.partial(
+                        submit_feedback_issue,
+                        repository=decision.repository,
+                        token=decision.token,
+                        title=issue_title,
+                        body=issue_body,
+                        labels=[
                             "pmcp-feedback",
                             "authenticated-feedback",
                             parsed.issue_type,
                         ],
-                    }
-                ).encode("utf-8")
-                req = Request(
-                    issue_api,
-                    data=payload,
-                    headers={
-                        "Accept": "application/vnd.github+json",
-                        "Authorization": f"Bearer {token}",
-                        "X-GitHub-Api-Version": "2022-11-28",
-                        "Content-Type": "application/json",
-                    },
-                    method="POST",
+                        deadline=deadline,
+                        progress=progress,
+                    ),
+                    abandon_on_cancel=True,
                 )
-                with urlopen(req, timeout=10) as resp:  # nosec B310
-                    created = json.loads(resp.read().decode("utf-8"))
+        except TimeoutError:
+            # Atomically closes the state; exactly one of abandon/claim_dispatch wins.
+            # `latest()` here instead would be the R1 race: it can answer
+            # not_dispatched with a compose URL while the worker goes on to post.
+            result = progress.abandon()
+        except Exception as exc:
+            # A transport that raises instead of returning an outcome is a bug, not a
+            # second door. Give up the same way, so the worker can never afterwards be
+            # granted permission to send.
+            logger.warning("Feedback submission raised: %s", exc)
+            result = progress.abandon()
 
-                issue_url = created.get("html_url")
-                issue_number = created.get("number")
-                self._record_feedback_event(
-                    "feedback_submitted",
-                    {
-                        "repository": repository,
-                        "issue_url": issue_url,
-                        "authenticated": True,
-                    },
-                )
-                return SubmitFeedbackOutput(
-                    ok=True,
-                    submitted=True,
-                    repository=repository,
-                    repository_visibility=cast(
-                        Literal["public", "private", "unknown"], repo_visibility
-                    ),
-                    issue_title=issue_title,
-                    issue_body=issue_body,
-                    issue_url=issue_url,
-                    issue_number=issue_number,
-                    authenticated=True,
-                    warning=warning,
-                    message=(
-                        "Feedback issue submitted successfully. "
-                        "Share issue_url with the user so they can review/delete it if desired."
-                    ),
-                )
-            except Exception as e:
-                logger.warning(f"Authenticated feedback submission failed: {e}")
-
-        if shutil.which("gh"):
-            cmd = [
-                "gh",
-                "issue",
-                "create",
-                "--repo",
-                repository,
-                "--title",
-                issue_title,
-                "--body",
-                issue_body,
-                "--label",
-                "pmcp-feedback",
-                "--label",
-                parsed.issue_type,
-            ]
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await process.communicate()
-            if process.returncode == 0:
-                issue_url = stdout.decode("utf-8", errors="replace").strip()
-                self._record_feedback_event(
-                    "feedback_submitted",
-                    {
-                        "repository": repository,
-                        "issue_url": issue_url,
-                        "authenticated": False,
-                    },
-                )
-                return SubmitFeedbackOutput(
-                    ok=True,
-                    submitted=True,
-                    repository=repository,
-                    repository_visibility="public",
-                    issue_title=issue_title,
-                    issue_body=issue_body,
-                    issue_url=issue_url,
-                    authenticated=False,
-                    warning=warning,
-                    message=(
-                        "Feedback issue submitted via gh CLI. "
-                        "Share issue_url with the user so they can review/delete it if desired."
-                    ),
-                )
-            logger.warning(
-                "gh issue create failed: "
-                + stderr.decode("utf-8", errors="replace").strip()
+        # FeedbackProgress is constructed with no destination, so the snapshots IT
+        # authors carry `issue_url=None`: the handler renders the COMPOSE url where
+        # nothing was sent and the SEARCH url where something may have been -- handing
+        # back a compose url after a possible success is how a duplicate gets filed.
+        # Snapshots the transport authors already carry the right one.
+        issue_url = result.issue_url
+        if issue_url is None:
+            issue_url = (
+                browser_search_url(repository, issue_title)
+                if result.outcome == "dispatched_unconfirmed"
+                else browser_issue_url(repository, issue_title, issue_body)
             )
 
-        browser_url = f"https://github.com/{repository}/issues/new?" + urlencode(
-            {"title": issue_title, "body": issue_body}
-        )
+        if result.outcome == "created":
+            self._record_feedback_event(
+                "feedback_submitted",
+                {
+                    "repository": repository,
+                    "issue_url": issue_url,
+                    "authenticated": True,
+                },
+            )
+            return SubmitFeedbackOutput(
+                ok=True,
+                submitted=True,
+                repository=repository,
+                repository_visibility=result.repository_visibility,
+                issue_title=issue_title,
+                issue_body=issue_body,
+                issue_url=issue_url,
+                issue_number=result.issue_number,
+                authenticated=True,
+                warning=warning,
+                message=(
+                    "Feedback issue submitted successfully. "
+                    "Share issue_url with the user so they can review/delete it if desired."
+                ),
+                submission_outcome="created",
+            )
+
+        # `submitted=False` here means "pmcp did not observe a submission", which is
+        # not the same claim for all three: only `refused` is a genuine negative.
+        outcomes = {
+            "refused": (
+                "GitHub refused the submission, so nothing was created. Open "
+                "issue_url to submit it by hand."
+            ),
+            "not_dispatched": "Nothing was sent. Open issue_url to submit it by hand.",
+            "dispatched_unconfirmed": (
+                "The request was sent and pmcp never saw the answer, so the issue "
+                "may already exist. Open issue_url to look for it before submitting "
+                "it again."
+            ),
+        }
         return SubmitFeedbackOutput(
-            ok=True,
+            ok=False,
             submitted=False,
             repository=repository,
-            repository_visibility="public",
+            repository_visibility="unknown",
             issue_title=issue_title,
             issue_body=issue_body,
-            issue_url=browser_url,
+            issue_url=issue_url,
             warning=warning,
-            message=(
-                "Could not auto-submit. Open issue_url to submit manually. "
-                "Share with user so they can edit/remove content before posting."
-            ),
+            message=outcomes[result.outcome],
+            submission_outcome=result.outcome,
         )
 
     def _discovered_update_refusal(self, server_name: str) -> UpdateServerOutput:
