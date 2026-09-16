@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import os
 import re
+import stat
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
@@ -87,8 +88,20 @@ def _read_env_file_strict(path: Path) -> dict[str, str]:
 
     Checking the shape *before* opening also keeps a FIFO at a store path from
     blocking the gate forever instead of answering.
+
+    ``exists()`` alone is not enough to ask the question, which is why this stats the
+    path itself: ``Path.exists()`` answers ``False`` for **every** failed lookup, not
+    only for a missing file. A self-referential symlink raises ``ELOOP`` underneath and
+    still reports ``False``, so the refusal above was skipped and ``read_env_file``
+    answered ``{}`` -- "nothing is planted" -- for a store pmcp could not resolve at
+    all. Only ``FileNotFoundError`` means *not there*; every other lookup error means
+    *unknown*, and unknown must reach the caller's fail-closed branch.
     """
-    if path.exists() and not path.is_file():
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        status = None
+    if status is not None and not stat.S_ISREG(status.st_mode):
         raise OSError(
             errno.EINVAL, "Credential store path is not a regular file", str(path)
         )

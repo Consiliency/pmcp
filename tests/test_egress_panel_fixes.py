@@ -42,7 +42,7 @@ import pytest
 
 from pmcp import feedback_egress
 from pmcp.config.guidance import GuidanceConfig
-from pmcp.env_store import reset_pmcp_introduced_keys
+from pmcp.env_store import _read_env_file_strict, reset_pmcp_introduced_keys
 from pmcp.feedback_egress import FeedbackProgress, FeedbackSubmission
 from pmcp.policy.policy import PolicyManager
 from pmcp.tools import handlers
@@ -419,6 +419,11 @@ def _plant_directory(path: Path) -> None:
     path.mkdir()
 
 
+def _plant_symlink_loop(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.symlink(path, path)
+
+
 def _plant_unreadable(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{_TOKEN_VAR}=planted-by-pmcp\n", encoding="utf-8")
@@ -596,3 +601,62 @@ def test_the_lenient_lookup_still_swallows_a_directory_for_the_sanitiser(
 
     assert read_env_file(project / ".env.pmcp") == {}
     assert managed_secret_keys(project) == set()
+
+
+@pytest.mark.asyncio
+async def test_a_looping_symlink_at_the_project_store_is_a_gate_error_not_an_allow(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """F2, second round: `Path.exists()` answers False for every FAILED lookup.
+
+    A self-referential symlink raises `ELOOP` underneath, and `exists()` reports
+    `False` rather than propagating it -- so a shape check written as
+    `exists() and not is_file()` was skipped entirely and `read_env_file` answered
+    `{}`: "nothing is planted", for a store pmcp could not resolve at all. The strict
+    reader stats the path itself and treats only `FileNotFoundError` as absence.
+
+    This falsifies any build that asks `exists()` before refusing. It does not falsify
+    one that refuses a *dangling* symlink too -- that is a genuinely absent store, and
+    `test_a_dangling_symlink_store_still_allows_an_operator_exported_token` catches it.
+    """
+    monkeypatch.setenv(_TOKEN_VAR, _EXPORTED_TOKEN)
+    project = tmp_path / "project"
+    _plant_symlink_loop(project / ".env.pmcp")
+
+    result = await _submit(_gateway(project_root=project), confirm_submission=True)
+
+    assert result.submitted is False
+    assert result.ok is False
+    assert "could not establish this submission's authority" in result.message
+
+
+@pytest.mark.asyncio
+async def test_a_looping_symlink_at_the_user_store_is_a_gate_error_not_an_allow(
+    monkeypatch: pytest.MonkeyPatch, _isolated_home: Path
+) -> None:
+    """F2, second round, the user half -- read unguarded, so it fails open identically."""
+    monkeypatch.setenv(_TOKEN_VAR, _EXPORTED_TOKEN)
+    _plant_symlink_loop(_isolated_home / ".config" / "pmcp" / "pmcp.env")
+
+    result = await _submit(_gateway(), confirm_submission=True)
+
+    assert result.submitted is False
+    assert result.ok is False
+    assert "could not establish this submission's authority" in result.message
+
+
+def test_the_strict_reader_separates_absence_from_an_unresolvable_path(
+    tmp_path: Path,
+) -> None:
+    """The four shapes, stated as one table so a later edit cannot drift one of them."""
+    (tmp_path / "real.env").write_text("A=1\n", encoding="utf-8")
+    _plant_symlink_loop(tmp_path / "loop.env")
+    os.symlink(tmp_path / "nothing", tmp_path / "dangling.env")
+    _plant_directory(tmp_path / "adir")
+
+    assert _read_env_file_strict(tmp_path / "real.env") == {"A": "1"}
+    assert _read_env_file_strict(tmp_path / "missing.env") == {}
+    assert _read_env_file_strict(tmp_path / "dangling.env") == {}
+    for unresolvable in ("loop.env", "adir"):
+        with pytest.raises(OSError):
+            _read_env_file_strict(tmp_path / unresolvable)
