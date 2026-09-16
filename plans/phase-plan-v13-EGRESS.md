@@ -2,7 +2,7 @@
 phase_loop_plan_version: 1
 phase: EGRESS
 roadmap: specs/phase-plans-v13.md
-roadmap_sha256: c1ba7f853a92d4368f25e26feeb20db0b5dbfa6829d24636832853bfaf189ae7
+roadmap_sha256: 7f8362022aa1ad953a9d2faf9ec842633ed14aaebc924385f7da1beb6d73df72
 ---
 
 # PHASE-4-EGRESS: Outbound actions need explicit authority
@@ -139,11 +139,21 @@ phase records no approvals.
   `_write_secret` → `set_env_value`, then `:4972`; verified store-before-environ, so
   there is no ordering window). But membership in the store is not durable evidence.
   `set_env_value` is a read-modify-write (`env_store.py:215-218`) over `read_env_file`,
-  which returns `{}` for a file it cannot read (`:47-48`) — so **any** `auth_connect`
-  call, for any unrelated server, can rewrite the store without an earlier key. An
-  operator deleting the file does the same. **A check whose evidence can disappear
-  while the thing it proves persists is not a check**, and the disappearance is
-  reachable through a tool the agent calls.
+  and an earlier key can disappear from the store while the variable it planted
+  persists in `os.environ`. **Corrected after execution, by measurement**: the
+  mechanism asserted through three plan revisions — "`read_env_file` returns `{}` for a
+  file it cannot read, so any `auth_connect` rewrites the store without the earlier
+  key" — does NOT reproduce on python-dotenv 1.2.3. An unreadable store raises
+  `PermissionError` out of `read_env_file`, `set_env_value` raises before it opens
+  anything, and the file is left byte-intact; a directory, undecodable bytes and an
+  invalid key each fail closed the same way. The routes that DO drop an entry are: an
+  operator deleting the store; a write that fails partway, because `write_env_file`
+  opens `O_TRUNC` and writes separately and is not atomic (reproduced under
+  `RLIMIT_FSIZE`); and a second writer — another gateway process, or `pmcp secrets
+  set` — racing this one (not reachable in-process: `_write_secret` is synchronous with
+  no await between the read and the write). **A check whose evidence can disappear
+  while the thing it proves persists is not a check**, and two of those three routes
+  need no operator action.
 
   **Why the record must cover LOADS, not only writes — the second panel's Q1.** The
   first revision recorded only runtime writes and left the startup store loads for SEAL,
@@ -151,7 +161,8 @@ phase records no approvals.
   refuted by this plan's own finding above. The full chain: a *previous* process's
   `auth_connect` put `PMCP_FEEDBACK_TOKEN` in the store; this process's
   `cli.py:2929-2930` loads it into `os.environ` recording nothing; the agent then calls
-  `auth_connect` for some unrelated server, whose read-modify-write drops the old entry;
+  `auth_connect` for some unrelated server, whose read-modify-write drops the old entry
+  (see the correction above for which failure shapes actually do that);
   and now `dotenv_sourced_keys()` never saw it, a write-only registry never wrote it,
   and `managed_secret_keys_strict()` no longer finds it — all three say *operator
   supplied*, and EC-EGRESS-1 is unmet. Recording the load closes it, which is why the

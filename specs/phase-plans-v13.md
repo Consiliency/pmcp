@@ -974,12 +974,20 @@ SEAL pays for if they are not read.**
    production caller.
    **Why store membership alone was not enough, which is the part worth carrying
    forward.** The obvious check — "is this key in one of PMCP's own credential
-   stores?" — reads evidence that the agent can erase. `set_env_value` is a
-   read-modify-write over `read_env_file` (`env_store.py:282-294`), and
-   `read_env_file` returns `{}` for a path it cannot read (`:47-48`), so **any**
-   later `auth_connect`, for **any** unrelated server, rewrites the store from
-   whatever it could read and drops the earlier key — while the environment variable
-   it planted persists. A check whose evidence can vanish while the thing it proves
+   stores?" — reads evidence that can disappear while the variable it proves
+   persists. **The mechanism this phase asserted for that, through three plan
+   revisions and three panel rounds, is wrong, and was corrected only after the
+   implementation panel prompted a measurement.** The claim was that `read_env_file`
+   returns `{}` for a path it cannot read, so any `set_env_value` rewrites the store
+   without the earlier key. On python-dotenv 1.2.3 an unreadable store instead RAISES
+   `PermissionError`, `set_env_value` raises before opening anything, and the file is
+   left byte-intact — as do a directory, undecodable bytes, and a key or value the
+   writer rejects. Every unreadable shape fails closed. What does drop an entry: an
+   operator deleting the store; a write that fails partway, since `write_env_file`
+   truncates before writing and is not atomic (reproduced under `RLIMIT_FSIZE`); and a
+   second writer racing this one, which needs another process because `_write_secret`
+   is synchronous with no await between its read and its write. **Lesson: a mechanism
+   repeated by four reviews is still only as true as the one time someone ran it.** A check whose evidence can vanish while the thing it proves
    persists is not a check, and the vanishing is reachable from a tool the agent
    calls. The same chain works across a restart, which is why the startup store loads
    are recorded too (`cli.py:2969-2972`): a previous process's `auth_connect` writes

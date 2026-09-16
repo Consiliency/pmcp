@@ -386,9 +386,12 @@ def test_a_project_store_lookup_failure_is_not_read_as_absent(
     """EC-EGRESS-2: a failed store read denies; the lenient lookup would have allowed.
 
     The failure is injected at ``read_env_file`` rather than produced with an
-    unreadable file on disk: ``dotenv_values`` swallows a missing or unreadable path
-    and returns ``{}``, and a chmod-000 file proves nothing when the suite runs as
-    root. The injected ``OSError`` is exactly what the two lookups differ about.
+    unreadable file on disk, because a chmod-000 file proves nothing when the suite
+    runs as root. (Corrected after measurement: ``dotenv_values`` does NOT swallow an
+    unreadable path -- it raises ``PermissionError`` -- so that shape was already
+    fail-closed. The shape that read as empty was a DIRECTORY at the store path, which
+    ``_read_env_file_strict`` now refuses.) The injected ``OSError`` is exactly what
+    the two lookups differ about.
     """
     project_store = env_store.resolve_scope_path("project", project_root)
     real_read = env_store.read_env_file
