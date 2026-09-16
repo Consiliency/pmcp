@@ -1296,6 +1296,11 @@ class ProvisionOutput(BaseModel):
     feedback_hint: str | None = None
 
 
+FeedbackSubmissionOutcome = Literal[
+    "created", "refused", "not_dispatched", "dispatched_unconfirmed"
+]
+
+
 class SubmitFeedbackInput(BaseModel):
     """Input for gateway.submit_feedback."""
 
@@ -1321,6 +1326,11 @@ class SubmitFeedbackOutput(BaseModel):
     authenticated: bool = False
     warning: str | None = None
     message: str
+    # What became of an attempted submission, when one was attempted. `None`
+    # means none was: a preview, or a refusal before any network call. The
+    # distinction `submitted` cannot carry is `dispatched_unconfirmed` -- the
+    # request left, the response never arrived, so the issue may exist.
+    submission_outcome: FeedbackSubmissionOutcome | None = None
 
 
 class UpdateServerInput(BaseModel):
