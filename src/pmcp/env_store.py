@@ -154,6 +154,64 @@ def reset_dotenv_keys() -> None:
     _DOTENV_SOURCED_KEYS.clear()
 
 
+# Env-var keys PMCP itself introduced into its OWN environment, by any route:
+# a runtime credential write or a load of one of PMCP's own credential stores.
+# Provenance, not file contents: see record_pmcp_introduced_keys
+# (Consiliency/pmcp#230).
+_PMCP_INTRODUCED_KEYS: set[str] = set()
+
+
+def record_pmcp_introduced_keys(keys: Iterable[str]) -> None:
+    """Record env-var keys PMCP itself introduced into its OWN environment.
+
+    Every route counts: a runtime write (``auth_connect`` setting
+    ``os.environ[env_var]`` after storing the credential) and a load of one of
+    PMCP's own credential-store files at startup. Callers record the delta they
+    measured around their own write or load, exactly as
+    :func:`record_dotenv_keys` does:
+
+    .. code-block:: python
+
+        before = set(os.environ)
+        load_dotenv(store_path, override=False)
+        record_pmcp_introduced_keys(set(os.environ) - before)
+
+    The gate that consults this registry needs one distinction: did PMCP put
+    this variable here, or did the operator's shell? A *store lookup* cannot
+    answer that durably. :func:`set_env_value` is a read-modify-write over
+    :func:`read_env_file`, which returns ``{}`` for a file it cannot read, so
+    any later store write -- for any unrelated server -- can drop an earlier
+    key while the variable it planted stays in ``os.environ``. A record of what
+    happened does not decay that way, which is why the registry is named for
+    what it means rather than for one mechanism.
+
+    Additive and idempotent, and deliberately separate from
+    :func:`record_dotenv_keys`: that registry has a merged consumer
+    (:func:`sanitized_subprocess_env` strips its keys from every spawned child),
+    so widening its membership would change behaviour elsewhere. An empty
+    registry is the correct default: PMCP imported as a library has introduced
+    nothing.
+    """
+    _PMCP_INTRODUCED_KEYS.update(keys)
+
+
+def pmcp_introduced_keys() -> frozenset[str]:
+    """Keys PMCP introduced into its own environment, by write or by load."""
+    return frozenset(_PMCP_INTRODUCED_KEYS)
+
+
+def reset_pmcp_introduced_keys() -> None:
+    """Clear the PMCP-introduced provenance registry. **Test-only seam.**
+
+    Production never calls this -- the registry only grows, as credential
+    writes and store loads happen, and a clear reachable from a gateway tool
+    would make the evidence erasable by the agent the record exists to catch.
+    Tests need it because the registry is process-global: without a reset, a key
+    one test recorded would still read as PMCP-introduced in every later test.
+    """
+    _PMCP_INTRODUCED_KEYS.clear()
+
+
 def managed_secret_keys(project: Path | None = None) -> set[str]:
     """Env-var keys of credentials PMCP manages in its user/project secret stores.
 
@@ -168,6 +226,23 @@ def managed_secret_keys(project: Path | None = None) -> set[str]:
         keys.update(read_env_file(resolve_scope_path("project", project)))
     except (OSError, ValueError):
         pass
+    return keys
+
+
+def managed_secret_keys_strict(project: Path | None = None) -> set[str]:
+    """:func:`managed_secret_keys`, but a failed lookup raises instead of hiding.
+
+    Same two files, same keys; the difference is the project lookup's
+    ``except (OSError, ValueError): pass``. That suppression makes "the lookup
+    failed" indistinguishable from "the key is not planted", and the failure
+    direction is *allow* -- fine for :func:`sanitized_subprocess_env`, where a
+    failed strip is a smaller harm than a crashed spawn, and wrong for a gate
+    deciding whether a credential is the operator's. Callers that must fail
+    closed use this variant and let the exception reach their own error branch.
+    (The user lookup is unguarded in both.)
+    """
+    keys: set[str] = set(read_env_file(resolve_scope_path("user")))
+    keys.update(read_env_file(resolve_scope_path("project", project)))
     return keys
 
 
