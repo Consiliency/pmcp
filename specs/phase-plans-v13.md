@@ -908,6 +908,226 @@ Redesigning the feedback feature; the wider redaction rework (that is S-12/#234)
 - redaction posture: `metadata_only`
 - missing or malformed evidence routes to `blocker_class=contract_bug` (non-human).
 
+### Post-execution amendments — EGRESS (2026-09-16)
+
+Recorded by SL-docs after SL-1, SL-2, SL-3 and SL-4 landed and were merged. All four
+exit criteria shipped as written and none had to be weakened, and IF-0-EGRESS-1
+shipped with the signatures it declared — plus one optional output field its own
+first revision had promised not to add, because keeping that promise would have
+forced the gateway to report a certain negative it does not have (item 6(e)). But
+**the exit criteria named three egress doors and there were four** (item 1), and the
+variable EC-EGRESS-1 makes authoritative was itself writable by a tool the agent
+calls (item 2). Line references are to `6a50e16`. **Items 1, 2 and 4 are the ones
+SEAL pays for if they are not read.**
+
+1. **The criteria named three doors and there were four, and the fourth survives
+   EC-EGRESS-1 as written.** EC-EGRESS-1 asks that "ambient `GITHUB_TOKEN` is never
+   used … asserted by a test that sets `GITHUB_TOKEN` and requires no request to be
+   attempted." On `main`, `submit_feedback` reached the outside from four places:
+   two `urlopen` calls (the visibility probe and the POST), a `shutil.which("gh")` →
+   `asyncio.create_subprocess_exec("gh", "issue", "create", …)` fallback, and the
+   browser URL it hands the agent. **Deleting `GITHUB_TOKEN` from the token lookup
+   satisfies the criterion literally and changes nothing for door 3**: with no API
+   token the handler fell through to `gh`, which authenticates from the inherited
+   environment and from `gh`'s own stored credentials, so the very operator the
+   criterion protects would still have posted under their personal identity — and
+   pmcp could not have told them which credential it used. Door 4 issues no request,
+   but it renders the destination into a URL the agent is told to open, so an
+   attacker-chosen value there is still a disclosure.
+   This was found by reading the function before planning, and confirmed by
+   execution: SL-4's red run against the pre-lane handler reached a live
+   `gh issue create --repo ViperJuice/pmcp` on the development host, which is why
+   that file's gh-door guard is autouse for every test in it rather than opt-in
+   (`c0b18e5`); two further tests drive `attacker/evil` — introduced by a real
+   `load_dotenv` over a checkout's `.env` — and a value carrying a control character
+   and shell metacharacters into the same `repository` that door 3 rendered straight
+   into its argv on `main` (`tests/test_feedback_egress.py:539`, `:599`). The path is now **deleted
+   rather than gated** — a gate in front of an unattributable identity still posts
+   under it — and asserted gone structurally as well as behaviourally, by reading the
+   handler's own source for `"gh"` and `create_subprocess_exec`
+   (`tests/test_feedback_egress.py:342-344`). `handlers.py` no longer imports
+   `shutil`, `urlopen` or `urlencode`, and the file's only remaining spawn is PKGID's
+   update probe (`handlers.py:3786`). The destination is resolved and validated
+   **first**, before every other rule, so no unvalidated value reaches any output —
+   a refusal included, and door 4's URL included.
+   **Lesson for SEAL, and the second phase in a row to learn it.** PKGID amendment 1
+   was "enumerate spawn sites, not install call sites". EGRESS's is the same shape:
+   **enumerate the paths that reach the outside, not the function you were looking
+   at.** A criterion that names a credential bounds a credential; it does not bound
+   an act. SEAL's adversarial suite should drive the S-04 reproduction at every exit
+   from the process, not at the one API call.
+
+2. **The credential predicate's own input was agent-writable.** EC-EGRESS-1 makes
+   `PMCP_FEEDBACK_TOKEN` authoritative, and `gateway.auth_connect` writes the
+   gateway's own `os.environ` (`handlers.py:4993`). `PMCP_FEEDBACK_TOKEN` is
+   credential-shaped, and `env_var_allowed` admits any credential-shaped name when a
+   server declares none — so an agent could have stored one through that tool and had
+   pmcp honour it as "the operator's". Driven through the real tool, not simulated
+   (`tests/test_feedback_egress.py:487-500`).
+   Closed by a durable, additive, process-global provenance registry —
+   `record_pmcp_introduced_keys` / `pmcp_introduced_keys` (`env_store.py:164`,
+   `:198`) — which the gate reads alongside `dotenv_sourced_keys()` and
+   `managed_secret_keys_strict(project_root)` (`feedback_egress.py:192-198`). The
+   write and its record sit in the same statement group with no `await` between
+   (`handlers.py:4993-5000`), and no gateway tool can clear the registry:
+   `reset_pmcp_introduced_keys` (`env_store.py:203`) is a test-only seam with no
+   production caller.
+   **Why store membership alone was not enough, which is the part worth carrying
+   forward.** The obvious check — "is this key in one of PMCP's own credential
+   stores?" — reads evidence that can disappear while the variable it proves
+   persists. **The mechanism this phase asserted for that, through three plan
+   revisions and three panel rounds, is wrong, and was corrected only after the
+   implementation panel prompted a measurement.** The claim was that `read_env_file`
+   returns `{}` for a path it cannot read, so any `set_env_value` rewrites the store
+   without the earlier key. On python-dotenv 1.2.3 an unreadable store instead RAISES
+   `PermissionError`, `set_env_value` raises before opening anything, and the file is
+   left byte-intact — as do a directory, undecodable bytes, and a key or value the
+   writer rejects. Every unreadable shape fails closed. What does drop an entry: an
+   operator deleting the store; a write that fails partway, since `write_env_file`
+   truncates before writing and is not atomic (reproduced under `RLIMIT_FSIZE`); and a
+   second writer racing this one, which needs another process because `_write_secret`
+   is synchronous with no await between its read and its write. **Lesson: a mechanism
+   repeated by four reviews is still only as true as the one time someone ran it.** A check whose evidence can vanish while the thing it proves
+   persists is not a check, and the vanishing is reachable from a tool the agent
+   calls. The same chain works across a restart, which is why the startup store loads
+   are recorded too (`cli.py:2969-2972`): a previous process's `auth_connect` writes
+   the store, this process loads it into `os.environ`, and one unrelated
+   `auth_connect` later all three sources would otherwise say "the operator exported
+   this".
+
+3. **The plan was reviewed three times before implementation, and each round found a
+   real defect.** Worth recording because none of the three was visible in the
+   criteria, and each would have shipped as a working, tested, wrong build.
+   - **Round 1 (P1, P2).** P1: the first revision proved provenance by store
+     membership, the proxy item 2 refutes. P2: `abandon_on_cancel=True` bounds the
+     **answer and not the act** — the worker outlives the handler and its return
+     value is discarded — so a handler timeout alone lets the issue be filed after
+     the operator has been told nothing was submitted, and the manual submission
+     through the returned URL then duplicates it. The same round corrected the frozen
+     decision order (the submission flag must be reported before the confirmation,
+     or the agent is taught that confirming is what authorises a post) and a bullet
+     that claimed `ok=True` plus payload plus browser URL for *every* refusal, which
+     contradicted five rows of the plan's own table.
+   - **Round 2 (Q1, Q2(b)).** Q1: the startup-load window above, which the first
+     revision had deferred to SEAL on the reasoning that removing a store entry is an
+     operator action — refuted by the plan's own read-modify-write finding. Q2(b): with
+     the worker's return value discarded, a POST that *succeeded* and whose visibility
+     probe then stalled had no way to be reported as the success it was, so the
+     handler needs a progress record it can read after abandoning, not just a timeout.
+   - **Round 3 (R1, R2).** R1: a race in which the handler truthfully reports
+     "nothing was sent" with a compose URL and the worker then sends. Fixed by making
+     the dispatch decision and the give-up decision **the same atomic step**:
+     `claim_dispatch(deadline)` is the last thing before the opener, `abandon()` is
+     what the handler calls on timeout, and exactly one of them wins under one lock
+     (`feedback_egress.py:387`, `:424`; `handlers.py:5153-5157`). A lock that merely
+     guards a snapshot slot does not give you this. R2: an error-status classifier
+     that treated every failure as proof of non-creation, so an intermediary's 502 —
+     which can arrive *after* the request was forwarded and the issue created — handed
+     back a compose URL. Fixed by an establishing-status **allowlist**
+     (401/403/404/410/422 carrying `X-GitHub-Request-Id`, `feedback_egress.py:90`,
+     `:94`);
+     everything else is uncertain, not negative.
+
+4. **Known limits, stated rather than hidden. Both are SEAL's to judge.**
+   - **No per-socket timeout is a total request bound**, in the standard library or
+     in `httpx`: the timeout restarts on every connect/send/recv, so a peer returning
+     one byte just under the threshold holds a call open indefinitely. The plan's
+     first revision claimed socket timeouts "summing under the handler bound" bounded
+     the request; they do not. What ships instead bounds the **act** — nothing is
+     dispatched that cannot finish inside the remaining budget — and publishes facts
+     as they are learned. The residual is that an abandoned worker can outlive the
+     handler: `abandon_on_cancel=True` (`handlers.py:5151`) does not cancel the
+     thread, so it keeps one of anyio's default thread-limiter tokens until it
+     returns. It is forbidden to send by then, so it cannot act; it can only occupy.
+   - **A credential-store file this process never read, written and removed entirely
+     out of band between this process's startup and the call, is invisible to all
+     three provenance sources.** Nothing PMCP does can determine an environment
+     variable's origin after the fact; the three registries work because PMCP is
+     present at every moment it introduces one itself. This residual requires an
+     out-of-band writer on the same machine and is not reachable from any gateway
+     tool.
+
+5. **Six corrections to this plan's own `## Verification` checks, across four checks,
+   each found by the lane the check would have blocked.** Five of the six are one
+   defect: **a grep that asserts a COUNT must match a call, not a name.** The
+   `record_pmcp_introduced_keys` check passed *vacuously* at wave 1 with zero callers,
+   because the defining module names it three times in a section comment and a
+   docstring example (`02ef6fe`), and the first fix was still incomplete because
+   without a trailing paren it counted an import line and a prose mention as well
+   (`f0e24fb`). The `load_dotenv` check matched a `.. code-block:: python` example
+   inside `env_store`'s own docstring. The `submit_feedback_issue` check was
+   unsatisfiable twice over: "exactly one `handlers.py` use" cannot hold when the
+   frozen call site names the bare symbol, and a paren-anchored pattern misses it too,
+   because the call goes through `functools.partial`. The sixth is a different defect
+   in the same block: the phase-boundary grep still listed `src/pmcp/types.py` after
+   the freeze had *mandated* the one optional field there, so it would have flagged
+   the phase's own interface as a boundary crossing (`6a50e16`, which records its
+   three as the fourth, fifth and sixth). **A plan-authoring lesson, not an execution
+   one**: a structural check is code, and a check nobody has run is a check nobody has
+   tested.
+
+6. **Where this roadmap's EGRESS text is contradicted by what shipped** (original
+   text left unedited, as in the three amendment blocks above).
+   - (a) **Scope notes: "Decompose into 2 lanes with disjoint concerns in one file."**
+     Four implementation lanes shipped, five with SL-docs, and three of them are not
+     in that file. The gate the phase turns on is a new module and its own lane
+     (SL-2, `src/pmcp/feedback_egress.py`); the provenance names every other lane
+     codes against are a preamble lane and the DAG's only root (SL-1,
+     `src/pmcp/env_store.py` and `src/pmcp/types.py`); the operator flag, the CLI verb
+     and the startup-load recording are a third (SL-3, `src/pmcp/config/guidance.py`
+     and `src/pmcp/cli.py`); and only SL-4 writes `handlers.py`. This is CONSENT
+     amendment 6's finding again: **a roadmap that names a shared interface as a
+     phase output should count it as a lane.**
+   - (b) **Scope notes: "Both touch `tools/handlers.py:4796-4992`."** Stale before
+     execution began. `submit_feedback` was `:4995-5191`, and `:4796-4992` was the
+     tail of `auth_connect` — a lane that trusted the citation would have edited the
+     wrong function. `plans/phase-plan-v13-EGRESS.md`'s Context records the
+     correction; the roadmap's line is left as written.
+   - (c) **DAG notes and Execution Notes: EGRESS is "parallel with all of them."**
+     True of the criteria, not of the files. EGRESS SL-4 writes `handlers.py`, which
+     PKGID also writes; SL-3 writes `cli.py`, which PKGID also wrote; and SL-docs
+     owns the same four documentation files as CONSENT's and PKGID's docs lanes —
+     the pairwise collision this roadmap's own Execution Notes already record for
+     CONSENT and PKGID, and which applies to EGRESS identically. EGRESS was executed
+     after PKGID merged, which is what made it safe. The Execution Notes' "written by
+     PKGID lane A and both EGRESS lanes" is right about the hazard and wrong about the
+     count: `handlers.py` had exactly one EGRESS writer.
+   - (d) **Key files, evidence paths and the `## Verification` block name one test
+     file.** Key files name `src/pmcp/tools/handlers.py` and
+     `tests/test_feedback_egress.py`; the spec-closeout evidence paths name that test
+     file and `CHANGELOG.md`; `## Verification` runs `uv run pytest -q
+     tests/test_feedback_egress.py` alone. The criteria are proven across **four**
+     test files — that one plus `tests/test_feedback_egress_gate.py`,
+     `tests/test_feedback_provenance.py` and
+     `tests/test_feedback_submission_flag.py` — and **six** source files:
+     `src/pmcp/feedback_egress.py`, `src/pmcp/env_store.py`, `src/pmcp/types.py`,
+     `src/pmcp/config/guidance.py`, `src/pmcp/cli.py` and
+     `src/pmcp/tools/handlers.py`. This is CONSENT amendment 5 and PKGID amendment
+     11(e) for the third time. **SEAL's closeout should collect all four test files**,
+     and the roadmap's `## Verification` block should run them.
+   - (e) **The exit criteria have no room for an unknown.** EC-EGRESS-2 and
+     EC-EGRESS-4 frame the outcome as submitted or not submitted. A POST whose bytes
+     were sent and whose response never arrived is neither: the issue may exist, and
+     reporting it as "not submitted" with a pre-filled compose URL is how the same
+     issue gets filed twice. The phase therefore adds exactly one optional output
+     field, `SubmitFeedbackOutput.submission_outcome` (`src/pmcp/types.py`), whose
+     `dispatched_unconfirmed` value carries that state and whose `issue_url` is a
+     **search** URL rather than a compose URL. Every existing field and every existing
+     assertion is untouched; the field defaults to `None`.
+   - (f) **`## Top Interface-Freeze Gates`: IF-0-EGRESS-1 is "the credential and
+     consent predicate … and the preview payload shape returned when it refuses."**
+     Accurate but incomplete in the way that matters: the gate also resolves and
+     validates the **destination**, and item 1 is why it must do so first. A reader
+     who takes the one-line summary as the gate's scope will not expect
+     `untrusted_repository_override` or `invalid_repository` in its vocabulary.
+
+7. **`SECURITY.md` is deliberately not updated by this phase**, as it was not by
+   TRUST, CONSENT or PKGID. The roadmap's Execution Notes assign the trust-model
+   write-up to SEAL, once, "to avoid four partial descriptions of one model", and
+   IF-0-SEAL-1 binds each documented claim to a proving test. The operator-facing
+   behaviour of this phase is in `CHANGELOG.md` and `README.md`; the model it belongs
+   to is SEAL's to state.
+
 ### Phase 5 — Document and prove the model (SEAL)
 
 **Objective**

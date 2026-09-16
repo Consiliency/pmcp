@@ -524,6 +524,39 @@ Freezing the ambient environment across an update is deliberately not done
 - Telemetry is technical-only and warns before submission; payloads include PMCP/tool context.
 - Disable permanently with `pmcp guidance --telemetry off`.
 
+**Preview is the default; posting is opt-in.** `gateway.submit_feedback` builds the
+exact issue payload and a browser URL an operator can open. PMCP posts nothing
+itself unless *both* of the following are true, and it never spawns `gh`:
+
+1. **The operator has allowed it.** `pmcp guidance --feedback-submission on` sets
+   `guidance.enable_feedback_submission: true` in `~/.claude/gateway-guidance.yaml`.
+   It is off by default, `pmcp guidance --feedback-submission off` turns it back
+   off, and `pmcp guidance` shows the current value. `enable_telemetry: false`
+   overrides it: with telemetry off nothing is built or sent at all.
+   An agent's `confirm_submission=true` is the *user's* consent to the payload, not
+   the operator's authority to send it, and is not by itself enough to post.
+2. **The operator has exported a token.** `PMCP_FEEDBACK_TOKEN` — a dedicated
+   GitHub token with permission to open an issue on the destination repository.
+   `GITHUB_TOKEN` and `GH_TOKEN` are not read on this path.
+
+**The token must be exported in the shell that starts pmcp.** PMCP refuses a
+`PMCP_FEEDBACK_TOKEN` it introduced into its own environment: one stored through
+`gateway.auth_connect`, one loaded at startup from PMCP's own credential stores
+(`~/.config/pmcp/pmcp.env`, the project `.env.pmcp`), or one a `.env` in the current
+checkout supplied. The credential that authorises an outbound post has to come from
+you, not from something the agent or the repository could have written.
+
+**The destination is validated.** The default is `Consiliency/pmcp`, this project's
+repository. `PMCP_FEEDBACK_REPO` overrides it, under the same rule: an override a
+checkout's `.env` introduced is refused, so is one that is not `owner/repo` shaped,
+and a refused destination is never rendered into a URL you are handed to open.
+
+Refusals are loud rather than silent. Each one says what to do — the exact
+`pmcp guidance` command, or the variable to export — and the ones that can still be
+acted on by hand return the payload and a browser URL. If PMCP sent a request and
+never saw the response, it says so (`submission_outcome: "dispatched_unconfirmed"`)
+and hands back a *search* URL, because the issue may already exist.
+
 ## Progressive Disclosure Workflow
 
 PMCP follows a progressive disclosure pattern - start with natural language, get recommendations, drill down as needed.
@@ -966,6 +999,9 @@ guidance:
     code_hints: true         # L1 hints
     code_snippets: false     # L2 examples (default: off)
     methodology_resource: true  # L3 guide
+
+  enable_telemetry: true            # failure feedback hints and issue previews
+  enable_feedback_submission: false # let PMCP POST feedback to GitHub (default: off)
 ```
 
 **Levels**:
@@ -976,9 +1012,15 @@ guidance:
 ### View Guidance Status
 
 ```bash
-pmcp guidance                 # Show configuration
-pmcp guidance --show-budget  # Show token estimates
+pmcp guidance                              # Show configuration
+pmcp guidance --show-budget                # Show token estimates
+pmcp guidance --telemetry on|off           # Feedback telemetry
+pmcp guidance --feedback-submission on|off # Let PMCP post feedback (default: off)
 ```
+
+`pmcp guidance` prints both switches, and each `--` form above persists the
+decision to `~/.claude/gateway-guidance.yaml` before printing the new state. See
+[Feedback Telemetry](#feedback-telemetry) for what submission requires.
 
 ### Token Budget
 

@@ -67,6 +67,15 @@ class GuidanceConfig(BaseModel):
             "Enable PMCP feedback telemetry hints and submission workflow for failures"
         ),
     )
+    enable_feedback_submission: bool = Field(
+        default=False,
+        description=(
+            "Allow PMCP to POST feedback to GitHub on the operator's behalf. "
+            "Off by default: telemetry turns the feedback workflow on, this turns "
+            "the outbound act on, and an agent asking to submit is not authority "
+            "to submit (Consiliency/pmcp#230)"
+        ),
+    )
 
     def __init__(self, **data):
         """Initialize guidance config and apply level presets."""
@@ -198,6 +207,10 @@ def create_default_guidance_config(output_path: Path | None = None) -> Path:
             "max_hint_length": 8,
             "max_snippet_lines": 4,
             "enable_telemetry": True,
+            # Stated rather than left implicit: an operator reading their own
+            # generated config can see the outbound switch exists and that it
+            # is off, instead of having to know the model's default.
+            "enable_feedback_submission": False,
         }
     }
 
@@ -230,6 +243,46 @@ def set_telemetry_enabled(
         guidance_data = {}
 
     guidance_data["enable_telemetry"] = enabled
+    data["guidance"] = guidance_data
+
+    with open(config_path, "w") as f:
+        yaml.dump(data, f, default_flow_style=False, sort_keys=False)
+
+    return (load_guidance_config(config_path), config_path)
+
+
+def set_feedback_submission_enabled(
+    enabled: bool, config_path: Path | None = None
+) -> tuple[GuidanceConfig, Path]:
+    """Persist the outbound-submission decision and return updated config/path.
+
+    Mirrors :func:`set_telemetry_enabled` exactly, including its read-modify-write
+    of the whole YAML document, so an operator's other settings survive a flip of
+    this one switch. ``off`` writes an explicit ``False`` rather than removing the
+    key: the file should record the decision, not the absence of one.
+
+    The file is ``~/.claude/gateway-guidance.yaml`` -- user-scoped and outside any
+    checkout, so a repository cannot ship its own consent (Consiliency/pmcp#230).
+    """
+    if config_path is None:
+        config_path = Path.home() / ".claude" / "gateway-guidance.yaml"
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    data: dict[str, object] = {}
+    if config_path.exists():
+        try:
+            loaded = yaml.safe_load(config_path.read_text())
+            if isinstance(loaded, dict):
+                data = loaded
+        except Exception:
+            data = {}
+
+    guidance_data = data.get("guidance")
+    if not isinstance(guidance_data, dict):
+        guidance_data = {}
+
+    guidance_data["enable_feedback_submission"] = enabled
     data["guidance"] = guidance_data
 
     with open(config_path, "w") as f:
