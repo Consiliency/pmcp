@@ -36,7 +36,7 @@ from pmcp.config.loader import (
     load_configs,
     set_startup_policy,
 )
-from pmcp.env_store import record_dotenv_keys
+from pmcp.env_store import record_dotenv_keys, record_pmcp_introduced_keys
 from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
 from pmcp.types import StartupPolicyOperation
@@ -549,6 +549,14 @@ Environment overrides:
         "--telemetry",
         choices=["on", "off"],
         help="Persistently enable or disable PMCP feedback telemetry prompts",
+    )
+    guidance_parser.add_argument(
+        "--feedback-submission",
+        choices=["on", "off"],
+        help=(
+            "Persistently allow or forbid PMCP posting feedback to GitHub on your "
+            "behalf (off by default)"
+        ),
     )
 
     # Doctor command
@@ -2436,7 +2444,11 @@ async def run_server(args: argparse.Namespace) -> None:
 
 def run_guidance(args: argparse.Namespace) -> None:
     """Show guidance configuration status."""
-    from pmcp.config.guidance import load_guidance_config, set_telemetry_enabled
+    from pmcp.config.guidance import (
+        load_guidance_config,
+        set_feedback_submission_enabled,
+        set_telemetry_enabled,
+    )
 
     setup_logging(args.log_level)
 
@@ -2446,6 +2458,15 @@ def run_guidance(args: argparse.Namespace) -> None:
         _updated, path = set_telemetry_enabled(enabled)
         state = "enabled" if enabled else "disabled"
         print(f"Telemetry {state} in {path}")
+
+    # Persist the outbound-submission decision if requested. Written before the
+    # config is loaded below, so the status block reports the decision this
+    # invocation just made (Consiliency/pmcp#230).
+    if getattr(args, "feedback_submission", None):
+        submission_enabled = args.feedback_submission == "on"
+        _updated, path = set_feedback_submission_enabled(submission_enabled)
+        state = "enabled" if submission_enabled else "disabled"
+        print(f"Feedback submission {state} in {path}")
 
     # Load guidance config
     config = load_guidance_config()
@@ -2463,6 +2484,7 @@ def run_guidance(args: argparse.Namespace) -> None:
         f"  L3 Methodology Resource: {'✓' if config.include_methodology_resource else '✗'}"
     )
     print(f"  Feedback Telemetry: {'✓' if config.enable_telemetry else '✗'}")
+    print(f"  Feedback Submission: {'✓' if config.enable_feedback_submission else '✗'}")
     print()
 
     if args.show_budget:
@@ -2910,8 +2932,23 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     stripped -- which is exactly right, because ``override=False`` means such a
     variable did not come from the file.
 
-    The two PMCP-store loads need no recording; ``managed_secret_keys`` already
-    covers those keys.
+    The two PMCP-store loads are recorded too, through a *different* registry:
+    ``record_pmcp_introduced_keys`` (Consiliency/pmcp#230). This function used to
+    record nothing for them, on the reasoning that ``managed_secret_keys``
+    already covered those keys -- true for the sanitiser, and **false for a
+    provenance check**, because ``managed_secret_keys`` answers about the store
+    file's contents *now*. A token a previous process's ``auth_connect`` wrote
+    to the store is loaded here into this process's environment, and any later
+    ``auth_connect`` -- for any unrelated server -- can drop it from the file,
+    because ``set_env_value`` rewrites the whole file from a ``read_env_file``
+    that returns ``{}`` for a file it cannot read. Without this record, all three
+    provenance sources would then say "the operator exported this" and the
+    outbound-feedback gate would honour an agent-plantable credential.
+
+    The two registries stay separate deliberately. ``dotenv_sourced_keys`` has a
+    merged consumer -- ``sanitized_subprocess_env`` strips its keys from every
+    spawned child -- so recording the stores there would change what downstream
+    servers inherit, which is behaviour outside this change.
 
     ``dotenv_path`` is a test seam, and ``None`` -- the production call -- is
     identical to the bare ``load_dotenv()`` this replaced: ``find_dotenv``
@@ -2925,9 +2962,14 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     before = set(os.environ)
     load_dotenv(dotenv_path)
     record_dotenv_keys(set(os.environ) - before)
-    # Load PMCP credential stores written by auth_connect (don't override already-set vars)
+    # Load PMCP credential stores written by auth_connect (don't override already-set
+    # vars) and record what they introduced. ``override=False`` is what makes the
+    # delta correct: a variable the operator exported is already in ``before``, so it
+    # is never recorded and never refused.
+    before = set(os.environ)
     load_dotenv(Path.home() / ".config" / "pmcp" / "pmcp.env", override=False)
     load_dotenv(Path.cwd() / ".env.pmcp", override=False)
+    record_pmcp_introduced_keys(set(os.environ) - before)
 
 
 def main() -> None:
