@@ -930,9 +930,14 @@ rg -n "shutil\.which\(.gh.\)|gh.*issue.*create" src/pmcp/tools/handlers.py
 # ^ MUST be empty.
 
 # The transport lives in exactly one place, and it is never awaited directly.
-rg -n 'submit_feedback_issue' src/pmcp/
-# ^ MUST show its definition in feedback_egress.py and exactly one handlers.py use,
-#   inside `anyio.to_thread.run_sync(...)`.
+rg -n 'submit_feedback_issue' src/pmcp/tools/handlers.py
+# ^ MUST be exactly two lines: the from-import (the frozen call site names the bare
+#   symbol, so an import is REQUIRED) and the reference handed to
+#   anyio.to_thread.run_sync. Corrected twice during execution: the original
+#   'exactly one handlers.py use' was unsatisfiable, and a paren-anchored pattern
+#   misses it too, because the call goes through functools.partial and the name is
+#   never immediately followed by '('. What matters is that handlers.py never OPENS
+#   a socket itself -- the urlopen/urlencode greps above assert that directly.
 
 # The provenance registry is not clearable by anything an agent can reach.
 rg -n 'reset_pmcp_introduced_keys' src/pmcp/
@@ -956,10 +961,16 @@ rg -n 'record_pmcp_introduced_keys\(' src/pmcp/ --glob '!env_store.py'
 
 # Every site that puts PMCP's own credential stores into PMCP's own environment records
 # it. These are the only such sites; a new one added later must record too.
-rg -n 'load_dotenv' src/pmcp/
+rg -n 'load_dotenv\(' src/pmcp/ --glob '!env_store.py'
 # ^ MUST be: cli.py's plain-.env load (recorded via record_dotenv_keys), cli.py's two
-#   store loads (recorded via record_pmcp_introduced_keys), and handlers.py:3017
-#   (already recorded via record_dotenv_keys). Any unrecorded load is a provenance hole.
+#   store loads (recorded via record_pmcp_introduced_keys), and handlers.py's runtime
+#   load (already recorded via record_dotenv_keys). Any unrecorded load is a provenance
+#   hole. Corrected during execution by SL-4: the name-only pattern also matched a
+#   `.. code-block:: python` example inside env_store's own docstring -- prose, not a
+#   load. Match the call, and exclude the module whose docstrings describe it.
+#   One prose match remains by design: cli.py's docstring sentence naming the bare
+#   ``load_dotenv()`` it replaced. Four real loads, one prose line, and the prose line
+#   sits inside the function the audit is about.
 
 # The gate reads the STRICT lookup; the lenient one keeps only its existing caller.
 rg -n 'managed_secret_keys\b' src/pmcp/
@@ -992,8 +1003,12 @@ rg -n '401|403|404|410|422|X-GitHub-Request-Id' src/pmcp/feedback_egress.py
 # EGRESS does not cross into a sibling phase's files.
 git diff --name-only origin/main..HEAD -- src/pmcp/policy/ src/pmcp/manifest/ \
     src/pmcp/provision_gate.py src/pmcp/trust_store.py src/pmcp/validation.py \
-    src/pmcp/types.py tests/conftest.py
+    tests/conftest.py
 # ^ MUST be empty. A non-empty result means a lane crossed the phase boundary.
+#   Corrected during execution by SL-4: src/pmcp/types.py was dropped from this list
+#   because IF-0-EGRESS-1 now MANDATES the one optional SubmitFeedbackOutput field, and
+#   SL-1 owns the file. The check predated that correction and would have flagged the
+#   phase's own frozen interface as a boundary crossing.
 
 python3 scripts/check_plan_consistency.py plans/phase-plan-v13-EGRESS.md
 ```
