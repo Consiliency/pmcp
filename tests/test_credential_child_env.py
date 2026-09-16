@@ -35,7 +35,16 @@ class TestRealSymbolsRealArity:
 
     def test_build_install_child_env_arity(self) -> None:
         sig = inspect.signature(build_install_child_env)
-        assert list(sig.parameters) == ["server_config"]
+        assert list(sig.parameters) == ["server_config", "project_root"]
+        # ``project_root`` is optional by deliberate design (SEAL SL-0,
+        # Consiliency/pmcp#230): a required parameter would have rewritten call
+        # sites across three merged phases' evidence files, including this one at
+        # :97. The default is therefore load-bearing and pinned here, and the
+        # hazard it creates -- an omitted argument silently acquires the old
+        # walk-up-from-cwd behaviour -- is closed by
+        # tests/test_install_child_env_project_root.py, which asserts no
+        # production call site omits it.
+        assert sig.parameters["project_root"].default is None
 
     def test_manifest_server_to_config_requires_two_args(self) -> None:
         sig = inspect.signature(_manifest_server_to_config)
