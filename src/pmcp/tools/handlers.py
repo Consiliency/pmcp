@@ -213,7 +213,10 @@ _REGISTRATION_RESOLVE_TIMEOUT_SECONDS = 20.0
 #: request bound -- it restarts on every connect/send/recv, so a peer that returns
 #: one byte just under the threshold holds the call open forever. The transport
 #: runs in a worker thread under this bound, and `feedback_egress`'s per-phase
-#: budgets sum below it so nothing starts that cannot finish inside it.
+#: budgets sum below it so nothing *starts* without room to finish inside it. That is
+#: the whole claim: a phase that has started can still overrun, because a single socket
+#: operation stalling below its own threshold cannot be interrupted from Python. This
+#: bounds how long the HANDLER waits, never how long the worker may take.
 _FEEDBACK_SUBMIT_TIMEOUT_SECONDS = 20.0
 
 #: What a provisioning refusal says before the gate's remedy, per reason.
@@ -4993,10 +4996,15 @@ class GatewayTools:
         os.environ[env_var] = parsed.credential
         # Recorded in the SAME statement group as the write, with no await between:
         # no other task may observe the environment write without the record. Store
-        # membership is not durable evidence -- `set_env_value` is a read-modify-write
-        # over a `read_env_file` that returns {} for a file it cannot read, so any
-        # later auth_connect, for any unrelated server, can drop this key from the
-        # file while the variable it planted stays here (Consiliency/pmcp#230).
+        # membership is not durable evidence: the entry can vanish while the variable
+        # it planted stays here. NOT by the route this comment used to name -- a later
+        # `auth_connect` whose read-modify-write silently drops the key is not
+        # reproducible, because every unreadable-store shape raises rather than
+        # rewriting. By these instead: `write_env_file` truncates before it writes, so
+        # a failed write loses the rest of the file; a concurrent writer in another
+        # process loses an update; an operator deletes the store; or a previous
+        # process wrote the key and this one never saw it. See
+        # `env_store.record_pmcp_introduced_keys` (Consiliency/pmcp#230).
         record_pmcp_introduced_keys([env_var])
 
         self._audit(
@@ -5155,6 +5163,32 @@ class GatewayTools:
             # `latest()` here instead would be the R1 race: it can answer
             # not_dispatched with a compose URL while the worker goes on to post.
             result = progress.abandon()
+        except anyio.get_cancelled_exc_class():
+            # The THIRD exit, and the one the two arms around it both miss. A
+            # cancellation -- the caller disconnected, the surrounding task group is
+            # unwinding -- is a `BaseException`, so neither `except TimeoutError` nor
+            # `except Exception` catches it. Without this arm `abandon()` never ran, and
+            # a worker parked before `claim_dispatch` still found `pending` with the
+            # handler apparently listening, won the claim, and POSTed after the caller
+            # had gone: the R1 race reached through a different door.
+            #
+            # Asked by class rather than by name so it holds under trio as well as
+            # asyncio, where the cancellation exception is a different type.
+            #
+            # A `try/finally` that abandoned on every exit would be shorter and is
+            # wrong: `abandon()` is NOT idempotent. The first call from `pending`
+            # returns `not_dispatched`; a second finds state `abandoned` -- neither
+            # `terminal` nor `pending` -- and falls through to `dispatched_unconfirmed`,
+            # so a `finally` after the `TimeoutError` arm would silently convert a
+            # certain "nothing was sent" into "it may already exist" and send the
+            # operator hunting for an issue that does not exist. The success path must
+            # not abandon at all. Three arms, each abandoning exactly once.
+            #
+            # RE-RAISED, never swallowed: answering normally here would tell the
+            # surrounding task group this call completed and hand a result to a caller
+            # that has already stopped listening.
+            progress.abandon()
+            raise
         except Exception as exc:
             # A transport that raises instead of returning an outcome is a bug, not a
             # second door. Give up the same way, so the worker can never afterwards be
