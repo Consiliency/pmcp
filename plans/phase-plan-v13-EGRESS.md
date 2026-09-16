@@ -938,11 +938,17 @@ rg -n 'submit_feedback_issue' src/pmcp/
 rg -n 'reset_pmcp_introduced_keys' src/pmcp/
 # ^ MUST be exactly one hit: the definition in env_store.py. Any src/ CALLER is a
 #   production clear path, and server.py dispatches 26 tools, none of which may reach it.
-rg -n 'record_pmcp_introduced_keys' src/pmcp/
-# ^ MUST be exactly three hits: the definition, the auth_connect call beside
-#   handlers.py:4972, and the startup store-load delta in cli.load_startup_env. A
-#   MISSING third hit is the second panel's Q1 hole: a store key loaded at startup and
-#   then dropped from the file by an unrelated auth_connect reads as operator-supplied.
+rg -n 'record_pmcp_introduced_keys' src/pmcp/ --glob '!env_store.py'
+# ^ MUST be exactly two hits: the auth_connect call beside handlers.py:4972, and the
+#   startup store-load delta in cli.load_startup_env. A MISSING hit is the second
+#   panel's Q1 hole: a store key loaded at startup and then dropped from the file by an
+#   unrelated auth_connect reads as operator-supplied.
+#   env_store.py is excluded because the definition site also carries the name in a
+#   section comment and in its own docstring example -- as record_dotenv_keys does
+#   (:107, :124) -- so a count over the whole tree measures prose, not call sites.
+#   Corrected during execution: the original 'exactly three hits' passed VACUOUSLY at
+#   wave 1 (definition + comment + docstring, zero callers) and would have failed
+#   spuriously at 5 once both real calls landed.
 
 # Every site that puts PMCP's own credential stores into PMCP's own environment records
 # it. These are the only such sites; a new one added later must record too.
