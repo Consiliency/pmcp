@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "last_updated": "2026-09-15T08:24:31+00:00",
+  "last_updated": "2026-09-16T00:00:00+00:00",
   "files": {
     "README.md": {
       "purpose": "root project README",
@@ -9,7 +9,8 @@
         "P2",
         "P3B",
         "UPDPATH",
-        "PKGID"
+        "PKGID",
+        "EGRESS"
       ]
     },
     "CHANGELOG.md": {
@@ -22,7 +23,8 @@
         "UPDPATH",
         "TRUST",
         "CONSENT",
-        "PKGID"
+        "PKGID",
+        "EGRESS"
       ]
     },
     "CONTRIBUTING.md": {
@@ -85,7 +87,8 @@
       "touched_by_phases": [
         "TRUST",
         "CONSENT",
-        "PKGID"
+        "PKGID",
+        "EGRESS"
       ]
     },
     "specs/phase-plans-v2.md": {
@@ -228,6 +231,12 @@
       "purpose": "per-phase lane plan",
       "touched_by_phases": [
         "CONSENT"
+      ]
+    },
+    "plans/phase-plan-v13-EGRESS.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": [
+        "EGRESS"
       ]
     },
     "plans/phase-plan-v13-PKGID.md": {

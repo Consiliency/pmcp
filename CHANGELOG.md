@@ -8,6 +8,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`pmcp guidance --feedback-submission on|off`, and the
+  `enable_feedback_submission` key it writes.** This is the only setting that lets
+  PMCP post a feedback issue to GitHub on your behalf, and it is **off by default**.
+  The verb mirrors `pmcp guidance --telemetry on|off`: it writes
+  `guidance.enable_feedback_submission` into `~/.claude/gateway-guidance.yaml` —
+  user-scoped and outside any checkout, so a repository cannot ship its own consent —
+  and `pmcp guidance` now prints `Feedback Submission: ✓/✗` beside the telemetry
+  line. `off` writes an explicit `false` rather than deleting the key, so the file
+  records the decision rather than the absence of one, and a newly generated default
+  config states the key rather than leaving an operator to know the model's default.
+  **`confirm_submission=true` no longer causes a post on its own.** That argument is
+  the *user's* consent to the exact payload; the flag is the *operator's* authority
+  to send it, and an agent cannot set the flag. With the flag off — which is every
+  gateway that has not run the verb — `gateway.submit_feedback` returns the built
+  payload and a browser URL and pmcp sends nothing, which is what it already did for
+  an unconfirmed call. Telemetry still outranks it: `enable_telemetry: false`
+  refuses before the submission flag is consulted, and says so rather than telling
+  you to turn on a switch telemetry would override. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **`gateway.submit_feedback` output gains `submission_outcome`.** Optional, absent
+  (`null`) on every preview and on every refusal made before a request — so no
+  existing field changes and no existing reading of `submitted` breaks. When pmcp did
+  attempt a post it is one of `created`, `refused`, `not_dispatched` or
+  `dispatched_unconfirmed`. The last is the one `submitted: false` cannot express on
+  its own: the request left this machine and no response came back, so **the issue
+  may exist**. On that outcome `issue_url` is a GitHub *search* URL for the title
+  rather than a pre-filled compose URL, and the message says the issue may already
+  be filed — handing back a compose URL after a possible success is how the same
+  issue gets filed twice. `refused` is a real negative: GitHub itself answered, so
+  the compose URL is safe. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **`pmcp trust approve-package|list-packages|revoke-package`, and a `packages:`
   section in the gateway policy.** These are the two ways an operator opts a
   discovered package in (see *Security* below). `pmcp trust approve-package
@@ -69,7 +100,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concrete published version. It has no caller in this release either. See
   [#230](https://github.com/Consiliency/pmcp/issues/230).
 
+### Removed
+- **The `gh issue create` fallback in `gateway.submit_feedback` is gone.** When the
+  gateway had no API token it used to shell out to `gh issue create --repo …` if the
+  `gh` CLI was on `PATH`. **If you relied on that, submission through pmcp now stops
+  working for you** and the call returns a preview with a browser URL instead: it
+  names `PMCP_FEEDBACK_TOKEN` and the `pmcp guidance --feedback-submission on` verb,
+  and the URL still files the issue by hand. The path was removed rather than gated
+  because `gh` authenticates from whatever the inherited environment and `gh`'s own
+  stored credentials provide, so pmcp could not say — and could not tell you —
+  which identity posted. The handler's last `asyncio.create_subprocess_exec` and the
+  file's last `shutil` use went with it: this path now spawns nothing. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **`GITHUB_TOKEN` and `GH_TOKEN` are no longer read anywhere on the feedback
+  path.** Previously an ambient `GITHUB_TOKEN` was accepted as the posting
+  credential, so an agent that asked to submit could publish under an operator's
+  personal GitHub identity — one that generally carries far more authority than
+  filing an issue. **Only `PMCP_FEEDBACK_TOKEN` is honoured now**, and an operator
+  who was posting on an ambient token must export that variable instead (a
+  fine-grained token with issue-write on one repository is enough). With no such
+  token the call previews and names the variable; it does not fall back to anything.
+  `GITHUB_TOKEN` still appears in `gateway.register_discovered_server`'s schema
+  example for a downstream server's own credentials, which is unrelated and
+  unchanged. See [#230](https://github.com/Consiliency/pmcp/issues/230).
+
 ### Security
+- **`gateway.submit_feedback` will not post under a credential or to a destination
+  that PMCP itself introduced.** Every submission is now decided by one
+  fail-closed gate (`src/pmcp/feedback_egress.py`) before any network call, and the
+  gate refuses `PMCP_FEEDBACK_TOKEN` unless it can establish that *you* put it in
+  the environment. A token PMCP wrote itself is refused: `gateway.auth_connect`
+  stores credentials and exports them into the gateway's own environment, and
+  `PMCP_FEEDBACK_TOKEN` is credential-shaped, so an agent could otherwise have
+  stored one through that tool and had pmcp post with it. So is a token a `.env` in
+  the current checkout supplied, and so is one PMCP loaded at startup from its own
+  credential stores — recorded as PMCP-introduced when the load happens, because
+  store membership alone can be erased afterwards by an unrelated
+  `auth_connect`. **Export the value in the shell that starts pmcp**; the refusal
+  names both store paths (`~/.config/pmcp/pmcp.env` and the project `.env.pmcp`) and
+  says so. The check is deliberately over-strict in one direction: if you export the
+  variable *and* the same key sits in a PMCP store, the two cannot be told apart
+  afterwards and the call is refused, with a remedy naming both fixes.
+  The destination is decided the same way and decided **first**, so no unvalidated
+  repository reaches any output — a refusal included, and the browser URL the agent
+  is told to open included. `PMCP_FEEDBACK_REPO` still overrides the default, but an
+  override that a checkout's `.env` introduced is refused, as is one that is not
+  `owner/repo` shaped, and the refusal renders the offending value inert rather than
+  echoing it. A refusal that cannot establish authority or destination returns no
+  payload and no URL at all. Any error while consulting the provenance records
+  denies rather than raising, so a failed lookup can never read as permission. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **A discovered server no longer runs an agent-chosen package without an
   operator's approval, and its registration is pinned to one resolved version.**
   Before this release, `gateway.register_discovered_server` stored whatever
@@ -233,6 +313,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+- **The default feedback repository was `ViperJuice/pmcp`, a repository this
+  project does not own.** Every unconfigured gateway that submitted feedback — or
+  merely previewed it — named that repository in its output and in the browser URL
+  it handed the agent to open. The packaged default is now
+  `Consiliency/pmcp`, the project's real remote, asserted in the tests against the
+  distribution's own `Project-URL: Repository` metadata rather than against a
+  duplicated literal, so the same drift cannot recur silently. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **A feedback submission no longer blocks the gateway's event loop, and it is
+  bounded.** Both HTTP calls used to run inline inside the async handler, so for as
+  long as they took — up to 15 s of socket timeouts, and unbounded in the worst case
+  — the gateway served no other downstream call. The submission now runs in a worker
+  thread under a 20 s end-to-end bound, with per-phase budgets that sum below it so
+  nothing is started that cannot finish inside it. A per-socket timeout is not a
+  request bound — it restarts on every read, so a peer trickling one byte at a time
+  holds a call open forever — which is why the bound is on the act and not only on
+  the answer: the worker asks for permission to send as the last step before it
+  opens the socket, and once the handler has given up that permission is refused, so
+  an operator is never told nothing was sent by a gateway that then sends. The
+  repository-visibility probe now runs *after* a created issue instead of before the
+  post, and a preview no longer claims `repository_visibility: "public"` on a path
+  that made no request; it reports `"unknown"`, which is what it knows. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **Starting pmcp from inside your home directory no longer asks you to approve
   your own `~/.pmcp/manifest.yaml`.** The project overlay search walks up from the
   working directory, and from any subdirectory of `$HOME` with no closer overlay it
