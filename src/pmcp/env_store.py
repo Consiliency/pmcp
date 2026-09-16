@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import re
 from collections.abc import Iterable, Mapping
@@ -55,6 +56,43 @@ def read_env_file(path: Path) -> dict[str, str]:
         else:
             values[key] = value
     return values
+
+
+def _read_env_file_strict(path: Path) -> dict[str, str]:
+    """:func:`read_env_file`, but "I could not read it" is never "it is not there".
+
+    Both answers are ``{}`` from :func:`read_env_file`, and for its own callers that is
+    right: a failed strip is a smaller harm than a crashed spawn. For a gate deciding
+    whether a credential is the operator's, the two answers are opposite -- "no store"
+    means nothing was planted, and "a store I could not read" means pmcp does not know.
+
+    Measured on this tree (python-dotenv 1.2.3), only ONE shape of unreadable store was
+    actually silent. A mode-000 *file* already raises ``PermissionError`` out of
+    ``dotenv_values``, so the strict lookup already failed closed for it; undecodable
+    bytes already raise ``UnicodeDecodeError``. But a **directory** at a store path --
+    and any other non-regular file -- satisfies ``Path.exists()`` and yields ``{}``
+    with no error at all, which the gate read as "nothing is planted" and allowed a
+    post. That is the hole this closes.
+
+    So this adds exactly one refusal and delegates everything else unchanged: a path
+    that **exists but is not a regular file** raises, and every other path goes to
+    :func:`read_env_file` exactly as before. Both halves of the condition earn their
+    place. ``exists()`` follows symlinks, so a store whose symlink target is gone is
+    genuinely **not there** and must stay an allow -- ``is_file()`` alone is false for
+    that and for a directory alike, and refusing both would refuse every operator who
+    has never run ``auth_connect``. And the delegation must stay a real call rather
+    than an early ``return {}`` for an absent path: :func:`read_env_file` is the seam
+    the existing lookup tests inject a failing read at, and short-circuiting past it
+    would quietly make those tests unable to see the strict lookup at all.
+
+    Checking the shape *before* opening also keeps a FIFO at a store path from
+    blocking the gate forever instead of answering.
+    """
+    if path.exists() and not path.is_file():
+        raise OSError(
+            errno.EINVAL, "Credential store path is not a regular file", str(path)
+        )
+    return read_env_file(path)
 
 
 def _validate_env_values(values: dict[str, str]) -> None:
@@ -178,12 +216,32 @@ def record_pmcp_introduced_keys(keys: Iterable[str]) -> None:
 
     The gate that consults this registry needs one distinction: did PMCP put
     this variable here, or did the operator's shell? A *store lookup* cannot
-    answer that durably. :func:`set_env_value` is a read-modify-write over
-    :func:`read_env_file`, which returns ``{}`` for a file it cannot read, so
-    any later store write -- for any unrelated server -- can drop an earlier
-    key while the variable it planted stays in ``os.environ``. A record of what
-    happened does not decay that way, which is why the registry is named for
-    what it means rather than for one mechanism.
+    answer that durably, because a store entry can vanish while the variable it
+    planted stays in ``os.environ``.
+
+    **The mechanisms, as measured rather than as first assumed.** An earlier
+    revision of this docstring said :func:`set_env_value` could drop a key
+    because it is a read-modify-write over a :func:`read_env_file` that returns
+    ``{}`` for a file it cannot read, so *any* later ``auth_connect`` would
+    erase an earlier entry. That is **not** reproducible: an unreadable file
+    raises ``PermissionError`` out of the read and the file is left byte-intact,
+    a directory at the path raises ``IsADirectoryError`` out of the write, and a
+    store holding a key or value the writer rejects raises ``ValueError`` before
+    the file is opened. Every one of those fails closed. What is real:
+
+    * :func:`write_env_file` truncates before it writes (``O_TRUNC``, then a
+      separate write), so a write that fails partway -- ``ENOSPC``, a quota, a
+      kill signal -- leaves the file truncated and its remaining entries gone;
+    * two read-modify-writes racing lose one update, reachable whenever a second
+      process touches the store (a ``pmcp secrets set``/``sync`` beside a running
+      gateway) -- not in-process, where :func:`set_env_value` runs synchronously
+      with no await between the read and the write;
+    * an operator simply deleting the store;
+    * and a store written by a *previous* process, whose keys a write-only
+      record never saw.
+
+    A record of what happened decays through none of these, which is why the
+    registry is named for what it means rather than for one mechanism.
 
     Additive and idempotent, and deliberately separate from
     :func:`record_dotenv_keys`: that registry has a merged consumer
@@ -232,17 +290,25 @@ def managed_secret_keys(project: Path | None = None) -> set[str]:
 def managed_secret_keys_strict(project: Path | None = None) -> set[str]:
     """:func:`managed_secret_keys`, but a failed lookup raises instead of hiding.
 
-    Same two files, same keys; the difference is the project lookup's
-    ``except (OSError, ValueError): pass``. That suppression makes "the lookup
-    failed" indistinguishable from "the key is not planted", and the failure
-    direction is *allow* -- fine for :func:`sanitized_subprocess_env`, where a
-    failed strip is a smaller harm than a crashed spawn, and wrong for a gate
-    deciding whether a credential is the operator's. Callers that must fail
-    closed use this variant and let the exception reach their own error branch.
-    (The user lookup is unguarded in both.)
+    Same two files, same keys. Two differences, and the second was found by the
+    assembled phase's review panel: the project lookup's
+    ``except (OSError, ValueError): pass`` is gone, and BOTH halves read through
+    :func:`_read_env_file_strict` rather than :func:`read_env_file`. That suppression
+    makes "the lookup failed" indistinguishable from "the key is not planted", and the
+    failure direction is *allow* -- fine for :func:`sanitized_subprocess_env`, where a
+    failed strip is a smaller harm than a crashed spawn, and wrong for a gate deciding
+    whether a credential is the operator's. Callers that must fail closed use this
+    variant and let the exception reach their own error branch.
+
+    Dropping the ``except`` was not enough on its own, and the *user* half being
+    unguarded was never the safety it looked like: an unguarded call only fails closed
+    for failures that RAISE. A directory at either store path raises nothing --
+    :func:`read_env_file` returns ``{}`` for it silently -- so before
+    :func:`_read_env_file_strict` both halves still answered "nothing is planted" for a
+    store pmcp could not read. Both halves are strict now, so both reach rule 9.
     """
-    keys: set[str] = set(read_env_file(resolve_scope_path("user")))
-    keys.update(read_env_file(resolve_scope_path("project", project)))
+    keys: set[str] = set(_read_env_file_strict(resolve_scope_path("user")))
+    keys.update(_read_env_file_strict(resolve_scope_path("project", project)))
     return keys
 
 

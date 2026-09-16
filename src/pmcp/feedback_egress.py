@@ -390,7 +390,17 @@ class FeedbackProgress:
         Returns ``False`` if the handler already gave up, or if the post could not
         finish inside *deadline*. Checking merely that the deadline has not passed is
         not enough: a POST started one second before it, with a ten-second socket
-        timeout, still runs nine seconds past. This is the rule that bounds the *act*.
+        timeout, still runs nine seconds past.
+
+        **The honest claim, and it is narrower than "this bounds the act".** What is
+        guaranteed is one-directional: a worker that LOSES this claim never sends a
+        byte. A worker that WINS it may still send long after *deadline* -- DNS,
+        connect, TLS and the request itself all happen after this returns, and as the
+        budget constants above say, no per-socket timeout is a total request bound. So
+        this rule decides whether the act may *begin*; it cannot end one already begun.
+        That residual is exactly why a handler that gave up on a worker already
+        ``dispatching`` reports ``dispatched_unconfirmed`` with a search URL rather
+        than claiming nothing was sent.
         """
         with self._lock:
             if self._handler_gave_up or self._state != "pending":
