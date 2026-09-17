@@ -283,6 +283,62 @@ def reset_pmcp_introduced_keys() -> None:
     _PMCP_INTRODUCED_KEYS.clear()
 
 
+def env_key_is_operator_supplied(key: str) -> bool:
+    """True only when ``key`` is set in the environment AND PMCP did not put it there.
+
+    A handful of environment variables -- ``PMCP_MANIFEST_PATH``, ``PMCP_CONFIG``
+    and ``PMCP_POLICY`` -- redirect the gateway to a manifest, config or policy
+    file, and the v13 trust phases treat all three as operator-supplied and so
+    ungated. That premise holds only for a value the operator exported into their
+    OWN shell. A checkout can set the same variable through a dotenv file the
+    gateway loads on its behalf -- ``cli.load_startup_env`` reads ``.env`` and
+    ``.env.pmcp`` before arg parsing, and ``GatewayTools._check_api_key_available``
+    reads ``.env`` during a credential check -- and then the redirect was chosen by
+    the repository, not the operator (review findings S-03 and S-11).
+
+    Provenance already tells the two apart, so this asks nothing new of the tree:
+
+    * :func:`dotenv_sourced_keys` holds keys a plain ``.env`` introduced (the
+      availability-check load records every key it reads there);
+    * :func:`pmcp_introduced_keys` holds keys PMCP's own store files -- including
+      ``.env.pmcp`` -- and ``auth_connect`` introduced.
+
+    Every dotenv load in the tree runs ``override=False``, so a variable the
+    operator already exported is never overwritten and never recorded. Therefore a
+    variable that is *set* but absent from BOTH registries is one the operator's
+    environment supplied; a variable present in EITHER registry reached the process
+    through a file PMCP loaded and must not be honoured as a trust-bearing redirect.
+
+    A key that is not set at all returns ``False``: the caller then behaves exactly
+    as if the variable were absent, which is the ungated-absence fallback the call
+    sites already had. This never gates the operator's own use -- an exported value
+    is honoured unchanged -- it only refuses a value a project file planted.
+    """
+    if key not in os.environ:
+        return False
+    return key not in _DOTENV_SOURCED_KEYS and key not in _PMCP_INTRODUCED_KEYS
+
+
+def describe_ignored_trust_env_var(variable: str, path: str) -> str:
+    """Operator-safe log line: a trust-bearing env var from a project file was ignored.
+
+    Names the variable and the path it pointed at, and says the value was ignored
+    because it came from a project file rather than the operator's environment. The
+    path is agent- or checkout-controlled text, so it is rendered through
+    :func:`pmcp.provision_gate.operator_safe` (escape every non-printable, then
+    ``shlex.quote``) before it reaches a terminal. Imported inside the function so
+    ``env_store`` -- a low-level module many others import -- keeps no import-time
+    dependency on ``provision_gate``.
+    """
+    from pmcp.provision_gate import operator_safe
+
+    return (
+        f"Ignoring {variable}={operator_safe(path)}: it was set by a project file "
+        f"(.env or .env.pmcp) rather than exported in the operator's environment, "
+        f"so pmcp will not let a checkout redirect itself through it."
+    )
+
+
 def managed_secret_keys(project: Path | None = None) -> set[str]:
     """Env-var keys of credentials PMCP manages in its user/project secret stores.
 
