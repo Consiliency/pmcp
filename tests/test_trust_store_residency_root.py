@@ -133,8 +133,7 @@ def test_serving_a_project_refuses_its_checkout_resident_store_from_elsewhere(
     # The real consumer drops the repo's server ...
     with caplog.at_level(logging.WARNING):
         names = [
-            c.name
-            for c in load_configs(project_root=checkout, user_config_paths=[])
+            c.name for c in load_configs(project_root=checkout, user_config_paths=[])
         ]
     assert "repo-server" not in names
 
