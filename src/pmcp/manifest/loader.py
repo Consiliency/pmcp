@@ -689,11 +689,34 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
     if project_path is not None:
         paths.append(("project", project_path))
 
+    # ``$PMCP_MANIFEST_PATH`` is a trust-bearing redirect: it chooses the
+    # highest-precedence overlay, which can ADD a server and REPLACE a shipped
+    # one. It is ungated on the assumption that it is the operator speaking --
+    # true only when the operator EXPORTED it. A checkout can set it through a
+    # dotenv file pmcp loads on the operator's behalf (``cli.load_startup_env``
+    # reads ``.env.pmcp``; ``_check_api_key_available`` reads ``.env``), and then
+    # the redirect is the repository's, not the operator's (S-03). Honour it only
+    # when provenance says the operator supplied it; otherwise skip it exactly as
+    # if it were unset and tell the operator their project file was ignored.
+    #
+    # Imported here, not at module scope: ``env_store`` imports
+    # ``config.loader``, which imports ``load_manifest`` from this module, so a
+    # top-level import would close that cycle.
+    from pmcp.env_store import (
+        describe_ignored_trust_env_var,
+        env_key_is_operator_supplied,
+    )
+
     env_value = os.environ.get("PMCP_MANIFEST_PATH")
     if env_value:
-        env_path = Path(env_value).expanduser()
-        if env_path.exists():
-            paths.append(("env", env_path))
+        if env_key_is_operator_supplied("PMCP_MANIFEST_PATH"):
+            env_path = Path(env_value).expanduser()
+            if env_path.exists():
+                paths.append(("env", env_path))
+        else:
+            logger.warning(
+                describe_ignored_trust_env_var("PMCP_MANIFEST_PATH", env_value)
+            )
 
     return paths
 
