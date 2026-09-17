@@ -125,6 +125,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. See [#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
+- **`SECURITY.md` now states the v13 trust boundary, and every claim in it is
+  bound to a test that proves it.** A new *The v13 trust boundary* section
+  describes the implemented model as 25 guarantees and 12 labelled limitations,
+  each carrying a machine-checkable citation to the test(s) that prove it, inside
+  a delimited claim region and ledger. `scripts/check_security_claims.py` (run by
+  the normal CI suite) fails the build if a sentence in that region makes a claim
+  no ledger row cites, if a cited test does not exist or would not be discovered
+  by `pytest tests/`, or if any of the v13 evidence files ships uncited — so the
+  document cannot drift from the code without turning CI red. The
+  vulnerability-report address in that file now points at **this project's own**
+  GitHub security advisories (`Consiliency/pmcp`) rather than the old
+  repository's. See [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **An install spawn now strips PMCP-managed credentials using the project root
+  the gateway was given, not the directory it happens to be running in.** When a
+  gateway started with `pmcp serve --project X` ran from a different working
+  directory, the install child's environment was sanitized by walking up from the
+  *working directory* to find the project credential store, while the credential
+  was written from the gateway's own root `X` — so a project-scoped credential in
+  `X/.env.pmcp` was **not** stripped and the install child (`npx -y …`) inherited
+  another server's secret. The strip now resolves the store from the gateway's
+  project root, matching where the credential was written; a gateway with no
+  `--project`, or run from its project root, is unchanged. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **A checkout can no longer redirect the gateway's manifest, config or policy by
+  planting `PMCP_MANIFEST_PATH`, `PMCP_CONFIG` or `PMCP_POLICY` in a `.env`
+  file.** These three variables choose a manifest overlay, an explicit config, or
+  an explicit policy, and were honoured unconditionally on the assumption that a
+  set variable meant the operator had exported it. But `pmcp` loads `.env` and
+  `.env.pmcp` on the operator's behalf before argument parsing, so a repository
+  could set any of the three through its own checked-in dotenv file and choose the
+  gateway's manifest, config or policy with no consent gate — the S-03 and S-11
+  boundaries through a back door. Each variable is now honoured only when
+  provenance shows the operator exported it into their own shell; a value a
+  project `.env`/`.env.pmcp` introduced is ignored exactly as if unset, at both
+  the startup and runtime doors, and the skip is logged operator-safe naming the
+  variable and path. A value the operator genuinely exported still applies. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230), #250.
+- **The trust store's checkout-residency guard now keys on the project the
+  gateway serves, not only the directory it was launched from.** A trust store
+  that resolves inside a checkout is refused, because a repository must not ship
+  its own approval record — but the guard discovered the checkout by walking up
+  from `Path.cwd()`, so `pmcp serve --project <checkout>` launched from any other
+  directory did not refuse a store planted inside that served checkout, and it
+  would load that checkout's self-approved `.mcp.json`. The guard now judges
+  residency against the served project root **and** the launch checkout (adding
+  the served root, never replacing the cwd walk, so a store resident in a second
+  checkout the operator launches from stays refused too). `pmcp status --project`
+  gets the same binding; the `pmcp trust` verbs and a bare `pmcp serve` keep
+  their previous cwd-derived behaviour. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230), #251.
 - **`gateway.submit_feedback` will not post under a credential or to a destination
   that PMCP itself introduced.** Every submission is now decided by one
   fail-closed gate (`src/pmcp/feedback_egress.py`) before any network call, and the
@@ -259,10 +309,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `allowPrivateRegistry` — all of which now pass through one choke point rather
   than gating themselves.
   **User-scoped and explicitly-configured sources are unaffected.** `~/.mcp.json`,
-  `~/.claude/.mcp.json`, `~/.claude/gateway-policy.yaml`, `$PMCP_MANIFEST_PATH`,
-  an explicit `--config` path and an explicit `--policy` path all apply with no
-  trust record at all, and an operator with no project files in their checkout
-  sees byte-identical behaviour to before. Approving nothing changes nothing for
+  `~/.claude/.mcp.json`, `~/.claude/gateway-policy.yaml`, an explicit `--config`
+  path and an explicit `--policy` path all apply with no trust record at all,
+  and an operator with no project files in their checkout sees byte-identical
+  behaviour to before. (The `$PMCP_MANIFEST_PATH`, `$PMCP_CONFIG` and
+  `$PMCP_POLICY` **environment** forms are unconditional only when the operator
+  exported them; a value a checkout's `.env`/`.env.pmcp` planted is now refused —
+  see the trust-boundary entries above.) Approving nothing changes nothing for
   them.
   Approval is over **bytes, not paths**: editing a file you approved revokes the
   approval by itself, with no `pmcp trust revoke` to remember. Each source is read

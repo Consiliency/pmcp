@@ -2,7 +2,7 @@
 phase_loop_plan_version: 1
 phase: PKGID
 roadmap: specs/phase-plans-v13.md
-roadmap_sha256: 7f8362022aa1ad953a9d2faf9ec842633ed14aaebc924385f7da1beb6d73df72
+roadmap_sha256: f47a054b8457e3683d498fde9be7a3dadb1aa2fe2eeb5671932c093c9c813adb
 ---
 
 # PHASE-3-PKGID: Provisioning binds to package identity

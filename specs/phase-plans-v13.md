@@ -115,7 +115,7 @@ tuple and a source-provenance/approval record, with a store to read and write th
 - [ ] EC-TRUST-2 — a source provenance record `(absolute_path, content_sha256, scope, decision, recorded_at)` round-trips through the store; a file whose content changes after approval reads back as **not approved**.
 - [ ] EC-TRUST-3 — the store refuses to answer "approved" for any path it has no record of; absence is never assent.
 - [ ] EC-TRUST-4 — the full CLI surface exists and is covered by tests: `pmcp trust approve <path>` (records), `pmcp trust list`, `pmcp trust revoke <path>`. The **approve** verb is what every downstream refusal message names, so omitting it would leave those messages naming a command that does not exist.
-- [ ] EC-TRUST-5 — the store lives **outside any repository** (user scope, e.g. `~/.config/pmcp/`), and a store path inside the current checkout is refused at startup. A repository that ships its own approval record must not be believed; without this, absence-is-not-assent is decorative.
+- [ ] EC-TRUST-5 — the store lives **outside any repository** (user scope, e.g. `~/.config/pmcp/`), and a store path inside the current checkout is refused. A repository that ships its own approval record must not be believed; without this, absence-is-not-assent is decorative. **Corrected under SEAL's `canonical_spec_update` closeout (2026-09-17):** the original read "refused at startup", but the residency guard raises per read of the store (`src/pmcp/trust_store.py:155`), so a checkout-resident store is genuinely refused yet the refusal surfaces through the consent gate's "not approved / run `pmcp trust approve`" message rather than as a distinct startup abort; and after SL-7 (Consiliency/pmcp#251) the checkout it is judged against is the served project root ∪ the launch checkout, not `cwd` alone. See the SEAL post-execution amendments, item 5.
 - [ ] EC-TRUST-6 — `is_approved` answers about **bytes, not paths**: the caller passes the content it is about to apply and the store hashes that, so a file swapped between check and use is not approved by a stale decision.
 
 **Scope notes**
@@ -1138,7 +1138,7 @@ boundaries hold together against an adversarial end-to-end suite.
 - [ ] EC-SEAL-1 — SECURITY.md describes the implemented model with no claim the tests do not prove; each claim cites the test that proves it.
 - [ ] EC-SEAL-2 — an adversarial suite drives the four review reproductions end to end and each fails closed, run against the real handlers rather than mocks.
 - [ ] EC-SEAL-5 — the **composition** cases fail closed too, not only the four original reproductions: an unapproved overlay that adds a server (EC-CONSENT-6), and an approval record shipped inside the checkout (EC-TRUST-5). Both are seams between phases that each pass their own criteria, which is exactly what a per-phase suite cannot catch.
-- [ ] EC-SEAL-3 — every refusal path prints the exact `pmcp` command that would grant the action, asserted for each gate.
+- [ ] EC-SEAL-3 — every refusal carries a remedy that is runnable as printed; every `pmcp` command a remedy names is a verb the CLI dispatches; and the refusals for which no `pmcp` verb exists are enumerated exhaustively from each gate's closed reason vocabulary, so that set can shrink but never grow silently. **Amended wording, under the original id, by SEAL's `canonical_spec_update` closeout (2026-09-17):** the original read "every refusal path prints the exact `pmcp` command that would grant the action, asserted for each gate", which is not satisfiable without inventing operator verbs for a policy-file edit, an unresolvable identity, an unpinned argv and a planted credential. The operator chose amendment over new behaviour, and what is proven is strictly stronger than a single unverifiable string. See the SEAL post-execution amendments, item 6.
 - [ ] EC-SEAL-4 — a fresh operator with no trust store and no project files sees unchanged behaviour for manifest-backed servers.
 
 **Scope notes**
@@ -1150,10 +1150,14 @@ rather than waiting for this phase to open.
 **Non-goals**
 New gates. This phase proves and documents; it does not add behaviour.
 
-**Key files**
-- `SECURITY.md`
-- `CHANGELOG.md`
-- `tests/test_trust_boundaries_e2e.py` (new)
+**Key files** *(corrected under SEAL's `canonical_spec_update` closeout, 2026-09-17,
+to the set that shipped; the plan named three)*
+- `SECURITY.md`, and its checker `scripts/check_security_claims.py` (new)
+- `CHANGELOG.md`, `README.md`, `.claude/docs-catalog.json`, `specs/phase-plans-v13.md`
+- `src/pmcp/manifest/installer.py`, `src/pmcp/tools/handlers.py` (SL-0)
+- `src/pmcp/env_store.py`, `src/pmcp/config/loader.py`, `src/pmcp/manifest/loader.py` (SL-6)
+- `src/pmcp/trust_store.py`, `src/pmcp/cli.py` (SL-6 and SL-7)
+- the nine test files enumerated in the SEAL post-execution amendments, item 6(b)
 
 **Depends on**
 - CONSENT
@@ -1170,6 +1174,196 @@ New gates. This phase proves and documents; it does not add behaviour.
 - evidence paths: `tests/test_trust_boundaries_e2e.py`, `CHANGELOG.md`
 - redaction posture: `metadata_only`
 - missing or malformed evidence routes to `blocker_class=contract_bug` (non-human).
+
+### Post-execution amendments — SEAL (2026-09-17)
+
+Recorded by SL-docs after SL-0 through SL-7 landed and were merged. All five exit
+criteria shipped, and neither freeze gate was reopened. This block is unlike the
+four above in one way that matters: SEAL's spec-closeout decision is
+`canonical_spec_update`, not `no_spec_delta`, so its closeout does not only append a
+record — **it edits the canonical spec to match what shipped.** Four such edits were
+owed and are made in this same commit: EC-TRUST-5's wording (item 5), EC-SEAL-3's
+wording (item 6 and the criterion line itself), the SEAL **Key files** list, and the
+`## Verification` block. Every line reference is to `85cee51`.
+
+**Items 1, 4 and 5 are the ones a reader relying on this roadmap pays for if they
+are not read.**
+
+1. **SEAL found two live reopenings of this roadmap's own findings, and both
+   existed only in the seam between two phases.** Each merged phase passed its own
+   acceptance criteria; neither hole was reachable from any single phase's suite,
+   which is exactly the class EC-SEAL-5's composition suite exists to catch and no
+   per-phase suite could. The operator authorised fixing both in-phase rather than
+   filing them, on the same rule SL-0 was taken under: **a reproduction that does
+   not fail closed is a criterion outranking a non-goal.** Neither is new behaviour
+   — each restores a boundary this roadmap already claims — so SEAL's "no new gates"
+   non-goal is not breached; a genuine bypass of a shipped boundary is not a gate.
+   - **#250 (SL-6): a checkout could redirect the gateway through
+     `PMCP_MANIFEST_PATH`, `PMCP_CONFIG` or `PMCP_POLICY`.** All three were honoured
+     unconditionally, on the premise that a set variable was the operator speaking.
+     But `cli.load_startup_env` reads `.env` and `.env.pmcp` before arg parsing, so
+     a repository could set any of the three through its own dotenv file and get an
+     ungated manifest overlay, config or policy — S-03 and S-11 through the back
+     door. Now each is honoured only when provenance shows the operator exported it:
+     `env_key_is_operator_supplied` (`src/pmcp/env_store.py:286`) is consulted at the
+     manifest door (`src/pmcp/manifest/loader.py:712`), the four config readers
+     (`src/pmcp/config/loader.py:39`, called at `:341`, `:1035`, `:1094`, `:1141`)
+     and the startup door for config and policy
+     (`resolve_env_config_and_policy`, `src/pmcp/cli.py:2285`, called at `:2438`). A
+     checkout-sourced value is skipped exactly as if unset and the skip is logged
+     operator-safe (`describe_ignored_trust_env_var`, `src/pmcp/env_store.py:322`); an
+     exported value still applies.
+   - **#251 (SL-7): the trust-store residency guard keyed on the working directory.**
+     A store resolving inside a checkout is refused so a repository cannot ship its
+     own approval record — but the guard found the checkout by walking up from
+     `Path.cwd()`, so `pmcp serve --project <checkout>` launched from elsewhere did
+     not refuse a store planted inside the *served* checkout and would load its
+     self-approved `.mcp.json`. The guard now keys on the served project root ∪ the
+     launch checkout: `set_active_project_root` (`src/pmcp/trust_store.py:87`) is
+     bound by `run_server` (`src/pmcp/cli.py:2430`) and `run_status` (`:1381`, cleared
+     at `:1387`), and `_checkout_roots` (`:108`) unions it with the cwd walk — added
+     to the walk, never replacing it, so a store resident in a second checkout the
+     operator launches from stays refused too. `trust_store_path` (`:155`) raises for
+     any of them.
+   - **Consequence for the SEAL plan's own `## Verification`, which this block
+     supersedes because that plan file is frozen.** `plans/phase-plan-v13-SEAL.md`
+     asserts the `src/` diff is **exactly** `installer.py` and `handlers.py` (SL-0's
+     two). SL-6 and SL-7 added five more, so the real v13-SEAL `src/` set is seven:
+     `src/pmcp/manifest/installer.py` and `src/pmcp/tools/handlers.py` (SL-0),
+     `src/pmcp/env_store.py`, `src/pmcp/config/loader.py` and
+     `src/pmcp/manifest/loader.py` (SL-6), and `src/pmcp/trust_store.py` and
+     `src/pmcp/cli.py` (SL-6 and SL-7). The plan's two-file assertion was correct for
+     the phase as planned and is amended here, in the only closeout permitted to edit
+     the roadmap, rather than in the plan.
+
+2. **The claim-binding contract (EC-SEAL-1) is mechanical, not a review promise.**
+   `scripts/check_security_claims.py` (SL-1) parses a delimited claim region and a
+   ledger out of `SECURITY.md` and enforces twenty-two frozen rules: every asserting
+   sentence carries a marker and every marker a ledger row; a guarantee cites a test
+   that exists, resolves under `ast.parse` and — the rule the second plan panel added
+   — is a **subset of what `pytest tests/` actually discovers**, so a proof CI would
+   never run fails the checker rather than shipping green; a limitation is labelled
+   and may cite only a `characterizes:` list. The checker runs in the normal CI
+   suite. What it finally makes **required** is the eleven lane-owned tests no merged
+   phase's acceptance criteria ran — the CONSENT-amendment-1 defect (ten in CONSENT,
+   one in TRUST), including `read_and_gate`'s one-read TOCTOU guard and the
+   redaction-widening rule's only falsifier: neither merged plan's criteria can be
+   edited now, so citing each from a `guarantee` row (`SECURITY.md`, the C-08 to
+   C-16 rows) is what makes it required — delete it and R8 fails, break it and CI's
+   suite fails. The shipped ledger is 25 guarantees and 12 labelled limitations
+   (`scripts/check_security_claims.py:92`, the frozen census; `:128`, the eleven
+   previously-unproven node ids).
+
+3. **The recurring measurement error, now named across the roadmap: a check or a
+   plan measurement that counts one shape of occurrence and reports it as the
+   total.** Two instances are verifiable in the tree and the amendments:
+   - **EGRESS's `## Verification` greps counted a name, not a call.** EGRESS
+     amendment 5 records six corrections to that phase's own checks, five of them
+     one defect: a grep asserting a *count* matched a symbol in a section comment, a
+     docstring code-block, an import line, or a `functools.partial` wrapper rather
+     than a call site, so a check passed vacuously (zero real callers) or missed the
+     one real one.
+   - **SL-0's blast-radius measurement counted production call sites and missed the
+     test surface.** The SEAL plan measured "55 existing call sites keep their
+     current behaviour and no existing assertion moves" and threaded an optional
+     parameter on that basis. Correct for production, but it did not count the arity
+     assertion that pins the signature (`tests/test_package_identity_gate.py`) or the
+     `JobManager` test doubles that re-declare `start_install`
+     (`tests/test_pkgid_panel_fixes.py`, `tests/test_tools.py`,
+     `tests/test_credential_child_env.py`); all four had to move (commits `72c6275`,
+     `2245809`, `6f69e26`).
+   - **The lesson, stated plainly:** the check that catches this class is running the
+     thing, not writing a better grep. It is why EC-SEAL-1's R9 pins the cited union
+     as a subset of what CI *discovers* rather than of what a pattern matches, and
+     why EC-SEAL-2/5 drive the real handlers rather than the predicates.
+   - **No cross-phase total is asserted here, on purpose.** The class recurred —
+     EGRESS documented six corrections in one block, all "match the call, not the
+     name"; SEAL added the distinct blast-radius instance above — but an earlier
+     draft of this item carried a single roadmap-wide count and a "PKGID ×3"
+     attribution that the PKGID amendment does not support: it records no such
+     defect. An amendment about measurements reported without being verified must
+     not itself ship an unverified count, so the count was dropped rather than
+     guessed. That is the discipline the item is about.
+
+4. **Open, filed, not fixed — each out of SEAL's scope, with why.** None is a
+   bypass of a shipped boundary; each is a follow-up, a merged-phase file, or new
+   behaviour the non-goal excludes. All are documented as `limitation` claims in
+   `SECURITY.md`.
+   - **#247** — the npm version-check User-Agent still names the old repository
+     (`src/pmcp/manifest/version_checker.py:24`). SL-5 fixed the `SECURITY.md`
+     occurrence; the source string is a merged-phase file and a `limitation`
+     (`SECURITY.md`, C-34). The README `mcp-name` comment and `server.json` name are
+     the same class — a registry identity validated as a pair — and are not this
+     lane's to split.
+   - **#248** — the approval-store write is not atomic and can truncate before it
+     finishes (`limitation` C-35). A durable-write fix is behaviour.
+   - **#252** — `pmcp trust approve` resolves the store from the working directory
+     while `serve --project` now resolves it from the served root (SL-7), so the two
+     can disagree (`limitation` C-36). Closing the asymmetry means changing the
+     `approve` verb's resolution, which is behaviour.
+   - **The standing limitations `SECURITY.md` documents**, each a `limitation` row
+     rather than a fix because closing it is a gate or a network call SEAL's charter
+     excludes: an operator approval binds no integrity digest (C-27); no per-socket
+     timeout is a total request bound (C-30); the `"denied"` decision is reserved but
+     no shipped verb writes it (C-26); `auth_connect` for a name in neither table
+     admits a credential-shaped override the gateway holds but no child inherits
+     (C-29); and `set_startup_policy` rewrites the selected source and silently
+     invalidates a content-keyed approval, so the operator learns only at the next
+     startup's consent refusal (C-28, filed as Consiliency/pmcp#253 — the SL-docs
+     plan section directed this lane to file it; a documented `limitation` because
+     adding a diagnostic to an operator-initiated write is behaviour SEAL's non-goal
+     excludes).
+
+5. **EC-TRUST-5's "refused at startup" wording is corrected here, and the criterion
+   line is edited in place.** This is a `canonical_spec_update` edit into Phase 1's
+   text, whose own amendment block states nothing was edited; it is made under SEAL's
+   closeout authority and dated, and is the one kind of cross-phase edit this
+   decision permits. The original read "a store path inside the current checkout is
+   **refused at startup**". Two things are truer: the residency guard raises **per
+   read** of the store (`trust_store_path`, `src/pmcp/trust_store.py:155`), not once
+   at boot, so a checkout-resident store is genuinely refused but the refusal reaches
+   the operator through the consent gate's "not approved / run `pmcp trust approve`"
+   message rather than as a distinct startup abort; and after SL-7 the checkout it is
+   judged against is the served project root ∪ the launch checkout, not `cwd` alone.
+   The behaviour is a `limitation` in the ledger (`SECURITY.md`, C-33) beside the
+   guarantee that the refusal itself holds (C-15).
+
+6. **The three roadmap corrections this closeout owes, that no other phase could
+   make.**
+   - (a) **The `## Verification` block ran a test file that never existed.** It named
+     `tests/test_project_source_consent.py`, which a single lane could never own and
+     was never created (CONSENT amendment 5). Corrected in this commit to the real
+     evidence set.
+   - (b) **The closeout test-file census, recorded in full.** The nineteen v13
+     evidence files SL-5's checker now enforces
+     (`scripts/check_security_claims.py:92`) are: `test_trust_store.py`,
+     `test_trust_cli.py`, `test_package_identity.py` (TRUST);
+     `test_project_consent_gate.py`, `test_project_source_consent_manifest.py`,
+     `test_project_source_consent_config.py`, `test_project_source_consent_policy.py`
+     (CONSENT); `test_package_identity_gate.py`, `test_package_approvals.py`,
+     `test_policy_package_identifiers.py`, `test_install_argv_logging.py`,
+     `test_pkgid_panel_fixes.py`, `test_pkgid_spawn_logging.py`,
+     `test_pkgid_manifest_npx_selectors.py` (PKGID); `test_feedback_egress.py`,
+     `test_feedback_egress_gate.py`, `test_feedback_provenance.py`,
+     `test_feedback_submission_flag.py`, `test_egress_panel_fixes.py` (EGRESS). SEAL
+     added **nine** test files, not the seven the plan named before SL-6 and SL-7:
+     the seven planned — `test_security_claims_parser.py` and `test_security_claims.py`
+     (the checker's own tests, cited by nothing by design),
+     `test_trust_boundaries_e2e.py`, `test_trust_boundaries_composition.py`,
+     `test_refusal_remedies.py`, `test_fresh_operator_baseline.py`,
+     `test_install_child_env_project_root.py` — plus `test_env_overlay_provenance.py`
+     (SL-6, #250) and `test_trust_store_residency_root.py` (SL-7, #251).
+     `tests/test_env_leak_229.py` is cited by the ledger but is deliberately **not**
+     census: it predates v13 (Consiliency/pmcp#229). Phase 5's **Key files** entry is
+     corrected in place to name the shipped set.
+   - (c) **Two amendment-block undercounts SL-0 found while building the census.**
+     TRUST's block records **no** evidence-path gap at all, though the phase added
+     three test files where the roadmap's evidence path names one; and EGRESS
+     amendment 6(d) — the block that records the undercount pattern for the third
+     time — is itself short by one, omitting `tests/test_egress_panel_fixes.py` from
+     its list of four. Recording both in the canonical spec, rather than in a fifth
+     amendment a sixth phase would have to read, is what `canonical_spec_update` is
+     for.
 
 ## Top Interface-Freeze Gates
 
@@ -1225,20 +1419,48 @@ New gates. This phase proves and documents; it does not add behaviour.
 ## Verification
 
 ```bash
-# Each phase's own suite
-uv run pytest -q tests/test_trust_store.py
-uv run pytest -q tests/test_project_source_consent.py
-uv run pytest -q tests/test_package_identity_gate.py
-uv run pytest -q tests/test_feedback_egress.py
+# Each phase's evidence suite -- the real set, corrected here under SEAL's
+# canonical_spec_update closeout. This block previously named
+# tests/test_project_source_consent.py, which never existed and was never
+# creatable (CONSENT amendment 5). The v13 evidence set is the nineteen files from
+# the four merged phases (the census SL-5's checker enforces) plus SEAL's own.
+uv run pytest -q tests/test_trust_store.py tests/test_trust_cli.py \
+                tests/test_package_identity.py tests/test_project_consent_gate.py \
+                tests/test_project_source_consent_manifest.py \
+                tests/test_project_source_consent_config.py \
+                tests/test_project_source_consent_policy.py \
+                tests/test_package_identity_gate.py tests/test_package_approvals.py \
+                tests/test_policy_package_identifiers.py tests/test_install_argv_logging.py \
+                tests/test_pkgid_panel_fixes.py tests/test_pkgid_spawn_logging.py \
+                tests/test_pkgid_manifest_npx_selectors.py tests/test_feedback_egress.py \
+                tests/test_feedback_egress_gate.py tests/test_feedback_provenance.py \
+                tests/test_feedback_submission_flag.py tests/test_egress_panel_fixes.py
 
-# The roadmap's end-to-end proof: the four review reproductions must fail closed
-uv run pytest -q tests/test_trust_boundaries_e2e.py
+# SEAL's own suites: the four review reproductions and the composition seams that
+# must fail closed, the refusal-remedy and fresh-operator audits, the two
+# between-phase reopenings SEAL found and fixed (SL-6 #250, SL-7 #251), and the
+# claim-ledger checker's own tests.
+uv run pytest -q tests/test_trust_boundaries_e2e.py tests/test_trust_boundaries_composition.py \
+                tests/test_refusal_remedies.py tests/test_fresh_operator_baseline.py \
+                tests/test_install_child_env_project_root.py \
+                tests/test_env_overlay_provenance.py tests/test_trust_store_residency_root.py \
+                tests/test_security_claims_parser.py tests/test_security_claims.py
 
 # No regression for an operator with no trust store and no project files
 uv run pytest -q tests/                 # compare counts to the pre-roadmap baseline
 uv run ruff check src/ tests/ scripts/ && uv run ruff format --check src/ tests/ scripts/
 uv run mypy src/
 uv run python scripts/check_workflows.py --base-ref origin/main
+
+# EC-SEAL-1: the documented model is bound to its proofs, run as a reviewer runs it.
+uv run python scripts/check_security_claims.py
+uv run python scripts/check_security_claims.py --run
+
+# The roadmap pin is fresh in all five v13 plans. SL-docs edits this file, so its
+# digest changes and every plan's roadmap_sha256 is re-pinned in the same commit;
+# no .github workflow runs this checker, so this is the only place a stale pin is
+# caught.
+python3 scripts/check_plan_consistency.py plans/phase-plan-v13-*.md
 ```
 
 Host note: `/tmp/package.json` makes ~107 npm-identity tests fail on some hosts
