@@ -1034,11 +1034,20 @@ class _MinimalClientManager:
 class _RecordingJobManager:
     def __init__(self) -> None:
         self.calls: list[tuple[list[str], ServerConfig]] = []
+        # The root production threaded through (SEAL SL-0). Recorded separately so
+        # the existing two-tuple `calls` assertions keep their exact shape.
+        self.project_roots: list[Path | None] = []
 
-    async def start_install(self, server_config: ServerConfig, platform: str) -> str:
+    async def start_install(
+        self,
+        server_config: ServerConfig,
+        platform: str,
+        project_root: Path | None = None,
+    ) -> str:
         self.calls.append(
             (list(server_config.install.get(platform) or []), server_config)
         )
+        self.project_roots.append(project_root)
         return f"job-{len(self.calls)}"
 
 
