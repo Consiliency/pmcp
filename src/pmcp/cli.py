@@ -36,7 +36,12 @@ from pmcp.config.loader import (
     load_configs,
     set_startup_policy,
 )
-from pmcp.env_store import record_dotenv_keys, record_pmcp_introduced_keys
+from pmcp.env_store import (
+    describe_ignored_trust_env_var,
+    env_key_is_operator_supplied,
+    record_dotenv_keys,
+    record_pmcp_introduced_keys,
+)
 from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
 from pmcp.types import StartupPolicyOperation
@@ -1367,7 +1372,19 @@ async def run_status(args: argparse.Namespace) -> None:
     # Load configs
     project_root = args.project if hasattr(args, "project") else None
     config_path = args.config if hasattr(args, "config") else None
-    configs = load_configs(project_root=project_root, custom_config_path=config_path)
+    # Same residency binding as `run_server`: judge a `--project <checkout>`
+    # store against the served checkout, not the launch directory, so `status`
+    # and `serve` give the same verdict for a checkout-resident store. `status`
+    # is one-shot, so the binding is scoped to the load and cleared afterwards
+    # rather than left set for the process (unlike `serve`, which reloads
+    # configs for its whole lifetime).
+    trust_store.set_active_project_root(project_root)
+    try:
+        configs = load_configs(
+            project_root=project_root, custom_config_path=config_path
+        )
+    finally:
+        trust_store.set_active_project_root(None)
 
     # Exclude self-referential gateway entries (e.g. pmcp/mcp-gateway)
     # so `pmcp status` only reports downstream servers.
@@ -2265,15 +2282,44 @@ async def run_upgrade(args: argparse.Namespace) -> None:
         _restart_local_pmcp_service()
 
 
+def resolve_env_config_and_policy(args: argparse.Namespace) -> None:
+    """Adopt ``$PMCP_CONFIG`` / ``$PMCP_POLICY`` into ``args`` -- only if exported.
+
+    Both variables pick the gateway's explicit config and policy files, and both
+    were honoured unconditionally on the assumption they were the operator
+    speaking. A checkout can set either through a dotenv file pmcp loads on the
+    operator's behalf (``load_startup_env`` reads ``.env`` and ``.env.pmcp``),
+    which would let a repository choose the gateway's policy with no gate (S-11).
+    Adopt each only when provenance says the operator exported it; a
+    checkout-sourced value is ignored exactly as if it were unset -- an explicit
+    ``--config``/``--policy`` on the command line already takes precedence here --
+    and the refusal is logged operator-safe, naming the variable and path.
+    """
+    logger = logging.getLogger(__name__)
+    if not args.config and os.environ.get("PMCP_CONFIG"):
+        if env_key_is_operator_supplied("PMCP_CONFIG"):
+            args.config = Path(os.environ["PMCP_CONFIG"])
+        else:
+            logger.warning(
+                describe_ignored_trust_env_var("PMCP_CONFIG", os.environ["PMCP_CONFIG"])
+            )
+    if not args.policy and os.environ.get("PMCP_POLICY"):
+        if env_key_is_operator_supplied("PMCP_POLICY"):
+            args.policy = Path(os.environ["PMCP_POLICY"])
+        else:
+            logger.warning(
+                describe_ignored_trust_env_var("PMCP_POLICY", os.environ["PMCP_POLICY"])
+            )
+
+
 async def run_server(args: argparse.Namespace) -> None:
     """Run the MCP gateway server."""
     from pmcp.server import GatewayServer
 
-    # Check environment variables
-    if not args.config and os.environ.get("PMCP_CONFIG"):
-        args.config = Path(os.environ["PMCP_CONFIG"])
-    if not args.policy and os.environ.get("PMCP_POLICY"):
-        args.policy = Path(os.environ["PMCP_POLICY"])
+    # Check environment variables. PMCP_CONFIG/PMCP_POLICY are trust-bearing and
+    # are honoured only when the operator exported them (S-11); see
+    # resolve_env_config_and_policy.
+    resolve_env_config_and_policy(args)
     if not getattr(args, "audit_jsonl", None) and os.environ.get("PMCP_AUDIT_JSONL"):
         args.audit_jsonl = Path(os.environ["PMCP_AUDIT_JSONL"])
     if os.environ.get("PMCP_LOG_LEVEL"):
@@ -2373,6 +2419,15 @@ async def run_server(args: argparse.Namespace) -> None:
         )
 
     logger.info("Starting PMCP...")
+
+    # Bind the trust store's checkout-residency guard to the project we are
+    # about to SERVE, before any config is loaded. Without this the guard keys
+    # on the launch directory's checkout, so `pmcp serve --project <checkout>`
+    # run from elsewhere fails to refuse a store planted inside that checkout
+    # and loads its self-approved `.mcp.json` (EC-TRUST-5, see
+    # Consiliency/pmcp#251, #230). `None` (bare `pmcp serve`) restores the
+    # cwd-derived behaviour.
+    trust_store.set_active_project_root(args.project)
 
     server = GatewayServer(
         project_root=args.project,

@@ -4341,7 +4341,8 @@ class TestCapabilityAndProvision:
         approve_package(identity)
 
         class FakeJobManager:
-            async def start_install(self, server_config, platform):
+            # Mirrors the real start_install, including SEAL SL-0's project root.
+            async def start_install(self, server_config, platform, project_root=None):
                 return "job-123"
 
         monkeypatch.setattr(

@@ -168,6 +168,7 @@ class JobManager:
         self,
         server_config: ServerConfig,
         platform: Platform,
+        project_root: Path | None = None,
     ) -> str:
         """Start a background installation job.
 
@@ -213,7 +214,7 @@ class JobManager:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=build_install_child_env(server_config),
+                env=build_install_child_env(server_config, project_root),
             )
             job.process = process
             job.status = "installing"
@@ -586,7 +587,9 @@ def get_job_manager() -> JobManager:
     return JobManager.get_instance()
 
 
-def build_install_child_env(server_config: ServerConfig) -> dict[str, str]:
+def build_install_child_env(
+    server_config: ServerConfig, project_root: Path | None = None
+) -> dict[str, str]:
     """Build the subprocess environment for a server's install/run command.
 
     Injects the server's runtime ``env_var`` with the credential resolved from
@@ -602,6 +605,16 @@ def build_install_child_env(server_config: ServerConfig) -> dict[str, str]:
     base URL selecting a self-hosted deployment. Without this, the only way to
     reach a non-default endpoint is to start the whole gateway with the variable
     already exported, which is process-global and invisible to the manifest.
+
+    ``project_root`` is the root the GATEWAY was given (``pmcp serve --project X``),
+    and it must be supplied by every production caller. Omitted, the strip below
+    resolves the project store by walking up from ``Path.cwd()``, while
+    ``_write_secret`` writes through the gateway's own root -- so a gateway started
+    from another directory would strip the wrong store and spawn the install child
+    holding another server's credential (Consiliency/pmcp#230). The parameter is
+    optional only so that existing test call sites keep working;
+    ``tests/test_install_child_env_project_root.py`` asserts that no production
+    call omits it.
     """
     # Declared non-secret vars first (e.g. a self-hosted base URL), so the
     # credential resolved below always wins if the two name the same key.
@@ -615,7 +628,7 @@ def build_install_child_env(server_config: ServerConfig) -> dict[str, str]:
                 break
     # Inherit the gateway env minus PMCP-managed secrets (no cross-server bleed),
     # then apply this server's own resolved credential.
-    return sanitized_subprocess_env(own_env)
+    return sanitized_subprocess_env(own_env, project_root)
 
 
 async def check_api_key(server_config: ServerConfig) -> None:
@@ -650,6 +663,7 @@ async def install_server(
     server_config: ServerConfig,
     platform: Platform,
     timeout: float = 120.0,
+    project_root: Path | None = None,
 ) -> None:
     """Install an MCP server using platform-specific commands (blocking).
 
@@ -688,7 +702,7 @@ async def install_server(
             *install_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=build_install_child_env(server_config),
+            env=build_install_child_env(server_config, project_root),
         )
 
         stdout, stderr = await asyncio.wait_for(
@@ -716,7 +730,9 @@ async def install_server(
         raise InstallError(f"Command not found for {server_config.name}: {e}")
 
 
-async def verify_installation(server_config: ServerConfig) -> bool:
+async def verify_installation(
+    server_config: ServerConfig, project_root: Path | None = None
+) -> bool:
     """Verify that a server is installed and runnable.
 
     Returns:
@@ -739,7 +755,7 @@ async def verify_installation(server_config: ServerConfig) -> bool:
             *verify_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=build_install_child_env(server_config),
+            env=build_install_child_env(server_config, project_root),
         )
 
         await asyncio.wait_for(process.communicate(), timeout=5.0)

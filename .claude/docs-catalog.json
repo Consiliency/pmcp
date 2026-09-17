@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "last_updated": "2026-09-16T00:00:00+00:00",
+  "last_updated": "2026-09-17T00:00:00+00:00",
   "files": {
     "README.md": {
       "purpose": "root project README",
@@ -10,7 +10,8 @@
         "P3B",
         "UPDPATH",
         "PKGID",
-        "EGRESS"
+        "EGRESS",
+        "SEAL"
       ]
     },
     "CHANGELOG.md": {
@@ -24,7 +25,8 @@
         "TRUST",
         "CONSENT",
         "PKGID",
-        "EGRESS"
+        "EGRESS",
+        "SEAL"
       ]
     },
     "CONTRIBUTING.md": {
@@ -39,7 +41,8 @@
       "touched_by_phases": [
         "P5",
         "P2",
-        "P3B"
+        "P3B",
+        "SEAL"
       ]
     },
     "SPEC_COMPLIANCE.md": {
@@ -88,7 +91,8 @@
         "TRUST",
         "CONSENT",
         "PKGID",
-        "EGRESS"
+        "EGRESS",
+        "SEAL"
       ]
     },
     "specs/phase-plans-v2.md": {
@@ -230,25 +234,29 @@
     "plans/phase-plan-v13-CONSENT.md": {
       "purpose": "per-phase lane plan",
       "touched_by_phases": [
-        "CONSENT"
+        "CONSENT",
+        "SEAL"
       ]
     },
     "plans/phase-plan-v13-EGRESS.md": {
       "purpose": "per-phase lane plan",
       "touched_by_phases": [
-        "EGRESS"
+        "EGRESS",
+        "SEAL"
       ]
     },
     "plans/phase-plan-v13-PKGID.md": {
       "purpose": "per-phase lane plan",
       "touched_by_phases": [
-        "PKGID"
+        "PKGID",
+        "SEAL"
       ]
     },
     "plans/phase-plan-v13-TRUST.md": {
       "purpose": "per-phase lane plan",
       "touched_by_phases": [
-        "TRUST"
+        "TRUST",
+        "SEAL"
       ]
     },
     "plans/phase-plan-v2-lifecycle.md": {
@@ -414,6 +422,12 @@
     "plans/v7-issue-tracker.md": {
       "purpose": "markdown document",
       "touched_by_phases": []
+    },
+    "plans/phase-plan-v13-SEAL.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": [
+        "SEAL"
+      ]
     }
   }
 }
