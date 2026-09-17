@@ -4672,7 +4672,9 @@ class GatewayTools:
         job_manager = get_job_manager()
 
         try:
-            job_id = await job_manager.start_install(server_config, platform)
+            job_id = await job_manager.start_install(
+                server_config, platform, self._project_root
+            )
 
             return ProvisionOutput(
                 ok=True,
