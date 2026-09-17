@@ -219,6 +219,128 @@ def test_serving_one_project_still_refuses_a_store_resident_in_the_launch_checko
 
 
 # --------------------------------------------------------------------------- #
+# SL-8: serving a SUBDIRECTORY of a checkout must judge the whole checkout.
+# --------------------------------------------------------------------------- #
+
+
+def test_serving_a_subdirectory_refuses_a_store_resident_in_the_enclosing_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``serve --project <checkout>/app`` must refuse a store resident in <checkout>.
+
+    The reopened subdirectory hole. SL-7 bound the served root but only appended
+    it *verbatim*, so the guard judged residency against ``<checkout>/app`` alone
+    and never walked up to ``<checkout>``. A store resident in the enclosing
+    checkout -- not in the served subdirectory -- that approves
+    ``<checkout>/app/.mcp.json`` was therefore accepted, and the repository
+    self-approved (EC-TRUST-5, subdirectory-dependent; Consiliency/pmcp#251,
+    #230).
+
+    The served dir carries its own ``.mcp.json`` -- that is the payload -- so the
+    enclosing checkout must be reached by walking up from the served root's
+    *parent*: ``find_project_root(<checkout>/app)`` stops at the served dir's own
+    marker and would discover nothing above it. The store here holds a genuine,
+    matching ``approved`` record, so the refusal is attributable to residency and
+    not to an absent or stale record.
+    """
+    checkout = _checkout(tmp_path)
+    app = checkout / "app"
+    app.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    # The payload the served subdirectory ships, and the store -- resident in the
+    # ENCLOSING checkout, not in the served subdir -- that approves it.
+    app_config = app / ".mcp.json"
+    app_config.write_text(_PWNED, encoding="utf-8")
+    store = _ship_an_approval_inside(checkout, app_config, outside, monkeypatch)
+    assert not store.is_relative_to(app.resolve())
+
+    # Launched from outside, serving the subdirectory.
+    monkeypatch.chdir(outside)
+    trust_store.set_active_project_root(app)
+
+    # Refused for residency in the ENCLOSING checkout -- named, not answered as
+    # "no record".
+    with pytest.raises(TrustStoreError) as raised:
+        trust_store.trust_store_path()
+    assert str(checkout.resolve()) in str(raised.value)
+    assert trust_store.is_approved(app_config, app_config.read_bytes()) is False
+
+    names = [c.name for c in load_configs(project_root=app, user_config_paths=[])]
+    assert "repo-server" not in names
+
+
+# --------------------------------------------------------------------------- #
+# A served root outside any checkout: the served root itself stays a boundary.
+# --------------------------------------------------------------------------- #
+
+
+def test_serving_a_dir_outside_any_checkout_refuses_a_store_resident_in_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The served root stays a boundary when it lies inside no checkout.
+
+    ``find_project_root`` finds no enclosing git checkout above a bare served
+    directory, so the walk-up arm adds nothing here -- the refusal rests entirely
+    on the served root being kept *verbatim*. A store resident in the served dir
+    itself must still be refused, or a project served from outside any checkout
+    could self-approve. (This is the case the mutation -- dropping only the
+    walk-up arm -- must leave green: the verbatim served root is untouched.)
+    """
+    served = tmp_path / "served-plain"
+    served.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    config = served / ".mcp.json"
+    config.write_text(_PWNED, encoding="utf-8")
+    # A real, matching approval in a store resident in the served dir itself.
+    store = _ship_an_approval_inside(served, config, outside, monkeypatch)
+    assert store.is_relative_to(served.resolve())
+
+    monkeypatch.chdir(outside)
+    trust_store.set_active_project_root(served)
+
+    with pytest.raises(TrustStoreError) as raised:
+        trust_store.trust_store_path()
+    assert str(served.resolve()) in str(raised.value)
+    assert trust_store.is_approved(config, config.read_bytes()) is False
+    names = [c.name for c in load_configs(project_root=served, user_config_paths=[])]
+    assert "repo-server" not in names
+
+
+def test_serving_a_dir_outside_any_checkout_loads_an_operator_store_outside_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Operator control for the outside-any-checkout case: a store outside loads.
+
+    Binding a served root that lies in no checkout must not turn a legitimate
+    operator store -- living outside the served dir -- into a refusal. The
+    residency rule binds where the store *lives*, and this store lives nowhere
+    near the served directory.
+    """
+    served = tmp_path / "served-plain"
+    served.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    operator_home = tmp_path / "operator-home"
+    operator_home.mkdir()
+    config = served / ".mcp.json"
+    config.write_text(_PWNED, encoding="utf-8")
+
+    monkeypatch.setenv("HOME", str(operator_home))
+    monkeypatch.chdir(outside)
+    trust_store.record(config, config.read_bytes(), "project", trust_store.APPROVED)
+
+    trust_store.set_active_project_root(served)
+
+    store = trust_store.trust_store_path()
+    assert not store.is_relative_to(served.resolve())
+    assert trust_store.is_approved(config, config.read_bytes()) is True
+    granted = [c.name for c in load_configs(project_root=served, user_config_paths=[])]
+    assert "repo-server" in granted
+
+
+# --------------------------------------------------------------------------- #
 # The CLI verbs keep using cwd (no served root is ever bound for them).
 # --------------------------------------------------------------------------- #
 
