@@ -270,6 +270,48 @@ def test_serving_a_subdirectory_refuses_a_store_resident_in_the_enclosing_checko
     assert "repo-server" not in names
 
 
+def test_a_bare_serve_from_a_subdirectory_refuses_a_store_in_the_enclosing_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The cwd arm must walk up too: no served root, cwd is a checkout SUBDIR.
+
+    With nothing bound -- a bare ``pmcp serve`` (no ``--project``) or any
+    ``pmcp trust`` verb -- residency rests entirely on the cwd walk. When cwd is
+    ``<checkout>/app`` and that subdirectory carries its own ``.mcp.json`` (the
+    payload), ``find_project_root(cwd)`` stops at ``<checkout>/app`` and, before
+    this fix, never reached the enclosing ``<checkout>``. A store planted in the
+    enclosing checkout was therefore accepted and the repository self-approved
+    ``<checkout>/app/.mcp.json`` from the everyday developer working directory
+    (EC-TRUST-5, cwd-subdirectory; Consiliency/pmcp#251, #230). This is the
+    sibling of the served-subdirectory hole on the ``_active_project_root is
+    None`` path; the mutation that reverts the cwd arm to a single
+    ``find_project_root(cwd)`` must turn it RED.
+    """
+    checkout = _checkout(tmp_path)
+    app = checkout / "app"
+    app.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    app_config = app / ".mcp.json"
+    app_config.write_text(_PWNED, encoding="utf-8")
+    # The store lives in the ENCLOSING checkout (checkout/home), not in the
+    # served subdir; it holds a genuine, matching approval for the payload.
+    store = _ship_an_approval_inside(checkout, app_config, outside, monkeypatch)
+    assert not store.is_relative_to(app.resolve())
+
+    # No served root bound; the process simply runs from the subdirectory.
+    monkeypatch.chdir(app)
+    assert trust_store._active_project_root is None
+
+    with pytest.raises(TrustStoreError) as raised:
+        trust_store.trust_store_path()
+    assert str(checkout.resolve()) in str(raised.value)
+    assert trust_store.is_approved(app_config, app_config.read_bytes()) is False
+
+    names = [c.name for c in load_configs(project_root=app, user_config_paths=[])]
+    assert "repo-server" not in names
+
+
 # --------------------------------------------------------------------------- #
 # A served root outside any checkout: the served root itself stays a boundary.
 # --------------------------------------------------------------------------- #

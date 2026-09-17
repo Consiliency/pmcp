@@ -109,45 +109,52 @@ def _checkout_roots() -> tuple[Path, ...]:
     """Resolved checkout roots the store's residency is judged against.
 
     The store is refused if it resolves inside **any** of these. They are the
-    deduped union of three sources:
+    deduped union of:
 
     * the project root the gateway was told to SERVE
       (``set_active_project_root``, bound by ``pmcp serve --project X``), kept
       *verbatim* -- a store resident in a served directory that lies inside no
       checkout must still be refused;
-    * every checkout ENCLOSING the served root, walked up from the served root's
-      *parent*; and
-    * the checkout discovered by walking up from ``Path.cwd()``.
+    * every checkout ENCLOSING the served root; and
+    * every checkout ENCLOSING ``Path.cwd()``.
 
-    The enclosing-checkout walk starts at the *parent*, not at the served root,
-    on purpose. ``find_project_root`` stops at the first marker it sees, and a
-    served subdirectory normally carries its own ``.mcp.json`` -- that is the
-    very payload being judged -- so walking from the served root would return the
-    served root itself and discover nothing above it. Serving a SUBDIRECTORY of a
-    checkout must judge residency against the whole checkout, the way the cwd arm
-    already walks up: otherwise a store planted in the enclosing checkout escapes
-    the guard while the gateway serves ``<repo>/app`` and the repository
-    self-approves ``<repo>/app/.mcp.json`` (EC-TRUST-5, subdirectory-dependent;
-    Consiliency/pmcp#251, #230). The walk chains -- ``root.parent`` upward -- so
-    an intermediate ``.mcp.json`` between the served dir and the real checkout
-    does not hide it either.
+    Both the served root and cwd are walked UP to the enclosing checkout, not
+    judged against the single directory they name. ``find_project_root`` stops at
+    the first marker it sees, and a subdirectory of a checkout normally carries
+    its own ``.mcp.json`` -- the very payload being judged -- so a single lookup
+    would stop at that subdirectory and never reach the real checkout. A store
+    planted in the enclosing checkout would then escape the guard while the
+    repository self-approves ``<repo>/app/.mcp.json`` -- whether the gateway was
+    pointed at the subdirectory with ``serve --project <repo>/app`` (the served
+    arm) or simply launched from inside it with a bare ``pmcp serve`` or a
+    ``pmcp trust`` verb (the cwd arm). Both are EC-TRUST-5 (subdirectory-
+    dependent; Consiliency/pmcp#251, #230); closing one arm and not the other
+    leaves the hole open on the everyday developer cwd, so both arms walk up. The
+    walk chains ``root.parent`` upward, so an intermediate ``.mcp.json`` between
+    the subdirectory and the real checkout cannot hide it.
 
-    Each of the three, alone, leaves a hole the others close. Before the served
-    root existed the guard asked only "is the store inside the checkout *this
-    process's cwd* is in", so ``pmcp serve --project <checkout>`` launched from
-    elsewhere left a checkout-resident store un-refused (EC-TRUST-5,
-    cwd-dependent). Keying *only* on the served root would open the symmetric
-    hole -- ``pmcp serve --project X`` launched from inside a *second* checkout
-    ``Y`` whose committed store resolves into ``Y`` (the dotfiles-symlink shape
+    The served arm additionally keeps the served root *verbatim* -- its walk
+    starts at the served root's *parent*, because the served root's own
+    ``.mcp.json`` would otherwise stop that walk at the served root, and a
+    project served from outside any checkout has no enclosing checkout yet its
+    own store must still be refused. The cwd arm needs no verbatim entry: a bare
+    working directory that is not itself a checkout is not a "checkout being
+    judged".
+
+    Each source, alone, leaves a hole the others close. Keying only on the served
+    root would reopen the launch-checkout hole -- ``serve --project X`` from
+    inside a second checkout ``Y`` whose committed store resolves into ``Y`` (the
+    dotfiles-symlink shape
     ``test_a_checkout_resident_store_is_refused_through_a_symlink`` treats as
-    hostile) would stop refusing ``Y``'s store, and that store, keyed by path,
-    can carry an approval for ``X/.mcp.json``. The union keeps all of them
-    closed, and adding roots is strictly more-refusing: it can never turn a
-    refusal into an acceptance.
+    hostile), carrying an approval for ``X/.mcp.json``; keying only on cwd
+    reopens the served-from-elsewhere hole. The union keeps all of them closed,
+    and adding roots is strictly more-refusing: it can never turn a refusal into
+    an acceptance.
 
-    With nothing bound -- every ``pmcp trust`` verb, and a bare ``pmcp serve`` --
-    only the cwd walk applies, so ``pmcp trust approve`` run inside a checkout
-    keeps working.
+    With nothing served bound -- every ``pmcp trust`` verb, and a bare
+    ``pmcp serve`` -- only the cwd walk applies, so ``pmcp trust approve`` run
+    inside a checkout keeps working (its store lives in the operator's home,
+    outside the checkout).
     """
     roots: list[Path] = []
 
@@ -167,15 +174,12 @@ def _checkout_roots() -> tuple[Path, ...]:
         if resolved not in roots:
             roots.append(resolved)
 
-    if _active_project_root is not None:
-        # The served root itself is always a boundary (see docstring).
-        _add(_active_project_root)
-        # Then every checkout enclosing it, walked from the PARENT so the served
-        # dir's own `.mcp.json` cannot stop the walk at the served root. Chain
-        # `root.parent` upward so an intermediate marker cannot hide the real
-        # checkout either; the walk terminates via `find_project_root`'s own
-        # temp/home/filesystem-root guards, or when a root is the filesystem root.
-        current: Path | None = _active_project_root.parent
+    def _walk_up(start: Path) -> None:
+        # Every checkout at or above `start`, chaining `root.parent` upward so an
+        # intermediate `.mcp.json` cannot stop the walk short of the real
+        # checkout. Terminates via `find_project_root`'s temp/home/filesystem-
+        # root guards, or when a root is the filesystem root (`parent == enclosing`).
+        current: Path | None = start
         while current is not None:
             enclosing = find_project_root(current)
             if enclosing is None:
@@ -184,7 +188,18 @@ def _checkout_roots() -> tuple[Path, ...]:
             parent = enclosing.parent
             current = parent if parent != enclosing else None
 
-    _add(find_project_root(Path.cwd()))
+    if _active_project_root is not None:
+        # The served root itself is always a boundary; then every checkout
+        # enclosing it, walked from the PARENT so the served dir's own
+        # `.mcp.json` cannot stop the walk at the served root.
+        _add(_active_project_root)
+        _walk_up(_active_project_root.parent)
+
+    # The cwd arm walks up too: cwd may itself be a checkout subdirectory
+    # carrying the payload `.mcp.json`, so `find_project_root(cwd)` alone would
+    # stop there and miss the enclosing checkout (the bare `pmcp serve` and
+    # `pmcp trust` verb case, EC-TRUST-5 cwd-subdirectory).
+    _walk_up(Path.cwd())
     return tuple(roots)
 
 
@@ -192,9 +207,9 @@ def trust_store_path() -> Path:
     """Resolved path of the user-scoped trust store.
 
     Raises ``TrustStoreError`` if the store would land inside a checkout being
-    judged -- the served project root, any checkout enclosing it, and the current
-    checkout (``_checkout_roots``) -- directly, or through a symlink anywhere in
-    its path.
+    judged -- the served project root, any checkout enclosing it, and any
+    checkout enclosing the current directory (``_checkout_roots``) -- directly,
+    or through a symlink anywhere in its path.
     Symlinks are resolved *before* the comparison, which is the only reason a
     planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
