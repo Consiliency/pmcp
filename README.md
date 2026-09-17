@@ -219,8 +219,19 @@ audience so the proxied `Host` is accepted.
 
 - PMCP binds to `127.0.0.1` by default — not safe to expose publicly without
   `PMCP_AUTH_TOKEN`.
-- Config files (`.mcp.json`) are trusted inputs — treat them like code; do not load untrusted configs.
-- Secrets in `.env` files are passed to child MCP server processes; protect the `.env` file with filesystem permissions.
+- User-scoped and explicitly configured sources (`~/.mcp.json`, an explicit
+  `--config`, an explicit `--policy`) are trusted inputs — treat them like code.
+  A project-scoped `.mcp.json`, `.pmcp/manifest.yaml` or
+  `.mcp-gateway-policy.yaml` checked into a repository is **not** trusted until
+  you approve it with `pmcp trust approve <absolute path>`; until then it is
+  ignored, and approval is keyed to the file's exact bytes, so editing an
+  approved file revokes the approval. See the *v13 trust boundary* section of
+  [`SECURITY.md`](SECURITY.md) for the full model.
+- Secrets you export in the shell that starts PMCP are inherited by child MCP
+  server processes; protect them accordingly. Keys that PMCP itself loads from a
+  project `.env` or `.env.pmcp` are **not** propagated to spawned servers — only
+  a server's own declared credential is — so a repository's `.env` cannot bleed
+  into every downstream server.
 
 **Production background service (Linux systemd):**
 
@@ -1692,7 +1703,7 @@ docker-compose up -d
 
 ```bash
 # Clone the repo
-git clone https://github.com/ViperJuice/pmcp
+git clone https://github.com/Consiliency/pmcp
 cd pmcp
 
 # Install with uv (recommended)
