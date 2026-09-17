@@ -69,8 +69,72 @@ class TrustRecord:
     recorded_at: datetime
 
 
-def _checkout_root() -> Path | None:
-    """Resolved root of the checkout the process is working in, if any."""
+#: The project root the gateway was told to SERVE, or ``None`` when nothing set
+#: it. ``pmcp serve --project X`` binds this once at startup
+#: (``set_active_project_root``); the residency guard then keys on it instead of
+#: walking up from ``Path.cwd()``. It exists because the guard's question --
+#: "does the store resolve inside the checkout being judged?" -- was silently
+#: answered against the *launch directory's* checkout, not the *served* one: a
+#: ``pmcp serve --project <checkout>`` run from any other directory therefore
+#: failed to refuse a store planted inside that checkout, reopening EC-TRUST-5
+#: cwd-dependently (see Consiliency/pmcp#251, #230). A process global, not a
+#: threaded argument, because the guard is reached through ``is_approved`` deep
+#: inside the config loader; the alternative is a signature change to every
+#: public store verb and its ~50 call sites.
+_active_project_root: Path | None = None
+
+
+def set_active_project_root(root: Path | None) -> None:
+    """Bind the residency check to the project the gateway is SERVING.
+
+    ``pmcp serve --project X`` (and ``pmcp status --project X``) calls this once,
+    before any config is loaded, so the checkout-residency guard in
+    ``trust_store_path`` keys on the *served* checkout rather than on wherever
+    the process was launched. A store that resolves inside the served checkout
+    is then refused no matter the launch directory -- closing the cwd-dependent
+    hole.
+
+    Passing ``None`` clears the binding and restores the ``cwd``-derived
+    behaviour, which every non-serving caller relies on: the ``pmcp trust``
+    verbs legitimately run inside a checkout and MUST keep using ``cwd``, and a
+    bare ``pmcp serve`` with no ``--project`` keeps discovering its root from the
+    launch directory exactly as before. The value is resolved eagerly so the
+    guard compares two already-resolved paths.
+    """
+    global _active_project_root
+    _active_project_root = root.resolve() if root is not None else None
+
+
+def _checkout_roots() -> tuple[Path, ...]:
+    """Resolved checkout roots the store's residency is judged against.
+
+    The store is refused if it resolves inside **any** of these. There are up to
+    two, and checking both -- not one instead of the other -- is the fix:
+
+    * the project root the gateway was told to SERVE
+      (``set_active_project_root``, bound by ``pmcp serve --project X``), and
+    * the checkout discovered by walking up from ``Path.cwd()``.
+
+    Before the served root existed the guard asked only "is the store inside the
+    checkout *this process's cwd* is in", so ``pmcp serve --project <checkout>``
+    launched from elsewhere left a checkout-resident store un-refused
+    (EC-TRUST-5, cwd-dependent; Consiliency/pmcp#251, #230). Adding the served
+    root closes that. But it is added *to* the cwd walk, never in place of it:
+    keying only on the served root would open a symmetric hole -- ``pmcp serve
+    --project X`` launched from inside a *second* checkout ``Y`` whose committed
+    store resolves into ``Y`` (the dotfiles-symlink shape
+    ``test_a_checkout_resident_store_is_refused_through_a_symlink`` treats as
+    hostile) would stop refusing ``Y``'s store, and that store, keyed by path,
+    can carry an approval for ``X/.mcp.json``. Refusing a store resident in the
+    served OR the launch checkout keeps both closed.
+
+    With nothing bound -- every ``pmcp trust`` verb, and a bare ``pmcp serve`` --
+    only the cwd walk applies, so ``pmcp trust approve`` run inside a checkout
+    keeps working.
+    """
+    roots: list[Path] = []
+    if _active_project_root is not None:
+        roots.append(_active_project_root)
     # Imported here, not at module scope, to break an import cycle introduced
     # when CONSENT landed: pmcp.config.loader now imports pmcp.project_consent,
     # which imports this module, which needed pmcp.config.loader. At module
@@ -80,26 +144,31 @@ def _checkout_root() -> Path | None:
     # The residency check only needs the project root at call time.
     from pmcp.config.loader import find_project_root
 
-    root = find_project_root(Path.cwd())
-    return root.resolve() if root else None
+    cwd_root = find_project_root(Path.cwd())
+    if cwd_root is not None:
+        resolved = cwd_root.resolve()
+        if resolved not in roots:
+            roots.append(resolved)
+    return tuple(roots)
 
 
 def trust_store_path() -> Path:
     """Resolved path of the user-scoped trust store.
 
-    Raises ``TrustStoreError`` if the store would land inside the current
-    checkout -- directly, or through a symlink anywhere in its path. Symlinks
-    are resolved *before* the comparison, which is the only reason a planted
-    ``~/.config/pmcp -> ./vendor`` is caught.
+    Raises ``TrustStoreError`` if the store would land inside a checkout being
+    judged -- the served project root and/or the current checkout
+    (``_checkout_roots``) -- directly, or through a symlink anywhere in its path.
+    Symlinks are resolved *before* the comparison, which is the only reason a
+    planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
     path = (Path.home() / ".config" / "pmcp" / "trust.json").resolve()
-    checkout = _checkout_root()
-    if checkout is not None and path.is_relative_to(checkout):
-        raise TrustStoreError(
-            f"Trust store {path} resolves inside the checkout at {checkout}. "
-            "A checkout-resident store lets a repository approve its own "
-            "content; move it under a home directory outside the repository."
-        )
+    for checkout in _checkout_roots():
+        if path.is_relative_to(checkout):
+            raise TrustStoreError(
+                f"Trust store {path} resolves inside the checkout at {checkout}. "
+                "A checkout-resident store lets a repository approve its own "
+                "content; move it under a home directory outside the repository."
+            )
     return path
 
 

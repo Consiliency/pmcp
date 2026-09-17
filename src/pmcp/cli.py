@@ -1372,7 +1372,19 @@ async def run_status(args: argparse.Namespace) -> None:
     # Load configs
     project_root = args.project if hasattr(args, "project") else None
     config_path = args.config if hasattr(args, "config") else None
-    configs = load_configs(project_root=project_root, custom_config_path=config_path)
+    # Same residency binding as `run_server`: judge a `--project <checkout>`
+    # store against the served checkout, not the launch directory, so `status`
+    # and `serve` give the same verdict for a checkout-resident store. `status`
+    # is one-shot, so the binding is scoped to the load and cleared afterwards
+    # rather than left set for the process (unlike `serve`, which reloads
+    # configs for its whole lifetime).
+    trust_store.set_active_project_root(project_root)
+    try:
+        configs = load_configs(
+            project_root=project_root, custom_config_path=config_path
+        )
+    finally:
+        trust_store.set_active_project_root(None)
 
     # Exclude self-referential gateway entries (e.g. pmcp/mcp-gateway)
     # so `pmcp status` only reports downstream servers.
@@ -2407,6 +2419,15 @@ async def run_server(args: argparse.Namespace) -> None:
         )
 
     logger.info("Starting PMCP...")
+
+    # Bind the trust store's checkout-residency guard to the project we are
+    # about to SERVE, before any config is loaded. Without this the guard keys
+    # on the launch directory's checkout, so `pmcp serve --project <checkout>`
+    # run from elsewhere fails to refuse a store planted inside that checkout
+    # and loads its self-approved `.mcp.json` (EC-TRUST-5, see
+    # Consiliency/pmcp#251, #230). `None` (bare `pmcp serve`) restores the
+    # cwd-derived behaviour.
+    trust_store.set_active_project_root(args.project)
 
     server = GatewayServer(
         project_root=args.project,
