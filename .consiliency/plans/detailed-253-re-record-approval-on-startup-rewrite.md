@@ -7,7 +7,7 @@
 
 ## Research summary
 - `set_startup_policy` (`src/pmcp/config/loader.py:723`) resolves a single target source, reads it via `_read_config_object`, computes the new `autoStart`, and — only when `should_write = operation.apply and not operation.dry_run and changed` — sets `data["autoStart"]` and calls `_atomic_write_json(target.path, data)` (`:803-805`). It returns a `StartupPolicyPreview` carrying `source`, `path`, `changed`, `dry_run`, `before_autoStart`, `after_autoStart`, `message`, `diagnostics`, `next_step`.
-- `_atomic_write_json` (`:712`) writes `json.dump(data, indent=2)` + a trailing `"\n"` via a temp file + `replace`. The exact on-disk bytes after the write are authoritative — re-read them rather than re-serialising, so the recorded digest cannot drift from what `_read_and_gate_project_config` will later hash.
+- `_atomic_write_json` (`:712`) writes `json.dump(data, indent=2)` + a trailing `"\n"` via a temp file + `replace`. **Do NOT re-read the file after the write to get the bytes to approve** — that opens a TOCTOU window (a concurrent writer could substitute attacker bytes between the write and the re-read, and approval would be recorded for content the operator never consented to; panel finding, codex). Instead the writer serialises once and returns the exact bytes it wrote, and approval is recorded for *those* bytes. If another process overwrites the file after our write, the recorded digest simply no longer matches on-disk and the next startup fails safe by refusing it — which is correct.
 - `trust_store.is_approved(path, content)` (`src/pmcp/trust_store.py:425`) matches on resolved path + content SHA + `decision == APPROVED`; it **ignores scope** and never raises. `trust_store.record(path, content, scope, decision)` (`:450`) writes the record and **raises `TrustStoreError` if the store is checkout-resident / unreadable / corrupt** (this is the residency guard, and post-#252 it also refuses a store resident in the checkout enclosing `path`).
 - `pmcp trust approve` records with scope `cli._TRUST_SCOPE` (`src/pmcp/cli.py:2618`). Re-record with the **same** scope for consistency.
 - Import posture: `config/loader.py` is imported by `pmcp.project_consent`, which `trust_store` imports; `trust_store` already imports `find_project_root` from loader **lazily** to break that cycle. Mirror that — import `trust_store` **inside** `set_startup_policy` (function-local), not at module scope, and confirm a clean-interpreter import still works.
@@ -15,13 +15,15 @@
 ## Changes
 
 ### `src/pmcp/config/loader.py` (modify)
-- `set_startup_policy` — modify — capture the pre-write approval state and re-record after the write:
-  - Immediately before `_atomic_write_json` in the `should_write` branch, read the current on-disk bytes: `old_bytes = target.path.read_bytes()` guarded by `try/except OSError` (a source being created for the first time has no prior bytes → `was_approved = False`).
-  - `was_approved = trust_store.is_approved(target.path, old_bytes)` (function-local `from pmcp import trust_store`).
-  - After `_atomic_write_json(target.path, data)`, if `was_approved`: read the exact written bytes `new_bytes = target.path.read_bytes()` and call `trust_store.record(target.path, new_bytes, cli._TRUST_SCOPE, trust_store.APPROVED)`. Wrap the `record` call in `try/except trust_store.TrustStoreError` — if the store is unusable (e.g. checkout-resident, post-#252), append a `StartupPolicyDiagnostic(code="approval_not_carried_forward", message=..., source, path)` to the returned preview instead of crashing, and leave the file written (the operator's autoStart edit still applies; only the re-approval failed, and the next startup will fail safe by refusing the unapproved file).
-  - Scope constant: to avoid a loader→cli import (cli imports loader), define the scope value where both can reach it. Prefer moving `_TRUST_SCOPE` to a neutral module (`trust_store` already owns approval concepts — add `trust_store.PROJECT_SCOPE` or reuse an existing constant) and have `cli._TRUST_SCOPE` reference it, so `set_startup_policy` and `pmcp trust approve` provably use the same scope. Decide the exact home during implementation; the invariant is *one shared constant*, not two literals.
+- `_atomic_write_json` — modify — **return the exact bytes it writes.** Serialise once (`payload = json.dumps(data, indent=2) + "\n"`), write `payload.encode("utf-8")`, and return those bytes. The re-record uses this return value; it MUST never `read_bytes()` after the write (the TOCTOU hole above). Update its one other caller accordingly (the return is additive — callers that ignore it are unaffected).
+- `set_startup_policy` — modify — bind approval to a single captured input snapshot, in this exact order:
+  - **Capture the input ONCE**: `input_bytes = target.path.read_bytes()` (guard `OSError` → `was_approved = False`, a first-time source has no prior bytes). Parse the object to mutate FROM `input_bytes` (the same bytes), not via a second independent read of `target.path`, so the bytes checked for approval are exactly the bytes being transformed. (Reconcile with the existing `_read_config_object(target.path)` read: read once, reuse; do not check approval of one read while transforming another.)
+  - `was_approved = trust_store.is_approved(target.path, input_bytes)` (function-local `from pmcp import trust_store`).
+  - In the `should_write` branch: `output_bytes = _atomic_write_json(target.path, data)` — the exact bytes written, returned by the writer.
+  - If `was_approved`: `trust_store.record(target.path, output_bytes, <shared scope>, trust_store.APPROVED)` — approve exactly the bytes just written, derived deterministically from the approved input snapshot. **No post-write read.** Wrap in `try/except trust_store.TrustStoreError` → append a `StartupPolicyDiagnostic(code="approval_not_carried_forward", ...)` and leave the file written (checkout-resident store, post-#252; do not crash — the next startup fails safe).
   - Never re-record on a dry run or a no-op (`should_write` already gates this).
-- `StartupPolicyPreview` — modify (if needed) — it already carries `diagnostics`; add a boolean like `approval_carried_forward` only if the CLI/JSON consumer needs to show it. Optional; the diagnostic path covers the failure case.
+  - Scope constant: one shared constant between `set_startup_policy` and `pmcp trust approve` — move `_TRUST_SCOPE` to a neutral home (e.g. `trust_store`) and have `cli._TRUST_SCOPE` reference it; never two literals.
+- `StartupPolicyPreview` — modify (if needed) — optional `approval_carried_forward` bool; the diagnostic path covers the failure case.
 
 ### `src/pmcp/cli.py` (modify)
 - `set-startup-policy` handler (`:1898`) — modify — after printing `After:`, if the preview reports the approval was carried forward (or a diagnostic says it was not), print one human line so the operator knows their approval survived (or did not). Keep it a single line; do not change the JSON shape beyond the new field if one is added.
@@ -43,6 +45,7 @@
   4. A **not-previously-approved** `.mcp.json`: after `set_startup_policy(add)`, `is_approved(path, new_bytes)` is **False** (no auto-approval created).
   5. `dry_run=True`: no record written.
   6. Checkout-resident store (post-#252): `set_startup_policy` returns `ok=True` with an `approval_not_carried_forward` diagnostic and does not raise.
+  7. **Substitution / consent-bypass test (panel finding, codex):** a concurrent process replaces `.mcp.json` with attacker bytes AFTER `input_bytes` is captured but before/around the write; assert that after `set_startup_policy`, the only approved bytes are the ones the writer returned (derived from the approved input snapshot), and the substituted attacker bytes are NOT approved (`is_approved(path, attacker_bytes)` is False). Because approval is recorded from the writer's return value, never a post-write read, there is no window in which attacker bytes are approved. The happy-path and mutation tests do not catch this — it is a required case.
 - Mutation: drop the re-record call → test (3) goes red (`is_approved` False after the rewrite).
 - `scripts/check_security_claims.py SECURITY.md` exit 0; `mypy src/`; `ruff check` + `ruff format --check`.
 
@@ -52,9 +55,10 @@
 - [ ] A dry-run `set_startup_policy` records nothing.
 - [ ] When `record()` refuses (checkout-resident store), `set_startup_policy` returns `ok=True` with an `approval_not_carried_forward` diagnostic and does not raise.
 - [ ] `set_startup_policy` and `pmcp trust approve` use one shared scope constant (no duplicated literal).
+- [ ] Approval is recorded only for the exact bytes `_atomic_write_json` returned (never a post-write re-read); a file substituted by another process between the input read and the write does NOT receive approval.
 - [ ] `scripts/check_security_claims.py` exits 0 with C-28 updated and the new test cited.
 
 ## Notes for the implementer
-- Re-read the written bytes for the digest; never re-serialise (drift risk vs `_atomic_write_json`'s exact format).
+- Record approval from the writer's returned bytes; NEVER `read_bytes()` after the write (TOCTOU consent-bypass — panel finding). Serialise once, write, return, and approve that same value.
 - Keep the `trust_store` import function-local in `loader.py` (import-cycle; mirror `find_project_root`'s lazy import).
 - This is the same family as #252 (an operator write vs. the content-keyed gate); land after or alongside #252 so the residency failure mode is the intended one.
