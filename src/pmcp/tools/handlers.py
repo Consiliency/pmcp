@@ -5002,10 +5002,10 @@ class GatewayTools:
         # it planted stays here. NOT by the route this comment used to name -- a later
         # `auth_connect` whose read-modify-write silently drops the key is not
         # reproducible, because every unreadable-store shape raises rather than
-        # rewriting. By these instead: `write_env_file` truncates before it writes, so
-        # a failed write loses the rest of the file; a concurrent writer in another
-        # process loses an update; an operator deletes the store; or a previous
-        # process wrote the key and this one never saw it. See
+        # rewriting. By these instead: a concurrent writer in another process loses an
+        # update; an operator deletes the store; or a previous process wrote the key
+        # and this one never saw it. (`write_env_file`'s old truncate-then-write route
+        # is closed -- it is now atomic, Consiliency/pmcp#248.) See
         # `env_store.record_pmcp_introduced_keys` (Consiliency/pmcp#230).
         record_pmcp_introduced_keys([env_var])
 
