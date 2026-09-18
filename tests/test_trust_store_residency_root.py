@@ -441,6 +441,59 @@ def test_trust_approve_verb_still_refuses_a_checkout_resident_store(
     assert str(checkout.resolve()) in str(raised.value)
 
 
+def test_trust_approve_from_outside_refuses_a_store_in_the_approved_paths_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`pmcp trust approve` must refuse a store resident in the APPROVED path's
+    checkout even when run from OUTSIDE it -- so approve agrees with serve (#252).
+
+    The cwd guard only fires when cwd is in the checkout; run from elsewhere,
+    ``trust_store_path`` does not refuse (cwd finds no repo, no served root is
+    bound), so approve once wrote into the checkout-resident store and printed
+    "Approved", then ``serve --project`` refused that same store forever. The
+    verb now judges residency against the checkout enclosing the file being
+    approved. Driven through the real CLI handler; a positive control proves the
+    refusal is residency, not an absent record.
+    """
+    checkout = _checkout(tmp_path)
+    store_home = checkout / "home"
+    store_home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    config = _repo_mcp_json(checkout)
+
+    monkeypatch.setenv("HOME", str(store_home))  # store resolves INSIDE the checkout
+    monkeypatch.chdir(outside)  # ... but the verb runs from OUTSIDE it
+
+    with pytest.raises(TrustStoreError) as raised:
+        cli._run_trust_approve(argparse.Namespace(path=str(config)))
+    assert str(checkout.resolve()) in str(raised.value)
+    # Nothing was recorded -- the refusal preceded the write.
+    assert trust_store.is_approved(config, config.read_bytes()) is False
+
+
+def test_trust_approve_from_outside_with_a_store_outside_still_approves(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Positive control for #252: a store OUTSIDE the approved path's checkout
+    still approves. The new guard must refuse only a checkout-resident store, not
+    the everyday operator store in a home directory outside the repository.
+    """
+    checkout = _checkout(tmp_path)
+    operator_home = tmp_path / "operator-home"
+    operator_home.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    config = _repo_mcp_json(checkout)
+
+    monkeypatch.setenv("HOME", str(operator_home))  # store OUTSIDE the checkout
+    monkeypatch.chdir(outside)
+
+    cli._run_trust_approve(argparse.Namespace(path=str(config)))
+    assert f"Approved {config.resolve()}" in capsys.readouterr().out
+    assert trust_store.is_approved(config, config.read_bytes()) is True
+
+
 # --------------------------------------------------------------------------- #
 # The wiring: the `run_status` CLI handler actually binds the served root.
 # --------------------------------------------------------------------------- #
