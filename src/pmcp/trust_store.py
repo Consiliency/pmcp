@@ -113,9 +113,11 @@ def _enclosing_checkouts(start: Path) -> Iterator[Path]:
     ``.mcp.json`` -- cannot stop the walk short of the real checkout. Terminates
     when ``find_project_root`` returns ``None`` (its temp/home guards) or at the
     filesystem root (``parent == enclosing``). Shared by ``_checkout_roots`` (the
-    residency guard's served and cwd arms) and by ``record`` (the checkout
-    enclosing the path being approved, Consiliency/pmcp#252) so the walk cannot
-    drift between them.
+    residency guard's served and cwd arms) and by
+    ``assert_store_outside_path_checkout`` (the approve verb's guard -- the
+    checkout enclosing the path being approved, Consiliency/pmcp#252) so the walk
+    cannot drift between them. ``record`` itself stays unguarded, so a store a
+    repository *ships* can still be planted in tests and shown refused.
     """
     # Imported here, not at module scope, to break an import cycle introduced
     # when CONSENT landed: pmcp.config.loader now imports pmcp.project_consent,
