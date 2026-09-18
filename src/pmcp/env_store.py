@@ -6,6 +6,7 @@ import errno
 import os
 import re
 import stat
+import tempfile
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
@@ -130,7 +131,17 @@ def _format_env_value(value: str) -> str:
 
 
 def write_env_file(path: Path, values: dict[str, str]) -> None:
-    """Write key/value pairs to .env file and lock permissions to 0600."""
+    """Write key/value pairs to a .env file atomically, at mode 0600.
+
+    The write is atomic: the content is written to a temporary file in the same
+    directory, flushed and ``fsync``-ed, then ``os.replace``-d over the
+    destination. A write that fails partway -- ``ENOSPC``, a quota, a kill
+    signal -- leaves the existing file byte-intact rather than truncated, so an
+    interrupted write can no longer lose the store's other entries
+    (Consiliency/pmcp#248). ``os.replace`` is an atomic same-filesystem rename,
+    which is why the temporary shares ``path``'s directory; the directory entry
+    is ``fsync``-ed too so the rename itself survives a crash.
+    """
     _validate_env_values(values)
 
     lines = [f"{key}={_format_env_value(val)}" for key, val in values.items()]
@@ -149,10 +160,33 @@ def write_env_file(path: Path, values: dict[str, str]) -> None:
             os.chmod(parent, 0o700)
         except OSError:
             pass
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as env_file:
-        env_file.write(content)
+
+    # Write-then-rename so the destination is never observed truncated. mkstemp
+    # creates the temp 0600 in `parent`; the explicit fchmod keeps that guarantee
+    # if the mkstemp default ever changes. On ANY failure the destination is left
+    # untouched and the partial temp is removed.
+    tmp_fd, tmp_name = tempfile.mkstemp(prefix=".pmcp-env-", dir=parent)
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as tmp_file:
+            os.fchmod(tmp_file.fileno(), 0o600)
+            tmp_file.write(content)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+    # Best-effort: fsync the directory so the rename is durable across a crash.
+    try:
+        dir_fd = os.open(parent, os.O_RDONLY)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError:
+        pass
 
 
 # Env-var keys PMCP itself introduced into its OWN environment from a dotenv
@@ -240,11 +274,8 @@ def record_pmcp_introduced_keys(keys: Iterable[str]) -> None:
     raises ``PermissionError`` out of the read and the file is left byte-intact,
     a directory at the path raises ``IsADirectoryError`` out of the write, and a
     store holding a key or value the writer rejects raises ``ValueError`` before
-    the file is opened. Every one of those fails closed. What is real:
+    the file is opened. Every one of those fails closed, and the partial-write route -- :func:`write_env_file` once truncated before it wrote -- is closed too: that write is now atomic (write-to-temp then ``os.replace``, Consiliency/pmcp#248). What remains real:
 
-    * :func:`write_env_file` truncates before it writes (``O_TRUNC``, then a
-      separate write), so a write that fails partway -- ``ENOSPC``, a quota, a
-      kill signal -- leaves the file truncated and its remaining entries gone;
     * two read-modify-writes racing lose one update, reachable whenever a second
       process touches the store (a ``pmcp secrets set``/``sync`` beside a running
       gateway) -- not in-process, where :func:`set_env_value` runs synchronously

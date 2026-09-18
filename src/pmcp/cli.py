@@ -2998,10 +2998,10 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     assumed. Measured on python-dotenv 1.2.3: an unreadable store makes
     ``read_env_file`` RAISE, and ``set_env_value`` then raises too and leaves the
     file byte-intact, so the "rewrite from an empty read" chain does not occur.
-    What does drop an entry: an operator deleting the store; a write that fails
-    partway, because ``write_env_file`` truncates before writing and is not
-    atomic; and a second writer (another gateway, or ``pmcp secrets set``)
-    racing this one. Without this record, all three
+    What does drop an entry: an operator deleting the store; and a second writer
+    (another gateway, or ``pmcp secrets set``) racing this one. The partial-write
+    route this once named is closed -- ``write_env_file`` is now atomic
+    (write-to-temp then ``os.replace``, Consiliency/pmcp#248). Without this record, all three
     provenance sources would then say "the operator exported this" and the
     outbound-feedback gate would honour an agent-plantable credential.
 

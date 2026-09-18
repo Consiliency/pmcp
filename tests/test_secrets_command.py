@@ -67,13 +67,21 @@ class TestSecretsHandlers:
         assert read_env_file(env_path)["OPENAI_API_KEY"] == "sk-test"
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
 
-    def test_write_env_file_creates_with_os_open_mode_0600(
+    def test_write_env_file_creates_atomically_at_mode_0600(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """write_env_file creates new env files through a restrictive descriptor."""
+        """write_env_file commits via an atomic rename and leaves the file 0600.
+
+        The destination is never opened with ``O_TRUNC`` (which would truncate it
+        in place, losing entries if the write failed partway); the bytes go to a
+        temp file that is ``os.replace``-d over the destination
+        (Consiliency/pmcp#248). The resulting file is mode 0600.
+        """
         env_path = tmp_path / ".env.pmcp"
         opened: list[tuple[Path, int, int]] = []
+        replaced: list[Path] = []
         real_open = os.open
+        real_replace = os.replace
 
         def open_spy(
             path: os.PathLike[str] | str,
@@ -85,11 +93,23 @@ class TestSecretsHandlers:
             opened.append((Path(path), flags, mode))
             return real_open(path, flags, mode)
 
+        def replace_spy(
+            src: os.PathLike[str] | str,
+            dst: os.PathLike[str] | str,
+            *args: object,
+            **kwargs: object,
+        ) -> None:
+            replaced.append(Path(dst))
+            real_replace(src, dst)
+
         monkeypatch.setattr("pmcp.env_store.os.open", open_spy)
+        monkeypatch.setattr("pmcp.env_store.os.replace", replace_spy)
 
         write_env_file(env_path, {"OPENAI_API_KEY": "sk-test"})
 
-        assert opened == [(env_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)]
+        # Committed by renaming a temp onto the destination -- not truncated in place.
+        assert replaced == [env_path]
+        assert not any(p == env_path and (flags & os.O_TRUNC) for p, flags, _ in opened)
         assert stat.S_IMODE(env_path.stat().st_mode) == 0o600
 
     @pytest.mark.asyncio
