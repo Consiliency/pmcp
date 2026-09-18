@@ -45,7 +45,7 @@
   4. A **not-previously-approved** `.mcp.json`: after `set_startup_policy(add)`, `is_approved(path, new_bytes)` is **False** (no auto-approval created).
   5. `dry_run=True`: no record written.
   6. Checkout-resident store (post-#252): `set_startup_policy` returns `ok=True` with an `approval_not_carried_forward` diagnostic and does not raise.
-  7. **Substitution / consent-bypass test (panel finding, codex):** a concurrent process replaces `.mcp.json` with attacker bytes AFTER `input_bytes` is captured but before/around the write; assert that after `set_startup_policy`, the only approved bytes are the ones the writer returned (derived from the approved input snapshot), and the substituted attacker bytes are NOT approved (`is_approved(path, attacker_bytes)` is False). Because approval is recorded from the writer's return value, never a post-write read, there is no window in which attacker bytes are approved. The happy-path and mutation tests do not catch this — it is a required case.
+  7. **Substitution / consent-bypass test (panel finding, codex + grok):** the load-bearing window is a substitute AFTER `_atomic_write_json` returns (a pre-write substitute is harmlessly clobbered by `replace`, so testing only that window would pass even for the buggy post-write-read design). The test MUST: (a) let a concurrent process replace `.mcp.json` with attacker bytes immediately after `_atomic_write_json` returns; (b) **spy on `trust_store.record`** and assert its `content` argument equals the writer's returned bytes AND equals an independent `json.dumps(parse(input_snapshot) with autoStart)` — never trust a disk re-read as the oracle; (c) assert `is_approved(path, attacker_bytes)` is False. This proves approval is bound to the writer's output, not to whatever is on disk at record time. The happy-path and mutation tests do not catch this — it is a required case.
 - Mutation: drop the re-record call → test (3) goes red (`is_approved` False after the rewrite).
 - `scripts/check_security_claims.py SECURITY.md` exit 0; `mypy src/`; `ruff check` + `ruff format --check`.
 
@@ -55,7 +55,7 @@
 - [ ] A dry-run `set_startup_policy` records nothing.
 - [ ] When `record()` refuses (checkout-resident store), `set_startup_policy` returns `ok=True` with an `approval_not_carried_forward` diagnostic and does not raise.
 - [ ] `set_startup_policy` and `pmcp trust approve` use one shared scope constant (no duplicated literal).
-- [ ] Approval is recorded only for the exact bytes `_atomic_write_json` returned (never a post-write re-read); a file substituted by another process between the input read and the write does NOT receive approval.
+- [ ] `trust_store.record` is called with the writer's returned bytes (verified by spying its `content`, not by a disk re-read); a file substituted by another process AFTER the write returns does NOT receive approval (`is_approved(path, attacker_bytes)` is False).
 - [ ] `scripts/check_security_claims.py` exits 0 with C-28 updated and the new test cited.
 
 ## Notes for the implementer
