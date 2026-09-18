@@ -1410,7 +1410,7 @@ class TestGetNpmVersion:
         clear_version_cache()
 
     def test_user_agent_uses_pmcp_version(self) -> None:
-        assert _USER_AGENT == f"pmcp/{__version__} (github.com/ViperJuice/pmcp)"
+        assert _USER_AGENT == f"pmcp/{__version__} (github.com/Consiliency/pmcp)"
 
     @pytest.mark.asyncio
     async def test_successful_lookup(self) -> None:
