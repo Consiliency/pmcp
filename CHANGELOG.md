@@ -366,6 +366,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+- **The npm version-check User-Agent now names `github.com/Consiliency/pmcp`** instead of the pre-rename `ViperJuice/pmcp`. See [#247](https://github.com/Consiliency/pmcp/issues/247).
 - **The default feedback repository was `ViperJuice/pmcp`, a repository this
   project does not own.** Every unconfigured gateway that submitted feedback — or
   merely previewed it — named that repository in its output and in the browser URL
