@@ -429,6 +429,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Changed
+- **`pmcp trust approve` now refuses a store resident in the checkout containing the file being approved**, matching what `serve --project` enforces — so approve no longer reports success for an approval that serve will then refuse. See [#252](https://github.com/Consiliency/pmcp/issues/252).
 - **Every install spawn now logs the command it runs, at WARNING, before it
   runs.** `start_install`, the legacy `install_server` and `verify_installation`
   each log a rendered command line immediately before the subprocess is
