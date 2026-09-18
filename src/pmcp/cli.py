@@ -2615,6 +2615,11 @@ def _run_trust_approve(args: argparse.Namespace) -> None:
         _trust_fail(f"cannot read {path}: {exc}")
         return
 
+    # #252: refuse a store resident in the checkout enclosing `path`, so approve
+    # agrees with what `serve --project` later enforces (raises TrustStoreError,
+    # which `run_trust` maps to a non-zero exit -- the same contract as the
+    # served/cwd residency guard in `trust_store_path`).
+    trust_store.assert_store_outside_path_checkout(path)
     rec = trust_store.record(path, content, _TRUST_SCOPE, trust_store.APPROVED)
     print(f"Approved {rec.absolute_path}")
     print(f"  sha256 {rec.content_sha256}")

@@ -229,7 +229,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 - **Limitation.** A store resident in the served checkout is genuinely refused, but the refusal is raised per read and surfaces through the consent gate's not-approved message naming `pmcp trust approve`, rather than as a distinct abort at startup [C-33].
 - **Limitation.** The npm version-check User-Agent still names the old repository, tracked as a follow-up rather than as a trust-boundary property [C-34].
 - **Limitation.** The approval-store write is not atomic and can truncate before it finishes, tracked as a follow-up to the durability of the operator's own records [C-35].
-- **Limitation.** The `pmcp trust approve` verb resolves the store from the working directory while serving resolves it from the served project root, so the two can disagree and the asymmetry is tracked as a follow-up [C-36].
+- **Limitation.** The `pmcp trust approve` verb now also refuses a store resident in the checkout containing the file being approved, closing the case where approve wrote into a checkout-resident store that `serve --project` then refused; the two verbs still resolve residency from different anchors -- approve from the working directory and the approved path's checkout, serve from the served project root -- so they are not guaranteed identical in every multi-checkout layout [C-36].
 - **Limitation.** PMCP spawns a child process for every downstream server, and although a project configuration entry is gated by consent and a discovered package is bound to an approved identity, a server an operator approves still runs, so configure only servers you trust [C-37].
 
 <!-- CLAIM-LEDGER: BEGIN -->
@@ -270,7 +270,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 | C-33 | limitation | — |
 | C-34 | limitation | — |
 | C-35 | limitation | — |
-| C-36 | limitation | characterizes: `tests/test_trust_store_residency_root.py::test_trust_approve_verb_inside_a_checkout_uses_cwd`, `tests/test_trust_store_residency_root.py::test_trust_approve_verb_still_refuses_a_checkout_resident_store` |
+| C-36 | limitation | characterizes: `tests/test_trust_store_residency_root.py::test_trust_approve_verb_inside_a_checkout_uses_cwd`, `tests/test_trust_store_residency_root.py::test_trust_approve_verb_still_refuses_a_checkout_resident_store`, `tests/test_trust_store_residency_root.py::test_trust_approve_from_outside_refuses_a_store_in_the_approved_paths_checkout`, `tests/test_trust_store_residency_root.py::test_trust_approve_from_outside_with_a_store_outside_still_approves` |
 | C-37 | limitation | — |
 <!-- CLAIM-LEDGER: END -->
 <!-- TRUST-MODEL-CLAIMS: END -->

@@ -105,6 +105,35 @@ def set_active_project_root(root: Path | None) -> None:
     _active_project_root = root.resolve() if root is not None else None
 
 
+def _enclosing_checkouts(start: Path) -> Iterator[Path]:
+    """Every checkout at or above ``start``, resolved, nearest first.
+
+    Walks up from ``start`` via ``find_project_root``, then chains
+    ``root.parent`` upward so an intermediate marker -- a subdirectory's own
+    ``.mcp.json`` -- cannot stop the walk short of the real checkout. Terminates
+    when ``find_project_root`` returns ``None`` (its temp/home guards) or at the
+    filesystem root (``parent == enclosing``). Shared by ``_checkout_roots`` (the
+    residency guard's served and cwd arms) and by ``record`` (the checkout
+    enclosing the path being approved, Consiliency/pmcp#252) so the walk cannot
+    drift between them.
+    """
+    # Imported here, not at module scope, to break an import cycle introduced
+    # when CONSENT landed: pmcp.config.loader now imports pmcp.project_consent,
+    # which imports this module. At module scope that made `import
+    # pmcp.config.loader` fail outright in a clean interpreter. The residency
+    # check only needs the project root at call time.
+    from pmcp.config.loader import find_project_root
+
+    current: Path | None = start
+    while current is not None:
+        enclosing = find_project_root(current)
+        if enclosing is None:
+            return
+        yield enclosing.resolve()
+        parent = enclosing.parent
+        current = parent if parent != enclosing else None
+
+
 def _checkout_roots() -> tuple[Path, ...]:
     """Resolved checkout roots the store's residency is judged against.
 
@@ -158,15 +187,6 @@ def _checkout_roots() -> tuple[Path, ...]:
     """
     roots: list[Path] = []
 
-    # Imported here, not at module scope, to break an import cycle introduced
-    # when CONSENT landed: pmcp.config.loader now imports pmcp.project_consent,
-    # which imports this module, which needed pmcp.config.loader. At module
-    # scope that made `import pmcp.config.loader` fail outright in a clean
-    # interpreter (the test suite hid it, because conftest imports trust_store
-    # first and the cycle is already resolved by the time loader is reached).
-    # The residency check only needs the project root at call time.
-    from pmcp.config.loader import find_project_root
-
     def _add(candidate: Path | None) -> None:
         if candidate is None:
             return
@@ -174,32 +194,21 @@ def _checkout_roots() -> tuple[Path, ...]:
         if resolved not in roots:
             roots.append(resolved)
 
-    def _walk_up(start: Path) -> None:
-        # Every checkout at or above `start`, chaining `root.parent` upward so an
-        # intermediate `.mcp.json` cannot stop the walk short of the real
-        # checkout. Terminates via `find_project_root`'s temp/home/filesystem-
-        # root guards, or when a root is the filesystem root (`parent == enclosing`).
-        current: Path | None = start
-        while current is not None:
-            enclosing = find_project_root(current)
-            if enclosing is None:
-                break
-            _add(enclosing)
-            parent = enclosing.parent
-            current = parent if parent != enclosing else None
-
     if _active_project_root is not None:
-        # The served root itself is always a boundary; then every checkout
-        # enclosing it, walked from the PARENT so the served dir's own
-        # `.mcp.json` cannot stop the walk at the served root.
+        # The served root itself is always a boundary (a served dir inside no
+        # checkout must still be refused); then every checkout enclosing it,
+        # walked from the PARENT so the served dir's own `.mcp.json` cannot stop
+        # the walk at the served root.
         _add(_active_project_root)
-        _walk_up(_active_project_root.parent)
+        for enclosing in _enclosing_checkouts(_active_project_root.parent):
+            _add(enclosing)
 
     # The cwd arm walks up too: cwd may itself be a checkout subdirectory
-    # carrying the payload `.mcp.json`, so `find_project_root(cwd)` alone would
-    # stop there and miss the enclosing checkout (the bare `pmcp serve` and
-    # `pmcp trust` verb case, EC-TRUST-5 cwd-subdirectory).
-    _walk_up(Path.cwd())
+    # carrying the payload `.mcp.json`, so a single lookup would stop there and
+    # miss the enclosing checkout (the bare `pmcp serve` and `pmcp trust` verb
+    # case, EC-TRUST-5 cwd-subdirectory).
+    for enclosing in _enclosing_checkouts(Path.cwd()):
+        _add(enclosing)
     return tuple(roots)
 
 
@@ -445,6 +454,32 @@ def is_approved(path: Path, content: bytes) -> bool:
         return False
     except Exception:  # noqa: BLE001 -- fail closed; see docstring
         return False
+
+
+def assert_store_outside_path_checkout(path: Path) -> None:
+    """Refuse if the store resolves inside a checkout enclosing ``path``.
+
+    ``trust_store_path`` already refuses a store resident in the served root or
+    the cwd checkout, but ``pmcp trust approve`` run from OUTSIDE the approved
+    file's checkout would otherwise write into a store resident in THAT checkout
+    and print "Approved" -- and ``serve --project`` then refuses the same store
+    forever. The approve verb calls this so approve and serve agree
+    (Consiliency/pmcp#252). Raises ``TrustStoreError`` naming the checkout; a
+    store outside every enclosing checkout is left alone. This guards the verb,
+    not ``record`` itself: ``record`` stays a primitive, so a store a repository
+    *ships* (never written through the verb) can still be planted and shown to
+    be refused on the read side.
+    """
+    store = trust_store_path()
+    approved = Path(path).resolve()
+    for checkout in _enclosing_checkouts(approved.parent):
+        if store.is_relative_to(checkout):
+            raise TrustStoreError(
+                f"Trust store {store} resolves inside the checkout at {checkout} "
+                f"that contains {approved}. A checkout-resident store lets a "
+                "repository approve its own content; move it under a home "
+                "directory outside the repository."
+            )
 
 
 def record(path: Path, content: bytes, scope: str, decision: str) -> TrustRecord:
