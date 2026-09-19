@@ -125,6 +125,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. See [#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
+- **Bumped `anyio` 4.12.0 → 4.14.2** to clear advisories `GHSA-82r6-8w77-94w6` and `GHSA-5p39-cfhj-2xmp`. Lockfile-only; the D-01 `pip-audit --strict` gate is green again.
 - **`SECURITY.md` now states the v13 trust boundary, and every claim in it is
   bound to a test that proves it.** A new *The v13 trust boundary* section
   describes the implemented model as 25 guarantees and 12 labelled limitations,
