@@ -5,10 +5,10 @@
 
 **Owner decision: RE-RECORD.** When the pre-write bytes were approved, re-record an `approved` decision for the exact new bytes. Never create a new approval for a file that was not already approved.
 
-This plan supersedes the earlier hand-written `.consiliency/plans/detailed-253-re-record-approval-on-startup-rewrite.md` (merged via #257). Its design invariants below are the product of five rounds of cross-vendor panel review; they close two consent races the panel surfaced and must be preserved.
+This plan supersedes the earlier hand-written `.consiliency/plans/detailed-253-re-record-approval-on-startup-rewrite.md` (merged via #257). Its design invariants below are the product of six rounds of cross-vendor panel review; they close three consent races the panel surfaced (byte-content TOCTOU, path-identity-at-record, and capture-vs-resolve ordering) and must be preserved.
 
 ## Execution Policy
-- execute: effort=high, reason=security-sensitive consent path with two TOCTOU races and a content-keyed trust store
+- execute: effort=high, reason=security-sensitive consent path with three TOCTOU races and a content-keyed trust store
 
 ## Research summary
 Read in-session (no Explore recon — the file map and design are fully in context):
@@ -28,14 +28,13 @@ Read in-session (no Explore recon — the file map and design are fully in conte
 
 ### `src/pmcp/config/loader.py` (modify)
 - `_atomic_write_json` — modify — **return the exact bytes it writes.** Serialise once (`payload = json.dumps(data, indent=2) + "\n"`), write `payload.encode("utf-8")`, and return those bytes. Never re-read the file to obtain the bytes to approve (post-write re-read is the byte-content TOCTOU). Update its one other caller (the return is additive — callers ignoring it are unaffected).
-- `set_startup_policy` — modify — bind approval to one captured input snapshot, in this exact order:
-  1. **Symlink refusal (up front):** if `target.path` is a symlink, refuse (`ok=False`, `invalid_source` diagnostic) rather than rewriting through it — so `os.replace` and the recorded key cannot refer to different files.
-  2. **Capture input ONCE:** `input_bytes = target.path.read_bytes()` (guard `OSError` → `was_approved = False`, first-time source). Parse the object to mutate FROM `input_bytes`, reusing the existing `_read_config_object` read rather than issuing a second independent read — the bytes checked for approval must be the bytes transformed.
-  3. `pinned_key = target.path.resolve()` — resolve the canonical trust key exactly once.
-  4. `was_approved = trust_store.is_approved_resolved(pinned_key, input_bytes)` (function-local `from pmcp import trust_store`).
-  5. In the `should_write` branch: `output_bytes = _atomic_write_json(target.path, data)` — the exact bytes written, returned by the writer.
-  6. If `was_approved`: `trust_store.record_resolved(pinned_key, output_bytes, trust_store.PROJECT_SCOPE, trust_store.APPROVED)` — approve exactly the written bytes against the pinned key. **No post-write read; no re-resolution.** Wrap in `try/except trust_store.TrustStoreError` → append `StartupPolicyDiagnostic(code="approval_not_carried_forward", ...)`, keep `ok=True`, leave the file written (checkout-resident store, post-#252; do not crash — next startup fails safe).
-  7. Never re-record on dry-run/no-op (`should_write` already gates this).
+- `set_startup_policy` — modify — bind input capture, approval lookup, the write target, and the record to ONE stable identity, established ATOMICALLY, in this exact order. The identity must be pinned *before or together with* the input read — a plan that reads input, then resolves, leaves a window in which `target.path` is swapped to a symlink pointing at a different, separately-approved file `B`, so the approval lookup keys on `B` while the bytes came from `A` and the record then grants `B`'s unrewritten contents (panel finding, codex — capture-vs-resolve ordering race):
+  1. **Pin identity + capture input atomically:** open `target.path` ONCE with `O_NOFOLLOW` on the final component — this refuses a symlinked `.mcp.json` up front AND fixes the file the rest of the operation binds to, with no capture-vs-resolve window. From that open descriptor: read `input_bytes`, and capture `pinned_key` as the descriptor's canonical path (`os.path.realpath("/proc/self/fd/<fd>")`, or the platform equivalent; on failure/`OSError`, refuse or treat as first-time `was_approved = False`). Parse the object to mutate FROM `input_bytes` (reuse this single read; never a second independent read of `target.path`). (This `O_NOFOLLOW` use is for CAPTURE, distinct from the re-record key — the earlier note dropped an fd as the *post-replace* record key, which remains correct; the record still keys on `pinned_key`, the path.)
+  2. `was_approved = trust_store.is_approved_resolved(pinned_key, input_bytes)` (function-local `from pmcp import trust_store`).
+  3. In the `should_write` branch: `output_bytes = _atomic_write_json(pinned_key, data)` — write to the PINNED path (not the mutable `target.path`), returning the exact bytes written.
+  4. If `was_approved`: `trust_store.record_resolved(pinned_key, output_bytes, trust_store.PROJECT_SCOPE, trust_store.APPROVED)` — approve exactly the written bytes against the same pinned key. **No post-write read; no re-resolution.** Wrap in `try/except trust_store.TrustStoreError` → append `StartupPolicyDiagnostic(code="approval_not_carried_forward", ...)`, keep `ok=True`, leave the file written (checkout-resident store, post-#252; do not crash — next startup fails safe).
+  5. Never re-record on dry-run/no-op (`should_write` already gates this).
+  - **Invariant:** `input_bytes` read, `is_approved_resolved`, `_atomic_write_json`, and `record_resolved` all name the SAME `pinned_key` established by the single `O_NOFOLLOW` open — there is no point at which a path re-resolution or a second read could bind a different file.
 - `StartupPolicyPreview` — modify (optional) — add `approval_carried_forward: bool` only if the CLI/JSON consumer needs to show it; the diagnostic path already covers the failure case. `ok` already exists.
 
 ### `src/pmcp/cli.py` (modify)
@@ -62,8 +61,9 @@ New `tests/test_startup_policy_reapproval.py`, driving the real `set_startup_pol
 4. **Byte-substitution (post-write TOCTOU):** a concurrent process replaces `.mcp.json` with attacker bytes immediately AFTER `_atomic_write_json` returns; **spy `trust_store.record_resolved`** and assert its `resolved_path` == `pinned_key` AND its `content` == the writer's returned bytes AND == an independent `json.dumps(parse(input_snapshot) with autoStart)`; assert `is_approved(path, attacker_bytes)` is False. Never use a disk re-read as the oracle. `set_startup_policy` must never call the re-resolving `trust_store.record`.
 5. **Symlink-substitution (post-write path-identity race):** after the write, replace `target.path` with a symlink to a previously-UNAPPROVED file `B` whose contents equal `output_bytes`; assert `is_approved(B, output_bytes)` is False (consent recorded against `pinned_key`, not transferred to `B`). Also assert a symlinked `.mcp.json` presented up front is refused.
 6. **Checkout-resident diagnostic:** with a checkout-resident store (post-#252), `record_resolved` raises `TrustStoreError`; `set_startup_policy` returns `ok=True` with an `approval_not_carried_forward` diagnostic and does not raise.
+7. **Capture-vs-resolve substitution (panel finding, codex):** file `A` holds unapproved bytes `I`; file `B` has a stored approval for `I` but currently holds unapproved bytes `O` equal to the planned rewrite of `I`. After `A`'s bytes are captured, swap `A`→symlink→`B` (before key resolution in a naive ordering). Assert the operation does NOT approve `B`'s contents (`is_approved(B, O)` stays False) — because identity is pinned atomically with capture via the single `O_NOFOLLOW` open, the swap either fails the open (symlink refused) or leaves the operation bound to the original file. A mutation that reads input before pinning the key (capture-then-resolve ordering) must turn this red.
 
-Mutations (each must turn its test RED): (a) revert `_atomic_write_json` to not returning bytes and re-read the file post-write → test 4 red; (b) let `set_startup_policy` call `record` (re-resolving) instead of `record_resolved(pinned_key, …)` → test 5 red; (c) drop the `was_approved` guard → test 2 red.
+Mutations (each must turn its test RED): (a) revert `_atomic_write_json` to not returning bytes and re-read the file post-write → test 4 red; (b) let `set_startup_policy` call `record` (re-resolving) instead of `record_resolved(pinned_key, …)` → test 5 red; (c) drop the `was_approved` guard → test 2 red; (d) reorder to read input BEFORE pinning the key (capture-then-resolve, no `O_NOFOLLOW`) → test 7 red.
 
 Ledger/lint: `uv run python scripts/check_security_claims.py SECURITY.md` exit 0; `uv run mypy src/`; `uv run ruff check` + `ruff format --check` on touched files.
 
@@ -72,6 +72,7 @@ Ledger/lint: `uv run python scripts/check_security_claims.py SECURITY.md` exit 0
 - [ ] `set_startup_policy` does NOT create an approval for a `.mcp.json` that was not already approved, and records nothing on a dry-run.
 - [ ] Approval is recorded via `trust_store.record_resolved(pinned_key, <writer-returned bytes>, …)` — verified by spying `record_resolved`, never a disk re-read; `set_startup_policy` never calls the re-resolving `trust_store.record`.
 - [ ] A byte- or symlink-substitution at `target.path` AFTER the write does NOT transfer approval to substituted content (`is_approved(attacker_bytes/B)` is False); a symlinked `.mcp.json` is refused up front.
+- [ ] Input capture, approval lookup, write, and record all bind to one `pinned_key` established atomically by a single `O_NOFOLLOW` open; a swap of `target.path` between capture and key resolution cannot transfer approval to another file.
 - [ ] A checkout-resident store yields `ok=True` + `approval_not_carried_forward` diagnostic without raising.
 - [ ] `set_startup_policy` and `pmcp trust approve` use one shared scope constant.
 - [ ] `scripts/check_security_claims.py SECURITY.md` exits 0 with C-28 updated and the new tests cited.
