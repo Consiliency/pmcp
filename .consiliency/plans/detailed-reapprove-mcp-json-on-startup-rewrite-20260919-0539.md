@@ -7,6 +7,11 @@
 
 This plan supersedes the earlier hand-written `.consiliency/plans/detailed-253-re-record-approval-on-startup-rewrite.md` (merged via #257). Its design invariants below are the product of six rounds of cross-vendor panel review; they close three consent races the panel surfaced (byte-content TOCTOU, path-identity-at-record, and capture-vs-resolve ordering) and must be preserved.
 
+## Threat model & scope (owner decision)
+The panel surfaced a further class of race: a live attacker holding concurrent write access to the operator's project directory who swaps `target.path` between individual syscalls of the operator's own `pmcp startup` invocation (e.g. during procfs pathname resolution) can still bind a different file. **This sub-syscall race against the operator's own authenticated CLI is declared OUT of scope for #253** (owner decision, 2026-09-19). The v13 threat model is a hostile *committed* repository's files and a prompt-injectable agent brokered through the gateway — not an attacker racing the operator's interactive terminal at syscall granularity. Closing that class would require descriptor-anchored trust keys (a validated fd↔key association replacing the path-based key), a larger `trust_store` key-model change with its own semantics cost (inode reuse, key stability across same-path edits); it is not undertaken here.
+
+What this plan DOES guarantee (in scope): the byte-content and path-identity-at-record races are closed for the ordinary case, and a symlinked `.mcp.json` is refused up front. The residual sub-syscall racer is a **documented limitation**, and the **fail-safe backstop** holds regardless: if a race ever binds the wrong bytes/file, the recorded approval simply will not match what the consent gate hashes at the next startup, so the file is *refused*, not silently trusted — the operator re-approves. #253 is a UX/consistency convenience (its own issue: "fails safe... not a bypass"), and this scope is proportionate to that.
+
 ## Execution Policy
 - execute: effort=high, reason=security-sensitive consent path with three TOCTOU races and a content-keyed trust store
 
@@ -34,7 +39,7 @@ Read in-session (no Explore recon — the file map and design are fully in conte
   3. In the `should_write` branch: `output_bytes = _atomic_write_json(pinned_key, data)` — write to the PINNED path (not the mutable `target.path`), returning the exact bytes written.
   4. If `was_approved`: `trust_store.record_resolved(pinned_key, output_bytes, trust_store.PROJECT_SCOPE, trust_store.APPROVED)` — approve exactly the written bytes against the same pinned key. **No post-write read; no re-resolution.** Wrap in `try/except trust_store.TrustStoreError` → append `StartupPolicyDiagnostic(code="approval_not_carried_forward", ...)`, keep `ok=True`, leave the file written (checkout-resident store, post-#252; do not crash — next startup fails safe).
   5. Never re-record on dry-run/no-op (`should_write` already gates this).
-  - **Invariant:** `input_bytes` read, `is_approved_resolved`, `_atomic_write_json`, and `record_resolved` all name the SAME `pinned_key` established by the single `O_NOFOLLOW` open — there is no point at which a path re-resolution or a second read could bind a different file.
+  - **Invariant (in scope):** `input_bytes` read, `is_approved_resolved`, `_atomic_write_json`, and `record_resolved` all name the SAME `pinned_key` established by the single `O_NOFOLLOW` open, which refuses a symlinked `.mcp.json` and binds the ordinary operation to one file. A sub-syscall swap during pathname resolution is the documented out-of-scope residual (see Threat model & scope); the fail-safe backstop covers it.
 - `StartupPolicyPreview` — modify (optional) — add `approval_carried_forward: bool` only if the CLI/JSON consumer needs to show it; the diagnostic path already covers the failure case. `ok` already exists.
 
 ### `src/pmcp/cli.py` (modify)
@@ -42,7 +47,7 @@ Read in-session (no Explore recon — the file map and design are fully in conte
 - `_TRUST_SCOPE` (around line 2618) — modify — reference the shared `trust_store` constant instead of a local literal.
 
 ## Documentation impact
-- `SECURITY.md` — modify — limitation **C-28** currently records this defect ("an operator write that invalidates their own approval"). After the fix, narrow or promote C-28 to reflect that the approval is carried forward, and add the new tests to its evidence. Re-run `scripts/check_security_claims.py` — must stay exit 0 (load-bearing: the checker fails if C-28's wording/evidence drift from the code, and a limitation must remain a single `characterizes:`-cited sentence — see #252's C-36 for the R12 single-sentence rule).
+- `SECURITY.md` — add — a limitation recording the in-scope guarantee AND the out-of-scope sub-syscall residual + fail-safe backstop, as a single `characterizes:`-cited sentence (R12). Then the existing limitation **C-28** currently records this defect ("an operator write that invalidates their own approval"). After the fix, narrow or promote C-28 to reflect that the approval is carried forward, and add the new tests to its evidence. Re-run `scripts/check_security_claims.py` — must stay exit 0 (load-bearing: the checker fails if C-28's wording/evidence drift from the code, and a limitation must remain a single `characterizes:`-cited sentence — see #252's C-36 for the R12 single-sentence rule).
 - `CHANGELOG.md` — add — one `### Changed` bullet under `[Unreleased]`: startup-policy edits now carry the operator's approval forward. Reference `#253`.
 - CONSENT post-execution amendment 10b references this as an open item — the roadmap/plan text that calls it "open" should note it is closed by this change (no edit to the historical amendment itself).
 
