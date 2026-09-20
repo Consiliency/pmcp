@@ -728,6 +728,31 @@
       "updated_at": "2026-09-19T05:43:13.972715+00:00"
     },
     {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-09-20T08:23:27.585802+00:00",
+      "file": ".consiliency/plans/detailed-test-cwd-filesystem-isolation-20260920-0814.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-20T08:23:27.585802+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {},
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": "~/.codex/skills/codex/reflections/claude-plan-detailed/6ae74a2dc523/plan-235-test-hermeticity/20260920-0814.md",
+      "roadmap_ref": null,
+      "slug": "test-cwd-filesystem-isolation",
+      "status": "committed",
+      "task_summary": "Isolate test cwd + ancestor chain (slice A of #235): closes #261 and the ~107-test npm-identity artifact",
+      "type": "detailed",
+      "updated_at": "2026-09-20T08:23:27.585802+00:00"
+    },
+    {
       "acceptance_criteria_count": null,
       "created_at": "2026-08-05T23:41:05Z",
       "file": "plans/phase-plan-v11-P5.md",
