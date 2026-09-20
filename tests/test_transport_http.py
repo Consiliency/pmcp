@@ -90,6 +90,34 @@ class TestMetricsEndpoint:
         assert "# TYPE" in r.text
         assert "pmcp_requests_total" in r.text
 
+    def test_request_metrics_reset_keeps_every_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``reset_request_metrics`` zeroes values without dropping series.
+
+        The fallback renderer iterates ``_metrics.items()``, so a ``clear()``
+        instead of per-key assignment would silently stop emitting every
+        ``pmcp_requests_*`` series (and make ``_inc`` raise ``KeyError`` on the
+        next request). Rendering through the fallback path is what makes this
+        observable.
+        """
+        import pmcp.transport.http as http_mod
+
+        http_mod.reset_request_metrics()
+        monkeypatch.setattr(http_mod, "_generate_latest", None)
+        client = _make_app()
+        r = client.get("/metrics")
+        assert r.status_code == 200
+        for key in (
+            "pmcp_requests_total",
+            "pmcp_requests_401",
+            "pmcp_requests_403",
+            "pmcp_requests_503",
+            "pmcp_requests_429",
+            "pmcp_requests_ok",
+        ):
+            assert key in r.text, f"{key} disappeared from the fallback renderer"
+
     def test_metrics_fallback_renderer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """When _generate_latest is None (prometheus_client absent), fallback renders pmcp_* counters."""
         import pmcp.transport.http as http_mod
@@ -304,14 +332,22 @@ class TestRateLimitHttp:
             assert r.status_code != 429
 
     def test_rate_limit_blocks_over_limit(self) -> None:
-        from pmcp.transport import http as http_mod
-
-        # Reset store to ensure a clean slate for this IP
-        http_mod._rl_store.clear()
-
         client = _make_app(rate_limit_rpm=3)
         statuses = [client.post("/mcp", content=b"{}").status_code for _ in range(5)]
         assert 429 in statuses
+
+    def test_rate_limit_bucket_is_empty_at_test_start(self) -> None:
+        """The autouse reset, not a manual clear, gives each test a fresh bucket.
+
+        This runs in default file order AFTER ``test_rate_limit_allows_under_limit``
+        (which leaves five timestamps in the shared ``testclient`` bucket) and
+        ``test_rate_limit_blocks_over_limit``. With ``rate_limit_rpm=1`` the FIRST
+        request here is 429 unless the bucket was reset between tests. It never
+        touches ``_rl_store`` -- that is the point: the assertion is behavioural,
+        so deleting ``reset_rate_limit_state()`` makes it fail.
+        """
+        client = _make_app(rate_limit_rpm=1)
+        assert client.post("/mcp", content=b"{}").status_code != 429
 
     def test_rate_limit_zero_disables(self) -> None:
         client = _make_app(rate_limit_rpm=0)

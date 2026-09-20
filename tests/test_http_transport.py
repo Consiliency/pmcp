@@ -308,9 +308,6 @@ class TestHttpObservabilityContracts:
         assert initialized.status_code == 202
 
     def test_rate_limit_uses_one_bucket_for_same_client_ip(self) -> None:
-        from pmcp.transport import http as http_mod
-
-        http_mod._rl_store.clear()
         client = _make_contract_client(rate_limit_rpm=2)
 
         statuses = [client.post("/mcp", content=b"{}").status_code for _ in range(3)]

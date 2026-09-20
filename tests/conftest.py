@@ -54,8 +54,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pmcp import trust_store
-from pmcp.manifest import package_identity
-from pmcp.env_store import reset_dotenv_keys
+from pmcp.manifest import npm_resolver, package_identity, registry, version_checker
+from pmcp.transport import http as transport_http
+from pmcp.env_store import reset_dotenv_keys, reset_pmcp_introduced_keys
 from pmcp.policy.policy import PolicyManager
 from pmcp.types import (
     LocalMcpServerConfig,
@@ -311,6 +312,58 @@ def _no_live_npm_registry(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[str]
         f"a test reached the npm registry: {attempts}; "
         "use the fake_npm_registry fixture"
     )
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_global_state() -> Iterator[None]:
+    """Reset process-global module state around every test. **Autouse.**
+
+    Each of these is a module-level mutable that outlives a test and makes a
+    later test's result depend on which tests ran before it -- the class the
+    2026-09-01 review logged as T-07. One line each, naming the consumer that
+    turns the leak into an ordering hazard:
+
+    * ``env_store._PMCP_INTRODUCED_KEYS`` -- provenance for
+      ``env_key_is_operator_supplied()``, the gate deciding whether a
+      ``PMCP_CONFIG`` / ``PMCP_POLICY`` / ``PMCP_MANIFEST_PATH`` override was
+      exported by the operator or planted by a checkout. A stale key makes a
+      later test's own exported redirect look PMCP-introduced and be ignored.
+    * ``version_checker._version_cache`` -- resolved npm versions; a cached
+      answer is returned for a lookup a later test believes it performed.
+    * ``registry._IN_PROCESS_CACHE`` / ``_IN_PROCESS_TASKS`` -- a 300 s registry
+      payload cache plus live tasks on loops pytest-asyncio has closed.
+    * ``transport.http._rl_store`` / ``_rl_lock`` -- per-IP rate-limit buckets;
+      every TestClient request shares the ``testclient`` IP, so a filled bucket
+      429s the next test's first request.
+    * ``transport.http._metrics`` -- request counters a later assertion reads as
+      its own delta.
+    * ``npm_resolver._resolver`` -- a process-wide singleton holding a spawned
+      node child, with sticky-failure and warned flags that must not be
+      inherited.
+
+    Composition lives here rather than in a ``src/`` aggregator by rule, not by
+    taste: ``tests/test_feedback_provenance.py:226`` AST-walks ``src/pmcp`` and
+    asserts no production caller of ``reset_pmcp_introduced_keys`` exists,
+    because one would make the gate's provenance evidence erasable. A complete
+    reset can therefore only be assembled in ``tests/``.
+
+    The resolver goes last: it is the only helper that touches a process and the
+    only one that can block (``proc.wait(timeout=2.0)``). Dropping it re-spawns
+    the node child for the next test that resolves an npm identity -- about 43 ms
+    -- which is the price of never inheriting another test's resolver state.
+    """
+
+    def _reset() -> None:
+        reset_pmcp_introduced_keys()
+        version_checker.clear_version_cache()
+        registry.clear_in_process_cache()
+        transport_http.reset_rate_limit_state()
+        transport_http.reset_request_metrics()
+        npm_resolver.reset_resolver_for_tests()
+
+    _reset()
+    yield
+    _reset()
 
 
 @pytest.fixture

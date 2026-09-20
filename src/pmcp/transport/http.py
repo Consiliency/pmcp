@@ -137,6 +137,28 @@ def _inc(key: str) -> None:
         c.inc()
 
 
+def reset_request_metrics() -> None:
+    """Zero the fallback request counters. **Tests only.**
+
+    Assigns zero to each existing key rather than ``clear()``-ing the dict, and
+    that is load-bearing in two places: ``_inc`` does ``_metrics[key] += 1`` and
+    would raise ``KeyError`` on the next request, and the fallback renderer in
+    ``handle_metrics`` iterates ``_metrics.items()`` to emit every
+    ``pmcp_requests_*`` series -- a cleared dict silently drops series that
+    scrapers expect to exist.
+
+    ``_prom_counters`` is deliberately **not** touched. Those are
+    ``prometheus_client.Counter`` objects registered into the default
+    ``CollectorRegistry`` at import; re-creating them raises
+    ``ValueError: Duplicated timeseries``, and clearing the dict would break
+    ``_inc``'s lookup. No test asserts an absolute Prometheus value -- they
+    assert presence, format, or a ``_metrics`` delta -- so leaving the registry
+    alone costs nothing. Do not "fix" this.
+    """
+    for key in _metrics:
+        _metrics[key] = 0
+
+
 class _NullResponse(Response):
     """Sentinel returned when session_manager.handle_request already sent the response.
 
@@ -177,6 +199,30 @@ async def _check_rate_limit(client_ip: str, max_rpm: int) -> bool:
             return False
         q.append(now)
         return True
+
+
+def reset_rate_limit_state() -> None:
+    """Empty the rate-limit buckets and drop the shared lock. **Tests only.**
+
+    ``_rl_store`` keeps a per-IP deque of request timestamps in a sliding 60 s
+    window. Every ``TestClient`` request arrives from the same synthetic IP
+    (``testclient``), so one test that fills a bucket leaves the next test over
+    the limit before it sends anything -- an ordering-dependent 429 that looks
+    like a rate-limit bug in whichever test happens to run second.
+
+    The lock is reset with it. ``_rl_lock`` is a module-global ``asyncio.Lock``
+    created lazily in ``_check_rate_limit``; it binds to a loop on its first
+    *contended* acquire, and pytest-asyncio gives each test a fresh loop. Today's
+    sequential ``TestClient`` posts never contend, so this is latent rather than
+    an observed failure -- but a later contended acquire on a different loop
+    raises ``RuntimeError: ... is bound to a different event loop``. Setting it
+    to ``None`` lets the next request build one on the current loop; do not
+    construct a ``Lock`` here, since this runs in a synchronous fixture with no
+    running loop.
+    """
+    global _rl_lock
+    _rl_store.clear()
+    _rl_lock = None
 
 
 def _is_loopback_host(hostname: str) -> bool:
