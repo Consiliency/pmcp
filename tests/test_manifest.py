@@ -47,6 +47,10 @@ from pmcp.manifest.registry import (
 )
 from pmcp.manifest.sync import sync_registry_to_manifest
 
+#: Repo root, so repo-relative reads do not depend on the working directory
+#: (tests run from an isolated cwd -- see tests/conftest.py::isolate_cwd).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 # === Environment Detection Tests ===
 
@@ -363,7 +367,7 @@ def test_manifest_search_by_keyword():
 
 
 def test_archived_reference_server_entries_are_explicitly_labeled() -> None:
-    manifest_path = Path("src/pmcp/manifest/manifest.yaml")
+    manifest_path = _REPO_ROOT / "src/pmcp/manifest/manifest.yaml"
     data = yaml.safe_load(manifest_path.read_text())
     audited_entries = {
         "github": "@modelcontextprotocol/server-github",
@@ -900,7 +904,7 @@ def test_keyword_match_generic_api_alone_stays_below_threshold() -> None:
     ],
 )
 def test_real_manifest_keyword_match_table(query: str, expected_server: str) -> None:
-    manifest = load_manifest(Path("src/pmcp/manifest/manifest.yaml"))
+    manifest = load_manifest(_REPO_ROOT / "src/pmcp/manifest/manifest.yaml")
 
     result = _keyword_match(query, manifest, detected_clis=set())
 

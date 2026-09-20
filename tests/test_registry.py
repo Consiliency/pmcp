@@ -15,6 +15,10 @@ from pmcp.manifest.registry import (
     save_registry_cache,
 )
 
+#: Repo root, so repo-relative reads do not depend on the working directory
+#: (tests run from an isolated cwd -- see tests/conftest.py::isolate_cwd).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 RECORDED_PAYLOAD = {
     "servers": [
@@ -178,10 +182,10 @@ async def test_fetch_registry_servers_timeout_returns_diagnostic(monkeypatch) ->
 async def test_fetch_registry_servers_paginates_and_deduplicates(monkeypatch) -> None:
     calls: list[str] = []
     page1 = json.loads(
-        Path("tests/fixtures/registry/v0_servers_page1.json").read_text()
+        (_REPO_ROOT / "tests/fixtures/registry/v0_servers_page1.json").read_text()
     )
     page2 = json.loads(
-        Path("tests/fixtures/registry/v0_servers_page2.json").read_text()
+        (_REPO_ROOT / "tests/fixtures/registry/v0_servers_page2.json").read_text()
     )
 
     monkeypatch.setattr(
