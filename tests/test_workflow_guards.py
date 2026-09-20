@@ -318,6 +318,8 @@ class TestTagTriggerInvariants:
         doc = yaml.safe_load("on:\n  pull_request:\njobs: {}\n")
         assert cw.tag_trigger_invariants(doc, ".github/workflows/anything.yml") == []
 
+    @pytest.mark.real_cwd  # subject IS the committed tree at the invocation root;
+    # scripts/check_workflows.py resolves .github/workflows relative to cwd by design.
     def test_the_allowlist_matches_the_committed_tree(self) -> None:
         tag_triggered = set()
         for path in cw.workflow_files():

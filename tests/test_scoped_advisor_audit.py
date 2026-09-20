@@ -28,6 +28,10 @@ from pmcp.server import GatewayServer
 from pmcp.types import InvokeInput
 from tests.conftest import MockClientManager, create_tool_info
 
+#: Repo root, so repo-relative reads do not depend on the working directory
+#: (tests run from an isolated cwd -- see tests/conftest.py::isolate_cwd).
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 def _write_scoped_policy(path: Path) -> Path:
     path.write_text(
@@ -123,7 +127,7 @@ def test_explicit_policy_failures_are_fatal_but_an_unparseable_default_is_not(
 
 
 def test_gateway_tool_policy_is_case_sensitive_and_scoped() -> None:
-    policy = PolicyManager(Path("examples/scoped-advisor-policy.yaml"))
+    policy = PolicyManager(_REPO_ROOT / "examples/scoped-advisor-policy.yaml")
     assert policy.is_scoped_advisor_policy() is True
     assert policy.scoped_advisor_active is False
     assert policy.is_gateway_tool_allowed("gateway.invoke") is True

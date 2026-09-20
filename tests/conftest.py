@@ -15,6 +15,21 @@ not ours**. A `/tmp/package.json` or `/tmp/node_modules` (both present on the
 development host for #195, the latter holding real executables) silently flips
 every `monkeypatch.chdir(tmp_path)` test from resolving to refusing.
 
+Two autouse fixtures below now act on this rather than only describing it
+(Consiliency/pmcp#235, #261):
+
+* `isolate_cwd` runs every test from a private directory under the temp root, so
+  the repository's own ancestors -- a `node_modules` at a storage-volume root,
+  say -- leave the walk entirely. It also closes #261, where the `HOME` redirect
+  in `isolate_trust_store` defeated the `$HOME` stop in the project-manifest walk
+  and let it reach the developer's real `~/.pmcp/manifest.yaml`.
+* `assert_clean_ancestor_chain` fails the session ONCE, naming the path, when the
+  temp root's own ancestors carry a `package.json`/`node_modules` -- the one case
+  `isolate_cwd` cannot escape, since `tmp_path` lives under the temp directory.
+
+Neither touches the production walk: `_has_local_prefix` replicates npm's real
+local-prefix rule, and weakening it to make tests pass would be the actual bug.
+
 The failure mode is nasty in one direction only: a test that asserts a REFUSAL
 passes for the wrong reason and looks green forever. So:
 
@@ -57,6 +72,52 @@ from pmcp.types import (
 #: so a check written against a live ``Path.home()`` would compare the fake home
 #: with itself and pass however broken the redirect was.
 _REAL_HOME = Path.home().resolve()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def assert_clean_ancestor_chain(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Fail ONCE, by name, if the temp root sits under an npm local prefix.
+
+    ``isolate_cwd`` moves every test onto a directory under pytest's temp root,
+    which removes the repository's own ancestors -- including a ``node_modules``
+    at the root of a storage volume, the case that inverted ~107 npm-identity
+    tests in ``/mnt/<volume>/worktrees`` checkouts -- from the walk entirely.
+    What it cannot escape is the temp root's OWN ancestors: ``tmp_path`` lives
+    under ``tempfile.gettempdir()``, so a ``/tmp/package.json`` is still an
+    ancestor of every isolated cwd. Detection is the honest answer there.
+
+    This walks **only** that chain, never ``Path.cwd()``. A session-scoped
+    fixture observes the *invocation* directory (the repository), never the
+    per-test isolated cwd, so walking cwd here would fail the whole session on
+    exactly the hosts ``isolate_cwd`` has already fixed.
+
+    The chain is derived from ``tmp_path_factory.getbasetemp()`` rather than
+    assuming ``/tmp``: ``--basetemp`` or ``TMPDIR`` relocates the temp root, and
+    the guard must follow it. This repository sets no ``basetemp`` override.
+
+    One named error beats ~107 refusals that each look like a real assertion
+    failure -- the state this file used to only document.
+    """
+    basetemp = tmp_path_factory.getbasetemp().resolve()
+    polluted = [
+        directory / marker
+        for directory in (basetemp, *basetemp.parents)
+        for marker in ("package.json", "node_modules")
+        if (directory / marker).exists()
+    ]
+    if polluted:
+        listing = "\n  ".join(str(path) for path in polluted)
+        raise RuntimeError(
+            "npm local-prefix pollution on the temp-root ancestor chain:\n  "
+            f"{listing}\n"
+            "npm's own local-prefix rule walks up from the working directory, so "
+            "every npm-identity test run from a temp directory will invert from "
+            "resolving to REFUSING -- roughly 107 tests failing for a reason that "
+            "has nothing to do with the code under test. Remove the path above, or "
+            "point pytest's temp root elsewhere with --basetemp/TMPDIR. "
+            "(pmcp's production walk is faithful to npm and is deliberately not "
+            "changed to paper over this.)"
+        )
 
 
 @pytest.fixture(autouse=True)
@@ -109,6 +170,60 @@ def isolate_trust_store(
         )
 
     yield fake_home
+
+
+@pytest.fixture(autouse=True)
+def isolate_cwd(
+    request: pytest.FixtureRequest,
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    isolate_trust_store: Path,
+) -> Iterator[Path | None]:
+    """Run each test from a private directory under the temp root. **Autouse.**
+
+    Two separate leaks close here, both caused by tests inheriting the
+    developer's real working directory:
+
+    * **The project-manifest walk (Consiliency/pmcp#261).**
+      ``manifest.loader._find_project_manifest`` walks up from ``Path.cwd()`` and
+      stops at ``Path.home()`` -- a guard added by #243 so a startup beneath
+      ``$HOME`` does not ask the operator to approve their own config. But
+      ``isolate_trust_store`` redirects ``HOME`` to a fake directory, so that stop
+      compares against the fake home and never matches the real one. Run from a
+      checkout under the real home, the walk sails past it, finds the real
+      ``~/.pmcp/manifest.yaml`` and gates it as a *project* overlay -- a second
+      consent refusal that broke
+      ``test_a_consent_refusal_reaches_the_operator_as_one_warning_naming_its_remedy``.
+      The isolation fixture caused that failure; chdir-ing under the temp root
+      makes the walk's existing ``temp_root`` stop fire instead.
+    * **The npm local-prefix walk.** A repository under a directory that holds
+      ``node_modules`` (a storage volume root, say) put that directory on every
+      un-chdir'ed test's ancestor chain and inverted npm-identity assertions.
+
+    The directory is a **sibling** of ``tmp_path``, via ``mktemp``, never a child
+    such as ``tmp_path / "cwd"``: a child would make every ``package.json`` /
+    ``.mcp.json`` / ``pyproject.toml`` a test writes into ``tmp_path`` an
+    *ancestor* of the working directory, re-creating the very hazard this closes.
+    The fake home is a sibling for the same measured reason.
+
+    ``isolate_trust_store`` is requested explicitly rather than relied on by
+    declaration order -- pytest does not guarantee autouse ordering, and the
+    fake home must exist before the chdir for the HOME-vs-cwd relationship above
+    to hold.
+
+    Opt out with ``@pytest.mark.real_cwd`` **only** where the invocation
+    directory is the test's subject. It is not an escape hatch for refusal
+    tests: a refusal test that leans on an ambient prefix passes for the wrong
+    reason, which is the failure this file has always warned about. Such tests
+    should build their own local prefix explicitly.
+    """
+    if request.node.get_closest_marker("real_cwd") is not None:
+        yield None
+        return
+
+    isolated = tmp_path_factory.mktemp("cwd")
+    monkeypatch.chdir(isolated)
+    yield isolated
 
 
 @pytest.fixture
