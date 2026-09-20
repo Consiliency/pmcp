@@ -172,6 +172,15 @@
             "split": "C1 of C1/C2/C3"
           },
           "transition": "committed"
+        },
+        {
+          "at": "2026-09-20T10:05:00Z",
+          "by": "claude-plan-detailed",
+          "transition": "committed",
+          "metadata": {
+            "revision": 2,
+            "reason": "panel review of PR #264: asyncio.TimeoutError on 3.10, verification grep, eventually(timeout=0) contract"
+          }
         }
       ],
       "owner_skill": "claude-plan-detailed",
@@ -182,7 +191,7 @@
       "status": "committed",
       "task_summary": "Slice C1 of #235 (see #226): shared tests/_timing.py helper (eventually / eventually_sync / Rendezvous), rendezvous-based #226 fix, and removal of every upper-bound wall-clock assertion; C2 (bulk poll-until) and C3 (clock injection) named for separate plans.",
       "type": "detailed",
-      "updated_at": "2026-09-20T08:46:13Z"
+      "updated_at": "2026-09-20T10:05:00Z"
     },
     {
       "acceptance_criteria_count": 5,

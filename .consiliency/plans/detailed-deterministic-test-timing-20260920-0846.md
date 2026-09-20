@@ -3,11 +3,23 @@
 > **Bounded-plan verdict: slice C EXCEEDS the threshold and is split.** The
 > full slice touches 29 test files (98 `sleep(` lines, ~90 real call sites).
 > This document plans **C1** — the shared helper, the #226 fix and its sibling,
-> and every *upper-bound* wall-clock assertion in the suite — across **7 test
+> and every *upper-bound* wall-clock assertion in the suite — across **6 test
 > files + 1 new module + 2 docs**. **C2** (bulk poll-until conversion, ~12
 > files) and **C3** (production-clock injection, ~3 files, touches `src/`) are
 > named at the end with their file lists so they can be planned as their own
 > bounded plans against the helper this slice lands.
+>
+> **Revision 2 (2026-09-20).** Panel review of PR #264 (codex DISAGREE, grok
+> PARTIALLY AGREE) validated the architecture and found three defects, all
+> fixed below: (1) `Rendezvous` must catch `asyncio.TimeoutError`, which on
+> Python 3.10 is *not* the builtin `TimeoutError` — as first written the
+> serial mutant failed but without the named message; (2) Verification step 6's
+> grep could not produce its stated result (it required `<` after `elapsed`, so
+> it could never match the lower bounds it claimed to list, and it *would*
+> match `test_manifest.py:1655`, which C1 keeps); (3) the `timeout=0` contract
+> of `eventually` contradicted itself. Also corrected: file count, CHANGELOG
+> headings, the mutant's expected duration, and a newly named residual class
+> (lower bounds on *work* inside a wall-clock window).
 
 ## Task
 
@@ -177,8 +189,17 @@ One module, three exports, no pytest fixtures (importable from helpers like
   `Rendezvous(parties: int, *, timeout: float = 2.0)`; `async def arrive()`
   increments an arrival count, sets an `asyncio.Event` when the count reaches
   `parties`, then `await asyncio.wait_for(event.wait(), timeout)`; on
-  `TimeoutError` raises `AssertionError(f"only {arrived} of {parties} parties
-  were in flight together")`. Property `arrived` (int) for post-hoc asserts.
+  **`asyncio.TimeoutError`** raises `AssertionError(f"only {arrived} of
+  {parties} parties were in flight together")`. The exception class matters:
+  on Python 3.10 `asyncio.wait_for` raises `asyncio.exceptions.TimeoutError`,
+  which is **not** a subclass of the builtin `TimeoutError` (that one is an
+  `OSError`; verified `asyncio.TimeoutError is TimeoutError` → `False` on the
+  project's 3.10 interpreter). `except TimeoutError:` would let the raw
+  timeout escape and `connect_all` would report `Failed to connect to a: `
+  with no message — the mutant still fails, but not by name. On 3.11+
+  `asyncio.TimeoutError` is an alias of the builtin, so catching the asyncio
+  name is correct on every supported version. Property `arrived` (int) for
+  post-hoc asserts.
   The `Event` is created lazily on first `arrive()` so the object can be
   built outside a running loop (Python 3.10 binds `Event` to a loop at
   construction).
@@ -293,8 +314,9 @@ One module, three exports, no pytest fixtures (importable from helpers like
   `Rendezvous`, and treat `timeout=` as a hang guard. Three sentences and a
   pointer to `tests/_timing.py`'s docstring — this is the rule reviewers will
   hold C2 to.
-- `CHANGELOG.md` — modify — under `## [Unreleased]`, a `### Fixed` entry (the
-  file uses only Added / Fixed / Security headings):
+- `CHANGELOG.md` — modify — under `## [Unreleased]`, append to the existing
+  `### Fixed` heading (Unreleased currently carries Added / Removed /
+  Security / Fixed / Changed):
   "Tests no longer assert upper bounds on wall-clock time; #226's parallel
   connection test proves concurrency with a rendezvous. See #235, see #226."
 - `plans/manifest.json` — modify — `type=detailed` entry for this plan
@@ -346,7 +368,12 @@ done
 #            task = asyncio.create_task(self._connect_singleflight(config, retry))
 #            await asyncio.gather(task, return_exceptions=True)
 #            tasks.append(task)
-#    Expected: the test fails within ~2 s with
+#        results = await asyncio.gather(*tasks, return_exceptions=True)  # KEEP
+#    (keep the original `results = await asyncio.gather(...)` line after the
+#    loop — removing it makes `connect_all` NameError on `results` instead of
+#    naming parties). Expected: the test fails in ~4 s — party 1 times out
+#    after 2 s, party 2 after another 2 s, then party 3 finds the gate open —
+#    inside the 5 s hang guard, with errors[0] ==
 #    "Failed to connect to …: only 1 of 3 parties were in flight together".
 uv run pytest tests/test_client_manager.py -k test_connect_all_parallel_execution -q
 git checkout src/pmcp/client/manager.py
@@ -365,10 +392,23 @@ uv run pytest tests/test_feedback_egress.py tests/test_feedback_egress_gate.py \
     tests/test_npm_resolver.py tests/runtime/test_hang_diagnostics.py -q -x; \
   kill %1 %2 )
 
-# 6. No upper-bound wall-clock assertion remains outside the Kind-4 lower
-#    bounds. Expected hits: ONLY the `> 8` / `> 12` lower bounds and the
-#    `0.5 < first_elapsed` lower bound.
-grep -rnE "assert .*(elapsed|time\.(time|monotonic)\(\) *- *[a-z_]+) *<" tests
+# 6a. No upper-bound wall-clock assertion remains. This grep matches only
+#     `elapsed < …` / `time.x() - start < …` forms, so it can never match
+#     the retained lower bounds; the one site it would still match and C1
+#     keeps — test_manifest.py:1655's heartbeat *freshness* check — is
+#     excluded by name. grep exit status 1 (no matches) is the PASS.
+if grep -rnE "assert .*(elapsed|time\.(time|monotonic)\(\) *- *[a-z_]+) *<" tests \
+     | grep -v "tests/test_manifest.py:.*job.last_heartbeat"; then
+  echo "FAIL: upper-bound wall-clock assertion(s) remain"; false
+else
+  echo "PASS: no upper-bound wall-clock assertions"
+fi
+
+# 6b. The three lower bounds C1 deliberately keeps are still present
+#     (they are safe; C2 may replace two of them with static constants).
+grep -nE "assert elapsed > 8" tests/mcp2x/test_listen_over_http.py
+grep -nE "assert elapsed > 12" tests/runtime/test_subscriptions_e2e.py
+grep -nE "assert 0\.5 < first_elapsed" tests/test_npm_resolver.py
 
 # 7. Full suite and the lint CI actually runs (test.yml:238/241 — ruff on
 #    src/ and tests/; mypy covers src/pmcp only, so it is not a gate here).
@@ -384,8 +424,12 @@ Edge cases to check by hand while implementing:
   warning in the run-2 output.
 - `eventually` with an `async` predicate that itself raises: the exception
   must propagate immediately (not be swallowed until the deadline).
-- `eventually(..., timeout=0)` evaluates the predicate exactly once, then
-  raises — useful for the C2 conversions that want "already true".
+- `eventually(..., timeout=0)` evaluates the predicate exactly once and
+  **returns its value if truthy; otherwise raises** — never sleeps. This is
+  the frozen contract C2 relies on for "must already be true" sites. (The
+  general rule: the predicate is always evaluated at least once, before the
+  deadline is consulted, so `timeout=0` is "check now" and `timeout=5.0` is
+  "check now, then poll".)
 
 ## Acceptance criteria
 
@@ -395,9 +439,9 @@ Edge cases to check by hand while implementing:
 - [ ] `test_connect_all_parallel_execution` contains no `time.` call and
       passes 30/30 under `--cov=pmcp`; with the serial mutant from step 3 it
       fails within 5 s with a message naming "of 3 parties".
-- [ ] Step 6's grep returns only the three lower-bound sites
-      (`test_listen_over_http.py`, `test_subscriptions_e2e.py`,
-      `test_npm_resolver.py`'s `0.5 <`); every `elapsed < …` at
+- [ ] Step 6a prints `PASS` (zero upper-bound matches after excluding
+      `test_manifest.py`'s `job.last_heartbeat` freshness check) and step 6b
+      finds all three retained lower bounds; every `elapsed < …` at
       `test_client_manager.py:2176/:2235`, `test_npm_resolver.py:811/:819`,
       `test_feedback_egress.py:682`, `test_feedback_egress_gate.py:988/:1002`,
       `test_package_identity_gate.py:1009`,
@@ -435,6 +479,20 @@ apart", a lower bound on a real timer, recorded via `loop.time()` in
 `tests/test_egress_panel_fixes.py:290`;
 `tests/mcp2x/test_listen_registration.py:286` (`anyio.sleep(0.2)` "let the
 cancellation land" — poll the bus's subscription table instead).
+**Known residual — a class neither C1 nor C2 converts:** *lower bounds on
+work done inside a wall-clock window.* `ticks >= 10` at
+`tests/test_package_identity_gate.py:983` (a 20 ms ticker must fire ≥10 times
+during a 0.5 s blocking fetch) and `spins >= 1` at
+`tests/test_client_manager.py:4298` (≥1 reconcile pass inside a 0.6 s window).
+These are not upper bounds on elapsed time, but they do assume the machine
+gets enough CPU inside a real window, so a badly starved runner can fail them.
+The fix is a different shape from `eventually` — for the ticker, prove the
+fetch ran off-loop (`fetch_threads[0] != loop_thread`, already asserted) and
+drop the count to `>= 1`; for the debounce, replace the window with "poll
+until ≥2 passes, then assert the gap between them ≥
+`_RECONCILE_RERUN_DEBOUNCE_S`" (a lower bound on a real timer). Assigned to
+C2; recorded here so it is not mistaken for coverage this slice provides.
+
 Also in C2: replace the tautological Kind-4 lower bounds (`elapsed > 8`,
 `elapsed > 12`) with a static relation between the sleep constant and the
 configured `request_timeout` — the property is "the sleep exceeds the budget",
