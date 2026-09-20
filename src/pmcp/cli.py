@@ -19,7 +19,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
-from pmcp import trust_store
+from pmcp import package_approvals, trust_store
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
 from pmcp.cli_commands.install import (
@@ -36,7 +36,13 @@ from pmcp.config.loader import (
     load_configs,
     set_startup_policy,
 )
-from pmcp.env_store import record_dotenv_keys
+from pmcp.env_store import (
+    describe_ignored_trust_env_var,
+    env_key_is_operator_supplied,
+    record_dotenv_keys,
+    record_pmcp_introduced_keys,
+)
+from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
 from pmcp.types import StartupPolicyOperation
 
@@ -549,6 +555,14 @@ Environment overrides:
         choices=["on", "off"],
         help="Persistently enable or disable PMCP feedback telemetry prompts",
     )
+    guidance_parser.add_argument(
+        "--feedback-submission",
+        choices=["on", "off"],
+        help=(
+            "Persistently allow or forbid PMCP posting feedback to GitHub on your "
+            "behalf (off by default)"
+        ),
+    )
 
     # Doctor command
     doctor_parser = subparsers.add_parser(
@@ -795,6 +809,31 @@ Environment overrides:
         "path",
         type=Path,
         help="File whose trust record is dropped",
+    )
+
+    # Package verbs (IF-0-PKGID-2). Same contract as above: a provisioning
+    # refusal prints the runnable `pmcp trust approve-package <name>@<version>`.
+    trust_approve_package_parser = trust_subparsers.add_parser(
+        "approve-package",
+        help="Approve one package at one exact version for provisioning",
+    )
+    trust_approve_package_parser.add_argument(
+        "spec",
+        help="Package and exact resolved version, e.g. @scope/server@1.2.3",
+    )
+
+    trust_subparsers.add_parser(
+        "list-packages",
+        help="List every recorded package approval",
+    )
+
+    trust_revoke_package_parser = trust_subparsers.add_parser(
+        "revoke-package",
+        help="Drop package approvals (one version, or every version)",
+    )
+    trust_revoke_package_parser.add_argument(
+        "spec",
+        help="Package name, or name@version to drop only that version",
     )
 
     return parser.parse_args()
@@ -1333,7 +1372,19 @@ async def run_status(args: argparse.Namespace) -> None:
     # Load configs
     project_root = args.project if hasattr(args, "project") else None
     config_path = args.config if hasattr(args, "config") else None
-    configs = load_configs(project_root=project_root, custom_config_path=config_path)
+    # Same residency binding as `run_server`: judge a `--project <checkout>`
+    # store against the served checkout, not the launch directory, so `status`
+    # and `serve` give the same verdict for a checkout-resident store. `status`
+    # is one-shot, so the binding is scoped to the load and cleared afterwards
+    # rather than left set for the process (unlike `serve`, which reloads
+    # configs for its whole lifetime).
+    trust_store.set_active_project_root(project_root)
+    try:
+        configs = load_configs(
+            project_root=project_root, custom_config_path=config_path
+        )
+    finally:
+        trust_store.set_active_project_root(None)
 
     # Exclude self-referential gateway entries (e.g. pmcp/mcp-gateway)
     # so `pmcp status` only reports downstream servers.
@@ -2231,15 +2282,44 @@ async def run_upgrade(args: argparse.Namespace) -> None:
         _restart_local_pmcp_service()
 
 
+def resolve_env_config_and_policy(args: argparse.Namespace) -> None:
+    """Adopt ``$PMCP_CONFIG`` / ``$PMCP_POLICY`` into ``args`` -- only if exported.
+
+    Both variables pick the gateway's explicit config and policy files, and both
+    were honoured unconditionally on the assumption they were the operator
+    speaking. A checkout can set either through a dotenv file pmcp loads on the
+    operator's behalf (``load_startup_env`` reads ``.env`` and ``.env.pmcp``),
+    which would let a repository choose the gateway's policy with no gate (S-11).
+    Adopt each only when provenance says the operator exported it; a
+    checkout-sourced value is ignored exactly as if it were unset -- an explicit
+    ``--config``/``--policy`` on the command line already takes precedence here --
+    and the refusal is logged operator-safe, naming the variable and path.
+    """
+    logger = logging.getLogger(__name__)
+    if not args.config and os.environ.get("PMCP_CONFIG"):
+        if env_key_is_operator_supplied("PMCP_CONFIG"):
+            args.config = Path(os.environ["PMCP_CONFIG"])
+        else:
+            logger.warning(
+                describe_ignored_trust_env_var("PMCP_CONFIG", os.environ["PMCP_CONFIG"])
+            )
+    if not args.policy and os.environ.get("PMCP_POLICY"):
+        if env_key_is_operator_supplied("PMCP_POLICY"):
+            args.policy = Path(os.environ["PMCP_POLICY"])
+        else:
+            logger.warning(
+                describe_ignored_trust_env_var("PMCP_POLICY", os.environ["PMCP_POLICY"])
+            )
+
+
 async def run_server(args: argparse.Namespace) -> None:
     """Run the MCP gateway server."""
     from pmcp.server import GatewayServer
 
-    # Check environment variables
-    if not args.config and os.environ.get("PMCP_CONFIG"):
-        args.config = Path(os.environ["PMCP_CONFIG"])
-    if not args.policy and os.environ.get("PMCP_POLICY"):
-        args.policy = Path(os.environ["PMCP_POLICY"])
+    # Check environment variables. PMCP_CONFIG/PMCP_POLICY are trust-bearing and
+    # are honoured only when the operator exported them (S-11); see
+    # resolve_env_config_and_policy.
+    resolve_env_config_and_policy(args)
     if not getattr(args, "audit_jsonl", None) and os.environ.get("PMCP_AUDIT_JSONL"):
         args.audit_jsonl = Path(os.environ["PMCP_AUDIT_JSONL"])
     if os.environ.get("PMCP_LOG_LEVEL"):
@@ -2340,6 +2420,15 @@ async def run_server(args: argparse.Namespace) -> None:
 
     logger.info("Starting PMCP...")
 
+    # Bind the trust store's checkout-residency guard to the project we are
+    # about to SERVE, before any config is loaded. Without this the guard keys
+    # on the launch directory's checkout, so `pmcp serve --project <checkout>`
+    # run from elsewhere fails to refuse a store planted inside that checkout
+    # and loads its self-approved `.mcp.json` (EC-TRUST-5, see
+    # Consiliency/pmcp#251, #230). `None` (bare `pmcp serve`) restores the
+    # cwd-derived behaviour.
+    trust_store.set_active_project_root(args.project)
+
     server = GatewayServer(
         project_root=args.project,
         custom_config_path=args.config,
@@ -2410,7 +2499,11 @@ async def run_server(args: argparse.Namespace) -> None:
 
 def run_guidance(args: argparse.Namespace) -> None:
     """Show guidance configuration status."""
-    from pmcp.config.guidance import load_guidance_config, set_telemetry_enabled
+    from pmcp.config.guidance import (
+        load_guidance_config,
+        set_feedback_submission_enabled,
+        set_telemetry_enabled,
+    )
 
     setup_logging(args.log_level)
 
@@ -2420,6 +2513,15 @@ def run_guidance(args: argparse.Namespace) -> None:
         _updated, path = set_telemetry_enabled(enabled)
         state = "enabled" if enabled else "disabled"
         print(f"Telemetry {state} in {path}")
+
+    # Persist the outbound-submission decision if requested. Written before the
+    # config is loaded below, so the status block reports the decision this
+    # invocation just made (Consiliency/pmcp#230).
+    if getattr(args, "feedback_submission", None):
+        submission_enabled = args.feedback_submission == "on"
+        _updated, path = set_feedback_submission_enabled(submission_enabled)
+        state = "enabled" if submission_enabled else "disabled"
+        print(f"Feedback submission {state} in {path}")
 
     # Load guidance config
     config = load_guidance_config()
@@ -2437,6 +2539,7 @@ def run_guidance(args: argparse.Namespace) -> None:
         f"  L3 Methodology Resource: {'✓' if config.include_methodology_resource else '✗'}"
     )
     print(f"  Feedback Telemetry: {'✓' if config.enable_telemetry else '✗'}")
+    print(f"  Feedback Submission: {'✓' if config.enable_feedback_submission else '✗'}")
     print()
 
     if args.show_budget:
@@ -2512,6 +2615,11 @@ def _run_trust_approve(args: argparse.Namespace) -> None:
         _trust_fail(f"cannot read {path}: {exc}")
         return
 
+    # #252: refuse a store resident in the checkout enclosing `path`, so approve
+    # agrees with what `serve --project` later enforces (raises TrustStoreError,
+    # which `run_trust` maps to a non-zero exit -- the same contract as the
+    # served/cwd residency guard in `trust_store_path`).
+    trust_store.assert_store_outside_path_checkout(path)
     rec = trust_store.record(path, content, _TRUST_SCOPE, trust_store.APPROVED)
     print(f"Approved {rec.absolute_path}")
     print(f"  sha256 {rec.content_sha256}")
@@ -2536,12 +2644,72 @@ def _run_trust_revoke(args: argparse.Namespace) -> None:
     print(f"Revoked {Path(path).resolve()}")
 
 
+def _exact_package_spec(spec: str) -> tuple[str, str]:
+    """Split ``name@version``, requiring one exact version.
+
+    A dist-tag or range is refused rather than resolved: an approval names the
+    bytes that run, and ``latest`` names whatever is published next. Refusals
+    always print a resolved version, so this costs an operator nothing.
+    """
+    name, version = parse_package_spec(spec)
+    if version is None or not is_valid_package_version(version):
+        raise ValueError(
+            f"{spec!r} does not name one exact version; use name@<version> as "
+            "printed in the provisioning refusal (ranges and dist-tags pin nothing)"
+        )
+    return name, version
+
+
+def _run_trust_approve_package(args: argparse.Namespace) -> None:
+    """Approve one package identity. Offline: no registry is consulted."""
+    from pmcp.manifest.package_identity import NPM_REGISTRY, PackageIdentity
+
+    name, version = _exact_package_spec(args.spec)
+    rec = package_approvals.approve_package(
+        PackageIdentity(
+            registry=NPM_REGISTRY, name=name, resolved_version=version, integrity=None
+        )
+    )
+    print(f"Approved {rec.registry} package {rec.name}@{rec.resolved_version}")
+
+
+def _run_trust_list_packages(args: argparse.Namespace) -> None:
+    """Print every package decision, or say plainly that there are none."""
+    records = package_approvals.list_package_approvals()
+    if not records:
+        print("No package approvals.")
+        return
+    for rec in records:
+        # Names and versions are re-validated when the store is read, so
+        # nothing printed here can carry a terminal control sequence.
+        print(
+            f"{rec.decision:<8}  {rec.recorded_at.isoformat()}  "
+            f"{rec.registry}:{rec.name}@{rec.resolved_version}  "
+            f"{rec.integrity or '-'}"
+        )
+
+
+def _run_trust_revoke_package(args: argparse.Namespace) -> None:
+    """Drop one version's approval, or every version's for a bare name."""
+    name, version = parse_package_spec(args.spec)
+    if version is not None and not is_valid_package_version(version):
+        raise ValueError(f"{args.spec!r} does not name one exact version")
+    label = f"{name}@{version}" if version else name
+    if not package_approvals.revoke_package(name, version):
+        _trust_fail(f"no package approval for {label}")
+        return
+    print(f"Revoked {label}")
+
+
 def run_trust(args: argparse.Namespace) -> None:
-    """Dispatch `pmcp trust <verb>` over the user-scoped trust store."""
+    """Dispatch `pmcp trust <verb>` over the user-scoped trust stores."""
     handlers = {
         "approve": _run_trust_approve,
         "list": _run_trust_list,
         "revoke": _run_trust_revoke,
+        "approve-package": _run_trust_approve_package,
+        "list-packages": _run_trust_list_packages,
+        "revoke-package": _run_trust_revoke_package,
     }
     handler = handlers.get(args.trust_command)
     if handler is None:
@@ -2824,8 +2992,28 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     stripped -- which is exactly right, because ``override=False`` means such a
     variable did not come from the file.
 
-    The two PMCP-store loads need no recording; ``managed_secret_keys`` already
-    covers those keys.
+    The two PMCP-store loads are recorded too, through a *different* registry:
+    ``record_pmcp_introduced_keys`` (Consiliency/pmcp#230). This function used to
+    record nothing for them, on the reasoning that ``managed_secret_keys``
+    already covered those keys -- true for the sanitiser, and **false for a
+    provenance check**, because ``managed_secret_keys`` answers about the store
+    file's contents *now*. A token a previous process's ``auth_connect`` wrote
+    to the store is loaded here into this process's environment, and
+    a later store write can drop it, though not by the route this phase first
+    assumed. Measured on python-dotenv 1.2.3: an unreadable store makes
+    ``read_env_file`` RAISE, and ``set_env_value`` then raises too and leaves the
+    file byte-intact, so the "rewrite from an empty read" chain does not occur.
+    What does drop an entry: an operator deleting the store; and a second writer
+    (another gateway, or ``pmcp secrets set``) racing this one. The partial-write
+    route this once named is closed -- ``write_env_file`` is now atomic
+    (write-to-temp then ``os.replace``, Consiliency/pmcp#248). Without this record, all three
+    provenance sources would then say "the operator exported this" and the
+    outbound-feedback gate would honour an agent-plantable credential.
+
+    The two registries stay separate deliberately. ``dotenv_sourced_keys`` has a
+    merged consumer -- ``sanitized_subprocess_env`` strips its keys from every
+    spawned child -- so recording the stores there would change what downstream
+    servers inherit, which is behaviour outside this change.
 
     ``dotenv_path`` is a test seam, and ``None`` -- the production call -- is
     identical to the bare ``load_dotenv()`` this replaced: ``find_dotenv``
@@ -2839,9 +3027,14 @@ def load_startup_env(dotenv_path: str | os.PathLike[str] | None = None) -> None:
     before = set(os.environ)
     load_dotenv(dotenv_path)
     record_dotenv_keys(set(os.environ) - before)
-    # Load PMCP credential stores written by auth_connect (don't override already-set vars)
+    # Load PMCP credential stores written by auth_connect (don't override already-set
+    # vars) and record what they introduced. ``override=False`` is what makes the
+    # delta correct: a variable the operator exported is already in ``before``, so it
+    # is never recorded and never refused.
+    before = set(os.environ)
     load_dotenv(Path.home() / ".config" / "pmcp" / "pmcp.env", override=False)
     load_dotenv(Path.cwd() / ".env.pmcp", override=False)
+    record_pmcp_introduced_keys(set(os.environ) - before)
 
 
 def main() -> None:

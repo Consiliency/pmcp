@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -9,15 +10,13 @@ import json
 import asyncio
 import time
 import platform
-import shutil
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Mapping
 from typing import Any, Literal, cast
-from urllib.request import urlopen
-from urllib.parse import urlencode
 
+import anyio
 from dotenv import load_dotenv
 from mcp.types import Tool
 from pmcp import __version__ as PMCP_VERSION
@@ -52,20 +51,35 @@ from pmcp.config.loader import (
 from pmcp.errors import ErrorCode, GatewayException, make_error
 from pmcp.env_store import (
     record_dotenv_keys,
+    record_pmcp_introduced_keys,
     sanitized_subprocess_env,
     set_env_value,
 )
-from pmcp.validation import env_var_allowed, is_valid_package_name
+from pmcp.feedback_egress import (
+    FeedbackProgress,
+    browser_issue_url,
+    browser_search_url,
+    evaluate_feedback_egress,
+    submit_feedback_issue,
+)
+from pmcp.validation import (
+    discovered_env_var_allowed,
+    env_var_allowed,
+    is_valid_package_name,
+    is_valid_package_version,
+)
 from pmcp.identity import filter_self_references
 from pmcp.manifest.code_patterns_loader import get_code_hint
 from pmcp.manifest.environment import CLIInfo, detect_platform, probe_clis
 from pmcp.templates.code_snippets_loader import get_code_snippet
 from pmcp.manifest.installer import (
     MissingApiKeyError,
+    _render_install_argv,
     get_job_manager,
     InstallError,
 )
 from pmcp.manifest.loader import load_manifest
+from pmcp.manifest.package_identity import PackageIdentity, resolve_package_identity
 from pmcp.manifest.matcher import (
     _keyword_match_score,
     _manifest_keyword_weights,
@@ -92,6 +106,12 @@ from pmcp.manifest.version_checker import (
     get_package_version,
 )
 from pmcp.policy.policy import PolicyManager
+from pmcp.provision_gate import (
+    ProvisionDecision,
+    ProvisionSource,
+    evaluate_provision,
+    operator_safe,
+)
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     build_remote_header_env_lookup,
@@ -99,6 +119,7 @@ from pmcp.remote_auth import (
 )
 from pmcp.types import (
     ArgInfo,
+    AuthState,
     AuthConnectInput,
     AuthConnectOutput,
     AuthEventKind,
@@ -181,6 +202,53 @@ from pmcp.manifest.loader import (
 logger = logging.getLogger(__name__)
 
 FEEDBACK_TOKEN_LIMIT = 4000
+
+#: Bound on one registration's registry lookup, end to end. The resolver's own
+#: 10 s is a per-socket-operation timeout, not a request bound, and it runs in a
+#: worker thread: this is what keeps a slow or hostile registry from holding a
+#: gateway tool call open indefinitely.
+_REGISTRATION_RESOLVE_TIMEOUT_SECONDS = 20.0
+
+#: Bound on one feedback submission, end to end. A per-socket timeout is not a
+#: request bound -- it restarts on every connect/send/recv, so a peer that returns
+#: one byte just under the threshold holds the call open forever. The transport
+#: runs in a worker thread under this bound, and `feedback_egress`'s per-phase
+#: budgets sum below it so nothing *starts* without room to finish inside it. That is
+#: the whole claim: a phase that has started can still overrun, because a single socket
+#: operation stalling below its own threshold cannot be interrupted from Python. This
+#: bounds how long the HANDLER waits, never how long the worker may take.
+_FEEDBACK_SUBMIT_TIMEOUT_SECONDS = 20.0
+
+#: What a provisioning refusal says before the gate's remedy, per reason.
+_PROVISION_REFUSAL_SUMMARY = {
+    "denied": "its package is denied by policy.",
+    "unresolvable_identity": "its package has no resolved identity.",
+    "unpinned_configured_argv": (
+        "its command is not pinned to the package version that was resolved."
+    ),
+    "not_approved": (
+        "its package has not been approved by an operator. To approve it, run:"
+    ),
+}
+
+
+def _package_refusal(
+    verb: str, server_name: str, decision: ProvisionDecision
+) -> tuple[str, AuthState]:
+    """The message and auth_state for a package-identity gate refusal.
+
+    Shared by `provision` and the lifecycle resolver so the two doors refuse in
+    the same words. ``policy_denied`` is reserved for an actual policy denylist
+    match; every other refusal is a missing operator decision or an unusable
+    identity, not a policy verdict, so it reports ``unknown``.
+    """
+    summary = _PROVISION_REFUSAL_SUMMARY.get(
+        decision.reason, "the provisioning gate refused it."
+    )
+    message = (
+        f"Refused to {verb} {operator_safe(server_name)}: {summary} {decision.remedy}"
+    )
+    return message, ("policy_denied" if decision.reason == "denied" else "unknown")
 
 
 def _refresh_config_unchanged(
@@ -379,6 +447,9 @@ def _detect_effective_version_pin(
 # Human-readable label for a ResolvedServerConfig.source, used in messages
 # that need to point an operator at the file a pin (or other override) came
 # from.
+#: Which of `_resolve_lifecycle_target`'s lookups produced a lifecycle config.
+_LifecycleLookup = Literal["configured", "manifest", "discovered", "running"]
+
 _CONFIG_SOURCE_LABELS: dict[str, str] = {
     "project": "the project .mcp.json",
     "user": "the user .mcp.json",
@@ -811,8 +882,12 @@ def get_gateway_tool_definitions() -> list[Tool]:
         Tool(
             name="gateway.submit_feedback",
             description=(
-                "Prepare and optionally submit a PMCP feedback issue to GitHub. "
-                "By default returns an exact preview payload; set confirm_submission=true to submit."
+                "Prepare a PMCP feedback issue for GitHub. Returns an exact "
+                "preview payload and a browser URL an operator can open. pmcp "
+                "posts nothing itself unless the operator has enabled submission "
+                "(`pmcp guidance --feedback-submission on`) and exported "
+                "PMCP_FEEDBACK_TOKEN; confirm_submission=true records the user's "
+                "consent and is not by itself authority to post."
             ),
             input_schema={
                 "type": "object",
@@ -1124,6 +1199,10 @@ class GatewayTools:
         self._detected_cli_infos: dict[str, CLIInfo] = {}
         self._platform: str | None = None
         self._discovered_server_configs: dict[str, ServerConfig] = {}
+        # The registry identity each discovered config was pinned to at
+        # registration. Written only alongside its config, and only by
+        # register_discovered_server; `provision` gates on it (#230).
+        self._discovered_server_identities: dict[str, PackageIdentity] = {}
         # provision_status finalization is one-shot per job: the per-job lock
         # serializes the server_ready→adopt handoff (and the complete→refresh)
         # so concurrent polls cannot double-adopt or re-refresh a finished job.
@@ -3316,6 +3395,29 @@ class GatewayTools:
         prior_status: str,
     ) -> tuple[ResolvedServerConfig | None, LifecycleServerOutput | None]:
         """Resolve a lifecycle target or return a structured failure output."""
+        config, failure, _lookup = self._resolve_lifecycle_target(
+            server_name, action=action, prior_status=prior_status
+        )
+        return (config, failure)
+
+    def _resolve_lifecycle_target(
+        self,
+        server_name: str,
+        *,
+        action: Literal["connect", "disconnect", "restart"],
+        prior_status: str,
+    ) -> tuple[
+        ResolvedServerConfig | None,
+        LifecycleServerOutput | None,
+        _LifecycleLookup | None,
+    ]:
+        """`_resolve_lifecycle_config`, plus WHICH lookup matched.
+
+        The lookup is returned rather than read back off the config because
+        the config cannot say: `manifest_server_to_config` stamps a discovered
+        config ``source="manifest"`` too, and every other field on a discovered
+        config was composed from agent input. ``None`` when nothing matched.
+        """
         configured_servers = self._load_all_configured_servers()
         if server_name in configured_servers:
             if not self._policy_manager.is_server_allowed(server_name):
@@ -3330,6 +3432,7 @@ class GatewayTools:
                         errors=[f"Server '{server_name}' is blocked by policy."],
                         auth_state="policy_denied",
                     ),
+                    "configured",
                 )
             configured = configured_servers[server_name]
             missing_env_vars = self._missing_remote_header_env_vars(configured)
@@ -3342,6 +3445,7 @@ class GatewayTools:
                         prior_status=prior_status,
                         missing_env_vars=missing_env_vars,
                     ),
+                    "configured",
                 )
             # Same class of bug as the provision() and startup-resolution
             # fixes (Consiliency/pmcp#114 board review finding 1): a
@@ -3374,13 +3478,19 @@ class GatewayTools:
                         auth_metadata=self._auth_metadata_for_server(manifest_server),
                         next_step=f"gateway.auth_connect(server_name='{server_name}')",
                     ),
+                    "configured",
                 )
-            return (configured, None)
+            return (configured, None, "configured")
 
         manifest = load_manifest()
         server_config = manifest.get_server(server_name)
+        # As in `provision`: the gate's source is which lookup matched.
+        source: ProvisionSource = "manifest"
+        identity: PackageIdentity | None = None
         if server_config is None:
             server_config = self._discovered_server_configs.get(server_name)
+            source = "discovered"
+            identity = self._discovered_server_identities.get(server_name)
 
         if server_config is not None:
             if not self._policy_manager.is_server_allowed(server_name):
@@ -3395,7 +3505,44 @@ class GatewayTools:
                         errors=[f"Server '{server_name}' is blocked by policy."],
                         auth_state="policy_denied",
                     ),
+                    source,
                 )
+
+            # Package identity gate (IF-0-PKGID-1), the second door to it.
+            # connect and restart spawn the config's argv, and update_server
+            # resolves here before its probe spawns `npx <pkg>`, so without this
+            # a registered-but-unapproved package runs with no `provision` call
+            # at all. Before the credential check, so a refused package never
+            # prompts for auth. Both lookups: a manifest hit is exempt by rule 2
+            # and can be refused only by rule 1, a packages.denylist naming one
+            # of its packages -- nothing else about manifest lifecycle changes.
+            # Not for disconnect: it spawns nothing, and refusing it would strand
+            # a server that is running.
+            if action != "disconnect":
+                decision = evaluate_provision(
+                    server_config,
+                    identity,
+                    source=source,
+                    policy=self._policy_manager,
+                )
+                if not decision.allowed:
+                    message, refusal_auth_state = _package_refusal(
+                        action, server_name, decision
+                    )
+                    logger.warning(message)
+                    return (
+                        None,
+                        self._lifecycle_output(
+                            ok=False,
+                            server=server_name,
+                            action=action,
+                            prior_status=prior_status,
+                            message=message,
+                            errors=[message],
+                            auth_state=refusal_auth_state,
+                        ),
+                        source,
+                    )
 
             if requires_credential(server_config) and server_config.env_var:
                 auth_env_options = self._auth_env_options(
@@ -3424,6 +3571,7 @@ class GatewayTools:
                             auth_metadata=self._auth_metadata_for_server(server_config),
                             next_step=f"gateway.auth_connect(server_name='{server_name}')",
                         ),
+                        source,
                     )
 
             resolved = manifest_server_to_config(server_config)
@@ -3437,9 +3585,10 @@ class GatewayTools:
                         prior_status=prior_status,
                         missing_env_vars=missing_env_vars,
                     ),
+                    source,
                 )
 
-            return (resolved, None)
+            return (resolved, None, source)
 
         if action == "disconnect" and self._client_manager.get_server_status(
             server_name
@@ -3451,6 +3600,7 @@ class GatewayTools:
                     config=LocalMcpServerConfig(command=""),
                 ),
                 None,
+                "running",
             )
 
         return (
@@ -3463,6 +3613,7 @@ class GatewayTools:
                 message=f"Server '{server_name}' is not known to PMCP.",
                 errors=[f"Unknown server: {server_name}"],
             ),
+            None,
         )
 
     def _keywords_for_config_server(self, config: ResolvedServerConfig) -> list[str]:
@@ -3629,6 +3780,12 @@ class GatewayTools:
         # process tree alive -- including grandchildren such as the Chrome that
         # @playwright/mcp launches, which then holds the profile SingletonLock
         # and breaks the next launch.
+        #
+        # The probe fetches and runs a package by construction (npx/uvx
+        # `--help`, cargo install, docker pull), so it is an install spawn
+        # (EC-PKGID-4): log the rendered, secret-safe argv at WARNING first, so
+        # a spawn that raises still leaves the record.
+        logger.warning(f"Running update probe: {_render_install_argv(command)}")
         process = await asyncio.create_subprocess_exec(
             *command,
             stdout=asyncio.subprocess.PIPE,
@@ -3672,6 +3829,10 @@ class GatewayTools:
             "Technical failure detected. If your framework supports ask-user/question tools, "
             "ask consent before submission. Then call gateway.submit_feedback with the exact "
             "title/description payload you will send and show it verbatim to the user first. "
+            "It returns the payload and a browser URL; confirm_submission=true is the "
+            "user's consent and is not what lets pmcp post, which an operator enables "
+            "with `pmcp guidance --feedback-submission on` plus an exported "
+            "PMCP_FEEDBACK_TOKEN. "
             "Warning: submission may use model tokens and sends technical data to GitHub. "
             "Do not include personal data, credentials, or secrets."
         )
@@ -4278,9 +4439,15 @@ class GatewayTools:
         # Load manifest
         manifest = load_manifest()
         server_config = manifest.get_server(server_name)
+        # The gate's `source` is WHICH LOOKUP found the config -- never a field
+        # on it, since a discovered config is composed from agent input.
+        source: ProvisionSource = "manifest"
+        identity: PackageIdentity | None = None
 
         if not server_config:
             server_config = self._discovered_server_configs.get(server_name)
+            source = "discovered"
+            identity = self._discovered_server_identities.get(server_name)
 
         if not server_config:
             return ProvisionOutput(
@@ -4290,6 +4457,31 @@ class GatewayTools:
                 message=(
                     f"Server '{server_name}' not found in manifest or .mcp.json configuration."
                 ),
+                feedback_hint=self._feedback_hint(),
+            )
+
+        # Package identity gate (IF-0-PKGID-1): nothing below may connect or
+        # spawn for a config the gate refuses. Ahead of the credential check,
+        # as in the lifecycle resolver: an agent must not be asked for a secret
+        # for a package that will then be refused.
+        decision = evaluate_provision(
+            server_config, identity, source=source, policy=self._policy_manager
+        )
+        if not decision.allowed:
+            message, refusal_auth_state = _package_refusal(
+                "provision", server_name, decision
+            )
+            logger.warning(message)
+            self._record_feedback_event(
+                "provision_failure",
+                {"server": server_name, "reason": decision.reason},
+            )
+            return ProvisionOutput(
+                ok=False,
+                server=server_name,
+                status="failed",
+                message=message,
+                auth_state=refusal_auth_state,
                 feedback_hint=self._feedback_hint(),
             )
 
@@ -4480,7 +4672,9 @@ class GatewayTools:
         job_manager = get_job_manager()
 
         try:
-            job_id = await job_manager.start_install(server_config, platform)
+            job_id = await job_manager.start_install(
+                server_config, platform, self._project_root
+            )
 
             return ProvisionOutput(
                 ok=True,
@@ -4692,9 +4886,14 @@ class GatewayTools:
         declared_storage_key = (
             credential_storage_key(server_config) if server_config else None
         )
+        # Which lookup supplied the declared name, never a field on the config:
+        # a discovered config's names are agent-chosen (see the allowlist check
+        # below).
+        from_discovered = False
         if declared_env_var is None:
             discovered = self._discovered_server_configs.get(server_name)
             if discovered is not None:
+                from_discovered = True
                 declared_env_var = discovered.env_var
                 declared_storage_key = credential_storage_key(discovered)
         # Persist under the (optionally namespaced) storage key so generic runtime
@@ -4742,7 +4941,16 @@ class GatewayTools:
         # server's declared storage key (or a credential-shaped name when none is
         # declared) is permitted; loader-influencing variables such as
         # LD_PRELOAD / NODE_OPTIONS / PATH / PYTHON* are refused outright.
-        if not env_var_allowed(env_var, declared_storage_key):
+        #
+        # A discovered server's names are held to the allowlist as well, the
+        # declared one included: registration refuses a disallowed name, but
+        # this door must not trust the config registration left, and with no
+        # declared name any credential-shaped override passed -- including
+        # NPM_CONFIG__AUTH, which the pinned `npx -y` spawn would then read
+        # (Consiliency/pmcp#230).
+        if not env_var_allowed(env_var, declared_storage_key) or (
+            from_discovered and not discovered_env_var_allowed(env_var)
+        ):
             self._audit(
                 method="gateway.auth_connect",
                 action="auth_connect",
@@ -4788,6 +4996,18 @@ class GatewayTools:
                 env_var=env_var,
             )
         os.environ[env_var] = parsed.credential
+        # Recorded in the SAME statement group as the write, with no await between:
+        # no other task may observe the environment write without the record. Store
+        # membership is not durable evidence: the entry can vanish while the variable
+        # it planted stays here. NOT by the route this comment used to name -- a later
+        # `auth_connect` whose read-modify-write silently drops the key is not
+        # reproducible, because every unreadable-store shape raises rather than
+        # rewriting. By these instead: a concurrent writer in another process loses an
+        # update; an operator deletes the store; or a previous process wrote the key
+        # and this one never saw it. (`write_env_file`'s old truncate-then-write route
+        # is closed -- it is now atomic, Consiliency/pmcp#248.) See
+        # `env_store.record_pmcp_introduced_keys` (Consiliency/pmcp#230).
+        record_pmcp_introduced_keys([env_var])
 
         self._audit(
             method="gateway.auth_connect",
@@ -4811,16 +5031,61 @@ class GatewayTools:
         )
 
     async def submit_feedback(self, input_data: dict[str, Any]) -> SubmitFeedbackOutput:
-        """gateway.submit_feedback - Prepare/submit PMCP feedback issue."""
+        """gateway.submit_feedback - Prepare/submit PMCP feedback issue.
+
+        The outbound-action gate is consulted before anything else, and it resolves the
+        destination first, so no unvalidated repository can appear in *any* output --
+        a refusal included, and the browser URL the agent is told to open included.
+        There is no ambient-credential fallback and no `gh` fallback: both authenticate
+        from whatever identity the host happens to be carrying, and a post pmcp cannot
+        attribute is one this gateway will not make (Consiliency/pmcp#230).
+        """
         parsed = SubmitFeedbackInput.model_validate(input_data)
-        repository = os.environ.get("PMCP_FEEDBACK_REPO", "ViperJuice/pmcp")
 
         warning = (
             "Submission sends technical telemetry to GitHub and may consume model tokens. "
             "Send technical data only; never include personal data or secrets."
         )
 
-        if not self._telemetry_enabled():
+        decision = evaluate_feedback_egress(
+            telemetry_enabled=self._telemetry_enabled(),
+            submission_enabled=bool(
+                self._guidance_config
+                and self._guidance_config.enable_feedback_submission
+            ),
+            confirm_submission=parsed.confirm_submission,
+            environ=os.environ,
+            project_root=self._project_root,
+        )
+        repository = decision.repository
+        remedy = decision.remedy or ""
+
+        # Refusals that build NO payload and record NO event. Each one refuses to
+        # discuss this submission at all, so there is nothing to preview and nowhere to
+        # point; `repository_visibility` is "unknown" because no request was made, and
+        # a claim about a repository pmcp did not ask about is not a fact.
+        refusals = {
+            "untrusted_repository_override": (
+                "Refused to submit: the feedback destination was introduced by pmcp "
+                "itself rather than exported by you."
+            ),
+            "invalid_repository": (
+                "Refused to submit: the feedback destination is not owner/repo shaped."
+            ),
+            "telemetry_disabled": (
+                "Feedback telemetry is disabled in guidance config "
+                "(enable_telemetry=false)."
+            ),
+            "untrusted_token": (
+                "Refused to submit: the feedback credential was introduced by pmcp "
+                "itself rather than exported by you."
+            ),
+            "gate_error": (
+                "Refused to submit: pmcp could not establish this submission's "
+                "authority."
+            ),
+        }
+        if decision.reason in refusals:
             return SubmitFeedbackOutput(
                 ok=False,
                 submitted=False,
@@ -4829,183 +5094,191 @@ class GatewayTools:
                 issue_title=parsed.title,
                 issue_body=parsed.description,
                 warning=warning,
-                message="Feedback telemetry is disabled in guidance config (enable_telemetry=false).",
+                message=f"{refusals[decision.reason]} {remedy}".strip(),
             )
-
-        self._record_feedback_event(
-            "feedback_prepare",
-            {
-                "issue_type": parsed.issue_type,
-                "subordinate_server": parsed.subordinate_server,
-                "failed_tool_call": parsed.failed_tool_call,
-            },
-        )
 
         issue_title, issue_body = self._build_feedback_issue(parsed, repository)
 
-        if not parsed.confirm_submission:
+        if not decision.submit_allowed:
+            # submission_not_enabled / not_confirmed / no_feedback_token: pmcp will not
+            # post, but the payload and where to put it are exactly what the operator
+            # needs, so both are built and the prepare event is recorded. The word
+            # "consent" stays in the submission_not_enabled text deliberately.
+            previews = {
+                "submission_not_enabled": (
+                    "Preview generated; pmcp will not post it. Ask the user for "
+                    "consent using your question tool, show this exact issue payload, "
+                    "and open issue_url to submit it by hand. To let pmcp submit, an "
+                    "operator runs:"
+                ),
+                "not_confirmed": "Preview generated.",
+                "no_feedback_token": (
+                    "Preview generated; pmcp has no operator-supplied credential to "
+                    "post with, so open issue_url to submit it by hand."
+                ),
+            }
+            self._record_feedback_event(
+                "feedback_prepare",
+                {
+                    "issue_type": parsed.issue_type,
+                    "subordinate_server": parsed.subordinate_server,
+                    "failed_tool_call": parsed.failed_tool_call,
+                },
+            )
             return SubmitFeedbackOutput(
                 ok=True,
                 submitted=False,
                 repository=repository,
-                repository_visibility="public",
+                repository_visibility="unknown",
                 issue_title=issue_title,
                 issue_body=issue_body,
+                issue_url=browser_issue_url(repository, issue_title, issue_body),
                 warning=warning,
-                message=(
-                    "Preview generated. Ask the user for consent using your question tool, "
-                    "show this exact issue payload, then call again with confirm_submission=true."
-                ),
+                message=f"{previews[decision.reason]} {remedy}".strip(),
             )
 
-        token = os.environ.get("PMCP_FEEDBACK_TOKEN") or os.environ.get("GITHUB_TOKEN")
-        if token:
-            try:
-                from urllib.request import Request
-
-                repo_visibility = "unknown"
-                try:
-                    repo_req = Request(
-                        f"https://api.github.com/repos/{repository}",
-                        headers={
-                            "Accept": "application/vnd.github+json",
-                            "Authorization": f"Bearer {token}",
-                            "X-GitHub-Api-Version": "2022-11-28",
-                        },
-                        method="GET",
-                    )
-                    with urlopen(repo_req, timeout=5) as repo_resp:  # nosec B310
-                        repo_info = json.loads(repo_resp.read().decode("utf-8"))
-                    private_flag = bool(repo_info.get("private"))
-                    repo_visibility = "private" if private_flag else "public"
-                except Exception:
-                    repo_visibility = "unknown"
-
-                issue_api = f"https://api.github.com/repos/{repository}/issues"
-                payload = json.dumps(
-                    {
-                        "title": issue_title,
-                        "body": issue_body,
-                        "labels": [
+        # Allowed. `token` is populated on exactly this branch.
+        assert decision.token is not None
+        progress = FeedbackProgress()
+        deadline = time.monotonic() + _FEEDBACK_SUBMIT_TIMEOUT_SECONDS
+        try:
+            with anyio.fail_after(_FEEDBACK_SUBMIT_TIMEOUT_SECONDS):
+                result = await anyio.to_thread.run_sync(
+                    functools.partial(
+                        submit_feedback_issue,
+                        repository=decision.repository,
+                        token=decision.token,
+                        title=issue_title,
+                        body=issue_body,
+                        labels=[
                             "pmcp-feedback",
                             "authenticated-feedback",
                             parsed.issue_type,
                         ],
-                    }
-                ).encode("utf-8")
-                req = Request(
-                    issue_api,
-                    data=payload,
-                    headers={
-                        "Accept": "application/vnd.github+json",
-                        "Authorization": f"Bearer {token}",
-                        "X-GitHub-Api-Version": "2022-11-28",
-                        "Content-Type": "application/json",
-                    },
-                    method="POST",
+                        deadline=deadline,
+                        progress=progress,
+                    ),
+                    abandon_on_cancel=True,
                 )
-                with urlopen(req, timeout=10) as resp:  # nosec B310
-                    created = json.loads(resp.read().decode("utf-8"))
+        except TimeoutError:
+            # Atomically closes the state; exactly one of abandon/claim_dispatch wins.
+            # `latest()` here instead would be the R1 race: it can answer
+            # not_dispatched with a compose URL while the worker goes on to post.
+            result = progress.abandon()
+        except anyio.get_cancelled_exc_class():
+            # The THIRD exit, and the one the two arms around it both miss. A
+            # cancellation -- the caller disconnected, the surrounding task group is
+            # unwinding -- is a `BaseException`, so neither `except TimeoutError` nor
+            # `except Exception` catches it. Without this arm `abandon()` never ran, and
+            # a worker parked before `claim_dispatch` still found `pending` with the
+            # handler apparently listening, won the claim, and POSTed after the caller
+            # had gone: the R1 race reached through a different door.
+            #
+            # Asked by class rather than by name so it holds under trio as well as
+            # asyncio, where the cancellation exception is a different type.
+            #
+            # A `try/finally` that abandoned on every exit would be shorter and is
+            # wrong: `abandon()` is NOT idempotent. The first call from `pending`
+            # returns `not_dispatched`; a second finds state `abandoned` -- neither
+            # `terminal` nor `pending` -- and falls through to `dispatched_unconfirmed`,
+            # so a `finally` after the `TimeoutError` arm would silently convert a
+            # certain "nothing was sent" into "it may already exist" and send the
+            # operator hunting for an issue that does not exist. The success path must
+            # not abandon at all. Three arms, each abandoning exactly once.
+            #
+            # RE-RAISED, never swallowed: answering normally here would tell the
+            # surrounding task group this call completed and hand a result to a caller
+            # that has already stopped listening.
+            progress.abandon()
+            raise
+        except Exception as exc:
+            # A transport that raises instead of returning an outcome is a bug, not a
+            # second door. Give up the same way, so the worker can never afterwards be
+            # granted permission to send.
+            logger.warning("Feedback submission raised: %s", exc)
+            result = progress.abandon()
 
-                issue_url = created.get("html_url")
-                issue_number = created.get("number")
-                self._record_feedback_event(
-                    "feedback_submitted",
-                    {
-                        "repository": repository,
-                        "issue_url": issue_url,
-                        "authenticated": True,
-                    },
-                )
-                return SubmitFeedbackOutput(
-                    ok=True,
-                    submitted=True,
-                    repository=repository,
-                    repository_visibility=cast(
-                        Literal["public", "private", "unknown"], repo_visibility
-                    ),
-                    issue_title=issue_title,
-                    issue_body=issue_body,
-                    issue_url=issue_url,
-                    issue_number=issue_number,
-                    authenticated=True,
-                    warning=warning,
-                    message=(
-                        "Feedback issue submitted successfully. "
-                        "Share issue_url with the user so they can review/delete it if desired."
-                    ),
-                )
-            except Exception as e:
-                logger.warning(f"Authenticated feedback submission failed: {e}")
-
-        if shutil.which("gh"):
-            cmd = [
-                "gh",
-                "issue",
-                "create",
-                "--repo",
-                repository,
-                "--title",
-                issue_title,
-                "--body",
-                issue_body,
-                "--label",
-                "pmcp-feedback",
-                "--label",
-                parsed.issue_type,
-            ]
-            process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await process.communicate()
-            if process.returncode == 0:
-                issue_url = stdout.decode("utf-8", errors="replace").strip()
-                self._record_feedback_event(
-                    "feedback_submitted",
-                    {
-                        "repository": repository,
-                        "issue_url": issue_url,
-                        "authenticated": False,
-                    },
-                )
-                return SubmitFeedbackOutput(
-                    ok=True,
-                    submitted=True,
-                    repository=repository,
-                    repository_visibility="public",
-                    issue_title=issue_title,
-                    issue_body=issue_body,
-                    issue_url=issue_url,
-                    authenticated=False,
-                    warning=warning,
-                    message=(
-                        "Feedback issue submitted via gh CLI. "
-                        "Share issue_url with the user so they can review/delete it if desired."
-                    ),
-                )
-            logger.warning(
-                "gh issue create failed: "
-                + stderr.decode("utf-8", errors="replace").strip()
+        # FeedbackProgress is constructed with no destination, so the snapshots IT
+        # authors carry `issue_url=None`: the handler renders the COMPOSE url where
+        # nothing was sent and the SEARCH url where something may have been -- handing
+        # back a compose url after a possible success is how a duplicate gets filed.
+        # Snapshots the transport authors already carry the right one.
+        issue_url = result.issue_url
+        if issue_url is None:
+            issue_url = (
+                browser_search_url(repository, issue_title)
+                if result.outcome == "dispatched_unconfirmed"
+                else browser_issue_url(repository, issue_title, issue_body)
             )
 
-        browser_url = f"https://github.com/{repository}/issues/new?" + urlencode(
-            {"title": issue_title, "body": issue_body}
-        )
+        if result.outcome == "created":
+            self._record_feedback_event(
+                "feedback_submitted",
+                {
+                    "repository": repository,
+                    "issue_url": issue_url,
+                    "authenticated": True,
+                },
+            )
+            return SubmitFeedbackOutput(
+                ok=True,
+                submitted=True,
+                repository=repository,
+                repository_visibility=result.repository_visibility,
+                issue_title=issue_title,
+                issue_body=issue_body,
+                issue_url=issue_url,
+                issue_number=result.issue_number,
+                authenticated=True,
+                warning=warning,
+                message=(
+                    "Feedback issue submitted successfully. "
+                    "Share issue_url with the user so they can review/delete it if desired."
+                ),
+                submission_outcome="created",
+            )
+
+        # `submitted=False` here means "pmcp did not observe a submission", which is
+        # not the same claim for all three: only `refused` is a genuine negative.
+        outcomes = {
+            "refused": (
+                "GitHub refused the submission, so nothing was created. Open "
+                "issue_url to submit it by hand."
+            ),
+            "not_dispatched": "Nothing was sent. Open issue_url to submit it by hand.",
+            "dispatched_unconfirmed": (
+                "The request was sent and pmcp never saw the answer, so the issue "
+                "may already exist. Open issue_url to look for it before submitting "
+                "it again."
+            ),
+        }
         return SubmitFeedbackOutput(
-            ok=True,
+            ok=False,
             submitted=False,
             repository=repository,
-            repository_visibility="public",
+            repository_visibility="unknown",
             issue_title=issue_title,
             issue_body=issue_body,
-            issue_url=browser_url,
+            issue_url=issue_url,
             warning=warning,
-            message=(
-                "Could not auto-submit. Open issue_url to submit manually. "
-                "Share with user so they can edit/remove content before posting."
-            ),
+            message=outcomes[result.outcome],
+            submission_outcome=result.outcome,
+        )
+
+    def _discovered_update_refusal(self, server_name: str) -> UpdateServerOutput:
+        """Why `update_server` will not move a discovered server, and what will."""
+        message = (
+            f"Refused to update {operator_safe(server_name)}: it is a discovered "
+            "server, and a discovered server's package approval is for one exact "
+            "version, so gateway.update_server will not fetch another. To move it "
+            "to a newer version, call gateway.register_discovered_server again "
+            "with the same server_name and package -- registration resolves and "
+            "pins the current version -- then have an operator approve that "
+            "version with pmcp trust approve-package before connecting it."
+        )
+        logger.warning(message)
+        return UpdateServerOutput(
+            ok=False, server=server_name, package_type="unknown", message=message
         )
 
     async def update_server(self, input_data: dict[str, Any]) -> UpdateServerOutput:
@@ -5060,7 +5333,7 @@ class GatewayTools:
         # them, which is why the restart below re-resolves and verifies rather
         # than assuming this one still holds (Consiliency/pmcp#151).
         prior_status = self._status_value(server_name)
-        resolved_config, resolve_failure = self._resolve_lifecycle_config(
+        resolved_config, resolve_failure, lookup = self._resolve_lifecycle_target(
             server_name, action="restart", prior_status=prior_status
         )
         if resolve_failure is not None:
@@ -5077,6 +5350,15 @@ class GatewayTools:
                 package_type="unknown",
                 message=f"Server '{server_name}' could not be resolved.",
             )
+        # A discovered server is never moved by this tool, whatever its argv
+        # looks like. Its approval is for one exact version, and the probe
+        # below runs `<pkg>@latest` -- a version nobody approved. Pin detection
+        # refuses a registered (pinned) argv today, but nothing ties the two
+        # together, so a miss there would run unapproved code. Decided by the
+        # lookup that matched, never by a field on the config
+        # (Consiliency/pmcp#230).
+        if lookup == "discovered":
+            return self._discovered_update_refusal(server_name)
 
         if isinstance(resolved_config.config, LocalMcpServerConfig):
             command = resolved_config.config.command
@@ -5208,11 +5490,15 @@ class GatewayTools:
         # The guarantee is "the config restarted onto is the config that was
         # probed" -- NOT "the config on disk when the restart completes". An
         # edit landing after this check applies on the next update.
-        recheck_config, recheck_failure = self._resolve_lifecycle_config(
-            server_name,
-            action="restart",
-            prior_status=self._status_value(server_name),
+        recheck_config, recheck_failure, recheck_lookup = (
+            self._resolve_lifecycle_target(
+                server_name,
+                action="restart",
+                prior_status=self._status_value(server_name),
+            )
         )
+        if recheck_lookup == "discovered":
+            return self._discovered_update_refusal(server_name)
         if recheck_failure is not None or recheck_config is None:
             return UpdateServerOutput(
                 ok=False,
@@ -5532,7 +5818,90 @@ class GatewayTools:
                 ),
             )
 
-        install_command = ["npx", "-y", package]
+        # A discovered server may declare only credential-shaped names outside
+        # the package-manager and runtime families. Each declared name is what
+        # auth_connect stores and build_install_child_env injects into the
+        # pinned spawn, so `npm_config_registry` would point an approved
+        # `npx -y name@version` at a registry serving other bytes. Checked
+        # before resolution: a refused registration touches neither the
+        # registry nor the discovered-server tables.
+        disallowed = [
+            name for name in parsed.env_vars if not discovered_env_var_allowed(name)
+        ]
+        if disallowed:
+            names = ", ".join(operator_safe(name) for name in disallowed)
+            return RegisterDiscoveredServerOutput(
+                ok=False,
+                server_name=server_name,
+                registered=False,
+                message=(
+                    f"Refused to register {operator_safe(server_name)}: a "
+                    f"discovered server may not declare the environment "
+                    f"variable(s) {names}. Only credential-shaped names (ending "
+                    "in _TOKEN, _KEY, _SECRET(S), _PASSWORD, _CREDENTIAL(S), "
+                    "_PAT, _DSN or _AUTH) are accepted, and never one that configures "
+                    "a package manager or runtime (NPM_CONFIG_*, NODE_*, "
+                    "COREPACK_*, YARN_*, PNPM_*, BUN_*) or loads code. Nothing "
+                    "was registered."
+                ),
+            )
+
+        # Resolve and pin (EC-PKGID-5). `resolve_package_identity` is synchronous
+        # network I/O, so it runs in a worker thread under a handler-level bound:
+        # called directly it would stall the whole gateway's event loop.
+        timed_out = False
+        resolved: PackageIdentity | None = None
+        try:
+            with anyio.fail_after(_REGISTRATION_RESOLVE_TIMEOUT_SECONDS):
+                resolved = await anyio.to_thread.run_sync(
+                    resolve_package_identity, package, abandon_on_cancel=True
+                )
+        except TimeoutError:
+            timed_out = True
+        except Exception as exc:  # resolution fails closed; see package_identity
+            logger.warning("Package identity lookup raised for %r: %s", package, exc)
+
+        if resolved is None:
+            reason = (
+                f"timed out after {_REGISTRATION_RESOLVE_TIMEOUT_SECONDS:g}s"
+                if timed_out
+                else "did not resolve to one exact version"
+            )
+            return RegisterDiscoveredServerOutput(
+                ok=False,
+                server_name=server_name,
+                registered=False,
+                message=(
+                    f"Refused to register {operator_safe(server_name)}: the npm "
+                    f"registry lookup for {operator_safe(package)} {reason}. "
+                    "Nothing was registered; check the package name and retry."
+                ),
+            )
+
+        # Registry data is semi-trusted and about to become argv: validate the
+        # resolved name and version before composing them.
+        if (
+            resolved.name != package
+            or not is_valid_package_name(resolved.name)
+            or not is_valid_package_version(resolved.resolved_version)
+        ):
+            return RegisterDiscoveredServerOutput(
+                ok=False,
+                server_name=server_name,
+                registered=False,
+                message=(
+                    f"Refused to register {operator_safe(server_name)}: the npm "
+                    f"registry returned an identity for {operator_safe(package)} "
+                    "that is not one exact, valid version of that package. "
+                    "Nothing was registered."
+                ),
+            )
+
+        spec = f"{resolved.name}@{resolved.resolved_version}"
+        # Pinned in BOTH argv: `install` is what start_install runs, `args` is
+        # what the client manager spawns on every later start. Pinning only one
+        # would approve this version and run `latest`.
+        install_command = ["npx", "-y", spec]
 
         requires_api_key = len(parsed.env_vars) > 0
         # Primary env var used for availability checks and auth_connect prompt
@@ -5547,7 +5916,7 @@ class GatewayTools:
                 "or export them before calling gateway.provision."
             )
 
-        self._discovered_server_configs[server_name] = ServerConfig(
+        server_config = ServerConfig(
             name=server_name,
             description=parsed.description or f"Discovered MCP package: {package}",
             keywords=["mcp", "discovered", server_name, package],
@@ -5558,7 +5927,7 @@ class GatewayTools:
                 "windows": list(install_command),
             },
             command="npx",
-            args=["-y", package],
+            args=["-y", spec],
             requires_api_key=requires_api_key,
             env_var=env_var,
             env_instructions=env_instructions,
@@ -5568,10 +5937,25 @@ class GatewayTools:
                 "registered_discovery_metadata_is_read_only_until_provisioned"
             ],
         )
+        self._discovered_server_configs[server_name] = server_config
+        self._discovered_server_identities[server_name] = resolved
 
         self._record_feedback_event(
             "server_registered",
-            {"server_name": server_name, "package": package},
+            {"server_name": server_name, "package": spec},
+        )
+
+        # Tell the agent now, not at provision time, if an operator must act.
+        preview = evaluate_provision(
+            server_config,
+            resolved,
+            source="discovered",
+            policy=self._policy_manager,
+        )
+        approval_note = (
+            ""
+            if preview.allowed
+            else f" Provisioning will be refused until an operator acts: {preview.remedy}"
         )
 
         return RegisterDiscoveredServerOutput(
@@ -5579,9 +5963,10 @@ class GatewayTools:
             server_name=server_name,
             registered=True,
             message=(
-                f"Registered '{server_name}' (package: {package}). "
-                f"gateway.provision will run: {' '.join(install_command)}. "
-                "Call gateway.provision to install and start it."
+                f"Registered {operator_safe(server_name)} (package: {spec}, "
+                "version resolved from the npm registry). "
+                f"gateway.provision will run: {' '.join(install_command)}."
+                f"{approval_note}"
             ),
             install_command=install_command,
             next_step=f"gateway.provision(server_name='{server_name}')",

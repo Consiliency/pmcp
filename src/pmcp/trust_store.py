@@ -69,37 +69,169 @@ class TrustRecord:
     recorded_at: datetime
 
 
-def _checkout_root() -> Path | None:
-    """Resolved root of the checkout the process is working in, if any."""
+#: The project root the gateway was told to SERVE, or ``None`` when nothing set
+#: it. ``pmcp serve --project X`` binds this once at startup
+#: (``set_active_project_root``); the residency guard then keys on it instead of
+#: walking up from ``Path.cwd()``. It exists because the guard's question --
+#: "does the store resolve inside the checkout being judged?" -- was silently
+#: answered against the *launch directory's* checkout, not the *served* one: a
+#: ``pmcp serve --project <checkout>`` run from any other directory therefore
+#: failed to refuse a store planted inside that checkout, reopening EC-TRUST-5
+#: cwd-dependently (see Consiliency/pmcp#251, #230). A process global, not a
+#: threaded argument, because the guard is reached through ``is_approved`` deep
+#: inside the config loader; the alternative is a signature change to every
+#: public store verb and its ~50 call sites.
+_active_project_root: Path | None = None
+
+
+def set_active_project_root(root: Path | None) -> None:
+    """Bind the residency check to the project the gateway is SERVING.
+
+    ``pmcp serve --project X`` (and ``pmcp status --project X``) calls this once,
+    before any config is loaded, so the checkout-residency guard in
+    ``trust_store_path`` keys on the *served* checkout rather than on wherever
+    the process was launched. A store that resolves inside the served checkout
+    is then refused no matter the launch directory -- closing the cwd-dependent
+    hole.
+
+    Passing ``None`` clears the binding and restores the ``cwd``-derived
+    behaviour, which every non-serving caller relies on: the ``pmcp trust``
+    verbs legitimately run inside a checkout and MUST keep using ``cwd``, and a
+    bare ``pmcp serve`` with no ``--project`` keeps discovering its root from the
+    launch directory exactly as before. The value is resolved eagerly so the
+    guard compares two already-resolved paths.
+    """
+    global _active_project_root
+    _active_project_root = root.resolve() if root is not None else None
+
+
+def _enclosing_checkouts(start: Path) -> Iterator[Path]:
+    """Every checkout at or above ``start``, resolved, nearest first.
+
+    Walks up from ``start`` via ``find_project_root``, then chains
+    ``root.parent`` upward so an intermediate marker -- a subdirectory's own
+    ``.mcp.json`` -- cannot stop the walk short of the real checkout. Terminates
+    when ``find_project_root`` returns ``None`` (its temp/home guards) or at the
+    filesystem root (``parent == enclosing``). Shared by ``_checkout_roots`` (the
+    residency guard's served and cwd arms) and by
+    ``assert_store_outside_path_checkout`` (the approve verb's guard -- the
+    checkout enclosing the path being approved, Consiliency/pmcp#252) so the walk
+    cannot drift between them. ``record`` itself stays unguarded, so a store a
+    repository *ships* can still be planted in tests and shown refused.
+    """
     # Imported here, not at module scope, to break an import cycle introduced
     # when CONSENT landed: pmcp.config.loader now imports pmcp.project_consent,
-    # which imports this module, which needed pmcp.config.loader. At module
-    # scope that made `import pmcp.config.loader` fail outright in a clean
-    # interpreter (the test suite hid it, because conftest imports trust_store
-    # first and the cycle is already resolved by the time loader is reached).
-    # The residency check only needs the project root at call time.
+    # which imports this module. At module scope that made `import
+    # pmcp.config.loader` fail outright in a clean interpreter. The residency
+    # check only needs the project root at call time.
     from pmcp.config.loader import find_project_root
 
-    root = find_project_root(Path.cwd())
-    return root.resolve() if root else None
+    current: Path | None = start
+    while current is not None:
+        enclosing = find_project_root(current)
+        if enclosing is None:
+            return
+        yield enclosing.resolve()
+        parent = enclosing.parent
+        current = parent if parent != enclosing else None
+
+
+def _checkout_roots() -> tuple[Path, ...]:
+    """Resolved checkout roots the store's residency is judged against.
+
+    The store is refused if it resolves inside **any** of these. They are the
+    deduped union of:
+
+    * the project root the gateway was told to SERVE
+      (``set_active_project_root``, bound by ``pmcp serve --project X``), kept
+      *verbatim* -- a store resident in a served directory that lies inside no
+      checkout must still be refused;
+    * every checkout ENCLOSING the served root; and
+    * every checkout ENCLOSING ``Path.cwd()``.
+
+    Both the served root and cwd are walked UP to the enclosing checkout, not
+    judged against the single directory they name. ``find_project_root`` stops at
+    the first marker it sees, and a subdirectory of a checkout normally carries
+    its own ``.mcp.json`` -- the very payload being judged -- so a single lookup
+    would stop at that subdirectory and never reach the real checkout. A store
+    planted in the enclosing checkout would then escape the guard while the
+    repository self-approves ``<repo>/app/.mcp.json`` -- whether the gateway was
+    pointed at the subdirectory with ``serve --project <repo>/app`` (the served
+    arm) or simply launched from inside it with a bare ``pmcp serve`` or a
+    ``pmcp trust`` verb (the cwd arm). Both are EC-TRUST-5 (subdirectory-
+    dependent; Consiliency/pmcp#251, #230); closing one arm and not the other
+    leaves the hole open on the everyday developer cwd, so both arms walk up. The
+    walk chains ``root.parent`` upward, so an intermediate ``.mcp.json`` between
+    the subdirectory and the real checkout cannot hide it.
+
+    The served arm additionally keeps the served root *verbatim* -- its walk
+    starts at the served root's *parent*, because the served root's own
+    ``.mcp.json`` would otherwise stop that walk at the served root, and a
+    project served from outside any checkout has no enclosing checkout yet its
+    own store must still be refused. The cwd arm needs no verbatim entry: a bare
+    working directory that is not itself a checkout is not a "checkout being
+    judged".
+
+    Each source, alone, leaves a hole the others close. Keying only on the served
+    root would reopen the launch-checkout hole -- ``serve --project X`` from
+    inside a second checkout ``Y`` whose committed store resolves into ``Y`` (the
+    dotfiles-symlink shape
+    ``test_a_checkout_resident_store_is_refused_through_a_symlink`` treats as
+    hostile), carrying an approval for ``X/.mcp.json``; keying only on cwd
+    reopens the served-from-elsewhere hole. The union keeps all of them closed,
+    and adding roots is strictly more-refusing: it can never turn a refusal into
+    an acceptance.
+
+    With nothing served bound -- every ``pmcp trust`` verb, and a bare
+    ``pmcp serve`` -- only the cwd walk applies, so ``pmcp trust approve`` run
+    inside a checkout keeps working (its store lives in the operator's home,
+    outside the checkout).
+    """
+    roots: list[Path] = []
+
+    def _add(candidate: Path | None) -> None:
+        if candidate is None:
+            return
+        resolved = candidate.resolve()
+        if resolved not in roots:
+            roots.append(resolved)
+
+    if _active_project_root is not None:
+        # The served root itself is always a boundary (a served dir inside no
+        # checkout must still be refused); then every checkout enclosing it,
+        # walked from the PARENT so the served dir's own `.mcp.json` cannot stop
+        # the walk at the served root.
+        _add(_active_project_root)
+        for enclosing in _enclosing_checkouts(_active_project_root.parent):
+            _add(enclosing)
+
+    # The cwd arm walks up too: cwd may itself be a checkout subdirectory
+    # carrying the payload `.mcp.json`, so a single lookup would stop there and
+    # miss the enclosing checkout (the bare `pmcp serve` and `pmcp trust` verb
+    # case, EC-TRUST-5 cwd-subdirectory).
+    for enclosing in _enclosing_checkouts(Path.cwd()):
+        _add(enclosing)
+    return tuple(roots)
 
 
 def trust_store_path() -> Path:
     """Resolved path of the user-scoped trust store.
 
-    Raises ``TrustStoreError`` if the store would land inside the current
-    checkout -- directly, or through a symlink anywhere in its path. Symlinks
-    are resolved *before* the comparison, which is the only reason a planted
-    ``~/.config/pmcp -> ./vendor`` is caught.
+    Raises ``TrustStoreError`` if the store would land inside a checkout being
+    judged -- the served project root, any checkout enclosing it, and any
+    checkout enclosing the current directory (``_checkout_roots``) -- directly,
+    or through a symlink anywhere in its path.
+    Symlinks are resolved *before* the comparison, which is the only reason a
+    planted ``~/.config/pmcp -> ./vendor`` is caught.
     """
     path = (Path.home() / ".config" / "pmcp" / "trust.json").resolve()
-    checkout = _checkout_root()
-    if checkout is not None and path.is_relative_to(checkout):
-        raise TrustStoreError(
-            f"Trust store {path} resolves inside the checkout at {checkout}. "
-            "A checkout-resident store lets a repository approve its own "
-            "content; move it under a home directory outside the repository."
-        )
+    for checkout in _checkout_roots():
+        if path.is_relative_to(checkout):
+            raise TrustStoreError(
+                f"Trust store {path} resolves inside the checkout at {checkout}. "
+                "A checkout-resident store lets a repository approve its own "
+                "content; move it under a home directory outside the repository."
+            )
     return path
 
 
@@ -324,6 +456,32 @@ def is_approved(path: Path, content: bytes) -> bool:
         return False
     except Exception:  # noqa: BLE001 -- fail closed; see docstring
         return False
+
+
+def assert_store_outside_path_checkout(path: Path) -> None:
+    """Refuse if the store resolves inside a checkout enclosing ``path``.
+
+    ``trust_store_path`` already refuses a store resident in the served root or
+    the cwd checkout, but ``pmcp trust approve`` run from OUTSIDE the approved
+    file's checkout would otherwise write into a store resident in THAT checkout
+    and print "Approved" -- and ``serve --project`` then refuses the same store
+    forever. The approve verb calls this so approve and serve agree
+    (Consiliency/pmcp#252). Raises ``TrustStoreError`` naming the checkout; a
+    store outside every enclosing checkout is left alone. This guards the verb,
+    not ``record`` itself: ``record`` stays a primitive, so a store a repository
+    *ships* (never written through the verb) can still be planted and shown to
+    be refused on the read side.
+    """
+    store = trust_store_path()
+    approved = Path(path).resolve()
+    for checkout in _enclosing_checkouts(approved.parent):
+        if store.is_relative_to(checkout):
+            raise TrustStoreError(
+                f"Trust store {store} resolves inside the checkout at {checkout} "
+                f"that contains {approved}. A checkout-resident store lets a "
+                "repository approve its own content; move it under a home "
+                "directory outside the repository."
+            )
 
 
 def record(path: Path, content: bytes, scope: str, decision: str) -> TrustRecord:

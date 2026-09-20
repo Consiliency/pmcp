@@ -8,6 +8,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`pmcp guidance --feedback-submission on|off`, and the
+  `enable_feedback_submission` key it writes.** This is the only setting that lets
+  PMCP post a feedback issue to GitHub on your behalf, and it is **off by default**.
+  The verb mirrors `pmcp guidance --telemetry on|off`: it writes
+  `guidance.enable_feedback_submission` into `~/.claude/gateway-guidance.yaml` —
+  user-scoped and outside any checkout, so a repository cannot ship its own consent —
+  and `pmcp guidance` now prints `Feedback Submission: ✓/✗` beside the telemetry
+  line. `off` writes an explicit `false` rather than deleting the key, so the file
+  records the decision rather than the absence of one, and a newly generated default
+  config states the key rather than leaving an operator to know the model's default.
+  **`confirm_submission=true` no longer causes a post on its own.** That argument is
+  the *user's* consent to the exact payload; the flag is the *operator's* authority
+  to send it, and an agent cannot set the flag. With the flag off — which is every
+  gateway that has not run the verb — `gateway.submit_feedback` returns the built
+  payload and a browser URL and pmcp sends nothing, which is what it already did for
+  an unconfirmed call. Telemetry still outranks it: `enable_telemetry: false`
+  refuses before the submission flag is consulted, and says so rather than telling
+  you to turn on a switch telemetry would override. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **`gateway.submit_feedback` output gains `submission_outcome`.** Optional, absent
+  (`null`) on every preview and on every refusal made before a request — so no
+  existing field changes and no existing reading of `submitted` breaks. When pmcp did
+  attempt a post it is one of `created`, `refused`, `not_dispatched` or
+  `dispatched_unconfirmed`. The last is the one `submitted: false` cannot express on
+  its own: the request left this machine and no response came back, so **the issue
+  may exist**. On that outcome `issue_url` is a GitHub *search* URL for the title
+  rather than a pre-filled compose URL, and the message says the issue may already
+  be filed — handing back a compose URL after a possible success is how the same
+  issue gets filed twice. `refused` is a real negative: GitHub itself answered, so
+  the compose URL is safe. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **`pmcp trust approve-package|list-packages|revoke-package`, and a `packages:`
+  section in the gateway policy.** These are the two ways an operator opts a
+  discovered package in (see *Security* below). `pmcp trust approve-package
+  <name>@<version>` records an approval for that one package at that one exact
+  version in `~/.config/pmcp/package_approvals.json`, beside the trust store and
+  under the same rules: it must live outside the checkout, it is written mode
+  `0o600`, and any read failure refuses rather than grants. The version must be
+  one exact SemVer version, the one a refusal message prints; a range or a
+  dist-tag such as `latest` is refused, because it names whatever is published
+  next. Approving is offline and consults no registry. `pmcp trust
+  list-packages` prints every record (decision, time, `registry:name@version`,
+  integrity), and `pmcp trust revoke-package <name>` drops every version's
+  approval while `pmcp trust revoke-package <name>@<version>` drops just that
+  one; it exits non-zero if there was nothing to drop. **A version bump is a new
+  package** and needs its own approval.
+  The policy's new `packages:` section takes `allowlist` and `denylist` globs,
+  and they match the package **name only**, never `name@version`, so a package
+  author cannot satisfy `*-mcp` by publishing version `1.0.0-mcp`. A
+  version-bearing entry such as `evil-pkg@1.2.3` would therefore match nothing,
+  so instead of being accepted it makes the policy schema-invalid when it
+  loads, with the same consequence as any other invalid policy file. A
+  `packages.allowlist` match lets a discovered package provision without a
+  recorded approval. A `packages.denylist` match refuses it even when an
+  approval is recorded, and also refuses a manifest-backed server whose npm
+  package it names. A project `.mcp-gateway-policy.yaml` can add a denial
+  but its allowlist never grants on its own. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **`pmcp trust approve|list|revoke`, and a user-scoped trust store at
   `~/.config/pmcp/trust.json`.** The store records one decision per absolute
   path — the file's SHA-256, the scope, the decision and when it was taken —
@@ -42,7 +100,189 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concrete published version. It has no caller in this release either. See
   [#230](https://github.com/Consiliency/pmcp/issues/230).
 
+### Removed
+- **The `gh issue create` fallback in `gateway.submit_feedback` is gone.** When the
+  gateway had no API token it used to shell out to `gh issue create --repo …` if the
+  `gh` CLI was on `PATH`. **If you relied on that, submission through pmcp now stops
+  working for you** and the call returns a preview with a browser URL instead: it
+  names `PMCP_FEEDBACK_TOKEN` and the `pmcp guidance --feedback-submission on` verb,
+  and the URL still files the issue by hand. The path was removed rather than gated
+  because `gh` authenticates from whatever the inherited environment and `gh`'s own
+  stored credentials provide, so pmcp could not say — and could not tell you —
+  which identity posted. The handler's last `asyncio.create_subprocess_exec` and the
+  file's last `shutil` use went with it: this path now spawns nothing. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **`GITHUB_TOKEN` and `GH_TOKEN` are no longer read anywhere on the feedback
+  path.** Previously an ambient `GITHUB_TOKEN` was accepted as the posting
+  credential, so an agent that asked to submit could publish under an operator's
+  personal GitHub identity — one that generally carries far more authority than
+  filing an issue. **Only `PMCP_FEEDBACK_TOKEN` is honoured now**, and an operator
+  who was posting on an ambient token must export that variable instead (a
+  fine-grained token with issue-write on one repository is enough). With no such
+  token the call previews and names the variable; it does not fall back to anything.
+  `GITHUB_TOKEN` still appears in `gateway.register_discovered_server`'s schema
+  example for a downstream server's own credentials, which is unrelated and
+  unchanged. See [#230](https://github.com/Consiliency/pmcp/issues/230).
+
 ### Security
+- **Bumped `anyio` 4.12.0 → 4.14.2** to clear advisories `GHSA-82r6-8w77-94w6` and `GHSA-5p39-cfhj-2xmp`. Lockfile-only; the D-01 `pip-audit --strict` gate is green again.
+- **`SECURITY.md` now states the v13 trust boundary, and every claim in it is
+  bound to a test that proves it.** A new *The v13 trust boundary* section
+  describes the implemented model as 25 guarantees and 12 labelled limitations,
+  each carrying a machine-checkable citation to the test(s) that prove it, inside
+  a delimited claim region and ledger. `scripts/check_security_claims.py` (run by
+  the normal CI suite) fails the build if a sentence in that region makes a claim
+  no ledger row cites, if a cited test does not exist or would not be discovered
+  by `pytest tests/`, or if any of the v13 evidence files ships uncited — so the
+  document cannot drift from the code without turning CI red. The
+  vulnerability-report address in that file now points at **this project's own**
+  GitHub security advisories (`Consiliency/pmcp`) rather than the old
+  repository's. See [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **An install spawn now strips PMCP-managed credentials using the project root
+  the gateway was given, not the directory it happens to be running in.** When a
+  gateway started with `pmcp serve --project X` ran from a different working
+  directory, the install child's environment was sanitized by walking up from the
+  *working directory* to find the project credential store, while the credential
+  was written from the gateway's own root `X` — so a project-scoped credential in
+  `X/.env.pmcp` was **not** stripped and the install child (`npx -y …`) inherited
+  another server's secret. The strip now resolves the store from the gateway's
+  project root, matching where the credential was written; a gateway with no
+  `--project`, or run from its project root, is unchanged. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **A checkout can no longer redirect the gateway's manifest, config or policy by
+  planting `PMCP_MANIFEST_PATH`, `PMCP_CONFIG` or `PMCP_POLICY` in a `.env`
+  file.** These three variables choose a manifest overlay, an explicit config, or
+  an explicit policy, and were honoured unconditionally on the assumption that a
+  set variable meant the operator had exported it. But `pmcp` loads `.env` and
+  `.env.pmcp` on the operator's behalf before argument parsing, so a repository
+  could set any of the three through its own checked-in dotenv file and choose the
+  gateway's manifest, config or policy with no consent gate — the S-03 and S-11
+  boundaries through a back door. Each variable is now honoured only when
+  provenance shows the operator exported it into their own shell; a value a
+  project `.env`/`.env.pmcp` introduced is ignored exactly as if unset, at both
+  the startup and runtime doors, and the skip is logged operator-safe naming the
+  variable and path. A value the operator genuinely exported still applies. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230), #250.
+- **The trust store's checkout-residency guard now keys on the project the
+  gateway serves, not only the directory it was launched from.** A trust store
+  that resolves inside a checkout is refused, because a repository must not ship
+  its own approval record — but the guard discovered the checkout by walking up
+  from `Path.cwd()`, so `pmcp serve --project <checkout>` launched from any other
+  directory did not refuse a store planted inside that served checkout, and it
+  would load that checkout's self-approved `.mcp.json`. The guard now judges
+  residency against the served project root **and** the launch checkout (adding
+  the served root, never replacing the cwd walk, so a store resident in a second
+  checkout the operator launches from stays refused too). `pmcp status --project`
+  gets the same binding; the `pmcp trust` verbs and a bare `pmcp serve` keep
+  their previous cwd-derived behaviour. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230), #251.
+- **`gateway.submit_feedback` will not post under a credential or to a destination
+  that PMCP itself introduced.** Every submission is now decided by one
+  fail-closed gate (`src/pmcp/feedback_egress.py`) before any network call, and the
+  gate refuses `PMCP_FEEDBACK_TOKEN` unless it can establish that *you* put it in
+  the environment. A token PMCP wrote itself is refused: `gateway.auth_connect`
+  stores credentials and exports them into the gateway's own environment, and
+  `PMCP_FEEDBACK_TOKEN` is credential-shaped, so an agent could otherwise have
+  stored one through that tool and had pmcp post with it. So is a token a `.env` in
+  the current checkout supplied, and so is one PMCP loaded at startup from its own
+  credential stores — recorded as PMCP-introduced when the load happens, because
+  store membership alone can be erased afterwards by an unrelated
+  `auth_connect`. **Export the value in the shell that starts pmcp**; the refusal
+  names both store paths (`~/.config/pmcp/pmcp.env` and the project `.env.pmcp`) and
+  says so. The check is deliberately over-strict in one direction: if you export the
+  variable *and* the same key sits in a PMCP store, the two cannot be told apart
+  afterwards and the call is refused, with a remedy naming both fixes.
+  The destination is decided the same way and decided **first**, so no unvalidated
+  repository reaches any output — a refusal included, and the browser URL the agent
+  is told to open included. `PMCP_FEEDBACK_REPO` still overrides the default, but an
+  override that a checkout's `.env` introduced is refused, as is one that is not
+  `owner/repo` shaped, and the refusal renders the offending value inert rather than
+  echoing it. A refusal that cannot establish authority or destination returns no
+  payload and no URL at all. Any error while consulting the provenance records
+  denies rather than raising, so a failed lookup can never read as permission. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **A discovered server no longer runs an agent-chosen package without an
+  operator's approval, and its registration is pinned to one resolved version.**
+  Before this release, `gateway.register_discovered_server` stored whatever
+  `package` the agent named, unpinned, and policy checked only the *server
+  name*. Allowlisting `internal-approved-tool` therefore let an agent register
+  that name with `package="totally-arbitrary-evil-package"` and have
+  `gateway.provision` run `npx -y totally-arbitrary-evil-package` (S-01).
+  Registration now looks the package up in the npm registry first, in a worker
+  thread under a 20-second bound, and writes the resolved `name@version` into
+  **both** the install command and the server's `args`, so every later start
+  runs the version that was resolved rather than re-resolving `latest`. A
+  package that does not resolve to exactly one valid version, or whose lookup
+  times out, is refused at registration and nothing is stored.
+  **Discovered servers are now default-deny.** `gateway.provision`,
+  `gateway.connect_server` and `gateway.restart_server` refuse a discovered
+  server until its exact `name@version` is approved with
+  `pmcp trust approve-package <name>@<version>` or matched by a
+  `packages.allowlist` entry in the operator's policy. A `packages.denylist`
+  match beats both. The refusal names the package and prints the runnable
+  approval command, and the registration response warns up front when
+  provisioning will be refused. `provision` checks this **before** it asks for
+  the server's credential, so an agent is never prompted for a secret for a
+  package that will be refused. The lifecycle tools are gated as well as
+  `provision` because `npx -y` fetches and runs the package when it spawns, so
+  without the gate `register` followed by `connect_server` would run the package
+  without `provision` ever being called. `gateway.disconnect_server` is not
+  gated, so an already running server can still be stopped.
+  **`gateway.update_server` now refuses every discovered server**, approved or
+  not: an approval covers one exact version, and an update would fetch another.
+  To move a discovered server to a newer version, call
+  `gateway.register_discovered_server` again with the same name and package
+  (which resolves and pins the current version), approve that version, then
+  connect it.
+  A refusal reports `auth_state="policy_denied"` only when a
+  `packages.denylist` entry matched. Every other refusal from this gate (not
+  approved, unresolvable identity, or argv not pinned to the approved version)
+  reports `auth_state="unknown"`, because no policy denied it.
+  **Manifest-backed and `.mcp.json` servers need no approval**, and provision,
+  connect, restart and update exactly as before, **with one exception: a
+  `packages.denylist` entry now refuses a manifest-backed server whose npm
+  package it names** (the entry's `package` field, or a package its `npx`
+  command or install command runs: the package argument, or any package chosen
+  with `-p`, `--package` or `--package=`; after such a selector the next
+  argument is the command npx runs, not a package). Such a server is refused by
+  `provision`, `connect_server`, `restart_server` and `update_server`, with the
+  same `policy_denied` refusal. **While any `packages.denylist` is in force,
+  a manifest entry whose npx packages cannot be determined is refused the same
+  way**: one with an npx option pmcp cannot interpret (such as `--registry` or
+  `-c`), a selector with no value, or a selected package that is not a plain
+  npm spec (such as `github:owner/repo` or `./dir`). The refusal message names
+  the argument. Without a denylist those entries behave as before, and no
+  shipped manifest entry is affected. If evaluating the package policy raises
+  an error, those four tools now refuse a manifest server instead of
+  proceeding. `.mcp.json` servers are not checked against the package lists. There is nothing to
+  migrate: discovered registrations are held in memory only and never survived
+  a gateway restart, so the first provision of a discovered server after
+  upgrading is refused with the command that approves it. Found by the
+  2026-09-01 codebase review (S-01); see
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **A discovered server may now declare only credential-shaped environment
+  variable names.** `gateway.register_discovered_server` refuses, before it
+  contacts the registry, any `env_vars` entry that is not credential-shaped (it
+  must end in `_TOKEN`, `_KEY`, `_SECRET`, `_SECRETS`, `_PASSWORD`,
+  `_CREDENTIAL`, `_CREDENTIALS`, `_PAT`, `_DSN` or `_AUTH`), any name that
+  influences how code loads (`LD_PRELOAD`, `NODE_OPTIONS`, `PATH`, `PYTHON*`
+  and the rest of the existing list), and any name starting with `NPM_CONFIG_`,
+  `NODE_`, `COREPACK_`, `YARN_`, `PNPM_` or `BUN_` in any letter case, even when
+  it is credential-shaped (`NPM_CONFIG__AUTH`, `NODE_AUTH_TOKEN`).
+  `gateway.auth_connect` applies the same rule to a discovered server, both to
+  the name it declared and to an explicit `env_var` override. Before this, an
+  agent could register a package the operator had **already approved** under a
+  new server name with `env_vars=["npm_config_registry"]`, store an attacker's
+  registry URL through `auth_connect`, and have the pinned `npx -y name@version`
+  spawn receive it. npx then fetched that version from the attacker's registry:
+  the approved name and version, but different bytes. The stored value also
+  landed in the gateway's own environment. The old check was a blocklist, and
+  a blocklist cannot work here, because the declared name is chosen by the
+  agent. **Manifest-backed servers keep the previous rule**, so a shipped server
+  that declares a non-credential name such as `POSTGRES_URL` works as before. A
+  server that needs any other kind of variable should be configured in
+  `.mcp.json` rather than registered. Found by the PKGID phase review; see
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **A repository's own configuration files no longer configure PMCP until you
   approve them, and an approved project policy can only *narrow* the operator's
   policy.** The behaviour an existing operator will feel first is the policy one.
@@ -70,10 +310,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `allowPrivateRegistry` — all of which now pass through one choke point rather
   than gating themselves.
   **User-scoped and explicitly-configured sources are unaffected.** `~/.mcp.json`,
-  `~/.claude/.mcp.json`, `~/.claude/gateway-policy.yaml`, `$PMCP_MANIFEST_PATH`,
-  an explicit `--config` path and an explicit `--policy` path all apply with no
-  trust record at all, and an operator with no project files in their checkout
-  sees byte-identical behaviour to before. Approving nothing changes nothing for
+  `~/.claude/.mcp.json`, `~/.claude/gateway-policy.yaml`, an explicit `--config`
+  path and an explicit `--policy` path all apply with no trust record at all,
+  and an operator with no project files in their checkout sees byte-identical
+  behaviour to before. (The `$PMCP_MANIFEST_PATH`, `$PMCP_CONFIG` and
+  `$PMCP_POLICY` **environment** forms are unconditional only when the operator
+  exported them; a value a checkout's `.env`/`.env.pmcp` planted is now refused —
+  see the trust-boundary entries above.) Approving nothing changes nothing for
   them.
   Approval is over **bytes, not paths**: editing a file you approved revokes the
   approval by itself, with no `pmcp trust revoke` to remember. Each source is read
@@ -124,6 +367,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+- **The credential store is written atomically** (temp file → `fsync` → `os.replace`), so an interrupted `write_env_file` no longer truncates the file and loses its other entries. See [#248](https://github.com/Consiliency/pmcp/issues/248).
+- **The npm version-check User-Agent now names `github.com/Consiliency/pmcp`** instead of the pre-rename `ViperJuice/pmcp`. See [#247](https://github.com/Consiliency/pmcp/issues/247).
+- **The default feedback repository was `ViperJuice/pmcp`, a repository this
+  project does not own.** Every unconfigured gateway that submitted feedback — or
+  merely previewed it — named that repository in its output and in the browser URL
+  it handed the agent to open. The packaged default is now
+  `Consiliency/pmcp`, the project's real remote, asserted in the tests against the
+  distribution's own `Project-URL: Repository` metadata rather than against a
+  duplicated literal, so the same drift cannot recur silently. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
+- **A feedback submission no longer blocks the gateway's event loop, and it is
+  bounded.** Both HTTP calls used to run inline inside the async handler, so for as
+  long as they took — up to 15 s of socket timeouts, and unbounded in the worst case
+  — the gateway served no other downstream call. The submission now runs in a worker
+  thread under a 20 s end-to-end bound, with per-phase budgets that sum below it so
+  nothing is started that cannot finish inside it. A per-socket timeout is not a
+  request bound — it restarts on every read, so a peer trickling one byte at a time
+  holds a call open forever — which is why the bound is on the act and not only on
+  the answer: the worker asks for permission to send as the last step before it
+  opens the socket, and once the handler has given up that permission is refused, so
+  an operator is never told nothing was sent by a gateway that then sends. The
+  repository-visibility probe now runs *after* a created issue instead of before the
+  post, and a preview no longer claims `repository_visibility: "public"` on a path
+  that made no request; it reports `"unknown"`, which is what it knows. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **Starting pmcp from inside your home directory no longer asks you to approve
   your own `~/.pmcp/manifest.yaml`.** The project overlay search walks up from the
   working directory, and from any subdirectory of `$HOME` with no closer overlay it
@@ -164,6 +432,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Changed
+- **`pmcp trust approve` now refuses a store resident in the checkout containing the file being approved**, matching what `serve --project` enforces — so approve no longer reports success for an approval that serve will then refuse. See [#252](https://github.com/Consiliency/pmcp/issues/252).
+- **Every install spawn now logs the command it runs, at WARNING, before it
+  runs.** `start_install`, the legacy `install_server` and `verify_installation`
+  each log a rendered command line immediately before the subprocess is
+  created, and still log it if the spawn then fails (for example
+  `FileNotFoundError`). Two other spawns that fetch and run a package log the
+  same way: starting a stdio server whose command is a package runner (`npx`,
+  `uvx`, `pnpx` or `bunx`, recognised under Windows and POSIX spellings alike:
+  any directory, either path separator, a drive prefix, any letter case and one
+  `.exe`, `.cmd` or `.bat` suffix; any other command logs no warning), and every
+  `gateway.update_server` probe. Previously `start_install` logged
+  `<args redacted>` at INFO, which hid exactly which package ran, and
+  `install_server` logged the full argv verbatim at INFO, including any
+  credential it carried.
+  The rendering is secret-safe by construction rather than by guessing what a
+  secret looks like. It shows the executable, the flag literals `-y`, `--yes` and
+  `--quiet` wherever they appear, `--registry` by name (never its value, which
+  can carry `user:password@`), and the package argument only when it is a pinned
+  `name@version`. Every other argument is `<redacted>`. The package argument is
+  found by its position, not by its shape, because a bare token is
+  indistinguishable from a package name. **Expect `<redacted>` in the package
+  position for manifest installs**: the shipped manifest's install commands are
+  not pinned to exact versions (for example `@playwright/mcp@latest`), so only
+  a pinned discovered server's spawn shows its package. See
+  [#230](https://github.com/Consiliency/pmcp/issues/230).
 - **Every GitHub Action is pinned to a commit SHA.** All 30 remote `uses:`
   references — 29 across the five workflows and the one inside the local
   composite action `.github/actions/pipeline-bootstrap-setup` — now read

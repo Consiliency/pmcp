@@ -219,8 +219,19 @@ audience so the proxied `Host` is accepted.
 
 - PMCP binds to `127.0.0.1` by default — not safe to expose publicly without
   `PMCP_AUTH_TOKEN`.
-- Config files (`.mcp.json`) are trusted inputs — treat them like code; do not load untrusted configs.
-- Secrets in `.env` files are passed to child MCP server processes; protect the `.env` file with filesystem permissions.
+- User-scoped and explicitly configured sources (`~/.mcp.json`, an explicit
+  `--config`, an explicit `--policy`) are trusted inputs — treat them like code.
+  A project-scoped `.mcp.json`, `.pmcp/manifest.yaml` or
+  `.mcp-gateway-policy.yaml` checked into a repository is **not** trusted until
+  you approve it with `pmcp trust approve <absolute path>`; until then it is
+  ignored, and approval is keyed to the file's exact bytes, so editing an
+  approved file revokes the approval. See the *v13 trust boundary* section of
+  [`SECURITY.md`](SECURITY.md) for the full model.
+- Secrets you export in the shell that starts PMCP are inherited by child MCP
+  server processes; protect them accordingly. Keys that PMCP itself loads from a
+  project `.env` or `.env.pmcp` are **not** propagated to spawned servers — only
+  a server's own declared credential is — so a repository's `.env` cannot bleed
+  into every downstream server.
 
 **Production background service (Linux systemd):**
 
@@ -411,7 +422,7 @@ compliance matrix and next-revision tracking checklist.
 | `gateway.submit_feedback` | Preview/submit technical PMCP feedback issues to GitHub |
 | `gateway.provision_status` | Check installation progress |
 | `gateway.search_registry` | Search the cached public MCP Registry metadata for external servers |
-| `gateway.register_discovered_server` | Register a registry result for provisioning |
+| `gateway.register_discovered_server` | Register a registry result for provisioning, pinned to its resolved npm version; provisioning needs operator approval (see [Discovered packages](#discovered-packages-need-an-operators-approval)) |
 
 ### Monitoring Tools
 
@@ -523,6 +534,39 @@ Freezing the ambient environment across an update is deliberately not done
 - PMCP can emit failure feedback hints and generate GitHub issue payload previews for agents.
 - Telemetry is technical-only and warns before submission; payloads include PMCP/tool context.
 - Disable permanently with `pmcp guidance --telemetry off`.
+
+**Preview is the default; posting is opt-in.** `gateway.submit_feedback` builds the
+exact issue payload and a browser URL an operator can open. PMCP posts nothing
+itself unless *both* of the following are true, and it never spawns `gh`:
+
+1. **The operator has allowed it.** `pmcp guidance --feedback-submission on` sets
+   `guidance.enable_feedback_submission: true` in `~/.claude/gateway-guidance.yaml`.
+   It is off by default, `pmcp guidance --feedback-submission off` turns it back
+   off, and `pmcp guidance` shows the current value. `enable_telemetry: false`
+   overrides it: with telemetry off nothing is built or sent at all.
+   An agent's `confirm_submission=true` is the *user's* consent to the payload, not
+   the operator's authority to send it, and is not by itself enough to post.
+2. **The operator has exported a token.** `PMCP_FEEDBACK_TOKEN` — a dedicated
+   GitHub token with permission to open an issue on the destination repository.
+   `GITHUB_TOKEN` and `GH_TOKEN` are not read on this path.
+
+**The token must be exported in the shell that starts pmcp.** PMCP refuses a
+`PMCP_FEEDBACK_TOKEN` it introduced into its own environment: one stored through
+`gateway.auth_connect`, one loaded at startup from PMCP's own credential stores
+(`~/.config/pmcp/pmcp.env`, the project `.env.pmcp`), or one a `.env` in the current
+checkout supplied. The credential that authorises an outbound post has to come from
+you, not from something the agent or the repository could have written.
+
+**The destination is validated.** The default is `Consiliency/pmcp`, this project's
+repository. `PMCP_FEEDBACK_REPO` overrides it, under the same rule: an override a
+checkout's `.env` introduced is refused, so is one that is not `owner/repo` shaped,
+and a refused destination is never rendered into a URL you are handed to open.
+
+Refusals are loud rather than silent. Each one says what to do — the exact
+`pmcp guidance` command, or the variable to export — and the ones that can still be
+acted on by hand return the payload and a browser URL. If PMCP sent a request and
+never saw the response, it says so (`submission_outcome: "dispatched_unconfirmed"`)
+and hands back a *search* URL, because the issue may already exist.
 
 ## Progressive Disclosure Workflow
 
@@ -966,6 +1010,9 @@ guidance:
     code_hints: true         # L1 hints
     code_snippets: false     # L2 examples (default: off)
     methodology_resource: true  # L3 guide
+
+  enable_telemetry: true            # failure feedback hints and issue previews
+  enable_feedback_submission: false # let PMCP POST feedback to GitHub (default: off)
 ```
 
 **Levels**:
@@ -976,9 +1023,15 @@ guidance:
 ### View Guidance Status
 
 ```bash
-pmcp guidance                 # Show configuration
-pmcp guidance --show-budget  # Show token estimates
+pmcp guidance                              # Show configuration
+pmcp guidance --show-budget                # Show token estimates
+pmcp guidance --telemetry on|off           # Feedback telemetry
+pmcp guidance --feedback-submission on|off # Let PMCP post feedback (default: off)
 ```
+
+`pmcp guidance` prints both switches, and each `--` form above persists the
+decision to `~/.claude/gateway-guidance.yaml` before printing the new state. See
+[Feedback Telemetry](#feedback-telemetry) for what submission requires.
 
 ### Token Budget
 
@@ -1335,6 +1388,12 @@ tools:
     - "*::delete_*"
     - "*::drop_*"
 
+packages:  # npm packages; globs match the package NAME only
+  allowlist:
+    - "@acme/*"  # Discovered servers provision without a per-version approval
+  denylist:
+    - "*-evil-*"  # Refused even when approved, manifest-backed servers included
+
 limits:
   max_tools_per_server: 100
   max_output_bytes: 50000
@@ -1366,6 +1425,75 @@ document whose root is valid JSON but not an object (`[]`, `42`, `null`) is
 likewise fatal, but an **empty `.json` file is not valid JSON at all**, so it
 takes the warn-and-continue path. If you are testing this behaviour, use an empty
 `.yaml` file to see the refusal.
+
+#### Discovered packages need an operator's approval
+
+A server registered with `gateway.register_discovered_server` runs an npm
+package an agent chose, so it does not start until an operator opts that package
+in. Registration resolves the package in the npm registry and pins the resolved
+version into the server's install command and its `args` (`npx -y
+name@version`); a package that does not resolve to one exact version is refused
+at registration. After that, `gateway.provision`, `gateway.connect_server` and
+`gateway.restart_server` refuse the server until one of these holds:
+
+- **The exact version is approved.** The refusal message prints the command to
+  run, for example:
+
+  ```bash
+  pmcp trust approve-package @acme/example-server@1.4.2
+  ```
+
+  Then provision again. The approval covers that one version: a registration that
+  resolves to a newer version needs a new approval.
+- **The operator's policy allowlists the package name** under
+  `packages.allowlist`, as in the example above.
+
+A `packages.denylist` match refuses the package in every case, including when an
+approval is recorded; such a refusal reports `auth_state="policy_denied"`, and
+every other package refusal reports `auth_state="unknown"`. Package globs match the
+name alone. A version-bearing entry such as `pkg@1.2.3` is rejected when the
+policy loads, because it could never match. A project `.mcp-gateway-policy.yaml`
+can deny a package but cannot allow one the operator's policy does not.
+
+`gateway.update_server` never updates a discovered server, approved or not. To move
+one to a newer version, call `gateway.register_discovered_server` again with the
+same `server_name` and `package`, approve the version it resolves, then connect it.
+
+A discovered server may declare, in `env_vars` or through `gateway.auth_connect`,
+only credential-shaped variable names: names ending in `_TOKEN`, `_KEY`, `_SECRET`,
+`_SECRETS`, `_PASSWORD`, `_CREDENTIAL`, `_CREDENTIALS`, `_PAT`, `_DSN` or `_AUTH`.
+Names that start with `NPM_CONFIG_`, `NODE_`, `COREPACK_`, `YARN_`, `PNPM_` or
+`BUN_` (in any case) and names that affect code loading are refused even when
+credential-shaped, because they change what `npx` fetches or how it runs. Configure
+a server that needs any other variable in `.mcp.json` instead.
+
+Manifest-backed and `.mcp.json` servers need no approval and keep their env var
+rules. The one exception is the denylist: a `packages.denylist` entry also refuses
+a **manifest-backed** server whose npm package it names (its `package` field, or a
+package its `npx` command or install command runs, including one chosen with `-p` or
+`--package`), at `gateway.provision`,
+`gateway.connect_server`, `gateway.restart_server` and `gateway.update_server`.
+While any `packages.denylist` is in force, a manifest entry whose npx packages pmcp
+cannot determine (an unrecognised npx option such as `--registry` or `-c`, or a
+package selected as `github:owner/repo` or `./dir`) is refused too, and the refusal
+names the argument; without a denylist it starts as before. `.mcp.json` servers
+are not checked against the package lists.
+
+Approvals live in `~/.config/pmcp/package_approvals.json`, beside the trust
+store. Review and remove them with:
+
+```bash
+pmcp trust list-packages
+pmcp trust revoke-package @acme/example-server@1.4.2  # one version
+pmcp trust revoke-package @acme/example-server        # every version
+```
+
+Every install spawn logs its command at WARNING before it runs. That includes
+starting a stdio server whose command is `npx`, `uvx`, `pnpx` or `bunx`, in any
+Windows or POSIX spelling (such as `C:\tools\npx.cmd` or `UVX.EXE`), and every `gateway.update_server` probe. Arguments are redacted except
+the executable, the flags `-y`, `--yes` and `--quiet`, `--registry` (its name, not
+its value) and a pinned `name@version`, so an operator can see which package ran
+without a credential reaching the log.
 
 #### Scoped advisor research
 
@@ -1486,6 +1614,14 @@ pmcp doctor --project /path/to/project
 # Manage project/user secrets
 pmcp secrets set API_TOKEN my-token --scope user
 pmcp secrets sync --from-scope user --to-scope project --overwrite
+
+# Approve, list and revoke trust decisions
+pmcp trust approve /abs/path/to/project/.mcp.json   # a project config file's current bytes
+pmcp trust list
+pmcp trust revoke /abs/path/to/project/.mcp.json
+pmcp trust approve-package @acme/example-server@1.4.2  # a discovered package, one exact version
+pmcp trust list-packages
+pmcp trust revoke-package @acme/example-server         # every version, or name@version for one
 ```
 
 ### `pmcp doctor` (Recommended before/after upgrades)
@@ -1567,7 +1703,7 @@ docker-compose up -d
 
 ```bash
 # Clone the repo
-git clone https://github.com/ViperJuice/pmcp
+git clone https://github.com/Consiliency/pmcp
 cd pmcp
 
 # Install with uv (recommended)

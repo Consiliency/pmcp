@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 # Cache for version lookups (avoid repeated network calls)
 _version_cache: dict[str, str] = {}
 
-_USER_AGENT = f"pmcp/{__version__} (github.com/ViperJuice/pmcp)"
+_USER_AGENT = f"pmcp/{__version__} (github.com/Consiliency/pmcp)"
 
 
 def _strip_npm_tag(package: str) -> str:

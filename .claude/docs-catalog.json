@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "last_updated": "2026-09-11T22:09:34+00:00",
+  "last_updated": "2026-09-17T00:00:00+00:00",
   "files": {
     "README.md": {
       "purpose": "root project README",
@@ -8,7 +8,10 @@
         "P5",
         "P2",
         "P3B",
-        "UPDPATH"
+        "UPDPATH",
+        "PKGID",
+        "EGRESS",
+        "SEAL"
       ]
     },
     "CHANGELOG.md": {
@@ -20,7 +23,10 @@
         "P3B",
         "UPDPATH",
         "TRUST",
-        "CONSENT"
+        "CONSENT",
+        "PKGID",
+        "EGRESS",
+        "SEAL"
       ]
     },
     "CONTRIBUTING.md": {
@@ -35,7 +41,8 @@
       "touched_by_phases": [
         "P5",
         "P2",
-        "P3B"
+        "P3B",
+        "SEAL"
       ]
     },
     "SPEC_COMPLIANCE.md": {
@@ -82,7 +89,10 @@
       "purpose": "multi-phase roadmap spec",
       "touched_by_phases": [
         "TRUST",
-        "CONSENT"
+        "CONSENT",
+        "PKGID",
+        "EGRESS",
+        "SEAL"
       ]
     },
     "specs/phase-plans-v2.md": {
@@ -224,17 +234,29 @@
     "plans/phase-plan-v13-CONSENT.md": {
       "purpose": "per-phase lane plan",
       "touched_by_phases": [
-        "CONSENT"
+        "CONSENT",
+        "SEAL"
+      ]
+    },
+    "plans/phase-plan-v13-EGRESS.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": [
+        "EGRESS",
+        "SEAL"
       ]
     },
     "plans/phase-plan-v13-PKGID.md": {
       "purpose": "per-phase lane plan",
-      "touched_by_phases": []
+      "touched_by_phases": [
+        "PKGID",
+        "SEAL"
+      ]
     },
     "plans/phase-plan-v13-TRUST.md": {
       "purpose": "per-phase lane plan",
       "touched_by_phases": [
-        "TRUST"
+        "TRUST",
+        "SEAL"
       ]
     },
     "plans/phase-plan-v2-lifecycle.md": {
@@ -400,6 +422,12 @@
     "plans/v7-issue-tracker.md": {
       "purpose": "markdown document",
       "touched_by_phases": []
+    },
+    "plans/phase-plan-v13-SEAL.md": {
+      "purpose": "per-phase lane plan",
+      "touched_by_phases": [
+        "SEAL"
+      ]
     }
   }
 }

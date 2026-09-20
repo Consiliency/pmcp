@@ -703,6 +703,31 @@
       "updated_at": "2026-06-25T02:28:14Z"
     },
     {
+      "acceptance_criteria_count": 7,
+      "created_at": "2026-09-19T05:43:13.972715+00:00",
+      "file": ".consiliency/plans/detailed-reapprove-mcp-json-on-startup-rewrite-20260919-0539.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-19T05:43:13.972715+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {},
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": "~/.codex/skills/codex/reflections/claude-plan-detailed/6ae74a2dc523/plan-253-reapprove-detailed/20260919-0539.md",
+      "roadmap_ref": null,
+      "slug": "reapprove-mcp-json-on-startup-rewrite",
+      "status": "committed",
+      "task_summary": "Re-record the operator's trust approval when set_startup_policy rewrites .mcp.json (#253)",
+      "type": "detailed",
+      "updated_at": "2026-09-19T05:43:13.972715+00:00"
+    },
+    {
       "acceptance_criteria_count": null,
       "created_at": "2026-08-05T23:41:05Z",
       "file": "plans/phase-plan-v11-P5.md",

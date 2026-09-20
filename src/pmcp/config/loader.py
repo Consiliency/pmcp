@@ -35,6 +35,35 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _env_pmcp_config_path() -> str | None:
+    """``$PMCP_CONFIG`` as a custom config path -- only when the operator exported it.
+
+    ``PMCP_CONFIG`` names an extra, highest-precedence config source that four
+    readers in this module consult. Honouring it unconditionally lets a checkout
+    choose the gateway's config through a dotenv file pmcp loads on the operator's
+    behalf -- ``cli.load_startup_env`` reads ``.env`` and ``.env.pmcp`` before arg
+    parsing (S-11). Return the value only when provenance says the operator
+    supplied it; a checkout-sourced value is ignored exactly as if unset, and the
+    refusal is logged operator-safe, naming the variable and the path.
+
+    ``env_store`` is imported inside this function because it imports this module,
+    so a top-level import would close a cycle.
+    """
+    env_path = os.environ.get("PMCP_CONFIG")
+    if not env_path:
+        return None
+    from pmcp.env_store import (
+        describe_ignored_trust_env_var,
+        env_key_is_operator_supplied,
+    )
+
+    if env_key_is_operator_supplied("PMCP_CONFIG"):
+        return env_path
+    logger.warning(describe_ignored_trust_env_var("PMCP_CONFIG", env_path))
+    return None
+
+
 # Documents the default user config locations. Do NOT read this frozen list at
 # runtime — it captures Path.home() at import time, so a changed/monkeypatched
 # HOME (e.g. in tests, or a re-homed process) would be ignored. Use
@@ -309,7 +338,7 @@ def _iter_config_source_paths(
 
     resolved_custom_path = custom_config_path
     if not resolved_custom_path:
-        env_path = os.environ.get("PMCP_CONFIG")
+        env_path = _env_pmcp_config_path()
         if env_path:
             resolved_custom_path = Path(env_path)
     if resolved_custom_path:
@@ -1003,7 +1032,7 @@ def load_configs(
     # 3. Load custom config (if specified via env or option)
     resolved_custom_path = custom_config_path
     if not resolved_custom_path:
-        env_path = os.environ.get("PMCP_CONFIG")
+        env_path = _env_pmcp_config_path()
         if env_path:
             resolved_custom_path = Path(env_path)
 
@@ -1062,7 +1091,7 @@ def load_disabled_auto_start(
     # Check custom config
     resolved_custom_path = custom_config_path
     if not resolved_custom_path:
-        env_path = os.environ.get("PMCP_CONFIG")
+        env_path = _env_pmcp_config_path()
         if env_path:
             resolved_custom_path = Path(env_path)
 
@@ -1109,7 +1138,7 @@ def load_enabled_auto_start(
     # Check custom config
     resolved_custom_path = custom_config_path
     if not resolved_custom_path:
-        env_path = os.environ.get("PMCP_CONFIG")
+        env_path = _env_pmcp_config_path()
         if env_path:
             resolved_custom_path = Path(env_path)
 

@@ -16,6 +16,8 @@ import pytest
 from pmcp.env_store import read_env_file
 from pmcp.manifest.environment import CLIInfo
 from pmcp.manifest.loader import CLIAlternative, Manifest, ServerConfig
+from pmcp.manifest.package_identity import NPM_REGISTRY, PackageIdentity
+from pmcp.package_approvals import approve_package
 from pmcp.manifest.registry import (
     RegistryCache,
     RegistryPackage,
@@ -2063,14 +2065,23 @@ class TestServerLifecycleTools:
     async def test_connect_server_uses_registered_discovered_server(
         self, gateway_tools: GatewayTools
     ) -> None:
+        # A discovered server only starts pinned to an approved identity (#230).
+        identity = PackageIdentity(
+            registry=NPM_REGISTRY,
+            name="discovered-pkg",
+            resolved_version="1.0.0",
+            integrity=None,
+        )
         gateway_tools._discovered_server_configs["discovered"] = ServerConfig(
             name="discovered",
             description="Discovered",
             keywords=["discovered"],
             install={},
-            command="discovered-cmd",
-            args=[],
+            command="npx",
+            args=["-y", "discovered-pkg@1.0.0"],
         )
+        gateway_tools._discovered_server_identities["discovered"] = identity
+        approve_package(identity)
 
         result = await gateway_tools.connect_server({"server_name": "discovered"})
 
@@ -4301,25 +4312,37 @@ class TestCapabilityAndProvision:
         monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
         monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
 
+        # A discovered server only provisions pinned to an approved identity
+        # (#230).
+        pinned = ["npx", "-y", "@acme/openbrowser-mcp@1.0.0"]
         gateway_tools._discovered_server_configs["@acme/openbrowser-mcp"] = (
             ServerConfig(
                 name="@acme/openbrowser-mcp",
                 description="Discovered package",
                 keywords=["mcp"],
                 install={
-                    "linux": ["npx", "-y", "@acme/openbrowser-mcp"],
-                    "mac": ["npx", "-y", "@acme/openbrowser-mcp"],
-                    "wsl": ["npx", "-y", "@acme/openbrowser-mcp"],
-                    "windows": ["npx", "-y", "@acme/openbrowser-mcp"],
+                    "linux": list(pinned),
+                    "mac": list(pinned),
+                    "wsl": list(pinned),
+                    "windows": list(pinned),
                 },
                 command="npx",
-                args=["-y", "@acme/openbrowser-mcp"],
+                args=pinned[1:],
                 requires_api_key=False,
             )
         )
+        identity = PackageIdentity(
+            registry=NPM_REGISTRY,
+            name="@acme/openbrowser-mcp",
+            resolved_version="1.0.0",
+            integrity=None,
+        )
+        gateway_tools._discovered_server_identities["@acme/openbrowser-mcp"] = identity
+        approve_package(identity)
 
         class FakeJobManager:
-            async def start_install(self, server_config, platform):
+            # Mirrors the real start_install, including SEAL SL-0's project root.
+            async def start_install(self, server_config, platform, project_root=None):
                 return "job-123"
 
         monkeypatch.setattr(
@@ -4587,8 +4610,9 @@ class TestSearchRegistryAndRegister:
 
     @pytest.mark.asyncio
     async def test_register_discovered_server_stores_config(
-        self, gateway_tools: GatewayTools
+        self, gateway_tools: GatewayTools, fake_npm_registry: dict[str, str]
     ) -> None:
+        fake_npm_registry["@modelcontextprotocol/server-github"] = "2025.4.8"
         result = await gateway_tools.register_discovered_server(
             {
                 "package": "@modelcontextprotocol/server-github",
@@ -4604,16 +4628,18 @@ class TestSearchRegistryAndRegister:
         assert "github" in gateway_tools._discovered_server_configs
         config = gateway_tools._discovered_server_configs["github"]
         assert config.command == "npx"
-        assert "@modelcontextprotocol/server-github" in config.args
+        # Pinned to the resolved version, never the bare name (#230).
+        assert "@modelcontextprotocol/server-github@2025.4.8" in config.args
         assert config.requires_api_key is True
         assert config.env_var == "GITHUB_TOKEN"
         assert "gateway.provision" in (result.next_step or "")
 
     @pytest.mark.asyncio
     async def test_register_then_provision_flow(
-        self, gateway_tools: GatewayTools, monkeypatch
+        self, gateway_tools: GatewayTools, monkeypatch, fake_npm_registry
     ) -> None:
         """Full agentic discovery flow: register → provision."""
+        fake_npm_registry["@modelcontextprotocol/server-github"] = "2025.4.8"
         monkeypatch.setattr(
             "pmcp.tools.handlers.load_manifest",
             lambda: Manifest(
@@ -4633,6 +4659,10 @@ class TestSearchRegistryAndRegister:
                 "env_vars": ["GITHUB_TOKEN"],
             }
         )
+        # The package gate runs before the credential check (#230), so an
+        # unapproved package is refused before any key is asked for. Approve
+        # the registered identity so this flow reaches the credential check.
+        approve_package(gateway_tools._discovered_server_identities["github-ext"])
 
         result = await gateway_tools.provision({"server_name": "github-ext"})
 

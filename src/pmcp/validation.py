@@ -30,6 +30,98 @@ def is_valid_package_name(name: str) -> bool:
     return bool(_PACKAGE_NAME_RE.fullmatch(name))
 
 
+def version_separator_index(spec: str) -> int:
+    """Index of the ``@`` separating a name from its version, or ``-1``.
+
+    A scoped name's leading ``@`` is not a separator, so the search starts after
+    index 0 for a spec that begins with one. Shared by ``parse_package_spec`` and
+    the policy schema, which must agree on where a name ends.
+    """
+    return spec.find("@", 1) if spec.startswith("@") else spec.find("@")
+
+
+def parse_package_spec(spec: str) -> tuple[str, str | None]:
+    """Split ``name[@version]`` into its name and requested version.
+
+    Splits **before** validating: ``is_valid_package_name`` rejects ``pkg@1.2.3``
+    because ``@`` is legal only as a scope prefix, so only the name half can be
+    validated. Raises ``ValueError`` when the name half is not a valid package
+    name, or when a trailing ``@`` names no version -- reading ``pkg@`` as "no
+    version requested" would stand in for ``latest``, a version nobody named.
+
+    The version half is returned as *requested*, unvalidated: it may be a
+    dist-tag such as ``latest``. Nothing it returns is fit for argv until
+    ``is_valid_package_version`` has accepted the *resolved* version.
+    """
+    at = version_separator_index(spec)
+    if at == -1:
+        name, version = spec, None
+    else:
+        name, version = spec[:at], spec[at + 1 :]
+        if not version:
+            raise ValueError(f"package spec {spec!r} has an empty version")
+    if not is_valid_package_name(name):
+        raise ValueError(f"package spec {spec!r} does not name a valid package")
+    return name, version
+
+
+# SemVer 2.0.0, spelled with explicit ASCII classes: ``\d`` would admit non-ASCII
+# digits. No leading zeros in numeric identifiers, no empty identifiers, and
+# nothing outside ``[0-9A-Za-z.+-]`` -- so no whitespace, shell metacharacter,
+# path separator or leading ``-``. An allowlist, deliberately: a denylist of
+# metacharacters is only as good as the author's memory of them.
+_NUMERIC = r"(?:0|[1-9][0-9]*)"
+_PRERELEASE_ID = r"(?:0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)"
+_BUILD_ID = r"[0-9A-Za-z-]+"
+_PACKAGE_VERSION_RE = re.compile(
+    rf"{_NUMERIC}\.{_NUMERIC}\.{_NUMERIC}"
+    rf"(?:-{_PRERELEASE_ID}(?:\.{_PRERELEASE_ID})*)?"
+    rf"(?:\+{_BUILD_ID}(?:\.{_BUILD_ID})*)?"
+)
+_MAX_PACKAGE_VERSION_LENGTH = 256
+
+
+def is_valid_package_version(version: str) -> bool:
+    """Return True if *version* is one concrete SemVer version, safe for argv.
+
+    The version this checks arrives in a registry response -- semi-trusted
+    network data -- and is then composed into ``["npx", "-y", f"{name}@{version}"]``.
+    Ranges and dist-tags are refused too: they pin nothing, so an approval of one
+    would re-resolve at every spawn.
+    """
+    if not version or len(version) > _MAX_PACKAGE_VERSION_LENGTH:
+        return False
+    return _PACKAGE_VERSION_RE.fullmatch(version) is not None
+
+
+_WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat")
+_PATH_SEPARATORS_RE = re.compile(r"[\\/]+")
+_WINDOWS_DRIVE_PREFIX_RE = re.compile(r"^[A-Za-z]:")
+
+
+def normalized_executable_name(executable: str) -> str:
+    """The name an executable is known by, whatever platform spelled it.
+
+    One leading drive prefix is removed first, so a drive-relative path such
+    as ``C:npx.cmd`` names ``npx`` (and ``C:`` alone names nothing). Then the
+    last non-empty component after splitting on EITHER separator, so
+    ``C:\\tools\\npx.cmd`` and ``/usr/bin/npx`` both work on any host. Split
+    by hand rather than with a path class: ``PureWindowsPath("//bin/npx")``
+    reads a UNC share and names nothing, while Linux runs that path as
+    ``/bin/npx``. Then lower-cased, because Windows file names are
+    case-insensitive, with ONE trailing ``.exe``/``.cmd``/``.bat`` removed:
+    ``npx.cmd.exe`` is ``npx.cmd``, not ``npx``. A value with no component
+    (``""``, ``"/"``) is ``""``, which names no executable.
+    """
+    path = _WINDOWS_DRIVE_PREFIX_RE.sub("", executable, count=1)
+    parts = [part for part in _PATH_SEPARATORS_RE.split(path) if part]
+    name = parts[-1].lower() if parts else ""
+    for suffix in _WINDOWS_EXECUTABLE_SUFFIXES:
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
 # Environment variables that change how a subsequently spawned subprocess loads
 # or executes code. Storing any of these would let a caller achieve code
 # execution in the next provisioned server process, so they are rejected
@@ -94,3 +186,40 @@ def env_var_allowed(env_var: str, declared_env_var: str | None) -> bool:
     if declared_env_var is not None:
         return env_var == declared_env_var
     return bool(_CREDENTIAL_NAME_RE.fullmatch(env_var))
+
+
+# Package-manager and runtime configuration families. npm, corepack, yarn, pnpm
+# and bun read these from the environment at spawn, so a value in one of them
+# changes WHAT an approved `npx -y name@version` fetches -- the registry it asks
+# (`npm_config_registry`), the auth it presents (`NPM_CONFIG__AUTH`) or the
+# runtime flags node starts with. Matched case-insensitively: npm reads
+# `npm_config_*` in any case.
+_PACKAGE_MANAGER_ENV_PREFIXES = (
+    "NPM_CONFIG_",
+    "NODE_",
+    "COREPACK_",
+    "YARN_",
+    "PNPM_",
+    "BUN_",
+)
+
+
+def discovered_env_var_allowed(name: str) -> bool:
+    """May a DISCOVERED server declare, or be given, the env var *name*?
+
+    An allowlist, unlike ``env_var_allowed``'s blocklist: a discovered server's
+    declared names are agent-chosen, and the declared name is exactly what
+    ``auth_connect`` stores and ``build_install_child_env`` injects into the
+    pinned spawn. So only a credential-shaped name is admitted, never one
+    ``is_dangerous_env_var`` refuses, and never one in a package-manager or
+    runtime configuration family -- even when credential-shaped, as
+    ``NPM_CONFIG__AUTH`` and ``NODE_AUTH_TOKEN`` are.
+
+    Manifest-backed servers keep ``env_var_allowed``: their declared names are
+    shipped, and many (``POSTGRES_URL``) are not credential-shaped.
+    """
+    if not name or is_dangerous_env_var(name):
+        return False
+    if name.upper().startswith(_PACKAGE_MANAGER_ENV_PREFIXES):
+        return False
+    return bool(_CREDENTIAL_NAME_RE.fullmatch(name))
