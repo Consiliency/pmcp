@@ -107,7 +107,12 @@ def assert_clean_ancestor_chain(tmp_path_factory: pytest.TempPathFactory) -> Non
     ]
     if polluted:
         listing = "\n  ".join(str(path) for path in polluted)
-        raise RuntimeError(
+        # `pytest.exit` rather than `raise`: a session-scoped fixture that raises
+        # has its setup failure CACHED and re-reported against every dependent
+        # test, so the "one clear error" this guard exists to give becomes the
+        # very cascade it is replacing (measured: 100 errors for one planted
+        # file). `pytest.exit` ends the session at the first detection.
+        pytest.exit(
             "npm local-prefix pollution on the temp-root ancestor chain:\n  "
             f"{listing}\n"
             "npm's own local-prefix rule walks up from the working directory, so "
@@ -116,7 +121,8 @@ def assert_clean_ancestor_chain(tmp_path_factory: pytest.TempPathFactory) -> Non
             "has nothing to do with the code under test. Remove the path above, or "
             "point pytest's temp root elsewhere with --basetemp/TMPDIR. "
             "(pmcp's production walk is faithful to npm and is deliberately not "
-            "changed to paper over this.)"
+            "changed to paper over this.)",
+            returncode=1,
         )
 
 
