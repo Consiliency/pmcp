@@ -728,6 +728,31 @@
       "updated_at": "2026-09-19T05:43:13.972715+00:00"
     },
     {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-09-20T08:50:24.787657+00:00",
+      "file": ".consiliency/plans/detailed-reset-module-state-between-tests-20260920-0846.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-20T08:50:24.787657+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {},
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": "~/.codex/skills/claude-plan-detailed/reflections/6ae74a2dc523/plan-235-slice-b-module-state/20260920-0846.md",
+      "roadmap_ref": null,
+      "slug": "reset-module-state-between-tests",
+      "status": "committed",
+      "task_summary": "Reset process-global module state between tests (slice B of #235): helpers in the owning src modules + one autouse conftest fixture",
+      "type": "detailed",
+      "updated_at": "2026-09-20T08:50:24.787657+00:00"
+    },
+    {
       "acceptance_criteria_count": null,
       "created_at": "2026-08-05T23:41:05Z",
       "file": "plans/phase-plan-v11-P5.md",
