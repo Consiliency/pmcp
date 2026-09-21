@@ -988,9 +988,11 @@ async def test_a_hung_registry_lookup_is_bounded_by_the_handler(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     release = threading.Event()
+    fetch_finished = threading.Event()
 
     def hung_fetch(name: str) -> dict[str, Any]:
         release.wait(30)  # a registry that never answers inside the socket timeout
+        fetch_finished.set()
         return _packument(name, "1.0.0")
 
     monkeypatch.setattr(package_identity, "_fetch_packument", hung_fetch)
@@ -1001,13 +1003,14 @@ async def test_a_hung_registry_lookup_is_bounded_by_the_handler(
         out = await gateway.register_discovered_server(
             {"server_name": "hung", "package": "hung-mcp"}
         )
-        # The fetch is still parked on `release` when the call returns, so the
-        # handler's own timeout -- not the registry -- ended it.
-        stalled_at_return = not release.is_set()
+        # The fetch had NOT finished when the call returned, so the handler's
+        # own timeout -- not the registry -- ended it. Without that bound the
+        # call could only return after `hung_fetch` completed, which sets this.
+        finished_before_return = fetch_finished.is_set()
     finally:
         release.set()
 
-    assert stalled_at_return is True, "the handler waited for the hung lookup"
+    assert finished_before_return is False, "the handler waited for the hung lookup"
     assert out.registered is False
     assert "hung-mcp" in out.message
     assert "hung" not in gateway._discovered_server_configs

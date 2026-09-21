@@ -665,9 +665,11 @@ async def test_a_slow_submission_is_bounded_by_the_handler_timeout(
         handlers, "_FEEDBACK_SUBMIT_TIMEOUT_SECONDS", 0.25, raising=False
     )
     release = threading.Event()
+    stall_finished = threading.Event()
 
     def _stall(**kwargs: Any) -> FeedbackSubmission:
         release.wait(timeout=10)
+        stall_finished.set()
         return _created()
 
     _install_transport(monkeypatch, _stall)
@@ -675,13 +677,16 @@ async def test_a_slow_submission_is_bounded_by_the_handler_timeout(
     try:
         result = await _submit(_gateway(submission=True), confirm_submission=True)
         # The deterministic form of "it did not wait for the stall": the
-        # transport is still parked on `release` at the moment _submit returns,
-        # so the handler's own timeout is what ended the call.
-        stalled_at_return = not release.is_set()
+        # transport had NOT finished when _submit returned, so the handler's own
+        # timeout ended the call. Without that bound, _submit could only return
+        # after `_stall` ran to completion -- which sets this flag.
+        finished_before_return = stall_finished.is_set()
     finally:
         release.set()
 
-    assert stalled_at_return is True, "the handler waited for the stalled submission"
+    assert finished_before_return is False, (
+        "the handler waited for the stalled submission"
+    )
     assert result.ok is False
     assert result.submitted is False
     assert result.issue_url is not None
