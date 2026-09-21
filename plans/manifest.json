@@ -743,6 +743,61 @@
     },
     {
       "acceptance_criteria_count": 5,
+      "created_at": "2026-09-21T05:09:00Z",
+      "file": ".consiliency/plans/detailed-policy-home-call-time-20260921-0509.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-21T05:09:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "branch": "plan/262-policy-home-calltime",
+            "issue": "Consiliency/pmcp#262",
+            "sibling": "Consiliency/pmcp#261",
+            "umbrella": "Consiliency/pmcp#235"
+          },
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": "/home/viperjuice/.claude/skills/claude-plan-detailed/reflections/9b7e9291/plan-262-policy-home-calltime/20260921T050900Z-a262pl.md",
+      "roadmap_ref": null,
+      "slug": "policy-home-call-time-262",
+      "status": "committed",
+      "task_summary": "Consiliency/pmcp#262: resolve the operator policy home (~/.claude/gateway-policy.*) at PolicyManager construction instead of import, via identity-sentinel defaults that keep the USER_POLICY_PATHS / DEFAULT_POLICY_PATHS monkeypatch seam honoured verbatim; three tests, one red on main.",
+      "type": "detailed",
+      "updated_at": "2026-09-21T05:09:00Z"
+    },
+    {
+      "acceptance_criteria_count": 3,
+      "created_at": "2026-09-21T23:11:20+00:00",
+      "file": ".consiliency/plans/detailed-poll-until-conversion-c2c-20260921-2311.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-21T23:11:20+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {},
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": "/home/viperjuice/.codex/skills/claude-plan-detailed/reflections/3979501cae5e/plan-235-slice-c2c/20260921-2311.md",
+      "roadmap_ref": null,
+      "slug": "poll-until-conversion-c2c",
+      "status": "committed",
+      "task_summary": "Convert the wall-clock-window tests (two off-loop ticker tests + reconcile debounce) and two process-reaping pollers to deterministic waits (slice C2c of #235).",
+      "type": "detailed",
+      "updated_at": "2026-09-21T23:11:20+00:00"
+    },
+    {
+      "acceptance_criteria_count": 5,
       "created_at": "2026-09-21T05:14:01Z",
       "file": ".consiliency/plans/detailed-poll-until-conversion-c2a-20260921-0514.md",
       "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
@@ -1297,36 +1352,6 @@
       "task_summary": null,
       "type": "phase",
       "updated_at": "2026-06-25T02:26:25Z"
-    },
-    {
-      "acceptance_criteria_count": 5,
-      "created_at": "2026-09-21T05:09:00Z",
-      "file": ".consiliency/plans/detailed-policy-home-call-time-20260921-0509.md",
-      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
-      "if_gates_produced": [],
-      "lanes": [],
-      "lifecycle": [
-        {
-          "at": "2026-09-21T05:09:00Z",
-          "by": "claude-plan-detailed",
-          "metadata": {
-            "branch": "plan/262-policy-home-calltime",
-            "issue": "Consiliency/pmcp#262",
-            "sibling": "Consiliency/pmcp#261",
-            "umbrella": "Consiliency/pmcp#235"
-          },
-          "transition": "committed"
-        }
-      ],
-      "owner_skill": "claude-plan-detailed",
-      "phase_alias": null,
-      "reflection_ref": "/home/viperjuice/.claude/skills/claude-plan-detailed/reflections/9b7e9291/plan-262-policy-home-calltime/20260921T050900Z-a262pl.md",
-      "roadmap_ref": null,
-      "slug": "policy-home-call-time-262",
-      "status": "committed",
-      "task_summary": "Consiliency/pmcp#262: resolve the operator policy home (~/.claude/gateway-policy.*) at PolicyManager construction instead of import, via identity-sentinel defaults that keep the USER_POLICY_PATHS / DEFAULT_POLICY_PATHS monkeypatch seam honoured verbatim; three tests, one red on main.",
-      "type": "detailed",
-      "updated_at": "2026-09-21T05:09:00Z"
     }
   ],
   "schema_version": 1
