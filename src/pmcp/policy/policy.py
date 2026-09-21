@@ -100,20 +100,36 @@ def default_user_policy_paths() -> list[Path]:
     return [Path.home() / tail for tail in _USER_POLICY_TAILS]
 
 
-# Do NOT read this frozen tuple at runtime: it captures `Path.home()` at import
+class _FrozenDefault(tuple[Path, ...]):
+    """Marker type for the two untouched defaults.
+
+    A PLAIN tuple would be unsafe as the sentinel: CPython returns the SAME
+    object from `tuple(t)` when `t` is already a tuple, so a caller normalising
+    with `USER_POLICY_PATHS = tuple(USER_POLICY_PATHS)` would still satisfy an
+    identity check and have its pin silently ignored in favour of the live home.
+    Constructing this subclass always copies, so any caller-supplied value --
+    list, tuple, or a copy of the default -- compares as replaced.
+    """
+
+    __slots__ = ()
+
+
+# Do NOT read this frozen value at runtime: it captures `Path.home()` at import
 # time. Read `_effective_user_policy_paths()` instead. It stays a module
 # attribute because `monkeypatch.setattr` on it is a documented test seam, and
 # the resolvers below key on OBJECT IDENTITY -- if this attribute is still this
 # exact object, the live home is used; if a caller replaced it, that caller's
-# value is used verbatim and the live home is never consulted. A tuple, so an
+# value is used verbatim and the live home is never consulted. Immutable, so an
 # in-place mutation raises instead of being silently ignored.
-USER_POLICY_PATHS: Sequence[Path] = tuple(default_user_policy_paths())
+USER_POLICY_PATHS: Sequence[Path] = _FrozenDefault(default_user_policy_paths())
 _FROZEN_USER_POLICY_PATHS = USER_POLICY_PATHS
 
 # Same contract: patched -> used verbatim; untouched -> derived from the
 # allowlist in force, so an entry can never be searched-but-unrecognised or
 # recognised-but-unsearched.
-DEFAULT_POLICY_PATHS: Sequence[Path] = (*PROJECT_POLICY_PATHS, *USER_POLICY_PATHS)
+DEFAULT_POLICY_PATHS: Sequence[Path] = _FrozenDefault(
+    (*PROJECT_POLICY_PATHS, *USER_POLICY_PATHS)
+)
 _FROZEN_DEFAULT_POLICY_PATHS = DEFAULT_POLICY_PATHS
 
 

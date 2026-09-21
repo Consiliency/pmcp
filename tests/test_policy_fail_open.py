@@ -559,6 +559,39 @@ def test_the_search_list_derives_from_the_patched_user_list(
     assert [r.message for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
+def test_a_copy_of_the_frozen_default_counts_as_patched(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller that normalises the attribute must not lose its pin.
+
+    The sentinel is object identity, and CPython returns the SAME object from
+    `tuple(t)` when `t` is already a plain tuple -- so with a plain-tuple
+    default, `USER_POLICY_PATHS = tuple(USER_POLICY_PATHS)` would still satisfy
+    the identity check and be silently resolved against the LIVE home instead
+    of the caller's pinned value. The default is a `tuple` SUBCLASS precisely so
+    every copy compares as replaced. Revert that subclass and this test fails.
+    """
+    from pmcp.policy import policy as policy_module
+
+    frozen = policy_module._FROZEN_USER_POLICY_PATHS
+    copied = tuple(frozen)
+    assert copied is not frozen, (
+        "a copy of the default is identical to it -- the identity sentinel "
+        "cannot distinguish a pin from the default"
+    )
+
+    home = _home_with_policy(tmp_path_factory, "home-copy", _VALID_POLICY)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("pmcp.policy.policy.USER_POLICY_PATHS", copied)
+
+    # The pin holds: the effective allowlist is the caller's copy, which names
+    # the OLD home, not the live one.
+    effective = set(policy_module._effective_user_policy_paths())
+    assert effective == set(copied)
+    assert not any(str(home) in str(entry) for entry in effective)
+
+
 # === explicit --policy is unchanged: all three modes remain fatal ===
 
 
