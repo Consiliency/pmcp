@@ -32,6 +32,17 @@ uv run pytest tests/test_policy.py -v
 uv run pytest tests/test_integration.py -v
 ```
 
+### Timing in tests
+
+Never assert an upper bound on elapsed wall time (`assert elapsed < 0.2`) — it
+fails on a loaded runner even when the code is correct, and it is the whole of
+this suite's historical flake. Wait for the property instead: `eventually` from
+`tests/_timing.py` polls until it holds, and `Rendezvous` proves that several
+coroutines were in flight together. A `timeout=` on either is a hang guard so a
+broken test fails loudly, never a measurement to tighten. Lower bounds on a real
+timer (`assert elapsed > 8` after `sleep(8.2)`) are safe. See the module
+docstring in `tests/_timing.py`.
+
 ## Adding a Server to the Manifest
 
 The manifest (`src/pmcp/manifest/manifest.yaml`) contains 90+ MCP servers

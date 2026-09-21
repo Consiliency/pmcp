@@ -997,16 +997,17 @@ async def test_a_hung_registry_lookup_is_bounded_by_the_handler(
     monkeypatch.setattr(handlers_module, "_REGISTRATION_RESOLVE_TIMEOUT_SECONDS", 0.3)
     gateway, jobs = _gateway(monkeypatch, _empty_policy(tmp_path))
 
-    started = time.monotonic()
     try:
         out = await gateway.register_discovered_server(
             {"server_name": "hung", "package": "hung-mcp"}
         )
+        # The fetch is still parked on `release` when the call returns, so the
+        # handler's own timeout -- not the registry -- ended it.
+        stalled_at_return = not release.is_set()
     finally:
         release.set()
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 5, elapsed
+    assert stalled_at_return is True, "the handler waited for the hung lookup"
     assert out.registered is False
     assert "hung-mcp" in out.message
     assert "hung" not in gateway._discovered_server_configs

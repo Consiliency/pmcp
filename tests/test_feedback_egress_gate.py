@@ -981,11 +981,10 @@ def test_the_body_read_is_bounded_by_its_own_budget(
     _install_opener(monkeypatch, lambda request, index: response)
 
     deadline = time.monotonic() + feedback_egress._POST_PHASE_BUDGET_SECONDS + 1.0
-    started = time.monotonic()
     result = _submit(deadline=deadline)
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 5.0, "the body read was not bounded"
+    # The bound is the byte cap: `_TricklingResponse.read` never sleeps, so an
+    # elapsed-time assertion here measured nothing.
     assert 1 < response.reads <= feedback_egress._MAX_RESPONSE_BYTES + 1
     assert result.outcome == "dispatched_unconfirmed"
 
@@ -994,12 +993,13 @@ def test_the_body_read_is_bounded_by_its_own_budget(
     # because reaching it through the transport requires a deadline at least a whole
     # `_POST_PHASE_BUDGET_SECONDS` away -- the claim refuses anything nearer.
     slow = _TricklingResponse()
-    read_start = time.monotonic()
-    body = feedback_egress._read_bounded_body(slow, read_start - 1.0)
+    past_deadline = time.monotonic() - 1.0
+    body = feedback_egress._read_bounded_body(slow, past_deadline)
 
     assert body == b""
+    # Never touched the peer once the deadline had passed -- the deterministic
+    # form of "it returned promptly".
     assert slow.reads == 0
-    assert time.monotonic() - read_start < 1.0
 
 
 def test_the_progress_record_is_safe_to_read_while_the_worker_runs(

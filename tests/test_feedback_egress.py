@@ -672,14 +672,16 @@ async def test_a_slow_submission_is_bounded_by_the_handler_timeout(
 
     _install_transport(monkeypatch, _stall)
 
-    started = time.monotonic()
     try:
         result = await _submit(_gateway(submission=True), confirm_submission=True)
+        # The deterministic form of "it did not wait for the stall": the
+        # transport is still parked on `release` at the moment _submit returns,
+        # so the handler's own timeout is what ended the call.
+        stalled_at_return = not release.is_set()
     finally:
         release.set()
-    elapsed = time.monotonic() - started
 
-    assert elapsed < 5.0, "the handler waited for the stalled submission"
+    assert stalled_at_return is True, "the handler waited for the stalled submission"
     assert result.ok is False
     assert result.submitted is False
     assert result.issue_url is not None

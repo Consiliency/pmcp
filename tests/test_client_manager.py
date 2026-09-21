@@ -50,6 +50,7 @@ from pmcp.types import (
     ServerStatusEnum,
     ToolInfo,
 )
+from tests._timing import Rendezvous, eventually
 
 
 class TestHelperFunctions:
@@ -2156,11 +2157,13 @@ class TestParallelConnections:
     async def test_connect_all_parallel_execution(self) -> None:
         """Test that connect_all runs connections in parallel."""
         manager = ClientManager()
-        call_times: list[float] = []
+        # Nobody is released until the third body arrives, so a serial
+        # implementation cannot satisfy the gate and fails by name instead of
+        # racing a wall-clock margin (see Consiliency/pmcp#226).
+        gate = Rendezvous(3)
 
         async def mock_connect(config: MagicMock) -> None:
-            call_times.append(time.time())
-            await asyncio.sleep(0.1)  # Simulate connection time
+            await gate.arrive()
 
         # Patch the connection method
         manager._connect_server = mock_connect  # type: ignore[method-assign]
@@ -2168,13 +2171,13 @@ class TestParallelConnections:
         # Create mock configs
         configs = [MagicMock(name=f"server{i}") for i in range(3)]
 
-        start = time.time()
-        await manager.connect_all(configs, retry=False)  # type: ignore[arg-type]
-        elapsed = time.time() - start
+        errors = await asyncio.wait_for(
+            manager.connect_all(configs, retry=False),  # type: ignore[arg-type]
+            5.0,
+        )
 
-        # If parallel, should complete in ~0.1s, not ~0.3s
-        assert elapsed < 0.2, f"Expected parallel execution, took {elapsed}s"
-        assert len(call_times) == 3
+        assert errors == []
+        assert gate.arrived == 3
 
     @pytest.mark.asyncio
     async def test_connect_all_collects_errors(self) -> None:
@@ -2208,7 +2211,7 @@ class TestParallelConnections:
 
         async def mock_connect(config: ResolvedServerConfig) -> None:
             calls.append(config.name)
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0)
 
         manager._connect_server = mock_connect  # type: ignore[method-assign]
         same_a = ResolvedServerConfig(
@@ -2227,12 +2230,12 @@ class TestParallelConnections:
             config=LocalMcpServerConfig(command="echo"),
         )
 
-        start = time.time()
         errors = await manager.connect_all([same_a, same_b, other], retry=False)
 
         assert errors == []
+        # Dedup is the property under test; concurrency is proven by
+        # test_connect_all_parallel_execution alone.
         assert sorted(calls) == ["other", "same"]
-        assert time.time() - start < 0.09
 
     @pytest.mark.asyncio
     async def test_concurrent_connect_all_calls_share_same_server_attempt(self) -> None:
@@ -3922,12 +3925,12 @@ class TestDownstreamReconcileScheduler:
     @staticmethod
     async def _drain(manager: ClientManager, timeout: float = 5.0) -> None:
         """Wait until no reconcile is in flight."""
-
-        async def _wait() -> None:
-            while manager._reconcile_tasks:
-                await asyncio.sleep(0.005)
-
-        await asyncio.wait_for(_wait(), timeout)
+        await eventually(
+            lambda: not manager._reconcile_tasks,
+            timeout=timeout,
+            interval=0.005,
+            message="a reconcile is still in flight",
+        )
 
     def _wire(
         self,
@@ -4654,12 +4657,12 @@ class TestDownstreamNotificationBehaviouralGuarantees:
     @staticmethod
     async def _drain(manager: ClientManager, timeout: float = 5.0) -> None:
         """Wait until no reconcile is in flight."""
-
-        async def _wait() -> None:
-            while manager._reconcile_tasks:
-                await asyncio.sleep(0.005)
-
-        await asyncio.wait_for(_wait(), timeout)
+        await eventually(
+            lambda: not manager._reconcile_tasks,
+            timeout=timeout,
+            interval=0.005,
+            message="a reconcile is still in flight",
+        )
 
     def _wire(self, manager: ClientManager, state: dict[str, list[str]]) -> list[str]:
         """Same shape as `TestDownstreamReconcileScheduler._wire`, without the
@@ -4999,11 +5002,12 @@ class TestReconcileMalformedEntryResilience:
 
     @staticmethod
     async def _drain(manager: ClientManager, timeout: float = 5.0) -> None:
-        async def _wait() -> None:
-            while manager._reconcile_tasks:
-                await asyncio.sleep(0.005)
-
-        await asyncio.wait_for(_wait(), timeout)
+        await eventually(
+            lambda: not manager._reconcile_tasks,
+            timeout=timeout,
+            interval=0.005,
+            message="a reconcile is still in flight",
+        )
 
     @staticmethod
     def _wire_listings(
@@ -6135,11 +6139,12 @@ class TestZeroLimitLogsAccurately:
                 "srv", managed, "notifications/tools/list_changed"
             )
 
-            async def _wait() -> None:
-                while manager._reconcile_tasks:
-                    await asyncio.sleep(0.005)
-
-            await asyncio.wait_for(_wait(), 5.0)
+            await eventually(
+                lambda: not manager._reconcile_tasks,
+                timeout=5.0,
+                interval=0.005,
+                message="a reconcile is still in flight",
+            )
 
         messages = [record.message for record in caplog.records]
         assert any("max_tools_per_server is 0" in message for message in messages), (
@@ -6183,11 +6188,12 @@ class TestZeroLimitLogsAccurately:
                 "srv", managed, "notifications/tools/list_changed"
             )
 
-            async def _wait() -> None:
-                while manager._reconcile_tasks:
-                    await asyncio.sleep(0.005)
-
-            await asyncio.wait_for(_wait(), 5.0)
+            await eventually(
+                lambda: not manager._reconcile_tasks,
+                timeout=5.0,
+                interval=0.005,
+                message="a reconcile is still in flight",
+            )
 
         messages = [record.message for record in caplog.records]
         assert any("unparseable" in message for message in messages), messages

@@ -45,7 +45,6 @@ import asyncio
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Any
 
@@ -144,10 +143,9 @@ async def test_a_server_task_that_never_finishes_raises_instead_of_hanging(
         # rather than claiming the task survived.
         assert "SURVIVED cancellation" not in message
 
-    started = time.monotonic()
+    # `_bounded` already raises on the same bound, so an elapsed assertion
+    # could never be the first thing to fail.
     await _bounded(_body(), _MUTANT_BOUND)
-    elapsed = time.monotonic() - started
-    assert elapsed < _MUTANT_BOUND, elapsed
     # The latch reset used to sit *after* `await task`, so the new diagnostic
     # raise would have skipped it and poisoned the next test.
     assert AppStatus.should_exit is False
@@ -172,11 +170,9 @@ async def test_a_serve_task_that_swallows_cancellation_still_raises(
         assert "server.started=True" in message
         assert "AppStatus.should_exit=" in message
 
-    started = time.monotonic()
     try:
+        # `_bounded` already raises on the same bound.
         await _bounded(_body(), _MUTANT_BOUND)
-        elapsed = time.monotonic() - started
-        assert elapsed < _MUTANT_BOUND, elapsed
         assert AppStatus.should_exit is False
         assert [s.swallowed for s in _SwallowsCancellation.instances] == [True]
     finally:
@@ -238,7 +234,6 @@ def test_the_timeout_plugin_is_active_and_covers_teardown(
     module = _write_module(tmp_path, _TEARDOWN_HANG_MODULE)
     method = str(pytestconfig.getini("timeout_method"))
 
-    started = time.monotonic()
     result = subprocess.run(
         [
             sys.executable,
@@ -258,11 +253,12 @@ def test_the_timeout_plugin_is_active_and_covers_teardown(
         timeout=60,
         cwd=tmp_path,
     )
-    elapsed = time.monotonic() - started
     output = result.stdout + result.stderr
 
+    # If the plugin had failed to kill the 30s teardown, the child session
+    # would have PASSED and printed no timeout text. `timeout=60` on the
+    # subprocess is the hang guard.
     assert result.returncode != 0, output
-    assert elapsed < 15, f"{elapsed}s\n{output}"
     assert "imeout" in output, output
 
 
