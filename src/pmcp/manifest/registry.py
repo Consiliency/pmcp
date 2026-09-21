@@ -649,6 +649,37 @@ async def fetch_registry_servers(
     )
 
 
+def clear_in_process_cache() -> None:
+    """Drop the in-process registry cache and any in-flight fetch. **Tests only.**
+
+    ``_IN_PROCESS_CACHE`` is keyed by the whole fetch shape -- endpoint, timeout,
+    max_pages, max_response_bytes, updated_since, allow_draft_schema -- and held
+    for ``REGISTRY_CACHE_TTL_SECONDS`` (300 s). In one pytest process that is
+    longer than the whole session, so a payload the first test cached for
+    ``DEFAULT_REGISTRY_ENDPOINT`` is what every later test receives, and a test
+    that asserts on a fetch it believes it performed is really asserting on an
+    earlier test's fixture. ``_IN_PROCESS_TASKS`` is worse: it holds live
+    ``asyncio.Task`` objects whose event loop pytest-asyncio has already closed.
+
+    Production never calls this -- the cache is process-wide on purpose. It is a
+    test seam in the voice of ``env_store.reset_dotenv_keys``.
+
+    Synchronous, and deliberately awaits nothing: it is called from an autouse
+    fixture with no running loop. A task whose loop is closed raises
+    ``RuntimeError`` from ``cancel()`` (only once it has actually started and is
+    parked on a waiter), which is caught here rather than escaping into teardown.
+    """
+    for task in _IN_PROCESS_TASKS.values():
+        if not task.done():
+            try:
+                task.cancel()
+            except RuntimeError:
+                # Its loop is already closed; the task dies with the loop.
+                pass
+    _IN_PROCESS_TASKS.clear()
+    _IN_PROCESS_CACHE.clear()
+
+
 def _cache_path(cache_path: Path | None) -> Path:
     return cache_path or default_registry_cache_path()
 

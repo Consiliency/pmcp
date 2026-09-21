@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -562,3 +563,59 @@ def test_non_boolean_config_field_is_ignored_not_coerced(monkeypatch, tmp_path) 
         registry_allow_private_from_config(project_root=project, user_config_paths=[])
         is None
     )
+
+
+def test_clear_in_process_cache_drops_payloads_and_tolerates_closed_loop_tasks() -> (
+    None
+):
+    """The reset empties both dicts and survives a task whose loop is gone.
+
+    The orphaned task must be **started** before its loop is closed. CPython's
+    ``Task.cancel`` only reaches ``call_soon`` when ``_fut_waiter`` is set; a task
+    created and never run has ``_fut_waiter is None``, so ``cancel()`` merely sets
+    ``_must_cancel``, returns ``True`` and raises nothing. A test built that way is
+    green with or without the ``RuntimeError`` guard and proves nothing -- measured
+    on 3.10/3.12/3.13. One ``run_until_complete(asyncio.sleep(0))`` cycle parks the
+    task on its waiter, and then the closed loop makes ``cancel()`` raise.
+
+    Writing the module globals directly is acceptable here because the subject of
+    the test is the helper that owns them -- the licence
+    ``tests/test_version_checker.py`` already takes with ``_version_cache``.
+    """
+    from pmcp.manifest import registry as registry_mod
+
+    async def _park() -> None:
+        await asyncio.Event().wait()
+
+    loop = asyncio.new_event_loop()
+    started = loop.create_task(_park())
+    loop.run_until_complete(asyncio.sleep(0))  # park it on its waiter
+    assert not started.done(), (
+        "precondition: the task must be started, not merely created"
+    )
+    assert started._fut_waiter is not None, (
+        "precondition: cancel() only raises once parked"
+    )
+    loop.close()
+
+    finished_loop = asyncio.new_event_loop()
+    finished = finished_loop.create_task(asyncio.sleep(0))
+    finished_loop.run_until_complete(finished)
+    assert finished.done()
+    finished_loop.close()
+
+    registry_mod._IN_PROCESS_CACHE[("endpoint", 1, 2, 3, None, False)] = (
+        time.monotonic(),
+        RegistryCache(
+            schema_version="registry-cache.v1",
+            source_endpoint="https://registry.example/v0/servers",
+            fetched_at="2026-06-15T00:00:00Z",
+        ),
+    )
+    registry_mod._IN_PROCESS_TASKS[("started",)] = started
+    registry_mod._IN_PROCESS_TASKS[("finished",)] = finished
+
+    registry_mod.clear_in_process_cache()  # must not raise
+
+    assert registry_mod._IN_PROCESS_CACHE == {}
+    assert registry_mod._IN_PROCESS_TASKS == {}
