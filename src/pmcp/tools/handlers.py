@@ -3795,11 +3795,12 @@ class GatewayTools:
         )
         try:
             stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=60.0)
-        except (asyncio.TimeoutError, TimeoutError, asyncio.CancelledError):
-            # Reap the tree before propagating; the caller turns TimeoutError
-            # into a user-facing "probe timed out" result, and cancellation must
-            # not leak a process either.
-            #
+        except asyncio.CancelledError:
+            # Reap the tree before propagating; cancellation must not leak a
+            # process. Re-raised unchanged -- a cancellation is not a timeout.
+            await _terminate_process_tree(process, "update-probe")
+            raise
+        except (asyncio.TimeoutError, TimeoutError) as exc:
             # asyncio.TimeoutError is listed EXPLICITLY: it only became an alias
             # of the builtin TimeoutError in 3.11, and this project supports
             # 3.10, where catching the builtin alone lets the timeout escape and
@@ -3807,7 +3808,14 @@ class GatewayTools:
             # both passed -- the fix silently did nothing on the oldest
             # supported version.
             await _terminate_process_tree(process, "update-probe")
-            raise
+            # NORMALISE to the builtin before it reaches a caller, the way
+            # ClientManager._send_request does. Re-raising the asyncio class
+            # reintroduced the same 3.10 split one frame up: the caller's
+            # `except TimeoutError` never fired, so a 60-second hang was
+            # reported by the generic handler as "Failed to run update probe: "
+            # -- with an empty reason, because wait_for raises with no args
+            # (Consiliency/pmcp#269).
+            raise TimeoutError("update probe timed out after 60 seconds") from exc
         output = (
             stdout.decode("utf-8", errors="replace")
             + "\n"
@@ -5446,7 +5454,13 @@ class GatewayTools:
                 self._project_root,
             )
             ok, output = await self._run_update_probe_command(update_cmd, env=probe_env)
-        except TimeoutError:
+        except (asyncio.TimeoutError, TimeoutError):
+            # Both classes, though the helper normalises to the builtin: on the
+            # 3.10 floor they are unrelated types, and this `except` must not
+            # depend on which one a callee happens to raise. Catching only the
+            # builtin sent a real 60s hang to the generic handler below, which
+            # reported it as "Failed to run update probe: " with an empty
+            # reason (Consiliency/pmcp#269).
             return UpdateServerOutput(
                 ok=False,
                 server=server_name,
