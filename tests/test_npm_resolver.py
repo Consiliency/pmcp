@@ -808,15 +808,18 @@ class TestHungChild:
             first = instance.resolve("npx", ["-y", "p0"], {}, None)
             first_elapsed = time.monotonic() - start
             assert first.is_refused, first
-            assert 0.5 < first_elapsed < 5.0, first_elapsed
+            # Lower bound only: `_QUERY_TIMEOUT` is a real timer, so the first
+            # caller cannot come back sooner. An upper bound here would be a
+            # wall-clock race.
+            assert 0.5 < first_elapsed, first_elapsed
 
-            start = time.monotonic()
+            # 19 further callers, none of which may wait on the child again.
+            # Which branch answered is the property -- the cooldown path --
+            # and it is stronger than "it was quick".
             for i in range(1, 20):
-                assert instance.resolve("npx", ["-y", f"p{i}"], {}, None).is_refused
-            rest_elapsed = time.monotonic() - start
-            # 19 further callers, none of which may wait on the child again --
-            # the cooldown answers them immediately.
-            assert rest_elapsed < 0.5, rest_elapsed
+                later = instance.resolve("npx", ["-y", f"p{i}"], {}, None)
+                assert later.is_refused, later
+                assert "cooling down" in later.reason, later.reason
             assert instance.spawn_attempts == 1
         finally:
             instance.close()

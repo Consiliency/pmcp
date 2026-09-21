@@ -367,6 +367,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+- **Tests no longer assert upper bounds on wall-clock time.** The parallel-connection test proves concurrency with a rendezvous instead of a 0.2 s margin, and the suite's ten other `elapsed < X` assertions are replaced by the deterministic property each stood in for. New `tests/_timing.py` (`eventually`, `eventually_sync`, `Rendezvous`) is the shared wait primitive. See [#235](https://github.com/Consiliency/pmcp/issues/235), see [#226](https://github.com/Consiliency/pmcp/issues/226).
 - **The credential store is written atomically** (temp file → `fsync` → `os.replace`), so an interrupted `write_env_file` no longer truncates the file and loses its other entries. See [#248](https://github.com/Consiliency/pmcp/issues/248).
 - **The npm version-check User-Agent now names `github.com/Consiliency/pmcp`** instead of the pre-rename `ViperJuice/pmcp`. See [#247](https://github.com/Consiliency/pmcp/issues/247).
 - **The default feedback repository was `ViperJuice/pmcp`, a repository this
