@@ -4418,6 +4418,120 @@ class TestCapabilityAndProvision:
         assert isinstance(probe_calls["env"], dict)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "raised",
+        [asyncio.TimeoutError, TimeoutError],
+        ids=["asyncio-timeouterror", "builtin-timeouterror"],
+    )
+    async def test_update_server_reports_a_probe_timeout_instead_of_raising(
+        self, monkeypatch, raised
+    ):
+        """A hung update probe must come back as ok=False, on every supported version.
+
+        `_run_update_probe_command` bounds the probe with `asyncio.wait_for`, and
+        on the 3.10 floor `asyncio.TimeoutError` is NOT the builtin `TimeoutError`
+        and not a subclass of it -- so a handler catching only the builtin lets the
+        timeout escape and `update_server` raises instead of answering. Both classes
+        are exercised because they are the same object on 3.11+ and distinct on
+        3.10; the parametrisation is what keeps the fix from silently doing nothing
+        on the oldest supported version.
+        """
+        client_manager = MockClientManager(create_mock_tools())
+        gateway_tools = GatewayTools(
+            client_manager=client_manager,  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        manifest = Manifest(
+            version="1.0",
+            cli_alternatives={},
+            servers={
+                "playwright": ServerConfig(
+                    name="playwright",
+                    description="Browser automation",
+                    keywords=["browser"],
+                    install={},
+                    command="npx",
+                    args=["@playwright/mcp"],
+                    requires_api_key=False,
+                )
+            },
+            discovery_queue_path=".mcp-gateway/discovery_queue.json",
+        )
+        monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+
+        async def fake_get_package_version(
+            command, args, env=None, cwd=None, timeout=5.0
+        ):
+            return ("1.2.3", "npm")
+
+        monkeypatch.setattr(
+            "pmcp.tools.handlers.get_package_version", fake_get_package_version
+        )
+
+        async def _hung_probe(command, env=None):
+            raise raised("probe hung")
+
+        monkeypatch.setattr(gateway_tools, "_run_update_probe_command", _hung_probe)
+
+        result = await gateway_tools.update_server({"server_name": "playwright"})
+
+        assert result.ok is False
+        assert result.server == "playwright"
+        assert "timed out" in result.message.lower(), result.message
+
+    @pytest.mark.asyncio
+    async def test_the_update_probe_normalises_its_timeout_to_the_builtin(
+        self, monkeypatch
+    ):
+        """The asyncio timeout class must not escape the helper.
+
+        `asyncio.wait_for` raises `asyncio.TimeoutError`, which on 3.10 is not
+        the builtin and not a subclass of it. The helper converts before the
+        exception reaches any caller, so a caller can catch one type on every
+        supported version -- the same contract `ClientManager._send_request`
+        provides. Covers the path the caller-level test above stubs out.
+        """
+        gateway_tools = GatewayTools(
+            client_manager=MockClientManager(create_mock_tools()),  # type: ignore
+            policy_manager=PolicyManager(),
+        )
+
+        class _Proc:
+            returncode = None
+            pid = 4321
+
+            async def communicate(self):  # pragma: no cover - never completes
+                raise AssertionError("communicate should not be awaited here")
+
+        async def _fake_exec(*args, **kwargs):
+            return _Proc()
+
+        async def _timing_out(coro, timeout=None):
+            coro.close()
+            raise asyncio.TimeoutError()
+
+        reaped: list[str] = []
+
+        async def _fake_reap(process, label):
+            reaped.append(label)
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+        monkeypatch.setattr(asyncio, "wait_for", _timing_out)
+        monkeypatch.setattr("pmcp.tools.handlers._terminate_process_tree", _fake_reap)
+
+        with pytest.raises(TimeoutError) as excinfo:
+            await gateway_tools._run_update_probe_command(["npx", "pkg", "--help"])
+
+        # The builtin, not the asyncio class -- on 3.10 `type(...) is TimeoutError`
+        # is the whole point and `isinstance` against the asyncio class would pass
+        # for the unfixed code on 3.11+.
+        assert type(excinfo.value) is TimeoutError
+        assert "timed out" in str(excinfo.value)
+        # The process tree is still reaped before propagating.
+        assert reaped == ["update-probe"]
+
+    @pytest.mark.asyncio
     async def test_submit_feedback_preview_includes_telemetry_and_scrubs(
         self, monkeypatch
     ):
