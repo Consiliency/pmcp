@@ -34,7 +34,9 @@ refresh steps to add the second downstream to `autoStart`, modelling an
 operator who adds an autoStart entry and refreshes.
 
 The gateway is booted with `request_timeout=5` (SL-5.1's harness keyword)
-and an explicit sleep pushes the refresh step's notification past t=12s --
+and an explicit sleep pushes the refresh step's notification past the
+configured `request_timeout` (`_SLEEP_PAST_TIMEOUT_S` vs
+`_REQUEST_TIMEOUT_S`, related at import time) --
 IF-0-P3B-3's `subscriptions/listen` exemption from the `request_timeout`
 wrapper is what keeps the stream alive that long; on pre-P3B code (or a
 regression that drops the exemption) this module fails outright because

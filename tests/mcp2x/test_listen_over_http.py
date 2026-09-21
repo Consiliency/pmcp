@@ -16,7 +16,9 @@ acceptance commands select with ``-k``:
 - ``test_timeout_exemption_keeps_stream_alive`` — the app is built with
   ``request_timeout=3``; on today's code (before SL-4.3) the stream is
   killed at exactly 3s with a truncated chunked body (measured spike 2).
-  This asserts the stream is still alive and still delivering past t>8s.
+  This asserts the stream is still alive and still delivering after a publish
+  delayed past `request_timeout` (`_SLEEP_PAST_TIMEOUT_S` vs
+  `_REQUEST_TIMEOUT_S`, related at import time).
 - ``test_client_close_ends_subscription`` — EC-P3B-2's HTTP client-close
   half, proven observably: with ``max_subscriptions=1``, closing the first
   subscription's connection must free its slot so a second subscription is
