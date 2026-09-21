@@ -54,9 +54,10 @@ def _write(path: Path, data: dict[str, Any]) -> Path:
 def _explicit_policy(tmp_path: Path, data: dict[str, Any]) -> PolicyManager:
     """A manager over exactly *data*, via `--policy`.
 
-    An explicit policy skips discovery, so these tests never read the
-    developer's real `~/.claude` policy -- `USER_POLICY_PATHS` is computed from
-    the home directory at import time, before the autouse HOME redirect.
+    An explicit policy skips discovery entirely, so these tests never read the
+    developer's real `~/.claude` policy and never depend on the discovery seam
+    at all -- which is why they are unaffected by whether the operator paths
+    resolve at import time or at call time (Consiliency/pmcp#262).
     """
     return PolicyManager(policy_path=_write(tmp_path / "policy.json", data))
 

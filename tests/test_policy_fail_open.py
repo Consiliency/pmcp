@@ -447,6 +447,118 @@ def test_default_policy_paths_stays_a_patchable_module_attribute(
     assert PolicyManager().is_server_allowed("deny-me") is False
 
 
+# === Path.home() is read at construction, not at import (Consiliency/pmcp#262) ===
+
+
+def _home_with_policy(
+    tmp_path_factory: pytest.TempPathFactory, name: str, policy: dict
+) -> Path:
+    """A fake home holding `.claude/gateway-policy.yaml`.
+
+    `mktemp` siblings, never under `tmp_path`: `tests/conftest.py` records the
+    measured reason a fake home must not nest inside the per-test tmp dir.
+    """
+    home = tmp_path_factory.mktemp(name)
+    claude = home / ".claude"
+    claude.mkdir()
+    (claude / "gateway-policy.yaml").write_text(json.dumps(policy))
+    return home
+
+
+def test_user_policy_paths_follow_home_at_construction(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """`USER_POLICY_PATHS` must not freeze `Path.home()` at import time.
+
+    Deliberately patches **neither** module list: the module's real state is the
+    subject, exactly as `test_default_paths_follow_the_cwd_at_construction`
+    treats the cwd. `pmcp.policy.policy` is imported at collection time, long
+    before these `setenv`s, so on unfixed code both managers read whichever home
+    was live at import and neither fake policy is found.
+
+    Two constructions in one process is the re-homed-process case #262 names.
+    """
+    first = _home_with_policy(
+        tmp_path_factory, "home-a", {"servers": {"denylist": ["deny-in-a"]}}
+    )
+    second = _home_with_policy(tmp_path_factory, "home-b", _VALID_POLICY)
+
+    with caplog.at_level(logging.WARNING):
+        monkeypatch.setenv("HOME", str(first))
+        under_first = PolicyManager()
+        monkeypatch.setenv("HOME", str(second))
+        under_second = PolicyManager()
+
+    assert under_first.is_server_allowed("deny-in-a") is False
+
+    assert under_second.is_server_allowed("deny-me") is False
+    assert under_second.get_max_tools_per_server() == 7
+    # The first home's policy must not linger once HOME moved.
+    assert under_second.is_server_allowed("deny-in-a") is True
+
+    # Both files are USER-scoped, so neither may be consent-refused. A warning
+    # here means the file was discovered but classed project-scoped.
+    assert [r.message for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+def test_a_patched_user_policy_list_is_honoured_over_the_live_home(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A patched allowlist wins over the live home -- the anti-naive-fix test.
+
+    The file IS in the search list but is NOT in the patched (empty) allowlist,
+    so it must be treated as project-scoped and refused by the consent gate.
+    A fix that resolved `Path.home()` unconditionally would class the operator's
+    real policy as ungated *inside the tests that guard S-11*.
+
+    `DEFAULT_POLICY_PATHS` is patched to the file rather than to `[]` on
+    purpose: with an empty search list nothing is discovered under ANY
+    implementation and this test could not fail.
+    """
+    home = _home_with_policy(tmp_path_factory, "home-patched", _VALID_POLICY)
+    policy_file = home / ".claude" / "gateway-policy.yaml"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("pmcp.policy.policy.USER_POLICY_PATHS", [])
+    monkeypatch.setattr("pmcp.policy.policy.DEFAULT_POLICY_PATHS", [policy_file])
+
+    with caplog.at_level(logging.WARNING):
+        manager = PolicyManager()
+
+    assert manager.is_server_allowed("deny-me") is True
+    assert manager.get_max_tools_per_server() != 7
+
+    warnings = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, warnings
+    assert str(policy_file) in warnings[0]
+
+
+def test_the_search_list_derives_from_the_patched_user_list(
+    tmp_path_factory: pytest.TempPathFactory,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unpatched search list is built from the allowlist IN FORCE.
+
+    Only `USER_POLICY_PATHS` is patched, to `[]`. The live home's policy must be
+    neither loaded nor refused: if the unpatched `DEFAULT_POLICY_PATHS` spliced
+    the live home instead of the effective (empty) user list, the file would be
+    searched and then consent-refused, and a warning would appear.
+    """
+    home = _home_with_policy(tmp_path_factory, "home-derived", _VALID_POLICY)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr("pmcp.policy.policy.USER_POLICY_PATHS", [])
+
+    with caplog.at_level(logging.WARNING):
+        manager = PolicyManager()
+
+    assert manager.is_server_allowed("deny-me") is True
+    assert [r.message for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
 # === explicit --policy is unchanged: all three modes remain fatal ===
 
 
