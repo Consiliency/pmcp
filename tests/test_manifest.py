@@ -1642,7 +1642,14 @@ class TestMonitorInstall:
             name="test",
             description="Test",
             keywords=["test"],
-            install={"linux": ["echo", "output line"]},
+            # The child must STAY ALIVE until the monitor has read its line.
+            # `_monitor_install` breaks out of its loop as soon as
+            # `process.returncode is not None` and never drains leftover
+            # stdout, so a bare `echo` can exit before the monitor's first
+            # iteration -- leaving output_lines empty and the heartbeat at its
+            # start-install value. Same shape as
+            # test_monitor_detects_server_ready_pattern below.
+            install={"linux": ["bash", "-c", "echo output line && sleep 5"]},
             command="echo",
             args=["test"],
             requires_api_key=False,
@@ -1655,19 +1662,21 @@ class TestMonitorInstall:
         assert job is not None
         hb0 = job.last_heartbeat
 
-        # Wait deterministically for the monitor to drain output and finish,
-        # rather than racing a fixed wall-clock sleep against the subprocess
-        # (same precedent as test_monitor_reads_stderr below).
-        assert job._monitor_task is not None
-        await asyncio.wait_for(job._monitor_task, timeout=5.0)
-
-        # The docstring's actual claim: stdout output REFRESHED the heartbeat
-        # (installer.py updates it on every output line). Strict `>` is safe --
-        # at least one event-loop turn and a pipe read separate the initial
-        # stamp in start_install from the one the monitor writes.
-        assert job.last_heartbeat > hb0, "stdout output did not refresh last_heartbeat"
+        # Wait for the PROPERTY the docstring claims -- that stdout output
+        # refreshed the heartbeat -- not for a proxy. Waiting on the monitor
+        # task instead would be satisfied by a monitor that exited without
+        # reading anything.
+        await eventually(
+            lambda: job.last_heartbeat > hb0,
+            timeout=5.0,
+            message="stdout output did not refresh last_heartbeat",
+        )
         # Heartbeat should be recent
         assert time.time() - job.last_heartbeat < 5
+
+        # Clean up - kill the process
+        if job.process and job.process.returncode is None:
+            job.process.kill()
 
     @pytest.mark.asyncio
     async def test_monitor_reads_stderr(self) -> None:

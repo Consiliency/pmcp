@@ -226,7 +226,9 @@ class TestTimeoutExemption:
         """On today's (pre-SL-4.3) code this app kills the stream at exactly
         3s with a truncated chunked body. With the exemption, the stream
         must still be alive and still delivering a notification published
-        well past that timeout — asserted at t > 8s, per IF-0-P3B-3."""
+        well past that timeout, per IF-0-P3B-3. The sleep-vs-request_timeout
+        relation is asserted at import time; the runtime proof is the frame
+        arriving after `_SLEEP_PAST_TIMEOUT_S`."""
         async with _run_listen_app(request_timeout=_REQUEST_TIMEOUT_S) as running:
             headers, body = _listen_envelope(notifications={"toolsListChanged": True})
             async with (

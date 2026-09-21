@@ -283,8 +283,10 @@ async def test_raising_bus_is_isolated_and_the_sink_still_works_afterward() -> N
     sink = BusCatalogEventSink(bus)
 
     sink.note_tools_changed()
-    # The drain must not propagate the exception: `eventually` re-raises a
-    # predicate exception immediately, so a propagating publish still surfaces.
+    # The publish happens in a separate DRAIN TASK, so `eventually`'s
+    # predicate-exception propagation says nothing about it either way -- the
+    # isolation is proven by the second half of this test (the sink still
+    # drains afterwards), not by how we wait here.
     await eventually(lambda: bus.calls >= 1)
 
     assert bus.calls == 1
