@@ -4847,7 +4847,7 @@ class TestUpdateProbeProcessCleanup:
     """
 
     _SCENARIO = """
-import asyncio, os, sys, tempfile
+import asyncio, os, sys, tempfile, time
 
 sys.path.insert(0, {src!r})
 from pmcp.tools.handlers import GatewayTools
@@ -4883,11 +4883,16 @@ async def main():
         await gt._run_update_probe_command([sys.executable, "-c", script])
     except BaseException:
         pass
-    await asyncio.sleep(0.5)
     pid = (open(pidfile).read() or "").strip()
     os.unlink(pidfile)
     if not pid:
         print("SETUP-FAILED"); return
+    # Hang guard, not a measurement: the probe has already awaited
+    # _terminate_process_tree; what we wait for is init's reap of the
+    # reparented grandchild. Stdlib only -- this runs in a child interpreter.
+    deadline = time.monotonic() + 5.0
+    while os.path.exists("/proc/" + pid) and time.monotonic() < deadline:
+        await asyncio.sleep(0.05)
     print("ORPHANED" if os.path.exists("/proc/" + pid) else "REAPED")
 
 asyncio.run(main())

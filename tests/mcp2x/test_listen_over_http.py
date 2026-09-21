@@ -31,7 +31,6 @@ import asyncio
 import contextlib
 import json
 import socket
-import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
@@ -46,6 +45,20 @@ from mcp.types import CLIENT_CAPABILITIES_META_KEY, PROTOCOL_VERSION_META_KEY
 from mcp.types.version import LATEST_MODERN_VERSION
 
 from pmcp.transport.http import create_http_app
+from tests._timing import eventually
+
+# The timeout-exemption proof (IF-0-P3B-3) rests on one relation: the publish is
+# delayed past the app's request_timeout, so a notification that STILL arrives
+# can only mean the listen stream survived it. A sleep never returns early, so
+# the relation is between two constants and is checked here, at import time,
+# rather than by timing the test.
+_REQUEST_TIMEOUT_S = 3
+_SLEEP_PAST_TIMEOUT_S = 8.2
+assert _SLEEP_PAST_TIMEOUT_S > _REQUEST_TIMEOUT_S, (
+    "the pre-publish sleep must exceed request_timeout or the exemption "
+    "test proves nothing"
+)
+
 
 pytestmark = pytest.mark.asyncio
 
@@ -114,12 +127,12 @@ async def _run_listen_app(
     uv_server = uvicorn.Server(config)
     task = asyncio.create_task(uv_server.serve())
     try:
-        for _ in range(200):
-            if uv_server.started:
-                break
-            await asyncio.sleep(0.05)
-        else:
-            raise RuntimeError("listen app never started")
+        await eventually(
+            lambda: uv_server.started,
+            timeout=10.0,
+            interval=0.05,
+            message="listen app never started",
+        )
         yield RunningListenApp(
             base_url=f"http://127.0.0.1:{port}", bus=bus, listen_handler=listen_handler
         )
@@ -214,9 +227,8 @@ class TestTimeoutExemption:
         3s with a truncated chunked body. With the exemption, the stream
         must still be alive and still delivering a notification published
         well past that timeout — asserted at t > 8s, per IF-0-P3B-3."""
-        async with _run_listen_app(request_timeout=3) as running:
+        async with _run_listen_app(request_timeout=_REQUEST_TIMEOUT_S) as running:
             headers, body = _listen_envelope(notifications={"toolsListChanged": True})
-            start = time.monotonic()
             async with (
                 httpx.AsyncClient(timeout=None) as client,
                 client.stream(
@@ -228,15 +240,16 @@ class TestTimeoutExemption:
                 ack = await _next_data_frame(lines)
                 assert ack["method"] == "notifications/subscriptions/acknowledged"
 
-                # Sleep well past request_timeout=3 before publishing, so a
+                # Sleep well past request_timeout before publishing, so a
                 # notification delivered afterward can only be explained by
-                # the stream having survived the timeout wrapper.
-                await asyncio.sleep(8.2)
+                # the stream having survived the timeout wrapper. The relation
+                # between the two constants is asserted at import time; timing
+                # the test would only re-measure a sleep that cannot return
+                # early.
+                await asyncio.sleep(_SLEEP_PAST_TIMEOUT_S)
                 await running.bus.publish(ToolsListChanged())
 
                 frame = await _next_data_frame(lines, timeout=5)
-                elapsed = time.monotonic() - start
-                assert elapsed > 8, elapsed
                 assert frame["method"] == "notifications/tools/list_changed"
 
 
@@ -267,10 +280,11 @@ class TestClientCloseReleasesSlot:
             headers_b, body_b = _listen_envelope(
                 notifications={"toolsListChanged": True}, request_id=2
             )
-            deadline = time.monotonic() + 10.0
             last: object = None
             async with httpx.AsyncClient(timeout=None) as client_b:
-                while time.monotonic() < deadline:
+
+                async def _b_is_acked() -> bool:
+                    nonlocal last
                     # Streamed, not `client_b.post(...)`: a successful ack
                     # opens a live SSE stream that never completes on its
                     # own, so a non-streaming call here would hang forever
@@ -283,14 +297,17 @@ class TestClientCloseReleasesSlot:
                         json=body_b,
                     ) as response_b:
                         message = await _first_message(response_b, timeout=3.0)
-                        if (
-                            message.get("method")
-                            == "notifications/subscriptions/acknowledged"
-                        ):
-                            return
-                        last = message
-                    await asyncio.sleep(0.2)
-            pytest.fail(
-                "subscription B was never acked after A's client disconnect "
-                f"(max_subscriptions=1); last response was {last!r}"
-            )
+                    last = message
+                    return (
+                        message.get("method")
+                        == "notifications/subscriptions/acknowledged"
+                    )
+
+                try:
+                    await eventually(_b_is_acked, timeout=10.0, interval=0.2)
+                except AssertionError:
+                    raise AssertionError(
+                        "subscription B was never acked after A's client "
+                        f"disconnect (max_subscriptions=1); last response "
+                        f"was {last!r}"
+                    ) from None

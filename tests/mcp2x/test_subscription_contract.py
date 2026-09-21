@@ -33,6 +33,7 @@ from mcp.shared.subscriptions import (
 )
 
 from pmcp.subscriptions import BusCatalogEventSink, CatalogEventSink
+from tests._timing import eventually
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 SUBSCRIPTIONS_MODULE = REPO_ROOT / "src" / "pmcp" / "subscriptions.py"
@@ -177,7 +178,10 @@ async def test_note_inside_running_loop_self_schedules_a_drain_with_no_flush_cal
     sink = BusCatalogEventSink(bus)
 
     sink.note_tools_changed()  # no flush() anywhere in this test
-    await asyncio.sleep(0.05)
+    await eventually(
+        lambda: bus.published,
+        message="note_* inside a running loop never self-scheduled a drain",
+    )
 
     assert bus.published == [ToolsListChanged()]
 
@@ -209,10 +213,10 @@ async def test_note_during_a_suspended_publish_is_not_stranded() -> None:
     bus.gate.set()  # release the first publish
     # Give the drain loop room to re-check `_pending`, find the prompts
     # event, and publish it too — no flush() call anywhere in this test.
-    for _ in range(50):
-        if len(bus.published) >= 2:
-            break
-        await asyncio.sleep(0.01)
+    await eventually(
+        lambda: len(bus.published) >= 2,
+        message="the prompts event noted during the suspended publish was stranded",
+    )
 
     assert bus.published == [ToolsListChanged(), PromptsListChanged()]
 
@@ -260,6 +264,9 @@ def test_naive_snapshot_and_exit_drain_fails_the_lost_wakeup_regression() -> Non
         await bus.entered.wait()
         naive.note_prompts_changed()  # sees `_draining is True`, declines to re-arm
         bus.gate.set()
+        # NEGATIVE SOAK -- deliberately a fixed sleep, not `eventually`.
+        # This asserts the naive sink NEVER delivers the second event; a poll
+        # would return true at t=0 regardless and prove nothing.
         await asyncio.sleep(0.1)
         return bus.published
 
@@ -276,14 +283,19 @@ async def test_raising_bus_is_isolated_and_the_sink_still_works_afterward() -> N
     sink = BusCatalogEventSink(bus)
 
     sink.note_tools_changed()
-    await asyncio.sleep(0.05)  # the drain must not propagate the exception
+    # The drain must not propagate the exception: `eventually` re-raises a
+    # predicate exception immediately, so a propagating publish still surfaces.
+    await eventually(lambda: bus.calls >= 1)
 
     assert bus.calls == 1
 
     # The drain's live flag must have been cleared despite the exception, or
     # this second note is silently dropped (mistaken for "a drain is live").
     sink.note_resources_changed()
-    await asyncio.sleep(0.05)
+    await eventually(
+        lambda: bus.calls >= 2,
+        message="the second note after a raising publish never drained -- _draining was left set",
+    )
 
     assert bus.calls == 2
 
@@ -416,10 +428,10 @@ async def test_cancellation_before_the_drain_starts_does_not_wedge_the_sink() ->
     # re-arm itself and publish the still-pending event with no further
     # `note_*` to prod it. (`_draining` may legitimately be True right here
     # -- that is the *replacement* drain being live, not a wedge.)
-    for _ in range(100):
-        await asyncio.sleep(0.01)
-        if any(isinstance(e, ToolsListChanged) for e in bus.published):
-            break
+    await eventually(
+        lambda: any(isinstance(e, ToolsListChanged) for e in bus.published),
+        message="pre-start cancellation stranded the event",
+    )
     assert any(isinstance(e, ToolsListChanged) for e in bus.published), (
         f"pre-start cancellation stranded the event: {bus.published}"
     )
@@ -448,10 +460,10 @@ async def test_event_noted_during_a_cancelled_drain_is_not_stranded() -> None:
     await asyncio.gather(*sink._drain_tasks, return_exceptions=True)
 
     # No further note_* -- the re-arm must come from the sink itself.
-    for _ in range(100):
-        await asyncio.sleep(0.01)
-        if any(isinstance(e, PromptsListChanged) for e in bus.published):
-            break
+    await eventually(
+        lambda: any(isinstance(e, PromptsListChanged) for e in bus.published),
+        message="event noted during a cancelled drain was stranded",
+    )
     assert any(isinstance(e, PromptsListChanged) for e in bus.published), (
         f"event noted during a cancelled drain was stranded: {bus.published}"
     )
@@ -484,8 +496,8 @@ async def test_cancelled_drain_does_not_wedge_the_sink() -> None:
     bus.gate.set()
     bus.published.clear()
     sink.note_prompts_changed()
-    for _ in range(50):
-        await asyncio.sleep(0.01)
-        if any(isinstance(e, PromptsListChanged) for e in bus.published):
-            break
+    await eventually(
+        lambda: any(isinstance(e, PromptsListChanged) for e in bus.published),
+        message="the sink stayed wedged after a cancelled drain",
+    )
     assert any(isinstance(e, PromptsListChanged) for e in bus.published)
