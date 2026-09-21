@@ -743,33 +743,33 @@
     },
     {
       "acceptance_criteria_count": 5,
-      "created_at": "2026-09-21T05:09:00Z",
-      "file": ".consiliency/plans/detailed-policy-home-call-time-20260921-0509.md",
+      "created_at": "2026-09-21T05:14:01Z",
+      "file": ".consiliency/plans/detailed-poll-until-conversion-c2a-20260921-0514.md",
       "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
       "if_gates_produced": [],
       "lanes": [],
       "lifecycle": [
         {
-          "at": "2026-09-21T05:09:00Z",
+          "at": "2026-09-21T05:14:01Z",
           "by": "claude-plan-detailed",
           "metadata": {
-            "branch": "plan/262-policy-home-calltime",
-            "issue": "Consiliency/pmcp#262",
-            "sibling": "Consiliency/pmcp#261",
-            "umbrella": "Consiliency/pmcp#235"
+            "branch": "plan/235-slice-c2-poll-until",
+            "commit": "4c6967b",
+            "issue": "Consiliency/pmcp#235",
+            "split": "C2a of C2a/C2b/C2c"
           },
           "transition": "committed"
         }
       ],
       "owner_skill": "claude-plan-detailed",
       "phase_alias": null,
-      "reflection_ref": "/home/viperjuice/.claude/skills/claude-plan-detailed/reflections/9b7e9291/plan-262-policy-home-calltime/20260921T050900Z-a262pl.md",
+      "reflection_ref": "~/.codex/skills/claude-plan-detailed/reflections/99231cce/plan-235-slice-c2-poll-until/20260921T051401Z-slice-c2a.md",
       "roadmap_ref": null,
-      "slug": "policy-home-call-time-262",
+      "slug": "poll-until-conversion-slice-c2a",
       "status": "committed",
-      "task_summary": "Consiliency/pmcp#262: resolve the operator policy home (~/.claude/gateway-policy.*) at PolicyManager construction instead of import, via identity-sentinel defaults that keep the USER_POLICY_PATHS / DEFAULT_POLICY_PATHS monkeypatch seam honoured verbatim; three tests, one red on main.",
+      "task_summary": "Slice C2a of Consiliency/pmcp#235 (see #235): convert the fixed sleep-then-assert sites (test_manifest, test_subscription_contract, test_listen_registration, the test_tools subprocess script) to eventually, and replace the tautological elapsed>8/elapsed>12 bounds with an import-time constant relation; C2b (private-poller consolidation) and C2c (wall-clock-window redesigns) named with per-file inventories.",
       "type": "detailed",
-      "updated_at": "2026-09-21T05:09:00Z"
+      "updated_at": "2026-09-21T05:14:01Z"
     },
     {
       "acceptance_criteria_count": 7,
@@ -1297,6 +1297,36 @@
       "task_summary": null,
       "type": "phase",
       "updated_at": "2026-06-25T02:26:25Z"
+    },
+    {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-09-21T05:09:00Z",
+      "file": ".consiliency/plans/detailed-policy-home-call-time-20260921-0509.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-21T05:09:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "branch": "plan/262-policy-home-calltime",
+            "issue": "Consiliency/pmcp#262",
+            "sibling": "Consiliency/pmcp#261",
+            "umbrella": "Consiliency/pmcp#235"
+          },
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": "/home/viperjuice/.claude/skills/claude-plan-detailed/reflections/9b7e9291/plan-262-policy-home-calltime/20260921T050900Z-a262pl.md",
+      "roadmap_ref": null,
+      "slug": "policy-home-call-time-262",
+      "status": "committed",
+      "task_summary": "Consiliency/pmcp#262: resolve the operator policy home (~/.claude/gateway-policy.*) at PolicyManager construction instead of import, via identity-sentinel defaults that keep the USER_POLICY_PATHS / DEFAULT_POLICY_PATHS monkeypatch seam honoured verbatim; three tests, one red on main.",
+      "type": "detailed",
+      "updated_at": "2026-09-21T05:09:00Z"
     }
   ],
   "schema_version": 1

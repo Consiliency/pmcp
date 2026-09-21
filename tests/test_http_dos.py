@@ -219,7 +219,7 @@ class TestListenStreamCap:
                             message = await asyncio.wait_for(
                                 _next_data_frame(response_b.aiter_lines()), timeout=3.0
                             )
-                        except (TimeoutError, AssertionError):
+                        except (asyncio.TimeoutError, TimeoutError, AssertionError):
                             message = None
                         if (
                             message is not None
