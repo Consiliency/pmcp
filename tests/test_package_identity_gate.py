@@ -31,7 +31,6 @@ import itertools
 import shutil
 import subprocess
 import threading
-import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any, cast
@@ -950,37 +949,45 @@ async def test_a_hostile_server_name_in_the_refusal_is_quoted(
 async def test_registration_resolves_off_the_event_loop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    loop = asyncio.get_running_loop()
     loop_thread = threading.get_ident()
     fetch_threads: list[int] = []
 
-    def slow_fetch(name: str) -> dict[str, Any]:
+    # A thread<->loop handshake proves the fetch runs off the loop without
+    # counting work inside a wall-clock window (the Consiliency/pmcp#226 flake
+    # class: a starved runner fails a tick count even when the code is right).
+    # The loop-side `acker` can only set `acked` if the loop keeps running
+    # *while* the fetch blocks -- impossible if the fetch ran on the loop
+    # thread, in which case `acked.wait(5)` times out and fails by name.
+    loop_alive = asyncio.Event()
+    acked = threading.Event()
+
+    async def acker() -> None:
+        await loop_alive.wait()
+        acked.set()
+
+    def handshake_fetch(name: str) -> dict[str, Any]:
         fetch_threads.append(threading.get_ident())
-        time.sleep(0.5)  # a blocking socket read
+        loop.call_soon_threadsafe(loop_alive.set)
+        assert acked.wait(5), (
+            "the loop never acked while the fetch blocked; "
+            "the registry lookup ran on the event loop thread"
+        )
         return _packument(name, "1.0.0")
 
-    monkeypatch.setattr(package_identity, "_fetch_packument", slow_fetch)
+    monkeypatch.setattr(package_identity, "_fetch_packument", handshake_fetch)
     gateway, _ = _gateway(monkeypatch, _empty_policy(tmp_path))
 
-    ticks = 0
-
-    async def ticker() -> None:
-        nonlocal ticks
-        while True:
-            await asyncio.sleep(0.02)
-            ticks += 1
-
-    task = asyncio.create_task(ticker())
+    ack_task = asyncio.create_task(acker())
     try:
         out = await gateway.register_discovered_server(
             {"server_name": "slow", "package": "slow-mcp"}
         )
     finally:
-        task.cancel()
+        ack_task.cancel()
 
     assert out.registered is True
     assert fetch_threads and fetch_threads[0] != loop_thread
-    # A blocked loop would tick ~0 times during the half-second fetch.
-    assert ticks >= 10, ticks
 
 
 @pytest.mark.asyncio

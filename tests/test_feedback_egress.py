@@ -30,7 +30,6 @@ import os
 import re
 import shutil
 import threading
-import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -616,32 +615,42 @@ async def test_a_hostile_repository_override_is_rendered_inert_in_the_refusal(
 async def test_no_blocking_http_call_runs_on_the_event_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """EC-EGRESS-4 (P-03). The submitter really blocks, and the loop really ticks.
+    """EC-EGRESS-4 (P-03). The submitter really blocks, and the loop stays live.
 
     A mock that returns instantly satisfies neither assertion honestly: it would pass
-    unchanged against `main`'s inline `urlopen`. This one sleeps for real and records
-    the thread it ran on.
+    unchanged against `main`'s inline `urlopen`. This one blocks for real, on a
+    handshake the loop must answer, and records the thread it ran on.
     """
     monkeypatch.setenv(_TOKEN_VAR, _EXPORTED_TOKEN)
     recorder = _Recorder()
+    loop = asyncio.get_running_loop()
+
+    # A thread<->loop handshake instead of counting loop ticks inside a
+    # wall-clock window: the tick count assumed the machine got enough CPU
+    # during the sleep, so a starved runner failed it even when the code was
+    # correct (the Consiliency/pmcp#226 flake class). The loop-side `_acker`
+    # can only set `acked` if the loop keeps running *while* the submit
+    # blocks -- impossible if the submit ran on the loop thread.
+    loop_alive = asyncio.Event()
+    acked = threading.Event()
+
+    async def _acker() -> None:
+        await loop_alive.wait()
+        acked.set()
 
     def _blocking(**kwargs: Any) -> FeedbackSubmission:
         recorder.calls.append(kwargs)
         recorder.thread_ids.append(threading.get_ident())
-        time.sleep(0.4)
+        loop.call_soon_threadsafe(loop_alive.set)
+        assert acked.wait(5), (
+            "the loop never acked while the submit blocked; "
+            "the submission ran on the event loop thread"
+        )
         return _created()
 
     _install_transport(monkeypatch, _blocking)
 
-    ticks = 0
-
-    async def _heartbeat() -> None:
-        nonlocal ticks
-        while True:
-            await asyncio.sleep(0.01)
-            ticks += 1
-
-    beat = asyncio.ensure_future(_heartbeat())
+    beat = asyncio.ensure_future(_acker())
     try:
         result = await _submit(_gateway(submission=True), confirm_submission=True)
     finally:
@@ -652,7 +661,6 @@ async def test_no_blocking_http_call_runs_on_the_event_loop(
     assert recorder.thread_ids[0] != threading.get_ident(), (
         "the blocking submission ran on the event loop's thread"
     )
-    assert ticks > 5, f"the event loop stopped ticking during the submission: {ticks}"
 
 
 @pytest.mark.asyncio
