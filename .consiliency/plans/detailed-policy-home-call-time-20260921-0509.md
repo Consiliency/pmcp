@@ -174,11 +174,22 @@ Add three tests under the existing `# === Path.cwd() is read at construction, no
    - M2 — the unpatched branch of `_default_policy_paths()` splices `default_user_policy_paths()` instead of `_effective_user_policy_paths()` → T3 fails (measured).
    - M3 — delete the unpatched branch of `_default_policy_paths()` (read the frozen attribute) → T1 fails (measured).
    - M4 — `_user_policy_paths()` reads `USER_POLICY_PATHS` directly → T1 fails (measured).
-3. **Seam files unchanged in behaviour** — `uv run pytest tests/test_policy_fail_open.py tests/test_project_source_consent_policy.py tests/test_policy_package_identifiers.py tests/test_trust_boundaries_composition.py tests/test_trust_boundaries_e2e.py tests/test_scoped_advisor_audit.py -q -p no:cacheprovider --cov-fail-under=0` → all pass (90 on the prototype). Red-turning mutation, **measured**: M5 — make `_default_policy_paths()` always take the unpatched branch (ignore a patched `DEFAULT_POLICY_PATHS`) → `15 failed, 19 passed` across `tests/test_policy_fail_open.py` + the new tests, including `test_default_policy_paths_stays_a_patchable_module_attribute`, `test_valid_discovered_policy_loads_and_enforces` and T2. Note: `tests/test_scoped_advisor_audit.py` stayed green under M5 (its assertion holds whether or not the malformed file is searched), so do not cite it as M5's red test.
+3. **Seam files unchanged in behaviour** — `uv run pytest tests/test_policy_fail_open.py tests/test_project_source_consent_policy.py tests/test_policy_package_identifiers.py tests/test_trust_boundaries_composition.py tests/test_trust_boundaries_e2e.py tests/test_scoped_advisor_audit.py -q -p no:cacheprovider --cov-fail-under=0` → all pass (90 on the prototype). Red-turning mutation, **measured**: M5 — make `_default_policy_paths()` always take the unpatched branch (ignore a patched `DEFAULT_POLICY_PATHS`) → `15 failed, 7 passed` across `tests/test_policy_fail_open.py` + the new tests, including `test_default_policy_paths_stays_a_patchable_module_attribute`, `test_valid_discovered_policy_loads_and_enforces` and T2. Note: `tests/test_scoped_advisor_audit.py` stayed green under M5 (its assertion holds whether or not the malformed file is searched), so do not cite it as M5's red test.
 4. **Type and lint gate** — `uv run mypy src/pmcp` (`Success: no issues found in 49 source files` on the prototype), `uv run ruff check src/ tests/`, `uv run ruff format --check src/ tests/`. Red-turning mutation: annotate `USER_POLICY_PATHS: list[Path]` while assigning the tuple → mypy error.
 5. **Claim ledger guard** — `python3 scripts/check_security_claims.py` → `OK … 123 cited node id(s)`. Red-turning mutation: rename any cited test in a touched file (e.g. `test_project_redaction_patterns_extend_rather_than_replace_defaults`) → `FAIL R8`. Nothing in this plan renames one.
 6. **Full suite** — `uv run pytest -q -p no:cacheprovider` shows no new failures. Same-host result with the prototype applied, this run: `4027 passed, 3 skipped, 25 deselected`, exit 0. Red-turning mutation: any of M1-M5 (each reddens at least one collected test above).
 7. **Untouched by design** — `git diff --stat` shows no change to `tests/conftest.py`, `src/pmcp/policy/policy.py::_discover_policies`, or the IF-0-CONSENT-2 comment block (`git diff -U0 src/pmcp/policy/policy.py | grep -c "IF-0-CONSENT-2"` → `0`).
+
+## Implementation notes carried from panel review
+
+- Annotate `_effective_user_policy_paths()` as returning `Sequence[Path]`, so
+  the unpatched `tuple[Path, ...]` and a monkeypatched `list[Path]` unify under
+  mypy without a cast (gemini and grok, independently).
+- `_default_policy_paths()` must keep passing its result through
+  `_resolve_against_cwd(...)`, i.e. resolve
+  `[*PROJECT_POLICY_PATHS, *_effective_user_policy_paths()]` — otherwise the
+  relative PROJECT entries stop being resolved against `Path.cwd()`, which is
+  the regression Consiliency/pmcp#202 fixed (gemini).
 
 ## Acceptance criteria
 - [ ] **AC-1 (call-time home; red on today's `main`).** `test_user_policy_paths_follow_home_at_construction` fails on `main` @ `11d7a8e` at its first assertion (`assert under_first.is_server_allowed("deny-in-a") is False` → `assert True is False`) and passes with the fix. Red-turning mutations against the fixed tree: M3 or M4 (either half of the resolver reading its frozen attribute).
