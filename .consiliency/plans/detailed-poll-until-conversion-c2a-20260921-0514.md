@@ -404,12 +404,20 @@ uv run ruff check src/ tests/ && uv run ruff format --check src/ tests/
 #    in the touched classes; whole files here). Expect ~35 s.
 uv run pytest $C2A $ORPHAN --cov=pmcp --cov-report= --cov-fail-under=0 -q -p no:cacheprovider
 
-# 3. No fixed nonzero sleep remains in the six files except the two documented
-#    keeps. Expected output: exactly the two lines below, nothing else.
+# 3. No fixed SLEEP-BEFORE-ASSERT remains in the six files. Polling INTERVALS
+#    are not that class and must be allowed: `eventually(interval=...)` sleeps,
+#    and the orphan scenario's own poll uses `await asyncio.sleep(0.05)`. A
+#    check that forbade them would fail a correct implementation -- three panel
+#    seats independently flagged the earlier form, which did exactly that.
+#    Expected output: exactly the three lines below, nothing else.
 #      tests/mcp2x/test_subscription_contract.py:<n>: ... asyncio.sleep(0.1)   (negative soak)
 #      tests/test_tools.py:<n>/<n+2>: ... time.sleep(30)                       (the hung parent/grandchild, in-script)
+#      tests/test_tools.py:<n>: ... asyncio.sleep(0.05)                        (the orphan poll's INTERVAL)
 grep -nE "(asyncio|anyio|time)\.sleep\(\s*[0-9]*\.?[0-9]+\s*\)" $C2A tests/test_tools.py \
   | grep -vE "sleep\(\s*0\s*\)" | grep -vE "_SLEEP_PAST_TIMEOUT_S"
+#    Then assert the interval is a POLL interval, not a bare wait: every
+#    remaining sub-second sleep must sit inside a `while`/deadline loop.
+#    Inspect each of the three hits by eye; there are only three.
 #    and the two tautological bounds are gone (both greps print nothing):
 grep -n "assert elapsed" tests/mcp2x/test_listen_over_http.py tests/runtime/test_subscriptions_e2e.py
 grep -n "^import time" tests/mcp2x/test_listen_over_http.py
@@ -417,9 +425,23 @@ grep -n "^import time" tests/mcp2x/test_listen_over_http.py
 # 4. Starved-CPU rehearsal: one core, two busy loops, three passes. This is
 #    the load profile behind Consiliency/pmcp#226 and the reason the old
 #    sleeps were flaky. Expect 3/3 green.
-( yes >/dev/null & yes >/dev/null & sleep 1; \
-  for i in 1 2 3; do taskset -c 0 uv run pytest $C2A $ORPHAN -q -x --cov-fail-under=0 -p no:cacheprovider || { echo "FAIL pass $i"; break; }; done; \
-  kill %1 %2 )
+#    NOTE: the status must PROPAGATE. An earlier form ended with `kill %1 %2`
+#    after a `break`, so the compound command exited 0 even when a pass failed
+#    -- a verification step that could not fail (codex, blocking). The busy
+#    loops are pinned to the SAME core as pytest, or they do not contend.
+(
+  taskset -c 0 yes >/dev/null & B1=$!
+  taskset -c 0 yes >/dev/null & B2=$!
+  sleep 1
+  rc=0
+  for i in 1 2 3; do
+    taskset -c 0 uv run pytest $C2A $ORPHAN -q -x --cov-fail-under=0 -p no:cacheprovider \
+      || { echo "FAIL pass $i"; rc=1; break; }
+  done
+  kill $B1 $B2 2>/dev/null
+  exit $rc
+)
+echo "starvation rehearsal exit=$?   # MUST be 0"
 
 # 5. MUTATIONS -- each must turn the named test RED. Apply one at a time,
 #    run, then `git checkout -- src/ tests/`.
@@ -444,8 +466,15 @@ uv run pytest tests/mcp2x/test_subscription_contract.py -k "self_schedules or ra
 #     -> test_raising_bus_is_isolated_and_the_sink_still_works_afterward fails on the
 #        second eventually ("_draining was left set"); the three cancellation tests fail too.
 uv run pytest tests/mcp2x/test_subscription_contract.py -k "raising_bus_is_isolated or wedge or stranded" -q --cov-fail-under=0
-# 5f. subscriptions.py:181  change `while self._pending:` to `if self._pending:` in `_drain_pending`
+# 5f. subscriptions.py  delete the RE-ARM branch in `_on_drain_done` (the
+#     `if not self._pending: return` / `_start_drain(...)` block, around :152-158)
 #     -> test_note_during_a_suspended_publish_is_not_stranded fails "was stranded".
+#     NOT `while`->`if` in `_drain_pending`: `_on_drain_done` re-arms whenever
+#     `_pending` is non-empty ("a cancellation must delay delivery, never strand
+#     it"), so the second event is still published and the test STAYS GREEN.
+#     That mutation was named in revision 1 and could not falsify its criterion
+#     (codex, blocking; confirmed against src/pmcp/subscriptions.py). Demonstrate
+#     this one actually red before ticking the sink criterion.
 uv run pytest tests/mcp2x/test_subscription_contract.py -k suspended_publish -q --cov-fail-under=0
 # 5g. handlers.py:3794  delete `start_new_session=True` in `_run_update_probe_command`
 #     -> the scenario prints ORPHANED after its 5 s guard; the test fails "did not reap".
@@ -453,7 +482,12 @@ uv run pytest $ORPHAN -q --cov-fail-under=0
 # 5h. http.py:696  change `"subscriptions/listen"` to `"subscriptions/never"`
 #     -> test_timeout_exemption_keeps_stream_alive fails (frame never arrives; the stream
 #        is truncated at 3 s), and test_subscriptions_e2e fails in _read_until after refresh.
-uv run pytest tests/mcp2x/test_listen_over_http.py -k timeout_exemption tests/runtime/test_subscriptions_e2e.py -q --cov-fail-under=0
+#     Run BOTH by explicit node id: `-k timeout_exemption` applies to every path
+#     given, so it deselected the runtime test entirely (codex, blocking).
+uv run pytest \
+  "tests/mcp2x/test_listen_over_http.py::test_timeout_exemption_keeps_stream_alive" \
+  "tests/runtime/test_subscriptions_e2e.py::test_connect_disconnect_refresh_each_deliver_all_three_kinds" \
+  -q --cov-fail-under=0
 # 5i. test_listen_over_http.py  set `_SLEEP_PAST_TIMEOUT_S = 2.5`;
 #     test_subscriptions_e2e.py  set `_SLEEP_PAST_TIMEOUT_S = 4`
 #     -> each module fails at COLLECTION with the relation's message (0 s, no test runs).
@@ -510,8 +544,9 @@ Each criterion names the mutation that turns it red (all from step 5).
 - [ ] **The sink tests poll the drain.** `test_subscription_contract.py` has
       exactly one fixed nonzero `asyncio.sleep` left (the `:263` negative
       soak, commented as such) and seven `eventually(` calls. *Red by:* 5d
-      (no self-scheduled drain), 5e (`_draining` wedge), 5f (naive
-      snapshot-and-exit drain strands the second event).
+      (no self-scheduled drain), 5e (`_draining` wedge), 5f (re-arm deleted, so
+      an event noted during an in-flight drain is stranded -- NOT the
+      `while`->`if` mutation, which `_on_drain_done`'s re-arm defeats).
 - [ ] **The orphan-reap script and the cancel-registration test poll their
       property.** `_SCENARIO` contains `time.monotonic()` and no
       `asyncio.sleep(0.5)`; `test_listen_registration.py` contains no
