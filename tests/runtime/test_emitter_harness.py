@@ -24,7 +24,6 @@ observes.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from unittest import mock
 
@@ -40,6 +39,7 @@ from tests.runtime.fake_remote import (
 )
 from tests.runtime.fake_stdio_server import StdioEmitter, build_fake_stdio_downstream
 from tests.runtime.harness import alloc_port
+from tests._timing import eventually
 
 AUTH_VALUE = "Bearer emitter-harness-token"
 
@@ -131,13 +131,15 @@ class TestRemoteEmitterReachesDispatch:
                     await remote.emitter.add_tool("fr_dyn", description="dynamic")
                     await remote.emitter.emit("notifications/tools/list_changed")
 
-                    for _ in range(50):
-                        if any(
+                    await eventually(
+                        lambda: any(
                             c.get("method") == "notifications/tools/list_changed"
                             for c in calls
-                        ):
-                            break
-                        await asyncio.sleep(0.05)
+                        ),
+                        timeout=2.5,
+                        interval=0.05,
+                        message="the emitted notification never reached the spy",
+                    )
         finally:
             await manager.disconnect_all()
 
@@ -163,10 +165,12 @@ class TestRemoteEmitterReachesDispatch:
 
                     await remote.emitter.emit("notifications/tools/list_changed")
 
-                    for _ in range(50):
-                        if calls:
-                            break
-                        await asyncio.sleep(0.05)
+                    await eventually(
+                        lambda: calls,
+                        timeout=2.5,
+                        interval=0.05,
+                        message="the emitted notification never reached the spy",
+                    )
         finally:
             await manager.disconnect_all()
 
@@ -189,10 +193,12 @@ class TestRemoteEmitterReachesDispatch:
 
                     await remote.emitter.emit("notifications/something_unrecognised")
 
-                    for _ in range(50):
-                        if calls:
-                            break
-                        await asyncio.sleep(0.05)
+                    await eventually(
+                        lambda: calls,
+                        timeout=2.5,
+                        interval=0.05,
+                        message="the emitted notification never reached the spy",
+                    )
         finally:
             await manager.disconnect_all()
 
@@ -217,10 +223,12 @@ class TestRemoteEmitterReachesDispatch:
                     await remote.emitter.remove_tool("fr_removable")
                     await remote.emitter.emit("notifications/tools/list_changed")
 
-                    for _ in range(50):
-                        if calls:
-                            break
-                        await asyncio.sleep(0.05)
+                    await eventually(
+                        lambda: calls,
+                        timeout=2.5,
+                        interval=0.05,
+                        message="the emitted notification never reached the spy",
+                    )
         finally:
             await manager.disconnect_all()
 
@@ -243,13 +251,15 @@ class TestStdioEmitterReachesDispatch:
                 await downstream.emitter.add_tool("stdio_dyn", description="dynamic")
                 await downstream.emitter.emit("notifications/tools/list_changed")
 
-                for _ in range(50):
-                    if any(
+                await eventually(
+                    lambda: any(
                         c.get("method") == "notifications/tools/list_changed"
                         for c in calls
-                    ):
-                        break
-                    await asyncio.sleep(0.05)
+                    ),
+                    timeout=2.5,
+                    interval=0.05,
+                    message="the emitted notification never reached the spy",
+                )
         finally:
             await manager.disconnect_all()
 
@@ -273,13 +283,15 @@ class TestStdioEmitterReachesDispatch:
 
                 await downstream.emitter.emit("notifications/tools/list_changed")
 
-                for _ in range(50):
-                    if any(
+                await eventually(
+                    lambda: any(
                         c.get("method") == "notifications/tools/list_changed"
                         for c in calls
-                    ):
-                        break
-                    await asyncio.sleep(0.05)
+                    ),
+                    timeout=2.5,
+                    interval=0.05,
+                    message="the emitted notification never reached the spy",
+                )
         finally:
             await manager.disconnect_all()
 
@@ -298,13 +310,15 @@ class TestStdioEmitterReachesDispatch:
 
                 await downstream.emitter.emit("notifications/something_unrecognised")
 
-                for _ in range(50):
-                    if any(
+                await eventually(
+                    lambda: any(
                         c.get("method") == "notifications/something_unrecognised"
                         for c in calls
-                    ):
-                        break
-                    await asyncio.sleep(0.05)
+                    ),
+                    timeout=2.5,
+                    interval=0.05,
+                    message="the emitted notification never reached the spy",
+                )
         finally:
             await manager.disconnect_all()
 
@@ -327,13 +341,15 @@ class TestStdioEmitterReachesDispatch:
                 await downstream.emitter.remove_tool("stdio_removable")
                 await downstream.emitter.emit("notifications/tools/list_changed")
 
-                for _ in range(50):
-                    if any(
+                await eventually(
+                    lambda: any(
                         c.get("method") == "notifications/tools/list_changed"
                         for c in calls
-                    ):
-                        break
-                    await asyncio.sleep(0.05)
+                    ),
+                    timeout=2.5,
+                    interval=0.05,
+                    message="the emitted notification never reached the spy",
+                )
         finally:
             await manager.disconnect_all()
 

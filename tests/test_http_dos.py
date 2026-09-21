@@ -22,7 +22,6 @@ import asyncio
 import contextlib
 import json
 import socket
-import time
 from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -37,6 +36,7 @@ from mcp.types.version import LATEST_MODERN_VERSION
 from starlette.testclient import TestClient
 
 from pmcp.transport.http import create_http_app
+from tests._timing import eventually
 
 
 def _make_contract_client(
@@ -137,12 +137,12 @@ async def _run_listen_app(*, max_subscriptions: int) -> AsyncIterator[str]:
     uv_server = uvicorn.Server(config)
     task = asyncio.create_task(uv_server.serve())
     try:
-        for _ in range(200):
-            if uv_server.started:
-                break
-            await asyncio.sleep(0.05)
-        else:
-            raise RuntimeError("listen app never started")
+        await eventually(
+            lambda: uv_server.started,
+            timeout=10.0,
+            interval=0.05,
+            message="listen app never started",
+        )
         yield f"http://127.0.0.1:{port}"
     finally:
         uv_server.should_exit = True
@@ -209,9 +209,11 @@ class TestListenStreamCap:
             headers_b, body_b = _listen_envelope(
                 notifications={"toolsListChanged": True}, request_id=2
             )
-            deadline = time.monotonic() + 10.0
+            last: object = None
             async with httpx.AsyncClient(timeout=None) as client_b:
-                while time.monotonic() < deadline:
+
+                async def _b_is_acked() -> bool:
+                    nonlocal last
                     async with client_b.stream(
                         "POST", f"{base_url}/mcp", headers=headers_b, json=body_b
                     ) as response_b:
@@ -220,18 +222,25 @@ class TestListenStreamCap:
                                 _next_data_frame(response_b.aiter_lines()), timeout=3.0
                             )
                         except (asyncio.TimeoutError, TimeoutError, AssertionError):
+                            # asyncio.TimeoutError is listed explicitly: on the
+                            # 3.10 floor it is NOT the builtin, so catching the
+                            # builtin alone lets a slow ack escape the retry
+                            # (Consiliency/pmcp#269).
                             message = None
-                        if (
-                            message is not None
-                            and message.get("method")
-                            == "notifications/subscriptions/acknowledged"
-                        ):
-                            return
-                    await asyncio.sleep(0.2)
-            pytest.fail(
-                "subscription B was never acked after A's client disconnect "
-                "(max_subscriptions=1)"
-            )
+                    last = message
+                    return (
+                        message is not None
+                        and message.get("method")
+                        == "notifications/subscriptions/acknowledged"
+                    )
+
+                try:
+                    await eventually(_b_is_acked, timeout=10.0, interval=0.2)
+                except AssertionError:
+                    pytest.fail(
+                        "subscription B was never acked after A's client "
+                        f"disconnect (max_subscriptions=1); last response was {last!r}"
+                    )
 
 
 class TestBodySizeCap:

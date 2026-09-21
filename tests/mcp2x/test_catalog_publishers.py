@@ -47,21 +47,7 @@ from pmcp.client.manager import ClientManager
 from pmcp.subscriptions import BusCatalogEventSink, CatalogEventSink
 from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
 from tests.runtime.harness import RT_FIXTURE_SRC
-
-POLL_ATTEMPTS = 100
-POLL_INTERVAL_S = 0.02
-
-
-async def _poll_until(predicate: Callable[[], bool]) -> None:
-    """Poll rather than assert-immediately-after-return: no production code
-    path calls `flush()`, so delivery here always goes through
-    `BusCatalogEventSink`'s self-scheduled drain, which is asynchronous
-    relative to the `note_*` call that armed it."""
-    for _ in range(POLL_ATTEMPTS):
-        if predicate():
-            return
-        await asyncio.sleep(POLL_INTERVAL_S)
-    assert predicate()  # final attempt — produces the real assertion failure
+from tests._timing import eventually
 
 
 class _RecordingSink:
@@ -242,8 +228,11 @@ async def test_connect_and_disconnect_publish_over_a_real_bus_no_manual_note_or_
         errors = await manager.connect_server(config, retry=False)
         assert errors == [], errors
 
-        await _poll_until(
-            lambda: any(isinstance(e, ToolsListChanged) for e in published)
+        await eventually(
+            lambda: any(isinstance(e, ToolsListChanged) for e in published),
+            timeout=2.0,
+            interval=0.02,
+            message="connect never published a tools/list_changed",
         )
 
         published.clear()
@@ -252,8 +241,11 @@ async def test_connect_and_disconnect_publish_over_a_real_bus_no_manual_note_or_
         )
         assert disconnected, error
 
-        await _poll_until(
-            lambda: any(isinstance(e, ToolsListChanged) for e in published)
+        await eventually(
+            lambda: any(isinstance(e, ToolsListChanged) for e in published),
+            timeout=2.0,
+            interval=0.02,
+            message="disconnect never published a tools/list_changed",
         )
     finally:
         await manager.disconnect_all()
@@ -291,7 +283,12 @@ async def test_refresh_with_empty_config_publishes_all_three_list_changed_events
         kinds = {type(e) for e in published}
         return {ToolsListChanged, ResourcesListChanged, PromptsListChanged} <= kinds
 
-    await _poll_until(_all_three_kinds_seen)
+    await eventually(
+        _all_three_kinds_seen,
+        timeout=2.0,
+        interval=0.02,
+        message="not all three catalog event kinds were published",
+    )
 
 
 # --- the board-found regression: the lost-wakeup race, via the mutators ----
@@ -316,7 +313,12 @@ async def test_note_during_a_suspended_publish_via_index_methods_is_not_stranded
 
     bus.gate.set()  # release the first publish
 
-    await _poll_until(lambda: len(bus.published) >= 2)
+    await eventually(
+        lambda: len(bus.published) >= 2,
+        timeout=2.0,
+        interval=0.02,
+        message="the second catalog event never drained",
+    )
 
     assert bus.published == [ToolsListChanged(), PromptsListChanged()]
 

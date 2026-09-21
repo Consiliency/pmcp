@@ -24,6 +24,7 @@ from pmcp.types import (
     ServerStatus,
     ServerStatusEnum,
 )
+from tests._timing import eventually
 
 pytestmark = pytest.mark.asyncio
 
@@ -51,9 +52,13 @@ async def _await_status(
     timeout: float,
     predicate=None,
 ) -> ServerStatus:
-    """Poll until ``name`` reaches ``status`` (and optional predicate), or fail."""
-    deadline = asyncio.get_event_loop().time() + timeout
-    while asyncio.get_event_loop().time() < deadline:
+    """Poll until ``name`` reaches ``status`` (and optional predicate), or fail.
+
+    The re-raise keeps the last observed status in the message; `eventually`'s
+    own timeout text cannot carry it, since the value is only known at failure.
+    """
+
+    def _reached() -> ServerStatus | None:
         current = mgr._servers.get(name)
         if (
             current is not None
@@ -61,12 +66,16 @@ async def _await_status(
             and (predicate is None or predicate())
         ):
             return current
-        await asyncio.sleep(0.1)
-    current = mgr._servers.get(name)
-    raise AssertionError(
-        f"{name} did not reach {status} within {timeout}s "
-        f"(last status={current.status if current else None})"
-    )
+        return None
+
+    try:
+        return await eventually(_reached, timeout=timeout, interval=0.1)
+    except AssertionError:
+        current = mgr._servers.get(name)
+        raise AssertionError(
+            f"{name} did not reach {status} within {timeout}s "
+            f"(last status={current.status if current else None})"
+        ) from None
 
 
 @pytest.fixture
@@ -194,14 +203,16 @@ async def test_failed_connect_leaves_no_stale_client(
     assert name not in manager._clients, "stale client left after failed connect"
 
     # No background task scoped to this server (stdout/stderr readers) stays live.
-    alive: list[asyncio.Task] = []
-    for _ in range(20):
-        alive = [
+    def _live_tasks() -> list[asyncio.Task]:
+        return [
             t
             for t in manager._background_tasks
             if manager._background_task_servers.get(t) == name and not t.done()
         ]
-        if not alive:
-            break
-        await asyncio.sleep(0.05)
-    assert not alive, "leaked live background task after failed connect"
+
+    try:
+        await eventually(lambda: not _live_tasks(), timeout=1.0, interval=0.05)
+    except AssertionError:
+        raise AssertionError(
+            f"leaked live background task after failed connect: {_live_tasks()}"
+        ) from None
