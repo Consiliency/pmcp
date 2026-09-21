@@ -39,8 +39,8 @@ to a clean tree. All results below are **measured**, not reasoned.
   (b) a count lower bound inside the window — the flake. Only cosmetic differences
   (`fetch_threads`/`ticker`/`create_task` vs `recorder.thread_ids`/`_heartbeat`/`ensure_future`).
 - Offload seams in `src/pmcp/tools/handlers.py`:
-  - registration → `resolved = await anyio.to_thread.run_sync(resolve_package_identity, package, abandon_on_cancel=True)` (`handlers.py:5870`), inside `with anyio.fail_after(_REGISTRATION_RESOLVE_TIMEOUT_SECONDS)` (=20.0, `handlers.py:210`). `resolve_package_identity` calls the monkeypatched `package_identity._fetch_packument`. The surrounding handler **fails closed** — `except Exception` at `handlers.py:5873` swallows anything the resolve raises.
-  - feedback submit → `result = await anyio.to_thread.run_sync(functools.partial(submit_feedback_issue, …), abandon_on_cancel=True)` (`handlers.py:5154`), inside `with anyio.fail_after(_FEEDBACK_SUBMIT_TIMEOUT_SECONDS)` (=20.0, `handlers.py:220`). Also fails closed — `except Exception` logs "Feedback submission raised: …" at `handlers.py:5202`.
+  - registration → `resolved = await anyio.to_thread.run_sync(resolve_package_identity, package, abandon_on_cancel=True)` (`handlers.py:5870`), inside `with anyio.fail_after(_REGISTRATION_RESOLVE_TIMEOUT_SECONDS)` (=20.0, `handlers.py:210`). `resolve_package_identity` calls the monkeypatched `package_identity._fetch_packument`. The surrounding handler **fails closed** — `handlers.py:5873` is `except TimeoutError:`; the arm that swallows the handshake's `AssertionError` is `except Exception` at **`handlers.py:5875`**.
+  - feedback submit → `result = await anyio.to_thread.run_sync(functools.partial(submit_feedback_issue, …), abandon_on_cancel=True)` (`handlers.py:5154`), inside `with anyio.fail_after(_FEEDBACK_SUBMIT_TIMEOUT_SECONDS)` (=20.0, `handlers.py:220`). Also fails closed — `except Exception` is `handlers.py:5202` and its warning "Feedback submission raised: …" is logged at **`handlers.py:5206`**.
 - Debounce: `src/pmcp/client/manager.py:169` `_RECONCILE_RERUN_DEBOUNCE_S = 0.25`,
   slept at `manager.py:2153` (`await asyncio.sleep(_RECONCILE_RERUN_DEBOUNCE_S)`).
 - Reaping: `_terminate_process_tree` (`manager.py:243`) SIGTERMs, waits, escalates to a
@@ -67,7 +67,7 @@ to a clean tree. All results below are **measured**, not reasoned.
    mutations are given precisely below.
 
 3. **Both ticker mutations surface through the handler's fail-closed path, not
-   the handshake message.** Because `handlers.py:5873`/`:5202` swallow the
+   the handshake message.** Because `handlers.py:5875`/`:5202` swallow the
    AssertionError the stalled handshake raises, the mutated pkgid test fails at
    `assert out.registered is True` and the mutated egress test at `assert
    result.submitted is True` — each after ~5 s (the handshake's own hang guard).
@@ -273,14 +273,16 @@ existing `thread[0] != loop_thread` assertion is kept in each as a direct belt.
           )
           # Wait for two re-runs to land; the timeout is a hang guard, not a
           # measurement.
-          await eventually(
-              lambda: len(stamps) >= 2,
-              timeout=5.0,
-              message=(
+          # The count must be read at FAILURE time. An f-string in `message=`
+          # is formatted when `eventually` is CALLED, so it would report the
+          # pre-poll count -- informative-looking and stale.
+          try:
+              await eventually(lambda: len(stamps) >= 2, timeout=5.0)
+          except AssertionError:
+              raise AssertionError(
                   "reconcile re-ran fewer than twice: "
                   f"{calls.count('tools/list')} tools/list passes"
-              ),
-          )
+              ) from None
 
           # Cancel the (deliberately endless) loop before asserting.
           await manager._cancel_background_tasks()
@@ -348,6 +350,21 @@ import in `test_client_manager.py`) is already merged on `main` (commit `db34db8
 so `eventually` is importable. No dependency on C2b (in review from its own
 worktree). Do **not** touch `tests/conftest.py` (merged slices own it).
 
+### Also update, or the file contradicts itself
+
+- `tests/test_client_manager.py:4265` — the storm test's docstring still says it
+  "asserts a hard ceiling on reconciles in a fixed window". After this slice the
+  body asserts a debounce GAP instead; reword it. (grok, non-blocking.)
+
+### Maintenance note on the literal floor
+
+`assert gap >= 0.2` is deliberately DECOUPLED from
+`_RECONCILE_RERUN_DEBOUNCE_S` (0.25) -- coupling them is what made the original
+assertion vacuous under its own mutation. The cost is that the two can drift: a
+0.21 s gap passes on purpose, and if the debounce constant is ever changed this
+independent threshold must be revisited by hand. Stated here so the next change
+to that constant does not silently outrun the test. (codex.)
+
 ## Verification
 
 All commands below were run this planning session; the pasted results are
@@ -397,7 +414,7 @@ tests were re-run green after each (so each mutation is red only under mutation)
       **Measured:** `1 failed in 5.44s`; `AssertionError: assert False is True` at
       `test_package_identity_gate.py:988` (`out.registered is True`) — the handshake
       AssertionError is swallowed by the fail-closed `except Exception` at
-      `handlers.py:5873`, so registration fails; the 5.44 s runtime is the stalled
+      `handlers.py:5875`, so registration fails; the 5.44 s runtime is the stalled
       loop. Intact: passes.
       *Red by (egress):* inline the submit — `handlers.py:5154`
       `await anyio.to_thread.run_sync(functools.partial(submit_feedback_issue, …),
