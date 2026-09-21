@@ -439,9 +439,9 @@ grep -n "^import time" tests/mcp2x/test_listen_over_http.py
       || { echo "FAIL pass $i"; rc=1; break; }
   done
   kill $B1 $B2 2>/dev/null
+  echo "starvation rehearsal rc=$rc   # MUST be 0"
   exit $rc
 )
-echo "starvation rehearsal exit=$?   # MUST be 0"
 
 # 5. MUTATIONS -- each must turn the named test RED. Apply one at a time,
 #    run, then `git checkout -- src/ tests/`.
@@ -468,13 +468,21 @@ uv run pytest tests/mcp2x/test_subscription_contract.py -k "self_schedules or ra
 uv run pytest tests/mcp2x/test_subscription_contract.py -k "raising_bus_is_isolated or wedge or stranded" -q --cov-fail-under=0
 # 5f. subscriptions.py  delete the RE-ARM branch in `_on_drain_done` (the
 #     `if not self._pending: return` / `_start_drain(...)` block, around :152-158)
-#     -> test_note_during_a_suspended_publish_is_not_stranded fails "was stranded".
-#     NOT `while`->`if` in `_drain_pending`: `_on_drain_done` re-arms whenever
-#     `_pending` is non-empty ("a cancellation must delay delivery, never strand
-#     it"), so the second event is still published and the test STAYS GREEN.
-#     That mutation was named in revision 1 and could not falsify its criterion
-#     (codex, blocking; confirmed against src/pmcp/subscriptions.py). Demonstrate
-#     this one actually red before ticking the sink criterion.
+#     -> test_event_noted_during_a_cancelled_drain_is_not_stranded fails.
+#
+#     THE TARGET TEST MATTERS. The sink is defended in depth, so no single-line
+#     mutation reddens `test_note_during_a_suspended_publish_is_not_stranded`:
+#       * `while`->`if` in `_drain_pending` is defeated by the re-arm, and
+#       * deleting the re-arm is defeated by the `while` loop, which re-checks
+#         `_pending` when the suspended publish resumes.
+#     Revision 1 named the first, revision 2 named the second, and BOTH left that
+#     test green (grok and codex, independently, both blocking). Pick a test where
+#     only ONE path exists: in the CANCELLED-drain case the loop cannot run at all,
+#     so the re-arm is the sole route and deleting it strands the event -- which is
+#     exactly what `_on_drain_done`'s docstring says it is there to prevent.
+uv run pytest tests/mcp2x/test_subscription_contract.py::test_event_noted_during_a_cancelled_drain_is_not_stranded -q --cov-fail-under=0
+#     To falsify the suspended-publish test specifically, apply BOTH mutations
+#     together; note it as a two-line mutation, not one.
 uv run pytest tests/mcp2x/test_subscription_contract.py -k suspended_publish -q --cov-fail-under=0
 # 5g. handlers.py:3794  delete `start_new_session=True` in `_run_update_probe_command`
 #     -> the scenario prints ORPHANED after its 5 s guard; the test fails "did not reap".
@@ -484,8 +492,13 @@ uv run pytest $ORPHAN -q --cov-fail-under=0
 #        is truncated at 3 s), and test_subscriptions_e2e fails in _read_until after refresh.
 #     Run BOTH by explicit node id: `-k timeout_exemption` applies to every path
 #     given, so it deselected the runtime test entirely (codex, blocking).
+#     `test_timeout_exemption_keeps_stream_alive` is a METHOD of
+#     `class TestTimeoutExemption`, so the bare function-style node id selects
+#     nothing and pytest exits 4 every time -- green-looking for the wrong reason
+#     (grok, blocking). Validated with `--collect-only`: the two ids below collect
+#     exactly 2 tests.
 uv run pytest \
-  "tests/mcp2x/test_listen_over_http.py::test_timeout_exemption_keeps_stream_alive" \
+  "tests/mcp2x/test_listen_over_http.py::TestTimeoutExemption::test_timeout_exemption_keeps_stream_alive" \
   "tests/runtime/test_subscriptions_e2e.py::test_connect_disconnect_refresh_each_deliver_all_three_kinds" \
   -q --cov-fail-under=0
 # 5i. test_listen_over_http.py  set `_SLEEP_PAST_TIMEOUT_S = 2.5`;
@@ -544,9 +557,10 @@ Each criterion names the mutation that turns it red (all from step 5).
 - [ ] **The sink tests poll the drain.** `test_subscription_contract.py` has
       exactly one fixed nonzero `asyncio.sleep` left (the `:263` negative
       soak, commented as such) and seven `eventually(` calls. *Red by:* 5d
-      (no self-scheduled drain), 5e (`_draining` wedge), 5f (re-arm deleted, so
-      an event noted during an in-flight drain is stranded -- NOT the
-      `while`->`if` mutation, which `_on_drain_done`'s re-arm defeats).
+      (no self-scheduled drain), 5e (`_draining` wedge), 5f (re-arm deleted,
+      proven against the CANCELLED-drain test, where the `while` loop cannot
+      run and the re-arm is the only delivery path; the suspended-publish test
+      needs both mutations at once, because each path covers the other).
 - [ ] **The orphan-reap script and the cancel-registration test poll their
       property.** `_SCENARIO` contains `time.monotonic()` and no
       `asyncio.sleep(0.5)`; `test_listen_registration.py` contains no
