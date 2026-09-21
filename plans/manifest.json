@@ -1297,6 +1297,36 @@
       "task_summary": null,
       "type": "phase",
       "updated_at": "2026-06-25T02:26:25Z"
+    },
+    {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-09-21T05:09:00Z",
+      "file": ".consiliency/plans/detailed-policy-home-call-time-20260921-0509.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-21T05:09:00Z",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "branch": "plan/262-policy-home-calltime",
+            "issue": "Consiliency/pmcp#262",
+            "sibling": "Consiliency/pmcp#261",
+            "umbrella": "Consiliency/pmcp#235"
+          },
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": "/home/viperjuice/.claude/skills/claude-plan-detailed/reflections/9b7e9291/plan-262-policy-home-calltime/20260921T050900Z-a262pl.md",
+      "roadmap_ref": null,
+      "slug": "policy-home-call-time-262",
+      "status": "committed",
+      "task_summary": "Consiliency/pmcp#262: resolve the operator policy home (~/.claude/gateway-policy.*) at PolicyManager construction instead of import, via identity-sentinel defaults that keep the USER_POLICY_PATHS / DEFAULT_POLICY_PATHS monkeypatch seam honoured verbatim; three tests, one red on main.",
+      "type": "detailed",
+      "updated_at": "2026-09-21T05:09:00Z"
     }
   ],
   "schema_version": 1
