@@ -37,6 +37,7 @@ from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, RedirectResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
+from tests._timing import eventually
 
 AUTH_HEADER = "authorization"
 
@@ -251,12 +252,12 @@ async def run_fake_remote(
     AppStatus.should_exit = False
     task = asyncio.create_task(server.serve())
     try:
-        for _ in range(200):
-            if server.started:
-                break
-            await asyncio.sleep(0.05)
-        else:
-            raise RuntimeError("fake remote server never started")
+        await eventually(
+            lambda: server.started,
+            timeout=10.0,
+            interval=0.05,
+            message="fake remote server never started",
+        )
         yield RunningFakeRemote(
             port=port,
             base_url=f"http://127.0.0.1:{port}",

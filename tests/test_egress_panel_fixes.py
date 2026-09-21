@@ -47,6 +47,7 @@ from pmcp.feedback_egress import FeedbackProgress, FeedbackSubmission
 from pmcp.policy.policy import PolicyManager
 from pmcp.tools import handlers
 from pmcp.tools.handlers import GatewayTools
+from tests._timing import eventually
 
 _TOKEN_VAR = "PMCP_FEEDBACK_TOKEN"
 _REPO_VAR = "PMCP_FEEDBACK_REPO"
@@ -291,13 +292,15 @@ async def _wait_for(event: threading.Event, timeout: float = 10.0) -> None:
     """Wait on a thread event without blocking the loop the handler runs on.
 
     A bare `event.wait()` here would deadlock: the handler task cannot reach its
-    `to_thread` hand-off while this coroutine holds the loop.
+    `to_thread` hand-off while this coroutine holds the loop. `eventually`
+    yields between polls, which is what keeps the hand-off reachable.
     """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout
-    while not event.is_set():
-        assert loop.time() < deadline, "the worker never parked before the claim"
-        await asyncio.sleep(0.01)
+    await eventually(
+        event.is_set,
+        timeout=timeout,
+        interval=0.01,
+        message="the worker never parked before the claim",
+    )
 
 
 # --------------------------------------------------------------------------- #

@@ -51,7 +51,6 @@ import signal
 import socket
 import subprocess
 import tempfile
-import time
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,6 +67,7 @@ from mcp.types import CLIENT_CAPABILITIES_META_KEY, PROTOCOL_VERSION_META_KEY
 from mcp.types.version import LATEST_MODERN_VERSION
 
 from tests.test_credential_boot import _children_of, _live_gateway_pid
+from tests._timing import eventually_sync
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 LIVE_GATEWAY_PORT = 3344  # NEVER boot a tests/runtime/ fixture on this port.
@@ -140,18 +140,25 @@ class BootedGateway:
 
 
 def _wait_for_health(proc: subprocess.Popen[bytes], boot_log: Path, port: int) -> None:
-    for _ in range(60):
+    def _healthy() -> bool:
         result = subprocess.run(
             ["curl", "-sf", f"http://127.0.0.1:{port}/health"],
             capture_output=True,
             check=False,
         )
         if result.returncode == 0:
-            return
+            return True
+        # Propagates immediately -- `eventually_sync` does not swallow a
+        # predicate exception, so an early exit is reported as itself rather
+        # than as a 30s timeout.
         if proc.poll() is not None:
             pytest.fail(f"fixture gateway exited early:\n{boot_log.read_text()}")
-        time.sleep(0.5)
-    pytest.fail(f"fixture gateway never became healthy:\n{boot_log.read_text()}")
+        return False
+
+    try:
+        eventually_sync(_healthy, timeout=30.0, interval=0.5)
+    except AssertionError:
+        pytest.fail(f"fixture gateway never became healthy:\n{boot_log.read_text()}")
 
 
 @contextlib.contextmanager

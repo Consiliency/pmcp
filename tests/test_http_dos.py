@@ -37,6 +37,7 @@ from mcp.types.version import LATEST_MODERN_VERSION
 from starlette.testclient import TestClient
 
 from pmcp.transport.http import create_http_app
+from tests._timing import eventually
 
 
 def _make_contract_client(
@@ -137,12 +138,12 @@ async def _run_listen_app(*, max_subscriptions: int) -> AsyncIterator[str]:
     uv_server = uvicorn.Server(config)
     task = asyncio.create_task(uv_server.serve())
     try:
-        for _ in range(200):
-            if uv_server.started:
-                break
-            await asyncio.sleep(0.05)
-        else:
-            raise RuntimeError("listen app never started")
+        await eventually(
+            lambda: uv_server.started,
+            timeout=10.0,
+            interval=0.05,
+            message="listen app never started",
+        )
         yield f"http://127.0.0.1:{port}"
     finally:
         uv_server.should_exit = True

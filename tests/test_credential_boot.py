@@ -30,10 +30,10 @@ import re
 import signal
 import subprocess
 import tempfile
-import time
 from pathlib import Path
 
 import pytest
+from tests._timing import eventually_sync
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIVE_GATEWAY_PORT = 3344  # NEVER boot the test fixture on this port.
@@ -240,18 +240,25 @@ servers:
 
 
 def _wait_for_health(gw_proc: subprocess.Popen, gw_log: Path) -> None:
-    for _ in range(60):
+    def _healthy() -> bool:
         result = subprocess.run(
             ["curl", "-sf", f"http://127.0.0.1:{SPARE_PORT}/health"],
             capture_output=True,
             check=False,
         )
         if result.returncode == 0:
-            return
+            return True
+        # Propagates immediately -- `eventually_sync` does not swallow a
+        # predicate exception, so an early exit is reported as itself rather
+        # than as a 30s timeout.
         if gw_proc.poll() is not None:
             pytest.fail(f"fixture gateway exited early:\n{gw_log.read_text()}")
-        time.sleep(0.5)
-    pytest.fail(f"fixture gateway never became healthy:\n{gw_log.read_text()}")
+        return False
+
+    try:
+        eventually_sync(_healthy, timeout=30.0, interval=0.5)
+    except AssertionError:
+        pytest.fail(f"fixture gateway never became healthy:\n{gw_log.read_text()}")
 
 
 async def _invoke_fixture_ping() -> None:
