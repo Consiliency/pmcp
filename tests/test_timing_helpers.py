@@ -33,16 +33,28 @@ class TestEventually:
 
         assert await eventually(predicate) == "ready"
 
-    async def test_a_raising_predicate_propagates_immediately(self) -> None:
-        """Not swallowed until the deadline: the deadline is 30s here."""
+    async def test_a_raising_predicate_propagates_immediately(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Not swallowed until the deadline -- and not retried either.
+
+        Proven without a clock: the predicate is called exactly once, and any
+        attempt to sleep between polls fails the test outright.
+        """
+        calls = 0
 
         async def predicate() -> bool:
+            nonlocal calls
+            calls += 1
             raise ValueError("boom")
 
-        started = asyncio.get_running_loop().time()
+        async def _no_sleeping(delay: float, *args: object, **kwargs: object) -> None:
+            raise AssertionError(f"eventually slept {delay}s instead of propagating")
+
+        monkeypatch.setattr(asyncio, "sleep", _no_sleeping)
         with pytest.raises(ValueError, match="boom"):
             await eventually(predicate, timeout=30.0)
-        assert asyncio.get_running_loop().time() - started < 1.0
+        assert calls == 1, "the predicate was retried instead of propagating"
 
     async def test_timeout_zero_checks_once_without_sleeping(self) -> None:
         """The frozen "must already be true" form C2 uses."""
@@ -78,11 +90,24 @@ class TestEventuallySync:
 
         assert eventually_sync(predicate, interval=0.001) == 2
 
-    def test_timeout_zero_checks_once_without_sleeping(self) -> None:
-        started = time.monotonic()
-        with pytest.raises(AssertionError):
-            eventually_sync(lambda: False, timeout=0, interval=5.0)
-        assert time.monotonic() - started < 1.0
+    def test_timeout_zero_checks_once_without_sleeping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No clock: sleeping at all is the failure, and once is the count."""
+        calls = 0
+
+        def predicate() -> bool:
+            nonlocal calls
+            calls += 1
+            return False
+
+        def _no_sleeping(delay: float) -> None:
+            raise AssertionError(f"eventually_sync slept {delay}s at timeout=0")
+
+        monkeypatch.setattr(time, "sleep", _no_sleeping)
+        with pytest.raises(AssertionError, match="condition not met"):
+            eventually_sync(predicate, timeout=0, interval=5.0)
+        assert calls == 1, "timeout=0 must evaluate exactly once"
 
 
 class TestRendezvous:
