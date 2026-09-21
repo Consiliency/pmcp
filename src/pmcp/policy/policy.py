@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import re
+from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -80,24 +81,85 @@ PROJECT_POLICY_PATHS = [
 #: Anything discovered that is *not* one of these is project-scoped and must pass
 #: the consent gate. That direction is the fail-closed one: an unrecognised entry
 #: is treated as repository-supplied, never as operator-supplied.
-USER_POLICY_PATHS = [
-    Path.home() / ".claude" / "gateway-policy.yaml",
-    Path.home() / ".claude" / "gateway-policy.json",
-]
+#: The home-relative tails, named once so the factory below and the frozen
+#: default cannot drift apart.
+_USER_POLICY_TAILS = (
+    Path(".claude") / "gateway-policy.yaml",
+    Path(".claude") / "gateway-policy.json",
+)
 
-DEFAULT_POLICY_PATHS = [*PROJECT_POLICY_PATHS, *USER_POLICY_PATHS]
+
+def default_user_policy_paths() -> list[Path]:
+    """The operator locations, with `Path.home()` read at CALL time.
+
+    Mirrors `config.loader.default_user_config_paths`. Resolving at call time is
+    what makes a changed `HOME` -- the test suite's isolation, or a re-homed
+    process -- take effect; the frozen attribute below cannot
+    (Consiliency/pmcp#262).
+    """
+    return [Path.home() / tail for tail in _USER_POLICY_TAILS]
 
 
-def _resolve_against_cwd(paths: list[Path]) -> list[Path]:
+class _FrozenDefault(tuple[Path, ...]):
+    """Marker type for the two untouched defaults.
+
+    A PLAIN tuple would be unsafe as the sentinel: CPython returns the SAME
+    object from `tuple(t)` when `t` is already a tuple, so a caller normalising
+    with `USER_POLICY_PATHS = tuple(USER_POLICY_PATHS)` would still satisfy an
+    identity check and have its pin silently ignored in favour of the live home.
+    Constructing this subclass always copies, so any caller-supplied value --
+    list, tuple, or a copy of the default -- compares as replaced.
+    """
+
+    __slots__ = ()
+
+
+# Do NOT read this frozen value at runtime: it captures `Path.home()` at import
+# time. Read `_effective_user_policy_paths()` instead. It stays a module
+# attribute because `monkeypatch.setattr` on it is a documented test seam, and
+# the resolvers below key on OBJECT IDENTITY -- if this attribute is still this
+# exact object, the live home is used; if a caller replaced it, that caller's
+# value is used verbatim and the live home is never consulted. Immutable, so an
+# in-place mutation raises instead of being silently ignored.
+USER_POLICY_PATHS: Sequence[Path] = _FrozenDefault(default_user_policy_paths())
+_FROZEN_USER_POLICY_PATHS = USER_POLICY_PATHS
+
+# Same contract: patched -> used verbatim; untouched -> derived from the
+# allowlist in force, so an entry can never be searched-but-unrecognised or
+# recognised-but-unsearched.
+DEFAULT_POLICY_PATHS: Sequence[Path] = _FrozenDefault(
+    (*PROJECT_POLICY_PATHS, *USER_POLICY_PATHS)
+)
+_FROZEN_DEFAULT_POLICY_PATHS = DEFAULT_POLICY_PATHS
+
+
+def _resolve_against_cwd(paths: Sequence[Path]) -> list[Path]:
     cwd = Path.cwd()
     return [path if path.is_absolute() else cwd / path for path in paths]
 
 
+def _effective_user_policy_paths() -> Sequence[Path]:
+    """The allowlist in force: the caller's if patched, else the live home.
+
+    IDENTITY, not equality -- a patched list that happens to equal the default
+    is still the caller's, and must not be quietly replaced by the live home.
+    """
+    if USER_POLICY_PATHS is _FROZEN_USER_POLICY_PATHS:
+        return default_user_policy_paths()
+    return USER_POLICY_PATHS
+
+
 def _default_policy_paths() -> list[Path]:
-    """Resolve `DEFAULT_POLICY_PATHS` against the *current* working directory.
+    """Resolve the search list against the *current* working directory.
 
     Read the module attribute at call time so a monkeypatched list is honoured.
+    When it is untouched the list is DERIVED from the allowlist in force, so the
+    searched user entries and the ungated user entries are always the same set.
     """
+    if DEFAULT_POLICY_PATHS is _FROZEN_DEFAULT_POLICY_PATHS:
+        return _resolve_against_cwd(
+            [*PROJECT_POLICY_PATHS, *_effective_user_policy_paths()]
+        )
     return _resolve_against_cwd(DEFAULT_POLICY_PATHS)
 
 
@@ -109,7 +171,7 @@ def _user_policy_paths() -> set[Path]:
     otherwise be measured against the real `~/.claude` entries captured when this
     module was first imported.
     """
-    return set(_resolve_against_cwd(USER_POLICY_PATHS))
+    return set(_resolve_against_cwd(_effective_user_policy_paths()))
 
 
 def _effective_redaction_patterns(policy: GatewayPolicy) -> list[str]:
