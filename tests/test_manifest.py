@@ -46,6 +46,7 @@ from pmcp.manifest.registry import (
     RegistryServerEntry,
 )
 from pmcp.manifest.sync import sync_registry_to_manifest
+from tests._timing import eventually
 
 #: Repo root, so repo-relative reads do not depend on the working directory
 #: (tests run from an isolated cwd -- see tests/conftest.py::isolate_cwd).
@@ -1641,7 +1642,14 @@ class TestMonitorInstall:
             name="test",
             description="Test",
             keywords=["test"],
-            install={"linux": ["echo", "output line"]},
+            # The child must STAY ALIVE until the monitor has read its line.
+            # `_monitor_install` breaks out of its loop as soon as
+            # `process.returncode is not None` and never drains leftover
+            # stdout, so a bare `echo` can exit before the monitor's first
+            # iteration -- leaving output_lines empty and the heartbeat at its
+            # start-install value. Same shape as
+            # test_monitor_detects_server_ready_pattern below.
+            install={"linux": ["bash", "-c", "echo output line && sleep 5"]},
             command="echo",
             args=["test"],
             requires_api_key=False,
@@ -1650,13 +1658,25 @@ class TestMonitorInstall:
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
 
-        # Wait for job to complete
-        await asyncio.sleep(0.2)
-
         job = manager.get_job(job_id)
         assert job is not None
+        hb0 = job.last_heartbeat
+
+        # Wait for the PROPERTY the docstring claims -- that stdout output
+        # refreshed the heartbeat -- not for a proxy. Waiting on the monitor
+        # task instead would be satisfied by a monitor that exited without
+        # reading anything.
+        await eventually(
+            lambda: job.last_heartbeat > hb0,
+            timeout=5.0,
+            message="stdout output did not refresh last_heartbeat",
+        )
         # Heartbeat should be recent
         assert time.time() - job.last_heartbeat < 5
+
+        # Clean up - kill the process
+        if job.process and job.process.returncode is None:
+            job.process.kill()
 
     @pytest.mark.asyncio
     async def test_monitor_reads_stderr(self) -> None:
@@ -1805,11 +1825,10 @@ class TestMonitorInstall:
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
 
-        # Give it time to start
-        await asyncio.sleep(0.1)
-
         job = manager.get_job(job_id)
         assert job is not None
+        # `start_install` sets status="installing" before it returns, so this
+        # is already true -- there is nothing to wait for.
         assert job.status == "installing"
 
         # Cancel the job
@@ -1906,8 +1925,6 @@ class TestCancelJob:
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
 
-        await asyncio.sleep(0.1)
-
         job = manager.get_job(job_id)
         assert job is not None
         process = job.process
@@ -1915,8 +1932,8 @@ class TestCancelJob:
         result = await manager.cancel_job(job_id)
         assert result is True
 
-        # Process should be terminated
-        await asyncio.sleep(0.1)
+        # `cancel_job` awaits `process.wait()` before returning, so the exit
+        # status is already set -- a "must already be true" assertion.
         assert process is None or process.returncode is not None
 
     @pytest.mark.asyncio
@@ -1935,19 +1952,20 @@ class TestCancelJob:
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
 
-        await asyncio.sleep(0.1)
-
         job = manager.get_job(job_id)
         assert job is not None
         monitor_task = job._monitor_task
 
         await manager.cancel_job(job_id)
 
-        # Wait for cancellation to complete
-        await asyncio.sleep(0.2)
-
-        # Monitor task should be cancelled or done
-        assert monitor_task is None or monitor_task.cancelled() or monitor_task.done()
+        # `cancelled()` is unreachable here: `_monitor_install` CATCHES
+        # CancelledError and returns normally, so the task completes rather
+        # than entering the cancelled state. Poll `done()`.
+        await eventually(
+            lambda: monitor_task is None or monitor_task.done(),
+            timeout=5.0,
+            message="monitor task still running after cancel_job",
+        )
 
     @pytest.mark.asyncio
     async def test_cancel_job_sets_failed_status(self) -> None:
@@ -1965,10 +1983,12 @@ class TestCancelJob:
         manager = JobManager.get_instance()
         job_id = await manager.start_install(server_config, "linux")
 
-        await asyncio.sleep(0.1)
-
         await manager.cancel_job(job_id)
 
+        # NO await between cancel_job and the assertion below: the monitor's
+        # CancelledError handler overwrites job.error with "Installation
+        # cancelled" on its next turn, so yielding here would turn this red
+        # for a reason unrelated to timing.
         job = manager.get_job(job_id)
         assert job is not None
         assert job.status == "failed"

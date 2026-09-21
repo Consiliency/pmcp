@@ -34,7 +34,9 @@ refresh steps to add the second downstream to `autoStart`, modelling an
 operator who adds an autoStart entry and refreshes.
 
 The gateway is booted with `request_timeout=5` (SL-5.1's harness keyword)
-and an explicit sleep pushes the refresh step's notification past t=12s --
+and an explicit sleep pushes the refresh step's notification past the
+configured `request_timeout` (`_SLEEP_PAST_TIMEOUT_S` vs
+`_REQUEST_TIMEOUT_S`, related at import time) --
 IF-0-P3B-3's `subscriptions/listen` exemption from the `request_timeout`
 wrapper is what keeps the stream alive that long; on pre-P3B code (or a
 regression that drops the exemption) this module fails outright because
@@ -60,6 +62,19 @@ from tests.runtime.harness import (
     listen_stream,
     modern_post,
 )
+
+# The deployed-wire exemption proof (IF-0-P3B-3) rests on one relation: the
+# refresh is delayed past the gateway's request_timeout, so a notification that
+# STILL arrives can only mean subscriptions/listen survived it. A sleep never
+# returns early, so the relation is between two constants and is checked here,
+# at import time, rather than by timing the run.
+_REQUEST_TIMEOUT_S = 5
+_SLEEP_PAST_TIMEOUT_S = 13
+assert _SLEEP_PAST_TIMEOUT_S > _REQUEST_TIMEOUT_S, (
+    "the pre-refresh sleep must exceed request_timeout or the exemption "
+    "test proves nothing"
+)
+
 
 _SECOND_DOWNSTREAM = "rt-fixture-2"
 
@@ -136,9 +151,9 @@ async def test_connect_disconnect_refresh_each_deliver_all_three_kinds() -> None
         }
 
         with booted_gateway(
-            request_timeout=5, extra_servers_no_autostart=second_server
+            request_timeout=_REQUEST_TIMEOUT_S,
+            extra_servers_no_autostart=second_server,
         ) as gw:
-            start = time.monotonic()
             a_log: list[dict] = []
             b_log: list[dict] = []
 
@@ -203,27 +218,21 @@ async def test_connect_disconnect_refresh_each_deliver_all_three_kinds() -> None
                 config["autoStart"] = sorted({*config["autoStart"], _SECOND_DOWNSTREAM})
                 config_path.write_text(json.dumps(config))
 
-                # Sleep well past request_timeout=5 before the mutation
-                # whose notification this test measures -- a notification
-                # that still arrives afterward can only be explained by
-                # subscriptions/listen surviving the request_timeout
-                # wrapper (IF-0-P3B-3), not by the read completing before
-                # the timeout fired.
-                await asyncio.sleep(13)
+                # Sleep well past request_timeout before the mutation whose
+                # notification this test observes -- a notification that still
+                # arrives afterward can only be explained by
+                # subscriptions/listen surviving the request_timeout wrapper
+                # (IF-0-P3B-3), not by the read completing before the timeout
+                # fired. The sleep-vs-timeout relation is asserted at import
+                # time; a sleep cannot return early, so timing it here would
+                # only re-measure the sleep.
+                await asyncio.sleep(_SLEEP_PAST_TIMEOUT_S)
 
                 _call_tool(gw.base_url, "gateway.refresh", {})
                 frames_a = await _read_until(sub_a, _ALL_THREE, budget=10.0, log=a_log)
                 _assert_stamped(frames_a, 101)
                 frames_b = await _read_until(sub_b, _TOOLS_ONLY, budget=10.0, log=b_log)
                 _assert_stamped(frames_b, 202)
-
-                elapsed = time.monotonic() - start
-                assert elapsed > 12, (
-                    f"refresh's notification landed at {elapsed:.1f}s from "
-                    "subscription open -- expected > 12s, which is the "
-                    "deployed-wire proof that request_timeout=5 did not "
-                    "truncate the stream"
-                )
 
             # Filter-negative, over the WHOLE run (all three mutations):
             # B is tools-only and must never have received a resources or

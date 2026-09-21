@@ -37,6 +37,7 @@ from mcp.types.version import LATEST_MODERN_VERSION
 
 from pmcp.server import GatewayServer
 from pmcp.subscriptions import BusCatalogEventSink
+from tests._timing import eventually
 
 
 def _new_server() -> GatewayServer:
@@ -280,10 +281,17 @@ async def test_cancelled_notification_ends_subscription() -> None:
         )
         await duplex.recv()  # ack id 2
 
+        # Read the SDK-private listener table as a SEQUENCING signal only: the
+        # cancellation produces no wire frame to wait on, and the assertion
+        # below still rests on the wire. A rename here is a loud AttributeError,
+        # never a false green.
+        listeners = gw._subscription_bus._listeners
+        before = len(listeners)
         await duplex.send(_cancelled_notification(1))
-        # Let the cancellation land before publishing -- notifications and
-        # the cancellation share no explicit ordering guarantee otherwise.
-        await anyio.sleep(0.2)
+        await eventually(
+            lambda: len(listeners) == before - 1,
+            message="cancelling listen id 1 never unsubscribed it from the bus",
+        )
 
         await gw._subscription_bus.publish(ToolsListChanged())  # only id 1 wants this
         await gw._subscription_bus.publish(PromptsListChanged())  # only id 2 wants this
