@@ -409,15 +409,18 @@ uv run pytest $C2A $ORPHAN --cov=pmcp --cov-report= --cov-fail-under=0 -q -p no:
 #    and the orphan scenario's own poll uses `await asyncio.sleep(0.05)`. A
 #    check that forbade them would fail a correct implementation -- three panel
 #    seats independently flagged the earlier form, which did exactly that.
-#    Expected output: exactly the three lines below, nothing else.
+#    Expected output: exactly these FOUR lines, nothing else. (`time.sleep(30)`
+#    appears on two separate lines -- the parent and the grandchild -- so the
+#    count is 4, not 3.)
 #      tests/mcp2x/test_subscription_contract.py:<n>: ... asyncio.sleep(0.1)   (negative soak)
-#      tests/test_tools.py:<n>/<n+2>: ... time.sleep(30)                       (the hung parent/grandchild, in-script)
+#      tests/test_tools.py:<n>: ... time.sleep(30)                             (the hung parent, in-script)
+#      tests/test_tools.py:<n+2>: ... time.sleep(30)                           (the grandchild, in-script)
 #      tests/test_tools.py:<n>: ... asyncio.sleep(0.05)                        (the orphan poll's INTERVAL)
 grep -nE "(asyncio|anyio|time)\.sleep\(\s*[0-9]*\.?[0-9]+\s*\)" $C2A tests/test_tools.py \
   | grep -vE "sleep\(\s*0\s*\)" | grep -vE "_SLEEP_PAST_TIMEOUT_S"
 #    Then assert the interval is a POLL interval, not a bare wait: every
 #    remaining sub-second sleep must sit inside a `while`/deadline loop.
-#    Inspect each of the three hits by eye; there are only three.
+#    Inspect each hit by eye; there are only four.
 #    and the two tautological bounds are gone (both greps print nothing):
 grep -n "assert elapsed" tests/mcp2x/test_listen_over_http.py tests/runtime/test_subscriptions_e2e.py
 grep -n "^import time" tests/mcp2x/test_listen_over_http.py
@@ -549,8 +552,9 @@ Each criterion names the mutation that turns it red (all from step 5).
       print nothing). *Red by:* 5i (collection error naming the relation);
       5h (the property the constants guard).
 - [ ] **The install-job tests wait for state, not time.** `grep -c
-      "asyncio.sleep(" tests/test_manifest.py` counts only the sites outside
-      `TestMonitorInstall`/`TestCancelJob` (i.e. zero in `:1637-1975`), and
+      "asyncio.sleep(" tests/test_manifest.py` returns **0**: all seven of the
+      file's current sleeps lie inside the converted range, so none survives
+      anywhere in the file, and
       `test_monitor_updates_heartbeat_on_output` asserts `job.last_heartbeat >
       hb0`. *Red by:* 5a (heartbeat never refreshed), 5b (returncode still
       None), 5c (monitor never finishes; fails at the 5 s guard by message).
