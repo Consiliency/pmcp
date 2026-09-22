@@ -4,7 +4,7 @@
       "acceptance_criteria_count": 4,
       "created_at": "2026-09-22T16:30:18+00:00",
       "file": ".consiliency/plans/detailed-231-auth-surface-hardening-20260922-1625.md",
-      "handoff_ref": "/mnt/HC_Volume_105438154/worktrees/pmcp-plan-231/.dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
       "if_gates_produced": [],
       "lanes": [],
       "lifecycle": [
@@ -17,7 +17,7 @@
       ],
       "owner_skill": "claude-plan-detailed",
       "phase_alias": null,
-      "reflection_ref": "/mnt/HC_Volume_105438154/worktrees/pmcp-plan-231/reflections/claude-plan-detailed/plan-231-auth-surface/20260922-1625.md",
+      "reflection_ref": "~/.codex/skills/claude-plan-detailed/reflections/plan-231-auth-surface/20260922-1625.md",
       "roadmap_ref": null,
       "slug": "231-auth-surface-hardening",
       "status": "committed",
