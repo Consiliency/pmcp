@@ -3634,17 +3634,23 @@ class TestTerminateProcessTree:
 
         await _terminate_process_tree(process, "real")
 
-        async def _gone(pid: int) -> bool:
-            for _ in range(30):
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    return True
-                await asyncio.sleep(0.1)
+        def _gone(pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
             return False
 
-        assert await _gone(parent_pid), "parent process was not reaped"
-        assert await _gone(child_pid), "grandchild process was orphaned, not reaped"
+        await eventually(
+            lambda: _gone(parent_pid),
+            timeout=3.0,
+            message="parent process was not reaped",
+        )
+        await eventually(
+            lambda: _gone(child_pid),
+            timeout=3.0,
+            message="grandchild process was orphaned, not reaped",
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.skipif(
@@ -3688,18 +3694,20 @@ class TestTerminateProcessTree:
 
         await _terminate_process_tree(process, "ignore")
 
-        async def _gone(pid: int) -> bool:
-            for _ in range(30):
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    return True
-                await asyncio.sleep(0.1)
+        def _gone(pid: int) -> bool:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return True
             return False
 
-        assert await _gone(parent_pid), "parent was not reaped"
-        assert await _gone(child_pid), (
-            "SIGTERM-ignoring grandchild was not group-SIGKILLed"
+        await eventually(
+            lambda: _gone(parent_pid), timeout=3.0, message="parent was not reaped"
+        )
+        await eventually(
+            lambda: _gone(child_pid),
+            timeout=3.0,
+            message="SIGTERM-ignoring grandchild was not group-SIGKILLed",
         )
 
     @pytest.mark.asyncio
@@ -4262,13 +4270,18 @@ class TestDownstreamReconcileScheduler:
 
         Coalescing alone does not bound this -- it bounds *concurrency*, and this
         loop is sequential. The re-run debounce is what bounds it, so this test
-        asserts a hard ceiling on reconciles in a fixed window rather than a
-        specific count.
+        asserts that consecutive re-runs are spaced by at least the debounce.
         """
         manager = ClientManager()
         managed = self._managed("srv")
         manager._clients["srv"] = managed
         calls: list[str] = []
+        # Stamp each reconcile re-run's `tools/list` on the loop clock. The gap
+        # between consecutive re-runs is bounded BELOW by the debounce, so a
+        # lower bound on that gap proves the loop is not spinning -- without an
+        # upper bound on work done inside a wall-clock window (the #226 class,
+        # which a starved runner fails even when the code is correct).
+        stamps: list[float] = []
 
         async def storm_send(
             managed_arg: ManagedClient,
@@ -4279,6 +4292,7 @@ class TestDownstreamReconcileScheduler:
         ) -> dict[str, Any]:
             calls.append(method)
             if method == "tools/list":
+                stamps.append(asyncio.get_running_loop().time())
                 # The server answers the listing by announcing another change.
                 manager._handle_downstream_notification(
                     "srv", managed_arg, "notifications/tools/list_changed"
@@ -4290,15 +4304,32 @@ class TestDownstreamReconcileScheduler:
         manager._handle_downstream_notification(
             "srv", managed, "notifications/tools/list_changed"
         )
-        await asyncio.sleep(0.6)
-        spins = calls.count("tools/list")
+        # Wait for two re-runs to land; the timeout is a hang guard, not a
+        # measurement. The count is read at FAILURE time -- an f-string in
+        # `message=` is formatted when `eventually` is CALLED, so it would
+        # report the pre-poll count: informative-looking and stale.
+        try:
+            await eventually(lambda: len(stamps) >= 2, timeout=5.0)
+        except AssertionError:
+            raise AssertionError(
+                "reconcile re-ran fewer than twice: "
+                f"{calls.count('tools/list')} tools/list passes"
+            ) from None
 
         # Cancel the (deliberately endless) loop before asserting.
         await manager._cancel_background_tasks()
 
-        # Without the debounce this is thousands. With it, ~1 + 0.6/0.25.
-        assert spins <= 6, f"reconcile loop is spinning: {spins} passes in 0.6s"
-        assert spins >= 1
+        # Consecutive re-runs are spaced by at least the debounce. 0.2 is a
+        # literal floor below the real 0.25 (`_RECONCILE_RERUN_DEBOUNCE_S`): a
+        # lower bound on a real `asyncio.sleep`, so it cannot flake, yet it goes
+        # red if the debounce is removed. Asserting against the imported
+        # constant would be a TAUTOLOGY -- the mutation that zeroes the debounce
+        # would zero the threshold too.
+        gap = stamps[1] - stamps[0]
+        assert gap >= 0.2, (
+            f"reconcile re-runs are not debounced: {gap:.3f}s gap "
+            "(expected >= _RECONCILE_RERUN_DEBOUNCE_S = 0.25)"
+        )
 
     # ---- SL-fix: fetch-first atomicity, per-kind isolation, content ------
 
