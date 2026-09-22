@@ -520,7 +520,15 @@ def create_http_app(
 
         if effective_auth_mode == "shared-secret":
             incoming = request.headers.get("authorization", "")
-            if not hmac.compare_digest(incoming, f"Bearer {auth_token}"):
+            # Compare BYTES: `hmac.compare_digest` raises TypeError on `str`
+            # containing non-ASCII, so an unauthenticated caller could turn any
+            # request into a 500 with one non-ASCII header byte (S-12 review
+            # finding S-09, Consiliency/pmcp#231). `surrogateescape` keeps any
+            # undecodable header bytes representable instead of raising here.
+            if not hmac.compare_digest(
+                incoming.encode("utf-8", "surrogateescape"),
+                f"Bearer {auth_token}".encode(),
+            ):
                 logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)
                 return _reject(401, "Unauthorized", _auth_headers(request))
         elif effective_auth_mode == "resource-server":
