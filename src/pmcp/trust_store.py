@@ -46,6 +46,17 @@ from typing import Any
 APPROVED = "approved"
 DENIED = "denied"
 
+#: The scope literal recorded by operator-facing project approvals. Both
+#: ``pmcp trust approve`` (``cli._run_trust_approve``) and
+#: ``config.loader.set_startup_policy``'s carry-forward re-record read it at
+#: their record call sites, so the two provably share one constant rather than
+#: two literals that could drift.
+#: Its value is the historical ``"user"`` scope, kept byte-for-byte: ``scope`` is
+#: descriptive metadata that ``is_approved`` ignores when matching (it keys on
+#: resolved path + content SHA + decision), so preserving the literal leaves
+#: every existing record and its tests unchanged.
+PROJECT_SCOPE = "user"
+
 #: The closed decision vocabulary. Anything else is rejected at ``record`` time
 #: rather than stored: a store that can hold a decision no reader understands
 #: is a store whose meaning depends on the reader.
@@ -447,11 +458,30 @@ def is_approved(path: Path, content: bytes) -> bool:
     trust by a corrupt file.
     """
     try:
+        return is_approved_resolved(Path(path).resolve(), content)
+    except Exception:  # noqa: BLE001 -- fail closed; see docstring
+        return False
+
+
+def is_approved_resolved(resolved_path: Path, content: bytes) -> bool:
+    """Is ``content`` approved for the ALREADY-RESOLVED canonical ``resolved_path``?
+
+    Identical to ``is_approved`` except that ``resolved_path`` is used as the
+    lookup key VERBATIM -- it is never passed through ``.resolve()`` again. This
+    is the surface a caller uses once it has pinned a canonical key from an
+    ``O_NOFOLLOW``-opened descriptor: re-resolving here would re-follow the path,
+    and an attacker who swapped the path to point at a different,
+    separately-approved file between the pin and this lookup could then key the
+    lookup on that other file. Pinning the key once and reusing it verbatim is
+    what closes that path-identity race (see ``config.loader.set_startup_policy``).
+
+    Never raises, for the same fail-closed reason as ``is_approved``.
+    """
+    try:
         records = _read_store(trust_store_path())
-        target = Path(path).resolve()
         digest = hashlib.sha256(content).hexdigest()
         for rec in records:
-            if rec.absolute_path == target:
+            if rec.absolute_path == resolved_path:
                 return rec.decision == APPROVED and rec.content_sha256 == digest
         return False
     except Exception:  # noqa: BLE001 -- fail closed; see docstring
@@ -493,6 +523,23 @@ def record(path: Path, content: bytes, scope: str, decision: str) -> TrustRecord
     unusable (checkout-resident, unreadable, or corrupt) -- writing over a store
     that could not be read would silently discard existing decisions.
     """
+    return record_resolved(Path(path).resolve(), content, scope, decision)
+
+
+def record_resolved(
+    resolved_path: Path, content: bytes, scope: str, decision: str
+) -> TrustRecord:
+    """Record a decision keyed on the ALREADY-RESOLVED canonical ``resolved_path``.
+
+    Identical to ``record`` -- same decision/scope validation, the same
+    residency/lock/validation guard via ``trust_store_path``, the same
+    replace-any-prior-for-this-key semantics -- except that ``resolved_path`` is
+    stored VERBATIM as the record's key, never re-resolved. A caller that pinned
+    a canonical key from an ``O_NOFOLLOW``-opened descriptor records against that
+    exact key, so the approval it writes cannot be redirected to a different file
+    by a path swapped underneath a second ``.resolve()`` (path-identity race; see
+    ``config.loader.set_startup_policy``).
+    """
     if decision not in DECISIONS:
         raise ValueError(
             f"Unsupported trust decision: {decision!r} "
@@ -503,7 +550,7 @@ def record(path: Path, content: bytes, scope: str, decision: str) -> TrustRecord
 
     store = trust_store_path()
     entry = TrustRecord(
-        absolute_path=Path(path).resolve(),
+        absolute_path=resolved_path,
         content_sha256=hashlib.sha256(content).hexdigest(),
         scope=scope,
         decision=decision,

@@ -208,6 +208,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 - Keys that a `.env` load introduced are stripped from every spawned server, and the install-spawn strip resolves the project store from the root the gateway was given rather than the working directory it happens to run in, while a server's own declared credential still resolves [C-18].
 - A fresh operator with no approval store and no project files provisions, connects and restarts a manifest-backed server unchanged, consults no consent gate, and sees no new startup warning [C-19].
 - Every refusal across the consent, provision and feedback gates carries a non-empty remedy that is runnable as printed, names only `pmcp` verbs the CLI dispatches, and renders a path holding a space or shell metacharacters inert [C-20].
+- Setting the startup policy carries an operator's prior content-keyed approval of the project `.mcp.json` forward onto the exact bytes the edit writes, keyed on the opened descriptor's verified identity — the resolved key is accepted only when it names the same file (`st_dev`, `st_ino`) the descriptor holds open — and never records an approval for a file that was not already approved [C-28].
 
 #### Outbound actions
 
@@ -221,7 +222,6 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 
 - **Limitation.** The approval store reserves a denied decision that nothing shipped writes: the CLI dispatches `approve`, `list` and `revoke`, and no verb records a denial [C-26].
 - **Limitation.** An operator approval binds no integrity digest, because the CLI records it as none, so the pin is a name and a version and not the bytes the registry serves [C-27].
-- **Limitation.** Setting the startup policy rewrites the selected source and silently invalidates a content-keyed approval it does not mention, so the operator learns only at the next startup's consent refusal [C-28].
 - **Limitation.** For a server name in neither the manifest nor the discovered table, `auth_connect` admits a credential-shaped override whose value is written to a gateway-managed store and inherited by no spawned server, though the gateway process itself holds it [C-29].
 - **Limitation.** No per-socket timeout bounds a whole request, so a feedback worker abandoned by a cancelled handler can outlive it, although it is forbidden to send by then [C-30].
 - **Limitation.** A credential store written and removed out of band, that this process never read, is invisible to every provenance source [C-31].
@@ -231,6 +231,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 - **Limitation.** The approval-store write is not atomic and can truncate before it finishes, tracked as a follow-up to the durability of the operator's own records [C-35].
 - **Limitation.** The `pmcp trust approve` verb now also refuses a store resident in the checkout containing the file being approved -- closing the case where approve wrote into a checkout-resident store that `serve --project` then refused, and aligning nested and sibling checkout layouts of that shape through the shared enclosing-checkout walk -- leaving a narrow residual only because serve treats the served root itself as a boundary verbatim while approve keys on the checkout enclosing the approved path, so the two are not guaranteed identical for a served root that is not itself a marked checkout [C-36].
 - **Limitation.** PMCP spawns a child process for every downstream server, and although a project configuration entry is gated by consent and a discovered package is bound to an approved identity, a server an operator approves still runs, so configure only servers you trust [C-37].
+- **Limitation.** The carry-forward closes the byte-content and path-identity races — a target swapped or unlinked between the open and the resolve is refused because the resolved key is verified against the opened descriptor's inode, and on POSIX a symlinked project `.mcp.json` is refused up front — leaving only the accepted, not-fail-safe residual that a swap racing the atomic write itself, or a symlinked final component where `O_NOFOLLOW` is unavailable, could still bind a file whose bytes equal those written [C-38].
 
 <!-- CLAIM-LEDGER: BEGIN -->
 | Claim | Kind | Proof |
@@ -262,7 +263,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 | C-25 | guarantee | `tests/test_feedback_provenance.py::test_a_key_pmcp_wrote_at_runtime_is_recorded`, `tests/test_feedback_provenance.py::test_the_new_registry_does_not_widen_the_dotenv_strip`, `tests/test_feedback_provenance.py::test_the_strict_lookup_raises_where_the_lenient_one_swallows` |
 | C-26 | limitation | — |
 | C-27 | limitation | characterizes: `tests/test_package_identity.py::test_a_missing_integrity_is_none_not_a_fabrication`, `tests/test_package_approvals.py::test_an_integrity_that_contradicts_the_record_is_not_approved` |
-| C-28 | limitation | — |
+| C-28 | guarantee | `tests/test_startup_policy_reapproval.py::test_happy_path_carries_the_approval_forward_and_the_next_load_applies_it`, `tests/test_startup_policy_reapproval.py::test_an_unapproved_file_is_not_auto_approved`, `tests/test_startup_policy_reapproval.py::test_a_post_write_byte_substitution_is_not_approved` |
 | C-29 | limitation | — |
 | C-30 | limitation | characterizes: `tests/test_egress_panel_fixes.py::test_a_cancelled_handler_abandons_the_claim_so_the_worker_never_posts`, `tests/test_egress_panel_fixes.py::test_a_cancelled_handler_re_raises_rather_than_answering` |
 | C-31 | limitation | — |
@@ -272,6 +273,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 | C-35 | limitation | — |
 | C-36 | limitation | characterizes: `tests/test_trust_store_residency_root.py::test_trust_approve_verb_inside_a_checkout_uses_cwd`, `tests/test_trust_store_residency_root.py::test_trust_approve_verb_still_refuses_a_checkout_resident_store`, `tests/test_trust_store_residency_root.py::test_trust_approve_from_outside_refuses_a_store_in_the_approved_paths_checkout`, `tests/test_trust_store_residency_root.py::test_trust_approve_from_outside_with_a_store_outside_still_approves` |
 | C-37 | limitation | — |
+| C-38 | limitation | characterizes: `tests/test_startup_policy_reapproval.py::test_a_post_write_symlink_swap_does_not_transfer_and_a_symlink_is_refused`, `tests/test_startup_policy_reapproval.py::test_a_capture_vs_resolve_swap_does_not_transfer_approval`, `tests/test_startup_policy_reapproval.py::test_an_unlink_after_open_is_refused_not_resurrected` |
 <!-- CLAIM-LEDGER: END -->
 <!-- TRUST-MODEL-CLAIMS: END -->
 
