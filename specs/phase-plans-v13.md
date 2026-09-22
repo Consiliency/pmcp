@@ -467,10 +467,6 @@ one to read first.
     --source project` invalidates the operator's own trust record and they get a
     refusal on the next startup. Arguably correct (the bytes did change), but a
     trap; it sits next to the existing "no bulk approve" note.
-    _Status update (not part of the amendment above, which stands as recorded):
-    closed by Consiliency/pmcp#253 — `set_startup_policy` now carries an approved
-    file's trust record forward onto the exact rewritten bytes (SECURITY.md C-28,
-    now a guarantee; the accepted out-of-scope sub-syscall residual is C-38)._
 
 11. **`plans/phase-plan-v13-CONSENT.md`'s Context line references have gone stale**
     as a result of this phase's own work: `_load_overlay_file` no longer opens the
