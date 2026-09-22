@@ -2779,7 +2779,24 @@ class ClientManager:
     ) -> None:
         """Dispatch one complete JSON-RPC line from a downstream server's stdout."""
         try:
-            message = json.loads(line.decode())
+            # `errors="replace"`: a bare `.decode()` raises UnicodeDecodeError on
+            # a non-UTF-8 byte, and that is NOT a `json.JSONDecodeError`, so it
+            # escaped the handler below, propagated to the stdout read loop's
+            # broad `except Exception`, and EXITED the loop -- marking the server
+            # unexpectedly disconnected. That is the "the server hangs" report
+            # (review finding C-03, Consiliency/pmcp#232). Replacement characters
+            # make it a normal parse failure, which is handled.
+            text = line.decode("utf-8", "replace")
+            if "\ufffd" in text:
+                # `errors="replace"` keeps the connection alive, but an
+                # undecodable byte INSIDE a JSON string still parses -- it just
+                # becomes U+FFFD. Without this the corruption would be accepted
+                # silently, which trades one failure mode for a quieter one.
+                logger.warning(
+                    f"[{name}] downstream sent undecodable bytes on stdout; "
+                    "the line was decoded with replacement characters"
+                )
+            message = json.loads(text)
             msg_id = message.get("id")
             if msg_id is not None and msg_id in managed.pending_requests:
                 pending = managed.pending_requests.pop(msg_id)

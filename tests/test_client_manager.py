@@ -4556,6 +4556,37 @@ class TestDownstreamReconcileScheduler:
         assert "srv::alpha" in manager._tools
 
     @pytest.mark.asyncio
+    async def test_a_non_utf8_stdout_line_is_discarded_not_raised(self) -> None:
+        """C-03. `_handle_stdout_line` decodes with `line.decode()` and guards
+        only `json.JSONDecodeError`. A non-UTF-8 byte raises `UnicodeDecodeError`,
+        which is NOT a subclass of it, so the exception escapes -- the caller's
+        broad `except Exception` then EXITS the stdout read loop and marks the
+        server unexpectedly disconnected. That is the "the server hangs" report.
+
+        This drives the HANDLER directly, which is the layer the defect is in;
+        the loop's own `except Exception` is what turned the escape into a
+        disconnect. The line must be discarded and the next one must dispatch.
+        """
+        manager = ClientManager()
+        managed = self._managed("srv")
+        manager._clients["srv"] = managed
+        self._wire(manager, {"tools": ["alpha"]})
+
+        # Invalid UTF-8: a lone 0xff byte.
+        manager._handle_stdout_line(
+            "srv", managed, b'{"jsonrpc":"2.0",\xff}', time.time()
+        )
+
+        # The reader survived: a well-formed line after it still dispatches.
+        line = json.dumps(
+            {"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}
+        ).encode()
+        manager._handle_stdout_line("srv", managed, line, time.time())
+        await self._drain(manager)
+
+        assert "srv::alpha" in manager._tools
+
+    @pytest.mark.asyncio
     async def test_sse_dispatch_path_reaches_the_reconcile_scheduler(self) -> None:
         """The `_read_sse` loop must recognise a notification, and must survive it:
         a raise inside that loop is caught by its blanket `except Exception`, which
