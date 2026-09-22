@@ -4556,14 +4556,16 @@ class TestDownstreamReconcileScheduler:
         assert "srv::alpha" in manager._tools
 
     @pytest.mark.asyncio
-    async def test_a_non_utf8_stdout_line_does_not_kill_the_read_loop(self) -> None:
+    async def test_a_non_utf8_stdout_line_is_discarded_not_raised(self) -> None:
         """C-03. `_handle_stdout_line` decodes with `line.decode()` and guards
         only `json.JSONDecodeError`. A non-UTF-8 byte raises `UnicodeDecodeError`,
         which is NOT a subclass of it, so the exception escapes -- the caller's
         broad `except Exception` then EXITS the stdout read loop and marks the
         server unexpectedly disconnected. That is the "the server hangs" report.
 
-        The line must be discarded and the next one must still dispatch.
+        This drives the HANDLER directly, which is the layer the defect is in;
+        the loop's own `except Exception` is what turned the escape into a
+        disconnect. The line must be discarded and the next one must dispatch.
         """
         manager = ClientManager()
         managed = self._managed("srv")

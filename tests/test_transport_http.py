@@ -69,27 +69,6 @@ class TestHealthEndpoint:
         )
         assert data["gateway_diagnostics"]["trace_context_supported"] is True
 
-    def test_a_non_ascii_authorization_header_is_rejected_not_a_500(self) -> None:
-        """S-09. `hmac.compare_digest` on `str` raises TypeError for non-ASCII:
-
-            TypeError: comparing strings with non-ASCII characters is not supported
-
-        An UNAUTHENTICATED caller could therefore turn any request into a 500 by
-        sending one non-ASCII byte in the Authorization header. The comparison
-        must happen on bytes, so a bad header is simply unauthorized.
-        """
-        client = _make_app(auth_token="secret")
-        # Raw bytes: HTTP headers are latin-1 on the wire, and Starlette decodes
-        # them back to `str`. Passing a `str` here would fail in the test client
-        # instead of reaching the server, which would make this test red for the
-        # wrong reason.
-        r = client.post(
-            "/mcp",
-            content=b"{}",
-            headers=[(b"authorization", b"Bearer \xe9")],
-        )
-        assert r.status_code == 401, r.status_code
-
     def test_health_unauthenticated_even_when_auth_configured(self) -> None:
         """Health endpoint must not require auth — load balancers won't have tokens."""
         client = _make_app(auth_token="secret")
@@ -636,6 +615,29 @@ class TestTimingSafeAuth:
             "/mcp", content=b"{}", headers={"Authorization": "Bearer secret"}
         )
         assert r.status_code != 401
+
+    def test_a_non_ascii_authorization_header_is_rejected_not_a_500(self) -> None:
+        """S-09. `hmac.compare_digest` on `str` raises TypeError for non-ASCII:
+
+            TypeError: comparing strings with non-ASCII characters is not supported
+
+        An UNAUTHENTICATED caller could therefore turn any request into a 500 by
+        putting one non-ASCII byte in the Authorization header. The comparison
+        must happen on bytes, so a bad header is simply unauthorized.
+        """
+        client = _make_app(auth_token="secret")
+        # Passed as BYTES so the value survives the test client: a `str` here
+        # dies inside httpx with UnicodeEncodeError before the request is ever
+        # sent, which would make this test red for the wrong reason. (The client
+        # still re-encodes the byte on its way out, so what reaches
+        # `compare_digest` is a non-ASCII value rather than this exact 0xe9; a
+        # raw-ASGI 0xe9 header was checked separately and is also 401.)
+        r = client.post(
+            "/mcp",
+            content=b"{}",
+            headers=[(b"authorization", b"Bearer \xe9")],
+        )
+        assert r.status_code == 401, r.status_code
 
     def test_wrong_token_rejected(self) -> None:
         client = _make_app(auth_token="secret")
