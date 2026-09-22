@@ -1914,6 +1914,10 @@ def run_config(args: argparse.Namespace) -> None:
             print(f"Source: {preview_output.path}")
         print(f"Before: {', '.join(preview_output.before_autoStart) or '-'}")
         print(f"After: {', '.join(preview_output.after_autoStart) or '-'}")
+        if preview_output.approval_carried_forward:
+            # #253: the write would otherwise have silently invalidated the
+            # operator's own prior `pmcp trust approve` of this file.
+            print("Trust approval carried forward to the rewritten file.")
         for diagnostic in preview_output.diagnostics:
             print(f"WARN {diagnostic.code}: {diagnostic.message}")
         return
@@ -2589,7 +2593,10 @@ def run_capabilities(args: argparse.Namespace) -> None:
 
 #: Every `pmcp trust` record this CLI writes is user-scoped, because the store
 #: itself is: there is no project-scoped trust file to point a --scope flag at.
-_TRUST_SCOPE = "user"
+#: Kept as a reference to the one shared constant in `trust_store` so this verb
+#: and `config.loader.set_startup_policy`'s carry-forward re-record provably
+#: record under the same scope literal rather than two that could drift.
+_TRUST_SCOPE = trust_store.PROJECT_SCOPE
 
 
 def _trust_fail(message: str) -> None:

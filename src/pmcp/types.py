@@ -350,6 +350,12 @@ class StartupPolicyPreview(BaseModel):
     after_autoStart: list[str] = Field(default_factory=list)
     diagnostics: list[StartupPolicyDiagnostic] = Field(default_factory=list)
     message: str
+    #: True when a prior operator trust approval of the pre-write ``.mcp.json``
+    #: was carried forward onto the exact bytes just written (#253). False when
+    #: nothing was written, when the file was not previously approved, or when a
+    #: checkout-resident store blocked the re-record (see the
+    #: ``approval_not_carried_forward`` diagnostic).
+    approval_carried_forward: bool = False
     next_step: str | None = None
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
@@ -709,15 +710,78 @@ def _select_policy_source(
     return None
 
 
-def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> bytes:
+    """Write ``data`` as JSON to ``path`` atomically and return the exact bytes.
+
+    The bytes are serialised ONCE and both written and returned, so a caller
+    that must record trust in the just-written content keys on precisely what
+    landed on disk without re-reading it. A post-write re-read to obtain those
+    bytes would be a byte-content TOCTOU: a concurrent process could substitute
+    the file between the replace and the read, and the caller would then approve
+    the substituted content. The serialisation matches the previous
+    ``json.dump(indent=2)`` + trailing newline byte-for-byte.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
-        "w", dir=path.parent, delete=False, encoding="utf-8"
-    ) as tmp_file:
-        json.dump(data, tmp_file, indent=2)
-        tmp_file.write("\n")
+    payload = (json.dumps(data, indent=2) + "\n").encode("utf-8")
+    with tempfile.NamedTemporaryFile("wb", dir=path.parent, delete=False) as tmp_file:
+        tmp_file.write(payload)
         tmp_path = Path(tmp_file.name)
     tmp_path.replace(path)
+    return payload
+
+
+def _pin_and_read_policy_target(
+    path: Path,
+) -> tuple[Path, bytes | None, str | None]:
+    """Open ``path`` ONCE with ``O_NOFOLLOW`` to pin one file identity and read
+    its bytes in the same act.
+
+    Returns ``(pinned_key, input_bytes, error)``:
+
+    - **file present** -> ``(canonical_path, bytes, None)``. ``pinned_key`` is
+      the OPEN DESCRIPTOR's own canonical path (via ``/proc/self/fd``), so every
+      later step -- approval lookup, write, record -- names the exact file this
+      descriptor is bound to, never whatever ``path`` may be swapped to point at
+      afterwards. ``O_NOFOLLOW`` on the final component means the capture and the
+      identity are established together, closing the capture-vs-resolve window
+      (a swap-to-symlink between "read the input" and "resolve the key").
+    - **file absent** (first-time create) -> ``(path.resolve(), None, None)``:
+      there is nothing to approve, and the caller will create the file.
+    - **symlinked final component, or any other open/read failure** ->
+      ``(path.resolve(), None, error_string)``: the caller refuses the edit. A
+      symlinked ``.mcp.json`` is refused up front; ``pinned_key`` is unused on
+      this branch.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        if exc.errno == errno.ENOENT:
+            # No file yet: a first-time create. Nothing was approved.
+            return path.resolve(), None, None
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            # O_NOFOLLOW refuses a symlinked final component with ELOOP.
+            return (
+                path.resolve(),
+                None,
+                f"symlinked_config: refusing to edit a symlinked .mcp.json at {path}",
+            )
+        return path.resolve(), None, f"unreadable_config: {exc}"
+    try:
+        try:
+            pinned_key = Path(os.path.realpath(f"/proc/self/fd/{fd}"))
+        except OSError as exc:
+            # Cannot canonicalise the descriptor: fail closed rather than record
+            # trust against a key we could not pin.
+            return path.resolve(), None, f"unpinnable_config: {exc}"
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return pinned_key, b"".join(chunks), None
+    finally:
+        os.close(fd)
 
 
 def set_startup_policy(
@@ -727,6 +791,10 @@ def set_startup_policy(
     custom_config_path: Path | None = None,
 ) -> StartupPolicyPreview:
     """Preview or apply a source-scoped autoStart mutation."""
+    # Function-local import to break the loader<->trust_store cycle (trust_store
+    # imports find_project_root from this module the same way).
+    from pmcp import trust_store
+
     sources = load_config_sources(project_root, user_config_paths, custom_config_path)
     target = _select_policy_source(operation, sources)
     if target is None:
@@ -744,7 +812,12 @@ def set_startup_policy(
             message="No startup policy change was applied.",
         )
 
-    raw_data, error = _read_config_object(target.path)
+    # Pin identity AND capture input in one act: a single O_NOFOLLOW open fixes
+    # the file this whole operation binds to and yields the bytes we may later
+    # approve, with no window between reading the input and resolving the key.
+    # `pinned_key` -- not the mutable `target.path` -- is what every subsequent
+    # step (approval lookup, write, record) names.
+    pinned_key, input_bytes, error = _pin_and_read_policy_target(target.path)
     if error:
         return StartupPolicyPreview(
             ok=False,
@@ -761,7 +834,37 @@ def set_startup_policy(
             ],
             message="No startup policy change was applied.",
         )
+
+    if input_bytes is None:
+        # First-time create: nothing on disk to parse or to have approved.
+        raw_data: dict[str, Any] | None = None
+        parse_error: str | None = None
+    else:
+        raw_data, parse_error = _config_object_from_bytes(input_bytes)
+    if parse_error:
+        return StartupPolicyPreview(
+            ok=False,
+            source=target.source,
+            path=str(target.path),
+            dry_run=operation.dry_run,
+            diagnostics=[
+                StartupPolicyDiagnostic(
+                    code="invalid_source",
+                    message=parse_error,
+                    source=target.source,
+                    path=str(target.path),
+                )
+            ],
+            message="No startup policy change was applied.",
+        )
     data = raw_data if raw_data is not None else {}
+
+    # Was THIS pinned file, with THESE exact input bytes, already operator-
+    # approved? Keyed verbatim on the pinned canonical path -- never re-resolved,
+    # so a swap of `target.path` cannot redirect the lookup to another file.
+    was_approved = input_bytes is not None and trust_store.is_approved_resolved(
+        pinned_key, input_bytes
+    )
 
     names = sorted({name for name in operation.names if name})
     before = data.get("autoStart", [])
@@ -796,9 +899,41 @@ def set_startup_policy(
     after = sorted(updated)
     changed = sorted(current) != after
     should_write = operation.apply and not operation.dry_run and changed
+    diagnostics: list[StartupPolicyDiagnostic] = []
+    approval_carried_forward = False
     if should_write:
         data["autoStart"] = after
-        _atomic_write_json(target.path, data)
+        # Write to the PINNED path and take back the exact bytes written -- never
+        # a post-write re-read (that would be the byte-content TOCTOU).
+        output_bytes = _atomic_write_json(pinned_key, data)
+        if was_approved:
+            # The operator had approved the pre-write bytes; carry that approval
+            # forward onto the exact bytes just written, against the SAME pinned
+            # key. No post-write read, no re-resolution.
+            try:
+                trust_store.record_resolved(
+                    pinned_key,
+                    output_bytes,
+                    trust_store.PROJECT_SCOPE,
+                    trust_store.APPROVED,
+                )
+                approval_carried_forward = True
+            except trust_store.TrustStoreError as exc:
+                # A checkout-resident store (post-#252) cannot be written. Leave
+                # the file written and do not crash: the operator's approval is
+                # simply not carried forward, and the next startup fails safe
+                # (the rewritten file is no longer recognised).
+                diagnostics.append(
+                    StartupPolicyDiagnostic(
+                        code="approval_not_carried_forward",
+                        message=(
+                            "Startup policy was written, but the prior trust "
+                            f"approval could not be carried forward: {exc}"
+                        ),
+                        source=target.source,
+                        path=str(pinned_key),
+                    )
+                )
 
     message = "Startup policy preview generated."
     if operation.apply and operation.dry_run:
@@ -817,6 +952,8 @@ def set_startup_policy(
         before_autoStart=sorted(current),
         after_autoStart=after,
         message=message,
+        diagnostics=diagnostics,
+        approval_carried_forward=approval_carried_forward,
         next_step='gateway.refresh(reason="startup_policy_changed")'
         if should_write
         else None,
