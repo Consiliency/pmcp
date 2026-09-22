@@ -1,6 +1,31 @@
 {
   "plans": [
     {
+      "acceptance_criteria_count": 4,
+      "created_at": "2026-09-22T16:30:18+00:00",
+      "file": ".consiliency/plans/detailed-231-auth-surface-hardening-20260922-1625.md",
+      "handoff_ref": "/mnt/HC_Volume_105438154/worktrees/pmcp-plan-231/.dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-22T16:30:18+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {},
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": "/mnt/HC_Volume_105438154/worktrees/pmcp-plan-231/reflections/claude-plan-detailed/plan-231-auth-surface/20260922-1625.md",
+      "roadmap_ref": null,
+      "slug": "231-auth-surface-hardening",
+      "status": "committed",
+      "task_summary": "Harden the HTTP auth surface: JWKS unknown-kid amplifier (S-07), JWKS fetch timeout (S-08), metadata Host reflection (S-10) for #231.",
+      "type": "detailed",
+      "updated_at": "2026-09-22T16:30:18+00:00"
+    },
+    {
       "acceptance_criteria_count": 8,
       "created_at": "2026-07-26T06:42:14Z",
       "file": "plans/detailed-103-scoped-advisor-audit-20260726.md",
