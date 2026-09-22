@@ -2591,12 +2591,12 @@ def run_capabilities(args: argparse.Namespace) -> None:
             print(capability["name"])
 
 
-#: Every `pmcp trust` record this CLI writes is user-scoped, because the store
-#: itself is: there is no project-scoped trust file to point a --scope flag at.
-#: Kept as a reference to the one shared constant in `trust_store` so this verb
-#: and `config.loader.set_startup_policy`'s carry-forward re-record provably
-#: record under the same scope literal rather than two that could drift.
-_TRUST_SCOPE = trust_store.PROJECT_SCOPE
+# Every `pmcp trust` record this CLI writes is user-scoped, because the store
+# itself is: there is no project-scoped trust file to point a --scope flag at.
+# The scope literal lives once in `trust_store.PROJECT_SCOPE` and is read at the
+# record call site (below) -- not copied into a module constant here -- so this
+# verb and `config.loader.set_startup_policy`'s carry-forward re-record resolve
+# the SAME object at use time and cannot drift into two literals.
 
 
 def _trust_fail(message: str) -> None:
@@ -2627,7 +2627,9 @@ def _run_trust_approve(args: argparse.Namespace) -> None:
     # which `run_trust` maps to a non-zero exit -- the same contract as the
     # served/cwd residency guard in `trust_store_path`).
     trust_store.assert_store_outside_path_checkout(path)
-    rec = trust_store.record(path, content, _TRUST_SCOPE, trust_store.APPROVED)
+    rec = trust_store.record(
+        path, content, trust_store.PROJECT_SCOPE, trust_store.APPROVED
+    )
     print(f"Approved {rec.absolute_path}")
     print(f"  sha256 {rec.content_sha256}")
 

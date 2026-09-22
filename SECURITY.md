@@ -208,7 +208,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 - Keys that a `.env` load introduced are stripped from every spawned server, and the install-spawn strip resolves the project store from the root the gateway was given rather than the working directory it happens to run in, while a server's own declared credential still resolves [C-18].
 - A fresh operator with no approval store and no project files provisions, connects and restarts a manifest-backed server unchanged, consults no consent gate, and sees no new startup warning [C-19].
 - Every refusal across the consent, provision and feedback gates carries a non-empty remedy that is runnable as printed, names only `pmcp` verbs the CLI dispatches, and renders a path holding a space or shell metacharacters inert [C-20].
-- Setting the startup policy carries an operator's prior content-keyed approval of the project `.mcp.json` forward onto the exact bytes the edit writes, keyed on one file identity pinned atomically with the read, and never records an approval for a file that was not already approved [C-28].
+- Setting the startup policy carries an operator's prior content-keyed approval of the project `.mcp.json` forward onto the exact bytes the edit writes, keyed on the opened descriptor's verified identity — the resolved key is accepted only when it names the same file (`st_dev`, `st_ino`) the descriptor holds open — and never records an approval for a file that was not already approved [C-28].
 
 #### Outbound actions
 
@@ -231,7 +231,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 - **Limitation.** The approval-store write is not atomic and can truncate before it finishes, tracked as a follow-up to the durability of the operator's own records [C-35].
 - **Limitation.** The `pmcp trust approve` verb now also refuses a store resident in the checkout containing the file being approved -- closing the case where approve wrote into a checkout-resident store that `serve --project` then refused, and aligning nested and sibling checkout layouts of that shape through the shared enclosing-checkout walk -- leaving a narrow residual only because serve treats the served root itself as a boundary verbatim while approve keys on the checkout enclosing the approved path, so the two are not guaranteed identical for a served root that is not itself a marked checkout [C-36].
 - **Limitation.** PMCP spawns a child process for every downstream server, and although a project configuration entry is gated by consent and a discovered package is bound to an approved identity, a server an operator approves still runs, so configure only servers you trust [C-37].
-- **Limitation.** The carry-forward closes the byte-content and path-identity races and refuses a symlinked project `.mcp.json` up front, but a sub-syscall swap of the target path during the operator's own `pmcp startup` run is out of scope and can still bind a different file whose bytes equal those written, an accepted residual that is not made fail-safe [C-38].
+- **Limitation.** The carry-forward closes the byte-content and path-identity races — a target swapped or unlinked between the open and the resolve is refused because the resolved key is verified against the opened descriptor's inode, and on POSIX a symlinked project `.mcp.json` is refused up front — leaving only the accepted, not-fail-safe residual that a swap racing the atomic write itself, or a symlinked final component where `O_NOFOLLOW` is unavailable, could still bind a file whose bytes equal those written [C-38].
 
 <!-- CLAIM-LEDGER: BEGIN -->
 | Claim | Kind | Proof |
@@ -273,7 +273,7 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
 | C-35 | limitation | — |
 | C-36 | limitation | characterizes: `tests/test_trust_store_residency_root.py::test_trust_approve_verb_inside_a_checkout_uses_cwd`, `tests/test_trust_store_residency_root.py::test_trust_approve_verb_still_refuses_a_checkout_resident_store`, `tests/test_trust_store_residency_root.py::test_trust_approve_from_outside_refuses_a_store_in_the_approved_paths_checkout`, `tests/test_trust_store_residency_root.py::test_trust_approve_from_outside_with_a_store_outside_still_approves` |
 | C-37 | limitation | — |
-| C-38 | limitation | characterizes: `tests/test_startup_policy_reapproval.py::test_a_post_write_symlink_swap_does_not_transfer_and_a_symlink_is_refused`, `tests/test_startup_policy_reapproval.py::test_a_capture_vs_resolve_swap_does_not_transfer_approval` |
+| C-38 | limitation | characterizes: `tests/test_startup_policy_reapproval.py::test_a_post_write_symlink_swap_does_not_transfer_and_a_symlink_is_refused`, `tests/test_startup_policy_reapproval.py::test_a_capture_vs_resolve_swap_does_not_transfer_approval`, `tests/test_startup_policy_reapproval.py::test_an_unlink_after_open_is_refused_not_resurrected` |
 <!-- CLAIM-LEDGER: END -->
 <!-- TRUST-MODEL-CLAIMS: END -->
 

@@ -7,10 +7,12 @@ the exact bytes), so that rewrite changes the bytes and would silently
 invalidate the operator's own prior ``pmcp trust approve <.mcp.json>`` -- the
 next startup then refuses the file. The owner decision is RE-RECORD: when the
 pre-write bytes were approved, re-record an ``approved`` decision for the exact
-new bytes, keyed on ONE file identity pinned atomically with the input read.
+new bytes, keyed on the opened descriptor's identity -- the resolved key is
+accepted only when it names the same file (``st_dev``, ``st_ino``) the
+descriptor holds open, so a swap or unlink is refused rather than mis-bound.
 
-Each test drives the real ``set_startup_policy`` + ``trust_store``. The three
-consent races the cross-vendor panel surfaced each have a falsifier here:
+Each test drives the real ``set_startup_policy`` + ``trust_store``. The consent
+races the cross-vendor panel surfaced each have a falsifier here:
 
 * **byte-content TOCTOU** -- a post-write substitution of the file must not be
   what gets approved (``test_a_post_write_byte_substitution_is_not_approved``);
@@ -19,17 +21,21 @@ consent races the cross-vendor panel surfaced each have a falsifier here:
   refused up front
   (``test_a_post_write_symlink_swap_does_not_transfer_and_a_symlink_is_refused``);
 * **capture-vs-resolve ordering** -- a swap of the target *between* reading the
-  input and resolving the key must not bind a different, separately-approved
-  file (``test_a_capture_vs_resolve_swap_does_not_transfer_approval``).
+  input and resolving the key is refused, not bound
+  (``test_a_capture_vs_resolve_swap_does_not_transfer_approval``);
+* **unlink after open** -- a file removed once the descriptor is open is refused,
+  not resurrected and approved at its stale key
+  (``test_an_unlink_after_open_is_refused_not_resurrected``).
 
-The out-of-scope residual (a sub-syscall swap against the operator's own CLI
-that binds a file whose bytes equal the written bytes) is documented in
-``SECURITY.md`` as an accepted limitation, not a fail-safe; it is not tested as
-closed because it is not.
+The accepted residual (a swap racing the atomic write itself, or a symlinked
+final component on a platform without ``O_NOFOLLOW``) is documented in
+``SECURITY.md`` C-38 as an accepted limitation, not a fail-safe; it is not tested
+as closed because it is not.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 from pathlib import Path
@@ -368,19 +374,16 @@ def test_a_capture_vs_resolve_swap_does_not_transfer_approval(
 
     moved = tmp_path / ".mcp.json.moved"
 
-    # Arm the swap only AFTER load_config_sources has done its own gate read, so
-    # it lands on the operation's key resolution, reproducing the
-    # capture-then-resolve window a naive ordering would leave.
-    #
-    # Both implementations resolve the key through os.path.realpath: the pinned
-    # design resolves the OPEN DESCRIPTOR (`/proc/self/fd/<fd>`), a naive
-    # capture-then-resolve resolves `target.path` itself. Firing the swap at the
-    # START of that first resolution means:
-    #   * correct code: the fd already binds file A, so realpath(/proc/self/fd)
-    #     still names A (renamed aside) -- B is never bound;
-    #   * naive code: realpath(target.path) now follows the symlink to B, binds
-    #     B, and (because B carries a stored approval for the captured bytes)
-    #     would wrongly carry that approval onto B's contents.
+    # The swap must land in the window BETWEEN the descriptor's identity being
+    # captured (os.fstat, right after open) and the key being resolved. The
+    # helper reads the descriptor with an explicit os.read between those two
+    # steps, so arm after load_config_sources' own gate read and fire on the
+    # first armed os.read, AFTER it returns the real bytes:
+    #   * correct code: fstat already captured file A's identity, so after the
+    #     swap `resolve(target)` names B, os.stat(B) != fstat(A) -> refused, B
+    #     never bound;
+    #   * a resolve-without-identity-check binds B (which carries a stored
+    #     approval for the captured bytes) and wrongly approves B's contents.
     state = {"armed": False, "fired": False}
     real_load = loader.load_config_sources
 
@@ -391,36 +394,118 @@ def test_a_capture_vs_resolve_swap_does_not_transfer_approval(
 
     monkeypatch.setattr(loader, "load_config_sources", load_and_arm)
 
-    real_realpath = os.path.realpath
+    real_read = os.read
 
-    def realpath_and_swap(path, *a, **k):  # type: ignore[no-untyped-def]
-        spath = os.fspath(path) if isinstance(path, (str, bytes, os.PathLike)) else path
-        relevant = isinstance(spath, str) and (
-            spath == str(mcp_json) or spath.startswith("/proc/self/fd/")
-        )
-        if state["armed"] and not state["fired"] and relevant:
+    def read_and_swap(fd: int, n: int) -> bytes:
+        data = real_read(fd, n)
+        if state["armed"] and not state["fired"]:
             state["fired"] = True
-            # Rename A aside (keeps its inode, so a pinned descriptor stays
-            # valid) and point the target path at B -- BEFORE the real resolve.
+            # Rename A aside (keeps its inode alive for the open descriptor) and
+            # point the target path at B -- AFTER the bytes are read, BEFORE the
+            # key is resolved.
             os.rename(mcp_json, moved)
             os.symlink(other, mcp_json)
-        return real_realpath(path, *a, **k)
+        return data
 
-    monkeypatch.setattr(os.path, "realpath", realpath_and_swap)
+    monkeypatch.setattr(os, "read", read_and_swap)
 
     _add(tmp_path, "demo")
 
     assert state["fired"] is True  # the swap really happened during the operation
-    # B's contents O must NOT be approved: identity was pinned atomically with
-    # capture, so the operation bound A (now `moved`), never B.
+    # B's contents O must NOT be approved: the resolved key was verified against
+    # the opened descriptor's inode, so the swap is refused rather than bound.
     assert trust_store.is_approved(other, other.read_bytes()) is False
     assert trust_store.is_approved(other, rewrite) is False
 
 
 # --------------------------------------------------------------------------
-# 8. The startup rewrite and `pmcp trust approve` share one scope constant.
+# 8. The startup rewrite and `pmcp trust approve` share ONE scope constant --
+#    resolved at use, so a same-value divergence is still caught.
 # --------------------------------------------------------------------------
 
 
-def test_startup_and_trust_approve_share_one_scope_constant() -> None:
-    assert cli._TRUST_SCOPE is trust_store.PROJECT_SCOPE
+def test_startup_and_trust_approve_share_one_scope_constant(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Redirect the single source of truth to a sentinel. If either site copied a
+    # literal instead of reading `trust_store.PROJECT_SCOPE` at use time, that
+    # site records the old value and diverges -- caught even when the copied
+    # literal equals the original (string interning made an `is` check useless).
+    monkeypatch.setattr(trust_store, "PROJECT_SCOPE", "SENTINEL_SHARED_SCOPE")
+
+    # `pmcp trust approve <file>`.
+    approved = tmp_path / "approved.json"
+    approved.write_bytes(b"{}\n")
+    cli._run_trust_approve(argparse.Namespace(path=str(approved)))
+    approve_rec = next(
+        r for r in trust_store.list_records() if r.absolute_path == approved.resolve()
+    )
+
+    # Startup-policy carry-forward re-record.
+    mcp_json = tmp_path / ".mcp.json"
+    _write_json(
+        mcp_json,
+        {"mcpServers": {"demo": {"command": "node"}}, "autoStart": []},
+    )
+    _approve(mcp_json)
+    _add(tmp_path, "demo")
+    startup_rec = next(
+        r for r in trust_store.list_records() if r.absolute_path == mcp_json.resolve()
+    )
+
+    assert approve_rec.scope == "SENTINEL_SHARED_SCOPE"
+    assert startup_rec.scope == "SENTINEL_SHARED_SCOPE"
+
+
+# --------------------------------------------------------------------------
+# 9. Unlink-between-open-and-resolve boundary (codex finding on /proc pathnames):
+#    a file removed after the descriptor is opened is refused, not resurrected
+#    and approved at its stale key.
+# --------------------------------------------------------------------------
+
+
+def test_an_unlink_after_open_is_refused_not_resurrected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mcp_json = tmp_path / ".mcp.json"
+    _write_json(
+        mcp_json,
+        {"mcpServers": {"demo": {"command": "node"}}, "autoStart": []},
+    )
+    _approve(mcp_json)  # the operator HAD approved it, so a stale-key lookup hits
+
+    state = {"armed": False, "fired": False}
+    real_load = loader.load_config_sources
+
+    def load_and_arm(*a: object, **k: object):
+        result = real_load(*a, **k)
+        state["armed"] = True
+        return result
+
+    monkeypatch.setattr(loader, "load_config_sources", load_and_arm)
+
+    real_read = os.read
+
+    def read_then_unlink(fd: int, n: int) -> bytes:
+        data = real_read(fd, n)
+        if state["armed"] and not state["fired"]:
+            state["fired"] = True
+            mcp_json.unlink()  # gone after the descriptor is open, before resolve
+        return data
+
+    monkeypatch.setattr(os, "read", read_then_unlink)
+
+    preview = _add(tmp_path, "demo")
+
+    assert state["fired"] is True
+    # The identity check refuses rather than writing/approving at a stale key.
+    assert preview.ok is False
+    assert [d.code for d in preview.diagnostics] == ["unpinnable_config"]
+    # The file was NOT resurrected, and nothing is approved for that path.
+    assert not mcp_json.exists()
+    assert (
+        trust_store.is_approved(
+            mcp_json, _rewrite_oracle(b'{"autoStart": []}', ["demo"])
+        )
+        is False
+    )

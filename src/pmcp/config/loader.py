@@ -730,56 +730,101 @@ def _atomic_write_json(path: Path, data: dict[str, Any]) -> bytes:
     return payload
 
 
+# ``O_NOFOLLOW`` is POSIX (Linux/macOS/BSD); absent on Windows. Where present it
+# refuses a symlinked FINAL component at open. Everywhere, identity is pinned by
+# comparing the opened descriptor's inode (``os.fstat``) against the resolved key
+# -- so the key is never taken on a path's word alone.
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
 def _pin_and_read_policy_target(
     path: Path,
-) -> tuple[Path, bytes | None, str | None]:
-    """Open ``path`` ONCE with ``O_NOFOLLOW`` to pin one file identity and read
-    its bytes in the same act.
+) -> tuple[Path, bytes | None, str | None, str | None]:
+    """Open ``path`` ONCE, capture its descriptor identity, read its bytes, and
+    bind the operation to a canonical key ONLY after verifying that key names the
+    exact file the descriptor holds open.
 
-    Returns ``(pinned_key, input_bytes, error)``:
+    Returns ``(pinned_key, input_bytes, error_code, error_message)``:
 
-    - **file present** -> ``(canonical_path, bytes, None)``. ``pinned_key`` is
-      the OPEN DESCRIPTOR's own canonical path (via ``/proc/self/fd``), so every
-      later step -- approval lookup, write, record -- names the exact file this
-      descriptor is bound to, never whatever ``path`` may be swapped to point at
-      afterwards. ``O_NOFOLLOW`` on the final component means the capture and the
-      identity are established together, closing the capture-vs-resolve window
-      (a swap-to-symlink between "read the input" and "resolve the key").
-    - **file absent** (first-time create) -> ``(path.resolve(), None, None)``:
-      there is nothing to approve, and the caller will create the file.
-    - **symlinked final component, or any other open/read failure** ->
-      ``(path.resolve(), None, error_string)``: the caller refuses the edit. A
-      symlinked ``.mcp.json`` is refused up front; ``pinned_key`` is unused on
-      this branch.
+    - **file present, identity verified** -> ``(canonical_path, bytes, None, None)``.
+      ``canonical_path`` is ``path.resolve()`` -- the same key ``pmcp trust
+      approve`` and the startup consent gate compute -- but it is trusted only
+      because ``os.stat(canonical_path)`` reports the SAME ``(st_dev, st_ino)`` as
+      ``os.fstat`` of the open descriptor. A ``/proc/self/fd`` pathname was NOT
+      used: it is a mutable name, not an identity (a file unlinked between the
+      open and the resolve reads back as ``<path> (deleted)`` and can name a
+      different file), and re-following it reopens the very race this closes.
+    - **file absent** (first-time create) -> ``(path.resolve(), None, None, None)``:
+      nothing to approve; the caller will create the file.
+    - **refused** -> ``(path.resolve(), None, code, message)``: a symlinked final
+      component (``invalid_source``, POSIX only), an unreadable file
+      (``invalid_source``), or a descriptor whose path no longer canonicalises to
+      the opened file -- swapped or unlinked mid-operation (``unpinnable_config``).
+      The identity check is what turns the between-syscall open->resolve window
+      from a mis-binding into a refusal.
     """
     try:
-        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(str(path), os.O_RDONLY | _O_NOFOLLOW)
     except OSError as exc:
         if exc.errno == errno.ENOENT:
             # No file yet: a first-time create. Nothing was approved.
-            return path.resolve(), None, None
+            return path.resolve(), None, None, None
         if exc.errno in (errno.ELOOP, errno.EMLINK):
             # O_NOFOLLOW refuses a symlinked final component with ELOOP.
             return (
                 path.resolve(),
                 None,
+                "invalid_source",
                 f"symlinked_config: refusing to edit a symlinked .mcp.json at {path}",
             )
-        return path.resolve(), None, f"unreadable_config: {exc}"
+        return path.resolve(), None, "invalid_source", f"unreadable_config: {exc}"
     try:
+        # Capture the true identity of the opened file BEFORE anything else can
+        # move it, then read its bytes from the descriptor itself.
         try:
-            pinned_key = Path(os.path.realpath(f"/proc/self/fd/{fd}"))
+            fd_stat = os.fstat(fd)
         except OSError as exc:
-            # Cannot canonicalise the descriptor: fail closed rather than record
-            # trust against a key we could not pin.
-            return path.resolve(), None, f"unpinnable_config: {exc}"
+            return (
+                path.resolve(),
+                None,
+                "unpinnable_config",
+                f"cannot stat the opened descriptor: {exc}",
+            )
         chunks: list[bytes] = []
         while True:
             chunk = os.read(fd, 65536)
             if not chunk:
                 break
             chunks.append(chunk)
-        return pinned_key, b"".join(chunks), None
+        input_bytes = b"".join(chunks)
+
+        # Resolve a canonical key and REQUIRE it to still name the opened file.
+        # `resolve()` re-follows the path (and any symlink a swap inserted); the
+        # `(st_dev, st_ino)` identity check against the descriptor is what makes
+        # that re-follow safe -- a swap or unlink is detected and refused rather
+        # than binding the key, the write, and the approval to another file.
+        candidate = Path(path).resolve()
+        try:
+            candidate_stat = os.stat(candidate)
+        except OSError as exc:
+            return (
+                path.resolve(),
+                None,
+                "unpinnable_config",
+                f"the target path no longer resolves to a live file: {exc}",
+            )
+        if (candidate_stat.st_dev, candidate_stat.st_ino) != (
+            fd_stat.st_dev,
+            fd_stat.st_ino,
+        ):
+            return (
+                path.resolve(),
+                None,
+                "unpinnable_config",
+                "the target path no longer names the opened file "
+                "(it was swapped or unlinked mid-operation)",
+            )
+        return candidate, input_bytes, None, None
     finally:
         os.close(fd)
 
@@ -817,8 +862,10 @@ def set_startup_policy(
     # approve, with no window between reading the input and resolving the key.
     # `pinned_key` -- not the mutable `target.path` -- is what every subsequent
     # step (approval lookup, write, record) names.
-    pinned_key, input_bytes, error = _pin_and_read_policy_target(target.path)
-    if error:
+    pinned_key, input_bytes, error_code, error_message = _pin_and_read_policy_target(
+        target.path
+    )
+    if error_code:
         return StartupPolicyPreview(
             ok=False,
             source=target.source,
@@ -826,8 +873,8 @@ def set_startup_policy(
             dry_run=operation.dry_run,
             diagnostics=[
                 StartupPolicyDiagnostic(
-                    code="invalid_source",
-                    message=error,
+                    code=error_code,
+                    message=error_message or error_code,
                     source=target.source,
                     path=str(target.path),
                 )
@@ -919,10 +966,14 @@ def set_startup_policy(
                 )
                 approval_carried_forward = True
             except trust_store.TrustStoreError as exc:
-                # A checkout-resident store (post-#252) cannot be written. Leave
-                # the file written and do not crash: the operator's approval is
-                # simply not carried forward, and the next startup fails safe
-                # (the rewritten file is no longer recognised).
+                # The store turned unusable at record time (e.g. it became
+                # checkout-resident, or unreadable, between the approval check
+                # and here). Leave the file written and do not crash: the
+                # approval is simply not carried forward and the next startup
+                # fails safe (the rewritten file is no longer recognised). NOTE:
+                # a store that is ALREADY unusable makes `was_approved` False
+                # (is_approved fails closed), so this branch is not that steady
+                # state -- it is the record-time race, kept as defence in depth.
                 diagnostics.append(
                     StartupPolicyDiagnostic(
                         code="approval_not_carried_forward",

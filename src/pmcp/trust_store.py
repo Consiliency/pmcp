@@ -47,9 +47,10 @@ APPROVED = "approved"
 DENIED = "denied"
 
 #: The scope literal recorded by operator-facing project approvals. Both
-#: ``pmcp trust approve`` (via ``cli._TRUST_SCOPE``, which references this) and
-#: ``config.loader.set_startup_policy``'s carry-forward re-record use it, so the
-#: two provably share one constant rather than two literals that could drift.
+#: ``pmcp trust approve`` (``cli._run_trust_approve``) and
+#: ``config.loader.set_startup_policy``'s carry-forward re-record read it at
+#: their record call sites, so the two provably share one constant rather than
+#: two literals that could drift.
 #: Its value is the historical ``"user"`` scope, kept byte-for-byte: ``scope`` is
 #: descriptive metadata that ``is_approved`` ignores when matching (it keys on
 #: resolved path + content SHA + decision), so preserving the literal leaves
