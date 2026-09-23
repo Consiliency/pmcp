@@ -7,7 +7,7 @@
 
 ## Task
 
-Close Consiliency/pmcp#236 (C-10 / M-02): the 26 hand-written `Tool(input_schema={...})`
+Address Consiliency/pmcp#236 (C-10 / M-02): the 26 hand-written `Tool(input_schema={...})`
 dicts in `src/pmcp/tools/handlers.py` drift from the pydantic models the handlers
 actually validate with, and unknown argument keys are silently ignored. pmcp
 brokers untrusted MCP servers for a prompt-injectable agent; the gateway's own
@@ -101,7 +101,7 @@ entries are exactly the tools `server.py` dispatches with `()`.
   forward-compatibility, not agent input. The base class introduced in A makes
   the boundary explicit (see `GatewayArguments` docstring).
 
-### Drift on HEAD (measured: 18 of 26 tools; `scratchpad/probe_head.out`)
+### Drift on HEAD (measured: 18 of 26 tools; the probe under *Measurement scripts* prints the per-tool table)
 
 Comparing each hand-written schema against the schema derived from its model
 (descriptions and `additionalProperties` ignored), **every difference is the
@@ -196,8 +196,8 @@ What is wrong with it as a deliverable:
 2. **It silently resolved the 15 description conflicts in favour of the model
    text**, losing agent-facing content. Fixed in A's `types.py` change list.
 3. **It ignored B's second-order consequences**: `_extract_trace_context`
-   (`handlers.py:850-870`) runs *before* `InvokeInput.model_validate`
-   (`:1449-1450`) and reads two undeclared spellings (`meta`, `traceContext`);
+   (post-A tree `handlers.py:850-870`; HEAD `:1279-1299`) runs *before*
+   `InvokeInput.model_validate` (post-A `:1449-1450`; HEAD `:1878-1879`) and reads two undeclared spellings (`meta`, `traceContext`);
    `InvokeInput.model_config = ConfigDict(populate_by_name=True)` makes the model
    accept `meta` while the `by_alias` schema advertises only `_meta` — so B's
    gate would reject `meta` and the model accept it, a new drift B would
@@ -389,7 +389,7 @@ following entry once B lands."
 
 ### `src/pmcp/tools/handlers.py` (modify)
 
-- `_extract_trace_context` (`:850-870`): drop the `input_data.get("meta")` and
+- `_extract_trace_context` (post-A `:850-870`; HEAD `:1279-1299`): drop the `input_data.get("meta")` and
   `input_data.get("traceContext")` candidates. Under B both spellings are
   rejected by the gate (never advertised) and by the model, so the branches are
   dead; keeping them documents a contract that no longer exists. Measured: no
@@ -525,9 +525,11 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
 
 1. A: `schema.py` → `types.py` (base class, reparenting, descriptions with the
    15 decisions) → `handlers.py` registry → tests → generate snapshot → review
-   the snapshot against `scratchpad/schemas_head.json` (the plan's measured HEAD
-   schemas): the *only* differences must be the 18-tool drift list above plus
-   the 19 new descriptions. → CHANGELOG A → PR A.
+   the snapshot against the HEAD schemas, regenerated with
+   `git show 860636a:src/pmcp/tools/handlers.py > /tmp/h.py` and
+   `{t.name: t.input_schema for t in get_gateway_tool_definitions()}` from that
+   module (the *Measurement scripts* section has the full probe): the *only*
+   differences must be the 18-tool drift list above plus the 19 new descriptions. → CHANGELOG A → PR A.
 2. B (after A merges): `types.py` flip + `populate_by_name` removal →
    `schema.py` no-arg schema → `handlers.py` trace-context branches →
    `test_tools.py:6213` → B tests → regenerate snapshot → CHANGELOG B + callout
@@ -538,12 +540,12 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
 ```bash
 cd <worktree>
 uv run pytest tests/test_gateway_tool_schemas.py tests/test_baseline_constraints.py \
-  -p no:cacheprovider --cov-fail-under=0 -q            # A: 163 passed (measured)
+  -p no:cacheprovider --cov-fail-under=0 -q            # A: schema file alone 163 passed (measured); baseline file unchanged
 uv run pytest tests/test_tools.py -p no:cacheprovider --cov-fail-under=0 -q   # B: after the :6213 edit
 nohup uv run pytest -p no:cacheprovider -q > /tmp/full.log 2>&1 & disown   # full suite, detached
 uv run ruff check src/ tests/                          # measured clean on A-only and on the spike
 uv run ruff format --check src/ tests/                 # measured clean on A-only and on the spike
-uv run mypy src/
+uv run mypy src/pmcp --exclude baml_client            # CI gate (test.yml:387); measured clean on HEAD (49 files), A-only (50), B (50)
 uv run python3 scripts/check_plan_consistency.py plans/phase-plan-v13-*.md   # blocking inconsistencies: 0 (measured)
 ```
 
@@ -1312,4 +1314,136 @@ index 1e91803..90876ee 100644
              }
          )
          health = await gt.health()
+```
+
+## Measurement scripts
+
+The instrument behind the inventory, `extra=` table, gate probe, `model_json_schema()` noise and per-tool drift table. Run it from a checkout of `860636a` with the A-only `schema.py` saved beside it as `spike_schema.py`: `uv run python probe_head.py <dir-holding-spike_schema.py>`.
+
+```python
+"""Measure HEAD (860636a): model `extra` defaults, jsonschema gate, verbatim
+model_json_schema() noise, and per-tool drift between the hand-written
+inputSchema and what the spike's input_schema_for() derives from the model."""
+
+import json
+import sys
+
+import jsonschema
+from pydantic import BaseModel
+
+sys.path.insert(0, sys.argv[1])  # dir holding spike_schema.py
+from spike_schema import input_schema_for  # noqa: E402
+
+from pmcp import types as T  # noqa: E402
+from pmcp.tools.handlers import get_gateway_tool_definitions  # noqa: E402
+
+MODELS = {
+    "gateway.catalog_search": T.CatalogSearchInput,
+    "gateway.describe": T.DescribeInput,
+    "gateway.invoke": T.InvokeInput,
+    "gateway.refresh": T.RefreshInput,
+    "gateway.connect_server": T.ConnectServerInput,
+    "gateway.disconnect_server": T.DisconnectServerInput,
+    "gateway.restart_server": T.RestartServerInput,
+    "gateway.health": None,
+    "gateway.config_status": None,
+    "gateway.get_startup_policy": None,
+    "gateway.set_startup_policy": T.StartupPolicyOperation,
+    "gateway.request_capability": T.CapabilityRequestInput,
+    "gateway.sync_environment": T.SyncEnvironmentInput,
+    "gateway.provision": T.ProvisionInput,
+    "gateway.update_server": T.UpdateServerInput,
+    "gateway.auth_connect": T.AuthConnectInput,
+    "gateway.submit_feedback": T.SubmitFeedbackInput,
+    "gateway.provision_status": T.ProvisionStatusInput,
+    "gateway.list_pending": T.ListPendingInput,
+    "gateway.cancel": T.CancelInput,
+    "gateway.tasks_list": T.TasksListInput,
+    "gateway.tasks_get": T.TasksGetInput,
+    "gateway.tasks_result": T.TasksResultInput,
+    "gateway.tasks_cancel": T.TasksCancelInput,
+    "gateway.search_registry": T.SearchRegistryInput,
+    "gateway.register_discovered_server": T.RegisterDiscoveredServerInput,
+}
+
+tools = {t.name: t for t in get_gateway_tool_definitions()}
+assert set(tools) == set(MODELS), set(tools) ^ set(MODELS)
+print("tools:", len(tools), "modelled:", sum(m is not None for m in MODELS.values()))
+
+print("\n== extra= on every argument model (incl. nested) ==")
+nested = [T.CatalogFilters, T.InvokeOptions, T.TaskMetadataInput, T.TraceContextInfo]
+for m in [m for m in MODELS.values() if m is not None] + nested:
+    print(f"  {m.__name__:32s} extra={m.model_config.get('extra')!r}")
+
+print("\n== runtime: unknown key silently dropped? ==")
+p = T.DescribeInput.model_validate({"tool_id": "a::b", "bogus_key": 1})
+print("  DescribeInput ->", p.model_dump(), "(no error)")
+p = T.InvokeInput.model_validate({"tool_id": "a::b", "options": {"timeoutMs": 5}})
+print("  InvokeInput options.timeoutMs ->", p.options, "(no error; default timeout)")
+
+print("\n== jsonschema gate: additionalProperties anywhere on HEAD? ==")
+hits = [n for n, t in tools.items() if "additionalProperties" in json.dumps(t.input_schema)]
+print("  tools whose schema mentions additionalProperties:", hits)
+for name, args in [
+    ("gateway.describe", {"tool_id": "a::b", "bogus_key": 1}),
+    ("gateway.health", {"bogus_key": True}),
+    ("gateway.invoke", {"tool_id": "a::b", "options": {"bogus_key": 1}}),
+]:
+    try:
+        jsonschema.validate(instance=args, schema=tools[name].input_schema)
+        print(f"  {name}: jsonschema ACCEPTS {args}")
+    except jsonschema.ValidationError as e:
+        print(f"  {name}: jsonschema REJECTS: {e.message}")
+
+print("\n== verbatim model_json_schema() noise (InvokeInput) ==")
+raw = T.InvokeInput.model_json_schema(by_alias=True, mode="validation")
+print("  top-level keys:", sorted(raw))
+print("  $defs:", sorted(raw.get("$defs", {})))
+print("  options prop:", raw["properties"]["options"])
+print("  tool_id prop:", raw["properties"]["tool_id"])
+print("  run_correlation_id prop:", raw["properties"]["run_correlation_id"])
+
+print("\n== schema-vs-model drift on HEAD (hand-written vs derived, per tool) ==")
+
+
+def strip_desc(node):
+    if isinstance(node, dict):
+        return {k: strip_desc(v) for k, v in node.items() if k != "description"}
+    if isinstance(node, list):
+        return [strip_desc(x) for x in node]
+    return node
+
+
+def flat(node, path=""):
+    out = {}
+    if isinstance(node, dict):
+        for k, v in node.items():
+            out.update(flat(v, f"{path}/{k}"))
+    elif isinstance(node, list):
+        out[path] = json.dumps(node, sort_keys=True)
+    else:
+        out[path] = repr(node)
+    return out
+
+
+drift_count = 0
+for name, model in MODELS.items():
+    hand = strip_desc(tools[name].input_schema)
+    derived = strip_desc(input_schema_for(model))
+    # additionalProperties is piece B, not drift; ignore for this comparison
+    d2 = json.loads(json.dumps(derived).replace('"additionalProperties": false, ', "").replace(', "additionalProperties": false', ""))
+    fh, fd = flat(hand), flat(d2)
+    only_hand = {k: v for k, v in fh.items() if k not in fd}
+    only_derived = {k: v for k, v in fd.items() if k not in fh}
+    differ = {k: (fh[k], fd[k]) for k in fh if k in fd and fh[k] != fd[k]}
+    if only_hand or only_derived or differ:
+        drift_count += 1
+        print(f"  {name}:")
+        for k, v in only_hand.items():
+            print(f"    only in hand-written: {k} = {v}")
+        for k, v in only_derived.items():
+            print(f"    only in model:        {k} = {v}")
+        for k, (a, b) in differ.items():
+            print(f"    differs: {k}: hand={a} model={b}")
+print(f"\n  tools with drift (ignoring descriptions and additionalProperties): {drift_count}/26")
 ```
