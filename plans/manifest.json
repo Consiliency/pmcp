@@ -26,6 +26,31 @@
       "updated_at": "2026-09-22T16:30:18+00:00"
     },
     {
+      "acceptance_criteria_count": 5,
+      "created_at": "2026-09-22T16:14:54.402453+00:00",
+      "file": ".consiliency/plans/detailed-232-runtime-liveness-gaps-20260922-1610.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-22T16:14:54.402453+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {},
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": "/home/viperjuice/.codex/skills/claude-plan-detailed/reflections/pmcp-9027cd412996/plan-232-runtime-gaps/20260922-1610-232-runtime-liveness-gaps.md",
+      "roadmap_ref": null,
+      "slug": "232-runtime-liveness-gaps",
+      "status": "committed",
+      "task_summary": "Close C-01/C-02/C-04 server-hang runtime gaps in client/manager.py (see #232)",
+      "type": "detailed",
+      "updated_at": "2026-09-22T16:14:54.402453+00:00"
+    },
+    {
       "acceptance_criteria_count": 8,
       "created_at": "2026-07-26T06:42:14Z",
       "file": "plans/detailed-103-scoped-advisor-audit-20260726.md",
