@@ -1,6 +1,31 @@
 {
   "plans": [
     {
+      "acceptance_criteria_count": 4,
+      "created_at": "2026-09-22T16:30:18+00:00",
+      "file": ".consiliency/plans/detailed-231-auth-surface-hardening-20260922-1625.md",
+      "handoff_ref": ".dev-skills/handoffs/claude-plan-detailed/latest.md",
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-22T16:30:18+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {},
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": "~/.codex/skills/claude-plan-detailed/reflections/plan-231-auth-surface/20260922-1625.md",
+      "roadmap_ref": null,
+      "slug": "231-auth-surface-hardening",
+      "status": "committed",
+      "task_summary": "Harden the HTTP auth surface: JWKS unknown-kid amplifier (S-07), JWKS fetch timeout (S-08), metadata Host reflection (S-10) for #231.",
+      "type": "detailed",
+      "updated_at": "2026-09-22T16:30:18+00:00"
+    },
+    {
       "acceptance_criteria_count": 5,
       "created_at": "2026-09-22T16:14:54.402453+00:00",
       "file": ".consiliency/plans/detailed-232-runtime-liveness-gaps-20260922-1610.md",
