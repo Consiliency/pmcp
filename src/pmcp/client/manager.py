@@ -3065,9 +3065,7 @@ class ClientManager:
                     if msg_id is None:
                         self._handle_downstream_notification(name, managed, method)
                     else:
-                        self._reply_to_downstream_request(
-                            name, managed, msg_id, method
-                        )
+                        self._reply_to_downstream_request(name, managed, msg_id, method)
                 elif msg_id is not None and msg_id in managed.pending_requests:
                     pending = managed.pending_requests.pop(msg_id)
 

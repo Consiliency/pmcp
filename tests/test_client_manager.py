@@ -21,6 +21,7 @@ from pydantic import ValidationError
 
 from pmcp.client.manager import (
     _MAX_LISTING_PAGES,
+    _OUTBOUND_QUEUE_MAXSIZE,
     ClientManager,
     DEFAULT_SCHEMA_DIALECT,
     ManagedClient,
@@ -6460,26 +6461,6 @@ class TestMissingInputSchemaIsUnparseable:
         for entry in ("a string", 3, None, ["a"]):
             with pytest.raises(TypeError):
                 _required_object(entry, "inputSchema")
-
-
-"""Acceptance tests for Consiliency/pmcp#232 C-01/C-02/C-04."""
-
-import asyncio
-import json
-import time
-from typing import Any
-from unittest.mock import AsyncMock, MagicMock
-
-import pytest
-
-from pmcp.client.manager import (
-    _OUTBOUND_QUEUE_MAXSIZE,
-    ClientManager,
-    ManagedClient,
-    PendingRequest,
-)
-from pmcp.types import ServerStatus, ServerStatusEnum
-from tests._timing import eventually
 
 
 def _managed_stdio(name: str) -> ManagedClient:
