@@ -6,6 +6,18 @@
 > arithmetic it was. Every number below was **measured this session** against a throwaway
 > spike on `plan/235-c3-clock` at `860636a` (= `origin/main`), then the spike was reverted
 > (`src/` and `tests/` byte-identical to HEAD before this plan was committed).
+>
+> **Revision 2 (2026-09-23).** Board review of PR Consiliency/pmcp#289 (grok AGREE, gemini
+> AGREE, codex PARTIALLY AGREE with tools down, native claude seat PARTIALLY AGREE) found
+> one blocking test-liveness gap: when the idle check stops *reading* the clock (mutant
+> M12, `now = pending.started_at`), the three driver-based tests hung to pytest-timeout
+> (700 s each) instead of failing — beyond the CI job's 25-minute limit, so the job would
+> be *cancelled* with no red test (the Consiliency/pmcp#200 failure mode). Fixed: each
+> driver fails every in-flight future with its own exception (`_fail_pending`), so a dead
+> driver ends the awaited call by name in ~5 s. Also: the `PendingRequest` comment no
+> longer claims the stamps are only compared inside the seam (handlers/cli subtract
+> `time.time()` from them today), and Verification gains the `uv sync -p 3.10
+> --all-extras` prerequisite. All numbers re-measured on the revised spike.
 
 ## Task
 
@@ -190,8 +202,25 @@ representable, so `==` assertions on fake elapsed time are exact (verified in-se
 **No upper bound on wall-clock time anywhere.** The converted tests assert on fake-clock
 values, read counts, log text, and returned values. The only real-time parameters are
 hang guards (`eventually`'s default 5 s; a bounded number of fake steps after which the
-driver fails the request with a *named* `AssertionError`). Each mutant that would
-otherwise hang ends by name (M2: "idle timeout never fired in 1.0 s of request-clock").
+driver fails the request with a *named* `AssertionError`).
+
+**A dead driver must end the awaited call, not just die.** The main coroutine is
+`await manager._send_request(...)` (or `_await_with_idle_timeout`), which spins on 1 ms
+slices for as long as the pending future is unresolved and the checks never fire. If
+the *driver* dies — its `eventually` guard expires because the clock is never read
+again, or an assertion inside it fails — the exception dies inside the driver task and
+the main coroutine spins until pytest-timeout (`timeout = 700` in `pyproject.toml`), i.e.
+past the CI job's 25-minute limit: a *cancelled* job with no red test (mutant M12, found
+by the board; measured before the fix: three tests each `Failed: Timeout` under a 20 s
+cap, and they would run to 700 s under the ini value). So every driver loop is wrapped in
+`try: ... except BaseException as exc: self._fail_pending(managed, exc); raise`, where
+`_fail_pending` sets that exception on every not-done pending future.
+`_await_with_idle_timeout` then returns `future.result()` on its next slice, which
+raises the driver's exception out of the main `await` by name. Measured after the fix:
+M12 → `3 failed, 7 passed`, each at ~5.0 s (`AssertionError: condition not met within
+5.0s`). Bounded fake steps (M2) still end with their own named message.
+`test_health_monitor_reads_the_request_clock` needs no wrapper: its `eventually` runs
+in the main coroutine.
 
 ### 5. Why the "started_at stays on wall time" mutant must be bounded in fake steps
 
@@ -212,7 +241,7 @@ outer guard would fail differently on 3.10 and 3.11+.
 |---|---|---|
 | import block `:18` | add `Callable` to `from collections.abc import ... Collection` | type of the injected clock |
 | new constant `IDLE_POLL_SLICE_S = 1.0` after `HEALTH_CHECK_INTERVAL` (`:349`) | add, with comment | the re-check cadence of `_await_with_idle_timeout`, patchable by tests without changing outcomes |
-| `PendingRequest.started_at` / `.last_heartbeat` field comments (`:965-966`) | reword: "request clock", plus a 3-line note that both come from `ClientManager._clock` and are epoch seconds because `gateway.list_pending` renders them | documents the coherence contract at the data it governs |
+| `PendingRequest.started_at` / `.last_heartbeat` field comments (`:965-966`) | reword: "request clock", plus a 3-line note that both come from `ClientManager._clock`, are compared only with that clock *inside ClientManager*, and are epoch seconds because handlers/cli render and subtract them | documents the coherence contract at the data it governs, without claiming more than is true today (handlers/cli still do their own `time.time()` arithmetic — Design decision 3) |
 | `ClientManager.__init__` (`:1033`) | add kw-only `clock: Callable[[], float] | None = None`; set `self._clock = clock if clock is not None else time.time` with a comment naming the seam group | the seam |
 | `_read_stdout` `:2922` | `time.time()` → `self._clock()` | stamps heartbeat |
 | `_read_sse` `:3044` | same | stamps heartbeat |
@@ -233,6 +262,7 @@ out-of-seam sites of Design decision 2.
 | `_FakeClock` (module-level, before `TestIdleTimeout`) | add | the fake: `value`, `reads`, `now()`, `advance()` |
 | `TestIdleTimeout` docstring | extend | states the fake-clock/dyadic contract for the class |
 | `TestIdleTimeout._pending` | add staticmethod | a `PendingRequest` stamped from the fake clock, as `_send_request` would |
+| `TestIdleTimeout._fail_pending` | add staticmethod | fails every in-flight future with a driver's exception so a dead driver ends the awaited call by name instead of spinning to pytest-timeout (Design decision 4, M12) |
 | `test_default_request_clock_is_wall_time` | add | pins the monotonic decision (M8) |
 | `test_idle_timeout_survives_periodic_output` | rewrite | fake clock + recorded `(reads, age)` sequence |
 | `test_idle_timeout_fires_when_silent` | rewrite | fires at exactly 0.25 s fake; bounded driver |
@@ -265,7 +295,7 @@ entry in the house style:
 
 ```diff
 diff --git a/src/pmcp/client/manager.py b/src/pmcp/client/manager.py
-index a7c3336..f99cfe6 100644
+index a7c3336..ba8068a 100644
 --- a/src/pmcp/client/manager.py
 +++ b/src/pmcp/client/manager.py
 @@ -15,7 +15,7 @@ import traceback
@@ -295,8 +325,8 @@ index a7c3336..f99cfe6 100644
 -    started_at: float  # time.time() when request started
 -    last_heartbeat: float  # time.time() of last activity
 +    # Both stamps come from the owning ClientManager's request clock (`_clock`,
-+    # wall time by default) and are only ever compared with readings of that
-+    # same clock. Epoch seconds: gateway.list_pending renders started_at as ISO.
++    # wall time by default); inside ClientManager they are compared only with
++    # readings of that clock. Epoch seconds: handlers/cli render and subtract them.
 +    started_at: float  # request clock when request started
 +    last_heartbeat: float  # request clock of last activity
      timeout_ms: int  # Configured timeout
@@ -462,6 +492,19 @@ class TestIdleTimeout:
             future=asyncio.get_running_loop().create_future(),
         )
 
+    @staticmethod
+    def _fail_pending(managed: ManagedClient, exc: BaseException) -> None:
+        """Fail every in-flight future with the driver's own exception.
+
+        A driver that dies (its `eventually` hang guard, an assertion) must end
+        the awaited call by name; otherwise the main coroutine keeps spinning
+        on 1 ms slices until pytest-timeout, and CI's job timeout cancels the
+        run with no red test (Consiliency/pmcp#200).
+        """
+        for req in managed.pending_requests.values():
+            if not req.future.done():
+                req.future.set_exception(exc)
+
     def test_default_request_clock_is_wall_time(self) -> None:
         """Without injection the request clock is the epoch, not monotonic.
 
@@ -494,14 +537,18 @@ class TestIdleTimeout:
             # One step per idle check: once read k has happened nothing else
             # moves the clock, so `value - last_heartbeat` is exactly the age
             # check k computed. Then "emit output" and move 0.125 s on.
-            for k in range(1, 5):
-                await eventually(lambda: clock.reads >= k, interval=0)
+            try:
+                for k in range(1, 5):
+                    await eventually(lambda: clock.reads >= k, interval=0)
+                    seen.append((clock.reads, clock.value - pending.last_heartbeat))
+                    pending.last_heartbeat = clock.value
+                    clock.advance(0.125)
+                await eventually(lambda: clock.reads >= 5, interval=0)
                 seen.append((clock.reads, clock.value - pending.last_heartbeat))
-                pending.last_heartbeat = clock.value
-                clock.advance(0.125)
-            await eventually(lambda: clock.reads >= 5, interval=0)
-            seen.append((clock.reads, clock.value - pending.last_heartbeat))
-            pending.future.set_result({"ok": True})
+                pending.future.set_result({"ok": True})
+            except BaseException as exc:
+                self._fail_pending(managed, exc)
+                raise
 
         task = asyncio.create_task(keepalive())
         result = await manager._await_with_idle_timeout(
@@ -526,18 +573,24 @@ class TestIdleTimeout:
         async def silence() -> None:
             # No output ever: each idle check finds the clock 0.125 s further on.
             # Bounded in fake steps so a broken idle path fails by name.
-            for k in range(1, 9):
-                await eventually(
-                    lambda: clock.reads >= k or not managed.pending_requests,
-                    interval=0,
+            try:
+                for k in range(1, 9):
+                    await eventually(
+                        lambda: clock.reads >= k or not managed.pending_requests,
+                        interval=0,
+                    )
+                    if not managed.pending_requests:
+                        return
+                    clock.advance(0.125)
+                self._fail_pending(
+                    managed,
+                    AssertionError(
+                        "idle timeout never fired in 1.0 s of request-clock"
+                    ),
                 )
-                if not managed.pending_requests:
-                    return
-                clock.advance(0.125)
-            for req in managed.pending_requests.values():
-                req.future.set_exception(
-                    AssertionError("idle timeout never fired in 1.0 s of request-clock")
-                )
+            except BaseException as exc:
+                self._fail_pending(managed, exc)
+                raise
 
         task = asyncio.create_task(silence())
         with pytest.raises(TimeoutError):
@@ -567,17 +620,21 @@ class TestIdleTimeout:
             # Fresh output before every idle check for 0.5 s of fake time (the
             # 0.5 s idle window never elapses), then silence, so a ceiling that
             # never fires still ends the request -- by the idle path, late.
-            for k in range(1, 13):
-                await eventually(
-                    lambda: clock.reads >= k or not managed.pending_requests,
-                    interval=0,
-                )
-                if not managed.pending_requests:
-                    return
-                if k <= 4:
-                    for req in managed.pending_requests.values():
-                        req.last_heartbeat = clock.value
-                clock.advance(0.125)
+            try:
+                for k in range(1, 13):
+                    await eventually(
+                        lambda: clock.reads >= k or not managed.pending_requests,
+                        interval=0,
+                    )
+                    if not managed.pending_requests:
+                        return
+                    if k <= 4:
+                        for req in managed.pending_requests.values():
+                            req.last_heartbeat = clock.value
+                    clock.advance(0.125)
+            except BaseException as exc:
+                self._fail_pending(managed, exc)
+                raise
 
         task = asyncio.create_task(chatty())
         with caplog.at_level(logging.WARNING, logger="pmcp.client.manager"):
@@ -727,6 +784,12 @@ class TestIdleTimeout:
 
 ## Verification
 
+**Prerequisite:** `uv sync -p 3.10 --all-extras` in the worktree first. A bare `uv sync`
+leaves out the dev tools (ruff, mypy, pytest-timeout) and on this host resolves to Python
+3.14 (memory: `worktree-needs-uv-sync-p310`). The board's claude seat also ran the
+converted tests on **Python 3.14.7**, where `asyncio.wait_for` was reimplemented, and
+reports they hold there.
+
 Every step below was run this session against the spike (`src/` + `tests/` as in the
 diff and test bodies above), on Python 3.10.12 via `uv run`. Node ids were validated
 with `--collect-only` before use. Expected results are the measured ones.
@@ -754,7 +817,7 @@ uv run pytest "tests/test_client_manager.py::TestIdleTimeout" -q --cov-fail-unde
 # 4. The whole file (every other test that builds PendingRequest with time.time() stamps
 #    and goes through a seam method on the default clock).
 nohup uv run pytest tests/test_client_manager.py -q --cov-fail-under=0 > /tmp/claude-1000/<lane>/c3-full-file.log 2>&1 & disown
-#   → 253 passed in 12.00s
+#   → 253 passed (12.00 s revision 1; 10.56 s revision 2)
 
 # 5. Whole suite (detached; poll the log yourself -- a disowned job sends no notification). Use a lane-unique log dir.
 nohup uv run pytest tests/ -q --cov-fail-under=0 > /tmp/claude-1000/<lane>/c3-suite.log 2>&1 & disown
@@ -779,9 +842,9 @@ uv run python3 scripts/check_plan_consistency.py plans/phase-plan-v13-*.md
 | 0. collect | 10 tests collected in the class (`10 tests collected in 0.05s`); the 7 pre-existing target ids resolved by content |
 | 1. boundary | `self._clock()` = 7; `time.time()` = 11; `monotonic` = 0 |
 | 2. ruff check / format / mypy | `All checks passed!` / `161 files already formatted` (after one `ruff format` reflow of a `cancel_request(...)` call) / `Success: no issues found in 1 source file` |
-| 3. class | `10 passed in 0.84s`; each converted test **0.01 s** call time (`--durations=0`) |
-| 4. whole file | **253 passed in 12.00s** |
-| 6. flake loop | **40/40 PASS, 0 FAIL**; summed call time of the class per run: mean **0.045 s**, every run 0.040–0.07 s; the pytest *process* wall was 1.72–2.43 s per run (mean 1.92 s), all of it collection/import of the 6 800-line module — the tests themselves never wait |
+| 3. class | `10 passed in 0.84s` (revision 1), `10 passed in 0.64s` (revision 2); each converted test **0.01 s** call time (`--durations=0`) |
+| 4. whole file | **253 passed** (`in 12.00s` on the revision-1 spike; `in 10.56s` on revision 2) |
+| 6. flake loop | **40/40 PASS, 0 FAIL** on the revision-1 spike (class call time mean 0.045 s, range 0.040–0.07 s, overlapping the full-file run) and again **40/40 PASS, 0 FAIL** on the revision-2 spike (mean **0.040 s**, max 0.050 s; process wall 1.72 s mean, 1.87 s max, all collection/import of the 6 800-line module — the tests themselves never wait) |
 | 7. plan consistency | `blocking inconsistencies: 0` |
 
 ### Whole suite
@@ -792,6 +855,9 @@ no failures (`-x` never stopped it). Slowest were the pre-existing 60 s
 `test_progressive_disclosure` docs-query tests, unrelated to this slice.
 
 ### Mutation table (each applied to the spike, confirmed by `diff` against the saved spike copy, then reverted)
+
+All twelve were run against the **revision-2** spike (the `_fail_pending` drivers); M1–M11
+outcomes and first `E` lines are identical to the revision-1 run, so the table keeps those.
 
 The confirmation column quotes the `diff` hunk header (`NNNNcNNNN`), which names the
 mutated line; `git diff --stat` against HEAD was non-empty for every mutant (27–29
@@ -810,13 +876,14 @@ insertions). Runs used `--tb=line`; the "red for" column is the first `E` line v
 | M9 | slice literal restored: `min(idle_timeout_s, IDLE_POLL_SLICE_S)` → `min(idle_timeout_s, 1.0)` (`:3368`) | `3368c3368` | **10 passed** (not red) | *cannot* be red without an upper-bound wall assertion, which is the flaky class this slice removes; detected by measurement instead: survives **1.25 s**, ceiling **1.01 s**, silent **0.50 s** call time vs 0.01 s each |
 | M10 | idle `>=` → `>` (`:3384`) — a *behaviour* mutant | `3384c3384` | **1 failed** | silent: `assert (4, 0.375) == (3, 0.25)` — fired one check late; the exact-boundary assertion has teeth |
 | M11 | ceiling `>=` → `>` (`:3376`) — behaviour mutant | `3376c3376` | **1 failed** | ceiling: `assert (4, 0.375) == (3, 0.25)` |
+| M12 | idle check stops *reading* the clock: `:3375` `now = self._clock()` → `now = pending.started_at` (board's mutant; age is always 0, the fake clock is never read after the stamp) | `3375c3375` | **before the `_fail_pending` fix:** the three driver tests HUNG — each `Failed: Timeout (>20.0s) from pytest-timeout` under a 20 s cap (`3 failed, 7 passed in 60.69s`), and would have run to the ini's 700 s each, past the CI job's 25-minute limit. **After the fix:** `3 failed, 7 passed in 15.14s` — survives 5.00 s, silent 5.00 s, ceiling 5.01 s | `AssertionError: condition not met within 5.0s` ×3 — the driver's `eventually` guard, re-raised out of the main `await` by `_fail_pending`; each test FAILS by name in ~5 s rather than hanging |
 
 After the last mutant `manager.py` was restored from the spike copy (`cmp` → identical).
 
 ### Acceptance criteria (runnable, all measured green above)
 
 1. `TestIdleTimeout` passes with every converted test ≤ 0.01 s call time (step 3).
-2. 40/40 repeated runs pass (step 6). The per-run call time is *reported*, not gated — mean 0.045 s, max 0.07 s this session vs a 1.11 s baseline for the three converted tests — because a ceiling on it would be the wall-clock upper bound this slice removes.
+2. 40/40 repeated runs pass (step 6; measured twice, 80/80 in total). The per-run call time is *reported*, not gated — mean 0.040–0.045 s, max 0.07 s this session vs a 1.11 s baseline for the three converted tests — because a ceiling on it would be the wall-clock upper bound this slice removes.
 3. `grep -c 'self\._clock()'` = 7 and `grep -c 'time\.time()'` = 11 in `manager.py` (step 1).
 4. Mutants M1–M8, M10, M11 each fail at least one named test (mutation table).
 5. `ruff check` and `ruff format --check` clean on `src/` and `tests/` (step 2).
@@ -833,6 +900,7 @@ After the last mutant `manager.py` was restored from the spike copy (`cmp` → i
 - **`test_c04_idle_timeout_notifies_downstream`** (`:6728`, 20 ms real, lower-bound only): kept.
 - **The other 24 `PendingRequest(...)` constructions in the test file** that stamp
   `time.time()`: they run on the default clock and are unaffected; converting them is churn.
+- **A public `ClientManager.now()` routing `handlers.py:6329-6341` and `cli.py:1478/1549` through the seam now** (board suggestion): declined for this slice. It is the first half of the monotonic follow-up and belongs in that PR so the consumer changes and the default swap are reviewed together; doing it here would add two more `src/` files and their tests to a test-hermeticity slice. The follow-up text in Design decision 3 already names the four sites.
 - **`IDLE_POLL_SLICE_S = 0`** (spin instead of a 1 ms timer) was considered and rejected
   as further from production behaviour for no measurable gain (0.01 s per test already).
 - No change to `tests/_timing.py`, `tests/conftest.py`, `SECURITY.md`, `plans/phase-plan-v13-*.md`, `specs/phase-plans-v13.md`.
