@@ -377,6 +377,13 @@ DEFAULT_STDIO_READ_LIMIT = 10 * 1024 * 1024
 # down the whole server connection (issue #79/1b).
 _STDIO_CHUNK_SIZE = 64 * 1024
 
+# Bound on the per-server outbound queue for fire-and-forget frames we originate
+# (server->client request replies and notifications/cancelled). One writer task
+# per ManagedClient drains it, so a downstream that stalls its own sink cannot
+# make us allocate an unbounded number of writer tasks or buffer unbounded
+# frames: at most this many queued plus one in-flight, then overflow is dropped.
+_OUTBOUND_QUEUE_MAXSIZE = 256
+
 
 def _stdio_read_limit() -> int:
     raw = os.environ.get("PMCP_STDIO_READ_LIMIT")
@@ -961,6 +968,10 @@ class PendingRequest:
     future: asyncio.Future[Any]
     task_id: str | None = None
     task_status: str | None = None
+    # The JSON-RPC method this request carried. Used to shape a downstream
+    # notifications/cancelled (the spec forbids cancelling `initialize`), and
+    # left "" for callers that don't set it.
+    method: str = ""
 
 
 @dataclass
@@ -1008,6 +1019,12 @@ class ManagedClient:
     response_times: deque[float] = field(default_factory=lambda: deque(maxlen=100))
     # Reconnect storm guard: True while a _reconnect_loop task is in flight
     reconnecting: bool = False
+    # Bounded outbound path for fire-and-forget frames pmcp originates toward
+    # this downstream (server->client request replies, notifications/cancelled).
+    # Lazily created by `_enqueue_outbound`; a single `outbound_writer` task
+    # drains the queue, recreated on demand when the previous one is done.
+    outbound: asyncio.Queue[dict[str, Any]] | None = None
+    outbound_writer: asyncio.Task[None] | None = None
 
 
 class ClientManager:
@@ -1367,6 +1384,20 @@ class ClientManager:
                 try:
                     await asyncio.wait_for(
                         asyncio.shield(managed.read_task), timeout=1.0
+                    )
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    pass
+                except Exception:
+                    pass
+
+            # Cancel the outbound writer explicitly (in addition to the
+            # server-name sweep below), so teardown of this path does not
+            # depend on that sweep also matching it.
+            if managed.outbound_writer and not managed.outbound_writer.done():
+                managed.outbound_writer.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(managed.outbound_writer), timeout=1.0
                     )
                 except (asyncio.TimeoutError, asyncio.CancelledError):
                     pass
@@ -2798,7 +2829,20 @@ class ClientManager:
                 )
             message = json.loads(text)
             msg_id = message.get("id")
-            if msg_id is not None and msg_id in managed.pending_requests:
+            method = message.get("method")
+            # Classify by `method` FIRST (C-01). A frame carrying a `method` can
+            # never resolve a pending future, so this both handles server->client
+            # requests (method + id) and fixes a latent misrouting: a downstream
+            # request whose id happens to collide with one of ours must not be
+            # mistaken for that response.
+            if isinstance(method, str):
+                if msg_id is None:
+                    # Notification: no id, nothing to resolve.
+                    self._handle_downstream_notification(name, managed, method)
+                else:
+                    # Server->client request: reply (ping -> {} else -32601).
+                    self._reply_to_downstream_request(name, managed, msg_id, method)
+            elif msg_id is not None and msg_id in managed.pending_requests:
                 pending = managed.pending_requests.pop(msg_id)
 
                 # Track response time
@@ -2816,14 +2860,6 @@ class ClientManager:
                     pending.future.set_exception(_downstream_error(message["error"]))
                 else:
                     pending.future.set_result(message.get("result", {}))
-            else:
-                # A notification carries a `method` and no `id`, so it falls
-                # through the gate above with nothing to resolve. Server->client
-                # *requests* also carry a method but do have an id, and are not
-                # ours to handle here — hence the explicit `msg_id is None`.
-                method = message.get("method")
-                if msg_id is None and isinstance(method, str):
-                    self._handle_downstream_notification(name, managed, method)
         except json.JSONDecodeError:
             # Non-JSON output already counted as a heartbeat by the caller.
             logger.debug(
@@ -3019,7 +3055,20 @@ class ClientManager:
                     exclude_none=True,
                 )
                 msg_id = payload.get("id")
-                if msg_id is not None and msg_id in managed.pending_requests:
+                method = payload.get("method")
+                # Classify by `method` first, exactly as the stdio path (C-01).
+                # `_handle_downstream_notification` and the reply/notify helpers
+                # never raise, which matters more here -- this loop's blanket
+                # `except Exception` would tear the connection down and trigger a
+                # reconnect.
+                if isinstance(method, str):
+                    if msg_id is None:
+                        self._handle_downstream_notification(name, managed, method)
+                    else:
+                        self._reply_to_downstream_request(
+                            name, managed, msg_id, method
+                        )
+                elif msg_id is not None and msg_id in managed.pending_requests:
                     pending = managed.pending_requests.pop(msg_id)
 
                     elapsed_ms = (now - pending.started_at) * 1000
@@ -3037,15 +3086,6 @@ class ClientManager:
                         )
                     else:
                         pending.future.set_result(payload.get("result", {}))
-                else:
-                    # Same fall-through as the stdio path: a notification has a
-                    # method and no id. `_handle_downstream_notification` never
-                    # raises, which matters more here — this loop's blanket
-                    # `except Exception` would tear the connection down and
-                    # trigger a reconnect.
-                    method = payload.get("method")
-                    if msg_id is None and isinstance(method, str):
-                        self._handle_downstream_notification(name, managed, method)
         except Exception as e:
             logger.debug(f"[{name}] SSE read error: {describe_exception(e)}")
         finally:
@@ -3067,6 +3107,126 @@ class ClientManager:
                     )
             managed.pending_requests.clear()
             managed.status.pending_request_count = 0
+
+    async def _send_message_to_downstream(
+        self, managed: ManagedClient, payload: dict[str, Any]
+    ) -> None:
+        """Write one fire-and-forget frame to a downstream server.
+
+        The single guarded writer behind the bounded outbound path. Only for
+        frames we originate and do not wait on (request replies,
+        notifications/cancelled) -- `_send_request`'s own request write stays
+        inline so its errors keep propagating to the caller. All write failures
+        are logged and swallowed here (a dead pipe must not tear anything down),
+        matching `_handle_downstream_notification`'s never-raises contract.
+        """
+        name = managed.config.name
+        try:
+            if managed.is_remote:
+                if managed.write_stream is None:
+                    return
+                msg = mcp_types.jsonrpc_message_adapter.validate_python(payload)
+                await managed.write_stream.send(SessionMessage(msg))
+            else:
+                if not managed.process or not managed.process.stdin:
+                    return
+                data = json.dumps(payload) + "\n"
+                managed.process.stdin.write(data.encode())
+                await managed.process.stdin.drain()
+        except Exception as e:
+            logger.debug(
+                f"[{name}] failed to write outbound frame "
+                f"{payload.get('method') or payload.get('id')}: {describe_exception(e)}"
+            )
+
+    async def _drain_outbound(self, managed: ManagedClient) -> None:
+        """The one writer task per client: drain the bounded outbound queue.
+
+        Blocking on `queue.get()` and on a stalled sink is the point -- it bounds
+        the whole path to `maxsize` queued plus one in-flight regardless of how
+        hard a downstream floods us, using exactly one task.
+        """
+        queue = managed.outbound
+        if queue is None:
+            return
+        while True:
+            payload = await queue.get()
+            await self._send_message_to_downstream(managed, payload)
+
+    def _enqueue_outbound(
+        self, name: str, managed: ManagedClient, frame: dict[str, Any]
+    ) -> None:
+        """Enqueue one fire-and-forget frame; create the queue/writer lazily.
+
+        Sync and never raises: `create_task` is guarded (`except RuntimeError`
+        for no running loop) and `put_nowait` overflow is caught and dropped, so
+        callers (`_reply_to_downstream_request`,
+        `_schedule_cancelled_notification`) can be called from a sync dispatch
+        path and from a cancellation cleanup without any failure mode escaping.
+        """
+        if managed.is_remote and managed.write_stream is None:
+            return
+        if managed.outbound is None:
+            managed.outbound = asyncio.Queue(maxsize=_OUTBOUND_QUEUE_MAXSIZE)
+        if managed.outbound_writer is None or managed.outbound_writer.done():
+            try:
+                writer = asyncio.create_task(self._drain_outbound(managed))
+            except RuntimeError:
+                # No running loop: both real dispatch paths run inside one, so
+                # this is unreachable in production. Drop rather than raise to
+                # keep the never-raises guarantee.
+                logger.debug(f"[{name}] no running loop; dropped outbound frame")
+                return
+            managed.outbound_writer = writer
+            self._track_background_task(writer, name)
+        try:
+            managed.outbound.put_nowait(frame)
+        except asyncio.QueueFull:
+            logger.warning(
+                f"[{name}] outbound queue full ({_OUTBOUND_QUEUE_MAXSIZE}); "
+                "dropped a downstream reply/notification frame"
+            )
+
+    def _reply_to_downstream_request(
+        self, name: str, managed: ManagedClient, msg_id: Any, method: str
+    ) -> None:
+        """Answer a server->client JSON-RPC request (C-01).
+
+        We advertise no client capabilities (`"capabilities": {}` in
+        `initialize`), so the only request we can honour is base-protocol `ping`
+        (empty result). Any other method is refused with `-32601` rather than
+        forwarded to the prompt-injectable agent -- a conscious trust-boundary
+        refusal, not a gap.
+        """
+        if method == "ping":
+            frame: dict[str, Any] = {"jsonrpc": "2.0", "id": msg_id, "result": {}}
+        else:
+            frame = {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": mcp_types.METHOD_NOT_FOUND,
+                    "message": "Method not found",
+                },
+            }
+        self._enqueue_outbound(name, managed, frame)
+
+    def _schedule_cancelled_notification(
+        self, managed: ManagedClient, request_id: int, method: str, reason: str
+    ) -> None:
+        """Send `notifications/cancelled` downstream for a request we abandoned (C-04).
+
+        Enqueued, never awaited, so it can never skip a `finally` pop. The spec
+        forbids cancelling `initialize`, so that method is silently skipped.
+        """
+        if method == "initialize":
+            return
+        frame = {
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {"requestId": request_id, "reason": reason},
+        }
+        self._enqueue_outbound(managed.config.name, managed, frame)
 
     async def _send_request(
         self,
@@ -3097,27 +3257,10 @@ class ClientManager:
             last_heartbeat=now,
             timeout_ms=timeout_ms,
             future=future,
+            method=method,
         )
         managed.pending_requests[request_id] = pending
         managed.status.pending_request_count = len(managed.pending_requests)
-
-        # Send request
-        if managed.is_remote:
-            if managed.write_stream is None:
-                raise RuntimeError("Remote stream not connected")
-            # mcp 2.0.0's JSONRPCMessage is a bare union (JSONRPCRequest |
-            # JSONRPCNotification | JSONRPCResponse | JSONRPCError), not a
-            # pydantic model, so it has no .model_validate(); construct via its
-            # published TypeAdapter instead.
-            msg = mcp_types.jsonrpc_message_adapter.validate_python(request)
-            await managed.write_stream.send(SessionMessage(msg))
-        else:
-            if not managed.process or not managed.process.stdin:
-                raise RuntimeError("Process not running")
-
-            data = json.dumps(request) + "\n"
-            managed.process.stdin.write(data.encode())
-            await managed.process.stdin.drain()
 
         # Wait for response with an inactivity (idle) timeout: the call survives
         # as long as the downstream keeps producing output (per-request
@@ -3133,6 +3276,27 @@ class ClientManager:
             _request_ceiling_ms() / 1000.0 if method == "tools/call" else idle_timeout_s
         )
         try:
+            # Send request. The write is INSIDE the try (C-02): a write error
+            # (e.g. BrokenPipeError from drain()) is neither TimeoutError nor
+            # CancelledError, so it propagates untouched -- and the `finally`
+            # still pops the pending entry.
+            if managed.is_remote:
+                if managed.write_stream is None:
+                    raise RuntimeError("Remote stream not connected")
+                # mcp 2.0.0's JSONRPCMessage is a bare union (JSONRPCRequest |
+                # JSONRPCNotification | JSONRPCResponse | JSONRPCError), not a
+                # pydantic model, so it has no .model_validate(); construct via
+                # its published TypeAdapter instead.
+                msg = mcp_types.jsonrpc_message_adapter.validate_python(request)
+                await managed.write_stream.send(SessionMessage(msg))
+            else:
+                if not managed.process or not managed.process.stdin:
+                    raise RuntimeError("Process not running")
+
+                data = json.dumps(request) + "\n"
+                managed.process.stdin.write(data.encode())
+                await managed.process.stdin.drain()
+
             result = await self._await_with_idle_timeout(
                 managed,
                 request_id,
@@ -3143,9 +3307,29 @@ class ClientManager:
             )
             return result
         except asyncio.TimeoutError:
+            # Idle or absolute-ceiling timeout: tell the downstream to stop work
+            # on this id (C-04). The arm covers both, so the reason is neutral.
+            self._schedule_cancelled_notification(
+                managed, request_id, method, "timeout"
+            )
+            raise TimeoutError(f"Request {method} timed out")
+        except asyncio.CancelledError:
+            # The caller was cancelled while we were mid-flight (C-04). Only
+            # notify when we still own the pending entry: `cancel_request` pops
+            # BEFORE it cancels the future and sends its own notification, so
+            # this guard dedupes the gateway.cancel path to exactly one frame.
+            if request_id in managed.pending_requests:
+                self._schedule_cancelled_notification(
+                    managed, request_id, method, "caller cancelled"
+                )
+            raise
+        finally:
+            # C-02 invariant: the entry is popped on EVERY exit -- success (the
+            # reader already popped; this is a no-op), timeout, cancellation, or
+            # a mid-write error. Nothing above is awaited after this, so no
+            # cancellation can skip it.
             managed.pending_requests.pop(request_id, None)
             managed.status.pending_request_count = len(managed.pending_requests)
-            raise TimeoutError(f"Request {method} timed out")
 
     async def _await_with_idle_timeout(
         self,
@@ -3344,7 +3528,11 @@ class ClientManager:
         cancel the in-flight reconnect (cascading into the running connect task)
         and abort the very recovery that called us.
         """
-        for task in (managed.read_task, managed.stderr_task):
+        # Include `outbound_writer`: a fixed tuple was cancelled here, but the
+        # `while True` writer is not a background-task sweep target on this path
+        # (`_cleanup_client` deliberately does NOT call `_cancel_background_tasks`),
+        # so without this it leaked one writer task per reconnect generation.
+        for task in (managed.read_task, managed.stderr_task, managed.outbound_writer):
             if task and not task.done():
                 task.cancel()
                 try:
@@ -4024,10 +4212,16 @@ class ClientManager:
                 elapsed,
             )
 
-        # Cancel the request
-        pending.future.cancel()
+        # Cancel the request. Pop BEFORE cancelling the future (C-04 dedup): the
+        # future.cancel() propagates a CancelledError into `_send_request`, and
+        # its `except CancelledError` only notifies when the id is still pending.
+        # Removing it first makes THIS the single site that notifies downstream.
         managed.pending_requests.pop(local_id, None)
         managed.status.pending_request_count = len(managed.pending_requests)
+        pending.future.cancel()
+        self._schedule_cancelled_notification(
+            managed, local_id, pending.method, "cancelled via gateway.cancel"
+        )
         logger.info(
             f"Cancelled request {request_id} (stalled={was_stalled}, elapsed={elapsed:.1f}s)"
         )
