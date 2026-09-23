@@ -1,0 +1,1430 @@
+# Detailed plan: shape-based secret redaction — separator-anchored keywords, opaque-run scoring, and a prose corpus (Consiliency/pmcp#234)
+
+> **Provenance.** This plan resumes an unfinished, unmeasured spike left in the
+> `plan/234-redactor` worktree by a previous planner (uncommitted edits to
+> `src/pmcp/auth.py`, `src/pmcp/policy/policy.py`, `tests/test_auth.py`, and an
+> untracked `tests/test_redaction.py`). The spike was read critically, probed
+> against an extended corpus, and **ten defects were found and fixed** (see
+> "Verdict on the inherited spike"). Every measurement below was taken in this
+> session; nothing is inherited as fact. The commit that carries this plan is
+> plan-only: `src/` and `tests/test_auth.py` are byte-identical to `main` @
+> `860636a`, and the test file's bodies are embedded under `## Test bodies`.
+
+## Task
+
+Address Consiliency/pmcp#234. The secret redactor that stands between a
+downstream server's error text and the agent's prompt-injectable context is
+**keyword-anchored**: it redacts the word after `token`, `secret`, `session`,
+`password`, `bearer` whether or not that word is a credential, and it lets
+credentials that carry no keyword (`AKIA…`, `ghp_…`, `xoxb-…`, a token in a URL
+*path*) straight through. Both directions are bugs: a false negative leaks a
+credential into an injectable surface; a false positive trains readers to
+ignore `[REDACTED]`. Consiliency/pmcp#225 widened the surface by routing far
+more exception text — including tracebacks — through `sanitize_auth_diagnostic`.
+
+Deliver **separator-anchored keyword rules AND shape-based rules**, plus a
+**prose corpus test** in which ordinary English and ordinary diagnostic text
+must survive byte-identically. Both directions are acceptance criteria.
+
+## Research summary
+
+### Surfaces and callers (unchanged by this plan)
+
+- `sanitize_auth_diagnostic(value, *, max_length=400)` in `src/pmcp/auth.py`
+  — the engine. Called from `client/manager.py` (`describe_exception`, and the
+  traceback path at `manager.py:2672` with `max_length=None`), `cli.py` (status,
+  `next=` step, errors), `cli_commands/doctor.py`, `tools/handlers.py`
+  (`_sanitize_error`, feedback events), and inside `auth.py` itself
+  (`ResourceServerAuthError.description`, `parse_www_authenticate`
+  `error_description`, `normalize_auth_metadata` diagnostics).
+- `PolicyManager.redact_secrets(output)` in `src/pmcp/policy/policy.py` — the
+  engine with `max_length=None`, then the operator's `_redaction_regexes`
+  (defaults from `DEFAULT_REDACTION_PATTERNS`), each match split at its first
+  `:`/`=`. Called from `process_output` (`gateway.invoke` when
+  `options.redact_secrets` is set or the result belongs to a task;
+  `gateway.tasks_result` **by default**), task `status_message`/`raw`
+  sanitising, and feedback scrubbing.
+- `redact_auth_url(url)` in `src/pmcp/auth.py` — userinfo + auth query keys.
+  Reached from the engine's URL pass **and** from `sanitize_public_auth_url` →
+  `sanitize_url_elicitation_url`, i.e. it produces **the URL the operator must
+  open to authorize**. Nothing in `tests/test_auth.py` pins an opaque path
+  segment through that route today (the fixtures are `/cb`, `/meta`).
+
+### Measured on `main` @ `860636a` — both surfaces
+
+Taken from a throwaway detached worktree of HEAD (`git worktree add --detach
+/mnt/HC_Volume_105438154/worktrees/pmcp-234-head-probe HEAD`, imported via
+`PYTHONPATH`, `pmcp.__file__` printed to prove which tree answered), never by
+reverting the spike in place.
+
+| input | engine (`sanitize_auth_diagnostic`) | policy (`redact_secrets`) | class |
+|---|---|---|---|
+| `token bucket rate limiting is enabled` | `token [REDACTED] rate limiting is enabled` | same | **FP** — `[\s:=]+` separator |
+| `the secret ingredient is love` | `the secret [REDACTED] is love` | same | **FP** |
+| `the secret to good code` | unchanged | unchanged | survives only because `to` < 3 chars |
+| `session expired, password reset sent` | `session [REDACTED], password [REDACTED] sent` | same | **FP** |
+| `Missing bearer token` / `the bearer of bad news` | `Missing bearer [REDACTED]` / `the bearer [REDACTED] bad news` | same | **FP** — `(\bbearer\s+)[^\s,;]+` |
+| `status_code=401 error_code=invalid_grant` | `status_code=[REDACTED] error_code=[REDACTED]` | same | **FP** — `code` matched anywhere in the key |
+| `exit code 137` | `exit code [REDACTED]` | same | **FP** |
+| `token_endpoint=https://auth.example/oauth/token` | `token_endpoint=[REDACTED]://auth.example/oauth/token` | same | **FP** — `token` matched as a substring of the key |
+| `token=secret-bearer failed` | `token=[REDACTED] [REDACTED]` | same | **FP on `failed`**: `\bbearer` fires after the hyphen in `secret-bearer` and eats the *next* word |
+| `https://api.example.com/v1/sk-live-abc123def456/status` | unchanged | `…/v1/[REDACTED]/status` | **FN (engine)** — path credential; the policy surface only catches it via the `sk-` default |
+| `AKIAIOSFODNN7EXAMPLE` | unchanged | unchanged | **FN** both |
+| `ghp_16C7e42F292c6912E7710c838347Ae178B4a` | unchanged | `[REDACTED]` | **FN (engine)** — policy catches it via the `ghp_` default only |
+| `xoxb-2444-2444-abcdefghijklmnop` | unchanged | unchanged | **FN** both |
+| `bare 4eC39HqLyjWDarjtT1zdp7dc here` (bare random alnum) | unchanged | unchanged | **FN** both |
+| `wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY` (AWS secret key) | unchanged | unchanged | **FN** both |
+| `AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBxY` | unchanged | unchanged | **FN** both |
+| `sk_test_4eC39HqLyjWDar7dc` | unchanged | unchanged | **FN** both (the `sk-` default wants a hyphen) |
+| `https://hooks.example/services/T0123ABCD/B0123ABCD/a1B2c3D4e5F6g7H8i9J0k1L2` | unchanged | unchanged | **FN** both — webhook secret in the path |
+| `{"password": "hunter2"}` | unchanged | unchanged | **FN** both — the quote after the key defeats `[\s:=]+` |
+| `{"code": -32601, "message": "x"}` | unchanged | unchanged | correct today; the spike broke it (below) |
+| `<Foo object at 0x7f3a2b1c4d50>`, `pod pmcp-7d9f8b6c5-x2k9q` | unchanged | unchanged | correct today; the spike broke both (below) |
+| custom operator pattern `[A-Za-z0-9+/]{16,}={1,2}` on `basic dXNlcjpwYXNzd29yZA== auth` | — | `basic dXNlcjpwYXNzd29yZA= [REDACTED] auth` | **leak** — `redact_secrets` splits at the first `=`, which here is base64 padding: the secret survives and the padding is "redacted" |
+
+Mechanism of the keyword FP (HEAD `auth.py:598-603`): the separator class
+`[\s:=]+` includes whitespace, so `<keyword><space><any 3+ char word>` loses the
+word. Mechanism of the keyword FN: the rule needs the keyword; a bare credential
+has none. Mechanism of the `bearer` FP: `\b` treats `-` as a boundary.
+
+Other facts established this session:
+
+- `policy_digest` hashes the loaded `GatewayPolicy` models only
+  (`policy.py:552-563`); `DEFAULT_REDACTION_PATTERNS` are applied at
+  compile time and are **not** in the payload, so changing the defaults does
+  not move any operator's telemetry digest.
+- `tests/test_project_source_consent_policy.py::test_an_explicit_user_redaction_list_is_not_dropped_by_the_project`
+  asserts `"ghp_abcdefghijklmnop" in PolicyManager().redact_secrets("ghp_abcdefghijklmnop")`
+  once the defaults are displaced, and the two C-13 proofs assert the same
+  probe **is** redacted while a default is present. The engine must therefore
+  stay blind to `ghp_` + a whole-alpha body, or those proofs go vacuous.
+- `GatewayPolicy.max_output_bytes` defaults to **50000** (`types.py:1054`).
+  Engine throughput on this host, 1 MB inputs: HEAD 0.42 s (prose) / 0.31 s
+  (one base64 run); revised 0.84 s / 0.63 s; MIME-wrapped base64 0.72 s;
+  random alnum words 0.81 s. At the default cap that is ~40 ms per call.
+- `gateway.tasks_result` calls `process_output(..., redact=True)` by default
+  (`handlers.py:6522`) and `process_output` JSON-dumps non-string results, so
+  `ImageContent.data` and any base64 payload a tool returns **does** go through
+  the engine. A shape rule with no upper bound on run length replaces the whole
+  image with `[REDACTED]` (measured on the spike: an 8 000-char blob →
+  `[REDACTED]`).
+
+### Verdict on the inherited spike
+
+**Kept** (its design is sound): keyword rules with the secret key as the
+*last* segment of the identifier; a whitespace-separated keyword only redacts a
+credential-shaped value; a small documented vendor supplement (AWS key-id
+family, Slack `xox*`, Google `AIza`, PEM blocks); a `prefix[_-]body` rule for
+structured vendor tokens whose body must mix letters and digits (so the C-13
+probe stays invisible); the character-class-transition score for bare opaque
+runs with uniform-hex exempt; redact-then-cut in the engine; backing the
+`truncate_output` cut off a partial token; the same two prose/credential corpora
+as the test design; the fixes to `DEFAULT_REDACTION_PATTERNS`.
+
+**Replaced or fixed** (each defect measured on the spiked tree with
+`scratchpad/probe/probe_spike.py` before the fix, re-measured after):
+
+| # | spike behaviour | why it is wrong | fix in this plan |
+|---|---|---|---|
+| 1 | `redact_auth_url` redacted opaque **path** segments | `redact_auth_url` is what `sanitize_url_elicitation_url` returns — the login URL. `https://dev-1.okta.com/oauth2/aus1a2b3c4D5e6F7g8h9/v1/authorize` became `…/oauth2/[REDACTED]/v1/authorize`: an unopenable OAuth flow. The diagnostic surface never needed it: the engine's whole-text shape pass already reaches a URL path. | `redact_auth_url` **unchanged from HEAD**; guard test that it keeps the Okta id byte-identical; path-credential test moved to the engine |
+| 2 | `{"code": -32601, "message": …}` → `{"code": [REDACTED], …}` | JSON-RPC error codes are every MCP error. The spike's `code` gate ("has a digit, ≥4 chars, ≥5 if all digits") accepted `-32601` because of the sign. | `code` redesigned (D5): bare or OAuth-qualified only, and never a word or number |
+| 3 | `Missing bearer token` → `Missing bearer [REDACTED]`; `the bearer of bad news`; `Bearer Token is required` | the most common auth diagnostic phrase in existence | `Bearer` value must not be a plain word or number (D3) |
+| 4 | `token secret-bearer failed` → `token secret-bearer [REDACTED]` | inherited HEAD's `\bbearer`: the credential survives and `failed` is redacted | `(?<![A-Za-z0-9_-])` instead of `\b` |
+| 5 | `<Foo object at 0x7f3a2b1c4d50>` → `<Foo object at [REDACTED]>` | every traceback and repr; the `x` defeated the uniform-hex exemption | `_UNIFORM_HEX_RE` accepts an optional `0x` |
+| 6 | an 8 000-char base64 blob → `[REDACTED]` | image data through `tasks_result` (see facts above) | `_OPAQUE_MAX_RUN = 256`; prefixed-body bound `{12,256}` |
+| 7 | `pod pmcp-7d9f8b6c5-x2k9q` → `pod [REDACTED]` | hyphen-joined short pieces, concatenated, score as random | a run containing `-`/`_` is scored per segment only, never whole |
+| 8 | `Missing bearer token:\nthe bearer…` → next line's first word redacted (found by extending the prose corpus) | the key/value separator `\s*` spanned the newline (HEAD's defaults have the same `[\s]*`) | `[ \t]*` in `_KEYWORD_SEP_RE` **and** in the four key/value `DEFAULT_REDACTION_PATTERNS` |
+| 9 | `token code=404` / `token expires_in=3600` → `token [REDACTED]` | a `param=value` after a keyword is another parameter, not the keyword's value | `(?![A-Za-z_-]+=[^=])` lookahead in `_KEYWORD_WS_RE` (the spike already had it for `Bearer realm=`) |
+| 10 | `redact_secrets` split-at-first-separator kept | HEAD bug, measured above: base64 padding taken as the separator | split only at a separator that has a value after it |
+
+**The `tests/test_auth.py` edit is dropped.** The spike changed two existing
+fixtures — `error_description="token secret-bearer failed"` → `token=secret-bearer
+failed` (line 764) and `error_description="code=super-secret"` → `token=super-secret`
+with the assertion `code=[REDACTED]` → `token=[REDACTED]` (lines 1116-1121) —
+because its own gates ("value must contain a digit") could not satisfy them. Under
+this plan's gates both original fixtures pass **unchanged**: `secret-bearer` is a
+punctuated 13-character value (not a plain word) so the whitespace rule redacts
+it, and bare `code=` with a non-word value is the OAuth callback parameter and is
+redacted. Measured: `tests/test_auth.py` restored from HEAD → **128 passed** against
+the revised engine. Neither old assertion was wrong; the spike's gate was.
+
+## Design
+
+The engine (`sanitize_auth_diagnostic`) runs these passes in order on the
+whole text, then cuts to `max_length`:
+
+1. **URLs** — `redact_auth_url` (userinfo, auth query keys). *Unchanged.*
+2. **`Authorization: …`** header — everything after the separator. *Unchanged.*
+3. **`Bearer <value>`** (D3) — the HTTP scheme, so the value is a token unless it
+   is a plain word or number (`bearer token`, `bearer of`, `Bearer Token`) or a
+   challenge parameter (`Bearer realm="…"`). Not when `Bearer` is itself a value
+   (`token_type=Bearer`). Boundary `(?<![A-Za-z0-9_-])`, never `\b`.
+4. **`<key><sep><value>`** (D1) — `sep` is `:` or `=` on the same line, quotes
+   allowed around key and value (JSON). The key's **last** segment (`_`/`-`
+   joined or camelCase) must be a secret key from `AUTH_DIAGNOSTIC_SECRET_KEYS`
+   (or `api[_-]?key`), optionally suffixed `_id`/`_key`/`s`. So `access_token=`,
+   `X-Auth-Token:`, `accessToken=`, `"password": "…"`, `session_id=`, `Set-Cookie:`
+   fire; `token_type=`, `token_endpoint=`, `secret_arn=`, `password_hash=`,
+   `tokenizer=` do not. Strong keys redact **any** value.
+5. **`<keyword><whitespace><value>`** (D2) — including `--flag value`. Redacts
+   only a value that *could be a credential*: not a plain word or number, and
+   either digit-bearing and ≥ 6 chars (`abc123def456`, `hunter2`) or punctuated
+   and ≥ 8 (`secret-bearer`, `correct-horse-battery-staple`). `token bucket`,
+   `session expired`, `password reset`, `token v2`, `token 3` all survive. A
+   `param=value` after the keyword is not its value.
+6. **`code`** (D5) — a credential only in the OAuth sense: bare (`code=`, the
+   callback parameter) or qualified by `auth`/`authorization`/`oauth`/`device`/`user`.
+   Even then a plain word or number is kept (`{"code": -32601}`, `{"code":
+   "not_found"}`, `code=404`). Any other qualifier (`status_code=`, `error_code=`,
+   `exit_code=`) leaves the value to the shape rules, which still catch an
+   opaque one — that direction is fail-closed. `code` never fires on whitespace.
+7. **JWT** — three dot-joined base64url segments. *Unchanged.*
+8. **Vendor shapes** (D4, a supplement, not the defence) — AWS access-key-id
+   family (`AKIA…`: uniform upper-case, too few transitions to score), Slack
+   `xox[abeprs]-…` (numeric segments), Google `AIza` + 35, PEM private-key
+   blocks (one replacement per block).
+9. **Prefixed tokens** (D4) — `[a-z]{2,8}` prefix, up to two short qualifiers,
+   `[_-]`, then 12-256 alphanumerics containing **both** a letter and a digit:
+   `sk-live-…`, `sk_test_…`, `ghp_…`, `github_pat_…`, `glpat-…`, `dop_v1_…`.
+   Whole-alpha and whole-numeric bodies are deliberately not matched (C-13 probe).
+10. **Opaque runs** (D4) — every maximal run of `[A-Za-z0-9_+/-]` (`={0,2}`
+    padding allowed), ≤ 256 chars, is scored: its lower/upper/digit classes must
+    change hands ≥ 3 times at > 25 % of adjacent positions, with ≥ 2 digit runs
+    (or, with one, the `xAB` mixed-case signature camelCase never produces and a
+    ratio > 0.35), and — under 16 chars — no lower-case word longer than 4.
+    Uniform hex (optionally `0x`-prefixed) is never opaque: git SHAs, digests,
+    UUIDs, addresses. A run containing `-`/`_` is scored **per segment** (≥ 10
+    chars each), never as a whole, so `pmcp-7d9f8b6c5-x2k9q`, `x86_64-linux-gnu`
+    and `ECDHE-RSA-AES256-GCM-SHA384` survive while `Xk3jd92LmQpw8Rt6Zy1nVb4c`
+    does not. A `/`-joined run that reads as a route (leading `/` or two plain
+    words) keeps its route and loses only the opaque piece: `/v1/[REDACTED]/status`.
+11. **Cut** to `max_length`. Redaction ran on the whole text first, so the cut
+    can shorten `[REDACTED]` but never expose a token prefix (pinned by
+    `test_the_engine_redacts_before_it_truncates`).
+
+`PolicyManager.redact_secrets` = engine + operator patterns. The post-pass
+keeps a `key<sep>` prefix when the match has one, and replaces the whole match
+when it has none — including when its only `=` is trailing padding (D6).
+
+`PolicyManager.truncate_output` (D7) — the byte cut happens **before**
+redaction in `process_output`, so a cut that lands inside a credential leaves a
+prefix no rule recognises (`ghp_16C7e`). The cut is backed up to the preceding
+non-token character, bounded at 64 characters: a longer trailing run is not
+backed out of, because ≥ 64 characters of a random string is still opaque to
+pass 10, and a giant single run must still truncate. This is a behaviour change
+for every truncated output that ends mid-token (≤ 64 bytes shorter);
+`tests/test_policy.py` pins no exact length (its `process_output` tests at
+lines 347 and 423 assert content, and passed unchanged).
+
+`DEFAULT_REDACTION_PATTERNS` (D8): `(bearer|token)[\s]+[a-zA-Z0-9._-]+` — the
+policy surface's own copy of the whitespace bug — becomes
+`\btoken[ \t]*[:=][ \t]*…` (bearer is the engine's job); `(secret|password|…)`
+gets `(?<![A-Za-z0-9:.])` so `arn:…:secret:Name` is not a match; every key/value
+default uses `[ \t]*` around the separator. The `sk-`/`ghp_`/`github_pat_`
+defaults stay, so SECURITY.md's C-13 proofs keep their probe.
+
+### What this design still will not catch, and why that is acceptable
+
+| residual | why | why acceptable |
+|---|---|---|
+| **Bare uniform-hex secrets** in free text (a 20-hex GitHub OAuth code with no `code=`, `key-<hex32>` Mailgun keys, plain hex API tokens) | shape-identical to git SHAs, digests, UUIDs and request ids, which every traceback and pip/docker log is full of; redacting them would make diagnostics unreadable | still caught when keyed (`code=`, `token=`, `?code=` in a URL) or prefixed (`dop_v1_<hex>` via pass 9); a hex token with no key and no prefix is the rarer issuance shape |
+| A single unbroken run **longer than 256** characters | it is a payload (image data, an encoded file) far more often than a credential; the longest single-run vendor tokens seen are ~164 (`sk-proj-`) | JWTs (dot-joined, unbounded rule) and private keys (PEM rule) are the long credential shapes, and both are covered |
+| base64url secrets whose `-`/`_` fall every < 10 characters | per-segment scoring (needed for pod names and hostnames) | expected gap between such characters in base64url is 32; measured examples all have a ≥ 10-char segment |
+| A digitless dev password after a whitespace keyword (`--password hunter`) and short digit-bearing ones (`--token 1a2b`) | indistinguishable from `password reset`, `token v2` | `password=hunter`, `password: hunter`, `"password": "hunter"` are all still redacted (strong key with a separator) |
+| Numeric one-time codes under `code` (`code=123456`) | indistinguishable from JSON-RPC and HTTP codes | single-use, minutes-lived, and a diagnostic from an untrusted server that quotes one gives the attacker nothing they did not already have |
+| `Set-Cookie: a=b; c=d` — only the first pair | the value class stops at `;` (HEAD behaviour, unchanged) | the session pair is conventionally first; the residual is HEAD's |
+| Low-entropy values under a non-OAuth `*_code=` (`error_code=super-secret`) | by design (pass 6) | the fail-closed direction: an opaque value is still caught by pass 10 |
+| **False positive:** prefixed opaque *identifiers* — `req_011CfKTgoiRuc27pR2Po`, `cus_J1x2Yz3AbCd4Ef`, an Okta `aus…` id inside a *diagnostic* | shape-identical to `sk_live_…`; a denylist of secret prefixes fails open | a correlation id lost from a diagnostic is a support inconvenience; a token leaked is a compromise. The elicitation URL itself is untouched (defect 1) |
+| **False positive:** MIME-wrapped base64 (76-column lines) and `data:` URIs under 256 chars | each line is a ≤ 256-char opaque run | one-run payloads (the common MCP `ImageContent` shape) survive; document as known |
+| **False positive:** an 8+ char punctuated non-word after a bare keyword (`session re-issued-twice`) | the price of catching `--password correct-horse-battery-staple` | rare in diagnostics; the corpus holds `session re-use` (6 chars) as the boundary |
+
+## Changes
+
+Every change names file, entity, action, reason. The exact code is in
+`### Patch (measured)` below — it is the code every number in this plan was
+measured against; implement it verbatim and then run the mutation table.
+
+### `src/pmcp/auth.py`
+
+- **module constants `_OPAQUE_RUN_RE`, `_UNIFORM_HEX_RE`, `_SEGMENT_SPLIT_RE`,
+  `_IDENTIFIER_JOINER_RE`, `_OPAQUE_MIN_SEGMENT`, `_OPAQUE_MIN_RUN`,
+  `_OPAQUE_MAX_RUN`, `_OPAQUE_MIN_TRANSITIONS`, `_OPAQUE_MIN_TRANSITION_RATIO`,
+  `_PREFIXED_TOKEN_RE`, `_VENDOR_SHAPE_RES`, `_CAMEL_BREAKER_RE`,
+  `_DIGIT_RUN_RE`, `_LOWER_RUN_RE`, `_WORDY_PIECES_RE`** — add, after `_JWT_RE` —
+  the shape layer's tunables, each with the false positive or negative it
+  exists for in its comment (pass 8-10 above).
+- **`_char_class`, `_looks_opaque`, `_run_is_opaque`, `_redact_run`,
+  `_redact_opaque_runs`** — add — the opaque-run scorer and the pass that
+  applies vendor shapes, prefixed tokens and scored runs, in that order.
+- **`_PLAIN_WORD_RE`, `_NUMBER_RE`, `_is_plain_word_or_number`,
+  `_value_could_be_a_credential`** — add — the two value gates (D2, D3, D5).
+  Sentence punctuation after a word is stripped before the test (`token:`).
+- **`_CODE_QUALIFIERS`** — add — the OAuth senses of `code` (D5).
+- **`_secret_key_alternation`, `_KEYWORD_SEP_RE`, `_KEYWORD_WS_RE`,
+  `_BEARER_RE`, `_redact_keyword_sep`, `_redact_keyword_ws`, `_redact_bearer`**
+  — add — the three keyword rules and their callbacks (D1, D2, D3).
+- **`sanitize_auth_diagnostic`** — modify — replace the `bearer` `re.sub` and
+  the `secret_keys` containing-match `re.sub` with `_BEARER_RE`,
+  `_KEYWORD_SEP_RE`, `_KEYWORD_WS_RE`, then `_JWT_RE` (as before), then
+  `_redact_opaque_runs`; the final `text[:max_length]` cut stays last and gains
+  the comment that says why.
+- **`redact_auth_url`** — **no change** (defect 1). The plan adds a test that
+  pins this.
+- `AUTH_DIAGNOSTIC_SECRET_KEYS` — no change; `code` stays a member (it is
+  still a key, with the D5 semantics) and the URL rules keep using
+  `AUTH_SECRET_QUERY_KEYS` as before.
+
+### `src/pmcp/policy/policy.py`
+
+- **`_TRAILING_PARTIAL_TOKEN_RE`** — add, before `DEFAULT_REDACTION_PATTERNS`
+  — a ≤ 64-char run of token characters at the very end of a string (D7).
+- **`DEFAULT_REDACTION_PATTERNS`** — modify — as in D8; comments name the
+  prose each change protects.
+- **`PolicyManager.truncate_output`** — modify — after decoding the byte cut,
+  back it up to the start of a trailing partial token (bounded), before the
+  truncation marker is appended (D7).
+- **`PolicyManager.redact_secrets.replace_match`** — modify — split at the
+  first `:`/`=` only if `full_match[i + 1:].strip(" \t:=")` is non-empty (D6).
+
+### `tests/test_redaction.py` (new)
+
+Both corpora and the composition tests; bodies under `## Test bodies`. Node
+ids, all validated with `--collect-only` this session (70 tests):
+
+- `test_prose_survives_the_engine_byte_identical`,
+  `test_prose_survives_the_policy_surface_byte_identical` — the prose direction
+  on both surfaces.
+- `test_the_keyword_rule_needs_a_separator_or_a_credential_shaped_value`,
+  `test_bearer_is_a_scheme_not_a_word`,
+  `test_code_is_a_credential_only_in_the_oauth_sense` — the keyword rules'
+  boundaries, one probe per clause.
+- `test_the_policy_defaults_probe_stays_invisible_to_the_engine` — the C-13
+  invariant.
+- `test_the_engine_redacts_the_credential_and_keeps_its_surroundings[…]`,
+  `test_the_policy_surface_redacts_the_credential_and_keeps_its_surroundings[…]`
+  — 28 credential classes × 2 surfaces.
+- `test_a_url_path_credential_is_redacted_in_diagnostics_not_in_the_url` — the
+  elicitation-URL guard (defect 1).
+- `test_identifiers_that_are_not_credentials_are_kept`,
+  `test_payload_sized_runs_are_data_not_credentials` — the shape layer's
+  exemptions.
+- `test_redaction_is_idempotent`,
+  `test_redact_secrets_keeps_a_key_but_never_splits_inside_a_secret`,
+  `test_the_engine_redacts_before_it_truncates`,
+  `test_process_output_never_ends_on_a_partial_token`,
+  `test_process_output_still_truncates_a_single_giant_run` — composition,
+  D6, D7.
+
+### `tests/test_auth.py`
+
+- **No change.** See the verdict above; 128 passed unchanged.
+
+### Patch (measured)
+
+`git diff` of the revised tree against `main` @ `860636a`, `src/` only. This
+is the exact text the mutation table and every probe in this plan ran against
+(`sha256` of the revised files: `auth.py 3f5196b3…cacf`, `policy.py
+b3948f52…363e`).
+
+```diff
+diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
+index f40ccbb..ab52c49 100644
+--- a/src/pmcp/auth.py
++++ b/src/pmcp/auth.py
+@@ -93,6 +93,278 @@ _JWT_RE = re.compile(
+     r"(?![A-Za-z0-9_-])"
+ )
+ 
++# --- shape-based redaction (Consiliency/pmcp#234) -----------------------------
++#
++# The keyword rules below only fire on `<key><sep><value>`; everything else a
++# credential can look like is caught by *shape*: a run of token characters whose
++# character classes alternate the way random bytes do and English, identifiers,
++# hex digests and timestamps do not. tests/test_redaction.py holds the two
++# corpora this is tuned against: prose that must survive byte-identical, and
++# credentials that must not survive at all. Both are acceptance criteria; a
++# redactor tested on only one of them drifts toward redacting everything or
++# nothing.
++
++#: A maximal run of token characters. `.` is excluded on purpose so module
++#: paths, versions and hostnames split into short words (JWTs, which are
++#: dot-joined, have their own rule above). `/` and `+` are included so a classic
++#: base64 blob stays one run and is scored whole.
++_OPAQUE_RUN_RE = re.compile(r"[A-Za-z0-9_+/-]+={0,2}")
++#: Uniform hex, optionally `0x`-prefixed: git SHAs, digests, UUIDs, request ids
++#: and the `<Foo object at 0x7f3a2b1c4d50>` in every traceback. Kept.
++_UNIFORM_HEX_RE = re.compile(r"^(?:0[xX])?(?:[0-9a-f]+|[0-9A-F]+)$")
++_SEGMENT_SPLIT_RE = re.compile(r"[_+/-]+")
++#: `-` and `_` join identifiers (`pmcp-7d9f8b6c5-x2k9q`, `x86_64-linux-gnu`);
++#: a run containing them is scored segment by segment, never as a whole, or
++#: the concatenation of short hyphenated pieces reads as random.
++_IDENTIFIER_JOINER_RE = re.compile(r"[_-]")
++
++#: A segment (or a whole run) is "opaque" when it is at least this long ...
++_OPAQUE_MIN_SEGMENT = 10
++_OPAQUE_MIN_RUN = 16
++#: ... and at most this long. Longer is a payload, not a credential: base64
++#: image data and encoded files come back through `process_output` with
++#: redaction on, and no vendor issues a single unbroken token this long (JWTs
++#: are dot-joined and have their own rule; private keys are PEM blocks).
++_OPAQUE_MAX_RUN = 256
++#: ... and its lower/upper/digit classes change hands at least this many times,
++#: at more than this fraction of adjacent positions. camelCase identifiers
++#: (`ResourceServerAuthError`: 3/22) and timestamps (`20260922T101500Z`: 3/15)
++#: sit under the ratio; random alphanumerics sit far above it.
++_OPAQUE_MIN_TRANSITIONS = 3
++_OPAQUE_MIN_TRANSITION_RATIO = 0.25
++
++#: Short lowercase prefix, up to two short qualifiers, then a body of 12-256
++#: alphanumerics that mixes letters and digits: `sk-live-…`, `ghp_…`,
++#: `glpat-…`, `hf_…`, `npm_…`. A prefix is evidence in itself, so the body is
++#: held to a weaker test than a bare run (a letter and a digit rather than the
++#: transition score). Whole-alpha and whole-numeric bodies are NOT matched:
++#: `ghp_abcdefghijklmnop` is the probe tests/test_project_source_consent_policy.py
++#: uses to prove the *policy* defaults still apply, and it must stay invisible
++#: to this engine or that proof goes vacuous.
++_PREFIXED_TOKEN_RE = re.compile(
++    r"(?<![A-Za-z0-9_-])"
++    r"[a-z]{2,8}(?:[_-][a-z0-9]{1,8}){0,2}[_-]"
++    r"(?=[A-Za-z0-9]*[0-9])(?=[A-Za-z0-9]*[A-Za-z])[A-Za-z0-9]{12,256}"
++    r"(?![A-Za-z0-9_-])"
++)
++
++#: Documented fixed vendor shapes the transition score cannot see. This list is
++#: a supplement to the shape rules, not the defence: a prefix nobody listed is
++#: still caught above if its body is random. Each entry says why it is here.
++_VENDOR_SHAPE_RES = (
++    # AWS access key ids: a 4-letter family prefix + 16 upper-alnum. Uniformly
++    # upper-case with few digits, so the transition score does not fire.
++    re.compile(
++        r"(?<![A-Za-z0-9])(?:AKIA|ASIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|APKA)"
++        r"[A-Z0-9]{16}(?![A-Za-z0-9])"
++    ),
++    # Slack tokens: `xox[abeprs]-` then numeric segments; only the last segment
++    # carries transitions, and on a short one the score misses.
++    re.compile(r"(?<![A-Za-z0-9])xox[abeprs]-[A-Za-z0-9-]{10,}(?![A-Za-z0-9])"),
++    # Google API keys: `AIza` + 35 base64url; caught by shape too, listed so the
++    # whole key is one replacement.
++    re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])"),
++    # PEM private-key blocks: one replacement for the block, not one per line.
++    re.compile(
++        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
++        re.DOTALL,
++    ),
++)
++
++
++#: camelCase never puts two capitals after a lower-case letter; random
++#: mixed-case text does so within a few characters.
++_CAMEL_BREAKER_RE = re.compile(r"[a-z][A-Z]{2}")
++_DIGIT_RUN_RE = re.compile(r"[0-9]+")
++_LOWER_RUN_RE = re.compile(r"[a-z]+")
++
++
++def _char_class(char: str) -> int:
++    if char.isdigit():
++        return 2
++    return 1 if char.isupper() else 0
++
++
++def _looks_opaque(alnum: str, minimum: int) -> bool:
++    """Does an alphanumeric string read as random bytes rather than a name?
++
++    Each clause names the false positive it exists to prevent; the corpora in
++    tests/test_redaction.py hold the evidence.
++    """
++    length = len(alnum)
++    if length < minimum or _UNIFORM_HEX_RE.match(alnum):
++        return False
++    transitions = sum(
++        1 for a, b in zip(alnum, alnum[1:]) if _char_class(a) != _char_class(b)
++    )
++    ratio = transitions / (length - 1)
++    if transitions < _OPAQUE_MIN_TRANSITIONS or ratio <= _OPAQUE_MIN_TRANSITION_RATIO:
++        return False  # `ResourceServerAuthError`, `20260922T101500Z`, `sha256sum`
++    digit_runs = len(_DIGIT_RUN_RE.findall(alnum))
++    if digit_runs < 2:
++        # Identifiers embed ONE number (`X509Cert`, `Rsa2048Key`,
++        # `Oauth2ClientError`, `UnicodeDecodeError`); random text scatters
++        # digits. With at most one, demand the mixed-case signature camelCase
++        # cannot produce, and a ratio above what acronym-bearing names reach
++        # (`parseJSON2Dict`: 0.31, `toHTML5String`: 0.33).
++        return ratio > 0.35 and _CAMEL_BREAKER_RE.search(alnum) is not None
++    if length < _OPAQUE_MIN_RUN:
++        # Short, with two numbers: `s3bucket2024` still carries a whole word.
++        longest_word = max(len(run) for run in _LOWER_RUN_RE.findall(alnum + "a"))
++        return longest_word <= 4
++    return True
++
++
++def _run_is_opaque(run: str) -> bool:
++    if len(run) > _OPAQUE_MAX_RUN:
++        return False  # a payload (base64 image data, an encoded file)
++    alnum = "".join(c for c in run if c.isalnum())
++    if not alnum or _UNIFORM_HEX_RE.match(alnum):
++        return False
++    if _IDENTIFIER_JOINER_RE.search(run) is None and _looks_opaque(
++        alnum, _OPAQUE_MIN_RUN
++    ):
++        return True  # a bare alphanumeric or classic-base64 run, scored whole
++    return any(
++        _looks_opaque(segment, _OPAQUE_MIN_SEGMENT)
++        for segment in _SEGMENT_SPLIT_RE.split(run.rstrip("="))
++    )
++
++
++def _redact_run(run: str) -> str:
++    if "/" in run and (run.startswith("/") or _WORDY_PIECES_RE.search(run)):
++        # A path: keep the route and replace only the credential-shaped
++        # pieces (`/v1/[REDACTED]/status`), so the reader still learns which
++        # endpoint failed. Base64 with `/` in it (an AWS secret key) has no
++        # leading slash and no words, and is scored -- and replaced -- whole.
++        return "/".join(
++            "[REDACTED]" if _run_is_opaque(piece) else piece for piece in run.split("/")
++        )
++    return "[REDACTED]" if _run_is_opaque(run) else run
++
++
++#: Two `/`-separated pieces that are plain lower-case words: a route, not a blob.
++_WORDY_PIECES_RE = re.compile(r"(?:^|/)[a-z]{3,}/(?:[^/]*/)*[a-z]{3,}(?:/|$)")
++
++
++def _redact_opaque_runs(text: str) -> str:
++    """Replace every credential-shaped run in ``text`` with ``[REDACTED]``."""
++    for vendor_re in _VENDOR_SHAPE_RES:
++        text = vendor_re.sub("[REDACTED]", text)
++    text = _PREFIXED_TOKEN_RE.sub("[REDACTED]", text)
++    return _OPAQUE_RUN_RE.sub(lambda m: _redact_run(m.group(0)), text)
++
++
++#: A word (`bucket`, `Token`, `not_found`, `invalid_grant`) or a number (`401`,
++#: `-32601`, `0x80070005`), sentence punctuation allowed after it (`token:`,
++#: `bucket.`): the values prose and status payloads put after a keyword, and
++#: never what a credential looks like.
++_PLAIN_WORD_RE = re.compile(r"[A-Za-z_]+")
++_NUMBER_RE = re.compile(r"[+-]?[0-9]+|0[xX][0-9a-fA-F]+")
++
++
++def _is_plain_word_or_number(value: str) -> bool:
++    value = value.strip("\"'").rstrip(".:!?")
++    return bool(_PLAIN_WORD_RE.fullmatch(value) or _NUMBER_RE.fullmatch(value))
++
++
++def _value_could_be_a_credential(value: str) -> bool:
++    """The test a whitespace-separated keyword value must pass to be redacted.
++
++    Not a plain word or number, and either digit-bearing and 6+ characters
++    (`abc123def456`, `hunter2`) or punctuated and 8+ (`secret-bearer`,
++    `correct-horse-battery`). `token bucket`, `session expired`, `token v2`
++    and `code 401` all fail it; `--token abc123def456` passes.
++    """
++    value = value.strip("\"'")
++    if _is_plain_word_or_number(value):
++        return False
++    if any(c.isdigit() for c in value):
++        return len(value) >= 6
++    return len(value) >= 8
++
++
++#: `code` names a credential only in the OAuth sense -- bare (`code=`, the
++#: callback parameter) or under one of these qualifiers (`auth_code=`,
++#: `device_code=`). Under any other qualifier (`status_code=401`,
++#: `error_code=invalid_grant`, `exit_code=137`) it names a status, and its
++#: value is left to the shape rules, which still catch an opaque one. Even in
++#: the OAuth sense a plain word or number is kept: `{"code": -32601}` is every
++#: JSON-RPC error and `{"code": "not_found"}` every REST one.
++_CODE_QUALIFIERS = frozenset({"", "auth", "authorization", "oauth", "device", "user"})
++
++
++def _secret_key_alternation() -> str:
++    return "|".join(
++        [*sorted(re.escape(key) for key in AUTH_DIAGNOSTIC_SECRET_KEYS), r"api[_-]?key"]
++    )
++
++
++#: `<identifier><sep><value>` where the identifier's LAST segment is a secret
++#: key. Last, not any: `token_type=Bearer`, `token_endpoint=` and `secret_arn=`
++#: name a type, an endpoint and an ARN, and the pre-#234 containing match
++#: (`unicode`, `encoded`, `tokenizer`) is how prose got mangled. Segments are
++#: `_`/`-` joined or camelCase (`accessToken`). The separator is `:` or `=`
++#: with optional quotes around key and value so JSON (`"password": "x"`) is
++#: covered; bare whitespace is NOT a separator here (see `_KEYWORD_WS_RE`).
++_KEYWORD_SEP_RE = re.compile(
++    r"(?P<key>(?P<qualifier>(?<![A-Za-z0-9:.])(?:[A-Za-z0-9]+[_-])*"
++    r"(?:(?-i:[a-z]+(?=[A-Z])))?)"
++    rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?)"
++    r"(?P<sep>[\"']?[ \t]*[:=][ \t]*)"
++    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s\"',;()\[\]{}]+)",
++    re.IGNORECASE,
++)
++
++#: A bare keyword (or `--keyword` flag) followed by whitespace and a value that
++#: could be a credential (`_value_could_be_a_credential`). This is what keeps
++#: `--token abc123def456` redacted without redacting the second word of
++#: `token bucket`, `secret ingredient` or `session expired`. A `param=value`
++#: after the keyword (`token expires_in=3600`) is not its value either. `code`
++#: never fires here: `exit code 137`, `status code 401`, `zip code 94105`.
++_KEYWORD_WS_RE = re.compile(
++    r"(?P<key>(?<![A-Za-z0-9_-])(?:--)?"
++    rf"(?P<name>{_secret_key_alternation()})s?)"
++    r"(?P<sep>[ \t]+)"
++    r"(?![A-Za-z_-]+=[^=])(?P<value>[^\s\"',;()\[\]{}]+)",
++    re.IGNORECASE,
++)
++
++#: `Bearer <token>` -- the HTTP scheme, so anything after it that is not a word
++#: is a token. Not `token_type=Bearer expires_in=3600` (bearer as a VALUE, the
++#: lookbehinds), not `Bearer realm="x"` (a challenge's own parameters, the
++#: lookahead), not `Missing bearer token` or `the bearer of bad news` (plain
++#: words, the callback). `(?<![A-Za-z0-9_-])` rather than `\b`: on main
++#: `\bbearer` fired inside `secret-bearer failed` and redacted `failed`.
++_BEARER_RE = re.compile(
++    r"(?<![=:\"'])(?<![=:\"'] )(?<![A-Za-z0-9_-])"
++    r"(?P<key>bearer[ \t]+)(?![A-Za-z_-]+=[^=])(?P<value>[^\s,;]+)",
++    re.IGNORECASE,
++)
++
++
++def _redact_keyword_sep(match: re.Match[str]) -> str:
++    name = match.group("name").lower()
++    value = match.group("value")
++    if name == "code":
++        qualifier = match.group("qualifier").rstrip("_-").lower()
++        if qualifier not in _CODE_QUALIFIERS or _is_plain_word_or_number(value):
++            return match.group(0)
++    return f"{match.group('key')}{match.group('sep')}[REDACTED]"
++
++
++def _redact_keyword_ws(match: re.Match[str]) -> str:
++    name = match.group("name").lower()
++    if name == "code" or not _value_could_be_a_credential(match.group("value")):
++        return match.group(0)
++    return f"{match.group('key')}{match.group('sep')}[REDACTED]"
++
++
++def _redact_bearer(match: re.Match[str]) -> str:
++    if _is_plain_word_or_number(match.group("value")):
++        return match.group(0)
++    return f"{match.group('key')}[REDACTED]"
++
+ 
+ def redact_auth_url(url: str) -> str:
+     """Strip URL userinfo and redact auth-bearing query values."""
+@@ -591,20 +863,13 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) ->
+         r"\1[REDACTED]",
+         text,
+     )
+-    text = re.sub(r"(?i)(\bbearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
+-    secret_keys = "|".join(
+-        [
+-            *[re.escape(key) for key in AUTH_DIAGNOSTIC_SECRET_KEYS],
+-            r"api[_-]?key",
+-        ]
+-    )
+-    text = re.sub(
+-        rf"(?i)\b([A-Za-z0-9_-]*(?:{secret_keys})[A-Za-z0-9_-]*)"
+-        r"([\s:=]+)([A-Za-z0-9._~+/=-]{3,})",
+-        r"\1\2[REDACTED]",
+-        text,
+-    )
++    text = _BEARER_RE.sub(_redact_bearer, text)
++    text = _KEYWORD_SEP_RE.sub(_redact_keyword_sep, text)
++    text = _KEYWORD_WS_RE.sub(_redact_keyword_ws, text)
+     text = _JWT_RE.sub("[REDACTED]", text)
++    text = _redact_opaque_runs(text)
++    # Redaction runs on the whole text and the cut is taken afterwards, so
++    # truncation can only ever shorten `[REDACTED]`, never expose a prefix.
+     return text if max_length is None else text[:max_length]
+ 
+ 
+diff --git a/src/pmcp/policy/policy.py b/src/pmcp/policy/policy.py
+index cac2702..d68fe80 100644
+--- a/src/pmcp/policy/policy.py
++++ b/src/pmcp/policy/policy.py
+@@ -44,12 +44,25 @@ _ListPolicy = ServerPolicy | ToolPolicy | ResourcePolicy | PromptPolicy
+ #: would otherwise return the wrong limit or raise at runtime.
+ _LimitField = Literal["max_tools_per_server", "max_output_bytes", "max_output_tokens"]
+ 
++#: A whole run of token characters at the very end of a truncated string, at
++#: most this long -- see `truncate_output`. A longer run is not backed out of:
++#: if it is credential-shaped the redactor still sees enough of it to fire.
++_TRAILING_PARTIAL_TOKEN_RE = re.compile(
++    r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{1,64}\Z"
++)
++
+ DEFAULT_REDACTION_PATTERNS = [
+-    # Common secret patterns (case-insensitive)
+-    r"(api[_-]?key|apikey)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
+-    r"(secret|password|passwd|pwd)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
+-    r"(bearer|token)[\s]+[a-zA-Z0-9._-]+",
+-    r"(aws_secret|aws_access)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
++    # Common secret patterns (case-insensitive). The separator is `:` or `=`
++    # on the same line: `[ \t]*`, not `[\s]*`, which let `token:\nthe` (a
++    # sentence ending in the keyword) redact the first word of the next line.
++    r"(api[_-]?key|apikey)[ \t]*[:=][ \t]*[\"']?([^\s\"']+)",
++    # Not after `:` or `.`: `arn:…:secret:Name` names a secret, it is not one.
++    r"(?<![A-Za-z0-9:.])(secret|password|passwd|pwd)[ \t]*[:=][ \t]*[\"']?([^\s\"']+)",
++    # `token` needs a real separator: the pre-#234 `(bearer|token)\s+…` form
++    # redacted the word after "token" in prose ("token bucket"). Bearer values
++    # are handled unconditionally by `sanitize_auth_diagnostic`.
++    r"\btoken[ \t]*[:=][ \t]*[\"']?([^\s\"']+)",
++    r"(aws_secret|aws_access)[ \t]*[:=][ \t]*[\"']?([^\s\"']+)",
+     r"\bsk-[A-Za-z0-9_-]{6,}\b",
+     r"\bghp_[A-Za-z0-9_]{10,}\b",
+     r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
+@@ -685,6 +698,14 @@ class PolicyManager:
+ 
+         # Decode, ignoring incomplete characters at the end
+         truncated_str = truncated_bytes.decode("utf-8", errors="ignore")
++        # Never end mid-token. Redaction runs AFTER this cut, and a credential
++        # cut down to a few characters no longer has the shape the redactor
++        # looks for; backing up to the last non-token character (bounded, so
++        # a giant blob still truncates) removes the exposed prefix
++        # (Consiliency/pmcp#234).
++        boundary = _TRAILING_PARTIAL_TOKEN_RE.search(truncated_str)
++        if boundary and boundary.start() > 0:
++            truncated_str = truncated_str[: boundary.start()]
+ 
+         # Add truncation indicator
+         truncated_str += (
+@@ -701,9 +722,13 @@ class PolicyManager:
+ 
+             def replace_match(match: re.Match[str]) -> str:
+                 full_match = match.group(0)
+-                # Find the separator (: or =)
++                # A `key<sep>value` match keeps its key: split at the first
++                # separator (: or =) that has a value after it. A separator
++                # with nothing but separators after it is base64 padding
++                # (`dXNlcjpwYXNzd29yZA==`), and splitting there kept the whole
++                # secret and replaced the `=` (Consiliency/pmcp#234).
+                 for i, char in enumerate(full_match):
+-                    if char in ":=":
++                    if char in ":=" and full_match[i + 1 :].strip(" \t:="):
+                         return full_match[: i + 1] + " [REDACTED]"
+                 return "[REDACTED]"
+ 
+```
+
+## Test bodies
+
+`tests/test_redaction.py`, verbatim (sha256 `951a1a9b…5ae8`; 70 tests; ruff
+clean):
+
+```python
+"""Both directions of secret redaction, pinned together (Consiliency/pmcp#234).
+
+The redactor stands between a downstream server's error text and a
+prompt-injectable context window. A false negative puts a credential into that
+window; a false positive teaches readers that `[REDACTED]` means nothing. So a
+redactor tested only on secrets gets tuned until it redacts everything, and one
+tested only on prose gets tuned until it redacts nothing. This file holds both
+corpora and ranks them equally: `PROSE` must survive byte-identical, and every
+`CREDENTIALS` entry must vanish with its surroundings intact.
+
+Both surfaces are covered -- `sanitize_auth_diagnostic` (the engine, used
+directly by the client manager, the CLI and the doctor) and
+`PolicyManager.redact_secrets` (the engine plus the operator's patterns).
+"""
+
+from __future__ import annotations
+
+import base64
+import random
+import re
+import string
+
+import pytest
+
+from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
+from pmcp.policy.policy import PolicyManager
+
+# --------------------------------------------------------------------------- #
+# The prose corpus. Every line is text a downstream server, pip, git, httpx or
+# the interpreter has produced or could produce, and none of it is a credential.
+# Each keyword the pre-#234 rule mangled appears at least once in the position
+# that mangled it. Extend it when a false positive is found; never trim it to
+# make a rule pass.
+# --------------------------------------------------------------------------- #
+
+PROSE = """\
+The token bucket rate limiter refused the call; the secret ingredient is
+patience. Your session expired, so the cookie consent banner reappeared and the
+password reset flow sent a status code 401 back. The tokenizer choked on unicode
+input and the encoded payload was base64. Set the PMCP_FEEDBACK_TOKEN environment
+variable to enable submission; the API key is read from the env store. Keys are
+rotated weekly. A secret to good code is small functions. Missing bearer token:
+the bearer of bad news said a Bearer Token is required. Session re-use is off.
+
+Traceback (most recent call last):
+  File "/home/u/.venv/lib/python3.10/site-packages/httpx/_client.py", line 1013, in send
+    response = self._send_handling_auth(
+  File "/home/u/code/pmcp/src/pmcp/client/manager.py", line 2641, in _run_transport
+    raise ResourceServerAuthError("invalid_token", str(exc)) from exc
+UnicodeDecodeError: 'utf-8' codec can't decode byte 0xff in position 0
+httpx.HTTPStatusError: Client error '401 Unauthorized' for url 'https://api.example.com/v1/tools'
+<pmcp.client.manager.ClientManager object at 0x7f3a2b1c4d50> pod pmcp-7d9f8b6c5-x2k9q
+JSONDecodeError SSLCertVerificationError IPv6Address Ed25519PrivateKey X509Cert
+Rsa2048Key Oauth2ClientError Base64UrlEncoder Sha256HashAlgorithm parseJSON2Dict
+
+status_code=401 error_code=invalid_grant token_type=Bearer expires_in=3600
+token_endpoint=https://auth.example/oauth/token code=404 token v2 is out
+{"code": -32601, "message": "Method not found", "data": {"code": "not_found"}}
+{"code": "not_found", "message": "no such tool", "request_id": "550e8400-e29b-41d4-a716-446655440000"}
+WWW-Authenticate: Bearer realm="api", error="insufficient_scope", scope="read write"
+secret_arn=arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret-a1b2c3
+exit code 137; error code 0x80070005; zip code 94105; status code 503
+error_code=AADSTS50011 sqlstate_code=42P01 error_codes=[50011] reason_code=E-1234
+
+commit 3843d2f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6 (HEAD -> main, origin/main)
+Author: Example <dev@example.test>
+Date:   2026-09-23T04:12:00+00:00
+    docs(plans): plan CONSENT and PKGID (#239)
+sha256:9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08
+Successfully installed pmcp-1.19.2 httpx-0.27.0 anyio-4.4.0 exceptiongroup-1.2.1
+Downloading pmcp-1.19.2-py3-none-any.whl (312 kB) for x86_64-linux-gnu
+TLS: ECDHE-RSA-AES256-GCM-SHA384 / TLS_AES_128_GCM_SHA256 negotiated at 20260923T041200Z
+tests/test_redaction.py::test_s11_an_approved_project_policy_cannot_widen_the_user_policy PASSED
+detailed-234-redactor-shape-based-20260922-1130.md build-20260922123456 s3bucket2024
+[REDACTED] [REDACTED_EMAIL] ghp_ sk- xoxb- AKIA
+"""
+
+# --------------------------------------------------------------------------- #
+# The credential corpus: (label, text, must_vanish, must_survive). The label is
+# the CLASS the entry stands for, not the vendor; a vendor nobody listed is
+# still caught if its shape is here. The four the issue measured come first.
+#
+# Samples deliberately do NOT match GitHub secret-scanning detectors (a Stripe
+# key with 24 body characters, a DigitalOcean token with 64 hex, a Slack token
+# with a numeric segment and a mixed-case body): push protection rejects a
+# commit that carries one, however synthetic. Each sample keeps the SHAPE the
+# rule needs and nothing more; the Slack rule is exercised by the issue's own
+# `xoxb-2444-2444-abcdefghijklmnop`, which the detector leaves alone.
+# --------------------------------------------------------------------------- #
+
+CREDENTIALS: list[tuple[str, str, str, list[str]]] = [
+    (
+        "credential-in-url-path",
+        "failed to fetch https://api.example.com/v1/sk-live-abc123def456/status",
+        "sk-live-abc123def456",
+        ["failed to fetch https://api.example.com/v1/", "/status"],
+    ),
+    (
+        "aws-access-key-id",
+        "unexpected value AKIAIOSFODNN7EXAMPLE in the request",
+        "AKIAIOSFODNN7EXAMPLE",
+        ["unexpected value", "in the request"],
+    ),
+    (
+        "prefixed-random-body",
+        "ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+        "16C7e42F292c6912E7710c838347Ae178B4a",
+        [],
+    ),
+    (
+        "slack-documented-shape",
+        "xoxb-2444-2444-abcdefghijklmnop",
+        "2444-2444-abcdefghijklmnop",
+        [],
+    ),
+    (
+        "bare-random-alnum",
+        "bare 4eC39HqLyjWDarjtT1zdp7dc here",
+        "4eC39HqLyjWDarjtT1zdp7dc",
+        ["bare", "here"],
+    ),
+    (
+        "base64-with-slashes",
+        "aws secret wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY leaked",
+        "wJalrXUtnFEMI",
+        ["aws secret", "leaked"],
+    ),
+    (
+        "base64-padded",
+        "basic dXNlcjpwYXNzd29yZA== auth",
+        "dXNlcjpwYXNzd29yZA",
+        ["basic", "auth"],
+    ),
+    (
+        "prefixed-hex-body",
+        "dop_v1_9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822c",
+        "9f86d081884c7d659a2feaa0c55ad015",
+        [],
+    ),
+    (
+        "prefixed-short-sample",
+        "sk_test_4eC39HqLyjWDar7dc",
+        "4eC39HqLyjWDar7dc",
+        [],
+    ),
+    (
+        "prefixed-low-entropy-with-digits",
+        "sk-abcdef123456",
+        "abcdef123456",
+        [],
+    ),
+    (
+        "prefixed-long-body",
+        "sk-proj-Ab3dEf6GhI9jKl2MnO5pQr8StU1vWx4Yz7AbCdEfGhIjKlMnOpQrStUvWxYz",
+        "Ab3dEf6GhI9jKl2MnO5pQr8StU1vWx4Yz7AbCdEfGhIjKlMnOpQrStUvWxYz",
+        [],
+    ),
+    (
+        "google-api-key",
+        "AIzaSyD-9tSrke72PouQMnMX-a7eZSW0jkFMBxY",
+        "9tSrke72PouQMnMX",
+        [],
+    ),
+    (
+        "webhook-path-keeps-route",
+        "https://hooks.example/services/T0123ABCD/B0123ABCD/a1B2c3D4e5F6g7H8i9J0k1L2",
+        "a1B2c3D4e5F6g7H8i9J0k1L2",
+        ["https://hooks.example/services/"],
+    ),
+    (
+        "pem-block",
+        "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQ\n-----END RSA PRIVATE KEY-----",
+        "MIIEow",
+        [],
+    ),
+    (
+        "json-quoted-value",
+        '{"password": "hunter2"}',
+        "hunter2",
+        ['"password"'],
+    ),
+    (
+        "flag-with-shaped-value",
+        "--token abc123def456 --password hunter2",
+        "abc123def456",
+        ["--token", "--password"],
+    ),
+    (
+        "flag-with-passphrase",
+        "--password correct-horse-battery-staple",
+        "correct-horse-battery-staple",
+        ["--password"],
+    ),
+    (
+        "camelcase-key",
+        "accessToken=AbC123dEf456GhI",
+        "AbC123dEf456GhI",
+        ["accessToken="],
+    ),
+    (
+        "oauth-code-bare",
+        "code=super-secret",
+        "super-secret",
+        ["code="],
+    ),
+    (
+        "oauth-code-qualified",
+        "auth_code=SplxlOBeZQQYbYS6WxSbIA",
+        "SplxlOBeZQQYbYS6WxSbIA",
+        ["auth_code="],
+    ),
+    (
+        "oauth-code-hex",
+        "code=a1b2c3d4e5f6a7b8c9d0",
+        "a1b2c3d4e5f6a7b8c9d0",
+        ["code="],
+    ),
+    (
+        "keyword-colon-low-entropy",
+        "password: hunter2",
+        "hunter2",
+        ["password:"],
+    ),
+    (
+        "header-with-qualifier",
+        "X-Auth-Token: abc123",
+        "abc123",
+        ["X-Auth-Token:"],
+    ),
+    (
+        "cookie-header",
+        "Set-Cookie: session=abc; Path=/",
+        "abc",
+        ["Set-Cookie:", "Path=/"],
+    ),
+    (
+        "session-id",
+        "session=013G8iK4noj1iNbSTqJVFEX6",
+        "013G8iK4noj1iNbSTqJVFEX6",
+        ["session="],
+    ),
+    (
+        "bearer-header",
+        "Authorization: Bearer abc.def",
+        "abc.def",
+        ["Authorization:"],
+    ),
+    (
+        "bearer-bare",
+        "sent Bearer test-token",
+        "test-token",
+        ["sent Bearer"],
+    ),
+    (
+        "jwt",
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzZWNyZXQifQ.N2QwODhmM2I4OTc1",
+        "eyJzdWIiOiJzZWNyZXQifQ",
+        [],
+    ),
+]
+
+TOKEN = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"
+
+
+def _engine(text: str) -> str:
+    return sanitize_auth_diagnostic(text, max_length=None)
+
+
+def _policy(text: str) -> str:
+    return PolicyManager().redact_secrets(text)
+
+
+# === the prose direction ================================================== #
+
+
+def test_prose_survives_the_engine_byte_identical() -> None:
+    assert _engine(PROSE) == PROSE
+
+
+def test_prose_survives_the_policy_surface_byte_identical() -> None:
+    assert _policy(PROSE) == PROSE
+
+
+def test_the_keyword_rule_needs_a_separator_or_a_credential_shaped_value() -> None:
+    """`token bucket` is prose; `--token abc123def456` is a flag with a secret.
+
+    The pre-#234 rule treated whitespace as a separator, so any 3+ letter word
+    after a keyword vanished. `the secret to good code` survived only because
+    `to` is two letters -- an accident, not a guard.
+    """
+    assert _engine("token bucket rate limiting is enabled") == (
+        "token bucket rate limiting is enabled"
+    )
+    assert _engine("the secret ingredient is love") == "the secret ingredient is love"
+    assert _engine("session expired, password reset sent") == (
+        "session expired, password reset sent"
+    )
+    assert _engine("--token abc123def456") == "--token [REDACTED]"
+    assert _engine("token secret-bearer failed") == "token [REDACTED] failed"
+
+
+def test_bearer_is_a_scheme_not_a_word() -> None:
+    """`Bearer <token>` is redacted; `bearer token` (the phrase) is not.
+
+    On main `\\bbearer` also fired *inside* `secret-bearer failed` and redacted
+    `failed` -- the word after the credential rather than the credential. A
+    hyphenated word that ends in `bearer` is a word, not the scheme: what
+    follows `secret-bearer` or `non-bearer` is not a token.
+    """
+    assert _engine("Missing bearer token") == "Missing bearer token"
+    assert _engine("the bearer of bad news") == "the bearer of bad news"
+    assert _engine("Bearer Token is required") == "Bearer Token is required"
+    assert _engine("Bearer test-token") == "Bearer [REDACTED]"
+    assert _engine("Bearer hunter2") == "Bearer [REDACTED]"
+    assert _engine("secret-bearer hunter2") == "secret-bearer hunter2"
+    assert _engine("non-bearer 2024-01-01 report") == "non-bearer 2024-01-01 report"
+    assert _engine('Bearer realm="api", error="x"') == 'Bearer realm="api", error="x"'
+    assert _engine("token_type=Bearer expires_in=3600") == (
+        "token_type=Bearer expires_in=3600"
+    )
+
+
+def test_code_is_a_credential_only_in_the_oauth_sense() -> None:
+    """Bare `code=` is the OAuth callback parameter; `status_code=` is a status.
+
+    JSON-RPC (`{"code": -32601}`) is every MCP error and REST (`{"code":
+    "not_found"}`) every other one, so even bare `code` keeps a word or number.
+    """
+    assert _engine('{"code": -32601, "message": "x"}') == (
+        '{"code": -32601, "message": "x"}'
+    )
+    assert _engine('{"code": "not_found"}') == '{"code": "not_found"}'
+    assert _engine("status_code=401 error_code=invalid_grant") == (
+        "status_code=401 error_code=invalid_grant"
+    )
+    assert _engine("code=404 exit code 137") == "code=404 exit code 137"
+    assert _engine("code=super-secret") == "code=[REDACTED]"
+    assert _engine("auth_code=SplxlOBeZQQYbYS6WxSbIA") == "auth_code=[REDACTED]"
+    assert _engine("device_code=a1b2c3d4e5f6a7b8c9d0") == "device_code=[REDACTED]"
+
+
+def test_the_policy_defaults_probe_stays_invisible_to_the_engine() -> None:
+    """`ghp_abcdefghijklmnop` proves the policy DEFAULTS apply (SECURITY.md C-13).
+
+    Those proofs (`tests/test_project_source_consent_policy.py`,
+    `tests/test_trust_boundaries_e2e.py`) assert the probe is redacted *because
+    a default pattern is still present*. If the engine ever caught it too they
+    would pass with the defaults dropped. The probe is deliberately whole-alpha
+    after its prefix; keep it that way and keep the engine blind to it.
+    """
+    assert _engine("ghp_abcdefghijklmnop") == "ghp_abcdefghijklmnop"
+    assert "ghp_abcdefghijklmnop" not in _policy("ghp_abcdefghijklmnop")
+
+
+# === the credential direction ============================================= #
+
+
+@pytest.mark.parametrize(
+    ("text", "must_vanish", "must_survive"),
+    [entry[1:] for entry in CREDENTIALS],
+    ids=[entry[0] for entry in CREDENTIALS],
+)
+def test_the_engine_redacts_the_credential_and_keeps_its_surroundings(
+    text: str, must_vanish: str, must_survive: list[str]
+) -> None:
+    out = _engine(text)
+    assert must_vanish not in out, out
+    assert "[REDACTED]" in out
+    for kept in must_survive:
+        assert kept in out, out
+
+
+@pytest.mark.parametrize(
+    ("text", "must_vanish", "must_survive"),
+    [entry[1:] for entry in CREDENTIALS],
+    ids=[entry[0] for entry in CREDENTIALS],
+)
+def test_the_policy_surface_redacts_the_credential_and_keeps_its_surroundings(
+    text: str, must_vanish: str, must_survive: list[str]
+) -> None:
+    out = _policy(text)
+    assert must_vanish not in out, out
+    for kept in must_survive:
+        assert kept in out, out
+
+
+def test_a_url_path_credential_is_redacted_in_diagnostics_not_in_the_url() -> None:
+    """The engine reaches a path segment; `redact_auth_url` deliberately does not.
+
+    `redact_auth_url` is what `sanitize_url_elicitation_url` returns -- the URL
+    the operator must OPEN to authorize -- and an IdP's authorization-server id
+    in that path (`/oauth2/aus1a2b3c4D5e6F7g8h9/v1/authorize`) is exactly the
+    shape a credential has. A diagnostic can lose it; the login flow cannot.
+    """
+    webhook = (
+        "https://hooks.example/services/T0123ABCD/B0123ABCD/a1B2c3D4e5F6g7H8i9J0k1L2"
+    )
+    assert _engine(f"failed: {webhook}") == (
+        "failed: https://hooks.example/services/T0123ABCD/B0123ABCD/[REDACTED]"
+    )
+    authorize = (
+        "https://dev-1.okta.com/oauth2/aus1a2b3c4D5e6F7g8h9/v1/authorize?state=ok"
+    )
+    assert redact_auth_url(authorize) == authorize
+
+
+def test_identifiers_that_are_not_credentials_are_kept() -> None:
+    """The shape rule's named exemptions, one probe each.
+
+    hex digests and UUIDs (uniform hex), `0x` addresses (uniform hex behind a
+    prefix), camelCase (no `xAB` signature), identifiers with one embedded
+    number (`X509Cert`), timestamps (low transition ratio), and hyphen-joined
+    short pieces (`pmcp-7d9f8b6c5-x2k9q`: scored per segment, never whole).
+    """
+    for kept in [
+        "3843d2f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6",
+        "550e8400-e29b-41d4-a716-446655440000",
+        "0x7f3a2b1c4d50",
+        "UnicodeDecodeError",
+        "IPv6Address",
+        "Ed25519PrivateKey",
+        "20260923T041200Z",
+        "x86_64-linux-gnu",
+        "ECDHE-RSA-AES256-GCM-SHA384",
+        "pmcp-7d9f8b6c5-x2k9q",
+    ]:
+        assert _engine(kept) == kept
+
+
+def test_payload_sized_runs_are_data_not_credentials() -> None:
+    """A base64 image or encoded file survives; a 200-character token does not.
+
+    `gateway.tasks_result` redacts by default and `process_output` JSON-dumps
+    the whole result, so `ImageContent.data` goes through this engine. No
+    vendor issues an unbroken token past 256 characters (JWTs are dot-joined
+    and have their own rule; private keys are PEM blocks).
+    """
+    blob = base64.b64encode(bytes(range(256)) * 24).decode()
+    assert len(blob) > 8000
+    assert _engine(blob) == blob
+    assert _policy(blob) == blob
+    rng = random.Random(234)
+    token = "".join(
+        rng.choice(string.ascii_letters + string.digits) for _ in range(200)
+    )
+    assert _engine(f"leaked {token} here") == "leaked [REDACTED] here"
+
+
+# === composition ========================================================== #
+
+
+def test_redaction_is_idempotent() -> None:
+    """`[REDACTED]` must not itself be re-matched; surfaces apply the engine twice."""
+    for text in [PROSE, *[entry[1] for entry in CREDENTIALS]]:
+        once = _engine(text)
+        assert _engine(once) == once, text
+        twice = _policy(text)
+        assert _policy(twice) == twice, text
+
+
+def test_redact_secrets_keeps_a_key_but_never_splits_inside_a_secret() -> None:
+    """The post-pass splits `key=value` at the separator, and only there.
+
+    On main the split took the FIRST `:`/`=` in the match, so an operator
+    pattern for a base64 shape kept the secret and replaced its padding:
+    `dXNlcjpwYXNzd29yZA= [REDACTED]`. The probe value is deliberately
+    low-entropy (uniform hex letters) so the engine's shape pass leaves it
+    alone and only the operator pattern -- and therefore the split -- is
+    exercised; a real base64 secret would be gone before the post-pass ran.
+    """
+    manager = PolicyManager()
+    manager._redaction_regexes = [re.compile(r"[A-Za-z0-9+/]{16,}={1,2}")]
+    assert (
+        sanitize_auth_diagnostic("abcdabcdabcdabcdabcd==") == "abcdabcdabcdabcdabcd=="
+    )
+    assert manager.redact_secrets("basic abcdabcdabcdabcdabcd== auth") == (
+        "basic [REDACTED] auth"
+    )
+    manager._redaction_regexes = [re.compile(r"mykey\s*[:=]\s*\S+")]
+    assert manager.redact_secrets("mykey: abcdef") == "mykey: [REDACTED]"
+
+
+def test_the_engine_redacts_before_it_truncates() -> None:
+    """The cut lands on `[REDACTED]`, never on a token prefix.
+
+    The token starts at offset 391 and `max_length` is 400: were the cut taken
+    first, nine characters of it would survive and no longer have a redactable
+    shape.
+    """
+    text = "x" * 390 + " " + TOKEN
+    out = sanitize_auth_diagnostic(text, max_length=400)
+    assert len(out) == 400
+    assert "ghp_" not in out
+    assert out.endswith(" [REDACTED")
+
+
+def test_process_output_never_ends_on_a_partial_token() -> None:
+    """The byte cut is taken BEFORE redaction, so it must not split a token.
+
+    With `max_bytes=300` the cut falls 200 bytes in, nine characters into the
+    token; `ghp_16C7e` has no shape any rule recognises. Backing the cut up to
+    the preceding boundary removes the exposed prefix.
+    """
+    policy = PolicyManager()
+    output = "a" * 190 + " " + TOKEN + " " + "c" * 100
+    processed = policy.process_output(output, redact=True, max_bytes=300)
+    assert processed["truncated"] is True
+    assert "ghp_" not in processed["result"], processed["result"]
+    assert processed["result"].startswith("a" * 190)
+
+
+def test_process_output_still_truncates_a_single_giant_run() -> None:
+    """The back-up is bounded: a 400-byte run cannot be backed out of, and is
+    cut where it always was (200 bytes in) rather than dropped."""
+    processed = PolicyManager().process_output("b" * 400, redact=True, max_bytes=300)
+    assert processed["truncated"] is True
+    assert processed["result"].startswith("b" * 200)
+```
+
+## Documentation impact
+
+- `CHANGELOG.md` — add under `[Unreleased]`:
+  - `### Fixed`: the redactor no longer redacts the word after `token`,
+    `secret`, `session`, `password` or `bearer` in prose (`token bucket`,
+    `Missing bearer token`, `session expired`), no longer redacts `status_code=`,
+    `error_code=`, `token_endpoint=` values or the first word of the line after a
+    keyword, and `redact_secrets` no longer splits an operator pattern's match
+    at base64 padding (Consiliency/pmcp#234).
+  - `### Security`: credentials with no keyword are now redacted by shape —
+    AWS access-key ids, Slack and Google tokens, `prefix_body` vendor tokens
+    (`sk-`, `sk_`, `ghp_`, `github_pat_`, `glpat-`, `dop_v1_` and any other
+    short prefix with a mixed body), PEM private-key blocks, bare high-entropy
+    strings, and credentials in a URL *path* — on both `sanitize_auth_diagnostic`
+    and `redact_secrets`; `process_output` never ends its truncated text inside
+    a token. Known residuals are listed in the plan.
+- `SECURITY.md` lines 120-122 currently claim redaction of "bearer tokens, API
+  keys, bare provider tokens (`sk-`, `ghp_`, `github_pat_`), common secrets, URL
+  userinfo, authorization codes, and auth-bearing query parameters". This plan
+  **widens** that claim (shape-based redaction, URL-path credentials) and adds
+  a caveat (prose-preserving gates; residuals above). **The implementer edits
+  SECURITY.md**, not this plan (the file is under the ledger checked by
+  `scripts/check_security_claims.py`; the C-13 ledger rows are unaffected — the
+  probe stays invisible to the engine, and `test_the_policy_defaults_probe_stays_invisible_to_the_engine`
+  pins that).
+- **Implementer note — GitHub push protection.** The first push of this plan
+  was rejected (`GH013`, "Push cannot contain secrets") because three corpus
+  samples matched GitHub's detectors exactly: a Stripe test key
+  (`sk_test_` + 24), a DigitalOcean token (`dop_v1_` + 64 hex) and a Slack token
+  (`xoxb-` + numeric segment(s) + a mixed-case body; 7-digit and single-segment
+  variants were still caught, so that entry was dropped — the issue's own
+  `xoxb-2444-2444-abcdefghijklmnop` exercises the same vendor rule and is not
+  flagged). The corpus now uses samples that keep the *shape each rule needs*
+  and nothing more (a 17-char Stripe body, 48 hex); the comment above `CREDENTIALS` says so. Any sample
+  added later must be checked the same way, or the implementation PR will be
+  blocked at push. `AKIAIOSFODNN7EXAMPLE` (AWS's documented example key),
+  `ghp_16C7e42F292c6912E7710c838347Ae178B4a`, the `AIza…` and `sk-proj-…`
+  samples were **not** flagged.
+- No README change: operators see the same `[REDACTED]` marker; the
+  `redaction.patterns` policy key is unchanged in shape (operators who set their
+  own patterns still displace the defaults, including the fixed `token` one).
+
+## Dependencies & order
+
+1. `src/pmcp/auth.py` — the shape block and the three keyword rules (all new
+   symbols), then the `sanitize_auth_diagnostic` body. Nothing else compiles
+   against them until they exist.
+2. `src/pmcp/policy/policy.py` — `_TRAILING_PARTIAL_TOKEN_RE`, the defaults,
+   `truncate_output`, `redact_secrets`.
+3. `tests/test_redaction.py` from `## Test bodies`.
+4. `uv run pytest tests/test_redaction.py tests/test_auth.py tests/test_policy.py tests/test_project_source_consent_policy.py tests/test_trust_boundaries_e2e.py`
+   — must be green with `tests/test_auth.py` **unmodified**.
+5. Mutation table (below) — every row RED, every diff confirmed.
+6. `SECURITY.md` claim + CHANGELOG, then the full suite and the CI gates.
+
+## Verification
+
+```bash
+cd <worktree>
+uv run pytest tests/test_redaction.py -q --cov-fail-under=0                      # 70 passed
+uv run pytest tests/test_auth.py -q --cov-fail-under=0                           # 128 passed, file byte-identical to main
+uv run pytest tests/test_policy.py tests/test_project_source_consent_policy.py \
+              tests/test_trust_boundaries_e2e.py -q --cov-fail-under=0           # C-13 proofs + truncation pins
+uv run pytest --collect-only -q tests/test_redaction.py | grep -c '::'            # 70 (a -k that matches nothing exits 0)
+uv run ruff check src/ tests/                                                     # CI gate
+uv run ruff format --check src/ tests/                                            # CI gate
+uv run mypy src/                                                                  # CI gate (see Unverified)
+uv run python3 scripts/check_security_claims.py                                   # after the SECURITY.md edit
+uv run python3 scripts/check_plan_consistency.py plans/phase-plan-v13-*.md        # blocking inconsistencies: 0
+# full suite -- detached, never in the foreground (runtime/ boots gateways; ~4 100 tests)
+nohup uv run pytest tests/ -q > /tmp/pmcp-234-full.log 2>&1 & disown
+tail -n 3 /tmp/pmcp-234-full.log
+```
+
+Measured this session on the revised tree: `test_redaction.py` **70 passed**;
+`test_auth.py` (HEAD copy) **128 passed**; the earlier spike-era targeted run of
+`test_redaction.py tests/test_auth.py tests/test_policy.py
+tests/test_project_source_consent_policy.py tests/test_trust_boundaries_e2e.py`
+**243 passed**; `ruff check` and `ruff format --check` on `src/ tests/` **clean**;
+`check_plan_consistency.py` **blocking inconsistencies: 0** (same on
+`origin/main`). Full suite on the revised tree (detached, `-m 'not live'`, 4 164
+collected): **4136 passed, 3 skipped, 25 deselected in 11:20**.
+
+## Mutation evidence
+
+Each mutation was applied to the revised tree with a scripted single-occurrence
+text replacement, **confirmed applied** by `diff -u` against the scratchpad
+baseline copy of the revised file (the diff line count is in the evidence
+column — a baseline `git diff --stat` would show the whole uncommitted spike, not
+the mutation, so the baseline is the revised copy), the named node ids were
+collected with `--collect-only` and then run, and the file was restored **from
+the baseline copy** (never `git checkout --`, which would restore HEAD's
+pre-fix code). The runner is reproducible from the patch above:
+`scratchpad/mutations/run_mutations.py`.
+
+Two mutants **survived the first run**, and the tests were strengthened rather
+than the rows dropped: M05 (the `\bbearer` boundary) survived because the
+`Bearer` value gate alone already kept `failed` in `token secret-bearer failed`,
+so `test_bearer_is_a_scheme_not_a_word` gained `secret-bearer hunter2` and
+`non-bearer 2024-01-01 report`, where only the boundary keeps the following
+value; M09 (the split guard) survived because the engine's shape pass redacted
+the real base64 probe before the operator pattern ever saw it, so the test now
+probes with a uniform-hex padded value the engine leaves alone (and asserts
+that it does). Final run, all 17 rows:
+
+| id | verdict | evidence | why it is red |
+|---|---|---|---|
+| M01-ws-gate-off | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.04s | whitespace keyword rule redacts any value again: `token bucket` -> `token [REDACTED]` |
+| M02-no-payload-bound | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | an 8 KB base64 blob is scored as a credential and replaced whole |
+| M03-whole-run-with-joiners | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.04s | `pmcp-7d9f8b6c5-x2k9q` scored whole reads as random and is redacted |
+| M04-hex-without-0x | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.04s | `<Foo object at 0x7f3a2b1c4d50>` loses its address: the `x` breaks uniform hex |
+| M05-bearer-word-boundary | RED | 4 diff lines; 1 nodes collected; 1 failed in 0.03s | `\bbearer` fires inside the hyphenated word `secret-bearer` (main's bug) and redacts the next word: `secret-bearer hunter2` -> `secret-bearer [REDACTED]` |
+| M06-bearer-gate-off | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.04s | `Missing bearer token` -> `Missing bearer [REDACTED]` |
+| M07-code-qualifiers-off | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | `error_code=AADSTS50011` and `reason_code=E-1234` are treated as OAuth codes and redacted |
+| M08-sep-spans-newline | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | `Missing bearer token:\nthe bearer of` -> the next line's first word is redacted |
+| M09-split-guard-off | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.03s | base64 padding is taken as the separator: `dXNlcjpwYXNzd29yZA= [REDACTED]` |
+| M10-no-truncation-backup | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.03s | the byte cut leaves `ghp_16C7e`, which no rule recognises, in the output |
+| M11-cut-before-redact | RED | 1 diff lines; 1 nodes collected; 1 failed in 0.03s | the cut at 400 leaves nine characters of the token, which no longer has a redactable shape |
+| M12-main-default-token-pattern | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | main's default pattern redacts the word after `token` on the policy surface even though the engine no longer does |
+| M13-prefixed-rule-off | RED | 1 diff lines; 2 nodes collected; 2 failed in 0.04s | `sk-abcdef123456` has a prefix but too little entropy for the transition score |
+| M14-prefixed-accepts-alpha-body | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.07s | the engine eats `ghp_abcdefghijklmnop`, and the C-13 proof that a DEFAULT pattern applies goes vacuous |
+| M15-aws-vendor-shape-off | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.03s | `AKIAIOSFODNN7EXAMPLE` is uniform upper-case with one digit: the transition score cannot see it |
+| M16-spike-url-path-redaction | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | the inherited spike's `redact_auth_url` change: the Okta authorization-server id in an elicitation URL is redacted |
+| M17-single-number-camel-clause-off | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | `Oauth2ClientError` (one embedded number, ratio 0.375) is scored opaque |
+
+## Acceptance criteria
+
+- [ ] **Prose direction.** `PROSE` in `tests/test_redaction.py` survives
+      `sanitize_auth_diagnostic(…, max_length=None)` **and**
+      `PolicyManager().redact_secrets` byte-identically
+      (`test_prose_survives_the_engine_byte_identical`,
+      `test_prose_survives_the_policy_surface_byte_identical`). It contains, in
+      the mangling position, every keyword the HEAD rule mangled plus the
+      diagnostic shapes the spike mangled (JSON-RPC `code`, `0x` addresses, pod
+      names, `bearer token`, a keyword at end of line).
+- [ ] **Credential direction.** All 28 `CREDENTIALS` entries vanish on both
+      surfaces with their `must_survive` context intact — including the four
+      the issue measured (`sk-live-…` in a URL path, `AKIA…`, `ghp_…`, `xoxb-…`)
+      and the classes they stand for (bare random alnum, base64 with `/` and
+      `=`, prefixed hex/short/long/low-entropy bodies, a webhook path, PEM,
+      JSON-quoted values, flags, camelCase keys, OAuth codes bare/qualified/hex,
+      headers with qualifiers, cookies, bare `Bearer`).
+- [ ] `redact_auth_url("https://dev-1.okta.com/oauth2/aus1a2b3c4D5e6F7g8h9/v1/authorize?state=ok")`
+      is byte-identical (the login URL is never shape-redacted), while the same
+      opaque path segment in a diagnostic is
+      (`test_a_url_path_credential_is_redacted_in_diagnostics_not_in_the_url`).
+- [ ] An 8 000-char base64 blob survives both surfaces; a 200-char random
+      alnum run does not (`test_payload_sized_runs_are_data_not_credentials`).
+- [ ] `ghp_abcdefghijklmnop` is invisible to the engine and still redacted by
+      the policy defaults; `tests/test_project_source_consent_policy.py` and
+      `tests/test_trust_boundaries_e2e.py` C-13 tests pass unchanged.
+- [ ] `tests/test_auth.py` is byte-identical to `main` and passes (128).
+- [ ] `sanitize_auth_diagnostic(text, max_length=400)` on a token starting at
+      offset 391 ends in `[REDACTED` — never `ghp_…`; `process_output(…,
+      max_bytes=300)` never leaves `ghp_` in a result cut inside the token, and a
+      400-byte single run still truncates at 200.
+- [ ] Custom pattern `[A-Za-z0-9+/]{16,}={1,2}` on `basic dXNlcjpwYXNzd29yZA== auth`
+      → `basic [REDACTED] auth`; `mykey: abcdef` → `mykey: [REDACTED]`.
+- [ ] Every row of the mutation table is RED for its named reason, with a
+      non-empty confirmed diff.
+- [ ] `ruff check src/ tests/`, `ruff format --check src/ tests/`, `mypy src/`
+      clean; full suite green; `check_security_claims.py` green after the
+      SECURITY.md edit.
+
+## Non-goals
+
+- Replacing `AUTH_DIAGNOSTIC_SECRET_KEYS` / `AUTH_SECRET_QUERY_KEYS` or
+  changing URL query redaction.
+- Redacting inside `redact_auth_url` paths (elicitation URLs must stay
+  openable — defect 1).
+- Making `process_output` redact before it truncates (a full-output redaction
+  pass on multi-MB tool results, and it would put whole base64 payloads through
+  the engine); the bounded back-up closes the exposure at the cut.
+- Detecting MIME-wrapped base64 payloads as payloads (documented residual FP).
+- Entropy (Shannon) scoring; the class-transition score was kept because it
+  separates camelCase and hex from random text where entropy thresholds do not.
+
+## Unverified
+
+- **Full suite: verified, with one caveat.** **4136 passed, 3 skipped, 25 deselected in 680.38s (11:20)**, run detached with `-m 'not live'` on the revised tree before the corpus samples were re-shaped to dodge GitHub's secret detectors (the re-shaped file was then re-run alone: 70 passed; mutation table re-run: 17/17 RED) and with `tests/test_auth.py` still carrying the spike's edit in memory (restored from HEAD afterwards and re-run alone: 128 passed).
+  The targeted files that exercise every changed symbol (`test_redaction.py`,
+  `test_auth.py`, `test_policy.py`, `test_project_source_consent_policy.py`,
+  `test_trust_boundaries_e2e.py`) were run and are green.
+- `uv run mypy src/` was **not** run this session; the patch adds only
+  module-level compiled regexes and `str -> bool`/`re.Match[str] -> str`
+  functions with annotations, but the implementer runs it.
+- `scripts/check_security_claims.py` was not run: SECURITY.md is not edited by
+  this plan.
+- Throughput numbers are from one host, one run each (no repetition).
+- The residual table's "expected gap 32" for base64url is arithmetic (2/64 per
+  character), not measured on a corpus of real tokens.
+
+## Execution Policy
+
+- execute: effort=medium, reason=the patch is fully specified and measured, but
+  it is security-sensitive and the prose/credential corpora must both stay
+  green while SECURITY.md is updated; the mutation table must be re-run on the
+  implementer's tree, not trusted from this plan.
