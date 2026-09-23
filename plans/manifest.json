@@ -1402,6 +1402,31 @@
       "task_summary": null,
       "type": "phase",
       "updated_at": "2026-06-25T02:26:25Z"
+    },
+    {
+      "acceptance_criteria_count": 10,
+      "created_at": "2026-09-23T23:15:00+00:00",
+      "file": ".consiliency/plans/detailed-236-schema-drift-20260923-0915.md",
+      "handoff_ref": null,
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-23T23:15:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {},
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": null,
+      "roadmap_ref": null,
+      "slug": "236-schema-drift",
+      "status": "committed",
+      "task_summary": "Derive every gateway tool inputSchema from its argument model (A), then extra=\"forbid\" on the argument models (B) for Consiliency/pmcp#236; A and B land as separate PRs.",
+      "type": "detailed",
+      "updated_at": "2026-09-23T23:15:00+00:00"
     }
   ],
   "schema_version": 1
