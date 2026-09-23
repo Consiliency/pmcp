@@ -21,6 +21,7 @@ from pydantic import ValidationError
 
 from pmcp.client.manager import (
     _MAX_LISTING_PAGES,
+    _OUTBOUND_QUEUE_MAXSIZE,
     ClientManager,
     DEFAULT_SCHEMA_DIALECT,
     ManagedClient,
@@ -6460,3 +6461,479 @@ class TestMissingInputSchemaIsUnparseable:
         for entry in ("a string", 3, None, ["a"]):
             with pytest.raises(TypeError):
                 _required_object(entry, "inputSchema")
+
+
+def _managed_stdio(name: str) -> ManagedClient:
+    status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+    managed = ManagedClient(config=MagicMock(), process=MagicMock(), status=status)
+    managed.config.name = name
+    managed.is_remote = False
+    managed.process.stdin.write = MagicMock()
+    managed.process.stdin.drain = AsyncMock()
+    return managed
+
+
+def _managed_remote(name: str, sent: list[Any]) -> ManagedClient:
+    status = ServerStatus(name=name, status=ServerStatusEnum.ONLINE, tool_count=0)
+    managed = ManagedClient(config=MagicMock(), process=None, status=status)
+    managed.config.name = name
+    managed.is_remote = True
+    ws = MagicMock()
+    ws.send = AsyncMock(side_effect=lambda m: sent.append(m))
+    managed.write_stream = ws
+    return managed
+
+
+def _sent_frames(managed: ManagedClient) -> list[dict[str, Any]]:
+    frames: list[dict[str, Any]] = []
+    for call in managed.process.stdin.write.call_args_list:
+        try:
+            frames.append(json.loads(call.args[0].decode()))
+        except Exception:
+            pass
+    return frames
+
+
+def _dumped(sent: list[Any]) -> list[dict[str, Any]]:
+    return [
+        m.message.model_dump(by_alias=True, mode="json", exclude_none=True)
+        for m in sent
+    ]
+
+
+async def _block(*_a: Any, **_k: Any) -> None:
+    await asyncio.Event().wait()
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_ping_gets_empty_result_reply() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    line = json.dumps({"jsonrpc": "2.0", "id": 99, "method": "ping"}).encode()
+    mgr._handle_stdout_line("srv", managed, line, time.time())
+    await eventually(
+        lambda: managed.process.stdin.write.called,
+        timeout=2.0,
+        interval=0.005,
+        message="no reply written for downstream ping",
+    )
+    assert {"jsonrpc": "2.0", "id": 99, "result": {}} in _sent_frames(managed)
+
+
+@pytest.mark.asyncio
+async def test_c01_sse_ping_gets_empty_result_reply() -> None:
+    mgr = ClientManager()
+    sent: list[Any] = []
+    managed = _managed_remote("srv", sent)
+    mgr._clients["srv"] = managed
+    mgr._schedule_reconnect = MagicMock()  # type: ignore[method-assign]
+
+    def _frame(payload: dict[str, Any]) -> Any:
+        frame = MagicMock()
+        frame.message.model_dump.return_value = payload
+        return frame
+
+    async def stream() -> Any:
+        yield _frame({"jsonrpc": "2.0", "id": 5, "method": "ping"})
+
+    await mgr._read_sse("srv", managed, stream())
+    await eventually(
+        lambda: bool(sent), timeout=2.0, interval=0.005, message="no SSE reply sent"
+    )
+    assert _dumped(sent)[0] == {"jsonrpc": "2.0", "id": 5, "result": {}}
+
+
+@pytest.mark.asyncio
+async def test_c01_collision_request_does_not_resolve_our_pending() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+    now = time.time()
+    managed.pending_requests[42] = PendingRequest(
+        request_id=42,
+        server_name="srv",
+        tool_id="srv::x",
+        started_at=now,
+        last_heartbeat=now,
+        timeout_ms=30000,
+        future=fut,
+    )
+    line = json.dumps({"jsonrpc": "2.0", "id": 42, "method": "ping"}).encode()
+    mgr._handle_stdout_line("srv", managed, line, now)
+    await asyncio.sleep(0.05)
+    assert not fut.done(), "server->client request misrouted as a response"
+    assert 42 in managed.pending_requests
+
+
+@pytest.mark.asyncio
+async def test_c01_unsupported_request_gets_method_not_found() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    line = json.dumps(
+        {"jsonrpc": "2.0", "id": 7, "method": "sampling/createMessage", "params": {}}
+    ).encode()
+    mgr._handle_stdout_line("srv", managed, line, time.time())
+    await eventually(
+        lambda: managed.process.stdin.write.called,
+        timeout=2.0,
+        interval=0.005,
+        message="no error reply for unsupported downstream request",
+    )
+    match = [f for f in _sent_frames(managed) if f.get("id") == 7 and "error" in f]
+    assert match, _sent_frames(managed)
+    assert match[0]["error"]["code"] == -32601, match
+    assert match[0]["error"]["message"] == "Method not found", match
+
+
+@pytest.mark.asyncio
+async def test_c01_sse_unsupported_request_gets_method_not_found() -> None:
+    mgr = ClientManager()
+    sent: list[Any] = []
+    managed = _managed_remote("srv", sent)
+    mgr._clients["srv"] = managed
+    mgr._schedule_reconnect = MagicMock()  # type: ignore[method-assign]
+
+    def _frame(payload: dict[str, Any]) -> Any:
+        frame = MagicMock()
+        frame.message.model_dump.return_value = payload
+        return frame
+
+    async def stream() -> Any:
+        yield _frame({"jsonrpc": "2.0", "id": 8, "method": "roots/list", "params": {}})
+
+    await mgr._read_sse("srv", managed, stream())
+    await eventually(
+        lambda: bool(sent), timeout=2.0, interval=0.005, message="no SSE error reply"
+    )
+    frame = _dumped(sent)[0]
+    assert frame["id"] == 8 and frame["error"]["code"] == -32601, frame
+    assert frame["error"]["message"] == "Method not found", frame
+
+
+@pytest.mark.asyncio
+async def test_c02_caller_cancellation_pops_pending_entry() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    task = asyncio.create_task(
+        mgr._send_request(managed, "tools/call", {}, timeout_ms=60000)
+    )
+    await eventually(
+        lambda: len(managed.pending_requests) == 1,
+        timeout=2.0,
+        interval=0.005,
+        message="request never registered",
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert managed.pending_requests == {}, "pending_requests leaked on cancellation"
+
+
+@pytest.mark.asyncio
+async def test_c02_cancel_during_stdio_drain_pops_pending() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    managed.process.stdin.drain = _block  # type: ignore[assignment]
+    mgr._clients["srv"] = managed
+    task = asyncio.create_task(
+        mgr._send_request(managed, "tools/call", {}, timeout_ms=60000)
+    )
+    await eventually(
+        lambda: len(managed.pending_requests) == 1,
+        timeout=2.0,
+        interval=0.005,
+        message="request never registered",
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert managed.pending_requests == {}, "leaked when cancelled during drain()"
+
+
+@pytest.mark.asyncio
+async def test_c02_cancel_during_remote_send_pops_pending() -> None:
+    mgr = ClientManager()
+    status = ServerStatus(name="srv", status=ServerStatusEnum.ONLINE, tool_count=0)
+    managed = ManagedClient(config=MagicMock(), process=None, status=status)
+    managed.config.name = "srv"
+    managed.is_remote = True
+    ws = MagicMock()
+    ws.send = _block
+    managed.write_stream = ws
+    mgr._clients["srv"] = managed
+    task = asyncio.create_task(
+        mgr._send_request(managed, "tools/call", {}, timeout_ms=60000)
+    )
+    await eventually(
+        lambda: len(managed.pending_requests) == 1,
+        timeout=2.0,
+        interval=0.005,
+        message="request never registered",
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert managed.pending_requests == {}, "leaked when cancelled during send()"
+
+
+@pytest.mark.asyncio
+async def test_c02_write_error_pops_pending_and_propagates() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    managed.process.stdin.drain = AsyncMock(side_effect=BrokenPipeError("dead"))
+    mgr._clients["srv"] = managed
+    with pytest.raises(BrokenPipeError):
+        await mgr._send_request(managed, "tools/call", {}, timeout_ms=60000)
+    assert managed.pending_requests == {}, "leaked when the write raised"
+
+
+@pytest.mark.asyncio
+async def test_c04_gateway_cancel_notifies_downstream() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+    now = time.time()
+    managed.pending_requests[5] = PendingRequest(
+        request_id=5,
+        server_name="srv",
+        tool_id="srv::x",
+        started_at=now - 100,
+        last_heartbeat=now - 100,
+        timeout_ms=1000,
+        future=fut,
+        method="tools/call",
+    )
+    status, _m, _s, _e = await mgr.cancel_request("srv::5", force=True)
+    assert status == "cancelled"
+    await eventually(
+        lambda: any(
+            f.get("method") == "notifications/cancelled" for f in _sent_frames(managed)
+        ),
+        timeout=2.0,
+        interval=0.005,
+        message="no notifications/cancelled sent on gateway.cancel",
+    )
+    notif = [
+        f for f in _sent_frames(managed) if f.get("method") == "notifications/cancelled"
+    ][0]
+    assert notif["params"]["requestId"] == 5, notif
+
+
+@pytest.mark.asyncio
+async def test_c04_idle_timeout_notifies_downstream() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    with pytest.raises(TimeoutError):
+        await mgr._send_request(managed, "tools/list", {}, timeout_ms=20)
+    await eventually(
+        lambda: any(
+            f.get("method") == "notifications/cancelled" for f in _sent_frames(managed)
+        ),
+        timeout=2.0,
+        interval=0.005,
+        message="no notifications/cancelled sent on idle timeout",
+    )
+
+
+@pytest.mark.asyncio
+async def test_c04_initialize_request_is_never_cancelled_downstream() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
+    now = time.time()
+    managed.pending_requests[3] = PendingRequest(
+        request_id=3,
+        server_name="srv",
+        tool_id="",
+        started_at=now - 100,
+        last_heartbeat=now - 100,
+        timeout_ms=1000,
+        future=fut,
+        method="initialize",
+    )
+    status, _m, _s, _e = await mgr.cancel_request("srv::3", force=True)
+    assert status == "cancelled"
+    await asyncio.sleep(0.1)
+    frames = _sent_frames(managed)
+    assert not any(f.get("method") == "notifications/cancelled" for f in frames), frames
+
+
+@pytest.mark.asyncio
+async def test_c04_gateway_cancel_sends_exactly_one_notification() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    task = asyncio.create_task(
+        mgr._send_request(managed, "tools/call", {}, timeout_ms=60000)
+    )
+    await eventually(
+        lambda: len(managed.pending_requests) == 1,
+        timeout=2.0,
+        interval=0.005,
+        message="request never registered",
+    )
+    req_id = next(iter(managed.pending_requests))
+    status, _m, _s, _e = await mgr.cancel_request(f"srv::{req_id}", force=True)
+    assert status == "cancelled"
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.1)
+    notifs = [
+        f for f in _sent_frames(managed) if f.get("method") == "notifications/cancelled"
+    ]
+    assert len(notifs) == 1, f"expected exactly one cancelled notification: {notifs}"
+
+
+@pytest.mark.asyncio
+async def test_c04_direct_caller_cancel_notifies_once() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    task = asyncio.create_task(
+        mgr._send_request(managed, "tools/call", {}, timeout_ms=60000)
+    )
+    await eventually(
+        lambda: len(managed.pending_requests) == 1,
+        timeout=2.0,
+        interval=0.005,
+        message="request never registered",
+    )
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await eventually(
+        lambda: any(
+            f.get("method") == "notifications/cancelled" for f in _sent_frames(managed)
+        ),
+        timeout=2.0,
+        interval=0.005,
+        message="no notifications/cancelled on direct caller cancellation",
+    )
+    notifs = [
+        f for f in _sent_frames(managed) if f.get("method") == "notifications/cancelled"
+    ]
+    assert len(notifs) == 1, notifs
+    assert notifs[0]["params"]["reason"] == "caller cancelled", notifs
+
+
+@pytest.mark.asyncio
+async def test_stalled_sink_does_not_allocate_unbounded_outbound_tasks() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    managed.process.stdin.drain = _block  # type: ignore[assignment]
+    mgr._clients["srv"] = managed
+    for i in range(400):
+        line = json.dumps({"jsonrpc": "2.0", "id": 1000 + i, "method": "ping"}).encode()
+        mgr._handle_stdout_line("srv", managed, line, time.time())
+    await asyncio.sleep(0.15)
+    live = [t for t in mgr._background_tasks if not t.done()]
+    assert len(live) <= 8, f"unbounded outbound tasks under a stalled sink: {len(live)}"
+
+
+@pytest.mark.asyncio
+async def test_outbound_queue_respects_maxsize_under_stall() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    managed.process.stdin.drain = _block  # type: ignore[assignment]
+    mgr._clients["srv"] = managed
+    for i in range(_OUTBOUND_QUEUE_MAXSIZE + 200):
+        line = json.dumps({"jsonrpc": "2.0", "id": 2000 + i, "method": "ping"}).encode()
+        mgr._handle_stdout_line("srv", managed, line, time.time())
+    await asyncio.sleep(0.15)
+    assert managed.outbound is not None
+    assert managed.outbound.qsize() <= _OUTBOUND_QUEUE_MAXSIZE, managed.outbound.qsize()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_cleanup_cancels_outbound_writer() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    managed.process.stdin.drain = _block  # type: ignore[assignment]
+    managed.process.returncode = 0  # let _terminate_process_tree early-return
+    mgr._clients["srv"] = managed
+    mgr._servers["srv"] = managed.status
+    mgr._reply_to_downstream_request("srv", managed, 1, "ping")
+    await eventually(
+        lambda: managed.outbound_writer is not None,
+        timeout=2.0,
+        interval=0.005,
+        message="writer never started",
+    )
+    writer = managed.outbound_writer
+    assert writer is not None
+    await mgr._cleanup_client("srv", managed)
+    assert writer.done(), "outbound writer leaked across _cleanup_client"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_server_cancels_outbound_writer() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    managed.process.stdin.drain = _block  # type: ignore[assignment]
+    managed.process.returncode = 0
+    mgr._clients["srv"] = managed
+    mgr._servers["srv"] = managed.status
+    mgr._reply_to_downstream_request("srv", managed, 1, "ping")
+    await eventually(
+        lambda: managed.outbound_writer is not None,
+        timeout=2.0,
+        interval=0.005,
+        message="writer never started",
+    )
+    writer = managed.outbound_writer
+    assert writer is not None
+    ok, _cancelled, _msg = await mgr.disconnect_server("srv", force=True)
+    assert ok
+    assert writer.done(), "outbound writer leaked across disconnect_server"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_client_resets_outbound_queue_so_stale_frames_are_not_redelivered() -> (
+    None
+):
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    managed.process.stdin.drain = _block  # writer stalls -> frames stay buffered
+    managed.process.returncode = 0  # let _terminate_process_tree early-return
+    mgr._clients["srv"] = managed
+    mgr._servers["srv"] = managed.status
+    # Buffer several fire-and-forget frames from the dying connection.
+    for i in range(3):
+        mgr._reply_to_downstream_request("srv", managed, 900 + i, "ping")
+    await eventually(
+        lambda: managed.outbound is not None and managed.outbound.qsize() >= 1,
+        timeout=2.0,
+        interval=0.005,
+        message="frames never buffered",
+    )
+    old_queue = managed.outbound
+    await mgr._cleanup_client("srv", managed)
+    # Postcondition: the outbound path is reset, so the stale queue is dropped.
+    assert managed.outbound is None, "stale outbound queue survived _cleanup_client"
+    assert managed.outbound_writer is None, "stale writer ref survived _cleanup_client"
+    # Simulate the next generation reusing this client object: a fresh write sink
+    # and a working drain. Only the new frame may reach it -- never the dead
+    # connection's buffered replies.
+    written: list[dict[str, Any]] = []
+    managed.process.stdin.write = MagicMock(
+        side_effect=lambda b: written.append(json.loads(b.decode()))
+    )
+    managed.process.stdin.drain = AsyncMock()
+    mgr._reply_to_downstream_request("srv", managed, 1, "ping")
+    await eventually(
+        lambda: any(f.get("id") == 1 for f in written),
+        timeout=2.0,
+        interval=0.005,
+        message="new-generation frame never written",
+    )
+    await asyncio.sleep(0.05)
+    stale = [f for f in written if f.get("id") in (900, 901, 902)]
+    assert stale == [], f"stale frames redelivered to the new generation: {stale}"
+    assert old_queue is not managed.outbound
