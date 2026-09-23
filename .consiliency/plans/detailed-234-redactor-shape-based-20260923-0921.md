@@ -1,5 +1,17 @@
 # Detailed plan: shape-based secret redaction — separator-anchored keywords, opaque-run scoring, and a prose corpus (Consiliency/pmcp#234)
 
+> **Revision 2 (2026-09-23).** Rev 1 (PR Consiliency/pmcp#288) boarded with
+> **three BLOCKING defects** (codex, by static tracing; the lead reproduced all
+> three against the embedded patch on current main; this revision reproduced
+> them again before fixing). Each is kept below as `REV 1 WAS WRONG` with its
+> before/after measurement, because each one is a trap: (a) the payload bound
+> was checked *after* path splitting, so a slash-leading base64 image
+> (`/9j/…`, a `/` every ~64 chars) came back as `[REDACTED]/[REDACTED]/…`;
+> (b) the truncation back-up was bounded on the whole trailing *run*, so a
+> credential after a long path (`/bbb…(68)/ghp_16C7e`) was left as a prefix;
+> (c) quoted values stopped at an escaped quote, so `{"password": "a\"hunter2"}`
+> left `hunter2"` behind. Three mutation rows (M18-M20) now pin the fixes.
+>
 > **Provenance.** This plan resumes an unfinished, unmeasured spike left in the
 > `plan/234-redactor` worktree by a previous planner (uncommitted edits to
 > `src/pmcp/auth.py`, `src/pmcp/policy/policy.py`, `tests/test_auth.py`, and an
@@ -12,7 +24,7 @@
 
 ## Task
 
-Address Consiliency/pmcp#234. The secret redactor that stands between a
+Close Consiliency/pmcp#234. The secret redactor that stands between a
 downstream server's error text and the agent's prompt-injectable context is
 **keyword-anchored**: it redacts the word after `token`, `secret`, `session`,
 `password`, `bearer` whether or not that word is a credential, and it lets
@@ -148,6 +160,24 @@ it, and bare `code=` with a non-word value is the OAuth callback parameter and i
 redacted. Measured: `tests/test_auth.py` restored from HEAD → **128 passed** against
 the revised engine. Neither old assertion was wrong; the spike's gate was.
 
+### Rev 2 board findings — before/after, measured
+
+All three reproduced on the rev-1 patch applied to this worktree (main @
+`860636a`; the lead reproduced them on current main), then re-measured after
+the fix. `TOKEN = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"`.
+
+| # | input | rev 1 (both surfaces unless noted) | rev 2 |
+|---|---|---|---|
+| a | `"/" + "4eC39HqLyjWDarjtT1zdp7dc" + "/" + "A"*8190` | `/[REDACTED]/AAAA…` | byte-identical |
+| a | `"/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgH" + 6 000 chars of seeded random base64 (101 slashes)` | corrupted from offset 28; 82 `[REDACTED]`s (`redact_secrets` and engine) | byte-identical |
+| a | 360-char REST route ending `/secrets/4eC39HqLyjWDarjtT1zdp7dc/versions/latest` | `…/secrets/[REDACTED]/versions/latest` | same (still split: reads as a route) |
+| b | `"a"*120 + " /" + "b"*68 + "/" + TOKEN + " " + "c"*100`, `process_output(redact=True, max_bytes=300)` | result contains `ghp_16C7e` (trailing run 79 chars > 64) | no `ghp_`; result ends `…aaa ` + marker |
+| b | `"a"*20 + " /" + "b"*300 + "/" + TOKEN + …`, `max_bytes=450` | (not covered by rev 1's tests) | no `ghp_`; ends `…bbb` + marker (last segment backed out) |
+| b | `"b"*400`, `max_bytes=300` | `bbb…(200)` shown (offset-0 guard) | marker only |
+| b | `"b"*1000`, `max_bytes=600` | 500 `b`s | 500 `b`s (giant run still truncates) |
+| c | `{"password": "a\"hunter2"}` | `{"password": [REDACTED]hunter2"}` | `{"password": [REDACTED]}` |
+| c | `{'password': 'a\'hunter2'}` | `{'password': [REDACTED]hunter2'}` | `{'password': [REDACTED]}` |
+
 ## Design
 
 The engine (`sanitize_auth_diagnostic`) runs these passes in order on the
@@ -165,7 +195,11 @@ whole text, then cuts to `max_length`:
    (or `api[_-]?key`), optionally suffixed `_id`/`_key`/`s`. So `access_token=`,
    `X-Auth-Token:`, `accessToken=`, `"password": "…"`, `session_id=`, `Set-Cookie:`
    fire; `token_type=`, `token_endpoint=`, `secret_arn=`, `password_hash=`,
-   `tokenizer=` do not. Strong keys redact **any** value.
+   `tokenizer=` do not. Strong keys redact **any** value. A quoted value runs
+   to its *closing* quote, past escaped ones (`"(?:[^"\\]|\\.)*"` and the
+   single-quote twin). `REV 1 WAS WRONG`: `"[^"]*"` stopped at the `\"` in the
+   valid JSON `{"password": "a\"hunter2"}` and both surfaces produced
+   `{"password": [REDACTED]hunter2"}`; same for `{'password': 'a\'hunter2'}`.
 5. **`<keyword><whitespace><value>`** (D2) — including `--flag value`. Redacts
    only a value that *could be a credential*: not a plain word or number, and
    either digit-bearing and ≥ 6 chars (`abc123def456`, `hunter2`) or punctuated
@@ -198,6 +232,23 @@ whole text, then cuts to `max_length`:
     and `ECDHE-RSA-AES256-GCM-SHA384` survive while `Xk3jd92LmQpw8Rt6Zy1nVb4c`
     does not. A `/`-joined run that reads as a route (leading `/` or two plain
     words) keeps its route and loses only the opaque piece: `/v1/[REDACTED]/status`.
+    **The 256-char payload bound is applied to the whole run *before* any path
+    splitting** (`REV 1 WAS WRONG`: it was applied per piece, so `/9j/4AAQ…`
+    JPEG base64 — a `/` every ~64 chars — was split and every piece scored;
+    measured: 82 `[REDACTED]`s in a 6 000-char image, first at offset 28, on
+    both surfaces; a `/4eC39HqLyjWDarjtT1zdp7dc/AAAA…(8190)` run became
+    `/[REDACTED]/AAAA…`). A run past the bound is still split when it *reads as
+    a route*: every piece ≤ 64 chars and at least two pieces plain lower-case
+    words (`/api/v1/organizations/acme-corp/…/secrets/<id>/versions/latest`,
+    360 chars, still loses only `<id>`). Base64 cannot satisfy that: a `/` lands
+    every ~64 chars at random, so a payload of any length has a piece over 64
+    (P(all of ~90 gaps ≤ 64) ≈ 0.63^90) and, in practice, no two word pieces.
+    Chosen over Gemini's bare early-return because the early return alone
+    reopened the deep-REST-path case; the residual that remains is a bare
+    opaque segment inside a > 256-char slash-run that does *not* read as a
+    route (a piece > 64 or fewer than two word pieces) — prefixed and vendor
+    credentials in such a run are still caught by passes 8-9, which run on the
+    whole text first.
 11. **Cut** to `max_length`. Redaction ran on the whole text first, so the cut
     can shorten `[REDACTED]` but never expose a token prefix (pinned by
     `test_the_engine_redacts_before_it_truncates`).
@@ -208,13 +259,23 @@ when it has none — including when its only `=` is trailing padding (D6).
 
 `PolicyManager.truncate_output` (D7) — the byte cut happens **before**
 redaction in `process_output`, so a cut that lands inside a credential leaves a
-prefix no rule recognises (`ghp_16C7e`). The cut is backed up to the preceding
-non-token character, bounded at 64 characters: a longer trailing run is not
-backed out of, because ≥ 64 characters of a random string is still opaque to
-pass 10, and a giant single run must still truncate. This is a behaviour change
-for every truncated output that ends mid-token (≤ 64 bytes shorter);
-`tests/test_policy.py` pins no exact length (its `process_output` tests at
-lines 347 and 423 assert content, and passed unchanged).
+prefix no rule recognises (`ghp_16C7e`). The trailing run of token characters
+(`[A-Za-z0-9_+/=-]+`, so a path and the token it ends in are one run) is backed
+out of **whole when it is ≤ 256 characters** — the same bound that says a
+longer run is a payload — including when it starts at offset 0 (an output that
+is one partial token is shown as nothing rather than as a prefix). A longer run
+is a payload or a long path: only its **last `/`-segment** is backed out of,
+which is where a credential in a path sits, and a giant unbroken blob still
+truncates where it always did. `REV 1 WAS WRONG`: it bounded the back-up at 64
+characters measured on the whole run, so
+`"a"*120 + " /" + "b"*68 + "/" + TOKEN + " " + "c"*100` with `max_bytes=300`
+produced a result containing `ghp_16C7e` (the run was 79 chars; nothing backed
+up; the fragment is too short for any rule) — and it kept a partial token at
+offset 0. Both measured before and after (`## Rev 2 board findings`). This is a
+behaviour change for every truncated output that ends mid-token (up to 256
+bytes shorter, or one path segment); `tests/test_policy.py` pins no exact
+length (its `process_output` tests at lines 347 and 423 assert content, and
+passed unchanged — 186 passed across the four targeted files).
 
 `DEFAULT_REDACTION_PATTERNS` (D8): `(bearer|token)[\s]+[a-zA-Z0-9._-]+` — the
 policy surface's own copy of the whitespace bug — becomes
@@ -229,6 +290,8 @@ defaults stay, so SECURITY.md's C-13 proofs keep their probe.
 |---|---|---|
 | **Bare uniform-hex secrets** in free text (a 20-hex GitHub OAuth code with no `code=`, `key-<hex32>` Mailgun keys, plain hex API tokens) | shape-identical to git SHAs, digests, UUIDs and request ids, which every traceback and pip/docker log is full of; redacting them would make diagnostics unreadable | still caught when keyed (`code=`, `token=`, `?code=` in a URL) or prefixed (`dop_v1_<hex>` via pass 9); a hex token with no key and no prefix is the rarer issuance shape |
 | A single unbroken run **longer than 256** characters | it is a payload (image data, an encoded file) far more often than a credential; the longest single-run vendor tokens seen are ~164 (`sk-proj-`) | JWTs (dot-joined, unbounded rule) and private keys (PEM rule) are the long credential shapes, and both are covered |
+| A **bare** opaque segment inside a > 256-char slash-joined run that does not read as a route (a piece > 64 chars, or fewer than two plain-word pieces) | the payload bound must win over path splitting or JPEG base64 is destroyed (rev 1's defect) | prefixed (`sk-…`, `ghp_…`) and vendor-shaped credentials in such a run are still caught by passes 8-9, which run on the whole text before pass 10; routes up to 64 chars per piece with two words are still split |
+| Truncation: a credential at the end of a > 256-char trailing run with **no `/`** in its last segment, or after the last `/` of a > 256-char segment | only the last `/`-segment of a long trailing run is backed out of | a run that long with no separator is a payload by the same rule as pass 10; the surviving fragment of a payload is not a credential prefix |
 | base64url secrets whose `-`/`_` fall every < 10 characters | per-segment scoring (needed for pod names and hostnames) | expected gap between such characters in base64url is 32; measured examples all have a ≥ 10-char segment |
 | A digitless dev password after a whitespace keyword (`--password hunter`) and short digit-bearing ones (`--token 1a2b`) | indistinguishable from `password reset`, `token v2` | `password=hunter`, `password: hunter`, `"password": "hunter"` are all still redacted (strong key with a separator) |
 | Numeric one-time codes under `code` (`code=123456`) | indistinguishable from JSON-RPC and HTTP codes | single-use, minutes-lived, and a diagnostic from an untrusted server that quotes one gives the attacker nothing they did not already have |
@@ -253,8 +316,10 @@ measured against; implement it verbatim and then run the mutation table.
   `_DIGIT_RUN_RE`, `_LOWER_RUN_RE`, `_WORDY_PIECES_RE`** — add, after `_JWT_RE` —
   the shape layer's tunables, each with the false positive or negative it
   exists for in its comment (pass 8-10 above).
-- **`_char_class`, `_looks_opaque`, `_run_is_opaque`, `_redact_run`,
-  `_redact_opaque_runs`** — add — the opaque-run scorer and the pass that
+- **`_char_class`, `_looks_opaque`, `_run_is_opaque`, `_reads_as_route`,
+  `_ROUTE_MAX_PIECE`, `_ROUTE_WORD_RE`, `_redact_run`, `_redact_opaque_runs`**
+  — add — the opaque-run scorer, the route test that lets a long run be split
+  only when it is a path and never when it is a payload, and the pass that
   applies vendor shapes, prefixed tokens and scored runs, in that order.
 - **`_PLAIN_WORD_RE`, `_NUMBER_RE`, `_is_plain_word_or_number`,
   `_value_could_be_a_credential`** — add — the two value gates (D2, D3, D5).
@@ -276,20 +341,23 @@ measured against; implement it verbatim and then run the mutation table.
 
 ### `src/pmcp/policy/policy.py`
 
-- **`_TRAILING_PARTIAL_TOKEN_RE`** — add, before `DEFAULT_REDACTION_PATTERNS`
-  — a ≤ 64-char run of token characters at the very end of a string (D7).
+- **`_TRAILING_PARTIAL_TOKEN_RE`, `_TRAILING_PATH_SEGMENT_RE`,
+  `_TRAILING_RUN_BACKUP`** — add, before `DEFAULT_REDACTION_PATTERNS` — the
+  whole trailing run of token characters, the last `/`-segment of one, and the
+  256-char bound under which a run is backed out of whole (D7).
 - **`DEFAULT_REDACTION_PATTERNS`** — modify — as in D8; comments name the
   prose each change protects.
 - **`PolicyManager.truncate_output`** — modify — after decoding the byte cut,
-  back it up to the start of a trailing partial token (bounded), before the
-  truncation marker is appended (D7).
+  back it up to the start of a trailing partial token when that run is ≤ 256
+  chars (offset 0 included), else to the start of its last `/`-segment, before
+  the truncation marker is appended (D7).
 - **`PolicyManager.redact_secrets.replace_match`** — modify — split at the
   first `:`/`=` only if `full_match[i + 1:].strip(" \t:=")` is non-empty (D6).
 
 ### `tests/test_redaction.py` (new)
 
 Both corpora and the composition tests; bodies under `## Test bodies`. Node
-ids, all validated with `--collect-only` this session (70 tests):
+ids, all validated with `--collect-only` this session (73 tests):
 
 - `test_prose_survives_the_engine_byte_identical`,
   `test_prose_survives_the_policy_surface_byte_identical` — the prose direction
@@ -306,14 +374,19 @@ ids, all validated with `--collect-only` this session (70 tests):
 - `test_a_url_path_credential_is_redacted_in_diagnostics_not_in_the_url` — the
   elicitation-URL guard (defect 1).
 - `test_identifiers_that_are_not_credentials_are_kept`,
-  `test_payload_sized_runs_are_data_not_credentials` — the shape layer's
-  exemptions.
+  `test_payload_sized_runs_are_data_not_credentials`,
+  `test_a_slash_leading_payload_is_not_split_into_scored_pieces` — the shape
+  layer's exemptions, the last one the rev-2 fix (a `/9j/…` JPEG with a `/`
+  every ~64 chars survives both surfaces; a 360-char REST route still loses
+  its opaque segment).
 - `test_redaction_is_idempotent`,
   `test_redact_secrets_keeps_a_key_but_never_splits_inside_a_secret`,
   `test_the_engine_redacts_before_it_truncates`,
   `test_process_output_never_ends_on_a_partial_token`,
-  `test_process_output_still_truncates_a_single_giant_run` — composition,
-  D6, D7.
+  `test_process_output_never_ends_on_a_partial_token_after_a_path`,
+  `test_process_output_still_truncates_a_single_giant_run`,
+  `test_a_quoted_value_runs_to_its_closing_quote` — composition, D6, D7, and
+  the rev-2 fixes for the truncation and escaped-quote defects.
 
 ### `tests/test_auth.py`
 
@@ -323,15 +396,15 @@ ids, all validated with `--collect-only` this session (70 tests):
 
 `git diff` of the revised tree against `main` @ `860636a`, `src/` only. This
 is the exact text the mutation table and every probe in this plan ran against
-(`sha256` of the revised files: `auth.py 3f5196b3…cacf`, `policy.py
-b3948f52…363e`).
+(`sha256` of the revised files: `auth.py fe85ce10…23f7`, `policy.py
+bca06c6a…e0aa`).
 
 ```diff
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index f40ccbb..ab52c49 100644
+index f40ccbb..bf0e8b9 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
-@@ -93,6 +93,278 @@ _JWT_RE = re.compile(
+@@ -93,6 +93,304 @@ _JWT_RE = re.compile(
      r"(?![A-Za-z0-9_-])"
  )
  
@@ -473,7 +546,27 @@ index f40ccbb..ab52c49 100644
 +    )
 +
 +
++def _reads_as_route(run: str) -> bool:
++    """Is a long `/`-joined run a URL path rather than a base64 payload?
++
++    A route is short pieces, at least two of them plain words
++    (`/api/v1/organizations/acme/secrets/<id>/versions/latest`). Base64 puts
++    a `/` every ~64 characters at random, so a payload of any length has
++    pieces over `_ROUTE_MAX_PIECE` and, in practice, no two word pieces.
++    """
++    pieces = run.split("/")
++    if max(len(piece) for piece in pieces) > _ROUTE_MAX_PIECE:
++        return False
++    return sum(1 for piece in pieces if _ROUTE_WORD_RE.fullmatch(piece)) >= 2
++
++
 +def _redact_run(run: str) -> str:
++    if len(run) > _OPAQUE_MAX_RUN and not _reads_as_route(run):
++        # A payload (JPEG base64 starts `/9j/` and carries a `/` every ~64
++        # characters): the bound applies to the whole run BEFORE any path
++        # splitting, or every piece between two slashes is scored on its own
++        # and an ordinary image comes back as `[REDACTED]/[REDACTED]/...`.
++        return run
 +    if "/" in run and (run.startswith("/") or _WORDY_PIECES_RE.search(run)):
 +        # A path: keep the route and replace only the credential-shaped
 +        # pieces (`/v1/[REDACTED]/status`), so the reader still learns which
@@ -486,6 +579,10 @@ index f40ccbb..ab52c49 100644
 +
 +
 +#: Two `/`-separated pieces that are plain lower-case words: a route, not a blob.
++#: For a run past `_OPAQUE_MAX_RUN`: the longest piece a route may have and
++#: the plain-word piece shape `_reads_as_route` counts.
++_ROUTE_MAX_PIECE = 64
++_ROUTE_WORD_RE = re.compile(r"[a-z]{3,}")
 +_WORDY_PIECES_RE = re.compile(r"(?:^|/)[a-z]{3,}/(?:[^/]*/)*[a-z]{3,}(?:/|$)")
 +
 +
@@ -548,13 +645,15 @@ index f40ccbb..ab52c49 100644
 +#: (`unicode`, `encoded`, `tokenizer`) is how prose got mangled. Segments are
 +#: `_`/`-` joined or camelCase (`accessToken`). The separator is `:` or `=`
 +#: with optional quotes around key and value so JSON (`"password": "x"`) is
-+#: covered; bare whitespace is NOT a separator here (see `_KEYWORD_WS_RE`).
++#: covered -- a quoted value runs to its CLOSING quote, past any escaped one
++#: (`"a\\"hunter2"`), or the tail after the escape survives; bare whitespace
++#: is NOT a separator here (see `_KEYWORD_WS_RE`).
 +_KEYWORD_SEP_RE = re.compile(
 +    r"(?P<key>(?P<qualifier>(?<![A-Za-z0-9:.])(?:[A-Za-z0-9]+[_-])*"
 +    r"(?:(?-i:[a-z]+(?=[A-Z])))?)"
 +    rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?)"
 +    r"(?P<sep>[\"']?[ \t]*[:=][ \t]*)"
-+    r"(?P<value>\"[^\"]*\"|'[^']*'|[^\s\"',;()\[\]{}]+)",
++    r"(?P<value>\"(?:[^\"\\]|\\.)*\"|'(?:[^'\\]|\\.)*'|[^\s\"',;()\[\]{}]+)",
 +    re.IGNORECASE,
 +)
 +
@@ -610,7 +709,7 @@ index f40ccbb..ab52c49 100644
  
  def redact_auth_url(url: str) -> str:
      """Strip URL userinfo and redact auth-bearing query values."""
-@@ -591,20 +863,13 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) ->
+@@ -591,20 +889,13 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) ->
          r"\1[REDACTED]",
          text,
      )
@@ -638,19 +737,20 @@ index f40ccbb..ab52c49 100644
  
  
 diff --git a/src/pmcp/policy/policy.py b/src/pmcp/policy/policy.py
-index cac2702..d68fe80 100644
+index cac2702..75c905c 100644
 --- a/src/pmcp/policy/policy.py
 +++ b/src/pmcp/policy/policy.py
-@@ -44,12 +44,25 @@ _ListPolicy = ServerPolicy | ToolPolicy | ResourcePolicy | PromptPolicy
+@@ -44,12 +44,26 @@ _ListPolicy = ServerPolicy | ToolPolicy | ResourcePolicy | PromptPolicy
  #: would otherwise return the wrong limit or raise at runtime.
  _LimitField = Literal["max_tools_per_server", "max_output_bytes", "max_output_tokens"]
  
-+#: A whole run of token characters at the very end of a truncated string, at
-+#: most this long -- see `truncate_output`. A longer run is not backed out of:
-+#: if it is credential-shaped the redactor still sees enough of it to fire.
-+_TRAILING_PARTIAL_TOKEN_RE = re.compile(
-+    r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]{1,64}\Z"
-+)
++#: The whole run of token characters at the very end of a truncated string --
++#: see `truncate_output`. Up to `_TRAILING_RUN_BACKUP` characters of it are
++#: backed out of; past that it is a payload or a long path, and only a final
++#: `/`-segment (where a credential in a path would sit) is backed out of.
++_TRAILING_PARTIAL_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_+/=-])[A-Za-z0-9_+/=-]+\Z")
++_TRAILING_PATH_SEGMENT_RE = re.compile(r"/[A-Za-z0-9_+=-]*\Z")
++_TRAILING_RUN_BACKUP = 256
 +
  DEFAULT_REDACTION_PATTERNS = [
 -    # Common secret patterns (case-insensitive)
@@ -672,22 +772,30 @@ index cac2702..d68fe80 100644
      r"\bsk-[A-Za-z0-9_-]{6,}\b",
      r"\bghp_[A-Za-z0-9_]{10,}\b",
      r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
-@@ -685,6 +698,14 @@ class PolicyManager:
+@@ -685,6 +699,22 @@ class PolicyManager:
  
          # Decode, ignoring incomplete characters at the end
          truncated_str = truncated_bytes.decode("utf-8", errors="ignore")
 +        # Never end mid-token. Redaction runs AFTER this cut, and a credential
 +        # cut down to a few characters no longer has the shape the redactor
-+        # looks for; backing up to the last non-token character (bounded, so
-+        # a giant blob still truncates) removes the exposed prefix
-+        # (Consiliency/pmcp#234).
++        # looks for. The trailing run of token characters is backed out of
++        # whole when it is short enough to be a credential (or a path ending
++        # in one: `/very/long/path/ghp_16C7e`); a longer run is a payload or a
++        # long path, and only its last `/`-segment is backed out of, so a
++        # giant blob still truncates. A run that starts at offset 0 is backed
++        # out of too: an output that is one partial token is shown as nothing
++        # rather than as a prefix (Consiliency/pmcp#234).
 +        boundary = _TRAILING_PARTIAL_TOKEN_RE.search(truncated_str)
-+        if boundary and boundary.start() > 0:
++        if boundary and len(boundary.group(0)) <= _TRAILING_RUN_BACKUP:
 +            truncated_str = truncated_str[: boundary.start()]
++        elif boundary:
++            segment = _TRAILING_PATH_SEGMENT_RE.search(truncated_str)
++            if segment:
++                truncated_str = truncated_str[: segment.start()]
  
          # Add truncation indicator
          truncated_str += (
-@@ -701,9 +722,13 @@ class PolicyManager:
+@@ -701,9 +731,13 @@ class PolicyManager:
  
              def replace_match(match: re.Match[str]) -> str:
                  full_match = match.group(0)
@@ -707,7 +815,7 @@ index cac2702..d68fe80 100644
 
 ## Test bodies
 
-`tests/test_redaction.py`, verbatim (sha256 `951a1a9b…5ae8`; 70 tests; ruff
+`tests/test_redaction.py`, verbatim (sha256 `b2113eb7…c4dc`; 73 tests; ruff
 clean):
 
 ```python
@@ -1159,6 +1267,33 @@ def test_payload_sized_runs_are_data_not_credentials() -> None:
     assert _engine(f"leaked {token} here") == "leaked [REDACTED] here"
 
 
+def test_a_slash_leading_payload_is_not_split_into_scored_pieces() -> None:
+    """The payload bound applies to the WHOLE run, before any path splitting.
+
+    JPEG base64 always starts `/9j/` and carries a `/` every ~64 characters;
+    scoring each piece between slashes on its own turned an ordinary image into
+    `[REDACTED]/[REDACTED]/...` (board finding on the first revision). A long
+    run that reads as a route -- short pieces, two of them plain words -- is
+    still split, so a credential segment deep in a REST path is still caught.
+    """
+    leading = "/" + "4eC39HqLyjWDarjtT1zdp7dc" + "/" + "A" * 8190
+    assert _engine(leading) == leading
+    assert _policy(leading) == leading
+    rng = random.Random(234)
+    body = base64.b64encode(bytes(rng.getrandbits(8) for _ in range(4500))).decode()
+    jpeg = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgH" + body
+    assert body.count("/") > 50  # the shape that broke: a slash every ~64 chars
+    assert _engine(jpeg) == jpeg
+    assert _policy(jpeg) == jpeg
+    route = (
+        "/api/v1/organizations/acme-corp/projects/"
+        + "/".join(f"segment{i}" for i in range(30))
+        + "/secrets/4eC39HqLyjWDarjtT1zdp7dc/versions/latest"
+    )
+    assert len(route) > 256
+    assert _engine(route) == route.replace("4eC39HqLyjWDarjtT1zdp7dc", "[REDACTED]")
+
+
 # === composition ========================================================== #
 
 
@@ -1222,12 +1357,54 @@ def test_process_output_never_ends_on_a_partial_token() -> None:
     assert processed["result"].startswith("a" * 190)
 
 
+def test_process_output_never_ends_on_a_partial_token_after_a_path() -> None:
+    """The trailing run is the PATH plus the token, and the whole run is backed
+    out of (board finding on the first revision: a 64-character bound measured
+    on the run left `/bbb.../ghp_16C7e` in the output). Past 256 characters the
+    run is a payload or a long path, and its last `/`-segment -- where a
+    credential in a path sits -- is still backed out of.
+    """
+    policy = PolicyManager()
+    output = "a" * 120 + " /" + "b" * 68 + "/" + TOKEN + " " + "c" * 100
+    processed = policy.process_output(output, redact=True, max_bytes=300)
+    assert processed["truncated"] is True
+    assert "ghp_" not in processed["result"], processed["result"]
+    assert processed["result"].startswith("a" * 120 + " ")
+    long_path = "a" * 20 + " /" + "b" * 300 + "/" + TOKEN + " " + "c" * 100
+    processed = policy.process_output(long_path, redact=True, max_bytes=450)
+    assert processed["truncated"] is True
+    assert "ghp_" not in processed["result"], processed["result"]
+    assert processed["result"].startswith("a" * 20 + " /" + "b" * 300)
+
+
 def test_process_output_still_truncates_a_single_giant_run() -> None:
-    """The back-up is bounded: a 400-byte run cannot be backed out of, and is
-    cut where it always was (200 bytes in) rather than dropped."""
+    """The back-up is bounded: a run over 256 characters is a payload, cut
+    where it always was (500 bytes in) rather than dropped. A SHORT run that is
+    the whole output is dropped rather than shown as a prefix."""
+    processed = PolicyManager().process_output("b" * 1000, redact=True, max_bytes=600)
+    assert processed["truncated"] is True
+    assert processed["result"].startswith("b" * 500)
     processed = PolicyManager().process_output("b" * 400, redact=True, max_bytes=300)
     assert processed["truncated"] is True
-    assert processed["result"].startswith("b" * 200)
+    assert processed["result"].startswith("\n\n[... OUTPUT TRUNCATED")
+
+
+def test_a_quoted_value_runs_to_its_closing_quote() -> None:
+    """An escaped quote inside a JSON string does not end the value.
+
+    `"[^"]*"` stopped at the `\\"` in `{"password": "a\\"hunter2"}` and left
+    `hunter2"` behind on both surfaces (board finding on the first revision).
+    """
+    for text, expected in [
+        ('{"password": "a\\"hunter2"}', '{"password": [REDACTED]}'),
+        ("{'password': 'a\\'hunter2'}", "{'password': [REDACTED]}"),
+        (
+            '{"password": "hunter2", "user": "bob"}',
+            '{"password": [REDACTED], "user": "bob"}',
+        ),
+    ]:
+        assert _engine(text) == expected
+        assert _policy(text) == expected
 ```
 
 ## Documentation impact
@@ -1289,11 +1466,11 @@ def test_process_output_still_truncates_a_single_giant_run() -> None:
 
 ```bash
 cd <worktree>
-uv run pytest tests/test_redaction.py -q --cov-fail-under=0                      # 70 passed
+uv run pytest tests/test_redaction.py -q --cov-fail-under=0                      # 73 passed
 uv run pytest tests/test_auth.py -q --cov-fail-under=0                           # 128 passed, file byte-identical to main
 uv run pytest tests/test_policy.py tests/test_project_source_consent_policy.py \
               tests/test_trust_boundaries_e2e.py -q --cov-fail-under=0           # C-13 proofs + truncation pins
-uv run pytest --collect-only -q tests/test_redaction.py | grep -c '::'            # 70 (a -k that matches nothing exits 0)
+uv run pytest --collect-only -q tests/test_redaction.py | grep -c '::'            # 73 (a -k that matches nothing exits 0)
 uv run ruff check src/ tests/                                                     # CI gate
 uv run ruff format --check src/ tests/                                            # CI gate
 uv run mypy src/                                                                  # CI gate (see Unverified)
@@ -1304,11 +1481,13 @@ nohup uv run pytest tests/ -q > /tmp/pmcp-234-full.log 2>&1 & disown
 tail -n 3 /tmp/pmcp-234-full.log
 ```
 
-Measured this session on the revised tree: `test_redaction.py` **70 passed**;
+Measured this session on the revised tree: `test_redaction.py` **73 passed**;
 `test_auth.py` (HEAD copy) **128 passed**; the earlier spike-era targeted run of
 `test_redaction.py tests/test_auth.py tests/test_policy.py
 tests/test_project_source_consent_policy.py tests/test_trust_boundaries_e2e.py`
-**243 passed**; `ruff check` and `ruff format --check` on `src/ tests/` **clean**;
+**243 passed**, and in rev 2 the same four files (`test_auth.py`, `test_policy.py`,
+`test_project_source_consent_policy.py`, `test_trust_boundaries_e2e.py`)
+**186 passed** against the rev-2 patch; `ruff check` and `ruff format --check` on `src/ tests/` **clean**;
 `check_plan_consistency.py` **blocking inconsistencies: 0** (same on
 `origin/main`). Full suite on the revised tree (detached, `-m 'not live'`, 4 164
 collected): **4136 passed, 3 skipped, 25 deselected in 11:20**.
@@ -1333,27 +1512,34 @@ so `test_bearer_is_a_scheme_not_a_word` gained `secret-bearer hunter2` and
 value; M09 (the split guard) survived because the engine's shape pass redacted
 the real base64 probe before the operator pattern ever saw it, so the test now
 probes with a uniform-hex padded value the engine leaves alone (and asserts
-that it does). Final run, all 17 rows:
+that it does). Rev 2 adds M18-M20, one per board defect, each the *rev-1 code*
+put back (M19 restores rev 1's whole back-up block, so both the 64-char bound
+and the offset-0 guard are exercised), and corrects M13's reason: only the
+engine nodes go red there, the policy twin still passes via the `\bsk-`
+default (grok). Final run, all 20 rows:
 
 | id | verdict | evidence | why it is red |
 |---|---|---|---|
 | M01-ws-gate-off | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.04s | whitespace keyword rule redacts any value again: `token bucket` -> `token [REDACTED]` |
-| M02-no-payload-bound | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | an 8 KB base64 blob is scored as a credential and replaced whole |
-| M03-whole-run-with-joiners | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.04s | `pmcp-7d9f8b6c5-x2k9q` scored whole reads as random and is redacted |
+| M02-no-payload-bound | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.05s | an 8 KB base64 blob is scored as a credential and replaced whole |
+| M03-whole-run-with-joiners | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.05s | `pmcp-7d9f8b6c5-x2k9q` scored whole reads as random and is redacted |
 | M04-hex-without-0x | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.04s | `<Foo object at 0x7f3a2b1c4d50>` loses its address: the `x` breaks uniform hex |
-| M05-bearer-word-boundary | RED | 4 diff lines; 1 nodes collected; 1 failed in 0.03s | `\bbearer` fires inside the hyphenated word `secret-bearer` (main's bug) and redacts the next word: `secret-bearer hunter2` -> `secret-bearer [REDACTED]` |
-| M06-bearer-gate-off | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.04s | `Missing bearer token` -> `Missing bearer [REDACTED]` |
+| M05-bearer-word-boundary | RED | 4 diff lines; 1 nodes collected; 1 failed in 0.04s | `\bbearer` fires inside the hyphenated word `secret-bearer` (main's bug) and redacts the next word: `secret-bearer hunter2` -> `secret-bearer [REDACTED]` |
+| M06-bearer-gate-off | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.05s | `Missing bearer token` -> `Missing bearer [REDACTED]` |
 | M07-code-qualifiers-off | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | `error_code=AADSTS50011` and `reason_code=E-1234` are treated as OAuth codes and redacted |
 | M08-sep-spans-newline | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | `Missing bearer token:\nthe bearer of` -> the next line's first word is redacted |
-| M09-split-guard-off | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.03s | base64 padding is taken as the separator: `dXNlcjpwYXNzd29yZA= [REDACTED]` |
-| M10-no-truncation-backup | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.03s | the byte cut leaves `ghp_16C7e`, which no rule recognises, in the output |
+| M09-split-guard-off | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | base64 padding is taken as the separator: `dXNlcjpwYXNzd29yZA= [REDACTED]` |
+| M10-no-truncation-backup | RED | 8 diff lines; 1 nodes collected; 1 failed in 0.04s | the byte cut leaves `ghp_16C7e`, which no rule recognises, in the output |
 | M11-cut-before-redact | RED | 1 diff lines; 1 nodes collected; 1 failed in 0.03s | the cut at 400 leaves nine characters of the token, which no longer has a redactable shape |
-| M12-main-default-token-pattern | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | main's default pattern redacts the word after `token` on the policy surface even though the engine no longer does |
-| M13-prefixed-rule-off | RED | 1 diff lines; 2 nodes collected; 2 failed in 0.04s | `sk-abcdef123456` has a prefix but too little entropy for the transition score |
-| M14-prefixed-accepts-alpha-body | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.07s | the engine eats `ghp_abcdefghijklmnop`, and the C-13 proof that a DEFAULT pattern applies goes vacuous |
+| M12-main-default-token-pattern | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.06s | main's default pattern redacts the word after `token` on the policy surface even though the engine no longer does |
+| M13-prefixed-rule-off | RED | 1 diff lines; 2 nodes collected; 2 failed in 0.05s | `sk-abcdef123456` has a prefix but too little entropy for the transition score (engine nodes only: the policy-surface twin still passes via the `\bsk-` default pattern) |
+| M14-prefixed-accepts-alpha-body | RED | 2 diff lines; 2 nodes collected; 2 failed in 0.05s | the engine eats `ghp_abcdefghijklmnop`, and the C-13 proof that a DEFAULT pattern applies goes vacuous |
 | M15-aws-vendor-shape-off | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.03s | `AKIAIOSFODNN7EXAMPLE` is uniform upper-case with one digit: the transition score cannot see it |
-| M16-spike-url-path-redaction | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | the inherited spike's `redact_auth_url` change: the Okta authorization-server id in an elicitation URL is redacted |
+| M16-spike-url-path-redaction | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.03s | the inherited spike's `redact_auth_url` change: the Okta authorization-server id in an elicitation URL is redacted |
 | M17-single-number-camel-clause-off | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | `Oauth2ClientError` (one embedded number, ratio 0.375) is scored opaque |
+| M18-payload-bound-after-path-split | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.06s | a slash-leading payload is split at every `/` and each piece scored: `/9j/...` JPEG base64 comes back as `[REDACTED]/[REDACTED]/...` |
+| M19-truncation-backup-measured-on-the-run | RED | 6 diff lines; 2 nodes collected; 2 failed in 0.05s | the first revision's 64-char bound on the whole run: `/bbb...(68)/ghp_16C7e` is 79 chars, not backed out of, and `ghp_16C7e` survives; the offset-0 guard shows a partial token as a prefix |
+| M20-quoted-value-stops-at-escaped-quote | RED | 2 diff lines; 1 nodes collected; 1 failed in 0.04s | `{"password": "a\"hunter2"}` -> `{"password": [REDACTED]hunter2"}` on both surfaces |
 
 ## Acceptance criteria
 
@@ -1386,6 +1572,20 @@ that it does). Final run, all 17 rows:
       offset 391 ends in `[REDACTED` — never `ghp_…`; `process_output(…,
       max_bytes=300)` never leaves `ghp_` in a result cut inside the token, and a
       400-byte single run still truncates at 200.
+- [ ] A slash-leading payload survives both surfaces byte-identically:
+      `"/" + "4eC39HqLyjWDarjtT1zdp7dc" + "/" + "A"*8190`, and
+      `"/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgH" + <6 000 chars of
+      seeded random base64 with > 50 slashes>`; a 360-char REST route still
+      loses its opaque segment (`test_a_slash_leading_payload_is_not_split_into_scored_pieces`).
+- [ ] `process_output("a"*120 + " /" + "b"*68 + "/" + TOKEN + " " + "c"*100, redact=True, max_bytes=300)`
+      contains no `ghp_`; the same with a 300-`b` path and `max_bytes=450`
+      contains no `ghp_` and keeps the path; `"b"*400` at `max_bytes=300` yields
+      only the truncation marker and `"b"*1000` at 600 keeps 500 `b`s
+      (`test_process_output_never_ends_on_a_partial_token_after_a_path`,
+      `test_process_output_still_truncates_a_single_giant_run`).
+- [ ] `{"password": "a\"hunter2"}` → `{"password": [REDACTED]}` and
+      `{'password': 'a\'hunter2'}` → `{'password': [REDACTED]}` on both
+      surfaces (`test_a_quoted_value_runs_to_its_closing_quote`).
 - [ ] Custom pattern `[A-Za-z0-9+/]{16,}={1,2}` on `basic dXNlcjpwYXNzd29yZA== auth`
       → `basic [REDACTED] auth`; `mykey: abcdef` → `mykey: [REDACTED]`.
 - [ ] Every row of the mutation table is RED for its named reason, with a
@@ -1409,7 +1609,7 @@ that it does). Final run, all 17 rows:
 
 ## Unverified
 
-- **Full suite: verified, with one caveat.** **4136 passed, 3 skipped, 25 deselected in 680.38s (11:20)**, run detached with `-m 'not live'` on the revised tree before the corpus samples were re-shaped to dodge GitHub's secret detectors (the re-shaped file was then re-run alone: 70 passed; mutation table re-run: 17/17 RED) and with `tests/test_auth.py` still carrying the spike's edit in memory (restored from HEAD afterwards and re-run alone: 128 passed).
+- **Full suite: verified, with one caveat.** rev 2: **4137 passed, 3 skipped, 25 deselected in 594.98s (9:54)**, run detached with `-m 'not live'` on the rev-2 tree (the exact `src/` hashes embedded above) after the 20-row mutation table; rev 1's run (4136 passed) predates the three fixes.
   The targeted files that exercise every changed symbol (`test_redaction.py`,
   `test_auth.py`, `test_policy.py`, `test_project_source_consent_policy.py`,
   `test_trust_boundaries_e2e.py`) were run and are green.
