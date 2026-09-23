@@ -6892,3 +6892,48 @@ async def test_disconnect_server_cancels_outbound_writer() -> None:
     ok, _cancelled, _msg = await mgr.disconnect_server("srv", force=True)
     assert ok
     assert writer.done(), "outbound writer leaked across disconnect_server"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_client_resets_outbound_queue_so_stale_frames_are_not_redelivered() -> (
+    None
+):
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    managed.process.stdin.drain = _block  # writer stalls -> frames stay buffered
+    managed.process.returncode = 0  # let _terminate_process_tree early-return
+    mgr._clients["srv"] = managed
+    mgr._servers["srv"] = managed.status
+    # Buffer several fire-and-forget frames from the dying connection.
+    for i in range(3):
+        mgr._reply_to_downstream_request("srv", managed, 900 + i, "ping")
+    await eventually(
+        lambda: managed.outbound is not None and managed.outbound.qsize() >= 1,
+        timeout=2.0,
+        interval=0.005,
+        message="frames never buffered",
+    )
+    old_queue = managed.outbound
+    await mgr._cleanup_client("srv", managed)
+    # Postcondition: the outbound path is reset, so the stale queue is dropped.
+    assert managed.outbound is None, "stale outbound queue survived _cleanup_client"
+    assert managed.outbound_writer is None, "stale writer ref survived _cleanup_client"
+    # Simulate the next generation reusing this client object: a fresh write sink
+    # and a working drain. Only the new frame may reach it -- never the dead
+    # connection's buffered replies.
+    written: list[dict[str, Any]] = []
+    managed.process.stdin.write = MagicMock(
+        side_effect=lambda b: written.append(json.loads(b.decode()))
+    )
+    managed.process.stdin.drain = AsyncMock()
+    mgr._reply_to_downstream_request("srv", managed, 1, "ping")
+    await eventually(
+        lambda: any(f.get("id") == 1 for f in written),
+        timeout=2.0,
+        interval=0.005,
+        message="new-generation frame never written",
+    )
+    await asyncio.sleep(0.05)
+    stale = [f for f in written if f.get("id") in (900, 901, 902)]
+    assert stale == [], f"stale frames redelivered to the new generation: {stale}"
+    assert old_queue is not managed.outbound

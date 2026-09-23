@@ -3537,6 +3537,21 @@ class ClientManager:
                     await asyncio.shield(task)
                 except (asyncio.CancelledError, Exception):
                     pass
+        # Reset the outbound path so nothing survives onto a next generation.
+        # The writer was cancelled above, but the Queue -- and any reply /
+        # notifications/cancelled frames the dead connection left buffered,
+        # keyed to request ids that no longer exist -- would otherwise stay on
+        # this object. Dropping it means `_enqueue_outbound` lazily rebuilds a
+        # fresh queue + writer, so a reused client can never drain a dead
+        # connection's frames into a new downstream process, and stale frames
+        # never occupy the bounded cap against the new connection's traffic.
+        # (Reconnect today allocates a fresh ManagedClient, so this hardens
+        # `_cleanup_client`'s postcondition rather than fixing an active bug --
+        # but the guarantee should not depend on that distant invariant, on a
+        # boundary where the peer is untrusted.) No `await` between the cancel
+        # above and this reset, so it cannot race a concurrent recreate.
+        managed.outbound = None
+        managed.outbound_writer = None
         if managed.is_remote:
             # Previously a no-op for remote clients: this function closed no
             # transport at all here, so a reconnect (the only caller that hits
