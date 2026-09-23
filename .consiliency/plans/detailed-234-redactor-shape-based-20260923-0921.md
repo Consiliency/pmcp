@@ -1,5 +1,26 @@
 # Detailed plan: shape-based secret redaction — separator-anchored keywords, opaque-run scoring, and a prose corpus (Consiliency/pmcp#234)
 
+> **Revision 5 (2026-09-23) — key coverage as a property.** The lead's own
+> property test on rev 4 (different generator, 0 leaks in 4 094 cuts) found
+> the one remaining gap: keys the redactor *names* as sensitive but did not
+> redact in every form. `passwd`/`pwd` were named only by the policy default
+> pattern, which a JSON closing quote defeats; a quoted `Authorization` value
+> stopped at the first space or punctuation; `private_key`, `credentials`
+> and bare `auth` were covered by nothing. Rev 5 widens
+> `AUTH_DIAGNOSTIC_SECRET_KEYS` (`passwd`, `pwd`, `private_key`,
+> `secret_access_key`, `aws_secret`, `aws_access`, `credential(s)`, `auth`),
+> introduces the public `WEAK_SECRET_KEYS` (`auth`, `code`, `credential(s)`:
+> a plain word or number after them is kept — `credentials: include`,
+> `auth=basic`), redacts a quoted `Authorization` value whole between its
+> quotes, lets a bare value start with punctuation, and makes an existing
+> `[REDACTED]` inert to every span. The test is a **property derived from
+> the source**: the union of `AUTH_DIAGNOSTIC_SECRET_KEYS` and every key
+> named in `DEFAULT_REDACTION_PATTERNS`, each in JSON, single-quoted, `key=`
+> and header form, with values that start with punctuation and contain
+> spaces — 31 keys, 6 158 strings, **0 leaks** on both surfaces (per-key
+> table below). M27 drops `passwd` from the strong set and the property goes
+> red. Every rev 1-4 test is kept (82 tests).
+>
 > **Revision 4 (2026-09-23) — architecture, not cases.** Round 3 found two
 > more leaks on rev 3 (the URL pass removed the backslash that escaped a
 > quote; the truncation cut after a backslash), the next instances of the two
@@ -18,7 +39,7 @@
 > and M26 (truncate then redact) are red under the property tests. All rev
 > 1-3 regression cases are kept. `uv run mypy src/` clean.
 >
-> **How to apply.** **Patch:** lines 585-1276 of this file (the content between the ```diff fences; `sed -n '585,1276p' <plan> > 234.patch && git apply --check 234.patch` on `main`). **Test file:** lines 1285-2143 (between the ```python fences; `sed -n '1285,2143p' <plan> > tests/test_redaction.py`).
+> **How to apply.** **Patch:** lines 685-1434 of this file (the content between the ```diff fences; `sed -n '685,1434p' <plan> > 234.patch && git apply --check 234.patch` on `main`). **Test file:** lines 1443-2409 (between the ```python fences; `sed -n '1443,2409p' <plan> > tests/test_redaction.py`).
 >
 > **Revision 3 (2026-09-23).** Rev 2 boarded again (codex, static tracing; the
 > lead reproduced both on the rev-2 patch; grok DEGRADED, below quorum) with
@@ -196,6 +217,19 @@ it, and bare `code=` with a non-word value is the OAuth callback parameter and i
 redacted. Measured: `tests/test_auth.py` restored from HEAD → **128 passed** against
 the revised engine. Neither old assertion was wrong; the spike's gate was.
 
+### Rev 5 lead findings — before/after, measured
+
+Reproduced on the rev-4 patch, re-measured after the change (both surfaces).
+
+| input | rev 4 | rev 5 |
+|---|---|---|
+| `{"passwd": "Xk9#mQ2vL"}`, `{"pwd": …}` | unredacted (named only by the policy default, which the JSON quote defeats) | `{"passwd": [REDACTED]}` |
+| `{"Authorization": "Xk9 mQ2vL"}` | `{"Authorization": "[REDACTED] mQ2vL"}` | `{"Authorization": "[REDACTED]"}` |
+| `{"Authorization": "(Xk9mQ2vL"}` | unredacted (value could not start on `(`) | `{"Authorization": "[REDACTED]"}` |
+| `{"private_key": …}`, `{"credentials": …}`, `{"auth": …}` | unredacted | `[REDACTED]` (the last two weak: `credentials: include`, `auth=basic` kept) |
+| `password=(Xk9mQ2vL)` | engine unredacted; policy `password= [REDACTED]` | `password=[REDACTED]` on both |
+| derived-key property | — | 31 keys × 4 forms, 6 158 strings, **0 leaks** |
+
 ### Rev 4 board findings — before/after, measured
 
 Both reproduced on the rev-3 patch in this worktree, then re-measured after
@@ -278,10 +312,11 @@ The rev-3 "pass-ordering audit" is gone because there is no order.
   `[REDACTED]` — the conservative direction; it never leaves a fragment.
 - For **identical** ranges `[REDACTED]` beats any other replacement
   (`token=https://…` → `token=[REDACTED]`, not a rewritten URL).
-- A span whose source text is already `[REDACTED]` is dropped, so every
-  surface is idempotent (`password=[REDACTED]` stays; the policy surface's
-  default `password=` pattern would otherwise turn it into
-  `password= [REDACTED]` on a second application).
+- An existing `[REDACTED]` in the text is **inert**: any span that touches
+  one is dropped, so every surface is idempotent (`password=[REDACTED]` stays;
+  the policy surface's default `password=` pattern would otherwise turn it
+  into `password= [REDACTED]`, and a bare value rule into `[REDACTED]]}`, on
+  a second application).
 - The URL span is the **whole** `https?://[^\s"'<>]+` match, trailing
   punctuation included (handed back in the replacement), so a keyed value
   that runs to the same punctuation sits inside it instead of straddling it.
@@ -303,7 +338,19 @@ The passes, as span producers (`collect_redaction_spans`):
    optionally suffixed `_id`/`_key`/`s`: `access_token=`, `X-Auth-Token:`,
    `accessToken=`, `"password": "…"`, `session_id=`, `Set-Cookie:` fire;
    `token_type=`, `token_endpoint=`, `secret_arn=`, `password_hash=`,
-   `tokenizer=` do not. Strong keys redact **any** value. A quoted value runs
+   `tokenizer=` do not. The key set (`AUTH_DIAGNOSTIC_SECRET_KEYS`) is the
+   union of everything either surface ever named: rev 5 adds `passwd`,
+   `pwd`, `private_key` (also `private-key`/`privateKey`),
+   `secret_access_key`, `aws_secret`, `aws_access`, `credential`,
+   `credentials`, `auth`. **Strong** keys redact **any** value. **Weak** keys
+   (`WEAK_SECRET_KEYS` = `auth`, `code`, `credential`, `credentials`) keep a
+   plain word or number — `credentials: include` is a fetch mode, `auth=basic`
+   a scheme, `{"code": -32601}` a JSON-RPC error — and redact everything else
+   (`auth=user:s3cret`, `credentials="…"`). `code` additionally needs to be
+   bare or OAuth-qualified (pass 5). A bare value ends at whitespace, a quote
+   or a list separator and at nothing else, and never *ends* on a closing
+   bracket: `password=(Xk9mQ2vL)` is one value, punctuation and all, while the
+   `}` of `{"password": [REDACTED]}` stays with the object. A quoted value runs
    to its **closing** quote, past escaped ones (`"(?:[^"\\\n]|\\.)*"` and
    the single-quote twin), never across a newline (a JSON string cannot hold
    one), and it needs that closing quote: every surface redacts before it
@@ -311,8 +358,12 @@ The passes, as span producers (`collect_redaction_spans`):
    "unterminated value runs to end of line" rule is **dropped** (one regex
    branch fewer; the case it served no longer arises).
 3. **`Authorization: …`** — `_authorization_spans`: the key may be
-   JSON-quoted (`"authorization": "Bearer x"`), the span is
-   `[Bearer ]<value>`, and the value stops at `"'()[]{}`.
+   JSON-quoted (`"authorization": "Bearer x"`). A **quoted** value is
+   redacted whole between its quotes (`"Authorization": "Xk9 mQ2vL"` →
+   `"Authorization": "[REDACTED]"`; rev 4 stopped at the space and left
+   `mQ2vL`, and could not start on `(`); a bare value is `[Bearer ]<value>`
+   to whitespace, a quote or a list separator, never ending on a closing
+   bracket.
 4. **`Bearer <value>`** — `_bearer_spans` (D3): the HTTP scheme, so the value
    is a token unless it is a plain word or number (`bearer token`, `bearer
    of`, `Bearer Token`) or a challenge parameter (`Bearer realm="…"`); not
@@ -437,6 +488,8 @@ the same server could send `hunter2` bare; that is not ours to guess at.
 | Low-entropy values under a non-OAuth `*_code=` (`error_code=super-secret`) | by design (pass 6) | the fail-closed direction: an opaque value is still caught by pass 10 |
 | **False positive:** prefixed opaque *identifiers* — `req_011CfKTgoiRuc27pR2Po`, `cus_J1x2Yz3AbCd4Ef`, an Okta `aus…` id inside a *diagnostic* | shape-identical to `sk_live_…`; a denylist of secret prefixes fails open | a correlation id lost from a diagnostic is a support inconvenience; a token leaked is a compromise. The elicitation URL itself is untouched (defect 1) |
 | **False positive:** MIME-wrapped base64 (76-column lines) and `data:` URIs under 256 chars | each line is a ≤ 256-char opaque run | one-run payloads (the common MCP `ImageContent` shape) survive; document as known |
+| A plain word or number after a **weak** key (`credentials: include`, `auth: none`, `auth=s3cret` if it happens to be all letters) | `WEAK_SECRET_KEYS` keep a word or number by design | those keys name a mode or a scheme far more often than a secret; an all-letter password under `auth=` is the price, and `password=`/`secret=` remain strong |
+| An **unterminated** quote in a bare form (`password="abc` with no closing quote) | a quoted value needs its closing quote and a bare value cannot start on one | malformed input; every surface redacts before it cuts, so it is never our truncation that produced it |
 | **False positive:** an 8+ char punctuated non-word after a bare keyword (`session re-issued-twice`) | the price of catching `--password correct-horse-battery-staple` | rare in diagnostics; the corpus holds `session re-use` (6 chars) as the boundary |
 
 ## Changes
@@ -518,7 +571,7 @@ measured against; implement it verbatim and then run the mutation table.
 
 Both corpora, the composition tests, and three property tests; bodies under
 `## Test bodies`. Node ids, all validated with `--collect-only` this session
-(81 tests, 8.4 s):
+(82 tests, 10.5 s):
 
 - `test_prose_survives_the_engine_byte_identical`,
   `test_prose_survives_the_policy_surface_byte_identical` — the prose corpus
@@ -568,7 +621,54 @@ Both corpora, the composition tests, and three property tests; bodies under
   0 leaks); `test_property_prose_survives_byte_identical` (2 000 generated
   lines of words, statuses, identifiers, digests, ids, timestamps, JSON-RPC
   errors, `Bearer Word`, `--flag word`; a keyword is followed only by a word
-  or a number, which is the documented boundary of D2).
+  or a number, which is the documented boundary of D2);
+  **`test_property_every_declared_key_is_redacted_in_every_form`** (rev 5:
+  `_declared_secret_keys()` = `AUTH_DIAGNOSTIC_SECRET_KEYS` ∪ every name in
+  the first alternation group of each `DEFAULT_REDACTION_PATTERNS` entry,
+  `[_-]?` expanded, plus `private-key`/`privateKey`; 60 seeded values per
+  key — half from every printable character, half from the bare-value
+  alphabet (printable minus `"',;`), a third starting with punctuation, a
+  third containing a space — in JSON, single-quoted, `key=value` and
+  `Key: value` form; for a weak key a plain word/number value is skipped by
+  design, for a strong key nothing is; 31 keys, 6 158 strings, 0 leaks on
+  both surfaces). Per-key results:
+
+| key | weak? | json | single-quoted | key=value | header | leaks (engine/policy) |
+|---|---|---|---|---|---|---|
+| `access_token` | strong | 60 | 60 | 34 | 34 | 0 |
+| `api-key` | strong | 60 | 60 | 42 | 42 | 0 |
+| `api_key` | strong | 60 | 60 | 40 | 40 | 0 |
+| `apikey` | strong | 60 | 60 | 37 | 37 | 0 |
+| `assertion` | strong | 60 | 60 | 38 | 38 | 0 |
+| `auth` | weak | 59 | 59 | 40 | 40 | 0 |
+| `aws_access` | strong | 60 | 60 | 42 | 42 | 0 |
+| `aws_secret` | strong | 60 | 60 | 44 | 44 | 0 |
+| `client_secret` | strong | 60 | 60 | 41 | 41 | 0 |
+| `code` | weak | 59 | 59 | 43 | 43 | 0 |
+| `cookie` | strong | 60 | 60 | 37 | 37 | 0 |
+| `credential` | weak | 59 | 59 | 39 | 39 | 0 |
+| `credentials` | weak | 60 | 60 | 42 | 42 | 0 |
+| `id_token` | strong | 60 | 60 | 42 | 42 | 0 |
+| `jwt` | strong | 60 | 60 | 41 | 41 | 0 |
+| `passwd` | strong | 60 | 60 | 35 | 35 | 0 |
+| `password` | strong | 60 | 60 | 39 | 39 | 0 |
+| `private-key` | strong | 60 | 60 | 37 | 37 | 0 |
+| `privateKey` | strong | 60 | 60 | 40 | 40 | 0 |
+| `private_key` | strong | 60 | 60 | 38 | 38 | 0 |
+| `pwd` | strong | 60 | 60 | 44 | 44 | 0 |
+| `refresh_token` | strong | 60 | 60 | 39 | 39 | 0 |
+| `saml` | strong | 60 | 60 | 44 | 44 | 0 |
+| `secret` | strong | 60 | 60 | 39 | 39 | 0 |
+| `secret_access_key` | strong | 60 | 60 | 40 | 40 | 0 |
+| `session` | strong | 60 | 60 | 40 | 40 | 0 |
+| `set-cookie` | strong | 60 | 60 | 39 | 39 | 0 |
+| `sid` | strong | 60 | 60 | 35 | 35 | 0 |
+| `tenant-id` | strong | 60 | 60 | 36 | 36 | 0 |
+| `tenant_id` | strong | 60 | 60 | 33 | 33 | 0 |
+| `token` | strong | 60 | 60 | 42 | 42 | 0 |
+
+keys: 31; strings checked: 6158; total leaks: 0
+
 
 ### `tests/test_auth.py`
 
@@ -578,12 +678,12 @@ Both corpora, the composition tests, and three property tests; bodies under
 
 `git diff` of the revised tree against `main` @ `860636a`, `src/` only. This
 is the exact text the mutation table and every probe in this plan ran against
-(`sha256` of the revised files: `auth.py ab207171…193b`, `policy.py
+(`sha256` of the revised files: `auth.py 22f2492f…11ca`, `policy.py
 667bbd92…2996`).
 
 ```diff
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index f40ccbb..10c472a 100644
+index f40ccbb..24658c5 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
 @@ -4,6 +4,7 @@ from __future__ import annotations
@@ -594,7 +694,48 @@ index f40ccbb..10c472a 100644
  import time
  import asyncio
  from collections.abc import Mapping
-@@ -93,9 +94,453 @@ _JWT_RE = re.compile(
+@@ -70,15 +71,24 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
+     "api_key",
+     "apikey",
+     "assertion",
++    "auth",
++    "aws_access",
++    "aws_secret",
+     "client_secret",
+     "code",
+     "cookie",
++    "credential",
++    "credentials",
+     "id_token",
+     "jwt",
++    "passwd",
+     "password",
++    "private_key",
++    "pwd",
+     "refresh_token",
+     "saml",
+     "secret",
++    "secret_access_key",
+     "session",
+     "set-cookie",
+     "sid",
+@@ -87,15 +97,486 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
+     "token",
+ }
+ 
++#: Keys that name a credential only sometimes. A plain word or number after
++#: them is kept: `credentials: include` (a fetch mode), `auth=basic`,
++#: `auth: none`, `{"code": -32601}` (every JSON-RPC error), `{"code":
++#: "not_found"}`. Anything else -- a token, `user:pass`, a path -- is
++#: redacted. Every other key in `AUTH_DIAGNOSTIC_SECRET_KEYS` is strong: its
++#: value is redacted whatever it looks like. `tests/test_redaction.py`
++#: derives its key-coverage property from both sets, so a key named here but
++#: not redacted in every form fails that test.
++WEAK_SECRET_KEYS = frozenset({"auth", "code", "credential", "credentials"})
++
+ _JWT_RE = re.compile(
+     r"(?<![A-Za-z0-9_-])"
+     r"[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"
      r"(?![A-Za-z0-9_-])"
  )
  
@@ -846,9 +987,15 @@ index f40ccbb..10c472a 100644
 +
 +def _secret_key_alternation() -> str:
 +    return "|".join(
-+        [*sorted(re.escape(key) for key in AUTH_DIAGNOSTIC_SECRET_KEYS), r"api[_-]?key"]
++        [
++            *sorted(re.escape(key) for key in AUTH_DIAGNOSTIC_SECRET_KEYS),
++            r"api[_-]?key",
++            r"private[_-]?key",
++        ]
 +    )
-+
+ 
+-def redact_auth_url(url: str) -> str:
+-    """Strip URL userinfo and redact auth-bearing query values."""
 +
 +#: `<identifier><sep><value>` where the identifier's LAST segment is a secret
 +#: key. Last, not any: `token_type=Bearer`, `token_endpoint=` and `secret_arn=`
@@ -863,19 +1010,20 @@ index f40ccbb..10c472a 100644
 +#: cuts (`sanitize_auth_diagnostic`, and `PolicyManager.process_output` over a
 +#: bounded window), so an unterminated value is the server's own text, not
 +#: ours to guess at. Bare whitespace is NOT a separator here (see
-+#: `_KEYWORD_WS_RE`).
++#: `_KEYWORD_WS_RE`). A bare value ends at whitespace, a quote or a list
++#: separator (`,`/`;`) and at nothing else, except that it never ENDS on a
++#: closing bracket: `password=(Xk9mQ2vL)` is one value, punctuation and all,
++#: while the `}` of `{"password": [REDACTED]}` stays with the object.
 +_KEYWORD_SEP_RE = re.compile(
 +    r"(?P<key>(?P<qualifier>(?<![A-Za-z0-9:.])(?:[A-Za-z0-9]+[_-])*"
 +    r"(?:(?-i:[a-z]+(?=[A-Z])))?)"
 +    rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?)"
 +    r"(?P<sep>[\"']?[ \t]*[:=][ \t]*)"
 +    r"(?P<value>\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'"
-+    r"|[^\s\"',;()\[\]{}]+)",
++    r"|[^\s\"',;]*[^\s\"',;)\]}])",
 +    re.IGNORECASE,
 +)
- 
--def redact_auth_url(url: str) -> str:
--    """Strip URL userinfo and redact auth-bearing query values."""
++
 +#: A bare keyword (or `--keyword` flag) followed by whitespace and a value that
 +#: could be a credential (`_value_could_be_a_credential`). This is what keeps
 +#: `--token abc123def456` redacted without redacting the second word of
@@ -906,10 +1054,14 @@ index f40ccbb..10c472a 100644
 +
 +
 +#: `Authorization: Bearer x`, `Authorization=x`, and JSON `"authorization":
-+#: "Bearer x"` (the key may be quoted); the value stops at a quote or bracket
-+#: for the same reason as `_BEARER_RE`.
++#: "Bearer x"` (the key may be quoted). A quoted value is redacted WHOLE
++#: between its quotes -- a header value can hold spaces (`Basic dXNl cg==`
++#: is malformed but leaks the same) and punctuation -- and a bare value runs
++#: to whitespace, a quote or a list separator.
 +_AUTHORIZATION_RE = re.compile(
-+    r"authorization[\"']?\s*[:=]\s*[\"']?(?P<value>(?:bearer\s+)?[^\s,;\"'()\[\]{}]+)",
++    r"authorization[\"']?\s*[:=]\s*"
++    r"(?:(?P<quoted>\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*')"
++    r"|(?P<bare>(?:bearer\s+)?[^\s,;\"']*[^\s,;\"')\]}]))",
 +    re.IGNORECASE,
 +)
 +
@@ -920,11 +1072,12 @@ index f40ccbb..10c472a 100644
 +def _keyword_sep_spans(text: str) -> list[Span]:
 +    spans: list[Span] = []
 +    for match in _KEYWORD_SEP_RE.finditer(text):
-+        if match.group("name").lower() == "code":
++        name = match.group("name").lower()
++        if name in WEAK_SECRET_KEYS and _is_plain_word_or_number(match.group("value")):
++            continue
++        if name == "code":
 +            qualifier = match.group("qualifier").rstrip("_-").lower()
-+            if qualifier not in _CODE_QUALIFIERS or _is_plain_word_or_number(
-+                match.group("value")
-+            ):
++            if qualifier not in _CODE_QUALIFIERS:
 +                continue
 +        spans.append((match.start("value"), match.end("value"), REDACTED))
 +    return spans
@@ -948,10 +1101,13 @@ index f40ccbb..10c472a 100644
 +
 +
 +def _authorization_spans(text: str) -> list[Span]:
-+    return [
-+        (match.start("value"), match.end("value"), REDACTED)
-+        for match in _AUTHORIZATION_RE.finditer(text)
-+    ]
++    spans: list[Span] = []
++    for match in _AUTHORIZATION_RE.finditer(text):
++        if match.group("quoted") is not None:
++            spans.append((match.start("quoted") + 1, match.end("quoted") - 1, REDACTED))
++        else:
++            spans.append((match.start("bare"), match.end("bare"), REDACTED))
++    return spans
 +
 +
 +def _redact_diagnostic_url(url: str) -> str:
@@ -1009,14 +1165,16 @@ index f40ccbb..10c472a 100644
 +    overlap are merged and their union becomes `[REDACTED]`; for identical
 +    ranges `[REDACTED]` beats any other replacement.
 +    """
++    # An existing marker is inert: no span may touch one (`password=[REDACTED]`
++    # would otherwise become `password= [REDACTED]` on the policy surface's
++    # second application), so every surface is idempotent.
++    markers = [(m.start(), m.end()) for m in re.finditer(re.escape(REDACTED), text)]
 +    ordered = sorted(
-+        # An existing marker is never re-redacted (`password=[REDACTED]` would
-+        # otherwise become `password= [REDACTED]` on the policy surface's
-+        # second application), so every surface is idempotent.
 +        (
 +            span
 +            for span in spans
-+            if span[0] < span[1] and text[span[0] : span[1]].strip() != REDACTED
++            if span[0] < span[1]
++            and not any(start < span[1] and span[0] < end for start, end in markers)
 +        ),
 +        key=lambda span: (span[0], -span[1], span[2] != REDACTED),
 +    )
@@ -1050,7 +1208,7 @@ index f40ccbb..10c472a 100644
      try:
          parsed = urlparse(url)
          port = parsed.port
-@@ -113,7 +558,8 @@ def redact_auth_url(url: str) -> str:
+@@ -113,7 +594,8 @@ def redact_auth_url(url: str) -> str:
          else:
              query_parts.append((key, value))
      query = "&".join(f"{quote(k)}={quote(v)}" for k, v in query_parts)
@@ -1060,7 +1218,7 @@ index f40ccbb..10c472a 100644
  
  
  def _is_loopback_host(hostname: str) -> bool:
-@@ -576,35 +1022,10 @@ def sanitize_url_elicitation_url(
+@@ -576,35 +1058,10 @@ def sanitize_url_elicitation_url(
  def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
      """Return a display-safe diagnostic string for auth failures."""
      text = str(value)
@@ -1278,7 +1436,7 @@ index cac2702..3657808 100644
 
 ## Test bodies
 
-`tests/test_redaction.py`, verbatim (sha256 `f0d030c9…fb43`; 81 tests; ruff
+`tests/test_redaction.py`, verbatim (sha256 `e8a4176a…98a7`; 82 tests; ruff
 clean):
 
 ```python
@@ -1308,8 +1466,13 @@ import uuid
 
 import pytest
 
-from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
-from pmcp.policy.policy import PolicyManager
+from pmcp.auth import (
+    AUTH_DIAGNOSTIC_SECRET_KEYS,
+    WEAK_SECRET_KEYS,
+    redact_auth_url,
+    sanitize_auth_diagnostic,
+)
+from pmcp.policy.policy import DEFAULT_REDACTION_PATTERNS, PolicyManager
 
 # --------------------------------------------------------------------------- #
 # The prose corpus. Every line is text a downstream server, pip, git, httpx or
@@ -2141,6 +2304,109 @@ def test_property_prose_survives_byte_identical() -> None:
         text = _random_prose(rng)
         assert _engine(text) == text, text
         assert _policy(text) == text, text
+
+
+def _declared_secret_keys() -> set[str]:
+    """Every key the redactor DECLARES sensitive, from both surfaces' sources.
+
+    `AUTH_DIAGNOSTIC_SECRET_KEYS`, plus every name in the first alternation
+    group of each `DEFAULT_REDACTION_PATTERNS` entry (`(secret|password|
+    passwd|pwd)`, `(api[_-]?key|apikey)` expanded to `api_key`, `api-key`,
+    `apikey`, ...). A key named anywhere as sensitive but not redacted in every
+    form below fails `test_property_every_declared_key_is_redacted_in_every_form`
+    on its own -- no case has to be hand-picked (board finding on rev 4:
+    `passwd`, `pwd`, `private_key`, `credentials`, `auth` were named or
+    expected and covered by nothing).
+    """
+    keys = set(AUTH_DIAGNOSTIC_SECRET_KEYS)
+    for pattern in DEFAULT_REDACTION_PATTERNS:
+        group = re.search(r"\(([a-z_|\[\]?-]+)\)", pattern)
+        if group is None:
+            continue  # a bare token shape (`sk-`, `ghp_`), not a key
+        for name in group.group(1).split("|"):
+            if "[_-]?" in name:
+                keys.update(name.replace("[_-]?", sep) for sep in ("_", "-", ""))
+            else:
+                keys.add(name)
+    keys.add("private-key")
+    keys.add("privateKey")
+    return keys
+
+
+#: Bare (unquoted) syntaxes cannot carry a quote or a list separator in a
+#: value; everything else, including leading punctuation and spaces, is fair.
+_BARE_VALUE_ALPHABET = "".join(c for c in _PRINTABLE if c not in "\"',;")
+
+
+def _key_forms(key: str, value: str) -> list[tuple[str, str, str]]:
+    """(text, encoded value, probe) for one key: JSON, single-quoted, `key=`,
+    header. The bare forms carry the value's first token with quotes and list
+    separators removed, which is all an unquoted syntax can carry; the probe
+    is the first four encoded characters."""
+    bare_tokens = "".join(c for c in value if c not in "\"',;").split()
+    bare = bare_tokens[0] if bare_tokens else ""
+    forms = [
+        (json.dumps({key: value}), json.dumps(value), json.dumps(value)[1:5]),
+        (
+            "{'" + key + "': " + _single_quoted(value) + "}",
+            _single_quoted(value),
+            _single_quoted(value)[1:5],
+        ),
+    ]
+    if bare:
+        forms.append((f"{key}={bare}", bare, bare[:4]))
+        forms.append((f"{key}: {bare}", bare, bare[:4]))
+    return forms
+
+
+def test_property_every_declared_key_is_redacted_in_every_form() -> None:
+    """Every declared key × every form × random values, both surfaces.
+
+    Values are drawn from every printable character (quoted forms) or every
+    printable character but quotes and list separators (bare forms); a third
+    of them start with punctuation and a third contain a space. For a WEAK
+    key (`WEAK_SECRET_KEYS`) a plain word or number is kept by design, so
+    those values are skipped for those keys; for a strong key nothing is
+    skipped. The per-key result table in the plan comes from this loop.
+    """
+    rng = random.Random(5234)
+    checked = 0
+    leaks: list[str] = []
+    for key in sorted(_declared_secret_keys()):
+        for _ in range(60):
+            alphabet = _PRINTABLE if rng.random() < 0.5 else _BARE_VALUE_ALPHABET
+            value = "".join(rng.choice(alphabet) for _ in range(rng.randint(4, 20)))
+            roll = rng.random()
+            if roll < 0.33:
+                value = rng.choice("!#$%&()*+-./:<=>?@[\\]^_`{|}~") + value
+            elif roll < 0.66:
+                value = value[:2] + " " + value[2:]
+            for text, encoded, probe in _key_forms(key, value):
+                if not _probe_is_usable(text, encoded, probe):
+                    continue
+                if (
+                    key.lower() in WEAK_SECRET_KEYS
+                    and _is_plain_word_or_number_for_test(encoded)
+                ):
+                    continue
+                if not encoded.strip("\"'").strip():
+                    continue
+                checked += 1
+                for surface, out in (
+                    ("engine", _engine(text)),
+                    ("policy", _policy(text)),
+                ):
+                    if probe in out:
+                        leaks.append(f"{surface} key={key!r} text={text!r} out={out!r}")
+    assert checked > 5000, checked
+    assert leaks == [], "\n".join(leaks[:20])
+
+
+def _is_plain_word_or_number_for_test(encoded: str) -> bool:
+    """The weak-key exemption, restated: a word (letters/underscores) or a
+    number, quotes and trailing sentence punctuation stripped."""
+    value = encoded.strip("\"'").rstrip(".:!?")
+    return bool(re.fullmatch(r"[A-Za-z_]+|[+-]?[0-9]+|0[xX][0-9a-fA-F]+", value))
 ```
 
 ## Documentation impact
@@ -2187,6 +2453,8 @@ def test_property_prose_survives_byte_identical() -> None:
   either beyond the `### Security` entry, which should say that redaction
   now runs before truncation and that passes no longer see each other's
   output.
+- SECURITY.md's key list (line 120-122) should name the widened set, or
+  refer to `AUTH_DIAGNOSTIC_SECRET_KEYS` / `WEAK_SECRET_KEYS` — implementer.
 - No README change: operators see the same `[REDACTED]` marker; the
   `redaction.patterns` policy key is unchanged in shape (operators who set their
   own patterns still displace the defaults, including the fixed `token` one).
@@ -2208,11 +2476,11 @@ def test_property_prose_survives_byte_identical() -> None:
 
 ```bash
 cd <worktree>
-uv run pytest tests/test_redaction.py -q --cov-fail-under=0                      # 81 passed
+uv run pytest tests/test_redaction.py -q --cov-fail-under=0                      # 82 passed
 uv run pytest tests/test_auth.py -q --cov-fail-under=0                           # 128 passed, file byte-identical to main
 uv run pytest tests/test_policy.py tests/test_project_source_consent_policy.py \
               tests/test_trust_boundaries_e2e.py -q --cov-fail-under=0           # C-13 proofs + truncation pins
-uv run pytest --collect-only -q tests/test_redaction.py | grep -c '::'            # 81 (a -k that matches nothing exits 0)
+uv run pytest --collect-only -q tests/test_redaction.py | grep -c '::'            # 82 (a -k that matches nothing exits 0)
 uv run ruff check src/ tests/                                                     # CI gate
 uv run ruff format --check src/ tests/                                            # CI gate
 uv run mypy src/                                                                  # CI gate -- measured: Success: no issues found in 49 source files
@@ -2223,7 +2491,7 @@ nohup uv run pytest tests/ -q > /tmp/pmcp-234-full.log 2>&1 & disown
 tail -n 3 /tmp/pmcp-234-full.log
 ```
 
-Measured this session on the revised tree: `test_redaction.py` **81 passed** (8.4 s; the three properties take 2.5 s, 4.1 s and 0.8 s);
+Measured this session on the revised tree: `test_redaction.py` **82 passed** (10.5 s; the four properties take 2.5 s, 4.1 s, 0.8 s and 1.6 s);
 `test_auth.py` (HEAD copy) **128 passed**; the earlier spike-era targeted run of
 `test_redaction.py tests/test_auth.py tests/test_policy.py
 tests/test_project_source_consent_policy.py tests/test_trust_boundaries_e2e.py`
@@ -2272,34 +2540,38 @@ red on the round-3 case and on the static property test) and **M26**
 two named cases), re-targets M19 to the window slack (`16384 → 0`: a 4 000-char
 value straddling the cap leaks), M11/M13/M16/M22/M24 to their rev-4 anchors,
 and retires M10 and M23 (the back-up and the end-of-line rule they mutated no
-longer exist; M26 and M25 cover their classes). Final run, all 24 rows:
+longer exist; M26 and M25 cover their classes). Rev 5 adds **M27** (`passwd`
+dropped from the strong set while the policy default still names it: the
+derived-key property goes red on its own) and re-targets M07 and M24 to their
+rev-5 anchors. Final run, all 25 rows:
 
 | id | verdict | evidence | why it is red |
 |---|---|---|---|
-| M01-ws-gate-off | RED | 2 diff lines; 2/2 nodes collected; 2 failed in 0.05s | whitespace keyword rule redacts any value again: `token bucket` -> `token [REDACTED]` |
-| M02-no-payload-bound | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.05s | an 8 KB base64 blob is scored as a credential and replaced whole |
-| M03-whole-run-with-joiners | RED | 2 diff lines; 2/2 nodes collected; 2 failed in 0.06s | `pmcp-7d9f8b6c5-x2k9q` scored whole reads as random and is redacted |
+| M01-ws-gate-off | RED | 2 diff lines; 2/2 nodes collected; 2 failed in 0.04s | whitespace keyword rule redacts any value again: `token bucket` -> `token [REDACTED]` |
+| M02-no-payload-bound | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.04s | an 8 KB base64 blob is scored as a credential and replaced whole |
+| M03-whole-run-with-joiners | RED | 2 diff lines; 2/2 nodes collected; 2 failed in 0.07s | `pmcp-7d9f8b6c5-x2k9q` scored whole reads as random and is redacted |
 | M04-hex-without-0x | RED | 2 diff lines; 2/2 nodes collected; 2 failed in 0.05s | `<Foo object at 0x7f3a2b1c4d50>` loses its address: the `x` breaks uniform hex |
-| M05-bearer-word-boundary | RED | 4 diff lines; 1/1 nodes collected; 1 failed in 0.04s | `\bbearer` fires inside the hyphenated word `secret-bearer` (main's bug) and redacts the next word: `secret-bearer hunter2` -> `secret-bearer [REDACTED]` |
-| M06-bearer-gate-off | RED | 2 diff lines; 2/2 nodes collected; 2 failed in 0.05s | `Missing bearer token` -> `Missing bearer [REDACTED]` |
-| M07-code-qualifiers-off | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.04s | `error_code=AADSTS50011` and `reason_code=E-1234` are treated as OAuth codes and redacted |
-| M08-sep-spans-newline | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.05s | `Missing bearer token:\nthe bearer of` -> the next line's first word is redacted |
+| M05-bearer-word-boundary | RED | 4 diff lines; 1/1 nodes collected; 1 failed in 0.03s | `\bbearer` fires inside the hyphenated word `secret-bearer` (main's bug) and redacts the next word: `secret-bearer hunter2` -> `secret-bearer [REDACTED]` |
+| M06-bearer-gate-off | RED | 2 diff lines; 2/2 nodes collected; 2 failed in 0.04s | `Missing bearer token` -> `Missing bearer [REDACTED]` |
+| M07-code-qualifiers-off | RED | 3 diff lines; 1/1 nodes collected; 1 failed in 0.04s | `error_code=AADSTS50011` and `reason_code=E-1234` are treated as OAuth codes and redacted |
+| M08-sep-spans-newline | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.04s | `Missing bearer token:\nthe bearer of` -> the next line's first word is redacted |
 | M09-split-guard-off | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.04s | base64 padding is taken as the separator: `dXNlcjpwYXNzd29yZA= [REDACTED]` |
-| M11-cut-before-redact | RED | 1 diff lines; 1/1 nodes collected; 1 failed in 0.03s | the cut at 400 leaves nine characters of the token, which no longer has a redactable shape |
+| M11-cut-before-redact | RED | 1 diff lines; 1/1 nodes collected; 1 failed in 0.04s | the cut at 400 leaves nine characters of the token, which no longer has a redactable shape |
 | M12-main-default-token-pattern | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.04s | main's default pattern redacts the word after `token` on the policy surface even though the engine no longer does |
 | M13-prefixed-rule-off | RED | 2 diff lines; 2/2 nodes collected; 2 failed in 0.05s | `sk-abcdef123456` has a prefix but too little entropy for the transition score (engine nodes only: the policy-surface twin still passes via the `\bsk-` default pattern) |
 | M14-prefixed-accepts-alpha-body | RED | 2 diff lines; 2/2 nodes collected; 2 failed in 0.06s | the engine eats `ghp_abcdefghijklmnop`, and the C-13 proof that a DEFAULT pattern applies goes vacuous |
 | M15-aws-vendor-shape-off | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.03s | `AKIAIOSFODNN7EXAMPLE` is uniform upper-case with one digit: the transition score cannot see it |
-| M16-spike-url-path-redaction | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.05s | the inherited spike's `redact_auth_url` change: the Okta authorization-server id in an elicitation URL is redacted |
+| M16-spike-url-path-redaction | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.04s | the inherited spike's `redact_auth_url` change: the Okta authorization-server id in an elicitation URL is redacted |
 | M17-single-number-camel-clause-off | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.04s | `Oauth2ClientError` (one embedded number, ratio 0.375) is scored opaque |
 | M18-payload-bound-after-path-split | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.05s | a slash-leading payload is split at every `/` and each piece scored: `/9j/...` JPEG base64 comes back as `[REDACTED]/[REDACTED]/...` |
 | M19-redaction-window-without-slack | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.08s | a 4 000-char keyed value straddling the cap ends outside a slack-less window, is not matched, and its first characters survive the cut |
-| M20-quoted-value-stops-at-escaped-quote | RED | 2 diff lines; 2/2 nodes collected; 1 failed, 1 passed in 2.61s | JSON {"password": "a\"hunter2"} -> {"password": [REDACTED]hunter2"} on both surfaces; the property test finds it in the first few hundred passwords |
+| M20-quoted-value-stops-at-escaped-quote | RED | 2 diff lines; 2/2 nodes collected; 1 failed, 1 passed in 2.81s | JSON {"password": "a\"hunter2"} -> {"password": [REDACTED]hunter2"} on both surfaces; the property test finds it in the first few hundred passwords |
 | M21-bearer-value-eats-quotes | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.04s | rev 2 Bearer value class eats the closing quote and brace: {"note": "see Bearer abc123def456"} -> {"note": "see Bearer [REDACTED] |
 | M22-keyed-values-pass-removed | RED | 1 diff lines; 3/3 nodes collected; 3 failed in 0.06s | no keyed-value pass at all: {"password": "hunter2"} survives |
-| M24-authorization-rule-misses-quoted-key-and-eats-quotes | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.04s | rev 2 Authorization rule: {"authorization": "Bearer abc123def456", "x": 1} is not matched at all (the quote after the key) and Authorization: "Bearer abc.def" is |
-| M25-mutate-in-place-composition | RED | 1 diff lines; 2/2 nodes collected; 1 failed, 1 passed in 2.65s | revs 1-3 composition for one pass: the URL pass rewrites the text before the others read it, removes the backslash escaping a quote, and {"password": "https://...\"hunter2"} -> {"password": [REDACTED]hunter2"}; the property test finds the class on its own |
-| M26-truncate-then-redact | RED | 6 diff lines; 3/3 nodes collected; 3 failed in 0.05s | main order (cut, then redact): the cut leaves ghp_16C7e, "hunter2 , "hunter2\ -- shapes no rule recognises; the sweep reports leaks |
+| M24-authorization-rule-misses-quoted-key-and-eats-quotes | RED | 2 diff lines; 1/1 nodes collected; 1 failed in 0.05s | rev 2 Authorization key syntax: the quote after a JSON key defeats authorization\s*[:=], so {"authorization": "Bearer abc123def456", "x": 1} is not matched at all |
+| M25-mutate-in-place-composition | RED | 1 diff lines; 2/2 nodes collected; 1 failed, 1 passed in 2.78s | revs 1-3 composition for one pass: the URL pass rewrites the text before the others read it, removes the backslash escaping a quote, and {"password": "https://...\"hunter2"} -> {"password": [REDACTED]hunter2"}; the property test finds the class on its own |
+| M26-truncate-then-redact | RED | 6 diff lines; 3/3 nodes collected; 3 failed in 0.06s | main order (cut, then redact): the cut leaves ghp_16C7e, "hunter2 , "hunter2\ -- shapes no rule recognises; the sweep reports leaks |
+| M27-passwd-dropped-from-the-strong-set | RED | 1 diff lines; 1/1 nodes collected; 1 failed in 1.64s | `passwd` is still named by the policy default `(secret|password|passwd|pwd)` but no longer by the engine: `{"passwd": "…"}` leaks and the derived-key property reports it |
 
 ## Acceptance criteria
 
@@ -2352,6 +2624,13 @@ longer exist; M26 and M25 cover their classes). Final run, all 24 rows:
       at `max_bytes=300` contains no `hunter2`; a 4 000-char value straddling
       the cap is `[REDACTED]` (`test_truncation_after_a_backslash_cannot_expose_a_password`,
       `test_the_redaction_window_reaches_past_the_cap`); M26 and M19 red.
+- [ ] **Key coverage.** `test_property_every_declared_key_is_redacted_in_every_form`
+      derives its keys from the source (31 keys) and checks > 5 000 strings
+      with 0 leaks; `{"passwd": "Xk9#mQ2vL"}`, `{"pwd": …}`, `{"private_key":
+      …}`, `{"credentials": …}`, `{"auth": …}` → value `[REDACTED]`;
+      `{"Authorization": "Xk9 mQ2vL"}` → `{"Authorization": "[REDACTED]"}`;
+      `{"Authorization": "(Xk9mQ2vL"}` and `password=(Xk9mQ2vL)` redacted;
+      `credentials: include` and `auth=basic` kept; M27 red.
 - [ ] **Properties.** `test_property_every_keyed_password_is_redacted_whole`
       checks > 10 000 strings with 0 leaks;
       `test_property_truncation_never_exposes_a_keyed_password` sweeps
@@ -2395,7 +2674,7 @@ longer exist; M26 and M25 cover their classes). Final run, all 24 rows:
 
 ## Unverified
 
-- **Full suite: verified, with one caveat.** rev 4: **4145 passed, 3 skipped, 25 deselected in 577.17s (9:37)**, run detached with `-m 'not live'` on the rev-4 tree (the exact `src/` hashes embedded above) after the 24-row mutation table; `uv run mypy src/` on the same tree: Success, 49 source files; earlier revs' runs (4136/4137/4139) predate their fixes.
+- **Full suite: verified, with one caveat.** rev 5: **4146 passed, 3 skipped, 25 deselected in 585.07s (9:45)**, run detached with `-m 'not live'` on the rev-5 tree (the exact `src/` hashes embedded above) after the 25-row mutation table; `uv run mypy src/` on the same tree: Success, 49 source files.
   The targeted files that exercise every changed symbol (`test_redaction.py`,
   `test_auth.py`, `test_policy.py`, `test_project_source_consent_policy.py`,
   `test_trust_boundaries_e2e.py`) were run and are green.
