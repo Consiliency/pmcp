@@ -77,12 +77,26 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
 }
 
 
-class TraceContextInfo(BaseModel):
+class GatewayArguments(BaseModel):
+    """Base for every model that parses arguments an agent sends to a gateway
+    tool, and for every model nested inside one. The advertised ``inputSchema``
+    of each gateway tool is derived from its model (Consiliency/pmcp#236), so
+    this base marks which models are agent-facing argument contracts. Models
+    that parse *downstream* data (McpTaskInfo, registry results, .mcp.json)
+    must NOT use this base.
+    """
+
+
+class TraceContextInfo(GatewayArguments):
     """OpenTelemetry-style trace context accepted by PMCP-owned surfaces."""
 
-    traceparent: str | None = None
-    tracestate: str | None = None
-    baggage: str | None = None
+    traceparent: str | None = Field(
+        default=None, description="W3C traceparent header value"
+    )
+    tracestate: str | None = Field(
+        default=None, description="W3C tracestate header value"
+    )
+    baggage: str | None = Field(default=None, description="W3C baggage header value")
 
 
 class GatewayAuditEvent(BaseModel):
@@ -327,15 +341,25 @@ class StartupPolicySource(BaseModel):
     error: str | None = None
 
 
-class StartupPolicyOperation(BaseModel):
+class StartupPolicyOperation(GatewayArguments):
     """Input for previewing or applying autoStart mutations."""
 
-    operation: Literal["add", "remove", "set"]
-    names: list[str] = Field(default_factory=list)
-    source: ConfigSourceName | None = None
-    path: str | None = None
-    dry_run: bool = True
-    apply: bool = False
+    operation: Literal["add", "remove", "set"] = Field(
+        description="Mutation to apply to the autoStart list"
+    )
+    names: list[str] = Field(
+        default_factory=list, description="Server names the operation applies to"
+    )
+    source: ConfigSourceName | None = Field(
+        default=None, description="Config source to edit (project, user, or custom)"
+    )
+    path: str | None = Field(
+        default=None, description="Explicit config file path (overrides source)"
+    )
+    dry_run: bool = Field(default=True, description="Preview without writing")
+    apply: bool = Field(
+        default=False, description="Write the change (requires dry_run=false)"
+    )
 
 
 class StartupPolicyPreview(BaseModel):
@@ -538,22 +562,34 @@ class McpTaskRecord(McpTaskInfo):
     requestor_context: dict[str, Any] | None = None
 
 
-class TaskMetadataInput(BaseModel):
+class TaskMetadataInput(GatewayArguments):
     """Task metadata for task-augmented tool invocation."""
 
-    enabled: bool = True
-    metadata: dict[str, Any] | None = None
-    ttl: int | None = None
-    poll_interval: float | None = None
-    requestor_context: dict[str, Any] | None = None
+    enabled: bool = Field(
+        default=True, description="Run as an MCP task when the server supports it"
+    )
+    metadata: dict[str, Any] | None = Field(
+        default=None, description="Opaque task metadata forwarded downstream"
+    )
+    ttl: int | None = Field(default=None, description="Requested task TTL in seconds")
+    poll_interval: float | None = Field(
+        default=None, description="Seconds between task status polls"
+    )
+    requestor_context: dict[str, Any] | None = Field(
+        default=None, description="Opaque requestor context forwarded downstream"
+    )
 
 
-class TasksListInput(BaseModel):
+class TasksListInput(GatewayArguments):
     """Input for gateway.tasks_list."""
 
-    server_name: str | None = None
-    cursor: str | None = None
-    requestor_context: dict[str, Any] | None = None
+    server_name: str | None = Field(default=None, description="Optional server filter")
+    cursor: str | None = Field(
+        default=None, description="Optional downstream pagination cursor"
+    )
+    requestor_context: dict[str, Any] | None = Field(
+        default=None, description="Opaque requestor context forwarded downstream"
+    )
 
 
 class TasksListOutput(BaseModel):
@@ -565,12 +601,14 @@ class TasksListOutput(BaseModel):
     errors: list[str] | None = None
 
 
-class TasksGetInput(BaseModel):
+class TasksGetInput(GatewayArguments):
     """Input for gateway.tasks_get."""
 
-    server_name: str = Field(min_length=1)
-    task_id: str = Field(min_length=1)
-    requestor_context: dict[str, Any] | None = None
+    server_name: str = Field(min_length=1, description="Server that owns the task")
+    task_id: str = Field(min_length=1, description="Opaque downstream task ID")
+    requestor_context: dict[str, Any] | None = Field(
+        default=None, description="Opaque requestor context forwarded downstream"
+    )
 
 
 class TasksGetOutput(BaseModel):
@@ -581,13 +619,17 @@ class TasksGetOutput(BaseModel):
     errors: list[str] | None = None
 
 
-class TasksResultInput(BaseModel):
+class TasksResultInput(GatewayArguments):
     """Input for gateway.tasks_result."""
 
-    server_name: str = Field(min_length=1)
-    task_id: str = Field(min_length=1)
-    options: InvokeOptions | None = None
-    requestor_context: dict[str, Any] | None = None
+    server_name: str = Field(min_length=1, description="Server that owns the task")
+    task_id: str = Field(min_length=1, description="Opaque downstream task ID")
+    options: InvokeOptions | None = Field(
+        default=None, description="Output redaction and truncation options"
+    )
+    requestor_context: dict[str, Any] | None = Field(
+        default=None, description="Opaque requestor context forwarded downstream"
+    )
 
 
 class TasksResultOutput(BaseModel):
@@ -602,13 +644,15 @@ class TasksResultOutput(BaseModel):
     errors: list[str] | None = None
 
 
-class TasksCancelInput(BaseModel):
+class TasksCancelInput(GatewayArguments):
     """Input for gateway.tasks_cancel."""
 
-    server_name: str = Field(min_length=1)
-    task_id: str = Field(min_length=1)
-    force: bool = False
-    requestor_context: dict[str, Any] | None = None
+    server_name: str = Field(min_length=1, description="Server that owns the task")
+    task_id: str = Field(min_length=1, description="Opaque downstream task ID")
+    force: bool = Field(default=False, description="Cancel even if the task is healthy")
+    requestor_context: dict[str, Any] | None = Field(
+        default=None, description="Opaque requestor context forwarded downstream"
+    )
 
 
 class TasksCancelOutput(BaseModel):
@@ -624,21 +668,36 @@ class TasksCancelOutput(BaseModel):
 # === Gateway Tool Input/Output Types ===
 
 
-class CatalogFilters(BaseModel):
+class CatalogFilters(GatewayArguments):
     """Filters for catalog search."""
 
-    server: str | None = None
-    tags: list[str] | None = None
-    risk_max: Literal["low", "medium", "high"] | None = None
+    server: str | None = Field(
+        default=None, description="Filter to tools from a specific server"
+    )
+    tags: list[str] | None = Field(
+        default=None, description="Filter to tools with any of these tags"
+    )
+    risk_max: Literal["low", "medium", "high"] | None = Field(
+        default=None, description="Maximum risk level to include"
+    )
 
 
-class CatalogSearchInput(BaseModel):
+class CatalogSearchInput(GatewayArguments):
     """Input for gateway.catalog_search."""
 
-    query: str | None = None
-    filters: CatalogFilters | None = None
-    limit: int = Field(default=20, ge=1, le=100)
-    include_offline: bool = False
+    query: str | None = Field(
+        default=None,
+        description="Search query to match against tool names, descriptions, and tags",
+    )
+    filters: CatalogFilters | None = Field(
+        default=None, description="Narrow results by server, tags, or risk level"
+    )
+    limit: int = Field(
+        default=20, ge=1, le=100, description="Maximum number of results to return"
+    )
+    include_offline: bool = Field(
+        default=False, description="Include tools from offline servers"
+    )
 
 
 class CapabilityCard(BaseModel):
@@ -688,10 +747,12 @@ class CatalogSearchOutput(BaseModel):
     manifest_candidates: list[CapabilityCandidate] = Field(default_factory=list)
 
 
-class DescribeInput(BaseModel):
+class DescribeInput(GatewayArguments):
     """Input for gateway.describe."""
 
-    tool_id: str = Field(min_length=1)
+    tool_id: str = Field(
+        min_length=1, description='The tool ID in format "server_name::tool_name"'
+    )
 
 
 class ArgInfo(BaseModel):
@@ -740,28 +801,66 @@ class SchemaCard(BaseModel):
     feedback_hint: str | None = None
 
 
-class InvokeOptions(BaseModel):
+class InvokeOptions(GatewayArguments):
     """Options for tool invocation."""
 
-    timeout_ms: int = Field(default=30000, ge=1000, le=300000)
-    max_output_chars: int | None = Field(default=None, ge=100, le=100000)
-    redact_secrets: bool = False
+    timeout_ms: int = Field(
+        default=30000, ge=1000, le=300000, description="Timeout in milliseconds"
+    )
+    max_output_chars: int | None = Field(
+        default=None,
+        ge=100,
+        le=100000,
+        description="Maximum output characters (truncated if exceeded)",
+    )
+    redact_secrets: bool = Field(
+        default=False, description="Redact detected secrets from output"
+    )
 
 
-class InvokeInput(BaseModel):
+class InvokeInput(GatewayArguments):
     """Input for gateway.invoke."""
 
     model_config = ConfigDict(populate_by_name=True)
 
-    tool_id: str = Field(min_length=1)
-    arguments: dict[str, Any] = Field(default_factory=dict)
-    task: TaskMetadataInput | None = None
-    options: InvokeOptions | None = None
-    trace_context: TraceContextInfo | None = None
-    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
-    run_correlation_id: str | None = Field(default=None, min_length=1, max_length=128)
-    seat_correlation_id: str | None = Field(default=None, min_length=1, max_length=128)
-    evidence_label_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    tool_id: str = Field(
+        min_length=1, description='The tool ID in format "server_name::tool_name"'
+    )
+    arguments: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Arguments to pass to the tool (must match tool schema)",
+    )
+    task: TaskMetadataInput | None = Field(
+        default=None, description="Run as an MCP task (long-running invocation)"
+    )
+    options: InvokeOptions | None = Field(
+        default=None, description="Timeout, output truncation, and redaction options"
+    )
+    trace_context: TraceContextInfo | None = Field(
+        default=None, description="Trace context forwarded to the downstream server"
+    )
+    meta: dict[str, Any] | None = Field(
+        default=None,
+        alias="_meta",
+        description="Request metadata; trace context keys are forwarded downstream",
+    )
+    run_correlation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Scoped-advisor run correlation ID",
+    )
+    seat_correlation_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        description="Scoped-advisor seat correlation ID",
+    )
+    evidence_label_digest: str | None = Field(
+        default=None,
+        pattern=r"^[0-9a-f]{64}$",
+        description="SHA-256 digest of the caller evidence label",
+    )
 
     @field_validator("run_correlation_id", "seat_correlation_id")
     @classmethod
@@ -809,12 +908,19 @@ class InvokeOutput(BaseModel):
     url_elicitations: list[UrlElicitationInfo] | None = None
 
 
-class RefreshInput(BaseModel):
+class RefreshInput(GatewayArguments):
     """Input for gateway.refresh."""
 
-    source: Literal["claude_config", "custom"] | None = None
-    reason: str | None = None
-    force: bool = False
+    source: Literal["claude_config", "custom"] | None = Field(
+        default=None, description="Config source to reload from"
+    )
+    reason: str | None = Field(
+        default=None, description="Reason for refresh (for logging)"
+    )
+    force: bool = Field(
+        default=False,
+        description="Cancel pending downstream requests before refreshing",
+    )
 
 
 class RefreshOutput(BaseModel):
@@ -836,24 +942,30 @@ class RefreshOutput(BaseModel):
     mcp_tasks_remaining: int = 0
 
 
-class ConnectServerInput(BaseModel):
+class ConnectServerInput(GatewayArguments):
     """Input for gateway.connect_server."""
 
     server_name: str = Field(min_length=1, description="Server to connect")
 
 
-class DisconnectServerInput(BaseModel):
+class DisconnectServerInput(GatewayArguments):
     """Input for gateway.disconnect_server."""
 
     server_name: str = Field(min_length=1, description="Server to disconnect")
-    force: bool = False
+    force: bool = Field(
+        default=False,
+        description="Cancel this server's pending requests before disconnecting",
+    )
 
 
-class RestartServerInput(BaseModel):
+class RestartServerInput(GatewayArguments):
     """Input for gateway.restart_server."""
 
     server_name: str = Field(min_length=1, description="Server to restart")
-    force: bool = False
+    force: bool = Field(
+        default=False,
+        description="Cancel this server's pending requests before restarting",
+    )
 
 
 class LifecycleServerOutput(BaseModel):
@@ -913,10 +1025,13 @@ class HealthOutput(BaseModel):
 # === Pending Request Monitoring Types ===
 
 
-class ListPendingInput(BaseModel):
+class ListPendingInput(GatewayArguments):
     """Input for gateway.list_pending."""
 
-    server: str | None = None  # Filter by server (optional)
+    server: str | None = Field(
+        default=None,
+        description="Filter to pending requests on a specific server (optional)",
+    )
 
 
 class PendingRequestInfo(BaseModel):
@@ -941,11 +1056,17 @@ class ListPendingOutput(BaseModel):
     total_pending: int
 
 
-class CancelInput(BaseModel):
+class CancelInput(GatewayArguments):
     """Input for gateway.cancel."""
 
-    request_id: str = Field(min_length=1)  # Format: "server_name::local_id"
-    force: bool = False  # Force cancel even if heartbeat is recent
+    request_id: str = Field(
+        min_length=1,
+        description='Request ID in format "server_name::local_id" from gateway.list_pending',
+    )
+    force: bool = Field(
+        default=False,
+        description="Force cancel even if request is healthy (has recent heartbeat)",
+    )
 
 
 class CancelOutput(BaseModel):
@@ -1083,7 +1204,7 @@ class GatewayPolicy(BaseModel):
 # === Capability Request Types ===
 
 
-class CapabilityRequestInput(BaseModel):
+class CapabilityRequestInput(GatewayArguments):
     """Input for gateway.request_capability."""
 
     query: str = Field(min_length=1, description="Natural language capability request")
@@ -1207,13 +1328,15 @@ class SearchRegistryResult(BaseModel):
     diagnostics: list[str] = Field(default_factory=list)
 
 
-class SearchRegistryInput(BaseModel):
+class SearchRegistryInput(GatewayArguments):
     """Input for gateway.search_registry."""
 
     query: str = Field(
         min_length=1, description="Natural language capability description"
     )
-    limit: int = Field(default=5, ge=1, le=20)
+    limit: int = Field(
+        default=5, ge=1, le=20, description="Maximum number of results to return"
+    )
 
 
 class SearchRegistryOutput(BaseModel):
@@ -1224,7 +1347,7 @@ class SearchRegistryOutput(BaseModel):
     next_step: str
 
 
-class RegisterDiscoveredServerInput(BaseModel):
+class RegisterDiscoveredServerInput(GatewayArguments):
     """Input for gateway.register_discovered_server."""
 
     package: str = Field(
@@ -1266,7 +1389,7 @@ class RegisterDiscoveredServerOutput(BaseModel):
     next_step: str | None = None
 
 
-class ProvisionInput(BaseModel):
+class ProvisionInput(GatewayArguments):
     """Input for gateway.provision - install and start a specific server."""
 
     server_name: str = Field(
@@ -1307,15 +1430,25 @@ FeedbackSubmissionOutcome = Literal[
 ]
 
 
-class SubmitFeedbackInput(BaseModel):
+class SubmitFeedbackInput(GatewayArguments):
     """Input for gateway.submit_feedback."""
 
-    title: str = Field(min_length=8, max_length=160)
-    description: str = Field(min_length=1)
-    issue_type: Literal["bug", "feature_request"] = Field(default="bug")
-    subordinate_server: str | None = None
-    failed_tool_call: str | None = None
-    confirm_submission: bool = False
+    title: str = Field(min_length=8, max_length=160, description="Issue title")
+    description: str = Field(
+        min_length=1, description="Issue details (technical data only)"
+    )
+    issue_type: Literal["bug", "feature_request"] = Field(
+        default="bug", description="Kind of issue to file"
+    )
+    subordinate_server: str | None = Field(
+        default=None, description="Subordinate MCP server involved (if known)"
+    )
+    failed_tool_call: str | None = Field(
+        default=None, description="Specific failed tool call (if known)"
+    )
+    confirm_submission: bool = Field(
+        default=False, description="Set true only after user confirms submission"
+    )
 
 
 class SubmitFeedbackOutput(BaseModel):
@@ -1339,7 +1472,7 @@ class SubmitFeedbackOutput(BaseModel):
     submission_outcome: FeedbackSubmissionOutcome | None = None
 
 
-class UpdateServerInput(BaseModel):
+class UpdateServerInput(GatewayArguments):
     """Input for gateway.update_server."""
 
     server_name: str = Field(min_length=1, description="Server to update")
@@ -1373,7 +1506,7 @@ class UpdateServerOutput(BaseModel):
     message: str
 
 
-class AuthConnectInput(BaseModel):
+class AuthConnectInput(GatewayArguments):
     """Input for gateway.auth_connect - save auth credentials for a server."""
 
     server_name: str = Field(
@@ -1389,10 +1522,20 @@ class AuthConnectInput(BaseModel):
     scope: Literal["user", "project"] = Field(
         default="user", description="Where to store credentials"
     )
-    auth_mode: Literal["api_key", "url_elicitation"] = "api_key"
-    elicitation_id: str | None = None
-    elicitation_url: str | None = None
-    consent_acknowledged: bool = False
+    auth_mode: Literal["api_key", "url_elicitation"] = Field(
+        default="api_key",
+        description="API-key storage or URL-mode elicitation acknowledgement",
+    )
+    elicitation_id: str | None = Field(
+        default=None, description="URL-mode elicitation identifier"
+    )
+    elicitation_url: str | None = Field(
+        default=None, description="Sanitized URL-mode elicitation URL"
+    )
+    consent_acknowledged: bool = Field(
+        default=False,
+        description="Acknowledge that the out-of-band URL flow was completed",
+    )
 
 
 class AuthConnectOutput(BaseModel):
@@ -1408,7 +1551,7 @@ class AuthConnectOutput(BaseModel):
     url_elicitation: UrlElicitationInfo | None = None
 
 
-class ProvisionStatusInput(BaseModel):
+class ProvisionStatusInput(GatewayArguments):
     """Input for gateway.provision_status - check job progress."""
 
     job_id: str = Field(min_length=1, description="Job ID from provision response")
@@ -1439,11 +1582,15 @@ class ProvisionJobStatus(BaseModel):
     error: str | None = None
 
 
-class SyncEnvironmentInput(BaseModel):
+class SyncEnvironmentInput(GatewayArguments):
     """Input for gateway.sync_environment."""
 
-    platform: Literal["mac", "wsl", "linux", "windows"] | None = None
-    detected_clis: list[str] | None = None
+    platform: Literal["mac", "wsl", "linux", "windows"] | None = Field(
+        default=None, description="Override detected platform (optional)"
+    )
+    detected_clis: list[str] | None = Field(
+        default=None, description="Override detected CLIs (optional)"
+    )
 
 
 class SyncEnvironmentOutput(BaseModel):

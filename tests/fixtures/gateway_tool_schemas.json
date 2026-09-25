@@ -1,0 +1,811 @@
+{
+ "gateway.auth_connect": {
+  "properties": {
+   "auth_mode": {
+    "default": "api_key",
+    "description": "API-key storage or URL-mode elicitation acknowledgement",
+    "enum": [
+     "api_key",
+     "url_elicitation"
+    ],
+    "type": "string"
+   },
+   "consent_acknowledged": {
+    "default": false,
+    "description": "Acknowledge that the out-of-band URL flow was completed",
+    "type": "boolean"
+   },
+   "credential": {
+    "description": "Secret token/API key to store",
+    "minLength": 1,
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "elicitation_id": {
+    "description": "URL-mode elicitation identifier",
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "elicitation_url": {
+    "description": "Sanitized URL-mode elicitation URL",
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "env_var": {
+    "description": "Override environment variable key to store into",
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "scope": {
+    "default": "user",
+    "description": "Where to store credentials",
+    "enum": [
+     "user",
+     "project"
+    ],
+    "type": "string"
+   },
+   "server_name": {
+    "description": "Server requiring authentication",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "server_name"
+  ],
+  "type": "object"
+ },
+ "gateway.cancel": {
+  "properties": {
+   "force": {
+    "default": false,
+    "description": "Force cancel even if request is healthy (has recent heartbeat)",
+    "type": "boolean"
+   },
+   "request_id": {
+    "description": "Request ID in format \"server_name::local_id\" from gateway.list_pending",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "request_id"
+  ],
+  "type": "object"
+ },
+ "gateway.catalog_search": {
+  "properties": {
+   "filters": {
+    "description": "Narrow results by server, tags, or risk level",
+    "properties": {
+     "risk_max": {
+      "description": "Maximum risk level to include",
+      "enum": [
+       "low",
+       "medium",
+       "high",
+       null
+      ],
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "server": {
+      "description": "Filter to tools from a specific server",
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "tags": {
+      "description": "Filter to tools with any of these tags",
+      "items": {
+       "type": "string"
+      },
+      "type": [
+       "array",
+       "null"
+      ]
+     }
+    },
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "include_offline": {
+    "default": false,
+    "description": "Include tools from offline servers",
+    "type": "boolean"
+   },
+   "limit": {
+    "default": 20,
+    "description": "Maximum number of results to return",
+    "maximum": 100,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "query": {
+    "description": "Search query to match against tool names, descriptions, and tags",
+    "type": [
+     "string",
+     "null"
+    ]
+   }
+  },
+  "type": "object"
+ },
+ "gateway.config_status": {
+  "properties": {},
+  "type": "object"
+ },
+ "gateway.connect_server": {
+  "properties": {
+   "server_name": {
+    "description": "Server to connect",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "server_name"
+  ],
+  "type": "object"
+ },
+ "gateway.describe": {
+  "properties": {
+   "tool_id": {
+    "description": "The tool ID in format \"server_name::tool_name\"",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "tool_id"
+  ],
+  "type": "object"
+ },
+ "gateway.disconnect_server": {
+  "properties": {
+   "force": {
+    "default": false,
+    "description": "Cancel this server's pending requests before disconnecting",
+    "type": "boolean"
+   },
+   "server_name": {
+    "description": "Server to disconnect",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "server_name"
+  ],
+  "type": "object"
+ },
+ "gateway.get_startup_policy": {
+  "properties": {},
+  "type": "object"
+ },
+ "gateway.health": {
+  "properties": {},
+  "type": "object"
+ },
+ "gateway.invoke": {
+  "properties": {
+   "_meta": {
+    "additionalProperties": true,
+    "description": "Request metadata; trace context keys are forwarded downstream",
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "arguments": {
+    "additionalProperties": true,
+    "description": "Arguments to pass to the tool (must match tool schema)",
+    "type": "object"
+   },
+   "evidence_label_digest": {
+    "description": "SHA-256 digest of the caller evidence label",
+    "pattern": "^[0-9a-f]{64}$",
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "options": {
+    "description": "Timeout, output truncation, and redaction options",
+    "properties": {
+     "max_output_chars": {
+      "description": "Maximum output characters (truncated if exceeded)",
+      "maximum": 100000,
+      "minimum": 100,
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "redact_secrets": {
+      "default": false,
+      "description": "Redact detected secrets from output",
+      "type": "boolean"
+     },
+     "timeout_ms": {
+      "default": 30000,
+      "description": "Timeout in milliseconds",
+      "maximum": 300000,
+      "minimum": 1000,
+      "type": "integer"
+     }
+    },
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "run_correlation_id": {
+    "description": "Scoped-advisor run correlation ID",
+    "maxLength": 128,
+    "minLength": 1,
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "seat_correlation_id": {
+    "description": "Scoped-advisor seat correlation ID",
+    "maxLength": 128,
+    "minLength": 1,
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "task": {
+    "description": "Run as an MCP task (long-running invocation)",
+    "properties": {
+     "enabled": {
+      "default": true,
+      "description": "Run as an MCP task when the server supports it",
+      "type": "boolean"
+     },
+     "metadata": {
+      "additionalProperties": true,
+      "description": "Opaque task metadata forwarded downstream",
+      "type": [
+       "object",
+       "null"
+      ]
+     },
+     "poll_interval": {
+      "description": "Seconds between task status polls",
+      "type": [
+       "number",
+       "null"
+      ]
+     },
+     "requestor_context": {
+      "additionalProperties": true,
+      "description": "Opaque requestor context forwarded downstream",
+      "type": [
+       "object",
+       "null"
+      ]
+     },
+     "ttl": {
+      "description": "Requested task TTL in seconds",
+      "type": [
+       "integer",
+       "null"
+      ]
+     }
+    },
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "tool_id": {
+    "description": "The tool ID in format \"server_name::tool_name\"",
+    "minLength": 1,
+    "type": "string"
+   },
+   "trace_context": {
+    "description": "Trace context forwarded to the downstream server",
+    "properties": {
+     "baggage": {
+      "description": "W3C baggage header value",
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "traceparent": {
+      "description": "W3C traceparent header value",
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "tracestate": {
+      "description": "W3C tracestate header value",
+      "type": [
+       "string",
+       "null"
+      ]
+     }
+    },
+    "type": [
+     "object",
+     "null"
+    ]
+   }
+  },
+  "required": [
+   "tool_id"
+  ],
+  "type": "object"
+ },
+ "gateway.list_pending": {
+  "properties": {
+   "server": {
+    "description": "Filter to pending requests on a specific server (optional)",
+    "type": [
+     "string",
+     "null"
+    ]
+   }
+  },
+  "type": "object"
+ },
+ "gateway.provision": {
+  "properties": {
+   "server_name": {
+    "description": "Name of the server to provision from manifest",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "server_name"
+  ],
+  "type": "object"
+ },
+ "gateway.provision_status": {
+  "properties": {
+   "job_id": {
+    "description": "Job ID from provision response",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "job_id"
+  ],
+  "type": "object"
+ },
+ "gateway.refresh": {
+  "properties": {
+   "force": {
+    "default": false,
+    "description": "Cancel pending downstream requests before refreshing",
+    "type": "boolean"
+   },
+   "reason": {
+    "description": "Reason for refresh (for logging)",
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "source": {
+    "description": "Config source to reload from",
+    "enum": [
+     "claude_config",
+     "custom",
+     null
+    ],
+    "type": [
+     "string",
+     "null"
+    ]
+   }
+  },
+  "type": "object"
+ },
+ "gateway.register_discovered_server": {
+  "properties": {
+   "description": {
+    "default": "",
+    "description": "Short description of the server's purpose",
+    "type": "string"
+   },
+   "env_vars": {
+    "description": "Required environment variable names",
+    "items": {
+     "type": "string"
+    },
+    "type": "array"
+   },
+   "package": {
+    "description": "npm package identifier (e.g. '@modelcontextprotocol/server-github')",
+    "minLength": 1,
+    "type": "string"
+   },
+   "server_name": {
+    "description": "Logical name for this server (e.g. 'github')",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "package",
+   "server_name"
+  ],
+  "type": "object"
+ },
+ "gateway.request_capability": {
+  "properties": {
+   "available_clis": {
+    "description": "Optional: CLIs known to be available in the environment",
+    "items": {
+     "type": "string"
+    },
+    "type": [
+     "array",
+     "null"
+    ]
+   },
+   "query": {
+    "description": "Natural language capability request",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "query"
+  ],
+  "type": "object"
+ },
+ "gateway.restart_server": {
+  "properties": {
+   "force": {
+    "default": false,
+    "description": "Cancel this server's pending requests before restarting",
+    "type": "boolean"
+   },
+   "server_name": {
+    "description": "Server to restart",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "server_name"
+  ],
+  "type": "object"
+ },
+ "gateway.search_registry": {
+  "properties": {
+   "limit": {
+    "default": 5,
+    "description": "Maximum number of results to return",
+    "maximum": 20,
+    "minimum": 1,
+    "type": "integer"
+   },
+   "query": {
+    "description": "Natural language capability description",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "query"
+  ],
+  "type": "object"
+ },
+ "gateway.set_startup_policy": {
+  "properties": {
+   "apply": {
+    "default": false,
+    "description": "Write the change (requires dry_run=false)",
+    "type": "boolean"
+   },
+   "dry_run": {
+    "default": true,
+    "description": "Preview without writing",
+    "type": "boolean"
+   },
+   "names": {
+    "description": "Server names the operation applies to",
+    "items": {
+     "type": "string"
+    },
+    "type": "array"
+   },
+   "operation": {
+    "description": "Mutation to apply to the autoStart list",
+    "enum": [
+     "add",
+     "remove",
+     "set"
+    ],
+    "type": "string"
+   },
+   "path": {
+    "description": "Explicit config file path (overrides source)",
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "source": {
+    "description": "Config source to edit (project, user, or custom)",
+    "enum": [
+     "project",
+     "user",
+     "custom",
+     null
+    ],
+    "type": [
+     "string",
+     "null"
+    ]
+   }
+  },
+  "required": [
+   "operation"
+  ],
+  "type": "object"
+ },
+ "gateway.submit_feedback": {
+  "properties": {
+   "confirm_submission": {
+    "default": false,
+    "description": "Set true only after user confirms submission",
+    "type": "boolean"
+   },
+   "description": {
+    "description": "Issue details (technical data only)",
+    "minLength": 1,
+    "type": "string"
+   },
+   "failed_tool_call": {
+    "description": "Specific failed tool call (if known)",
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "issue_type": {
+    "default": "bug",
+    "description": "Kind of issue to file",
+    "enum": [
+     "bug",
+     "feature_request"
+    ],
+    "type": "string"
+   },
+   "subordinate_server": {
+    "description": "Subordinate MCP server involved (if known)",
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "title": {
+    "description": "Issue title",
+    "maxLength": 160,
+    "minLength": 8,
+    "type": "string"
+   }
+  },
+  "required": [
+   "title",
+   "description"
+  ],
+  "type": "object"
+ },
+ "gateway.sync_environment": {
+  "properties": {
+   "detected_clis": {
+    "description": "Override detected CLIs (optional)",
+    "items": {
+     "type": "string"
+    },
+    "type": [
+     "array",
+     "null"
+    ]
+   },
+   "platform": {
+    "description": "Override detected platform (optional)",
+    "enum": [
+     "mac",
+     "wsl",
+     "linux",
+     "windows",
+     null
+    ],
+    "type": [
+     "string",
+     "null"
+    ]
+   }
+  },
+  "type": "object"
+ },
+ "gateway.tasks_cancel": {
+  "properties": {
+   "force": {
+    "default": false,
+    "description": "Cancel even if the task is healthy",
+    "type": "boolean"
+   },
+   "requestor_context": {
+    "additionalProperties": true,
+    "description": "Opaque requestor context forwarded downstream",
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "server_name": {
+    "description": "Server that owns the task",
+    "minLength": 1,
+    "type": "string"
+   },
+   "task_id": {
+    "description": "Opaque downstream task ID",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "server_name",
+   "task_id"
+  ],
+  "type": "object"
+ },
+ "gateway.tasks_get": {
+  "properties": {
+   "requestor_context": {
+    "additionalProperties": true,
+    "description": "Opaque requestor context forwarded downstream",
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "server_name": {
+    "description": "Server that owns the task",
+    "minLength": 1,
+    "type": "string"
+   },
+   "task_id": {
+    "description": "Opaque downstream task ID",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "server_name",
+   "task_id"
+  ],
+  "type": "object"
+ },
+ "gateway.tasks_list": {
+  "properties": {
+   "cursor": {
+    "description": "Optional downstream pagination cursor",
+    "type": [
+     "string",
+     "null"
+    ]
+   },
+   "requestor_context": {
+    "additionalProperties": true,
+    "description": "Opaque requestor context forwarded downstream",
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "server_name": {
+    "description": "Optional server filter",
+    "type": [
+     "string",
+     "null"
+    ]
+   }
+  },
+  "type": "object"
+ },
+ "gateway.tasks_result": {
+  "properties": {
+   "options": {
+    "description": "Output redaction and truncation options",
+    "properties": {
+     "max_output_chars": {
+      "description": "Maximum output characters (truncated if exceeded)",
+      "maximum": 100000,
+      "minimum": 100,
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "redact_secrets": {
+      "default": false,
+      "description": "Redact detected secrets from output",
+      "type": "boolean"
+     },
+     "timeout_ms": {
+      "default": 30000,
+      "description": "Timeout in milliseconds",
+      "maximum": 300000,
+      "minimum": 1000,
+      "type": "integer"
+     }
+    },
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "requestor_context": {
+    "additionalProperties": true,
+    "description": "Opaque requestor context forwarded downstream",
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "server_name": {
+    "description": "Server that owns the task",
+    "minLength": 1,
+    "type": "string"
+   },
+   "task_id": {
+    "description": "Opaque downstream task ID",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "server_name",
+   "task_id"
+  ],
+  "type": "object"
+ },
+ "gateway.update_server": {
+  "properties": {
+   "force": {
+    "default": false,
+    "description": "Restart the server even if it has pending requests or active MCP tasks, cancelling them. Mirrors gateway.restart_server's force flag.",
+    "type": "boolean"
+   },
+   "server_name": {
+    "description": "Server to update",
+    "minLength": 1,
+    "type": "string"
+   }
+  },
+  "required": [
+   "server_name"
+  ],
+  "type": "object"
+ }
+}
