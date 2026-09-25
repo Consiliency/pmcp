@@ -15,7 +15,7 @@ import traceback
 import string
 import time
 from collections import deque
-from collections.abc import Collection
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, Iterator, TypeVar
@@ -347,6 +347,10 @@ async def _terminate_process_tree(
 HEARTBEAT_WARN_THRESHOLD = 60.0  # Warn if no activity for 60s
 HEARTBEAT_STALL_THRESHOLD = 120.0  # Mark as stalled after 120s
 HEALTH_CHECK_INTERVAL = 30.0  # Background health check every 30s
+# Longest real wait between two idle/ceiling checks in _await_with_idle_timeout.
+# The checks themselves read the request clock (ClientManager._clock); this only
+# bounds how often they run, so tests can shrink it without changing an outcome.
+IDLE_POLL_SLICE_S = 1.0
 
 # Connection retry settings
 MAX_CONNECTION_RETRIES = 3
@@ -962,8 +966,11 @@ class PendingRequest:
     request_id: int
     server_name: str
     tool_id: str  # Empty for non-tool requests (initialize, tools/list)
-    started_at: float  # time.time() when request started
-    last_heartbeat: float  # time.time() of last activity
+    # Both stamps come from the owning ClientManager's request clock (`_clock`,
+    # wall time by default); inside ClientManager they are compared only with
+    # readings of that clock. Epoch seconds: handlers/cli render and subtract them.
+    started_at: float  # request clock when request started
+    last_heartbeat: float  # request clock of last activity
     timeout_ms: int  # Configured timeout
     future: asyncio.Future[Any]
     task_id: str | None = None
@@ -1037,10 +1044,17 @@ class ClientManager:
         project_root: Path | None = None,
         *,
         catalog_events: CatalogEventSink | None = None,
+        clock: Callable[[], float] | None = None,
     ) -> None:
         self._catalog_events: CatalogEventSink = (
             catalog_events or _NullCatalogEventSink()
         )
+        # The request clock: every PendingRequest stamp (started_at,
+        # last_heartbeat, status.last_activity_at) and every comparison against
+        # one (idle/ceiling timeout, health monitor, request state, cancel)
+        # reads THIS, so a test can drive the idle timeout with a fake clock.
+        # Wall time by default: handlers/cli render started_at as an epoch.
+        self._clock: Callable[[], float] = clock if clock is not None else time.time
         self._clients: dict[str, ManagedClient] = {}
         self._tools: dict[str, ToolInfo] = {}
         self._resources: dict[str, ResourceInfo] = {}
@@ -2919,7 +2933,7 @@ class ClientManager:
                 # UPDATE heartbeat on ANY output from server. This includes JSON
                 # progress notifications (id: null) that don't resolve a request,
                 # so per-request liveness drives the idle timeout in _send_request.
-                now = time.time()
+                now = self._clock()
                 managed.status.last_activity_at = now
                 for req in managed.pending_requests.values():
                     req.last_heartbeat = now
@@ -3041,7 +3055,7 @@ class ClientManager:
             async for message in read_stream:
                 # Any output counts as per-request liveness, including progress
                 # notifications (id: null), so the idle timeout sees the keepalive.
-                now = time.time()
+                now = self._clock()
                 managed.status.last_activity_at = now
                 for req in managed.pending_requests.values():
                     req.last_heartbeat = now
@@ -3236,7 +3250,7 @@ class ClientManager:
     ) -> dict[str, Any]:
         """Send a JSON-RPC request and wait for response."""
         request_id = self._next_request_id(managed.config.name)
-        now = time.time()
+        now = self._clock()
 
         request = {
             "jsonrpc": "2.0",
@@ -3347,15 +3361,18 @@ class ClientManager:
         future, so a response arriving mid-slice is returned rather than dropped.
         Raises ``asyncio.TimeoutError`` on idle/ceiling so the caller maps it to the
         usual ``TimeoutError``.
+
+        The slice (``IDLE_POLL_SLICE_S``) is real event-loop time and only decides
+        how often the check runs; what the check *sees* is ``self._clock``.
         """
-        slice_s = min(idle_timeout_s, 1.0)
+        slice_s = min(idle_timeout_s, IDLE_POLL_SLICE_S)
         while True:
             try:
                 return await asyncio.wait_for(asyncio.shield(future), timeout=slice_s)
             except asyncio.TimeoutError:
                 if future.done():
                     return future.result()
-                now = time.time()
+                now = self._clock()
                 if now - pending.started_at >= ceiling_s:
                     logger.warning(
                         "[%s] request %d hit absolute ceiling (%.1fs)",
@@ -4047,7 +4064,7 @@ class ClientManager:
         while True:
             try:
                 await asyncio.sleep(HEALTH_CHECK_INTERVAL)
-                now = time.time()
+                now = self._clock()
 
                 # Periodic memory logging
                 if now - last_memory_log >= MEMORY_LOG_INTERVAL:
@@ -4154,7 +4171,7 @@ class ClientManager:
 
     def get_request_state(self, pending: PendingRequest) -> RequestState:
         """Determine current state of a pending request."""
-        now = time.time()
+        now = self._clock()
         elapsed = now - pending.started_at
         heartbeat_age = now - pending.last_heartbeat
 
@@ -4210,7 +4227,7 @@ class ClientManager:
         if pending.future.done():
             return ("already_complete", "Request already completed", False, None)
 
-        now = time.time()
+        now = self._clock()
         elapsed = now - pending.started_at
         heartbeat_age = now - pending.last_heartbeat
         was_stalled = heartbeat_age > HEARTBEAT_STALL_THRESHOLD
