@@ -22,7 +22,12 @@ from pmcp.types import (
     ServerPolicy,
     ToolPolicy,
 )
-from pmcp.auth import sanitize_auth_diagnostic
+from pmcp.auth import (
+    REDACTED,
+    Span,
+    apply_redaction_spans,
+    collect_redaction_spans,
+)
 
 if TYPE_CHECKING:
     # Annotation only. `pmcp.manifest`'s package `__init__` imports the loader and
@@ -44,12 +49,31 @@ _ListPolicy = ServerPolicy | ToolPolicy | ResourcePolicy | PromptPolicy
 #: would otherwise return the wrong limit or raise at runtime.
 _LimitField = Literal["max_tools_per_server", "max_output_bytes", "max_output_tokens"]
 
+#: `process_output` redacts BEFORE it truncates, over the first
+#: ``max_bytes + _REDACTION_WINDOW_SLACK`` characters of the output, so the cut
+#: never lands inside a credential the redactor has not yet seen whole
+#: (Consiliency/pmcp#234). The slack is the longest keyed value the redactor
+#: can be asked to match across the cut: a 4096-bit RSA PEM block is ~3.2 KB,
+#: a JWT with generous claims a few KB, a SAML assertion under ~16 KB. The
+#: cost is bounded by it (~1 ms per KB on this host), and the residual is a
+#: single value longer than the slack straddling the cap -- not a credential
+#: shape. The window's far edge is never emitted: see `process_output`.
+_REDACTION_WINDOW_SLACK = 16384
+
 DEFAULT_REDACTION_PATTERNS = [
-    # Common secret patterns (case-insensitive)
-    r"(api[_-]?key|apikey)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
-    r"(secret|password|passwd|pwd)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
-    r"(bearer|token)[\s]+[a-zA-Z0-9._-]+",
-    r"(aws_secret|aws_access)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
+    # Common secret patterns (case-insensitive). The separator mirrors the
+    # engine's: `:`, `=`, `=>`, `:=`, or `==` followed directly by the value,
+    # on the same line (`[ \t]*`, not `[\s]*`, which let `token:\nthe` -- a
+    # sentence ending in the keyword -- redact the first word of the next
+    # line; `token == expected` is a comparison on this surface too).
+    r"(api[_-]?key|apikey)[ \t]*(?:=>|:=|==(?![ \t=])|[:=](?!=))[ \t]*[\"']?([^\s\"']+)",
+    # Not after `:` or `.`: `arn:…:secret:Name` names a secret, it is not one.
+    r"(?<![A-Za-z0-9:.])(secret|password|passwd|pwd)[ \t]*(?:=>|:=|==(?![ \t=])|[:=](?!=))[ \t]*[\"']?([^\s\"']+)",
+    # `token` needs a real separator: the pre-#234 `(bearer|token)\s+…` form
+    # redacted the word after "token" in prose ("token bucket"). Bearer values
+    # are handled unconditionally by `sanitize_auth_diagnostic`.
+    r"\btoken[ \t]*(?:=>|:=|==(?![ \t=])|[:=](?!=))[ \t]*[\"']?([^\s\"']+)",
+    r"(aws_secret|aws_access)[ \t]*(?:=>|:=|==(?![ \t=])|[:=](?!=))[ \t]*[\"']?([^\s\"']+)",
     r"\bsk-[A-Za-z0-9_-]{6,}\b",
     r"\bghp_[A-Za-z0-9_]{10,}\b",
     r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
@@ -666,18 +690,31 @@ class PolicyManager:
         return self._composed_limit("max_output_tokens")
 
     def truncate_output(
-        self, output: str, max_bytes: int | None = None
+        self,
+        output: str,
+        max_bytes: int | None = None,
+        *,
+        original_size: int | None = None,
     ) -> tuple[str, bool, int]:
         """
         Truncate output to max size.
 
+        ``original_size`` is the size to report when ``output`` is already a
+        window of a larger text (see `process_output`); the marker then names
+        the real size, and a window that fits under the cap but dropped text
+        still counts as truncated and is cut where any text is.
+
         Returns: (result, truncated, original_size)
         """
         max_size = max_bytes or self.get_max_output_bytes()
-        original_size = len(output.encode("utf-8"))
+        if original_size is None:
+            original_size = len(output.encode("utf-8"))
 
         if original_size <= max_size:
             return (output, False, original_size)
+        # A window that already fits still takes the same cut (`max_size -
+        # 100`, room for the marker) so the cap holds wherever the text came
+        # from; slicing a short window is a no-op.
 
         # Truncate to max bytes, being careful with UTF-8
         encoded = output.encode("utf-8")
@@ -687,29 +724,54 @@ class PolicyManager:
         truncated_str = truncated_bytes.decode("utf-8", errors="ignore")
 
         # Add truncation indicator
-        truncated_str += (
-            f"\n\n[... OUTPUT TRUNCATED: {original_size} bytes -> {max_size} bytes ...]"
-        )
+        truncated_str += self._truncation_marker(original_size, max_size)
 
         return (truncated_str, True, original_size)
 
+    @staticmethod
+    def _truncation_marker(original_size: int, max_size: int) -> str:
+        return (
+            f"\n\n[... OUTPUT TRUNCATED: {original_size} bytes -> {max_size} bytes ...]"
+        )
+
     def redact_secrets(self, output: str) -> str:
-        """Redact secrets from output."""
-        result = sanitize_auth_diagnostic(output, max_length=None)
+        """Redact secrets from output.
 
+        The engine's spans and the operator's pattern spans are all collected
+        over the same, unmodified ``output`` and applied in one step, so the
+        operator's patterns never see -- and never depend on -- the engine's
+        rewriting (Consiliency/pmcp#234).
+        """
+        return apply_redaction_spans(output, self.redaction_spans(output))
+
+    def _pattern_matches(self, text: str) -> bool:
+        """Does any operator (or default) pattern match ``text``? Asked of a
+        percent-decoded query value so an encoded token cannot evade a
+        pattern written for its decoded shape (main decoded before matching)."""
+        return any(regex.search(text) for regex in self._redaction_regexes)
+
+    def redaction_spans(self, output: str) -> list[Span]:
+        """Every redaction either surface would make to ``output``, as spans."""
+        spans: list[Span] = collect_redaction_spans(
+            output, covers=self._pattern_matches
+        )
         for regex in self._redaction_regexes:
-
-            def replace_match(match: re.Match[str]) -> str:
+            for match in regex.finditer(output):
                 full_match = match.group(0)
-                # Find the separator (: or =)
+                # A `key<sep>value` match keeps its key: split at the first
+                # separator (: or =) that has a value after it. A separator
+                # with nothing but separators after it is base64 padding
+                # (`dXNlcjpwYXNzd29yZA==`), and splitting there kept the whole
+                # secret and replaced the `=`.
                 for i, char in enumerate(full_match):
-                    if char in ":=":
-                        return full_match[: i + 1] + " [REDACTED]"
-                return "[REDACTED]"
-
-            result = regex.sub(replace_match, result)
-
-        return result
+                    if char in ":=" and full_match[i + 1 :].strip(" \t:="):
+                        spans.append(
+                            (match.start() + i + 1, match.end(), " " + REDACTED)
+                        )
+                        break
+                else:
+                    spans.append((match.start(), match.end(), REDACTED))
+        return spans
 
     def process_output(
         self,
@@ -731,11 +793,42 @@ class PolicyManager:
 
         raw_size = len(output_str.encode("utf-8"))
 
-        # Truncate first
-        truncated_str, truncated, _ = self.truncate_output(output_str, max_bytes)
-
-        # Redact if requested
-        final_str = self.redact_secrets(truncated_str) if redact else truncated_str
+        if redact:
+            # Redact BEFORE the cut, over a window that reaches past the cap
+            # by `_REDACTION_WINDOW_SLACK`: the redactor then sees every value
+            # the cut could land in whole, and the cut can only ever shorten a
+            # `[REDACTED]` (Consiliency/pmcp#234). Cutting first left the
+            # first characters of a credential -- a shape no rule recognises.
+            #
+            # Invariant: no character from past the cap is emitted except
+            # inside a span. The window's far edge is a second cut, and it is
+            # not redacted either; so the text kept is the cap, extended only
+            # to the end of any span that starts before it. Rev 5 applied the
+            # spans to the whole window and returned it when redaction had
+            # shrunk it under the cap -- edge included.
+            max_size = max_bytes or self.get_max_output_bytes()
+            window = output_str[: max_size + _REDACTION_WINDOW_SLACK]
+            # A structured result is serialised first and the window of the
+            # serialised text redacted: JSON text INSIDE a leaf arrives with
+            # escaped quotes the keyed rules do not read -- scoped out to
+            # Consiliency/pmcp#290; the bar here is never worse than main.
+            spans = self.redaction_spans(window)
+            keep = len(
+                window.encode("utf-8")[:max_size].decode("utf-8", errors="ignore")
+            )
+            for start, end, _ in sorted(spans):
+                if start < keep < end:
+                    keep = end
+            head = window[:keep]
+            final_str, truncated, _ = self.truncate_output(
+                apply_redaction_spans(
+                    head, [span for span in spans if span[1] <= keep]
+                ),
+                max_bytes,
+                original_size=raw_size,
+            )
+        else:
+            final_str, truncated, _ = self.truncate_output(output_str, max_bytes)
 
         # Generate summary if truncated
         summary: str | None = None
