@@ -100,7 +100,12 @@ def _object_schemas(schema: dict[str, Any]) -> list[dict[str, Any]]:
 
     def walk(node: Any) -> None:
         if isinstance(node, dict):
-            if node.get("type") == "object" and "properties" in node:
+            kind = node.get("type")
+            # An optional nested object is typed ["object", "null"] (A1).
+            is_object = kind == "object" or (
+                isinstance(kind, list) and "object" in kind
+            )
+            if is_object and "properties" in node:
                 found.append(node)
             for key, value in node.items():
                 if key == "properties" and isinstance(value, dict):

@@ -16,7 +16,7 @@
     "type": "boolean"
    },
    "credential": {
-    "description": "Secret token/API key to store",
+    "description": "API key, token, or subscription credential to store",
     "minLength": 1,
     "type": [
      "string",
@@ -38,7 +38,7 @@
     ]
    },
    "env_var": {
-    "description": "Override environment variable key to store into",
+    "description": "Optional explicit environment variable key",
     "type": [
      "string",
      "null"
@@ -46,7 +46,7 @@
    },
    "scope": {
     "default": "user",
-    "description": "Where to store credentials",
+    "description": "Where to store the credential",
     "enum": [
      "user",
      "project"
@@ -54,7 +54,7 @@
     "type": "string"
    },
    "server_name": {
-    "description": "Server requiring authentication",
+    "description": "Server name that needs authentication",
     "minLength": 1,
     "type": "string"
    }
@@ -152,7 +152,7 @@
  "gateway.connect_server": {
   "properties": {
    "server_name": {
-    "description": "Server to connect",
+    "description": "Name of the server to connect",
     "minLength": 1,
     "type": "string"
    }
@@ -183,7 +183,7 @@
     "type": "boolean"
    },
    "server_name": {
-    "description": "Server to disconnect",
+    "description": "Name of the server to disconnect",
     "minLength": 1,
     "type": "string"
    }
@@ -372,7 +372,7 @@
  "gateway.provision": {
   "properties": {
    "server_name": {
-    "description": "Name of the server to provision from manifest",
+    "description": "Name of the server to provision (from manifest)",
     "minLength": 1,
     "type": "string"
    }
@@ -385,7 +385,7 @@
  "gateway.provision_status": {
   "properties": {
    "job_id": {
-    "description": "Job ID from provision response",
+    "description": "Job ID from gateway.provision response",
     "minLength": 1,
     "type": "string"
    }
@@ -432,7 +432,7 @@
     "type": "string"
    },
    "env_vars": {
-    "description": "Required environment variable names",
+    "description": "Required environment variable names (e.g. ['GITHUB_TOKEN'])",
     "items": {
      "type": "string"
     },
@@ -444,7 +444,7 @@
     "type": "string"
    },
    "server_name": {
-    "description": "Logical name for this server (e.g. 'github')",
+    "description": "Logical name for this server (e.g. 'github') used with gateway.provision",
     "minLength": 1,
     "type": "string"
    }
@@ -468,7 +468,7 @@
     ]
    },
    "query": {
-    "description": "Natural language capability request",
+    "description": "Natural language description of the capability needed (e.g., 'I need to scrape a website', 'browser automation')",
     "minLength": 1,
     "type": "string"
    }
@@ -486,7 +486,7 @@
     "type": "boolean"
    },
    "server_name": {
-    "description": "Server to restart",
+    "description": "Name of the server to restart",
     "minLength": 1,
     "type": "string"
    }
@@ -506,7 +506,7 @@
     "type": "integer"
    },
    "query": {
-    "description": "Natural language capability description",
+    "description": "Natural language description of the capability needed",
     "minLength": 1,
     "type": "string"
    }
@@ -798,7 +798,7 @@
     "type": "boolean"
    },
    "server_name": {
-    "description": "Server to update",
+    "description": "Name of server to update",
     "minLength": 1,
     "type": "string"
    }

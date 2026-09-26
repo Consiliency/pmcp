@@ -945,13 +945,15 @@ class RefreshOutput(BaseModel):
 class ConnectServerInput(GatewayArguments):
     """Input for gateway.connect_server."""
 
-    server_name: str = Field(min_length=1, description="Server to connect")
+    server_name: str = Field(min_length=1, description="Name of the server to connect")
 
 
 class DisconnectServerInput(GatewayArguments):
     """Input for gateway.disconnect_server."""
 
-    server_name: str = Field(min_length=1, description="Server to disconnect")
+    server_name: str = Field(
+        min_length=1, description="Name of the server to disconnect"
+    )
     force: bool = Field(
         default=False,
         description="Cancel this server's pending requests before disconnecting",
@@ -961,7 +963,7 @@ class DisconnectServerInput(GatewayArguments):
 class RestartServerInput(GatewayArguments):
     """Input for gateway.restart_server."""
 
-    server_name: str = Field(min_length=1, description="Server to restart")
+    server_name: str = Field(min_length=1, description="Name of the server to restart")
     force: bool = Field(
         default=False,
         description="Cancel this server's pending requests before restarting",
@@ -1207,7 +1209,10 @@ class GatewayPolicy(BaseModel):
 class CapabilityRequestInput(GatewayArguments):
     """Input for gateway.request_capability."""
 
-    query: str = Field(min_length=1, description="Natural language capability request")
+    query: str = Field(
+        min_length=1,
+        description="Natural language description of the capability needed (e.g., 'I need to scrape a website', 'browser automation')",
+    )
     available_clis: list[str] | None = Field(
         default=None,
         description="Optional: CLIs known to be available in the environment",
@@ -1332,7 +1337,8 @@ class SearchRegistryInput(GatewayArguments):
     """Input for gateway.search_registry."""
 
     query: str = Field(
-        min_length=1, description="Natural language capability description"
+        min_length=1,
+        description="Natural language description of the capability needed",
     )
     limit: int = Field(
         default=5, ge=1, le=20, description="Maximum number of results to return"
@@ -1355,10 +1361,12 @@ class RegisterDiscoveredServerInput(GatewayArguments):
         description="npm package identifier (e.g. '@modelcontextprotocol/server-github')",
     )
     server_name: str = Field(
-        min_length=1, description="Logical name for this server (e.g. 'github')"
+        min_length=1,
+        description="Logical name for this server (e.g. 'github') used with gateway.provision",
     )
     env_vars: list[str] = Field(
-        default_factory=list, description="Required environment variable names"
+        default_factory=list,
+        description="Required environment variable names (e.g. ['GITHUB_TOKEN'])",
     )
     description: str = Field(
         default="", description="Short description of the server's purpose"
@@ -1393,7 +1401,7 @@ class ProvisionInput(GatewayArguments):
     """Input for gateway.provision - install and start a specific server."""
 
     server_name: str = Field(
-        min_length=1, description="Name of the server to provision from manifest"
+        min_length=1, description="Name of the server to provision (from manifest)"
     )
 
 
@@ -1475,7 +1483,7 @@ class SubmitFeedbackOutput(BaseModel):
 class UpdateServerInput(GatewayArguments):
     """Input for gateway.update_server."""
 
-    server_name: str = Field(min_length=1, description="Server to update")
+    server_name: str = Field(min_length=1, description="Name of server to update")
     force: bool = Field(
         default=False,
         description=(
@@ -1510,17 +1518,19 @@ class AuthConnectInput(GatewayArguments):
     """Input for gateway.auth_connect - save auth credentials for a server."""
 
     server_name: str = Field(
-        min_length=1, description="Server requiring authentication"
+        min_length=1, description="Server name that needs authentication"
     )
     credential: str | None = Field(
-        default=None, min_length=1, description="Secret token/API key to store"
+        default=None,
+        min_length=1,
+        description="API key, token, or subscription credential to store",
     )
     env_var: str | None = Field(
         default=None,
-        description="Override environment variable key to store into",
+        description="Optional explicit environment variable key",
     )
     scope: Literal["user", "project"] = Field(
-        default="user", description="Where to store credentials"
+        default="user", description="Where to store the credential"
     )
     auth_mode: Literal["api_key", "url_elicitation"] = Field(
         default="api_key",
@@ -1554,7 +1564,9 @@ class AuthConnectOutput(BaseModel):
 class ProvisionStatusInput(GatewayArguments):
     """Input for gateway.provision_status - check job progress."""
 
-    job_id: str = Field(min_length=1, description="Job ID from provision response")
+    job_id: str = Field(
+        min_length=1, description="Job ID from gateway.provision response"
+    )
 
 
 class ProvisionJobStatus(BaseModel):
