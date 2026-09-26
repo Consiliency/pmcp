@@ -1,5 +1,46 @@
 # Detailed plan: derive gateway `inputSchema`s from their argument models, then forbid unknown keys
 
+> **Revision 2 (2026-09-26): A1/A2/A3/X1 from the board.** Piece A is now
+> *embedded*, not described: the four code blocks under *Verbatim bodies → A*
+> (`schema.py` and the test module as whole files, `types.py` and `handlers.py`
+> as `git apply` patches against `origin/main` @ `9ca081e`) plus the generated
+> snapshot are byte-identical to the frozen, verified piece-A code
+> (`wip/236-schema-drift-rev2-code` @ `72eaa76`). Proven by applying them to a
+> fresh `origin/main` worktree and running `cmp` on all five files (see
+> *Embedding proof*). The five files, and `server.py`, are byte-identical
+> between `860636a`, `8dec131` and `9ca081e`, so every "HEAD" measurement
+> below still describes `main`. What changed:
+> - **A1 (blocking):** `_collapse_nullable` now adds `"null"` to the collapsed
+>   `type` (and `None` to `enum`), so the gate accepts explicit `null` exactly
+>   where the model does. Pinned per field by
+>   `test_optional_field_null_agrees_between_gate_and_model` (42 cases). This
+>   *loosens* the gate on 28 fields that `main` rejected (see *A is not fully
+>   behaviour-neutral*).
+> - **A2 (blocking):** schemas are derived once per process
+>   (`@functools.cache _derived_gateway_tools`), pinned by call count in
+>   `test_schemas_are_derived_once_per_process`.
+> - **A3:** the scoped-audit gap on gate rejections is attributed correctly: it
+>   pre-exists on `main`, A moves more rejections onto it, B adds more. It is
+>   scoped out with a named follow-up (*Scoped-audit gap on gate rejections*).
+> - **X1 (blocking for B):** `test_every_dispatched_gateway_name_is_registered`
+>   pins dispatch == registry both ways. B depends on it.
+> - The "jsonschema echoes only the key" claim is corrected: `type`, `enum` and
+>   `pattern` errors echo the value (measured on `main`).
+> - X2: the handler-link test already used a word-boundary regex in the frozen
+>   code.
+> - Counts re-measured on the frozen code: 208 schema tests; full suite
+>   `4272 passed, 3 skipped, 25 deselected`; snapshot 811 lines; probe reports
+>   23/26 tools differing from `main` (18 constraint drift + 5 null-only).
+>   Every piece-B number is from the revision-1 tree and is marked for
+>   re-measurement.
+> - **Two places where the frozen code departs from revision 1's text, stated
+>   here and not silently absorbed:** (1) the 15 description conflicts resolve
+>   to the **model** text in the frozen code, not the HEAD text revision 1
+>   promised. This is an open decision (*Piece A → `types.py`*). (2) The board's
+>   `search_registry.available_clis` does not exist. The field is
+>   `request_capability.available_clis`, and `main`'s gate *rejects* `null`
+>   there.
+>
 > Resumes an unfinished spike from a planner whose session died. Everything
 > below marked **measured** was run in this session against `860636a`
 > (`origin/main` at planning time) or against the spike tree described in
@@ -18,9 +59,10 @@ The fix lands as **two separately-mergeable pieces, A then B**:
 
 - **A — kill the drift by construction.** Each advertised `inputSchema` is
   derived from the model its handler validates with; a test pins every link in
-  that chain. Behaviour-preserving at the model layer; at the transport gate it
-  starts rejecting what the model already rejected (see *A is not fully
-  behaviour-neutral*).
+  that chain. Behaviour-preserving at the model layer. At the transport gate it
+  starts rejecting what the model already rejected, and (revision 2, A1) accepts
+  explicit `null` where the model already accepted it (see *A is not fully
+  behaviour-neutral*). Schemas are derived once per process (A2).
 - **B — `extra="forbid"` on every argument model.** A behaviour change for
   callers that send extra keys. Own CHANGELOG entry, release-note callout,
   measured blast radius.
@@ -47,7 +89,8 @@ this as documentation drift; it is also an enforcement inconsistency.
 
 **26 tools, 23 dispatched through a model, 3 argless. There are zero tools that
 take arguments and have no model.** Measured with
-`scratchpad/probe_head.py` against `860636a`:
+`scratchpad/probe_head.py` against `860636a` (re-run 2026-09-26 against
+`9ca081e`: first line still `tools: 26 modelled: 23`):
 
 | Tool | Model (`src/pmcp/types.py`) | Nested argument models |
 |---|---|---|
@@ -101,12 +144,25 @@ entries are exactly the tools `server.py` dispatches with `()`.
   forward-compatibility, not agent input. The base class introduced in A makes
   the boundary explicit (see `GatewayArguments` docstring).
 
-### Drift on HEAD (measured: 18 of 26 tools; the probe under *Measurement scripts* prints the per-tool table)
+### Drift on HEAD (measured: 18 of 26 tools with constraint drift; with the revision-2 `schema.py` the probe prints 23/26, see below)
 
 Comparing each hand-written schema against the schema derived from its model
 (descriptions and `additionalProperties` ignored), **every difference is the
 model being stricter or broader than what is advertised** — nowhere does the
-hand-written schema state something the model lacks:
+hand-written schema state something the model lacks.
+
+**Revision 2 re-run.** With the frozen revision-2 `schema.py` as
+`spike_schema.py`, the probe's last line reads
+`tools with drift (ignoring descriptions and additionalProperties): 23/26`
+(was 18/26 with revision 1's `schema.py`). The extra five are **null-only**:
+their only differences are `hand='string' model=["string", "null"]`-style
+`type` lines and a trailing `null` in `enum` (A1's collapse). The five are
+`catalog_search`, `refresh`, `set_startup_policy`, `sync_environment` and
+`list_pending`. The 18 below are unchanged, and in several of them (`invoke`,
+`auth_connect`, `submit_feedback`, `tasks_list`, `tasks_result`,
+`request_capability`) the same `"null"` lines now appear next to the constraint
+drift. The full measured output is under *Measurement scripts*.
+The 18 constraint-drift tools:
 
 - `minLength: 1` unadvertised on 20 string arguments across 15 tools
   (`tool_id`, `server_name`, `query`, `job_id`, `request_id`, `task_id`,
@@ -141,16 +197,33 @@ Measured on `InvokeInput.model_json_schema(by_alias=True, mode="validation")`:
   becomes a top-level `description` that would shadow the `Tool.description`.
 - `run_correlation_id` is `{'anyOf': [{...string...}, {'type': 'null'}], 'default': None, 'title': ...}`.
 
-MCP clients (and `_summarize_arg_schema` in this repo, which reads
-`prop["type"]` directly) expect self-contained, `$ref`-free object schemas with
-a plain `"type"` per property. So post-processing is required, and **that
-post-processing is itself drift surface**: it gets its own module
-(`src/pmcp/tools/schema.py`, 4 documented transforms: inline `$defs`/`$ref`,
-drop `title`, collapse `anyOf:[X, null] + default:null` → `X`, drop the
-docstring description) and its own test against a synthetic model
-(`test_input_schema_for_normalises_pydantic_output`) so a change to the
-transforms cannot hide behind the real tools' snapshot. Mutation M4 below proves
-that test fires.
+MCP clients expect self-contained, `$ref`-free object schemas. So
+post-processing is required, and **that post-processing is itself drift
+surface**: it gets its own module (`src/pmcp/tools/schema.py`, 4 documented
+transforms: inline `$defs`/`$ref`, drop `title`, collapse
+`anyOf:[X, null] + default:null` → `X` **with `"null"` added to `X`'s `type`
+(and `None` to its `enum`)**, drop the docstring description) and its own test
+against a synthetic model (`test_input_schema_for_normalises_pydantic_output`),
+so a change to the transforms cannot hide behind the real tools' snapshot.
+Mutations M4 and M-A1 below prove that test fires.
+
+**Revision 2: optional fields advertise `type: [X, "null"]`, not a bare `X`.**
+Revision 1 collapsed to the bare type, which made the gate reject `null` where
+the model accepts it (board finding A1). The frozen code keeps the schema flat
+(no `anyOf`) but lists `"null"` in `type`. It leaves a *required*-nullable field
+(no `None` default) as pydantic's `anyOf`
+(`test_required_nullable_field_is_left_as_pydantic_wrote_it`). No real gateway
+model has one today, which is why
+`test_advertised_schema_is_a_self_contained_mcp_input_schema`'s "no surviving
+`anyOf`" assertion passes. Adding one will turn that test RED on purpose.
+Revision 1 said `_summarize_arg_schema` reads `prop["type"]` as a string. That
+function only summarises *downstream* tools' schemas for `gateway.describe`
+(post-A `handlers.py:692`, called at `:1381`). No in-repo code reads a gateway
+tool's property `type` (grep of `src/pmcp`: the only consumers of
+`get_gateway_tool_definitions()` are `server.py:266` (`tools/list`) and `:277`
+(the gate)). How external MCP clients handle a `type` array is **unmeasured**.
+It is valid JSON Schema (Draft 2020-12 `check_schema` passes for all 26), but
+this plan has not tested any specific client with it.
 
 **Irreducible residue** — "advertised == model" means "advertised == the
 model's *JSON-Schema projection*". Three things the models enforce are not
@@ -171,8 +244,11 @@ here before it reaches an agent. It cannot drift *silently* (the test fails when
 it disagrees); its residual risk is a blind
 `PMCP_UPDATE_SCHEMA_SNAPSHOT=1` regeneration, which is a review-discipline item
 called out in the test's docstring and in `CONTRIBUTING`-style guidance below.
-Measured sizes: A-only snapshot 681 lines (0 × `additionalProperties: false`,
-8 × `additionalProperties: true` for the free-form dicts); spike/B snapshot 712.
+Measured sizes (revision 2, frozen code): A snapshot **811 lines**
+(0 × `"additionalProperties": false`, 8 × `"additionalProperties": true` for the
+free-form dicts, 42 × `"null"` from A1). The revision-1 A snapshot was 681
+lines, and the revision-1 spike/B snapshot 712. **B's snapshot size is
+unmeasured on revision 2.**
 
 ### Verdict on the inherited spike
 
@@ -194,10 +270,13 @@ What is wrong with it as a deliverable:
    leaking into A's builder. Split as described below; measured A-only tree:
    163 passed.
 2. **It silently resolved the 15 description conflicts in favour of the model
-   text**, losing agent-facing content. Fixed in A's `types.py` change list.
+   text**, losing agent-facing content. Revision 1 fixed this in A's
+   `types.py` change list. **The frozen revision-2 code has the same outcome
+   again (model text in all 15). It is an open decision, see *Piece A →
+   `types.py`*.**
 3. **It ignored B's second-order consequences**: `_extract_trace_context`
-   (post-A tree `handlers.py:850-870`; HEAD `:1279-1299`) runs *before*
-   `InvokeInput.model_validate` (post-A `:1449-1450`; HEAD `:1878-1879`) and reads two undeclared spellings (`meta`, `traceContext`);
+   (post-A tree `handlers.py:858-878`; HEAD `:1279-1299`) runs *before*
+   `InvokeInput.model_validate` (post-A `:1458`; HEAD `:1879`) and reads two undeclared spellings (`meta`, `traceContext`);
    `InvokeInput.model_config = ConfigDict(populate_by_name=True)` makes the model
    accept `meta` while the `by_alias` schema advertises only `_meta` — so B's
    gate would reject `meta` and the model accept it, a new drift B would
@@ -221,7 +300,35 @@ Measured through `_handle_call_tool` for `describe {"tool_id": ""}`,
 (`test_server_gate_rejects_what_the_model_rejects`). Also, 16 properties become
 newly *advertised* (`invoke.task.*`, `invoke.trace_context.*`, `invoke._meta`,
 `tasks_*.requestor_context`, `tasks_result.options.timeout_ms`) and 19 arguments
-that had no description get one. This goes in A's CHANGELOG entry.
+that had no description get one (both re-measured on the frozen code by
+`desc_cmp.py` under *Measurement scripts*: `same 40 differ 15 new description 19
+newly advertised 16`). This goes in A's CHANGELOG entry.
+
+**Revision 2: A also *loosens* the gate for explicit `null` (A1).** The
+42 optional-field-`null` cases (every `X | None = None` field, top level and
+one level into a nested argument model) were measured with `probe_null.py` on
+`main` and on the frozen A. The model accepts all 42. A's gate accepts all 42
+(42/42 agree). **`main`'s gate agreed on only 14.** Those 14 are the ones the
+board named, and they were accepted on `main` only because the hand-written
+schema never declared them: `invoke.task` (+4 sub-fields), `invoke.trace_context`
+(+3), `invoke._meta`, and `requestor_context` on all **four** `tasks_*` tools.
+They stay accepted. The other **28 were rejected by `main`'s gate**
+(`None is not of type 'string'`) and now pass it and reach the handler, which
+already accepted them:
+`auth_connect.{credential, elicitation_id, elicitation_url, env_var}`,
+`catalog_search.{query, filters, filters.server, filters.tags, filters.risk_max}`,
+`invoke.{run_correlation_id, seat_correlation_id, evidence_label_digest, options, options.max_output_chars}`,
+`list_pending.server`, `refresh.{source, reason}`,
+`request_capability.available_clis`, `set_startup_policy.{source, path}`,
+`submit_feedback.{subordinate_server, failed_tool_call}`,
+`sync_environment.{platform, detected_clis}`, `tasks_list.{server_name, cursor}`,
+`tasks_result.{options, options.max_output_chars}`.
+This is the direction A1 asked for (gate == model), but it is a behaviour
+change for callers that send `null`, so it goes in A's CHANGELOG entry too.
+The board's list also named `search_registry.available_clis`. That field does
+not exist (`SearchRegistryInput` has only `query` and `limit`). The nearest
+field, `request_capability.available_clis`, is one of the 28 that `main`
+rejected.
 
 ## Order: A first, then B — why
 
@@ -237,14 +344,44 @@ that had no description get one. This goes in A's CHANGELOG entry.
   snapshot.
 - Measured why the gate must stay in front under B: pydantic's
   `extra_forbidden` error string includes
-  `input_value='Bearer sk-SECRETVALUE'`; jsonschema's names only the key.
-  `server.py:428-457` returns `str(e)[:400]` and logs it, so a forbid error
-  reaching pydantic from a gate-bypassing caller echoes the value. B pins that
-  the gate catches it first (`test_unknown_key_value_never_echoed`).
+  `input_value='Bearer sk-SAMPLE'`. `server.py:427-458` logs it
+  (`logger.error(f"Tool execution error: {e}")`, `:428`) and returns
+  `str(e)[:400]`, so a forbid error that reaches pydantic from a
+  gate-bypassing caller echoes the value into both the response and the log.
+  B pins that the gate catches it first (`test_unknown_key_value_never_echoed`).
+- **Correction (revision 2): jsonschema does *not* in general "name only the
+  key".** Measured with `probe_echo.py` (*Measurement scripts*), identically on
+  `main` and on A:
+
+  | Gate error class | Message | Echoes the value? |
+  |---|---|---|
+  | `additionalProperties: false` | `Additional properties are not allowed ('authorizatoin' was unexpected)` | **no** (key only) |
+  | `type` (`invoke.arguments` sent a string) | `'Bearer sk-SAMPLE' is not of type 'object'` | **yes** |
+  | `enum` (`refresh.source`) | `'Bearer sk-SAMPLE' is not one of ['claude_config', 'custom']` | **yes** |
+  | `pattern` (`invoke.evidence_label_digest`, the one `pattern` in any gateway schema) | `'Bearer sk-SAMPLE' does not match '^[0-9a-f]{64}$'` | **yes** |
+  | `minLength` (A only) | `'' should be non-empty` | yes, but only the empty string |
+
+  The value echo on `type`/`enum`/`pattern` errors is **pre-existing on
+  `main`**. A adds no new echoing keyword; its new constraints are
+  `minLength`/`maxLength`/bounds, which only echo short or out-of-range
+  values. The gate path returns the message in the `CallToolResult` but does
+  **not** log it (`server.py:298-308` has no logger call), whereas the pydantic
+  path does both. What this means:
+  - **For B:** the gate protects B's *unknown-key* class specifically, because
+    `additionalProperties` is the one error class that names only the key.
+    `test_unknown_key_value_never_echoed` is scoped to exactly that class and
+    is correct as written. B must not claim that gate errors never carry
+    values. A secret sent as a wrong-*typed* value to a *declared* key is
+    echoed today and stays echoed (out of scope, unchanged by A or B).
+  - **For X1:** the protection holds only when the gate *runs*. For a
+    dispatched name absent from the registry, `_find_gateway_tool` returns
+    `None`, the gate is skipped, and under B pydantic's `extra_forbidden` (value
+    included) would reach both the response and the log. That is why X1 pins
+    dispatch == registry, and why B depends on it (*X1*).
 
 ## Piece A — changes
 
-### `src/pmcp/tools/schema.py` (add, 80 lines; verbatim under *Test bodies → A*)
+### `src/pmcp/tools/schema.py` (add, 99 lines; whole file verbatim under *Verbatim bodies → A*)
 
 - `NO_ARGUMENTS_SCHEMA = {"type": "object", "properties": {}}` — **no**
   `additionalProperties` (that is B). Byte-equal to what `gateway.health`
@@ -255,13 +392,22 @@ that had no description get one. This goes in A's CHANGELOG entry.
 - `_normalize(node, defs)` — inline `#/$defs/*` refs (sibling keys such as
   `description` merged over the target; any other `$ref` prefix raises
   `ValueError`), drop `title` keys (but never a *property named* `title`), recurse.
-- `_collapse_nullable(node)` — `anyOf: [X, {"type": "null"}]` with
-  `default: None` → `X` with the `default` removed. Optional fields advertise
-  as their bare type, matching HEAD's hand-written shape.
+- `_collapse_nullable(node)` (**revised for A1**) — only for
+  `anyOf: [X, {"type": "null"}]` **with `default: None`** (an optional field):
+  → `X`'s keywords flat, `anyOf` and `default` removed, **`"null"` appended to
+  `X`'s `type`** (`"string"` → `["string", "null"]`; an existing list gains
+  `"null"` if missing) and **`None` appended to `X`'s `enum`** if it has one
+  (the `enum` keyword is checked independently of `type`, so without this a
+  `Literal | None` field would still reject `null`). A nullable field
+  *without* a `None` default (required-but-nullable) is returned untouched as
+  pydantic's `anyOf`. The gate therefore accepts exactly what the model
+  accepts: the field omitted, `null`, or an `X`.
 - Reason: documented in the module docstring; each transform is one line of
-  drift surface and is pinned by `test_input_schema_for_normalises_pydantic_output`.
+  drift surface and is pinned by `test_input_schema_for_normalises_pydantic_output`
+  (plus `test_required_nullable_field_is_left_as_pydantic_wrote_it` for the
+  collapse's boundary).
 
-### `src/pmcp/types.py` (modify)
+### `src/pmcp/types.py` (modify; `git apply` patch verbatim under *Verbatim bodies → A*, +243 / −96)
 
 - **Add `class GatewayArguments(BaseModel)`** directly above `TraceContextInfo`
   with **no `model_config`** in A. Docstring: marks agent-facing argument
@@ -271,27 +417,43 @@ that had no description get one. This goes in A's CHANGELOG entry.
   plus `CatalogFilters`, `InvokeOptions`, `TaskMetadataInput`, `TraceContextInfo`.
   `InvokeInput` keeps `ConfigDict(populate_by_name=True)` in A (B removes it).
 - **Move every argument description into `Field(description=…)`** so the derived
-  schema carries it. Rule for the text: **the HEAD hand-written schema text wins**
-  — it is what agents have been reading and is uniformly the more informative —
-  with one exception, `UpdateServerInput.force`, whose model text ("Restart the
-  server even if it has pending requests or active MCP tasks… Mirrors
-  gateway.restart_server's force flag.") is the accurate one (the hand-written
-  copy predates task support). The 15 conflicts to resolve, HEAD text → keep:
-  - `ConnectServerInput.server_name` → "Name of the server to connect"
-  - `DisconnectServerInput.server_name` → "Name of the server to disconnect"
-  - `RestartServerInput.server_name` → "Name of the server to restart"
-  - `CapabilityRequestInput.query` → "Natural language description of the capability needed (e.g., 'I need to scrape a website', 'browser automation')"
-  - `ProvisionInput.server_name` → "Name of the server to provision (from manifest)"
-  - `UpdateServerInput.server_name` → "Name of server to update"
-  - `UpdateServerInput.force` → **keep the model text** (exception above)
-  - `AuthConnectInput.server_name` → "Server name that needs authentication"
-  - `AuthConnectInput.credential` → "API key, token, or subscription credential to store"
-  - `AuthConnectInput.env_var` → "Optional explicit environment variable key"
-  - `AuthConnectInput.scope` → "Where to store the credential"
-  - `ProvisionStatusInput.job_id` → "Job ID from gateway.provision response"
-  - `SearchRegistryInput.query` → "Natural language description of the capability needed"
-  - `RegisterDiscoveredServerInput.server_name` → "Logical name for this server (e.g. 'github') used with gateway.provision"
-  - `RegisterDiscoveredServerInput.env_vars` → "Required environment variable names (e.g. ['GITHUB_TOKEN'])"
+  schema carries it.
+
+  > **Open decision: the frozen code does not implement revision 1's rule.**
+  > Revision 1 said "**the HEAD hand-written schema text wins**", with one
+  > exception (`UpdateServerInput.force`, where the model text is the accurate
+  > one). The frozen piece-A code (`72eaa76`) keeps the **model** text in
+  > **all 15** conflicts. Measured with `desc_cmp.py` (`main` → frozen A):
+  >
+  > | Argument | `main` (hand-written) | frozen A (model) |
+  > |---|---|---|
+  > | `connect_server.server_name` | Name of the server to connect | Server to connect |
+  > | `disconnect_server.server_name` | Name of the server to disconnect | Server to disconnect |
+  > | `restart_server.server_name` | Name of the server to restart | Server to restart |
+  > | `request_capability.query` | Natural language description of the capability needed (e.g., 'I need to scrape a website', 'browser automation') | Natural language capability request |
+  > | `provision.server_name` | Name of the server to provision (from manifest) | Name of the server to provision from manifest |
+  > | `update_server.server_name` | Name of server to update | Server to update |
+  > | `update_server.force` | Cancel this server's pending requests before restarting | Restart the server even if it has pending requests or active MCP tasks, cancelling them. Mirrors gateway.restart_server's force flag. *(model text intended here by both revisions)* |
+  > | `auth_connect.server_name` | Server name that needs authentication | Server requiring authentication |
+  > | `auth_connect.credential` | API key, token, or subscription credential to store | Secret token/API key to store |
+  > | `auth_connect.env_var` | Optional explicit environment variable key | Override environment variable key to store into |
+  > | `auth_connect.scope` | Where to store the credential | Where to store credentials |
+  > | `provision_status.job_id` | Job ID from gateway.provision response | Job ID from provision response |
+  > | `search_registry.query` | Natural language description of the capability needed | Natural language capability description |
+  > | `register_discovered_server.server_name` | Logical name for this server (e.g. 'github') used with gateway.provision | Logical name for this server (e.g. 'github') |
+  > | `register_discovered_server.env_vars` | Required environment variable names (e.g. ['GITHUB_TOKEN']) | Required environment variable names |
+  >
+  > The embedded patch reproduces the frozen code, so executing this plan as
+  > written ships the model text, and agents lose content in some of these
+  > (the worked examples in `request_capability.query`, the
+  > `gateway.provision` cross-reference, the `GITHUB_TOKEN` example). This
+  > plan does **not** rewrite the rationale to fit. The board or maintainer
+  > must choose before A merges: **(a)** accept the model text (the snapshot
+  > diff in A's PR is the review surface), or **(b)** apply revision 1's
+  > HEAD-text rule for 14 arguments (all but `update_server.force`) as a
+  > follow-up edit to the `Field(description=…)` strings. That changes only
+  > descriptions and the snapshot, not behaviour. Option (b) invalidates the
+  > byte-identity proof below, so it has to be re-proved.
 
   40 descriptions are lifted verbatim (measured); 19 arguments that had no
   description on HEAD get the spike's text (list in `scratchpad/desc_diff.out`:
@@ -303,9 +465,9 @@ that had no description get one. This goes in A's CHANGELOG entry.
 - Reason: the model is the single source; descriptions that live only in the
   hand-written dict are exactly the drift being removed.
 
-### `src/pmcp/tools/handlers.py` (modify)
+### `src/pmcp/tools/handlers.py` (modify; `git apply` patch verbatim under *Verbatim bodies → A*, +195 / −616)
 
-- Import `NamedTuple` (typing) and `BaseModel` (pydantic); import
+- Import `functools`, `NamedTuple` (typing) and `BaseModel` (pydantic); import
   `input_schema_for` from `pmcp.tools.schema`.
 - **Add `class _GatewayToolSpec(NamedTuple)`**: `name: str`,
   `input_model: type[BaseModel] | None`, `description: str`.
@@ -315,43 +477,161 @@ that had no description get one. This goes in A's CHANGELOG entry.
   `None` for `health`, `config_status`, `get_startup_policy`.
 - **Add `GATEWAY_TOOL_INPUT_MODELS: dict[str, type[BaseModel] | None]`** derived
   from the specs — the public registry the tests read.
-- **Replace the body of `get_gateway_tool_definitions()`** (currently
-  `handlers.py:470-1110`, 26 inline `Tool(...)`) with
-  `[Tool(name=spec.name, description=spec.description, input_schema=input_schema_for(spec.input_model)) for spec in _GATEWAY_TOOL_SPECS]`.
-  Net −431 lines.
+- **Replace `get_gateway_tool_definitions()`** (HEAD `handlers.py:470-1111`,
+  26 inline `Tool(...)`; post-A the registry and builder occupy `:472-689`)
+  with **two functions (A2)**:
+  - `@functools.cache def _derived_gateway_tools() -> tuple[Tool, ...]`, which
+    builds `Tool(name=spec.name, description=spec.description, input_schema=input_schema_for(spec.input_model))`
+    for each spec **once per process**;
+  - `get_gateway_tool_definitions() -> list[Tool]`, which returns
+    `list(_derived_gateway_tools())`.
+
+  Net −421 lines (numstat +195 / −616).
+  Why cache: the board measured the derivation at 13.4 ms per call, against
+  0.058 ms for the hand-written literal, and `server.py:277`
+  (`_find_gateway_tool`) calls `get_gateway_tool_definitions()` on **every**
+  `tools/call`, and `:266` on every `tools/list`. The models are module-level
+  and immutable at runtime, so a process-lifetime cache is exact. Callers get a
+  fresh `list`, but the `Tool` objects (and their `input_schema` dicts) are
+  **shared** across calls. Nothing in-repo mutates them (the only consumers are
+  `server.py:266` and `:277`, which read). A future caller that mutates an
+  `input_schema` would poison every later `tools/list` and gate check.
+  `test_schemas_are_derived_once_per_process` pins the call count (A2 row
+  under *Acceptance criteria*). It deliberately measures call count, not wall
+  time.
 - Nothing else in the file changes. `server.py` is untouched in A: it already
   reads `get_gateway_tool_definitions()` for both `tools/list` and the gate.
+  The `_extract_trace_context` / `InvokeInput.model_validate` bodies are
+  unchanged and move to post-A `:858-878` / `:1458` (HEAD `:1279-1299` /
+  `:1879`).
 - Reason: by construction there is no hand-written schema left to drift.
 
-### `tests/test_gateway_tool_schemas.py` (add; verbatim under *Test bodies → A*)
+### `tests/test_gateway_tool_schemas.py` (add, 443 lines; whole file verbatim under *Verbatim bodies → A*)
 
-The three-link chain plus shape, snapshot, normalisation, and gate tests:
+**208 tests** (measured: `208 passed`, collect-only counts in brackets). The
+three-link chain plus shape, snapshot, normalisation, gate, and the revision-2
+additions:
 
 - `test_registry_lists_every_advertised_tool_in_order`
 - `test_advertised_schema_is_derived_from_registered_model[26]` — the
   "hand-corrupted schema" detector (M1).
 - `test_handler_validates_arguments_with_the_registered_model[23]` — asserts
-  `f"{Model.__name__}.model_validate("` appears in the handler's source. Known
-  cost: source inspection is brittle to refactors that move validation into a
-  helper; the structural alternative (server.py validating via the registry
-  instead of each handler) is a named non-goal.
+  `re.search(rf"\b{Model.__name__}\.model_validate\(", source)` on the
+  handler's source. **X2: already a word-boundary regex in the frozen code**
+  (mutant M-X2 below: `_DescribeInput.model_validate(` passes a substring check
+  but fails this one). Known cost: source inspection is brittle to refactors
+  that move validation into a helper. The structural alternative (server.py
+  validating via the registry instead of each handler) is a named non-goal.
 - `test_server_dispatch_agrees_with_registry[26]` — `None` ⇔ `method()` in
-  `_handle_call_tool` source.
+  `_handle_call_tool` source. Proves registry → dispatch only.
+- **`test_every_dispatched_gateway_name_is_registered` (X1, new)** — see *X1*
+  below. Proves dispatch ⇔ registry, both ways.
 - `test_no_argument_tools_advertise_an_empty_object[3]`
 - `test_advertised_schema_is_a_self_contained_mcp_input_schema[26]` — no
   `$ref`/`$defs`/`title` keywords, no surviving `anyOf`, every property described.
+  **Known coverage gap since A1 (measured, not fixed in the frozen code):** its
+  helper `_object_schemas` selects `node.get("type") == "object"`, so after A1
+  the five *optional* nested objects (`catalog_search.filters`,
+  `invoke.options`, `invoke.task`, `invoke.trace_context`,
+  `tasks_result.options`, now typed `["object", "null"]`) are no longer walked.
+  The helper finds 26 of the 31 object schemas. The property it would check
+  holds today: all 17 nested properties have a description and no `anyOf`
+  (measured). But it is unpinned. B edits this file anyway and must fix the
+  helper (see *Piece B*).
 - `test_advertised_schema_is_valid_json_schema[26]` — `Draft202012Validator.check_schema`.
 - `test_advertised_schema_accepts_the_minimal_valid_arguments[26]` — gate and
   model both accept the minimal argument set.
 - `test_advertised_schemas_match_snapshot`
-- `test_input_schema_for_normalises_pydantic_output`, `test_input_schema_for_none_is_the_empty_object`
+- `test_input_schema_for_normalises_pydantic_output` (now expects
+  `["string", "null"]`, `["object", "null"]` and `enum: ["a", "b", None]` for the
+  synthetic optionals), `test_input_schema_for_none_is_the_empty_object`
+- **`test_required_nullable_field_is_left_as_pydantic_wrote_it` (new)** — the
+  collapse's boundary: `str | None` with no default keeps its `anyOf`.
+- **`test_optional_field_null_agrees_between_gate_and_model[42]` (A1, new)** —
+  for every optional field with a `None` default (top level, and one level
+  into each nested argument model), sends explicit `null` through both the
+  gate (`jsonschema.validate` against the advertised schema) and the model,
+  and asserts `gate_accepts == model_accepts`. This is the board's requested
+  property, "the model accepts `null` iff the derived schema does", checked
+  per field. Note: the 42-case enumeration walks
+  `model_fields[...].annotation`, and `TasksResultInput.options` is a
+  `ForwardRef` until the model is rebuilt. It resolves here because the module
+  computes `TOOL_NAMES` (which derives every schema) at import, before the
+  parametrize list is built. Measured: without that rebuild, the enumeration
+  yields 41 cases on `main`'s models, missing
+  `tasks_result.options.max_output_chars`.
+- **`test_schemas_are_derived_once_per_process` (A2, new)** — patches
+  `handlers.input_schema_for` with a counting wrapper, clears the cache, then
+  calls `get_gateway_tool_definitions()` and `GatewayServer._find_gateway_tool`
+  5× each, and asserts `input_schema_for` ran exactly `len(TOOL_NAMES)` = 26
+  times.
 - `test_server_gate_rejects_what_the_model_rejects[3]` — pins A's error-shape change.
 
 ### `tests/fixtures/gateway_tool_schemas.json` (add)
 
-Generated once with `PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py`
-after the description decisions above are applied, then reviewed line by line in
-the PR (A-only measured: 681 lines, no `additionalProperties: false`).
+Generated with `PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py`
+after the code above is applied (the writer is deterministic:
+`json.dumps(..., indent=1, sort_keys=True) + "\n"`), then reviewed line by line
+in the PR. Measured: 811 lines, 0 × `additionalProperties: false`, 8 × `true`.
+The embedding proof `cmp`s the generated file against the frozen fixture.
+
+### X1 — dispatch == registry, pinned (blocking for B)
+
+`_handle_call_tool` runs the gate only for names `_find_gateway_tool` finds in
+`get_gateway_tool_definitions()` (`server.py:296-308`). A dispatch branch in
+`call_tool` for a name **not** in the registry would skip the gate and hand raw
+arguments to its handler. Under B that handler's pydantic `extra_forbidden`
+error, which carries `input_value='Bearer sk-…'`, would then be both logged
+(`:428`) and returned (`:458`). Measured on `main` and on frozen A: the
+dispatched names equal the registry (26/26) **today**, but nothing pinned it.
+The existing `test_server_dispatch_agrees_with_registry` iterates the
+*registry* and so proves only registry → dispatch.
+
+`test_every_dispatched_gateway_name_is_registered` extracts every
+`name == "gateway.…"` literal from `inspect.getsource(GatewayServer._handle_call_tool)`
+with `\bname == "(gateway\.[a-z_]+)"`. It asserts the pattern matched (at least
+`len(TOOL_NAMES) - 1` names, so a regex that silently matches nothing cannot
+pass), then asserts `dispatched == set(TOOL_NAMES)`, reporting each direction's
+difference. Mutant M-X1: rename the `gateway.health` dispatch branch to
+`gateway.health_internal`. **Only this test** goes RED (1 failed, 207 passed).
+The older registry → dispatch test stays green, because
+`self._gateway_tools.health()` is still in the source.
+
+**Pin, not fail closed.** The board offered two options: pin, or return an
+error early when `tool is None`. We chose pin. An early return for an unknown
+name would skip `call_tool` entirely. Today an unknown name reaches `call_tool`,
+raises `ValueError(f"Unknown tool: {name}")` (`server.py:392`), and is
+**recorded** by the `except Exception` arm (`_record_scoped_invocation(...,
+terminal_status="failure")`, `:436`). Failing closed at the gate would move
+unknown names onto the same unaudited path that A3 is about. Unknown names are
+already rejected, so the only gap was an *unregistered dispatch branch*, and
+the pin closes that at test time.
+
+### Scoped-audit gap on gate rejections (A3) — attributed, scoped out
+
+**Attribution (revision 1 put it in B; it starts earlier).** On `main` the
+gate returns `CallToolResult(is_error=True, …)` at `server.py:300-308`
+*before* `call_tool` is entered. So a gate rejection never reaches
+`_record_scoped_invocation` (`:320`, `:405`, `:436`), and it also skips
+`_require_scoped_audit()` and the policy check. **This is pre-existing on
+`main`** for every gate rejection the hand-written schemas already made
+(missing required key, wrong type, enum). **A moves more rejections onto that
+path:** on the 18 constraint-drift tools, inputs that `main`'s gate passed and
+the *model* rejected (e.g. `describe {"tool_id": ""}`) were audited as
+`failure` inside `call_tool`. Under A the gate rejects them first, unaudited.
+(A1 moves 28 `null` cases the other way, off the unaudited path.) **B adds
+more:** every unknown-key call becomes a gate rejection.
+
+**Decision: scope out, with a named follow-up.** A does not touch `server.py`,
+and recording a *rejected, unvalidated* payload means deciding what the audit
+may store without copying raw values. That needs its own design and review.
+Named follow-up: **"Record `tools/call` gate rejections in the scoped-advisor
+audit"**. The likely shape mirrors the existing `except Exception` arm:
+`terminal_status="failure"`, `result={"error_type": "InputValidationError"}`,
+arguments passed through the audit's existing filtering, and never the
+jsonschema message (which can echo values, see above). It is to be filed on
+Consiliency/pmcp and landed **before B merges**, since B is where the unaudited
+set grows the most. Not filed by this revision.
 
 ### `CHANGELOG.md` (modify) — `[Unreleased]` → `### Fixed`
 
@@ -364,10 +644,59 @@ those rejections now come back as an `isError` tool result reading
 `Input validation error: …` instead of an `{"error": true}` payload.
 `gateway.invoke` now advertises `task`, `trace_context` and `_meta`;
 `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains
-`timeout_ms`. Unknown keys are still ignored in this release — see the
-following entry once B lands."
+`timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and
+the transport gate now accepts an explicit `null` for them, as the handlers
+always did; 28 optional arguments (e.g. `catalog_search.query`,
+`invoke.options`, `auth_connect.credential`) were previously rejected at the
+gate when sent as `null`. Unknown keys are still ignored in this release — see
+the following entry once B lands."
+
+(If the open description decision above resolves to (b), add: "Argument
+descriptions are unchanged except …". Under (a), the 15 changed descriptions
+are visible in the snapshot diff.)
 
 ## Piece B — changes
+
+> **Revision 2 status of B: described, not implemented, and not re-measured.**
+> Every B number in this plan (223 schema tests, 264 with the edited callers,
+> the 712-line snapshot with 31 × `false` / 8 × `true`, the MB1–MB4 counts,
+> the full suite 4287 passed) was measured on the **revision-1** tree, whose A
+> collapsed optionals to a bare `type`. None of them has been re-measured on
+> revision-2 A. B's executor must re-measure all of them. What is known to
+> still hold, and what must change:
+>
+> - **B depends on X1.** B's security claim ("an unknown key is rejected by
+>   *name*, and its value is never echoed or logged") holds only for names the
+>   gate sees. `test_every_dispatched_gateway_name_is_registered` (in A) is what
+>   guarantees that every dispatched name is gated. B's PR must not merge
+>   unless that test is present and green on B's head. If a later change
+>   removes or weakens it, `test_unknown_key_value_never_echoed` no longer
+>   covers every tool.
+> - **Hunks still apply (checked by reading the post-A source, not by
+>   applying).** The `types.py` `GatewayArguments` / `InvokeInput` context and
+>   the `_extract_trace_context` candidate tuple (post-A `handlers.py:862-867`)
+>   are unchanged by revision 2. The `NO_ARGUMENTS_SCHEMA` replacement is
+>   unchanged. The four caller edits touch files A does not modify.
+> - **B test-code changes forced by revision-2 A (1 required, 1 recommended):**
+>   1. `test_advertised_schema_forbids_unknown_keys` skips any property whose
+>      `type` is not the string `"object"`. After A1, the optional nested
+>      objects are `["object", "null"]`, so as written it would silently skip
+>      `invoke.options`, `invoke.task`, `invoke.trace_context`, `invoke._meta`,
+>      `catalog_search.filters` and `tasks_result.options`: a check that proves
+>      less than it claims. Change the guard to "`"object"` is the type or is
+>      in the type list". Fix A's `_object_schemas` helper the same way (A's
+>      self-contained test has the same blind spot, see *Piece A*). Then prove
+>      the fix with a mutant: drop `additionalProperties: false` from
+>      `InvokeOptions` only, and expect RED.
+>   2. B's appended block defines `_model_types`, but revision-2 A's test
+>      module already defines an identical `_model_types`. Appending it again
+>      is harmless at runtime (same body), and ruff does not flag it (measured:
+>      `ruff check --select F811` on A's module + B's block reports
+>      "All checks passed!"). It is still a second copy, so omit B's
+>      `_model_types` and reuse A's.
+> - The A1 property test (`test_optional_field_null_agrees_between_gate_and_model`)
+>   still applies under B unchanged: `extra="forbid"` does not affect `null`
+>   on declared fields.
 
 ### `src/pmcp/types.py` (modify)
 
@@ -426,7 +755,7 @@ in the free-form `arguments` dict and keep that proof.
 
 **These four are the whole measured in-repo blast radius** (see *Blast radius*).
 
-### `tests/test_gateway_tool_schemas.py` (modify; verbatim under *Test bodies → B*)
+### `tests/test_gateway_tool_schemas.py` (modify; verbatim under *Verbatim bodies → B*, with the two changes in the B preamble)
 
 - `test_every_argument_model_extends_gateway_arguments` — walks nested
   annotations; every argument model is a `GatewayArguments` with `extra == "forbid"`.
@@ -475,7 +804,7 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
   mentions `gateway.invoke` in a comment only). `client/manager.py`'s
   `requestor_context` is *outbound* to downstream servers, not a gateway-tool
   argument.
-- **Full suite on the fused spike (= B before any test edit): 4 failed, 4251
+- **Full suite on the fused spike (= B before any test edit; revision-1 tree): 4 failed, 4251
   passed, 3 skipped in 11:35.** All four pass on the A-only tree (measured:
   `4 passed`), so they are B's entire in-repo blast radius, and each is a test
   that sends keys its tool does not declare:
@@ -489,20 +818,27 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
 
   A consequence worth stating: a gate rejection returns before
   `_record_scoped_invocation`, so under B an extra-key call is **not** written
-  to the scoped-advisor audit. That is already true on HEAD for every gate
-  rejection (missing required, wrong type); B widens the set. Recording gate
-  rejections in the audit is a named non-goal / follow-up, not silently absorbed.
-- **Full suite on the B tree after those four edits**: **4287 passed, 0
-  failed**, 3 skipped, 25 deselected in 9:56 (`scratchpad/b_full.log`). The
-  60 tests over A-only are B's new parametrized cases.
-- **Full suite on the A-only tree**: **4227 passed, 0 failed**, 3 skipped, 25
-  deselected in 12:25 (`scratchpad/aonly_full.log`). A breaks nothing in-repo.
+  to the scoped-advisor audit. As *Scoped-audit gap on gate rejections (A3)*
+  sets out, that is pre-existing on `main`, A moves the drift tools'
+  model-rejections onto it, and B widens the set further. It is scoped out
+  with a named follow-up to land before B.
+- **Full suite on the B tree after those four edits** (revision-1 tree,
+  **not re-measured on revision 2**): 4287 passed, 0 failed, 3 skipped, 25
+  deselected in 9:56 (`scratchpad/b_full.log`). The 60 tests over the
+  revision-1 A were B's new parametrized cases.
+- **Full suite on the A tree (revision 2, frozen code `72eaa76`, re-measured
+  2026-09-26)**: **4272 passed, 0 failed, 3 skipped, 25 deselected** in 6:58
+  (`uv run pytest -m 'not live' -p no:cacheprovider -q` with `npm_config_cache`
+  and `npm_config_store_dir` unset). That is 45 more than revision 1's A
+  (4227), matching the schema file's growth from 163 to 208. A breaks nothing
+  in-repo.
 - **Full suite on `860636a` (baseline, throwaway worktree
   `/mnt/HC_Volume_105438154/worktrees/pmcp-236-head`)**: 4063 passed, 1 failed —
   `tests/test_manifest.py::TestMonitorInstall::test_monitor_reads_stderr`, which
   passed 3/3 when re-run in isolation; a load-induced flake (host load ≈16
   during the run) in a file no piece touches. The 4227 − 4063 = 164 extra
-  A-only tests are the new parametrized schema tests.
+  revision-1 A tests were the new parametrized schema tests (revision 2: 4272).
+  The `860636a` baseline was not re-run on `9ca081e`.
 - **Argument for `forbid` everywhere rather than selectively**: every argument
   model is consumed by exactly one audience — a prompt-injectable agent — and
   every field that legitimately carries open content is already typed
@@ -523,58 +859,89 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
 
 ## Dependencies & order
 
-1. A: `schema.py` → `types.py` (base class, reparenting, descriptions with the
-   15 decisions) → `handlers.py` registry → tests → generate snapshot → review
-   the snapshot against the HEAD schemas, regenerated with
-   `git show 860636a:src/pmcp/tools/handlers.py > /tmp/h.py` and
-   `{t.name: t.input_schema for t in get_gateway_tool_definitions()}` from that
-   module (the *Measurement scripts* section has the full probe): the *only*
-   differences must be the 18-tool drift list above plus the 19 new descriptions. → CHANGELOG A → PR A.
-2. B (after A merges): `types.py` flip + `populate_by_name` removal →
+1. A: apply the four verbatim bodies (*Verbatim bodies → A*, exact commands in
+   *Embedding proof*) → generate the snapshot → review the snapshot against the
+   HEAD schemas with the *Measurement scripts* probes run from a `main` checkout:
+   the *only* differences must be the 23/26 `probe_head.py` list (18 constraint
+   drift + 5 null-only), the 16 newly advertised properties, the 19 new
+   descriptions and the 15 description conflicts (`desc_cmp.py`) → **resolve
+   the open description decision** → **file the A3 follow-up** →
+   CHANGELOG A → PR A.
+2. B (after A merges, **and after the A3 follow-up lands**; X1's test must be
+   green on B's head): `types.py` flip + `populate_by_name` removal →
    `schema.py` no-arg schema → `handlers.py` trace-context branches →
-   `test_tools.py:6213` → B tests → regenerate snapshot → CHANGELOG B + callout
-   → PR B with the snapshot diff called out in the description.
+   `test_tools.py:6213` → B tests (with the B-preamble type-list fix) →
+   re-measure every B number → regenerate snapshot → CHANGELOG B + callout →
+   PR B with the snapshot diff called out in the description.
 
 ## Verification
 
 ```bash
 cd <worktree>
+uv sync --all-extras -p 3.10                           # fresh worktree: without it pytest is the system one
+uv run pytest tests/test_gateway_tool_schemas.py -p no:cacheprovider --cov-fail-under=0 -q
+                                                       # A: 208 passed (measured, revision 2)
 uv run pytest tests/test_gateway_tool_schemas.py tests/test_baseline_constraints.py \
-  -p no:cacheprovider --cov-fail-under=0 -q            # A: schema file alone 163 passed (measured); baseline file unchanged
+  -p no:cacheprovider --cov-fail-under=0 -q            # A: 245 passed (measured; baseline file alone 37, unchanged)
 uv run pytest tests/test_tools.py -p no:cacheprovider --cov-fail-under=0 -q   # B: after the :6213 edit
-nohup uv run pytest -p no:cacheprovider -q > /tmp/full.log 2>&1 & disown   # full suite, detached
-uv run ruff check src/ tests/                          # measured clean on A-only and on the spike
-uv run ruff format --check src/ tests/                 # measured clean on A-only and on the spike
-uv run mypy src/pmcp --exclude baml_client            # CI gate (test.yml:387); measured clean on HEAD (49 files), A-only (50), B (50)
-uv run python3 scripts/check_plan_consistency.py plans/phase-plan-v13-*.md   # blocking inconsistencies: 0 (measured)
+env -u npm_config_cache -u npm_config_store_dir \
+  uv run pytest -m 'not live' -p no:cacheprovider -q   # full suite; run it as a background task that notifies on exit
+                                                       # A: 4272 passed, 3 skipped, 25 deselected (measured, revision 2)
+uv run ruff check src/ tests/                          # A: "All checks passed!" (measured, revision 2)
+uv run ruff format --check src/ tests/                 # A: "163 files already formatted" (measured, revision 2)
+uv run mypy src/pmcp --exclude baml_client            # CI gate (test.yml:387); A: "no issues found in 50 source files" (measured, revision 2)
+uv run python ~/code/pmcp/scripts/check_plan_consistency.py \
+  .consiliency/plans/detailed-236-schema-drift-20260923-0915.md   # see *Consistency gate* for what it checks here
 ```
 
 Edge cases exercised by the tests: a model field literally named `title`
 (`_Outer.title`) must survive title-stripping; an aliased field (`_meta`) must
 advertise under its alias; a `Literal | None` field must collapse to
-`{"type": "string", "enum": [...]}`; the argless tools must be exactly the ones
-`server.py` dispatches with `()`.
+`{"type": ["string", "null"], "enum": [..., None]}`; a required-nullable field
+keeps its `anyOf`; the argless tools must be exactly the ones `server.py`
+dispatches with `()`; dispatch names must equal registry names.
 
 ## Acceptance criteria — measured this session
 
-### Piece A (tree: spike with `forbid` and `additionalProperties` removed; 163 passed green)
+### Piece A (tree: frozen revision-2 code `72eaa76`; 208 passed green)
 
-Each mutation was applied to the A-only tree, confirmed with `diff -u` against
-the saved A-only copy (`scratchpad/mutate_A.out` has the full diffs), run
-against `tests/test_gateway_tool_schemas.py`, and restored (`diff -q` clean,
-five files). All RED for the named reason:
+Re-measured 2026-09-26 in a detached worktree at `72eaa76`, after the full
+suite there had finished (the mutants edit files the suite imports). Each
+mutation was applied by exact-string replacement asserted to match once, shown
+with `diff -u` against a saved copy, run against
+`tests/test_gateway_tool_schemas.py`, then restored with `cp` from the saved
+copy and proven by `cmp` and `git diff --quiet HEAD -- <file>`. Unmutated
+baseline: `208 passed`. All RED for the named reason:
 
 | # | Mutation (file:entity) | Confirmed diff | RED tests | Why it must fire |
 |---|---|---|---|---|
-| M1 | `handlers.py:get_gateway_tool_definitions` — inline dict for `gateway.describe` without `minLength` (**the hand-corrupted schema**) | `-input_schema=input_schema_for(spec.input_model)` / `+… if spec.name == "gateway.describe" else …` | `test_advertised_schema_is_derived_from_registered_model[gateway.describe]`, `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]` — 3 failed, 160 passed | someone reintroduces a hand-written schema that bypasses the builder |
-| M2 | `handlers.py:_GATEWAY_TOOL_SPECS` — `gateway.describe` registered with `ConnectServerInput` | `-input_model=DescribeInput,` / `+input_model=ConnectServerInput,` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]`, `…accepts_the_minimal_valid_arguments[gateway.describe]`, snapshot, gate — 4 failed, 159 passed | the registry names a model the handler does not run |
-| M3 | `types.py:DescribeInput.tool_id` — `min_length=1` → `2` | `-min_length=1,` / `+min_length=2,` | `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]` — 2 failed, 161 passed | an agent-facing contract change must be a reviewed snapshot diff |
-| M4 | `schema.py:_collapse_nullable` — early `return node` (nullable `anyOf` no longer collapsed) | `+    return node` | `test_input_schema_for_normalises_pydantic_output`, snapshot, `…is_a_self_contained_mcp_input_schema[…]` × 10+ — the synthetic-model test fires independently of the real tools | the post-processing is drift surface of its own |
+| M1 | `handlers.py:_derived_gateway_tools` — HEAD's hand-written dict for `gateway.describe` (no `minLength`) (**the hand-corrupted schema**) | `-input_schema=input_schema_for(spec.input_model),` / `+input_schema=({…HEAD dict…} if spec.name == "gateway.describe" else input_schema_for(spec.input_model)),` | `test_advertised_schema_is_derived_from_registered_model[gateway.describe]`, `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]`, and incidentally `test_schemas_are_derived_once_per_process` (25 ≠ 26 calls) — 4 failed, 204 passed | someone reintroduces a hand-written schema that bypasses the builder |
+| M2 | `handlers.py:_GATEWAY_TOOL_SPECS` — `gateway.describe` registered with `ConnectServerInput` | `-input_model=DescribeInput,` / `+input_model=ConnectServerInput,` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]`, `…accepts_the_minimal_valid_arguments[gateway.describe]`, snapshot, gate — 4 failed, 204 passed | the registry names a model the handler does not run |
+| M3 | `types.py:DescribeInput.tool_id` — `min_length=1` → `2` | `-min_length=1, …` / `+min_length=2, …` | `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]` — 2 failed, 206 passed | an agent-facing contract change must be a reviewed snapshot diff |
+| M4 | `schema.py:_collapse_nullable` — early `return node` (nullable `anyOf` no longer collapsed) | `+    return node` | `test_input_schema_for_normalises_pydantic_output`, snapshot, `…is_a_self_contained_mcp_input_schema[…]` ×13 — 15 failed, 193 passed. The synthetic-model test fires independently of the real tools | the post-processing is drift surface of its own |
+| **M-A1** | `schema.py:_collapse_nullable` (`:94`) — drop `"null"`: `out["type"] = [inner_type, "null"]` → `out["type"] = inner_type` (revision 1's behaviour) | `-        out["type"] = [inner_type, "null"]` / `+        out["type"] = inner_type` | `test_optional_field_null_agrees_between_gate_and_model` **×42** (e.g. `gateway.submit_feedback {…, 'failed_tool_call': None}: gate=False model=True`), snapshot, `test_input_schema_for_normalises_pydantic_output` — 44 failed, 164 passed. All 42 fail, including the 14 fields `main` accepted only because it never declared them, since A declares them | the gate must accept `null` exactly where the model does (board A1) |
+| **M-A2** | `handlers.py:get_gateway_tool_definitions` (`:689`) — bypass the cache at the call site: `list(_derived_gateway_tools())` → `list(_derived_gateway_tools.__wrapped__())` | `-    return list(_derived_gateway_tools())` / `+    return list(_derived_gateway_tools.__wrapped__())` | `test_schemas_are_derived_once_per_process` — **`assert 260 == 26`** (10 lookups × 26 derivations) — 1 failed, 207 passed | derivation must happen once per process, not per `tools/call` (board A2) |
+| **M-X1** | `server.py:_handle_call_tool` — rename the dispatch branch `name == "gateway.health"` → `"gateway.health_internal"` | `-                elif name == "gateway.health":` / `+                elif name == "gateway.health_internal":` | **only** `test_every_dispatched_gateway_name_is_registered` — 1 failed, 207 passed. `test_server_dispatch_agrees_with_registry` stays green, which is the gap X1 closes | a dispatch branch for an unregistered name would skip the gate |
+| **M-X2** | `handlers.py:GatewayTools.describe` — `DescribeInput.model_validate(` → `_DescribeInput.model_validate(` (a substring match, not a word match) | `-        parsed = DescribeInput.model_validate(input_data)` / `+        parsed = _DescribeInput.model_validate(input_data)` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]` — 1 failed, 207 passed | the handler-link check matches on a word boundary, not a substring |
 
 Note M1 and M3 both light the gate test: the gate test is what turns "the
 schema says X" into "the transport enforces X".
 
-### Piece B (tree: fused spike + B additions)
+**The A2 mutant to cite is M-A2, not "delete the decorator".** Removing
+`@functools.cache` also turns `test_schemas_are_derived_once_per_process` RED
+(measured, 1 failed, 207 passed), but for the wrong reason: the test's own
+`handlers._derived_gateway_tools.cache_clear()` raises
+`AttributeError: 'function' object has no attribute 'cache_clear'` before
+anything is counted. That RED proves the decorator exists, not that
+derivation happens once. M-A2 keeps the decorator and bypasses it at the call
+site, and the test fails on the count (`260 == 26`), which is the property.
+
+### Piece B (tree: fused spike + B additions — **revision-1 tree; not re-measured on revision 2**)
+
+Every count below predates A1 (bare `type` for optionals), A2, X1 and the 45 new A
+tests. On revision-2 A the base count is 208, not 163, and MB1's
+`test_advertised_schema_forbids_unknown_keys` count depends on the type-list fix in
+the B preamble. B's executor re-runs MB1–MB4 and adds one mutant for that fix.
 
 B tree = fused spike + `populate_by_name` removed + `meta`/`traceContext`
 branches dropped + the four test edits + A's and B's extra tests. Measured:
@@ -594,7 +961,15 @@ callers 264 passed; snapshot 712 lines, 31 × `additionalProperties: false`,
 
 ### Restoration proofs
 
-- [x] `src/` and `tests/` byte-identical to `860636a` before the plan commit —
+- [x] Revision 2: the plan branch's `src/` and `tests/` are byte-identical to
+  its base `8dec131` (`git diff --stat 8dec131 -- src tests` empty at commit
+  time). Against `origin/main` @ `9ca081e` they differ only in the two files
+  that Consiliency/pmcp#292 changed on `main` (`src/pmcp/client/manager.py`,
+  `tests/test_client_manager.py`), none of which piece A touches. The revision
+  changes only this plan and `plans/manifest.json`. The
+  measurement worktree's mutations were each restored and proven by `cmp` +
+  `git diff --quiet HEAD`, and the worktree was then removed.
+- [x] Revision 1: `src/` and `tests/` byte-identical to `860636a` before the plan commit —
   measured after `finish.sh`: `git status --short` shows only `?? .consiliency/plans/detailed-236-schema-drift-20260923-0915.md`; `git status --short -- src tests` empty; zero untracked files under `src/` or `tests/`.
 - [x] `origin/plan/236-schema-drift` == HEAD — proven after the push by `git rev-parse HEAD origin/plan/236-schema-drift` printing one sha twice (recorded in the delivery report; a plan cannot contain its own commit sha).
 
@@ -607,19 +982,134 @@ callers 264 passed; snapshot 712 lines, 31 × `additionalProperties: false`,
 - Changing any handler's behaviour, any tool's description, or the tool count.
 - Expressing the three validator-only constraints in JSON Schema.
 - Downstream tools' schemas (`gateway.describe` output) — untouched.
+- Recording gate rejections in the scoped-advisor audit (A3). The gap is
+  pre-existing on `main`. Named follow-up, to land before B: "Record
+  `tools/call` gate rejections in the scoped-advisor audit".
+- Failing closed on unknown tool names at the gate (X1 pins dispatch ==
+  registry instead; unknown names keep today's audited `Unknown tool` path).
+- Value echo in `type`/`enum`/`pattern` gate errors for *declared* keys
+  (pre-existing on `main`, unchanged by A or B).
 
 ## Execution Policy
 
-- execute A: effort=medium, reason=mechanical registry + 27 model edits, but 15
-  description decisions and a 681-line snapshot must be reviewed against the
-  measured HEAD schemas, not eyeballed.
-- execute B: effort=low, reason=one-line flip plus four consequential edits; the
-  risk is entirely in the release note and the snapshot diff review.
+- execute A: effort=low, reason=A is embedded verbatim and proven
+  byte-identical to verified code (four bodies + a deterministic snapshot).
+  The remaining work is review: the open description decision, and the
+  811-line snapshot, which must be read against the measured HEAD schemas, not
+  eyeballed.
+- execute B: effort=medium (was low), reason=one-line flip plus four
+  consequential edits, but every B number must be re-measured on revision-2
+  A, the type-list fix to two test helpers needs its own mutant, and B is
+  gated on the A3 follow-up and on X1's test.
 - Every PR to main needs panel CR + reconcile first (repo rule).
 
-## Test bodies
+## Embedding proof (revision 2, measured 2026-09-26)
 
-### A — `src/pmcp/tools/schema.py` (new module, verbatim; A-only: no `additionalProperties`)
+Proves that the A bodies below, applied exactly as *A — how an executor
+applies these* instructs, reproduce the frozen, verified piece-A code byte for
+byte. Fresh detached worktree at `origin/main` (`9ca081e`, 0 changes) →
+`uv sync --all-extras -p 3.10` → the extractor taken **out of this plan**
+(not a local copy) → the four extract commands → `git apply --check` + `git
+apply` → the snapshot generation command → `cmp` each resulting file against
+`git show origin/wip/236-schema-drift-rev2-code:<path>` (`72eaa76`) → the
+schema test file:
+
+```text
+base: 9ca081e674806202dfa41864489cb9e3ae225dd9  clean: 0 changes
+src/pmcp/tools/schema.py: 99 lines
+tests/test_gateway_tool_schemas.py: 443 lines
+<scratch>/types.patch: 564 lines
+<scratch>/handlers.patch: 866 lines
+1 passed, 207 deselected in 0.15s
+===== cmp against origin/wip/236-schema-drift-rev2-code (72eaa76)
+cmp OK  src/pmcp/tools/schema.py  sha256=ddc7a14d17b91bcb
+cmp OK  src/pmcp/tools/handlers.py  sha256=9b8c18905828826e
+cmp OK  src/pmcp/types.py  sha256=f9ca3ba67282e228
+cmp OK  tests/test_gateway_tool_schemas.py  sha256=a239fe1cc214cf8b
+cmp OK  tests/fixtures/gateway_tool_schemas.json  sha256=906d28753772f268
+changed vs base:  M src/pmcp/tools/handlers.py  M src/pmcp/types.py ?? src/pmcp/tools/schema.py ?? tests/fixtures/gateway_tool_schemas.json ?? tests/test_gateway_tool_schemas.py
+===== pytest
+208 passed in 0.51s
+```
+
+After the proof, the extractor's docstring gained the qualified issue
+reference (behaviour unchanged). The four bodies were then re-extracted from
+the *final* plan text with the *final* extractor: `schema.py` and the test
+module are `cmp`-equal to `72eaa76`, both patches are `cmp`-equal to the ones
+applied in the proof, and `git apply -R --check` of both succeeds in the
+proof tree.
+
+Exactly the five files changed, and nothing else. The fixture `cmp` is the
+check that the snapshot *content* matches. The generation run itself passes
+by construction, since it writes the file it then reads. The proof worktree
+was removed afterwards.
+
+**Consistency gate.** `uv run python ~/code/pmcp/scripts/check_plan_consistency.py
+.consiliency/plans/detailed-236-schema-drift-20260923-0915.md` →
+`lane-contracted: 0   EC-proved node ids: 0 / consistent / blocking
+inconsistencies: 0`. This is vacuous for a detailed plan. The gate
+cross-checks phase-plan lane tables against `EC-*` node ids and verifies a
+`roadmap_sha256` pin, and this plan has no lanes, no EC ids and no pin. The
+same class of cross-check (the rule stated in three places must agree) was
+done by hand for A1/A2/X1/A3 across the header, *Piece A*, *Acceptance
+criteria* and *Piece B*.
+
+## Verbatim bodies
+
+### A — how an executor applies these (and the extractor)
+
+Piece A is four byte-exact bodies plus a generated snapshot. From a fresh
+worktree of `origin/main`:
+
+```bash
+PLAN=.consiliency/plans/detailed-236-schema-drift-20260923-0915.md   # read it from the plan branch
+X=<scratch>/extract_plan_block.py                                       # the script below, saved verbatim
+python3 $X $PLAN "### A — \`src/pmcp/tools/schema.py\`"      src/pmcp/tools/schema.py
+python3 $X $PLAN "### A — \`tests/test_gateway_tool_schemas.py\`" tests/test_gateway_tool_schemas.py
+python3 $X $PLAN "### A — \`src/pmcp/types.py\`"             <scratch>/types.patch
+python3 $X $PLAN "### A — \`src/pmcp/tools/handlers.py\`"     <scratch>/handlers.patch
+git apply --check <scratch>/types.patch <scratch>/handlers.patch && git apply <scratch>/types.patch <scratch>/handlers.patch
+uv sync --all-extras -p 3.10
+PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py -q -k test_advertised_schemas_match_snapshot
+uv run pytest tests/test_gateway_tool_schemas.py -q                     # expect 208 passed
+```
+
+The two patches are `git diff origin/main 72eaa76 -- <file>` against
+`origin/main` @ `9ca081e` (identical for these files to `860636a` and
+`8dec131`). Their blank context lines carry one leading space. An editor that
+strips trailing whitespace breaks them, and `git apply --check` then fails
+loudly rather than half-applying. The snapshot writer is deterministic, so the
+generated fixture is `cmp`-equal to the frozen one (see *Embedding proof*).
+
+```python
+"""Extract one verbatim body from the Consiliency/pmcp#236 plan, byte for byte.
+
+usage: python extract_plan_block.py <plan.md> "<heading prefix>" <out-file>
+
+Finds the single line that starts with the heading prefix, takes the first
+fenced block after it (the fence line starts with three backticks), and writes
+every line up to the closing fence (a line that is exactly three backticks),
+each followed by a newline.
+"""
+
+import sys
+from pathlib import Path
+
+plan, heading, out = sys.argv[1], sys.argv[2], sys.argv[3]
+lines = Path(plan).read_text().split("\n")
+starts = [i for i, line in enumerate(lines) if line.startswith(heading)]
+assert len(starts) == 1, f"heading {heading!r} found {len(starts)} times"
+i = starts[0] + 1
+while not lines[i].startswith("```"):
+    i += 1
+j = i + 1
+while lines[j] != "```":
+    j += 1
+Path(out).write_text("".join(line + "\n" for line in lines[i + 1 : j]))
+print(f"{out}: {j - i - 1} lines")
+```
+
+### A — `src/pmcp/tools/schema.py` (new module, whole file, 99 lines)
 
 ```python
 """Derive the gateway's advertised tool ``inputSchema`` from its argument model.
@@ -635,9 +1125,10 @@ it hoists nested models into ``$defs``/``$ref``, emits a ``title`` on every
 property, spells optional fields as ``anyOf: [X, {"type": "null"}]`` with
 ``default: null``, and carries the model docstring as a top-level
 ``description``. :func:`input_schema_for` post-processes all four so the
-advertised shape matches what the hand-written schemas advertised before —
-self-contained, title-free, ``"type": "string"`` for an optional string —
-and ``tests/test_gateway_tool_schemas.py`` pins that post-processing.
+advertised shape is self-contained and title-free, and an optional string is
+``"type": ["string", "null"]`` — flat like the hand-written schemas were, but
+accepting ``null`` exactly where the model does.
+``tests/test_gateway_tool_schemas.py`` pins that post-processing.
 """
 
 from __future__ import annotations
@@ -695,18 +1186,34 @@ def _normalize(node: Any, defs: dict[str, Any]) -> Any:
 
 
 def _collapse_nullable(node: dict[str, Any]) -> dict[str, Any]:
-    """``anyOf: [X, null]`` + ``default: null`` -> ``X`` (an optional field)."""
+    """``anyOf: [X, null]`` + ``default: null`` -> ``X`` with ``null`` still allowed.
+
+    pydantic spells ``X | None = None`` as that ``anyOf``. The advertised
+    schema keeps ``X``'s keywords flat (no ``anyOf``) and adds ``"null"`` to
+    its ``type`` (and to its ``enum``, if any), so the gate accepts exactly
+    what the model accepts: the field omitted, ``null``, or an ``X``. A
+    nullable field WITHOUT a ``None`` default (required-but-nullable) is left
+    as pydantic wrote it -- the collapse is only defined for the optional case.
+    """
     any_of = node.get("anyOf")
     if not isinstance(any_of, list) or len(any_of) != 2 or _NULL_SCHEMA not in any_of:
         return node
+    if "default" not in node or node["default"] is not None:
+        return node
     (inner,) = [branch for branch in any_of if branch != _NULL_SCHEMA]
-    rest = {key: value for key, value in node.items() if key != "anyOf"}
-    if "default" in rest and rest["default"] is None:
-        del rest["default"]
-    return {**inner, **rest}
+    rest = {k: v for k, v in node.items() if k not in ("anyOf", "default")}
+    out = {**inner, **rest}
+    inner_type = out.get("type")
+    if isinstance(inner_type, str):
+        out["type"] = [inner_type, "null"]
+    elif isinstance(inner_type, list) and "null" not in inner_type:
+        out["type"] = [*inner_type, "null"]
+    if isinstance(out.get("enum"), list) and None not in out["enum"]:
+        out["enum"] = [*out["enum"], None]
+    return out
 ```
 
-### A — `tests/test_gateway_tool_schemas.py` (verbatim, measured 163 passed on the A-only tree)
+### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 443 lines, 208 tests)
 
 ```python
 """Advertised gateway tool schemas are derived from, and agree with, the
@@ -720,6 +1227,15 @@ pin the three links in that chain — advertised == derived, derived == what
 the handler validates with, and the post-processing that turns
 `model_json_schema()` into an MCP `inputSchema` — so a hand edit to any one
 of them fails here rather than drifting.
+
+"Advertised == model" means advertised == the model's JSON-Schema PROJECTION.
+Three things the models enforce are not expressible in the schema and stay
+handler-only: `InvokeInput`'s correlation-ID charset validator and its
+all-or-none `model_validator`, and `RegisterDiscoveredServerInput`'s
+`_validate_package`. Everything the projection CAN express -- types, bounds,
+enums, required, and (A1) `null` on optional fields -- must agree in both
+directions, which `test_optional_field_null_agrees_between_gate_and_model`
+checks per field.
 """
 
 from __future__ import annotations
@@ -727,6 +1243,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any, Literal
 
@@ -777,6 +1294,14 @@ MINIMAL_VALID_ARGUMENTS: dict[str, dict[str, Any]] = {
 TOOL_NAMES = [tool.name for tool in get_gateway_tool_definitions()]
 TOOLS_WITH_MODELS = [n for n in TOOL_NAMES if GATEWAY_TOOL_INPUT_MODELS[n] is not None]
 TOOLS_WITHOUT_MODELS = [n for n in TOOL_NAMES if GATEWAY_TOOL_INPUT_MODELS[n] is None]
+
+
+def _model_types(annotation: Any) -> list[type[BaseModel]]:
+    import typing
+
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return [annotation]
+    return [t for arg in typing.get_args(annotation) for t in _model_types(arg)]
 
 
 def _tool(name: str):
@@ -850,7 +1375,7 @@ def test_handler_validates_arguments_with_the_registered_model(name: str) -> Non
     model = GATEWAY_TOOL_INPUT_MODELS[name]
     assert model is not None
     source = inspect.getsource(getattr(GatewayTools, _handler_method(name)))
-    assert f"{model.__name__}.model_validate(" in source, (
+    assert re.search(rf"\b{model.__name__}\.model_validate\(", source), (
         f"{name}: handler does not validate with {model.__name__}"
     )
 
@@ -865,6 +1390,20 @@ def test_server_dispatch_agrees_with_registry(name: str) -> None:
     else:
         assert f"self._gateway_tools.{method}(" in source
         assert f"self._gateway_tools.{method}()" not in source
+
+
+def test_every_dispatched_gateway_name_is_registered() -> None:
+    """X1: `_handle_call_tool` validates only names it finds in the registry,
+    so a dispatch branch for an unregistered name would skip the schema gate
+    and hand raw arguments to its handler. Pin the two sets equal, both ways
+    (the parametrised test above only proves registry -> dispatch)."""
+    source = inspect.getsource(GatewayServer._handle_call_tool)
+    dispatched = set(re.findall(r'\bname == "(gateway\.[a-z_]+)"', source))
+    assert len(dispatched) >= len(TOOL_NAMES) - 1  # the pattern matched the branches
+    assert dispatched == set(TOOL_NAMES), {
+        "dispatched, not registered": sorted(dispatched - set(TOOL_NAMES)),
+        "registered, not dispatched": sorted(set(TOOL_NAMES) - dispatched),
+    }
 
 
 @pytest.mark.parametrize("name", TOOLS_WITHOUT_MODELS)
@@ -933,7 +1472,10 @@ def test_input_schema_for_normalises_pydantic_output() -> None:
         "required": ["name"],
         "properties": {
             "name": {"type": "string", "minLength": 1, "description": "Name"},
-            "title": {"type": "string", "description": "A field called title"},
+            "title": {
+                "type": ["string", "null"],
+                "description": "A field called title",
+            },
             "count": {
                 "type": "integer",
                 "default": 3,
@@ -942,23 +1484,109 @@ def test_input_schema_for_normalises_pydantic_output() -> None:
                 "description": "Count",
             },
             "inner": {
-                "type": "object",
+                "type": ["object", "null"],
                 "description": "Inner",
                 "properties": {
                     "level": {
-                        "type": "string",
-                        "enum": ["a", "b"],
+                        "type": ["string", "null"],
+                        "enum": ["a", "b", None],
                         "description": "Level",
                     }
                 },
             },
             "_meta": {
-                "type": "object",
+                "type": ["object", "null"],
                 "additionalProperties": True,
                 "description": "Meta",
             },
         },
     }
+
+
+class _RequiredNullable(BaseModel):
+    value: str | None = Field(description="Nullable but required")
+
+
+def test_required_nullable_field_is_left_as_pydantic_wrote_it() -> None:
+    """The collapse is defined for `X | None = None` only; a required nullable
+    field has no `default: null` and keeps its `anyOf`."""
+    prop = input_schema_for(_RequiredNullable)["properties"]["value"]
+    assert prop == {
+        "anyOf": [{"type": "string"}, {"type": "null"}],
+        "description": "Nullable but required",
+    }
+
+
+def _optional_fields(model: type[BaseModel]) -> list[str]:
+    return [
+        (f.alias or n)
+        for n, f in model.model_fields.items()
+        if not f.is_required() and f.default is None
+    ]
+
+
+def _nullable_cases() -> list[tuple[str, dict[str, Any]]]:
+    """Every (tool, arguments) where one optional field -- top-level or one
+    level down inside a nested argument model -- is sent as explicit null."""
+    cases: list[tuple[str, dict[str, Any]]] = []
+    for name in TOOLS_WITH_MODELS:
+        model = GATEWAY_TOOL_INPUT_MODELS[name]
+        assert model is not None
+        base = MINIMAL_VALID_ARGUMENTS[name]
+        for field in _optional_fields(model):
+            cases.append((name, {**base, field: None}))
+        for fname, finfo in model.model_fields.items():
+            for nested in _model_types(finfo.annotation):
+                for sub in _optional_fields(nested):
+                    cases.append((name, {**base, (finfo.alias or fname): {sub: None}}))
+    return cases
+
+
+@pytest.mark.parametrize(("name", "arguments"), _nullable_cases())
+def test_optional_field_null_agrees_between_gate_and_model(
+    name: str, arguments: dict[str, Any]
+) -> None:
+    """A1: the gate accepts explicit null for an optional field iff the model
+    does. On HEAD the hand-written schemas rejected null where the model took
+    it (`invoke.task`, `tasks_*.requestor_context`, ...)."""
+    from pydantic import ValidationError
+
+    model = GATEWAY_TOOL_INPUT_MODELS[name]
+    assert model is not None
+    try:
+        model.model_validate(arguments)
+        model_accepts = True
+    except ValidationError:
+        model_accepts = False
+    try:
+        jsonschema.validate(instance=arguments, schema=_tool(name).input_schema)
+        gate_accepts = True
+    except jsonschema.ValidationError:
+        gate_accepts = False
+    assert gate_accepts == model_accepts, (
+        f"{name} {arguments}: gate={gate_accepts} model={model_accepts}"
+    )
+
+
+def test_schemas_are_derived_once_per_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A2: deriving 23 schemas costs ~13 ms; `GatewayServer` reads the tool list
+    on every tools/call and tools/list, so it must be built once, not per call."""
+    import pmcp.tools.handlers as handlers
+
+    calls: list[Any] = []
+    real = handlers.input_schema_for
+    monkeypatch.setattr(
+        handlers, "input_schema_for", lambda m: (calls.append(m), real(m))[1]
+    )
+    handlers._derived_gateway_tools.cache_clear()
+    try:
+        srv = GatewayServer()
+        for _ in range(5):
+            get_gateway_tool_definitions()
+            srv._find_gateway_tool("gateway.describe")
+        assert len(calls) == len(TOOL_NAMES), len(calls)
+    finally:
+        handlers._derived_gateway_tools.cache_clear()
 
 
 def test_input_schema_for_none_is_the_empty_object() -> None:
@@ -1033,6 +1661,1446 @@ async def test_server_gate_rejects_what_the_model_rejects(
     assert fragment in text, text
 ```
 
+### A — `src/pmcp/types.py` (`git apply` patch against `origin/main`, +243 / −96)
+
+```diff
+diff --git a/src/pmcp/types.py b/src/pmcp/types.py
+index 215088d..0d3cd43 100644
+--- a/src/pmcp/types.py
++++ b/src/pmcp/types.py
+@@ -77,12 +77,26 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
+ }
+ 
+ 
+-class TraceContextInfo(BaseModel):
++class GatewayArguments(BaseModel):
++    """Base for every model that parses arguments an agent sends to a gateway
++    tool, and for every model nested inside one. The advertised ``inputSchema``
++    of each gateway tool is derived from its model (Consiliency/pmcp#236), so
++    this base marks which models are agent-facing argument contracts. Models
++    that parse *downstream* data (McpTaskInfo, registry results, .mcp.json)
++    must NOT use this base.
++    """
++
++
++class TraceContextInfo(GatewayArguments):
+     """OpenTelemetry-style trace context accepted by PMCP-owned surfaces."""
+ 
+-    traceparent: str | None = None
+-    tracestate: str | None = None
+-    baggage: str | None = None
++    traceparent: str | None = Field(
++        default=None, description="W3C traceparent header value"
++    )
++    tracestate: str | None = Field(
++        default=None, description="W3C tracestate header value"
++    )
++    baggage: str | None = Field(default=None, description="W3C baggage header value")
+ 
+ 
+ class GatewayAuditEvent(BaseModel):
+@@ -327,15 +341,25 @@ class StartupPolicySource(BaseModel):
+     error: str | None = None
+ 
+ 
+-class StartupPolicyOperation(BaseModel):
++class StartupPolicyOperation(GatewayArguments):
+     """Input for previewing or applying autoStart mutations."""
+ 
+-    operation: Literal["add", "remove", "set"]
+-    names: list[str] = Field(default_factory=list)
+-    source: ConfigSourceName | None = None
+-    path: str | None = None
+-    dry_run: bool = True
+-    apply: bool = False
++    operation: Literal["add", "remove", "set"] = Field(
++        description="Mutation to apply to the autoStart list"
++    )
++    names: list[str] = Field(
++        default_factory=list, description="Server names the operation applies to"
++    )
++    source: ConfigSourceName | None = Field(
++        default=None, description="Config source to edit (project, user, or custom)"
++    )
++    path: str | None = Field(
++        default=None, description="Explicit config file path (overrides source)"
++    )
++    dry_run: bool = Field(default=True, description="Preview without writing")
++    apply: bool = Field(
++        default=False, description="Write the change (requires dry_run=false)"
++    )
+ 
+ 
+ class StartupPolicyPreview(BaseModel):
+@@ -538,22 +562,34 @@ class McpTaskRecord(McpTaskInfo):
+     requestor_context: dict[str, Any] | None = None
+ 
+ 
+-class TaskMetadataInput(BaseModel):
++class TaskMetadataInput(GatewayArguments):
+     """Task metadata for task-augmented tool invocation."""
+ 
+-    enabled: bool = True
+-    metadata: dict[str, Any] | None = None
+-    ttl: int | None = None
+-    poll_interval: float | None = None
+-    requestor_context: dict[str, Any] | None = None
++    enabled: bool = Field(
++        default=True, description="Run as an MCP task when the server supports it"
++    )
++    metadata: dict[str, Any] | None = Field(
++        default=None, description="Opaque task metadata forwarded downstream"
++    )
++    ttl: int | None = Field(default=None, description="Requested task TTL in seconds")
++    poll_interval: float | None = Field(
++        default=None, description="Seconds between task status polls"
++    )
++    requestor_context: dict[str, Any] | None = Field(
++        default=None, description="Opaque requestor context forwarded downstream"
++    )
+ 
+ 
+-class TasksListInput(BaseModel):
++class TasksListInput(GatewayArguments):
+     """Input for gateway.tasks_list."""
+ 
+-    server_name: str | None = None
+-    cursor: str | None = None
+-    requestor_context: dict[str, Any] | None = None
++    server_name: str | None = Field(default=None, description="Optional server filter")
++    cursor: str | None = Field(
++        default=None, description="Optional downstream pagination cursor"
++    )
++    requestor_context: dict[str, Any] | None = Field(
++        default=None, description="Opaque requestor context forwarded downstream"
++    )
+ 
+ 
+ class TasksListOutput(BaseModel):
+@@ -565,12 +601,14 @@ class TasksListOutput(BaseModel):
+     errors: list[str] | None = None
+ 
+ 
+-class TasksGetInput(BaseModel):
++class TasksGetInput(GatewayArguments):
+     """Input for gateway.tasks_get."""
+ 
+-    server_name: str = Field(min_length=1)
+-    task_id: str = Field(min_length=1)
+-    requestor_context: dict[str, Any] | None = None
++    server_name: str = Field(min_length=1, description="Server that owns the task")
++    task_id: str = Field(min_length=1, description="Opaque downstream task ID")
++    requestor_context: dict[str, Any] | None = Field(
++        default=None, description="Opaque requestor context forwarded downstream"
++    )
+ 
+ 
+ class TasksGetOutput(BaseModel):
+@@ -581,13 +619,17 @@ class TasksGetOutput(BaseModel):
+     errors: list[str] | None = None
+ 
+ 
+-class TasksResultInput(BaseModel):
++class TasksResultInput(GatewayArguments):
+     """Input for gateway.tasks_result."""
+ 
+-    server_name: str = Field(min_length=1)
+-    task_id: str = Field(min_length=1)
+-    options: InvokeOptions | None = None
+-    requestor_context: dict[str, Any] | None = None
++    server_name: str = Field(min_length=1, description="Server that owns the task")
++    task_id: str = Field(min_length=1, description="Opaque downstream task ID")
++    options: InvokeOptions | None = Field(
++        default=None, description="Output redaction and truncation options"
++    )
++    requestor_context: dict[str, Any] | None = Field(
++        default=None, description="Opaque requestor context forwarded downstream"
++    )
+ 
+ 
+ class TasksResultOutput(BaseModel):
+@@ -602,13 +644,15 @@ class TasksResultOutput(BaseModel):
+     errors: list[str] | None = None
+ 
+ 
+-class TasksCancelInput(BaseModel):
++class TasksCancelInput(GatewayArguments):
+     """Input for gateway.tasks_cancel."""
+ 
+-    server_name: str = Field(min_length=1)
+-    task_id: str = Field(min_length=1)
+-    force: bool = False
+-    requestor_context: dict[str, Any] | None = None
++    server_name: str = Field(min_length=1, description="Server that owns the task")
++    task_id: str = Field(min_length=1, description="Opaque downstream task ID")
++    force: bool = Field(default=False, description="Cancel even if the task is healthy")
++    requestor_context: dict[str, Any] | None = Field(
++        default=None, description="Opaque requestor context forwarded downstream"
++    )
+ 
+ 
+ class TasksCancelOutput(BaseModel):
+@@ -624,21 +668,36 @@ class TasksCancelOutput(BaseModel):
+ # === Gateway Tool Input/Output Types ===
+ 
+ 
+-class CatalogFilters(BaseModel):
++class CatalogFilters(GatewayArguments):
+     """Filters for catalog search."""
+ 
+-    server: str | None = None
+-    tags: list[str] | None = None
+-    risk_max: Literal["low", "medium", "high"] | None = None
++    server: str | None = Field(
++        default=None, description="Filter to tools from a specific server"
++    )
++    tags: list[str] | None = Field(
++        default=None, description="Filter to tools with any of these tags"
++    )
++    risk_max: Literal["low", "medium", "high"] | None = Field(
++        default=None, description="Maximum risk level to include"
++    )
+ 
+ 
+-class CatalogSearchInput(BaseModel):
++class CatalogSearchInput(GatewayArguments):
+     """Input for gateway.catalog_search."""
+ 
+-    query: str | None = None
+-    filters: CatalogFilters | None = None
+-    limit: int = Field(default=20, ge=1, le=100)
+-    include_offline: bool = False
++    query: str | None = Field(
++        default=None,
++        description="Search query to match against tool names, descriptions, and tags",
++    )
++    filters: CatalogFilters | None = Field(
++        default=None, description="Narrow results by server, tags, or risk level"
++    )
++    limit: int = Field(
++        default=20, ge=1, le=100, description="Maximum number of results to return"
++    )
++    include_offline: bool = Field(
++        default=False, description="Include tools from offline servers"
++    )
+ 
+ 
+ class CapabilityCard(BaseModel):
+@@ -688,10 +747,12 @@ class CatalogSearchOutput(BaseModel):
+     manifest_candidates: list[CapabilityCandidate] = Field(default_factory=list)
+ 
+ 
+-class DescribeInput(BaseModel):
++class DescribeInput(GatewayArguments):
+     """Input for gateway.describe."""
+ 
+-    tool_id: str = Field(min_length=1)
++    tool_id: str = Field(
++        min_length=1, description='The tool ID in format "server_name::tool_name"'
++    )
+ 
+ 
+ class ArgInfo(BaseModel):
+@@ -740,28 +801,66 @@ class SchemaCard(BaseModel):
+     feedback_hint: str | None = None
+ 
+ 
+-class InvokeOptions(BaseModel):
++class InvokeOptions(GatewayArguments):
+     """Options for tool invocation."""
+ 
+-    timeout_ms: int = Field(default=30000, ge=1000, le=300000)
+-    max_output_chars: int | None = Field(default=None, ge=100, le=100000)
+-    redact_secrets: bool = False
++    timeout_ms: int = Field(
++        default=30000, ge=1000, le=300000, description="Timeout in milliseconds"
++    )
++    max_output_chars: int | None = Field(
++        default=None,
++        ge=100,
++        le=100000,
++        description="Maximum output characters (truncated if exceeded)",
++    )
++    redact_secrets: bool = Field(
++        default=False, description="Redact detected secrets from output"
++    )
+ 
+ 
+-class InvokeInput(BaseModel):
++class InvokeInput(GatewayArguments):
+     """Input for gateway.invoke."""
+ 
+     model_config = ConfigDict(populate_by_name=True)
+ 
+-    tool_id: str = Field(min_length=1)
+-    arguments: dict[str, Any] = Field(default_factory=dict)
+-    task: TaskMetadataInput | None = None
+-    options: InvokeOptions | None = None
+-    trace_context: TraceContextInfo | None = None
+-    meta: dict[str, Any] | None = Field(default=None, alias="_meta")
+-    run_correlation_id: str | None = Field(default=None, min_length=1, max_length=128)
+-    seat_correlation_id: str | None = Field(default=None, min_length=1, max_length=128)
+-    evidence_label_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
++    tool_id: str = Field(
++        min_length=1, description='The tool ID in format "server_name::tool_name"'
++    )
++    arguments: dict[str, Any] = Field(
++        default_factory=dict,
++        description="Arguments to pass to the tool (must match tool schema)",
++    )
++    task: TaskMetadataInput | None = Field(
++        default=None, description="Run as an MCP task (long-running invocation)"
++    )
++    options: InvokeOptions | None = Field(
++        default=None, description="Timeout, output truncation, and redaction options"
++    )
++    trace_context: TraceContextInfo | None = Field(
++        default=None, description="Trace context forwarded to the downstream server"
++    )
++    meta: dict[str, Any] | None = Field(
++        default=None,
++        alias="_meta",
++        description="Request metadata; trace context keys are forwarded downstream",
++    )
++    run_correlation_id: str | None = Field(
++        default=None,
++        min_length=1,
++        max_length=128,
++        description="Scoped-advisor run correlation ID",
++    )
++    seat_correlation_id: str | None = Field(
++        default=None,
++        min_length=1,
++        max_length=128,
++        description="Scoped-advisor seat correlation ID",
++    )
++    evidence_label_digest: str | None = Field(
++        default=None,
++        pattern=r"^[0-9a-f]{64}$",
++        description="SHA-256 digest of the caller evidence label",
++    )
+ 
+     @field_validator("run_correlation_id", "seat_correlation_id")
+     @classmethod
+@@ -809,12 +908,19 @@ class InvokeOutput(BaseModel):
+     url_elicitations: list[UrlElicitationInfo] | None = None
+ 
+ 
+-class RefreshInput(BaseModel):
++class RefreshInput(GatewayArguments):
+     """Input for gateway.refresh."""
+ 
+-    source: Literal["claude_config", "custom"] | None = None
+-    reason: str | None = None
+-    force: bool = False
++    source: Literal["claude_config", "custom"] | None = Field(
++        default=None, description="Config source to reload from"
++    )
++    reason: str | None = Field(
++        default=None, description="Reason for refresh (for logging)"
++    )
++    force: bool = Field(
++        default=False,
++        description="Cancel pending downstream requests before refreshing",
++    )
+ 
+ 
+ class RefreshOutput(BaseModel):
+@@ -836,24 +942,30 @@ class RefreshOutput(BaseModel):
+     mcp_tasks_remaining: int = 0
+ 
+ 
+-class ConnectServerInput(BaseModel):
++class ConnectServerInput(GatewayArguments):
+     """Input for gateway.connect_server."""
+ 
+     server_name: str = Field(min_length=1, description="Server to connect")
+ 
+ 
+-class DisconnectServerInput(BaseModel):
++class DisconnectServerInput(GatewayArguments):
+     """Input for gateway.disconnect_server."""
+ 
+     server_name: str = Field(min_length=1, description="Server to disconnect")
+-    force: bool = False
++    force: bool = Field(
++        default=False,
++        description="Cancel this server's pending requests before disconnecting",
++    )
+ 
+ 
+-class RestartServerInput(BaseModel):
++class RestartServerInput(GatewayArguments):
+     """Input for gateway.restart_server."""
+ 
+     server_name: str = Field(min_length=1, description="Server to restart")
+-    force: bool = False
++    force: bool = Field(
++        default=False,
++        description="Cancel this server's pending requests before restarting",
++    )
+ 
+ 
+ class LifecycleServerOutput(BaseModel):
+@@ -913,10 +1025,13 @@ class HealthOutput(BaseModel):
+ # === Pending Request Monitoring Types ===
+ 
+ 
+-class ListPendingInput(BaseModel):
++class ListPendingInput(GatewayArguments):
+     """Input for gateway.list_pending."""
+ 
+-    server: str | None = None  # Filter by server (optional)
++    server: str | None = Field(
++        default=None,
++        description="Filter to pending requests on a specific server (optional)",
++    )
+ 
+ 
+ class PendingRequestInfo(BaseModel):
+@@ -941,11 +1056,17 @@ class ListPendingOutput(BaseModel):
+     total_pending: int
+ 
+ 
+-class CancelInput(BaseModel):
++class CancelInput(GatewayArguments):
+     """Input for gateway.cancel."""
+ 
+-    request_id: str = Field(min_length=1)  # Format: "server_name::local_id"
+-    force: bool = False  # Force cancel even if heartbeat is recent
++    request_id: str = Field(
++        min_length=1,
++        description='Request ID in format "server_name::local_id" from gateway.list_pending',
++    )
++    force: bool = Field(
++        default=False,
++        description="Force cancel even if request is healthy (has recent heartbeat)",
++    )
+ 
+ 
+ class CancelOutput(BaseModel):
+@@ -1083,7 +1204,7 @@ class GatewayPolicy(BaseModel):
+ # === Capability Request Types ===
+ 
+ 
+-class CapabilityRequestInput(BaseModel):
++class CapabilityRequestInput(GatewayArguments):
+     """Input for gateway.request_capability."""
+ 
+     query: str = Field(min_length=1, description="Natural language capability request")
+@@ -1207,13 +1328,15 @@ class SearchRegistryResult(BaseModel):
+     diagnostics: list[str] = Field(default_factory=list)
+ 
+ 
+-class SearchRegistryInput(BaseModel):
++class SearchRegistryInput(GatewayArguments):
+     """Input for gateway.search_registry."""
+ 
+     query: str = Field(
+         min_length=1, description="Natural language capability description"
+     )
+-    limit: int = Field(default=5, ge=1, le=20)
++    limit: int = Field(
++        default=5, ge=1, le=20, description="Maximum number of results to return"
++    )
+ 
+ 
+ class SearchRegistryOutput(BaseModel):
+@@ -1224,7 +1347,7 @@ class SearchRegistryOutput(BaseModel):
+     next_step: str
+ 
+ 
+-class RegisterDiscoveredServerInput(BaseModel):
++class RegisterDiscoveredServerInput(GatewayArguments):
+     """Input for gateway.register_discovered_server."""
+ 
+     package: str = Field(
+@@ -1266,7 +1389,7 @@ class RegisterDiscoveredServerOutput(BaseModel):
+     next_step: str | None = None
+ 
+ 
+-class ProvisionInput(BaseModel):
++class ProvisionInput(GatewayArguments):
+     """Input for gateway.provision - install and start a specific server."""
+ 
+     server_name: str = Field(
+@@ -1307,15 +1430,25 @@ FeedbackSubmissionOutcome = Literal[
+ ]
+ 
+ 
+-class SubmitFeedbackInput(BaseModel):
++class SubmitFeedbackInput(GatewayArguments):
+     """Input for gateway.submit_feedback."""
+ 
+-    title: str = Field(min_length=8, max_length=160)
+-    description: str = Field(min_length=1)
+-    issue_type: Literal["bug", "feature_request"] = Field(default="bug")
+-    subordinate_server: str | None = None
+-    failed_tool_call: str | None = None
+-    confirm_submission: bool = False
++    title: str = Field(min_length=8, max_length=160, description="Issue title")
++    description: str = Field(
++        min_length=1, description="Issue details (technical data only)"
++    )
++    issue_type: Literal["bug", "feature_request"] = Field(
++        default="bug", description="Kind of issue to file"
++    )
++    subordinate_server: str | None = Field(
++        default=None, description="Subordinate MCP server involved (if known)"
++    )
++    failed_tool_call: str | None = Field(
++        default=None, description="Specific failed tool call (if known)"
++    )
++    confirm_submission: bool = Field(
++        default=False, description="Set true only after user confirms submission"
++    )
+ 
+ 
+ class SubmitFeedbackOutput(BaseModel):
+@@ -1339,7 +1472,7 @@ class SubmitFeedbackOutput(BaseModel):
+     submission_outcome: FeedbackSubmissionOutcome | None = None
+ 
+ 
+-class UpdateServerInput(BaseModel):
++class UpdateServerInput(GatewayArguments):
+     """Input for gateway.update_server."""
+ 
+     server_name: str = Field(min_length=1, description="Server to update")
+@@ -1373,7 +1506,7 @@ class UpdateServerOutput(BaseModel):
+     message: str
+ 
+ 
+-class AuthConnectInput(BaseModel):
++class AuthConnectInput(GatewayArguments):
+     """Input for gateway.auth_connect - save auth credentials for a server."""
+ 
+     server_name: str = Field(
+@@ -1389,10 +1522,20 @@ class AuthConnectInput(BaseModel):
+     scope: Literal["user", "project"] = Field(
+         default="user", description="Where to store credentials"
+     )
+-    auth_mode: Literal["api_key", "url_elicitation"] = "api_key"
+-    elicitation_id: str | None = None
+-    elicitation_url: str | None = None
+-    consent_acknowledged: bool = False
++    auth_mode: Literal["api_key", "url_elicitation"] = Field(
++        default="api_key",
++        description="API-key storage or URL-mode elicitation acknowledgement",
++    )
++    elicitation_id: str | None = Field(
++        default=None, description="URL-mode elicitation identifier"
++    )
++    elicitation_url: str | None = Field(
++        default=None, description="Sanitized URL-mode elicitation URL"
++    )
++    consent_acknowledged: bool = Field(
++        default=False,
++        description="Acknowledge that the out-of-band URL flow was completed",
++    )
+ 
+ 
+ class AuthConnectOutput(BaseModel):
+@@ -1408,7 +1551,7 @@ class AuthConnectOutput(BaseModel):
+     url_elicitation: UrlElicitationInfo | None = None
+ 
+ 
+-class ProvisionStatusInput(BaseModel):
++class ProvisionStatusInput(GatewayArguments):
+     """Input for gateway.provision_status - check job progress."""
+ 
+     job_id: str = Field(min_length=1, description="Job ID from provision response")
+@@ -1439,11 +1582,15 @@ class ProvisionJobStatus(BaseModel):
+     error: str | None = None
+ 
+ 
+-class SyncEnvironmentInput(BaseModel):
++class SyncEnvironmentInput(GatewayArguments):
+     """Input for gateway.sync_environment."""
+ 
+-    platform: Literal["mac", "wsl", "linux", "windows"] | None = None
+-    detected_clis: list[str] | None = None
++    platform: Literal["mac", "wsl", "linux", "windows"] | None = Field(
++        default=None, description="Override detected platform (optional)"
++    )
++    detected_clis: list[str] | None = Field(
++        default=None, description="Override detected CLIs (optional)"
++    )
+ 
+ 
+ class SyncEnvironmentOutput(BaseModel):
+```
+
+### A — `src/pmcp/tools/handlers.py` (`git apply` patch against `origin/main`, +195 / −616)
+
+```diff
+diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
+index 956c8c8..45a956c 100644
+--- a/src/pmcp/tools/handlers.py
++++ b/src/pmcp/tools/handlers.py
+@@ -14,11 +14,12 @@ from collections import deque
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from collections.abc import Callable, Mapping
+-from typing import Any, Literal, cast
++from typing import Any, Literal, cast, NamedTuple
+ 
+ import anyio
+ from dotenv import load_dotenv
+ from mcp.types import Tool
++from pydantic import BaseModel
+ from pmcp import __version__ as PMCP_VERSION
+ from pmcp.auth import (
+     UNVERIFIED_URL_CAVEAT,
+@@ -190,6 +191,7 @@ from pmcp.types import (
+     UrlElicitationInfo,
+ )
+ 
++from pmcp.tools.schema import input_schema_for
+ from pmcp.manifest.loader import (
+     Manifest,
+     ServerConfig,
+@@ -467,647 +469,224 @@ TRACE_VALUE_DENY_PATTERN = re.compile(
+ )
+ 
+ 
+-def get_gateway_tool_definitions() -> list[Tool]:
+-    """Get MCP tool definitions for the gateway."""
+-    return [
+-        Tool(
+-            name="gateway.catalog_search",
+-            description=(
+-                "Search for available tools across all connected MCP servers. "
+-                "Returns compact capability cards without full schemas. "
+-                "Use filters to narrow results by server, tags, or risk level. "
+-                "Set include_offline=True to also discover provisionable servers not yet running. "
+-                "This is the primary tool discovery entry point."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "query": {
+-                        "type": "string",
+-                        "description": "Search query to match against tool names, descriptions, and tags",
+-                    },
+-                    "filters": {
+-                        "type": "object",
+-                        "properties": {
+-                            "server": {
+-                                "type": "string",
+-                                "description": "Filter to tools from a specific server",
+-                            },
+-                            "tags": {
+-                                "type": "array",
+-                                "items": {"type": "string"},
+-                                "description": "Filter to tools with any of these tags",
+-                            },
+-                            "risk_max": {
+-                                "type": "string",
+-                                "enum": ["low", "medium", "high"],
+-                                "description": "Maximum risk level to include",
+-                            },
+-                        },
+-                    },
+-                    "limit": {
+-                        "type": "integer",
+-                        "minimum": 1,
+-                        "maximum": 100,
+-                        "default": 20,
+-                        "description": "Maximum number of results to return",
+-                    },
+-                    "include_offline": {
+-                        "type": "boolean",
+-                        "default": False,
+-                        "description": "Include tools from offline servers",
+-                    },
+-                },
+-            },
++class _GatewayToolSpec(NamedTuple):
++    """One advertised gateway tool: its name, argument model, and description."""
++
++    name: str
++    input_model: type[BaseModel] | None
++    description: str
++
++
++# The single source of each gateway tool's advertised inputSchema is the
++# pydantic model its handler validates with (Consiliency/pmcp#236). `None`
++# marks the tools dispatched with no arguments (see server.py call_tool).
++_GATEWAY_TOOL_SPECS: tuple[_GatewayToolSpec, ...] = (
++    _GatewayToolSpec(
++        name="gateway.catalog_search",
++        input_model=CatalogSearchInput,
++        description=(
++            "Search for available tools across all connected MCP servers. Returns compact capability cards without full schemas. Use filters to narrow results by server, tags, or risk level. Set include_offline=True to also discover provisionable servers not yet running. This is the primary tool discovery entry point."
+         ),
+-        Tool(
+-            name="gateway.describe",
+-            description=(
+-                "Get detailed information about a specific tool, including its arguments and constraints. "
+-                "Use this before invoking a tool to understand its requirements."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "tool_id": {
+-                        "type": "string",
+-                        "description": 'The tool ID in format "server_name::tool_name"',
+-                    },
+-                },
+-                "required": ["tool_id"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.describe",
++        input_model=DescribeInput,
++        description=(
++            "Get detailed information about a specific tool, including its arguments and constraints. Use this before invoking a tool to understand its requirements."
+         ),
+-        Tool(
+-            name="gateway.invoke",
+-            description=(
+-                "Invoke a tool on a downstream MCP server. "
+-                "Arguments are validated against the tool schema before execution. "
+-                "Output is automatically truncated if too large."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "tool_id": {
+-                        "type": "string",
+-                        "description": 'The tool ID in format "server_name::tool_name"',
+-                    },
+-                    "arguments": {
+-                        "type": "object",
+-                        "description": "Arguments to pass to the tool (must match tool schema)",
+-                    },
+-                    "run_correlation_id": {
+-                        "type": "string",
+-                        "description": "Scoped-advisor run correlation ID",
+-                    },
+-                    "seat_correlation_id": {
+-                        "type": "string",
+-                        "description": "Scoped-advisor seat correlation ID",
+-                    },
+-                    "evidence_label_digest": {
+-                        "type": "string",
+-                        "pattern": "^[0-9a-f]{64}$",
+-                        "description": "SHA-256 digest of the caller evidence label",
+-                    },
+-                    "options": {
+-                        "type": "object",
+-                        "properties": {
+-                            "timeout_ms": {
+-                                "type": "integer",
+-                                "minimum": 1000,
+-                                "maximum": 300000,
+-                                "default": 30000,
+-                                "description": "Timeout in milliseconds",
+-                            },
+-                            "max_output_chars": {
+-                                "type": "integer",
+-                                "minimum": 100,
+-                                "maximum": 100000,
+-                                "description": "Maximum output characters (truncated if exceeded)",
+-                            },
+-                            "redact_secrets": {
+-                                "type": "boolean",
+-                                "default": False,
+-                                "description": "Redact detected secrets from output",
+-                            },
+-                        },
+-                    },
+-                },
+-                "required": ["tool_id"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.invoke",
++        input_model=InvokeInput,
++        description=(
++            "Invoke a tool on a downstream MCP server. Arguments are validated against the tool schema before execution. Output is automatically truncated if too large."
+         ),
+-        Tool(
+-            name="gateway.refresh",
+-            description=(
+-                "Reload backend MCP server configurations and reconnect. "
+-                "Use this when new MCP servers have been configured or to recover from connection errors. "
+-                "Refuses by default while downstream requests are pending; set force=true to cancel them."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "source": {
+-                        "type": "string",
+-                        "enum": ["claude_config", "custom"],
+-                        "description": "Config source to reload from",
+-                    },
+-                    "reason": {
+-                        "type": "string",
+-                        "description": "Reason for refresh (for logging)",
+-                    },
+-                    "force": {
+-                        "type": "boolean",
+-                        "default": False,
+-                        "description": "Cancel pending downstream requests before refreshing",
+-                    },
+-                },
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.refresh",
++        input_model=RefreshInput,
++        description=(
++            "Reload backend MCP server configurations and reconnect. Use this when new MCP servers have been configured or to recover from connection errors. Refuses by default while downstream requests are pending; set force=true to cancel them."
+         ),
+-        Tool(
+-            name="gateway.connect_server",
+-            description=(
+-                "Connect or start a known downstream MCP server by name. "
+-                "Resolves configured, provisioned manifest, and registered discovered servers."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server_name": {
+-                        "type": "string",
+-                        "description": "Name of the server to connect",
+-                    },
+-                },
+-                "required": ["server_name"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.connect_server",
++        input_model=ConnectServerInput,
++        description=(
++            "Connect or start a known downstream MCP server by name. Resolves configured, provisioned manifest, and registered discovered servers."
+         ),
+-        Tool(
+-            name="gateway.disconnect_server",
+-            description=(
+-                "Disconnect a running downstream MCP server without changing persistent config. "
+-                "Refuses by default when that server has pending requests; set force=true to cancel them."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server_name": {
+-                        "type": "string",
+-                        "description": "Name of the server to disconnect",
+-                    },
+-                    "force": {
+-                        "type": "boolean",
+-                        "default": False,
+-                        "description": "Cancel this server's pending requests before disconnecting",
+-                    },
+-                },
+-                "required": ["server_name"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.disconnect_server",
++        input_model=DisconnectServerInput,
++        description=(
++            "Disconnect a running downstream MCP server without changing persistent config. Refuses by default when that server has pending requests; set force=true to cancel them."
+         ),
+-        Tool(
+-            name="gateway.restart_server",
+-            description=(
+-                "Restart a known downstream MCP server without changing persistent config. "
+-                "Refuses by default when that server has pending requests; set force=true to cancel them."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server_name": {
+-                        "type": "string",
+-                        "description": "Name of the server to restart",
+-                    },
+-                    "force": {
+-                        "type": "boolean",
+-                        "default": False,
+-                        "description": "Cancel this server's pending requests before restarting",
+-                    },
+-                },
+-                "required": ["server_name"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.restart_server",
++        input_model=RestartServerInput,
++        description=(
++            "Restart a known downstream MCP server without changing persistent config. Refuses by default when that server has pending requests; set force=true to cancel them."
+         ),
+-        Tool(
+-            name="gateway.health",
+-            description=(
+-                "Get the health status of the gateway and all connected MCP servers. "
+-                "Shows server status, tool counts, and last refresh time."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {},
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.health",
++        input_model=None,
++        description=(
++            "Get the health status of the gateway and all connected MCP servers. Shows server status, tool counts, and last refresh time."
+         ),
+-        Tool(
+-            name="gateway.config_status",
+-            description=(
+-                "Show read-only effective configuration and startup policy status "
+-                "with source attribution and non-secret diagnostics."
+-            ),
+-            input_schema={"type": "object", "properties": {}},
++    ),
++    _GatewayToolSpec(
++        name="gateway.config_status",
++        input_model=None,
++        description=(
++            "Show read-only effective configuration and startup policy status with source attribution and non-secret diagnostics."
+         ),
+-        Tool(
+-            name="gateway.get_startup_policy",
+-            description=(
+-                "Return persisted autoStart and legacy disableAutoStart entries "
+-                "grouped by config source."
+-            ),
+-            input_schema={"type": "object", "properties": {}},
++    ),
++    _GatewayToolSpec(
++        name="gateway.get_startup_policy",
++        input_model=None,
++        description=(
++            "Return persisted autoStart and legacy disableAutoStart entries grouped by config source."
+         ),
+-        Tool(
+-            name="gateway.set_startup_policy",
+-            description=(
+-                "Preview or explicitly apply an autoStart add/remove/set operation "
+-                "against one selected config source or path."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "operation": {
+-                        "type": "string",
+-                        "enum": ["add", "remove", "set"],
+-                    },
+-                    "names": {"type": "array", "items": {"type": "string"}},
+-                    "source": {
+-                        "type": "string",
+-                        "enum": ["project", "user", "custom"],
+-                    },
+-                    "path": {"type": "string"},
+-                    "dry_run": {"type": "boolean", "default": True},
+-                    "apply": {"type": "boolean", "default": False},
+-                },
+-                "required": ["operation"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.set_startup_policy",
++        input_model=StartupPolicyOperation,
++        description=(
++            "Preview or explicitly apply an autoStart add/remove/set operation against one selected config source or path."
+         ),
+-        Tool(
+-            name="gateway.request_capability",
+-            description=(
+-                "Recommend the right tool for a task — describe what you need in natural language. "
+-                "Examples: 'scrape a website', 'search Slack messages', 'query Postgres', 'browse the web'. "
+-                "Matches against installed CLIs and 90+ provisionable MCP servers and returns ranked candidates; "
+-                "it does NOT start anything — call gateway.provision to actually install/start the recommended server. "
+-                "Prefer this over gateway.provision when you don't already know the exact server name."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "query": {
+-                        "type": "string",
+-                        "description": "Natural language description of the capability needed (e.g., 'I need to scrape a website', 'browser automation')",
+-                    },
+-                    "available_clis": {
+-                        "type": "array",
+-                        "items": {"type": "string"},
+-                        "description": "Optional: CLIs known to be available in the environment",
+-                    },
+-                },
+-                "required": ["query"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.request_capability",
++        input_model=CapabilityRequestInput,
++        description=(
++            "Recommend the right tool for a task — describe what you need in natural language. Examples: 'scrape a website', 'search Slack messages', 'query Postgres', 'browse the web'. Matches against installed CLIs and 90+ provisionable MCP servers and returns ranked candidates; it does NOT start anything — call gateway.provision to actually install/start the recommended server. Prefer this over gateway.provision when you don't already know the exact server name."
+         ),
+-        Tool(
+-            name="gateway.sync_environment",
+-            description=(
+-                "Sync environment information from the host. "
+-                "Detects the platform (mac/wsl/linux/windows) and probes for installed CLIs. "
+-                "This information is used to prefer CLIs over MCP servers when matching capabilities."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "platform": {
+-                        "type": "string",
+-                        "enum": ["mac", "wsl", "linux", "windows"],
+-                        "description": "Override detected platform (optional)",
+-                    },
+-                    "detected_clis": {
+-                        "type": "array",
+-                        "items": {"type": "string"},
+-                        "description": "Override detected CLIs (optional)",
+-                    },
+-                },
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.sync_environment",
++        input_model=SyncEnvironmentInput,
++        description=(
++            "Sync environment information from the host. Detects the platform (mac/wsl/linux/windows) and probes for installed CLIs. This information is used to prefer CLIs over MCP servers when matching capabilities."
+         ),
+-        Tool(
+-            name="gateway.provision",
+-            description=(
+-                "Provision (install and start) a specific MCP server from the manifest. "
+-                "Use this after reviewing candidates from gateway.request_capability. "
+-                "Returns immediately with a job_id for tracking. "
+-                "Poll gateway.provision_status to check progress. "
+-                "Use gateway.request_capability instead if you don't know the exact server name."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server_name": {
+-                        "type": "string",
+-                        "description": "Name of the server to provision (from manifest)",
+-                    },
+-                },
+-                "required": ["server_name"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.provision",
++        input_model=ProvisionInput,
++        description=(
++            "Provision (install and start) a specific MCP server from the manifest. Use this after reviewing candidates from gateway.request_capability. Returns immediately with a job_id for tracking. Poll gateway.provision_status to check progress. Use gateway.request_capability instead if you don't know the exact server name."
+         ),
+-        Tool(
+-            name="gateway.update_server",
+-            description=(
+-                "Update a subordinate MCP server package to latest version and restart it "
+-                "so the new version is actually running. "
+-                "Call this to check for and apply an update -- the gateway does not "
+-                "volunteer update notices, so nothing will prompt you. "
+-                "Refuses to restart by default when the server has pending requests; "
+-                "set force=true to cancel them."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server_name": {
+-                        "type": "string",
+-                        "description": "Name of server to update",
+-                    },
+-                    "force": {
+-                        "type": "boolean",
+-                        "default": False,
+-                        "description": "Cancel this server's pending requests before restarting",
+-                    },
+-                },
+-                "required": ["server_name"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.update_server",
++        input_model=UpdateServerInput,
++        description=(
++            "Update a subordinate MCP server package to latest version and restart it so the new version is actually running. Call this to check for and apply an update -- the gateway does not volunteer update notices, so nothing will prompt you. Refuses to restart by default when the server has pending requests; set force=true to cancel them."
+         ),
+-        Tool(
+-            name="gateway.auth_connect",
+-            description=(
+-                "Store credentials for a server and make them available to provisioning. "
+-                "Use this when gateway.provision reports missing authentication."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server_name": {
+-                        "type": "string",
+-                        "description": "Server name that needs authentication",
+-                    },
+-                    "credential": {
+-                        "type": "string",
+-                        "description": "API key, token, or subscription credential to store",
+-                    },
+-                    "auth_mode": {
+-                        "type": "string",
+-                        "enum": ["api_key", "url_elicitation"],
+-                        "default": "api_key",
+-                        "description": "API-key storage or URL-mode elicitation acknowledgement",
+-                    },
+-                    "elicitation_id": {
+-                        "type": "string",
+-                        "description": "URL-mode elicitation identifier",
+-                    },
+-                    "elicitation_url": {
+-                        "type": "string",
+-                        "description": "Sanitized URL-mode elicitation URL",
+-                    },
+-                    "consent_acknowledged": {
+-                        "type": "boolean",
+-                        "default": False,
+-                        "description": "Acknowledge that the out-of-band URL flow was completed",
+-                    },
+-                    "env_var": {
+-                        "type": "string",
+-                        "description": "Optional explicit environment variable key",
+-                    },
+-                    "scope": {
+-                        "type": "string",
+-                        "enum": ["user", "project"],
+-                        "default": "user",
+-                        "description": "Where to store the credential",
+-                    },
+-                },
+-                "required": ["server_name"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.auth_connect",
++        input_model=AuthConnectInput,
++        description=(
++            "Store credentials for a server and make them available to provisioning. Use this when gateway.provision reports missing authentication."
+         ),
+-        Tool(
+-            name="gateway.submit_feedback",
+-            description=(
+-                "Prepare a PMCP feedback issue for GitHub. Returns an exact "
+-                "preview payload and a browser URL an operator can open. pmcp "
+-                "posts nothing itself unless the operator has enabled submission "
+-                "(`pmcp guidance --feedback-submission on`) and exported "
+-                "PMCP_FEEDBACK_TOKEN; confirm_submission=true records the user's "
+-                "consent and is not by itself authority to post."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "title": {
+-                        "type": "string",
+-                        "description": "Issue title",
+-                    },
+-                    "description": {
+-                        "type": "string",
+-                        "description": "Issue details (technical data only)",
+-                    },
+-                    "issue_type": {
+-                        "type": "string",
+-                        "enum": ["bug", "feature_request"],
+-                        "default": "bug",
+-                    },
+-                    "subordinate_server": {
+-                        "type": "string",
+-                        "description": "Subordinate MCP server involved (if known)",
+-                    },
+-                    "failed_tool_call": {
+-                        "type": "string",
+-                        "description": "Specific failed tool call (if known)",
+-                    },
+-                    "confirm_submission": {
+-                        "type": "boolean",
+-                        "default": False,
+-                        "description": "Set true only after user confirms submission",
+-                    },
+-                },
+-                "required": ["title", "description"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.submit_feedback",
++        input_model=SubmitFeedbackInput,
++        description=(
++            "Prepare a PMCP feedback issue for GitHub. Returns an exact preview payload and a browser URL an operator can open. pmcp posts nothing itself unless the operator has enabled submission (`pmcp guidance --feedback-submission on`) and exported PMCP_FEEDBACK_TOKEN; confirm_submission=true records the user's consent and is not by itself authority to post."
+         ),
+-        Tool(
+-            name="gateway.provision_status",
+-            description=(
+-                "Check the status of a running server installation. "
+-                "Use after gateway.provision returns a job_id. "
+-                "Returns progress percentage, output log, and final tools when complete."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "job_id": {
+-                        "type": "string",
+-                        "description": "Job ID from gateway.provision response",
+-                    },
+-                },
+-                "required": ["job_id"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.provision_status",
++        input_model=ProvisionStatusInput,
++        description=(
++            "Check the status of a running server installation. Use after gateway.provision returns a job_id. Returns progress percentage, output log, and final tools when complete."
+         ),
+-        Tool(
+-            name="gateway.list_pending",
+-            description=(
+-                "List all pending tool invocations with health status. "
+-                "Shows elapsed time, heartbeat age, and current state for each request. "
+-                "Use this to monitor long-running operations before deciding to cancel."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server": {
+-                        "type": "string",
+-                        "description": "Filter to pending requests on a specific server (optional)",
+-                    },
+-                },
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.list_pending",
++        input_model=ListPendingInput,
++        description=(
++            "List all pending tool invocations with health status. Shows elapsed time, heartbeat age, and current state for each request. Use this to monitor long-running operations before deciding to cancel."
+         ),
+-        Tool(
+-            name="gateway.cancel",
+-            description=(
+-                "Cancel a pending tool invocation. "
+-                "By default, refuses to cancel healthy requests (recent heartbeat). "
+-                "Use force=true to cancel anyway. "
+-                "Use gateway.list_pending first to see request IDs and health status."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "request_id": {
+-                        "type": "string",
+-                        "description": 'Request ID in format "server_name::local_id" from gateway.list_pending',
+-                    },
+-                    "force": {
+-                        "type": "boolean",
+-                        "default": False,
+-                        "description": "Force cancel even if request is healthy (has recent heartbeat)",
+-                    },
+-                },
+-                "required": ["request_id"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.cancel",
++        input_model=CancelInput,
++        description=(
++            "Cancel a pending tool invocation. By default, refuses to cancel healthy requests (recent heartbeat). Use force=true to cancel anyway. Use gateway.list_pending first to see request IDs and health status."
+         ),
+-        Tool(
+-            name="gateway.tasks_list",
+-            description=(
+-                "List brokered downstream MCP tasks. "
+-                "MCP task IDs are opaque downstream task identifiers, not PMCP request IDs."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server_name": {
+-                        "type": "string",
+-                        "description": "Optional server filter",
+-                    },
+-                    "cursor": {
+-                        "type": "string",
+-                        "description": "Optional downstream pagination cursor",
+-                    },
+-                },
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.tasks_list",
++        input_model=TasksListInput,
++        description=(
++            "List brokered downstream MCP tasks. MCP task IDs are opaque downstream task identifiers, not PMCP request IDs."
+         ),
+-        Tool(
+-            name="gateway.tasks_get",
+-            description="Get current status for one downstream MCP task.",
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server_name": {"type": "string"},
+-                    "task_id": {"type": "string"},
+-                },
+-                "required": ["server_name", "task_id"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.tasks_get",
++        input_model=TasksGetInput,
++        description=("Get current status for one downstream MCP task."),
++    ),
++    _GatewayToolSpec(
++        name="gateway.tasks_result",
++        input_model=TasksResultInput,
++        description=(
++            "Fetch a downstream MCP task result and apply the same output redaction and truncation options as gateway.invoke."
+         ),
+-        Tool(
+-            name="gateway.tasks_result",
+-            description=(
+-                "Fetch a downstream MCP task result and apply the same output "
+-                "redaction and truncation options as gateway.invoke."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server_name": {"type": "string"},
+-                    "task_id": {"type": "string"},
+-                    "options": {
+-                        "type": "object",
+-                        "properties": {
+-                            "max_output_chars": {"type": "integer"},
+-                            "redact_secrets": {"type": "boolean"},
+-                        },
+-                    },
+-                },
+-                "required": ["server_name", "task_id"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.tasks_cancel",
++        input_model=TasksCancelInput,
++        description=(
++            "Cancel a downstream MCP task by opaque task ID. Use gateway.cancel only for PMCP request IDs from gateway.list_pending."
+         ),
+-        Tool(
+-            name="gateway.tasks_cancel",
+-            description=(
+-                "Cancel a downstream MCP task by opaque task ID. "
+-                "Use gateway.cancel only for PMCP request IDs from gateway.list_pending."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "server_name": {"type": "string"},
+-                    "task_id": {"type": "string"},
+-                    "force": {"type": "boolean", "default": False},
+-                },
+-                "required": ["server_name", "task_id"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.search_registry",
++        input_model=SearchRegistryInput,
++        description=(
++            "Search the public MCP Registry for external servers not in the local manifest. Use this when gateway.request_capability returns not_available. Returns package names and metadata; call gateway.register_discovered_server then gateway.provision to install."
+         ),
+-        Tool(
+-            name="gateway.search_registry",
+-            description=(
+-                "Search the public MCP Registry for external servers not in the local manifest. "
+-                "Use this when gateway.request_capability returns not_available. "
+-                "Returns package names and metadata; call gateway.register_discovered_server then gateway.provision to install."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "query": {
+-                        "type": "string",
+-                        "description": "Natural language description of the capability needed",
+-                    },
+-                    "limit": {
+-                        "type": "integer",
+-                        "minimum": 1,
+-                        "maximum": 20,
+-                        "default": 5,
+-                        "description": "Maximum number of results to return",
+-                    },
+-                },
+-                "required": ["query"],
+-            },
++    ),
++    _GatewayToolSpec(
++        name="gateway.register_discovered_server",
++        input_model=RegisterDiscoveredServerInput,
++        description=(
++            "Register an externally-discovered MCP server package so it can be provisioned. Call this after gateway.search_registry to register the chosen package, then call gateway.provision to install and start it."
+         ),
++    ),
++)
++
++#: Advertised tool name -> the model its handler validates arguments with.
++GATEWAY_TOOL_INPUT_MODELS: dict[str, type[BaseModel] | None] = {
++    spec.name: spec.input_model for spec in _GATEWAY_TOOL_SPECS
++}
++
++
++@functools.cache
++def _derived_gateway_tools() -> tuple[Tool, ...]:
++    """Derive every Tool once per process: ``input_schema_for`` walks 23 model
++    schemas (~13 ms), and ``GatewayServer`` looks the list up on every
++    ``tools/call`` and ``tools/list``."""
++    return tuple(
+         Tool(
+-            name="gateway.register_discovered_server",
+-            description=(
+-                "Register an externally-discovered MCP server package so it can be provisioned. "
+-                "Call this after gateway.search_registry to register the chosen package, "
+-                "then call gateway.provision to install and start it."
+-            ),
+-            input_schema={
+-                "type": "object",
+-                "properties": {
+-                    "package": {
+-                        "type": "string",
+-                        "description": "npm package identifier (e.g. '@modelcontextprotocol/server-github')",
+-                    },
+-                    "server_name": {
+-                        "type": "string",
+-                        "description": "Logical name for this server (e.g. 'github') used with gateway.provision",
+-                    },
+-                    "env_vars": {
+-                        "type": "array",
+-                        "items": {"type": "string"},
+-                        "description": "Required environment variable names (e.g. ['GITHUB_TOKEN'])",
+-                    },
+-                    "description": {
+-                        "type": "string",
+-                        "description": "Short description of the server's purpose",
+-                    },
+-                },
+-                "required": ["package", "server_name"],
+-            },
+-        ),
+-    ]
++            name=spec.name,
++            description=spec.description,
++            input_schema=input_schema_for(spec.input_model),
++        )
++        for spec in _GATEWAY_TOOL_SPECS
++    )
++
++
++def get_gateway_tool_definitions() -> list[Tool]:
++    """Get MCP tool definitions for the gateway, schemas derived from the models."""
++    return list(_derived_gateway_tools())
+ 
+ 
+ def _summarize_arg_schema(
+```
+
 ### B — `src/pmcp/tools/schema.py`: `NO_ARGUMENTS_SCHEMA` becomes
 
 ```python
@@ -1066,7 +3134,7 @@ NO_ARGUMENTS_SCHEMA: dict[str, Any] = {
          ):
 ```
 
-### B — appended to `tests/test_gateway_tool_schemas.py` (verbatim, measured 223 passed on the B tree)
+### B — appended to `tests/test_gateway_tool_schemas.py` (verbatim as measured on the revision-1 B tree: 223 passed; apply the B-preamble changes, then re-measure)
 
 ```python
 # --- unknown keys are an error (Consiliency/pmcp#236, piece B) -----------------
@@ -1318,7 +3386,134 @@ index 1e91803..90876ee 100644
 
 ## Measurement scripts
 
-The instrument behind the inventory, `extra=` table, gate probe, `model_json_schema()` noise and per-tool drift table. Run it from a checkout of `860636a` with the A-only `schema.py` saved beside it as `spike_schema.py`: `uv run python probe_head.py <dir-holding-spike_schema.py>`.
+The instrument behind the inventory, `extra=` table, gate probe, `model_json_schema()` noise and per-tool drift table. Run it from a checkout of `860636a` (or `main` @ `9ca081e`, where every file it imports is identical) with the piece-A `schema.py` saved beside it as `spike_schema.py`: `uv run python probe_head.py <dir-holding-spike_schema.py>`.
+
+**Revision 2 re-run** (2026-09-26): `main` @ `9ca081e` `src/` on `PYTHONPATH`, the
+frozen revision-2 `schema.py` as `spike_schema.py`. The inventory, `extra=`,
+runtime-drop, gate-accepts and `model_json_schema()` sections print exactly
+what the Research summary quotes (`tools: 26 modelled: 23`; all 27 models
+`extra=None`; `DescribeInput -> {'tool_id': 'a::b'} (no error)`; no
+`additionalProperties` anywhere; the three gate probes `ACCEPTS`). The
+drift section, in full:
+
+```text
+== schema-vs-model drift on HEAD (hand-written vs derived, per tool) ==
+  gateway.catalog_search:
+    differs: /properties/query/type: hand='string' model=["string", "null"]
+    differs: /properties/filters/type: hand='object' model=["object", "null"]
+    differs: /properties/filters/properties/server/type: hand='string' model=["string", "null"]
+    differs: /properties/filters/properties/tags/type: hand='array' model=["array", "null"]
+    differs: /properties/filters/properties/risk_max/type: hand='string' model=["string", "null"]
+    differs: /properties/filters/properties/risk_max/enum: hand=["low", "medium", "high"] model=["low", "medium", "high", null]
+  gateway.describe:
+    only in model:        /properties/tool_id/minLength = 1
+  gateway.invoke:
+    only in model:        /properties/tool_id/minLength = 1
+    only in model:        /properties/arguments/additionalProperties = True
+    only in model:        /properties/task/properties/enabled/default = True
+    only in model:        /properties/task/properties/enabled/type = 'boolean'
+    only in model:        /properties/task/properties/metadata/additionalProperties = True
+    only in model:        /properties/task/properties/metadata/type = ["object", "null"]
+    only in model:        /properties/task/properties/ttl/type = ["integer", "null"]
+    only in model:        /properties/task/properties/poll_interval/type = ["number", "null"]
+    only in model:        /properties/task/properties/requestor_context/additionalProperties = True
+    only in model:        /properties/task/properties/requestor_context/type = ["object", "null"]
+    only in model:        /properties/task/type = ["object", "null"]
+    only in model:        /properties/trace_context/properties/traceparent/type = ["string", "null"]
+    only in model:        /properties/trace_context/properties/tracestate/type = ["string", "null"]
+    only in model:        /properties/trace_context/properties/baggage/type = ["string", "null"]
+    only in model:        /properties/trace_context/type = ["object", "null"]
+    only in model:        /properties/_meta/additionalProperties = True
+    only in model:        /properties/_meta/type = ["object", "null"]
+    only in model:        /properties/run_correlation_id/maxLength = 128
+    only in model:        /properties/run_correlation_id/minLength = 1
+    only in model:        /properties/seat_correlation_id/maxLength = 128
+    only in model:        /properties/seat_correlation_id/minLength = 1
+    differs: /properties/run_correlation_id/type: hand='string' model=["string", "null"]
+    differs: /properties/seat_correlation_id/type: hand='string' model=["string", "null"]
+    differs: /properties/evidence_label_digest/type: hand='string' model=["string", "null"]
+    differs: /properties/options/type: hand='object' model=["object", "null"]
+    differs: /properties/options/properties/max_output_chars/type: hand='integer' model=["integer", "null"]
+  gateway.refresh:
+    differs: /properties/source/type: hand='string' model=["string", "null"]
+    differs: /properties/source/enum: hand=["claude_config", "custom"] model=["claude_config", "custom", null]
+    differs: /properties/reason/type: hand='string' model=["string", "null"]
+  gateway.connect_server:
+    only in model:        /properties/server_name/minLength = 1
+  gateway.disconnect_server:
+    only in model:        /properties/server_name/minLength = 1
+  gateway.restart_server:
+    only in model:        /properties/server_name/minLength = 1
+  gateway.set_startup_policy:
+    differs: /properties/source/type: hand='string' model=["string", "null"]
+    differs: /properties/source/enum: hand=["project", "user", "custom"] model=["project", "user", "custom", null]
+    differs: /properties/path/type: hand='string' model=["string", "null"]
+  gateway.request_capability:
+    only in model:        /properties/query/minLength = 1
+    differs: /properties/available_clis/type: hand='array' model=["array", "null"]
+  gateway.sync_environment:
+    differs: /properties/platform/type: hand='string' model=["string", "null"]
+    differs: /properties/platform/enum: hand=["mac", "wsl", "linux", "windows"] model=["mac", "wsl", "linux", "windows", null]
+    differs: /properties/detected_clis/type: hand='array' model=["array", "null"]
+  gateway.provision:
+    only in model:        /properties/server_name/minLength = 1
+  gateway.update_server:
+    only in model:        /properties/server_name/minLength = 1
+  gateway.auth_connect:
+    only in model:        /properties/server_name/minLength = 1
+    only in model:        /properties/credential/minLength = 1
+    differs: /properties/credential/type: hand='string' model=["string", "null"]
+    differs: /properties/elicitation_id/type: hand='string' model=["string", "null"]
+    differs: /properties/elicitation_url/type: hand='string' model=["string", "null"]
+    differs: /properties/env_var/type: hand='string' model=["string", "null"]
+  gateway.submit_feedback:
+    only in model:        /properties/title/maxLength = 160
+    only in model:        /properties/title/minLength = 8
+    differs: /properties/subordinate_server/type: hand='string' model=["string", "null"]
+    differs: /properties/failed_tool_call/type: hand='string' model=["string", "null"]
+  gateway.provision_status:
+    only in model:        /properties/job_id/minLength = 1
+  gateway.list_pending:
+    differs: /properties/server/type: hand='string' model=["string", "null"]
+  gateway.cancel:
+    only in model:        /properties/request_id/minLength = 1
+  gateway.tasks_list:
+    only in model:        /properties/requestor_context/additionalProperties = True
+    only in model:        /properties/requestor_context/type = ["object", "null"]
+    differs: /properties/server_name/type: hand='string' model=["string", "null"]
+    differs: /properties/cursor/type: hand='string' model=["string", "null"]
+  gateway.tasks_get:
+    only in model:        /properties/server_name/minLength = 1
+    only in model:        /properties/task_id/minLength = 1
+    only in model:        /properties/requestor_context/additionalProperties = True
+    only in model:        /properties/requestor_context/type = ["object", "null"]
+  gateway.tasks_result:
+    only in model:        /properties/server_name/minLength = 1
+    only in model:        /properties/task_id/minLength = 1
+    only in model:        /properties/options/properties/timeout_ms/default = 30000
+    only in model:        /properties/options/properties/timeout_ms/maximum = 300000
+    only in model:        /properties/options/properties/timeout_ms/minimum = 1000
+    only in model:        /properties/options/properties/timeout_ms/type = 'integer'
+    only in model:        /properties/options/properties/max_output_chars/maximum = 100000
+    only in model:        /properties/options/properties/max_output_chars/minimum = 100
+    only in model:        /properties/options/properties/redact_secrets/default = False
+    only in model:        /properties/requestor_context/additionalProperties = True
+    only in model:        /properties/requestor_context/type = ["object", "null"]
+    differs: /properties/options/type: hand='object' model=["object", "null"]
+    differs: /properties/options/properties/max_output_chars/type: hand='integer' model=["integer", "null"]
+  gateway.tasks_cancel:
+    only in model:        /properties/server_name/minLength = 1
+    only in model:        /properties/task_id/minLength = 1
+    only in model:        /properties/requestor_context/additionalProperties = True
+    only in model:        /properties/requestor_context/type = ["object", "null"]
+  gateway.search_registry:
+    only in model:        /properties/query/minLength = 1
+  gateway.register_discovered_server:
+    only in model:        /properties/package/minLength = 1
+    only in model:        /properties/server_name/minLength = 1
+
+  tools with drift (ignoring descriptions and additionalProperties): 23/26
+```
 
 ```python
 """Measure HEAD (860636a): model `extra` defaults, jsonschema gate, verbatim
@@ -1446,4 +3641,191 @@ for name, model in MODELS.items():
         for k, (a, b) in differ.items():
             print(f"    differs: {k}: hand={a} model={b}")
 print(f"\n  tools with drift (ignoring descriptions and additionalProperties): {drift_count}/26")
+```
+
+### Revision-2 probes (A1 null agreement, echo classes, descriptions)
+
+Each is run twice, once with `main`'s `src/` on `PYTHONPATH` and once with
+piece A's, both using the same venv:
+`PYTHONPATH=<src> uv run python <probe> > out`.
+
+`probe_null.py`: for every optional field (top level, and one level into a
+nested argument model) sent as explicit `null`, does the gate accept it, and
+does the model? `null_cmp.py main.json a.json` compares the two runs.
+
+```python
+"""For every optional field (top level, and one level down in a nested
+argument model) sent as explicit null: does the gate accept it, does the model?
+Run once with main's src on PYTHONPATH and once with piece A's."""
+import json, sys, typing
+import jsonschema
+from pydantic import BaseModel, ValidationError
+from pmcp import types as T
+from pmcp.tools.handlers import get_gateway_tool_definitions
+
+MODELS = {
+    "gateway.catalog_search": T.CatalogSearchInput, "gateway.describe": T.DescribeInput,
+    "gateway.invoke": T.InvokeInput, "gateway.refresh": T.RefreshInput,
+    "gateway.connect_server": T.ConnectServerInput, "gateway.disconnect_server": T.DisconnectServerInput,
+    "gateway.restart_server": T.RestartServerInput, "gateway.set_startup_policy": T.StartupPolicyOperation,
+    "gateway.request_capability": T.CapabilityRequestInput, "gateway.sync_environment": T.SyncEnvironmentInput,
+    "gateway.provision": T.ProvisionInput, "gateway.update_server": T.UpdateServerInput,
+    "gateway.auth_connect": T.AuthConnectInput, "gateway.submit_feedback": T.SubmitFeedbackInput,
+    "gateway.provision_status": T.ProvisionStatusInput, "gateway.list_pending": T.ListPendingInput,
+    "gateway.cancel": T.CancelInput, "gateway.tasks_list": T.TasksListInput,
+    "gateway.tasks_get": T.TasksGetInput, "gateway.tasks_result": T.TasksResultInput,
+    "gateway.tasks_cancel": T.TasksCancelInput, "gateway.search_registry": T.SearchRegistryInput,
+    "gateway.register_discovered_server": T.RegisterDiscoveredServerInput,
+}
+MIN = {"gateway.describe": {"tool_id": "srv::tool"}, "gateway.invoke": {"tool_id": "srv::tool"},
+    "gateway.connect_server": {"server_name": "srv"}, "gateway.disconnect_server": {"server_name": "srv"},
+    "gateway.restart_server": {"server_name": "srv"}, "gateway.set_startup_policy": {"operation": "add"},
+    "gateway.request_capability": {"query": "scrape a site"}, "gateway.provision": {"server_name": "srv"},
+    "gateway.update_server": {"server_name": "srv"}, "gateway.auth_connect": {"server_name": "srv"},
+    "gateway.submit_feedback": {"title": "a title here", "description": "d"},
+    "gateway.provision_status": {"job_id": "job"}, "gateway.cancel": {"request_id": "srv::1"},
+    "gateway.tasks_get": {"server_name": "srv", "task_id": "t"},
+    "gateway.tasks_result": {"server_name": "srv", "task_id": "t"},
+    "gateway.tasks_cancel": {"server_name": "srv", "task_id": "t"},
+    "gateway.search_registry": {"query": "github"},
+    "gateway.register_discovered_server": {"package": "pkg", "server_name": "srv"}}
+
+def mtypes(a):
+    if isinstance(a, type) and issubclass(a, BaseModel):
+        return [a]
+    return [t for x in typing.get_args(a) for t in mtypes(x)]
+
+def opt(m):
+    return [(f.alias or n) for n, f in m.model_fields.items() if not f.is_required() and f.default is None]
+
+tools = {t.name: t for t in get_gateway_tool_definitions()}
+for _m in MODELS.values():
+    _m.model_rebuild(force=True)  # resolve ForwardRef annotations (TasksResultInput.options)
+out = {}
+for name, m in MODELS.items():
+    base = MIN.get(name, {})
+    cases = [(f, {**base, f: None}) for f in opt(m)]
+    for fn, fi in m.model_fields.items():
+        for nested in mtypes(fi.annotation):
+            for sub in opt(nested):
+                cases.append((f"{fi.alias or fn}.{sub}", {**base, (fi.alias or fn): {sub: None}}))
+    for label, args in cases:
+        try:
+            m.model_validate(args); ma = True
+        except ValidationError:
+            ma = False
+        try:
+            jsonschema.validate(instance=args, schema=tools[name].input_schema); ga = True
+        except jsonschema.ValidationError:
+            ga = False
+        out[f"{name}.{label}"] = [ga, ma]
+json.dump(out, sys.stdout, indent=0, sort_keys=True)
+```
+
+```python
+"""Compare probe_null.py output from main and from piece A."""
+import json, sys
+m = json.load(open(sys.argv[1])); a = json.load(open(sys.argv[2]))
+assert m.keys() == a.keys(), set(m) ^ set(a)
+print("cases:", len(a), "| model accepts null:", sum(v[1] for v in a.values()))
+print("A gate == model:", sum(v[0] == v[1] for v in a.values()), "| main gate == model:", sum(v[0] == v[1] for v in m.values()))
+print("main gate rejects, model accepts:", sorted(k for k, v in m.items() if v[0] != v[1]))
+```
+
+Output (measured):
+
+```text
+cases: 42 | model accepts null: 42
+A gate == model: 42 | main gate == model: 14
+main gate rejects, model accepts: ['gateway.auth_connect.credential', 'gateway.auth_connect.elicitation_id', 'gateway.auth_connect.elicitation_url', 'gateway.auth_connect.env_var', 'gateway.catalog_search.filters', 'gateway.catalog_search.filters.risk_max', 'gateway.catalog_search.filters.server', 'gateway.catalog_search.filters.tags', 'gateway.catalog_search.query', 'gateway.invoke.evidence_label_digest', 'gateway.invoke.options', 'gateway.invoke.options.max_output_chars', 'gateway.invoke.run_correlation_id', 'gateway.invoke.seat_correlation_id', 'gateway.list_pending.server', 'gateway.refresh.reason', 'gateway.refresh.source', 'gateway.request_capability.available_clis', 'gateway.set_startup_policy.path', 'gateway.set_startup_policy.source', 'gateway.submit_feedback.failed_tool_call', 'gateway.submit_feedback.subordinate_server', 'gateway.sync_environment.detected_clis', 'gateway.sync_environment.platform', 'gateway.tasks_list.cursor', 'gateway.tasks_list.server_name', 'gateway.tasks_result.options', 'gateway.tasks_result.options.max_output_chars']
+```
+
+`probe_echo.py`: which gate and model error classes echo the argument *value*.
+Its output on `main` and on A is quoted in *Order: A first, then B* (the only
+difference is the `minLength` row: `main` ACCEPTS `""`, A rejects it with
+`'' should be non-empty`).
+
+```python
+"""Which gate/model errors echo the argument VALUE? (Consiliency/pmcp#236 rev 2)"""
+import json, jsonschema
+from pydantic import BaseModel, ConfigDict, ValidationError
+from pmcp.tools.handlers import get_gateway_tool_definitions
+tools = {t.name: t for t in get_gateway_tool_definitions()}
+S = "Bearer sk-SAMPLE"
+def gate(name, args):
+    try:
+        jsonschema.validate(instance=args, schema=tools[name].input_schema); return "ACCEPTS"
+    except jsonschema.ValidationError as e:
+        return f"{e.message!r} echoes_value={S in e.message}"
+print("type   :", gate("gateway.invoke", {"tool_id": "a::b", "arguments": S}))
+print("minLen :", gate("gateway.describe", {"tool_id": ""}))
+print("enum   :", gate("gateway.refresh", {"source": S}))
+print("extra  :", gate("gateway.invoke", {"tool_id": "a::b", "authorizatoin": S}))
+print("pattern keywords in any gateway schema:", "pattern" in json.dumps([t.input_schema for t in tools.values()]))
+try:
+    jsonschema.validate({"x": 1, "authorizatoin": S}, {"type": "object", "properties": {"x": {}}, "additionalProperties": False})
+except jsonschema.ValidationError as e:
+    print("additionalProperties:false :", repr(e.message), "echoes_value=", S in e.message)
+try:
+    jsonschema.validate({"x": S}, {"type": "object", "properties": {"x": {"type": "string", "pattern": "^[a-z]+$"}}})
+except jsonschema.ValidationError as e:
+    print("pattern (synthetic)        :", repr(e.message), "echoes_value=", S in e.message)
+class F(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    x: int = 1
+try:
+    F.model_validate({"authorizatoin": S})
+except ValidationError as e:
+    print("pydantic extra_forbidden   : echoes_value=", S in str(e), "|", str(e).splitlines()[2].strip())
+print("pattern (invoke.evidence_label_digest):", gate("gateway.invoke", {"tool_id": "a::b", "evidence_label_digest": S}))
+```
+
+`dump_schemas.py` + `desc_cmp.py`: argument-description comparison, `main` →
+A. Run `dump_schemas.py` under each `src/`, then
+`desc_cmp.py main.json a.json`. Output (measured; the 15 `DIFF` lines are the
+table under *Piece A → `types.py`*):
+
+```python
+import json, sys
+from pmcp.tools.handlers import get_gateway_tool_definitions
+json.dump({t.name: {"d": t.description, "s": t.input_schema} for t in get_gateway_tool_definitions()}, sys.stdout, sort_keys=True)
+```
+
+```python
+import json, sys
+main = json.load(open(sys.argv[1])); a = json.load(open(sys.argv[2]))
+def props(node, path=""):
+    out = {}
+    for name, p in (node.get("properties") or {}).items():
+        out[f"{path}{name}"] = p
+        if isinstance(p, dict) and "properties" in p:
+            out.update(props(p, f"{path}{name}."))
+    return out
+same = differ = newdesc = newprop = 0
+diffs = []; newdescs = []; newprops = []
+for tool in main:
+    assert main[tool]["d"] == a[tool]["d"], tool
+    pm, pa = props(main[tool]["s"]), props(a[tool]["s"])
+    assert set(pm) <= set(pa), (tool, set(pm) - set(pa))
+    for k, p in pa.items():
+        key = f"{tool}.{k}"
+        if k not in pm:
+            newprop += 1; newprops.append(key); continue
+        dm = pm[k].get("description")
+        if dm is None:
+            newdesc += 1; newdescs.append(key)
+        elif dm == p.get("description"):
+            same += 1
+        else:
+            differ += 1; diffs.append((key, dm, p.get("description")))
+print("tool descriptions byte-identical: 26/26" if len(main) == 26 else len(main))
+print("same", same, "differ", differ, "new description", newdesc, "newly advertised", newprop)
+for d in diffs: print("DIFF", d)
+print("NEWDESC", newdescs)
+print("NEWPROP", newprops)
+```
+
+```text
+tool descriptions byte-identical: 26/26
+same 40 differ 15 new description 19 newly advertised 16
 ```
