@@ -1402,6 +1402,121 @@
       "task_summary": null,
       "type": "phase",
       "updated_at": "2026-06-25T02:26:25Z"
+    },
+    {
+      "acceptance_criteria_count": 23,
+      "created_at": "2026-09-23T23:15:00+00:00",
+      "file": ".consiliency/plans/detailed-236-schema-drift-20260923-0915.md",
+      "handoff_ref": null,
+      "if_gates_produced": [],
+      "lanes": [],
+      "lifecycle": [
+        {
+          "at": "2026-09-23T23:15:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {},
+          "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T03:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "advisor-board review of Consiliency/pmcp#291: A1 null agreement, A2 derive-once cache, A3 audit-gap attribution, X1 dispatch==registry pin; piece A embedded verbatim and cmp-proven against 72eaa76",
+            "revision": 2
+          },
+          "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T05:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "re-embedded from d0722f4: description conflicts resolved to option (b) (main's text; update_server.force keeps model text), _object_schemas walks nullable nested objects (mutant M-W)",
+            "revision": 2
+          },
+          "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T07:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "board round 2 on 28ae22d (F1-F5): re-embedded from 40b2ed5 incl. server.py X1 fail-closed guard (mutant M-X1s); lax-coercion, gate-passing echo path, host dialect risk, A3 filed as Consiliency/pmcp#296",
+            "revision": 2
+          },
+          "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T09:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "board round 3 on 3481bbc (N1-N4): re-embedded from 972bc90 (guard above scoped check, digest length bounds; mutants M-N1, M-N2); F3 linked to Consiliency/pmcp#297; A CHANGELOG states the policy-blocked audit consequence until Consiliency/pmcp#296",
+            "revision": 2
+          },
+          "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T10:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "re-embedded test module from a25dce0 (docstring-only change vs 972bc90: names the regex-dialect class); runtime results cited from 972bc90",
+            "revision": 2
+          },
+          "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T12:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "board round 4 on b308e57 (F1): re-embedded from c79bf1a (task.ttl int64 bound; sixth gate/model class, integer range; mutant M-F1); records main+A = 4282 (seat)",
+            "revision": 2
+          },
+          "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T14:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "board round 5 on 749185a (G1): re-embedded from 7a71a52 (task.ttl int64 ge= too; class-wide both-bounds test; mutant M-G1); corrected round-4 overstatement of the integer-range class; poll_interval NaN/inf and negative ttl noted as non-goals",
+            "revision": 2
+          },
+          "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T16:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "board round 6 on 5628aa6 (N6-1..3): re-embedded from 37da099 (task.ttl ge=-2**63+1; mutant M-N6-1); imported the seat's exhaustive differential class table (re-run at 37da099: 236/5636); N6-2 -> Consiliency/pmcp#297, N6-3 -> Consiliency/pmcp#298",
+            "revision": 2
+          },
+          "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T17:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "re-embedded test module from 3d0d437 (docstring-only vs 37da099: names the two deferred classes, Consiliency/pmcp#297 and Consiliency/pmcp#298); runtime results cited from 37da099",
+            "revision": 2
+          },
+          "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T18:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "board round 7 on 76c41a0 (N7-1..3, text only): row 7 two-sided (|n| >= 2^1024-2^970, either sign; remedy needs a finite bound on each side); row 8 = 804 (int_parsing_size 20); test module re-embedded from cb6afa4 (docstring-only); runtime results cited from 37da099",
+            "revision": 2
+          },
+          "transition": "committed"
+        }
+      ],
+      "owner_skill": "claude-plan-detailed",
+      "phase_alias": null,
+      "reflection_ref": null,
+      "roadmap_ref": null,
+      "slug": "236-schema-drift",
+      "status": "committed",
+      "task_summary": "Derive every gateway tool inputSchema from its argument model (A), then extra=\"forbid\" on the argument models (B) for Consiliency/pmcp#236; A and B land as separate PRs.",
+      "type": "detailed",
+      "updated_at": "2026-09-26T18:00:00+00:00"
     }
   ],
   "schema_version": 1
