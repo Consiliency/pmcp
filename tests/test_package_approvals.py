@@ -594,3 +594,58 @@ def test_the_stale_warning_escapes_the_stored_text(
     with caplog.at_level("WARNING", logger="pmcp.package_approvals"):
         is_package_approved(good)
     assert "'old-pkg'@'1.0.0-x.tgz'" in caplog.text
+
+
+def _store_with_stale(name: str = "old-pkg", version: str = "1.0.0-x.tgz") -> Path:
+    approve_package(_identity("good-pkg", "1.2.3"))
+    store = package_approvals_path()
+    data = json.loads(store.read_text())
+    data["records"].append(
+        dict(data["records"][0], name=name, resolved_version=version)
+    )
+    store.write_text(json.dumps(data))
+    return store
+
+
+@pytest.mark.parametrize(
+    ("name", "version"), [("other-pkg", None), ("old-pkg", "2.0.0")]
+)
+def test_revoke_of_a_non_matching_name_or_version_leaves_the_store_alone(
+    name: str, version: str | None
+) -> None:
+    """A stale record for a DIFFERENT name, or the same name at a different
+    version, is not a match: revoke reports False and rewrites nothing."""
+    store = _store_with_stale()
+    before = store.read_bytes()
+    assert revoke_package(name, version) is False
+    assert store.read_bytes() == before
+
+
+@pytest.mark.parametrize("entry", [["not", "a", "dict"], "a string", 42, None])
+def test_a_non_dict_entry_fails_the_store_as_a_package_approval_error(
+    entry: object,
+) -> None:
+    """Type confusion in the records list is corruption: it surfaces as the
+    store's own error, not an AttributeError/TypeError from the stale check."""
+    approve_package(_identity("good-pkg", "1.2.3"))
+    store = package_approvals_path()
+    data = json.loads(store.read_text())
+    data["records"].append(entry)
+    store.write_text(json.dumps(data))
+    with pytest.raises(PackageApprovalError):
+        list_package_approvals()
+
+
+@pytest.mark.parametrize("version", [123, 1.5, ["1.0.0-x.tgz"], None])
+def test_a_non_string_version_fails_the_store_as_a_package_approval_error(
+    version: object,
+) -> None:
+    approve_package(_identity("good-pkg", "1.2.3"))
+    store = package_approvals_path()
+    data = json.loads(store.read_text())
+    data["records"].append(
+        dict(data["records"][0], name="x-pkg", resolved_version=version)
+    )
+    store.write_text(json.dumps(data))
+    with pytest.raises(PackageApprovalError):
+        list_package_approvals()

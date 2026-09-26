@@ -399,7 +399,9 @@ def revoke_package(name: str, version: str | None = None) -> bool:
     """Drop the records for *name* (at *version*, or at every version).
 
     Returns whether anything was removed. Revoking returns the identity to
-    *absent*, which the gate already refuses. Raises ``TrustStoreError`` if the
+    *absent*, which the gate already refuses. A stale record
+    (``_is_stale_record``) matching *name* (and *version*) counts as removed;
+    like every write, this one also drops stale records for other names. Raises ``TrustStoreError`` if the
     store is unusable.
     """
     store = package_approvals_path()
