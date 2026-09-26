@@ -2232,15 +2232,18 @@ def test_the_differential_corpus_covers_every_axis() -> None:
         ('{"access_token": null}', '{"access_token": null}'),
         ('{"token": true}', '{"token": true}'),
         ('{"password": false}', '{"password": false}'),
-        ('{"token": 42}', '{"token": "[REDACTED]"}'),
-        ('{"token": -1.5e3}', '{"token": "[REDACTED]"}'),
+        # rev 10 (F5/F6, the maintainer's decision 1): a bare number after
+        # a quoted key stays unchanged, as on main; numeric secrets under a
+        # quoted key are Consiliency/pmcp#290's scope
+        ('{"token": 42}', '{"token": 42}'),
+        ('{"token": -1.5e3}', '{"token": -1.5e3}'),
     ],
 )
 def test_b1_a_json_literal_after_a_quoted_key_keeps_the_document(
     text: str, expected: str
 ) -> None:
-    """B1: `null`/`true`/`false` are not secrets; a number is redacted as a
-    JSON string so the document stays JSON; a dict result stays a dict."""
+    """B1: a bare JSON scalar after a quoted key is not a secret; the
+    document stays JSON and a dict result stays a dict."""
     for surface, out in _both(text):
         assert out == expected, (surface, out)
     assert _process(json.loads(text)) == json.loads(expected)
@@ -2606,6 +2609,531 @@ def test_property_json_fuzz_keeps_documents_and_dicts() -> None:
     assert broken == [], "\n".join(broken[:10])
     assert checked > 3000 and excluded > 0, (checked, excluded)
     assert main_types.count("dict") > 1000
+
+
+# === rev 10: regression tests, one per fix family ========================== #
+#
+# Each is red on rev 9 (`60ca193`) and green here; each fix is also pinned by a
+# mutant of its production change that these tests kill (the plan lists them).
+
+
+def _leaf(text: str) -> str:
+    """`process_output({"t": text})`'s leaf, which must still be a dict."""
+    result = _process({"t": text})
+    assert isinstance(result, dict), result
+    return str(result["t"])
+
+
+def _gone(text: str, secret: str) -> None:
+    for surface, out in _both(text):
+        assert secret not in out, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"token": float("nan")},
+        {"secret": float("inf")},
+        {"session": float("-inf")},
+        {"password": float("nan"), "x": 1},
+        {"stats": {"tokens": float("nan")}},
+        {"usage": {"input_tokens": 12, "output_tokens": 34}, "max_tokens": 1024},
+        {"sessions": 3, "secrets": 0, "Authorization": 7},
+    ],
+)
+def test_f5_f6_a_bare_json_scalar_after_a_quoted_key_is_unchanged(obj: dict) -> None:
+    """F5/F6 (the maintainer's decision 1): every scalar `json.dumps` emits,
+    `NaN` and `+-Infinity` included, stays as it is after a quoted key, as on
+    main: the result stays a dict and no leaf changes type. Numeric secrets
+    under a quoted key are Consiliency/pmcp#290's."""
+    result = _process(obj)
+    assert isinstance(result, dict), result
+    assert json.dumps(result, sort_keys=True) == json.dumps(obj, sort_keys=True)
+    for text in ('{"token": NaN}', '{"token": -Infinity}', '{"Authorization": 1e+20}'):
+        for surface, out in _both(text):
+            assert out == text, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "pre",
+    ["\xa0", "\x08", "\x0c", "\x0b", "\x1b", "\x7f", "\x85", "\u3000", "\u2028"]
+    + ["\xe9", "\u2022", "\u201c", "\u5bc6", "\U0001f642", "\\", '"'],
+    ids=lambda c: f"U+{ord(c):04X}",
+)
+@pytest.mark.parametrize(
+    ("body", "secret"),
+    [
+        ("password=hunter22x", "hunter22x"),
+        ("Token hunter2tok", "hunter2tok"),
+        ("Secret abc123def456", "abc123def456"),
+        ("Bearer hunter2tok", "hunter2tok"),
+    ],
+)
+def test_f3_a_json_escape_before_a_key_is_a_boundary(
+    pre: str, body: str, secret: str
+) -> None:
+    """F3: `process_output` serialises a dict leaf with `ensure_ascii=True`,
+    so every control, non-ASCII and escaped whitespace character before a key
+    arrives as an escape whose tail is alphanumeric (`\\u00a0password`,
+    `\\bToken`); main's `\\b[A-Za-z0-9_-]*` swallowed the tail and redacted."""
+    assert secret not in _leaf(pre + body)
+    for surface, out in _both(json.dumps({"t": pre + body})):
+        assert secret not in out, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"t": "\\u00a0password=hunter22x"}',
+        '{"t": "\\bsecret: hunter22x"}',
+        '{"t": "\\u2022token=hunter22x"}',
+        '{"t": "\\ftoken: hunter22x"}',
+    ],
+)
+def test_f3_the_policy_defaults_read_a_json_escape_as_a_boundary(text: str) -> None:
+    """F3 on the operator-visible defaults themselves (the engine covers the
+    policy surface too, so only the patterns can show it): `\\b` made a key
+    start right after an escape's alphanumeric tail on main."""
+    hits = [
+        m.group(m.lastindex)
+        for pattern in DEFAULT_REDACTION_PATTERNS
+        for m in re.finditer(pattern, text, re.IGNORECASE)
+        if m.lastindex
+    ]
+    assert any(h.startswith("hunter22x") for h in hits), hits
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("Cookie: session=bearer \u2006(t8B7fzJ0L)", "t8B7fzJ0L"),
+        ("token: BEARER \r{hM6odfJdqx}", "hM6odfJdqx"),
+        ("Authorization:\u2006'gn1y2tpo'", "gn1y2tpo"),
+        ("AUTHORIZATION:\u2006Bearer\n\n'ay47NjWsmUf'", "ay47NjWsmUf"),
+        ("authorization=\u2029bearer\t'gS6CJ7XD'", "gS6CJ7XD"),
+    ],
+)
+def test_f3_an_escaped_space_after_bearer_or_authorization_separates(
+    text: str, secret: str
+) -> None:
+    """F3's follow-up: in a serialised leaf the whitespace between
+    `Bearer`/`Authorization:` and the value is an escape (`\\u2006`, `\\r`,
+    `\\t`); main's `\\s+[^\\s,;]+` took it as part of the value and
+    redacted the token with it."""
+    assert secret not in _leaf(text)
+    for surface, out in _both(json.dumps({"t": text})):
+        assert secret not in out, (surface, out)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("password:\n\nhunter22x", "hunter22x"),
+        ("Temporary password:\n\n    hunter22x", "hunter22x"),
+        ("password:\r\n\r\nhunter22x", "hunter22x"),
+        ("password:\rhunter22x", "hunter22x"),
+        ("password:\n\rhunter22x", "hunter22x"),
+        ("Secret:\r\rhunter22x", "hunter22x"),
+        ("token\n\nhunter22tok", "hunter22tok"),
+        ("token\r\r\nhunter22tok", "hunter22tok"),
+        ("token:\n\n  abc123def456", "abc123def456"),
+        ("Authorization:\n\nhunter22x", "hunter22x"),
+        # F4b: the break BEFORE the operator
+        ("password\n: hunter22x", "hunter22x"),
+        ("Authorization\r\n: hunter22x", "hunter22x"),
+        ("api_key\n=\nhunter22x", "hunter22x"),
+    ],
+)
+def test_f4_any_line_break_run_separates(text: str, secret: str) -> None:
+    """F4: a blank line, a bare CR, `\\n\\r` or `\\r\\r\\n`, on either side of
+    the operator: main's `[\\s:=]+` accepted any run. The unindented-break gate
+    still keeps prose (`token:\\n\\nThe next paragraph`, the FP table)."""
+    _gone(text, secret)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("X-Auth: Bearer hunter22x", "hunter22x"),
+        ("X-Auth:Bearer hunter22x", "hunter22x"),
+        ("auth: bearer\thunter2tok", "hunter2tok"),
+        ("token: Bearer abc123def456", "abc123def456"),
+        ("X-Access-Token: Bearer hunter2tok", "hunter2tok"),
+        ("session=Bearer hunter2tok", "hunter2tok"),
+        ("Cookie: session=Bearer hunter2tok", "hunter2tok"),
+        ("headers: {X-Auth: Bearer hunter2tok}", "hunter2tok"),
+    ],
+)
+def test_f2_bearer_after_a_key_and_separator(text: str, secret: str) -> None:
+    """F2: a header or field whose value is `Bearer <token>`. The lookahead
+    and the plain-word gate already keep `token_type=Bearer expires_in=3600`
+    (the FP table)."""
+    _gone(text, secret)
+    assert secret not in _leaf(text)
+
+
+def test_f9_the_pem_rule_is_linear() -> None:
+    """F9: every BEGIN without an END scanned to the end of the text (rev 9:
+    5.6 s on 264 KB; main 0.05 s). The bound is generous against CI noise and
+    still an order of magnitude under rev 9."""
+    import time
+
+    text = "-----BEGIN RSA PRIVATE KEY-----\n" * 8250  # 264 KB
+    for surface, redact in (("engine", _engine), ("policy", _policy)):
+        start = time.perf_counter()
+        redact(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, (surface, elapsed)
+    block = "-----BEGIN RSA PRIVATE KEY-----\nMIIEabc\n-----END RSA PRIVATE KEY-----"
+    assert _engine(f"key: {block} end") == "key: [REDACTED] end"
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("Database:Password=hunter22x", "hunter22x"),
+        ("ConnectionStrings:Password=hunter22x", "hunter22x"),
+        ("--Database:Password=hunter22x", "hunter22x"),
+        ("App:ClientSecret=hunter22x", "hunter22x"),
+        ("vault:secret=hunter22x", "hunter22x"),
+        ("env:SECRET=hunter22x", "hunter22x"),
+        ("mongodb:password: hunter22x", "hunter22x"),
+    ],
+)
+def test_f1_a_colon_qualified_key_is_a_key(text: str, secret: str) -> None:
+    """F1: `Section:Key` (.NET configuration, namespaced log fields). Not
+    `::` (a path) and not a key inside an `arn:`/`urn:` name (the FP table)."""
+    _gone(text, secret)
+    assert secret not in _leaf(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("password===hunter22x", "hunter22x"),
+        ("password====hunter22x", "hunter22x"),
+        ("password:: hunter22x", "hunter22x"),
+        ("password=:\u205fhunter22x", "hunter22x"),
+        ("Database:Password=:hunter22x", "hunter22x"),
+        ("token:==abc123def456", "abc123def456"),
+    ],
+)
+def test_n1_an_operator_run_separates(text: str, secret: str) -> None:
+    """N1: main's `[\\s:=]+` took any run; a run holding `==` or `::` is a
+    comparison or a path unless the value is credential-shaped
+    (`if (token === expected)`, `token::Type`: the FP table)."""
+    _gone(text, secret)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("password_=hunter22x", "hunter22x"),
+        ("password-=hunter22x", "hunter22x"),
+        ("password__=hunter22x", "hunter22x"),
+        ("id_token__Xv=hunter22x", "hunter22x"),
+        ("api_keyNf--sKOs: hunter22x", "hunter22x"),
+        ("password__ abc123def456", "abc123def456"),
+    ],
+)
+def test_n2_a_trailing_joiner_or_joiner_run_in_the_suffix(
+    text: str, secret: str
+) -> None:
+    _gone(text, secret)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ('password="hunter22x', "hunter22x"),
+        ("api_key='hunter22x", "hunter22x"),
+        ('secret: "hunter22x', "hunter22x"),
+        ("aws_secret='hunter22x more", "hunter22x"),
+    ],
+)
+def test_n5_an_unterminated_opening_quote(text: str, secret: str) -> None:
+    """N5: main's policy defaults took the run after an opening quote."""
+    _gone(text, secret)
+    assert _engine('password="hunter22x') == 'password="[REDACTED]'
+    for kept in ('password="', 'He said "token', "it's the password's fault"):
+        for surface, out in _both(kept):
+            assert out == kept, (surface, out)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('Bearer "hunter22x"', 'Bearer "[REDACTED]"'),
+        ("Bearer 'hunter22x'", "Bearer '[REDACTED]'"),
+        ("Bearer (hunter22x)", "Bearer ([REDACTED])"),
+        ("Bearer [hunter22x]", "Bearer [[REDACTED]]"),
+        ("Bearer {hunter22x}", "Bearer {[REDACTED]}"),
+        ("Authorization: [hunter22x]", "Authorization: [[REDACTED]]"),
+        ("Authorization: {hunter22x}", "Authorization: {[REDACTED]}"),
+        ('Authorization: Bearer "hunter22x"', 'Authorization: Bearer "[REDACTED]"'),
+    ],
+)
+def test_n6_n7_a_wrapped_bearer_or_authorization_value(
+    text: str, expected: str
+) -> None:
+    """N6/N7: the inside of a wrapped value is redacted and the wrapping
+    kept. After a quoted key a bracket is JSON structure."""
+    for surface, out in _both(text):
+        assert out == expected, (surface, out)
+    for obj in ({"Authorization": [1.5]}, {"Authorization": {"a": "b"}}):
+        assert _process(obj) == obj
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "otp_code",
+        "verification_code",
+        "mfa_code",
+        "recovery_code",
+        "sms_code",
+        "invite_code",
+    ],
+)
+def test_n8_code_under_a_non_status_qualifier_is_a_weak_key(key: str) -> None:
+    """N8: `code` under a qualifier that is not a status name redacts a
+    credential-shaped value, as main did; plain words and numbers are kept
+    (a weak key), and a status qualifier keeps its value."""
+    _gone(f"{key}=abc123def456", "abc123def456")
+    _gone(f'{{"{key}": "abc123def456"}}', "abc123def456")
+    for kept in (
+        f"{key}=expired",
+        f"{key}=401",
+        "status_code=401",
+        "error_code=invalid_grant",
+        "sqlstate_code=42P01",
+    ):
+        for surface, out in _both(kept):
+            assert out == kept, (surface, out)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("C:\\secret=hunter22x", "hunter22x"),
+        ("DOMAIN\\password=hunter22x", "hunter22x"),
+        ("\\password hunter22x", "hunter22x"),
+        ("\\0WM9qpSecret_old=tEDvZ67S1", "tEDvZ67S1"),
+        ("\\token=hunter22x", "hunter22x"),
+        ("\\tenant_id: hunter22x", "hunter22x"),
+    ],
+)
+def test_f8_a_key_after_a_backslash(text: str, secret: str) -> None:
+    """F8: a backslash is a key boundary, as `\\b` made it on main; only the
+    tail of a JSON escape (`\\u00a0`, `\\n`) is never part of a key."""
+    _gone(text, secret)
+    assert secret not in _leaf(text)
+    assert _leaf("\u2022-code-id=:hunter22x") == "\u2022-code-id=:[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("java -jar x.jar -password hunter22x -user bob", "hunter22x"),
+        ("-token abc123def456", "abc123def456"),
+        ("_token hunter22x", "hunter22x"),
+        ("-secret\thunter22x", "hunter22x"),
+        ("---secret abc123def456", "abc123def456"),
+        ("_-password hunter22x", "hunter22x"),
+        ("a-b-c-d-e-f-g-h-i-j-password hunter22x", "hunter22x"),
+    ],
+)
+def test_n9_a_single_dash_flag_before_whitespace(text: str, secret: str) -> None:
+    """N9: a single-dash or `_` flag (any run of them), and a qualifier of
+    any number of joined segments, before a whitespace-separated value."""
+    _gone(text, secret)
+    for kept in ("-token bucket", "-secret santa", "_token ok", "use -session expired"):
+        for surface, out in _both(kept):
+            assert out == kept, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "text", ["PGPassword abc123def456", "DBPassword hunter22x", "APIToken abc123def456"]
+)
+def test_n4b_an_acronym_glued_to_a_titlecase_key(text: str) -> None:
+    """N4b: `PGPassword` (libpq) is a key; `Ed25519PrivateKey X509Cert` and
+    random-case glued keys (`gby3zPassword x`, the maintainer's decision 4)
+    stay prose."""
+    _gone(text, text.split()[-1])
+    for kept in ("Ed25519PrivateKey X509Cert", "RSAPrivateKey Rsa2048Key"):
+        for surface, out in _both(kept):
+            assert out == kept, (surface, out)
+
+
+#: The false positives each rev-9 narrowing was written for (the rev-10
+#: audit's guard list): `(text, engine, policy, dict leaf)`, `None` meaning
+#: unchanged. Four entries changed from rev 9, each commented; every other
+#: entry is exactly rev 9's output.
+_FALSE_POSITIVE_TABLE: list[tuple[str, str | None, str | None, str | None]] = [
+    ("token_type=Bearer expires_in=3600", None, None, None),
+    ('{"token_type": "Bearer"}', None, None, None),
+    ("token_type: Bearer, expires_in: 3600", None, None, None),
+    ('{"token_type":"Bearer","expires_in":3600}', None, None, None),
+    ("token_type=bearer&expires_in=3600", None, None, None),
+    ("Missing bearer token", None, None, None),
+    ("the bearer of bad news", None, None, None),
+    ('Bearer realm="api"', None, None, None),
+    ('WWW-Authenticate: Bearer realm="x", error="invalid_token"', None, None, None),
+    (
+        "token_type: Bearer\nexpires_in: 3600",
+        "token_type: Bearer\nexpires_in: 3600",
+        "token_type: Bearer\nexpires_in: 3600",
+        "token_type: [REDACTED] 3600",
+    ),
+    ("auth: Bearer", None, None, None),
+    ("scheme=Bearer scope=read", None, None, None),
+    (
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:MyDbPassword-AbCdEf",
+        None,
+        None,
+        None,
+    ),
+    (
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db/password-Xk9mQ2",
+        None,
+        None,
+        None,
+    ),
+    ("arn:aws:iam::123456789012:role/token-refresher", None, None, None),
+    ("urn:ietf:params:oauth:token-type:access_token", None, None, None),
+    ("urn:ietf:params:oauth:grant-type:token-exchange", None, None, None),
+    ("at 12:30:token expired", None, None, None),
+    ("ns:token bucket", None, None, None),
+    (
+        "token:\nthe bearer of",
+        "token:\nthe bearer of",
+        "token:\nthe bearer of",
+        "token:[REDACTED] bearer of",
+    ),
+    (
+        "token:\n  - item",
+        "token:\n  - item",
+        "token:\n  - item",
+        "token:[REDACTED]  - item",
+    ),
+    (
+        "Set the Authorization:\nheader first",
+        "Set the Authorization:\nheader first",
+        "Set the Authorization:\nheader first",
+        "Set the Authorization:[REDACTED] first",
+    ),
+    (
+        "password:\n\n- bullet",
+        "password:\n\n- bullet",
+        "password:\n\n- bullet",
+        "password:[REDACTED] bullet",
+    ),
+    (
+        "token:\n\nThe next paragraph",
+        "token:\n\nThe next paragraph",
+        "token:\n\nThe next paragraph",
+        "token:[REDACTED] next paragraph",
+    ),
+    ("Secret\n\nIngredient list", None, None, None),
+    (
+        "password:\r\n\r\nSee the docs",
+        "password:\r\n\r\nSee the docs",
+        "password:\r\n\r\nSee the docs",
+        "password:[REDACTED] the docs",
+    ),
+    ("session\n\nexpired", None, None, None),
+    ("token\n\n", None, None, None),
+    (
+        "Enter your password:\n\n> ",
+        "Enter your password:\n\n> ",
+        "Enter your password:\n\n> ",
+        "Enter your password:[REDACTED] ",
+    ),
+    (
+        "token:\n\n  - a\n  - b",
+        "token:\n\n  - a\n  - b",
+        "token:\n\n  - a\n  - b",
+        "token:[REDACTED]  - a\n  - b",
+    ),
+    ("caf\xe9 tokenizer=bert", None, None, None),
+    ("na\xefve session expired", None, None, None),
+    ("\u201ctoken\u201d bucket", None, None, None),
+    ("\u2022token bucket", None, None, None),
+    (
+        "\u5bc6\u7801 token \u8fc7\u671f",
+        "\u5bc6\u7801 token \u8fc7\u671f",
+        "\u5bc6\u7801 token \u8fc7\u671f",
+        "\u5bc6\u7801 token [REDACTED]",
+    ),
+    ("if (token === expected)", None, None, None),
+    ("if token == expected:", None, None, None),
+    # rev 10 (N1): `::` is a path -- the engine keeps it; the `token` policy default still reads `:` as its separator
+    ("token::Type", "token::Type", "token: [REDACTED]", "token: [REDACTED]"),
+    ("std::secret::Holder", None, None, None),
+    # rev 10 (N1): as `token::Type`
+    ("secret::new()", "secret::new()", "secret: [REDACTED]", "secret: [REDACTED]"),
+    ("password === confirm", None, None, None),
+    ("a::token::b", "a::token::b", "a::token: [REDACTED]", "a::token: [REDACTED]"),
+    ('password="', None, None, None),
+    (
+        'He said "token: x',
+        'He said "token: [REDACTED]',
+        'He said "token:[REDACTED]',
+        'He said "token:[REDACTED]',
+    ),
+    ('"password": "', None, None, None),
+    ("token='", None, None, None),
+    ("it's the password's fault", None, None, None),
+    ("Bearer (see RFC 6750)", None, None, None),
+    # rev 10 (N6): the inside of a bracketed Authorization value is redacted, as main redacted `[required]`
+    (
+        "Authorization: [required]",
+        "Authorization: [[REDACTED]]",
+        "Authorization: [[REDACTED]]",
+        "Authorization: [[REDACTED]]",
+    ),
+    ('authorization: {"type": "bearer"}', None, None, None),
+    ('"authorization": ["read", "write"]', None, None, None),
+    ('Bearer "realm"', None, None, None),
+    ("use the Bearer [scheme]", None, None, None),
+    # rev 10 (N6): the bracket stays; rev 9 ate the opening one
+    (
+        "Authorization: (none)",
+        "Authorization: ([REDACTED])",
+        "Authorization: ([REDACTED])",
+        "Authorization: ([REDACTED])",
+    ),
+    ("error_code=E_TIMEOUT_42", None, None, None),
+    ("status_code=HTTP_401", None, None, None),
+    ("exit_code=137", None, None, None),
+    ("zip_code=94105", None, None, None),
+    ("country_code=US", None, None, None),
+    ("lang_code=en-US", None, None, None),
+    ("response_code=ERR_42x", None, None, None),
+    ("error_code=invalid_grant", None, None, None),
+    ("-token bucket", None, None, None),
+    ("-secret santa", None, None, None),
+    ("_token ok", None, None, None),
+    ("use -session expired", None, None, None),
+    ("token-based auth", None, None, None),
+    ("password_ reset", None, None, None),
+    ("the tokenizer=bert", None, None, None),
+    ("token bucket", None, None, None),
+    ("session expired", None, None, None),
+]
+
+
+def test_the_false_positive_guard_list_holds() -> None:
+    assert (
+        len(_FALSE_POSITIVE_TABLE) == len({t for t, *_ in _FALSE_POSITIVE_TABLE}) == 71
+    )
+    assert sum(1 for _, e, *_ in _FALSE_POSITIVE_TABLE if e is None) >= 55
+    policy = PolicyManager()
+    for text, engine, pol, leaf in _FALSE_POSITIVE_TABLE:
+        assert _engine(text) == (text if engine is None else engine), text
+        assert policy.redact_secrets(text) == (text if pol is None else pol), text
+        result = policy.process_output({"t": text}, redact=True)["result"]
+        assert result == {"t": text if leaf is None else leaf}, (text, result)
 
 
 def test_sources_hold_no_literal_control_or_separator_characters() -> None:

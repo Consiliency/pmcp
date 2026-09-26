@@ -69,11 +69,13 @@ DEFAULT_REDACTION_PATTERNS = [
     # line; `token == expected` is a comparison on this surface too).
     r"(api[_-]?key|apikey)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
     # Not after `:` or `.`: `arn:…:secret:Name` names a secret, it is not one.
-    r"(?<![A-Za-z0-9:])(secret|password|passwd|pwd)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
+    # Right after a JSON escape it is a key (`\u00a0password=` in a
+    # serialised leaf), as `\b` made it on main.
+    r"(?:(?<![A-Za-z0-9:])|(?<=\\[nrtbf/\"\\])|(?<=\\u[0-9a-fA-F]{4}))(secret|password|passwd|pwd)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
     # `token` needs a real separator: the pre-#234 `(bearer|token)\s+…` form
     # redacted the word after "token" in prose ("token bucket"). Bearer values
     # are handled unconditionally by `sanitize_auth_diagnostic`.
-    r"\btoken[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
+    r"(?:\b|(?<=\\[nrtbf/\"\\])|(?<=\\u[0-9a-fA-F]{4}))token[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
     r"(aws_secret|aws_access)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
     r"\bsk-[A-Za-z0-9_-]{6,}\b",
     r"\bghp_[A-Za-z0-9_]{10,}\b",

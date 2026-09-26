@@ -185,8 +185,13 @@ _VENDOR_SHAPE_RES = (
     # whole key is one replacement.
     re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])"),
     # PEM private-key blocks: one replacement for the block, not one per line.
+    # The body never scans past the next BEGIN: `.*?` alone made every
+    # unterminated BEGIN scan to the end of the text, which is quadratic in
+    # the number of BEGINs (rev 9: 5.6 s on 264 KB of them; F9 of rev 9's
+    # board).
     re.compile(
-        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:(?!-----BEGIN ).)*?"
+        r"-----END [A-Z ]*PRIVATE KEY-----",
         re.DOTALL,
     ),
 )
@@ -349,14 +354,98 @@ def _value_could_be_a_credential(value: str) -> bool:
     return len(value) >= 8
 
 
-#: `code` names a credential only in the OAuth sense -- bare (`code=`, the
+#: `code` names a credential in the OAuth sense -- bare (`code=`, the
 #: callback parameter) or under one of these qualifiers (`auth_code=`,
-#: `device_code=`). Under any other qualifier (`status_code=401`,
-#: `error_code=invalid_grant`, `exit_code=137`) it names a status, and its
-#: value is left to the shape rules, which still catch an opaque one. Even in
-#: the OAuth sense a plain word or number is kept: `{"code": -32601}` is every
-#: JSON-RPC error and `{"code": "not_found"}` every REST one.
+#: `device_code=`) -- and is then a weak key: a plain word or number is kept
+#: (`{"code": -32601}` is every JSON-RPC error and `{"code": "not_found"}`
+#: every REST one), anything else is redacted.
 _CODE_QUALIFIERS = frozenset({"", "auth", "authorization", "oauth", "device", "user"})
+#: Under a status or descriptive qualifier (`status_code=401`,
+#: `error_code=invalid_grant`, `exit_code=137`, `zip_code=94105`,
+#: `sqlstate_code=42P01`) `code` names a status, and its value is left to the
+#: shape rules, which still catch an opaque one. Under any OTHER qualifier
+#: (`otp_code=`, `mfa_code=`, `verification_code=`, `recovery_code=`) it is
+#: a weak key: a credential-shaped value is redacted, as main redacted it.
+#: An unknown qualifier therefore fails closed. Matched against the
+#: qualifier's last `_`/`-` segment.
+_STATUS_CODE_QUALIFIERS = frozenset(
+    {
+        "status",
+        "error",
+        "exit",
+        "http",
+        "response",
+        "return",
+        "result",
+        "reason",
+        "zip",
+        "postal",
+        "country",
+        "lang",
+        "language",
+        "currency",
+        "iso",
+        "area",
+        "region",
+        "locale",
+        "event",
+        "op",
+        "opcode",
+        "key",
+        "char",
+        "byte",
+        "source",
+        "color",
+        "colour",
+        "product",
+        "item",
+        "sku",
+        "promo",
+        "discount",
+        "coupon",
+        "sqlstate",
+        "state",
+        "exception",
+        "fault",
+        "ret",
+        "rc",
+        "err",
+        "errno",
+    }
+)
+
+
+def _last_segment(qualifier: str) -> str:
+    return re.split(r"[_-]", qualifier.rstrip("_-").lower())[-1]
+
+
+#: Where a key may start in addition to after a non-identifier character:
+#: right after a JSON escape (`\\n`, `\\t`, `\\b`, `\\f`, `\\"`, `\\\\`, `\\/`,
+#: `\\u00a0`). `process_output` serialises a dict leaf with
+#: `json.dumps(ensure_ascii=True)`, so every control character, every
+#: non-ASCII character and 25 of the 29 `str.isspace()` characters reach the
+#: redactor as an escape whose last character is alphanumeric
+#: (`\\u00a0password=`), which would otherwise read as a glued prefix. Main's
+#: `\\b[A-Za-z0-9_-]*` swallowed the escape's tail and redacted (F3 of rev 9's
+#: board).
+_JSON_ESCAPE_BOUNDARY = r"(?<=\\[nrtbf/\"\\])|(?<=\\u[0-9a-fA-F]{4})"
+#: ... and what a qualifier or a glued prefix may NOT start on: the tail of
+#: such an escape (the `u00a0` of `\\u00a0password`, the `n` of
+#: `\\npassword`), which would otherwise be read as part of the key. The key
+#: NAME may start there (`\\token=x` is `token` in raw text), and anything
+#: else after a backslash may be a qualifier or glued prefix
+#: (`DOMAIN\\password=`, `C:\\secret=`, `\\dbpassword=`), as `\\b` made it on
+#: main (F8 of rev 9's board).
+_NOT_ON_AN_ESCAPE_TAIL = r"(?!(?<=\\)(?:[nrtbf]|u[0-9a-fA-F]{4}))"
+#: A whitespace character as `json.dumps` spells it: `\t \n \r \f`, or a
+#: `\uXXXX` escape of one of the other `str.isspace()` characters. Between
+#: `Bearer`/`Authorization:` and a value in a serialised leaf, main's
+#: `\s+[^\s,;]+` took such an escape as part of the value and redacted it
+#: with the token (`Bearer \u2006(tok)`); here it is part of the separator.
+_JSON_SPACE_ESCAPE = (
+    r"\\(?:[tnrf]|u(?:000[bB]|001[c-fC-F]|0085|00[aA]0|1680|200[0-9aA]"
+    r"|202[89fF]|205[fF]|3000))"
+)
 
 
 def _secret_key_alternation() -> str:
@@ -381,23 +470,33 @@ def _secret_key_alternation() -> str:
 #: the redactor sees whole values because every surface redacts BEFORE it
 #: cuts (`sanitize_auth_diagnostic`, and `PolicyManager.process_output` over a
 #: bounded window), so an unterminated value is the server's own text, not
-#: ours to guess at. Bare whitespace is NOT a separator here (see
-#: `_KEYWORD_WS_RE`). A key starts at a non-identifier character or right
-#: after a JSON-escaped line break or tab (`\\r\\nsecret: hunter2` inside a
-#: serialised leaf -- `main`'s containing match covered that by accident, and
-#: the bar is never worse than `main`). The separator is `:` or `=`, Ruby's `=>`, httpie's `:=`,
-#: or `==` when nothing but the value follows it (`password==hunter2` is
-#: httpie's query syntax; `if token == expected` is a comparison). The value
+#: ours to guess at -- except an UNTERMINATED opening quote followed by a
+#: bare run to whitespace, a list separator or the end (`password="hunter2`,
+#: `api_key='abc`): main's policy defaults took the run after the quote, so
+#: this does too (N5). Bare whitespace is NOT a separator here (see
+#: `_KEYWORD_WS_RE`). A key starts at a non-identifier character, at a single
+#: `:` (`Database:Password=`, .NET configuration; not `::`, a path, and not
+#: inside an `arn:`/`urn:` resource name, see `_RESOURCE_NAME_RE`), after a
+#: backslash (`DOMAIN\\password=`), or right after a JSON escape
+#: (`_JSON_ESCAPE_BOUNDARY`) -- `main`'s containing match covered all of
+#: these, and the bar is never worse than `main`. The separator is `:` or
+#: `=`, Ruby's `=>`, httpie's `:=`, a run of up to four `:`/`=` (`===`,
+#: `=:`), or `==` when nothing but the value follows it (`password==hunter2`
+#: is httpie's query syntax); a separator holding `==` or `::` (`if token ==
+#: expected`, `token::Type`) is a comparison or a path unless the value is
+#: credential-shaped. The value
 #: may sit on the NEXT line when that line is indented (YAML block style,
 #: pretty-printed JSON) or starts with a quote, or -- unindented -- when the
 #: value is credential-shaped (`password:\r\nhunter2`, as main redacted it);
 #: `token:\nthe bearer of` and `token:\n  - a bullet` are prose. The next
 #: line never opens on a `--` flag or a lone `-`/`*`/`#`/`>` marker followed
 #: by whitespace; a marker glued to the value is part of it
-#: (`password:\n  -hunter22`, as main redacted it). Horizontal whitespace is ` `, tab or
-#: no-break space (`\xa0`, which `\s` matched on main); a line break is
-#: `\n` or `\r\n` (HTTP header folding, Windows dumps) -- rev 7 dropped `\r`
-#: and `\xa0` and regressed against main. A bare value ends at whitespace, a quote or a list
+#: (`password:\n  -hunter22`, as main redacted it). Horizontal whitespace is
+#: every `str.isspace()` character but `\r`/`\n`; a line break is any run of
+#: `\r`/`\n` with whitespace between (blank lines, a bare CR, HTTP header
+#: folding, Windows dumps), before or after the operator -- rev 9 took
+#: exactly `\r?\n` after it and regressed against main's `[\s:=]+` (F4 of
+#: rev 9's board). A bare value ends at whitespace, a quote or a list
 #: separator (`,`, `;`, or `&` -- a query string's) and at nothing else,
 #: except that it never STARTS on `[` or `{` (`"password": [\n  "x"\n]` is a
 #: list -- `_keyword_list_spans` redacts its quoted elements instead; the
@@ -414,24 +513,49 @@ def _secret_key_alternation() -> str:
 #: opens a value, whatever it holds (`", secret"` is a valid password).
 _STRADDLE_RE = re.compile(r"[^\S\r\n]*[,:\]}]")
 
-#: A JSON number (a bare value after a quoted key).
-_JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+#: Every bare scalar `json.dumps` emits (`allow_nan=True` is its default):
+#: after a quoted key it is a JSON literal, and it is left alone, as main left
+#: it -- redacting it would make the document invalid (`NaN`, `Infinity`) or
+#: change the leaf's type (`{"max_tokens": 1024}`). Numeric secrets under a
+#: quoted key are Consiliency/pmcp#290's scope.
+_JSON_SCALAR_RE = re.compile(
+    r"null|true|false|NaN|-?Infinity"
+    r"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
+)
+
+#: A line break inside a separator: any run of `\r`/`\n`, with any whitespace
+#: around it, that ends before a visible character.
+_BREAK = r"[^\S\r\n]*[\r\n]\s*"
 
 _KEYWORD_KEY_SEP = (
-    r"(?P<key>(?P<qualifier>(?:(?<![A-Za-z0-9:])|(?<=\\[nrt]))(?:[A-Za-z0-9]+[_-]){0,8}"
+    r"(?P<key>(?P<qualifier>(?:(?<![A-Za-z0-9])(?<!::)|"
+    + _JSON_ESCAPE_BOUNDARY
+    + r")(?:"
+    + _NOT_ON_AN_ESCAPE_TAIL
+    + r"(?:[A-Za-z0-9]+[_-]){1,8})?"
     r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?)"
-    r"(?P<glued>(?<!\\)[A-Za-z0-9]{0,24}?)"
+    r"(?P<glued>(?:" + _NOT_ON_AN_ESCAPE_TAIL + r"[A-Za-z0-9]{1,24}?)?)"
     rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
-    r"(?P<extra>(?:[_-]?[A-Za-z0-9]){0,24}))"
-    r"(?P<sep>[\"']?[^\S\r\n]*(?:=>|:=|==(?!=)|[:=](?!=))"
-    r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=\S)(?!--|[-*#>](?:\s|$))|[^\S\r\n]*))"
+    r"(?P<extra>(?:[_-]*[A-Za-z0-9]){0,24}[_-]*))"
+    r"(?P<sep>[\"']?\s*(?:=>|:=(?![:=])|[:=]{2,4}(?![:=])|[:=](?!=))"
+    r"(?:" + _BREAK + r"(?=\S)(?!--|[-*#>](?:\s|$))|[^\S\r\n]*))"
 )
+#: The run a bare value is made of.
+_BARE_RUN = r"[^\s\"',;&]*[^\s\"',;&)\]}\\]"
 _KEYWORD_SEP_RE = re.compile(
     _KEYWORD_KEY_SEP
     + r"(?P<value>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_])"
-    r"|(?!\{)(?!\[(?!REDACTED\]))[^\s\"',;&]*[^\s\"',;&)\]}\\])",
+    # an unterminated opening quote, then a bare run to whitespace, a list
+    # separator, the end, or a double quote (the end of the JSON string a
+    # single-quoted value sits in)
+    r"|[\"'](?=" + _BARE_RUN + r"(?:[\s,;&\"]|$))" + _BARE_RUN + r"(?!')"
+    r"|(?!\{)(?!\[(?!REDACTED\]))" + _BARE_RUN + r")",
     re.IGNORECASE,
 )
+#: An AWS ARN or a URN: a key inside one names a resource
+#: (`arn:aws:secretsmanager:…:secret:Name`,
+#: `urn:ietf:params:oauth:token-type:access_token`), it is not one.
+_RESOURCE_NAME_RE = re.compile(r"\b[au]rn:[^\s\"'<>]*", re.IGNORECASE)
 
 #: The same keyword and separator followed by a flat list (`"password":
 #: ["hunter2"]`, pretty-printed or not): each quoted element is a value of the
@@ -464,32 +588,52 @@ _QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
 #: after a word) and not a lone `-`, `*`, `#` or `>` followed by whitespace or
 #: the end (`token:\n  - item` is a bullet). A single marker glued to the
 #: value is part of it: `token -abc123def`, `password\n  -hunter22` (a
-#: base64url secret can start with `-`) are redacted, as on main.
+#: base64url secret can start with `-`) are redacted, as on main. The flag
+#: may be `--`, a single `-`, `_` or any run of them (`java -jar x.jar
+#: -password hunter22x`; N9 of the rev-10 audit), and the qualifier may have
+#: any number of joined segments, as main's `[A-Za-z0-9_-]*` did: the match
+#: can only start where an identifier starts (the lookbehind), so an
+#: unbounded qualifier stays linear here, unlike the keyed rule's, which may
+#: restart after every joiner and is bounded instead.
 _KEYWORD_WS_RE = re.compile(
-    r"(?P<key>(?:(?<![A-Za-z0-9_-])|(?<=\\[nrt]))(?:--)?(?:[A-Za-z0-9]+[_-]){0,8}"
+    r"(?P<key>(?:(?<![A-Za-z0-9_-])|"
+    + _JSON_ESCAPE_BOUNDARY
+    + r")[_-]*(?:"
+    + _NOT_ON_AN_ESCAPE_TAIL
+    + r"(?:[A-Za-z0-9]+[_-]+)+)?"
     r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?"
-    r"(?P<glued>(?<!\\)[A-Za-z0-9]{0,24}?)"
+    r"(?P<glued>(?:" + _NOT_ON_AN_ESCAPE_TAIL + r"[A-Za-z0-9]{1,24}?)?)"
     rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
-    r"(?:[_-]?[A-Za-z0-9]){0,24})"
-    r"(?P<sep>[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]*)"
+    r"(?:[_-]*[A-Za-z0-9]){0,24}[_-]*)"
+    r"(?P<sep>[^\S\r\n]+|" + _BREAK + r")"
     r"(?![A-Za-z_-]+=[^=])(?!--|[-*#>](?:\s|$))(?P<value>[^\s\"',;()\[\]{}]*[^\s\"',;()\[\]{}\\])",
     re.IGNORECASE,
 )
 
 #: `Bearer <token>` -- the HTTP scheme, so anything after it that is not a word
-#: is a token. Not `token_type=Bearer expires_in=3600` (bearer as a VALUE, the
-#: lookbehinds -- which do NOT exclude a quote: `{"text": "Bearer x"}` is how
-#: every JSON-serialised string arrives, and rev 6 let it through), not `Bearer realm="x"` (a challenge's own parameters, the
-#: lookahead), not `Missing bearer token` or `the bearer of bad news` (plain
-#: words, the callback). `(?<![A-Za-z0-9_-])` rather than `\b`: on main
-#: `\bbearer` fired inside `secret-bearer failed` and redacted `failed`. The
-#: value stops at a quote or bracket: `{"password": "hunter2 Bearer x"}` must
-#: keep its closing quote for the keyword pass, not lose it to this one.
+#: is a token, wherever it stands: `X-Auth: Bearer x`, `session=Bearer x`
+#: (rev 9 excluded a preceding `:`/`=` and leaked those; F2 of its board).
+#: Bearer as a VALUE is already excluded by the rest: `token_type=Bearer
+#: expires_in=3600` (the lookahead: a `param=value` is not a token),
+#: `token_type: Bearer` and `{"token_type": "Bearer"}` (nothing follows but
+#: a quote, a comma or the end). Not `Bearer realm="x"` (a challenge's own
+#: parameters, the lookahead), not `Missing bearer token` or `the bearer of
+#: bad news` (plain words, the callback). `(?<![A-Za-z0-9_-])` rather than
+#: `\b`: on main `\bbearer` fired inside `secret-bearer failed` and
+#: redacted `failed`; a JSON escape before it is a boundary too
+#: (`\u00a0Bearer x` in a serialised leaf). A token may be wrapped in a quote
+#: or bracket that closes right after it (`Bearer "x"`, `Bearer (x)`, N7 of
+#: the rev-10 audit): the inside is redacted and the wrapping kept. Otherwise
+#: the value stops at a quote or bracket: `{"password": "hunter2 Bearer x"}`
+#: must keep its closing quote for the keyword pass, not lose it to this one.
 #: It never ends on a backslash either: in a serialised leaf the token reads
 #: `Bearer hunter2tok\"`, and eating the `\` un-escapes the quote.
 _BEARER_RE = re.compile(
-    r"(?<![=:])(?<![=:] )(?<![A-Za-z0-9_-])"
-    r"(?P<key>bearer(?:[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]*))(?![A-Za-z_-]+=[^=])(?P<value>[^\s,;\"'()\[\]{}]*[^\s,;\"'()\[\]{}\\])",
+    r"(?:(?<![A-Za-z0-9_-])|" + _JSON_ESCAPE_BOUNDARY + r")"
+    r"(?P<key>bearer(?:(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")+|" + _BREAK + r"))"
+    r"(?![A-Za-z_-]+=[^=])"
+    r"(?:[\"'(\[{<](?=[^\s,;\"'()\[\]{}<>\\]+[\"')\]}>]))?"
+    r"(?P<value>[^\s,;\"'()\[\]{}<>]*[^\s,;\"'()\[\]{}<>\\])",
     re.IGNORECASE,
 )
 
@@ -501,12 +645,20 @@ _BEARER_RE = re.compile(
 #: an optional HTTP auth scheme word (`Basic dXNl…` goes whole, as on main)
 #: then a run to whitespace, a quote or a list separator -- unless it is a plain word
 #: or number (`authorization: none`, `Authorization: required`), which is
-#: prose. The separator is on the same line: `Set the Authorization:\nheader
-#: first` is a sentence, not a header.
+#: prose (`Set the Authorization:\nheader first` is a sentence). A value
+#: wrapped in a bracket or quote after the scheme (`Authorization: [x]`,
+#: `Authorization: Bearer "x"`, N6 of the rev-10 audit) has its inside
+#: redacted -- except after a quoted key, where `"Authorization": [1.5]` is
+#: JSON structure. The separator may hold line breaks on either side of the
+#: operator, as main's `\s*[:=]\s*` did.
 _AUTHORIZATION_RE = re.compile(
-    r"authorization[\"']?[^\S\r\n]*[:=]"
-    r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=\S)(?!--|[-*#>](?:\s|$))|[^\S\r\n]*)"
+    r"authorization[\"']?(?:\s|" + _JSON_SPACE_ESCAPE + r")*[:=]"
+    r"(?:" + _BREAK + r"(?=\S)(?!--|[-*#>](?:\s|$))"
+    r"|(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")*)"
     r"(?:(?P<quoted>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_]))"
+    r"|(?:(?:bearer|basic|digest|negotiate|ntlm|token)"
+    r"(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")+)?"
+    r"[\"'(\[{<](?P<inner>[^\s,;\"'()\[\]{}<>\\]+)[\"')\]}>]"
     r"|(?P<bare>(?![\[{])(?:(?:bearer|basic|digest|negotiate|ntlm|token)[^\S\r\n]+)?"
     r"[^\s,;\"']*[^\s,;\"')\]}\\]))",
     re.IGNORECASE,
@@ -516,13 +668,21 @@ _AUTHORIZATION_RE = re.compile(
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 
 
-#: A separator whose line break is followed by no indentation.
-_UNINDENTED_BREAK_RE = re.compile(r"\r?\n[^ \t\xa0]*$")
+#: A separator whose (last) line break is followed by no indentation.
+_UNINDENTED_BREAK_RE = re.compile(r"[\r\n][^ \t\xa0]*$")
+
+
+def _in_resource_name(text: str) -> Callable[[int], bool]:
+    ranges = [(m.start(), m.end()) for m in _RESOURCE_NAME_RE.finditer(text)]
+    return lambda position: any(a <= position < b for a, b in ranges)
 
 
 def _keyword_sep_spans(text: str) -> list[Span]:
     spans: list[Span] = []
+    in_resource_name = _in_resource_name(text)
     for match in _KEYWORD_SEP_RE.finditer(text):
+        if in_resource_name(match.start()):
+            continue  # `arn:…:secret:Name` names a secret, it is not one
         name = match.group("name").lower()
         if name in WEAK_SECRET_KEYS and _is_plain_word_or_number(match.group("value")):
             continue
@@ -535,14 +695,20 @@ def _keyword_sep_spans(text: str) -> list[Span]:
             qualifier = (
                 (match.group("qualifier") + match.group("glued")).rstrip("_-").lower()
             )
-            if qualifier not in _CODE_QUALIFIERS:
-                continue
+            if qualifier not in _CODE_QUALIFIERS and (
+                _last_segment(qualifier) in _STATUS_CODE_QUALIFIERS
+                or not _value_could_be_a_credential(match.group("value"))
+            ):
+                continue  # `status_code=401`; `otp_code=abc123def456` is redacted
         start, end = match.start("value"), match.end("value")
         value = match.group("value")
-        if "==" in match.group("sep") and not _value_could_be_a_credential(
+        sep = match.group("sep")
+        if ("==" in sep or "::" in sep) and not _value_could_be_a_credential(
             value.strip("\"'")
         ):
-            continue  # `if token == expected:` compares; `password == hunter2` assigns
+            # `if token == expected:` compares, `token::Type` is a path;
+            # `password == hunter2` assigns
+            continue
         if match.group("glued") or (
             match.group("extra")
             and not _DECLARED_KEY_RE.fullmatch(
@@ -562,17 +728,14 @@ def _keyword_sep_spans(text: str) -> list[Span]:
                 or not _value_could_be_a_credential(inner)
             ):
                 continue  # `token_endpoint=https://…`, `secret_arn=arn:…` name things
-        if match.group("sep")[:1] in "\"'" and value[0] not in "\"'":
-            # A quoted key -- JSON (or a Python/JS literal): a bare value is a
-            # JSON literal. `null`/`true`/`false` hold nothing; a number may
-            # (a PIN), so it becomes the STRING "[REDACTED]" -- the document
-            # stays JSON and a dict result stays a dict (the leaf's type
-            # changes from number to string: stated in the plan).
-            if value in ("null", "true", "false"):
-                continue
-            if _JSON_NUMBER_RE.fullmatch(value):
-                spans.append((start, end, f'"{REDACTED}"'))
-                continue
+        if (
+            match.group("sep")[:1] in "\"'"
+            and value[0] not in "\"'"
+            and _JSON_SCALAR_RE.fullmatch(value)
+        ):
+            # A quoted key -- JSON (or a Python/JS literal): a bare scalar is
+            # a JSON literal, left as main left it (`_JSON_SCALAR_RE`)
+            continue
         if (
             value[0] in "\"'"
             and match.group("sep")[:1] not in "\"'"
@@ -584,6 +747,17 @@ def _keyword_sep_spans(text: str) -> list[Span]:
             )
         ):
             continue  # the quote closes the string this key sits in
+        if value[0] in "\"'" and (len(value) == 1 or value[-1] != value[0]):
+            # An unterminated opening quote: the run after it. Ended by a
+            # double quote, it may be the end of the JSON string a
+            # single-quoted value sits in (`{"a": "password='x", …}`): only
+            # a credential-shaped run is a value there.
+            if text[end : end + 1] == '"' and not _value_could_be_a_credential(
+                value[1:]
+            ):
+                continue
+            spans.append((start + 1, end, REDACTED))
+            continue
         if value[0] in "\"'":
             # Redact INSIDE the quotes: `{"password": "[REDACTED]"}` is still
             # JSON, so a structured result round-trips as a dict (main's did).
@@ -594,10 +768,14 @@ def _keyword_sep_spans(text: str) -> list[Span]:
 
 def _keyword_list_spans(text: str) -> list[Span]:
     spans: list[Span] = []
+    in_resource_name = _in_resource_name(text)
     for match in _KEYWORD_LIST_RE.finditer(text):
+        if in_resource_name(match.start()):
+            continue
         name = match.group("name").lower()
-        if name == "code" and (
-            match.group("qualifier").rstrip("_-").lower() not in _CODE_QUALIFIERS
+        if (
+            name == "code"
+            and _last_segment(match.group("qualifier")) in _STATUS_CODE_QUALIFIERS
         ):
             continue  # `error_codes: [...]` are diagnostics, as in the scalar pass
         base = match.start("list")
@@ -620,16 +798,24 @@ def _is_single_case(word: str) -> bool:
     )
 
 
+#: An acronym glued to a Titlecase word: `PGPassword`, `DBPassword`,
+#: `APIToken` (N4b of the rev-10 audit). Not `Ed25519PrivateKey`.
+_ACRONYM_TITLE_RE = re.compile(r"[A-Z0-9]{1,8}[A-Z][a-z]+")
+
+
 def _keyword_ws_spans(text: str) -> list[Span]:
     return [
         (match.start("value"), match.end("value"), REDACTED)
         for match in _KEYWORD_WS_RE.finditer(text)
         if match.group("name").lower() != "code"
         and _value_could_be_a_credential(match.group("value"))
-        # a glued prefix (`CLIENTSECRET abc…`) only on a single-case key: a
+        # a glued prefix (`CLIENTSECRET abc…`) only on a single-case key or
+        # an acronym + Titlecase one (`PGPassword abc…`): any other
         # mixed-case identifier (`Ed25519PrivateKey X509Cert`) is prose
         and (
-            not match.group("glued") or _is_single_case(match.group("key").lstrip("-"))
+            not match.group("glued")
+            or _is_single_case(match.group("key").lstrip("-_"))
+            or _ACRONYM_TITLE_RE.fullmatch(match.group("key").lstrip("-_")) is not None
         )
         and "://" not in match.group("value")
         and not match.group("value").lower().startswith("arn:")
@@ -667,15 +853,14 @@ def _authorization_spans(text: str) -> list[Span]:
                 continue  # the quote closes the string this key sits in
             spans.append((match.start("quoted") + 1, match.end("quoted") - 1, REDACTED))
             continue
+        if match.group("inner") is not None:
+            if not quoted_key:  # `"Authorization": [1.5]` is JSON structure
+                spans.append((match.start("inner"), match.end("inner"), REDACTED))
+            continue
         bare = match.group("bare")
-        if quoted_key and (
-            bare in ("null", "true", "false") or _JSON_NUMBER_RE.fullmatch(bare)
-        ):
-            # a JSON literal after a quoted key: same rule as the keyword
-            # pass -- literals hold nothing, a number becomes a STRING
-            if bare not in ("null", "true", "false"):
-                spans.append((match.start("bare"), match.end("bare"), f'"{REDACTED}"'))
-        elif not _is_plain_word_or_number(bare):
+        if quoted_key and _JSON_SCALAR_RE.fullmatch(bare):
+            continue  # a JSON literal after a quoted key: same rule as above
+        if not _is_plain_word_or_number(bare):
             spans.append((match.start("bare"), match.end("bare"), REDACTED))
     return spans
 
