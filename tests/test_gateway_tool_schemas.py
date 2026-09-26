@@ -27,6 +27,11 @@ newline and pydantic's Rust `$` does not -- closed for the one `pattern` field
 Nor on an integer's range: pydantic refuses a float past int64, so an
 unbounded integer field (`task.ttl`) gets that range (both sides) advertised, pinned by
 `test_ttl_range_agrees_between_gate_and_model`.
+Two classes stay open, both refused by the model and deferred: a lone
+surrogate in a length-limited string passes the gate on the SDK's
+newer-protocol HTTP entry (the model echoes it -- Consiliency/pmcp#297), and
+an unbounded float (`task.poll_interval`, a JSON integer >= 2**1024 - 2**970)
+passes the gate (Consiliency/pmcp#298).
 """
 
 from __future__ import annotations
