@@ -1414,6 +1414,36 @@ _DIFF_KEYS = [
     "x-api-key",
     "private_key",
     "credentials",
+    # rev 9 (B3): dotted keys -- a config path or an attribute
+    "db.password",
+    "spring.datasource.password",
+    "self.password",
+    "config.api_key",
+    # rev 9 (B4): PascalCase and camelCase keys
+    "AccessToken",
+    "ClientSecret",
+    "SessionToken",
+    "DbPassword",
+    "clientSecret",
+    "sessionToken",
+    "passwordHash",
+    "apiKey",
+    # rev 9 (N1): suffixed keys -- credential suffixes and descriptive ones
+    "password2",
+    "password_confirmation",
+    "secret_value",
+    "token_id",
+    "SECRET_KEY",
+    "token_type",
+    "password_length",
+    "token_endpoint",
+    "secret_arn",
+    # rev 9 (N1): command-line flags
+    "--token",
+    "--password",
+    "--clientSecret",
+    "--sessionToken",
+    "--token_id",
 ]
 _DIFF_VALUES = [
     "hunter2",
@@ -1438,6 +1468,16 @@ _DIFF_VALUES = [
     "(paren)",
     "tok[1]",
     "🙂ß",
+    # rev 9 (B1): JSON literals -- after a quoted key they are JSON, not text
+    "null",
+    "true",
+    "false",
+    "12345",
+    "-1.5e3",
+    # rev 9 (N3): values starting on a JSON delimiter
+    ",hunter22",
+    "}hunter22",
+    ", s3cr3tval",
 ]
 _DIFF_SEPS = [
     "=",
@@ -1466,6 +1506,33 @@ _DIFF_SEPS = [
     "\r\n  ",
     ":\xa0",
     ":\r\n",
+    # rev 9 (G1): a spaced `==`, and a quoted key before a bare value (B1)
+    " == ",
+    "== ",
+    " ==",
+    '": ',
+]
+#: rev 9 (B1): the JSON literals among `_DIFF_VALUES`, and the wraps that
+#: take the pair as an object member.
+_DIFF_JSON_LITERALS = ["null", "true", "false", "12345", "-1.5e3"]
+_DIFF_JSON_MEMBER_WRAPS = [
+    "{{{}}}",
+    '{{"id": 7, {}, "ok": true, "n": null}}',
+    '{{"outer": {{"inner": {{{}}}, "n": 1.5}}}}',
+    '{{"items": [{{"id": 1, {}}}, {{"id": 2, "name": "prod"}}]}}',
+    '[{{{}}}, {{"id": 2, "tags": ["a", "b"]}}]',
+]
+#: rev 9 (B1): JSON scalars as structured values in the dict corpus.
+_DIFF_JSON_SCALARS: list[object] = [None, True, False, 42, -1.5, 0]
+#: rev 9 (B5): every character `str.isspace()` accepts except `\r` and `\n`
+#: (pinned against a full enumeration in the axis test), as the whole
+#: separator and after a colon.
+_DIFF_SPACE_CHARS = (
+    "\t\x0b\x0c\x1c\x1d\x1e\x1f \x85\xa0\u1680\u2000\u2001\u2002\u2003"
+    "\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+)
+_DIFF_SEPS += [
+    sep for ch in _DIFF_SPACE_CHARS for sep in (ch, ":" + ch) if sep not in _DIFF_SEPS
 ]
 _DIFF_WRAPS = [
     "{}",
@@ -1488,29 +1555,65 @@ _DIFF_WRAPS = [
     "log: {}",
     "{}\n{}",
     "{}; {}",
+    # rev 9 (B1, B2, N2, N3): JSON documents -- mixed value types, the pair
+    # as a member, nested objects, lists of objects
+    '{{"id": 7, "ok": true, "n": null, "v": "{}"}}',
+    '{{"id": 7, {}, "ok": true, "n": null}}',
+    '{{"outer": {{"inner": {{{}}}, "n": 1.5}}}}',
+    '{{"items": [{{"id": 1, {}}}, {{"id": 2, "name": "prod"}}]}}',
+    '[{{{}}}, {{"id": 2, "tags": ["a", "b"]}}]',
 ]
 _DIFF_TOKEN = re.compile(r"[A-Za-z0-9_.+/-]{3,}")
 
 
 def _differential_corpus() -> list[tuple[str, str, str, str, str]]:
-    """The board's differential corpus (seed 20260923, 4 000 inputs): keys ×
-    values × separators × wraps -- the seat's generator with four separators
-    added in rev 8 (which reshuffles the draws); the oracle fixture was
-    recorded from `main` @ 860636a over exactly these rows."""
+    """The board's differential corpus, widened in rev 9 (seed 20260923,
+    8 000 inputs): keys × values × separators × wraps, one random draw per
+    axis per row, the key upper- or title-cased 30% of the time, then two
+    rows per key holding a JSON literal as a quoted member of a JSON wrap. The oracle
+    fixture is recorded from `main` @ 860636a over exactly these rows.
+
+    Axes (each asserted present by
+    `test_the_differential_corpus_covers_every_axis`):
+
+    * keys -- plain, snake, kebab and header names; dotted (`db.password`);
+      PascalCase and camelCase (`AccessToken`, `clientSecret`); suffixed,
+      credential (`password2`, `secret_value`) and descriptive (`token_type`,
+      `secret_arn`); `--flag` forms;
+    * separators -- `=`, `:`, `=>`, `:=`, quoted forms, a quoted key before a
+      bare value, prose non-separators, CRLF and LF continuations, spaced
+      `==`, and every `str.isspace()` character but `\\r`/`\\n`, alone and
+      after `:`;
+    * values -- credential-shaped, plain words and numbers, punctuation,
+      URLs, non-ASCII, JSON literals (`null`, `true`, `false`, numbers) and
+      values starting on `,` or `}`;
+    * wraps -- prose, brackets, quotes, markup, URLs (query, fragment,
+      userinfo), shell, repeated pairs, and JSON documents with mixed value
+      types, the pair as a member, nested objects and lists of objects.
+    """
     rng = random.Random(2026_09_23)
     out = []
-    for _ in range(4000):
+    for _ in range(8000 - 2 * len(_DIFF_KEYS)):
         key = rng.choice(_DIFF_KEYS)
         if rng.random() < 0.3:
             key = key.upper() if rng.random() < 0.5 else key.title()
         value = rng.choice(_DIFF_VALUES)
         sep = rng.choice(_DIFF_SEPS)
         kv = f"{key}{sep.format(value)}" if "{}" in sep else f"{key}{sep}{value}"
-        if kv.startswith(key) and '"' in sep and "{}" in sep and sep.startswith('"'):
-            kv = f'"{kv}'
+        if sep.startswith('"'):
+            kv = f'"{kv}'  # the key's opening quote
         wrap = rng.choice(_DIFF_WRAPS)
         text = wrap.format(kv, kv) if wrap.count("{}") == 2 else wrap.format(kv)
         out.append((text, key, sep, value, wrap))
+    # B1's axis, which random draws almost never land in a valid document:
+    # each key, quoted, as a JSON member holding a literal -- once bare after
+    # the key (`"token": null`), once as a quoted string (`"token": "null"`)
+    for key in _DIFF_KEYS:
+        for sep in ('": ', '": "{}"'):
+            value = rng.choice(_DIFF_JSON_LITERALS)
+            wrap = rng.choice(_DIFF_JSON_MEMBER_WRAPS)
+            kv = f'"{key}{sep.format(value)}' if "{}" in sep else f'"{key}{sep}{value}'
+            out.append((wrap.format(kv), key, sep, value, wrap))
     return out
 
 
@@ -1545,20 +1648,42 @@ _DIFF_COLLATERAL = frozenset(
 )
 
 
-_DIFF_WHITESPACE_SEPS = frozenset({" ", "  ", "\t", "\n  ", "\r\n  "})
 _DIFF_PROSE_SEPS = frozenset({" is ", "|", "->"})
+#: rev 9 (N1): keys that carry a suffix after the credential name -- decided
+#: from the key as written in `_DIFF_KEYS`, case- and flag-insensitively.
+_DIFF_SUFFIXED_KEYS = frozenset(
+    {
+        "password2",
+        "password_confirmation",
+        "passwordhash",
+        "secret_value",
+        "secret_key",
+        "token_id",
+        "token_type",
+        "password_length",
+        "token_endpoint",
+        "secret_arn",
+    }
+)
+#: rev 9 (C): compound keys with no boundary left once case-folded
+#: (`CLIENTSECRET`, `Dbpassword`); the PascalCase spelling keeps its boundary.
+_DIFF_GLUED_KEYS = frozenset(
+    {"clientsecret", "dbpassword", "accesstoken", "sessiontoken"}
+)
 
 
 def _accepted_regression_class(
     key: str, sep: str, value: str, kept: list[str], wrap: str = ""
 ) -> str | None:
     """Rows where this redactor keeps a piece main removed, BY DESIGN -- decided from
-    the row's own key, separator and value, not from sniffing the text. Each
+    the row's own key, separator, value and wrap, never from the output. Each
     class is listed in the plan's accepted-regression table with its count
     and reason. Anything not matched here is a bug."""
     base = key.lower()
+    bare_key = base.lstrip("-")
     name = base.split("_")[-1].split("-")[-1]
     plain = _is_plain_word_or_number_for_test(value)
+    credential = _value_could_be_a_credential_for_test(value)
     if wrap.startswith("https://h.example/?") and "=" not in sep and " " not in sep:
         # `?x=1&bearer:abc…&y=2`: main's `parse_qsl` took `bearer:abc…` as a
         # KEY and re-spelled it `bearer%3Aabc…=` -- a re-encoding, not a
@@ -1569,17 +1694,25 @@ def _accepted_regression_class(
         # `%7C` inside a URL, and ate `is`/`->` rows through `[\s:=]+`; it left
         # `token|hunter2` outside a URL untouched
         return "`is`/`|`/`->` are not separators (main: URL re-encoding of `|`, or its whitespace rule)"
-    if sep in _DIFF_WHITESPACE_SEPS:
+    if sep.isspace():
+        # rev 9 (B5): every `str.isspace()` separator, not a fixed list
         if name == "code":
             return "`code` never fires on a whitespace-only separator (main redacted `code<TAB>s3cr3t`)"
-        if not _value_could_be_a_credential_for_test(value):
+        if not credential:
             return "whitespace-only separator with a non-credential-shaped value (D2)"
-        return None
+    if sep.strip() == "==" and not credential:
+        return "`==` is a comparison unless the value is credential-shaped (G1: `if token == expected:`)"
+    if bare_key in _DIFF_SUFFIXED_KEYS and not credential:
+        return "a suffixed key names metadata unless the value is credential-shaped (N1: `password_length=12`)"
     if (
-        sep == ":\r\n"
-        and not value.startswith(('"', "'"))
-        and not _value_could_be_a_credential_for_test(value)
+        bare_key in _DIFF_GLUED_KEYS
+        and _is_single_case_for_test(key)
+        and (not credential or "://" in value or value.lower().startswith("arn:"))
     ):
+        return "a glued, single-case key counts only with a credential-shaped value that is not a URL or ARN (C)"
+    if not sep.startswith('"') and value.startswith((",", "}")):
+        return 'after an unquoted key a value starting on `,`/`}` is JSON structure (N3: `"missing token: ", "code"`)'
+    if sep == ":\r\n" and not value.startswith(('"', "'")) and not credential:
         return "unindented line-break continuation with a non-credential-shaped value (D2 applied to a line break)"
     if sep == '\\": \\"{}\\"':
         return "backslash-escaped quotes in a plain string (JSON inside a leaf is Consiliency/pmcp#290)"
@@ -1588,6 +1721,14 @@ def _accepted_regression_class(
     if base in ("authorization", "bearer") and plain:
         return "`Authorization`/`Bearer` followed by a plain word is prose"
     return None
+
+
+def _is_single_case_for_test(key: str) -> bool:
+    """All upper, all lower, or one capital then lower (flag dashes aside)."""
+    word = key.lstrip("-")
+    return (
+        word.isupper() or word.islower() or (word[:1].isupper() and word[1:].islower())
+    )
 
 
 def _value_could_be_a_credential_for_test(value: str) -> bool:
@@ -1609,7 +1750,7 @@ def test_differential_against_main_never_worse_except_by_stated_class() -> None:
     policy = PolicyManager()
     corpus = _differential_corpus()
     oracle = _main_oracle()["string"]
-    assert len(corpus) == len(oracle) == 4000
+    assert len(corpus) == len(oracle) == 8000
     bugs: list[str] = []
     accepted: dict[str, int] = {}
     better = worse_rows = 0
@@ -1648,21 +1789,41 @@ def test_differential_against_main_never_worse_except_by_stated_class() -> None:
             else:
                 accepted[reason] = accepted.get(reason, 0) + 1
     assert bugs == [], f"{len(bugs)} unaccepted regressions:\n" + "\n".join(bugs[:25])
-    assert better > 1000, better
+    assert better > 1500, better
 
 
 def _dict_corpus() -> list[tuple[dict, str, str, str]]:
-    """Structured results (seed 20260924, 400): a JSON text leaf, a header
-    leaf, a prose leaf with a URL, a top-level key, a nested key, a list."""
+    """Structured results (seed 20260924, 800), widened in rev 9. Shapes: a
+    JSON text leaf, a header leaf, a prose leaf with a URL, a top-level key,
+    a nested key, a list of leaves, and (rev 9) mixed value types, a
+    three-deep nested object and a list of objects. Keys and string values
+    come from the string corpus's axes; a quarter of the values are JSON
+    scalars (`None`, `True`, `False`, an int, a float) instead. The last
+    element is the value as the text shapes spell it."""
     rng = random.Random(2026_09_24)
     out: list[tuple[dict, str, str, str]] = []
-    for _ in range(400):
+    for _ in range(800):
         key = rng.choice(_DIFF_KEYS)
-        value = rng.choice(_DIFF_VALUES)
-        sep = rng.choice([": ", "=", ': "{}"'])
-        kv = f"{key}{sep.format(value)}" if "{}" in sep else f"{key}{sep}{value}"
+        value: object = (
+            rng.choice(_DIFF_JSON_SCALARS)
+            if rng.random() < 0.25
+            else rng.choice(_DIFF_VALUES)
+        )
+        spelled = value if isinstance(value, str) else json.dumps(value)
+        sep = rng.choice([": ", "=", ': "{}"', " == ", ":\u3000"])
+        kv = f"{key}{sep.format(spelled)}" if "{}" in sep else f"{key}{sep}{spelled}"
         shape = rng.choice(
-            ["leaf-json", "leaf-header", "leaf-text", "top-key", "nested", "list"]
+            [
+                "leaf-json",
+                "leaf-header",
+                "leaf-text",
+                "top-key",
+                "nested",
+                "list",
+                "mixed",
+                "deep",
+                "list-of-objects",
+            ]
         )
         if shape == "leaf-json":
             obj: dict = {
@@ -1672,7 +1833,7 @@ def _dict_corpus() -> list[tuple[dict, str, str, str]]:
         elif shape == "leaf-header":
             obj = {
                 "content": [
-                    {"type": "text", "text": f"HTTP/1.1 401\r\n{key}: {value}\r\n"}
+                    {"type": "text", "text": f"HTTP/1.1 401\r\n{key}: {spelled}\r\n"}
                 ]
             }
         elif shape == "leaf-text":
@@ -1680,7 +1841,7 @@ def _dict_corpus() -> list[tuple[dict, str, str, str]]:
                 "content": [
                     {
                         "type": "text",
-                        "text": f"error: {kv} while calling https://h.example/?{key}={value}",
+                        "text": f"error: {kv} while calling https://h.example/?{key}={spelled}",
                     }
                 ]
             }
@@ -1688,14 +1849,25 @@ def _dict_corpus() -> list[tuple[dict, str, str, str]]:
             obj = {key: value, "note": "ok"}
         elif shape == "nested":
             obj = {"result": {"auth": {key: value}, "items": [1, 2]}}
-        else:
+        elif shape == "list":
             obj = {
                 "content": [
-                    {"type": "text", "text": value},
+                    {"type": "text", "text": spelled},
                     {"type": "text", "text": kv},
                 ]
             }
-        out.append((obj, key, sep, value))
+        elif shape == "mixed":
+            obj = {"id": 7, "ok": True, key: value, "n": None, "ratio": 0.5}
+        elif shape == "deep":
+            obj = {"outer": {"inner": {"leaf": {key: value}}, "n": 1.5}}
+        else:
+            obj = {
+                "items": [
+                    {"id": 1, key: value},
+                    {"id": 2, "name": "prod", "tags": ["a", "b"]},
+                ]
+            }
+        out.append((obj, key, sep, spelled))
     return out
 
 
@@ -1704,17 +1876,17 @@ def test_differential_on_structured_results_never_worse_than_main() -> None:
     window); JSON text inside a leaf is Consiliency/pmcp#290's problem. The
     bar here is main's: every piece main's `process_output` removed from the
     serialised result is removed here too, or the row is in an accepted class
-    (the same classes as the string differential). 400 structured results;
-    main removes something on 111 of them.
+    (the same classes as the string differential). 800 structured results;
+    main removes something on 172 of them.
     """
     policy = PolicyManager()
     oracle = _main_oracle()["dict"]
     corpus = _dict_corpus()
-    assert len(corpus) == len(oracle) == 400
+    assert len(corpus) == len(oracle) == 800
     bugs: list[str] = []
     accepted: dict[str, int] = {}
     main_types = _main_oracle()["dict_types"]
-    assert len(main_types) == 400 and main_types.count("dict") == 370
+    assert len(main_types) == 800 and main_types.count("dict") == 786
     for (obj, key, sep, value), main_removed, main_type in zip(
         corpus, oracle, main_types
     ):
@@ -1764,10 +1936,73 @@ def test_differential_on_structured_results_never_worse_than_main() -> None:
     ] == {"text": "Bearer [REDACTED]"}
 
 
+_DIFF_FUZZ_KEYS = [
+    "password",
+    "token",
+    "api_key",
+    "secret",
+    "client_secret",
+    "authorization",
+    "code",
+    "auth",
+    "credentials",
+    "Authorization",
+    "pwd",
+    "session",
+    "cookie",
+    "private_key",
+    "msg",
+    "text",
+    "note",
+]
+_DIFF_FUZZ_PIECES = [
+    *"abcXYZ0129 _-/+=.:;,&!@#$%^*()[]{}<>|~`'\"\\\n\t",
+    "é",
+    "\u3000",
+    "\xa0",
+    "password=",
+    "token: ",
+    "Bearer ",
+    "https://h/?token=x&",
+    '"password": "',
+    "[",
+    "]",
+]
+
+
+def _json_fuzz_corpus() -> list[dict]:
+    """The claude seat's random-JSON fuzz (seed 7), committed: 1 500 random
+    objects whose keys are credential and neutral names and whose values are
+    random strings of delimiters, quotes, backslashes, whitespace (U+3000,
+    NBSP) and redactor trigger words, nested lists and objects up to three
+    deep, and JSON scalars."""
+    rng = random.Random(7)
+
+    def value(depth: int = 0) -> object:
+        roll = rng.random()
+        if roll < 0.6 or depth > 2:
+            return "".join(
+                rng.choice(_DIFF_FUZZ_PIECES) for _ in range(rng.randint(0, 14))
+            )
+        if roll < 0.8:
+            return [value(depth + 1) for _ in range(rng.randint(0, 3))]
+        if roll < 0.9:
+            return {
+                rng.choice(_DIFF_FUZZ_KEYS): value(depth + 1)
+                for _ in range(rng.randint(1, 3))
+            }
+        return rng.choice([123, -32601, True, None, 1.5])
+
+    return [
+        {rng.choice(_DIFF_FUZZ_KEYS): value() for _ in range(rng.randint(1, 4))}
+        for _ in range(1500)
+    ]
+
+
 def test_redaction_never_breaks_a_json_document() -> None:
     """Wherever the input parses as JSON, the output does too, on both surfaces.
-    Main broke 7 of the corpus's 258 JSON rows (it ate a closing quote); rev 8
-    breaks none. A keyed value in quotes is redacted INSIDE the quotes."""
+    Main breaks 8 of the widened corpus's 810 JSON rows (it ate a closing
+    quote); this redactor breaks none. A keyed value in quotes is redacted INSIDE the quotes."""
     policy = PolicyManager()
     checked = 0
     for text, *_ in _differential_corpus():
@@ -1784,7 +2019,7 @@ def test_redaction_never_breaks_a_json_document() -> None:
                 json.loads(out)
             except ValueError:
                 pytest.fail(f"{surface} broke JSON: {text!r} -> {out!r}")
-    assert checked == 258, checked
+    assert checked == 810, checked
 
 
 @pytest.mark.parametrize(
@@ -1909,3 +2144,460 @@ def test_a_comparison_survives_on_both_surfaces() -> None:
     assert _policy("if token == expected:") == "if token == expected:"
     assert _policy("password==hunter2") == "password=[REDACTED]"
     assert _policy("password:=hunter2") == "password:[REDACTED]"
+
+
+# === rev 9: the board's second round and the differential it widened ====== #
+#
+# One test per finding class, each red on rev 8 (`56d7f80`) and green here;
+# where a finding lives on both surfaces, both are asserted. Where main's exact
+# text differs from ours only by a separator character (the policy default
+# re-spells `:　` as `:`), the assertion is `secret not in out`.
+
+
+def _both(text: str) -> list[tuple[str, str]]:
+    return [("engine", _engine(text)), ("policy", _policy(text))]
+
+
+def _process(obj: dict) -> object:
+    return PolicyManager().process_output(obj, redact=True)["result"]
+
+
+def test_the_differential_corpus_covers_every_axis() -> None:
+    """The widened generator really produces each axis it claims (a check is
+    only a check if it would fail were the axis missing)."""
+    corpus = _differential_corpus()
+    keys = {key.lower() for _, key, *_ in corpus}
+    seps = {sep for _, _, sep, _, _ in corpus}
+    values = {value for *_, value, _ in corpus}
+    wraps = {wrap for *_, wrap in corpus}
+    assert {k.lower() for k in _DIFF_KEYS} <= keys
+    assert set(_DIFF_SEPS) <= seps and set(_DIFF_VALUES) <= values
+    assert set(_DIFF_WRAPS) <= wraps
+    for axis in (
+        "db.password",
+        "accesstoken",
+        "clientsecret",
+        "password_confirmation",
+        "--clientsecret",
+    ):
+        assert axis in keys, axis
+    # every `str.isspace()` character but CR and LF, alone and after `:`
+    spaces = {chr(i) for i in range(0x110000) if chr(i).isspace()} - {"\r", "\n"}
+    assert set(_DIFF_SPACE_CHARS) == spaces
+    assert {c for c in spaces} <= seps and {":" + c for c in spaces} <= seps
+    assert {" == ", "== ", " ==", '": '} <= seps
+    assert {"null", "true", "false", "-1.5e3", ",hunter22", "}hunter22"} <= values
+    # JSON literals really sit after a quoted key in a valid document, and
+    # the JSON wraps really produce nested objects and lists of objects
+    documents = []
+    for text, *_ in corpus:
+        try:
+            documents.append(json.loads(text))
+        except ValueError:
+            continue
+    corpus_keys = {k.lower() for k in _DIFF_KEYS}
+
+    def literal_members(node: object) -> int:
+        if isinstance(node, list):
+            return sum(literal_members(item) for item in node)
+        if not isinstance(node, dict):
+            return 0
+        return sum(
+            (
+                k.lower() in corpus_keys
+                and (v is None or isinstance(v, (bool, int, float)))
+            )
+            + literal_members(v)
+            for k, v in node.items()
+        )
+
+    literal_after_quoted_key = [doc for doc in documents if literal_members(doc)]
+    assert len(literal_after_quoted_key) >= len(_DIFF_KEYS)
+    assert any(isinstance(d, dict) and "items" in d for d in documents)
+    assert any(isinstance(d, dict) and "outer" in d for d in documents)
+    assert any(isinstance(d, list) and isinstance(d[0], dict) for d in documents)
+    shapes = [obj for obj, *_ in _dict_corpus()]
+    assert any(v is None for obj in shapes if "note" in obj for v in obj.values())
+    assert any("items" in obj for obj in shapes) and any(
+        "outer" in obj for obj in shapes
+    )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('{"access_token": null}', '{"access_token": null}'),
+        ('{"token": true}', '{"token": true}'),
+        ('{"password": false}', '{"password": false}'),
+        ('{"token": 42}', '{"token": "[REDACTED]"}'),
+        ('{"token": -1.5e3}', '{"token": "[REDACTED]"}'),
+    ],
+)
+def test_b1_a_json_literal_after_a_quoted_key_keeps_the_document(
+    text: str, expected: str
+) -> None:
+    """B1: `null`/`true`/`false` are not secrets; a number is redacted as a
+    JSON string so the document stays JSON; a dict result stays a dict."""
+    for surface, out in _both(text):
+        assert out == expected, (surface, out)
+    assert _process(json.loads(text)) == json.loads(expected)
+
+
+@pytest.mark.parametrize(
+    "obj", [{"Authorization": {"a": "b"}}, {"Authorization": ["9"]}]
+)
+def test_b2_authorization_never_starts_on_a_bracket(obj: dict) -> None:
+    """B2: an object or list under `Authorization` is structure, not a value."""
+    text = json.dumps(obj)
+    for surface, out in _both(text):
+        assert out == text, (surface, out)
+    assert _process(obj) == obj
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "db.password",
+        "self.password",
+        "spring.datasource.password",
+        # B4: PascalCase
+        "AccessToken",
+        "ClientSecret",
+        "SessionToken",
+        "DbPassword",
+    ],
+)
+@pytest.mark.parametrize("sep", ["=", " = ", ": "])
+def test_b3_b4_dotted_and_pascal_case_keys(key: str, sep: str) -> None:
+    text = f"{key}{sep}hunter22"
+    for surface, out in _both(text):
+        assert "hunter22" not in out and out.startswith(key), (surface, out)
+
+
+@pytest.mark.parametrize(
+    "space",
+    [c for c in _DIFF_SPACE_CHARS if c not in "\n\r"],
+    ids=lambda c: f"U+{ord(c):04X}",
+)
+def test_b5_every_whitespace_character_separates(space: str) -> None:
+    """B5: every `str.isspace()` character but CR/LF, after `:` and alone."""
+    for text in (f"password:{space}hunter22", f"token{space}abc123def456"):
+        for surface, out in _both(text):
+            assert "hunter22" not in out and "abc123def456" not in out, (
+                surface,
+                out,
+            )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "password2=hunter22",
+        "password_confirmation=hunter22",
+        "passwordHash=hunter22",
+        "secret_value=hunter22",
+        "SECRET_KEY abc123def456",
+        "--clientSecret abc123def456",
+        "--sessionToken abc123def456",
+        "--token_id abc123def456",
+        # the whitespace form of a suffixed key (defect B of round 3)
+        "password2 abc123def456",
+        "passwordHash hunter2",
+        "passwordHash\tabc123def456",
+        "secret_value\tabc123def456",
+    ],
+)
+def test_n1_suffixed_keys_redact_a_credential_shaped_value(text: str) -> None:
+    secret = re.split(r"[=\s]", text)[-1]
+    for surface, out in _both(text):
+        assert secret not in out, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "token_type=bearer",
+        "password_length=12",
+        "token_endpoint=https://h.example/oauth/token",
+        "secret_arn=arn:aws:secretsmanager:us-east-1:1:secret:x",
+        "token_endpoint https://h.example/oauth/token",
+        "passwords expired now",
+    ],
+)
+def test_n1_suffixed_keys_keep_metadata(text: str) -> None:
+    """Guards (already green on rev 8): a suffix naming metadata keeps its
+    non-credential value."""
+    for surface, out in _both(text):
+        assert out == text, (surface, out)
+
+
+def test_n2_a_list_of_objects_is_not_a_flat_value() -> None:
+    obj = {"secrets": [{"id": "db", "name": "prod"}]}
+    for surface, out in _both(json.dumps(obj)):
+        assert out == json.dumps(obj), (surface, out)
+    assert _process(obj) == obj
+
+
+def test_n3_a_quote_opening_on_structure_is_not_a_value() -> None:
+    """N3: after an UNQUOTED key (`token: ` at the end of a string), a quote
+    whose content starts on `,:]}` closes that string. After a QUOTED key the
+    quote always opens the value."""
+    obj = {"msg": "missing token: ", "code": 401}
+    for surface, out in _both(json.dumps(obj)):
+        assert out == json.dumps(obj), (surface, out)
+    assert _process(obj) == obj
+    for surface, out in _both('{"password": ", secret"}'):
+        assert json.loads(out) == {"password": REDACTED}, (surface, out)
+
+
+def test_n4_the_key_qualifier_is_bounded() -> None:
+    """N4: rev 8 took ~216 s on this; main and rev 9 take well under 1 s.
+    The 2 s bound is generous against CI noise and still catches the quadratic
+    shape by two orders of magnitude."""
+    import time
+
+    text = "a_" * 33000
+    for surface, redact in (("engine", _engine), ("policy", _policy)):
+        start = time.perf_counter()
+        redact(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, (surface, elapsed)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("password == hunter2", "hunter2"),
+        ("password== hunter2", "hunter2"),
+        ("if token == hunter2:", "hunter2"),
+    ],
+)
+def test_g1_a_spaced_double_equals_before_a_secret(text: str, secret: str) -> None:
+    for surface, out in _both(text):
+        assert secret not in out, (surface, out)
+    for surface, out in _both("if token == expected:"):
+        assert out == "if token == expected:", (surface, out)
+
+
+def test_c2_a_percent_encoded_key_is_still_the_key() -> None:
+    for surface, out in _both("https://h.example/?api%2Dkey=hunter2"):
+        assert "hunter2" not in out, (surface, out)
+
+
+def test_c4_bearer_across_a_crlf() -> None:
+    for surface, out in _both("Bearer\r\nhunter2"):
+        assert out == "Bearer\r\n[REDACTED]", (surface, out)
+    prose = "--rotated bearer\n--ingredient assertion"
+    for surface, out in _both(prose):
+        assert out == prose, (surface, out)
+
+
+@pytest.mark.parametrize(
+    ("obj", "expected"),
+    [
+        ({"text": 'token hunter2value" hi'}, {"text": 'token [REDACTED]" hi'}),
+        (
+            {"text": 'Authorization: hunter2value" hi'},
+            {"text": 'Authorization: [REDACTED]" hi'},
+        ),
+    ],
+)
+def test_c6_a_quote_inside_a_leaf_keeps_the_dict(obj: dict, expected: dict) -> None:
+    assert _process(obj) == expected
+
+
+def test_c7_a_bracket_inside_a_quoted_list_element() -> None:
+    """C7: `"first]"` does not end the list (this leaked on main too); a list
+    under a non-secret key is untouched."""
+    text = '{"password": ["first]", "hunter2"]}'
+    for surface, out in _both(text):
+        assert json.loads(out) == {"password": [REDACTED, REDACTED]}, (surface, out)
+    assert _process(json.loads(text)) == {"password": [REDACTED, REDACTED]}
+    kept = '{"error_codes": ["AADSTS50011"]}'
+    for surface, out in _both(kept):
+        assert out == kept, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'password="hunter2\\\\"',
+        "password=abc123\\",
+        "token='abc123def456'",
+        'api_key="abc123def456"',
+        'aws_secret="wJalrXUtnFEMI\\\\"',
+    ],
+)
+def test_policy_defaults_never_start_on_a_quote_or_end_on_a_backslash(
+    text: str,
+) -> None:
+    """The operator-visible default patterns: the captured value never starts
+    on a quote (rev 8 ate the opening one) and never ends on a backslash (the
+    escape of a JSON quote); the engine redacts quoted values INSIDE them."""
+    for pattern in DEFAULT_REDACTION_PATTERNS:
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            if match.lastindex is None:
+                continue
+            value = match.group(match.lastindex)
+            assert not value.startswith(('"', "'")), (pattern, value)
+            assert not value.endswith("\\"), (pattern, value)
+    out = _policy(text)
+    quote = text[text.index("=") + 1]
+    if quote in "\"'":
+        assert out.startswith(text[: text.index("=") + 2] + REDACTED), out
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"a": "token: [x", "b": "]"},
+        {"a": "password: [x", "b": "y]"},
+    ],
+)
+def test_a_keyed_list_never_straddles_a_string_boundary(obj: dict) -> None:
+    """After an unquoted key inside a leaf, `[` opens a list only if a literal
+    array follows (quoted strings or JSON scalars): `[x", "b": "]` is two
+    string values, not one list."""
+    text = json.dumps(obj)
+    for surface, out in _both(text):
+        assert set(json.loads(out)) == set(obj), (surface, out)
+        assert json.loads(out)["b"] == obj["b"], (surface, out)
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"a": "password='x", "b": "y'"},
+        {"a": "secret='q", "b": 1, "c": "z'"},
+    ],
+)
+def test_a_quoted_value_never_straddles_via_the_other_quote(obj: dict) -> None:
+    """After an unquoted key, a single-quoted "value" that holds an unescaped
+    double quote runs across a JSON string boundary; it is not a value."""
+    text = json.dumps(obj)
+    for surface, out in _both(text):
+        assert json.loads(out) == obj, (surface, out)
+
+
+@pytest.mark.parametrize("space", ["\x0b", "\x85", "\xa0", " ", " ", "　"])
+@pytest.mark.parametrize("key", ["token", "bearer:", "password", "SECRET_KEY"])
+def test_no_span_starts_inside_a_json_escape(space: str, key: str) -> None:
+    """Defect A of round 3: `json.dumps` spells non-ASCII whitespace
+    `\\uXXXX`; a span starting at the `u` left a lone backslash, so the
+    document broke and a dict result came back as a string."""
+    obj = {"text": f"{key}{space}abc123def456"}
+    text = json.dumps(obj)
+    for surface, out in _both(text):
+        assert "abc123def456" not in json.loads(out)["text"], (surface, out)
+    result = _process(obj)
+    assert isinstance(result, dict) and "abc123def456" not in result["text"]
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "CLIENTSECRET",
+        "Clientsecret",
+        "clientsecret",
+        "DBPASSWORD",
+        "dbpassword",
+        "ACCESSTOKEN",
+        "accesstoken",
+        "MYPASSWORD",
+    ],
+)
+@pytest.mark.parametrize("sep", ["=", ": ", "\t"])
+def test_a_case_folded_compound_key_is_still_a_key(key: str, sep: str) -> None:
+    """Defect C of round 3: with its case boundary folded away, a compound
+    key still names a secret when the value is credential-shaped."""
+    for surface, out in _both(f"{key}{sep}abc123def456"):
+        assert "abc123def456" not in out, (surface, out)
+
+
+def test_a_mixed_case_identifier_is_not_a_glued_key() -> None:
+    for text in ("Ed25519PrivateKey X509Cert", "errorcode=invalid_grant"):
+        for surface, out in _both(text):
+            assert out == text, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "secret -1.5e3",
+        "password2\xa0-1.5e3",
+        "refresh_token:\r\n  -1.5e3",
+        "token -abc123def",
+        "password\n  -hunter22",
+        "password:\n  -hunter22",
+        "Bearer\n-abc123def",
+    ],
+)
+def test_a_dash_glued_to_a_value_is_part_of_it(text: str) -> None:
+    """A base64url secret can start with `-`; only a `--` flag or a lone
+    marker followed by whitespace is a flag or a bullet (as on main)."""
+    secret = text.split()[-1]
+    for surface, out in _both(text):
+        assert secret not in out, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "secret --bucket",
+        "token:\n  - item",
+        "token:\n- item",
+        "password:\n  * item",
+        "--rotated bearer\n--ingredient assertion",
+        "Bearer\n--flag12345",
+    ],
+)
+def test_a_flag_or_a_bullet_after_a_keyword_is_not_its_value(text: str) -> None:
+    for surface, out in _both(text):
+        assert out == text, (surface, out)
+
+
+def _has_escaped_quote(text: str) -> bool:
+    """A backslash-escaped quote in the INPUT: JSON inside a leaf, which is
+    Consiliency/pmcp#290's scope."""
+    return '\\"' in text
+
+
+def test_property_json_fuzz_keeps_documents_and_dicts() -> None:
+    """The claude seat's JSON fuzz, committed (seed 7, 1 500 objects, each
+    serialised four ways -- compact and indented, ASCII-escaped and not --
+    so 6 000 documents per surface). Two invariants:
+
+    * a document with no backslash-escaped quote (`\\"`, decided from the
+      INPUT; Consiliency/pmcp#290's scope) still parses after redaction on both surfaces --
+      main breaks ~1 000 of them per surface;
+    * `process_output(obj)` returns a dict wherever main's did (main's type
+      per object is recorded in the oracle fixture, not computed here).
+    """
+    policy = PolicyManager()
+    objects = _json_fuzz_corpus()
+    main_types = _main_oracle()["fuzz_types"]
+    assert len(objects) == len(main_types) == 1500
+    checked = excluded = 0
+    broken: list[str] = []
+    for obj, main_type in zip(objects, main_types):
+        for indent in (None, 2):
+            for ascii_only in (True, False):
+                text = json.dumps(obj, indent=indent, ensure_ascii=ascii_only)
+                if _has_escaped_quote(text):
+                    excluded += 1
+                    continue
+                checked += 1
+                for surface, out in (
+                    ("engine", _engine(text)),
+                    ("policy", policy.redact_secrets(text)),
+                ):
+                    try:
+                        json.loads(out)
+                    except ValueError:
+                        broken.append(f"{surface}: {text!r} -> {out!r}")
+        result = policy.process_output(obj, redact=True)["result"]
+        if main_type == "dict" and not isinstance(result, dict):
+            broken.append(f"process_output: {obj!r} -> {result!r}")
+    assert broken == [], "\n".join(broken[:10])
+    assert checked > 3000 and excluded > 0, (checked, excluded)
+    assert main_types.count("dict") > 1000

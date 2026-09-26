@@ -391,7 +391,10 @@ def _secret_key_alternation() -> str:
 #: may sit on the NEXT line when that line is indented (YAML block style,
 #: pretty-printed JSON) or starts with a quote, or -- unindented -- when the
 #: value is credential-shaped (`password:\r\nhunter2`, as main redacted it);
-#: `token:\nthe bearer of` and `token:\n  - a bullet` are prose. Horizontal whitespace is ` `, tab or
+#: `token:\nthe bearer of` and `token:\n  - a bullet` are prose. The next
+#: line never opens on a `--` flag or a lone `-`/`*`/`#`/`>` marker followed
+#: by whitespace; a marker glued to the value is part of it
+#: (`password:\n  -hunter22`, as main redacted it). Horizontal whitespace is ` `, tab or
 #: no-break space (`\xa0`, which `\s` matched on main); a line break is
 #: `\n` or `\r\n` (HTTP header folding, Windows dumps) -- rev 7 dropped `\r`
 #: and `\xa0` and regressed against main. A bare value ends at whitespace, a quote or a list
@@ -421,7 +424,7 @@ _KEYWORD_KEY_SEP = (
     rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
     r"(?P<extra>(?:[_-]?[A-Za-z0-9]){0,24}))"
     r"(?P<sep>[\"']?[^\S\r\n]*(?:=>|:=|==(?!=)|[:=](?!=))"
-    r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=[^\s\-*#>])|[^\S\r\n]*))"
+    r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=\S)(?!--|[-*#>](?:\s|$))|[^\S\r\n]*))"
 )
 _KEYWORD_SEP_RE = re.compile(
     _KEYWORD_KEY_SEP
@@ -457,8 +460,11 @@ _QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
 #: never fires here: `exit code 137`, `status code 401`, `zip code 94105`.
 #: The whitespace may include a newline into an indented line (a folded
 #: header: `x-api-key\n  abc123def456`), gated by the same value test. A
-#: value never starts with `-`, `*`, `#` or `>`: `secret --bucket` is a flag
-#: after a word, `token:\n  - item` a bullet.
+#: value is never a flag or a bullet: not `--…` (`secret --bucket` is a flag
+#: after a word) and not a lone `-`, `*`, `#` or `>` followed by whitespace or
+#: the end (`token:\n  - item` is a bullet). A single marker glued to the
+#: value is part of it: `token -abc123def`, `password\n  -hunter22` (a
+#: base64url secret can start with `-`) are redacted, as on main.
 _KEYWORD_WS_RE = re.compile(
     r"(?P<key>(?:(?<![A-Za-z0-9_-])|(?<=\\[nrt]))(?:--)?(?:[A-Za-z0-9]+[_-]){0,8}"
     r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?"
@@ -466,7 +472,7 @@ _KEYWORD_WS_RE = re.compile(
     rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
     r"(?:[_-]?[A-Za-z0-9]){0,24})"
     r"(?P<sep>[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]*)"
-    r"(?![A-Za-z_-]+=[^=])(?![-*#>])(?P<value>[^\s\"',;()\[\]{}]*[^\s\"',;()\[\]{}\\])",
+    r"(?![A-Za-z_-]+=[^=])(?!--|[-*#>](?:\s|$))(?P<value>[^\s\"',;()\[\]{}]*[^\s\"',;()\[\]{}\\])",
     re.IGNORECASE,
 )
 
@@ -499,7 +505,7 @@ _BEARER_RE = re.compile(
 #: first` is a sentence, not a header.
 _AUTHORIZATION_RE = re.compile(
     r"authorization[\"']?[^\S\r\n]*[:=]"
-    r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=[^\s\-*#>])|[^\S\r\n]*)"
+    r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=\S)(?!--|[-*#>](?:\s|$))|[^\S\r\n]*)"
     r"(?:(?P<quoted>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_]))"
     r"|(?P<bare>(?![\[{])(?:(?:bearer|basic|digest|negotiate|ntlm|token)[^\S\r\n]+)?"
     r"[^\s,;\"']*[^\s,;\"')\]}\\]))",
@@ -638,7 +644,12 @@ def _bearer_spans(text: str) -> list[Span]:
         and not (
             _UNINDENTED_BREAK_RE.search(match.group("key"))
             and (
-                match.group("value")[0] in "-*#>"  # a flag or bullet on the next line
+                # a flag or a lone bullet on the next line (the value holds no
+                # whitespace, so a one-character marker is the bullet case)
+                match.group("value").startswith("--")
+                or (
+                    match.group("value")[0] in "-*#>" and len(match.group("value")) == 1
+                )
                 or not _value_could_be_a_credential(match.group("value"))
             )
         )
