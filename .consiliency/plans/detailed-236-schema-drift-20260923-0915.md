@@ -5,13 +5,12 @@
 > (`schema.py` and the test module as whole files; `types.py`, `handlers.py`
 > and `server.py` as `git apply` patches against `origin/main` @ `9ca081e`)
 > plus the generated snapshot are byte-identical to the frozen, verified
-> piece-A code (`wip/236-schema-drift-rev2-code` @ `a25dce0`; ancestors
-> `972bc90`, `40b2ed5`, `d0722f4`, `72eaa76`). **`a25dce0` differs from
-> `972bc90` only in the module docstring of
-> `tests/test_gateway_tool_schemas.py`** (+5/−1, which names the regex-dialect
-> class), so every runtime measurement cited for `972bc90` (full suite,
-> mutants, gates, probes) stands for `a25dce0` and was deliberately not
-> re-run. Proven by applying them to a fresh `origin/main`
+> piece-A code (`wip/236-schema-drift-rev2-code` @ `c79bf1a`; ancestors
+> `a25dce0`, `972bc90`, `40b2ed5`, `d0722f4`, `72eaa76`). `a25dce0` differed
+> from `972bc90` only in the test module's docstring. `c79bf1a` adds board
+> round 4's F1 fix (a `le=` bound on `task.ttl`, a test, a docstring line, +1
+> snapshot line). Full suite, mutants and gates were re-measured at
+> `c79bf1a`. Proven by applying them to a fresh `origin/main`
 > worktree and running `cmp` on all six files (see *Embedding proof*). The six
 > files are byte-identical between `860636a`, `8dec131` and `9ca081e`, so
 > every "HEAD" measurement below still describes `main`. What changed:
@@ -36,6 +35,15 @@
 >   M-X1s). The text pin `test_every_dispatched_gateway_name_is_registered`
 >   stays as a second line of defence. The board showed it can be bypassed on
 >   its own. B depends on the guard.
+> - **Board round 4 (`b308e57`) finding F1 folded in (code at `c79bf1a`):** a
+>   sixth gate/model disagreement class, **integer range**. `task.ttl` was the
+>   only integer property with no `maximum` (measured). The gate accepted
+>   `1e20`, and the model refused it with `int_parsing_size`, echoing the
+>   value, so the gate was the *looser* layer (on `main` too). `c79bf1a` adds
+>   `le=9_223_372_036_854_775_807` (int64), and both layers now reject it
+>   (new test, mutant M-F1). Side effect, measured: a JSON **integer** above
+>   int64 for `task.ttl` was accepted by the model on `main` and now is not.
+>   See *A is not fully behaviour-neutral*.
 > - **Board round 3 (`3481bbc`) findings N1–N4 folded in (code at `972bc90`):**
 >   N1, the X1 guard now runs *before* the scoped-audit
 >   `InvokeInput.model_validate` (new test, mutant M-N1; B must keep that
@@ -56,13 +64,19 @@
 >   `pattern` errors echo the value (measured on `main`).
 > - X2: the handler-link test already used a word-boundary regex in the frozen
 >   code.
-> - Counts re-measured on the frozen code: **211** schema tests at `972bc90`
->   (209 at `40b2ed5`, 208 at `72eaa76`/`d0722f4`). Full suite at `972bc90`: `4275 passed, 3 skipped, 25 deselected` in 8:21, with no errors (measured here, and by the coordinator). At `40b2ed5`: `4273 passed, 3 skipped, 25 deselected` in 6:59, with no errors (measured here, and by the coordinator).
+> - Counts re-measured on the frozen code: **213** schema tests at `c79bf1a`
+>   (211 at `972bc90`/`a25dce0`, 209 at `40b2ed5`, 208 at `72eaa76`/`d0722f4`).
+>   Full suite at `c79bf1a`: `4277 passed, 3 skipped, 25 deselected` in 6:53, with no errors (measured here, and by the coordinator). **On current `main` + A** (the
+>   board seat's assembled `9ca081e` + `a25dce0` tree): `4282 passed, 3
+>   skipped, 25 deselected`, i.e. the plan's number plus exactly the 7 newer
+>   C3 tests on `main` (`tests/test_client_manager.py` collects 256 on `main`
+>   + A vs 249 on the A branch, whose base is `8dec131`). That is the seat's
+>   measurement and was not re-run here. Full suite at `972bc90`: `4275 passed, 3 skipped, 25 deselected` in 8:21, with no errors (measured here, and by the coordinator). At `40b2ed5`: `4273 passed, 3 skipped, 25 deselected` in 6:59, with no errors (measured here, and by the coordinator).
 >   Earlier: `4272 passed, 3 skipped, 25 deselected` (measured by this planner
 >   on `72eaa76`, and by the coordinator on `d0722f4`). The `d0722f4` run also hit 1 teardown error in
 >   `test_workflow_guards`, because the host's live gateway restarted a
 >   firecrawl child mid-run. That is environmental: the file passes 194/194 on
->   this tree and on `main`. Snapshot 813 lines (811 before N2). Probe reports 23/26 tools
+>   this tree and on `main`. Snapshot 814 lines (813 before F1, 811 before N2). Probe reports 23/26 tools
 >   differing from `main` (18 constraint drift + 5 null-only). Every piece-B
 >   number is from the revision-1 tree and is marked for re-measurement.
 > - **Descriptions (resolved in-revision).** `72eaa76` kept the model text in
@@ -291,7 +305,7 @@ here before it reaches an agent. It cannot drift *silently* (the test fails when
 it disagrees); its residual risk is a blind
 `PMCP_UPDATE_SCHEMA_SNAPSHOT=1` regeneration, which is a review-discipline item
 called out in the test's docstring and in `CONTRIBUTING`-style guidance below.
-Measured sizes (revision 2, frozen code): A snapshot **813 lines** at `972bc90` (811 before N2's `minLength`/`maxLength` on `evidence_label_digest`)
+Measured sizes (revision 2, frozen code): A snapshot **814 lines** at `c79bf1a` (813 before F1's `maximum` on `task.ttl`; 811 before N2's `minLength`/`maxLength` on `evidence_label_digest`)
 (0 × `"additionalProperties": false`, 8 × `"additionalProperties": true` for the
 free-form dicts, 42 × `"null"` from A1). The revision-1 A snapshot was 681
 lines, and the revision-1 spike/B snapshot 712. **B's snapshot size is
@@ -434,6 +448,42 @@ plan does not recommend a portable anchor. The
 test module's docstring names this class and the test that pins it, as of
 `a25dce0`.
 
+**A sixth class: integer range (board round 4, F1), closed for the only
+field it hit.** JSON Schema's `integer` accepts any integral number,
+including the float `1e20`. pydantic's lax float→int conversion refuses a
+float past int64 with `int_parsing_size`, and that error echoes the value.
+An integer property with no `maximum` therefore has the gate *looser* than
+the model. Measured with `probe_int_range.py`, which walks every advertised
+schema for integer properties without a `maximum`:
+
+```text
+integer properties without `maximum`: ['gateway.invoke.task.ttl']
+task.ttl=1e+20: gate accepts | model rejects (int_parsing_size)
+task.ttl=9223372036854775808: gate accepts | model accepts
+task.ttl=3600: gate accepts | model accepts
+```
+
+(at `a25dce0`; on `main` the gate never declared `task`, so it too accepts
+`1e20`, and the model is the same). At `c79bf1a`:
+
+```text
+integer properties without `maximum`: []
+task.ttl=1e+20: gate rejects | model rejects (int_parsing_size)
+task.ttl=9223372036854775808: gate rejects | model rejects (less_than_equal)
+task.ttl=3600: gate accepts | model accepts
+```
+
+`c79bf1a` adds `le=9_223_372_036_854_775_807` to `TaskMetadataInput.ttl`, so
+the gate advertises the bound and rejects `1e20`. Test:
+`test_ttl_range_agrees_between_gate_and_model[1e20, 2**63]`, mutant M-F1. No
+other integer property lacks a `maximum` (measured: `[]`). **Correction to
+the framing "the int64 bound pydantic already enforces":** it already
+enforced it for *floats* only. A JSON **integer** `2**63` was accepted by the
+model at `a25dce0` (and on `main`) and is now rejected by both layers
+(`less_than_equal`). That is a narrowing for `task.ttl` values above
+2^63−1, which no real TTL reaches. It is listed with A's other behaviour
+changes. The test module's docstring names this class as of `c79bf1a`.
+
 ## Order: A first, then B — why
 
 - A is mergeable on its own and is behaviour-preserving at the model layer; B is
@@ -538,7 +588,7 @@ test module's docstring names this class and the test that pins it, as of
   (plus `test_required_nullable_field_is_left_as_pydantic_wrote_it` for the
   collapse's boundary).
 
-### `src/pmcp/types.py` (modify; `git apply` patch verbatim under *Verbatim bodies → A*, +274 / −110)
+### `src/pmcp/types.py` (modify; `git apply` patch verbatim under *Verbatim bodies → A*, +281 / −110)
 
 - **Add `class GatewayArguments(BaseModel)`** directly above `TraceContextInfo`
   with **no `model_config`** in A. Docstring: marks agent-facing argument
@@ -652,9 +702,9 @@ test module's docstring names this class and the test that pins it, as of
   (`Unknown tool` else-branch `:392`→`:401`, `except Exception` `:427`→`:436`).
   Where this plan cites `server.py` lines without "post-A", they are `main`'s.
 
-### `tests/test_gateway_tool_schemas.py` (add, 535 lines; whole file verbatim under *Verbatim bodies → A*)
+### `tests/test_gateway_tool_schemas.py` (add, 555 lines; whole file verbatim under *Verbatim bodies → A*)
 
-**211 tests** at `972bc90` (measured: `211 passed`, collect-only counts in brackets; 209 at `40b2ed5`, 208 before the X1 guard test). The
+**213 tests** at `c79bf1a` (measured: `213 passed`, collect-only counts in brackets; 211 at `972bc90`/`a25dce0`, 209 at `40b2ed5`, 208 before the X1 guard test). The
 three-link chain plus shape, snapshot, normalisation, gate, and the revision-2
 additions:
 
@@ -685,6 +735,9 @@ additions:
 - **`test_digest_pattern_agrees_between_gate_and_model` (N2, new at
   `972bc90`)** — `"a"*64 + "\n"` for `evidence_label_digest` is rejected by
   both the gate and the model.
+- **`test_ttl_range_agrees_between_gate_and_model[2]` (F1, new at
+  `c79bf1a`)** — `task.ttl` of `1e20` and `2**63` is rejected by both the gate
+  and the model, and `3600` is accepted by both.
 - `test_no_argument_tools_advertise_an_empty_object[3]`
 - `test_advertised_schema_is_a_self_contained_mcp_input_schema[26]` — no
   `$ref`/`$defs`/`title` keywords, no surviving `anyOf`, every property described.
@@ -734,7 +787,7 @@ additions:
 Generated with `PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py`
 after the code above is applied (the writer is deterministic:
 `json.dumps(..., indent=1, sort_keys=True) + "\n"`), then reviewed line by line
-in the PR. Measured at `972bc90`: 813 lines, 0 × `additionalProperties: false`, 8 × `true`.
+in the PR. Measured at `c79bf1a`: 814 lines, 0 × `additionalProperties: false`, 8 × `true`.
 The embedding proof `cmp`s the generated file against the frozen fixture.
 
 ### X1 — unregistered names fail closed inside the audited path (structural; blocking for B)
@@ -877,6 +930,9 @@ coercion: values such as `1` for a boolean or `"5"` for an integer on the
 newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`),
 which were previously accepted and coerced, are now rejected with
 `Input validation error: 1 is not of type 'boolean'`.
+`invoke.task.ttl` now advertises an int64 maximum, so `1e20` (and any
+integer above 2^63−1, which the handler previously accepted) is rejected at
+the gate.
 `invoke.evidence_label_digest` now also advertises its exact length (64), so
 a digest with a trailing newline is rejected at the gate instead of by the
 handler. **Scoped-audit change until Consiliency/pmcp#296 lands:** gate
@@ -1071,13 +1127,20 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
   **not re-measured on revision 2**): 4287 passed, 0 failed, 3 skipped, 25
   deselected in 9:56 (`scratchpad/b_full.log`). The 60 tests over the
   revision-1 A were B's new parametrized cases.
-- **Full suite on the A tree (revision 2, frozen code `972bc90`, re-measured
-  2026-09-26)**: **4275 passed, 0 failed, 3 skipped, 25 deselected** in 8:21,
+- **Full suite on the A tree (revision 2, frozen code `c79bf1a`, re-measured
+  2026-09-26)**: **4277 passed, 0 failed, 3 skipped, 25 deselected** in 6:53,
   with no errors (`uv run pytest -m 'not live' -p no:cacheprovider -q` with
   `npm_config_cache`, `npm_config_store_dir` and `pnpm_config_store_dir`
-  unset). That is 48 more than revision 1's A (4227), matching the schema
-  file's growth from 163 to 211. A breaks nothing in-repo. Earlier revision-2
-  trees: `72eaa76` and `d0722f4` gave 4272 each, and `40b2ed5` gave 4273. The coordinator's `d0722f4`
+  unset). That is 50 more than revision 1's A (4227), matching the schema
+  file's growth from 163 to 213. A breaks nothing in-repo. Earlier revision-2
+  trees: `72eaa76` and `d0722f4` gave 4272 each, `40b2ed5` gave 4273, and
+  `972bc90` gave 4275. **On current `main` + A:** the A branch's base is
+  `8dec131`, not `main`'s `9ca081e`. The board's claude seat assembled
+  `9ca081e` + `a25dce0` and measured `4282 passed, 3 skipped, 25
+  deselected`, with no errors. That is 4275 plus exactly the 7 newer C3 tests
+  on `main` (`tests/test_client_manager.py` collects 256 there vs 249 on the
+  A branch). It is the seat's measurement, not re-run here. At `c79bf1a` the
+  expected equivalent is 4284, which is unmeasured. The coordinator's `d0722f4`
   run also hit 1 environmental teardown error in `test_workflow_guards`.
 - **Full suite on `860636a` (baseline, throwaway worktree
   `/mnt/HC_Volume_105438154/worktrees/pmcp-236-head`)**: 4063 passed, 1 failed —
@@ -1127,16 +1190,16 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
 cd <worktree>
 uv sync --all-extras -p 3.10                           # fresh worktree: without it pytest is the system one
 uv run pytest tests/test_gateway_tool_schemas.py -p no:cacheprovider --cov-fail-under=0 -q
-                                                       # A: 211 passed (measured at 972bc90)
+                                                       # A: 213 passed (measured at c79bf1a)
 uv run pytest tests/test_gateway_tool_schemas.py tests/test_baseline_constraints.py \
-  -p no:cacheprovider --cov-fail-under=0 -q            # A: 248 passed (measured at 972bc90; baseline file alone 37, unchanged)
+  -p no:cacheprovider --cov-fail-under=0 -q            # A: 250 passed (measured at c79bf1a; baseline file alone 37, unchanged)
 uv run pytest tests/test_tools.py -p no:cacheprovider --cov-fail-under=0 -q   # B: after the :6213 edit
 env -u npm_config_cache -u npm_config_store_dir \
   uv run pytest -m 'not live' -p no:cacheprovider -q   # full suite; run it as a background task that notifies on exit
-                                                       # A: 4275 passed, 3 skipped, 25 deselected (measured at 972bc90)
-uv run ruff check src/ tests/                          # A: "All checks passed!" (measured at 972bc90)
-uv run ruff format --check src/ tests/                 # A: "163 files already formatted" (measured at 972bc90)
-uv run mypy src/pmcp --exclude baml_client            # CI gate (test.yml:387); A: "no issues found in 50 source files" (measured at 972bc90)
+                                                       # A: 4277 passed, 3 skipped, 25 deselected (measured at c79bf1a; 4282 on current main + A, board seat)
+uv run ruff check src/ tests/                          # A: "All checks passed!" (measured at c79bf1a)
+uv run ruff format --check src/ tests/                 # A: "163 files already formatted" (measured at c79bf1a)
+uv run mypy src/pmcp --exclude baml_client            # CI gate (test.yml:387); A: "no issues found in 50 source files" (measured at c79bf1a)
 uv run python ~/code/pmcp/scripts/check_plan_consistency.py \
   .consiliency/plans/detailed-236-schema-drift-20260923-0915.md   # see *Consistency gate* for what it checks here
 ```
@@ -1150,36 +1213,37 @@ dispatches with `()`; dispatch names must equal registry names.
 
 ## Acceptance criteria — measured this session
 
-### Piece A (tree: frozen revision-2 code `972bc90`; 211 passed green)
+### Piece A (tree: frozen revision-2 code `c79bf1a`; 213 passed green)
 
 Re-measured 2026-09-26 in a detached worktree at `72eaa76`, after the full
 suite there had finished (the mutants edit files the suite imports). Re-run
-at `d0722f4` (counts identical), at `40b2ed5`, and **again at `972bc90`**,
-after its full suite finished. The counts below are the `972bc90` run: every
-earlier row has the same failing tests as at `40b2ed5`, plus two more passes
-from the two N1/N2 tests. The exception is M-X1s, which now also fails the
-N1 test. Each
+at `d0722f4` (counts identical), at `40b2ed5`, at `972bc90`, and **again at
+`c79bf1a`**, after its full suite finished. The counts below are the
+`c79bf1a` run: every row has the same failing tests as at `972bc90`, plus
+two more passes from the two F1 test cases. (M-X1s gained the N1 test as a
+second failure at `972bc90`.) Each
 mutation was applied by exact-string replacement asserted to match once, shown
 with `diff -u` against a saved copy, run against
 `tests/test_gateway_tool_schemas.py`, then restored with `cp` from the saved
 copy and proven by `cmp` and `git diff --quiet HEAD -- <file>`. Unmutated
-baseline: `211 passed`. All RED for the named reason:
+baseline: `213 passed`. All RED for the named reason:
 
 | # | Mutation (file:entity) | Confirmed diff | RED tests | Why it must fire |
 |---|---|---|---|---|
-| M1 | `handlers.py:_derived_gateway_tools` — HEAD's hand-written dict for `gateway.describe` (no `minLength`) (**the hand-corrupted schema**) | `-input_schema=input_schema_for(spec.input_model),` / `+input_schema=({…HEAD dict…} if spec.name == "gateway.describe" else input_schema_for(spec.input_model)),` | `test_advertised_schema_is_derived_from_registered_model[gateway.describe]`, `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]`, and incidentally `test_schemas_are_derived_once_per_process` (25 ≠ 26 calls) — 4 failed, 207 passed | someone reintroduces a hand-written schema that bypasses the builder |
-| M2 | `handlers.py:_GATEWAY_TOOL_SPECS` — `gateway.describe` registered with `ConnectServerInput` | `-input_model=DescribeInput,` / `+input_model=ConnectServerInput,` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]`, `…accepts_the_minimal_valid_arguments[gateway.describe]`, snapshot, gate — 4 failed, 207 passed | the registry names a model the handler does not run |
-| M3 | `types.py:DescribeInput.tool_id` — `min_length=1` → `2` | `-min_length=1, …` / `+min_length=2, …` | `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]` — 2 failed, 209 passed | an agent-facing contract change must be a reviewed snapshot diff |
-| M4 | `schema.py:_collapse_nullable` — early `return node` (nullable `anyOf` no longer collapsed) | `+    return node` | `test_input_schema_for_normalises_pydantic_output`, snapshot, `…is_a_self_contained_mcp_input_schema[…]` ×13 — 15 failed, 196 passed. The synthetic-model test fires independently of the real tools | the post-processing is drift surface of its own |
-| **M-A1** | `schema.py:_collapse_nullable` (`:94`) — drop `"null"`: `out["type"] = [inner_type, "null"]` → `out["type"] = inner_type` (revision 1's behaviour) | `-        out["type"] = [inner_type, "null"]` / `+        out["type"] = inner_type` | `test_optional_field_null_agrees_between_gate_and_model` **×42** (e.g. `gateway.submit_feedback {…, 'failed_tool_call': None}: gate=False model=True`), snapshot, `test_input_schema_for_normalises_pydantic_output` — 44 failed, 167 passed. All 42 fail, including the 14 fields `main` accepted only because it never declared them, since A declares them | the gate must accept `null` exactly where the model does (board A1) |
-| **M-A2** | `handlers.py:get_gateway_tool_definitions` (`:689`) — bypass the cache at the call site: `list(_derived_gateway_tools())` → `list(_derived_gateway_tools.__wrapped__())` | `-    return list(_derived_gateway_tools())` / `+    return list(_derived_gateway_tools.__wrapped__())` | `test_schemas_are_derived_once_per_process` — **`assert 260 == 26`** (10 lookups × 26 derivations) — 1 failed, 210 passed | derivation must happen once per process, not per `tools/call` (board A2) |
-| **M-X1** | `server.py:_handle_call_tool` — rename the dispatch branch `name == "gateway.health"` → `"gateway.health_internal"` | `-                elif name == "gateway.health":` / `+                elif name == "gateway.health_internal":` | **only** `test_every_dispatched_gateway_name_is_registered` — 1 failed, 210 passed. `test_server_dispatch_agrees_with_registry` stays green, which is the gap X1 closes | a dispatch branch for an unregistered name would skip the gate |
-| **M-X2** | `handlers.py:GatewayTools.describe` — `DescribeInput.model_validate(` → `_DescribeInput.model_validate(` (a substring match, not a word match) | `-        parsed = DescribeInput.model_validate(input_data)` / `+        parsed = _DescribeInput.model_validate(input_data)` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]` — 1 failed, 210 passed | the handler-link check matches on a word boundary, not a substring |
-| **M-W** | `types.py:InvokeOptions.timeout_ms` (`:808`) — drop `description="Timeout in milliseconds"`  | `-        default=30000, ge=1000, le=300000, description="Timeout in milliseconds"` / `+        default=30000, ge=1000, le=300000` | `…is_a_self_contained_mcp_input_schema[gateway.invoke]` and `[gateway.tasks_result]` — plus the snapshot — 3 failed, 208 passed (under `-k self_contained`: 2 failed, 24 passed). The `72eaa76` helper passes 26/26 on the same mutant | the walker must reach the `["object", "null"]` nested objects |
-| **M-X1s** | `server.py:_handle_call_tool.call_tool` — X1 guard off: `if tool is None:` → `if False:` | `-                if tool is None:` / `+                if False:` | `test_a_dispatch_branch_for_an_unregistered_name_fails_closed` and `test_an_unregistered_invoke_never_reaches_the_scoped_audit_model` — 2 failed, 209 passed. The text pin stays green, because the dispatch source is unchanged | an ungated name must never reach a handler, whatever the dispatch condition's shape |
-| *(bypass, not a test-RED mutant)* | `server.py` — the board seat's bypass: `elif name == "gateway.health" or name == "gateway.health2":` | as named | **none: 211 passed**, as expected, since the pin is lexical and the guard is behavioural. The guard's effect was measured directly with `probe_bypass.py`: guard on, `handler_ran=False response='{"error": true, "message": "Unknown tool: gateway.health2"}'`; guard off (M-X1s + bypass), `handler_ran=True response='{}'` | shows why X1 is structural: the pin cannot see this, the guard refuses it |
-| **M-N1** | `server.py:_handle_call_tool.call_tool` — move the X1 guard back **below** the scoped-audit `InvokeInput.model_validate` check (the `40b2ed5` order) | the guard block and the scoped block swap places (full diff in the run log) | **only** `test_an_unregistered_invoke_never_reaches_the_scoped_audit_model` — 1 failed, 210 passed | an ungated `gateway.invoke` must not reach the scoped pydantic parse, whose error echoes values (board N1) |
-| **M-N2** | `types.py:InvokeInput.evidence_label_digest` — drop `min_length=64, max_length=64` | `-        min_length=64,` / `-        max_length=64,` | `test_digest_pattern_agrees_between_gate_and_model`, snapshot — 2 failed, 209 passed | the gate's Python `$` accepts a trailing newline that pydantic's Rust `$` rejects; the lengths make both layers agree (board N2) |
+| M1 | `handlers.py:_derived_gateway_tools` — HEAD's hand-written dict for `gateway.describe` (no `minLength`) (**the hand-corrupted schema**) | `-input_schema=input_schema_for(spec.input_model),` / `+input_schema=({…HEAD dict…} if spec.name == "gateway.describe" else input_schema_for(spec.input_model)),` | `test_advertised_schema_is_derived_from_registered_model[gateway.describe]`, `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]`, and incidentally `test_schemas_are_derived_once_per_process` (25 ≠ 26 calls) — 4 failed, 209 passed | someone reintroduces a hand-written schema that bypasses the builder |
+| M2 | `handlers.py:_GATEWAY_TOOL_SPECS` — `gateway.describe` registered with `ConnectServerInput` | `-input_model=DescribeInput,` / `+input_model=ConnectServerInput,` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]`, `…accepts_the_minimal_valid_arguments[gateway.describe]`, snapshot, gate — 4 failed, 209 passed | the registry names a model the handler does not run |
+| M3 | `types.py:DescribeInput.tool_id` — `min_length=1` → `2` | `-min_length=1, …` / `+min_length=2, …` | `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]` — 2 failed, 211 passed | an agent-facing contract change must be a reviewed snapshot diff |
+| M4 | `schema.py:_collapse_nullable` — early `return node` (nullable `anyOf` no longer collapsed) | `+    return node` | `test_input_schema_for_normalises_pydantic_output`, snapshot, `…is_a_self_contained_mcp_input_schema[…]` ×13 — 15 failed, 198 passed. The synthetic-model test fires independently of the real tools | the post-processing is drift surface of its own |
+| **M-A1** | `schema.py:_collapse_nullable` (`:94`) — drop `"null"`: `out["type"] = [inner_type, "null"]` → `out["type"] = inner_type` (revision 1's behaviour) | `-        out["type"] = [inner_type, "null"]` / `+        out["type"] = inner_type` | `test_optional_field_null_agrees_between_gate_and_model` **×42** (e.g. `gateway.submit_feedback {…, 'failed_tool_call': None}: gate=False model=True`), snapshot, `test_input_schema_for_normalises_pydantic_output` — 44 failed, 169 passed. All 42 fail, including the 14 fields `main` accepted only because it never declared them, since A declares them | the gate must accept `null` exactly where the model does (board A1) |
+| **M-A2** | `handlers.py:get_gateway_tool_definitions` (`:689`) — bypass the cache at the call site: `list(_derived_gateway_tools())` → `list(_derived_gateway_tools.__wrapped__())` | `-    return list(_derived_gateway_tools())` / `+    return list(_derived_gateway_tools.__wrapped__())` | `test_schemas_are_derived_once_per_process` — **`assert 260 == 26`** (10 lookups × 26 derivations) — 1 failed, 212 passed | derivation must happen once per process, not per `tools/call` (board A2) |
+| **M-X1** | `server.py:_handle_call_tool` — rename the dispatch branch `name == "gateway.health"` → `"gateway.health_internal"` | `-                elif name == "gateway.health":` / `+                elif name == "gateway.health_internal":` | **only** `test_every_dispatched_gateway_name_is_registered` — 1 failed, 212 passed. `test_server_dispatch_agrees_with_registry` stays green, which is the gap X1 closes | a dispatch branch for an unregistered name would skip the gate |
+| **M-X2** | `handlers.py:GatewayTools.describe` — `DescribeInput.model_validate(` → `_DescribeInput.model_validate(` (a substring match, not a word match) | `-        parsed = DescribeInput.model_validate(input_data)` / `+        parsed = _DescribeInput.model_validate(input_data)` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]` — 1 failed, 212 passed | the handler-link check matches on a word boundary, not a substring |
+| **M-W** | `types.py:InvokeOptions.timeout_ms` (`:808`) — drop `description="Timeout in milliseconds"`  | `-        default=30000, ge=1000, le=300000, description="Timeout in milliseconds"` / `+        default=30000, ge=1000, le=300000` | `…is_a_self_contained_mcp_input_schema[gateway.invoke]` and `[gateway.tasks_result]` — plus the snapshot — 3 failed, 210 passed (under `-k self_contained`: 2 failed, 24 passed). The `72eaa76` helper passes 26/26 on the same mutant | the walker must reach the `["object", "null"]` nested objects |
+| **M-X1s** | `server.py:_handle_call_tool.call_tool` — X1 guard off: `if tool is None:` → `if False:` | `-                if tool is None:` / `+                if False:` | `test_a_dispatch_branch_for_an_unregistered_name_fails_closed` and `test_an_unregistered_invoke_never_reaches_the_scoped_audit_model` — 2 failed, 211 passed. The text pin stays green, because the dispatch source is unchanged | an ungated name must never reach a handler, whatever the dispatch condition's shape |
+| *(bypass, not a test-RED mutant)* | `server.py` — the board seat's bypass: `elif name == "gateway.health" or name == "gateway.health2":` | as named | **none: 213 passed**, as expected, since the pin is lexical and the guard is behavioural. The guard's effect was measured directly with `probe_bypass.py`: guard on, `handler_ran=False response='{"error": true, "message": "Unknown tool: gateway.health2"}'`; guard off (M-X1s + bypass), `handler_ran=True response='{}'` | shows why X1 is structural: the pin cannot see this, the guard refuses it |
+| **M-N1** | `server.py:_handle_call_tool.call_tool` — move the X1 guard back **below** the scoped-audit `InvokeInput.model_validate` check (the `40b2ed5` order) | the guard block and the scoped block swap places (full diff in the run log) | **only** `test_an_unregistered_invoke_never_reaches_the_scoped_audit_model` — 1 failed, 212 passed | an ungated `gateway.invoke` must not reach the scoped pydantic parse, whose error echoes values (board N1) |
+| **M-N2** | `types.py:InvokeInput.evidence_label_digest` — drop `min_length=64, max_length=64` | `-        min_length=64,` / `-        max_length=64,` | `test_digest_pattern_agrees_between_gate_and_model`, snapshot — 2 failed, 211 passed | the gate's Python `$` accepts a trailing newline that pydantic's Rust `$` rejects; the lengths make both layers agree (board N2) |
+| **M-F1** | `types.py:TaskMetadataInput.ttl` — drop `le=9_223_372_036_854_775_807` | `-        le=9_223_372_036_854_775_807,` | `test_ttl_range_agrees_between_gate_and_model[1e+20]`, `[9223372036854775808]`, snapshot — 3 failed, 210 passed | an integer property with no `maximum` lets the gate accept a float the model refuses with a value-echoing `int_parsing_size` (board round 4, F1) |
 
 Note M1 and M3 both light the gate test: the gate test is what turns "the
 schema says X" into "the transport enforces X".
@@ -1196,7 +1260,7 @@ site, and the test fails on the count (`260 == 26`), which is the property.
 ### Piece B (tree: fused spike + B additions — **revision-1 tree; not re-measured on revision 2**)
 
 Every count below predates A1 (bare `type` for optionals), A2, X1 and the 45 new A
-tests. On revision-2 A the base count is 211, not 163, and MB1's
+tests. On revision-2 A the base count is 213, not 163, and MB1's
 `test_advertised_schema_forbids_unknown_keys` count depends on the type-list fix in
 the B preamble. B's executor re-runs MB1–MB4 and adds one mutant for that fix.
 
@@ -1257,7 +1321,7 @@ callers 264 passed; snapshot 712 lines, 31 × `additionalProperties: false`,
 
 - execute A: effort=low, reason=A is embedded verbatim and proven
   byte-identical to verified code (five bodies + a deterministic snapshot).
-  The remaining work is review of the 813-line snapshot, which must be read against the measured HEAD schemas, not
+  The remaining work is review of the 814-line snapshot, which must be read against the measured HEAD schemas, not
   eyeballed.
 - execute B: effort=medium (was low), reason=one-line flip plus four
   consequential edits, but every B number must be re-measured on revision-2
@@ -1265,7 +1329,7 @@ callers 264 passed; snapshot 712 lines, 31 × `additionalProperties: false`,
   gated on Consiliency/pmcp#296 (A3) and on X1's guard test.
 - Every PR to main needs panel CR + reconcile first (repo rule).
 
-## Embedding proof (revision 2, re-measured 2026-09-26 against `a25dce0`)
+## Embedding proof (revision 2, re-measured 2026-09-26 against `c79bf1a`)
 
 Proves that the A bodies below, applied exactly as *A — how an executor
 applies these* instructs, reproduce the frozen, verified piece-A code byte for
@@ -1273,27 +1337,27 @@ byte. Fresh detached worktree at `origin/main` (`9ca081e`, 0 changes) →
 `uv sync --all-extras -p 3.10` → the extractor taken **out of this plan**
 (not a local copy) → the five extract commands → `git apply --check` + `git
 apply` of the three patches → the snapshot generation command → `cmp` each of
-the six resulting files against `git show a25dce0:<path>`
+the six resulting files against `git show c79bf1a:<path>`
 (= `origin/wip/236-schema-drift-rev2-code`) → the schema test file:
 
 ```text
 base: 9ca081e674806202dfa41864489cb9e3ae225dd9  clean: 0 changes
 src/pmcp/tools/schema.py: 99 lines
-tests/test_gateway_tool_schemas.py: 535 lines
-<scratch>/types.patch: 627 lines
+tests/test_gateway_tool_schemas.py: 555 lines
+<scratch>/types.patch: 634 lines
 <scratch>/handlers.patch: 866 lines
 <scratch>/server.patch: 20 lines
-1 passed, 210 deselected in 0.15s
-===== cmp against a25dce0 (= origin/wip/236-schema-drift-rev2-code)
+1 passed, 212 deselected in 0.18s
+===== cmp against c79bf1a (= origin/wip/236-schema-drift-rev2-code)
 cmp OK  src/pmcp/tools/schema.py  sha256=ddc7a14d17b91bcb
 cmp OK  src/pmcp/tools/handlers.py  sha256=9b8c18905828826e
-cmp OK  src/pmcp/types.py  sha256=21905f4b0aca4b52
+cmp OK  src/pmcp/types.py  sha256=767696eb3c959efc
 cmp OK  src/pmcp/server.py  sha256=b6d1f494a7186c39
-cmp OK  tests/test_gateway_tool_schemas.py  sha256=ac77f6298e85b257
-cmp OK  tests/fixtures/gateway_tool_schemas.json  sha256=384ba365fc3a10d2
+cmp OK  tests/test_gateway_tool_schemas.py  sha256=4707fd43d8870716
+cmp OK  tests/fixtures/gateway_tool_schemas.json  sha256=5da153e64ed5970f
 changed vs base:  M src/pmcp/server.py  M src/pmcp/tools/handlers.py  M src/pmcp/types.py ?? src/pmcp/tools/schema.py ?? tests/fixtures/gateway_tool_schemas.json ?? tests/test_gateway_tool_schemas.py
 ===== pytest
-211 passed in 0.53s
+213 passed in 0.54s
 ```
 
 Exactly the six files changed, and nothing else. The fixture `cmp` is the
@@ -1302,8 +1366,8 @@ by construction, since it writes the file it then reads. Pasting this output
 into the plan was the only edit after the proof. The five bodies were then
 re-extracted from the final plan text and re-`cmp`ed. The proof worktree was
 removed afterwards. (Earlier proofs against `72eaa76`, `d0722f4` (five files
-each, 208 tests), `40b2ed5` (six files, 209 tests) and `972bc90` (six files,
-211 tests) also passed every `cmp`.)
+each, 208 tests), `40b2ed5` (six files, 209 tests), and `972bc90` and
+`a25dce0` (six files, 211 tests) also passed every `cmp`.)
 
 **Consistency gate.** `uv run python ~/code/pmcp/scripts/check_plan_consistency.py
 .consiliency/plans/detailed-236-schema-drift-20260923-0915.md` →
@@ -1334,10 +1398,10 @@ git apply --check <scratch>/types.patch <scratch>/handlers.patch <scratch>/serve
   && git apply <scratch>/types.patch <scratch>/handlers.patch <scratch>/server.patch
 uv sync --all-extras -p 3.10
 PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py -q -k test_advertised_schemas_match_snapshot
-uv run pytest tests/test_gateway_tool_schemas.py -q                     # expect 211 passed
+uv run pytest tests/test_gateway_tool_schemas.py -q                     # expect 213 passed
 ```
 
-The three patches are `git diff origin/main a25dce0 -- <file>` (identical to `972bc90` for these files) against
+The three patches are `git diff origin/main c79bf1a -- <file>` against
 `origin/main` @ `9ca081e` (identical for these files to `860636a` and
 `8dec131`). Their blank context lines carry one leading space. An editor that
 strips trailing whitespace breaks them, and `git apply --check` then fails
@@ -1476,7 +1540,7 @@ def _collapse_nullable(node: dict[str, Any]) -> dict[str, Any]:
     return out
 ```
 
-### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 535 lines, 211 tests)
+### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 555 lines, 213 tests)
 
 ```python
 """Advertised gateway tool schemas are derived from, and agree with, the
@@ -1505,6 +1569,9 @@ itself, on a regex `pattern`: the gate's Python `$` matches before a final
 newline and pydantic's Rust `$` does not -- closed for the one `pattern` field
 (`evidence_label_digest`) by length bounds, pinned by
 `test_digest_pattern_agrees_between_gate_and_model`.
+Nor on an integer's range: pydantic refuses a float past int64, so an
+unbounded integer field (`task.ttl`) gets that bound advertised, pinned by
+`test_ttl_range_agrees_between_gate_and_model`.
 """
 
 from __future__ import annotations
@@ -2014,13 +2081,30 @@ def test_digest_pattern_agrees_between_gate_and_model() -> None:
         jsonschema.validate(args, schema)
     with pytest.raises(Exception):
         InvokeInput.model_validate(args)
+
+
+@pytest.mark.parametrize("ttl", [1e20, 2**63])
+def test_ttl_range_agrees_between_gate_and_model(ttl: float) -> None:
+    """`task.ttl` past int64: the model refuses it, so the gate must too
+    (board round 4, F1: `1e20` passed the gate on main and under A)."""
+    from pmcp.types import InvokeInput
+
+    schema = _tool("gateway.invoke").input_schema
+    args = {"tool_id": "a::b", "task": {"ttl": ttl}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args, schema)
+    with pytest.raises(Exception):
+        InvokeInput.model_validate(args)
+    ok = {"tool_id": "a::b", "task": {"ttl": 3600}}
+    jsonschema.validate(ok, schema)
+    InvokeInput.model_validate(ok)
 ```
 
-### A — `src/pmcp/types.py` (`git apply` patch against `origin/main`, +274 / −110)
+### A — `src/pmcp/types.py` (`git apply` patch against `origin/main`, +281 / −110)
 
 ```diff
 diff --git a/src/pmcp/types.py b/src/pmcp/types.py
-index 215088d..322a053 100644
+index 215088d..6496e37 100644
 --- a/src/pmcp/types.py
 +++ b/src/pmcp/types.py
 @@ -77,12 +77,26 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
@@ -2087,7 +2171,7 @@ index 215088d..322a053 100644
  
  
  class StartupPolicyPreview(BaseModel):
-@@ -538,22 +562,34 @@ class McpTaskRecord(McpTaskInfo):
+@@ -538,22 +562,41 @@ class McpTaskRecord(McpTaskInfo):
      requestor_context: dict[str, Any] | None = None
  
  
@@ -2106,7 +2190,14 @@ index 215088d..322a053 100644
 +    metadata: dict[str, Any] | None = Field(
 +        default=None, description="Opaque task metadata forwarded downstream"
 +    )
-+    ttl: int | None = Field(default=None, description="Requested task TTL in seconds")
++    ttl: int | None = Field(
++        default=None,
++        # int64: pydantic already refuses a float past it (`int_parsing_size`),
++        # so advertise it and let the gate refuse `1e20` too, rather than
++        # passing it on to the model (Consiliency/pmcp#236, board round 4)
++        le=9_223_372_036_854_775_807,
++        description="Requested task TTL in seconds",
++    )
 +    poll_interval: float | None = Field(
 +        default=None, description="Seconds between task status polls"
 +    )
@@ -2132,7 +2223,7 @@ index 215088d..322a053 100644
  
  
  class TasksListOutput(BaseModel):
-@@ -565,12 +601,14 @@ class TasksListOutput(BaseModel):
+@@ -565,12 +608,14 @@ class TasksListOutput(BaseModel):
      errors: list[str] | None = None
  
  
@@ -2151,7 +2242,7 @@ index 215088d..322a053 100644
  
  
  class TasksGetOutput(BaseModel):
-@@ -581,13 +619,17 @@ class TasksGetOutput(BaseModel):
+@@ -581,13 +626,17 @@ class TasksGetOutput(BaseModel):
      errors: list[str] | None = None
  
  
@@ -2174,7 +2265,7 @@ index 215088d..322a053 100644
  
  
  class TasksResultOutput(BaseModel):
-@@ -602,13 +644,15 @@ class TasksResultOutput(BaseModel):
+@@ -602,13 +651,15 @@ class TasksResultOutput(BaseModel):
      errors: list[str] | None = None
  
  
@@ -2195,7 +2286,7 @@ index 215088d..322a053 100644
  
  
  class TasksCancelOutput(BaseModel):
-@@ -624,21 +668,36 @@ class TasksCancelOutput(BaseModel):
+@@ -624,21 +675,36 @@ class TasksCancelOutput(BaseModel):
  # === Gateway Tool Input/Output Types ===
  
  
@@ -2241,7 +2332,7 @@ index 215088d..322a053 100644
  
  
  class CapabilityCard(BaseModel):
-@@ -688,10 +747,12 @@ class CatalogSearchOutput(BaseModel):
+@@ -688,10 +754,12 @@ class CatalogSearchOutput(BaseModel):
      manifest_candidates: list[CapabilityCandidate] = Field(default_factory=list)
  
  
@@ -2256,7 +2347,7 @@ index 215088d..322a053 100644
  
  
  class ArgInfo(BaseModel):
-@@ -740,28 +801,71 @@ class SchemaCard(BaseModel):
+@@ -740,28 +808,71 @@ class SchemaCard(BaseModel):
      feedback_hint: str | None = None
  
  
@@ -2342,7 +2433,7 @@ index 215088d..322a053 100644
  
      @field_validator("run_correlation_id", "seat_correlation_id")
      @classmethod
-@@ -809,12 +913,19 @@ class InvokeOutput(BaseModel):
+@@ -809,12 +920,19 @@ class InvokeOutput(BaseModel):
      url_elicitations: list[UrlElicitationInfo] | None = None
  
  
@@ -2366,7 +2457,7 @@ index 215088d..322a053 100644
  
  
  class RefreshOutput(BaseModel):
-@@ -836,24 +947,32 @@ class RefreshOutput(BaseModel):
+@@ -836,24 +954,32 @@ class RefreshOutput(BaseModel):
      mcp_tasks_remaining: int = 0
  
  
@@ -2407,7 +2498,7 @@ index 215088d..322a053 100644
  
  
  class LifecycleServerOutput(BaseModel):
-@@ -913,10 +1032,13 @@ class HealthOutput(BaseModel):
+@@ -913,10 +1039,13 @@ class HealthOutput(BaseModel):
  # === Pending Request Monitoring Types ===
  
  
@@ -2423,7 +2514,7 @@ index 215088d..322a053 100644
  
  
  class PendingRequestInfo(BaseModel):
-@@ -941,11 +1063,17 @@ class ListPendingOutput(BaseModel):
+@@ -941,11 +1070,17 @@ class ListPendingOutput(BaseModel):
      total_pending: int
  
  
@@ -2444,7 +2535,7 @@ index 215088d..322a053 100644
  
  
  class CancelOutput(BaseModel):
-@@ -1083,10 +1211,13 @@ class GatewayPolicy(BaseModel):
+@@ -1083,10 +1218,13 @@ class GatewayPolicy(BaseModel):
  # === Capability Request Types ===
  
  
@@ -2460,7 +2551,7 @@ index 215088d..322a053 100644
      available_clis: list[str] | None = Field(
          default=None,
          description="Optional: CLIs known to be available in the environment",
-@@ -1207,13 +1338,16 @@ class SearchRegistryResult(BaseModel):
+@@ -1207,13 +1345,16 @@ class SearchRegistryResult(BaseModel):
      diagnostics: list[str] = Field(default_factory=list)
  
  
@@ -2480,7 +2571,7 @@ index 215088d..322a053 100644
  
  
  class SearchRegistryOutput(BaseModel):
-@@ -1224,7 +1358,7 @@ class SearchRegistryOutput(BaseModel):
+@@ -1224,7 +1365,7 @@ class SearchRegistryOutput(BaseModel):
      next_step: str
  
  
@@ -2489,7 +2580,7 @@ index 215088d..322a053 100644
      """Input for gateway.register_discovered_server."""
  
      package: str = Field(
-@@ -1232,10 +1366,12 @@ class RegisterDiscoveredServerInput(BaseModel):
+@@ -1232,10 +1373,12 @@ class RegisterDiscoveredServerInput(BaseModel):
          description="npm package identifier (e.g. '@modelcontextprotocol/server-github')",
      )
      server_name: str = Field(
@@ -2504,7 +2595,7 @@ index 215088d..322a053 100644
      )
      description: str = Field(
          default="", description="Short description of the server's purpose"
-@@ -1266,11 +1402,11 @@ class RegisterDiscoveredServerOutput(BaseModel):
+@@ -1266,11 +1409,11 @@ class RegisterDiscoveredServerOutput(BaseModel):
      next_step: str | None = None
  
  
@@ -2518,7 +2609,7 @@ index 215088d..322a053 100644
      )
  
  
-@@ -1307,15 +1443,25 @@ FeedbackSubmissionOutcome = Literal[
+@@ -1307,15 +1450,25 @@ FeedbackSubmissionOutcome = Literal[
  ]
  
  
@@ -2551,7 +2642,7 @@ index 215088d..322a053 100644
  
  
  class SubmitFeedbackOutput(BaseModel):
-@@ -1339,10 +1485,10 @@ class SubmitFeedbackOutput(BaseModel):
+@@ -1339,10 +1492,10 @@ class SubmitFeedbackOutput(BaseModel):
      submission_outcome: FeedbackSubmissionOutcome | None = None
  
  
@@ -2564,7 +2655,7 @@ index 215088d..322a053 100644
      force: bool = Field(
          default=False,
          description=(
-@@ -1373,26 +1519,38 @@ class UpdateServerOutput(BaseModel):
+@@ -1373,26 +1526,38 @@ class UpdateServerOutput(BaseModel):
      message: str
  
  
@@ -2612,7 +2703,7 @@ index 215088d..322a053 100644
  
  
  class AuthConnectOutput(BaseModel):
-@@ -1408,10 +1566,12 @@ class AuthConnectOutput(BaseModel):
+@@ -1408,10 +1573,12 @@ class AuthConnectOutput(BaseModel):
      url_elicitation: UrlElicitationInfo | None = None
  
  
@@ -2627,7 +2718,7 @@ index 215088d..322a053 100644
  
  
  class ProvisionJobStatus(BaseModel):
-@@ -1439,11 +1599,15 @@ class ProvisionJobStatus(BaseModel):
+@@ -1439,11 +1606,15 @@ class ProvisionJobStatus(BaseModel):
      error: str | None = None
  
  
@@ -4469,4 +4560,51 @@ Output at `972bc90` (measured):
 pattern keywords in advertised schemas: [('gateway.invoke/properties/evidence_label_digest', '^[0-9a-f]{64}$')]
 pattern constraints on argument models (incl. nested): ['InvokeInput.evidence_label_digest']
 64 hex + newline: gate rejects: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa | model rejects (string_too_long)
+```
+
+### Board round 4 probe (F1 integer range)
+
+`probe_int_range.py` lists every integer property without a `maximum` in the
+advertised schemas, then checks `task.ttl` values `1e20`, `2**63` and `3600`
+against gate and model. It needs piece A's registry. Its output at
+`a25dce0` and `c79bf1a` is quoted under *A is not fully behaviour-neutral*.
+
+```python
+"""Board round 4, F1: integer fields without a `maximum`, and `1e20` for
+task.ttl through gate and model (Consiliency/pmcp#236)."""
+import jsonschema
+from pydantic import ValidationError
+from pmcp.tools.handlers import get_gateway_tool_definitions
+from pmcp.types import InvokeInput
+
+tools = {t.name: t for t in get_gateway_tool_definitions()}
+unbounded = []
+def walk(node, path):
+    if isinstance(node, dict):
+        t = node.get("type")
+        if (t == "integer" or (isinstance(t, list) and "integer" in t)) and "maximum" not in node:
+            unbounded.append(path)
+        for k, v in node.items():
+            if k == "properties" and isinstance(v, dict):
+                for pn, pv in v.items():
+                    walk(pv, f"{path}.{pn}")
+            elif isinstance(v, (dict, list)):
+                walk(v, path)
+    elif isinstance(node, list):
+        for i in node:
+            walk(i, path)
+for name, t in tools.items():
+    walk(t.input_schema, name)
+print("integer properties without `maximum`:", unbounded)
+for ttl in (1e20, 2**63, 3600):
+    args = {"tool_id": "a::b", "task": {"ttl": ttl}}
+    try:
+        jsonschema.validate(args, tools["gateway.invoke"].input_schema); g = "accepts"
+    except jsonschema.ValidationError:
+        g = "rejects"
+    try:
+        InvokeInput.model_validate(args); m = "accepts"
+    except ValidationError as e:
+        m = f"rejects ({e.errors()[0]['type']})"
+    print(f"task.ttl={ttl!r}: gate {g} | model {m}")
 ```
