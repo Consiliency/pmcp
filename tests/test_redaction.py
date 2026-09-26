@@ -325,7 +325,11 @@ def test_bearer_is_a_scheme_not_a_word() -> None:
     assert _engine("Bearer Token is required") == "Bearer Token is required"
     assert _engine("Bearer test-token") == "Bearer [REDACTED]"
     assert _engine("Bearer hunter2") == "Bearer [REDACTED]"
-    assert _engine("secret-bearer hunter2") == "secret-bearer hunter2"
+    # not the Bearer SCHEME: the word after a compound is not a token ...
+    assert _engine("secret-bearer failed") == "secret-bearer failed"
+    # ... but `secret-bearer` is a suffixed `secret` key, and a credential-shaped
+    # value after it is redacted by that rule, as on main
+    assert _engine("secret-bearer hunter2") == "secret-bearer [REDACTED]"
     assert _engine("non-bearer 2024-01-01 report") == "non-bearer 2024-01-01 report"
     assert _engine('Bearer realm="api", error="x"') == 'Bearer realm="api", error="x"'
     assert _engine("token_type=Bearer expires_in=3600") == (

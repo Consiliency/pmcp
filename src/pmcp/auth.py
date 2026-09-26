@@ -461,7 +461,8 @@ _QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
 _KEYWORD_WS_RE = re.compile(
     r"(?P<key>(?:(?<![A-Za-z0-9_-])|(?<=\\[nrt]))(?:--)?(?:[A-Za-z0-9]+[_-]){0,8}"
     r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?"
-    rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?)"
+    rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
+    r"(?:[_-]?[A-Za-z0-9]){0,24})"
     r"(?P<sep>[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]*)"
     r"(?![A-Za-z_-]+=[^=])(?![-*#>])(?P<value>[^\s\"',;()\[\]{}]*[^\s\"',;()\[\]{}\\])",
     re.IGNORECASE,
@@ -596,6 +597,8 @@ def _keyword_ws_spans(text: str) -> list[Span]:
         for match in _KEYWORD_WS_RE.finditer(text)
         if match.group("name").lower() != "code"
         and _value_could_be_a_credential(match.group("value"))
+        and "://" not in match.group("value")
+        and not match.group("value").lower().startswith("arn:")
     ]
 
 
@@ -749,7 +752,7 @@ def collect_redaction_spans(
     query value (a raw encoded value evades a pattern written for the
     decoded shape; main decoded before matching, and so does this).
     """
-    return [
+    spans = [
         *_url_spans(text, _depth, covers),
         *_keyword_sep_spans(text),
         *_keyword_list_spans(text),
@@ -758,6 +761,27 @@ def collect_redaction_spans(
         *_keyword_ws_spans(text),
         *_shape_spans(text),
     ]
+    return widen_over_escapes(text, spans)
+
+
+def widen_over_escapes(text: str, spans: list[Span]) -> list[Span]:
+    """Start no span in the middle of a backslash escape.
+
+    A serialised result reaches the redactor as JSON text, where
+    `json.dumps` spells non-ASCII whitespace as `\\u2003`: a span that starts
+    at the `u` would leave a lone `\\` -- invalid JSON, so a dict result
+    silently became a string. A span preceded by an escaping backslash (an
+    odd run of them) takes the backslash too, so the whole escape goes.
+    """
+    widened: list[Span] = []
+    for start, end, replacement in spans:
+        run = 0
+        while start - run - 1 >= 0 and text[start - run - 1] == "\\":
+            run += 1
+        if run % 2 == 1 and start < end:
+            start -= 1
+        widened.append((start, end, replacement))
+    return widened
 
 
 def apply_redaction_spans(text: str, spans: list[Span]) -> str:

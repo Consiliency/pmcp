@@ -27,6 +27,7 @@ from pmcp.auth import (
     Span,
     apply_redaction_spans,
     collect_redaction_spans,
+    widen_over_escapes,
 )
 
 if TYPE_CHECKING:
@@ -771,7 +772,7 @@ class PolicyManager:
                         break
                 else:
                     spans.append((match.start(), match.end(), REDACTED))
-        return spans
+        return widen_over_escapes(output, spans)
 
     def process_output(
         self,
