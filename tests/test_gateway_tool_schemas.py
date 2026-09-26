@@ -538,7 +538,10 @@ def test_digest_pattern_agrees_between_gate_and_model() -> None:
         InvokeInput.model_validate(args)
 
 
-@pytest.mark.parametrize("ttl", [1e20, 2**63, -1e20, -9.3e18, -1e308, -(2**63) - 1])
+@pytest.mark.parametrize(
+    "ttl",
+    [1e20, 2**63, float(2**63), -1e20, -9.3e18, -1e308, -(2**63) - 1, float(-(2**63))],
+)
 def test_ttl_range_agrees_between_gate_and_model(ttl: float) -> None:
     """`task.ttl` outside int64, either side: the model refuses it, so the
     gate must too (board round 4 F1: `1e20`; round 5 G1: `-1e20`, which the

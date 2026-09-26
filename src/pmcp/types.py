@@ -577,7 +577,9 @@ class TaskMetadataInput(GatewayArguments):
         # (`int_parsing_size`), so advertise the range and let the gate refuse
         # `1e20` and `-1e20` too, rather than passing them on to the model
         # (Consiliency/pmcp#236, board rounds 4 and 5)
-        ge=-9_223_372_036_854_775_808,
+        # -2**63 + 1: `float(-2**63)` is exactly representable, and pydantic
+        # refuses it (board round 6, N6-1), so the inclusive bound stops one short
+        ge=-9_223_372_036_854_775_807,
         le=9_223_372_036_854_775_807,
         description="Requested task TTL in seconds",
     )
