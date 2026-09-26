@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 import time
 import asyncio
 from collections.abc import Mapping
@@ -20,6 +20,7 @@ import aiohttp
 import jwt
 from jwt import PyJWKSet
 
+from pmcp.redaction_floor import floor_spans
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
 
@@ -968,9 +969,21 @@ def _url_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
 
 
 def collect_redaction_spans(
-    text: str, *, _depth: int = 0, covers: Covers | None = None
+    text: str,
+    *,
+    _depth: int = 0,
+    covers: Covers | None = None,
+    floor_patterns: Sequence[re.Pattern[str]] | None = None,
 ) -> list[Span]:
-    """Every redaction the engine would make to ``text``, as spans over it.
+    """Every redaction the engine would make to ``text``, as spans over it:
+    main's floor (`pmcp.redaction_floor`: what main's own rules removed,
+    replayed, less the named suppressions) and the additive rules below.
+
+    ``floor_patterns`` None is the diagnostic surface's floor (main's
+    `sanitize_auth_diagnostic`); the policy surface passes its effective
+    patterns (main's `redact_secrets`). A decoded query value asked about by
+    `_covers_anything` (``_depth`` > 0) gets the additive rules only: the
+    floor already replayed main's URL rule on the text it came from.
 
     Each pass reads the same, unmodified ``text``. The order of the list does
     not matter: `apply_redaction_spans` merges overlaps. ``covers`` lets the
@@ -978,8 +991,16 @@ def collect_redaction_spans(
     query value (a raw encoded value evades a pattern written for the
     decoded shape; main decoded before matching, and so does this).
     """
+    spans = _additive_spans(text, _depth, covers)
+    if _depth == 0:
+        spans.extend(floor_spans(text, floor_patterns)[1])
+    return spans
+
+
+def _additive_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
+    """The rules added on top of main's floor (revs 1-10 of #234)."""
     spans = [
-        *_url_spans(text, _depth, covers),
+        *_url_spans(text, depth, covers),
         *_keyword_sep_spans(text),
         *_keyword_list_spans(text),
         *_authorization_spans(text),
@@ -1010,6 +1031,29 @@ def widen_over_escapes(text: str, spans: list[Span]) -> list[Span]:
     return widened
 
 
+def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
+    """The disjoint spans `apply_redaction_spans` applies, ascending (see
+    there for the overlap rules)."""
+    markers: list[Span] = [
+        (m.start(), m.end(), REDACTED) for m in re.finditer(re.escape(REDACTED), text)
+    ]
+    candidates = [*spans, *markers]
+    ordered = sorted(
+        (span for span in candidates if span[0] < span[1]),
+        key=lambda span: (span[0], -span[1], span[2] != REDACTED),
+    )
+    merged: list[Span] = []
+    for start, end, replacement in ordered:
+        if merged and start < merged[-1][1]:
+            previous_start, previous_end, previous_replacement = merged[-1]
+            if end <= previous_end and previous_replacement in (REDACTED, ""):
+                continue
+            merged[-1] = (previous_start, max(end, previous_end), REDACTED)
+            continue
+        merged.append((start, end, replacement))
+    return merged
+
+
 def apply_redaction_spans(text: str, spans: list[Span]) -> str:
     """Apply ``spans`` to ``text`` in one pass.
 
@@ -1029,23 +1073,7 @@ def apply_redaction_spans(text: str, spans: list[Span]) -> str:
     surface `password= [REDACTED]` becomes `password=[REDACTED]` once, then
     stays).
     """
-    markers: list[Span] = [
-        (m.start(), m.end(), REDACTED) for m in re.finditer(re.escape(REDACTED), text)
-    ]
-    candidates = [*spans, *markers]
-    ordered = sorted(
-        (span for span in candidates if span[0] < span[1]),
-        key=lambda span: (span[0], -span[1], span[2] != REDACTED),
-    )
-    merged: list[Span] = []
-    for start, end, replacement in ordered:
-        if merged and start < merged[-1][1]:
-            previous_start, previous_end, previous_replacement = merged[-1]
-            if end <= previous_end and previous_replacement in (REDACTED, ""):
-                continue
-            merged[-1] = (previous_start, max(end, previous_end), REDACTED)
-            continue
-        merged.append((start, end, replacement))
+    merged = merge_redaction_spans(text, spans)
     pieces: list[str] = []
     position = 0
     for start, end, replacement in merged:

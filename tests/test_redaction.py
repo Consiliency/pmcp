@@ -43,7 +43,11 @@ from pmcp.auth import (
     redact_auth_url,
     sanitize_auth_diagnostic,
 )
-from pmcp.policy.policy import DEFAULT_REDACTION_PATTERNS, PolicyManager
+from pmcp.policy.policy import (
+    _ADDITIVE_DEFAULT_PATTERNS,
+    DEFAULT_REDACTION_PATTERNS,
+    PolicyManager,
+)
 from tests import _redaction_grammar as G
 
 # --------------------------------------------------------------------------- #
@@ -338,7 +342,10 @@ def test_bearer_is_a_scheme_not_a_word() -> None:
     # ... but `secret-bearer` is a suffixed `secret` key, and a credential-shaped
     # value after it is redacted by that rule, as on main
     assert _engine("secret-bearer hunter2") == "secret-bearer [REDACTED]"
-    assert _engine("non-bearer 2024-01-01 report") == "non-bearer 2024-01-01 report"
+    # `non-bearer 2024-01-01`: main's `\\bbearer` fires after a joiner, and a
+    # credential-shaped value there is not in any stated class, so the floor
+    # keeps main's redaction (B2 of rev 10's board: `--bearer s3cr3tvalue`)
+    assert _engine("non-bearer 2024-01-01 report") == "non-bearer [REDACTED] report"
     assert _engine('Bearer realm="api", error="x"') == 'Bearer realm="api", error="x"'
     assert _engine("token_type=Bearer expires_in=3600") == (
         "token_type=Bearer expires_in=3600"
@@ -529,7 +536,9 @@ def test_redact_secrets_keeps_a_key_but_never_splits_inside_a_secret() -> None:
         "basic [REDACTED] auth"
     )
     manager._redaction_regexes = [re.compile(r"mykey\s*[:=]\s*\S+")]
-    assert manager.redact_secrets("mykey: abcdef") == "mykey: [REDACTED]"
+    # main's split of this pattern is the floor (it takes the value too), and
+    # the two merge into one marker
+    assert manager.redact_secrets("mykey: abcdef") == "mykey:[REDACTED]"
 
 
 def test_the_engine_redacts_before_it_truncates() -> None:
@@ -867,7 +876,10 @@ def _random_prose(rng: random.Random) -> str:
         lambda: f"installed pmcp-1.{rng.randint(0, 30)}.{rng.randint(0, 9)}",
         lambda: f"Bearer {rng.choice(_PROSE_WORDS).capitalize()}",
         lambda: f"code={number()}",
-        lambda: f"--{rng.choice(_PROSE_WORDS)} {rng.choice(_PROSE_WORDS)}",
+        # a flag right after a keyword is that keyword's value on main (`secret
+        # --bucket`), and the floor keeps main's redaction: the flag follows a
+        # plain verb here
+        lambda: f"run --{rng.choice(_PROSE_WORDS)} {rng.choice(_PROSE_WORDS)}",
         lambda: f'{{"code": -{rng.randint(32000, 32768)}, "message": "{words()}"}}',
     ]
     return rng.choice([" ", ", ", "; ", ". ", "\n"]).join(
@@ -897,7 +909,7 @@ def _declared_secret_keys() -> set[str]:
     expected and covered by nothing).
     """
     keys = set(AUTH_DIAGNOSTIC_SECRET_KEYS)
-    for pattern in DEFAULT_REDACTION_PATTERNS:
+    for pattern in _ADDITIVE_DEFAULT_PATTERNS:
         group = re.search(r"\(([a-z_|\[\]?-]+)\)", pattern)
         if group is None:
             continue  # a bare token shape (`sk-`, `ghp_`), not a key
@@ -1119,6 +1131,8 @@ def _span_texts(text: str, spans: list[tuple[int, int, str]]) -> list[str]:
         for start, end, replacement in spans
         if replacement in (REDACTED, "")
         and end - start >= 4
+        # a literal marker in the input is replaced by the marker
+        and text[start:end] != REDACTED
         and text.count(text[start:end]) == 1
     ]
 
@@ -2452,9 +2466,11 @@ def test_c2_a_percent_encoded_key_is_still_the_key() -> None:
 def test_c4_bearer_across_a_crlf() -> None:
     for surface, out in _both("Bearer\r\nhunter2"):
         assert out == "Bearer\r\n[REDACTED]", (surface, out)
+    # a flag on the next line after `bearer` was its value on main (`\\s+`
+    # crosses the break): the floor keeps main's redaction
     prose = "--rotated bearer\n--ingredient assertion"
     for surface, out in _both(prose):
-        assert out == prose, (surface, out)
+        assert out == "--rotated bearer\n[REDACTED] assertion", (surface, out)
 
 
 @pytest.mark.parametrize(
@@ -2498,8 +2514,10 @@ def test_policy_defaults_never_start_on_a_quote_or_end_on_a_backslash(
 ) -> None:
     """The operator-visible default patterns: the captured value never starts
     on a quote (rev 8 ate the opening one) and never ends on a backslash (the
-    escape of a JSON quote); the engine redacts quoted values INSIDE them."""
-    for pattern in DEFAULT_REDACTION_PATTERNS:
+    escape of a JSON quote); the engine redacts quoted values INSIDE them.
+    Rev 10's forms (`_ADDITIVE_DEFAULT_PATTERNS`) carry this; main's own
+    defaults are the floor, whose JSON adjustment keeps the same guarantee."""
+    for pattern in _ADDITIVE_DEFAULT_PATTERNS:
         for match in re.finditer(pattern, text, re.IGNORECASE):
             if match.lastindex is None:
                 continue
@@ -2538,10 +2556,20 @@ def test_a_keyed_list_never_straddles_a_string_boundary(obj: dict) -> None:
 )
 def test_a_quoted_value_never_straddles_via_the_other_quote(obj: dict) -> None:
     """After an unquoted key, a single-quoted "value" that holds an unescaped
-    double quote runs across a JSON string boundary; it is not a value."""
+    double quote runs across a JSON string boundary; the additive rules do not
+    read it as a value. Main's policy default did (`[\"']?([^\\s\"']+)` took
+    the `x`), so the floor redacts it there -- inside the string, and the
+    document stays JSON."""
     text = json.dumps(obj)
     for surface, out in _both(text):
-        assert json.loads(out) == obj, (surface, out)
+        if surface == "engine":
+            assert json.loads(out) == obj, (surface, out)
+        else:
+            key = next(iter(obj))
+            assert json.loads(out) == {
+                **obj,
+                key: obj[key].split("'")[0] + "'" + REDACTED,
+            }, (surface, out)
 
 
 @pytest.mark.parametrize(
@@ -2610,17 +2638,36 @@ def test_a_dash_glued_to_a_value_is_part_of_it(text: str) -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        "secret --bucket",
         "token:\n  - item",
         "token:\n- item",
-        "password:\n  * item",
-        "--rotated bearer\n--ingredient assertion",
-        "Bearer\n--flag12345",
     ],
 )
 def test_a_flag_or_a_bullet_after_a_keyword_is_not_its_value(text: str) -> None:
     for surface, out in _both(text):
         assert out == text, (surface, out)
+
+
+@pytest.mark.parametrize(
+    ("text", "surfaces", "expected"),
+    [
+        ("secret --bucket", ("engine", "policy"), "secret [REDACTED]"),
+        ("password:\n  * item", ("policy",), "password:\n  [REDACTED] item"),
+        (
+            "--rotated bearer\n--ingredient assertion",
+            ("engine", "policy"),
+            "--rotated bearer\n[REDACTED] assertion",
+        ),
+        ("Bearer\n--flag12345", ("engine", "policy"), "Bearer\n[REDACTED]"),
+    ],
+)
+def test_a_flag_or_a_bullet_main_redacted_stays_redacted(
+    text: str, surfaces: tuple[str, ...], expected: str
+) -> None:
+    """Rev 10 kept these; main redacted them (its value classes take a flag
+    or a bullet after a keyword), and no stated class covers a flag or a
+    bullet, so the floor keeps main's redaction on the surfaces main made it."""
+    for surface, out in _both(text):
+        assert out == (expected if surface in surfaces else text), (surface, out)
 
 
 def _has_escaped_quote(text: str) -> bool:
@@ -2755,7 +2802,7 @@ def test_f3_the_policy_defaults_read_a_json_escape_as_a_boundary(text: str) -> N
     start right after an escape's alphanumeric tail on main."""
     hits = [
         m.group(m.lastindex)
-        for pattern in DEFAULT_REDACTION_PATTERNS
+        for pattern in _ADDITIVE_DEFAULT_PATTERNS
         for m in re.finditer(pattern, text, re.IGNORECASE)
         if m.lastindex
     ]

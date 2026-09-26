@@ -62,6 +62,23 @@ _LimitField = Literal["max_tools_per_server", "max_output_bytes", "max_output_to
 _REDACTION_WINDOW_SLACK = 16384
 
 DEFAULT_REDACTION_PATTERNS = [
+    # Common secret patterns (case-insensitive). main's list, unchanged: it is
+    # the floor (`pmcp.redaction_floor` replays it with main's semantics), and
+    # `_ADDITIVE_DEFAULT_PATTERNS` adds to it (Consiliency/pmcp#234).
+    r"(api[_-]?key|apikey)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
+    r"(secret|password|passwd|pwd)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
+    r"(bearer|token)[\s]+[a-zA-Z0-9._-]+",
+    r"(aws_secret|aws_access)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
+    r"\bsk-[A-Za-z0-9_-]{6,}\b",
+    r"\bghp_[A-Za-z0-9_]{10,}\b",
+    r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
+]
+
+#: Rev 10's forms of the defaults, entry for entry: applied IN ADDITION to
+#: the default they stand beside, whenever that default is effective. They
+#: only add redactions; main's own default, replayed as the floor, still
+#: removes everything it removed.
+_ADDITIVE_DEFAULT_PATTERNS = [
     # Common secret patterns (case-insensitive). The separator mirrors the
     # engine's: `:`, `=`, `=>`, `:=`, or `==` followed directly by the value,
     # on the same line (`[ \t]*`, not `[\s]*`, which let `token:\nthe` -- a
@@ -81,6 +98,30 @@ DEFAULT_REDACTION_PATTERNS = [
     r"\bghp_[A-Za-z0-9_]{10,}\b",
     r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
 ]
+
+_ADDITIVE_FOR_DEFAULT = {
+    default: re.compile(additive, re.IGNORECASE)
+    for default, additive in zip(
+        DEFAULT_REDACTION_PATTERNS, _ADDITIVE_DEFAULT_PATTERNS, strict=True
+    )
+}
+
+
+def _additive_form(regex: re.Pattern[str]) -> re.Pattern[str]:
+    return _ADDITIVE_FOR_DEFAULT.get(regex.pattern, regex)
+
+
+def _value_separator(full_match: str) -> int:
+    """Where an additive pattern's match splits into key and value: the first
+    separator (`:` or `=`) that has a value after it, or -1. A separator
+    with nothing but separators after it is base64 padding
+    (`dXNlcjpwYXNzd29yZA==`); splitting there kept the whole secret and
+    replaced the `=`."""
+    for i, char in enumerate(full_match):
+        if char in ":=" and full_match[i + 1 :].strip(" \t:="):
+            return i
+    return -1
+
 
 # Search order for an auto-discovered policy. The project-local entries are kept
 # RELATIVE on purpose: they are resolved against `Path.cwd()` when a
@@ -747,31 +788,40 @@ class PolicyManager:
         """
         return apply_redaction_spans(output, self.redaction_spans(output))
 
+    def _additive_regexes(self) -> list[re.Pattern[str]]:
+        """The additive form of each effective pattern: rev 10's form of a
+        default (`_ADDITIVE_DEFAULT_PATTERNS`), an operator's pattern as it
+        is -- applied with the split below, which also keeps base64 padding
+        whole where main's first-separator split did not."""
+        return [_additive_form(regex) for regex in self._redaction_regexes]
+
     def _pattern_matches(self, text: str) -> bool:
         """Does any operator (or default) pattern match ``text``? Asked of a
         percent-decoded query value so an encoded token cannot evade a
         pattern written for its decoded shape (main decoded before matching)."""
-        return any(regex.search(text) for regex in self._redaction_regexes)
+        return any(
+            regex.search(text)
+            for regex in (*self._redaction_regexes, *self._additive_regexes())
+        )
 
     def redaction_spans(self, output: str) -> list[Span]:
-        """Every redaction either surface would make to ``output``, as spans."""
+        """Every redaction either surface would make to ``output``, as spans:
+        main's floor for this surface (the engine's rules, then the effective
+        patterns, replayed in main's order with main's semantics) and the
+        additive rules on top."""
         spans: list[Span] = collect_redaction_spans(
-            output, covers=self._pattern_matches
+            output,
+            covers=self._pattern_matches,
+            floor_patterns=self._redaction_regexes,
         )
-        for regex in self._redaction_regexes:
+        for regex in self._additive_regexes():
             for match in regex.finditer(output):
                 full_match = match.group(0)
-                # A `key<sep>value` match keeps its key: split at the first
-                # separator (: or =) that has a value after it. A separator
-                # with nothing but separators after it is base64 padding
-                # (`dXNlcjpwYXNzd29yZA==`), and splitting there kept the whole
-                # secret and replaced the `=`.
-                for i, char in enumerate(full_match):
-                    if char in ":=" and full_match[i + 1 :].strip(" \t:="):
-                        spans.append(
-                            (match.start() + i + 1, match.end(), " " + REDACTED)
-                        )
-                        break
+                split = _value_separator(full_match)
+                if split >= 0:
+                    spans.append(
+                        (match.start() + split + 1, match.end(), " " + REDACTED)
+                    )
                 else:
                     spans.append((match.start(), match.end(), REDACTED))
         return widen_over_escapes(output, spans)
