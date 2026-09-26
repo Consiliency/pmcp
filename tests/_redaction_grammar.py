@@ -33,8 +33,11 @@ qual       main's `[A-Za-z0-9_-]*` prefix: joined (`x_`, `x-`), glued in
            random case (1-8), glued past the 24 bound (25-32), a leading
            joiner run (`_ - -- --- _-`), 2-10 joined segments.
 name       main's 20 keys plus the policy keys, lower / UPPER / Title /
-           rAnDoM case; 30% of name-focus rows are `code` under a random
-           qualifier.
+           rAnDoM case; 30% of name-focus rows are `code` under a
+           qualifier: a random word, a diagnostic one
+           (`DIAGNOSTIC_CODE_QUALIFIERS`, class C12) or a credential one
+           (`key otp mfa sms verification recovery invite promo coupon
+           discount api access secret`), in any case, `_`- or `-`-joined.
 suffix     main's `[A-Za-z0-9_-]*` suffix: declared (`s _id _key Key -id id
            key`), a trailing joiner or joiner run, descriptive (`_new 2 Hash
            _type _length ized ...`), random, and past the 24 bound.
@@ -52,6 +55,19 @@ authz      `authorization\\s*[:=]\\s*(bearer\\s+)?[^\\s,;]+`: a prefix, 0-2
            `\\s` characters each side of the operator, a scheme (or none, or
            one followed by a blank line), a credential or plain value,
            optionally wrapped.
+wrap       where the pair sits: bare; in prose (a word and one ASCII
+           punctuation or `str.isspace()` character on each side -- what
+           ends main's `\\b` and value class); or in each position of a URL
+           main's URL rule reads: path, query pair, query value, fragment.
+url        main's URL grammar itself (`https?://[^\\s"'<>]+`, trailing
+           `).,;` handed back, then `redact_auth_url`): userinfo (user,
+           user:password, :password), hosts (one whose port does not parse,
+           which makes main keep the URL as written), 0-3 query pairs whose
+           key is or is not in `AUTH_SECRET_QUERY_KEYS` (any case, optionally
+           percent-encoded) with a credential, plain, percent-encoded or
+           empty value, and a fragment (none, a word, a secret,
+           `access_token=` + a secret), in prose. The secrets are what main
+           removes.
 scalars    every scalar `json.dumps` emits under 37 keys (the 24 above plus
            `auth credentials authorization Authorization bearer tokens
            input_tokens max_tokens token_type Password API_KEY privateKey
@@ -65,6 +81,9 @@ spellings `json.dumps({"t": text}, ensure_ascii in (True, False), indent in
 (None, 2))` (`EjAC EjAI EjUC EjUI PjAC PjAI PjUC PjUI`); `process_output(text)`
 (`POs`); and `process_output({"t": text})` (`POd`, the dict-leaf path), whose
 result type is recorded too. A scalar row is observed on `POo`, with its type.
+A piece counts as present in an output as written or percent-decoded (a query
+value's `+` read as a space): main's URL rule re-encodes what it keeps, and
+a re-encoded secret is still there.
 
 Sampling density (`corpus(tier)`; tier 2 is tier 1 followed by the rest):
 
@@ -79,17 +98,29 @@ sep              the 992 1- and 2-character separators  the 992 x `secret`,
 pre              each of the 77 pre characters x        lead `abc` x 5 keys,
                  `password`, `token` x (`=`, `: `,      no lead x 3 more
                  ` `) x {credential, plain}: 924        keys: 3 696
+code             `code` under each of the 37 diagnostic  --
+                 and 13 credential qualifiers x (`=`,
+                 `: `) x {credential, plain}: 200
 focus:<axis>     500 per axis (pre qual name suffix     9 500 per axis:
-                 sep value bearer authz): 4 000         76 000
-mix              1 000 (every axis at once)             19 000
+                 sep value wrap bearer authz url):      95 000
+                 5 000
+mix              1 000 (every axis at once, the wrap    19 000
+                 included)
 scalar           13 scalars x 37 keys x 3 shapes:       --
                  1 443
 ===============  =====================================  ======================
 
-Tier 1 is 11 335 rows; tier 2 is 145 983. A focus row varies one axis and
-keeps the others benign (no pre, qualifier or suffix; `=` or `: `; a
+Tier 1 is 12 535 rows; tier 2 is 166 183. A focus row varies one axis and
+keeps the others benign (no pre, qualifier, suffix or wrap; `=` or `: `; a
 credential value), so a failure is attributed to one axis; mix rows vary
 them all at once (`-password hunter22x` was found only there).
+
+How it runs: tier 1 is `test_grammar_differential_never_worse_than_main_
+except_by_stated_class` in the default suite. Tier 2 is
+`test_grammar_differential_full_set`, marked `slow`: `pytest
+tests/test_redaction.py -m slow` (about 2-3 minutes). `addopts` excludes
+`slow` by default, so CI -- which runs `pytest tests/` with `addopts` --
+does NOT run it.
 
 This module is stdlib-only and imports nothing from `pmcp`: the fixture is
 recorded by running it against `main`'s tree.
@@ -103,6 +134,7 @@ import random
 import re
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import unquote
 
 # ---------------------------------------------------------------- alphabets
 
@@ -217,7 +249,92 @@ BEARER_PRE = (
     "X-Api-Token: ",
     "auth: ",
 )
-FOCI = ("pre", "qual", "name", "suffix", "sep", "value")
+FOCI = ("pre", "qual", "name", "suffix", "sep", "value", "wrap")
+#: main's `AUTH_SECRET_QUERY_KEYS`: the query keys `redact_auth_url` redacts
+#: (after `parse_qsl` decodes them, case-insensitively).
+MAIN_QUERY_KEYS = (
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "auth_code",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "code",
+    "id_token",
+    "assertion",
+    "key",
+    "password",
+    "refresh_token",
+    "saml",
+    "secret",
+    "session",
+    "sid",
+    "ticket",
+    "token",
+    "jwt",
+)
+#: The stated diagnostic class (C12): `code` under one of these qualifiers
+#: (its last `_`/`-` segment) names a status or a descriptive code and keeps
+#: its value. Pinned equal to `pmcp.auth._STATUS_CODE_QUALIFIERS` by a test.
+DIAGNOSTIC_CODE_QUALIFIERS = frozenset(
+    {
+        "area",
+        "byte",
+        "char",
+        "color",
+        "colour",
+        "country",
+        "currency",
+        "err",
+        "errno",
+        "error",
+        "event",
+        "exception",
+        "exit",
+        "fault",
+        "http",
+        "iso",
+        "item",
+        "lang",
+        "language",
+        "locale",
+        "op",
+        "opcode",
+        "postal",
+        "product",
+        "rc",
+        "reason",
+        "region",
+        "response",
+        "result",
+        "ret",
+        "return",
+        "sku",
+        "source",
+        "sqlstate",
+        "state",
+        "status",
+        "zip",
+    }
+)
+#: Qualifiers under which `code` names a credential or a redeemable value.
+CREDENTIAL_CODE_QUALIFIERS = (
+    "key",
+    "otp",
+    "mfa",
+    "sms",
+    "verification",
+    "recovery",
+    "invite",
+    "promo",
+    "coupon",
+    "discount",
+    "api",
+    "access",
+    "secret",
+)
 EXHAUSTIVE_KEYS = ("password", "token", "secret", "api_key", "session")
 
 Row = dict[str, Any]
@@ -364,7 +481,130 @@ def _sample_value(rng: random.Random, focus: bool) -> tuple[str, str]:
 
 
 def _text(f: dict[str, str]) -> str:
-    return f"{f['pre']}{f['qual']}{f['name']}{f['suffix']}{f['sep']}{f['value']}"
+    return (
+        f"{f.get('left', '')}{f['pre']}{f['qual']}{f['name']}{f['suffix']}"
+        f"{f['sep']}{f['value']}{f.get('right', '')}"
+    )
+
+
+def _pct(rng: random.Random, text: str) -> str:
+    """Percent-encode one to three characters of ``text`` (as `parse_qsl`
+    decodes it)."""
+    chars = list(text)
+    for i in rng.sample(range(len(chars)), min(len(chars), rng.randint(1, 3))):
+        chars[i] = "%{:02X}".format(ord(chars[i]))
+    return "".join(chars)
+
+
+_URL_BASE = ("https://h.example", "http://h.example:8443", "https://127.0.0.1")
+
+
+def _sample_wrap(rng: random.Random, focus: bool) -> tuple[str, str, str]:
+    """Where the pair sits: bare, in prose (a word and a delimiter each side:
+    what ends main's `\\b` and value class), or in each position of a URL
+    main's URL rule reads (path, query pair, query value, fragment)."""
+    if not focus:
+        return "none", "", ""
+    kind = rng.choice(
+        [
+            "none",
+            "none",
+            "prose",
+            "prose",
+            "url-path",
+            "url-query-pair",
+            "url-query-value",
+        ]
+        + ["url-fragment"]
+    )
+    if kind == "none":  # so the mix block keeps unwrapped pairs too
+        return kind, "", ""
+    base = rng.choice(_URL_BASE)
+    if kind == "prose":
+        left = rng.choice(["", "abc", "error:", "log"]) + rng.choice(
+            ASCII_PUNCT + SPACES
+        )
+        right = rng.choice(ASCII_PUNCT + SPACES) + rng.choice(["", "tail", "x=1"])
+    elif kind == "url-path":
+        left, right = base + "/p/", rng.choice(["", "/v1", "?q=1"])
+    elif kind == "url-query-pair":
+        left = base + "/?" + rng.choice(["", "x=1&"])
+        right = rng.choice(["", "&y=2", "#f"])
+    elif kind == "url-query-value":
+        left, right = base + "/?q=", rng.choice(["", "&y=2"])
+    else:
+        left, right = base + "/#", ""
+    return kind, left, right
+
+
+def _url_row(rng: random.Random) -> Row:
+    """A URL from main's URL grammar (`https?://[^\\s"'<>]+`, trailing `).,;`
+    handed back, then `redact_auth_url`): userinfo (dropped), a host (one
+    whose port does not parse makes main keep the URL as written), query
+    pairs whose key is or is not in `AUTH_SECRET_QUERY_KEYS` (any case,
+    optionally percent-encoded) with a credential, plain, percent-encoded or
+    empty value, and a fragment (dropped). The pieces are what main removes:
+    userinfo passwords, values under a secret key, fragment secrets -- one
+    per secret, so at most five."""
+    secrets: list[str] = []
+
+    def secret(value: str) -> str:
+        secrets.append(value)
+        return value
+
+    kinds = []
+    ui = rng.choice(["none", "user", "user-pass", "pass-only"])
+    userinfo = {"none": "", "user": "user@"}.get(ui) or (
+        ("user:" if ui == "user-pass" else ":") + secret(cred(rng)) + "@"
+    )
+    if ui != "none":
+        kinds.append("userinfo")
+    host = rng.choice(
+        ["h.example", "h.example:8443", "127.0.0.1", "[::1]", "h.example:99999"]
+    )
+    path = rng.choice(["", "/", "/v1/items", "/cb"])
+    pairs = []
+    for _ in range(rng.randint(0, 3)):
+        key_kind = rng.choice(["secret", "secret", "secret-encoded", "other"])
+        if key_kind == "other":
+            key = rng.choice(["q", "page", "access", "next", "redirect", "u"])
+        else:
+            key = recase(rng, rng.choice(MAIN_QUERY_KEYS))
+            if key_kind == "secret-encoded":
+                key = _pct(rng, key)
+        value_kind = rng.choice(["cred", "plain", "encoded", "empty"])
+        value = {
+            "cred": cred(rng),
+            # a non-secret key's plain value never repeats a secret's word,
+            # or a kept `redirect=Basic` would read as a kept secret `Basic`
+            "plain": rng.choice(
+                PLAIN_WORDS if key_kind != "other" else ("home", "en", "2")
+            ),
+            "encoded": _pct(rng, cred(rng)),
+            "empty": "",
+        }[value_kind]
+        if key_kind != "other" and value:
+            secret(value)
+        kinds.append(f"query-{key_kind}-{value_kind}")
+        pairs.append(f"{key}={value}")
+    query = ("?" + "&".join(pairs)) if pairs else rng.choice(["", "?"])
+    fragment = rng.choice(["", "#top", "#access_token=", "#"])
+    if fragment in ("#access_token=", "#"):
+        fragment += secret(cred(rng))
+        kinds.append("fragment")
+    left = rng.choice(["", "GET ", "see ", "(", '"', "url="])
+    right = rng.choice(["", ".", ")", ",", ";", " failed", '"'])
+    text = f"{left}{rng.choice(['http', 'https'])}://{userinfo}{host}{path}{query}{fragment}{right}"
+    return {
+        "block": "focus:url",
+        "bucket": "url",
+        "kinds": kinds,
+        "f": None,
+        "t": text,
+        "value": " ".join(secrets),
+        # one piece per secret: the longest run of an encoded one
+        "pieces": [max(PIECE_RE.findall(v) or [v], key=len) for v in secrets],
+    }
 
 
 def _text_row(rng: random.Random, focus: str | None, block: str) -> Row:
@@ -373,14 +613,25 @@ def _text_row(rng: random.Random, focus: str | None, block: str) -> Row:
     name_k = "case" if focus == "name" else "lower"
     name = rng.choice(KEYS)
     if focus == "name" and rng.random() < 0.3:
-        name_k, name = "code-qualified", "code"
-        qual = ident_run(rng, 2, 10, False) + "_"
+        name = "code"
+        name_k = rng.choice(["code-qualified", "code-diagnostic", "code-credential"])
+        if name_k == "code-diagnostic":
+            word = rng.choice(sorted(DIAGNOSTIC_CODE_QUALIFIERS))
+        elif name_k == "code-credential":
+            word = rng.choice(CREDENTIAL_CODE_QUALIFIERS)
+        else:
+            word = ident_run(rng, 2, 10, False)
+        qual = recase(rng, word, rng.choice(["lower", "upper", "title"])) + rng.choice(
+            "_-"
+        )
     if focus == "name" and name_k == "case":
         name = recase(rng, name)
     suf_k, suffix = _sample_suffix(rng, focus == "suffix")
     sep_k, sep = _sample_sep(rng, focus == "sep")
     val_k, value = _sample_value(rng, focus == "value")
+    wrap_k, left, right = _sample_wrap(rng, focus == "wrap")
     kinds = {
+        "wrap": wrap_k,
         "pre": pre_k,
         "qual": qual_k,
         "name": name_k,
@@ -395,6 +646,8 @@ def _text_row(rng: random.Random, focus: str | None, block: str) -> Row:
         "suffix": suffix,
         "sep": sep,
         "value": value,
+        "left": left,
+        "right": right,
     }
     bucket = f"{focus}:{kinds[focus]}" if focus in kinds else block
     return {"block": block, "bucket": bucket, "f": f, "t": _text(f), "value": value}
@@ -403,7 +656,9 @@ def _text_row(rng: random.Random, focus: str | None, block: str) -> Row:
 def _mix_row(rng: random.Random) -> Row:
     row = _text_row(rng, None, "mix")
     for focus in FOCI:
-        row["f"][focus] = _text_row(rng, focus, "mix")["f"][focus]
+        other = _text_row(rng, focus, "mix")["f"]
+        for part in ("left", "right") if focus == "wrap" else (focus,):
+            row["f"][part] = other[part]
     row["t"] = _text(row["f"])
     row["value"] = row["f"]["value"]
     row["bucket"] = "mix"
@@ -507,6 +762,21 @@ def _pre_rows(
     ]
 
 
+def _code_rows(rng: random.Random) -> list[Row]:
+    """`code` under every diagnostic and every credential qualifier, with a
+    credential and a plain value, after `=` and `: `."""
+    return [
+        _fixed_row("code", f"code:{kind}", v, qual=word + "_", name="code", sep=sep)
+        for kind, words in (
+            ("diagnostic", sorted(DIAGNOSTIC_CODE_QUALIFIERS)),
+            ("credential", CREDENTIAL_CODE_QUALIFIERS),
+        )
+        for word in words
+        for sep in ("=", ": ")
+        for v in (cred(rng), rng.choice(PLAIN_WORDS))
+    ]
+
+
 def _scalar_rows() -> list[Row]:
     rows = []
     for sname, s in SCALARS.items():
@@ -536,13 +806,14 @@ def _focus_rows(rng: random.Random, per_axis: int) -> list[Row]:
         rows += [_text_row(rng, focus, f"focus:{focus}") for _ in range(per_axis)]
     rows += [_bearer_row(rng) for _ in range(per_axis)]
     rows += [_authz_row(rng) for _ in range(per_axis)]
+    rows += [_url_row(rng) for _ in range(per_axis)]
     return rows
 
 
 PAIRS = list(SEP_ALPHABET) + [a + b for a in SEP_ALPHABET for b in SEP_ALPHABET]
 BLOCKS = (
-    ("sep", "pre")
-    + tuple(f"focus:{f}" for f in (*FOCI, "bearer", "authz"))
+    ("sep", "pre", "code")
+    + tuple(f"focus:{f}" for f in (*FOCI, "bearer", "authz", "url"))
     + ("mix", "scalar")
 )
 
@@ -552,6 +823,7 @@ def corpus(tier: int) -> list[Row]:
     rng = random.Random(2026_09_26)
     rows = _sep_rows(rng, PAIRS, ("password", "token"))
     rows += _pre_rows(rng, ("",), ("password", "token"))
+    rows += _code_rows(rng)
     rows += _focus_rows(rng, 500)
     rows += [_mix_row(rng) for _ in range(1000)]
     rows += _scalar_rows()
@@ -609,6 +881,8 @@ BIG = 10**7
 
 
 def pieces(row: Row) -> list[str]:
+    if "pieces" in row:
+        return list(row["pieces"])
     return PIECE_RE.findall(row["value"]) if row["value"] else []
 
 
@@ -619,14 +893,23 @@ def observe(
     process_output: Callable[[object], object],
 ) -> str:
     """What survives on each surface, as one base-32 digit per surface (bit i:
-    piece i is still in the output) and a final type letter for the dict
+    piece i is still in the output, as written or percent-decoded -- main's
+    URL rule re-encodes what it keeps, which is not a removal) and a final type letter for the dict
     path (`d` dict, `s` str). A piece's spelling is the same on every surface:
     nothing in `PIECE_RE`'s alphabet is escaped by `json.dumps`."""
     ps = pieces(row)
     assert len(ps) <= 5, ps
 
     def mask(out: str) -> str:
-        return _DIGITS32[sum(1 << i for i, p in enumerate(ps) if p in out)]
+        decoded = unquote(out)
+        return _DIGITS32[
+            sum(
+                1 << i
+                for i, p in enumerate(ps)
+                # a query value's `+` is a space once decoded
+                if p in out or p in decoded or p.replace("+", " ") in decoded
+            )
+        ]
 
     def po(obj: object) -> tuple[str, str]:
         r = process_output(obj)
@@ -775,6 +1058,7 @@ CLASSES = {
     "N6b": "a quoted value on a serialised surface is JSON inside a leaf (Consiliency/pmcp#290)",
     "C10": "a weak key keeps a plain word or number; `code` under a non-OAuth qualifier keeps any non-credential-shaped value (N8's gate)",
     "C11": "`Authorization`/`Bearer` followed by a plain word, bare or wrapped in quotes or brackets, is prose",
+    "C12": "a `code` key qualified by a diagnostic or descriptive word (`DIAGNOSTIC_CODE_QUALIFIERS`, the qualifier's last segment) keeps its value (`error_code=E_TIMEOUT_42`, `sqlstate_code=42P01`)",
 }
 
 
@@ -782,6 +1066,7 @@ def accepted(f: dict[str, str], surface: str) -> str | None:
     """The accepted class of a (row, surface) this redactor is worse on than
     main, or None: a defect."""
     pre, qual, name, suffix = f["pre"], f["qual"], f["name"], f["suffix"]
+    pre = f.get("left", "") + pre  # the wrap's text before the pair
     glue_m = re.search(r"[A-Za-z0-9]*$", pre)
     full_qual = (glue_m.group(0) if glue_m else "") + qual
     sep, value = f["sep"], f["value"]
@@ -797,12 +1082,17 @@ def accepted(f: dict[str, str], surface: str) -> str | None:
         return "N3"
     if re.search(r"\b[au]rn:[^\s\"'<>]*$", pre, re.IGNORECASE):
         return "N10"
+    if lname == "code" and re.split(r"[_-]", full_qual.strip("_-").lower())[-1] in (
+        DIAGNOSTIC_CODE_QUALIFIERS
+    ):
+        return "C12"
     if sep.isspace():
         if lname == "code":
             return "C3a"
         if not cred:
             return "C3"
-        if re.match(r"[A-Za-z_-]+=[^=]", value):
+        # the value as written runs on into the wrap (`x=1`, `=tail`)
+        if re.match(r"[A-Za-z_-]+=[^=]", value + f.get("right", "")):
             return "N11"
         if glued and not _single_case(key) and not _acronym_title(key):
             return "N4"

@@ -3854,3 +3854,25 @@ APPLIED first). Final run, all 35 rows:
   it is security-sensitive and the prose/credential corpora must both stay
   green while SECURITY.md is updated; the mutation table must be re-run on the
   implementer's tree, not trusted from this plan.
+
+## Rev 10 addendum: the stated class C12 (diagnostic `code` qualifiers)
+
+A `code` key qualified by a diagnostic or descriptive word keeps its value
+(`error_code=E_TIMEOUT_42`, `sqlstate_code=42P01`, `zip_code=94105`). The
+class is decided from the key's qualifier alone: the qualifier's last `_`/`-`
+segment, case-folded, is in this set, which is `pmcp.auth._STATUS_CODE_QUALIFIERS`
+and `tests/_redaction_grammar.py::DIAGNOSTIC_CODE_QUALIFIERS` (a test pins the
+two equal):
+
+`area byte char color colour country currency err errno error event exception
+exit fault http iso item lang language locale op opcode postal product rc
+reason region response result ret return sku source sqlstate state status zip`
+
+Nothing in it names a credential or a redeemable value: `key`, `promo`,
+`coupon` and `discount` were removed, so `key_code=`, `promo_code=`,
+`coupon_code=` and `discount_code=` are weak keys and a credential-shaped
+value under them is redacted, as on main. Every other qualifier (`otp_code=`,
+`mfa_code=`, an unknown word) is a weak key too (class C10 keeps its
+non-credential-shaped values). The grammar corpus draws `code` under every
+qualifier in the set and under 13 credential qualifiers, exhaustively (the
+`code` block) and in the name-focus and mix rows.

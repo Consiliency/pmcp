@@ -11,6 +11,12 @@ corpora and ranks them equally: `PROSE` must survive byte-identical, and every
 Both surfaces are covered -- `sanitize_auth_diagnostic` (the engine, used
 directly by the client manager, the CLI and the doctor) and
 `PolicyManager.redact_secrets` (the engine plus the operator's patterns).
+
+The never-worse-than-main differential is grammar-derived
+(`tests/_redaction_grammar.py`). Its tier 1 runs in the default suite; its
+full set is marked `slow` and runs only on request (`pytest
+tests/test_redaction.py -m slow`, about 2-3 minutes). `addopts` excludes
+`slow`, so CI (`pytest tests/`) does not run it.
 """
 
 from __future__ import annotations
@@ -1699,7 +1705,7 @@ def _grammar_differential(
 
 
 def test_grammar_differential_never_worse_than_main_except_by_stated_class() -> None:
-    """Tier 1 (11 335 rows x 12 surfaces, plus the result type of every
+    """Tier 1 (12 535 rows x 12 surfaces, plus the result type of every
     dict): every piece of the value main removed on a surface is removed here
     too, and every dict main kept stays a dict, unless the (row, surface) is
     in a stated class. The oracle is main's recorded output over exactly this
@@ -1707,7 +1713,7 @@ def test_grammar_differential_never_worse_than_main_except_by_stated_class() -> 
     rows = G.corpus(1)
     oracle = _main_oracle()
     assert oracle["grammar_fingerprint"]["1"] == G.fingerprint(rows)
-    assert len(rows) == 11_335 and len(oracle["grammar"]) == 145_983
+    assert len(rows) == 12_535 and len(oracle["grammar"]) == 166_183
     counts, bugs, controls = _grammar_differential(rows, oracle["grammar"][: len(rows)])
     assert bugs == [], f"{len(bugs)} unaccepted:\n" + "\n".join(bugs[:25])
     text_rows = sum(1 for row in rows if row["value"])
@@ -1720,13 +1726,13 @@ def test_grammar_differential_never_worse_than_main_except_by_stated_class() -> 
 @pytest.mark.slow
 @pytest.mark.parametrize("block", G.BLOCKS)
 def test_grammar_differential_full_set(block: str) -> None:
-    """Tier 2, the full set (145 983 rows), one block per case so a failure
+    """Tier 2, the full set (166 183 rows), one block per case so a failure
     is attributed to an axis and each case stays well inside the per-test
     timeout."""
     rows = G.corpus(2)
     oracle = _main_oracle()
     assert oracle["grammar_fingerprint"]["2"] == G.fingerprint(rows)
-    assert len(rows) == len(oracle["grammar"]) == 145_983
+    assert len(rows) == len(oracle["grammar"]) == 166_183
     picked = [(r, c) for r, c in zip(rows, oracle["grammar"]) if r["block"] == block]
     assert picked, block
     counts, bugs, controls = _grammar_differential(
@@ -1776,10 +1782,28 @@ def test_the_grammar_corpus_covers_every_axis() -> None:
     ):
         assert escape in dumped, escape
     buckets = {row["bucket"] for row in rows}
+    # `code` under every diagnostic and credential qualifier, both values
+    code_quals = {row["f"]["qual"][:-1] for row in by_block["code"]}
+    diagnostic = set(G.DIAGNOSTIC_CODE_QUALIFIERS)
+    assert code_quals == diagnostic | set(G.CREDENTIAL_CODE_QUALIFIERS)
+    assert not set(G.CREDENTIAL_CODE_QUALIFIERS) & diagnostic
+    # every part of main's URL grammar
+    url_kinds = {k for row in by_block["focus:url"] for k in row["kinds"]}
+    for key_kind in ("secret", "secret-encoded", "other"):
+        for value_kind in ("cred", "plain", "encoded", "empty"):
+            assert f"query-{key_kind}-{value_kind}" in url_kinds, (key_kind, value_kind)
+    assert {"userinfo", "fragment"} <= url_kinds
+    urls = " ".join(row["t"] for row in by_block["focus:url"])
+    assert (
+        ":99999" in urls and "[::1]" in urls and "://:" in urls and "://user:" in urls
+    )
     for kinds in (
         [f"pre:{c}" for c in G.PRE_CHARS],
         ["qual:joined", "qual:glued", "qual:glued-long", "qual:leading-joiner"],
         ["qual:multi-segment", "name:case", "name:code-qualified"],
+        ["name:code-diagnostic", "name:code-credential", "wrap:none", "wrap:prose"],
+        ["wrap:url-path", "wrap:url-query-pair", "wrap:url-query-value"],
+        ["wrap:url-fragment", "code:diagnostic", "code:credential"],
         ["suffix:declared", "suffix:trailing-joiner", "suffix:descriptive"],
         ["suffix:random", "suffix:long"],
         ["sep:line-break", "sep:operator-run", "sep:whitespace-only", "sep:mixed"],
@@ -2928,12 +2952,17 @@ def test_n6_n7_a_wrapped_bearer_or_authorization_value(
         "recovery_code",
         "sms_code",
         "invite_code",
+        # a key or a redeemable value is not a status
+        "key_code",
+        "promo_code",
+        "coupon_code",
+        "discount_code",
     ],
 )
 def test_n8_code_under_a_non_status_qualifier_is_a_weak_key(key: str) -> None:
-    """N8: `code` under a qualifier that is not a status name redacts a
+    """N8: `code` under a qualifier that is not a diagnostic word redacts a
     credential-shaped value, as main did; plain words and numbers are kept
-    (a weak key), and a status qualifier keeps its value."""
+    (a weak key), and a diagnostic qualifier keeps its value (class C12)."""
     _gone(f"{key}=abc123def456", "abc123def456")
     _gone(f'{{"{key}": "abc123def456"}}', "abc123def456")
     for kept in (
@@ -2998,6 +3027,34 @@ def test_n4b_an_acronym_glued_to_a_titlecase_key(text: str) -> None:
     for kept in ("Ed25519PrivateKey X509Cert", "RSAPrivateKey Rsa2048Key"):
         for surface, out in _both(kept):
             assert out == kept, (surface, out)
+
+
+def test_n8_the_diagnostic_qualifiers_are_the_stated_class() -> None:
+    """The qualifiers under which `code` keeps its value are exactly the ones
+    the differential's class C12 states, and none names a credential."""
+    from pmcp.auth import _STATUS_CODE_QUALIFIERS
+
+    assert set(_STATUS_CODE_QUALIFIERS) == set(G.DIAGNOSTIC_CODE_QUALIFIERS)
+    assert not set(G.CREDENTIAL_CODE_QUALIFIERS) & set(_STATUS_CODE_QUALIFIERS)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'see https://:v1OW9iGwM@h.example:99999?SID=%69wX2caGkT7Xjb8Ll"',
+        'https://h.example/?token=abc123def456"',
+        'url https://h.example/?q=1&sid=hunter22x" more',
+    ],
+)
+def test_a_url_never_ends_on_the_backslash_of_an_escaped_quote(text: str) -> None:
+    """In a serialised leaf a URL runs up to the `\\` of the closing `\\"`; a
+    query-value span that ate it broke the JSON, and the dict came back as a
+    string (the URL axis found it; main kept such a URL when its port did not
+    parse)."""
+    result = _process({"t": text})
+    assert isinstance(result, dict), result
+    for surface, out in _both(json.dumps({"t": text})):
+        json.loads(out)
 
 
 #: The false positives each rev-9 narrowing was written for (the rev-10

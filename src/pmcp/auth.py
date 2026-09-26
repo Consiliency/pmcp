@@ -367,7 +367,10 @@ _CODE_QUALIFIERS = frozenset({"", "auth", "authorization", "oauth", "device", "u
 #: (`otp_code=`, `mfa_code=`, `verification_code=`, `recovery_code=`) it is
 #: a weak key: a credential-shaped value is redacted, as main redacted it.
 #: An unknown qualifier therefore fails closed. Matched against the
-#: qualifier's last `_`/`-` segment.
+#: qualifier's last `_`/`-` segment. Nothing here names a credential or a
+#: redeemable value: `key_code`, `promo_code`, `coupon_code` and
+#: `discount_code` are weak keys (tests/_redaction_grammar.py states this set
+#: as an accepted class and a test pins the two equal).
 _STATUS_CODE_QUALIFIERS = frozenset(
     {
         "status",
@@ -391,7 +394,6 @@ _STATUS_CODE_QUALIFIERS = frozenset(
         "event",
         "op",
         "opcode",
-        "key",
         "char",
         "byte",
         "source",
@@ -400,9 +402,6 @@ _STATUS_CODE_QUALIFIERS = frozenset(
         "product",
         "item",
         "sku",
-        "promo",
-        "discount",
-        "coupon",
         "sqlstate",
         "state",
         "exception",
@@ -959,7 +958,10 @@ def _url_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
     spans: list[Span] = []
     for match in _URL_RE.finditer(text):
         raw_url = match.group(0)
-        while raw_url and raw_url[-1] in ").,;":
+        # Trailing sentence punctuation is handed back, and so is a trailing
+        # backslash: in a serialised leaf it escapes the closing quote
+        # (`…?sid=x\\"`), and a query-value span that ate it broke the JSON.
+        while raw_url and raw_url[-1] in ").,;\\":
             raw_url = raw_url[:-1]
         spans.extend(_url_component_spans(match.start(), raw_url, depth, covers))
     return spans
