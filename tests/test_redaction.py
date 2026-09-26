@@ -1618,9 +1618,12 @@ def _differential_corpus() -> list[tuple[str, str, str, str, str]]:
 
 
 def _main_oracle() -> dict[str, list]:
-    """`main` @ 860636a's removals: per string-corpus row the token pieces its
-    engine and policy removed; per dict-corpus row the pieces `process_output`
-    removed from the serialised result."""
+    """`main`'s recorded behaviour (auth.py/policy.py unchanged from 860636a to
+    9ca081e): per string-corpus row the token pieces its engine and policy
+    removed (`string`); per dict-corpus row the pieces `process_output`
+    removed from the serialised result (`dict`) and the result's type
+    (`dict_types`); per fuzz object the `process_output` result type
+    (`fuzz_types`)."""
     blob = (
         Path(__file__).parent / "fixtures" / "redaction_main_oracle.b64"
     ).read_text()
