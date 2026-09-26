@@ -1,15 +1,15 @@
 # Detailed plan: derive gateway `inputSchema`s from their argument models, then forbid unknown keys
 
 > **Revision 2 (2026-09-26): A1/A2/A3/X1 from the board.** Piece A is now
-> *embedded*, not described: the four code blocks under *Verbatim bodies → A*
-> (`schema.py` and the test module as whole files, `types.py` and `handlers.py`
-> as `git apply` patches against `origin/main` @ `9ca081e`) plus the generated
-> snapshot are byte-identical to the frozen, verified piece-A code
-> (`wip/236-schema-drift-rev2-code` @ `d0722f4`, parent `72eaa76`). Proven by applying them to a
-> fresh `origin/main` worktree and running `cmp` on all five files (see
-> *Embedding proof*). The five files, and `server.py`, are byte-identical
-> between `860636a`, `8dec131` and `9ca081e`, so every "HEAD" measurement
-> below still describes `main`. What changed:
+> *embedded*, not described: the five code blocks under *Verbatim bodies → A*
+> (`schema.py` and the test module as whole files; `types.py`, `handlers.py`
+> and `server.py` as `git apply` patches against `origin/main` @ `9ca081e`)
+> plus the generated snapshot are byte-identical to the frozen, verified
+> piece-A code (`wip/236-schema-drift-rev2-code` @ `40b2ed5`; ancestors
+> `d0722f4`, `72eaa76`). Proven by applying them to a fresh `origin/main`
+> worktree and running `cmp` on all six files (see *Embedding proof*). The six
+> files are byte-identical between `860636a`, `8dec131` and `9ca081e`, so
+> every "HEAD" measurement below still describes `main`. What changed:
 > - **A1 (blocking):** `_collapse_nullable` now adds `"null"` to the collapsed
 >   `type` (and `None` to `enum`), so the gate accepts explicit `null` exactly
 >   where the model does. Pinned per field by
@@ -20,18 +20,31 @@
 >   (`@functools.cache _derived_gateway_tools`), pinned by call count in
 >   `test_schemas_are_derived_once_per_process`.
 > - **A3:** the scoped-audit gap on gate rejections is attributed correctly: it
->   pre-exists on `main`, A moves more rejections onto it, B adds more. It is
->   scoped out with a named follow-up (*Scoped-audit gap on gate rejections*).
-> - **X1 (blocking for B):** `test_every_dispatched_gateway_name_is_registered`
->   pins dispatch == registry both ways. B depends on it.
+>   pre-exists on `main`, A moves more rejections onto it, B adds more.
+>   Scoped out to **Consiliency/pmcp#296**, which lands before B. Under A, a
+>   malformed call to a policy-blocked tool is no longer recorded as `denied`
+>   (measured).
+> - **X1 (blocking for B), now structural (`40b2ed5`):** `call_tool` raises
+>   `Unknown tool` for any name the registry does not list, *before* the
+>   dispatch chain and inside the audited path
+>   (`test_a_dispatch_branch_for_an_unregistered_name_fails_closed`, mutant
+>   M-X1s). The text pin `test_every_dispatched_gateway_name_is_registered`
+>   stays as a second line of defence. The board showed it can be bypassed on
+>   its own. B depends on the guard.
+> - **Board round 2 (`28ae22d`) findings F1–F5 folded in:** lax-coercion
+>   disagreement (F1, 11 new `invoke.task` rejections under A, in
+>   *A is not fully behaviour-neutral* and A's CHANGELOG); X1 structural (F2);
+>   the gate-*passing* pydantic echo path (F3, in *Order: A first, then B*);
+>   host dialect support for `type: [X, "null"]` named as an unmeasured risk
+>   (F4); A3 filed and the policy-blocked consequence measured (F5).
 > - The "jsonschema echoes only the key" claim is corrected: `type`, `enum` and
 >   `pattern` errors echo the value (measured on `main`).
 > - X2: the handler-link test already used a word-boundary regex in the frozen
 >   code.
-> - Counts re-measured on the frozen code: 208 schema tests (on both
->   `72eaa76` and `d0722f4`). Full suite `4272 passed, 3 skipped, 25
->   deselected` (measured by this planner on `72eaa76`, and by the coordinator
->   on `d0722f4`). The `d0722f4` run also hit 1 teardown error in
+> - Counts re-measured on the frozen code: **209** schema tests at `40b2ed5`
+>   (208 at `72eaa76`/`d0722f4`). Full suite at `40b2ed5`: `4273 passed, 3 skipped, 25 deselected` in 6:59, with no errors (measured here, and by the coordinator).
+>   Earlier: `4272 passed, 3 skipped, 25 deselected` (measured by this planner
+>   on `72eaa76`, and by the coordinator on `d0722f4`). The `d0722f4` run also hit 1 teardown error in
 >   `test_workflow_guards`, because the host's live gateway restarted a
 >   firecrawl child mid-run. That is environmental: the file passes 194/194 on
 >   this tree and on `main`. Snapshot 811 lines. Probe reports 23/26 tools
@@ -229,9 +242,20 @@ function only summarises *downstream* tools' schemas for `gateway.describe`
 (post-A `handlers.py:692`, called at `:1381`). No in-repo code reads a gateway
 tool's property `type` (grep of `src/pmcp`: the only consumers of
 `get_gateway_tool_definitions()` are `server.py:266` (`tools/list`) and `:277`
-(the gate)). How external MCP clients handle a `type` array is **unmeasured**.
-It is valid JSON Schema (Draft 2020-12 `check_schema` passes for all 26), but
-this plan has not tested any specific client with it.
+(the gate)). It is valid JSON Schema: Draft 2020-12 `check_schema` passes for
+all 26. The board's claude seat confirmed that the MCP SDK ships the schemas
+unchanged over `tools/list`; for example, `refresh.source` goes out as
+`{"enum": ["claude_config","custom",null], "type": ["string","null"]}`.
+
+**Named risk (F4), unmeasured: MCP-host dialect support for `type: [X,
+"null"]` and for `null` inside `enum`.** Some hosts translate a tool's
+`inputSchema` into a function-calling schema that is an OpenAPI subset.
+Older Gemini function declarations are the example the board named, and
+historically they have rejected type arrays and `null` in `enum`. Such a host
+could refuse the whole tool list or drop tools. This plan has measured no
+host. **Before releasing A,** run one `tools/list` smoke test from each
+host family the fleet drives the gateway from (at least a Gemini host), and
+check that all 26 gateway tools load and one `null`-bearing call works.
 
 **Irreducible residue** — "advertised == model" means "advertised == the
 model's *JSON-Schema projection*". Three things the models enforce are not
@@ -337,6 +361,34 @@ not exist (`SearchRegistryInput` has only `query` and `limit`). The nearest
 field, `request_capability.available_clis`, is one of the 28 that `main`
 rejected.
 
+**A also *tightens* the gate on lax-coercible values (board F1).** In lax mode
+pydantic coerces `1`/`0`/`"true"` to a boolean and `"5"`/`True` to a number;
+jsonschema does not. Where the gate and the model both type a field, the gate
+is therefore **stricter** than the model. The board's claude seat ran a
+7,655-case differential corpus through the real `_handle_call_tool` and found
+**54** "gate rejects, model accepts" cases under A. **43** of them were
+already rejected on `main`, because the hand-written schema had the same
+types. **11 are new under A**, all on the newly advertised `invoke.task.*`
+sub-fields, which `main` passed through undeclared. The 11 are reproduced
+here with `probe_coerce.py` (`main`: 0 of the 11 rejected; A: 11 of 11):
+
+```text
+task.enabled=1          A gate: 1 is not of type 'boolean'
+task.enabled=0 / 'true' A gate: … is not of type 'boolean'
+task.ttl='5'            A gate: '5' is not of type 'integer', 'null'
+task.ttl=True / False / '0005'
+task.poll_interval=True A gate: True is not of type 'number', 'null'
+task.poll_interval=False / '5' / '0005'
+```
+
+(The 54/43 totals are the seat's measurement and were not re-run here.) This
+is the safe direction: the error names the problem, and no value is silently
+changed. It is a behaviour change nonetheless, so it goes in A's CHANGELOG.
+The test module's docstring was corrected at `40b2ed5` to match: gate and
+model agree on *required* fields and on `null`, not on type *coercion*. Lax
+coercion is the fourth residue class, alongside the three validator-only
+constraints.
+
 ## Order: A first, then B — why
 
 - A is mergeable on its own and is behaviour-preserving at the model layer; B is
@@ -383,8 +435,33 @@ rejected.
   - **For X1:** the protection holds only when the gate *runs*. For a
     dispatched name absent from the registry, `_find_gateway_tool` returns
     `None`, the gate is skipped, and under B pydantic's `extra_forbidden` (value
-    included) would reach both the response and the log. That is why X1 pins
-    dispatch == registry, and why B depends on it (*X1*).
+    included) would reach both the response and the log. That is why X1
+    closes that path structurally, and why B depends on it (*X1*).
+  - **The gate-*passing* path (board F3, pre-existing, measured).** Arguments
+    that pass the gate and are rejected by a **model-only validator** raise a
+    pydantic `ValidationError` whose string includes `input_value`. The
+    `except Exception` arm logs it (`server.py:428`, post-A `:436`) and
+    returns `str(e)[:400]` (`:458`, post-A `:466`). Measured with
+    `probe_model_echo.py`, the same on `main` and on A:
+    - the correlation-ID **charset validator** echoes the full value
+      (`run_correlation_id="Bearer sk-…"` → `echoes value = True`);
+    - the **all-or-none `model_validator`** echoes the whole argument dict as
+      `input_value`. pydantic truncates the middle but keeps the tail, so with
+      an 80-character secret in `arguments.api_key` the last **21 characters**
+      of the secret appear (`…FGHIJKLMNOPqrstuvwxyz'}}`, measured). The
+      `arguments` dict is where downstream credentials travel;
+    - under A only, `meta` with a non-dict value (accepted as a spelling of
+      `_meta` through `populate_by_name`) gives a `dict_type` error that
+      echoes the value (`echoes value = True`, and also on `main`, where
+      `meta` was likewise accepted by the model).
+
+    **What B changes here:** only the `meta` case. B removes
+    `populate_by_name`, and `meta` becomes an undeclared key that the gate
+    rejects by *name* (`additionalProperties`), so its value no longer reaches
+    pydantic. The charset and all-or-none paths are **unchanged by B**. They
+    are listed under *Non-goals* with a follow-up to be filed (render pydantic
+    errors without `input_value`). B's `test_unknown_key_value_never_echoed`
+    must not be read as covering them.
 
 ## Piece A — changes
 
@@ -505,16 +582,30 @@ rejected.
   `test_schemas_are_derived_once_per_process` pins the call count (A2 row
   under *Acceptance criteria*). It deliberately measures call count, not wall
   time.
-- Nothing else in the file changes. `server.py` is untouched in A: it already
-  reads `get_gateway_tool_definitions()` for both `tools/list` and the gate.
+- Nothing else in the file changes. `server.py` already reads
+  `get_gateway_tool_definitions()` for both `tools/list` and the gate. Its
+  only change in A is the X1 guard (next section).
   The `_extract_trace_context` / `InvokeInput.model_validate` bodies are
   unchanged and move to post-A `:858-878` / `:1458` (HEAD `:1279-1299` /
   `:1879`).
 - Reason: by construction there is no hand-written schema left to drift.
 
-### `tests/test_gateway_tool_schemas.py` (add, 448 lines; whole file verbatim under *Verbatim bodies → A*)
+### `src/pmcp/server.py` (modify; `git apply` patch verbatim under *Verbatim bodies → A*, +8 / −0)
 
-**208 tests** (measured: `208 passed`, collect-only counts in brackets). The
+- In `_handle_call_tool.call_tool`, directly before the dispatch chain
+  (`if name == "gateway.catalog_search":`), insert
+  `if tool is None: raise ValueError(f"Unknown tool: {name}")` with a comment.
+  This is the structural half of X1 (see *X1* below). It runs after the
+  policy check and the scoped-invoke correlation check, so a blocked unknown
+  name is still recorded `denied`, and any other unknown name is recorded
+  `failure` by the `except Exception` arm, as before.
+- Post-A `server.py` line numbers after `:337` shift by +8 relative to `main`
+  (`Unknown tool` else-branch `:392`→`:400`, `except Exception` `:427`→`:435`).
+  Where this plan cites `server.py` lines without "post-A", they are `main`'s.
+
+### `tests/test_gateway_tool_schemas.py` (add, 484 lines; whole file verbatim under *Verbatim bodies → A*)
+
+**209 tests** at `40b2ed5` (measured: `209 passed`, collect-only counts in brackets; 208 before the X1 guard test). The
 three-link chain plus shape, snapshot, normalisation, gate, and the revision-2
 additions:
 
@@ -530,8 +621,13 @@ additions:
   validating via the registry instead of each handler) is a named non-goal.
 - `test_server_dispatch_agrees_with_registry[26]` — `None` ⇔ `method()` in
   `_handle_call_tool` source. Proves registry → dispatch only.
-- **`test_every_dispatched_gateway_name_is_registered` (X1, new)** — see *X1*
-  below. Proves dispatch ⇔ registry, both ways.
+- **`test_every_dispatched_gateway_name_is_registered` (X1 text pin, new)** —
+  see *X1* below. Lexical: proves dispatch ⇔ registry for `name == "…"`
+  branches only.
+- **`test_a_dispatch_branch_for_an_unregistered_name_fails_closed` (X1
+  structural, new at `40b2ed5`)** — see *X1*. Unregisters `gateway.health`
+  via monkeypatch and asserts its handler never runs and the response says
+  `Unknown tool: gateway.health`.
 - `test_no_argument_tools_advertise_an_empty_object[3]`
 - `test_advertised_schema_is_a_self_contained_mcp_input_schema[26]` — no
   `$ref`/`$defs`/`title` keywords, no surviving `anyOf`, every property described.
@@ -584,39 +680,68 @@ after the code above is applied (the writer is deterministic:
 in the PR. Measured: 811 lines, 0 × `additionalProperties: false`, 8 × `true`.
 The embedding proof `cmp`s the generated file against the frozen fixture.
 
-### X1 — dispatch == registry, pinned (blocking for B)
+### X1 — unregistered names fail closed inside the audited path (structural; blocking for B)
 
 `_handle_call_tool` runs the gate only for names `_find_gateway_tool` finds in
-`get_gateway_tool_definitions()` (`server.py:296-308`). A dispatch branch in
-`call_tool` for a name **not** in the registry would skip the gate and hand raw
-arguments to its handler. Under B that handler's pydantic `extra_forbidden`
-error, which carries `input_value='Bearer sk-…'`, would then be both logged
-(`:428`) and returned (`:458`). Measured on `main` and on frozen A: the
-dispatched names equal the registry (26/26) **today**, but nothing pinned it.
-The existing `test_server_dispatch_agrees_with_registry` iterates the
-*registry* and so proves only registry → dispatch.
+`get_gateway_tool_definitions()` (`server.py:296-308`). On `main`, a dispatch
+branch in `call_tool` for a name **not** in the registry would skip the gate
+and hand raw arguments to its handler. Under B that handler's pydantic
+`extra_forbidden` error, which carries `input_value='Bearer sk-…'`, would then
+be both logged and returned. Measured on `main` and on A: today the dispatched
+names equal the registry (26/26).
 
-`test_every_dispatched_gateway_name_is_registered` extracts every
-`name == "gateway.…"` literal from `inspect.getsource(GatewayServer._handle_call_tool)`
-with `\bname == "(gateway\.[a-z_]+)"`. It asserts the pattern matched (at least
-`len(TOOL_NAMES) - 1` names, so a regex that silently matches nothing cannot
-pass), then asserts `dispatched == set(TOOL_NAMES)`, reporting each direction's
-difference. Mutant M-X1: rename the `gateway.health` dispatch branch to
-`gateway.health_internal`. **Only this test** goes RED (1 failed, 207 passed).
-The older registry → dispatch test stays green, because
-`self._gateway_tools.health()` is still in the source.
+**Revision 2's first answer was a text pin, and the board showed it can be
+bypassed.** `test_every_dispatched_gateway_name_is_registered` extracts
+`\bname == "(gateway\.[a-z_]+)"` from the source of `_handle_call_tool`. The
+board's claude seat broke it with a one-line mutant,
+`elif name == "gateway.health" or name == "gateway.health2":`. The schema
+tests stayed green, `_find_gateway_tool("gateway.health2")` returned `None`,
+and the raw arguments were dispatched. A lexical pin cannot see `or`, `in`,
+`match`, or dict dispatch.
 
-**Pin, not fail closed.** The board offered two options: pin, or return an
-error early when `tool is None`. We chose pin. An early return for an unknown
-name would skip `call_tool` entirely. Today an unknown name reaches `call_tool`,
-raises `ValueError(f"Unknown tool: {name}")` (`server.py:392`), and is
-**recorded** by the `except Exception` arm (`_record_scoped_invocation(...,
-terminal_status="failure")`, `:436`). Failing closed at the gate would move
-unknown names onto the same unaudited path that A3 is about. Unknown names are
-already rejected, so the only gap was an *unregistered dispatch branch*, and
-the pin closes that at test time.
+**So X1 is now structural (`40b2ed5`, `server.py` +8).** Inside `call_tool`,
+after the policy check and the scoped-invoke correlation check, and *before*
+the dispatch chain:
 
-### Scoped-audit gap on gate rejections (A3) — attributed, scoped out
+```python
+if tool is None:
+    raise ValueError(f"Unknown tool: {name}")
+```
+
+(post-A `server.py:337-343`, with a comment). Nothing can reach a handler
+without having gone through the schema gate, whatever shape a dispatch
+condition takes. The guard raises **inside** the audited path: the
+`except Exception` arm (post-A `:435`) records the call as
+`terminal_status="failure"`, exactly as an unknown name has always been
+recorded through the old `else: raise ValueError(...)` (post-A `:400`, now
+unreachable for unregistered names). This retires revision 2's "pin, not
+fail closed" argument. That argument assumed failing closed meant an early
+return at the gate, *outside* the audited path. Failing closed inside
+`call_tool` is what the seat proposed, and it keeps the audit.
+
+- **Test:** `test_a_dispatch_branch_for_an_unregistered_name_fails_closed`.
+  It monkeypatches `srv._find_gateway_tool` to report `gateway.health` (a
+  name that *has* a dispatch branch) as unregistered, replaces the `health`
+  handler with a recorder, and calls `_handle_call_tool` with
+  `{"x": "Bearer sk-x"}`. It asserts that the handler never ran and that the
+  response contains `Unknown tool: gateway.health`.
+- **Mutant M-X1s** (guard off, `if tool is None:` → `if False:`): this test
+  fails by name (see *Acceptance criteria*). The coordinator also measured
+  the seat's own bypass (`… or name == "gateway.health2"`) against the guard:
+  the response is `Unknown tool: gateway.health2`.
+- **The text pin stays as a second line of defence.** It gives an earlier,
+  clearer failure for the common case of a branch whose name was never
+  registered. Mutant M-X1 (rename the `gateway.health` branch) is still caught
+  by the pin alone. The older `test_server_dispatch_agrees_with_registry`
+  proves only registry → dispatch.
+
+**B depends on the structural guard, not on the pin.** B's claim that an
+unknown key is rejected by name and its value never echoed holds only for
+names the gate sees. The `tool is None` guard is what guarantees that every
+name that reaches a handler was gated. B's PR must not merge unless both the
+guard and its test are present and green on B's head.
+
+### Scoped-audit gap on gate rejections (A3) — attributed, scoped out to Consiliency/pmcp#296
 
 **Attribution (revision 1 put it in B; it starts earlier).** On `main` the
 gate returns `CallToolResult(is_error=True, …)` at `server.py:300-308`
@@ -628,19 +753,39 @@ gate returns `CallToolResult(is_error=True, …)` at `server.py:300-308`
 path:** on the 18 constraint-drift tools, inputs that `main`'s gate passed and
 the *model* rejected (e.g. `describe {"tool_id": ""}`) were audited as
 `failure` inside `call_tool`. Under A the gate rejects them first, unaudited.
-(A1 moves 28 `null` cases the other way, off the unaudited path.) **B adds
-more:** every unknown-key call becomes a gate rejection.
+The board's corpus counts 544 such model→gate moves. (A1 moves 28 `null`
+cases the other way, off the unaudited path.) **B adds more:** every
+unknown-key call becomes a gate rejection.
 
-**Decision: scope out, with a named follow-up.** A does not touch `server.py`,
-and recording a *rejected, unvalidated* payload means deciding what the audit
-may store without copying raw values. That needs its own design and review.
-Named follow-up: **"Record `tools/call` gate rejections in the scoped-advisor
-audit"**. The likely shape mirrors the existing `except Exception` arm:
-`terminal_status="failure"`, `result={"error_type": "InputValidationError"}`,
+**A consequence for policy-blocked tools (board F5, measured).** Because the
+gate runs before the policy check, a *malformed* call to a *policy-blocked*
+tool was recorded as `denied` on `main` and is not recorded under A.
+`probe_blocked_audit.py` forces `is_gateway_tool_allowed` to `False` and
+captures `_record_scoped_invocation`:
+
+```text
+== main
+  describe {'tool_id': ''}: is_error=False text='{\n  "error": true,\n  "message": "Gateway tool blocked by pol' audit=['denied']
+  describe {'tool_id': 'srv::tool'}: is_error=False text='{\n  "error": true,\n  "message": "Gateway tool blocked by pol' audit=['denied']
+== A
+  describe {'tool_id': ''}: is_error=True text="Input validation error: '' should be non-empty" audit=[]
+  describe {'tool_id': 'srv::tool'}: is_error=False text='{\n  "error": true,\n  "message": "Gateway tool blocked by pol' audit=['denied']
+```
+
+So probes of blocked tools with malformed arguments drop out of the scoped
+audit under A. A gate rejection has no side effects, so the audit loses
+*attempts*, not *actions*.
+
+**Decision: scope out to Consiliency/pmcp#296, which lands before B.**
+Recording a *rejected, unvalidated* payload means deciding what the audit may
+store without copying raw values. That needs its own design and review.
+Consiliency/pmcp#296 ("Record `tools/call` gate rejections in the
+scoped-advisor audit") is filed. Its likely shape mirrors the existing
+`except Exception` arm: `terminal_status="failure"`, or `"denied"` when the
+tool is policy-blocked, `result={"error_type": "InputValidationError"}`,
 arguments passed through the audit's existing filtering, and never the
-jsonschema message (which can echo values, see above). It is to be filed on
-Consiliency/pmcp and landed **before B merges**, since B is where the unaudited
-set grows the most. Not filed by this revision.
+jsonschema message (which can echo values, see above). It must land **before B
+merges**, since B is where the unaudited set grows the most.
 
 ### `CHANGELOG.md` (modify) — `[Unreleased]` → `### Fixed`
 
@@ -657,8 +802,12 @@ those rejections now come back as an `isError` tool result reading
 the transport gate now accepts an explicit `null` for them, as the handlers
 always did; 28 optional arguments (e.g. `catalog_search.query`,
 `invoke.options`, `auth_connect.credential`) were previously rejected at the
-gate when sent as `null`. Unknown keys are still ignored in this release — see
-the following entry once B lands."
+gate when sent as `null`. The gate does not apply pydantic's lax
+coercion: values such as `1` for a boolean or `"5"` for an integer on the
+newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`),
+which were previously accepted and coerced, are now rejected with
+`Input validation error: 1 is not of type 'boolean'`. Unknown keys are still
+ignored in this release — see the following entry once B lands."
 
 Add to that entry (the description decision was resolved to (b)): "Argument
 descriptions agents already saw are unchanged, except
@@ -675,13 +824,15 @@ descriptions agents already saw are unchanged, except
 > revision-2 A. B's executor must re-measure all of them. What is known to
 > still hold, and what must change:
 >
-> - **B depends on X1.** B's security claim ("an unknown key is rejected by
->   *name*, and its value is never echoed or logged") holds only for names the
->   gate sees. `test_every_dispatched_gateway_name_is_registered` (in A) is what
->   guarantees that every dispatched name is gated. B's PR must not merge
->   unless that test is present and green on B's head. If a later change
->   removes or weakens it, `test_unknown_key_value_never_echoed` no longer
->   covers every tool.
+> - **B depends on X1's structural guard.** B's security claim ("an unknown
+>   key is rejected by *name*, and its value is never echoed or logged") holds
+>   only for names the gate sees. The `tool is None` guard in `call_tool`
+>   (in A) guarantees that no ungated name reaches a handler.
+>   `test_a_dispatch_branch_for_an_unregistered_name_fails_closed` pins it.
+>   B's PR must not merge unless the guard and that test are present and green
+>   on B's head. If a later change removes either,
+>   `test_unknown_key_value_never_echoed` no longer covers every tool.
+> - **B lands after Consiliency/pmcp#296** (A3).
 > - **Hunks still apply (checked by reading the post-A source, not by
 >   applying).** The `types.py` `GatewayArguments` / `InvokeInput` context and
 >   the `_extract_trace_context` candidate tuple (post-A `handlers.py:862-867`)
@@ -831,17 +982,19 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
   to the scoped-advisor audit. As *Scoped-audit gap on gate rejections (A3)*
   sets out, that is pre-existing on `main`, A moves the drift tools'
   model-rejections onto it, and B widens the set further. It is scoped out
-  with a named follow-up to land before B.
+  to Consiliency/pmcp#296, which lands before B.
 - **Full suite on the B tree after those four edits** (revision-1 tree,
   **not re-measured on revision 2**): 4287 passed, 0 failed, 3 skipped, 25
   deselected in 9:56 (`scratchpad/b_full.log`). The 60 tests over the
   revision-1 A were B's new parametrized cases.
-- **Full suite on the A tree (revision 2, frozen code `72eaa76`, re-measured
-  2026-09-26)**: **4272 passed, 0 failed, 3 skipped, 25 deselected** in 6:58
-  (`uv run pytest -m 'not live' -p no:cacheprovider -q` with `npm_config_cache`
-  and `npm_config_store_dir` unset). That is 45 more than revision 1's A
-  (4227), matching the schema file's growth from 163 to 208. A breaks nothing
-  in-repo.
+- **Full suite on the A tree (revision 2, frozen code `40b2ed5`, re-measured
+  2026-09-26)**: **4273 passed, 0 failed, 3 skipped, 25 deselected** in 6:59,
+  with no errors (`uv run pytest -m 'not live' -p no:cacheprovider -q` with
+  `npm_config_cache`, `npm_config_store_dir` and `pnpm_config_store_dir`
+  unset). That is 46 more than revision 1's A (4227), matching the schema
+  file's growth from 163 to 209. A breaks nothing in-repo. Earlier revision-2
+  trees: `72eaa76` and `d0722f4` gave 4272 each. The coordinator's `d0722f4`
+  run also hit 1 environmental teardown error in `test_workflow_guards`.
 - **Full suite on `860636a` (baseline, throwaway worktree
   `/mnt/HC_Volume_105438154/worktrees/pmcp-236-head`)**: 4063 passed, 1 failed —
   `tests/test_manifest.py::TestMonitorInstall::test_monitor_reads_stderr`, which
@@ -875,10 +1028,10 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
    the *only* differences must be the 23/26 `probe_head.py` list (18 constraint
    drift + 5 null-only), the 16 newly advertised properties, the 19 new
    descriptions and exactly one description change, `update_server.force`
-   (`desc_cmp.py`: `same 54 differ 1`) → **file the A3 follow-up** →
-   CHANGELOG A → PR A.
-2. B (after A merges, **and after the A3 follow-up lands**; X1's test must be
-   green on B's head): `types.py` flip + `populate_by_name` removal →
+   (`desc_cmp.py`: `same 54 differ 1`) → F4 host smoke test (before
+   release) → CHANGELOG A → PR A.
+2. B (after A merges, **and after Consiliency/pmcp#296 lands**; X1's guard
+   test must be green on B's head): `types.py` flip + `populate_by_name` removal →
    `schema.py` no-arg schema → `handlers.py` trace-context branches →
    `test_tools.py:6213` → B tests (with the B-preamble type-list fix) →
    re-measure every B number → regenerate snapshot → CHANGELOG B + callout →
@@ -890,16 +1043,16 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
 cd <worktree>
 uv sync --all-extras -p 3.10                           # fresh worktree: without it pytest is the system one
 uv run pytest tests/test_gateway_tool_schemas.py -p no:cacheprovider --cov-fail-under=0 -q
-                                                       # A: 208 passed (measured, revision 2)
+                                                       # A: 209 passed (measured at 40b2ed5)
 uv run pytest tests/test_gateway_tool_schemas.py tests/test_baseline_constraints.py \
-  -p no:cacheprovider --cov-fail-under=0 -q            # A: 245 passed (measured; baseline file alone 37, unchanged)
+  -p no:cacheprovider --cov-fail-under=0 -q            # A: 246 passed (measured at 40b2ed5; baseline file alone 37, unchanged)
 uv run pytest tests/test_tools.py -p no:cacheprovider --cov-fail-under=0 -q   # B: after the :6213 edit
 env -u npm_config_cache -u npm_config_store_dir \
   uv run pytest -m 'not live' -p no:cacheprovider -q   # full suite; run it as a background task that notifies on exit
-                                                       # A: 4272 passed, 3 skipped, 25 deselected (measured, revision 2)
-uv run ruff check src/ tests/                          # A: "All checks passed!" (measured, revision 2)
-uv run ruff format --check src/ tests/                 # A: "163 files already formatted" (measured, revision 2)
-uv run mypy src/pmcp --exclude baml_client            # CI gate (test.yml:387); A: "no issues found in 50 source files" (measured, revision 2)
+                                                       # A: 4273 passed, 3 skipped, 25 deselected (measured at 40b2ed5)
+uv run ruff check src/ tests/                          # A: "All checks passed!" (measured at 40b2ed5)
+uv run ruff format --check src/ tests/                 # A: "163 files already formatted" (measured at 40b2ed5)
+uv run mypy src/pmcp --exclude baml_client            # CI gate (test.yml:387); A: "no issues found in 50 source files" (measured at 40b2ed5)
 uv run python ~/code/pmcp/scripts/check_plan_consistency.py \
   .consiliency/plans/detailed-236-schema-drift-20260923-0915.md   # see *Consistency gate* for what it checks here
 ```
@@ -913,36 +1066,39 @@ dispatches with `()`; dispatch names must equal registry names.
 
 ## Acceptance criteria — measured this session
 
-### Piece A (tree: frozen revision-2 code `d0722f4`; 208 passed green)
+### Piece A (tree: frozen revision-2 code `40b2ed5`; 209 passed green)
 
 Re-measured 2026-09-26 in a detached worktree at `72eaa76`, after the full
 suite there had finished (the mutants edit files the suite imports). Re-run
-again at `d0722f4` after the description and walker fix: every row's
-failed/passed counts are identical. Each
+at `d0722f4` (counts identical) and **again at `40b2ed5`**, after its full
+suite finished. The counts below are the `40b2ed5` run: every row has the
+same failing tests as before, plus one more pass from the new guard test. Each
 mutation was applied by exact-string replacement asserted to match once, shown
 with `diff -u` against a saved copy, run against
 `tests/test_gateway_tool_schemas.py`, then restored with `cp` from the saved
 copy and proven by `cmp` and `git diff --quiet HEAD -- <file>`. Unmutated
-baseline: `208 passed`. All RED for the named reason:
+baseline: `209 passed`. All RED for the named reason:
 
 | # | Mutation (file:entity) | Confirmed diff | RED tests | Why it must fire |
 |---|---|---|---|---|
-| M1 | `handlers.py:_derived_gateway_tools` — HEAD's hand-written dict for `gateway.describe` (no `minLength`) (**the hand-corrupted schema**) | `-input_schema=input_schema_for(spec.input_model),` / `+input_schema=({…HEAD dict…} if spec.name == "gateway.describe" else input_schema_for(spec.input_model)),` | `test_advertised_schema_is_derived_from_registered_model[gateway.describe]`, `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]`, and incidentally `test_schemas_are_derived_once_per_process` (25 ≠ 26 calls) — 4 failed, 204 passed | someone reintroduces a hand-written schema that bypasses the builder |
-| M2 | `handlers.py:_GATEWAY_TOOL_SPECS` — `gateway.describe` registered with `ConnectServerInput` | `-input_model=DescribeInput,` / `+input_model=ConnectServerInput,` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]`, `…accepts_the_minimal_valid_arguments[gateway.describe]`, snapshot, gate — 4 failed, 204 passed | the registry names a model the handler does not run |
-| M3 | `types.py:DescribeInput.tool_id` — `min_length=1` → `2` | `-min_length=1, …` / `+min_length=2, …` | `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]` — 2 failed, 206 passed | an agent-facing contract change must be a reviewed snapshot diff |
-| M4 | `schema.py:_collapse_nullable` — early `return node` (nullable `anyOf` no longer collapsed) | `+    return node` | `test_input_schema_for_normalises_pydantic_output`, snapshot, `…is_a_self_contained_mcp_input_schema[…]` ×13 — 15 failed, 193 passed. The synthetic-model test fires independently of the real tools | the post-processing is drift surface of its own |
-| **M-A1** | `schema.py:_collapse_nullable` (`:94`) — drop `"null"`: `out["type"] = [inner_type, "null"]` → `out["type"] = inner_type` (revision 1's behaviour) | `-        out["type"] = [inner_type, "null"]` / `+        out["type"] = inner_type` | `test_optional_field_null_agrees_between_gate_and_model` **×42** (e.g. `gateway.submit_feedback {…, 'failed_tool_call': None}: gate=False model=True`), snapshot, `test_input_schema_for_normalises_pydantic_output` — 44 failed, 164 passed. All 42 fail, including the 14 fields `main` accepted only because it never declared them, since A declares them | the gate must accept `null` exactly where the model does (board A1) |
-| **M-A2** | `handlers.py:get_gateway_tool_definitions` (`:689`) — bypass the cache at the call site: `list(_derived_gateway_tools())` → `list(_derived_gateway_tools.__wrapped__())` | `-    return list(_derived_gateway_tools())` / `+    return list(_derived_gateway_tools.__wrapped__())` | `test_schemas_are_derived_once_per_process` — **`assert 260 == 26`** (10 lookups × 26 derivations) — 1 failed, 207 passed | derivation must happen once per process, not per `tools/call` (board A2) |
-| **M-X1** | `server.py:_handle_call_tool` — rename the dispatch branch `name == "gateway.health"` → `"gateway.health_internal"` | `-                elif name == "gateway.health":` / `+                elif name == "gateway.health_internal":` | **only** `test_every_dispatched_gateway_name_is_registered` — 1 failed, 207 passed. `test_server_dispatch_agrees_with_registry` stays green, which is the gap X1 closes | a dispatch branch for an unregistered name would skip the gate |
-| **M-X2** | `handlers.py:GatewayTools.describe` — `DescribeInput.model_validate(` → `_DescribeInput.model_validate(` (a substring match, not a word match) | `-        parsed = DescribeInput.model_validate(input_data)` / `+        parsed = _DescribeInput.model_validate(input_data)` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]` — 1 failed, 207 passed | the handler-link check matches on a word boundary, not a substring |
-| **M-W** | `types.py:InvokeOptions.timeout_ms` (`:808`) — drop `description="Timeout in milliseconds"` (measured at `d0722f4` only) | `-        default=30000, ge=1000, le=300000, description="Timeout in milliseconds"` / `+        default=30000, ge=1000, le=300000` | `…is_a_self_contained_mcp_input_schema[gateway.invoke]` and `[gateway.tasks_result]` — 2 failed, 24 passed under `-k self_contained`. The `72eaa76` helper passes 26/26 on the same mutant | the walker must reach the `["object", "null"]` nested objects |
+| M1 | `handlers.py:_derived_gateway_tools` — HEAD's hand-written dict for `gateway.describe` (no `minLength`) (**the hand-corrupted schema**) | `-input_schema=input_schema_for(spec.input_model),` / `+input_schema=({…HEAD dict…} if spec.name == "gateway.describe" else input_schema_for(spec.input_model)),` | `test_advertised_schema_is_derived_from_registered_model[gateway.describe]`, `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]`, and incidentally `test_schemas_are_derived_once_per_process` (25 ≠ 26 calls) — 4 failed, 205 passed | someone reintroduces a hand-written schema that bypasses the builder |
+| M2 | `handlers.py:_GATEWAY_TOOL_SPECS` — `gateway.describe` registered with `ConnectServerInput` | `-input_model=DescribeInput,` / `+input_model=ConnectServerInput,` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]`, `…accepts_the_minimal_valid_arguments[gateway.describe]`, snapshot, gate — 4 failed, 205 passed | the registry names a model the handler does not run |
+| M3 | `types.py:DescribeInput.tool_id` — `min_length=1` → `2` | `-min_length=1, …` / `+min_length=2, …` | `test_advertised_schemas_match_snapshot`, `test_server_gate_rejects_what_the_model_rejects[gateway.describe…]` — 2 failed, 207 passed | an agent-facing contract change must be a reviewed snapshot diff |
+| M4 | `schema.py:_collapse_nullable` — early `return node` (nullable `anyOf` no longer collapsed) | `+    return node` | `test_input_schema_for_normalises_pydantic_output`, snapshot, `…is_a_self_contained_mcp_input_schema[…]` ×13 — 15 failed, 194 passed. The synthetic-model test fires independently of the real tools | the post-processing is drift surface of its own |
+| **M-A1** | `schema.py:_collapse_nullable` (`:94`) — drop `"null"`: `out["type"] = [inner_type, "null"]` → `out["type"] = inner_type` (revision 1's behaviour) | `-        out["type"] = [inner_type, "null"]` / `+        out["type"] = inner_type` | `test_optional_field_null_agrees_between_gate_and_model` **×42** (e.g. `gateway.submit_feedback {…, 'failed_tool_call': None}: gate=False model=True`), snapshot, `test_input_schema_for_normalises_pydantic_output` — 44 failed, 165 passed. All 42 fail, including the 14 fields `main` accepted only because it never declared them, since A declares them | the gate must accept `null` exactly where the model does (board A1) |
+| **M-A2** | `handlers.py:get_gateway_tool_definitions` (`:689`) — bypass the cache at the call site: `list(_derived_gateway_tools())` → `list(_derived_gateway_tools.__wrapped__())` | `-    return list(_derived_gateway_tools())` / `+    return list(_derived_gateway_tools.__wrapped__())` | `test_schemas_are_derived_once_per_process` — **`assert 260 == 26`** (10 lookups × 26 derivations) — 1 failed, 208 passed | derivation must happen once per process, not per `tools/call` (board A2) |
+| **M-X1** | `server.py:_handle_call_tool` — rename the dispatch branch `name == "gateway.health"` → `"gateway.health_internal"` | `-                elif name == "gateway.health":` / `+                elif name == "gateway.health_internal":` | **only** `test_every_dispatched_gateway_name_is_registered` — 1 failed, 208 passed. `test_server_dispatch_agrees_with_registry` stays green, which is the gap X1 closes | a dispatch branch for an unregistered name would skip the gate |
+| **M-X2** | `handlers.py:GatewayTools.describe` — `DescribeInput.model_validate(` → `_DescribeInput.model_validate(` (a substring match, not a word match) | `-        parsed = DescribeInput.model_validate(input_data)` / `+        parsed = _DescribeInput.model_validate(input_data)` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]` — 1 failed, 208 passed | the handler-link check matches on a word boundary, not a substring |
+| **M-W** | `types.py:InvokeOptions.timeout_ms` (`:808`) — drop `description="Timeout in milliseconds"`  | `-        default=30000, ge=1000, le=300000, description="Timeout in milliseconds"` / `+        default=30000, ge=1000, le=300000` | `…is_a_self_contained_mcp_input_schema[gateway.invoke]` and `[gateway.tasks_result]` — plus the snapshot — 3 failed, 206 passed (under `-k self_contained`: 2 failed, 24 passed). The `72eaa76` helper passes 26/26 on the same mutant | the walker must reach the `["object", "null"]` nested objects |
+| **M-X1s** | `server.py:_handle_call_tool.call_tool` — X1 guard off: `if tool is None:` → `if False:` | `-                if tool is None:` / `+                if False:` | **only** `test_a_dispatch_branch_for_an_unregistered_name_fails_closed` — 1 failed, 208 passed. The text pin stays green, because the dispatch source is unchanged | an ungated name must never reach a handler, whatever the dispatch condition's shape |
+| *(bypass, not a test-RED mutant)* | `server.py` — the board seat's bypass: `elif name == "gateway.health" or name == "gateway.health2":` | as named | **none: 209 passed**, as expected, since the pin is lexical and the guard is behavioural. The guard's effect was measured directly with `probe_bypass.py`: guard on, `handler_ran=False response='{"error": true, "message": "Unknown tool: gateway.health2"}'`; guard off (M-X1s + bypass), `handler_ran=True response='{}'` | shows why X1 is structural: the pin cannot see this, the guard refuses it |
 
 Note M1 and M3 both light the gate test: the gate test is what turns "the
 schema says X" into "the transport enforces X".
 
 **The A2 mutant to cite is M-A2, not "delete the decorator".** Removing
 `@functools.cache` also turns `test_schemas_are_derived_once_per_process` RED
-(measured, 1 failed, 207 passed), but for the wrong reason: the test's own
+(measured at `72eaa76`, 1 failed, 207 passed), but for the wrong reason: the test's own
 `handlers._derived_gateway_tools.cache_clear()` raises
 `AttributeError: 'function' object has no attribute 'cache_clear'` before
 anything is counted. That RED proves the decorator exists, not that
@@ -952,7 +1108,7 @@ site, and the test fails on the count (`260 == 26`), which is the property.
 ### Piece B (tree: fused spike + B additions — **revision-1 tree; not re-measured on revision 2**)
 
 Every count below predates A1 (bare `type` for optionals), A2, X1 and the 45 new A
-tests. On revision-2 A the base count is 208, not 163, and MB1's
+tests. On revision-2 A the base count is 209, not 163, and MB1's
 `test_advertised_schema_forbids_unknown_keys` count depends on the type-list fix in
 the B preamble. B's executor re-runs MB1–MB4 and adds one mutant for that fix.
 
@@ -996,61 +1152,69 @@ callers 264 passed; snapshot 712 lines, 31 × `additionalProperties: false`,
 - Expressing the three validator-only constraints in JSON Schema.
 - Downstream tools' schemas (`gateway.describe` output) — untouched.
 - Recording gate rejections in the scoped-advisor audit (A3). The gap is
-  pre-existing on `main`. Named follow-up, to land before B: "Record
-  `tools/call` gate rejections in the scoped-advisor audit".
-- Failing closed on unknown tool names at the gate (X1 pins dispatch ==
-  registry instead; unknown names keep today's audited `Unknown tool` path).
+  pre-existing on `main`. Consiliency/pmcp#296, to land before B.
+- Failing closed on unknown names with an early return *at the gate*
+  (outside the audited path). X1 instead fails closed inside `call_tool`,
+  where the audit records it.
+- Value echo from **model-only validators** on gate-*passing* arguments (F3):
+  the correlation-ID charset validator and the all-or-none `model_validator`.
+  This is pre-existing on `main` and unchanged by A or B (see *Order: A
+  first, then B*). Follow-up **to be filed** (not filed by this revision):
+  render pydantic errors without `input_value` in the `except Exception` arm,
+  e.g. catch `ValidationError` and format `e.errors(include_input=False)`.
 - Value echo in `type`/`enum`/`pattern` gate errors for *declared* keys
   (pre-existing on `main`, unchanged by A or B).
 
 ## Execution Policy
 
 - execute A: effort=low, reason=A is embedded verbatim and proven
-  byte-identical to verified code (four bodies + a deterministic snapshot).
+  byte-identical to verified code (five bodies + a deterministic snapshot).
   The remaining work is review of the 811-line snapshot, which must be read against the measured HEAD schemas, not
   eyeballed.
 - execute B: effort=medium (was low), reason=one-line flip plus four
   consequential edits, but every B number must be re-measured on revision-2
   A, the type-list fix to two test helpers needs its own mutant, and B is
-  gated on the A3 follow-up and on X1's test.
+  gated on Consiliency/pmcp#296 (A3) and on X1's guard test.
 - Every PR to main needs panel CR + reconcile first (repo rule).
 
-## Embedding proof (revision 2, re-measured 2026-09-26 against `d0722f4`)
+## Embedding proof (revision 2, re-measured 2026-09-26 against `40b2ed5`)
 
 Proves that the A bodies below, applied exactly as *A — how an executor
 applies these* instructs, reproduce the frozen, verified piece-A code byte for
 byte. Fresh detached worktree at `origin/main` (`9ca081e`, 0 changes) →
 `uv sync --all-extras -p 3.10` → the extractor taken **out of this plan**
-(not a local copy) → the four extract commands → `git apply --check` + `git
-apply` → the snapshot generation command → `cmp` each resulting file against
-`git show d0722f4:<path>` (= `origin/wip/236-schema-drift-rev2-code`) → the
-schema test file:
+(not a local copy) → the five extract commands → `git apply --check` + `git
+apply` of the three patches → the snapshot generation command → `cmp` each of
+the six resulting files against `git show 40b2ed5:<path>`
+(= `origin/wip/236-schema-drift-rev2-code`) → the schema test file:
 
 ```text
 base: 9ca081e674806202dfa41864489cb9e3ae225dd9  clean: 0 changes
 src/pmcp/tools/schema.py: 99 lines
-tests/test_gateway_tool_schemas.py: 448 lines
+tests/test_gateway_tool_schemas.py: 484 lines
 <scratch>/types.patch: 622 lines
 <scratch>/handlers.patch: 866 lines
-1 passed, 207 deselected in 0.15s
-===== cmp against d0722f4 (= origin/wip/236-schema-drift-rev2-code)
+<scratch>/server.patch: 19 lines
+1 passed, 208 deselected in 0.17s
+===== cmp against 40b2ed5 (= origin/wip/236-schema-drift-rev2-code)
 cmp OK  src/pmcp/tools/schema.py  sha256=ddc7a14d17b91bcb
 cmp OK  src/pmcp/tools/handlers.py  sha256=9b8c18905828826e
 cmp OK  src/pmcp/types.py  sha256=a6e85c5ab49d24dc
-cmp OK  tests/test_gateway_tool_schemas.py  sha256=0f46d212e229f270
+cmp OK  src/pmcp/server.py  sha256=09c925b33f76f7a5
+cmp OK  tests/test_gateway_tool_schemas.py  sha256=97aba6316e7a7d0f
 cmp OK  tests/fixtures/gateway_tool_schemas.json  sha256=9da66316e07bcdf6
-changed vs base:  M src/pmcp/tools/handlers.py  M src/pmcp/types.py ?? src/pmcp/tools/schema.py ?? tests/fixtures/gateway_tool_schemas.json ?? tests/test_gateway_tool_schemas.py
+changed vs base:  M src/pmcp/server.py  M src/pmcp/tools/handlers.py  M src/pmcp/types.py ?? src/pmcp/tools/schema.py ?? tests/fixtures/gateway_tool_schemas.json ?? tests/test_gateway_tool_schemas.py
 ===== pytest
-208 passed in 0.52s
+209 passed in 0.57s
 ```
 
-Exactly the five files changed, and nothing else. The fixture `cmp` is the
+Exactly the six files changed, and nothing else. The fixture `cmp` is the
 check that the snapshot *content* matches. The generation run itself passes
 by construction, since it writes the file it then reads. Pasting this output
-into the plan was the only edit after the proof. The four bodies were then
+into the plan was the only edit after the proof. The five bodies were then
 re-extracted from the final plan text and re-`cmp`ed. The proof worktree was
-removed afterwards. (The earlier proof against `72eaa76`, before the
-description and walker fix, also passed 5/5 `cmp` and 208.)
+removed afterwards. (Earlier proofs against `72eaa76` and `d0722f4`, with
+five files each, also passed every `cmp` and 208 tests.)
 
 **Consistency gate.** `uv run python ~/code/pmcp/scripts/check_plan_consistency.py
 .consiliency/plans/detailed-236-schema-drift-20260923-0915.md` →
@@ -1066,7 +1230,7 @@ criteria* and *Piece B*.
 
 ### A — how an executor applies these (and the extractor)
 
-Piece A is four byte-exact bodies plus a generated snapshot. From a fresh
+Piece A is five byte-exact bodies plus a generated snapshot. From a fresh
 worktree of `origin/main`:
 
 ```bash
@@ -1076,13 +1240,15 @@ python3 $X $PLAN "### A — \`src/pmcp/tools/schema.py\`"      src/pmcp/tools/sc
 python3 $X $PLAN "### A — \`tests/test_gateway_tool_schemas.py\`" tests/test_gateway_tool_schemas.py
 python3 $X $PLAN "### A — \`src/pmcp/types.py\`"             <scratch>/types.patch
 python3 $X $PLAN "### A — \`src/pmcp/tools/handlers.py\`"     <scratch>/handlers.patch
-git apply --check <scratch>/types.patch <scratch>/handlers.patch && git apply <scratch>/types.patch <scratch>/handlers.patch
+python3 $X $PLAN "### A — \`src/pmcp/server.py\`"            <scratch>/server.patch
+git apply --check <scratch>/types.patch <scratch>/handlers.patch <scratch>/server.patch \
+  && git apply <scratch>/types.patch <scratch>/handlers.patch <scratch>/server.patch
 uv sync --all-extras -p 3.10
 PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py -q -k test_advertised_schemas_match_snapshot
-uv run pytest tests/test_gateway_tool_schemas.py -q                     # expect 208 passed
+uv run pytest tests/test_gateway_tool_schemas.py -q                     # expect 209 passed
 ```
 
-The two patches are `git diff origin/main d0722f4 -- <file>` against
+The three patches are `git diff origin/main 40b2ed5 -- <file>` against
 `origin/main` @ `9ca081e` (identical for these files to `860636a` and
 `8dec131`). Their blank context lines carry one leading space. An editor that
 strips trailing whitespace breaks them, and `git apply --check` then fails
@@ -1221,7 +1387,7 @@ def _collapse_nullable(node: dict[str, Any]) -> dict[str, Any]:
     return out
 ```
 
-### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 448 lines, 208 tests)
+### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 484 lines, 209 tests)
 
 ```python
 """Advertised gateway tool schemas are derived from, and agree with, the
@@ -1241,9 +1407,11 @@ Three things the models enforce are not expressible in the schema and stay
 handler-only: `InvokeInput`'s correlation-ID charset validator and its
 all-or-none `model_validator`, and `RegisterDiscoveredServerInput`'s
 `_validate_package`. Everything the projection CAN express -- types, bounds,
-enums, required, and (A1) `null` on optional fields -- must agree in both
-directions, which `test_optional_field_null_agrees_between_gate_and_model`
-checks per field.
+enums, required, and (A1) `null` on optional fields -- agrees on what is
+REQUIRED and on `null` (`test_optional_field_null_agrees_between_gate_and_model`
+checks per field). It does not agree on type COERCION: pydantic's lax mode
+accepts `1` / `"true"` for a boolean and `"5"` for a number, and the JSON-Schema
+gate does not, so the gate is stricter there (stated in the plan).
 """
 
 from __future__ import annotations
@@ -1672,6 +1840,40 @@ async def test_server_gate_rejects_what_the_model_rejects(
     text = result.content[0].text  # type: ignore[union-attr]
     assert text.startswith("Input validation error:"), text
     assert fragment in text, text
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_branch_for_an_unregistered_name_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X1, structurally: a name the registry does not list never reaches a
+    handler, even when `_handle_call_tool` has a dispatch branch for it (the
+    board's bypass was `elif name == "gateway.health" or name == "gateway.health2"`,
+    which the text pin above cannot see). Simulated by unregistering a name
+    that has a branch: the gate is skipped, so dispatch must refuse it."""
+    from mcp.types import CallToolRequestParams
+
+    srv = GatewayServer()
+    real_find = srv._find_gateway_tool
+    monkeypatch.setattr(
+        srv,
+        "_find_gateway_tool",
+        lambda name: None if name == "gateway.health" else real_find(name),
+    )
+    called: list[str] = []
+
+    async def health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        called.append("health")
+        return {}
+
+    monkeypatch.setattr(srv._gateway_tools, "health", health)
+    result = await srv._handle_call_tool(
+        None,  # type: ignore[arg-type]
+        CallToolRequestParams(name="gateway.health", arguments={"x": "Bearer sk-x"}),
+    )
+    assert called == [], "an ungated name reached its handler"
+    text = " ".join(getattr(c, "text", "") for c in result.content)
+    assert "Unknown tool: gateway.health" in text, text
 ```
 
 ### A — `src/pmcp/types.py` (`git apply` patch against `origin/main`, +269 / −110)
@@ -3172,6 +3374,30 @@ index 956c8c8..45a956c 100644
  def _summarize_arg_schema(
 ```
 
+### A — `src/pmcp/server.py` (`git apply` patch against `origin/main`, +8 / −0)
+
+```diff
+diff --git a/src/pmcp/server.py b/src/pmcp/server.py
+index f702600..aa74439 100644
+--- a/src/pmcp/server.py
++++ b/src/pmcp/server.py
+@@ -334,6 +334,14 @@ class GatewayServer:
+                             "scoped advisor invoke requires run, seat, and evidence correlations"
+                         )
+ 
++                if tool is None:
++                    # Fail closed on any name the registry does not list: only
++                    # a registered name went through the schema gate above, so
++                    # no dispatch branch below may run for anything else. This
++                    # raises inside the audited path, like an unknown name
++                    # always has (Consiliency/pmcp#236, X1).
++                    raise ValueError(f"Unknown tool: {name}")
++
+                 if name == "gateway.catalog_search":
+                     result = await self._gateway_tools.catalog_search(arguments)
+                 elif name == "gateway.describe":
+```
+
 ### B — `src/pmcp/tools/schema.py`: `NO_ARGUMENTS_SCHEMA` becomes
 
 ```python
@@ -3902,3 +4128,126 @@ same 54 differ 1 new description 19 newly advertised 16
 ```
 
 (At `72eaa76`, before option (b): `same 40 differ 15`.)
+
+### Board round 2 probes (F1 coercion, F3 model-validator echo, F5 blocked audit, X1 bypass)
+
+Run like the others, `PYTHONPATH=<main or A src> uv run python <probe>`.
+`probe_bypass.py` and the M-X1s check need a tree with the bypass mutant
+applied (see *Acceptance criteria*).
+
+```python
+"""F1: lax-coercible values on invoke.task.* -- gate vs model (Consiliency/pmcp#236)."""
+import jsonschema
+from pydantic import ValidationError
+from pmcp.tools.handlers import get_gateway_tool_definitions
+from pmcp.types import InvokeInput
+schema = {t.name: t for t in get_gateway_tool_definitions()}["gateway.invoke"].input_schema
+vals = {"enabled": [1, 0, "true"], "ttl": ["5", True, False, "0005"], "poll_interval": [True, False, "5", "0005"]}
+n_new = 0
+for field, vs in vals.items():
+    for v in vs:
+        args = {"tool_id": "srv::tool", "task": {field: v}}
+        try:
+            InvokeInput.model_validate(args); model = True
+        except ValidationError:
+            model = False
+        try:
+            jsonschema.validate(args, schema); gate = "accepts"
+        except jsonschema.ValidationError as e:
+            gate = f"rejects: {e.message}"
+        n_new += model and gate != "accepts"
+        print(f"  task.{field}={v!r}: model={'accepts' if model else 'rejects'} gate {gate}")
+print("model accepts, gate rejects:", n_new)
+```
+
+```python
+"""F3: model-only validators echo input_value (Consiliency/pmcp#236)."""
+from pydantic import ValidationError
+from pmcp.types import InvokeInput
+S = "Bearer sk-SAMPLE-value"
+cases = {
+    "charset validator": {"tool_id": "s::t", "run_correlation_id": S, "seat_correlation_id": "s1", "evidence_label_digest": "a" * 64},
+    "all-or-none validator": {"tool_id": "s::t", "run_correlation_id": "r1", "arguments": {"api_key": S}},
+    "meta non-dict (populate_by_name)": {"tool_id": "s::t", "meta": S},
+}
+for label, args in cases.items():
+    try:
+        InvokeInput.model_validate(args); print(f"  {label}: ACCEPTED")
+    except ValidationError as e:
+        print(f"  {label}: str(e) echoes value = {S in str(e)}")
+```
+
+Output of both, `main` then A (measured at `40b2ed5`):
+
+```text
+== main
+  task.enabled=1: model=accepts gate accepts
+  task.enabled=0: model=accepts gate accepts
+  task.enabled='true': model=accepts gate accepts
+  task.ttl='5': model=accepts gate accepts
+  task.ttl=True: model=accepts gate accepts
+  task.ttl=False: model=accepts gate accepts
+  task.ttl='0005': model=accepts gate accepts
+  task.poll_interval=True: model=accepts gate accepts
+  task.poll_interval=False: model=accepts gate accepts
+  task.poll_interval='5': model=accepts gate accepts
+  task.poll_interval='0005': model=accepts gate accepts
+model accepts, gate rejects: 0
+  charset validator: str(e) echoes value = True
+  all-or-none validator: str(e) echoes value = False
+  meta non-dict (populate_by_name): str(e) echoes value = True
+== A
+  task.enabled=1: model=accepts gate rejects: 1 is not of type 'boolean'
+  task.enabled=0: model=accepts gate rejects: 0 is not of type 'boolean'
+  task.enabled='true': model=accepts gate rejects: 'true' is not of type 'boolean'
+  task.ttl='5': model=accepts gate rejects: '5' is not of type 'integer', 'null'
+  task.ttl=True: model=accepts gate rejects: True is not of type 'integer', 'null'
+  task.ttl=False: model=accepts gate rejects: False is not of type 'integer', 'null'
+  task.ttl='0005': model=accepts gate rejects: '0005' is not of type 'integer', 'null'
+  task.poll_interval=True: model=accepts gate rejects: True is not of type 'number', 'null'
+  task.poll_interval=False: model=accepts gate rejects: False is not of type 'number', 'null'
+  task.poll_interval='5': model=accepts gate rejects: '5' is not of type 'number', 'null'
+  task.poll_interval='0005': model=accepts gate rejects: '0005' is not of type 'number', 'null'
+model accepts, gate rejects: 11
+  charset validator: str(e) echoes value = True
+  all-or-none validator: str(e) echoes value = False
+  meta non-dict (populate_by_name): str(e) echoes value = True
+```
+
+```python
+"""F5: a malformed call to a policy-blocked tool -- recorded in the audit? (Consiliency/pmcp#236)"""
+import asyncio
+from mcp.types import CallToolRequestParams
+from pmcp.server import GatewayServer
+
+async def main():
+    srv = GatewayServer()
+    recorded = []
+    srv._policy_manager.is_gateway_tool_allowed = lambda name: False
+    srv._record_scoped_invocation = lambda **kw: recorded.append(kw["terminal_status"])
+    for args in ({"tool_id": ""}, {"tool_id": "srv::tool"}):
+        recorded.clear()
+        r = await srv._handle_call_tool(None, CallToolRequestParams(name="gateway.describe", arguments=args))
+        print(f"  describe {args}: is_error={r.is_error} text={r.content[0].text[:60]!r} audit={recorded}")
+asyncio.run(main())
+```
+
+(Output quoted under *Scoped-audit gap on gate rejections (A3)*.)
+
+```python
+"""Seat's X1 bypass: a dispatch branch for an unregistered name (Consiliency/pmcp#236)."""
+import asyncio
+from mcp.types import CallToolRequestParams
+from pmcp.server import GatewayServer
+async def main():
+    srv = GatewayServer()
+    called = []
+    async def health(*a, **k):
+        called.append(1); return {}
+    srv._gateway_tools.health = health
+    r = await srv._handle_call_tool(None, CallToolRequestParams(name="gateway.health2", arguments={"x": "Bearer sk-x"}))
+    print(f"  gateway.health2: handler_ran={bool(called)} response={r.content[0].text!r}")
+asyncio.run(main())
+```
+
+(Output quoted in the *Acceptance criteria* bypass row.)
