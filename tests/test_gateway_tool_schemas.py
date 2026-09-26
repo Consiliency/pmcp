@@ -25,7 +25,7 @@ newline and pydantic's Rust `$` does not -- closed for the one `pattern` field
 (`evidence_label_digest`) by length bounds, pinned by
 `test_digest_pattern_agrees_between_gate_and_model`.
 Nor on an integer's range: pydantic refuses a float past int64, so an
-unbounded integer field (`task.ttl`) gets that bound advertised, pinned by
+unbounded integer field (`task.ttl`) gets that range (both sides) advertised, pinned by
 `test_ttl_range_agrees_between_gate_and_model`.
 """
 
@@ -538,10 +538,11 @@ def test_digest_pattern_agrees_between_gate_and_model() -> None:
         InvokeInput.model_validate(args)
 
 
-@pytest.mark.parametrize("ttl", [1e20, 2**63])
+@pytest.mark.parametrize("ttl", [1e20, 2**63, -1e20, -9.3e18, -1e308, -(2**63) - 1])
 def test_ttl_range_agrees_between_gate_and_model(ttl: float) -> None:
-    """`task.ttl` past int64: the model refuses it, so the gate must too
-    (board round 4, F1: `1e20` passed the gate on main and under A)."""
+    """`task.ttl` outside int64, either side: the model refuses it, so the
+    gate must too (board round 4 F1: `1e20`; round 5 G1: `-1e20`, which the
+    upper bound alone still let through)."""
     from pmcp.types import InvokeInput
 
     schema = _tool("gateway.invoke").input_schema
@@ -553,3 +554,30 @@ def test_ttl_range_agrees_between_gate_and_model(ttl: float) -> None:
     ok = {"tool_id": "a::b", "task": {"ttl": 3600}}
     jsonschema.validate(ok, schema)
     InvokeInput.model_validate(ok)
+
+
+def _unbounded_integers(node: Any, path: str = "") -> list[str]:
+    found: list[str] = []
+    if isinstance(node, dict):
+        kind = node.get("type")
+        kinds = kind if isinstance(kind, list) else [kind]
+        if "integer" in kinds and ("minimum" not in node or "maximum" not in node):
+            found.append(path or "<root>")
+        for name, prop in (node.get("properties") or {}).items():
+            found += _unbounded_integers(prop, f"{path}.{name}")
+        if isinstance(node.get("items"), dict):
+            found += _unbounded_integers(node["items"], f"{path}[]")
+    return found
+
+
+def test_every_advertised_integer_is_bounded_both_sides() -> None:
+    """pydantic refuses a float outside int64 (`int_parsing_size`); an integer
+    property the gate leaves unbounded on either side passes such a value to
+    the model, which refuses it and echoes it. The class, not the one field
+    the board named (round 4 found the maximum missing, round 5 the minimum)."""
+    missing = [
+        f"{name}{path}"
+        for name in TOOL_NAMES
+        for path in _unbounded_integers(_tool(name).input_schema)
+    ]
+    assert missing == [], missing

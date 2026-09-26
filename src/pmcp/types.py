@@ -573,9 +573,11 @@ class TaskMetadataInput(GatewayArguments):
     )
     ttl: int | None = Field(
         default=None,
-        # int64: pydantic already refuses a float past it (`int_parsing_size`),
-        # so advertise it and let the gate refuse `1e20` too, rather than
-        # passing it on to the model (Consiliency/pmcp#236, board round 4)
+        # int64, both sides: pydantic already refuses a float outside it
+        # (`int_parsing_size`), so advertise the range and let the gate refuse
+        # `1e20` and `-1e20` too, rather than passing them on to the model
+        # (Consiliency/pmcp#236, board rounds 4 and 5)
+        ge=-9_223_372_036_854_775_808,
         le=9_223_372_036_854_775_807,
         description="Requested task TTL in seconds",
     )
