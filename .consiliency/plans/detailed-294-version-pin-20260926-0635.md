@@ -17,6 +17,36 @@
 > (Verification step 9 re-checks that). The spike diff and the new test file are embedded
 > verbatim below as the reference patch.
 
+## Revision 2 (2026-09-26): board round on Consiliency/pmcp#295 @ `9d08184`
+
+The board reached quorum: gemini AGREE, claude PARTIALLY AGREE, codex DISAGREE with 3
+blocking findings, and grok timed out. Every finding is resolved below. Each blocking
+one was **reproduced first**, then fixed, and is proved by a new test that is red on the
+revision-1 spike and green on revision 2, plus a mutant (mutation table, M15-M24). All
+numbers below were re-measured on the revision-2 spike, which was then reverted.
+
+| # | finding | resolution | evidence |
+|---|---|---|---|
+| codex P1 (blocking) + claude N1 | The materialiser rewrote an alias `myalias@npm:firecrawl-mcp@3.25.5` to `myalias@3.25.5`, which is a different registry package. | `_pin_npx_args` now pins only a **plain registry spec**, defined by grammar as an allowlist: `name`, or `name@<selector>` where the selector is one exact SemVer version (`is_valid_package_version`) or a dist-tag (`package_identity._DIST_TAG_RE`, a letter-led `[A-Za-z0-9._-]` word). Everything else npm accepts after `name@` is refused with a WARNING and the entry stays unpinned: aliases, URLs, git/`github:`, `file:`/tarball, and also ranges (a range selects a set). See D3 step 3. | Reproduced with the real npm resolver: `detect_package_type("npx", ["-y","myalias@npm:firecrawl-mcp@3.25.5"])` gives `('unknown', None)`, and `["-y","myalias@3.25.5"]` gives `('npm', 'myalias')`. Test `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec` covers 7 cases, all **7 red on rev 1** (`assert '3.25.5' is None`) and green on rev 2. `test_version_replaces_a_dist_tag_slot` is the positive control. Mutants M15 (7 red) and M16 (2 red). |
+| codex P2 (blocking) + claude F1 | A range or dist-tag (`^3.25.5`, `~`, `next`) silenced the self-hosted warning, and `pmcp update` labelled a range `[PINNED] ... pinned at ^3.25.0`. | New `_is_exact_pin(package_type, pin)`: exact means `is_valid_package_version` in every ecosystem, plus a docker `sha256:` digest and a PEP 440 `==X` with no wildcard. The warning suppresses only on an **exact** pin, and names a non-exact one: `floats on '^3.25.5' (a range or tag, not one exact version)`. `update_server`'s refusal is **unchanged**: it still does not move what the operator chose. It now reports a non-exact selector as `floating_selector` (with `pinned_version=None`, `latest_comparison=None`) and a message that starts `'fc' is held at '^3.25.0'`. `pmcp update` prints **`[FLOATING] fc: held at ^3.25.0, a range or tag that re-resolves at every spawn (latest 3.26.0)`**. See D6 and D7. | `test_health_warns_on_a_range_or_dist_tag` (4 specs), `test_update_server_reports_a_range_as_floating_not_pinned` and `test_pmcp_update_renders_a_range_as_floating`: **6 red on rev 1** (`assert 0 == 1` ×4, `AttributeError: ... 'floating_selector'`, `['[FAILED] fc: long message']`), all green on rev 2. Mutants M17 (5 red), M18 (1) and M24 (1). |
+| codex P3 (blocking) | One malformed entry aborted the whole manifest load: `args: ["-y", 123]` plus `version:` raised `AttributeError`. | Materialisation is contained **per entry** (`_materialize_version_pin_soft`). Any exception costs that entry its pin, with a WARNING, and everything else loads. | Reproduced with the same overlay (user `~/.pmcp/manifest.yaml`, entry `malformed`, `args: ["-y", 123]`, `version: "1.2.3"`): **main `9ca081e`: `entries: 108`**; **rev 1: `LOAD FAILED: AttributeError 'int' object has no attribute 'startswith'`**; **rev 2: `entries: 108 malformed.version: None`**. Test `test_a_pin_on_a_malformed_entry_costs_only_that_entry` covers int in args, int in an install argv, and int `command`, asserting `len(servers) == shipped + 1`: **3 red on rev 1** (`AttributeError` ×2, `TypeError`), green on rev 2. Mutant M19 (3 red). |
+| claude F2 | A relaxer that the child inherits from the gateway's own environment never triggered the warning. | The **advisory** warning now judges the relaxer on `sanitized_subprocess_env(resolved.config.env, project_root)`, the exact environment `client/manager.py:2409` spawns with (the gateway's env minus managed secrets, plus the entry's env). The credential gate is **unchanged**: `credential_requirement`'s gate callers still pass `config.env`. For a gate, ignoring the ambient value is the safe direction (#124). For a warning, including it is. `tests/test_credential_predicate_guard.py` (no `os.environ` passed as `child_env`) stays green. | `test_health_warns_when_the_relaxer_comes_from_the_gateway_environment` (`monkeypatch.setenv("SELFHOST_API_URL", ...)`, empty `extra_env`) is **red on rev 1** (`assert 0 == 1`) and green on rev 2. In the same test, `credential_requirement(server).required is True` proves the gate did not move. Mutant M20 (1 red). |
+| claude F3 | `gateway.health` loaded the manifest once or twice per call (~92 ms each), and logged a WARNING per load while an unapproved project overlay was present. | Health no longer reads config files at all. (1) The relaxer-declaring manifest entries are cached by `manifest_sources_fingerprint()`, a new `stat`-only key over the shipped manifest, the user overlay, the project overlay found by the cwd walk, the `$PMCP_MANIFEST_PATH` value and target, and the **trust store** (an approval changes what loads without touching the overlay). The manifest is re-loaded only when that key changes. (2) The config judged is the one the gateway actually **connected** with (`ClientManager.get_connected_configs()`, which already exists), so there is no `load_configs()`. A server that is not connected is not judged by health; `update_server` still warns for it. | Measured with 21 `health()` calls, firecrawl connected, a user `server_env` URL and an **unapproved project overlay** in the cwd. **main: 0.0 ms mean, 0 WARNING lines. rev 1: 223.6 ms mean (220.7 ms steady), 42 WARNING lines (2 per call). rev 2: 9.5 ms mean, first call 174.1 ms (one load plus resolver spawn), then 1.3 ms steady; 1 WARNING line in total.** Test `test_health_loads_the_manifest_once_until_a_source_changes` expects 3 calls to give 1 load, and a user-overlay write to give a 2nd load. It is **red on rev 1** (`assert 3 == 1`) and green on rev 2. Mutants M21 (no cache) and M22 (fingerprint misses the user overlay), 1 red each. |
+| claude N2 | Build metadata was accepted (`3.25.5+evil`). | **Refused.** npm ignores build metadata when resolving, so the argv would run 3.25.5 while every report echoed a label that names nothing. The rule is `is_valid_package_version(raw) and "+" not in raw`, because SemVer's build segment is the `+...` suffix. | The parametrized refusal set gains `"3.25.5+evil"`: **red on rev 1** (`assert '3.25.5+evil' is None`), green on rev 2. Mutant M23 (1 red). |
+| gemini note 1 | PyPI `pkg==1.2.3`: the pinned report's latest lookup uses the name `pkg==1.2.3` and so comes back unknown. | **Tabled, explicitly.** It is pre-existing: `detect_package_type` keeps `==X` in a uvx "name" on purpose, so the existing pinned-refusal fires. This plan only adds the report, which honestly says "latest version could not be determined". Fixing it means a PEP 440 lookup name for uvx pins, and it lands with any future uvx `version:` support (D5), not here. `_is_exact_pin` already treats `==1.2.3` as exact, so no false FLOATING and no false warning. | D5 (unchanged text), plus this row. |
+| gemini note 2 | The descriptions cache labels a pinned server's tools with the registry's latest. | **Tabled, explicitly**, as Non-goal plus R2. It is pre-existing for `.mcp.json` pins, causes regeneration churn only, and nothing reads the label as the running version since #150. | Non-goals and R2 (unchanged). |
+
+**Other notes from the claude seat.** (a) A lazily registered server that has never
+connected is not judged by health. That is now explicit, and `update_server` still warns
+for it. (b) After adding a pin, run `gateway.refresh`, because a child spawned before the
+pin keeps its version until it is respawned. The README subsection states this (see
+Documentation impact).
+
+**Scope growth.** Still within threshold. There is no new source file: `handlers.py`
+gains `_is_exact_pin`, `_relaxable_manifest_servers` and the cache attribute; `loader.py`
+gains `_materialize_version_pin_soft` and `manifest_sources_fingerprint`; `types.py`
+gains `floating_selector`; `cli.py` gains the `[FLOATING]` branch.
+
 ## Task
 
 Consiliency/pmcp#294. Built-in manifest entries launch npm MCP clients unversioned
@@ -141,6 +171,7 @@ pin. The following are refused, fail-soft with a WARNING, and the entry stays un
 | ranges: `^3.25.5`, `~3.25.5`, `3.x`, `*`, `>=3.25.0` | `npx -y pkg@^3` re-resolves the newest match at every spawn, which is the drift this issue is about. A range "pin" is a pin in name only, and `package_identity._resolve_version` refuses ranges for the same reason. |
 | dist-tags: `latest`, `next` | The registry moves them. `@latest` is exactly today's unpinned behaviour, and `_detect_effective_version_pin` already reads it as unpinned. |
 | `v3.25.5`, `3.25`, YAML float `3.25`, `true`, `""` | Not one exact SemVer. |
+| build metadata: `3.25.5+evil` (rev 2, board N2) | npm ignores `+...` when resolving, so the argv would run `3.25.5` while every report echoed a label that names nothing. |
 | anything with a name, space or flag: `evil-pkg@1.0.0`, `npm:evil-pkg@1.0.0`, `3.25.5 --registry=http://evil.test`, `../../tmp/x` | The value is a version and only a version. See D3. |
 
 Validation is **syntactic and offline**. `load_manifest` never touches the network.
@@ -198,7 +229,13 @@ and also for an explicit `manifest_path`. For an entry with `version` set:
    keeps the **name** and replaces only the version suffix, so `firecrawl-mcp` becomes
    `firecrawl-mcp@3.25.5` and `@playwright/mcp@latest` becomes `@playwright/mcp@1.2.3`.
    If the slot is missing or not a package spec (`-p x`, `github:x/y`), the pin is
-   refused.
+   refused. **Revision 2 (codex P1):** the slot must also be a **plain registry spec**,
+   `name` or `name@<exact-version | dist-tag>`, decided by grammar
+   (`is_valid_package_version` or `package_identity._DIST_TAG_RE`). An alias
+   (`myalias@npm:other@1`), URL, git/`github:`, `file:`/tarball, or range selector is
+   refused, because replacing it with `@<version>` would change **which** package runs.
+   `myalias@npm:firecrawl-mcp@3.25.5` → `myalias@3.25.5` is the registry package
+   `myalias` (measured with the real resolver).
 4. The same rewrite is applied to **every** `install[platform]` argv. Each must be npx
    and must name the **same package** as `args`. Otherwise the whole pin is refused, all
    or nothing, because pinning `args` and not `install` "approves X and runs latest".
@@ -207,6 +244,10 @@ and also for an explicit `manifest_path`. For an entry with `version` set:
    "`version` is set" always means "every spawning argv is pinned". The firecrawl test
    pins that invariant through the gate's own predicate:
    `_config_runs_exactly(pinned, "firecrawl-mcp@3.25.5")`.
+6. **Revision 2 (codex P3): per entry.** The pass calls `_materialize_version_pin_soft`,
+   so an exception while reading one entry (a non-string argv element or `command`,
+   which overlays can carry because only parsed fields are shape-checked) costs that
+   entry its pin, with a WARNING. It never costs the manifest its other entries.
 
 **Why no redirect is possible.** The pin value passes D1's exact-version grammar (no `@`,
 `/`, `:` or whitespace), and the package name always comes from the entry's own argv. A
@@ -288,6 +329,18 @@ refusal>`. Other results render exactly as today. Every string in `warnings` pri
 its result as `  warning: <text>`. `--json` gets the new fields for free. The exit code is
 unchanged (0), because `run_update` has never exited nonzero on a per-server result.
 
+**Revision 2 (codex P2 / claude F1): a range or tag is FLOATING, not PINNED.**
+`_detect_effective_version_pin` answers "does the argv carry any version selector". That
+is the right question for the refusal: do not move what the operator chose, and the
+refusal is unchanged. It is the wrong question for the label. `_is_exact_pin` decides
+the label. An exact pin reports as above. A range or dist-tag (`^3.25.0`, `~3.25.5`,
+`next`) returns `floating_selector="^3.25.0"`, `pinned_version=None` and
+`latest_comparison=None`, with a message that starts `'fc' is held at '^3.25.0' in ...`
+and says `'^3.25.0' is a range or tag, not one exact version: it re-resolves at every
+spawn, so it does not hold the client still (latest: 3.26.0).` `pmcp update` prints
+`[FLOATING] fc: held at ^3.25.0, a range or tag that re-resolves at every spawn (latest 3.26.0)`.
+`[FLOATING]` is not a failure, and the exit code stays 0.
+
 ### D7. The unpinned-self-hosted warning (proposal 2)
 
 `_unpinned_self_hosted_warning(server_name, manifest_server, resolved)` in `handlers.py`
@@ -309,14 +362,37 @@ text depends on the source. A manifest-sourced npm entry is told
 `pin it with \`server_version: {firecrawl: <version>}\` in ~/.pmcp/manifest.yaml`. Anything
 else is told to pin it in the args of the config that launches it.
 
+**Revision 2 changes to the predicate:**
+
+- **Exactness (codex P2 / claude F1).** The argv counts as pinned only if
+  `_is_exact_pin(package_type, pin)`: `is_valid_package_version(pin)` in every
+  ecosystem, a docker `sha256:` digest (immutable), or a PyPI `==X` with no wildcard.
+  A bare spec, `@latest`, a range or another dist-tag all warn. A non-exact selector is
+  named in the text: `floats on '^3.25.5' (a range or tag, not one exact version)`.
+- **Inherited environment (claude F2).** The relaxer is judged on
+  `sanitized_subprocess_env(resolved.config.env, project_root)`, which is exactly what
+  `client/manager.py:2409` spawns the child with. So a `FIRECRAWL_API_URL` exported in the
+  shell that started pmcp counts. This is advisory only: every credential **gate** keeps
+  `child_env=config.env` and is not touched (for a gate, ignoring the ambient value is
+  the safe direction, #124), and `tests/test_credential_predicate_guard.py` stays green.
+- **Health cost (claude F3).** Health judges the config the gateway **connected** with
+  (`ClientManager.get_connected_configs()`, an existing public method), so there is no
+  config-file I/O. The relaxer-declaring manifest entries are cached per `GatewayTools`
+  and keyed by `manifest_sources_fingerprint()` (`stat` only), so the manifest is
+  re-loaded only when a source or the trust store changes. A server that is not
+  connected is not judged by health; `update_server` still judges it, on a fresh
+  resolution.
+
 The warning appears in two places:
 
 - **`gateway.health`.** `ServerHealthInfo.warnings: list[str]` (default `[]`) is filled by
-  `_attach_version_pin_warnings(servers)` just before diagnostics. The cost: one
-  `load_manifest()` per health call, and a config load plus one resolver query per
-  relaxer-declaring server **that is present in the health list**. There is zero config
-  I/O when no entry declares a relaxer (today only `firecrawl` does). It is wrapped in
-  `try/except`, logged at DEBUG, and never costs health its answer.
+  `_attach_version_pin_warnings(servers)` just before diagnostics. The cost, **as of
+  revision 2 and measured** (21 calls, an unapproved project overlay present): one
+  `load_manifest()` per change of `manifest_sources_fingerprint()`, not per call, and
+  then per connected relaxer-declaring server one `sanitized_subprocess_env` plus one
+  resolver query. That is 174 ms on the first call and 1.3 ms steady, with 1 WARNING
+  line in total. Revision 1 measured 220.7 ms steady and 42 WARNING lines. It is
+  wrapped in `try/except`, logged at DEBUG, and never costs health its answer.
 - **`gateway.update_server`.** The public method becomes a thin wrapper around the
   unchanged body (renamed `_update_server_unwarned`). It appends the warning computed on
   the configuration **after** the attempt. The warning never changes `ok` and never
@@ -334,6 +410,10 @@ The warning appears in two places:
 | `_parse_version_pin(name, raw, field_label)` | add | D1, fail-soft WARNING that names the field (`version` / `server_version`) |
 | `_pin_npx_args(args, version)` | add | D3 step 3. Local import of `provision_gate._NPX_LEADING_FLAGS` (provision_gate imports `ServerConfig` under `TYPE_CHECKING` only, but a local import keeps the module graph as it is) |
 | `_materialize_version_pin(server)` | add | D3 steps 1-5, all or nothing |
+| `_pin_npx_args` plain-registry-spec check (rev 2) | add: `requested` must be `None`, `is_valid_package_version`, or `package_identity._DIST_TAG_RE` (local import) | D3 step 3, codex P1 |
+| `_materialize_version_pin_soft(server)` (rev 2) | add; the load pass calls it | D3 step 6, codex P3 |
+| `manifest_sources_fingerprint()` (rev 2) | add, public, `stat` only | D7 health cache, claude F3 |
+| `_parse_version_pin` (rev 2) | also refuse `+` build metadata | D1, claude N2 |
 | `_parse_server_config` | add `version=_parse_version_pin(name, data.get("version"), "version")` | D2 `version:` key |
 | `_OverlayDocument` | widen to a 4-tuple `(servers, clis, server_env, server_version)` | D2. The only callers are `_load_overlay_file` and `load_manifest` (grep: no test imports it) |
 | `_load_overlay_file`, `_parse_overlay_document` | return 4-tuples; parse `server_version:` (a mapping of non-empty str → `_parse_version_pin`; a non-mapping gets a WARNING); docstring paragraph | D2 |
@@ -345,24 +425,28 @@ The warning appears in two places:
 |---|---|---|
 | `ServerHealthInfo.warnings: list[str] = Field(default_factory=list)` | add | D7. The same `default_factory` shape as `missing_env_vars` |
 | `UpdateServerOutput.pinned_version`, `.latest_available: str \| None = None`, `.latest_comparison: Literal["newer","not_newer","incomparable"] \| None = None`, `.warnings: list[str]` | add | D6/D7 |
+| `UpdateServerOutput.floating_selector: str \| None = None` (rev 2) | add | D6 FLOATING, codex P2 |
 
 ### `src/pmcp/tools/handlers.py` (modify)
 
 | entity | action | reason |
 |---|---|---|
 | imports | add `compare_versions` (version_checker) and `credential_requirement` (manifest.loader) | D6/D7 |
-| `_unpinned_self_hosted_warning(...)` (module level, after `_detect_effective_version_pin`) | add | D7 |
+| `_unpinned_self_hosted_warning(server_name, manifest_server, resolved, project_root)` (module level, after `_detect_effective_version_pin`) | add | D7 (rev 2: judges the relaxer on `sanitized_subprocess_env`, and suppresses only on `_is_exact_pin`) |
+| `_is_exact_pin(package_type, pin)` (rev 2) | add | D6/D7, codex P2 |
+| imports (rev 2) | add `_parse_version` (version_checker) and `manifest_sources_fingerprint` (manifest.loader) | `_is_exact_pin`, the health cache |
+| `GatewayTools._relaxable_cache`, `_relaxable_manifest_servers()` (rev 2) | add | D7 health cache, claude F3 |
 | `health` | call `self._attach_version_pin_warnings(servers)` before the diagnostics block | D7 |
-| `_version_pin_warning(server_name)`, `_attach_version_pin_warnings(servers)` (methods, before `_config_source_paths_by_server`) | add | D7 |
+| `_version_pin_warning(server_name)`, `_attach_version_pin_warnings(servers)` (methods, before `_config_source_paths_by_server`) | add | D7. Rev 2: health judges `get_connected_configs()`, not `load_configs()` |
 | `update_server` | becomes a wrapper that **keeps the full contract docstring** (plus one #294 paragraph); the body moves to `_update_server_unwarned` with a one-line pointer docstring and is otherwise unchanged except for the pinned branch | D7. `tests/test_tools.py::test_update_server_docstring_states_both_probe_window_env_contracts` reads `GatewayTools.update_server.__doc__` (measured: moving the docstring turns it red) |
-| pinned branch of the body (`if pinned_to is not None:`) | add the registry read + `compare_versions`, set the three fields, and add the availability sentence to the message | D6 |
+| pinned branch of the body (`if pinned_to is not None:`) | add the registry read + `compare_versions`, set the three fields, and add the availability sentence to the message. Rev 2: `exact = _is_exact_pin(...)`; a non-exact selector sets `floating_selector`, and the message says `is held at` | D6 |
 
 ### `src/pmcp/cli.py` (modify)
 
 | entity | action | reason |
 |---|---|---|
 | `run_update` print loop | `for line in _format_update_result(item): print(line)` | D6 |
-| `_format_update_result(item)` (after `run_update`) | add | D6. Pure, so it is unit-tested without a gateway |
+| `_format_update_result(item)` (after `run_update`) | add | D6. Pure, so it is unit-tested without a gateway. Rev 2: the `[FLOATING]` branch |
 
 ### `tests/test_pkgid_panel_fixes.py` (modify): keep the pinned-refusal test offline
 
@@ -375,7 +459,7 @@ drives `update_server` or `health` (19 files):
 
 - HEAD: 0 registry lookups.
 - The spike without this stub: exactly **1** offender, this test (`1 failed, 857 passed`).
-- The spike with the stub: 0.
+- The spike with the stub: 0. Revision 2 re-measured this over the same 19 files: `878 passed, 1 deselected`.
 
 The pinned-refusal tests in `tests/test_tools.py` (`test_update_server_refuses_pinned_configured_override`,
 `..._pinned_docker_tag`) already stub `get_package_version` and need no change. The stub
@@ -383,7 +467,7 @@ is included in the production diff above.
 
 ### `tests/test_version_pin.py` (create)
 
-37 tests (16 are a parametrized refusal set). Body verbatim below.
+57 tests (rev 2; 37 in rev 1). The parametrized sets are: 17 version refusals, 7 non-plain slots, 3 malformed shapes and 4 floating specs. Body verbatim below.
 
 ### Production diff (spike, verbatim; apply as-is)
 
@@ -391,10 +475,10 @@ The diff is against `9ca081e`, already `ruff format`-clean.
 
 ```diff
 diff --git a/src/pmcp/cli.py b/src/pmcp/cli.py
-index 74ced0d..be928ab 100644
+index 74ced0d..8760f54 100644
 --- a/src/pmcp/cli.py
 +++ b/src/pmcp/cli.py
-@@ -1005,15 +1005,42 @@ async def run_update(args: argparse.Namespace) -> None:
+@@ -1005,15 +1005,51 @@ async def run_update(args: argparse.Namespace) -> None:
              return
  
          for item in results:
@@ -413,12 +497,21 @@ index 74ced0d..be928ab 100644
 +    """Render one gateway.update_server result for `pmcp update`.
 +
 +    A pinned server was deliberately not moved, so it is ``[PINNED]`` with
-+    its availability line, not ``[FAILED]`` (Consiliency/pmcp#294). Warnings
-+    are advisory and printed under the result whatever its status.
++    its availability line, not ``[FAILED]`` (Consiliency/pmcp#294). A server
++    held at a range or dist-tag was not moved either, but it is not pinned --
++    it re-resolves at every spawn -- so it is ``[FLOATING]`` (#295 board).
++    Warnings are advisory and printed under the result whatever its status.
 +    """
 +    server = item.get("server", "unknown")
 +    pinned = item.get("pinned_version")
-+    if pinned:
++    floating = item.get("floating_selector")
++    if floating:
++        latest = item.get("latest_available") or "unknown"
++        lines = [
++            f"[FLOATING] {server}: held at {floating}, a range or tag that "
++            f"re-resolves at every spawn (latest {latest})"
++        ]
++    elif pinned:
 +        latest = item.get("latest_available")
 +        comparison = item.get("latest_comparison")
 +        if comparison == "newer":
@@ -443,7 +536,7 @@ index 74ced0d..be928ab 100644
      """Return the PMCP gateway MCP endpoint URL."""
      return os.environ.get(
 diff --git a/src/pmcp/manifest/loader.py b/src/pmcp/manifest/loader.py
-index 9837e82..2c10828 100644
+index 9837e82..d27ce06 100644
 --- a/src/pmcp/manifest/loader.py
 +++ b/src/pmcp/manifest/loader.py
 @@ -14,6 +14,7 @@ from typing import Any, Literal, cast
@@ -467,7 +560,7 @@ index 9837e82..2c10828 100644
  
  
  def credential_storage_key(server: Any) -> str | None:
-@@ -553,6 +560,105 @@ def _parse_api_key_optional_when(
+@@ -553,6 +560,184 @@ def _parse_api_key_optional_when(
      return parsed
  
  
@@ -484,13 +577,16 @@ index 9837e82..2c10828 100644
 +    """
 +    if raw is None:
 +        return None
-+    if isinstance(raw, str) and is_valid_package_version(raw):
++    # SemVer build metadata (the `+...` segment) is refused too: npm ignores it
++    # when resolving, so `3.25.5+x` would run 3.25.5 while every report echoed
++    # a label that names nothing (Consiliency/pmcp#295 board, N2).
++    if isinstance(raw, str) and is_valid_package_version(raw) and "+" not in raw:
 +        return raw
 +    logger.warning(
 +        f"Ignoring '{field_label}' {raw!r} for server '{name}': a version pin "
 +        'must be one exact version such as "3.25.5" -- not a range, a '
-+        'dist-tag such as "latest", or a package spec; the server stays '
-+        "unpinned"
++        'dist-tag such as "latest", build metadata (+...), or a package '
++        "spec; the server stays unpinned"
 +    )
 +    return None
 +
@@ -502,18 +598,34 @@ index 9837e82..2c10828 100644
 +    first argument that is not an allowlisted leading flag. Its NAME is kept
 +    and only its version suffix is replaced, so a pin can select a version of
 +    the package the entry already runs and never a different package.
-+    ``None`` when the slot is missing or is not a package spec (``-p x``,
-+    ``github:x/y``, ``./dir``).
++    ``None`` when the slot is missing or is not a PLAIN REGISTRY SPEC.
++
++    A plain registry spec is ``name`` or ``name@<selector>`` where the selector
++    is one exact SemVer version (``is_valid_package_version``) or a dist-tag
++    (``package_identity._DIST_TAG_RE``: a letter-led ``[A-Za-z0-9._-]`` word).
++    That is an allowlist by grammar, not a list of bad examples: everything
++    else npm accepts after ``name@`` -- an alias (``npm:other@1``), a URL, a
++    git or ``github:`` spec, a ``file:`` path or tarball, and also a range --
++    names or selects something the version suffix alone does not, so
++    replacing it with ``@<version>`` could change WHICH package runs
++    (``myalias@npm:firecrawl-mcp@3.25.5`` -> ``myalias@3.25.5`` is the
++    registry package ``myalias``; Consiliency/pmcp#295 board, codex P1).
 +    """
-+    # Local import: provision_gate is a consumer of this module's ServerConfig.
++    # Local imports: provision_gate is a consumer of this module's
++    # ServerConfig; package_identity owns the dist-tag grammar.
++    from pmcp.manifest.package_identity import _DIST_TAG_RE
 +    from pmcp.provision_gate import _NPX_LEADING_FLAGS
 +
 +    for index, arg in enumerate(args):
 +        if arg in _NPX_LEADING_FLAGS:
 +            continue
 +        try:
-+            name, _requested = parse_package_spec(arg)
++            name, requested = parse_package_spec(arg)
 +        except ValueError:
++            return None
++        if requested is not None and not (
++            is_valid_package_version(requested) or _DIST_TAG_RE.match(requested)
++        ):
 +            return None
 +        return [*args[:index], f"{name}@{version}", *args[index + 1 :]], name
 +    return None
@@ -551,7 +663,11 @@ index 9837e82..2c10828 100644
 +        )
 +    pinned = _pin_npx_args(list(server.args), version)
 +    if pinned is None:
-+        return refuse("its args name no npm package to pin")
++        return refuse(
++            "its args name no plain registry package (name or name@version/tag) "
++            "to pin -- an alias, URL, git, file or range spec could change which "
++            "package runs"
++        )
 +    args, package = pinned
 +    install: dict[Platform, list[str]] = {}
 +    for platform, argv in server.install.items():
@@ -563,17 +679,73 @@ index 9837e82..2c10828 100644
 +        pinned_install = _pin_npx_args(list(argv[1:]), version)
 +        if pinned_install is None or pinned_install[1] != package:
 +            return refuse(
-+                f"its {platform} install command does not run the package "
-+                f"{package!r} its args run"
++                f"its {platform} install command does not run the plain "
++                f"registry package {package!r} its args run"
 +            )
 +        install[platform] = [argv[0], *pinned_install[0]]
 +    return replace(server, args=args, install=install)
 +
 +
++def _materialize_version_pin_soft(server: ServerConfig) -> ServerConfig:
++    """`_materialize_version_pin`, contained to one entry.
++
++    Overlay entries are only shape-checked where a field is parsed, so an argv
++    can still carry a non-string (``args: ["-y", 123]``) or a non-string
++    ``command``. HEAD loads such an entry untouched; a pin on it must cost that
++    entry its pin, never the whole manifest (Consiliency/pmcp#295 board,
++    codex P3).
++    """
++    try:
++        return _materialize_version_pin(server)
++    except Exception as exc:
++        logger.warning(
++            f"Ignoring version pin {server.version!r} for server '{server.name}': "
++            f"its command/args/install could not be read ({type(exc).__name__}: "
++            f"{exc}); the server stays unpinned"
++        )
++        return replace(server, version=None)
++
++
++def manifest_sources_fingerprint() -> tuple[object, ...]:
++    """A cheap identity for everything ``load_manifest()`` reads.
++
++    ``stat`` only -- no parse and no log line -- over the shipped manifest,
++    the user overlay, the project overlay the cwd walk finds, the raw
++    ``$PMCP_MANIFEST_PATH`` value and its target, and the trust store (a
++    project overlay's approval changes what loads without touching the
++    overlay file). A caller that only needs a few manifest facts on a hot
++    path (gateway.health) re-loads when this changes instead of on every
++    call (Consiliency/pmcp#295 board, claude F3).
++    """
++
++    def stat(path: Path) -> tuple[str, int | None, int | None]:
++        try:
++            st = path.stat()
++        except OSError:
++            return (str(path), None, None)
++        return (str(path), st.st_mtime_ns, st.st_size)
++
++    parts: list[object] = [
++        stat(Path(__file__).parent / "manifest.yaml"),
++        stat(Path.home() / ".pmcp" / "manifest.yaml"),
++    ]
++    project = _find_project_manifest()
++    parts.append(stat(project) if project is not None else None)
++    env_value = os.environ.get("PMCP_MANIFEST_PATH")
++    parts.append((env_value, stat(Path(env_value).expanduser())) if env_value else None)
++    try:
++        from pmcp.trust_store import trust_store_path
++
++        parts.append(stat(trust_store_path()))
++    except Exception:
++        parts.append(None)
++    return tuple(parts)
++
++
  def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
      """Parse a server config from raw YAML data."""
      install_data = data.get("install", {})
-@@ -613,6 +719,7 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
+@@ -613,6 +798,7 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
          status=data.get("status"),
          source=data.get("source"),
          replacement=data.get("replacement"),
@@ -581,7 +753,7 @@ index 9837e82..2c10828 100644
      )
  
  
-@@ -722,7 +829,10 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
+@@ -722,7 +908,10 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
  
  
  _OverlayDocument = tuple[
@@ -593,7 +765,7 @@ index 9837e82..2c10828 100644
  ]
  
  
-@@ -739,7 +849,7 @@ def _load_overlay_file(path: Path) -> _OverlayDocument:
+@@ -739,7 +928,7 @@ def _load_overlay_file(path: Path) -> _OverlayDocument:
          content = path.read_bytes()
      except OSError as exc:
          logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
@@ -602,7 +774,7 @@ index 9837e82..2c10828 100644
  
      return _parse_overlay_document(path, content)
  
-@@ -747,7 +857,7 @@ def _load_overlay_file(path: Path) -> _OverlayDocument:
+@@ -747,7 +936,7 @@ def _load_overlay_file(path: Path) -> _OverlayDocument:
  def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
      """Parse overlay bytes, fail-soft. ``path`` is for messages only.
  
@@ -611,7 +783,7 @@ index 9837e82..2c10828 100644
      non-mapping top-level document logs a warning naming the file and returns
      empty dicts. Each entry is parsed in its own try/except so one malformed
      entry is skipped without dropping siblings.
-@@ -759,18 +869,22 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
+@@ -759,18 +948,22 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
      operator can point a shipped server at a self-hosted endpoint without
      restating its command, args, and install block. It deliberately cannot
      create a server: ``servers:`` remains whole-entry replace.
@@ -636,7 +808,7 @@ index 9837e82..2c10828 100644
  
      servers: dict[str, ServerConfig] = {}
      raw_servers = data.get("servers", {})
-@@ -814,7 +928,22 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
+@@ -814,7 +1007,22 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
      elif raw_server_env:
          logger.warning(f"Skipping 'server_env' in overlay {path}: not a mapping")
  
@@ -660,7 +832,7 @@ index 9837e82..2c10828 100644
  
  
  def load_manifest(manifest_path: Path | None = None) -> Manifest:
-@@ -868,19 +997,31 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
+@@ -868,19 +1076,31 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
                      continue
                  # Parse the bytes the gate judged. Re-opening `overlay_path`
                  # here would apply content nobody approved.
@@ -700,7 +872,7 @@ index 9837e82..2c10828 100644
                  )
              for name in overlay_servers:
                  if name in servers:
-@@ -906,6 +1047,23 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
+@@ -906,6 +1126,25 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
                      existing, extra_env={**existing.extra_env, **patch}
                  )
  
@@ -719,61 +891,93 @@ index 9837e82..2c10828 100644
 +    # Materialise every pin once, after all overlays: a later source's
 +    # whole-entry replace or server_version patch must be what gets written
 +    # into argv, not an earlier one's.
-+    servers = {name: _materialize_version_pin(entry) for name, entry in servers.items()}
++    servers = {
++        name: _materialize_version_pin_soft(entry) for name, entry in servers.items()
++    }
 +
      manifest = Manifest(
          version=data.get("version", "1.0"),
          cli_alternatives=cli_alternatives,
 diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
-index 956c8c8..e854bae 100644
+index 956c8c8..9fd3ec3 100644
 --- a/src/pmcp/tools/handlers.py
 +++ b/src/pmcp/tools/handlers.py
-@@ -102,6 +102,7 @@ from pmcp.manifest.version_checker import (
+@@ -101,7 +101,9 @@ from pmcp.manifest.version_checker import (
+     _docker_image_tag,
      _npm_package_arg,
      _npm_tag,
++    _parse_version,
      _uvx_package_arg,
 +    compare_versions,
      detect_package_type,
      get_package_version,
  )
-@@ -194,6 +195,7 @@ from pmcp.manifest.loader import (
+@@ -194,8 +196,10 @@ from pmcp.manifest.loader import (
      Manifest,
      ServerConfig,
      credential_lookup_keys,
 +    credential_requirement,
      credential_storage_key,
      is_usable_credential_value,
++    manifest_sources_fingerprint,
      requires_credential,
-@@ -444,6 +446,55 @@ def _detect_effective_version_pin(
+ )
+ 
+@@ -444,6 +448,86 @@ def _detect_effective_version_pin(
      return None
  
  
++def _is_exact_pin(package_type: str, pin: str) -> bool:
++    """Does *pin* hold the client at ONE version, or only name a selector?
++
++    ``_detect_effective_version_pin`` answers "does the argv carry any
++    version selector", which is the right question for update_server's
++    refusal (do not move what the operator chose) and the wrong one for
++    drift: ``^3.25.5``, ``~3.25.5`` and ``next`` re-resolve at every spawn
++    (Consiliency/pmcp#295 board, codex P2 / claude F1). Exact means one
++    SemVer version (``is_valid_package_version``) in every ecosystem, plus a
++    docker ``sha256:`` digest (immutable) and a PEP 440 ``==X`` without a
++    wildcard for PyPI (``==1.2`` is exact there, and ``==1.*`` is not).
++    """
++    if is_valid_package_version(pin):
++        return True
++    if package_type == "docker":
++        return pin.startswith("sha256:")
++    if package_type == "pypi":
++        return "*" not in pin and _parse_version(pin) is not None
++    return False
++
++
 +def _unpinned_self_hosted_warning(
 +    server_name: str,
 +    manifest_server: ServerConfig | None,
 +    resolved: ResolvedServerConfig,
++    project_root: Path | None,
 +) -> str | None:
 +    """Warn when a self-hosted backend is served by an unpinned client.
 +
 +    Consiliency/pmcp#294, proposal 2. Fires only when BOTH hold:
 +
 +    * the manifest entry's ``api_key_optional_when`` relaxer is active on the
-+      environment the child actually receives (``credential_requirement`` with
-+      the resolved config's env as ``child_env`` -- the same judgement the
-+      credential gates make, Consiliency/pmcp#114/#124); and
-+    * the argv that actually spawns (the configured entry when there is one,
-+      else the manifest's) is not pinned, by the same
-+      ``_detect_effective_version_pin`` gateway.update_server uses, so the two
-+      can never disagree about "pinned". ``@latest`` is unpinned.
++      environment the child ACTUALLY receives: ``sanitized_subprocess_env``
++      of the resolved config's env, which is exactly what ``client/manager.py``
++      spawns with -- the gateway's own environment minus managed secrets, plus
++      the entry's env. So a relaxer exported in the shell that started pmcp
++      counts (Consiliency/pmcp#295 board, claude F2). This is an ADVISORY
++      read: the credential gates keep ``child_env=config.env`` and are not
++      touched (#124: for a gate, ignoring the ambient value is the safe
++      direction; for a warning, including it is); and
++    * the argv that actually spawns is not held at one exact version
++      (``_is_exact_pin`` over ``_detect_effective_version_pin``): a bare
++      spec, ``@latest``, a range or another dist-tag all warn.
 +
 +    A vendor-hosted server (relaxer inactive) never warns: following the
 +    vendor's latest client is the intended default there.
 +    """
 +    if manifest_server is None or not isinstance(resolved.config, LocalMcpServerConfig):
 +        return None
-+    relaxed_by = credential_requirement(
-+        manifest_server, child_env=resolved.config.env
-+    ).relaxed_by
++    child_env = sanitized_subprocess_env(resolved.config.env, project_root)
++    relaxed_by = credential_requirement(manifest_server, child_env=child_env).relaxed_by
 +    if relaxed_by is None:
 +        return None
 +    command, args = resolved.config.command, list(resolved.config.args)
@@ -781,7 +985,8 @@ index 956c8c8..e854bae 100644
 +    package_type, package_name = detect_package_type(command, args, env, cwd)
 +    if package_type == "unknown" or not package_name:
 +        return None
-+    if _detect_effective_version_pin(package_type, command, args, env, cwd):
++    pin = _detect_effective_version_pin(package_type, command, args, env, cwd)
++    if pin and _is_exact_pin(package_type, pin):
 +        return None
 +    if package_type == "npm" and resolved.source == "manifest":
 +        remedy = (
@@ -789,10 +994,15 @@ index 956c8c8..e854bae 100644
 +            "~/.pmcp/manifest.yaml"
 +        )
 +    else:
-+        remedy = "pin its version in the args of the config that launches it"
++        remedy = "pin an exact version in the args of the config that launches it"
++    state = (
++        f"floats on '{pin}' (a range or tag, not one exact version)"
++        if pin
++        else "is unpinned"
++    )
 +    return (
 +        f"'{server_name}' talks to a self-hosted backend ({relaxed_by} is set) "
-+        f"but its client {package_type}:{package_name} is unpinned, so a spawn "
++        f"but its client {package_type}:{package_name} {state}, so a spawn "
 +        "or `pmcp update` can move it ahead of the server; " + remedy + "."
 +    )
 +
@@ -800,7 +1010,7 @@ index 956c8c8..e854bae 100644
  # Human-readable label for a ResolvedServerConfig.source, used in messages
  # that need to point an operator at the file a pin (or other override) came
  # from.
-@@ -2675,6 +2726,8 @@ class GatewayTools:
+@@ -2675,6 +2759,8 @@ class GatewayTools:
                  )
              )
  
@@ -809,7 +1019,7 @@ index 956c8c8..e854bae 100644
          diagnostics = self._transport_diagnostics.model_copy()
          diagnostics.audit_buffer_size = self._audit_events.maxlen or len(
              self._audit_events
-@@ -2697,6 +2750,48 @@ class GatewayTools:
+@@ -2697,6 +2783,69 @@ class GatewayTools:
              audit_events=list(self._audit_events) or None,
          )
  
@@ -821,34 +1031,55 @@ index 956c8c8..e854bae 100644
 +        resolved = self._load_all_configured_servers().get(
 +            server_name
 +        ) or manifest_server_to_config(manifest_server)
-+        return _unpinned_self_hosted_warning(server_name, manifest_server, resolved)
++        return _unpinned_self_hosted_warning(
++            server_name, manifest_server, resolved, self._project_root
++        )
++
++    #: (manifest_sources_fingerprint(), relaxer-declaring manifest entries).
++    _relaxable_cache: tuple[tuple[object, ...], dict[str, ServerConfig]] | None = None
++
++    def _relaxable_manifest_servers(self) -> dict[str, ServerConfig]:
++        """Manifest entries that declare ``api_key_optional_when``, cached.
++
++        gateway.health is polled; ``load_manifest()`` costs ~90 ms and logs a
++        WARNING per call while an unapproved project overlay is present. Re-load
++        only when a manifest source (or the trust store) changes on disk
++        (Consiliency/pmcp#295 board, claude F3).
++        """
++        key = manifest_sources_fingerprint()
++        cached = self._relaxable_cache
++        if cached is not None and cached[0] == key:
++            return cached[1]
++        relaxable = {
++            name: server
++            for name, server in load_manifest().servers.items()
++            if server.api_key_optional_when
++        }
++        self._relaxable_cache = (key, relaxable)
++        return relaxable
 +
 +    def _attach_version_pin_warnings(self, servers: list[ServerHealthInfo]) -> None:
 +        """Add the unpinned-self-hosted warning to each health entry it applies to.
 +
-+        Advisory only, so it must never cost gateway.health its answer: any
-+        failure is logged and the entries are left as they are. Cheap when no
-+        manifest entry declares a relaxer (one manifest load, no config read);
-+        otherwise one config load for the whole call.
++        Judged on the config the gateway actually CONNECTED the server with
++        (``get_connected_configs``), not on a fresh config read: that is the
++        argv and env that are running, and it costs no file I/O. A server that
++        is not connected is not judged here (update_server still warns for
++        it). Advisory only: any failure is logged at DEBUG and the entries are
++        left as they are.
 +        """
 +        try:
-+            manifest = load_manifest()
-+            relaxable = {
-+                name: server
-+                for name, server in manifest.servers.items()
-+                if server.api_key_optional_when
-+            }
++            relaxable = self._relaxable_manifest_servers()
 +            wanted = [info for info in servers if info.name in relaxable]
 +            if not wanted:
 +                return
-+            configured = self._load_all_configured_servers()
++            connected = self._client_manager.get_connected_configs()
 +            for info in wanted:
-+                manifest_server = relaxable[info.name]
-+                resolved = configured.get(info.name) or manifest_server_to_config(
-+                    manifest_server
-+                )
++                resolved = connected.get(info.name)
++                if resolved is None:
++                    continue
 +                warning = _unpinned_self_hosted_warning(
-+                    info.name, manifest_server, resolved
++                    info.name, relaxable[info.name], resolved, self._project_root
 +                )
 +                if warning:
 +                    info.warnings.append(warning)
@@ -858,7 +1089,7 @@ index 956c8c8..e854bae 100644
      def _config_source_paths_by_server(self) -> dict[str, tuple[str, str]]:
          paths: dict[str, tuple[str, str]] = {}
          for source in load_config_sources(
-@@ -5319,7 +5414,26 @@ class GatewayTools:
+@@ -5319,7 +5468,26 @@ class GatewayTools:
          Freezing the ambient environment across the update is deliberately NOT
          done here; it would mean threading a frozen env through ClientManager,
          which is a separate concern from this TOCTOU.
@@ -885,7 +1116,7 @@ index 956c8c8..e854bae 100644
          parsed = UpdateServerInput.model_validate(input_data)
          server_name = parsed.server_name
  
-@@ -5415,14 +5529,46 @@ class GatewayTools:
+@@ -5415,14 +5583,59 @@ class GatewayTools:
              source_desc = _CONFIG_SOURCE_LABELS.get(
                  resolved_config.source, f"the {resolved_config.source} config"
              )
@@ -896,12 +1127,23 @@ index 956c8c8..e854bae 100644
 +            latest_available, _ = await get_package_version(
 +                command, args, server_env, server_cwd, timeout=5.0
 +            )
++            # A range or dist-tag still stops this tool (the operator chose
++            # it), but it is not a pin: npx re-resolves it at every spawn, so
++            # it is reported as FLOATING, never as "pinned at ^3.25.0"
++            # (Consiliency/pmcp#295 board, codex P2 / claude F1).
++            exact = _is_exact_pin(package_type, pinned_to)
 +            comparison = (
 +                compare_versions(pinned_to, latest_available, package_type)
-+                if latest_available
++                if latest_available and exact
 +                else None
 +            )
-+            if comparison == "newer":
++            if not exact:
++                availability = (
++                    f"'{pinned_to}' is a range or tag, not one exact version: it "
++                    "re-resolves at every spawn, so it does not hold the client "
++                    f"still (latest: {latest_available or 'unknown'})."
++                )
++            elif comparison == "newer":
 +                availability = (
 +                    f"Pinned at {pinned_to}, newer available: {latest_available}."
 +                )
@@ -922,19 +1164,22 @@ index 956c8c8..e854bae 100644
                  server=server_name,
                  package_type=package_type,
                  package_name=package_name,
-+                pinned_version=pinned_to,
++                pinned_version=pinned_to if exact else None,
++                floating_selector=None if exact else pinned_to,
 +                latest_available=latest_available,
 +                latest_comparison=comparison,
                  message=(
-                     f"'{server_name}' is pinned to '{pinned_to}' in {source_desc} "
+-                    f"'{server_name}' is pinned to '{pinned_to}' in {source_desc} "
 -                    f"({command} {' '.join(args)}). gateway.update_server will not "
++                    f"'{server_name}' is {'pinned to' if exact else 'held at'} "
++                    f"'{pinned_to}' in {source_desc} "
 +                    f"({command} {' '.join(args)}). {availability} "
 +                    "gateway.update_server will not "
                      "move a pinned server to the latest version -- edit or remove "
                      "the pin in that config to allow updates."
                  ),
 diff --git a/src/pmcp/types.py b/src/pmcp/types.py
-index 215088d..74d0c18 100644
+index 215088d..3772008 100644
 --- a/src/pmcp/types.py
 +++ b/src/pmcp/types.py
 @@ -898,6 +898,9 @@ class ServerHealthInfo(BaseModel):
@@ -947,7 +1192,7 @@ index 215088d..74d0c18 100644
  
  
  class HealthOutput(BaseModel):
-@@ -1371,6 +1374,16 @@ class UpdateServerOutput(BaseModel):
+@@ -1371,6 +1374,20 @@ class UpdateServerOutput(BaseModel):
      cancelled_request_count: int = 0
      cancelled_task_count: int = 0
      message: str
@@ -956,6 +1201,10 @@ index 215088d..74d0c18 100644
 +    # `compare_versions(pinned_version, latest_available)` -- None when the
 +    # latest could not be fetched. Three-way on purpose (#164).
 +    pinned_version: str | None = None
++    # Set instead of pinned_version when the config holds the server at a
++    # range or dist-tag (`^3.25.0`, `next`): the tool still does not move it,
++    # but it is not a pin -- it re-resolves at every spawn (#295 board).
++    floating_selector: str | None = None
 +    latest_available: str | None = None
 +    latest_comparison: Literal["newer", "not_newer", "incomparable"] | None = None
 +    # Advisory; never changes `ok`. E.g. an unpinned client talking to a
@@ -1015,8 +1264,13 @@ from typing import Any, cast
 
 import pytest
 
-from pmcp.config.loader import _merge_manifest_defaults
-from pmcp.manifest.loader import Manifest, ServerConfig, load_manifest
+from pmcp.config.loader import _merge_manifest_defaults, manifest_server_to_config
+from pmcp.manifest.loader import (
+    Manifest,
+    ServerConfig,
+    credential_requirement,
+    load_manifest,
+)
 from pmcp.policy.policy import PolicyManager
 from pmcp.provision_gate import _config_runs_exactly
 from pmcp.tools import handlers as handlers_module
@@ -1138,6 +1392,7 @@ servers:
         '"../../tmp/x"',
         '""',
         "true",
+        '"3.25.5+evil"',  # build metadata: npm ignores it, reports would echo it
     ],
 )
 def test_server_version_refuses_anything_but_one_exact_version(
@@ -1235,6 +1490,97 @@ server_version:
     assert entry.install == {"linux": ["npx", "-y", "other-mcp"]}
 
 
+@pytest.mark.parametrize(
+    "slot",
+    [
+        "myalias@npm:firecrawl-mcp@3.25.5",  # alias: `myalias@3.25.5` is another package
+        "t@file:../evil",
+        "t@github:evil/x",
+        "t@https://evil.test/t.tgz",
+        "t@git+https://evil.test/t.git",
+        "t@^3.25.0",  # a range selects a set, not a version of a known package
+        "t@>=1.0.0",
+    ],
+)
+def test_version_refuses_a_slot_that_is_not_a_plain_registry_spec(
+    slot: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Only ``name`` or ``name@<version-or-tag>`` may have its version replaced."""
+    _user_overlay(
+        f"""
+servers:
+  odd-slot:
+    description: "odd slot"
+    keywords: [o]
+    install:
+      linux: ["npx", "-y", "{slot}"]
+    command: "npx"
+    args: ["-y", "{slot}"]
+    version: "3.25.5"
+"""
+    )
+
+    with caplog.at_level(logging.WARNING):
+        entry = load_manifest().servers["odd-slot"]
+
+    assert entry.version is None
+    assert entry.args == ["-y", slot]
+    assert entry.install == {"linux": ["npx", "-y", slot]}
+    assert any("plain registry" in m for m in _warnings(caplog))
+
+
+def test_version_replaces_a_dist_tag_slot() -> None:
+    """A dist-tag is part of the plain-registry grammar and is replaced."""
+    _user_overlay(
+        """
+servers:
+  tagged:
+    description: "tagged"
+    keywords: [t]
+    install:
+      linux: ["npx", "-y", "tagged-mcp@next"]
+    command: "npx"
+    args: ["-y", "tagged-mcp@next"]
+    version: "1.0.0"
+"""
+    )
+
+    assert load_manifest().servers["tagged"].args == ["-y", "tagged-mcp@1.0.0"]
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        'command: "npx"\n    args: ["-y", 123]',
+        'command: "npx"\n    args: ["-y", "ok-mcp"]\n    install:\n      linux: ["npx", "-y", 123]',
+        'command: 123\n    args: ["-y", "ok-mcp"]',
+    ],
+)
+def test_a_pin_on_a_malformed_entry_costs_only_that_entry(
+    shape: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """HEAD loads every entry of this overlay; the pin must not change that."""
+    shipped_count = len(load_manifest().servers)
+    _user_overlay(
+        f"""
+servers:
+  malformed:
+    description: "non-string argv"
+    keywords: [m]
+    {shape}
+    version: "1.2.3"
+"""
+    )
+
+    with caplog.at_level(logging.WARNING):
+        manifest = load_manifest()  # must not raise
+
+    assert len(manifest.servers) == shipped_count + 1
+    assert manifest.servers["malformed"].version is None
+    assert manifest.servers["firecrawl"].args == ["-y", "firecrawl-mcp"]
+    assert any("malformed" in m for m in _warnings(caplog))
+
+
 def test_a_config_entry_without_a_command_inherits_the_pin() -> None:
     _user_overlay('server_version:\n  firecrawl: "3.25.5"\n')
     manifest_servers = load_manifest().servers
@@ -1283,6 +1629,11 @@ class _ClientManager:
     def get_registry_meta(self) -> tuple[str, float]:
         return ("test-rev", 0.0)
 
+    def get_connected_configs(self) -> dict[str, ResolvedServerConfig]:
+        return dict(self.connected)
+
+    connected: dict[str, ResolvedServerConfig] = {}
+
 
 def _server(
     name: str,
@@ -1328,8 +1679,16 @@ def _gateway(
         ServerStatus(name=n, status=ServerStatusEnum.ONLINE, tool_count=0)
         for n in (online or [])
     ]
+    manager = _ClientManager(statuses)
+    # What the gateway connected each online server with: the configured entry
+    # when there is one, else the manifest's -- as startup resolution picks.
+    by_name = {c.name: c for c in configured or []}
+    manager.connected = {
+        n: by_name.get(n) or manifest_server_to_config(servers[n])
+        for n in (online or [])
+    }
     gateway = GatewayTools(
-        client_manager=cast(Any, _ClientManager(statuses)),
+        client_manager=cast(Any, manager),
         policy_manager=PolicyManager(policy_path=policy_path),
     )
     cast(Any, gateway)._platform = "linux"
@@ -1521,6 +1880,92 @@ async def test_health_judges_the_configured_entry_not_the_manifest(
     assert info.warnings == []
 
 
+@pytest.mark.parametrize(
+    "spec", ["fc-mcp@^3.25.5", "fc-mcp@~3.25.5", "fc-mcp@3.x", "fc-mcp@next"]
+)
+@pytest.mark.asyncio
+async def test_health_warns_on_a_range_or_dist_tag(
+    spec: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_tables: None
+) -> None:
+    """A range or tag re-resolves at every spawn: it is not a pin."""
+    gateway = _gateway(
+        monkeypatch, tmp_path, {"fc": _server("fc", ["-y", spec])}, online=["fc"]
+    )
+
+    health = await gateway.health()
+
+    (info,) = [s for s in health.servers if s.name == "fc"]
+    assert len(info.warnings) == 1
+    assert "floats on" in info.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_health_warns_when_the_relaxer_comes_from_the_gateway_environment(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_tables: None
+) -> None:
+    """The child inherits the gateway's env, so an exported URL is self-hosting.
+
+    Advisory only: the credential gate still ignores the ambient value.
+    """
+    server = _server("fc", ["-y", "fc-mcp"], relaxer_value=None)
+    monkeypatch.setenv("SELFHOST_API_URL", "http://self-hosted.internal:3002")
+    gateway = _gateway(monkeypatch, tmp_path, {"fc": server}, online=["fc"])
+
+    health = await gateway.health()
+
+    (info,) = [s for s in health.servers if s.name == "fc"]
+    assert len(info.warnings) == 1
+    assert "SELFHOST_API_URL" in info.warnings[0]
+    # The gate is unchanged: it never reads os.environ (#124).
+    assert credential_requirement(server).required is True
+
+
+@pytest.mark.asyncio
+async def test_health_loads_the_manifest_once_until_a_source_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_tables: None
+) -> None:
+    gateway = _gateway(
+        monkeypatch, tmp_path, {"fc": _server("fc", ["-y", "fc-mcp"])}, online=["fc"]
+    )
+    loaded = handlers_module.load_manifest
+    loads: list[int] = []
+
+    def counting() -> Manifest:
+        loads.append(1)
+        return loaded()
+
+    monkeypatch.setattr(handlers_module, "load_manifest", counting)
+
+    for _ in range(3):
+        health = await gateway.health()
+    assert len(loads) == 1
+    (info,) = [s for s in health.servers if s.name == "fc"]
+    assert len(info.warnings) == 1  # the cached answer is still an answer
+
+    _user_overlay("server_env: {}\n")  # a manifest source changed on disk
+    await gateway.health()
+    assert len(loads) == 2
+
+
+@pytest.mark.asyncio
+async def test_update_server_reports_a_range_as_floating_not_pinned(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_tables: None
+) -> None:
+    gateway = _gateway(
+        monkeypatch, tmp_path, {"fc": _server("fc", ["-y", "fc-mcp@^3.25.0"])}
+    )
+    _latest(monkeypatch, "3.26.0")
+    probes = _no_probe(monkeypatch, gateway)
+
+    result = await gateway.update_server({"server_name": "fc"})
+
+    assert result.ok is False
+    assert probes == []  # still not moved: the operator chose the selector
+    assert (result.pinned_version, result.floating_selector) == (None, "^3.25.0")
+    assert result.latest_comparison is None
+    assert "range or tag" in result.message
+
+
 @pytest.mark.asyncio
 async def test_update_server_carries_the_unpinned_self_hosted_warning(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_tables: None
@@ -1558,6 +2003,26 @@ def test_pmcp_update_renders_a_pinned_server_as_pinned_not_failed() -> None:
     assert lines == ["[PINNED] firecrawl: pinned at 3.25.5, newer available: 3.26.0"]
 
 
+def test_pmcp_update_renders_a_range_as_floating() -> None:
+    from pmcp.cli import _format_update_result
+
+    lines = _format_update_result(
+        {
+            "ok": False,
+            "server": "fc",
+            "floating_selector": "^3.25.0",
+            "latest_available": "3.26.0",
+            "message": "long message",
+            "warnings": [],
+        }
+    )
+
+    assert lines == [
+        "[FLOATING] fc: held at ^3.25.0, a range or tag that re-resolves at "
+        "every spawn (latest 3.26.0)"
+    ]
+
+
 def test_pmcp_update_prints_warnings_under_the_result() -> None:
     from pmcp.cli import _format_update_result
 
@@ -1587,7 +2052,9 @@ def test_pmcp_update_prints_warnings_under_the_result() -> None:
     uvx/cargo/docker;
   - "a whole-entry `servers:` replace in a higher-precedence overlay drops a
     lower-precedence pin";
-  - what `pmcp update` prints for a pinned server (`[PINNED] ...`);
+  - what `pmcp update` prints for a pinned server (`[PINNED] ...`), and for a range or tag (`[FLOATING] ...`);
+  - that a new pin reaches a running server only on respawn, so run `gateway.refresh` after adding one;
+  - that aliases, URLs, git/file specs and ranges in an entry's slot are refused (the pin could change the package);
   - the `gateway.health` warning for an unpinned self-hosted client.
 
   In the gateway-tools table row for `gateway.update_server`, mention that a pinned
@@ -1695,18 +2162,20 @@ cd "$WORKTREE"   # a fresh worktree off origin/main, with the diff + test file a
 
 # 0. The new tests exist.
 uv run pytest tests/test_version_pin.py --collect-only -q --cov-fail-under=0 | tail -1
-#   -> 37 tests collected
+#   -> 57 tests collected
 
 # 1. Red on HEAD (before the diff; the test file alone).
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
   uv run pytest tests/test_version_pin.py -q --cov-fail-under=0 --tb=line | tail -1
-#   -> 36 failed, 1 passed   (the 1 is test_explicit_config_args_win_over_the_manifest_pin,
+#   -> 56 failed, 1 passed   (the 1 is test_explicit_config_args_win_over_the_manifest_pin,
 #      an inertness guard that is green on HEAD by design)
+#   Against the REVISION-1 spike: 19 failed, 38 passed; exactly the 19 new rev-2 cases
+#   (Revision 2 table).
 
 # 2. Green with the diff.
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
   uv run pytest tests/test_version_pin.py -q --cov-fail-under=0 | tail -1
-#   -> 37 passed
+#   -> 57 passed
 
 # 3. CI gates (all three are in .github/workflows).
 uv run ruff check src/ tests/                 # -> All checks passed!
@@ -1720,14 +2189,14 @@ unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
     tests/test_package_identity_gate.py tests/test_credential_gates_handlers.py \
     tests/test_credential_gates_startup.py tests/test_credential_optionality_e2e.py \
     tests/test_manifest_provision.py tests/test_version_checker.py \
-    -q --cov-fail-under=0 | tail -1
-#   -> 1562 passed, 19 deselected
+    tests/test_credential_predicate_guard.py -q --cov-fail-under=0 | tail -1
+#   -> 1588 passed, 19 deselected   (rev 2; adds the credential-predicate guard for F2)
 
 # 5. Whole suite: Bash run_in_background, wait for the notification. Do not detach with
 #    nohup/disown. Use a lane-unique log path.
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
   uv run pytest tests/ -q --cov-fail-under=0 -p no:cacheprovider > "$LOGDIR/294-suite.log" 2>&1
-#   -> 4108 passed, 3 skipped, 25 deselected in 418.12s (0:06:58)   (revision 2; revision 1 was 1 failed / 4107 passed -- see the mutation-table note;
+#   -> 4128 passed, 3 skipped, 25 deselected in 422.12s (0:07:02)   (board revision 2 / patch rev 4; earlier: 4108 passed; the first spike was 1 failed / 4107 passed -- see the mutation-table note;
 #      revision 3 adds only the offline stub in test_pkgid_panel_fixes.py, re-measured by step 5b)
 
 # 5b. Hermeticity: no update_server/health test may reach a real registry. The plugin
@@ -1743,7 +2212,7 @@ F=$(grep -rln "update_server(\|\.health()\|gateway.health" tests/ | grep -v harn
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
   PYTHONPATH="$LOGDIR/plug" uv run pytest ${=F} -q --cov-fail-under=0 -p nonet -p no:cacheprovider | tail -1
 #   (zsh: ${=F} word-splits; in bash use $F)
-#   -> 858 passed, 1 deselected (measured with the stub). The spike WITHOUT the panel-fixes stub gave
+#   -> 878 passed, 1 deselected (board revision 2; 858 in revision 1, measured with the stub). The spike WITHOUT the panel-fixes stub gave
 #      "1 failed, 857 passed, 1 deselected" (the one offender named above); with the stub,
 #      the offender and tests/test_version_pin.py pass under the plugin (84 passed for those
 #      two files). On HEAD, the 6-file update_server subset gives 357 passed, 0 lookups.
@@ -1797,24 +2266,34 @@ line). `tests/test_version_pin.py` was run with `--tb=line`, and the file was re
 checked with `cmp` (`restored=True` for every row). The driver script is
 `mutants.py`, embedded at the end of this plan.
 
-| # | mutation (spike line) | applied | result | red for (first `E` line, verbatim) |
+| # | mutation | applied | result | red for (first `E` line, verbatim) / failing tests (driver prints up to 6 node ids per mutant) |
 |---|---|---|---|---|
-| M1 | `_parse_version_pin`: `is_valid_package_version(raw)` → `raw` (grammar accepts any non-empty string) | `576c576` | **13 failed**, 24 passed | every string case of `test_server_version_refuses_anything_but_one_exact_version` (`^3.25.5`, `~`, `3.x`, `*`, `>=`, `latest`, `next`, `v3.25.5`, `"3.25"`, `--registry`, `evil-pkg@1.0.0`, `npm:evil-pkg@1.0.0`, `../../tmp/x`): `AssertionError: assert '^3.25.5' is None`. The 3 non-red cases (YAML float, `true`, `""`) are still refused by the `isinstance(raw, str) and raw` residue of the mutated line, so they are correctly not red. |
-| M2 | install argv not rewritten: `install[platform] = [argv[0], *pinned_install[0]]` → `argv` | `658c658` | **3 failed** | firecrawl, scoped and whole-entry tests: `assert {'mac': ['npx...recrawl-mcp']} == {'mac': ['npx...-mcp@3.25.5']}` |
-| M3 | slot keeps its old tag: `f"{name}@{version}"` → `f"{arg}@{version}"` | `607c607` | **1 failed** | `test_version_replaces_an_existing_tag_on_a_scoped_package`: `assert ['-y', '@play...latest@1.2.3'] == ['-y', '@play...ht/mcp@1.2.3']` |
-| M4 | `servers:` entry's `version:` ignored (`version=None`) | `722c722` | **1 failed** | `test_version_key_on_a_whole_servers_entry_is_materialised` |
-| M5 | consent bypass: after `log_refusal`, `continue` → `content = overlay_path.read_bytes()` | `997c997` | **1 failed** | `test_unapproved_project_server_version_contributes_nothing`: `assert '3.25.5' is None` |
-| M6 | non-npx command accepted (`if not _is_npx(server.command)` → `if False`) | `635c635` | **1 failed** | `test_version_on_a_uvx_server_is_refused_with_the_escape_hatch`: `assert False`. The install check still refuses uvx, but with a message that does not name the `.mcp.json` escape hatch, and the test pins the message. |
-| M7 | install may name another package (`or pinned_install[1] != package` removed) | `653c653` | **1 failed** | `test_version_is_refused_when_an_install_argv_names_another_package`: `assert '1.0.0' is None` |
-| M8 | `compare_versions` arguments swapped | `5540c5540` | **1 failed** | `test_update_server_reports_a_newer_version_for_a_pinned_server`: `assert 'not_newer' == 'newer'` |
-| M9 | warning no longer requires an active relaxer | `475,476d474` | **1 failed** | `test_health_is_silent_when_the_relaxer_is_not_active`: `assert ["'fc' talks ...nifest.yaml."] == []` |
-| M10 | warning no longer consults the pin | `482,483d481` | **2 failed** | `test_health_is_silent_when_the_client_is_pinned`, `test_health_judges_the_configured_entry_not_the_manifest` |
-| M11 | health judges the manifest entry, not the configured one | `2784c2784` | **1 failed** | `test_health_judges_the_configured_entry_not_the_manifest` (the ViperJuice/dotfiles#325 shape) |
-| M12 | `update_server` wrapper drops the warning | `5429,5430d5428` | **1 failed** | `test_update_server_carries_the_unpinned_self_hosted_warning`: `assert 0 == 1` |
-| M13 | CLI keys the status off `ok` (`if pinned:` → `if False:`) | `1023c1023` | **1 failed** | `test_pmcp_update_renders_a_pinned_server_as_pinned_not_failed`: `assert ['[FAILED] fi...long message'] == ['[PINNED] fi...able: 3.26.0']` |
-| M14 | health never calls `_attach_version_pin_warnings` | `2729d2728` | **2 failed** | `test_health_warns_when_a_self_hosted_backend_client_is_unpinned`, `test_health_treats_latest_as_unpinned`: `assert 0 == 1` |
+| M1 | grammar accepts any string | `579c579` | **13 failed, 44 passed** (restored=True) | `AssertionError: assert '^3.25.5' is None`; `test_server_version_refuses_anything_but_one_exact_version` |
+| M2 | install argv not pinned | `681c681` | **3 failed, 54 passed** (restored=True) | `AssertionError: assert {'mac': ['npx...recrawl-mcp']} == {'mac': ['npx...-mcp@3.25.5']}`; `test_server_version_pins_the_shipped_firecrawl_entry_everywhere_it_spawns`, `test_version_key_on_a_whole_servers_entry_is_materialised`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
+| M3 | existing tag not replaced | `626c626` | **2 failed, 55 passed** (restored=True) | `AssertionError: assert ['-y', '@play...latest@1.2.3'] == ['-y', '@play...ht/mcp@1.2.3']`; `test_version_replaces_a_dist_tag_slot`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
+| M4 | servers: version: key ignored | `801c801` | **12 failed, 45 passed** (restored=True) | `AssertionError: assert ['-y', 'custo...port', '3000'] == ['-y', 'custo...port', '3000']`; `test_version_key_on_a_whole_servers_entry_is_materialised`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec` |
+| M5 | unapproved project overlay applied | `1076c1076` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert '3.25.5' is None`; `test_unapproved_project_server_version_contributes_nothing` |
+| M6 | non-npx command accepted | `654c654` | **2 failed, 55 passed** (restored=True) | `assert False`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry`, `test_version_on_a_uvx_server_is_refused_with_the_escape_hatch` |
+| M7 | install may name another package | `676c676` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert '1.0.0' is None`; `test_version_is_refused_when_an_install_argv_names_another_package` |
+| M8 | comparison arguments swapped | `5599c5599` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert 'not_newer' == 'newer'`; `test_update_server_reports_a_newer_version_for_a_pinned_server` |
+| M9 | relaxer not required for the warning | `502,503d501` | **1 failed, 56 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_is_silent_when_the_relaxer_is_not_active` |
+| M10 | pin not consulted for the warning | `510,511d509` | **2 failed, 55 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_is_silent_when_the_client_is_pinned`, `test_health_judges_the_configured_entry_not_the_manifest` |
+| M11 | health judges the manifest, not the connected config | `2838c2838` | **1 failed, 56 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_judges_the_configured_entry_not_the_manifest` |
+| M12 | update_server drops the warning | `5483,5484d5482` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_update_server_carries_the_unpinned_self_hosted_warning` |
+| M13 | CLI keys the status off ok | `1032c1032` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert ['[FAILED] fi...long message'] == ['[PINNED] fi...able: 3.26.0']`; `test_pmcp_update_renders_a_pinned_server_as_pinned_not_failed` |
+| M14 | health never attaches warnings | `2762d2761` | **8 failed, 49 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_treats_latest_as_unpinned`, `test_health_warns_on_a_range_or_dist_tag`, `test_health_warns_when_a_self_hosted_backend_client_is_unpinned` |
+| M15 | P1: any slot selector accepted (alias/url/git/file/range) | `622c622` | **7 failed, 50 passed** (restored=True) | `AssertionError: assert '3.25.5' is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec` |
+| M16 | P1: dist-tag slots refused | `623c623` | **2 failed, 55 passed** (restored=True) | `AssertionError: assert ['-y', '@play...t/mcp@latest'] == ['-y', '@play...ht/mcp@1.2.3']`; `test_version_replaces_a_dist_tag_slot`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
+| M17 | P2: any npm selector counts as exact | `469c469` | **5 failed, 52 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_warns_on_a_range_or_dist_tag`, `test_update_server_reports_a_range_as_floating_not_pinned` |
+| M18 | P2: update reports a range as pinned | `5597c5597` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert ('^3.25.0', None) == (None, '^3.25.0')`; `test_update_server_reports_a_range_as_floating_not_pinned` |
+| M19 | P3: materialisation not contained per entry | `1145c1145` | **3 failed, 54 passed** (restored=True) | `AttributeError: 'int' object has no attribute 'startswith'`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry` |
+| M20 | F2: inherited env ignored | `500c500` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_warns_when_the_relaxer_comes_from_the_gateway_environment` |
+| M21 | F3: no cache | `2811c2811` | **1 failed, 56 passed** (restored=True) | `assert 3 == 1`; `test_health_loads_the_manifest_once_until_a_source_changes` |
+| M22 | F3: fingerprint misses the user overlay | `726d725` | **1 failed, 56 passed** (restored=True) | `assert 1 == 2`; `test_health_loads_the_manifest_once_until_a_source_changes` |
+| M23 | N2: build metadata accepted | `579c579` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert '3.25.5+evil' is None`; `test_server_version_refuses_anything_but_one_exact_version` |
+| M24 | CLI labels a range [FAILED] | `1026c1026` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert ['[FAILED] fc: long message'] == ['[FLOATING] ...test 3.26.0)']`; `test_pmcp_update_renders_a_range_as_floating` |
 
-**14 of 14 mutants red**, each for the named reason. After each run the file was restored
+**24 of 24 mutants red** on the board-revision-2 spike (M1-M14 re-run, M15-M24 new for the board findings), each for the named reason. After each run the file was restored
 from the spike copy, and `cmp` confirmed it identical (`restored=True`).
 
 **A finding from the first full-suite run (fixed in the diff above).** The first spike
@@ -1829,7 +2308,7 @@ must not move that docstring.**
 
 ## Acceptance criteria
 
-- [ ] `tests/test_version_pin.py` passes: 37 tests, Verification step 2.
+- [ ] `tests/test_version_pin.py` passes: 57 tests, Verification step 2.
 - [ ] A user overlay line `server_version: {firecrawl: "3.25.5"}` makes
   `load_manifest().servers["firecrawl"].args == ["-y", "firecrawl-mcp@3.25.5"]`, every
   `install` argv equal to `["npx", "-y", "firecrawl-mcp@3.25.5"]`, and
@@ -1853,6 +2332,12 @@ must not move that docstring.**
 - [ ] CI gates are clean (`ruff check`, `ruff format --check`, `mypy src/`), and the
   whole suite shows no failure that is not also present on `9ca081e`
   (Verification steps 3 and 5).
+
+- [ ] Board revision 2: a non-plain npx slot (alias, URL, git, file, range) is never
+  pinned; a range or tag warns and reports `[FLOATING]`; a malformed overlay entry
+  costs only its own pin (`len(servers) == shipped + 1`); an inherited relaxer warns
+  while `credential_requirement(...).required` stays `True`; and health loads the
+  manifest once per source change. Proven by the tests named in the Revision 2 table.
 
 ## Non-goals (explicit)
 
@@ -1886,7 +2371,7 @@ must not move that docstring.**
   entry carries `pkg@X` explicitly, and a later `server_version` change no longer
   reaches it, because explicit args win. That is the same snapshot semantics `init`
   already has for `@latest` entries. The README subsection should say it in one line.
-- **R4: health cost.** It is one `load_manifest()` per `gateway.health` call. When a
+- **R4: health cost (superseded by revision 2, measured).** Now one manifest load per source change, and no config I/O: 1.3 ms steady (was 220.7 ms). Original text follows.  It is one `load_manifest()` per `gateway.health` call. When a
   relaxer-declaring server is in the list, it adds one `load_configs` and one resolver
   query per such server (~0.5 ms each, `npm_resolver.py:460`). There is no config I/O
   when no entry declares a relaxer. The work is wrapped so a failure can never cost
@@ -1897,6 +2382,10 @@ must not move that docstring.**
   is the manifest's only structured statement that "this entry can be self-hosted".
 - **R6: the `_OverlayDocument` 4-tuple.** Any out-of-tree caller that unpacks the
   3-tuple breaks. There are none in-tree (grep), and it is a private name.
+
+- **R7 (rev 2): the fingerprint is `stat`-based.** An edit that preserves both mtime_ns
+  and size is not seen until the next change. For health's advisory list that is
+  acceptable; `update_server` always re-reads.
 
 ## Open questions for the maintainer
 
@@ -1931,7 +2420,7 @@ must not move that docstring.**
   remain open.
 - PR: cross-vendor panel CR plus reconcile before merge (repo rule).
 
-## Appendix: mutation driver (`mutants.py`, run from the scratch dir with the spike copies under `spike/`)
+## Appendix: mutation driver (`mutants.py`, run from the scratch dir with the board-revision-2 spike copies under `rev4/`)
 
 ```python
 """Apply one mutant at a time to the spike, run the pin tests, restore, cmp."""
@@ -1941,7 +2430,7 @@ from pathlib import Path
 WT = Path("/home/viperjuice/workspace/worktrees/pmcp-294")
 S = Path(sys.argv[0]).parent
 MUTANTS = [
-    ("M1", "src/pmcp/manifest/loader.py", "if isinstance(raw, str) and is_valid_package_version(raw):", "if isinstance(raw, str) and raw:", "grammar accepts any string"),
+    ("M1", "src/pmcp/manifest/loader.py", 'is_valid_package_version(raw) and "+" not in raw:', 'raw and "+" not in raw:', "grammar accepts any string"),
     ("M2", "src/pmcp/manifest/loader.py", "install[platform] = [argv[0], *pinned_install[0]]", "install[platform] = argv", "install argv not pinned"),
     ("M3", "src/pmcp/manifest/loader.py", 'return [*args[:index], f"{name}@{version}", *args[index + 1 :]], name', 'return [*args[:index], f"{arg}@{version}", *args[index + 1 :]], name', "existing tag not replaced"),
     ("M4", "src/pmcp/manifest/loader.py", 'version=_parse_version_pin(name, data.get("version"), "version"),', "version=None,", "servers: version: key ignored"),
@@ -1950,18 +2439,28 @@ MUTANTS = [
     ("M7", "src/pmcp/manifest/loader.py", "        if pinned_install is None or pinned_install[1] != package:", "        if pinned_install is None:", "install may name another package"),
     ("M8", "src/pmcp/tools/handlers.py", "compare_versions(pinned_to, latest_available, package_type)", "compare_versions(latest_available, pinned_to, package_type)", "comparison arguments swapped"),
     ("M9", "src/pmcp/tools/handlers.py", "    if relaxed_by is None:\n        return None\n", "", "relaxer not required for the warning"),
-    ("M10", "src/pmcp/tools/handlers.py", "    if _detect_effective_version_pin(package_type, command, args, env, cwd):\n        return None\n", "", "pin not consulted for the warning"),
-    ("M11", "src/pmcp/tools/handlers.py", "resolved = configured.get(info.name) or manifest_server_to_config(", "resolved = manifest_server_to_config(", "health judges the manifest, not the configured entry"),
+    ("M10", "src/pmcp/tools/handlers.py", "    if pin and _is_exact_pin(package_type, pin):\n        return None\n", "", "pin not consulted for the warning"),
+    ("M11", "src/pmcp/tools/handlers.py", "                resolved = connected.get(info.name)\n", "                resolved = manifest_server_to_config(relaxable[info.name])\n", "health judges the manifest, not the connected config"),
     ("M12", "src/pmcp/tools/handlers.py", "        if warning:\n            result.warnings.append(warning)\n        return result", "        return result", "update_server drops the warning"),
-    ("M13", "src/pmcp/cli.py", "    if pinned:\n", "    if False:\n", "CLI keys the status off ok"),
+    ("M13", "src/pmcp/cli.py", "    elif pinned:\n", "    elif False:\n", "CLI keys the status off ok"),
     ("M14", "src/pmcp/tools/handlers.py", "        self._attach_version_pin_warnings(servers)\n", "", "health never attaches warnings"),
+    ("M15", "src/pmcp/manifest/loader.py", "        if requested is not None and not (", "        if False and not (", "P1: any slot selector accepted (alias/url/git/file/range)"),
+    ("M16", "src/pmcp/manifest/loader.py", "is_valid_package_version(requested) or _DIST_TAG_RE.match(requested)", "is_valid_package_version(requested)", "P1: dist-tag slots refused"),
+    ("M17", "src/pmcp/tools/handlers.py", '        return "*" not in pin and _parse_version(pin) is not None\n    return False\n', '        return "*" not in pin and _parse_version(pin) is not None\n    return True\n', "P2: any npm selector counts as exact"),
+    ("M18", "src/pmcp/tools/handlers.py", "            exact = _is_exact_pin(package_type, pinned_to)", "            exact = True", "P2: update reports a range as pinned"),
+    ("M19", "src/pmcp/manifest/loader.py", "name: _materialize_version_pin_soft(entry) for", "name: _materialize_version_pin(entry) for", "P3: materialisation not contained per entry"),
+    ("M20", "src/pmcp/tools/handlers.py", "    child_env = sanitized_subprocess_env(resolved.config.env, project_root)", "    child_env = resolved.config.env or {}", "F2: inherited env ignored"),
+    ("M21", "src/pmcp/tools/handlers.py", "        if cached is not None and cached[0] == key:", "        if False:", "F3: no cache"),
+    ("M22", "src/pmcp/manifest/loader.py", '        stat(Path.home() / ".pmcp" / "manifest.yaml"),\n', "", "F3: fingerprint misses the user overlay"),
+    ("M23", "src/pmcp/manifest/loader.py", ' and "+" not in raw:', ":", "N2: build metadata accepted"),
+    ("M24", "src/pmcp/cli.py", "    if floating:\n", "    if False:\n", "CLI labels a range [FAILED]"),
 ]
 only = set(sys.argv[1:])
 for mid, rel, old, new, desc in MUTANTS:
     if only and mid not in only:
         continue
     path = WT / rel
-    spike = S / "spike" / rel
+    spike = S / "rev4" / rel
     text = path.read_text()
     assert text.count(old) == 1, (mid, old)
     path.write_text(text.replace(old, new, 1))
