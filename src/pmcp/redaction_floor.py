@@ -42,6 +42,8 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
 
+from pmcp.keyword_matcher import key_start_pattern, keys_alternation, keyword_matches
+
 REDACTED = "[REDACTED]"
 
 # --------------------------------------------------------------------------
@@ -122,100 +124,21 @@ _MAIN_JWT_RE = re.compile(
 
 
 # --------------------------------------------------------------------------
-# main's keyword rule, linear.
-#
-# Main:  (?i)\b([A-Za-z0-9_-]*(?:KEYS)[A-Za-z0-9_-]*)([\s:=]+)([A-Za-z0-9._~+/=-]{3,})
-#
-# Why this is the same match set, left to right:
-#
-# * Group 1 is made of identifier characters W = [A-Za-z0-9_-] (under (?i),
-#   which also admits the case-fold partners of those letters) and group 2
-#   starts with a character of [\s:=], which W never contains. So group 1
-#   always ends exactly where the maximal W-run it starts in ends (r), and a
-#   match needs text[r] in [\s:=].
-# * Group 2 is greedy: it takes the maximal [\s:=] run [r, q) and backtracks
-#   one character at a time. The value V = [A-Za-z0-9._~+/=-] shares only `=`
-#   with it, so a value starting at p < q is the `=` run from p, continuing
-#   past q only if every character in between is `=`. The first p, from q
-#   down to r + 1, whose V-run is 3+ long is main's.
-# * Whether a match exists therefore depends only on r, never on where in the
-#   run it starts. It starts at the leftmost position s of the run where `\b`
-#   holds and a key starts at or after s (the key must lie inside [s, r)).
-# * A value ends at a character outside V, which is outside W too (W is a
-#   subset of V), so the next match's run starts after it: runs inside a
-#   consumed value are skipped.
-#
-# `tests/test_redaction_floor.py` compares this with the real regex (under a
-# timeout) on the grammar corpora and adversarial runs.
+# main's keyword rule, linear: `pmcp.keyword_matcher` (standalone, so it can
+# replace main's quadratic regex on its own).
 
 
 def _main_keys_alternation(keys: frozenset[str]) -> str:
-    return "|".join([*sorted(re.escape(key) for key in keys), r"api[_-]?key"])
+    return keys_alternation(keys)
 
 
-_W_RUN_RE = re.compile(r"(?i)[A-Za-z0-9_-]+")
-_SEP_RUN_RE = re.compile(r"[\s:=]+")
-_VALUE_RUN_RE = re.compile(r"(?i)[A-Za-z0-9._~+/=-]+")
-_WORD_CHAR_RE = re.compile(r"\w")
-_KEY_START_RE = re.compile(
-    rf"(?i)(?=(?:{_main_keys_alternation(MAIN_DIAGNOSTIC_SECRET_KEYS)}))"
-)
+_KEY_START_RE = key_start_pattern(MAIN_DIAGNOSTIC_SECRET_KEYS)
 
 
-def main_keyword_matches(
-    text: str, key_start_re: re.Pattern[str] = _KEY_START_RE
-) -> Iterator[tuple[int, int, int, int]]:
-    """Main's keyword rule's matches, left to right, in linear time: for
-    each, (match start, group 1 end, group 2 end, match end) -- the same
-    tuples `finditer` of main's regex yields. Self-contained: it depends on
-    nothing but the three character classes and the key set, so it can
-    replace main's regex on its own."""
-
-    def is_word(index: int) -> bool:
-        return 0 <= index < len(text) and _WORD_CHAR_RE.match(text, index) is not None
-
-    consumed = 0
-    for run in _W_RUN_RE.finditer(text):
-        a, r = run.span()
-        if a < consumed:
-            continue  # inside the previous match's value
-        sep = _SEP_RUN_RE.match(text, r)
-        if sep is None:
-            continue
-        q = sep.end()
-        value = _VALUE_RUN_RE.match(text, q)
-        value_end = value.end() if value is not None else q
-        # p from q down: the V-run from p, as the backtracking regex sees it
-        start_of_value = -1
-        run_end = value_end  # the V-run's end from p, as p decreases
-        p = q
-        while p > r:
-            if p < q:
-                if text[p] != "=":
-                    run_end = p  # empty here; a lower `=` restarts a run
-                elif p + 1 < q and text[p + 1] != "=":
-                    run_end = p + 1
-                # else: the `=` run from p+1 (or the value at q) continues
-            if run_end - p >= 3:
-                start_of_value = p
-                break
-            p -= 1
-        if start_of_value < 0:
-            continue
-        last_key = -1
-        for key in key_start_re.finditer(text, a, r):
-            last_key = key.start()
-        if last_key < 0:
-            continue
-        start = -1
-        for s in range(a, last_key + 1):
-            if is_word(s - 1) != is_word(s):
-                start = s
-                break
-        if start < 0:
-            continue
-        yield (start, r, start_of_value, run_end)
-        consumed = run_end
+def main_keyword_matches(text: str) -> Iterator[tuple[int, int, int, int]]:
+    """Main's keyword rule's matches over ``text`` (see
+    `pmcp.keyword_matcher.keyword_matches`), with main's frozen key set."""
+    return keyword_matches(text, _KEY_START_RE)
 
 
 # --------------------------------------------------------------------------
@@ -1013,6 +936,12 @@ _ESCAPE_TAIL_RE = re.compile(r"(?:[nrtbf]|u[0-9a-fA-F]{4})")
 _GLUED_RE = re.compile(r"[A-Za-z0-9]*\Z")
 
 
+#: A key longer than this is read no way at all, so every predicate that
+#: reads the key declines and main's redaction stands: a run of 11 000
+#: `token-` has 11 000 readings, and reading each is quadratic.
+_MAX_READ_KEY = 256
+
+
 def key_readings(span: FloorSpan) -> list[KeyReading]:
     """Every reading of the span's key: each key word in it, and -- when the
     key starts on the tail of a JSON escape (`\\npassword`) -- with and
@@ -1020,6 +949,8 @@ def key_readings(span: FloorSpan) -> list[KeyReading]:
     on EVERY reading, so an ambiguous key is never read the lenient way."""
     key = span.key.rstrip()
     before = span.before
+    if len(key) > _MAX_READ_KEY:
+        return []  # no reading: no key-reading predicate fires (a cost bound)
     variants = [(_GLUED_RE.search(before).group(0), key)]  # type: ignore[union-attr]
     if (len(before) - len(before.rstrip("\\"))) % 2 == 1:
         tail = _ESCAPE_TAIL_RE.match(key)
