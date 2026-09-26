@@ -404,15 +404,27 @@ def _secret_key_alternation() -> str:
 #: before a quote in a JSON-serialised string escapes that quote; eating it
 #: breaks the document): `password=(Xk9mQ2vL)` is one value, punctuation and all,
 #: while the `}` of `{"password": [REDACTED]}` stays with the object.
+#: The opening quote of what looks like a quoted value, when the content
+#: then starts with a JSON structural character: `…token: ", "next": …` is a
+#: key at the END of a JSON string, and this quote closes that string. Only
+#: consulted after an UNQUOTED key -- after `"password": "` the quote always
+#: opens a value, whatever it holds (`", secret"` is a valid password).
+_STRADDLE_RE = re.compile(r"[^\S\r\n]*[,:\]}]")
+
+#: A JSON number (a bare value after a quoted key).
+_JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
+
 _KEYWORD_KEY_SEP = (
-    r"(?P<key>(?P<qualifier>(?:(?<![A-Za-z0-9:.])|(?<=\\[nrt]))(?:[A-Za-z0-9]+[_-])*"
-    r"(?:(?-i:[a-z]+(?=[A-Z])))?)"
-    rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?)"
-    r"(?P<sep>[\"']?[ \t\xa0]*(?:=>|:=|==(?![ \t=])|[:=](?!=))"
-    r"(?:[ \t\xa0]*\r?\n[ \t\xa0]*(?=[^\s\-*#>])|[ \t\xa0]*))"
+    r"(?P<key>(?P<qualifier>(?:(?<![A-Za-z0-9:])|(?<=\\[nrt]))(?:[A-Za-z0-9]+[_-]){0,8}"
+    r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?)"
+    rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
+    r"(?P<extra>(?:[_-]?[A-Za-z0-9]){0,24}))"
+    r"(?P<sep>[\"']?[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))"
+    r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=[^\s\-*#>])|[^\S\r\n]*))"
 )
 _KEYWORD_SEP_RE = re.compile(
-    _KEYWORD_KEY_SEP + r"(?P<value>\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'"
+    _KEYWORD_KEY_SEP
+    + r"(?P<value>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_])"
     r"|(?!\{)(?!\[(?!REDACTED\]))[^\s\"',;&]*[^\s\"',;&)\]}\\])",
     re.IGNORECASE,
 )
@@ -420,8 +432,13 @@ _KEYWORD_SEP_RE = re.compile(
 #: The same keyword and separator followed by a flat list (`"password":
 #: ["hunter2"]`, pretty-printed or not): each quoted element is a value of the
 #: key. No nested brackets -- a list of objects carries its own keys.
+#: A key that is itself declared (`secret_access_key` is one key, not
+#: `secret` + a suffix): the suffixed-key gate does not apply to it.
+_DECLARED_KEY_RE = re.compile(
+    rf"(?:{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?", re.IGNORECASE
+)
 _KEYWORD_LIST_RE = re.compile(
-    _KEYWORD_KEY_SEP + r"(?P<list>\[[^\[\]]*\])", re.IGNORECASE
+    _KEYWORD_KEY_SEP + r"(?P<list>\[[^\[\]{}]*\])", re.IGNORECASE
 )
 _QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
 
@@ -436,9 +453,10 @@ _QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
 #: value never starts with `-`, `*`, `#` or `>`: `secret --bucket` is a flag
 #: after a word, `token:\n  - item` a bullet.
 _KEYWORD_WS_RE = re.compile(
-    r"(?P<key>(?:(?<![A-Za-z0-9_-])|(?<=\\[nrt]))(?:--)?(?:[A-Za-z0-9]+[_-])*"
-    rf"(?P<name>{_secret_key_alternation()})s?)"
-    r"(?P<sep>[ \t\xa0]+|[ \t\xa0]*\r?\n[ \t\xa0]*)"
+    r"(?P<key>(?:(?<![A-Za-z0-9_-])|(?<=\\[nrt]))(?:--)?(?:[A-Za-z0-9]+[_-]){0,8}"
+    r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?"
+    rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?)"
+    r"(?P<sep>[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]*)"
     r"(?![A-Za-z_-]+=[^=])(?![-*#>])(?P<value>[^\s\"',;()\[\]{}]+)",
     re.IGNORECASE,
 )
@@ -456,7 +474,7 @@ _KEYWORD_WS_RE = re.compile(
 #: `Bearer hunter2tok\"`, and eating the `\` un-escapes the quote.
 _BEARER_RE = re.compile(
     r"(?<![=:])(?<![=:] )(?<![A-Za-z0-9_-])"
-    r"(?P<key>bearer(?:[ \t\xa0]+|[ \t\xa0]*\r?\n[ \t\xa0]+))(?![A-Za-z_-]+=[^=])(?P<value>[^\s,;\"'()\[\]{}]*[^\s,;\"'()\[\]{}\\])",
+    r"(?P<key>bearer(?:[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]+))(?![A-Za-z_-]+=[^=])(?P<value>[^\s,;\"'()\[\]{}]*[^\s,;\"'()\[\]{}\\])",
     re.IGNORECASE,
 )
 
@@ -471,10 +489,10 @@ _BEARER_RE = re.compile(
 #: prose. The separator is on the same line: `Set the Authorization:\nheader
 #: first` is a sentence, not a header.
 _AUTHORIZATION_RE = re.compile(
-    r"authorization[\"']?[ \t\xa0]*[:=]"
-    r"(?:[ \t\xa0]*\r?\n[ \t\xa0]*(?=[^\s\-*#>])|[ \t\xa0]*)"
-    r"(?:(?P<quoted>\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*')"
-    r"|(?P<bare>(?:(?:bearer|basic|digest|negotiate|ntlm|token)[ \t]+)?"
+    r"authorization[\"']?[^\S\r\n]*[:=]"
+    r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=[^\s\-*#>])|[^\S\r\n]*)"
+    r"(?:(?P<quoted>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_]))"
+    r"|(?P<bare>(?![\[{])(?:(?:bearer|basic|digest|negotiate|ntlm|token)[^\S\r\n]+)?"
     r"[^\s,;\"']*[^\s,;\"')\]}]))",
     re.IGNORECASE,
 )
@@ -503,7 +521,38 @@ def _keyword_sep_spans(text: str) -> list[Span]:
             if qualifier not in _CODE_QUALIFIERS:
                 continue
         start, end = match.start("value"), match.end("value")
-        if match.group("value")[0] in "\"'":
+        value = match.group("value")
+        if match.group("extra") and not _DECLARED_KEY_RE.fullmatch(
+            text, match.start("name"), match.end("extra")
+        ):
+            # `password_confirmation=`, `passwordHash=`, `secret_value=`: a
+            # suffixed key is only a secret when its value looks like one
+            # (`token_type=bearer`, `password_length=12` are not)
+            inner = value[1:-1] if value[0] in "\"'" else value
+            if (
+                "://" in inner
+                or inner.lower().startswith("arn:")
+                or not _value_could_be_a_credential(inner)
+            ):
+                continue  # `token_endpoint=https://…`, `secret_arn=arn:…` name things
+        if match.group("sep")[:1] in "\"'" and value[0] not in "\"'":
+            # A quoted key -- JSON (or a Python/JS literal): a bare value is a
+            # JSON literal. `null`/`true`/`false` hold nothing; a number may
+            # (a PIN), so it becomes the STRING "[REDACTED]" -- the document
+            # stays JSON and a dict result stays a dict (the leaf's type
+            # changes from number to string: stated in the plan).
+            if value in ("null", "true", "false"):
+                continue
+            if _JSON_NUMBER_RE.fullmatch(value):
+                spans.append((start, end, f'"{REDACTED}"'))
+                continue
+        if (
+            value[0] in "\"'"
+            and match.group("sep")[:1] not in "\"'"
+            and _STRADDLE_RE.match(value, 1)
+        ):
+            continue  # the quote closes the string this key sits in
+        if value[0] in "\"'":
             # Redact INSIDE the quotes: `{"password": "[REDACTED]"}` is still
             # JSON, so a structured result round-trips as a dict (main's did).
             start, end = start + 1, end - 1
@@ -547,9 +596,23 @@ def _bearer_spans(text: str) -> list[Span]:
 def _authorization_spans(text: str) -> list[Span]:
     spans: list[Span] = []
     for match in _AUTHORIZATION_RE.finditer(text):
-        if match.group("quoted") is not None:
+        key_end = match.start() + len("authorization")
+        quoted_key = text[key_end : key_end + 1] in ('"', "'")
+        quoted = match.group("quoted")
+        if quoted is not None:
+            if not quoted_key and _STRADDLE_RE.match(quoted, 1):
+                continue  # the quote closes the string this key sits in
             spans.append((match.start("quoted") + 1, match.end("quoted") - 1, REDACTED))
-        elif not _is_plain_word_or_number(match.group("bare")):
+            continue
+        bare = match.group("bare")
+        if quoted_key and (
+            bare in ("null", "true", "false") or _JSON_NUMBER_RE.fullmatch(bare)
+        ):
+            # a JSON literal after a quoted key: same rule as the keyword
+            # pass -- literals hold nothing, a number becomes a STRING
+            if bare not in ("null", "true", "false"):
+                spans.append((match.start("bare"), match.end("bare"), f'"{REDACTED}"'))
+        elif not _is_plain_word_or_number(bare):
             spans.append((match.start("bare"), match.end("bare"), REDACTED))
     return spans
 

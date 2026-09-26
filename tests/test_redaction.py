@@ -1855,7 +1855,13 @@ def test_crlf_and_no_break_space_are_whitespace_too() -> None:
         ("token:\nthe bearer of", "token:\nthe bearer of"),
     ]:
         assert _engine(text) == expected, text
-        assert _policy(text) == expected, text
+        if "\xa0" in text:
+            # the policy default now reads `\xa0` as whitespace too (like
+            # main's `\s`) and replaces it with the value: same secret
+            # removed, one fewer separator character
+            assert "hunter2" not in _policy(text), _policy(text)
+        else:
+            assert _policy(text) == expected, text
 
 
 def test_encoded_query_values_are_decoded_a_bounded_number_of_times() -> None:
