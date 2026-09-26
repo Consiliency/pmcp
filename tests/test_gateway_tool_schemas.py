@@ -15,9 +15,11 @@ Three things the models enforce are not expressible in the schema and stay
 handler-only: `InvokeInput`'s correlation-ID charset validator and its
 all-or-none `model_validator`, and `RegisterDiscoveredServerInput`'s
 `_validate_package`. Everything the projection CAN express -- types, bounds,
-enums, required, and (A1) `null` on optional fields -- must agree in both
-directions, which `test_optional_field_null_agrees_between_gate_and_model`
-checks per field.
+enums, required, and (A1) `null` on optional fields -- agrees on what is
+REQUIRED and on `null` (`test_optional_field_null_agrees_between_gate_and_model`
+checks per field). It does not agree on type COERCION: pydantic's lax mode
+accepts `1` / `"true"` for a boolean and `"5"` for a number, and the JSON-Schema
+gate does not, so the gate is stricter there (stated in the plan).
 """
 
 from __future__ import annotations
@@ -446,3 +448,37 @@ async def test_server_gate_rejects_what_the_model_rejects(
     text = result.content[0].text  # type: ignore[union-attr]
     assert text.startswith("Input validation error:"), text
     assert fragment in text, text
+
+
+@pytest.mark.asyncio
+async def test_a_dispatch_branch_for_an_unregistered_name_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """X1, structurally: a name the registry does not list never reaches a
+    handler, even when `_handle_call_tool` has a dispatch branch for it (the
+    board's bypass was `elif name == "gateway.health" or name == "gateway.health2"`,
+    which the text pin above cannot see). Simulated by unregistering a name
+    that has a branch: the gate is skipped, so dispatch must refuse it."""
+    from mcp.types import CallToolRequestParams
+
+    srv = GatewayServer()
+    real_find = srv._find_gateway_tool
+    monkeypatch.setattr(
+        srv,
+        "_find_gateway_tool",
+        lambda name: None if name == "gateway.health" else real_find(name),
+    )
+    called: list[str] = []
+
+    async def health(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        called.append("health")
+        return {}
+
+    monkeypatch.setattr(srv._gateway_tools, "health", health)
+    result = await srv._handle_call_tool(
+        None,  # type: ignore[arg-type]
+        CallToolRequestParams(name="gateway.health", arguments={"x": "Bearer sk-x"}),
+    )
+    assert called == [], "an ungated name reached its handler"
+    text = " ".join(getattr(c, "text", "") for c in result.content)
+    assert "Unknown tool: gateway.health" in text, text

@@ -334,6 +334,14 @@ class GatewayServer:
                             "scoped advisor invoke requires run, seat, and evidence correlations"
                         )
 
+                if tool is None:
+                    # Fail closed on any name the registry does not list: only
+                    # a registered name went through the schema gate above, so
+                    # no dispatch branch below may run for anything else. This
+                    # raises inside the audited path, like an unknown name
+                    # always has (Consiliency/pmcp#236, X1).
+                    raise ValueError(f"Unknown tool: {name}")
+
                 if name == "gateway.catalog_search":
                     result = await self._gateway_tools.catalog_search(arguments)
                 elif name == "gateway.describe":
