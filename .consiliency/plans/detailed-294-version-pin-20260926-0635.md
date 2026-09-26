@@ -17,6 +17,27 @@
 > (Verification step 9 re-checks that). The spike diff and the new test file are embedded
 > verbatim below as the reference patch.
 
+## Revision 3 (2026-09-26): board round 2 on `95968c8`
+
+The claude seat returned DISAGREE with one blocker (B1) and four non-blocking items. It
+confirmed every other round-1 resolution and reproduced the round-1 numbers. Each
+item below was **reproduced first**, then fixed, and has a test that is red on the
+revision-2 spike and green on revision 3, plus a mutant (M25-M33). All numbers were
+re-measured on the revision-3 spike, which was then reverted.
+
+| # | finding | resolution | evidence |
+|---|---|---|---|
+| **B1** (blocking) | Tarball specs slipped through the P1 allowlist. npm treats `name@corp.tgz`, `name@x.tar` and `name@x.tar.gz` (any case), and a bare **unscoped** `corp.tgz` slot, as local tarball **files**. The rev-2 tag regex read them as dist-tags, so `firecrawl-mcp@corp-mcp.TGZ` plus a pin became the public `firecrawl-mcp@3.25.5`: dependency confusion. | npm's own rule, verbatim from npm-package-arg: `isFileType = /[.](?:tgz\|tar\.gz\|tar)$/i`. It is applied to the selector **and** to an unscoped name, exactly where npa applies it; a scoped name is exempt, as in npa. The allowlist was then **re-derived class by class** against npa's classifier (the class table below, in D3), which also closed N4. The rule is pure grammar in the new public `split_plain_registry_spec`. It never consults the resolver, so pins keep working while identity is disabled. | **Reproduced** end to end with the seat's overlay (temp HOME): main `9ca081e` gives `['-y','firecrawl-mcp@corp-mcp.TGZ']`; rev 2 (per the seat, and per the `grammar_conformance` probe below) gives `['-y','firecrawl-mcp@3.25.5']`, silently; **rev 3 gives `version: None args: ['-y','firecrawl-mcp@corp-mcp.TGZ']` plus the WARNING** `Ignoring version pin '3.25.5' for server 'corp-mcp': its args name no plain registry package ...`. **Grammar conformance against the host's real npa** (461 crafted slots): rev-2 rule, **136 violations** (accepted slots that npa classifies as `file`, as `range`, or as invalid); **rev-3 rule, 0 violations**. The P1 test now has one case per npa class (25 ids): **12 red on rev 2** (every tarball form, both bare tarballs, `x`, `X`, `v1.2.x`, and the trailing newline), green on rev 3. A new positive-control test covers 8 accepted classes. Mutant **M26** (drop the name clause) is red on **`bare-tarball-tgz`, `bare-tarball-TAR` and `tarball-name-with-version`**. M25 (drop the selector clause) is red on all 5 tarball-selector ids. |
+| **N1** | Two cache-key components had no test: the project overlay and the trust store. | Added `test_fingerprint_changes_when_a_project_overlay_appears` and `test_fingerprint_changes_when_the_project_overlay_is_approved`. The latter uses `approve_project_file`, which changes only the trust store, and asserts that the approved `server_version` then loads. | Mutant **M32** (`parts.append(None)` for the project line) is red on the first test. **M33** (the same for the trust-store line) is red on the second. Before revision 3, both mutants survived (the seat measured 70 passed). |
+| **N2** | The warning and `pmcp update` went silent when npm identity was disabled, which is dev0's default (`npm_config_cache`). | **I chose the structural fallback, and it fails loud when that can't decide.** For an npx launch whose identity is refused, the warning reads the slot with the provision gate's `_package_slot` and the same `split_plain_registry_spec` grammar, and says so (`(read from the argv: npm package identity is unavailable)`). An exact pin stays silent. When even the grammar can't name a plain registry package, it warns `pmcp cannot verify that its client is pinned: npm package identity is unavailable (see gateway_diagnostics.npm_identity) ...`. `pmcp update` prints the same warning under its result through the update wrapper. The update result itself is the pre-existing "Could not determine a registry package", because moving a package needs identity (#195) and that stays refused. | **Reproduced** with `npm_config_cache=/tmp/...` set: identity is `('unknown', None)`. rev 2 gives `warnings: []`. **rev 3 gives `'firecrawl' ... npm:firecrawl-mcp is unpinned (read from the argv: npm package identity is unavailable) ...`.** There are 3 tests (unpinned, exact pin, unreadable slot), using the `npm_identity_disabled` fixture. **2 are red on rev 2** (the exact-pin control is green on both). Mutants M29 and M30. |
+| **N3** | Build metadata was refused only for manifest pins. A `.pmcp.json` argv `firecrawl-mcp@3.25.5+evil` was labelled `[PINNED] 3.25.5+evil`. | **The label says what npm runs.** A configured argv is the operator's own, so pmcp does not refuse it. `_is_exact_pin` keeps treating it as exact, correctly: npm runs exactly 3.25.5, so the warning stays suppressed. `update_server` now reports `pinned_version="3.25.5"`, compares 3.25.5 against latest, and its message says `(build metadata '+evil' is ignored by npm)`. The same applies to cargo. The manifest path still refuses `+` outright (round-1 N2). | `test_update_server_labels_build_metadata_with_what_npm_runs`: **red on rev 2** (`('3.25.5+evil', 'newer') == ('3.25.5', 'newer')`), green on rev 3. Mutant M31. |
+| **N4** (nit) | `latest\n` was accepted (`match` rather than `fullmatch`), and `x`/`X` were accepted as "tags" although npm treats them as ranges. | The tag word is now `fullmatch`. Letter-led version or range words (`x`, `X`, `x.x`, `v1`, `v1.2.x`, `x-beta`) are **refused** by a partial-version-word clause, consistent with refusing every range. The clause is deliberately broad: a real tag it also catches only loses its pin, with a warning. | The P1 test ids `range-x`, `range-X`, `range-v-partial` and `tag-trailing-newline` are red on rev 2. Mutants M27 (range words) and M28 (`match`; red on `tag-trailing-newline` and 7 others). |
+| **N5** | This was already documented. | Unchanged, as instructed. | None needed. |
+
+**Scope growth.** There is still no new source file. `loader.py` gains the
+`split_plain_registry_spec` grammar (three module regexes), and `handlers.py` gains the
+identity-disabled fallback and the build-metadata label.
+
 ## Revision 2 (2026-09-26): board round on Consiliency/pmcp#295 @ `9d08184`
 
 The board reached quorum: gemini AGREE, claude PARTIALLY AGREE, codex DISAGREE with 3
@@ -244,6 +265,35 @@ and also for an explicit `manifest_path`. For an entry with `version` set:
    "`version` is set" always means "every spawning argv is pinned". The firecrawl test
    pins that invariant through the gate's own predicate:
    `_config_runs_exactly(pinned, "firecrawl-mcp@3.25.5")`.
+   **Revision 3 (board round 2, B1/N4): the allowlist, derived class by class from
+   npm-package-arg.** The source is npa as shipped with the host's npm
+   (`node_modules/npm-package-arg/lib/npa.js`). npa classifies a spec in a fixed order,
+   and only the last branch, `fromRegistry`, fetches `name` from the registry.
+   `split_plain_registry_spec(arg)` accepts a slot only if it reaches that branch as a
+   `version` or `tag` (or as a bare name, which npa types as the range `*`):
+
+   | npa class (branch, in npa's order) | npa trigger | how `split_plain_registry_spec` treats it |
+   |---|---|---|
+   | url / git url (`isURL`, whole arg) | `^(?:git[+])?[a-z]+:` | refused: the name half contains `:`, so `parse_package_spec` rejects it |
+   | git ssh (`isGit`, whole arg) | `^[^@]+@[^:.]+\.[^:]+:.+$` | refused: the selector contains `:` and is not a tag word |
+   | file / directory, unscoped name part (whole arg) | name part has `/` **or `isFileType`** | refused: `/` fails `is_valid_package_name`; **`isFileType` on an unscoped name is refused explicitly (B1)**. A scoped name is exempt, as in npa. |
+   | file (`isFileSpec`, selector) | `file:` prefix, or starts with `.`, `~/`, `/` or `X:` | refused: not a version and not a tag word (`:`, `/`, `.`-led, `~`) |
+   | alias (`isAliasSpec`, selector) | `npm:` prefix | refused: `:` |
+   | hosted git (`HostedGit.fromUrl`, selector) | `github:`, `gitlab:`, `user/repo`, ... | refused: `:` or `/` |
+   | remote (`isURL`, selector) | `https:` and similar | refused: `:` |
+   | file (`hasSlashes \|\| isFileType`, selector) | any `/`, **or `.tgz`/`.tar`/`.tar.gz`, any case** | refused: `/` is not a tag-word char; **`isFileType` on the selector is refused explicitly (B1)** |
+   | registry `version` (`semver.valid`, loose) | e.g. `3.25.5` | **accepted** when `is_valid_package_version` (strict SemVer). Loose forms such as `v3.25.5` and `=3.25.5` are refused, which is conservative. |
+   | registry `range` (`semver.validRange`, loose) | `^`, `~`, `>=`, `*`, `x`, `X`, `v1`, `1.x`, ... | **refused**. Symbol forms fail the tag word. **Letter-led forms (`x`, `X`, `v1.2.x`) are refused by the partial-version-word clause (N4).** A bare name (npa range `*`) is accepted: that is the entry running `name` at latest. |
+   | registry `tag` (`encodeURIComponent(spec) === spec`) | anything URI-safe that is not a version or range | **accepted** when it fullmatches the letter-led `[A-Za-z][A-Za-z0-9._-]*` (a subset of npa's tags), and is neither a tarball name nor a partial-version word |
+   | invalid (`EINVALIDTAGNAME` / `EINVALIDPACKAGENAME`) | e.g. `latest\n`, `tag!` | refused: `fullmatch` (N4), and `!` is outside the tag word |
+
+   **Measured against the real npa** (`grammar_conformance.py`, Verification step 10,
+   461 crafted slots across 9 names × 50 selectors plus bare forms): **0 accepted slots
+   that npa does not fetch as the same name from the registry** (72 accepted: 18 `version`,
+   48 `tag`, 6 bare-name `range *`). The revision-2 rule, on the same corpus, had **136
+   violations**. The tests use one case per class (`_NON_PLAIN_SLOTS`, 25 ids) plus 8
+   accepted-class controls, because round 2 showed that example lists which only
+   use `:`-prefixed forms can't see a letter-led class.
 6. **Revision 2 (codex P3): per entry.** The pass calls `_materialize_version_pin_soft`,
    so an exception while reading one entry (a non-string argv element or `command`,
    which overlays can carry because only parsed fields are shape-checked) costs that
@@ -341,6 +391,12 @@ spawn, so it does not hold the client still (latest: 3.26.0).` `pmcp update` pri
 `[FLOATING] fc: held at ^3.25.0, a range or tag that re-resolves at every spawn (latest 3.26.0)`.
 `[FLOATING]` is not a failure, and the exit code stays 0.
 
+**Revision 3 (board round 2, N3): build metadata in a configured argv.** npm and cargo
+ignore `+...` when resolving, so for an exact pin the label is **what runs**:
+`firecrawl-mcp@3.25.5+evil` reports `pinned_version="3.25.5"`, compares `3.25.5` with
+latest, and says `(build metadata '+evil' is ignored by npm)`. A manifest `version:`
+with `+` is still refused at load.
+
 ### D7. The unpinned-self-hosted warning (proposal 2)
 
 `_unpinned_self_hosted_warning(server_name, manifest_server, resolved)` in `handlers.py`
@@ -383,6 +439,15 @@ else is told to pin it in the args of the config that launches it.
   connected is not judged by health; `update_server` still judges it, on a fresh
   resolution.
 
+**Revision 3 change (board round 2, N2): npm identity disabled.** When
+`detect_package_type` refuses an **npx** launch (identity disabled or refused, #195),
+the warning does not go silent. It reads the slot with `provision_gate._package_slot`
+and `split_plain_registry_spec`, the grammar the materialiser uses. An exact pin is
+silent. `@latest`, a bare spec, a range or a tag warns, with `(read from the argv: npm
+package identity is unavailable)`. A slot the grammar can't name at all warns
+`pmcp cannot verify that its client is pinned ... (see gateway_diagnostics.npm_identity)`.
+Any other command with unknown identity stays silent, as before.
+
 The warning appears in two places:
 
 - **`gateway.health`.** `ServerHealthInfo.warnings: list[str]` (default `[]`) is filled by
@@ -410,7 +475,7 @@ The warning appears in two places:
 | `_parse_version_pin(name, raw, field_label)` | add | D1, fail-soft WARNING that names the field (`version` / `server_version`) |
 | `_pin_npx_args(args, version)` | add | D3 step 3. Local import of `provision_gate._NPX_LEADING_FLAGS` (provision_gate imports `ServerConfig` under `TYPE_CHECKING` only, but a local import keeps the module graph as it is) |
 | `_materialize_version_pin(server)` | add | D3 steps 1-5, all or nothing |
-| `_pin_npx_args` plain-registry-spec check (rev 2) | add: `requested` must be `None`, `is_valid_package_version`, or `package_identity._DIST_TAG_RE` (local import) | D3 step 3, codex P1 |
+| `split_plain_registry_spec(arg)` + `_NPM_FILE_TYPE_RE`, `_TAG_WORD_RE`, `_PARTIAL_VERSION_WORD_RE` (rev 3; public) | add; `_pin_npx_args` calls it for the slot (it replaces the rev-2 `_DIST_TAG_RE` check) | D3 class table: codex P1, board round 2 B1/N4 |
 | `_materialize_version_pin_soft(server)` (rev 2) | add; the load pass calls it | D3 step 6, codex P3 |
 | `manifest_sources_fingerprint()` (rev 2) | add, public, `stat` only | D7 health cache, claude F3 |
 | `_parse_version_pin` (rev 2) | also refuse `+` build metadata | D1, claude N2 |
@@ -434,6 +499,8 @@ The warning appears in two places:
 | imports | add `compare_versions` (version_checker) and `credential_requirement` (manifest.loader) | D6/D7 |
 | `_unpinned_self_hosted_warning(server_name, manifest_server, resolved, project_root)` (module level, after `_detect_effective_version_pin`) | add | D7 (rev 2: judges the relaxer on `sanitized_subprocess_env`, and suppresses only on `_is_exact_pin`) |
 | `_is_exact_pin(package_type, pin)` (rev 2) | add | D6/D7, codex P2 |
+| identity-disabled fallback in `_unpinned_self_hosted_warning` (rev 3) | add: npx only, via `provision_gate._is_npx`/`_package_slot` + `split_plain_registry_spec` (imports added) | D7, board round 2 N2 |
+| pinned branch: `build_note` (rev 3) | add: strip `+...` from an exact npm/cargo pin before comparing and labelling | D6, board round 2 N3 |
 | imports (rev 2) | add `_parse_version` (version_checker) and `manifest_sources_fingerprint` (manifest.loader) | `_is_exact_pin`, the health cache |
 | `GatewayTools._relaxable_cache`, `_relaxable_manifest_servers()` (rev 2) | add | D7 health cache, claude F3 |
 | `health` | call `self._attach_version_pin_warnings(servers)` before the diagnostics block | D7 |
@@ -459,7 +526,7 @@ drives `update_server` or `health` (19 files):
 
 - HEAD: 0 registry lookups.
 - The spike without this stub: exactly **1** offender, this test (`1 failed, 857 passed`).
-- The spike with the stub: 0. Revision 2 re-measured this over the same 19 files: `878 passed, 1 deselected`.
+- The spike with the stub: 0. Revision 2 re-measured this over the same 19 files: `878 passed, 1 deselected`; revision 3: `910 passed, 1 deselected`.
 
 The pinned-refusal tests in `tests/test_tools.py` (`test_update_server_refuses_pinned_configured_override`,
 `..._pinned_docker_tag`) already stub `get_package_version` and need no change. The stub
@@ -467,7 +534,7 @@ is included in the production diff above.
 
 ### `tests/test_version_pin.py` (create)
 
-57 tests (rev 2; 37 in rev 1). The parametrized sets are: 17 version refusals, 7 non-plain slots, 3 malformed shapes and 4 floating specs. Body verbatim below.
+89 tests (rev 3; 57 in rev 2, 37 in rev 1). The parametrized sets are: 17 version refusals, **25 npa-class non-plain slots**, 8 accepted-class controls, 3 malformed shapes and 4 floating specs. It also has 2 fingerprint tests, 3 identity-disabled tests and 1 build-metadata label test. Body verbatim below.
 
 ### Production diff (spike, verbatim; apply as-is)
 
@@ -536,7 +603,7 @@ index 74ced0d..8760f54 100644
      """Return the PMCP gateway MCP endpoint URL."""
      return os.environ.get(
 diff --git a/src/pmcp/manifest/loader.py b/src/pmcp/manifest/loader.py
-index 9837e82..d27ce06 100644
+index 9837e82..695c712 100644
 --- a/src/pmcp/manifest/loader.py
 +++ b/src/pmcp/manifest/loader.py
 @@ -14,6 +14,7 @@ from typing import Any, Literal, cast
@@ -560,7 +627,7 @@ index 9837e82..d27ce06 100644
  
  
  def credential_storage_key(server: Any) -> str | None:
-@@ -553,6 +560,184 @@ def _parse_api_key_optional_when(
+@@ -553,6 +560,229 @@ def _parse_api_key_optional_when(
      return parsed
  
  
@@ -591,42 +658,87 @@ index 9837e82..d27ce06 100644
 +    return None
 +
 +
++# npm-package-arg's classification, restated as the ALLOWLIST a pin may
++# rewrite (Consiliency/pmcp#295 board rounds 1-2). npa decides a spec's class
++# in a fixed order, and only its final branch, `fromRegistry`, fetches `name`
++# from the registry; every earlier branch (URL, git, alias, file, directory,
++# hosted git) names something else. The plan's class table maps each branch to
++# the clause below that refuses it.
++#
++# npa `isFileType`, verbatim: a selector -- or an UNSCOPED bare name -- ending
++# in .tgz/.tar/.tar.gz (any case) is a local tarball FILE, checked before the
++# registry branch. Letter-led, so a tag-shaped regex alone admits it.
++_NPM_FILE_TYPE_RE = re.compile(r"[.](?:tgz|tar\.gz|tar)$", re.IGNORECASE)
++# A dist-tag: npa's registry branch accepts any encodeURIComponent-safe word
++# that is neither a version nor a range; this is the letter-led subset of it
++# (fullmatch, so no trailing newline).
++_TAG_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9._-]*")
++# A letter-led word npm reads as a VERSION or RANGE, not a tag: an optional
++# v/V, then a partial version whose parts are numbers or x/X/* wildcards
++# (`x`, `X.x`, `v1`, `v1.2.x`, `x-beta`). Refused like every range: rewriting
++# it would be harmless to package identity (still `fromRegistry`), but a range
++# is not the version-or-tag class a pin replaces. Deliberately broad: a real
++# tag this also matches only loses its pin, with a warning.
++_PARTIAL_VERSION_WORD_RE = re.compile(
++    r"[vV]?(?:[0-9]+|[xX*])(?:\.(?:[0-9]+|[xX*])){0,2}(?:[-+].*)?"
++)
++
++
++def split_plain_registry_spec(arg: str) -> tuple[str, str | None] | None:
++    """``(name, selector)`` if npm would fetch *arg* from the registry as
++    ``name`` at an exact version or a dist-tag; else ``None``.
++
++    Accepted: ``name`` (npa: registry range ``*``), ``name@<exact SemVer>``
++    (npa: ``version``) and ``name@<dist-tag>`` (npa: ``tag``). Refused, by
++    class: anything ``parse_package_spec`` rejects (URLs, aliases, git, paths,
++    flags: their name half is not a package name, or they have no name); an
++    unscoped name ending in a tarball suffix (npa: ``file``); a selector that
++    is not an exact version or a tag word (``:`` / ``/`` / ``~`` / ``.``-led
++    forms, i.e. alias, git, URL, file, directory, and every range); a tag word
++    ending in a tarball suffix (npa: ``file``); and a tag word that npm reads as
++    a version or range (``x``, ``v1``). Pure grammar: it never asks the
++    resolver, so it works while npm package identity is disabled.
++    """
++    try:
++        name, selector = parse_package_spec(arg)
++    except (ValueError, TypeError, AttributeError):
++        return None
++    if not name.startswith("@") and _NPM_FILE_TYPE_RE.search(name):
++        return None
++    if selector is None or is_valid_package_version(selector):
++        return name, selector
++    if (
++        _TAG_WORD_RE.fullmatch(selector)
++        and not _NPM_FILE_TYPE_RE.search(selector)
++        and not _PARTIAL_VERSION_WORD_RE.fullmatch(selector)
++    ):
++        return name, selector
++    return None
++
++
 +def _pin_npx_args(args: list[str], version: str) -> tuple[list[str], str] | None:
 +    """*args* with the npx package slot pinned to *version*, and the name.
 +
 +    The slot is the provision gate's (`provision_gate._package_slot`): the
-+    first argument that is not an allowlisted leading flag. Its NAME is kept
-+    and only its version suffix is replaced, so a pin can select a version of
-+    the package the entry already runs and never a different package.
-+    ``None`` when the slot is missing or is not a PLAIN REGISTRY SPEC.
-+
-+    A plain registry spec is ``name`` or ``name@<selector>`` where the selector
-+    is one exact SemVer version (``is_valid_package_version``) or a dist-tag
-+    (``package_identity._DIST_TAG_RE``: a letter-led ``[A-Za-z0-9._-]`` word).
-+    That is an allowlist by grammar, not a list of bad examples: everything
-+    else npm accepts after ``name@`` -- an alias (``npm:other@1``), a URL, a
-+    git or ``github:`` spec, a ``file:`` path or tarball, and also a range --
-+    names or selects something the version suffix alone does not, so
-+    replacing it with ``@<version>`` could change WHICH package runs
-+    (``myalias@npm:firecrawl-mcp@3.25.5`` -> ``myalias@3.25.5`` is the
-+    registry package ``myalias``; Consiliency/pmcp#295 board, codex P1).
++    first argument that is not an allowlisted leading flag. It must be a plain
++    registry spec (`split_plain_registry_spec`); its NAME is kept and only its
++    version suffix is replaced, so a pin can select a version of the package
++    the entry already runs and never a different one. ``None`` otherwise:
++    ``myalias@npm:firecrawl-mcp@3.25.5`` -> ``myalias@3.25.5`` would be the
++    registry package ``myalias`` (codex P1), and
++    ``firecrawl-mcp@corp-mcp.TGZ`` -> ``firecrawl-mcp@3.25.5`` would turn a
++    local tarball into a public-registry fetch (round-2 B1).
 +    """
-+    # Local imports: provision_gate is a consumer of this module's
-+    # ServerConfig; package_identity owns the dist-tag grammar.
-+    from pmcp.manifest.package_identity import _DIST_TAG_RE
++    # Local import: provision_gate is a consumer of this module's ServerConfig.
 +    from pmcp.provision_gate import _NPX_LEADING_FLAGS
 +
 +    for index, arg in enumerate(args):
 +        if arg in _NPX_LEADING_FLAGS:
 +            continue
-+        try:
-+            name, requested = parse_package_spec(arg)
-+        except ValueError:
++        plain = split_plain_registry_spec(arg)
++        if plain is None:
 +            return None
-+        if requested is not None and not (
-+            is_valid_package_version(requested) or _DIST_TAG_RE.match(requested)
-+        ):
-+            return None
++        name, _selector = plain
 +        return [*args[:index], f"{name}@{version}", *args[index + 1 :]], name
 +    return None
 +
@@ -745,7 +857,7 @@ index 9837e82..d27ce06 100644
  def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
      """Parse a server config from raw YAML data."""
      install_data = data.get("install", {})
-@@ -613,6 +798,7 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
+@@ -613,6 +843,7 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
          status=data.get("status"),
          source=data.get("source"),
          replacement=data.get("replacement"),
@@ -753,7 +865,7 @@ index 9837e82..d27ce06 100644
      )
  
  
-@@ -722,7 +908,10 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
+@@ -722,7 +953,10 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
  
  
  _OverlayDocument = tuple[
@@ -765,7 +877,7 @@ index 9837e82..d27ce06 100644
  ]
  
  
-@@ -739,7 +928,7 @@ def _load_overlay_file(path: Path) -> _OverlayDocument:
+@@ -739,7 +973,7 @@ def _load_overlay_file(path: Path) -> _OverlayDocument:
          content = path.read_bytes()
      except OSError as exc:
          logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
@@ -774,7 +886,7 @@ index 9837e82..d27ce06 100644
  
      return _parse_overlay_document(path, content)
  
-@@ -747,7 +936,7 @@ def _load_overlay_file(path: Path) -> _OverlayDocument:
+@@ -747,7 +981,7 @@ def _load_overlay_file(path: Path) -> _OverlayDocument:
  def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
      """Parse overlay bytes, fail-soft. ``path`` is for messages only.
  
@@ -783,7 +895,7 @@ index 9837e82..d27ce06 100644
      non-mapping top-level document logs a warning naming the file and returns
      empty dicts. Each entry is parsed in its own try/except so one malformed
      entry is skipped without dropping siblings.
-@@ -759,18 +948,22 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
+@@ -759,18 +993,22 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
      operator can point a shipped server at a self-hosted endpoint without
      restating its command, args, and install block. It deliberately cannot
      create a server: ``servers:`` remains whole-entry replace.
@@ -808,7 +920,7 @@ index 9837e82..d27ce06 100644
  
      servers: dict[str, ServerConfig] = {}
      raw_servers = data.get("servers", {})
-@@ -814,7 +1007,22 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
+@@ -814,7 +1052,22 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
      elif raw_server_env:
          logger.warning(f"Skipping 'server_env' in overlay {path}: not a mapping")
  
@@ -832,7 +944,7 @@ index 9837e82..d27ce06 100644
  
  
  def load_manifest(manifest_path: Path | None = None) -> Manifest:
-@@ -868,19 +1076,31 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
+@@ -868,19 +1121,31 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
                      continue
                  # Parse the bytes the gate judged. Re-opening `overlay_path`
                  # here would apply content nobody approved.
@@ -872,7 +984,7 @@ index 9837e82..d27ce06 100644
                  )
              for name in overlay_servers:
                  if name in servers:
-@@ -906,6 +1126,25 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
+@@ -906,6 +1171,25 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
                      existing, extra_env={**existing.extra_env, **patch}
                  )
  
@@ -899,10 +1011,10 @@ index 9837e82..d27ce06 100644
          version=data.get("version", "1.0"),
          cli_alternatives=cli_alternatives,
 diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
-index 956c8c8..9fd3ec3 100644
+index 956c8c8..66b5c4f 100644
 --- a/src/pmcp/tools/handlers.py
 +++ b/src/pmcp/tools/handlers.py
-@@ -101,7 +101,9 @@ from pmcp.manifest.version_checker import (
+@@ -101,13 +101,17 @@ from pmcp.manifest.version_checker import (
      _docker_image_tag,
      _npm_package_arg,
      _npm_tag,
@@ -912,7 +1024,15 @@ index 956c8c8..9fd3ec3 100644
      detect_package_type,
      get_package_version,
  )
-@@ -194,8 +196,10 @@ from pmcp.manifest.loader import (
+ from pmcp.policy.policy import PolicyManager
+ from pmcp.provision_gate import (
+     ProvisionDecision,
++    _is_npx,
++    _package_slot,
+     ProvisionSource,
+     evaluate_provision,
+     operator_safe,
+@@ -194,8 +198,11 @@ from pmcp.manifest.loader import (
      Manifest,
      ServerConfig,
      credential_lookup_keys,
@@ -920,10 +1040,11 @@ index 956c8c8..9fd3ec3 100644
      credential_storage_key,
      is_usable_credential_value,
 +    manifest_sources_fingerprint,
++    split_plain_registry_spec,
      requires_credential,
  )
  
-@@ -444,6 +448,86 @@ def _detect_effective_version_pin(
+@@ -444,6 +451,108 @@ def _detect_effective_version_pin(
      return None
  
  
@@ -983,9 +1104,31 @@ index 956c8c8..9fd3ec3 100644
 +    command, args = resolved.config.command, list(resolved.config.args)
 +    env, cwd = resolved.config.env, resolved.config.cwd
 +    package_type, package_name = detect_package_type(command, args, env, cwd)
++    note = ""
 +    if package_type == "unknown" or not package_name:
-+        return None
-+    pin = _detect_effective_version_pin(package_type, command, args, env, cwd)
++        # npm package identity is refused or disabled (#195; e.g. whenever
++        # `npm_config_cache` is set). Do not go silent (Consiliency/pmcp#295
++        # board round 2, N2): for an npx launch, read the slot STRUCTURALLY
++        # with the materialiser's own grammar, and say so; if even that cannot
++        # name a plain registry package, warn that the pin cannot be verified.
++        if not _is_npx(command):
++            return None
++        slot = _package_slot(args)
++        plain = split_plain_registry_spec(slot) if slot is not None else None
++        if plain is None:
++            return (
++                f"'{server_name}' talks to a self-hosted backend ({relaxed_by} is "
++                "set), but pmcp cannot verify that its client is pinned: npm "
++                "package identity is unavailable (see gateway_diagnostics."
++                "npm_identity) and its npx package slot is not a plain registry "
++                "spec. Pin an exact version in the args of the config that "
++                "launches it."
++            )
++        package_type, package_name = "npm", plain[0]
++        pin = plain[1] if plain[1] and plain[1] != "latest" else None
++        note = " (read from the argv: npm package identity is unavailable)"
++    else:
++        pin = _detect_effective_version_pin(package_type, command, args, env, cwd)
 +    if pin and _is_exact_pin(package_type, pin):
 +        return None
 +    if package_type == "npm" and resolved.source == "manifest":
@@ -1002,7 +1145,7 @@ index 956c8c8..9fd3ec3 100644
 +    )
 +    return (
 +        f"'{server_name}' talks to a self-hosted backend ({relaxed_by} is set) "
-+        f"but its client {package_type}:{package_name} {state}, so a spawn "
++        f"but its client {package_type}:{package_name} {state}{note}, so a spawn "
 +        "or `pmcp update` can move it ahead of the server; " + remedy + "."
 +    )
 +
@@ -1010,7 +1153,7 @@ index 956c8c8..9fd3ec3 100644
  # Human-readable label for a ResolvedServerConfig.source, used in messages
  # that need to point an operator at the file a pin (or other override) came
  # from.
-@@ -2675,6 +2759,8 @@ class GatewayTools:
+@@ -2675,6 +2784,8 @@ class GatewayTools:
                  )
              )
  
@@ -1019,7 +1162,7 @@ index 956c8c8..9fd3ec3 100644
          diagnostics = self._transport_diagnostics.model_copy()
          diagnostics.audit_buffer_size = self._audit_events.maxlen or len(
              self._audit_events
-@@ -2697,6 +2783,69 @@ class GatewayTools:
+@@ -2697,6 +2808,69 @@ class GatewayTools:
              audit_events=list(self._audit_events) or None,
          )
  
@@ -1089,7 +1232,7 @@ index 956c8c8..9fd3ec3 100644
      def _config_source_paths_by_server(self) -> dict[str, tuple[str, str]]:
          paths: dict[str, tuple[str, str]] = {}
          for source in load_config_sources(
-@@ -5319,7 +5468,26 @@ class GatewayTools:
+@@ -5319,7 +5493,26 @@ class GatewayTools:
          Freezing the ambient environment across the update is deliberately NOT
          done here; it would mean threading a frozen env through ClientManager,
          which is a separate concern from this TOCTOU.
@@ -1116,7 +1259,7 @@ index 956c8c8..9fd3ec3 100644
          parsed = UpdateServerInput.model_validate(input_data)
          server_name = parsed.server_name
  
-@@ -5415,14 +5583,59 @@ class GatewayTools:
+@@ -5415,14 +5608,70 @@ class GatewayTools:
              source_desc = _CONFIG_SOURCE_LABELS.get(
                  resolved_config.source, f"the {resolved_config.source} config"
              )
@@ -1132,6 +1275,17 @@ index 956c8c8..9fd3ec3 100644
 +            # it is reported as FLOATING, never as "pinned at ^3.25.0"
 +            # (Consiliency/pmcp#295 board, codex P2 / claude F1).
 +            exact = _is_exact_pin(package_type, pinned_to)
++            # SemVer build metadata selects nothing: `pkg@3.25.5+x` runs
++            # 3.25.5. Report what runs, and say the suffix was ignored -- the
++            # manifest path refuses such a pin outright; a configured argv is
++            # the operator's own and is labelled honestly instead (#295 board
++            # round 2, N3).
++            build_note = ""
++            if exact and package_type in ("npm", "cargo") and "+" in pinned_to:
++                pinned_to, _, build = pinned_to.partition("+")
++                build_note = (
++                    f" (build metadata '+{build}' is ignored by {package_type})"
++                )
 +            comparison = (
 +                compare_versions(pinned_to, latest_available, package_type)
 +                if latest_available and exact
@@ -1172,7 +1326,7 @@ index 956c8c8..9fd3ec3 100644
 -                    f"'{server_name}' is pinned to '{pinned_to}' in {source_desc} "
 -                    f"({command} {' '.join(args)}). gateway.update_server will not "
 +                    f"'{server_name}' is {'pinned to' if exact else 'held at'} "
-+                    f"'{pinned_to}' in {source_desc} "
++                    f"'{pinned_to}'{build_note} in {source_desc} "
 +                    f"({command} {' '.join(args)}). {availability} "
 +                    "gateway.update_server will not "
                      "move a pinned server to the latest version -- edit or remove "
@@ -1263,6 +1417,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+import yaml
 
 from pmcp.config.loader import _merge_manifest_defaults, manifest_server_to_config
 from pmcp.manifest.loader import (
@@ -1270,6 +1425,8 @@ from pmcp.manifest.loader import (
     ServerConfig,
     credential_requirement,
     load_manifest,
+    manifest_sources_fingerprint,
+    split_plain_registry_spec,
 )
 from pmcp.policy.policy import PolicyManager
 from pmcp.provision_gate import _config_runs_exactly
@@ -1490,43 +1647,97 @@ server_version:
     assert entry.install == {"linux": ["npx", "-y", "other-mcp"]}
 
 
+# One case per npm-package-arg class that is NOT a registry version/tag
+# (the plan's class table). Round 2 (B1) found the tarball class missing: every
+# earlier file/URL case carried a `:` prefix, which the old regex excluded
+# anyway, so no test exercised a letter-led tarball.
+_NON_PLAIN_SLOTS = {
+    "alias": "myalias@npm:firecrawl-mcp@3.25.5",
+    "url": "t@https://evil.test/t.tgz",
+    "git-url": "t@git+https://evil.test/t.git",
+    "hosted-shortcut": "t@github:evil/x",
+    "hosted-path": "t@evil/x",
+    "git-ssh": "t@git@github.com:evil/x",
+    "file-prefix": "t@file:../evil",
+    "relative-dir": "t@../evil",
+    "home-dir": "t@~/evil",
+    "absolute-dir": "t@/abs/evil",
+    "tarball-tgz": "t@corp.tgz",
+    "tarball-TGZ-mixed": "firecrawl-mcp@corp-mcp.TGZ",
+    "tarball-tar": "t@x.tar",
+    "tarball-tar.gz": "t@x.tar.gz",
+    "tarball-Tar.Gz": "@s/p@X.Tar.Gz",
+    "bare-tarball-tgz": "corp.tgz",
+    "bare-tarball-TAR": "x.TAR",
+    "tarball-name-with-version": "corp.tgz@3.25.5",
+    "range-caret": "t@^3.25.0",
+    "range-gte": "t@>=1.0.0",
+    "range-x": "t@x",
+    "range-X": "t@X",
+    "range-v-partial": "t@v1.2.x",
+    "tag-trailing-newline": "t@latest\n",
+    "not-uri-safe-tag": "t@tag!",
+}
+
+
+def _odd_slot_overlay(slot: str, version: str = "3.25.5") -> None:
+    _user_overlay(
+        yaml.safe_dump(
+            {
+                "servers": {
+                    "odd-slot": {
+                        "description": "odd slot",
+                        "keywords": ["o"],
+                        "install": {"linux": ["npx", "-y", slot]},
+                        "command": "npx",
+                        "args": ["-y", slot],
+                        "version": version,
+                    }
+                }
+            }
+        )
+    )
+
+
 @pytest.mark.parametrize(
-    "slot",
-    [
-        "myalias@npm:firecrawl-mcp@3.25.5",  # alias: `myalias@3.25.5` is another package
-        "t@file:../evil",
-        "t@github:evil/x",
-        "t@https://evil.test/t.tgz",
-        "t@git+https://evil.test/t.git",
-        "t@^3.25.0",  # a range selects a set, not a version of a known package
-        "t@>=1.0.0",
-    ],
+    "slot", list(_NON_PLAIN_SLOTS.values()), ids=list(_NON_PLAIN_SLOTS)
 )
 def test_version_refuses_a_slot_that_is_not_a_plain_registry_spec(
     slot: str, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Only ``name`` or ``name@<version-or-tag>`` may have its version replaced."""
-    _user_overlay(
-        f"""
-servers:
-  odd-slot:
-    description: "odd slot"
-    keywords: [o]
-    install:
-      linux: ["npx", "-y", "{slot}"]
-    command: "npx"
-    args: ["-y", "{slot}"]
-    version: "3.25.5"
-"""
-    )
+    _odd_slot_overlay(slot)
 
     with caplog.at_level(logging.WARNING):
         entry = load_manifest().servers["odd-slot"]
 
+    assert split_plain_registry_spec(slot) is None
     assert entry.version is None
     assert entry.args == ["-y", slot]
     assert entry.install == {"linux": ["npx", "-y", slot]}
     assert any("plain registry" in m for m in _warnings(caplog))
+
+
+@pytest.mark.parametrize(
+    ("slot", "pinned"),
+    [
+        ("t", "t@3.25.5"),  # npa: registry range `*`
+        ("t@1.0.0", "t@3.25.5"),  # npa: version
+        ("t@1.0.0-rc.1", "t@3.25.5"),
+        ("t@next", "t@3.25.5"),  # npa: tag
+        ("t@beta-2.tgzx", "t@3.25.5"),  # tag: `.tgzx` is not a tarball suffix
+        ("@s/p", "@s/p@3.25.5"),
+        ("@s/p.tgz", "@s/p.tgz@3.25.5"),  # a SCOPED name is never a file to npa
+        ("@s/p@latest", "@s/p@3.25.5"),
+    ],
+)
+def test_version_pins_every_plain_registry_class(slot: str, pinned: str) -> None:
+    _odd_slot_overlay(slot)
+
+    entry = load_manifest().servers["odd-slot"]
+
+    assert entry.args == ["-y", pinned]
+    assert entry.version == "3.25.5"
 
 
 def test_version_replaces_a_dist_tag_slot() -> None:
@@ -1947,6 +2158,117 @@ async def test_health_loads_the_manifest_once_until_a_source_changes(
     assert len(loads) == 2
 
 
+def test_fingerprint_changes_when_a_project_overlay_appears(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    project = tmp_path / "proj"
+    (project / ".pmcp").mkdir(parents=True)
+    monkeypatch.chdir(project)
+    before = manifest_sources_fingerprint()
+
+    (project / ".pmcp" / "manifest.yaml").write_text(
+        'server_version:\n  firecrawl: "3.25.5"\n'
+    )
+
+    assert manifest_sources_fingerprint() != before
+
+
+def test_fingerprint_changes_when_the_project_overlay_is_approved(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, approve_project_file: Any
+) -> None:
+    """Approval changes what loads without touching the overlay file."""
+    overlay = tmp_path / "proj" / ".pmcp" / "manifest.yaml"
+    overlay.parent.mkdir(parents=True)
+    overlay.write_text('server_version:\n  firecrawl: "3.25.5"\n')
+    monkeypatch.chdir(tmp_path / "proj")
+    before = manifest_sources_fingerprint()
+    assert load_manifest().servers["firecrawl"].version is None
+
+    approve_project_file(overlay)
+
+    assert manifest_sources_fingerprint() != before
+    assert load_manifest().servers["firecrawl"].version == "3.25.5"
+
+
+@pytest.fixture
+def npm_identity_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """What `npm_config_cache` in the gateway env produces: every npm argv refused."""
+    from pmcp.manifest import version_checker
+
+    def refused(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(version_checker, "_npm_package_arg", refused)
+    monkeypatch.setattr(handlers_module, "_npm_package_arg", refused)
+
+
+@pytest.mark.asyncio
+async def test_health_still_warns_when_npm_identity_is_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_identity_disabled: None
+) -> None:
+    gateway = _gateway(
+        monkeypatch, tmp_path, {"fc": _server("fc", ["-y", "fc-mcp"])}, online=["fc"]
+    )
+
+    health = await gateway.health()
+
+    (info,) = [s for s in health.servers if s.name == "fc"]
+    assert len(info.warnings) == 1
+    assert "is unpinned (read from the argv" in info.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_health_reads_an_exact_pin_structurally_when_identity_is_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_identity_disabled: None
+) -> None:
+    gateway = _gateway(
+        monkeypatch,
+        tmp_path,
+        {"fc": _server("fc", ["-y", "fc-mcp@3.25.5"])},
+        online=["fc"],
+    )
+
+    health = await gateway.health()
+
+    (info,) = [s for s in health.servers if s.name == "fc"]
+    assert info.warnings == []
+
+
+@pytest.mark.asyncio
+async def test_health_says_it_cannot_verify_an_unreadable_slot_without_identity(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_identity_disabled: None
+) -> None:
+    gateway = _gateway(
+        monkeypatch,
+        tmp_path,
+        {"fc": _server("fc", ["-y", "-p", "other", "fc-mcp@3.25.5"])},
+        online=["fc"],
+    )
+
+    health = await gateway.health()
+
+    (info,) = [s for s in health.servers if s.name == "fc"]
+    assert len(info.warnings) == 1
+    assert "cannot verify" in info.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_update_server_labels_build_metadata_with_what_npm_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_tables: None
+) -> None:
+    """A configured `pkg@3.25.5+evil` runs 3.25.5; the label must say that."""
+    gateway = _gateway(
+        monkeypatch, tmp_path, {"fc": _server("fc", ["-y", "fc-mcp@3.25.5+evil"])}
+    )
+    _latest(monkeypatch, "3.26.0")
+
+    result = await gateway.update_server({"server_name": "fc"})
+
+    assert (result.pinned_version, result.latest_comparison) == ("3.25.5", "newer")
+    assert "build metadata '+evil' is ignored by npm" in result.message
+    assert "3.25.5+evil" not in (result.pinned_version or "")
+
+
 @pytest.mark.asyncio
 async def test_update_server_reports_a_range_as_floating_not_pinned(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_tables: None
@@ -2162,20 +2484,26 @@ cd "$WORKTREE"   # a fresh worktree off origin/main, with the diff + test file a
 
 # 0. The new tests exist.
 uv run pytest tests/test_version_pin.py --collect-only -q --cov-fail-under=0 | tail -1
-#   -> 57 tests collected
+#   -> 89 tests collected
 
 # 1. Red on HEAD (before the diff; the test file alone).
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
   uv run pytest tests/test_version_pin.py -q --cov-fail-under=0 --tb=line | tail -1
-#   -> 56 failed, 1 passed   (the 1 is test_explicit_config_args_win_over_the_manifest_pin,
+#   -> ImportError: cannot import name 'manifest_sources_fingerprint' from 'pmcp.manifest.loader' -- 1 error during collection
+#      (rev 3: the file imports manifest_sources_fingerprint and split_plain_registry_spec,
+#      which HEAD lacks, so collection itself is red; the per-test red evidence is the
+#      rev-1/rev-2 spike runs below and in the Revision tables)
+#   rev 2 was: 56 failed, 1 passed   (the 1 is test_explicit_config_args_win_over_the_manifest_pin,
 #      an inertness guard that is green on HEAD by design)
 #   Against the REVISION-1 spike: 19 failed, 38 passed; exactly the 19 new rev-2 cases
 #   (Revision 2 table).
+#   Against the REVISION-2 spike: 15 failed, 74 passed (Revision 3 table; measured with a
+#   one-line import shim, because rev 2 has no public split_plain_registry_spec).
 
 # 2. Green with the diff.
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
   uv run pytest tests/test_version_pin.py -q --cov-fail-under=0 | tail -1
-#   -> 57 passed
+#   -> 89 passed
 
 # 3. CI gates (all three are in .github/workflows).
 uv run ruff check src/ tests/                 # -> All checks passed!
@@ -2190,13 +2518,13 @@ unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
     tests/test_credential_gates_startup.py tests/test_credential_optionality_e2e.py \
     tests/test_manifest_provision.py tests/test_version_checker.py \
     tests/test_credential_predicate_guard.py -q --cov-fail-under=0 | tail -1
-#   -> 1588 passed, 19 deselected   (rev 2; adds the credential-predicate guard for F2)
+#   -> 1620 passed, 19 deselected   (rev 3; rev 2: 1588, adding the credential-predicate guard for F2)
 
 # 5. Whole suite: Bash run_in_background, wait for the notification. Do not detach with
 #    nohup/disown. Use a lane-unique log path.
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
   uv run pytest tests/ -q --cov-fail-under=0 -p no:cacheprovider > "$LOGDIR/294-suite.log" 2>&1
-#   -> 4128 passed, 3 skipped, 25 deselected in 422.12s (0:07:02)   (board revision 2 / patch rev 4; earlier: 4108 passed; the first spike was 1 failed / 4107 passed -- see the mutation-table note;
+#   -> 4160 passed, 3 skipped, 25 deselected in 442.33s (0:07:22)   (board revision 3; revision 2: 4128 passed, 3 skipped, 25 deselected in 422.12s; earlier: 4108 passed; the first spike was 1 failed / 4107 passed -- see the mutation-table note;
 #      revision 3 adds only the offline stub in test_pkgid_panel_fixes.py, re-measured by step 5b)
 
 # 5b. Hermeticity: no update_server/health test may reach a real registry. The plugin
@@ -2212,7 +2540,7 @@ F=$(grep -rln "update_server(\|\.health()\|gateway.health" tests/ | grep -v harn
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
   PYTHONPATH="$LOGDIR/plug" uv run pytest ${=F} -q --cov-fail-under=0 -p nonet -p no:cacheprovider | tail -1
 #   (zsh: ${=F} word-splits; in bash use $F)
-#   -> 878 passed, 1 deselected (board revision 2; 858 in revision 1, measured with the stub). The spike WITHOUT the panel-fixes stub gave
+#   -> 910 passed, 1 deselected (board revision 3; 878 in revision 2, 858 in revision 1, measured with the stub). The spike WITHOUT the panel-fixes stub gave
 #      "1 failed, 857 passed, 1 deselected" (the one offender named above); with the stub,
 #      the offender and tests/test_version_pin.py pass under the plugin (84 passed for those
 #      two files). On HEAD, the 6-file update_server subset gives 357 passed, 0 lookups.
@@ -2244,6 +2572,68 @@ uv run python ~/code/pmcp/scripts/check_plan_consistency.py .consiliency/plans/d
 #      (vacuous for a detailed plan: it has no lane table or EC ids; run for the record)
 ```
 
+```bash
+# 10. Grammar conformance against npm's own classifier (needs node + npm; not a CI gate).
+#     npa_classify.js prints npa's (type, name, registry) for each slot; the Python side
+#     asserts every slot split_plain_registry_spec accepts is a same-name registry
+#     version/tag (or a bare name). Both files are below.
+uv run python grammar_conformance.py <dir-with-npa_classify.js>
+#   -> slots: 461  accepted: 72 by npa class {'range': 6, 'version': 18, 'tag': 48}
+#      refused: 389 by npa class {'ERROR:EINVALIDPACKAGENAME': 1, 'ERROR:EINVALIDTAGNAME': 115, 'alias': 6,
+#               'directory': 61, 'file': 53, 'git': 30, 'range': 79, 'remote': 7, 'tag': 25, 'version': 12}
+#      VIOLATIONS (accepted but not a same-name registry version/tag): 0
+#   (the revision-2 rule on the same corpus: accepted 226, VIOLATIONS 136 -- file, range, invalid)
+```
+
+`npa_classify.js` (set `<NPM_ROOT>` to `$(dirname $(readlink -f $(which npm)))/..`):
+
+```javascript
+const npa = require("<NPM_ROOT>/node_modules/npm-package-arg");
+const slots = JSON.parse(require("fs").readFileSync(0, "utf8"));
+const out = {};
+for (const s of slots) {
+  try { const r = npa(s, "/tmp"); out[s] = [r.type, r.name || null, r.registry ? true : false]; }
+  catch (e) { out[s] = ["ERROR:" + e.code, null, false]; }
+}
+console.log(JSON.stringify(out));
+```
+
+`grammar_conformance.py`:
+
+```python
+"""Every slot split_plain_registry_spec accepts must be an npm REGISTRY fetch of
+the same name, of class version or tag (or the bare-name range `*`)."""
+import json, subprocess, sys
+from collections import Counter
+from pmcp.manifest.loader import split_plain_registry_spec
+S = sys.argv[1]
+names = ["firecrawl-mcp", "@scope/pkg", "t", "corp.tgz", "x.tar", "a.TAR.GZ", "@s/p.tgz", "x", "latest"]
+selectors = ["", "3.25.5", "3.25.5-rc.1", "3.25.5+b", "v3.25.5", "=3.25.5", "latest", "next", "beta-2", "x", "X", "x.x",
+  "v1", "v1.2.x", "1.x", "*", "^3.25.5", "~3.25.5", ">=1.0.0", "1 - 2", "1||2", "corp.tgz", "corp-mcp.TGZ", "x.tar", "x.tar.gz",
+  "X.Tar.Gz", "npm:other@1", "file:../x", "../x", "./x", "~/x", "/abs/x", "C:x", "github:a/b", "a/b", "git+https://h/x.git",
+  "https://h/x.tgz", "git@github.com:a/b", "latest\n", "late st", "tag!", "tag(1)", "ｘ", "вeta", "a.b", "tgz", "tar", "x-beta", "v", "vnext"]
+slots = []
+for n in names:
+    for sel in selectors:
+        slots.append(n if sel == "" else f"{n}@{sel}")
+slots += ["-y", "--package=x", "https://h/x.tgz", "git+ssh://h/x", "github:a/b", "../dir", "./x.tgz", "a/b", "@@x", "x@", "@s/p@corp.tgz"]
+res = json.loads(subprocess.run(["node", f"{S}/npa_classify.js"], input=json.dumps(slots), capture_output=True, text=True, check=True).stdout)
+bad = []; acc = Counter(); ref = Counter()
+for s in slots:
+    t, nm, reg = res[s]
+    ours = split_plain_registry_spec(s)
+    if ours is not None:
+        acc[t] += 1
+        ok = reg and nm == ours[0] and (t in ("version", "tag") or (t == "range" and ours[1] is None))
+        if not ok: bad.append((s, t, nm, ours))
+    else:
+        ref[t] += 1
+print(f"slots: {len(slots)}  accepted: {sum(acc.values())} by npa class {dict(acc)}")
+print(f"refused: {sum(ref.values())} by npa class {dict(sorted(ref.items()))}")
+print(f"VIOLATIONS (accepted but not a same-name registry version/tag): {len(bad)}")
+for b in bad: print("   ", b)
+```
+
 ### Live check (optional, network, not a gate)
 
 The operator can confirm the report end to end against the real registry:
@@ -2266,34 +2656,43 @@ line). `tests/test_version_pin.py` was run with `--tb=line`, and the file was re
 checked with `cmp` (`restored=True` for every row). The driver script is
 `mutants.py`, embedded at the end of this plan.
 
-| # | mutation | applied | result | red for (first `E` line, verbatim) / failing tests (driver prints up to 6 node ids per mutant) |
+| # | mutation | applied | result | first `E` line (verbatim, truncated at 160) / failing tests |
 |---|---|---|---|---|
-| M1 | grammar accepts any string | `579c579` | **13 failed, 44 passed** (restored=True) | `AssertionError: assert '^3.25.5' is None`; `test_server_version_refuses_anything_but_one_exact_version` |
-| M2 | install argv not pinned | `681c681` | **3 failed, 54 passed** (restored=True) | `AssertionError: assert {'mac': ['npx...recrawl-mcp']} == {'mac': ['npx...-mcp@3.25.5']}`; `test_server_version_pins_the_shipped_firecrawl_entry_everywhere_it_spawns`, `test_version_key_on_a_whole_servers_entry_is_materialised`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
-| M3 | existing tag not replaced | `626c626` | **2 failed, 55 passed** (restored=True) | `AssertionError: assert ['-y', '@play...latest@1.2.3'] == ['-y', '@play...ht/mcp@1.2.3']`; `test_version_replaces_a_dist_tag_slot`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
-| M4 | servers: version: key ignored | `801c801` | **12 failed, 45 passed** (restored=True) | `AssertionError: assert ['-y', 'custo...port', '3000'] == ['-y', 'custo...port', '3000']`; `test_version_key_on_a_whole_servers_entry_is_materialised`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec` |
-| M5 | unapproved project overlay applied | `1076c1076` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert '3.25.5' is None`; `test_unapproved_project_server_version_contributes_nothing` |
-| M6 | non-npx command accepted | `654c654` | **2 failed, 55 passed** (restored=True) | `assert False`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry`, `test_version_on_a_uvx_server_is_refused_with_the_escape_hatch` |
-| M7 | install may name another package | `676c676` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert '1.0.0' is None`; `test_version_is_refused_when_an_install_argv_names_another_package` |
-| M8 | comparison arguments swapped | `5599c5599` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert 'not_newer' == 'newer'`; `test_update_server_reports_a_newer_version_for_a_pinned_server` |
-| M9 | relaxer not required for the warning | `502,503d501` | **1 failed, 56 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_is_silent_when_the_relaxer_is_not_active` |
-| M10 | pin not consulted for the warning | `510,511d509` | **2 failed, 55 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_is_silent_when_the_client_is_pinned`, `test_health_judges_the_configured_entry_not_the_manifest` |
-| M11 | health judges the manifest, not the connected config | `2838c2838` | **1 failed, 56 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_judges_the_configured_entry_not_the_manifest` |
-| M12 | update_server drops the warning | `5483,5484d5482` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_update_server_carries_the_unpinned_self_hosted_warning` |
-| M13 | CLI keys the status off ok | `1032c1032` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert ['[FAILED] fi...long message'] == ['[PINNED] fi...able: 3.26.0']`; `test_pmcp_update_renders_a_pinned_server_as_pinned_not_failed` |
-| M14 | health never attaches warnings | `2762d2761` | **8 failed, 49 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_treats_latest_as_unpinned`, `test_health_warns_on_a_range_or_dist_tag`, `test_health_warns_when_a_self_hosted_backend_client_is_unpinned` |
-| M15 | P1: any slot selector accepted (alias/url/git/file/range) | `622c622` | **7 failed, 50 passed** (restored=True) | `AssertionError: assert '3.25.5' is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec` |
-| M16 | P1: dist-tag slots refused | `623c623` | **2 failed, 55 passed** (restored=True) | `AssertionError: assert ['-y', '@play...t/mcp@latest'] == ['-y', '@play...ht/mcp@1.2.3']`; `test_version_replaces_a_dist_tag_slot`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
-| M17 | P2: any npm selector counts as exact | `469c469` | **5 failed, 52 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_warns_on_a_range_or_dist_tag`, `test_update_server_reports_a_range_as_floating_not_pinned` |
-| M18 | P2: update reports a range as pinned | `5597c5597` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert ('^3.25.0', None) == (None, '^3.25.0')`; `test_update_server_reports_a_range_as_floating_not_pinned` |
-| M19 | P3: materialisation not contained per entry | `1145c1145` | **3 failed, 54 passed** (restored=True) | `AttributeError: 'int' object has no attribute 'startswith'`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry` |
-| M20 | F2: inherited env ignored | `500c500` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_warns_when_the_relaxer_comes_from_the_gateway_environment` |
-| M21 | F3: no cache | `2811c2811` | **1 failed, 56 passed** (restored=True) | `assert 3 == 1`; `test_health_loads_the_manifest_once_until_a_source_changes` |
-| M22 | F3: fingerprint misses the user overlay | `726d725` | **1 failed, 56 passed** (restored=True) | `assert 1 == 2`; `test_health_loads_the_manifest_once_until_a_source_changes` |
-| M23 | N2: build metadata accepted | `579c579` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert '3.25.5+evil' is None`; `test_server_version_refuses_anything_but_one_exact_version` |
-| M24 | CLI labels a range [FAILED] | `1026c1026` | **1 failed, 56 passed** (restored=True) | `AssertionError: assert ['[FAILED] fc: long message'] == ['[FLOATING] ...test 3.26.0)']`; `test_pmcp_update_renders_a_range_as_floating` |
+| M1 | grammar accepts any string | `579c579` | **13 failed, 76 passed** (restored=True) | `AssertionError: assert '^3.25.5' is None`; `test_server_version_refuses_anything_but_one_exact_version["*"]`, `test_server_version_refuses_anything_but_one_exact_version["../../tmp/x"]`, `test_server_version_refuses_anything_but_one_exact_version["3.25"]`, `test_server_version_refuses_anything_but_one_exact_version["3.25.5 --registry=http://evil.test"]`, `test_server_version_refuses_anything_but_one_exact_version["3.x"]`, `test_server_version_refuses_anything_but_one_exact_version[">=3.25.0"]`, `test_server_version_refuses_anything_but_one_exact_version["^3.25.5"]`, `test_server_version_refuses_anything_but_one_exact_version["evil-pkg@1.0.0"]` (+5 more) |
+| M2 | install argv not pinned | `726c726` | **3 failed, 86 passed** (restored=True) | `AssertionError: assert {'mac': ['npx...recrawl-mcp']} == {'mac': ['npx...-mcp@3.25.5']}`; `test_server_version_pins_the_shipped_firecrawl_entry_everywhere_it_spawns`, `test_version_key_on_a_whole_servers_entry_is_materialised`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
+| M3 | existing tag not replaced | `671c671` | **7 failed, 82 passed** (restored=True) | `AssertionError: assert ['-y', '@play...latest@1.2.3'] == ['-y', '@play...ht/mcp@1.2.3']`; `test_version_pins_every_plain_registry_class[@s/p@latest-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[t@1.0.0-rc.1-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@1.0.0-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@beta-2.tgzx-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@next-t@3.25.5]`, `test_version_replaces_a_dist_tag_slot`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
+| M4 | servers: version: key ignored | `846c846` | **38 failed, 51 passed** (restored=True) | `AssertionError: assert ['-y', 'custo...port', '3000'] == ['-y', 'custo...port', '3000']`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: "npx"\n    args: ["-y", "ok-mcp"]\n    install:\n      linux: ["npx", "-y", 123]]`, `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: "npx"\n    args: ["-y", 123]]`, `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: 123\n    args: ["-y", "ok-mcp"]]`, `test_version_key_on_a_whole_servers_entry_is_materialised`, `test_version_pins_every_plain_registry_class[@s/p-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[@s/p.tgz-@s/p.tgz@3.25.5]`, `test_version_pins_every_plain_registry_class[@s/p@latest-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[t-t@3.25.5]` (+30 more) |
+| M5 | unapproved project overlay applied | `1121c1121` | **2 failed, 87 passed** (restored=True) | `AssertionError: assert '3.25.5' is None`; `test_fingerprint_changes_when_the_project_overlay_is_approved`, `test_unapproved_project_server_version_contributes_nothing` |
+| M6 | non-npx command accepted | `699c699` | **2 failed, 87 passed** (restored=True) | `assert False`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: 123\n    args: ["-y", "ok-mcp"]]`, `test_version_on_a_uvx_server_is_refused_with_the_escape_hatch` |
+| M7 | install may name another package | `721c721` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert '1.0.0' is None`; `test_version_is_refused_when_an_install_argv_names_another_package` |
+| M8 | comparison arguments swapped | `5635c5635` | **2 failed, 87 passed** (restored=True) | `AssertionError: assert 'not_newer' == 'newer'`; `test_update_server_labels_build_metadata_with_what_npm_runs`, `test_update_server_reports_a_newer_version_for_a_pinned_server` |
+| M9 | relaxer not required for the warning | `505,506d504` | **1 failed, 88 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_is_silent_when_the_relaxer_is_not_active` |
+| M10 | pin not consulted for the warning | `535,536d534` | **3 failed, 86 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_is_silent_when_the_client_is_pinned`, `test_health_judges_the_configured_entry_not_the_manifest`, `test_health_reads_an_exact_pin_structurally_when_identity_is_disabled` |
+| M11 | health judges the manifest, not the connected config | `2863c2863` | **1 failed, 88 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_judges_the_configured_entry_not_the_manifest` |
+| M12 | update_server drops the warning | `5508,5509d5507` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_update_server_carries_the_unpinned_self_hosted_warning` |
+| M13 | CLI keys the status off ok | `1032c1032` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert ['[FAILED] fi...long message'] == ['[PINNED] fi...able: 3.26.0']`; `test_pmcp_update_renders_a_pinned_server_as_pinned_not_failed` |
+| M14 | health never attaches warnings | `2787d2786` | **10 failed, 79 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_loads_the_manifest_once_until_a_source_changes`, `test_health_says_it_cannot_verify_an_unreadable_slot_without_identity`, `test_health_still_warns_when_npm_identity_is_disabled`, `test_health_treats_latest_as_unpinned`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@3.x]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@^3.25.5]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@next]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@~3.25.5]` (+2 more) |
+| M15 | P1: any selector accepted (alias/url/git/file/dir/range) | `645c645` | **22 failed, 67 passed** (restored=True) | `AssertionError: assert ('myalias', 'npm:firecrawl-mcp@3.25.5') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[absolute-dir]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[alias]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[file-prefix]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-ssh]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-url]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[home-dir]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-path]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-shortcut]` (+14 more) |
+| M16 | P1: dist-tag slots refused | `640c640` | **5 failed, 84 passed** (restored=True) | `AssertionError: assert ['-y', '@play...t/mcp@latest'] == ['-y', '@play...ht/mcp@1.2.3']`; `test_version_pins_every_plain_registry_class[@s/p@latest-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[t@beta-2.tgzx-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@next-t@3.25.5]`, `test_version_replaces_a_dist_tag_slot`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
+| M17 | P2: any npm selector counts as exact | `472c472` | **5 failed, 84 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_warns_on_a_range_or_dist_tag[fc-mcp@3.x]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@^3.25.5]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@next]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@~3.25.5]`, `test_update_server_reports_a_range_as_floating_not_pinned` |
+| M18 | P2: update reports a range as pinned | `5622c5622` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert ('^3.25.0', None) == (None, '^3.25.0')`; `test_update_server_reports_a_range_as_floating_not_pinned` |
+| M19 | P3: materialisation not contained per entry | `1190c1190` | **1 failed, 88 passed** (restored=True) | `TypeError: expected str, bytes or os.PathLike object, not int`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: 123\n    args: ["-y", "ok-mcp"]]` |
+| M20 | F2: inherited env ignored | `503c503` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_warns_when_the_relaxer_comes_from_the_gateway_environment` |
+| M21 | F3: no cache | `2836c2836` | **1 failed, 88 passed** (restored=True) | `assert 3 == 1`; `test_health_loads_the_manifest_once_until_a_source_changes` |
+| M22 | F3: fingerprint misses the user overlay | `771d770` | **1 failed, 88 passed** (restored=True) | `assert 1 == 2`; `test_health_loads_the_manifest_once_until_a_source_changes` |
+| M23 | N2: build metadata accepted | `579c579` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert '3.25.5+evil' is None`; `test_server_version_refuses_anything_but_one_exact_version["3.25.5+evil"]` |
+| M24 | CLI labels a range [FAILED] | `1026c1026` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert ['[FAILED] fc: long message'] == ['[FLOATING] ...test 3.26.0)']`; `test_pmcp_update_renders_a_range_as_floating` |
+| M25 | B1: tarball SELECTOR accepted as a tag | `641d640` | **5 failed, 84 passed** (restored=True) | `AssertionError: assert ('t', 'corp.tgz') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-TGZ-mixed]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-Tar.Gz]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-tar.gz]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-tar]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-tgz]` |
+| M26 | B1: bare-tarball / tarball-NAME slot accepted | `635,636d634` | **3 failed, 86 passed** (restored=True) | `AssertionError: assert ('corp.tgz', None) is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[bare-tarball-TAR]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[bare-tarball-tgz]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-name-with-version]` |
+| M27 | N4: x/X/v1.2.x range words accepted as tags | `642d641` | **3 failed, 86 passed** (restored=True) | `AssertionError: assert ('t', 'x') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-X]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-v-partial]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-x]` |
+| M28 | N4: match instead of fullmatch (trailing newline) | `640c640` | **8 failed, 81 passed** (restored=True) | `AssertionError: assert ('myalias', 'npm:firecrawl-mcp@3.25.5') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[alias]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[file-prefix]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-ssh]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-url]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-path]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-shortcut]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[not-uri-safe-tag]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tag-trailing-newline]` |
+| M29 | N2: silent when npm identity is disabled | `517,518c517` | **2 failed, 87 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_says_it_cannot_verify_an_unreadable_slot_without_identity`, `test_health_still_warns_when_npm_identity_is_disabled` |
+| M30 | N2: silent when the slot cannot be read either | `521a522` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_says_it_cannot_verify_an_unreadable_slot_without_identity` |
+| M31 | N3: label keeps +metadata | `5629c5629` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert ('3.25.5+evil', 'newer') == ('3.25.5', 'newer')`; `test_update_server_labels_build_metadata_with_what_npm_runs` |
+| M32 | N1: fingerprint misses the project overlay | `774c774` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert (('/mnt/workspace/worktrees/viperjuice/pmcp-294/src/pmcp/manifest/manifest.yaml', 1790403902071608017, 78260), ('/tmp/...l', None, None),`; `test_fingerprint_changes_when_a_project_overlay_appears` |
+| M33 | N1: fingerprint misses the trust store | `780c780` | **1 failed, 88 passed** (restored=True) | `AssertionError: assert (('/mnt/workspace/worktrees/viperjuice/pmcp-294/src/pmcp/manifest/manifest.yaml', 1790403902071608017, 78260), ('/tmp/...-viperjuice/pyte`; `test_fingerprint_changes_when_the_project_overlay_is_approved` |
 
-**24 of 24 mutants red** on the board-revision-2 spike (M1-M14 re-run, M15-M24 new for the board findings), each for the named reason. After each run the file was restored
+**33 of 33 mutants red** on the board-revision-3 spike (M1-M14 and M17-M24 re-run; M15/M16 rewritten for the new grammar; M25-M33 new for board round 2), each for the named reason. **M26 (bare-tarball clause) is red on `bare-tarball-tgz`, `bare-tarball-TAR` and `tarball-name-with-version`.** After each run the file was restored
 from the spike copy, and `cmp` confirmed it identical (`restored=True`).
 
 **A finding from the first full-suite run (fixed in the diff above).** The first spike
@@ -2308,7 +2707,7 @@ must not move that docstring.**
 
 ## Acceptance criteria
 
-- [ ] `tests/test_version_pin.py` passes: 57 tests, Verification step 2.
+- [ ] `tests/test_version_pin.py` passes: 89 tests, Verification step 2.
 - [ ] A user overlay line `server_version: {firecrawl: "3.25.5"}` makes
   `load_manifest().servers["firecrawl"].args == ["-y", "firecrawl-mcp@3.25.5"]`, every
   `install` argv equal to `["npx", "-y", "firecrawl-mcp@3.25.5"]`, and
@@ -2338,6 +2737,13 @@ must not move that docstring.**
   costs only its own pin (`len(servers) == shipped + 1`); an inherited relaxer warns
   while `credential_requirement(...).required` stays `True`; and health loads the
   manifest once per source change. Proven by the tests named in the Revision 2 table.
+
+- [ ] Board revision 3: no slot that npa classifies as file, directory, git, remote, alias,
+  range or invalid is ever pinned. That includes every tarball form, bare or after `@`,
+  in any case (`test_version_refuses_a_slot_that_is_not_a_plain_registry_spec`, 25 ids,
+  plus Verification step 10: 0 violations). Both fingerprint components have tests. With
+  npm identity disabled, the warning still fires or says it cannot verify. A configured
+  `+metadata` pin is labelled with what npm runs.
 
 ## Non-goals (explicit)
 
@@ -2420,7 +2826,7 @@ must not move that docstring.**
   remain open.
 - PR: cross-vendor panel CR plus reconcile before merge (repo rule).
 
-## Appendix: mutation driver (`mutants.py`, run from the scratch dir with the board-revision-2 spike copies under `rev4/`)
+## Appendix: mutation driver (`mutants.py`, run from the scratch dir with the board-revision-3 spike copies under `rev5/`)
 
 ```python
 """Apply one mutant at a time to the spike, run the pin tests, restore, cmp."""
@@ -2444,8 +2850,6 @@ MUTANTS = [
     ("M12", "src/pmcp/tools/handlers.py", "        if warning:\n            result.warnings.append(warning)\n        return result", "        return result", "update_server drops the warning"),
     ("M13", "src/pmcp/cli.py", "    elif pinned:\n", "    elif False:\n", "CLI keys the status off ok"),
     ("M14", "src/pmcp/tools/handlers.py", "        self._attach_version_pin_warnings(servers)\n", "", "health never attaches warnings"),
-    ("M15", "src/pmcp/manifest/loader.py", "        if requested is not None and not (", "        if False and not (", "P1: any slot selector accepted (alias/url/git/file/range)"),
-    ("M16", "src/pmcp/manifest/loader.py", "is_valid_package_version(requested) or _DIST_TAG_RE.match(requested)", "is_valid_package_version(requested)", "P1: dist-tag slots refused"),
     ("M17", "src/pmcp/tools/handlers.py", '        return "*" not in pin and _parse_version(pin) is not None\n    return False\n', '        return "*" not in pin and _parse_version(pin) is not None\n    return True\n', "P2: any npm selector counts as exact"),
     ("M18", "src/pmcp/tools/handlers.py", "            exact = _is_exact_pin(package_type, pinned_to)", "            exact = True", "P2: update reports a range as pinned"),
     ("M19", "src/pmcp/manifest/loader.py", "name: _materialize_version_pin_soft(entry) for", "name: _materialize_version_pin(entry) for", "P3: materialisation not contained per entry"),
@@ -2454,13 +2858,24 @@ MUTANTS = [
     ("M22", "src/pmcp/manifest/loader.py", '        stat(Path.home() / ".pmcp" / "manifest.yaml"),\n', "", "F3: fingerprint misses the user overlay"),
     ("M23", "src/pmcp/manifest/loader.py", ' and "+" not in raw:', ":", "N2: build metadata accepted"),
     ("M24", "src/pmcp/cli.py", "    if floating:\n", "    if False:\n", "CLI labels a range [FAILED]"),
+    ("M15", "src/pmcp/manifest/loader.py", "        return name, selector\n    return None\n", "        return name, selector\n    return name, selector\n", "P1: any selector accepted (alias/url/git/file/dir/range)"),
+    ("M16", "src/pmcp/manifest/loader.py", "        _TAG_WORD_RE.fullmatch(selector)\n", "        False\n", "P1: dist-tag slots refused"),
+    ("M25", "src/pmcp/manifest/loader.py", "        and not _NPM_FILE_TYPE_RE.search(selector)\n", "", "B1: tarball SELECTOR accepted as a tag"),
+    ("M26", "src/pmcp/manifest/loader.py", '    if not name.startswith("@") and _NPM_FILE_TYPE_RE.search(name):\n        return None\n', "", "B1: bare-tarball / tarball-NAME slot accepted"),
+    ("M27", "src/pmcp/manifest/loader.py", "        and not _PARTIAL_VERSION_WORD_RE.fullmatch(selector)\n", "", "N4: x/X/v1.2.x range words accepted as tags"),
+    ("M28", "src/pmcp/manifest/loader.py", "        _TAG_WORD_RE.fullmatch(selector)\n", "        _TAG_WORD_RE.match(selector)\n", "N4: match instead of fullmatch (trailing newline)"),
+    ("M29", "src/pmcp/tools/handlers.py", "        if not _is_npx(command):\n            return None\n", "        return None\n", "N2: silent when npm identity is disabled"),
+    ("M30", "src/pmcp/tools/handlers.py", "        if plain is None:\n            return (", "        if plain is None:\n            return None\n            return (", "N2: silent when the slot cannot be read either"),
+    ("M31", "src/pmcp/tools/handlers.py", '            if exact and package_type in ("npm", "cargo") and "+" in pinned_to:', "            if False:", "N3: label keeps +metadata"),
+    ("M32", "src/pmcp/manifest/loader.py", "    parts.append(stat(project) if project is not None else None)", "    parts.append(None)", "N1: fingerprint misses the project overlay"),
+    ("M33", "src/pmcp/manifest/loader.py", "        parts.append(stat(trust_store_path()))", "        parts.append(None)", "N1: fingerprint misses the trust store"),
 ]
 only = set(sys.argv[1:])
 for mid, rel, old, new, desc in MUTANTS:
     if only and mid not in only:
         continue
     path = WT / rel
-    spike = S / "rev4" / rel
+    spike = S / "rev5" / rel
     text = path.read_text()
     assert text.count(old) == 1, (mid, old)
     path.write_text(text.replace(old, new, 1))
@@ -2479,7 +2894,7 @@ for mid, rel, old, new, desc in MUTANTS:
         shutil.copyfile(spike, path)
     same = filecmp.cmp(spike, path, shallow=False)
     print(f"{mid} | {desc} | applied {header} | {summary} | restored={same}")
-    for f in fails[:6]:
+    for f in fails:
         print(f"    {f}")
     for e in elines:
         print(f"    first: {e[:220]}")
