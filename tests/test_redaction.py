@@ -45,7 +45,6 @@ from pmcp.auth import (
 )
 from pmcp.policy.policy import (
     _ADDITIVE_DEFAULT_PATTERNS,
-    DEFAULT_REDACTION_PATTERNS,
     PolicyManager,
 )
 from tests import _redaction_grammar as G
