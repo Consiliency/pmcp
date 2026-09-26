@@ -589,11 +589,11 @@ def test_a_quoted_value_runs_to_its_closing_quote() -> None:
     `hunter2"` behind on both surfaces (board finding on the first revision).
     """
     for text, expected in [
-        ('{"password": "a\\"hunter2"}', '{"password": [REDACTED]}'),
-        ("{'password': 'a\\'hunter2'}", "{'password': [REDACTED]}"),
+        ('{"password": "a\\"hunter2"}', '{"password": "[REDACTED]"}'),
+        ("{'password': 'a\\'hunter2'}", "{'password': '[REDACTED]'}"),
         (
             '{"password": "hunter2", "user": "bob"}',
-            '{"password": [REDACTED], "user": "bob"}',
+            '{"password": "[REDACTED]", "user": "bob"}',
         ),
     ]:
         assert _engine(text) == expected
@@ -611,15 +611,15 @@ def test_an_earlier_pass_never_eats_the_boundary_a_later_pass_needs() -> None:
     value class and also missed a JSON-quoted key entirely.
     """
     for text, expected in [
-        ('{"password": "hunter2 Bearer test-token"}', '{"password": [REDACTED]}'),
-        ("{'password': 'hunter2 Bearer x'}", "{'password': [REDACTED]}"),
+        ('{"password": "hunter2 Bearer test-token"}', '{"password": "[REDACTED]"}'),
+        ("{'password': 'hunter2 Bearer x'}", "{'password': '[REDACTED]'}"),
         (
             '{"authorization": "Bearer abc123def456", "x": 1}',
             '{"authorization": "[REDACTED]", "x": 1}',
         ),
         ('Authorization: "Bearer abc.def"', 'Authorization: "[REDACTED]"'),
         ('{"note": "see Bearer abc123def456"}', '{"note": "see Bearer [REDACTED]"}'),
-        ('token="Bearer abc"', "token=[REDACTED]"),
+        ('token="Bearer abc"', 'token="[REDACTED]"'),
     ]:
         assert _engine(text) == expected, text
         assert "hunter2" not in _policy(text) and "abc" not in _policy(text), text
@@ -667,8 +667,8 @@ def test_no_pass_can_consume_a_boundary_another_pass_needs() -> None:
     value's span contains the URL's span and wins.
     """
     text = '{"password": "https://example.test/?token=abc123def456\\"hunter2"}'
-    assert _engine(text) == '{"password": [REDACTED]}'
-    assert _policy(text) == '{"password": [REDACTED]}'
+    assert _engine(text) == '{"password": "[REDACTED]"}'
+    assert _policy(text) == '{"password": "[REDACTED]"}'
     # a URL that is NOT inside a keyed value keeps its host and route
     assert _engine("see https://example.test/?token=abc123def456&page=2.") == (
         "see https://example.test/?token=[REDACTED]&page=2."
@@ -700,7 +700,7 @@ def test_the_redaction_window_reaches_past_the_cap() -> None:
     processed = PolicyManager().process_output(output, redact=True, max_bytes=400)
     assert processed["truncated"] is True  # the cut is at byte 300, inside the value
     assert value[:4] not in processed["result"], processed["result"][180:240]
-    assert processed["result"].startswith("a" * 190 + ' {"password": [REDACTED]')
+    assert processed["result"].startswith("a" * 190 + ' {"password": "[REDACTED]')
 
 
 # === properties =========================================================== #
@@ -1065,8 +1065,8 @@ def test_a_literal_marker_in_the_input_is_not_a_shield() -> None:
     for text, expected in [
         ("password=hunter2[REDACTED]", "password=[REDACTED]"),
         ("api_key=abc123def456[REDACTED]", "api_key=[REDACTED]"),
-        ('{"password": "hunter2 [REDACTED]"}', '{"password": [REDACTED]}'),
-        ('{"password": "[REDACTED] hunter2"}', '{"password": [REDACTED]}'),
+        ('{"password": "hunter2 [REDACTED]"}', '{"password": "[REDACTED]"}'),
+        ('{"password": "[REDACTED] hunter2"}', '{"password": "[REDACTED]"}'),
         ("token=[REDACTED]abc123def456 tail", "token=[REDACTED] tail"),
         ("password=[REDACTED]", "password=[REDACTED]"),
         ('{"password": [REDACTED]}', '{"password": [REDACTED]}'),
@@ -1338,7 +1338,7 @@ def test_quoted_bearer_and_httpie_and_ruby_separators() -> None:
         ("password:=hunter2", "password:=[REDACTED]"),
         ("token:=abc123def456", "token:=[REDACTED]"),
         ("password==hunter2", "password==[REDACTED]"),
-        ('{"password"=>"hunter2"}', '{"password"=>[REDACTED]}'),
+        ('{"password"=>"hunter2"}', '{"password"=>"[REDACTED]"}'),
         ("if token == expected:", "if token == expected:"),
         ("token_type=Bearer expires_in=3600", "token_type=Bearer expires_in=3600"),
     ]:
@@ -1369,7 +1369,7 @@ def test_a_value_may_sit_on_the_next_indented_line() -> None:
     """YAML block style, pretty-printed JSON and a folded header are formats;
     a keyword at the end of a sentence followed by an unindented line, or by
     a bullet, is prose."""
-    assert _engine('"password":\n    "hunter2"') == '"password":\n    [REDACTED]'
+    assert _engine('"password":\n    "hunter2"') == '"password":\n    "[REDACTED]"'
     assert _engine("password:\n  hunter2") == "password:\n  [REDACTED]"
     assert _engine("[x-api-key\n  abc123def456]") == "[x-api-key\n  [REDACTED]]"
     assert (
@@ -1711,9 +1711,18 @@ def test_differential_on_structured_results_never_worse_than_main() -> None:
     assert len(corpus) == len(oracle) == 400
     bugs: list[str] = []
     accepted: dict[str, int] = {}
-    for (obj, key, sep, value), main_removed in zip(corpus, oracle):
+    main_types = _main_oracle()["dict_types"]
+    assert len(main_types) == 400 and main_types.count("dict") == 370
+    for (obj, key, sep, value), main_removed, main_type in zip(
+        corpus, oracle, main_types
+    ):
         dumped = json.dumps(obj, indent=2)
         result = policy.process_output(obj, redact=True)["result"]
+        # A dict result stays a dict wherever main's did: gateway.invoke and
+        # tasks_result put this on the wire, and a redaction that breaks the
+        # serialised JSON silently turns the result into a string.
+        if main_type == "dict" and not isinstance(result, dict):
+            bugs.append(f"{obj!r} came back as {type(result).__name__}: {result!r}")
         out = result if isinstance(result, str) else json.dumps(result, indent=2)
         removed_here = set(_DIFF_TOKEN.findall(dumped)) - set(_DIFF_TOKEN.findall(out))
         kept = [
@@ -1751,6 +1760,81 @@ def test_differential_on_structured_results_never_worse_than_main() -> None:
     assert PolicyManager().process_output({"text": "Bearer test-token"}, redact=True)[
         "result"
     ] == {"text": "Bearer [REDACTED]"}
+
+
+def test_redaction_never_breaks_a_json_document() -> None:
+    """Wherever the input parses as JSON, the output does too, on both surfaces.
+    Main broke 7 of the corpus's 258 JSON rows (it ate a closing quote); rev 8
+    breaks none. A keyed value in quotes is redacted INSIDE the quotes."""
+    policy = PolicyManager()
+    checked = 0
+    for text, *_ in _differential_corpus():
+        try:
+            json.loads(text)
+        except ValueError:
+            continue
+        checked += 1
+        for surface, out in (
+            ("engine", _engine(text)),
+            ("policy", policy.redact_secrets(text)),
+        ):
+            try:
+                json.loads(out)
+            except ValueError:
+                pytest.fail(f"{surface} broke JSON: {text!r} -> {out!r}")
+    assert checked == 258, checked
+
+
+@pytest.mark.parametrize(
+    ("obj", "expected"),
+    [
+        ({"password": "hunter2"}, {"password": REDACTED}),
+        ({"password": ["hunter2", "s3cr3t99"]}, {"password": [REDACTED, REDACTED]}),
+        (
+            {"result": {"auth": {"api_key": "abc123def456"}}},
+            {"result": {"auth": {"api_key": REDACTED}}},
+        ),
+        ({"password": ""}, {"password": ""}),
+        ({"code": ["red", "x9Kq2mZ7"]}, {"code": ["red", REDACTED]}),
+    ],
+)
+def test_structured_result_round_trips_as_a_dict(obj: dict, expected: dict) -> None:
+    """The headline case, on the structured surface: redacted, still a dict."""
+    assert PolicyManager().process_output(obj, redact=True)["result"] == expected
+
+
+def test_pretty_printed_list_value_is_redacted_inside_its_quotes() -> None:
+    """`"password": [\n  "hunter2"\n]` -- a list under a secret key. Rev 7 ate
+    the `[`; main and the rev-8 spike left the value. Each quoted element is
+    redacted in place and the brackets stay."""
+    text = '{\n  "password": [\n    "hunter2"\n  ]\n}'
+    for out in (_engine(text), _policy(text)):
+        assert "hunter2" not in out
+        assert json.loads(out) == {"password": [REDACTED]}
+
+
+def test_operator_pattern_applies_to_a_percent_encoded_query_value(
+    tmp_path: Path,
+) -> None:
+    """Item 4 of rev 8: an operator's own pattern, written for the decoded
+    shape, still redacts the value when it arrives percent-encoded in a URL
+    query (main decoded before matching)."""
+    policy_file = tmp_path / "policy.yaml"
+    policy_file.write_text("redaction:\n  patterns:\n    - 'acme-[0-9]{6}'\n")
+    policy = PolicyManager(policy_path=policy_file)
+    plain = policy.redact_secrets("id acme-123456 end")
+    assert "123456" not in plain  # the pattern is live on the plain surface
+    out = policy.redact_secrets("https://h.example/?q=%61%63%6D%65%2D123456")
+    assert "123456" not in out and "%61%63%6D%65" not in out, out
+
+
+def test_url_decode_depth_bound_fails_closed() -> None:
+    """Item 3 of rev 8: a value that decodes past the depth bound raises no
+    RecursionError and is redacted whole rather than passed through."""
+    text = "https://h.example/?q=" * 400 + "%" + "25" * 400 + "20"
+    for out in (_engine(text), _policy(text)):
+        assert "%25%25" not in out
+        assert REDACTED in out
 
 
 def test_crlf_and_no_break_space_are_whitespace_too() -> None:
@@ -1817,12 +1901,3 @@ def test_a_comparison_survives_on_both_surfaces() -> None:
     assert _policy("if token == expected:") == "if token == expected:"
     assert _policy("password==hunter2") == "password=[REDACTED]"
     assert _policy("password:=hunter2") == "password:[REDACTED]"
-
-
-def test_a_keyed_list_is_a_stated_residual() -> None:
-    """`"password": ["hunter2"]` pretty-printed as a STRING: the list's
-    elements carry no key, and a bare value never starts on `[` (rev 7 ate
-    the `[` and broke the JSON). Main leaves it entirely alone too."""
-    text = '{\n  "password": [\n    "hunter2"\n  ]\n}'
-    assert _engine(text) == text
-    assert _policy(text) == text

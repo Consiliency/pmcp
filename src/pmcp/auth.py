@@ -404,16 +404,26 @@ def _secret_key_alternation() -> str:
 #: before a quote in a JSON-serialised string escapes that quote; eating it
 #: breaks the document): `password=(Xk9mQ2vL)` is one value, punctuation and all,
 #: while the `}` of `{"password": [REDACTED]}` stays with the object.
-_KEYWORD_SEP_RE = re.compile(
+_KEYWORD_KEY_SEP = (
     r"(?P<key>(?P<qualifier>(?:(?<![A-Za-z0-9:.])|(?<=\\[nrt]))(?:[A-Za-z0-9]+[_-])*"
     r"(?:(?-i:[a-z]+(?=[A-Z])))?)"
     rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?)"
     r"(?P<sep>[\"']?[ \t\xa0]*(?:=>|:=|==(?![ \t=])|[:=](?!=))"
     r"(?:[ \t\xa0]*\r?\n[ \t\xa0]*(?=[^\s\-*#>])|[ \t\xa0]*))"
-    r"(?P<value>\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'"
+)
+_KEYWORD_SEP_RE = re.compile(
+    _KEYWORD_KEY_SEP + r"(?P<value>\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'"
     r"|(?!\{)(?!\[(?!REDACTED\]))[^\s\"',;&]*[^\s\"',;&)\]}\\])",
     re.IGNORECASE,
 )
+
+#: The same keyword and separator followed by a flat list (`"password":
+#: ["hunter2"]`, pretty-printed or not): each quoted element is a value of the
+#: key. No nested brackets -- a list of objects carries its own keys.
+_KEYWORD_LIST_RE = re.compile(
+    _KEYWORD_KEY_SEP + r"(?P<list>\[[^\[\]]*\])", re.IGNORECASE
+)
+_QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
 
 #: A bare keyword (or `--keyword` flag) followed by whitespace and a value that
 #: could be a credential (`_value_could_be_a_credential`). This is what keeps
@@ -492,7 +502,29 @@ def _keyword_sep_spans(text: str) -> list[Span]:
             qualifier = match.group("qualifier").rstrip("_-").lower()
             if qualifier not in _CODE_QUALIFIERS:
                 continue
-        spans.append((match.start("value"), match.end("value"), REDACTED))
+        start, end = match.start("value"), match.end("value")
+        if match.group("value")[0] in "\"'":
+            # Redact INSIDE the quotes: `{"password": "[REDACTED]"}` is still
+            # JSON, so a structured result round-trips as a dict (main's did).
+            start, end = start + 1, end - 1
+        spans.append((start, end, REDACTED))
+    return spans
+
+
+def _keyword_list_spans(text: str) -> list[Span]:
+    spans: list[Span] = []
+    for match in _KEYWORD_LIST_RE.finditer(text):
+        name = match.group("name").lower()
+        base = match.start("list")
+        for element in _QUOTED_RE.finditer(match.group("list")):
+            inner = element.group()[1:-1]
+            if not inner or (
+                name in WEAK_SECRET_KEYS and _is_plain_word_or_number(inner)
+            ):
+                continue
+            spans.append(
+                (base + element.start() + 1, base + element.end() - 1, REDACTED)
+            )
     return spans
 
 
@@ -626,6 +658,7 @@ def collect_redaction_spans(
     return [
         *_url_spans(text, _depth, covers),
         *_keyword_sep_spans(text),
+        *_keyword_list_spans(text),
         *_authorization_spans(text),
         *_bearer_spans(text),
         *_keyword_ws_spans(text),
