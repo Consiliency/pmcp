@@ -19,7 +19,11 @@ enums, required, and (A1) `null` on optional fields -- agrees on what is
 REQUIRED and on `null` (`test_optional_field_null_agrees_between_gate_and_model`
 checks per field). It does not agree on type COERCION: pydantic's lax mode
 accepts `1` / `"true"` for a boolean and `"5"` for a number, and the JSON-Schema
-gate does not, so the gate is stricter there (stated in the plan).
+gate does not, so the gate is stricter there (stated in the plan). Nor, by
+itself, on a regex `pattern`: the gate's Python `$` matches before a final
+newline and pydantic's Rust `$` does not -- closed for the one `pattern` field
+(`evidence_label_digest`) by length bounds, pinned by
+`test_digest_pattern_agrees_between_gate_and_model`.
 """
 
 from __future__ import annotations
