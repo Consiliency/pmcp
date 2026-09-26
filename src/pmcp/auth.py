@@ -417,6 +417,7 @@ _JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]
 _KEYWORD_KEY_SEP = (
     r"(?P<key>(?P<qualifier>(?:(?<![A-Za-z0-9:])|(?<=\\[nrt]))(?:[A-Za-z0-9]+[_-]){0,8}"
     r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?)"
+    r"(?P<glued>(?<!\\)[A-Za-z0-9]{0,24}?)"
     rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
     r"(?P<extra>(?:[_-]?[A-Za-z0-9]){0,24}))"
     r"(?P<sep>[\"']?[^\S\r\n]*(?:=>|:=|==(?!=)|[:=](?!=))"
@@ -461,6 +462,7 @@ _QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
 _KEYWORD_WS_RE = re.compile(
     r"(?P<key>(?:(?<![A-Za-z0-9_-])|(?<=\\[nrt]))(?:--)?(?:[A-Za-z0-9]+[_-]){0,8}"
     r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?"
+    r"(?P<glued>(?<!\\)[A-Za-z0-9]{0,24}?)"
     rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
     r"(?:[_-]?[A-Za-z0-9]){0,24})"
     r"(?P<sep>[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]*)"
@@ -524,7 +526,9 @@ def _keyword_sep_spans(text: str) -> list[Span]:
         ):
             continue  # `token:\nthe bearer of`: a sentence, not a value
         if name == "code":
-            qualifier = match.group("qualifier").rstrip("_-").lower()
+            qualifier = (
+                (match.group("qualifier") + match.group("glued")).rstrip("_-").lower()
+            )
             if qualifier not in _CODE_QUALIFIERS:
                 continue
         start, end = match.start("value"), match.end("value")
@@ -533,9 +537,15 @@ def _keyword_sep_spans(text: str) -> list[Span]:
             value.strip("\"'")
         ):
             continue  # `if token == expected:` compares; `password == hunter2` assigns
-        if match.group("extra") and not _DECLARED_KEY_RE.fullmatch(
-            text, match.start("name"), match.end("extra")
+        if match.group("glued") or (
+            match.group("extra")
+            and not _DECLARED_KEY_RE.fullmatch(
+                text, match.start("name"), match.end("extra")
+            )
         ):
+            # `CLIENTSECRET=`, `dbpassword=` (a prefix glued on with no case
+            # or separator boundary) and suffixed keys: a secret only when
+            # the value looks like one
             # `password_confirmation=`, `passwordHash=`, `secret_value=`: a
             # suffixed key is only a secret when its value looks like one
             # (`token_type=bearer`, `password_length=12` are not)
@@ -560,7 +570,12 @@ def _keyword_sep_spans(text: str) -> list[Span]:
         if (
             value[0] in "\"'"
             and match.group("sep")[:1] not in "\"'"
-            and _STRADDLE_RE.match(value, 1)
+            and (
+                _STRADDLE_RE.match(value, 1)
+                # the OTHER quote, unescaped, inside: the value runs across a
+                # JSON string boundary (`…password='x"], "k": "y'`)
+                or ('"' if value[0] == "'" else "'") in value[1:-1].replace("\\\\", "")
+            )
         ):
             continue  # the quote closes the string this key sits in
         if value[0] in "\"'":
@@ -591,12 +606,25 @@ def _keyword_list_spans(text: str) -> list[Span]:
     return spans
 
 
+def _is_single_case(word: str) -> bool:
+    """`CLIENTSECRET`, `clientsecret`, `Clientsecret` -- one word, case-folded.
+    Not `Ed25519PrivateKey` (`str.istitle` would accept that)."""
+    return (
+        word.isupper() or word.islower() or (word[:1].isupper() and word[1:].islower())
+    )
+
+
 def _keyword_ws_spans(text: str) -> list[Span]:
     return [
         (match.start("value"), match.end("value"), REDACTED)
         for match in _KEYWORD_WS_RE.finditer(text)
         if match.group("name").lower() != "code"
         and _value_could_be_a_credential(match.group("value"))
+        # a glued prefix (`CLIENTSECRET abc…`) only on a single-case key: a
+        # mixed-case identifier (`Ed25519PrivateKey X509Cert`) is prose
+        and (
+            not match.group("glued") or _is_single_case(match.group("key").lstrip("-"))
+        )
         and "://" not in match.group("value")
         and not match.group("value").lower().startswith("arn:")
     ]
