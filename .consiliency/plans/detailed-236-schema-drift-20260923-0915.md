@@ -5,9 +5,14 @@
 > (`schema.py` and the test module as whole files; `types.py`, `handlers.py`
 > and `server.py` as `git apply` patches against `origin/main` @ `9ca081e`)
 > plus the generated snapshot are byte-identical to the frozen, verified
-> piece-A code (`wip/236-schema-drift-rev2-code` @ `37da099`; ancestors
-> `7a71a52`, `c79bf1a`, `a25dce0`, `972bc90`, `40b2ed5`, `d0722f4`, `72eaa76`).
-> `37da099` moves `task.ttl`'s lower bound to −2^63+1 (board round 6, N6-1).
+> piece-A code (`wip/236-schema-drift-rev2-code` @ `3d0d437`; ancestors
+> `37da099`, `7a71a52`, `c79bf1a`, `a25dce0`, `972bc90`, `40b2ed5`, `d0722f4`,
+> `72eaa76`). `37da099` moves `task.ttl`'s lower bound to −2^63+1 (board round
+> 6, N6-1). **`3d0d437` differs from `37da099` only in the module docstring of
+> `tests/test_gateway_tool_schemas.py`** (+5 lines naming the two deferred
+> classes, Consiliency/pmcp#297 and Consiliency/pmcp#298), so every runtime
+> measurement cited for `37da099` (full suite, mutants, gates, probes, the
+> re-run differential) stands for `3d0d437` and was deliberately not re-run.
 > `a25dce0` differed from `972bc90` only in the test module's docstring.
 > `c79bf1a` added board round 4's F1 fix (an int64 `le=` on `task.ttl`), and
 > `7a71a52` adds round 5's G1 fix (the matching `ge=`, negative test cases,
@@ -637,9 +642,10 @@ here. **So the claim is not "everything the projection can express agrees
 except coercion".** The gate and model agree everywhere except rows 1, 2, 6
 and 7. Row 1 fails safe in the gate's favour. Rows 2, 6 and 7 fail safe in
 the model's favour, but echo the value, and are tracked on
-Consiliency/pmcp#297 and Consiliency/pmcp#298. The test module's docstring
-at `37da099` names coercion, regex dialect and integer range, but not rows 6
-and 7. The plan is the complete list.
+Consiliency/pmcp#297 and Consiliency/pmcp#298. As of `3d0d437` the test
+module's docstring names all of them: coercion, regex dialect and integer
+range as closed or stated, and rows 6 and 7 as open and deferred to those two
+issues.
 
 ## Order: A first, then B — why
 
@@ -859,7 +865,7 @@ and 7. The plan is the complete list.
   (`Unknown tool` else-branch `:392`→`:401`, `except Exception` `:427`→`:436`).
   Where this plan cites `server.py` lines without "post-A", they are `main`'s.
 
-### `tests/test_gateway_tool_schemas.py` (add, 586 lines; whole file verbatim under *Verbatim bodies → A*)
+### `tests/test_gateway_tool_schemas.py` (add, 591 lines; whole file verbatim under *Verbatim bodies → A*)
 
 **220 tests** at `37da099` (measured: `220 passed`, collect-only counts in brackets; 218 at `7a71a52`, 213 at `c79bf1a`, 211 at `972bc90`/`a25dce0`, 209 at `40b2ed5`, 208 before the X1 guard test). The
 three-link chain plus shape, snapshot, normalisation, gate, and the revision-2
@@ -1512,7 +1518,7 @@ callers 264 passed; snapshot 712 lines, 31 × `additionalProperties: false`,
   gated on Consiliency/pmcp#296 (A3) and on X1's guard test.
 - Every PR to main needs panel CR + reconcile first (repo rule).
 
-## Embedding proof (revision 2, re-measured 2026-09-26 against `37da099`)
+## Embedding proof (revision 2, re-measured 2026-09-26 against `3d0d437`)
 
 Proves that the A bodies below, applied exactly as *A — how an executor
 applies these* instructs, reproduce the frozen, verified piece-A code byte for
@@ -1520,27 +1526,27 @@ byte. Fresh detached worktree at `origin/main` (`9ca081e`, 0 changes) →
 `uv sync --all-extras -p 3.10` → the extractor taken **out of this plan**
 (not a local copy) → the five extract commands → `git apply --check` + `git
 apply` of the three patches → the snapshot generation command → `cmp` each of
-the six resulting files against `git show 37da099:<path>`
+the six resulting files against `git show 3d0d437:<path>`
 (= `origin/wip/236-schema-drift-rev2-code`) → the schema test file:
 
 ```text
 base: 9ca081e674806202dfa41864489cb9e3ae225dd9  clean: 0 changes
 src/pmcp/tools/schema.py: 99 lines
-tests/test_gateway_tool_schemas.py: 586 lines
+tests/test_gateway_tool_schemas.py: 591 lines
 <scratch>/types.patch: 638 lines
 <scratch>/handlers.patch: 866 lines
 <scratch>/server.patch: 20 lines
 1 passed, 219 deselected in 0.17s
-===== cmp against 37da099 (= origin/wip/236-schema-drift-rev2-code)
+===== cmp against 3d0d437 (= origin/wip/236-schema-drift-rev2-code)
 cmp OK  src/pmcp/tools/schema.py  sha256=ddc7a14d17b91bcb
 cmp OK  src/pmcp/tools/handlers.py  sha256=9b8c18905828826e
 cmp OK  src/pmcp/types.py  sha256=25c761fda4335a39
 cmp OK  src/pmcp/server.py  sha256=b6d1f494a7186c39
-cmp OK  tests/test_gateway_tool_schemas.py  sha256=230cabe4d156ec0f
+cmp OK  tests/test_gateway_tool_schemas.py  sha256=618858f02f6e1599
 cmp OK  tests/fixtures/gateway_tool_schemas.json  sha256=5d1fc4e7ff8f87d3
 changed vs base:  M src/pmcp/server.py  M src/pmcp/tools/handlers.py  M src/pmcp/types.py ?? src/pmcp/tools/schema.py ?? tests/fixtures/gateway_tool_schemas.json ?? tests/test_gateway_tool_schemas.py
 ===== pytest
-220 passed in 0.61s
+220 passed in 0.60s
 ```
 
 Exactly the six files changed, and nothing else. The fixture `cmp` is the
@@ -1550,8 +1556,9 @@ into the plan was the only edit after the proof. The five bodies were then
 re-extracted from the final plan text and re-`cmp`ed. The proof worktree was
 removed afterwards. (Earlier proofs against `72eaa76`, `d0722f4` (five files
 each, 208 tests), `40b2ed5` (six files, 209 tests), `972bc90` and `a25dce0`
-(six files, 211 tests), `c79bf1a` (six files, 213 tests) and `7a71a52` (six
-files, 218 tests) also passed every `cmp`.)
+(six files, 211 tests), `c79bf1a` (six files, 213 tests), `7a71a52` (six
+files, 218 tests) and `37da099` (six files, 220 tests) also passed every
+`cmp`.)
 
 **Consistency gate.** `uv run python ~/code/pmcp/scripts/check_plan_consistency.py
 .consiliency/plans/detailed-236-schema-drift-20260923-0915.md` →
@@ -1585,7 +1592,7 @@ PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py -
 uv run pytest tests/test_gateway_tool_schemas.py -q                     # expect 220 passed
 ```
 
-The three patches are `git diff origin/main 37da099 -- <file>` against
+The three patches are `git diff origin/main 3d0d437 -- <file>` (identical to `37da099` for these files) against
 `origin/main` @ `9ca081e` (identical for these files to `860636a` and
 `8dec131`). Their blank context lines carry one leading space. An editor that
 strips trailing whitespace breaks them, and `git apply --check` then fails
@@ -1724,7 +1731,7 @@ def _collapse_nullable(node: dict[str, Any]) -> dict[str, Any]:
     return out
 ```
 
-### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 586 lines, 220 tests)
+### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 591 lines, 220 tests)
 
 ```python
 """Advertised gateway tool schemas are derived from, and agree with, the
@@ -1756,6 +1763,11 @@ newline and pydantic's Rust `$` does not -- closed for the one `pattern` field
 Nor on an integer's range: pydantic refuses a float past int64, so an
 unbounded integer field (`task.ttl`) gets that range (both sides) advertised, pinned by
 `test_ttl_range_agrees_between_gate_and_model`.
+Two classes stay open, both refused by the model and deferred: a lone
+surrogate in a length-limited string passes the gate on the SDK's
+newer-protocol HTTP entry (the model echoes it -- Consiliency/pmcp#297), and
+an unbounded float (`task.poll_interval`, a JSON integer >= 2**1024 - 2**970)
+passes the gate (Consiliency/pmcp#298).
 """
 
 from __future__ import annotations

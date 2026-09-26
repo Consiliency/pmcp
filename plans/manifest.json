@@ -1488,6 +1488,15 @@
             "revision": 2
           },
           "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T17:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "re-embedded test module from 3d0d437 (docstring-only vs 37da099: names the two deferred classes, Consiliency/pmcp#297 and Consiliency/pmcp#298); runtime results cited from 37da099",
+            "revision": 2
+          },
+          "transition": "committed"
         }
       ],
       "owner_skill": "claude-plan-detailed",
@@ -1498,7 +1507,7 @@
       "status": "committed",
       "task_summary": "Derive every gateway tool inputSchema from its argument model (A), then extra=\"forbid\" on the argument models (B) for Consiliency/pmcp#236; A and B land as separate PRs.",
       "type": "detailed",
-      "updated_at": "2026-09-26T16:00:00+00:00"
+      "updated_at": "2026-09-26T17:00:00+00:00"
     }
   ],
   "schema_version": 1
