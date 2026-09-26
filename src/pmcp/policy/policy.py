@@ -116,9 +116,17 @@ def _value_separator(full_match: str) -> int:
     separator (`:` or `=`) that has a value after it, or -1. A separator
     with nothing but separators after it is base64 padding
     (`dXNlcjpwYXNzd29yZA==`); splitting there kept the whole secret and
-    replaced the `=`."""
+    replaced the `=`.
+
+    Linear: "a value after it" is one comparison with where the trailing run
+    of separators starts. Rev 10 re-stripped the rest of the match at every
+    position, which is quadratic in a run of `:=` (B3 of its board: 58 s on
+    264 KB, reachable from callers with no window)."""
+    content_end = len(full_match.rstrip(" \t:="))
     for i, char in enumerate(full_match):
-        if char in ":=" and full_match[i + 1 :].strip(" \t:="):
+        if i + 1 >= content_end:
+            return -1
+        if char in ":=":
             return i
     return -1
 
