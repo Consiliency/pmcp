@@ -374,7 +374,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A hung `gateway.update_server` probe is reported as a timeout again on Python 3.10.** `_run_update_probe_command` bounds the probe with `asyncio.wait_for`, whose `asyncio.TimeoutError` is not the builtin `TimeoutError` and not a subclass of it before 3.11 — so the caller's handler never fired and a real 60-second hang surfaced through the generic branch as `Failed to run update probe: ` with an empty reason. The helper now normalises to the builtin before the exception reaches a caller (the contract `ClientManager._send_request` already provides), and the caller accepts either class. See [#269](https://github.com/Consiliency/pmcp/issues/269).
 - **Tests: the idle-timeout tests no longer depend on wall time.** `ClientManager` now
   takes an injected request clock (`clock=`, wall time by default) that stamps and
-  compares every request heartbeat, and the idle re-check cadence is a constant
+  compares every request heartbeat, and the idle re-check interval is capped by a constant
   (`IDLE_POLL_SLICE_S`); the heartbeat-vs-idle-window and ceiling tests drive a fake
   clock one idle check at a time instead of sleeping 0.05–0.1 s against 0.2–0.3 s
   windows, and finish in ~10 ms each (slice C3). No production behaviour changes: the
