@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import tempfile
 from collections.abc import Iterator
@@ -39,8 +40,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+
 from pmcp.trust_store import TrustStoreError, trust_store_path
-from pmcp.validation import is_valid_package_name, is_valid_package_version
+from pmcp.validation import (
+    NPM_FILE_TYPE_RE,
+    is_valid_package_name,
+    is_valid_package_version,
+)
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # Annotation only: `pmcp.manifest`'s package `__init__` imports the loader
@@ -168,7 +176,43 @@ def _read_store(path: Path) -> list[PackageApproval]:
     entries = data.get("records")
     if not isinstance(entries, list):
         raise PackageApprovalError(f"Package approvals {path} has no records list")
-    return [_decode(entry) for entry in entries]
+    records: list[PackageApproval] = []
+    for entry in entries:
+        stale = _stale_tarball_version(entry)
+        if stale is not None:
+            # Recorded before the exact-version check followed npm's tarball
+            # rule. It approves nothing now; dropping it (rather than refusing
+            # the whole store) keeps every other approval working, and the next
+            # write removes it. Any OTHER invalid record still fails the store.
+            logger.warning(
+                "Ignoring package approval %s@%s in %s: npm reads this version as "
+                "a tarball spec, not a registry version, so it approves nothing; "
+                "re-approve the package at a registry version",
+                entry.get("name"),
+                stale,
+                path,
+            )
+            continue
+        records.append(_decode(entry))
+    return records
+
+
+def _stale_tarball_version(entry: Any) -> str | None:
+    """The version of a record that is valid in every way except npm's tarball
+    rule -- one approved before that rule was enforced -- else ``None``."""
+    if not isinstance(entry, dict):
+        return None
+    version = entry.get("resolved_version")
+    if not isinstance(version, str) or not NPM_FILE_TYPE_RE.search(version):
+        return None
+    shifted = NPM_FILE_TYPE_RE.sub("", version)
+    try:
+        _require_identity_fields(
+            entry.get("registry"), entry.get("name"), shifted or "x"
+        )
+    except ValueError:
+        return None
+    return version
 
 
 def _ensure_store_dir(parent: Path) -> None:

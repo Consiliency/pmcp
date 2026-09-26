@@ -79,12 +79,14 @@ _PACKAGE_VERSION_RE = re.compile(
     rf"(?:\+{_BUILD_ID}(?:\.{_BUILD_ID})*)?"
 )
 _MAX_PACKAGE_VERSION_LENGTH = 256
-# npm-package-arg's `isFileType`, verbatim: a spec (or the part after `name@`)
-# ending in .tgz / .tar / .tar.gz, in any case, is a LOCAL TARBALL FILE to npm.
-# npa tests it BEFORE it reads the selector as a registry version, and a strict
-# SemVer prerelease/build tail can end that way (`1.0.0-x.tgz`,
-# `3.25.5+b.tar.gz`), so "valid SemVer" does not imply "a registry version".
-NPM_FILE_TYPE_RE = re.compile(r"[.](?:tgz|tar\.gz|tar)$", re.IGNORECASE)
+# npm-package-arg's `isFileType`: a spec (or the part after `name@`) matching it
+# is a tarball FILE to npm, which tests it BEFORE reading the selector as a
+# registry version -- and a strict SemVer prerelease/build tail can match it, so
+# "valid SemVer" does not imply "a registry version". This is npm 10's pattern
+# (npm-package-arg 12.x, bundled with Node 22 LTS), whose `.` before `gz` is
+# unescaped: it also matches `1.0.0-x.tar-gz`, and is a superset of npm 11's
+# escaped `tar\.gz` (npm-package-arg 13.x). pmcp runs whatever npx is on PATH.
+NPM_FILE_TYPE_RE = re.compile(r"[.](?:tgz|tar.gz|tar)$", re.IGNORECASE)
 
 
 def is_valid_package_version(version: str) -> bool:
@@ -93,9 +95,9 @@ def is_valid_package_version(version: str) -> bool:
     The version this checks arrives in a registry response -- semi-trusted
     network data -- and is then composed into ``["npx", "-y", f"{name}@{version}"]``.
     Ranges and dist-tags are refused too: they pin nothing, so an approval of one
-    would re-resolve at every spawn. So is a version npm would read as a local
-    tarball (``NPM_FILE_TYPE_RE``): composed into argv it names a file, not the
-    registry version that was checked or approved.
+    would re-resolve at every spawn. So is a version npm classifies as a
+    tarball spec (``NPM_FILE_TYPE_RE``): composed into argv it would not name
+    the registry version that was checked or approved.
     """
     if not version or len(version) > _MAX_PACKAGE_VERSION_LENGTH:
         return False

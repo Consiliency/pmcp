@@ -369,14 +369,22 @@ def test_a_project_denied_package_is_denied_even_when_the_user_allows_it(
 
 @pytest.mark.parametrize(
     "version",
-    ["1.0.0-x.tgz", "1.0.0-X.TGZ", "1.0.0-x.tar", "3.25.5+b.tar.gz", "2.0.0-rc.TaR.Gz"],
+    [
+        "1.0.0-x.tgz",
+        "1.0.0-X.TGZ",
+        "1.0.0-x.tar",
+        "3.25.5+b.tar.gz",
+        "2.0.0-rc.TaR.Gz",
+        # npm 10 (npm-package-arg 12.x) leaves the `.` in `tar.gz` unescaped
+        "1.0.0-x.tar-gz",
+        "1.0.0-a.tarXgz",
+        "1.0.0+b.tar0gz",
+    ],
 )
 def test_a_version_npm_reads_as_a_tarball_file_is_not_a_version(version: str) -> None:
-    """npm-package-arg classifies `name@<spec>` as a local FILE when the spec ends
-    in .tgz/.tar/.tar.gz (any case), before it tries a registry version -- and a
-    SemVer prerelease/build tail can end that way. Composed into
-    `npx -y name@<version>`, such a version names a file in the child's working
-    directory, not the registry version that was checked or approved."""
+    """npm-package-arg classifies `name@<spec>` as a tarball spec, not a registry
+    version, when it matches `isFileType` -- tested before version parsing, and a
+    SemVer prerelease/build tail can match. Covers npm 10's looser pattern too."""
     assert is_valid_package_version(version) is False
 
 

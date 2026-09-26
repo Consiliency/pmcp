@@ -496,3 +496,33 @@ def test_revoke_package_cli_reports_nothing_to_revoke(
         _run_cli("trust", "revoke-package", "example-mcp")
     assert exc.value.code == 1
     assert "no package approval" in capsys.readouterr().err
+
+
+def test_a_stale_tarball_shaped_record_is_ignored_not_fatal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A record approved before the exact-version check followed npm's tarball
+    rule approves nothing now -- but refusing the WHOLE store over it would
+    disable every other approval and make `list`/`revoke` unusable. It is
+    dropped with a warning that names it; any other invalid record still
+    fails the store."""
+    good = _identity("good-pkg", "1.2.3")
+    approve_package(good)
+    store = package_approvals_path()
+    data = json.loads(store.read_text())
+    stale = dict(data["records"][0], name="old-pkg", resolved_version="1.0.0-x.tgz")
+    data["records"].append(stale)
+    store.write_text(json.dumps(data))
+
+    with caplog.at_level("WARNING", logger="pmcp.package_approvals"):
+        assert is_package_approved(good) is True
+        names = [r.name for r in list_package_approvals()]
+    assert names == ["good-pkg"]
+    assert not is_package_approved(_identity("old-pkg", "1.0.0-x.tgz"))
+    assert "old-pkg@1.0.0-x.tgz" in caplog.text
+    assert "tarball spec" in caplog.text
+
+    corrupt = dict(stale, resolved_version="1.0.0;$(id)")
+    data["records"][-1] = corrupt
+    store.write_text(json.dumps(data))
+    assert is_package_approved(good) is False  # other corruption still fails closed
