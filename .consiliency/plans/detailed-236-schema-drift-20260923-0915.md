@@ -582,8 +582,9 @@ pydantic enforced it for *floats* only. JSON **integers** outside int64
 since the minimum is −2^63+1 (measured: `greater_than_equal` on both layers).
 That is a narrowing for `task.ttl` values outside [−2^63+1, 2^63−1], which no
 real TTL reaches. It is listed with A's other
-behaviour changes. The test module's docstring names this class ("range
-(both sides)") as of `7a71a52`.
+behaviour changes. The test module's docstring names this class as of
+`cb6afa4`: "bounds on both sides -- -2**63 + 1 (one short of int64's minimum,
+because `float(-2**63)` is exact and refused) to 2**63 - 1".
 
 **Not a disagreement, noted:** the two layers *agree* on accepting a
 negative `task.ttl` (e.g. `-5`) and `NaN`/`Infinity` for `task.poll_interval`
