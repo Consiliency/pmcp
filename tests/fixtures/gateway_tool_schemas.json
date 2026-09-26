@@ -307,6 +307,7 @@
      },
      "ttl": {
       "description": "Requested task TTL in seconds",
+      "maximum": 9223372036854775807,
       "type": [
        "integer",
        "null"

@@ -571,7 +571,14 @@ class TaskMetadataInput(GatewayArguments):
     metadata: dict[str, Any] | None = Field(
         default=None, description="Opaque task metadata forwarded downstream"
     )
-    ttl: int | None = Field(default=None, description="Requested task TTL in seconds")
+    ttl: int | None = Field(
+        default=None,
+        # int64: pydantic already refuses a float past it (`int_parsing_size`),
+        # so advertise it and let the gate refuse `1e20` too, rather than
+        # passing it on to the model (Consiliency/pmcp#236, board round 4)
+        le=9_223_372_036_854_775_807,
+        description="Requested task TTL in seconds",
+    )
     poll_interval: float | None = Field(
         default=None, description="Seconds between task status polls"
     )

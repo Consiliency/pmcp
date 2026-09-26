@@ -24,6 +24,9 @@ itself, on a regex `pattern`: the gate's Python `$` matches before a final
 newline and pydantic's Rust `$` does not -- closed for the one `pattern` field
 (`evidence_label_digest`) by length bounds, pinned by
 `test_digest_pattern_agrees_between_gate_and_model`.
+Nor on an integer's range: pydantic refuses a float past int64, so an
+unbounded integer field (`task.ttl`) gets that bound advertised, pinned by
+`test_ttl_range_agrees_between_gate_and_model`.
 """
 
 from __future__ import annotations
@@ -533,3 +536,20 @@ def test_digest_pattern_agrees_between_gate_and_model() -> None:
         jsonschema.validate(args, schema)
     with pytest.raises(Exception):
         InvokeInput.model_validate(args)
+
+
+@pytest.mark.parametrize("ttl", [1e20, 2**63])
+def test_ttl_range_agrees_between_gate_and_model(ttl: float) -> None:
+    """`task.ttl` past int64: the model refuses it, so the gate must too
+    (board round 4, F1: `1e20` passed the gate on main and under A)."""
+    from pmcp.types import InvokeInput
+
+    schema = _tool("gateway.invoke").input_schema
+    args = {"tool_id": "a::b", "task": {"ttl": ttl}}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args, schema)
+    with pytest.raises(Exception):
+        InvokeInput.model_validate(args)
+    ok = {"tool_id": "a::b", "task": {"ttl": 3600}}
+    jsonschema.validate(ok, schema)
+    InvokeInput.model_validate(ok)
