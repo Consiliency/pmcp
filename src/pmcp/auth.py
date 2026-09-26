@@ -437,9 +437,13 @@ _KEYWORD_SEP_RE = re.compile(
 _DECLARED_KEY_RE = re.compile(
     rf"(?:{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?", re.IGNORECASE
 )
+#: A literal array: quoted strings or JSON scalars separated by commas --
+#: nothing bare. `[x", "b": "]` after `token: ` inside a string leaf is not an
+#: array (the scan would run past the string's closing quote), while
+#: `["first]", "hunter2"]` is one (a `]` inside a quoted element is text).
+_LIST_BODY = r"(?P<list>\[\s*(?:(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|-?[0-9][0-9.eE+-]*|null|true|false)\s*,\s*)*(?:(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|-?[0-9][0-9.eE+-]*|null|true|false))?\s*,?\s*\])"
 _KEYWORD_LIST_RE = re.compile(
-    _KEYWORD_KEY_SEP
-    + r"(?P<list>\[(?:[^\[\]{}\"']|\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*')*\])",
+    _KEYWORD_KEY_SEP + _LIST_BODY,
     re.IGNORECASE,
 )
 _QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
