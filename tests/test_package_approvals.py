@@ -519,10 +519,78 @@ def test_a_stale_tarball_shaped_record_is_ignored_not_fatal(
         names = [r.name for r in list_package_approvals()]
     assert names == ["good-pkg"]
     assert not is_package_approved(_identity("old-pkg", "1.0.0-x.tgz"))
-    assert "old-pkg@1.0.0-x.tgz" in caplog.text
+    assert "'old-pkg'@'1.0.0-x.tgz'" in caplog.text
     assert "tarball spec" in caplog.text
 
     corrupt = dict(stale, resolved_version="1.0.0;$(id)")
     data["records"][-1] = corrupt
     store.write_text(json.dumps(data))
     assert is_package_approved(good) is False  # other corruption still fails closed
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("decision", "maybe"),
+        ("recorded_at", "not-a-time"),
+        ("integrity", 42),
+        ("name", "bad name!"),
+        ("registry", ""),
+        ("resolved_version", "1.0.0.tgz"),  # never valid SemVer, tarball or not
+        ("resolved_version", "1.0.0-x.tar\rgz"),  # a control character in the wildcard
+    ],
+)
+def test_a_tarball_shaped_record_with_any_other_defect_still_fails_the_store(
+    field: str, value: object
+) -> None:
+    """Only a record valid in every respect but npm's tarball rule is skipped;
+    one that is ALSO corrupt in any other field (or not SemVer at all) fails the
+    whole store closed, exactly as before the rule."""
+    good = _identity("good-pkg", "1.2.3")
+    approve_package(good)
+    store = package_approvals_path()
+    data = json.loads(store.read_text())
+    entry = dict(data["records"][0], name="old-pkg", resolved_version="1.0.0-x.tgz")
+    entry[field] = value
+    data["records"].append(entry)
+    store.write_text(json.dumps(data))
+    assert is_package_approved(good) is False
+    with pytest.raises(PackageApprovalError):
+        list_package_approvals()
+
+
+def test_revoke_by_name_clears_a_stale_record(caplog: pytest.LogCaptureFixture) -> None:
+    """`pmcp trust revoke-package old` removes a stale record it can no longer
+    list, so the warning stops repeating on every gate check."""
+    good = _identity("good-pkg", "1.2.3")
+    approve_package(good)
+    store = package_approvals_path()
+    data = json.loads(store.read_text())
+    data["records"].append(
+        dict(data["records"][0], name="old-pkg", resolved_version="1.0.0-x.tgz")
+    )
+    store.write_text(json.dumps(data))
+    assert revoke_package("old-pkg") is True
+    assert [r["name"] for r in json.loads(store.read_text())["records"]] == ["good-pkg"]
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="pmcp.package_approvals"):
+        assert is_package_approved(good) is True
+    assert "tarball spec" not in caplog.text
+
+
+def test_the_stale_warning_escapes_the_stored_text(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The warning renders the stored name/version with repr, so no raw
+    control character from the file reaches the operator's terminal."""
+    good = _identity("good-pkg", "1.2.3")
+    approve_package(good)
+    store = package_approvals_path()
+    data = json.loads(store.read_text())
+    data["records"].append(
+        dict(data["records"][0], name="old-pkg", resolved_version="1.0.0-x.tgz")
+    )
+    store.write_text(json.dumps(data))
+    with caplog.at_level("WARNING", logger="pmcp.package_approvals"):
+        is_package_approved(good)
+    assert "'old-pkg'@'1.0.0-x.tgz'" in caplog.text

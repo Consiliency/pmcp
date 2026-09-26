@@ -89,6 +89,17 @@ _MAX_PACKAGE_VERSION_LENGTH = 256
 NPM_FILE_TYPE_RE = re.compile(r"[.](?:tgz|tar.gz|tar)$", re.IGNORECASE)
 
 
+def is_semver_package_version(version: str) -> bool:
+    """Return True if *version* is one concrete SemVer version by grammar alone.
+
+    Does NOT apply npm's tarball rule; ``is_valid_package_version`` does. Kept
+    separate so a record written before that rule can be recognised as such.
+    """
+    if not version or len(version) > _MAX_PACKAGE_VERSION_LENGTH:
+        return False
+    return _PACKAGE_VERSION_RE.fullmatch(version) is not None
+
+
 def is_valid_package_version(version: str) -> bool:
     """Return True if *version* is one concrete SemVer version, safe for argv.
 
@@ -99,11 +110,7 @@ def is_valid_package_version(version: str) -> bool:
     tarball spec (``NPM_FILE_TYPE_RE``): composed into argv it would not name
     the registry version that was checked or approved.
     """
-    if not version or len(version) > _MAX_PACKAGE_VERSION_LENGTH:
-        return False
-    if NPM_FILE_TYPE_RE.search(version):
-        return False
-    return _PACKAGE_VERSION_RE.fullmatch(version) is not None
+    return is_semver_package_version(version) and not NPM_FILE_TYPE_RE.search(version)
 
 
 _WINDOWS_EXECUTABLE_SUFFIXES = (".exe", ".cmd", ".bat")
