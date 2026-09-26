@@ -2482,7 +2482,9 @@ def test_a_quoted_value_never_straddles_via_the_other_quote(obj: dict) -> None:
         assert json.loads(out) == obj, (surface, out)
 
 
-@pytest.mark.parametrize("space", ["\x0b", "\x85", "\xa0", " ", " ", "　"])
+@pytest.mark.parametrize(
+    "space", ["\x0b", "\x85", "\xa0", "\u2003", "\u2028", "\u3000"]
+)
 @pytest.mark.parametrize("key", ["token", "bearer:", "password", "SECRET_KEY"])
 def test_no_span_starts_inside_a_json_escape(space: str, key: str) -> None:
     """Defect A of round 3: `json.dumps` spells non-ASCII whitespace
@@ -2604,3 +2606,25 @@ def test_property_json_fuzz_keeps_documents_and_dicts() -> None:
     assert broken == [], "\n".join(broken[:10])
     assert checked > 3000 and excluded > 0, (checked, excluded)
     assert main_types.count("dict") > 1000
+
+
+def test_sources_hold_no_literal_control_or_separator_characters() -> None:
+    """Review tooling refuses a bundle containing a transport-active control
+    character (a literal U+2028 in this file blocked every external seat on
+    plan rev 9): write such characters as escapes, in code and tests."""
+    import unicodedata
+
+    root = Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in [
+        root / "src" / "pmcp" / "auth.py",
+        root / "src" / "pmcp" / "policy" / "policy.py",
+        Path(__file__),
+    ]:
+        for lineno, line in enumerate(path.read_text("utf-8").split("\n"), 1):
+            for ch in line:
+                if (
+                    unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") and ch != "\t"
+                ) or ch == "\x85":
+                    offenders.append(f"{path.name}:{lineno}: {ch!r}")
+    assert offenders == [], offenders
