@@ -43,10 +43,9 @@ from typing import TYPE_CHECKING, Any
 
 from pmcp.trust_store import TrustStoreError, trust_store_path
 from pmcp.validation import (
-    NPM_FILE_TYPE_RE,
-    is_semver_package_version,
     is_valid_package_name,
     is_valid_package_version,
+    matches_package_version_grammar,
 )
 
 logger = logging.getLogger(__name__)
@@ -188,16 +187,17 @@ def _read_store_and_stale(
     stale: list[tuple[str, str]] = []
     for entry in entries:
         if _is_stale_record(entry):
-            # Recorded before the exact-version check followed npm's tarball
-            # rule: it approves nothing now. Leaving it out (rather than
+            # Recorded before the exact-version check followed npm's version
+            # rules (tarball suffix, core-part bound): it approves nothing now. Leaving it out (rather than
             # refusing the whole store) keeps every other approval working; the
             # next write drops it. Every OTHER invalid record -- including one
             # with a tarball-shaped version and any other defect -- still
             # fails the store in `_decode`.
             logger.warning(
-                "Ignoring package approval %r@%r in %s: npm reads this version "
-                "as a tarball spec, not a registry version, so it approves "
-                "nothing; re-approve the package at a registry version",
+                "Ignoring package approval %r@%r in %s: npm does not read this "
+                "version as a registry version (a tarball spec or a dist-tag), "
+                "so it approves nothing; re-approve the package at a registry "
+                "version",
                 entry["name"],
                 entry["resolved_version"],
                 path,
@@ -209,19 +209,20 @@ def _read_store_and_stale(
 
 
 def _is_stale_record(entry: Any) -> bool:
-    """A record that is valid in every respect except npm's tarball rule.
+    """A record that is valid in every respect except npm's version rules.
 
-    Its version must be SemVer by grammar (what the store accepted before the
-    rule) and match the rule; with the version replaced, the whole entry must
-    decode. Anything else is corruption and is left to ``_decode`` to refuse.
+    Its version must match the SemVer grammar (what the store accepted before
+    those rules) and be refused now -- npm reads it as a tarball spec or a
+    dist-tag, not a registry version; with the version replaced, the whole
+    entry must decode. Anything else is corruption, left to ``_decode``.
     """
     if not isinstance(entry, dict):
         return False
     version = entry.get("resolved_version")
     if (
         not isinstance(version, str)
-        or not is_semver_package_version(version)
-        or not NPM_FILE_TYPE_RE.search(version)
+        or not matches_package_version_grammar(version)
+        or is_valid_package_version(version)
     ):
         return False
     try:

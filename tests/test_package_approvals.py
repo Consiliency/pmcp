@@ -649,3 +649,13 @@ def test_a_non_string_version_fails_the_store_as_a_package_approval_error(
     store.write_text(json.dumps(data))
     with pytest.raises(PackageApprovalError):
         list_package_approvals()
+
+
+def test_a_stale_record_at_an_over_bound_core_version_is_skipped_too() -> None:
+    """A version the old grammar accepted but npm reads as a dist-tag
+    (core part above 2**53 - 1) is stale in the same way as a tarball one."""
+    store = _store_with_stale("big-pkg", f"{2**53}.0.0")
+    assert is_package_approved(_identity("good-pkg", "1.2.3")) is True
+    assert [r.name for r in list_package_approvals()] == ["good-pkg"]
+    assert revoke_package("big-pkg") is True
+    assert "big-pkg" not in store.read_text()

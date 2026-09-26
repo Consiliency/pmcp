@@ -403,3 +403,40 @@ def test_the_provision_gate_refuses_a_tarball_shaped_resolved_version() -> None:
     assert not _identity_is_argv_safe(
         PackageIdentity("npm", "legit", "1.0.0-x.tgz", None)
     )
+
+
+_MAX_SAFE = 2**53 - 1
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        f"{_MAX_SAFE + 1}.0.0",
+        f"0.{_MAX_SAFE + 1}.0",
+        f"0.0.{_MAX_SAFE + 1}",
+        "1" * 17 + ".0.0",
+        "9" * 16 + ".0.0",
+        f"{_MAX_SAFE + 1}.0.0-rc.1",
+    ],
+)
+def test_a_core_part_npm_reads_as_a_dist_tag_is_not_a_version(version: str) -> None:
+    """node-semver refuses a major/minor/patch above Number.MAX_SAFE_INTEGER and
+    npm-package-arg then classifies `name@<that>` as a dist-TAG: the registry's
+    dist-tags map, not the version string, decides what runs."""
+    assert is_valid_package_version(version) is False
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        f"{_MAX_SAFE}.0.0",
+        f"0.0.{_MAX_SAFE}",
+        f"1.0.0-{_MAX_SAFE + 1}",
+        "1.0.0-rc." + "9" * 40,
+        "1.0.0+" + "9" * 40,
+    ],
+)
+def test_prerelease_and_build_numbers_are_not_bounded(version: str) -> None:
+    """Only the three core parts are bounded (checked against npm-package-arg
+    12.x and 13.x: each of these classifies as `version`)."""
+    assert is_valid_package_version(version) is True

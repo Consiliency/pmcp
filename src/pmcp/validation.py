@@ -79,6 +79,8 @@ _PACKAGE_VERSION_RE = re.compile(
     rf"(?:\+{_BUILD_ID}(?:\.{_BUILD_ID})*)?"
 )
 _MAX_PACKAGE_VERSION_LENGTH = 256
+#: JavaScript's Number.MAX_SAFE_INTEGER, node-semver's bound on each core part.
+_MAX_SAFE_VERSION_COMPONENT = 2**53 - 1
 # npm-package-arg's `isFileType`: a spec (or the part after `name@`) matching it
 # is a tarball FILE to npm, which tests it BEFORE reading the selector as a
 # registry version -- and a strict SemVer prerelease/build tail can match it, so
@@ -89,15 +91,27 @@ _MAX_PACKAGE_VERSION_LENGTH = 256
 NPM_FILE_TYPE_RE = re.compile(r"[.](?:tgz|tar.gz|tar)$", re.IGNORECASE)
 
 
-def is_semver_package_version(version: str) -> bool:
-    """Return True if *version* is one concrete SemVer version by grammar alone.
-
-    Does NOT apply npm's tarball rule; ``is_valid_package_version`` does. Kept
-    separate so a record written before that rule can be recognised as such.
-    """
+def matches_package_version_grammar(version: str) -> bool:
+    """The SemVer grammar and length bound alone -- what earlier releases
+    accepted as an exact version. A record stored under it but refused by
+    ``is_valid_package_version`` predates npm's rules below."""
     if not version or len(version) > _MAX_PACKAGE_VERSION_LENGTH:
         return False
     return _PACKAGE_VERSION_RE.fullmatch(version) is not None
+
+
+def is_semver_package_version(version: str) -> bool:
+    """Return True if *version* is one concrete SemVer version as npm reads it.
+
+    Does NOT apply npm's tarball rule; ``is_valid_package_version`` does.
+    """
+    if not matches_package_version_grammar(version):
+        return False
+    # node-semver refuses a major/minor/patch above Number.MAX_SAFE_INTEGER,
+    # and npm-package-arg then reads the selector as a dist-TAG, not a version
+    # (prerelease and build identifiers are not bounded this way).
+    core = re.split(r"[-+]", version, maxsplit=1)[0]
+    return all(int(part) <= _MAX_SAFE_VERSION_COMPONENT for part in core.split("."))
 
 
 def is_valid_package_version(version: str) -> bool:
