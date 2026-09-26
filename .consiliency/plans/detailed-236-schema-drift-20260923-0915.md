@@ -5,7 +5,7 @@
 > (`schema.py` and the test module as whole files, `types.py` and `handlers.py`
 > as `git apply` patches against `origin/main` @ `9ca081e`) plus the generated
 > snapshot are byte-identical to the frozen, verified piece-A code
-> (`wip/236-schema-drift-rev2-code` @ `72eaa76`). Proven by applying them to a
+> (`wip/236-schema-drift-rev2-code` @ `d0722f4`, parent `72eaa76`). Proven by applying them to a
 > fresh `origin/main` worktree and running `cmp` on all five files (see
 > *Embedding proof*). The five files, and `server.py`, are byte-identical
 > between `860636a`, `8dec131` and `9ca081e`, so every "HEAD" measurement
@@ -28,16 +28,24 @@
 >   `pattern` errors echo the value (measured on `main`).
 > - X2: the handler-link test already used a word-boundary regex in the frozen
 >   code.
-> - Counts re-measured on the frozen code: 208 schema tests; full suite
->   `4272 passed, 3 skipped, 25 deselected`; snapshot 811 lines; probe reports
->   23/26 tools differing from `main` (18 constraint drift + 5 null-only).
->   Every piece-B number is from the revision-1 tree and is marked for
->   re-measurement.
-> - **Two places where the frozen code departs from revision 1's text, stated
->   here and not silently absorbed:** (1) the 15 description conflicts resolve
->   to the **model** text in the frozen code, not the HEAD text revision 1
->   promised. This is an open decision (*Piece A → `types.py`*). (2) The board's
->   `search_registry.available_clis` does not exist. The field is
+> - Counts re-measured on the frozen code: 208 schema tests (on both
+>   `72eaa76` and `d0722f4`). Full suite `4272 passed, 3 skipped, 25
+>   deselected` (measured by this planner on `72eaa76`, and by the coordinator
+>   on `d0722f4`). The `d0722f4` run also hit 1 teardown error in
+>   `test_workflow_guards`, because the host's live gateway restarted a
+>   firecrawl child mid-run. That is environmental: the file passes 194/194 on
+>   this tree and on `main`. Snapshot 811 lines. Probe reports 23/26 tools
+>   differing from `main` (18 constraint drift + 5 null-only). Every piece-B
+>   number is from the revision-1 tree and is marked for re-measurement.
+> - **Descriptions (resolved in-revision).** `72eaa76` kept the model text in
+>   all 15 description conflicts, contrary to revision 1's rule. The code was
+>   corrected to option (b) at `d0722f4`: the 14 conflicts use `main`'s
+>   hand-written text, and `update_server.force` keeps the model text.
+>   Measured with `desc_cmp.py`: `same 54 differ 1` (the one is
+>   `update_server.force`).
+> - **Walker (fixed in A at `d0722f4`).** The test helper `_object_schemas`
+>   now also walks objects typed `["object", "null"]` (31/31 object schemas).
+> - The board's `search_registry.available_clis` does not exist. The field is
 >   `request_capability.available_clis`, and `main`'s gate *rejects* `null`
 >   there.
 >
@@ -270,10 +278,9 @@ What is wrong with it as a deliverable:
    leaking into A's builder. Split as described below; measured A-only tree:
    163 passed.
 2. **It silently resolved the 15 description conflicts in favour of the model
-   text**, losing agent-facing content. Revision 1 fixed this in A's
-   `types.py` change list. **The frozen revision-2 code has the same outcome
-   again (model text in all 15). It is an open decision, see *Piece A →
-   `types.py`*.**
+   text**, losing agent-facing content. Fixed in A's `types.py` change list:
+   `72eaa76` repeated the problem, and `d0722f4` corrects it (see *Piece A →
+   `types.py`*).
 3. **It ignored B's second-order consequences**: `_extract_trace_context`
    (post-A tree `handlers.py:858-878`; HEAD `:1279-1299`) runs *before*
    `InvokeInput.model_validate` (post-A `:1458`; HEAD `:1879`) and reads two undeclared spellings (`meta`, `traceContext`);
@@ -301,7 +308,7 @@ Measured through `_handle_call_tool` for `describe {"tool_id": ""}`,
 newly *advertised* (`invoke.task.*`, `invoke.trace_context.*`, `invoke._meta`,
 `tasks_*.requestor_context`, `tasks_result.options.timeout_ms`) and 19 arguments
 that had no description get one (both re-measured on the frozen code by
-`desc_cmp.py` under *Measurement scripts*: `same 40 differ 15 new description 19
+`desc_cmp.py` under *Measurement scripts*: `same 54 differ 1 new description 19
 newly advertised 16`). This goes in A's CHANGELOG entry.
 
 **Revision 2: A also *loosens* the gate for explicit `null` (A1).** The
@@ -407,7 +414,7 @@ rejected.
   (plus `test_required_nullable_field_is_left_as_pydantic_wrote_it` for the
   collapse's boundary).
 
-### `src/pmcp/types.py` (modify; `git apply` patch verbatim under *Verbatim bodies → A*, +243 / −96)
+### `src/pmcp/types.py` (modify; `git apply` patch verbatim under *Verbatim bodies → A*, +269 / −110)
 
 - **Add `class GatewayArguments(BaseModel)`** directly above `TraceContextInfo`
   with **no `model_config`** in A. Docstring: marks agent-facing argument
@@ -419,13 +426,23 @@ rejected.
 - **Move every argument description into `Field(description=…)`** so the derived
   schema carries it.
 
-  > **Open decision: the frozen code does not implement revision 1's rule.**
-  > Revision 1 said "**the HEAD hand-written schema text wins**", with one
-  > exception (`UpdateServerInput.force`, where the model text is the accurate
-  > one). The frozen piece-A code (`72eaa76`) keeps the **model** text in
-  > **all 15** conflicts. Measured with `desc_cmp.py` (`main` → frozen A):
+  Rule for the text: **`main`'s hand-written schema text wins**. It is what
+  agents have been reading, and it is uniformly the more informative. There is
+  one exception, `UpdateServerInput.force`: its model text is the accurate one,
+  because the hand-written copy predates task support.
+
+  > **Decision: option (b), applied and measured.** The first revision-2 code
+  > (`72eaa76`) kept the model text in all 15 conflicts. Choosing between
+  > (a) accepting that and (b) restoring revision 1's rule, the coordinator
+  > chose **(b)** and applied it at `d0722f4`: the 14 conflicts are moved into
+  > `Field(description=…)` with `main`'s text, and the snapshot is regenerated
+  > (14 lines change). Measured with `desc_cmp.py` (`main` → `d0722f4`):
+  > `tool descriptions byte-identical: 26/26`, `same 54 differ 1 new
+  > description 19 newly advertised 16`. The one remaining difference is
+  > `update_server.force`, the intended exception. The 15 conflicts, and what
+  > each resolves to:
   >
-  > | Argument | `main` (hand-written) | frozen A (model) |
+  > | Argument | `main` (hand-written) → **kept** except `force` | model text (`72eaa76`) |
   > |---|---|---|
   > | `connect_server.server_name` | Name of the server to connect | Server to connect |
   > | `disconnect_server.server_name` | Name of the server to disconnect | Server to disconnect |
@@ -433,7 +450,7 @@ rejected.
   > | `request_capability.query` | Natural language description of the capability needed (e.g., 'I need to scrape a website', 'browser automation') | Natural language capability request |
   > | `provision.server_name` | Name of the server to provision (from manifest) | Name of the server to provision from manifest |
   > | `update_server.server_name` | Name of server to update | Server to update |
-  > | `update_server.force` | Cancel this server's pending requests before restarting | Restart the server even if it has pending requests or active MCP tasks, cancelling them. Mirrors gateway.restart_server's force flag. *(model text intended here by both revisions)* |
+  > | `update_server.force` | Cancel this server's pending requests before restarting | Restart the server even if it has pending requests or active MCP tasks, cancelling them. Mirrors gateway.restart_server's force flag. **← kept (the exception)** |
   > | `auth_connect.server_name` | Server name that needs authentication | Server requiring authentication |
   > | `auth_connect.credential` | API key, token, or subscription credential to store | Secret token/API key to store |
   > | `auth_connect.env_var` | Optional explicit environment variable key | Override environment variable key to store into |
@@ -442,20 +459,9 @@ rejected.
   > | `search_registry.query` | Natural language description of the capability needed | Natural language capability description |
   > | `register_discovered_server.server_name` | Logical name for this server (e.g. 'github') used with gateway.provision | Logical name for this server (e.g. 'github') |
   > | `register_discovered_server.env_vars` | Required environment variable names (e.g. ['GITHUB_TOKEN']) | Required environment variable names |
-  >
-  > The embedded patch reproduces the frozen code, so executing this plan as
-  > written ships the model text, and agents lose content in some of these
-  > (the worked examples in `request_capability.query`, the
-  > `gateway.provision` cross-reference, the `GITHUB_TOKEN` example). This
-  > plan does **not** rewrite the rationale to fit. The board or maintainer
-  > must choose before A merges: **(a)** accept the model text (the snapshot
-  > diff in A's PR is the review surface), or **(b)** apply revision 1's
-  > HEAD-text rule for 14 arguments (all but `update_server.force`) as a
-  > follow-up edit to the `Field(description=…)` strings. That changes only
-  > descriptions and the snapshot, not behaviour. Option (b) invalidates the
-  > byte-identity proof below, so it has to be re-proved.
 
-  40 descriptions are lifted verbatim (measured); 19 arguments that had no
+  54 descriptions match `main` byte for byte (40 lifted verbatim + the 14
+  resolved conflicts; measured); 19 arguments that had no
   description on HEAD get the spike's text (list in `scratchpad/desc_diff.out`:
   `catalog_search.filters`, `invoke.options`, the six `set_startup_policy.*`,
   `submit_feedback.issue_type`, `tasks_get/result/cancel.server_name|task_id`,
@@ -506,7 +512,7 @@ rejected.
   `:1879`).
 - Reason: by construction there is no hand-written schema left to drift.
 
-### `tests/test_gateway_tool_schemas.py` (add, 443 lines; whole file verbatim under *Verbatim bodies → A*)
+### `tests/test_gateway_tool_schemas.py` (add, 448 lines; whole file verbatim under *Verbatim bodies → A*)
 
 **208 tests** (measured: `208 passed`, collect-only counts in brackets). The
 three-link chain plus shape, snapshot, normalisation, gate, and the revision-2
@@ -529,15 +535,18 @@ additions:
 - `test_no_argument_tools_advertise_an_empty_object[3]`
 - `test_advertised_schema_is_a_self_contained_mcp_input_schema[26]` — no
   `$ref`/`$defs`/`title` keywords, no surviving `anyOf`, every property described.
-  **Known coverage gap since A1 (measured, not fixed in the frozen code):** its
-  helper `_object_schemas` selects `node.get("type") == "object"`, so after A1
-  the five *optional* nested objects (`catalog_search.filters`,
-  `invoke.options`, `invoke.task`, `invoke.trace_context`,
-  `tasks_result.options`, now typed `["object", "null"]`) are no longer walked.
-  The helper finds 26 of the 31 object schemas. The property it would check
-  holds today: all 17 nested properties have a description and no `anyOf`
-  (measured). But it is unpinned. B edits this file anyway and must fix the
-  helper (see *Piece B*).
+  **Walker fixed for A1 (`d0722f4`).** After A1 the five *optional* nested
+  objects (`catalog_search.filters`, `invoke.options`, `invoke.task`,
+  `invoke.trace_context`, `tasks_result.options`) are typed
+  `["object", "null"]`. The `72eaa76` helper selected only
+  `node.get("type") == "object"` and found 26 of the 31 object schemas. The
+  helper `_object_schemas` now also accepts a `type` list containing
+  `"object"` and finds all 31 (measured). Mutant M-W: remove the description
+  from `InvokeOptions.timeout_ms` (`types.py:808`). The new helper fails
+  `…is_a_self_contained_mcp_input_schema[gateway.invoke]` and
+  `[gateway.tasks_result]`, which shares `InvokeOptions` (2 failed, 24 passed
+  under `-k self_contained`). The `72eaa76` helper passes all 26 on the same
+  mutant, which was the blind spot.
 - `test_advertised_schema_is_valid_json_schema[26]` — `Draft202012Validator.check_schema`.
 - `test_advertised_schema_accepts_the_minimal_valid_arguments[26]` — gate and
   model both accept the minimal argument set.
@@ -651,9 +660,10 @@ always did; 28 optional arguments (e.g. `catalog_search.query`,
 gate when sent as `null`. Unknown keys are still ignored in this release — see
 the following entry once B lands."
 
-(If the open description decision above resolves to (b), add: "Argument
-descriptions are unchanged except …". Under (a), the 15 changed descriptions
-are visible in the snapshot diff.)
+Add to that entry (the description decision was resolved to (b)): "Argument
+descriptions agents already saw are unchanged, except
+`gateway.update_server.force`, which now describes the task-aware behaviour;
+19 previously undescribed arguments gain a description."
 
 ## Piece B — changes
 
@@ -678,16 +688,16 @@ are visible in the snapshot diff.)
 >   are unchanged by revision 2. The `NO_ARGUMENTS_SCHEMA` replacement is
 >   unchanged. The four caller edits touch files A does not modify.
 > - **B test-code changes forced by revision-2 A (1 required, 1 recommended):**
->   1. `test_advertised_schema_forbids_unknown_keys` skips any property whose
->      `type` is not the string `"object"`. After A1, the optional nested
->      objects are `["object", "null"]`, so as written it would silently skip
->      `invoke.options`, `invoke.task`, `invoke.trace_context`, `invoke._meta`,
->      `catalog_search.filters` and `tasks_result.options`: a check that proves
->      less than it claims. Change the guard to "`"object"` is the type or is
->      in the type list". Fix A's `_object_schemas` helper the same way (A's
->      self-contained test has the same blind spot, see *Piece A*). Then prove
->      the fix with a mutant: drop `additionalProperties: false` from
->      `InvokeOptions` only, and expect RED.
+>   1. `test_advertised_schema_forbids_unknown_keys` (B's own test) skips any
+>      property whose `type` is not the string `"object"`. After A1, the
+>      optional nested objects are `["object", "null"]`, so as written it would
+>      silently skip `invoke.options`, `invoke.task`, `invoke.trace_context`,
+>      `invoke._meta`, `catalog_search.filters` and `tasks_result.options`: a
+>      check that proves less than it claims. Change its guard to "`"object"`
+>      is the type or is in the type list". (A's `_object_schemas` helper, which
+>      this test also calls, is already fixed in A at `d0722f4`, so there is
+>      nothing to do there.) Then prove the fix with a mutant: drop
+>      `additionalProperties: false` from `InvokeOptions` only, and expect RED.
 >   2. B's appended block defines `_model_types`, but revision-2 A's test
 >      module already defines an identical `_model_types`. Appending it again
 >      is harmless at runtime (same body), and ruff does not flag it (measured:
@@ -864,8 +874,8 @@ one paragraph, same content, headed *Breaking for agents sending extra keys*.
    HEAD schemas with the *Measurement scripts* probes run from a `main` checkout:
    the *only* differences must be the 23/26 `probe_head.py` list (18 constraint
    drift + 5 null-only), the 16 newly advertised properties, the 19 new
-   descriptions and the 15 description conflicts (`desc_cmp.py`) → **resolve
-   the open description decision** → **file the A3 follow-up** →
+   descriptions and exactly one description change, `update_server.force`
+   (`desc_cmp.py`: `same 54 differ 1`) → **file the A3 follow-up** →
    CHANGELOG A → PR A.
 2. B (after A merges, **and after the A3 follow-up lands**; X1's test must be
    green on B's head): `types.py` flip + `populate_by_name` removal →
@@ -903,10 +913,12 @@ dispatches with `()`; dispatch names must equal registry names.
 
 ## Acceptance criteria — measured this session
 
-### Piece A (tree: frozen revision-2 code `72eaa76`; 208 passed green)
+### Piece A (tree: frozen revision-2 code `d0722f4`; 208 passed green)
 
 Re-measured 2026-09-26 in a detached worktree at `72eaa76`, after the full
-suite there had finished (the mutants edit files the suite imports). Each
+suite there had finished (the mutants edit files the suite imports). Re-run
+again at `d0722f4` after the description and walker fix: every row's
+failed/passed counts are identical. Each
 mutation was applied by exact-string replacement asserted to match once, shown
 with `diff -u` against a saved copy, run against
 `tests/test_gateway_tool_schemas.py`, then restored with `cp` from the saved
@@ -923,6 +935,7 @@ baseline: `208 passed`. All RED for the named reason:
 | **M-A2** | `handlers.py:get_gateway_tool_definitions` (`:689`) — bypass the cache at the call site: `list(_derived_gateway_tools())` → `list(_derived_gateway_tools.__wrapped__())` | `-    return list(_derived_gateway_tools())` / `+    return list(_derived_gateway_tools.__wrapped__())` | `test_schemas_are_derived_once_per_process` — **`assert 260 == 26`** (10 lookups × 26 derivations) — 1 failed, 207 passed | derivation must happen once per process, not per `tools/call` (board A2) |
 | **M-X1** | `server.py:_handle_call_tool` — rename the dispatch branch `name == "gateway.health"` → `"gateway.health_internal"` | `-                elif name == "gateway.health":` / `+                elif name == "gateway.health_internal":` | **only** `test_every_dispatched_gateway_name_is_registered` — 1 failed, 207 passed. `test_server_dispatch_agrees_with_registry` stays green, which is the gap X1 closes | a dispatch branch for an unregistered name would skip the gate |
 | **M-X2** | `handlers.py:GatewayTools.describe` — `DescribeInput.model_validate(` → `_DescribeInput.model_validate(` (a substring match, not a word match) | `-        parsed = DescribeInput.model_validate(input_data)` / `+        parsed = _DescribeInput.model_validate(input_data)` | `test_handler_validates_arguments_with_the_registered_model[gateway.describe]` — 1 failed, 207 passed | the handler-link check matches on a word boundary, not a substring |
+| **M-W** | `types.py:InvokeOptions.timeout_ms` (`:808`) — drop `description="Timeout in milliseconds"` (measured at `d0722f4` only) | `-        default=30000, ge=1000, le=300000, description="Timeout in milliseconds"` / `+        default=30000, ge=1000, le=300000` | `…is_a_self_contained_mcp_input_schema[gateway.invoke]` and `[gateway.tasks_result]` — 2 failed, 24 passed under `-k self_contained`. The `72eaa76` helper passes 26/26 on the same mutant | the walker must reach the `["object", "null"]` nested objects |
 
 Note M1 and M3 both light the gate test: the gate test is what turns "the
 schema says X" into "the transport enforces X".
@@ -994,8 +1007,7 @@ callers 264 passed; snapshot 712 lines, 31 × `additionalProperties: false`,
 
 - execute A: effort=low, reason=A is embedded verbatim and proven
   byte-identical to verified code (four bodies + a deterministic snapshot).
-  The remaining work is review: the open description decision, and the
-  811-line snapshot, which must be read against the measured HEAD schemas, not
+  The remaining work is review of the 811-line snapshot, which must be read against the measured HEAD schemas, not
   eyeballed.
 - execute B: effort=medium (was low), reason=one-line flip plus four
   consequential edits, but every B number must be re-measured on revision-2
@@ -1003,7 +1015,7 @@ callers 264 passed; snapshot 712 lines, 31 × `additionalProperties: false`,
   gated on the A3 follow-up and on X1's test.
 - Every PR to main needs panel CR + reconcile first (repo rule).
 
-## Embedding proof (revision 2, measured 2026-09-26)
+## Embedding proof (revision 2, re-measured 2026-09-26 against `d0722f4`)
 
 Proves that the A bodies below, applied exactly as *A — how an executor
 applies these* instructs, reproduce the frozen, verified piece-A code byte for
@@ -1011,38 +1023,34 @@ byte. Fresh detached worktree at `origin/main` (`9ca081e`, 0 changes) →
 `uv sync --all-extras -p 3.10` → the extractor taken **out of this plan**
 (not a local copy) → the four extract commands → `git apply --check` + `git
 apply` → the snapshot generation command → `cmp` each resulting file against
-`git show origin/wip/236-schema-drift-rev2-code:<path>` (`72eaa76`) → the
+`git show d0722f4:<path>` (= `origin/wip/236-schema-drift-rev2-code`) → the
 schema test file:
 
 ```text
 base: 9ca081e674806202dfa41864489cb9e3ae225dd9  clean: 0 changes
 src/pmcp/tools/schema.py: 99 lines
-tests/test_gateway_tool_schemas.py: 443 lines
-<scratch>/types.patch: 564 lines
+tests/test_gateway_tool_schemas.py: 448 lines
+<scratch>/types.patch: 622 lines
 <scratch>/handlers.patch: 866 lines
 1 passed, 207 deselected in 0.15s
-===== cmp against origin/wip/236-schema-drift-rev2-code (72eaa76)
+===== cmp against d0722f4 (= origin/wip/236-schema-drift-rev2-code)
 cmp OK  src/pmcp/tools/schema.py  sha256=ddc7a14d17b91bcb
 cmp OK  src/pmcp/tools/handlers.py  sha256=9b8c18905828826e
-cmp OK  src/pmcp/types.py  sha256=f9ca3ba67282e228
-cmp OK  tests/test_gateway_tool_schemas.py  sha256=a239fe1cc214cf8b
-cmp OK  tests/fixtures/gateway_tool_schemas.json  sha256=906d28753772f268
+cmp OK  src/pmcp/types.py  sha256=a6e85c5ab49d24dc
+cmp OK  tests/test_gateway_tool_schemas.py  sha256=0f46d212e229f270
+cmp OK  tests/fixtures/gateway_tool_schemas.json  sha256=9da66316e07bcdf6
 changed vs base:  M src/pmcp/tools/handlers.py  M src/pmcp/types.py ?? src/pmcp/tools/schema.py ?? tests/fixtures/gateway_tool_schemas.json ?? tests/test_gateway_tool_schemas.py
 ===== pytest
-208 passed in 0.51s
+208 passed in 0.52s
 ```
-
-After the proof, the extractor's docstring gained the qualified issue
-reference (behaviour unchanged). The four bodies were then re-extracted from
-the *final* plan text with the *final* extractor: `schema.py` and the test
-module are `cmp`-equal to `72eaa76`, both patches are `cmp`-equal to the ones
-applied in the proof, and `git apply -R --check` of both succeeds in the
-proof tree.
 
 Exactly the five files changed, and nothing else. The fixture `cmp` is the
 check that the snapshot *content* matches. The generation run itself passes
-by construction, since it writes the file it then reads. The proof worktree
-was removed afterwards.
+by construction, since it writes the file it then reads. Pasting this output
+into the plan was the only edit after the proof. The four bodies were then
+re-extracted from the final plan text and re-`cmp`ed. The proof worktree was
+removed afterwards. (The earlier proof against `72eaa76`, before the
+description and walker fix, also passed 5/5 `cmp` and 208.)
 
 **Consistency gate.** `uv run python ~/code/pmcp/scripts/check_plan_consistency.py
 .consiliency/plans/detailed-236-schema-drift-20260923-0915.md` →
@@ -1074,7 +1082,7 @@ PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py -
 uv run pytest tests/test_gateway_tool_schemas.py -q                     # expect 208 passed
 ```
 
-The two patches are `git diff origin/main 72eaa76 -- <file>` against
+The two patches are `git diff origin/main d0722f4 -- <file>` against
 `origin/main` @ `9ca081e` (identical for these files to `860636a` and
 `8dec131`). Their blank context lines carry one leading space. An editor that
 strips trailing whitespace breaks them, and `git apply --check` then fails
@@ -1213,7 +1221,7 @@ def _collapse_nullable(node: dict[str, Any]) -> dict[str, Any]:
     return out
 ```
 
-### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 443 lines, 208 tests)
+### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 448 lines, 208 tests)
 
 ```python
 """Advertised gateway tool schemas are derived from, and agree with, the
@@ -1318,7 +1326,12 @@ def _object_schemas(schema: dict[str, Any]) -> list[dict[str, Any]]:
 
     def walk(node: Any) -> None:
         if isinstance(node, dict):
-            if node.get("type") == "object" and "properties" in node:
+            kind = node.get("type")
+            # An optional nested object is typed ["object", "null"] (A1).
+            is_object = kind == "object" or (
+                isinstance(kind, list) and "object" in kind
+            )
+            if is_object and "properties" in node:
                 found.append(node)
             for key, value in node.items():
                 if key == "properties" and isinstance(value, dict):
@@ -1661,11 +1674,11 @@ async def test_server_gate_rejects_what_the_model_rejects(
     assert fragment in text, text
 ```
 
-### A — `src/pmcp/types.py` (`git apply` patch against `origin/main`, +243 / −96)
+### A — `src/pmcp/types.py` (`git apply` patch against `origin/main`, +269 / −110)
 
 ```diff
 diff --git a/src/pmcp/types.py b/src/pmcp/types.py
-index 215088d..0d3cd43 100644
+index 215088d..57ca626 100644
 --- a/src/pmcp/types.py
 +++ b/src/pmcp/types.py
 @@ -77,12 +77,26 @@ DEFAULT_AUTH_STATE_SEMANTICS: dict[AuthState, AuthStateSemanticsInfo] = {
@@ -2006,7 +2019,7 @@ index 215088d..0d3cd43 100644
  
  
  class RefreshOutput(BaseModel):
-@@ -836,24 +942,30 @@ class RefreshOutput(BaseModel):
+@@ -836,24 +942,32 @@ class RefreshOutput(BaseModel):
      mcp_tasks_remaining: int = 0
  
  
@@ -2014,15 +2027,19 @@ index 215088d..0d3cd43 100644
 +class ConnectServerInput(GatewayArguments):
      """Input for gateway.connect_server."""
  
-     server_name: str = Field(min_length=1, description="Server to connect")
+-    server_name: str = Field(min_length=1, description="Server to connect")
++    server_name: str = Field(min_length=1, description="Name of the server to connect")
  
  
 -class DisconnectServerInput(BaseModel):
 +class DisconnectServerInput(GatewayArguments):
      """Input for gateway.disconnect_server."""
  
-     server_name: str = Field(min_length=1, description="Server to disconnect")
+-    server_name: str = Field(min_length=1, description="Server to disconnect")
 -    force: bool = False
++    server_name: str = Field(
++        min_length=1, description="Name of the server to disconnect"
++    )
 +    force: bool = Field(
 +        default=False,
 +        description="Cancel this server's pending requests before disconnecting",
@@ -2033,8 +2050,9 @@ index 215088d..0d3cd43 100644
 +class RestartServerInput(GatewayArguments):
      """Input for gateway.restart_server."""
  
-     server_name: str = Field(min_length=1, description="Server to restart")
+-    server_name: str = Field(min_length=1, description="Server to restart")
 -    force: bool = False
++    server_name: str = Field(min_length=1, description="Name of the server to restart")
 +    force: bool = Field(
 +        default=False,
 +        description="Cancel this server's pending requests before restarting",
@@ -2042,7 +2060,7 @@ index 215088d..0d3cd43 100644
  
  
  class LifecycleServerOutput(BaseModel):
-@@ -913,10 +1025,13 @@ class HealthOutput(BaseModel):
+@@ -913,10 +1027,13 @@ class HealthOutput(BaseModel):
  # === Pending Request Monitoring Types ===
  
  
@@ -2058,7 +2076,7 @@ index 215088d..0d3cd43 100644
  
  
  class PendingRequestInfo(BaseModel):
-@@ -941,11 +1056,17 @@ class ListPendingOutput(BaseModel):
+@@ -941,11 +1058,17 @@ class ListPendingOutput(BaseModel):
      total_pending: int
  
  
@@ -2079,7 +2097,7 @@ index 215088d..0d3cd43 100644
  
  
  class CancelOutput(BaseModel):
-@@ -1083,7 +1204,7 @@ class GatewayPolicy(BaseModel):
+@@ -1083,10 +1206,13 @@ class GatewayPolicy(BaseModel):
  # === Capability Request Types ===
  
  
@@ -2087,8 +2105,15 @@ index 215088d..0d3cd43 100644
 +class CapabilityRequestInput(GatewayArguments):
      """Input for gateway.request_capability."""
  
-     query: str = Field(min_length=1, description="Natural language capability request")
-@@ -1207,13 +1328,15 @@ class SearchRegistryResult(BaseModel):
+-    query: str = Field(min_length=1, description="Natural language capability request")
++    query: str = Field(
++        min_length=1,
++        description="Natural language description of the capability needed (e.g., 'I need to scrape a website', 'browser automation')",
++    )
+     available_clis: list[str] | None = Field(
+         default=None,
+         description="Optional: CLIs known to be available in the environment",
+@@ -1207,13 +1333,16 @@ class SearchRegistryResult(BaseModel):
      diagnostics: list[str] = Field(default_factory=list)
  
  
@@ -2097,16 +2122,18 @@ index 215088d..0d3cd43 100644
      """Input for gateway.search_registry."""
  
      query: str = Field(
-         min_length=1, description="Natural language capability description"
-     )
--    limit: int = Field(default=5, ge=1, le=20)
+-        min_length=1, description="Natural language capability description"
++        min_length=1,
++        description="Natural language description of the capability needed",
++    )
 +    limit: int = Field(
 +        default=5, ge=1, le=20, description="Maximum number of results to return"
-+    )
+     )
+-    limit: int = Field(default=5, ge=1, le=20)
  
  
  class SearchRegistryOutput(BaseModel):
-@@ -1224,7 +1347,7 @@ class SearchRegistryOutput(BaseModel):
+@@ -1224,7 +1353,7 @@ class SearchRegistryOutput(BaseModel):
      next_step: str
  
  
@@ -2115,7 +2142,22 @@ index 215088d..0d3cd43 100644
      """Input for gateway.register_discovered_server."""
  
      package: str = Field(
-@@ -1266,7 +1389,7 @@ class RegisterDiscoveredServerOutput(BaseModel):
+@@ -1232,10 +1361,12 @@ class RegisterDiscoveredServerInput(BaseModel):
+         description="npm package identifier (e.g. '@modelcontextprotocol/server-github')",
+     )
+     server_name: str = Field(
+-        min_length=1, description="Logical name for this server (e.g. 'github')"
++        min_length=1,
++        description="Logical name for this server (e.g. 'github') used with gateway.provision",
+     )
+     env_vars: list[str] = Field(
+-        default_factory=list, description="Required environment variable names"
++        default_factory=list,
++        description="Required environment variable names (e.g. ['GITHUB_TOKEN'])",
+     )
+     description: str = Field(
+         default="", description="Short description of the server's purpose"
+@@ -1266,11 +1397,11 @@ class RegisterDiscoveredServerOutput(BaseModel):
      next_step: str | None = None
  
  
@@ -2124,7 +2166,12 @@ index 215088d..0d3cd43 100644
      """Input for gateway.provision - install and start a specific server."""
  
      server_name: str = Field(
-@@ -1307,15 +1430,25 @@ FeedbackSubmissionOutcome = Literal[
+-        min_length=1, description="Name of the server to provision from manifest"
++        min_length=1, description="Name of the server to provision (from manifest)"
+     )
+ 
+ 
+@@ -1307,15 +1438,25 @@ FeedbackSubmissionOutcome = Literal[
  ]
  
  
@@ -2157,7 +2204,7 @@ index 215088d..0d3cd43 100644
  
  
  class SubmitFeedbackOutput(BaseModel):
-@@ -1339,7 +1472,7 @@ class SubmitFeedbackOutput(BaseModel):
+@@ -1339,10 +1480,10 @@ class SubmitFeedbackOutput(BaseModel):
      submission_outcome: FeedbackSubmissionOutcome | None = None
  
  
@@ -2165,8 +2212,12 @@ index 215088d..0d3cd43 100644
 +class UpdateServerInput(GatewayArguments):
      """Input for gateway.update_server."""
  
-     server_name: str = Field(min_length=1, description="Server to update")
-@@ -1373,7 +1506,7 @@ class UpdateServerOutput(BaseModel):
+-    server_name: str = Field(min_length=1, description="Server to update")
++    server_name: str = Field(min_length=1, description="Name of server to update")
+     force: bool = Field(
+         default=False,
+         description=(
+@@ -1373,26 +1514,38 @@ class UpdateServerOutput(BaseModel):
      message: str
  
  
@@ -2175,14 +2226,24 @@ index 215088d..0d3cd43 100644
      """Input for gateway.auth_connect - save auth credentials for a server."""
  
      server_name: str = Field(
-@@ -1389,10 +1522,20 @@ class AuthConnectInput(BaseModel):
-     scope: Literal["user", "project"] = Field(
-         default="user", description="Where to store credentials"
+-        min_length=1, description="Server requiring authentication"
++        min_length=1, description="Server name that needs authentication"
      )
--    auth_mode: Literal["api_key", "url_elicitation"] = "api_key"
--    elicitation_id: str | None = None
--    elicitation_url: str | None = None
--    consent_acknowledged: bool = False
+     credential: str | None = Field(
+-        default=None, min_length=1, description="Secret token/API key to store"
++        default=None,
++        min_length=1,
++        description="API key, token, or subscription credential to store",
+     )
+     env_var: str | None = Field(
+         default=None,
+-        description="Override environment variable key to store into",
++        description="Optional explicit environment variable key",
+     )
+     scope: Literal["user", "project"] = Field(
+-        default="user", description="Where to store credentials"
++        default="user", description="Where to store the credential"
++    )
 +    auth_mode: Literal["api_key", "url_elicitation"] = Field(
 +        default="api_key",
 +        description="API-key storage or URL-mode elicitation acknowledgement",
@@ -2196,11 +2257,15 @@ index 215088d..0d3cd43 100644
 +    consent_acknowledged: bool = Field(
 +        default=False,
 +        description="Acknowledge that the out-of-band URL flow was completed",
-+    )
+     )
+-    auth_mode: Literal["api_key", "url_elicitation"] = "api_key"
+-    elicitation_id: str | None = None
+-    elicitation_url: str | None = None
+-    consent_acknowledged: bool = False
  
  
  class AuthConnectOutput(BaseModel):
-@@ -1408,7 +1551,7 @@ class AuthConnectOutput(BaseModel):
+@@ -1408,10 +1561,12 @@ class AuthConnectOutput(BaseModel):
      url_elicitation: UrlElicitationInfo | None = None
  
  
@@ -2208,8 +2273,14 @@ index 215088d..0d3cd43 100644
 +class ProvisionStatusInput(GatewayArguments):
      """Input for gateway.provision_status - check job progress."""
  
-     job_id: str = Field(min_length=1, description="Job ID from provision response")
-@@ -1439,11 +1582,15 @@ class ProvisionJobStatus(BaseModel):
+-    job_id: str = Field(min_length=1, description="Job ID from provision response")
++    job_id: str = Field(
++        min_length=1, description="Job ID from gateway.provision response"
++    )
+ 
+ 
+ class ProvisionJobStatus(BaseModel):
+@@ -1439,11 +1594,15 @@ class ProvisionJobStatus(BaseModel):
      error: str | None = None
  
  
@@ -3782,8 +3853,8 @@ print("pattern (invoke.evidence_label_digest):", gate("gateway.invoke", {"tool_i
 
 `dump_schemas.py` + `desc_cmp.py`: argument-description comparison, `main` →
 A. Run `dump_schemas.py` under each `src/`, then
-`desc_cmp.py main.json a.json`. Output (measured; the 15 `DIFF` lines are the
-table under *Piece A → `types.py`*):
+`desc_cmp.py main.json a.json`. Output at `d0722f4` (measured; the one `DIFF`
+line is `update_server.force`):
 
 ```python
 import json, sys
@@ -3827,5 +3898,7 @@ print("NEWPROP", newprops)
 
 ```text
 tool descriptions byte-identical: 26/26
-same 40 differ 15 new description 19 newly advertised 16
+same 54 differ 1 new description 19 newly advertised 16
 ```
+
+(At `72eaa76`, before option (b): `same 40 differ 15`.)
