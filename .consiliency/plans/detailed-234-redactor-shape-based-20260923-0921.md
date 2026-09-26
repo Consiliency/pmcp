@@ -6,8 +6,9 @@
 > Consiliency/pmcp#290 (whose body lists six measured defects as acceptance
 > criteria). Rev 7 was boarded by four seats (claude, grok, codex DISAGREE;
 > gemini AGREE); the core held, and rev 8 answers each finding. The code is
-> frozen at `origin/wip/234-redactor-rev8-code` @ `d316364` and embedded
-> below verbatim. **(1) Structured layer removed** — `_redact_leaves` is gone
+> frozen at `origin/wip/234-redactor-rev8-code` @ `56d7f80` and embedded
+> below verbatim (`56d7f80` = `d316364` plus comment/docstring wording and
+> the removal of a no-op `not inner` check; behaviour identical). **(1) Structured layer removed** — `_redact_leaves` is gone
 > and the serialisation decision is now **(c), scoped out to
 > Consiliency/pmcp#290**: a dict result is serialised, then redacted as text,
 > exactly as on `main`. `{"password": "hunter2"}` is fixed in text **and** in
@@ -153,7 +154,7 @@
 > and M26 (truncate then redact) are red under the property tests. All rev
 > 1-3 regression cases are kept. `uv run mypy src/` clean.
 >
-> **How to apply.** **Patch:** lines 1167-2080 of this file (the content between the ```diff fences; `sed -n '1167,2080p' <plan> > 234.patch && git apply --check 234.patch && git apply 234.patch` on `main`; it is `git diff 860636a origin/wip/234-redactor-rev8-code -- src/` verbatim). **Test file:** lines 2089-3991 (between the ```python fences; `sed -n '2089,3991p' <plan> > tests/test_redaction.py`). **Fixture:** copy
+> **How to apply.** **Patch:** lines 1174-2086 of this file (the content between the ```diff fences; `sed -n '1174,2086p' <plan> > 234.patch && git apply --check 234.patch && git apply 234.patch` on `main`; it is `git diff 860636a origin/wip/234-redactor-rev8-code -- src/` verbatim). **Test file:** lines 2095-3997 (between the ```python fences; `sed -n '2095,3997p' <plan> > tests/test_redaction.py`). **Fixture:** copy
 > `.consiliency/plans/detailed-234-redactor-main-oracle.b64` (committed beside
 > this plan) to `tests/fixtures/redaction_main_oracle.b64`; the differential
 > test reads it from there. To regenerate it from `main` (rev 8 layout):
@@ -351,7 +352,8 @@ the revised engine. Neither old assertion was wrong; the spike's gate was.
 
 Probed with one script on three trees: `main` @ `9ca081e` (its `auth.py`/`policy.py`
 equal `860636a`'s), rev 7 (this plan's rev-7 patch applied to `main`), and
-rev 8 (`origin/wip/234-redactor-rev8-code` @ `d316364`); `pmcp.__file__` was
+rev 8 (`origin/wip/234-redactor-rev8-code` @ `d316364`, behaviourally
+identical to `56d7f80`); `pmcp.__file__` was
 printed each time to prove which tree answered. E = engine, P = policy.
 
 | # | input | main | rev 7 | rev 8 |
@@ -605,7 +607,8 @@ The passes, as span producers (`collect_redaction_spans`):
    `_KEYWORD_LIST_RE` is `_KEYWORD_KEY_SEP` followed by a flat list
    (`\[[^\[\]]*\]`, pretty-printed or not); each quoted element
    (`_QUOTED_RE`) is a value of the key and is redacted inside its quotes;
-   empty elements are skipped, and under a weak key a plain word or number
+   an empty element yields a zero-length span, which `apply_redaction_spans`
+   drops, and under a weak key a plain word or number
    is kept (`{"code": ["red", "x9Kq2mZ7"]}` → `["red", "[REDACTED]"]`). No
    nested brackets: a list of objects carries its own keys. `REV 7 WAS
    WRONG`: `"password": [\n  "hunter2"\n]` lost its `[` and kept `hunter2`
@@ -1157,15 +1160,19 @@ of `main`'s 30 (checked by index).
 ### Patch (measured)
 
 `git diff 860636a origin/wip/234-redactor-rev8-code -- src/` (the frozen
-rev-8 code @ `d316364`), verbatim. Every rev-8 measurement and the rev-8
-mutation rows (Q1-Q3, D1, D2) ran against exactly this code (`sha256` of
-the revised files: `auth.py 36e5c289…b2c5`, `policy.py 8e6b51ca…5771`).
+rev-8 code @ `56d7f80`), verbatim (`sha256` of the revised files: `auth.py
+f587b92d…95f2`, `policy.py 8e6b51ca…5771`). The rev-8 mutation rows (Q1-Q3,
+D1, D2) ran against exactly this code. The differential, property and
+full-suite measurements ran on its parent `d316364`, which differs only in
+comments, one docstring and a no-op `not inner` check in
+`_keyword_list_spans` (an empty element's span is zero-length and dropped
+either way); 149 tests pass on both.
 `auth.py` and `policy.py` are unchanged from `860636a` to today's `main`
 (`9ca081e`), so the patch applies to either.
 
 ```diff
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index f40ccbb..72d984f 100644
+index f40ccbb..72671a4 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
 @@ -4,6 +4,7 @@ from __future__ import annotations
@@ -1210,7 +1217,7 @@ index f40ccbb..72d984f 100644
      "session",
      "set-cookie",
      "sid",
-@@ -87,12 +97,620 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
+@@ -87,12 +97,619 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
      "token",
  }
  
@@ -1514,7 +1521,7 @@ index f40ccbb..72d984f 100644
 +#: and `\xa0` and regressed against main. A bare value ends at whitespace, a quote or a list
 +#: separator (`,`, `;`, or `&` -- a query string's) and at nothing else,
 +#: except that it never STARTS on `[` or `{` (`"password": [\n  "x"\n]` is a
-+#: list, whose elements carry no key -- a stated residual, main's too; the
++#: list -- `_keyword_list_spans` redacts its quoted elements instead; the
 +#: one `[` allowed is the marker's own, so `token=[REDACTED]abc123def456`
 +#: is still one value) and
 +#: never ENDS on a closing bracket or a backslash (the `\\`
@@ -1635,9 +1642,8 @@ index f40ccbb..72d984f 100644
 +        base = match.start("list")
 +        for element in _QUOTED_RE.finditer(match.group("list")):
 +            inner = element.group()[1:-1]
-+            if not inner or (
-+                name in WEAK_SECRET_KEYS and _is_plain_word_or_number(inner)
-+            ):
++            # An empty element needs no case: a zero-length span is a no-op.
++            if name in WEAK_SECRET_KEYS and _is_plain_word_or_number(inner):
 +                continue
 +            spans.append(
 +                (base + element.start() + 1, base + element.end() - 1, REDACTED)
@@ -1831,7 +1837,7 @@ index f40ccbb..72d984f 100644
  
  def redact_auth_url(url: str) -> str:
      """Strip URL userinfo and redact auth-bearing query values."""
-@@ -576,35 +1194,10 @@ def sanitize_url_elicitation_url(
+@@ -576,35 +1193,10 @@ def sanitize_url_elicitation_url(
  def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
      """Return a display-safe diagnostic string for auth failures."""
      text = str(value)
@@ -2083,7 +2089,7 @@ index cac2702..1e4269a 100644
 ## Test bodies
 
 `tests/test_redaction.py`, verbatim from `origin/wip/234-redactor-rev8-code`
-(sha256 `91700397…0a03`; 149 tests; `ruff check`, `ruff format --check` clean):
+@ `56d7f80` (sha256 `84da6a20…b746`; 149 tests; `ruff check`, `ruff format --check` clean):
 
 ```python
 """Both directions of secret redaction, pinned together (Consiliency/pmcp#234).
@@ -3636,7 +3642,7 @@ _DIFF_PROSE_SEPS = frozenset({" is ", "|", "->"})
 def _accepted_regression_class(
     key: str, sep: str, value: str, kept: list[str], wrap: str = ""
 ) -> str | None:
-    """Rows where rev 7 keeps a piece main removed, BY DESIGN -- decided from
+    """Rows where this redactor keeps a piece main removed, BY DESIGN -- decided from
     the row's own key, separator and value, not from sniffing the text. Each
     class is listed in the plan's accepted-regression table with its count
     and reason. Anything not matched here is a bug."""
@@ -4082,6 +4088,7 @@ tail -n 3 <scratch>/pmcp-234-full.log
 ```
 
 Measured on the rev-8 code (`origin/wip/234-redactor-rev8-code` @ `d316364`,
+the parent of the embedded `56d7f80`, same behaviour;
 a scratch worktree): `test_redaction.py` **149 passed** (~6 s); `ruff check`
 and `ruff format --check` on `src/ tests/` clean; `mypy src/` **Success: no
 issues found in 49 source files**; full suite (`-m 'not live'`, npm env vars
@@ -4163,21 +4170,21 @@ APPLIED first). Rev 7's final run, all 35 rows, is the table below
 (M01-M38).
 
 **Rev 8.** Five mutants, one per new mechanism, were run on the frozen rev-8
-code in a scratch worktree of `origin/wip/234-redactor-rev8-code`: each a
+code (`56d7f80`, applied from this plan in a scratch worktree off `main`): each a
 single-occurrence text replacement (the runner refuses an anchor that does
 not occur exactly once), the diff counted, the **whole**
 `tests/test_redaction.py` run (149 nodes, no `-k`), the file restored from a
 saved copy and its sha256 re-checked against the frozen value (baseline
-before the run: 149 passed; all restored). A sixth, **Q4** (skip an empty
+before the run: 149 passed; all restored). Run on `56d7f80`; on `d316364`
+the same five gave the same failures (Q3 then had a 4-line diff, its gate
+spanning three lines). A sixth, **Q4** (skip an empty
 quoted value `""` in `_keyword_sep_spans`), is **equivalent**:
 `apply_redaction_spans` drops a zero-length span, so the guard changed
 nothing — the guard was deleted from the code rather than kept untested.
 `{"password": ""}` staying `""` (`test_structured_result_round_trips_as_a_dict[obj3-expected3]`)
 is that zero-length drop at work (`apply_redaction_spans` keeps only spans
-with `start < end`). By the same argument the `not inner` half of the skip
-in `_keyword_list_spans` is also equivalent; it is still in the frozen code
-and is not mutated here (noted for the implementer, not changed: the code
-is frozen).
+with `start < end`). By the same argument an empty-element check in
+`_keyword_list_spans` would be equivalent, so it is not there either.
 
 | id | verdict | evidence | why it is red |
 |---|---|---|---|
@@ -4185,7 +4192,7 @@ is frozen).
 | D2-policy-covers-none | RED | 2 diff lines (`covers=self._pattern_matches` → `covers=None` in `redaction_spans`); 2 failed, 147 passed | `test_operator_pattern_applies_to_a_percent_encoded_query_value`, `test_encoded_query_values_are_matched_by_the_policy_patterns_too`: an operator pattern and the `ghp_` default never see the decoded value |
 | Q1-quoted-span-whole | RED | 2 diff lines (the inside-the-quotes adjustment removed); 12 failed, 137 passed | a quoted keyed value is redacted with its quotes again: `test_redaction_never_breaks_a_json_document`, `test_differential_on_structured_results_never_worse_than_main` (a dict comes back as a string), `test_structured_result_round_trips_as_a_dict` ×3, and the 7 quote-preserving expectations |
 | Q2-no-list-pass | RED | 1 diff line (`*_keyword_list_spans(text)` removed from `collect_redaction_spans`); 3 failed, 146 passed | `test_pretty_printed_list_value_is_redacted_inside_its_quotes`, `test_structured_result_round_trips_as_a_dict[obj1-…]` and `[obj4-…]`: list elements under a secret key survive |
-| Q3-list-weak-filter-off | RED | 4 diff lines (the weak-key plain-word gate removed from `_keyword_list_spans`); 1 failed, 148 passed | `test_structured_result_round_trips_as_a_dict[obj4-expected4]`: `{"code": ["red", …]}` loses `red` |
+| Q3-list-weak-filter-off | RED | 2 diff lines (the weak-key plain-word gate in `_keyword_list_spans` replaced by `if False:`); 1 failed, 148 passed | `test_structured_result_round_trips_as_a_dict[obj4-expected4]`: `{"code": ["red", …]}` loses `red` |
 | Q4-empty-quoted-value-skip | EQUIVALENT — guard deleted | (recorded in the rev-8 session notes; not re-run here: there is nothing left to mutate) | `apply_redaction_spans` drops zero-length spans |
 
 **Rows M01-M38 were not re-run on rev 8.** Their evidence below is rev 7's
@@ -4392,7 +4399,7 @@ Rev 7's final run, all 35 rows:
 
 ## Unverified
 
-- **Full suite: verified.** rev 8: **4213 passed, 3 skipped, 25 deselected in 421.04s (0:07:01)**, `-m 'not live'`, npm env vars unset, on a scratch worktree of `origin/wip/234-redactor-rev8-code` @ `d316364` (the `src/` hashes above, with the oracle fixture in place); `ruff check`, `ruff format --check` clean and `uv run mypy src/` Success, 49 source files, on the same tree. Rows M01-M38 were **not** re-run on rev 8 (see Mutation evidence); Q1-Q3, D1, D2 were. History: rev 7: **4200 passed, 3 skipped, 25 deselected in 651.87s (10:51)**, run detached with `-m 'not live'` on the rev-7 tree (the exact `src/` hashes embedded above, with the oracle fixture at `tests/fixtures/redaction_main_oracle.b64`) after the 35-row mutation table; `uv run mypy src/` on the same tree: Success, 49 source files.
+- **Full suite: verified.** rev 8: **4213 passed, 3 skipped, 25 deselected in 421.04s (0:07:01)**, `-m 'not live'`, npm env vars unset, on a scratch worktree of `origin/wip/234-redactor-rev8-code` @ `d316364` (the parent of the embedded `56d7f80`; they differ only in comments, a docstring and a no-op check; oracle fixture in place); `ruff check`, `ruff format --check` clean and `uv run mypy src/` Success, 49 source files, on the same tree. Rows M01-M38 were **not** re-run on rev 8 (see Mutation evidence); Q1-Q3, D1, D2 were. History: rev 7: **4200 passed, 3 skipped, 25 deselected in 651.87s (10:51)**, run detached with `-m 'not live'` on the rev-7 tree (the exact `src/` hashes embedded above, with the oracle fixture at `tests/fixtures/redaction_main_oracle.b64`) after the 35-row mutation table; `uv run mypy src/` on the same tree: Success, 49 source files.
   The targeted files that exercise every changed symbol (`test_redaction.py`,
   `test_auth.py`, `test_policy.py`, `test_project_source_consent_policy.py`,
   `test_trust_boundaries_e2e.py`) were run and are green.
