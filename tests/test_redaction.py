@@ -23,6 +23,7 @@ import re
 import string
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -37,6 +38,7 @@ from pmcp.auth import (
     sanitize_auth_diagnostic,
 )
 from pmcp.policy.policy import DEFAULT_REDACTION_PATTERNS, PolicyManager
+from tests import _redaction_grammar as G
 
 # --------------------------------------------------------------------------- #
 # The prose corpus. Every line is text a downstream server, pip, git, httpx or
@@ -1617,13 +1619,15 @@ def _differential_corpus() -> list[tuple[str, str, str, str, str]]:
     return out
 
 
-def _main_oracle() -> dict[str, list]:
+def _main_oracle() -> dict[str, Any]:
     """`main`'s recorded behaviour (auth.py/policy.py unchanged from 860636a to
-    9ca081e): per string-corpus row the token pieces its engine and policy
-    removed (`string`); per dict-corpus row the pieces `process_output`
+    9ca081e): per grammar-corpus row what survives on each surface
+    (`grammar`, `_redaction_grammar.observe` codes over `corpus(2)`, whose
+    prefix is tier 1) and the corpus digest it was recorded over
+    (`grammar_fingerprint`); per dict-corpus row the pieces `process_output`
     removed from the serialised result (`dict`) and the result's type
     (`dict_types`); per fuzz object the `process_output` result type
-    (`fuzz_types`)."""
+    (`fuzz_types`). Recorded by `tests/fixtures/regen_redaction_main_oracle.py`."""
     blob = (
         Path(__file__).parent / "fixtures" / "redaction_main_oracle.b64"
     ).read_text()
@@ -1651,148 +1655,152 @@ _DIFF_COLLATERAL = frozenset(
 )
 
 
-_DIFF_PROSE_SEPS = frozenset({" is ", "|", "->"})
-#: rev 9 (N1): keys that carry a suffix after the credential name -- decided
-#: from the key as written in `_DIFF_KEYS`, case- and flag-insensitively.
-_DIFF_SUFFIXED_KEYS = frozenset(
-    {
-        "password2",
-        "password_confirmation",
-        "passwordhash",
-        "secret_value",
-        "secret_key",
-        "token_id",
-        "token_type",
-        "password_length",
-        "token_endpoint",
-        "secret_arn",
-    }
-)
-#: rev 9 (C): compound keys with no boundary left once case-folded
-#: (`CLIENTSECRET`, `Dbpassword`); the PascalCase spelling keeps its boundary.
-_DIFF_GLUED_KEYS = frozenset(
-    {"clientsecret", "dbpassword", "accesstoken", "sessiontoken"}
-)
+# === rev 10: the grammar-derived differential ============================= #
+#
+# The never-worse-than-main differential is derived from the ORACLE's grammar
+# (main's rules plus what `json.dumps` emits), not from past findings:
+# `tests/_redaction_grammar.py` holds the generator (its docstring has every
+# axis and the sampling density), the observation of each surface and the
+# accepted-regression classes. Tier 1 runs here; the full set (tier 2) is
+# `-m slow`.
 
 
-def _accepted_regression_class(
-    key: str, sep: str, value: str, kept: list[str], wrap: str = ""
-) -> str | None:
-    """Rows where this redactor keeps a piece main removed, BY DESIGN -- decided from
-    the row's own key, separator, value and wrap, never from the output. Each
-    class is listed in the plan's accepted-regression table with its count
-    and reason. Anything not matched here is a bug."""
-    base = key.lower()
-    bare_key = base.lstrip("-")
-    name = base.split("_")[-1].split("-")[-1]
-    plain = _is_plain_word_or_number_for_test(value)
-    credential = _value_could_be_a_credential_for_test(value)
-    if wrap.startswith("https://h.example/?") and "=" not in sep and " " not in sep:
-        # `?x=1&bearer:abc…&y=2`: main's `parse_qsl` took `bearer:abc…` as a
-        # KEY and re-spelled it `bearer%3Aabc…=` -- a re-encoding, not a
-        # redaction (the same as `|` -> `%7C`); the value is still there
-        return "inside a URL query main re-encoded `key<sep>value` as a key (`%3A`, `%7C`); not a redaction"
-    if sep in _DIFF_PROSE_SEPS:
-        # main "removed" the value in `?jwt|hunter2` by re-encoding `|` as
-        # `%7C` inside a URL, and ate `is`/`->` rows through `[\s:=]+`; it left
-        # `token|hunter2` outside a URL untouched
-        return "`is`/`|`/`->` are not separators (main: URL re-encoding of `|`, or its whitespace rule)"
-    if sep.isspace():
-        # rev 9 (B5): every `str.isspace()` separator, not a fixed list
-        if name == "code":
-            return "`code` never fires on a whitespace-only separator (main redacted `code<TAB>s3cr3t`)"
-        if not credential:
-            return "whitespace-only separator with a non-credential-shaped value (D2)"
-    if sep.strip() == "==" and not credential:
-        return "`==` is a comparison unless the value is credential-shaped (G1: `if token == expected:`)"
-    if bare_key in _DIFF_SUFFIXED_KEYS and not credential:
-        return "a suffixed key names metadata unless the value is credential-shaped (N1: `password_length=12`)"
-    if (
-        bare_key in _DIFF_GLUED_KEYS
-        and _is_single_case_for_test(key)
-        and (not credential or "://" in value or value.lower().startswith("arn:"))
-    ):
-        return "a glued, single-case key counts only with a credential-shaped value that is not a URL or ARN (C)"
-    if not sep.startswith('"') and value.startswith((",", "}")):
-        return 'after an unquoted key a value starting on `,`/`}` is JSON structure (N3: `"missing token: ", "code"`)'
-    if sep == ":\r\n" and not value.startswith(('"', "'")) and not credential:
-        return "unindented line-break continuation with a non-credential-shaped value (D2 applied to a line break)"
-    if sep == '\\": \\"{}\\"':
-        return "backslash-escaped quotes in a plain string (JSON inside a leaf is Consiliency/pmcp#290)"
-    if base in ("code", "auth_code", "credentials") and plain:
-        return "weak key keeps a plain word or number"
-    if base in ("authorization", "bearer") and plain:
-        return "`Authorization`/`Bearer` followed by a plain word is prose"
-    return None
-
-
-def _is_single_case_for_test(key: str) -> bool:
-    """All upper, all lower, or one capital then lower (flag dashes aside)."""
-    word = key.lstrip("-")
-    return (
-        word.isupper() or word.islower() or (word[:1].isupper() and word[1:].islower())
-    )
-
-
-def _value_could_be_a_credential_for_test(value: str) -> bool:
-    """D2, restated: not a plain word or number, and digit-bearing and 6+
-    chars or punctuated and 8+."""
-    if _is_plain_word_or_number_for_test(value):
-        return False
-    return len(value) >= (6 if any(c.isdigit() for c in value) else 8)
-
-
-def test_differential_against_main_never_worse_except_by_stated_class() -> None:
-    """For every corpus row and surface, every ≥ 4-char piece main removed is
-    removed here too, unless the row falls into an accepted-regression class.
-    Rev 6 hand-picked its never-worse corpus from inputs main handled cleanly
-    and reported 0 while two regressions existed; this test takes the board's
-    corpus and main's recorded output as the oracle instead. Rule: no
-    lookahead, lookbehind or rule narrowing lands without re-running this.
-    """
+def _grammar_differential(
+    rows: list[G.Row], main_codes: list[str]
+) -> tuple[dict[str, int], list[str], int]:
+    """Per (row, surface) this redactor is worse on than main: its accepted
+    class (decided from the row as written and the surface, never from the
+    output), or a bug. Also counts the positive control: rows on which main
+    removed a piece on some surface."""
     policy = PolicyManager()
-    corpus = _differential_corpus()
-    oracle = _main_oracle()["string"]
-    assert len(corpus) == len(oracle) == 8000
+
+    def process(obj: object) -> object:
+        return policy.process_output(obj, redact=True, max_bytes=G.BIG)["result"]
+
+    counts = dict.fromkeys(G.CLASSES, 0)
     bugs: list[str] = []
-    accepted: dict[str, int] = {}
-    better = worse_rows = 0
-    for (text, key, sep, value, wrap), (main_engine, main_policy) in zip(
-        corpus, oracle
-    ):
-        here = {
-            "engine": _engine(text),
-            "policy": policy.redact_secrets(text),
-        }
-        removed_here = {
-            surface: set(_DIFF_TOKEN.findall(text)) - set(_DIFF_TOKEN.findall(out))
-            for surface, out in here.items()
-        }
-        if removed_here["engine"] - set(main_engine) or removed_here["policy"] - set(
-            main_policy
-        ):
-            better += 1
-        for surface, main_removed in (("engine", main_engine), ("policy", main_policy)):
-            kept = [
-                piece
-                for piece in main_removed
-                if len(piece) >= 4
-                and piece.lower() not in _DIFF_COLLATERAL
-                and piece.lower() != key.lower()  # main ate the KEY itself
-                and piece not in removed_here[surface]
-            ]
-            if not kept:
-                continue
-            worse_rows += 1
-            reason = _accepted_regression_class(key, sep, value, kept, wrap)
-            if reason is None:
-                bugs.append(
-                    f"{surface} {text!r} keeps {kept} (main removed them); here: {here[surface]!r}"
-                )
+    controls = 0
+    for row, main in zip(rows, main_codes, strict=True):
+        assert len(main) == (2 if "o" in row else len(G.TEXT_SURFACES) + 1), main
+        here = G.observe(row, _engine, policy.redact_secrets, process)
+        controls += bool(row["value"]) and G.removed_by_main(row, main)
+        for surface in G.worse_surfaces(row, main, here):
+            cls = (
+                G.accepted(row["f"], surface)
+                if row["f"] is not None and not surface.endswith(".type")
+                else None
+            )
+            if cls is None:
+                shown = row.get("t", row.get("o"))
+                bugs.append(f"{surface}: {shown!r} main={main} here={here}")
             else:
-                accepted[reason] = accepted.get(reason, 0) + 1
-    assert bugs == [], f"{len(bugs)} unaccepted regressions:\n" + "\n".join(bugs[:25])
-    assert better > 1500, better
+                counts[cls] += 1
+    return counts, bugs, controls
+
+
+def test_grammar_differential_never_worse_than_main_except_by_stated_class() -> None:
+    """Tier 1 (11 335 rows x 12 surfaces, plus the result type of every
+    dict): every piece of the value main removed on a surface is removed here
+    too, and every dict main kept stays a dict, unless the (row, surface) is
+    in a stated class. The oracle is main's recorded output over exactly this
+    corpus (the fingerprint)."""
+    rows = G.corpus(1)
+    oracle = _main_oracle()
+    assert oracle["grammar_fingerprint"]["1"] == G.fingerprint(rows)
+    assert len(rows) == 11_335 and len(oracle["grammar"]) == 145_983
+    counts, bugs, controls = _grammar_differential(rows, oracle["grammar"][: len(rows)])
+    assert bugs == [], f"{len(bugs)} unaccepted:\n" + "\n".join(bugs[:25])
+    text_rows = sum(1 for row in rows if row["value"])
+    # the oracle is not vacuous: main removes the value on most rows, and the
+    # classes are exercised (each class's count is in the plan)
+    assert controls > 0.85 * text_rows, (controls, text_rows)
+    assert sum(counts.values()) > 10_000, counts
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("block", G.BLOCKS)
+def test_grammar_differential_full_set(block: str) -> None:
+    """Tier 2, the full set (145 983 rows), one block per case so a failure
+    is attributed to an axis and each case stays well inside the per-test
+    timeout."""
+    rows = G.corpus(2)
+    oracle = _main_oracle()
+    assert oracle["grammar_fingerprint"]["2"] == G.fingerprint(rows)
+    assert len(rows) == len(oracle["grammar"]) == 145_983
+    picked = [(r, c) for r, c in zip(rows, oracle["grammar"]) if r["block"] == block]
+    assert picked, block
+    counts, bugs, controls = _grammar_differential(
+        [r for r, _ in picked], [c for _, c in picked]
+    )
+    assert bugs == [], f"{len(bugs)} unaccepted:\n" + "\n".join(bugs[:25])
+    if block != "scalar":
+        assert controls > 0.5 * len(picked), (controls, len(picked))
+
+
+def test_the_grammar_corpus_covers_every_axis() -> None:
+    """Each axis the generator's docstring claims is really produced (a check
+    is only a check if it would fail were the axis missing)."""
+    spaces = {chr(i) for i in range(0x110000) if chr(i).isspace()}
+    assert set(G.SPACES) == spaces and len(G.SPACES) == len(spaces) == 29
+    rows = G.corpus(1)
+    by_block: dict[str, list[G.Row]] = {}
+    for row in rows:
+        by_block.setdefault(row["block"], []).append(row)
+    assert set(by_block) == set(G.BLOCKS)
+    # every 1- and 2-character separator over `\s` + `:` + `=`
+    seps = {row["f"]["sep"] for row in by_block["sep"]}
+    assert len(G.PAIRS) == 31 + 31 * 31 and set(G.PAIRS) <= seps
+    # every pre character, and every JSON escape the serialiser emits
+    pres = {row["f"]["pre"] for row in by_block["pre"]}
+    assert {ch for chars in G.PRE_CHARS.values() for ch in chars} <= pres
+    dumped = "".join(json.dumps(row["t"]) for row in by_block["pre"])
+    for escape in (
+        '\\"',
+        "\\\\",
+        "\\b",
+        "\\f",
+        "\\n",
+        "\\r",
+        "\\t",
+        "\\u0000",
+        "\\u001b",
+    ):
+        assert escape in dumped, escape
+    for escape in (
+        "\\u007f",
+        "\\u0085",
+        "\\u00a0",
+        "\\u3000",
+        "\\u00e9",
+        "\\ud83d\\ude42",
+    ):
+        assert escape in dumped, escape
+    buckets = {row["bucket"] for row in rows}
+    for kinds in (
+        [f"pre:{c}" for c in G.PRE_CHARS],
+        ["qual:joined", "qual:glued", "qual:glued-long", "qual:leading-joiner"],
+        ["qual:multi-segment", "name:case", "name:code-qualified"],
+        ["suffix:declared", "suffix:trailing-joiner", "suffix:descriptive"],
+        ["suffix:random", "suffix:long"],
+        ["sep:line-break", "sep:operator-run", "sep:whitespace-only", "sep:mixed"],
+        ["value:main-class", "value:plain", "value:number", "value:quoted"],
+        ["value:unterminated-quote", "value:bracketed", "value:json-literal"],
+        ["value:punctuated", "bearer:after-:/=", "bearer:line-break"],
+        ["bearer:wrapped-value", "bearer:plain-context"],
+        ["authorization:line-break", "authorization:wrapped-value"],
+        ["authorization:scheme", "authorization:plain", "mix"],
+        [f"scalar:{name}" for name in G.SCALARS],
+    ):
+        assert set(kinds) <= buckets, set(kinds) - buckets
+    # every scalar under every key in every shape; every case of the key word
+    assert len(by_block["scalar"]) == len(G.SCALARS) * len(G.SCALAR_KEYS) * 3
+    names = {row["f"]["name"] for row in by_block["focus:name"]}
+    assert any(n.isupper() for n in names) and any(n.istitle() for n in names)
+    assert any(not n.isupper() and not n.islower() and not n.istitle() for n in names)
+    # the observation covers every surface, and each class is decidable
+    code = G.observe(rows[0], _engine, _policy, lambda obj: obj)
+    assert len(code) == len(G.TEXT_SURFACES) + 1 == 13
+    assert set(G.SERIALISED) >= {"POd", "EjAC", "EjUI", "PjAC", "PjUI"}
 
 
 def _dict_corpus() -> list[tuple[dict, str, str, str]]:
@@ -1874,6 +1882,33 @@ def _dict_corpus() -> list[tuple[dict, str, str, str]]:
     return out
 
 
+#: The key words a `_DIFF_KEYS` key is made of, for the structured
+#: differential's classifier (which reads a row as `qual + name + suffix`).
+_KEY_WORDS = sorted(
+    {*AUTH_DIAGNOSTIC_SECRET_KEYS, "api_key", "api-key", "apikey", "private_key"}
+    | {"authorization", "bearer"}
+)
+
+
+def _grammar_fields(key: str, sep: str, value: str) -> dict[str, str]:
+    """A structured-corpus row as the grammar classifier's fields: the key
+    word is the one that ends last in the key (the longest on a tie)."""
+    low = key.lower()
+    end, length, start = max(
+        (low.rfind(w) + len(w), len(w), low.rfind(w)) for w in _KEY_WORDS if w in low
+    )
+    before, _, after = sep.partition("{}")
+    quote = before[-1:] if before[-1:] in "\"'" else ""
+    return {
+        "pre": "",
+        "qual": key[:start],
+        "name": key[start:end],
+        "suffix": key[end:],
+        "sep": before[: len(before) - len(quote)],
+        "value": quote + value + after if quote else value,
+    }
+
+
 def test_differential_on_structured_results_never_worse_than_main() -> None:
     """A dict result goes through the CORE path (serialise, then redact the
     window); JSON text inside a leaf is Consiliency/pmcp#290's problem. The
@@ -1910,7 +1945,7 @@ def test_differential_on_structured_results_never_worse_than_main() -> None:
             and p not in removed_here
         ]
         if kept:
-            reason = _accepted_regression_class(key, sep, value, kept)
+            reason = G.accepted(_grammar_fields(key, sep, value), "POd")
             if reason is None:
                 bugs.append(f"{obj!r} keeps {kept}; here: {out!r}")
             else:
@@ -3148,6 +3183,7 @@ def test_sources_hold_no_literal_control_or_separator_characters() -> None:
         root / "src" / "pmcp" / "auth.py",
         root / "src" / "pmcp" / "policy" / "policy.py",
         Path(__file__),
+        Path(__file__).parent / "_redaction_grammar.py",
     ]:
         for lineno, line in enumerate(path.read_text("utf-8").split("\n"), 1):
             for ch in line:
