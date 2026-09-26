@@ -397,7 +397,7 @@ def _secret_key_alternation() -> str:
 #: and `\xa0` and regressed against main. A bare value ends at whitespace, a quote or a list
 #: separator (`,`, `;`, or `&` -- a query string's) and at nothing else,
 #: except that it never STARTS on `[` or `{` (`"password": [\n  "x"\n]` is a
-#: list, whose elements carry no key -- a stated residual, main's too; the
+#: list -- `_keyword_list_spans` redacts its quoted elements instead; the
 #: one `[` allowed is the marker's own, so `token=[REDACTED]abc123def456`
 #: is still one value) and
 #: never ENDS on a closing bracket or a backslash (the `\\`
@@ -518,9 +518,8 @@ def _keyword_list_spans(text: str) -> list[Span]:
         base = match.start("list")
         for element in _QUOTED_RE.finditer(match.group("list")):
             inner = element.group()[1:-1]
-            if not inner or (
-                name in WEAK_SECRET_KEYS and _is_plain_word_or_number(inner)
-            ):
+            # An empty element needs no case: a zero-length span is a no-op.
+            if name in WEAK_SECRET_KEYS and _is_plain_word_or_number(inner):
                 continue
             spans.append(
                 (base + element.start() + 1, base + element.end() - 1, REDACTED)

@@ -1548,7 +1548,7 @@ _DIFF_PROSE_SEPS = frozenset({" is ", "|", "->"})
 def _accepted_regression_class(
     key: str, sep: str, value: str, kept: list[str], wrap: str = ""
 ) -> str | None:
-    """Rows where rev 7 keeps a piece main removed, BY DESIGN -- decided from
+    """Rows where this redactor keeps a piece main removed, BY DESIGN -- decided from
     the row's own key, separator and value, not from sniffing the text. Each
     class is listed in the plan's accepted-regression table with its count
     and reason. Anything not matched here is a bug."""
