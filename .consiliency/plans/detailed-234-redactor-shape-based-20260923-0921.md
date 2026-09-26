@@ -1,5 +1,66 @@
 # Detailed plan: shape-based secret redaction — separator-anchored keywords, opaque-run scoring, and a prose corpus (Consiliency/pmcp#234)
 
+> **Revision 10 (2026-09-26) — never worse than `main`, by `main`'s
+> grammar.** **The method changed, and this is why.** Three board rounds in
+> a row (rev 7 → 8: grok's CRLF/no-break-space rows; rev 8 → 9: B1-B5,
+> N1-N4, G1, C2-C7; rev 9 → 10: the claude seat's F1-F10, DISAGREE) ended
+> the same way: rev N passed its own never-worse differential with 0
+> unaccepted rows, then a fresh seat found inputs worse than `main` on an
+> axis the generator had never produced, because every axis had been added
+> *after* a finding. With the maintainer's approval the differential is no
+> longer built from findings. It is **derived from the oracle's grammar**:
+> `main`'s keyword, `Authorization`, `Bearer` and URL rules and its policy
+> defaults, plus everything `json.dumps` emits (escapes, scalars) on the
+> structured path. A read-only audit set every construct of that grammar
+> against rev 9 (table A, one row per construct of `main`'s regexes and
+> policy defaults; table B, the serialiser's escapes and literals); each
+> row now names rev 10's equivalent and says **⊇** or names the stated
+> class that accepts the difference. **Those two tables, in
+> "Rev 10: never worse than main, by main's grammar" below, are what the
+> board reviews.** The generator (`tests/_redaction_grammar.py`) samples
+> each construct: every 1- and 2-character separator over `\s` + `:` +
+> `=`, every character class before a key, every escape and scalar the
+> serialiser emits, `main`'s URL grammar, and one-axis and all-axes rows.
+> Its tier 1 (12 535 rows × 12 surfaces) runs in the default suite; tier 2
+> (166 183 rows) is marked `slow` and is not run by CI. Frozen code:
+> `origin/wip/234-redactor-rev10-code` @ `e79d75f`
+> (`60ca193..e79d75f`: the audit's fixes, the grammar-derived
+> differential, and the maintainer's decisions), embedded below verbatim
+> with the new test module, the committed oracle regenerator and the
+> `pyproject.toml` marker. **Fixed** (each red on rev 9, green here,
+> pinned by a mutant): F1 colon-qualified keys, F2 `Bearer` after
+> `key:`/`key=`, F3 a JSON escape before a key, F4 any line-break run and a
+> break before the operator, F5 `NaN`/`±Infinity` (decision 1), F8 a
+> backslash before a key, F9 the quadratic PEM rule, and the audit's new
+> gaps N1 operator runs, N2 joiner runs in a suffix, N4b acronym-glued
+> keys, N5 an unterminated opening quote, N6/N7 wrapped `Bearer` and
+> `Authorization` values, N8 `code` under a non-status qualifier, N9
+> single-dash flags; also a URL that ended on the backslash of an escaped
+> quote. **The maintainer's decisions**, each a stated class or a rule: (1)
+> a bare JSON scalar after a quoted key is left unchanged, as on `main`
+> (this reverses rev 9's number → `"[REDACTED]"`; numeric secrets under a
+> quoted key are Consiliency/pmcp#290's); (2) a glued prefix or suffix
+> longer than 24 characters is an identifier (class N3); (3) a quoted
+> `Authorization` value in a JSON text leaf is Consiliency/pmcp#290's
+> (class N6b); (4) random-case glued keys before whitespace are prose
+> (class N4); (5) `key_code` is redacted (a weak key); (6) diagnostic
+> `code` qualifiers are class C12, listed explicitly (37), with `promo`,
+> `coupon` and `discount` removed because they name redeemable values;
+> (7) the slow tier is not run in CI (how to run it is under
+> Verification). **Measured** (all re-run for this plan on `e79d75f`):
+> tier 1 12 535 rows, **0 unaccepted**; tier 2 166 183 rows, **0
+> unaccepted**, and 0 on a second seed pair; `main`'s URL rows: `main`
+> removes a secret in 8 897 of 10 000, rev 10 is worse on none and better
+> on 1 687; 21 of 21 mutants killed; red/green 157 of 472 default-tier
+> nodes red on rev 9; slow tier 15 passed in 195 s; full suite 4 536
+> passed, 3 skipped, 40 deselected (details under Unverified). **Rev 9's accepted-class counts (8 000 rows, ten classes)
+> are superseded:** its hand-listed string differential is removed and the
+> classifier replaced. **The plan holds no literal control or separator
+> character** (a literal U+2028 in rev 9's embedded test file made every
+> external seat refuse the bundle): the final file was scanned for Unicode
+> categories Cc, Cf, Zl and Zp (tab and newline aside) and U+0085, and a
+> test in the embedded file guards the sources.
+>
 > **Revision 9 (2026-09-26) — the differential was only as wide as its
 > generator.** The board round on rev 8 (`fd7adb8`) came back **DISAGREE
 > from all four seats** (claude, grok, codex, gemini; the claude seat was
@@ -245,29 +306,26 @@
 > and M26 (truncate then redact) are red under the property tests. All rev
 > 1-3 regression cases are kept. `uv run mypy src/` clean.
 >
-> **How to apply.** **Patch:** lines 1538-2609 of this file (the content between the ```diff fences; `sed -n '1538,2609p' <plan> > 234.patch && git apply --check 234.patch && git apply 234.patch` on `main`; it is `git diff 860636a origin/wip/234-redactor-rev9-code -- src/` verbatim). **Test file:** lines 2620-5225 (between the ```python fences; `sed -n '2620,5225p' <plan> > tests/test_redaction.py`). **Regenerator:** lines 5235-5274 (`sed -n '5235,5274p' <plan> > regen_fixture.py`). **Fixture:** copy
+> **How to apply.** **Patch:** lines 2046-3306 of this file (the content between the ```diff fences; `sed -n '2046,3306p' <plan> > 234.patch && git apply --check 234.patch && git apply 234.patch` on `main`; it is `git diff 860636a origin/wip/234-redactor-rev10-code -- src/` verbatim). **pyproject.toml:** lines 7863-7883 (`sed -n '7863,7883p' <plan> > pyproject.patch && git apply pyproject.patch`). **Test file:** lines 3319-6569 (`sed -n '3319,6569p' <plan> > tests/test_redaction.py`). **Grammar module:** lines 6716-7853 (`sed -n '6716,7853p' <plan> > tests/_redaction_grammar.py`). **Regenerator:** lines 6580-6705 (`sed -n '6580,6705p' <plan> > tests/fixtures/regen_redaction_main_oracle.py`). **Fixture:** copy
 > `.consiliency/plans/detailed-234-redactor-main-oracle.b64` (committed beside
 > this plan) to `tests/fixtures/redaction_main_oracle.b64`; the differential
-> test reads it from there. **Regenerating it (rev 9):** the regenerator is
-> embedded under `## Oracle regenerator` (lines given at the top of this
-> entry). From a clean `main` checkout (not a directory whose path contains
-> `/pmcp-234/`: the script asserts it is not importing the redactor's tree),
-> run `PYTHONPATH=src uv run python regen_fixture.py <this plan's test file>
-> <out.b64>`. It loads the `_DIFF_*` constants and `_differential_corpus`,
-> `_dict_corpus` and `_json_fuzz_corpus` from the test file by AST, runs
-> `main`'s engine and policy over them, and writes
-> `{"string", "dict", "dict_types", "fuzz_types"}`: `string[i]` =
-> `[engine_removed, policy_removed]` (the sorted `_DIFF_TOKEN` pieces of the
-> input absent from each surface's output), `dict[i]` = the pieces of
-> `json.dumps(obj, indent=2)` absent from `process_output(obj,
-> redact=True)["result"]` (re-dumped with `indent=2` if still a dict), and
-> `dict_types[i]` / `fuzz_types[i]` = that result's type name for the dict
-> and fuzz corpora; `json.dumps(..., separators=(",", ":"))`, gzip with
-> `mtime=0`, `base64.encodebytes` (76-column lines). Measured: run from
-> `main` @ `9ca081e` (whose `auth.py` and `policy.py` equal `860636a`'s),
-> the output is `cmp`-identical to the committed fixture; it reports
-> `dict_types {'dict': 786, 'str': 14}` and `fuzz_types {'dict': 1181,
-> 'str': 319}`.
+> test reads it from there. **Regenerating it (rev 10):** the committed
+> regenerator is `tests/fixtures/regen_redaction_main_oracle.py` (embedded
+> under `## Oracle regenerator`; it reads `tests/_redaction_grammar.py` and
+> `tests/test_redaction.py` from its own checkout). With the rev-10 test
+> files in place, run it against a **main** tree:
+> `PYTHONPATH=<main>/src python tests/fixtures/regen_redaction_main_oracle.py
+> <main>/src <out.b64>` (it asserts that `pmcp` was imported from `<main>/src`).
+> It records, over `corpus(2)` (166 183 rows; tier 1 is its prefix), `main`'s
+> observation code per row (`grammar`), the fingerprint of each tier
+> (`grammar_fingerprint`), and for the kept structured corpora `dict`,
+> `dict_types` and `fuzz_types`; `json.dumps(sort_keys=True,
+> separators=(",", ":"))`, gzip with `mtime=0`, `base64.encodebytes`
+> (76-column lines). Copy the output to both
+> `tests/fixtures/redaction_main_oracle.b64` and
+> `.consiliency/plans/detailed-234-redactor-main-oracle.b64`. Measured: run
+> against `main` @ `1fb36f2` (redactor sources unchanged since `860636a`) in
+> the embedding proof, the output is `cmp`-identical to the fixture.
 >
 > **Revision 3 (2026-09-23).** Rev 2 boarded again (codex, static tracing; the
 > lead reproduced both on the rev-2 patch; grok DEGRADED, below quorum) with
@@ -597,6 +655,378 @@ the fix. `TOKEN = "ghp_16C7e42F292c6912E7710c838347Ae178B4a"`.
 | c | `{"password": "a\"hunter2"}` | `{"password": [REDACTED]hunter2"}` | `{"password": [REDACTED]}` |
 | c | `{'password': 'a\'hunter2'}` | `{'password': [REDACTED]hunter2'}` | `{'password': [REDACTED]}` |
 
+## Rev 10: never worse than main, by main's grammar
+
+This section is what the board reviews. It states the never-worse claim as a
+correspondence between `main`'s grammar and rev 10's, row by row (tables A
+and B), then gives the generator that samples every row, the accepted
+classes, the red/green run, the mutants and a cross-reference from every
+rev-9 finding and every audit gap to its fix or class.
+
+**Trees.** `main` is `~/code/pmcp` @ `1fb36f2` (one docs-only commit past
+`9ca081e`; `src/pmcp/auth.py` and `src/pmcp/policy/policy.py` are unchanged
+from `860636a`, checked with `git diff --stat`). Rev 10 is a detached
+scratch worktree of `origin/wip/234-redactor-rev10-code` @ `e79d75f`. Rev 9
+is `60ca193`'s `src/` (identical to `8e7d98c`'s; `60ca193` changed tests
+only) on `PYTHONPATH`. Every run printed `pmcp.__file__`. Line numbers
+below are `e79d75f`'s.
+
+**Surfaces.** Every generated text row is observed on 12 surfaces: E =
+`sanitize_auth_diagnostic(t, max_length=None)` and P =
+`PolicyManager().redact_secrets(t)` on the raw text; E and P on each of the
+four spellings `json.dumps({"t": t}, ensure_ascii ∈ {True, False}, indent ∈
+{None, 2})` (`EjAC EjAI EjUC EjUI PjAC PjAI PjUC PjUI`); `process_output(t)`
+(POs); and `process_output({"t": t})` (POd, the dict-leaf path), whose result
+type is recorded too. A scalar row is observed on `process_output(obj)`
+(POo) with its type. A (row, surface) pair is **worse** when rev 10 keeps a
+piece of the planted value that `main` removed on that surface (a piece
+counts as present as written or percent-decoded, because `main`'s URL rule
+re-encodes what it keeps), or when `main` returned a dict and rev 10 does
+not. A worse pair is accepted only by a class decided from the row **as
+written** (its `pre`, `qual`, `name`, `suffix`, `sep`, `value`, wrap) and
+the surface, never from the output (`accepted()` in
+`tests/_redaction_grammar.py`); anything else fails the test.
+
+**How the evidence column was measured.** The audit's own counts
+(`scratchpad/234-audit/audit.md`, `n/ctl/worse/GAP`) are **rev 9's** probes
+and were not re-run. The rev-10 evidence is the grammar corpus itself: tier
+2 (166 183 rows) observed on both trees for this plan, grouped by the
+generator's bucket. For every bucket: rows, rows where `main` removes a
+piece (the positive control), worse (row, surface) pairs by class, and
+unaccepted pairs, which are **0 in every bucket**. "⊇" means no worse pair
+in the buckets that sample the construct; "⊇ except X" means every worse
+pair there is in class X.
+
+### Table A: main's grammar vs rev 10
+
+`main`'s engine (`main:src/pmcp/auth.py:576-608`) runs, in order: the URL
+rule `https?://[^\s"'<>]+` → `redact_auth_url`;
+`(?i)(authorization\s*[:=]\s*)(bearer\s+)?[^\s,;]+`;
+`(?i)(\bbearer\s+)[^\s,;]+`; the keyword rule **K** =
+`(?i)\b([A-Za-z0-9_-]*(?:KEYS|api[_-]?key)[A-Za-z0-9_-]*)([\s:=]+)([A-Za-z0-9._~+/=-]{3,})`;
+then `_JWT_RE`. `main`'s P runs the engine and then the seven
+`DEFAULT_REDACTION_PATTERNS` over the rewritten text.
+
+| row | main construct | rev 10 equivalent (`e79d75f`) | verdict | evidence (tier 2 bucket: rows / main removes / worse pairs by class) |
+|---|---|---|---|---|
+| A1a | K `\b`: ASCII punctuation before the key | `(?<![A-Za-z0-9])(?<!::)` in `_KEYWORD_KEY_SEP` (auth.py:529); `(?<![A-Za-z0-9_-])` in `_KEYWORD_WS_RE` (:597) | ⊇ except C3 | `pre:ascii-punct` 2 973 / 2 973 / C3 3 360 (whitespace-separator rows, D2) |
+| A1b | K `\b` after each of the 29 `str.isspace()` characters (25 serialise as `\u00XX`, `\f`, `\u2028` …) | the same, or `_JSON_ESCAPE_BOUNDARY` (:430): a key may start right after any JSON escape; also in the P defaults (policy.py:74, :78) | ⊇ except C3 (was GAP F3) | `pre:isspace` 2 993 / 2 993 / C3 3 480 |
+| A1c | K `\b` after a non-ASCII character (serialised `\uXXXX`) | as A1b | ⊇ except C3 (was GAP F3); raw text is better than `main` (its Unicode `\b` misses `épassword=`) | `pre:non-ascii` 1 841 / 1 841 / C3 890; 922 rows better |
+| A1c' | K `\b` after a control character (`\u0000`, `\b`, `\u001b`, `\u007f`) | as A1b | ⊇ except C3 (was GAP F3) | `pre:control` 1 512 / 1 512 / C3 600 |
+| A1d | K `\b` + prefix across `:` (`Database:Password=`) | a single `:` is a boundary; `::` is not (`(?<!::)`); nothing inside an `arn:`/`urn:` name starts a key (`_RESOURCE_NAME_RE`, :557) | ⊇ except C3, N10 (was GAP F1) | `pre:colon` 1 368 / 1 368 / C3 120; `pre:resource` 1 286 / 959 / N10 3 070 |
+| A1e | K `\b` after `\` (`C:\secret=`, `DOMAIN\password=`, `\password x`) | a backslash is a boundary; only a JSON escape's tail may not start a qualifier or glued prefix (`_NOT_ON_AN_ESCAPE_TAIL`, :438) | ⊇ except C3 (was GAP F8) | `pre:backslash` 1 275 / 1 275 / C3 120 |
+| A1f | K at the start of the text | the lookbehinds | ⊇ except C3, C6 | `pre:start` 1 372 / 1 372 / C3 120, C6 106 |
+| A2a | K prefix `[A-Za-z0-9_-]*`, joined (`db_`, `X-`, 2-10 segments, a leading `_`/`-`/`--` run) | keyed rule `(?:[A-Za-z0-9]+[_-]){1,8}` (:529; the match restarts at a later segment); whitespace rule `[_-]*(?:[A-Za-z0-9]+[_-]+)+` unbounded but anchored (:597; N9) | ⊇ | `qual:joined` 1 956, `qual:leading-joiner` 2 022, `qual:multi-segment` 2 023: 0 worse |
+| A2b | K prefix, glued (`dbpassword`, `PGPASSWORD`, `DBpassword`, > 24 characters) | `(?P<glued>…[A-Za-z0-9]{1,24}?)` + the glued gate (credential-shaped, not a URL/ARN); on the whitespace rule a single-case word or an acronym + Titlecase key (`_ACRONYM_TITLE_RE`, :802; N4b) | ⊇ except C6, N3, N4 | `qual:glued` 1 995: 0 worse; `qual:glued-long` 2 004 / 2 004 / N3 4 004; N4 97 in the mix rows; C6 1 190 across `pre:start`, `authorization:*` and the mix rows |
+| A3 | K key alternation: every `main` key + `api[_-]?key` | `_secret_key_alternation()` (a superset) | ⊇ | `name:case` 7 014: 0 worse |
+| A3b | K `code` is a key under any qualifier | bare/OAuth-qualified `code` (`_CODE_QUALIFIERS`); under a diagnostic qualifier (`_STATUS_CODE_QUALIFIERS`, :374, 37 words) its value is left to the shape rules; under any other qualifier a weak key gated on a credential-shaped value (N8, fails closed) | ⊇ except C12, C10 | `name:code-diagnostic` 1 002 / 1 002 / C12 3 360; `name:code-credential` 992: 0 worse; `code:diagnostic` 148 / C12 1 164; `code:credential` 52 / C10 312 |
+| A4 | K `(?i)` | `re.IGNORECASE`; the camel boundary is case-sensitive | ⊇ | `name:case` (above) |
+| A5 | K suffix `[A-Za-z0-9_-]*` | `(?:[_-]?(?:id\|key)\|s)?(?P<extra>(?:[_-]*[A-Za-z0-9]){0,24}[_-]*)` (:537; joiner runs and a trailing joiner, N2) + the suffixed gate | ⊇ except C5, N3 | `suffix:declared` 2 033, `suffix:descriptive` 2 023, `suffix:random` 1 983, `suffix:trailing-joiner` 2 015: 0 worse; `suffix:long` 1 946 / 1 702 / N3 5 856; C5 6 007 in the mix rows |
+| A6a | K `[\s:=]+`: operator runs, line-break runs, a break before the operator | `[\"']?\s*(?:=>\|:=(?![:=])\|[:=]{2,4}(?![:=])\|[:=](?!=))` then `_BREAK` = `[^\S\r\n]*[\r\n]\s*` (:527, :539; N1, F4) | ⊇ except C4, C8, C3, C3a | `sep:operator-run` 1 830 / 1 828 / C4 351; `sep:line-break` 7 401 / 7 373 / C3 8 805, C8 945, C4 15, C3a 12; `sep:mixed` 11 531: 0 worse |
+| A6b | K `[\s:=]+` with whitespace only | `_KEYWORD_WS_RE`: `[^\S\r\n]+` or `_BREAK`, gated on a credential-shaped value (D2) | ⊇ except C3, C3a | `sep:whitespace-only` 29 158 / 28 918 / C3 64 410, C3a 121 |
+| A7 | K value `[A-Za-z0-9._~+/=-]{3,}` | `_BARE_RUN` (:543, wider), a quoted value, an unterminated-quote arm (N5); weak keys keep a plain word or number | ⊇ except C10, C4 | `value:main-class` 1 263 / C10 72, C4 48; `value:plain` C10 624; `value:number` C10 648; `value:json-literal` C10 300; `value:quoted` 1 299, `value:unterminated-quote` 1 223, `value:bracketed` 1 186, `value:punctuated` 1 278: 0 worse |
+| A8 | `(?i)authorization\s*[:=]\s*(bearer\s+)?[^\s,;]+` | `_AUTHORIZATION_RE` (:653): whitespace, line breaks and escaped spaces on both sides of the operator, a scheme word, a wrapped value's inside (N6), a quoted value, a bare value never starting on `[`/`{` | ⊇ except C11, N6b, C8, C6 | `authorization:scheme` 1 819: 0 worse; `authorization:plain` 962 / 962 / C11 1 409, C6 317; `authorization:line-break` 2 398 / 2 119 / C11 609, N6b 582, C8 561, C6 155; `authorization:wrapped-value` 4 821 / 3 284 / N6b 1 757, C6 177 |
+| A9 | `(?i)\bbearer\s+[^\s,;]+` | `_BEARER_RE` (:630): no `=`/`:` lookbehind (F2), a JSON escape is a boundary, escaped spaces separate, a wrapped token's inside (N7), a line-break run | ⊇ except N6b | `bearer:after-:/=` 6 463 / 6 463 / N6b 538; `bearer:plain-context` 1 038: 0 worse; `bearer:line-break` 467 / N6b 20; `bearer:wrapped-value` 2 032 / N6b 304 |
+| A10 | `_JWT_RE` | identical (checked with `diff`) | ⊇ | — |
+| A11 | the URL rule + `redact_auth_url` (userinfo, query keys and values, fragment) | `_url_spans` / `_url_component_spans` (:877-969), percent-decoded keys and values (C2), a trailing backslash handed back like trailing punctuation | ⊇ | `url` 10 000 / 8 897 / 0 worse, 1 687 rows better; `wrap:url-path` 1 286, `wrap:url-query-pair` 1 230, `wrap:url-query-value` 1 269, `wrap:url-fragment` 1 249: 0 worse |
+| A12 | P1 `(api[_-]?key\|apikey)[\s]*[:=][\s]*["']?([^\s"']+)` | policy.py:70 plus the engine's spans on the P surface | ⊇ except the engine classes | every bucket above is observed on P and on the four P spellings; 0 unaccepted |
+| A13 | P2 `(secret\|password\|passwd\|pwd)[\s]*[:=]…` (no `\b`) | policy.py:74 (a JSON escape is a boundary) plus the engine | ⊇ except N10 and the engine classes | as A12; `pre:resource` (N10) |
+| A14 | P3 `(bearer\|token)[\s]+[a-zA-Z0-9._-]+` | dropped; the engine's whitespace rule (D2 gate) and `token` with a separator (policy.py:78) | ⊇ except C3 | `sep:whitespace-only` (above) |
+| A15 | P4 `(aws_secret\|aws_access)[\s]*[:=]…` | policy.py:79 plus the engine keys | ⊇ except the engine classes | as A12 |
+| A16 | P5-P7 `sk-`, `ghp_`, `github_pat_` | identical (checked) | ⊇ | — |
+| — | P ran on the engine's rewritten text | every span is collected on the original text | not a narrowing | no row found either way |
+| F7 | (no `main` construct: a rev-only over-match) | unchanged from rev 9 (measured: `{"a":"'password':'","b":"'"}` still loses member `b` on E and P; the output parses) | residual, not a leak | stated below |
+| F9 | (no `main` construct: cost) | the PEM body is tempered, `(?:(?!-----BEGIN ).)*?` (:193) | fixed | `test_f9_the_pem_rule_is_linear` (2 s guard); mutant F9 |
+| F10 | the `Authorization` scheme arm on a Digest header | unchanged from rev 9 (`Authorization: [REDACTED]"bob", response="…"`; `main`: `Authorization: [REDACTED] username="bob", response="…"`) | residual, cosmetic | the `response=` hash is kept on both trees |
+
+### Table B: the serialiser's grammar vs rev 10
+
+`process_output` serialises a dict with `json.dumps(obj, indent=2)`
+(`ensure_ascii=True`). Python emits the escapes `\"`, `\\`, `\b`, `\f`,
+`\n`, `\r`, `\t` and `\uXXXX` (U+0000-U+001F except `bfnrt`, U+007F, every
+non-ASCII character, surrogate pairs), never `\/`. The grammar corpus places
+the characters these escapes spell in each position (the `pre`, `sep` and
+`value` axes); the POd and `Ej*`/`Pj*` surfaces see them escaped.
+`test_the_grammar_corpus_covers_every_axis` asserts that `\"`, `\\`, `\b`,
+`\f`, `\n`, `\r`, `\t`, `\u0000`, `\u001b`, `\u007f`, `\u0085`, `\u00a0`,
+`\u3000`, `\u00e9` and the pair `\ud83d\ude42` all occur in the serialised
+corpus.
+
+| escape | before the key | as the separator | after `:`/`=` | inside the value |
+|---|---|---|---|---|
+| `\"` | ⊇ | ⊇ | ⊇ except N6b: an unterminated opening quote now has a value arm (N5); a wrapped `Authorization`/`Bearer` value's inside is redacted (N6/N7); a quoted `Authorization` value in a leaf is decision 3 | ⊇ except N6b (`authorization=ab"V` in a leaf) |
+| `\\` | ⊇ except C3 (was GAP F8): `_NOT_ON_AN_ESCAPE_TAIL` | ⊇ | ⊇ | ⊇ |
+| `\b`, `\f` | ⊇ except C3 (was GAP F3): `_JSON_ESCAPE_BOUNDARY` | ⊇ | ⊇ | ⊇ |
+| `\n`, `\r` | ⊇ | ⊇ except C3, C8, C4, C3a (was GAP F4): `_BREAK` | ⊇ except C8 (was GAP F4) | ⊇ |
+| `\t` | ⊇ | ⊇ except C3 | ⊇ | ⊇ |
+| `\u0000`, `\u0001`, `\u000b`, `\u001b`, `\u001f`, `\u0085`, `\u007f` | ⊇ except C3 (was GAP F3) | ⊇ except C3 | ⊇ | ⊇ |
+| `\u00a0`, `\u2028`, `\u3000` | ⊇ except C3 (was GAP F3) | ⊇ except C3; after `Bearer`/`Authorization:` an escaped space is separator, not value (`_JSON_SPACE_ESCAPE`, :444) | ⊇ | ⊇ |
+| `\u00e9`, `\u5bc6`, `\u2022`, `\ud83d\ude42` | ⊇ except C3 (was GAP F3) | ⊇ | ⊇ | ⊇ |
+| `/` (never escaped) | ⊇ | ⊇ | ⊇ | ⊇ |
+
+Evidence: the `pre:*` buckets of table A (every worse pair there is C3,
+C6 or N10); `sep:line-break`; `value:quoted` and
+`value:unterminated-quote` (0 worse); `authorization:*` and `bearer:*`
+(N6b is decided from the surface: it applies only on a serialised surface);
+and the named tests `test_f3_a_json_escape_before_a_key_is_a_boundary`
+(64 cases), `test_f3_the_policy_defaults_read_a_json_escape_as_a_boundary`,
+`test_f3_an_escaped_space_after_bearer_or_authorization_separates`,
+`test_f4_any_line_break_run_separates`, `test_f8_a_key_after_a_backslash`,
+`test_n5_an_unterminated_opening_quote` and
+`test_n6_n7_a_wrapped_bearer_or_authorization_value`.
+
+**Bare scalars after a quoted key** (`process_output(dict)` only): every
+scalar `json.dumps` emits — `null`, `true`, `false`, `0`, `-1`, `2**100`,
+`1.5`, `-0.0`, `1e+20`, `1e-07`, `NaN`, `Infinity`, `-Infinity` — under 37
+keys in three shapes (top level, nested, a list of objects): 13 × 111 =
+1 443 rows. `main` returns a dict and removes nothing on every one (the
+positive control is 0: these rows test the result **type**, not a leak);
+rev 10 returns the same dict on every one (0 worse, `(dict, dict)` 1 443 of
+1 443). This is decision 1 (`_JSON_SCALAR_RE`, :520): rev 9 turned
+`NaN`/`±Infinity` into invalid JSON (dict → str, F5) and numbers into
+`"[REDACTED]"` (F6). The text surfaces agree: `'{"max_tokens": 1024, "t":
+NaN}'` is unchanged on E and P (measured); rev 9 wrote `"max_tokens":
+"[REDACTED]"`.
+
+### The generator: axes and sampling density
+
+`tests/_redaction_grammar.py` (embedded below; its docstring is the
+specification). A text row is `pre + qual + name + suffix + sep + value`,
+optionally wrapped:
+
+| axis | drawn from |
+|---|---|
+| `pre` | the character before the key: none; every ASCII punctuation character but the joiners; `:`; `\`; all 29 `str.isspace()` characters; control characters (`\u0000 \u0001 \b \u001b \u007f` once serialised); non-ASCII letters, punctuation and an astral character; an `arn:`/`urn:` context; each optionally after the word `abc` |
+| `qual` | `main`'s `[A-Za-z0-9_-]*` prefix: joined, glued in random case (1-8), glued past the bound (25-32), a leading joiner run, 2-10 joined segments |
+| `name` | `main`'s 20 keys and the policy keys, in lower, UPPER, Title and rAnDoM case; 30 % of name-focus rows are `code` under a random, a diagnostic (C12) or a credential qualifier (`key otp mfa sms verification recovery invite promo coupon discount api access secret`) |
+| `suffix` | declared (`s _id _key Key -id id key`), a trailing joiner or joiner run, descriptive (`_new 2 Hash _type _length ized …`), random, and past the bound |
+| `sep` | **every** 1- and 2-character string over the 31 characters `str.isspace()` + `:` + `=` (992), plus sampled 3-character ones; focus rows draw 1-3 characters, half operator, half space |
+| `value` | `main`'s value class `[A-Za-z0-9._~+/=-]{3,14}`, plain words, integers, quoted, an unterminated opening quote, bracketed, JSON literals, punctuated |
+| `bearer` | `bearer\s+[^\s,;]+` after 13 contexts (`X-Auth: `, `x=`, `token: `, …) or a random punctuation, non-ASCII or space character; a 1-3-character `\s` run; a credential, optionally wrapped in `"" '' () [] {} <>` |
+| `authz` | `authorization\s*[:=]\s*(bearer\s+)?[^\s,;]+`: a prefix, 0-2 `\s` characters each side of the operator, a scheme (or none, or one followed by a blank line), a credential or plain value, optionally wrapped |
+| `wrap` | bare; in prose (a word and one punctuation or space character each side); or in each position `main`'s URL rule reads: path, query pair, query value, fragment |
+| `url` | `main`'s URL grammar: userinfo (`user`, `user:password`, `:password`), hosts (including a port that does not parse, which makes `main` keep the URL as written), 0-3 query pairs whose key is or is not in `AUTH_SECRET_QUERY_KEYS` (any case, optionally percent-encoded) with a credential, plain, percent-encoded or empty value, and a fragment |
+| `scalar` | every scalar `json.dumps` emits under 37 keys, top level, nested and in a list of objects |
+
+Sampling density (`corpus(tier)`; tier 2 is tier 1 followed by the rest;
+seeds 20260926 and 20260927):
+
+| block | tier 1 (default suite) | tier 2 adds (`slow`) |
+|---|---|---|
+| `sep` | the 992 1- and 2-character separators × `password`, `token` × {credential, plain}: 3 968 | the 992 × `secret`, `api_key`, `session` × 2, and 3 000 sampled 3-character ones × 5 keys × 2: 35 952 |
+| `pre` | each of the 77 pre characters × `password`, `token` × (`=`, `: `, ` `) × {credential, plain}: 924 | lead `abc` × 5 keys, no lead × 3 more keys: 3 696 |
+| `code` | `code` under each of the 37 diagnostic and 13 credential qualifiers × (`=`, `: `) × {credential, plain}: 200 | — |
+| `focus:<axis>` | 500 per axis (`pre qual name suffix sep value wrap bearer authz url`): 5 000 | 9 500 per axis: 95 000 |
+| `mix` | 1 000 (every axis at once, the wrap included) | 19 000 |
+| `scalar` | 13 scalars × 37 keys × 3 shapes: 1 443 | — |
+| **total** | **12 535** | **166 183** |
+
+A focus row varies one axis and keeps the others benign (no pre, qualifier,
+suffix or wrap; `=` or `: `; a credential value), so a failure is
+attributed to one axis; mix rows vary all of them (the realistic
+`java -jar x.jar -password hunter22x`, N9, was found only there).
+`test_the_grammar_corpus_covers_every_axis` asserts that every claimed
+axis, separator, pre character, escape, qualifier, URL part and surface is
+produced (it would fail were one missing). The oracle fixture records
+`main`'s observation code for every tier-2 row and a fingerprint of each
+tier's corpus, so a corpus change without a new fixture fails.
+
+**Runtimes** (24-core host, measured for this plan): tier 1 is
+`test_grammar_differential_never_worse_than_main_except_by_stated_class`,
+9.2 s, inside a default-tier `tests/test_redaction.py` of 472 tests in
+21 s. Tier 2 is `test_grammar_differential_full_set`, 15 cases (one per
+block), **15 passed in 195 s** single-process (the implementation agent
+measured 171 s); it is marked `slow`, excluded by `addopts`, and **not run
+by CI**. Observing all 166 183 rows on one tree takes about 274 s of CPU
+(18 s on 20 processes).
+
+### Accepted classes
+
+Labels are `CLASSES` in `tests/_redaction_grammar.py`, verbatim; counts are
+worse (row, surface) pairs, measured for this plan. Seed B is the same
+generator with seeds 7 and 77 (tier 1 is its first 12 535 rows), `main`
+and rev 10 both observed; the recorded second-seed run in the
+implementation agent's scratch predates `e79d75f` and used the previous
+generator (145 983 rows, no code, URL or wrap axes), so it is superseded by
+this one.
+
+| class | stated rule (decided from the row as written) | tier 1 | tier 2 | seed B tier 2 | decision |
+|---|---|---|---|---|---|
+| N3 | a glued prefix or a suffix of more than 24 alphanumerics: an identifier, not a key (a cost bound) | 1 308 | 24 955 | 26 204 | 2 |
+| N10 | a key inside an `arn:`/`urn:` resource name names a resource | 387 | 5 912 | 6 132 | |
+| C3a | `code` never fires on a whitespace-only separator | 96 | 2 086 | 2 174 | |
+| C3 | a whitespace-only separator with a non-credential-shaped value (D2) | 10 448 | 83 874 | 83 873 | |
+| N11 | a `name=value` token after a keyword and whitespace is its own pair | 0 | 24 | 20 | |
+| N4 | a glued mixed-case key before whitespace is an identifier, not a key (`Ed25519PrivateKey X509Cert`, `gby3zPassword x`) | 0 | 97 | 133 | 4 |
+| N4c | the key as written holds another key word starting inside the written name (`aws_accessid` holds `sid`) | 0 | 3 | 10 | |
+| C4 | an operator run holding `==` or `::` with a non-credential-shaped value is a comparison or a path | 175 | 2 663 | 2 367 | |
+| C5 | a suffixed key with a non-credential-shaped value names metadata | 257 | 6 007 | 5 803 | |
+| C6 | a glued key (no joiner before the name, any case) counts only with a credential-shaped value that is not a URL or ARN | 39 | 1 190 | 1 022 | |
+| C7 | after an unquoted key a value starting on `,`/`}` is JSON structure | **0** | **0** | **0** | |
+| C8 | a separator whose last line break is unindented, with a non-credential-shaped unquoted value, ends a sentence | 69 | 1 542 | 1 605 | |
+| N6b | a quoted value on a serialised surface is JSON inside a leaf (Consiliency/pmcp#290) | 188 | 3 201 | 2 902 | 3 |
+| C10 | a weak key keeps a plain word or number; `code` under a non-OAuth qualifier keeps any non-credential-shaped value (N8's gate) | 408 | 2 583 | 2 540 | 5 |
+| C11 | `Authorization`/`Bearer` followed by a plain word, bare or wrapped in quotes or brackets, is prose | 130 | 2 018 | 2 141 | |
+| C12 | a `code` key qualified by a diagnostic or descriptive word (`DIAGNOSTIC_CODE_QUALIFIERS`, the qualifier's last segment) keeps its value (`error_code=E_TIMEOUT_42`, `sqlstate_code=42P01`) | 1 272 | 4 531 | 4 431 | 6 |
+| **unaccepted** | | **0** | **0** | **0** | |
+
+Totals: tier 1, 12 535 rows (11 070 with a value; `main` removes a piece on
+10 070), 14 777 accepted pairs, 0 unaccepted; tier 2, 166 183 rows (144 641
+positive), 140 686 accepted pairs, 0 unaccepted; seed B tier 1, 14 789
+accepted, 0 unaccepted; seed B tier 2, 141 357 accepted, 0 unaccepted. Rows
+better than `main` on some surface: 4 790 (tier 1), 72 285 (tier 2). Result
+type (main, rev 10) over every dict-path row: tier 2 `(dict, dict)` 159 360,
+`(str, dict)` 6 823, `(dict, str)` **0**.
+
+**Class C7 was never used** on either tier or either seed; **N11, N4 and
+N4c are 0 in tier 1** and occur only in tier 2. A class with a count of 0 is kept
+because it is decided from the row, not from a count.
+
+**Decision 1** (bare scalars unchanged) needs no class: rev 10 does what
+`main` does on every scalar row. **Decision 5** (`key_code`) removes `key`
+from the diagnostic list, so `key_code=abc123def456` is redacted as on
+`main` (`test_n8_code_under_a_non_status_qualifier_is_a_weak_key`, mutant
+N8b). **Decision 6**: the 37 diagnostic qualifiers of class C12, exactly
+`_STATUS_CODE_QUALIFIERS` (auth.py:374; `test_n8_the_diagnostic_qualifiers_are_the_stated_class`
+pins the two sets equal): `area byte char color colour country currency err
+errno error event exception exit fault http iso item lang language locale
+op opcode postal product rc reason region response result ret return sku
+source sqlstate state status zip`. `promo`, `coupon` and `discount` are not
+among them (they name redeemable values) and are sampled as credential
+qualifiers. **Decision 7**: see Verification.
+
+**Other measurements on rev 10.** `main`'s URL rows (`focus:url`, 10 000
+tier-2 rows): `main` removes a secret in 8 897, rev 10 is worse on 0 and
+better on 1 687 (seed B: 8 913 / 0 / 1 681); with the URL-wrap rows added
+(15 034 rows), 11 402 / 0 / 4 450. The implementation agent reported 8 895
+and 1 686 for the same block; the difference of 2 and 1 rows is a
+definition difference not resolved here, and never-worse holds either way.
+The structured-result differential (800 dicts, seed 20260924) and the JSON
+fuzz (1 500 objects × 4 serialisations) are unchanged corpora, now
+classified by the grammar classifier: result types (main, rev 10) `(dict,
+dict)` 786, `(str, dict)` 14 and `(dict, dict)` 1 181, `(str, dict)` 319;
+fuzz documents without `\"` 3 272 checked, 0 broken. The 810 JSON rows of
+rev 9's string corpus (kept for `test_redaction_never_breaks_a_json_document`)
+stay valid on both surfaces.
+
+### Red/green: the rev-10 test file on rev 9 and on rev 10
+
+The embedded `tests/test_redaction.py` (default tier) run with rev 9's
+`src/` on `PYTHONPATH`, then on rev 10: **rev 9: 157 failed, 315 passed, 15
+deselected; rev 10: 472 passed, 15 deselected.** Rev 10 has 96 test
+functions (rev 9: 74): 23 new, and rev 9's hand-listed
+`test_differential_against_main_never_worse_except_by_stated_class` is
+removed. Red nodes on rev 9, by function:
+
+| test function | red on rev 9 / nodes |
+|---|---|
+| `test_grammar_differential_never_worse_than_main_except_by_stated_class` | 1/1 |
+| `test_b1_a_json_literal_after_a_quoted_key_keeps_the_document` (the two number rows: decision 1 reverses rev 9's rule) | 2/5 |
+| `test_f5_f6_a_bare_json_scalar_after_a_quoted_key_is_unchanged` | 7/7 |
+| `test_f3_a_json_escape_before_a_key_is_a_boundary` | 55/64 |
+| `test_f3_the_policy_defaults_read_a_json_escape_as_a_boundary` | 4/4 |
+| `test_f3_an_escaped_space_after_bearer_or_authorization_separates` | 5/5 |
+| `test_f4_any_line_break_run_separates` | 13/13 |
+| `test_f2_bearer_after_a_key_and_separator` | 8/8 |
+| `test_f9_the_pem_rule_is_linear` | 1/1 |
+| `test_f1_a_colon_qualified_key_is_a_key` | 7/7 |
+| `test_n1_an_operator_run_separates` | 5/6 |
+| `test_n2_a_trailing_joiner_or_joiner_run_in_the_suffix` | 6/6 |
+| `test_n5_an_unterminated_opening_quote` | 4/4 |
+| `test_n6_n7_a_wrapped_bearer_or_authorization_value` | 8/8 |
+| `test_n8_code_under_a_non_status_qualifier_is_a_weak_key` | 10/10 |
+| `test_f8_a_key_after_a_backslash` | 6/6 |
+| `test_n9_a_single_dash_flag_before_whitespace` | 7/7 |
+| `test_n4b_an_acronym_glued_to_a_titlecase_key` | 3/3 |
+| `test_n8_the_diagnostic_qualifiers_are_the_stated_class` | 1/1 |
+| `test_a_url_never_ends_on_the_backslash_of_an_escaped_quote` | 3/3 |
+| `test_the_false_positive_guard_list_holds` (71 strings pinned on E, P and the dict leaf) | 1/1 |
+| **total** | **157** |
+
+Green on both by design: `test_the_grammar_corpus_covers_every_axis` (it
+pins the generator, not the redactor) and
+`test_sources_hold_no_literal_control_or_separator_characters` (it pins the
+sources). `test_grammar_differential_full_set` is `slow` and deselected in
+this run. The non-red nodes of the partly red functions are rows rev 9
+already handled (9 of the 64 escape cases, 1 of the 6 operator runs, 3 of
+the 5 B1 literals).
+
+### Mutants
+
+Each of the 21 mutants (`scratchpad/234-r10/mutants.py`, the implementation
+agent's definitions) was applied to a copy of rev 10's `src/` (every anchor
+asserted to occur exactly once), and the **whole** default-tier
+`tests/test_redaction.py` (472 nodes, no `-k`) was run against it with
+`pmcp.__file__` checked; the frozen tree's sha256 was checked unchanged at
+the end. Three mutants edit two sites (F4b, N6/N7, F3c: the rule lives in
+two regexes). **All 21 killed.**
+
+| mutant | diff lines | whole file | red functions |
+|---|---|---|---|
+| F56: scalars → only `null`/`true`/`false` | 2 | 13 failed | `test_f5_f6_…`, `test_b1_…`, the structured differential, the grammar differential, the JSON fuzz, `test_redaction_never_breaks_a_json_document` |
+| F3: escape boundary → rev 9's `\\[nrt]` | 2 | 53 failed | `test_f3_a_json_escape_…`, the grammar differential |
+| F3b: an escaped space never separates | 3 | 6 failed | `test_f3_an_escaped_space_…`, the grammar differential |
+| F3c: policy defaults without the escape boundary | 4 | 4 failed | `test_f3_the_policy_defaults_…` |
+| F4a: a break → rev 9's `\r?\n` | 2 | 11 failed | `test_f4_…`, the grammar differential |
+| F4b: no break before the operator | 4 | 4 failed | `test_f4_…`, the grammar differential |
+| F2: the `Bearer` lookbehinds restored | 2 | 11 failed | `test_f2_…`, `test_f3_an_escaped_space_…`, the grammar differential |
+| F9: PEM body `.*?` | 2 | 1 failed | `test_f9_the_pem_rule_is_linear` |
+| F1: `:` is not a boundary | 2 | 9 failed | `test_f1_…`, `test_n1_…`, the grammar differential |
+| F1b: no resource-name filter | 2 | 1 failed | `test_the_false_positive_guard_list_holds` |
+| N1: operator runs → rev 9 | 2 | 12 failed | `test_n1_…`, `test_f8_…`, the guard list, the grammar differential |
+| N1b: `::` not gated | 2 | 1 failed | the guard list |
+| N2: suffix → rev 9 | 2 | 6 failed | `test_n2_…`, the grammar differential |
+| N5: no unterminated-quote arm | 1 | 5 failed | `test_n5_…`, the grammar differential |
+| N6/N7: no wrapped values | 4 | 14 failed | `test_n6_n7_…`, `test_f3_an_escaped_space_…`, the guard list, the grammar differential |
+| N8: `code` under any other qualifier skipped | 5 | 11 failed | `test_n8_…weak_key`, the grammar differential |
+| N8b: `key` back in the diagnostic list | 1 | 3 failed | both `test_n8_…`, the grammar differential |
+| F8: no glued prefix after any backslash | 2 | 2 failed | `test_f8_…`, the grammar differential |
+| N9: flag → rev 9's `(--)?` and `{0,8}` | 4 | 7 failed | `test_n9_…` |
+| N4b: no acronym clause | 2 | 4 failed | `test_n4b_…`, the grammar differential |
+| URL may end on a backslash | 2 | 4 failed | `test_a_url_never_ends_…`, the grammar differential |
+
+### Residuals new or restated in rev 10
+
+| residual | why | why acceptable |
+|---|---|---|
+| A numeric secret under a quoted key (`{"pin_code": 482913}`) is kept | decision 1: every bare scalar after a quoted key is left unchanged, as on `main` | `main` keeps it too; numeric secrets in structured results are Consiliency/pmcp#290 |
+| `code` under a credential qualifier with a non-credential value (`otp_code=123456`) is kept; `main` redacts it | N8's gate: `code` under a non-OAuth, non-diagnostic qualifier is a weak key (class C10) | one-time codes are short-lived; a credential-shaped value (`otp_code=abc123def456`) is redacted |
+| `code` under a diagnostic qualifier with a credential-shaped value (`status_code=abc123def456`) is kept; `main` redacts it | class C12 (decision 6): the value is left to the shape rules, which still catch an opaque run | status and error codes are diagnostics; the list is explicit and pinned |
+| F7: a single-quote straddle in compact JSON text deletes a following member (`{"a":"'password':'","b":"'"}` → member `b` gone, E and P) | the other-quote guard runs only after an unquoted key | an over-match, not a leak; the output parses; the rev-9 seat noted it cannot occur through `process_output`'s `indent=2` dump (the straddle would cross a newline) |
+| F10: `Authorization: Digest username="bob", …` → `Authorization: [REDACTED]"bob", …` | the scheme arm takes `Digest username=` as the value | cosmetic; the `response=` hash is kept on `main` too |
+| The rev-9 test files are not in the plan any more | the embedded files are rev 10's | the rev-9 embedding is at `da97753` |
+
+### Cross-reference: every rev-9 finding and every audit gap
+
+| id | what | fix or class | evidence |
+|---|---|---|---|
+| F1 | colon-qualified keys (`Database:Password=`) leaked | a single `:` is a boundary, `::` and `arn:`/`urn:` names are not; class N10 for resource names | `test_f1_a_colon_qualified_key_is_a_key` 7/7 red on rev 9; mutants F1, F1b; `pre:colon`, `pre:resource` |
+| F2 | `X-Auth: Bearer x`, `token: Bearer x` leaked | the `Bearer` `=`/`:` lookbehinds removed | `test_f2_…` 8/8; mutant F2; `bearer:after-:/=` (N6b only) |
+| F3 | a JSON escape before a key (dict path) made it glued | `_JSON_ESCAPE_BOUNDARY` in every keyword rule, `Bearer` and the P defaults; `_JSON_SPACE_ESCAPE` after `Bearer`/`Authorization:` | `test_f3_…` ×3 (55/64, 4/4, 5/5); mutants F3, F3b, F3c; `pre:isspace`, `pre:non-ascii`, `pre:control` |
+| F4 | blank line, bare CR, `\n\r`, `\r\r\n`, a break before the operator | `_BREAK` = any `\r`/`\n` run, on either side of the operator; class C8 for a plain value | `test_f4_…` 13/13; mutants F4a, F4b; `sep:line-break` |
+| F5 | `NaN`/`±Infinity` under a key: dict → str | decision 1, `_JSON_SCALAR_RE` | `test_f5_f6_…` 7/7; mutant F56; the 1 443 scalar rows, 0 worse |
+| F6 | numbers under a key became `"[REDACTED]"` | decision 1 (reverses rev 9's B1 number rule) | as F5; `test_b1_…` number rows now unchanged |
+| F7 | single-quote straddle deletes a member | **not changed**: residual (over-match, not a leak) | measured on rev 10 |
+| F8 | a key after a backslash (`C:\secret=`) | `_NOT_ON_AN_ESCAPE_TAIL`: only an escape's tail may not start a prefix | `test_f8_…` 6/6; mutant F8; `pre:backslash` |
+| F9 | quadratic PEM rule | tempered body | `test_f9_…`; mutant F9 |
+| F10 | Digest header cosmetic | **not changed**: residual | measured on rev 10 |
+| N1 | operator runs (`===`, `::`, `=:`) | `[:=]{2,4}` operator run; `==`/`::` gated on a credential-shaped value (class C4) | `test_n1_…` 5/6; mutants N1, N1b; `sep:operator-run` |
+| N2 | a trailing joiner or joiner run in the suffix | `extra` takes joiner runs | `test_n2_…` 6/6; mutant N2; `suffix:trailing-joiner` 0 worse |
+| N3 | a glued prefix or suffix > 24 | **class N3** (decision 2) | `qual:glued-long`, `suffix:long` |
+| N4a | glued mixed-case key, plain value | class C6 (any case) | mix rows |
+| N4b | acronym + Titlecase key before whitespace (`PGPassword x`) | `_ACRONYM_TITLE_RE` on the whitespace rule; random-case rest is **class N4** (decision 4) | `test_n4b_…` 3/3; mutant N4b |
+| N4c | an inner key word inside a mixed-case compound | **class N4c** | tier 2: 3 pairs |
+| N5 | unterminated opening quote (`password="x`) | a value arm for it | `test_n5_…` 4/4; mutant N5; `value:unterminated-quote` 0 worse |
+| N6 | `Authorization` value in brackets or quotes | the inside is redacted, the wrapping kept (not after a quoted key) | `test_n6_n7_…` 8/8; mutant N6/N7; `authorization:wrapped-value` |
+| N6b | a quoted `Authorization` value in a JSON text leaf | **class N6b** (decision 3, Consiliency/pmcp#290) | `authorization:*`, `bearer:*` |
+| N7 | `Bearer "x"`, `Bearer (x)` | the inside is redacted | as N6; `bearer:wrapped-value` |
+| N8 | `code` under a non-OAuth qualifier (`otp_code=`) | a weak key gated on a credential-shaped value, except the diagnostic list (**class C12**, decision 6); `key_code` a weak key (decision 5) | `test_n8_…` ×2; mutants N8, N8b; `name:code-*`, `code:*` |
+| N9 | single-dash or `_` flag (`-password x`) | the whitespace rule takes any `-`/`_` flag run | `test_n9_…` 7/7; mutant N9 |
+| N10 | `arn:…:secret:Name` | **class N10** | `pre:resource` |
+| N11 | `name=value` after a keyword and whitespace | **class N11** | tier 2: 24 pairs |
+| URL | a URL ending on the backslash of `\"` in a leaf (found by the URL axis) | a trailing backslash is handed back | `test_a_url_never_ends_…` 3/3; mutant URL |
+
+
 ## Design
 
 Two mechanisms, both new in rev 4, close the two defect classes the board
@@ -701,13 +1131,21 @@ The passes, as span producers (`collect_redaction_spans`):
    30) and 16 of 258 JSON rows per surface (`main`: 7); now 14 (all among
    `main`'s 30) and 0. `sep` is `:` or `=` on the same line, quotes allowed around key and
    value (JSON). The key starts at a non-identifier character — `.` counts
-   as one since rev 9 (B3: `db.password=`, `self.password =`), `:` does not
-   (`arn:…:secret:Name`) — or right after a JSON-escaped `\n`/`\r`/`\t`
-   (`\r\nsecret: hunter2` inside a serialised leaf; `main`'s containing
-   match covered that by accident). **Rev 9 (B1):** after a *quoted* key a
-   bare JSON literal is JSON, not text: `null`/`true`/`false` are kept and a
-   number becomes the string `"[REDACTED]"` (`{"token": 42}` →
-   `{"token": "[REDACTED]"}`), so the document stays valid. **Rev 9 (N3,
+   as one since rev 9 (B3: `db.password=`, `self.password =`), and since
+   rev 10 a single `:` does too (F1: `Database:Password=`), while `::`
+   (`std::secret::Holder`) and anything inside an `arn:`/`urn:` resource
+   name (`_RESOURCE_NAME_RE`; class N10) do not — or right after **any** JSON
+   escape (rev 10, F3: `_JSON_ESCAPE_BOUNDARY`, `\n \r \t \b \f \" \\ \/`
+   and `\uXXXX`; rev 9 had only `\n`/`\r`/`\t`), and a backslash is a
+   boundary too (F8: `C:\secret=`), except that an escape's own tail may not
+   start a qualifier or glued prefix (`_NOT_ON_AN_ESCAPE_TAIL`). **Rev 10
+   (decision 1, F5/F6):** after a *quoted* key every bare scalar
+   `json.dumps` emits (`null`, `true`, `false`, numbers, `NaN`,
+   `±Infinity`; `_JSON_SCALAR_RE`) is left unchanged, as on `main`, so the
+   document stays valid and the leaf keeps its type. This reverses rev 9's
+   B1 rule, which turned a number into `"[REDACTED]"` (`{"max_tokens":
+   1024}`, F6) and made `NaN` invalid JSON (F5); numeric secrets under a
+   quoted key are Consiliency/pmcp#290's. **Rev 9 (N3,
    other-quote straddle):** after an *unquoted* key, a quoted "value" whose
    content starts on `,:]}` (`_STRADDLE_RE`) or contains the other quote
    character closes the string the key sits in and is skipped
@@ -717,11 +1155,13 @@ The passes, as span producers (`collect_redaction_spans`):
    must be a secret key from `AUTH_DIAGNOSTIC_SECRET_KEYS` (or `api[_-]?key`),
    optionally suffixed `_id`/`_key`/`s`: `access_token=`, `X-Auth-Token:`,
    `accessToken=`, `"password": "…"`, `session_id=`, `Set-Cookie:` fire.
-   **Rev 9:** the qualifier is at most 8 `_`/`-` segments (N4: `"a_" * n`
+   **Rev 9:** the qualifier is 1-8 `_`/`-` segments (N4: `"a_" * n`
    was quadratic) and may start with a capital (B4: `AccessToken=`,
    `ClientSecret=`); a key may carry a `glued` prefix of ≤ 24 characters
-   (C: `CLIENTSECRET=`, `dbpassword=`) or an `extra` suffix of ≤ 24 (N1:
-   `password2=`, `passwordHash=`, `secret_value=`), and either one counts
+   (C: `CLIENTSECRET=`, `dbpassword=`) or an `extra` suffix of ≤ 24
+   alphanumerics (N1: `password2=`, `passwordHash=`, `secret_value=`;
+   rev 10, N2: with joiner runs and a trailing joiner, `password_=`,
+   `id_token__Xv=`) — longer is class N3 (decision 2) — and either one counts
    **only with a credential-shaped value that is not a URL or ARN**
    (declared compounds such as `secret_access_key` are exempt, via
    `_DECLARED_KEY_RE`). Measured on rev 9: `token_type=Bearer`,
@@ -769,10 +1209,19 @@ The passes, as span producers (`collect_redaction_spans`):
    `}` of `{"password": [REDACTED]}` stays with the object. A quoted value runs
    to its **closing** quote, past escaped ones (`"(?:[^"\\\n]|\\.)*"` and
    the single-quote twin), never across a newline (a JSON string cannot hold
-   one), and it needs that closing quote: every surface redacts before it
-   cuts (below), so the redactor always sees whole values, and rev 3's
-   "unterminated value runs to end of line" rule is **dropped** (one regex
-   branch fewer; the case it served no longer arises).
+   one). **Rev 10 (N5):** an *unterminated* opening quote
+   (`password="hunter22x`) is followed by a bare run, which is the value
+   (`password="[REDACTED]`); when that run ends at a double quote it must be
+   credential-shaped. (Rev 3's "unterminated value runs to end of line"
+   rule stays dropped: every surface redacts before it cuts, so our own
+   truncation never produces an unterminated value; this arm is for the
+   server's.) **Rev 10 (F4, N1):** the separator is `[\"']?\s*` then an
+   operator — `=>`, `:=`, a run of 2-4 `:`/`=`, or one `:`/`=` — so a line
+   break may stand before the operator (`password\n: x`), and a line break
+   after it is any `\r`/`\n` run (`_BREAK`: `password:\n\nx`,
+   `token\r\r\nx`); a run holding `==` or `::` needs a credential-shaped
+   value (class C4), and the unindented-break gate still applies (class
+   C8).
    2a. **`<key><sep>[ … ]`** (rev 8) — `_keyword_list_spans`:
    `_KEYWORD_LIST_RE` is `_KEYWORD_KEY_SEP` followed by a **literal array**,
    `_LIST_BODY` (rev 9): quoted strings or JSON scalars, comma-separated,
@@ -805,7 +1254,15 @@ The passes, as span producers (`collect_redaction_spans`):
    closing bracket or (rev 9, C6) a backslash, and never starting on `[`/`{`
    (rev 9, B2) — unless it is a plain word or number (`authorization:
    none`), which is prose (rev 5 had no such gate). After a quoted
-   `Authorization` key a JSON literal gets pass 2's B1 rule.
+   `Authorization` key a bare JSON scalar is left unchanged (decision 1).
+   **Rev 10:** whitespace, line-break runs and escaped spaces
+   (`_JSON_SPACE_ESCAPE`) may stand on either side of the operator (F4,
+   F3), and a value wrapped in a bracket or quote after the optional scheme
+   has its inside redacted and the wrapping kept (N6: `Authorization: [x]`
+   → `Authorization: [[REDACTED]]`, `Authorization: Bearer "x"`), except
+   after a quoted key, where `"Authorization": [1.5]` is JSON structure. A
+   quoted `Authorization` value inside a JSON text leaf reaches the rule as
+   `\"x\"` and is class N6b (decision 3, Consiliency/pmcp#290).
 4. **`Bearer <value>`** — `_bearer_spans` (D3): the HTTP scheme, so the value
    is a token unless it is a plain word or number (`bearer token`, `bearer
    of`, `Bearer Token`) or a challenge parameter (`Bearer realm="…"`); not
@@ -818,7 +1275,12 @@ The passes, as span producers (`collect_redaction_spans`):
    and not a flag or bullet — `Bearer\r\nhunter2`). `REV 6 WAS WRONG`: the bearer-as-value lookbehind
    also excluded a *quote* before `Bearer`, so `{"text": "Bearer test-token"}`
    — how every JSON-serialised string arrives — passed through on both
-   surfaces; `main` redacted it. The lookbehind now excludes `=`/`:` only.
+   surfaces; `main` redacted it. Rev 7-9's lookbehind excluding `=`/`:`
+   is **gone in rev 10** (F2: `X-Auth: Bearer x`, `token: Bearer x` leaked):
+   the lookahead and the plain-word gate already keep `token_type=Bearer
+   expires_in=3600`. Rev 10 also redacts the inside of a wrapped token
+   (N7: `Bearer "x"` → `Bearer "[REDACTED]"`) and reads an escaped space
+   after `Bearer` as separator (`_JSON_SPACE_ESCAPE`).
 5. **`<keyword><whitespace><value>`** — `_keyword_ws_spans` (D2), including
    `--flag value`: redacts only a value that *could be a credential* — not a
    plain word or number, and either digit-bearing and ≥ 6 chars
@@ -841,7 +1303,15 @@ The passes, as span producers (`collect_redaction_spans`):
    is a single-case word (`Ed25519PrivateKey X509Cert` is prose); a URL or
    ARN value is not redacted; the value never ends on a backslash (C6); and
    the flag/bullet guard skips only `--` or a lone `-*#>` marker followed
-   by whitespace (`token -abc123def` is redacted, as on `main`).
+   by whitespace (`token -abc123def` is redacted, as on `main`). **Rev 10:**
+   the flag may be `--`, a single `-`, `_` or any run of them, and the
+   qualifier any number of joined segments (N9: `java -jar x.jar -password
+   hunter22x` leaked); the match can only start where an identifier starts,
+   so the unbounded qualifier stays linear here. An acronym glued to a
+   Titlecase key counts (`_ACRONYM_TITLE_RE`, N4b: `PGPassword
+   abc123def456`); a random-case glued key before whitespace stays prose
+   (class N4, decision 4). A JSON escape before the key is a boundary (F3),
+   and the separator may be a line-break run (`_BREAK`, F4).
 6. **Shape** — `_shape_spans` (D4): JWT (three dot-joined base64url
    segments); the vendor supplement (AWS access-key-id family, Slack
    `xox[abeprs]-…`, Google `AIza` + 35, PEM private-key blocks — a
@@ -1020,13 +1490,13 @@ this engine; the source line under the frame may lose its right-hand side.
 | Truncation: the cut can land inside a marker and leave `[REDAC` | the cut is taken on redacted text | cosmetic — the marker's own text, never a credential fragment |
 | base64url secrets whose `-`/`_` fall every < 10 characters | per-segment scoring (needed for pod names and hostnames) | expected gap between such characters in base64url is 32; measured examples all have a ≥ 10-char segment |
 | A digitless dev password after a whitespace keyword (`--password hunter`) and short digit-bearing ones (`--token 1a2b`) | indistinguishable from `password reset`, `token v2` | `password=hunter`, `password: hunter`, `"password": "hunter"` are all still redacted (strong key with a separator) |
-| Numeric one-time codes under `code` (`code=123456`) | indistinguishable from JSON-RPC and HTTP codes | single-use, minutes-lived, and a diagnostic from an untrusted server that quotes one gives the attacker nothing they did not already have |
+| Numeric one-time codes under `code` (`code=123456`, and since rev 10 `otp_code=123456`; a credential-shaped `otp_code=abc123def456` is redacted, N8) | indistinguishable from JSON-RPC and HTTP codes; class C10 | single-use, minutes-lived, and a diagnostic from an untrusted server that quotes one gives the attacker nothing they did not already have |
 | `Set-Cookie: a=b; c=d` — only the first pair | the value class stops at `;` (HEAD behaviour, unchanged) | the session pair is conventionally first; the residual is HEAD's |
 | Low-entropy values under a non-OAuth `*_code=` (`error_code=super-secret`) | by design (pass 6) | the fail-closed direction: an opaque value is still caught by pass 10 |
 | **False positive:** prefixed opaque *identifiers* — `req_011CfKTgoiRuc27pR2Po`, `cus_J1x2Yz3AbCd4Ef`, an Okta `aus…` id inside a *diagnostic* | shape-identical to `sk_live_…`; a denylist of secret prefixes fails open | a correlation id lost from a diagnostic is a support inconvenience; a token leaked is a compromise. The elicitation URL itself is untouched (defect 1) |
 | **False positive:** MIME-wrapped base64 (76-column lines) and `data:` URIs under 256 chars | each line is a ≤ 256-char opaque run | one-run payloads (the common MCP `ImageContent` shape) survive; document as known |
 | An **identifier-shaped** value after a **weak** key — letters and underscores in any case: `auth=secret`, `auth=my_secret`, `auth=EMBByY_b`, `{"code": "AccessDenied"}` — is kept (grok) | `WEAK_SECRET_KEYS` keep `[A-Za-z_]+` or a number by design; narrowing to lower-case snake would drop AWS-style `AccessDenied` codes, and the transition score cannot see `EMBByY_b` (no digits) | those keys name a mode, a scheme or an error code far more often than a secret; an identifier-shaped password under `auth=`/`credentials=` is the price, and `password=`/`secret=`/`token=` remain strong |
-| An **unterminated** quote in a bare form (`password="abc` with no closing quote) | a quoted value needs its closing quote and a bare value cannot start on one | malformed input; every surface redacts before it cuts, so it is never our truncation that produced it |
+| ~~An **unterminated** quote in a bare form~~ — **fixed in rev 10** (N5): `password="hunter22x` → `password="[REDACTED]` on both surfaces | an arm for the bare run after the quote | — |
 | A bare value that contains `&` (`password=a&b`) loses its tail; a bare value that begins with `=` (`key==value`) is not a value | `&` is a query separator and `==` a comparison, and the bare syntax cannot say otherwise | quoted forms carry both; `main` cut at `&` too |
 | Hex signatures in signed URLs (`X-Amz-Signature=<64 hex>`) under keys not in `AUTH_SECRET_QUERY_KEYS` | uniform hex is never opaque; the key set is `main`'s | the same key set governed `main`; widening it is a one-line follow-up the implementer may take |
 | Nested URL with userinfo inside a query value (`?next=https://u:p@h/`), bracketed keys (`user[password]=x`), PHP `[password] => x`, XML `<password>x</password>` | no rule reads these syntaxes | all leak on `main` too; the differential's accepted classes do not cover them because `main` does not redact them either — listed so the next revision knows |
@@ -1087,6 +1557,26 @@ measured against; implement it verbatim and then run the mutation table.
 - **`_MAX_DECODE_DEPTH = 3`, `Covers = Callable[[str], bool]`** — add (rev
   8) — the decode bound (fails closed) and the type of `covers`;
   `from collections.abc import Callable` added.
+- **Rev 10 additions and changes** (each with its finding; see the
+  rev-10 section's cross-reference) — `_JSON_ESCAPE_BOUNDARY` (a key starts
+  after any JSON escape: F3), `_NOT_ON_AN_ESCAPE_TAIL` (only an escape's
+  tail may not start a qualifier or glued prefix: F8), `_JSON_SPACE_ESCAPE`
+  (an escaped space after `Bearer`/`Authorization:` separates: F3),
+  `_JSON_SCALAR_RE` (every bare scalar after a quoted key is left
+  unchanged: decision 1, F5/F6; replaces rev 9's `_JSON_NUMBER_RE`),
+  `_BREAK` (any line-break run: F4), `_BARE_RUN` and an unterminated-quote
+  value arm (N5), `_RESOURCE_NAME_RE` and `_in_resource_name` (`arn:`/`urn:`
+  names: F1, N10), `_STATUS_CODE_QUALIFIERS` and `_last_segment` (the 37
+  diagnostic `code` qualifiers, class C12; any other qualifier makes `code`
+  a weak key: N8, decisions 5 and 6), `_ACRONYM_TITLE_RE` (N4b). In
+  `_KEYWORD_KEY_SEP`: `(?<![A-Za-z0-9])(?<!::)` (F1), a 1-8 segment
+  qualifier, `extra` with joiner runs (N2), `\s*` before the operator and
+  an operator run `[:=]{2,4}` (F4, N1). `_KEYWORD_WS_RE`: any `-`/`_` flag
+  run and an unbounded, anchored qualifier (N9). `_BEARER_RE`: the `=`/`:`
+  lookbehinds removed (F2), a wrapped token (N7). `_AUTHORIZATION_RE`: a
+  wrapped value's inside (N6), escaped spaces and line breaks around the
+  operator. The PEM vendor shape has a tempered body (F9). A URL hands
+  back a trailing backslash.
 - **Rev 9 additions** — `_STRADDLE_RE` (a quote whose content starts on
   `,:]}` closes the enclosing string: N3), `_JSON_NUMBER_RE` (B1),
   `_DECLARED_KEY_RE` (declared compound keys are exempt from the
@@ -1133,7 +1623,10 @@ measured against; implement it verbatim and then run the mutation table.
   — Unicode horizontal whitespace (B5), a value that never starts on a
   quote (the engine redacts a quoted value inside its quotes, which removes
   rev 8's opening-quote residual) and never ends on a backslash (C6); the
-  `secret|password|passwd|pwd` lookbehind drops `.` (B3).
+  `secret|password|passwd|pwd` lookbehind drops `.` (B3). **Rev 10 (F3):**
+  the `secret|password|passwd|pwd` and `token` defaults also start after a
+  JSON escape (`(?<=\\[nrtbf/\"\\])|(?<=\\u[0-9a-fA-F]{4})`); the other
+  defaults are unchanged.
 - **`PolicyManager.truncate_output`** — modify — gains keyword-only
   `original_size: int | None = None`; when the original exceeded the cap the
   same `max_size - 100` cut and marker apply whatever the window's own size
@@ -1166,11 +1659,15 @@ measured against; implement it verbatim and then run the mutation table.
 ### `tests/test_redaction.py` (new)
 
 Both corpora, the composition tests, and three property tests; bodies under
-`## Test bodies`. Node ids, all validated with `--collect-only` (rev 9:
-**306 tests** in 74 functions, 306 passed in ~10 s on this host; rev 8 had
-149). Every count quoted in this section was re-measured on the rev-9 code
-(`8e7d98c`) with an instrumented scratch copy of the test file (prints
-only; the embedded file is unmodified):
+`## Test bodies`. **Rev 10: 96 test functions, 487 nodes: 472 in the
+default tier (472 passed in 21 s) and 15 marked `slow` (tier 2 of the
+grammar differential, deselected by default).** Rev 10 adds two files: the
+grammar module `tests/_redaction_grammar.py` and the oracle regenerator
+`tests/fixtures/regen_redaction_main_oracle.py` (both embedded below). Rev
+9 had 306 tests in 74 functions, rev 8 149. The property-test counts below
+were measured on the rev-9 code (`8e7d98c`) with an instrumented scratch
+copy of the test file (prints only); rev 10 did not change those
+generators, and the property tests pass on rev 10:
 
 - `test_prose_survives_the_engine_byte_identical`,
   `test_prose_survives_the_policy_surface_byte_identical` — the prose corpus
@@ -1381,6 +1878,12 @@ keys: 31; strings checked: 6106; total leaks: 0 (rev 8 code, measured with an in
 
 #### The never-worse differential, rev 9: generator axes
 
+> **Superseded in rev 10.** Rev 9's hand-listed string differential and its
+> word-list classifier are removed; the grammar-derived differential in
+> "Rev 10: never worse than main, by main's grammar" replaces them. Kept as
+> history. (The dict corpus and the JSON fuzz below are kept in rev 10, now
+> classified by the grammar classifier.)
+
 The claim "never worse than `main`" is exactly as broad as the corpus it is
 measured on, so the axes are stated here and
 `test_the_differential_corpus_covers_every_axis` asserts that each one is
@@ -1430,6 +1933,9 @@ actually generated (a check that fails if an axis goes missing).
 
 #### Measured on rev 9
 
+> **Superseded in rev 10** (the accepted-class counts below are rev 9's; rev
+> 10's are in "Accepted classes" under the rev-10 section).
+
 String differential: rows 8000; rev 9 removes more than main on 1902 rows; 1792 (row, surface) pairs keep a piece main removed, all 1792 in accepted classes; **unaccepted: 0**.
 
 | # | accepted regression class (label in `_accepted_regression_class`) | row-surfaces | why it is by design |
@@ -1471,6 +1977,8 @@ returns a dict for every one of the 1 181 objects `main` returned as a dict
 (`main`: 1 181 dict / 319 str, recorded in the oracle's `fuzz_types`).
 
 #### Red/green: the rev-9 test file on rev 8 and on rev 9
+
+> History (rev 9). Rev 10's red/green is in the rev-10 section.
 
 The embedded test file run with rev 8's `src/` (`56d7f80`) on `PYTHONPATH`,
 then on rev 9: **rev 8 144 failed, 162 passed; rev 9 306 passed.** Every
@@ -1527,16 +2035,16 @@ different.
 
 ### Patch (measured)
 
-`git diff 860636a origin/wip/234-redactor-rev9-code -- src/` (the frozen
-rev-9 code @ `8e7d98c`), verbatim (`sha256` of the revised files: `auth.py
-7fd17f52…30a7`, `policy.py 7963aceb…699e`). Every rev-9 measurement,
-probe and mutant in this plan ran against exactly this code. `auth.py` and
-`policy.py` are unchanged from `860636a` to today's `main` (`9ca081e`), so
-the patch applies to either.
+`git diff 860636a origin/wip/234-redactor-rev10-code -- src/` (the frozen
+rev-10 code @ `e79d75f`), verbatim (`sha256` of the revised files:
+`auth.py c00faa67…4eab`, `policy.py 055c149a…6b56`). Every rev-10
+measurement, probe and mutant in this plan ran against exactly this code.
+`auth.py` and `policy.py` are unchanged from `860636a` to today's `main`
+(`1fb36f2`), so the patch applies to either.
 
 ```diff
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index f40ccbb..d127b6d 100644
+index f40ccbb..7a5ff46 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
 @@ -4,6 +4,7 @@ from __future__ import annotations
@@ -1581,7 +2089,7 @@ index f40ccbb..d127b6d 100644
      "session",
      "set-cookie",
      "sid",
-@@ -87,12 +97,777 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
+@@ -87,12 +97,964 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
      "token",
  }
  
@@ -1673,8 +2181,13 @@ index f40ccbb..d127b6d 100644
 +    # whole key is one replacement.
 +    re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])"),
 +    # PEM private-key blocks: one replacement for the block, not one per line.
++    # The body never scans past the next BEGIN: `.*?` alone made every
++    # unterminated BEGIN scan to the end of the text, which is quadratic in
++    # the number of BEGINs (rev 9: 5.6 s on 264 KB of them; F9 of rev 9's
++    # board).
 +    re.compile(
-+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
++        r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?:(?!-----BEGIN ).)*?"
++        r"-----END [A-Z ]*PRIVATE KEY-----",
 +        re.DOTALL,
 +    ),
 +)
@@ -1837,14 +2350,97 @@ index f40ccbb..d127b6d 100644
 +    return len(value) >= 8
 +
 +
-+#: `code` names a credential only in the OAuth sense -- bare (`code=`, the
++#: `code` names a credential in the OAuth sense -- bare (`code=`, the
 +#: callback parameter) or under one of these qualifiers (`auth_code=`,
-+#: `device_code=`). Under any other qualifier (`status_code=401`,
-+#: `error_code=invalid_grant`, `exit_code=137`) it names a status, and its
-+#: value is left to the shape rules, which still catch an opaque one. Even in
-+#: the OAuth sense a plain word or number is kept: `{"code": -32601}` is every
-+#: JSON-RPC error and `{"code": "not_found"}` every REST one.
++#: `device_code=`) -- and is then a weak key: a plain word or number is kept
++#: (`{"code": -32601}` is every JSON-RPC error and `{"code": "not_found"}`
++#: every REST one), anything else is redacted.
 +_CODE_QUALIFIERS = frozenset({"", "auth", "authorization", "oauth", "device", "user"})
++#: Under a status or descriptive qualifier (`status_code=401`,
++#: `error_code=invalid_grant`, `exit_code=137`, `zip_code=94105`,
++#: `sqlstate_code=42P01`) `code` names a status, and its value is left to the
++#: shape rules, which still catch an opaque one. Under any OTHER qualifier
++#: (`otp_code=`, `mfa_code=`, `verification_code=`, `recovery_code=`) it is
++#: a weak key: a credential-shaped value is redacted, as main redacted it.
++#: An unknown qualifier therefore fails closed. Matched against the
++#: qualifier's last `_`/`-` segment. Nothing here names a credential or a
++#: redeemable value: `key_code`, `promo_code`, `coupon_code` and
++#: `discount_code` are weak keys (tests/_redaction_grammar.py states this set
++#: as an accepted class and a test pins the two equal).
++_STATUS_CODE_QUALIFIERS = frozenset(
++    {
++        "status",
++        "error",
++        "exit",
++        "http",
++        "response",
++        "return",
++        "result",
++        "reason",
++        "zip",
++        "postal",
++        "country",
++        "lang",
++        "language",
++        "currency",
++        "iso",
++        "area",
++        "region",
++        "locale",
++        "event",
++        "op",
++        "opcode",
++        "char",
++        "byte",
++        "source",
++        "color",
++        "colour",
++        "product",
++        "item",
++        "sku",
++        "sqlstate",
++        "state",
++        "exception",
++        "fault",
++        "ret",
++        "rc",
++        "err",
++        "errno",
++    }
++)
++
++
++def _last_segment(qualifier: str) -> str:
++    return re.split(r"[_-]", qualifier.rstrip("_-").lower())[-1]
++
++
++#: Where a key may start in addition to after a non-identifier character:
++#: right after a JSON escape (`\\n`, `\\t`, `\\b`, `\\f`, `\\"`, `\\\\`, `\\/`,
++#: `\\u00a0`). `process_output` serialises a dict leaf with
++#: `json.dumps(ensure_ascii=True)`, so every control character, every
++#: non-ASCII character and 25 of the 29 `str.isspace()` characters reach the
++#: redactor as an escape whose last character is alphanumeric
++#: (`\\u00a0password=`), which would otherwise read as a glued prefix. Main's
++#: `\\b[A-Za-z0-9_-]*` swallowed the escape's tail and redacted (F3 of rev 9's
++#: board).
++_JSON_ESCAPE_BOUNDARY = r"(?<=\\[nrtbf/\"\\])|(?<=\\u[0-9a-fA-F]{4})"
++#: ... and what a qualifier or a glued prefix may NOT start on: the tail of
++#: such an escape (the `u00a0` of `\\u00a0password`, the `n` of
++#: `\\npassword`), which would otherwise be read as part of the key. The key
++#: NAME may start there (`\\token=x` is `token` in raw text), and anything
++#: else after a backslash may be a qualifier or glued prefix
++#: (`DOMAIN\\password=`, `C:\\secret=`, `\\dbpassword=`), as `\\b` made it on
++#: main (F8 of rev 9's board).
++_NOT_ON_AN_ESCAPE_TAIL = r"(?!(?<=\\)(?:[nrtbf]|u[0-9a-fA-F]{4}))"
++#: A whitespace character as `json.dumps` spells it: `\t \n \r \f`, or a
++#: `\uXXXX` escape of one of the other `str.isspace()` characters. Between
++#: `Bearer`/`Authorization:` and a value in a serialised leaf, main's
++#: `\s+[^\s,;]+` took such an escape as part of the value and redacted it
++#: with the token (`Bearer \u2006(tok)`); here it is part of the separator.
++_JSON_SPACE_ESCAPE = (
++    r"\\(?:[tnrf]|u(?:000[bB]|001[c-fC-F]|0085|00[aA]0|1680|200[0-9aA]"
++    r"|202[89fF]|205[fF]|3000))"
++)
 +
 +
 +def _secret_key_alternation() -> str:
@@ -1869,23 +2465,33 @@ index f40ccbb..d127b6d 100644
 +#: the redactor sees whole values because every surface redacts BEFORE it
 +#: cuts (`sanitize_auth_diagnostic`, and `PolicyManager.process_output` over a
 +#: bounded window), so an unterminated value is the server's own text, not
-+#: ours to guess at. Bare whitespace is NOT a separator here (see
-+#: `_KEYWORD_WS_RE`). A key starts at a non-identifier character or right
-+#: after a JSON-escaped line break or tab (`\\r\\nsecret: hunter2` inside a
-+#: serialised leaf -- `main`'s containing match covered that by accident, and
-+#: the bar is never worse than `main`). The separator is `:` or `=`, Ruby's `=>`, httpie's `:=`,
-+#: or `==` when nothing but the value follows it (`password==hunter2` is
-+#: httpie's query syntax; `if token == expected` is a comparison). The value
++#: ours to guess at -- except an UNTERMINATED opening quote followed by a
++#: bare run to whitespace, a list separator or the end (`password="hunter2`,
++#: `api_key='abc`): main's policy defaults took the run after the quote, so
++#: this does too (N5). Bare whitespace is NOT a separator here (see
++#: `_KEYWORD_WS_RE`). A key starts at a non-identifier character, at a single
++#: `:` (`Database:Password=`, .NET configuration; not `::`, a path, and not
++#: inside an `arn:`/`urn:` resource name, see `_RESOURCE_NAME_RE`), after a
++#: backslash (`DOMAIN\\password=`), or right after a JSON escape
++#: (`_JSON_ESCAPE_BOUNDARY`) -- `main`'s containing match covered all of
++#: these, and the bar is never worse than `main`. The separator is `:` or
++#: `=`, Ruby's `=>`, httpie's `:=`, a run of up to four `:`/`=` (`===`,
++#: `=:`), or `==` when nothing but the value follows it (`password==hunter2`
++#: is httpie's query syntax); a separator holding `==` or `::` (`if token ==
++#: expected`, `token::Type`) is a comparison or a path unless the value is
++#: credential-shaped. The value
 +#: may sit on the NEXT line when that line is indented (YAML block style,
 +#: pretty-printed JSON) or starts with a quote, or -- unindented -- when the
 +#: value is credential-shaped (`password:\r\nhunter2`, as main redacted it);
 +#: `token:\nthe bearer of` and `token:\n  - a bullet` are prose. The next
 +#: line never opens on a `--` flag or a lone `-`/`*`/`#`/`>` marker followed
 +#: by whitespace; a marker glued to the value is part of it
-+#: (`password:\n  -hunter22`, as main redacted it). Horizontal whitespace is ` `, tab or
-+#: no-break space (`\xa0`, which `\s` matched on main); a line break is
-+#: `\n` or `\r\n` (HTTP header folding, Windows dumps) -- rev 7 dropped `\r`
-+#: and `\xa0` and regressed against main. A bare value ends at whitespace, a quote or a list
++#: (`password:\n  -hunter22`, as main redacted it). Horizontal whitespace is
++#: every `str.isspace()` character but `\r`/`\n`; a line break is any run of
++#: `\r`/`\n` with whitespace between (blank lines, a bare CR, HTTP header
++#: folding, Windows dumps), before or after the operator -- rev 9 took
++#: exactly `\r?\n` after it and regressed against main's `[\s:=]+` (F4 of
++#: rev 9's board). A bare value ends at whitespace, a quote or a list
 +#: separator (`,`, `;`, or `&` -- a query string's) and at nothing else,
 +#: except that it never STARTS on `[` or `{` (`"password": [\n  "x"\n]` is a
 +#: list -- `_keyword_list_spans` redacts its quoted elements instead; the
@@ -1902,24 +2508,49 @@ index f40ccbb..d127b6d 100644
 +#: opens a value, whatever it holds (`", secret"` is a valid password).
 +_STRADDLE_RE = re.compile(r"[^\S\r\n]*[,:\]}]")
 +
-+#: A JSON number (a bare value after a quoted key).
-+_JSON_NUMBER_RE = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?")
++#: Every bare scalar `json.dumps` emits (`allow_nan=True` is its default):
++#: after a quoted key it is a JSON literal, and it is left alone, as main left
++#: it -- redacting it would make the document invalid (`NaN`, `Infinity`) or
++#: change the leaf's type (`{"max_tokens": 1024}`). Numeric secrets under a
++#: quoted key are Consiliency/pmcp#290's scope.
++_JSON_SCALAR_RE = re.compile(
++    r"null|true|false|NaN|-?Infinity"
++    r"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?"
++)
++
++#: A line break inside a separator: any run of `\r`/`\n`, with any whitespace
++#: around it, that ends before a visible character.
++_BREAK = r"[^\S\r\n]*[\r\n]\s*"
 +
 +_KEYWORD_KEY_SEP = (
-+    r"(?P<key>(?P<qualifier>(?:(?<![A-Za-z0-9:])|(?<=\\[nrt]))(?:[A-Za-z0-9]+[_-]){0,8}"
++    r"(?P<key>(?P<qualifier>(?:(?<![A-Za-z0-9])(?<!::)|"
++    + _JSON_ESCAPE_BOUNDARY
++    + r")(?:"
++    + _NOT_ON_AN_ESCAPE_TAIL
++    + r"(?:[A-Za-z0-9]+[_-]){1,8})?"
 +    r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?)"
-+    r"(?P<glued>(?<!\\)[A-Za-z0-9]{0,24}?)"
++    r"(?P<glued>(?:" + _NOT_ON_AN_ESCAPE_TAIL + r"[A-Za-z0-9]{1,24}?)?)"
 +    rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
-+    r"(?P<extra>(?:[_-]?[A-Za-z0-9]){0,24}))"
-+    r"(?P<sep>[\"']?[^\S\r\n]*(?:=>|:=|==(?!=)|[:=](?!=))"
-+    r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=\S)(?!--|[-*#>](?:\s|$))|[^\S\r\n]*))"
++    r"(?P<extra>(?:[_-]*[A-Za-z0-9]){0,24}[_-]*))"
++    r"(?P<sep>[\"']?\s*(?:=>|:=(?![:=])|[:=]{2,4}(?![:=])|[:=](?!=))"
++    r"(?:" + _BREAK + r"(?=\S)(?!--|[-*#>](?:\s|$))|[^\S\r\n]*))"
 +)
++#: The run a bare value is made of.
++_BARE_RUN = r"[^\s\"',;&]*[^\s\"',;&)\]}\\]"
 +_KEYWORD_SEP_RE = re.compile(
 +    _KEYWORD_KEY_SEP
 +    + r"(?P<value>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_])"
-+    r"|(?!\{)(?!\[(?!REDACTED\]))[^\s\"',;&]*[^\s\"',;&)\]}\\])",
++    # an unterminated opening quote, then a bare run to whitespace, a list
++    # separator, the end, or a double quote (the end of the JSON string a
++    # single-quoted value sits in)
++    r"|[\"'](?=" + _BARE_RUN + r"(?:[\s,;&\"]|$))" + _BARE_RUN + r"(?!')"
++    r"|(?!\{)(?!\[(?!REDACTED\]))" + _BARE_RUN + r")",
 +    re.IGNORECASE,
 +)
++#: An AWS ARN or a URN: a key inside one names a resource
++#: (`arn:aws:secretsmanager:…:secret:Name`,
++#: `urn:ietf:params:oauth:token-type:access_token`), it is not one.
++_RESOURCE_NAME_RE = re.compile(r"\b[au]rn:[^\s\"'<>]*", re.IGNORECASE)
 +
 +#: The same keyword and separator followed by a flat list (`"password":
 +#: ["hunter2"]`, pretty-printed or not): each quoted element is a value of the
@@ -1952,32 +2583,52 @@ index f40ccbb..d127b6d 100644
 +#: after a word) and not a lone `-`, `*`, `#` or `>` followed by whitespace or
 +#: the end (`token:\n  - item` is a bullet). A single marker glued to the
 +#: value is part of it: `token -abc123def`, `password\n  -hunter22` (a
-+#: base64url secret can start with `-`) are redacted, as on main.
++#: base64url secret can start with `-`) are redacted, as on main. The flag
++#: may be `--`, a single `-`, `_` or any run of them (`java -jar x.jar
++#: -password hunter22x`; N9 of the rev-10 audit), and the qualifier may have
++#: any number of joined segments, as main's `[A-Za-z0-9_-]*` did: the match
++#: can only start where an identifier starts (the lookbehind), so an
++#: unbounded qualifier stays linear here, unlike the keyed rule's, which may
++#: restart after every joiner and is bounded instead.
 +_KEYWORD_WS_RE = re.compile(
-+    r"(?P<key>(?:(?<![A-Za-z0-9_-])|(?<=\\[nrt]))(?:--)?(?:[A-Za-z0-9]+[_-]){0,8}"
++    r"(?P<key>(?:(?<![A-Za-z0-9_-])|"
++    + _JSON_ESCAPE_BOUNDARY
++    + r")[_-]*(?:"
++    + _NOT_ON_AN_ESCAPE_TAIL
++    + r"(?:[A-Za-z0-9]+[_-]+)+)?"
 +    r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?"
-+    r"(?P<glued>(?<!\\)[A-Za-z0-9]{0,24}?)"
++    r"(?P<glued>(?:" + _NOT_ON_AN_ESCAPE_TAIL + r"[A-Za-z0-9]{1,24}?)?)"
 +    rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
-+    r"(?:[_-]?[A-Za-z0-9]){0,24})"
-+    r"(?P<sep>[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]*)"
++    r"(?:[_-]*[A-Za-z0-9]){0,24}[_-]*)"
++    r"(?P<sep>[^\S\r\n]+|" + _BREAK + r")"
 +    r"(?![A-Za-z_-]+=[^=])(?!--|[-*#>](?:\s|$))(?P<value>[^\s\"',;()\[\]{}]*[^\s\"',;()\[\]{}\\])",
 +    re.IGNORECASE,
 +)
 +
 +#: `Bearer <token>` -- the HTTP scheme, so anything after it that is not a word
-+#: is a token. Not `token_type=Bearer expires_in=3600` (bearer as a VALUE, the
-+#: lookbehinds -- which do NOT exclude a quote: `{"text": "Bearer x"}` is how
-+#: every JSON-serialised string arrives, and rev 6 let it through), not `Bearer realm="x"` (a challenge's own parameters, the
-+#: lookahead), not `Missing bearer token` or `the bearer of bad news` (plain
-+#: words, the callback). `(?<![A-Za-z0-9_-])` rather than `\b`: on main
-+#: `\bbearer` fired inside `secret-bearer failed` and redacted `failed`. The
-+#: value stops at a quote or bracket: `{"password": "hunter2 Bearer x"}` must
-+#: keep its closing quote for the keyword pass, not lose it to this one.
++#: is a token, wherever it stands: `X-Auth: Bearer x`, `session=Bearer x`
++#: (rev 9 excluded a preceding `:`/`=` and leaked those; F2 of its board).
++#: Bearer as a VALUE is already excluded by the rest: `token_type=Bearer
++#: expires_in=3600` (the lookahead: a `param=value` is not a token),
++#: `token_type: Bearer` and `{"token_type": "Bearer"}` (nothing follows but
++#: a quote, a comma or the end). Not `Bearer realm="x"` (a challenge's own
++#: parameters, the lookahead), not `Missing bearer token` or `the bearer of
++#: bad news` (plain words, the callback). `(?<![A-Za-z0-9_-])` rather than
++#: `\b`: on main `\bbearer` fired inside `secret-bearer failed` and
++#: redacted `failed`; a JSON escape before it is a boundary too
++#: (`\u00a0Bearer x` in a serialised leaf). A token may be wrapped in a quote
++#: or bracket that closes right after it (`Bearer "x"`, `Bearer (x)`, N7 of
++#: the rev-10 audit): the inside is redacted and the wrapping kept. Otherwise
++#: the value stops at a quote or bracket: `{"password": "hunter2 Bearer x"}`
++#: must keep its closing quote for the keyword pass, not lose it to this one.
 +#: It never ends on a backslash either: in a serialised leaf the token reads
 +#: `Bearer hunter2tok\"`, and eating the `\` un-escapes the quote.
 +_BEARER_RE = re.compile(
-+    r"(?<![=:])(?<![=:] )(?<![A-Za-z0-9_-])"
-+    r"(?P<key>bearer(?:[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]*))(?![A-Za-z_-]+=[^=])(?P<value>[^\s,;\"'()\[\]{}]*[^\s,;\"'()\[\]{}\\])",
++    r"(?:(?<![A-Za-z0-9_-])|" + _JSON_ESCAPE_BOUNDARY + r")"
++    r"(?P<key>bearer(?:(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")+|" + _BREAK + r"))"
++    r"(?![A-Za-z_-]+=[^=])"
++    r"(?:[\"'(\[{<](?=[^\s,;\"'()\[\]{}<>\\]+[\"')\]}>]))?"
++    r"(?P<value>[^\s,;\"'()\[\]{}<>]*[^\s,;\"'()\[\]{}<>\\])",
 +    re.IGNORECASE,
 +)
 +
@@ -1989,12 +2640,20 @@ index f40ccbb..d127b6d 100644
 +#: an optional HTTP auth scheme word (`Basic dXNl…` goes whole, as on main)
 +#: then a run to whitespace, a quote or a list separator -- unless it is a plain word
 +#: or number (`authorization: none`, `Authorization: required`), which is
-+#: prose. The separator is on the same line: `Set the Authorization:\nheader
-+#: first` is a sentence, not a header.
++#: prose (`Set the Authorization:\nheader first` is a sentence). A value
++#: wrapped in a bracket or quote after the scheme (`Authorization: [x]`,
++#: `Authorization: Bearer "x"`, N6 of the rev-10 audit) has its inside
++#: redacted -- except after a quoted key, where `"Authorization": [1.5]` is
++#: JSON structure. The separator may hold line breaks on either side of the
++#: operator, as main's `\s*[:=]\s*` did.
 +_AUTHORIZATION_RE = re.compile(
-+    r"authorization[\"']?[^\S\r\n]*[:=]"
-+    r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=\S)(?!--|[-*#>](?:\s|$))|[^\S\r\n]*)"
++    r"authorization[\"']?(?:\s|" + _JSON_SPACE_ESCAPE + r")*[:=]"
++    r"(?:" + _BREAK + r"(?=\S)(?!--|[-*#>](?:\s|$))"
++    r"|(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")*)"
 +    r"(?:(?P<quoted>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_]))"
++    r"|(?:(?:bearer|basic|digest|negotiate|ntlm|token)"
++    r"(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")+)?"
++    r"[\"'(\[{<](?P<inner>[^\s,;\"'()\[\]{}<>\\]+)[\"')\]}>]"
 +    r"|(?P<bare>(?![\[{])(?:(?:bearer|basic|digest|negotiate|ntlm|token)[^\S\r\n]+)?"
 +    r"[^\s,;\"']*[^\s,;\"')\]}\\]))",
 +    re.IGNORECASE,
@@ -2004,13 +2663,21 @@ index f40ccbb..d127b6d 100644
 +_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 +
 +
-+#: A separator whose line break is followed by no indentation.
-+_UNINDENTED_BREAK_RE = re.compile(r"\r?\n[^ \t\xa0]*$")
++#: A separator whose (last) line break is followed by no indentation.
++_UNINDENTED_BREAK_RE = re.compile(r"[\r\n][^ \t\xa0]*$")
++
++
++def _in_resource_name(text: str) -> Callable[[int], bool]:
++    ranges = [(m.start(), m.end()) for m in _RESOURCE_NAME_RE.finditer(text)]
++    return lambda position: any(a <= position < b for a, b in ranges)
 +
 +
 +def _keyword_sep_spans(text: str) -> list[Span]:
 +    spans: list[Span] = []
++    in_resource_name = _in_resource_name(text)
 +    for match in _KEYWORD_SEP_RE.finditer(text):
++        if in_resource_name(match.start()):
++            continue  # `arn:…:secret:Name` names a secret, it is not one
 +        name = match.group("name").lower()
 +        if name in WEAK_SECRET_KEYS and _is_plain_word_or_number(match.group("value")):
 +            continue
@@ -2023,14 +2690,20 @@ index f40ccbb..d127b6d 100644
 +            qualifier = (
 +                (match.group("qualifier") + match.group("glued")).rstrip("_-").lower()
 +            )
-+            if qualifier not in _CODE_QUALIFIERS:
-+                continue
++            if qualifier not in _CODE_QUALIFIERS and (
++                _last_segment(qualifier) in _STATUS_CODE_QUALIFIERS
++                or not _value_could_be_a_credential(match.group("value"))
++            ):
++                continue  # `status_code=401`; `otp_code=abc123def456` is redacted
 +        start, end = match.start("value"), match.end("value")
 +        value = match.group("value")
-+        if "==" in match.group("sep") and not _value_could_be_a_credential(
++        sep = match.group("sep")
++        if ("==" in sep or "::" in sep) and not _value_could_be_a_credential(
 +            value.strip("\"'")
 +        ):
-+            continue  # `if token == expected:` compares; `password == hunter2` assigns
++            # `if token == expected:` compares, `token::Type` is a path;
++            # `password == hunter2` assigns
++            continue
 +        if match.group("glued") or (
 +            match.group("extra")
 +            and not _DECLARED_KEY_RE.fullmatch(
@@ -2050,17 +2723,14 @@ index f40ccbb..d127b6d 100644
 +                or not _value_could_be_a_credential(inner)
 +            ):
 +                continue  # `token_endpoint=https://…`, `secret_arn=arn:…` name things
-+        if match.group("sep")[:1] in "\"'" and value[0] not in "\"'":
-+            # A quoted key -- JSON (or a Python/JS literal): a bare value is a
-+            # JSON literal. `null`/`true`/`false` hold nothing; a number may
-+            # (a PIN), so it becomes the STRING "[REDACTED]" -- the document
-+            # stays JSON and a dict result stays a dict (the leaf's type
-+            # changes from number to string: stated in the plan).
-+            if value in ("null", "true", "false"):
-+                continue
-+            if _JSON_NUMBER_RE.fullmatch(value):
-+                spans.append((start, end, f'"{REDACTED}"'))
-+                continue
++        if (
++            match.group("sep")[:1] in "\"'"
++            and value[0] not in "\"'"
++            and _JSON_SCALAR_RE.fullmatch(value)
++        ):
++            # A quoted key -- JSON (or a Python/JS literal): a bare scalar is
++            # a JSON literal, left as main left it (`_JSON_SCALAR_RE`)
++            continue
 +        if (
 +            value[0] in "\"'"
 +            and match.group("sep")[:1] not in "\"'"
@@ -2072,6 +2742,17 @@ index f40ccbb..d127b6d 100644
 +            )
 +        ):
 +            continue  # the quote closes the string this key sits in
++        if value[0] in "\"'" and (len(value) == 1 or value[-1] != value[0]):
++            # An unterminated opening quote: the run after it. Ended by a
++            # double quote, it may be the end of the JSON string a
++            # single-quoted value sits in (`{"a": "password='x", …}`): only
++            # a credential-shaped run is a value there.
++            if text[end : end + 1] == '"' and not _value_could_be_a_credential(
++                value[1:]
++            ):
++                continue
++            spans.append((start + 1, end, REDACTED))
++            continue
 +        if value[0] in "\"'":
 +            # Redact INSIDE the quotes: `{"password": "[REDACTED]"}` is still
 +            # JSON, so a structured result round-trips as a dict (main's did).
@@ -2082,10 +2763,14 @@ index f40ccbb..d127b6d 100644
 +
 +def _keyword_list_spans(text: str) -> list[Span]:
 +    spans: list[Span] = []
++    in_resource_name = _in_resource_name(text)
 +    for match in _KEYWORD_LIST_RE.finditer(text):
++        if in_resource_name(match.start()):
++            continue
 +        name = match.group("name").lower()
-+        if name == "code" and (
-+            match.group("qualifier").rstrip("_-").lower() not in _CODE_QUALIFIERS
++        if (
++            name == "code"
++            and _last_segment(match.group("qualifier")) in _STATUS_CODE_QUALIFIERS
 +        ):
 +            continue  # `error_codes: [...]` are diagnostics, as in the scalar pass
 +        base = match.start("list")
@@ -2108,16 +2793,24 @@ index f40ccbb..d127b6d 100644
 +    )
 +
 +
++#: An acronym glued to a Titlecase word: `PGPassword`, `DBPassword`,
++#: `APIToken` (N4b of the rev-10 audit). Not `Ed25519PrivateKey`.
++_ACRONYM_TITLE_RE = re.compile(r"[A-Z0-9]{1,8}[A-Z][a-z]+")
++
++
 +def _keyword_ws_spans(text: str) -> list[Span]:
 +    return [
 +        (match.start("value"), match.end("value"), REDACTED)
 +        for match in _KEYWORD_WS_RE.finditer(text)
 +        if match.group("name").lower() != "code"
 +        and _value_could_be_a_credential(match.group("value"))
-+        # a glued prefix (`CLIENTSECRET abc…`) only on a single-case key: a
++        # a glued prefix (`CLIENTSECRET abc…`) only on a single-case key or
++        # an acronym + Titlecase one (`PGPassword abc…`): any other
 +        # mixed-case identifier (`Ed25519PrivateKey X509Cert`) is prose
 +        and (
-+            not match.group("glued") or _is_single_case(match.group("key").lstrip("-"))
++            not match.group("glued")
++            or _is_single_case(match.group("key").lstrip("-_"))
++            or _ACRONYM_TITLE_RE.fullmatch(match.group("key").lstrip("-_")) is not None
 +        )
 +        and "://" not in match.group("value")
 +        and not match.group("value").lower().startswith("arn:")
@@ -2155,15 +2848,14 @@ index f40ccbb..d127b6d 100644
 +                continue  # the quote closes the string this key sits in
 +            spans.append((match.start("quoted") + 1, match.end("quoted") - 1, REDACTED))
 +            continue
++        if match.group("inner") is not None:
++            if not quoted_key:  # `"Authorization": [1.5]` is JSON structure
++                spans.append((match.start("inner"), match.end("inner"), REDACTED))
++            continue
 +        bare = match.group("bare")
-+        if quoted_key and (
-+            bare in ("null", "true", "false") or _JSON_NUMBER_RE.fullmatch(bare)
-+        ):
-+            # a JSON literal after a quoted key: same rule as the keyword
-+            # pass -- literals hold nothing, a number becomes a STRING
-+            if bare not in ("null", "true", "false"):
-+                spans.append((match.start("bare"), match.end("bare"), f'"{REDACTED}"'))
-+        elif not _is_plain_word_or_number(bare):
++        if quoted_key and _JSON_SCALAR_RE.fullmatch(bare):
++            continue  # a JSON literal after a quoted key: same rule as above
++        if not _is_plain_word_or_number(bare):
 +            spans.append((match.start("bare"), match.end("bare"), REDACTED))
 +    return spans
 +
@@ -2262,7 +2954,10 @@ index f40ccbb..d127b6d 100644
 +    spans: list[Span] = []
 +    for match in _URL_RE.finditer(text):
 +        raw_url = match.group(0)
-+        while raw_url and raw_url[-1] in ").,;":
++        # Trailing sentence punctuation is handed back, and so is a trailing
++        # backslash: in a serialised leaf it escapes the closing quote
++        # (`…?sid=x\\"`), and a query-value span that ate it broke the JSON.
++        while raw_url and raw_url[-1] in ").,;\\":
 +            raw_url = raw_url[:-1]
 +        spans.extend(_url_component_spans(match.start(), raw_url, depth, covers))
 +    return spans
@@ -2359,7 +3054,7 @@ index f40ccbb..d127b6d 100644
  
  def redact_auth_url(url: str) -> str:
      """Strip URL userinfo and redact auth-bearing query values."""
-@@ -576,35 +1351,10 @@ def sanitize_url_elicitation_url(
+@@ -576,35 +1538,10 @@ def sanitize_url_elicitation_url(
  def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
      """Return a display-safe diagnostic string for auth failures."""
      text = str(value)
@@ -2400,7 +3095,7 @@ index f40ccbb..d127b6d 100644
  
  
 diff --git a/src/pmcp/policy/policy.py b/src/pmcp/policy/policy.py
-index cac2702..343b8db 100644
+index cac2702..1c353a6 100644
 --- a/src/pmcp/policy/policy.py
 +++ b/src/pmcp/policy/policy.py
 @@ -22,7 +22,13 @@ from pmcp.types import (
@@ -2418,7 +3113,7 @@ index cac2702..343b8db 100644
  
  if TYPE_CHECKING:
      # Annotation only. `pmcp.manifest`'s package `__init__` imports the loader and
-@@ -44,12 +50,31 @@ _ListPolicy = ServerPolicy | ToolPolicy | ResourcePolicy | PromptPolicy
+@@ -44,12 +50,33 @@ _ListPolicy = ServerPolicy | ToolPolicy | ResourcePolicy | PromptPolicy
  #: would otherwise return the wrong limit or raise at runtime.
  _LimitField = Literal["max_tools_per_server", "max_output_bytes", "max_output_tokens"]
  
@@ -2446,16 +3141,18 @@ index cac2702..343b8db 100644
 +    # line; `token == expected` is a comparison on this surface too).
 +    r"(api[_-]?key|apikey)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
 +    # Not after `:` or `.`: `arn:…:secret:Name` names a secret, it is not one.
-+    r"(?<![A-Za-z0-9:])(secret|password|passwd|pwd)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
++    # Right after a JSON escape it is a key (`\u00a0password=` in a
++    # serialised leaf), as `\b` made it on main.
++    r"(?:(?<![A-Za-z0-9:])|(?<=\\[nrtbf/\"\\])|(?<=\\u[0-9a-fA-F]{4}))(secret|password|passwd|pwd)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
 +    # `token` needs a real separator: the pre-#234 `(bearer|token)\s+…` form
 +    # redacted the word after "token" in prose ("token bucket"). Bearer values
 +    # are handled unconditionally by `sanitize_auth_diagnostic`.
-+    r"\btoken[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
++    r"(?:\b|(?<=\\[nrtbf/\"\\])|(?<=\\u[0-9a-fA-F]{4}))token[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
 +    r"(aws_secret|aws_access)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
      r"\bsk-[A-Za-z0-9_-]{6,}\b",
      r"\bghp_[A-Za-z0-9_]{10,}\b",
      r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
-@@ -666,18 +691,31 @@ class PolicyManager:
+@@ -666,18 +693,31 @@ class PolicyManager:
          return self._composed_limit("max_output_tokens")
  
      def truncate_output(
@@ -2489,7 +3186,7 @@ index cac2702..343b8db 100644
  
          # Truncate to max bytes, being careful with UTF-8
          encoded = output.encode("utf-8")
-@@ -687,29 +725,54 @@ class PolicyManager:
+@@ -687,29 +727,54 @@ class PolicyManager:
          truncated_str = truncated_bytes.decode("utf-8", errors="ignore")
  
          # Add truncation indicator
@@ -2559,7 +3256,7 @@ index cac2702..343b8db 100644
  
      def process_output(
          self,
-@@ -731,11 +794,42 @@ class PolicyManager:
+@@ -731,11 +796,42 @@ class PolicyManager:
  
          raw_size = len(output_str.encode("utf-8"))
  
@@ -2611,10 +3308,12 @@ index cac2702..343b8db 100644
 
 ## Test bodies
 
-`tests/test_redaction.py`, verbatim from `origin/wip/234-redactor-rev9-code`
-@ `8e7d98c` (sha256 `4ac14ef0…43c2`; 306 tests; `ruff check`, `ruff format --check` clean).
-The fixture it reads, `tests/fixtures/redaction_main_oracle.b64`, is the
-plan-folder `.b64` (sha256 `4ff21e38…22d3`, 308 lines):
+`tests/test_redaction.py`, verbatim from `origin/wip/234-redactor-rev10-code`
+@ `e79d75f` (sha256 `247b7349…75f3`; 487 tests, 472 in the default tier;
+`ruff check`, `ruff format --check` clean). It imports
+`tests/_redaction_grammar.py` (under `## Grammar module`). The fixture it
+reads, `tests/fixtures/redaction_main_oracle.b64`, is the plan-folder
+`.b64` (sha256 `a3a9777a…39e1`, 1 009 lines):
 
 ```python
 """Both directions of secret redaction, pinned together (Consiliency/pmcp#234).
@@ -2630,6 +3329,12 @@ corpora and ranks them equally: `PROSE` must survive byte-identical, and every
 Both surfaces are covered -- `sanitize_auth_diagnostic` (the engine, used
 directly by the client manager, the CLI and the doctor) and
 `PolicyManager.redact_secrets` (the engine plus the operator's patterns).
+
+The never-worse-than-main differential is grammar-derived
+(`tests/_redaction_grammar.py`). Its tier 1 runs in the default suite; its
+full set is marked `slow` and runs only on request (`pytest
+tests/test_redaction.py -m slow`, about 2-3 minutes). `addopts` excludes
+`slow`, so CI (`pytest tests/`) does not run it.
 """
 
 from __future__ import annotations
@@ -2642,6 +3347,7 @@ import re
 import string
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -2656,6 +3362,7 @@ from pmcp.auth import (
     sanitize_auth_diagnostic,
 )
 from pmcp.policy.policy import DEFAULT_REDACTION_PATTERNS, PolicyManager
+from tests import _redaction_grammar as G
 
 # --------------------------------------------------------------------------- #
 # The prose corpus. Every line is text a downstream server, pip, git, httpx or
@@ -4236,13 +4943,15 @@ def _differential_corpus() -> list[tuple[str, str, str, str, str]]:
     return out
 
 
-def _main_oracle() -> dict[str, list]:
+def _main_oracle() -> dict[str, Any]:
     """`main`'s recorded behaviour (auth.py/policy.py unchanged from 860636a to
-    9ca081e): per string-corpus row the token pieces its engine and policy
-    removed (`string`); per dict-corpus row the pieces `process_output`
+    9ca081e): per grammar-corpus row what survives on each surface
+    (`grammar`, `_redaction_grammar.observe` codes over `corpus(2)`, whose
+    prefix is tier 1) and the corpus digest it was recorded over
+    (`grammar_fingerprint`); per dict-corpus row the pieces `process_output`
     removed from the serialised result (`dict`) and the result's type
     (`dict_types`); per fuzz object the `process_output` result type
-    (`fuzz_types`)."""
+    (`fuzz_types`). Recorded by `tests/fixtures/regen_redaction_main_oracle.py`."""
     blob = (
         Path(__file__).parent / "fixtures" / "redaction_main_oracle.b64"
     ).read_text()
@@ -4270,148 +4979,170 @@ _DIFF_COLLATERAL = frozenset(
 )
 
 
-_DIFF_PROSE_SEPS = frozenset({" is ", "|", "->"})
-#: rev 9 (N1): keys that carry a suffix after the credential name -- decided
-#: from the key as written in `_DIFF_KEYS`, case- and flag-insensitively.
-_DIFF_SUFFIXED_KEYS = frozenset(
-    {
-        "password2",
-        "password_confirmation",
-        "passwordhash",
-        "secret_value",
-        "secret_key",
-        "token_id",
-        "token_type",
-        "password_length",
-        "token_endpoint",
-        "secret_arn",
-    }
-)
-#: rev 9 (C): compound keys with no boundary left once case-folded
-#: (`CLIENTSECRET`, `Dbpassword`); the PascalCase spelling keeps its boundary.
-_DIFF_GLUED_KEYS = frozenset(
-    {"clientsecret", "dbpassword", "accesstoken", "sessiontoken"}
-)
+# === rev 10: the grammar-derived differential ============================= #
+#
+# The never-worse-than-main differential is derived from the ORACLE's grammar
+# (main's rules plus what `json.dumps` emits), not from past findings:
+# `tests/_redaction_grammar.py` holds the generator (its docstring has every
+# axis and the sampling density), the observation of each surface and the
+# accepted-regression classes. Tier 1 runs here; the full set (tier 2) is
+# `-m slow`.
 
 
-def _accepted_regression_class(
-    key: str, sep: str, value: str, kept: list[str], wrap: str = ""
-) -> str | None:
-    """Rows where this redactor keeps a piece main removed, BY DESIGN -- decided from
-    the row's own key, separator, value and wrap, never from the output. Each
-    class is listed in the plan's accepted-regression table with its count
-    and reason. Anything not matched here is a bug."""
-    base = key.lower()
-    bare_key = base.lstrip("-")
-    name = base.split("_")[-1].split("-")[-1]
-    plain = _is_plain_word_or_number_for_test(value)
-    credential = _value_could_be_a_credential_for_test(value)
-    if wrap.startswith("https://h.example/?") and "=" not in sep and " " not in sep:
-        # `?x=1&bearer:abc…&y=2`: main's `parse_qsl` took `bearer:abc…` as a
-        # KEY and re-spelled it `bearer%3Aabc…=` -- a re-encoding, not a
-        # redaction (the same as `|` -> `%7C`); the value is still there
-        return "inside a URL query main re-encoded `key<sep>value` as a key (`%3A`, `%7C`); not a redaction"
-    if sep in _DIFF_PROSE_SEPS:
-        # main "removed" the value in `?jwt|hunter2` by re-encoding `|` as
-        # `%7C` inside a URL, and ate `is`/`->` rows through `[\s:=]+`; it left
-        # `token|hunter2` outside a URL untouched
-        return "`is`/`|`/`->` are not separators (main: URL re-encoding of `|`, or its whitespace rule)"
-    if sep.isspace():
-        # rev 9 (B5): every `str.isspace()` separator, not a fixed list
-        if name == "code":
-            return "`code` never fires on a whitespace-only separator (main redacted `code<TAB>s3cr3t`)"
-        if not credential:
-            return "whitespace-only separator with a non-credential-shaped value (D2)"
-    if sep.strip() == "==" and not credential:
-        return "`==` is a comparison unless the value is credential-shaped (G1: `if token == expected:`)"
-    if bare_key in _DIFF_SUFFIXED_KEYS and not credential:
-        return "a suffixed key names metadata unless the value is credential-shaped (N1: `password_length=12`)"
-    if (
-        bare_key in _DIFF_GLUED_KEYS
-        and _is_single_case_for_test(key)
-        and (not credential or "://" in value or value.lower().startswith("arn:"))
-    ):
-        return "a glued, single-case key counts only with a credential-shaped value that is not a URL or ARN (C)"
-    if not sep.startswith('"') and value.startswith((",", "}")):
-        return 'after an unquoted key a value starting on `,`/`}` is JSON structure (N3: `"missing token: ", "code"`)'
-    if sep == ":\r\n" and not value.startswith(('"', "'")) and not credential:
-        return "unindented line-break continuation with a non-credential-shaped value (D2 applied to a line break)"
-    if sep == '\\": \\"{}\\"':
-        return "backslash-escaped quotes in a plain string (JSON inside a leaf is Consiliency/pmcp#290)"
-    if base in ("code", "auth_code", "credentials") and plain:
-        return "weak key keeps a plain word or number"
-    if base in ("authorization", "bearer") and plain:
-        return "`Authorization`/`Bearer` followed by a plain word is prose"
-    return None
-
-
-def _is_single_case_for_test(key: str) -> bool:
-    """All upper, all lower, or one capital then lower (flag dashes aside)."""
-    word = key.lstrip("-")
-    return (
-        word.isupper() or word.islower() or (word[:1].isupper() and word[1:].islower())
-    )
-
-
-def _value_could_be_a_credential_for_test(value: str) -> bool:
-    """D2, restated: not a plain word or number, and digit-bearing and 6+
-    chars or punctuated and 8+."""
-    if _is_plain_word_or_number_for_test(value):
-        return False
-    return len(value) >= (6 if any(c.isdigit() for c in value) else 8)
-
-
-def test_differential_against_main_never_worse_except_by_stated_class() -> None:
-    """For every corpus row and surface, every ≥ 4-char piece main removed is
-    removed here too, unless the row falls into an accepted-regression class.
-    Rev 6 hand-picked its never-worse corpus from inputs main handled cleanly
-    and reported 0 while two regressions existed; this test takes the board's
-    corpus and main's recorded output as the oracle instead. Rule: no
-    lookahead, lookbehind or rule narrowing lands without re-running this.
-    """
+def _grammar_differential(
+    rows: list[G.Row], main_codes: list[str]
+) -> tuple[dict[str, int], list[str], int]:
+    """Per (row, surface) this redactor is worse on than main: its accepted
+    class (decided from the row as written and the surface, never from the
+    output), or a bug. Also counts the positive control: rows on which main
+    removed a piece on some surface."""
     policy = PolicyManager()
-    corpus = _differential_corpus()
-    oracle = _main_oracle()["string"]
-    assert len(corpus) == len(oracle) == 8000
+
+    def process(obj: object) -> object:
+        return policy.process_output(obj, redact=True, max_bytes=G.BIG)["result"]
+
+    counts = dict.fromkeys(G.CLASSES, 0)
     bugs: list[str] = []
-    accepted: dict[str, int] = {}
-    better = worse_rows = 0
-    for (text, key, sep, value, wrap), (main_engine, main_policy) in zip(
-        corpus, oracle
-    ):
-        here = {
-            "engine": _engine(text),
-            "policy": policy.redact_secrets(text),
-        }
-        removed_here = {
-            surface: set(_DIFF_TOKEN.findall(text)) - set(_DIFF_TOKEN.findall(out))
-            for surface, out in here.items()
-        }
-        if removed_here["engine"] - set(main_engine) or removed_here["policy"] - set(
-            main_policy
-        ):
-            better += 1
-        for surface, main_removed in (("engine", main_engine), ("policy", main_policy)):
-            kept = [
-                piece
-                for piece in main_removed
-                if len(piece) >= 4
-                and piece.lower() not in _DIFF_COLLATERAL
-                and piece.lower() != key.lower()  # main ate the KEY itself
-                and piece not in removed_here[surface]
-            ]
-            if not kept:
-                continue
-            worse_rows += 1
-            reason = _accepted_regression_class(key, sep, value, kept, wrap)
-            if reason is None:
-                bugs.append(
-                    f"{surface} {text!r} keeps {kept} (main removed them); here: {here[surface]!r}"
-                )
+    controls = 0
+    for row, main in zip(rows, main_codes, strict=True):
+        assert len(main) == (2 if "o" in row else len(G.TEXT_SURFACES) + 1), main
+        here = G.observe(row, _engine, policy.redact_secrets, process)
+        controls += bool(row["value"]) and G.removed_by_main(row, main)
+        for surface in G.worse_surfaces(row, main, here):
+            cls = (
+                G.accepted(row["f"], surface)
+                if row["f"] is not None and not surface.endswith(".type")
+                else None
+            )
+            if cls is None:
+                shown = row.get("t", row.get("o"))
+                bugs.append(f"{surface}: {shown!r} main={main} here={here}")
             else:
-                accepted[reason] = accepted.get(reason, 0) + 1
-    assert bugs == [], f"{len(bugs)} unaccepted regressions:\n" + "\n".join(bugs[:25])
-    assert better > 1500, better
+                counts[cls] += 1
+    return counts, bugs, controls
+
+
+def test_grammar_differential_never_worse_than_main_except_by_stated_class() -> None:
+    """Tier 1 (12 535 rows x 12 surfaces, plus the result type of every
+    dict): every piece of the value main removed on a surface is removed here
+    too, and every dict main kept stays a dict, unless the (row, surface) is
+    in a stated class. The oracle is main's recorded output over exactly this
+    corpus (the fingerprint)."""
+    rows = G.corpus(1)
+    oracle = _main_oracle()
+    assert oracle["grammar_fingerprint"]["1"] == G.fingerprint(rows)
+    assert len(rows) == 12_535 and len(oracle["grammar"]) == 166_183
+    counts, bugs, controls = _grammar_differential(rows, oracle["grammar"][: len(rows)])
+    assert bugs == [], f"{len(bugs)} unaccepted:\n" + "\n".join(bugs[:25])
+    text_rows = sum(1 for row in rows if row["value"])
+    # the oracle is not vacuous: main removes the value on most rows, and the
+    # classes are exercised (each class's count is in the plan)
+    assert controls > 0.85 * text_rows, (controls, text_rows)
+    assert sum(counts.values()) > 10_000, counts
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("block", G.BLOCKS)
+def test_grammar_differential_full_set(block: str) -> None:
+    """Tier 2, the full set (166 183 rows), one block per case so a failure
+    is attributed to an axis and each case stays well inside the per-test
+    timeout."""
+    rows = G.corpus(2)
+    oracle = _main_oracle()
+    assert oracle["grammar_fingerprint"]["2"] == G.fingerprint(rows)
+    assert len(rows) == len(oracle["grammar"]) == 166_183
+    picked = [(r, c) for r, c in zip(rows, oracle["grammar"]) if r["block"] == block]
+    assert picked, block
+    counts, bugs, controls = _grammar_differential(
+        [r for r, _ in picked], [c for _, c in picked]
+    )
+    assert bugs == [], f"{len(bugs)} unaccepted:\n" + "\n".join(bugs[:25])
+    if block != "scalar":
+        assert controls > 0.5 * len(picked), (controls, len(picked))
+
+
+def test_the_grammar_corpus_covers_every_axis() -> None:
+    """Each axis the generator's docstring claims is really produced (a check
+    is only a check if it would fail were the axis missing)."""
+    spaces = {chr(i) for i in range(0x110000) if chr(i).isspace()}
+    assert set(G.SPACES) == spaces and len(G.SPACES) == len(spaces) == 29
+    rows = G.corpus(1)
+    by_block: dict[str, list[G.Row]] = {}
+    for row in rows:
+        by_block.setdefault(row["block"], []).append(row)
+    assert set(by_block) == set(G.BLOCKS)
+    # every 1- and 2-character separator over `\s` + `:` + `=`
+    seps = {row["f"]["sep"] for row in by_block["sep"]}
+    assert len(G.PAIRS) == 31 + 31 * 31 and set(G.PAIRS) <= seps
+    # every pre character, and every JSON escape the serialiser emits
+    pres = {row["f"]["pre"] for row in by_block["pre"]}
+    assert {ch for chars in G.PRE_CHARS.values() for ch in chars} <= pres
+    dumped = "".join(json.dumps(row["t"]) for row in by_block["pre"])
+    for escape in (
+        '\\"',
+        "\\\\",
+        "\\b",
+        "\\f",
+        "\\n",
+        "\\r",
+        "\\t",
+        "\\u0000",
+        "\\u001b",
+    ):
+        assert escape in dumped, escape
+    for escape in (
+        "\\u007f",
+        "\\u0085",
+        "\\u00a0",
+        "\\u3000",
+        "\\u00e9",
+        "\\ud83d\\ude42",
+    ):
+        assert escape in dumped, escape
+    buckets = {row["bucket"] for row in rows}
+    # `code` under every diagnostic and credential qualifier, both values
+    code_quals = {row["f"]["qual"][:-1] for row in by_block["code"]}
+    diagnostic = set(G.DIAGNOSTIC_CODE_QUALIFIERS)
+    assert code_quals == diagnostic | set(G.CREDENTIAL_CODE_QUALIFIERS)
+    assert not set(G.CREDENTIAL_CODE_QUALIFIERS) & diagnostic
+    # every part of main's URL grammar
+    url_kinds = {k for row in by_block["focus:url"] for k in row["kinds"]}
+    for key_kind in ("secret", "secret-encoded", "other"):
+        for value_kind in ("cred", "plain", "encoded", "empty"):
+            assert f"query-{key_kind}-{value_kind}" in url_kinds, (key_kind, value_kind)
+    assert {"userinfo", "fragment"} <= url_kinds
+    urls = " ".join(row["t"] for row in by_block["focus:url"])
+    assert (
+        ":99999" in urls and "[::1]" in urls and "://:" in urls and "://user:" in urls
+    )
+    for kinds in (
+        [f"pre:{c}" for c in G.PRE_CHARS],
+        ["qual:joined", "qual:glued", "qual:glued-long", "qual:leading-joiner"],
+        ["qual:multi-segment", "name:case", "name:code-qualified"],
+        ["name:code-diagnostic", "name:code-credential", "wrap:none", "wrap:prose"],
+        ["wrap:url-path", "wrap:url-query-pair", "wrap:url-query-value"],
+        ["wrap:url-fragment", "code:diagnostic", "code:credential"],
+        ["suffix:declared", "suffix:trailing-joiner", "suffix:descriptive"],
+        ["suffix:random", "suffix:long"],
+        ["sep:line-break", "sep:operator-run", "sep:whitespace-only", "sep:mixed"],
+        ["value:main-class", "value:plain", "value:number", "value:quoted"],
+        ["value:unterminated-quote", "value:bracketed", "value:json-literal"],
+        ["value:punctuated", "bearer:after-:/=", "bearer:line-break"],
+        ["bearer:wrapped-value", "bearer:plain-context"],
+        ["authorization:line-break", "authorization:wrapped-value"],
+        ["authorization:scheme", "authorization:plain", "mix"],
+        [f"scalar:{name}" for name in G.SCALARS],
+    ):
+        assert set(kinds) <= buckets, set(kinds) - buckets
+    # every scalar under every key in every shape; every case of the key word
+    assert len(by_block["scalar"]) == len(G.SCALARS) * len(G.SCALAR_KEYS) * 3
+    names = {row["f"]["name"] for row in by_block["focus:name"]}
+    assert any(n.isupper() for n in names) and any(n.istitle() for n in names)
+    assert any(not n.isupper() and not n.islower() and not n.istitle() for n in names)
+    # the observation covers every surface, and each class is decidable
+    code = G.observe(rows[0], _engine, _policy, lambda obj: obj)
+    assert len(code) == len(G.TEXT_SURFACES) + 1 == 13
+    assert set(G.SERIALISED) >= {"POd", "EjAC", "EjUI", "PjAC", "PjUI"}
 
 
 def _dict_corpus() -> list[tuple[dict, str, str, str]]:
@@ -4493,6 +5224,33 @@ def _dict_corpus() -> list[tuple[dict, str, str, str]]:
     return out
 
 
+#: The key words a `_DIFF_KEYS` key is made of, for the structured
+#: differential's classifier (which reads a row as `qual + name + suffix`).
+_KEY_WORDS = sorted(
+    {*AUTH_DIAGNOSTIC_SECRET_KEYS, "api_key", "api-key", "apikey", "private_key"}
+    | {"authorization", "bearer"}
+)
+
+
+def _grammar_fields(key: str, sep: str, value: str) -> dict[str, str]:
+    """A structured-corpus row as the grammar classifier's fields: the key
+    word is the one that ends last in the key (the longest on a tie)."""
+    low = key.lower()
+    end, length, start = max(
+        (low.rfind(w) + len(w), len(w), low.rfind(w)) for w in _KEY_WORDS if w in low
+    )
+    before, _, after = sep.partition("{}")
+    quote = before[-1:] if before[-1:] in "\"'" else ""
+    return {
+        "pre": "",
+        "qual": key[:start],
+        "name": key[start:end],
+        "suffix": key[end:],
+        "sep": before[: len(before) - len(quote)],
+        "value": quote + value + after if quote else value,
+    }
+
+
 def test_differential_on_structured_results_never_worse_than_main() -> None:
     """A dict result goes through the CORE path (serialise, then redact the
     window); JSON text inside a leaf is Consiliency/pmcp#290's problem. The
@@ -4529,7 +5287,7 @@ def test_differential_on_structured_results_never_worse_than_main() -> None:
             and p not in removed_here
         ]
         if kept:
-            reason = _accepted_regression_class(key, sep, value, kept)
+            reason = G.accepted(_grammar_fields(key, sep, value), "POd")
             if reason is None:
                 bugs.append(f"{obj!r} keeps {kept}; here: {out!r}")
             else:
@@ -4851,15 +5609,18 @@ def test_the_differential_corpus_covers_every_axis() -> None:
         ('{"access_token": null}', '{"access_token": null}'),
         ('{"token": true}', '{"token": true}'),
         ('{"password": false}', '{"password": false}'),
-        ('{"token": 42}', '{"token": "[REDACTED]"}'),
-        ('{"token": -1.5e3}', '{"token": "[REDACTED]"}'),
+        # rev 10 (F5/F6, the maintainer's decision 1): a bare number after
+        # a quoted key stays unchanged, as on main; numeric secrets under a
+        # quoted key are Consiliency/pmcp#290's scope
+        ('{"token": 42}', '{"token": 42}'),
+        ('{"token": -1.5e3}', '{"token": -1.5e3}'),
     ],
 )
 def test_b1_a_json_literal_after_a_quoted_key_keeps_the_document(
     text: str, expected: str
 ) -> None:
-    """B1: `null`/`true`/`false` are not secrets; a number is redacted as a
-    JSON string so the document stays JSON; a dict result stays a dict."""
+    """B1: a bare JSON scalar after a quoted key is not a secret; the
+    document stays JSON and a dict result stays a dict."""
     for surface, out in _both(text):
         assert out == expected, (surface, out)
     assert _process(json.loads(text)) == json.loads(expected)
@@ -5101,7 +5862,9 @@ def test_a_quoted_value_never_straddles_via_the_other_quote(obj: dict) -> None:
         assert json.loads(out) == obj, (surface, out)
 
 
-@pytest.mark.parametrize("space", ["\x0b", "\x85", "\xa0", " ", " ", "　"])
+@pytest.mark.parametrize(
+    "space", ["\x0b", "\x85", "\xa0", "\u2003", "\u2028", "\u3000"]
+)
 @pytest.mark.parametrize("key", ["token", "bearer:", "password", "SECRET_KEY"])
 def test_no_span_starts_inside_a_json_escape(space: str, key: str) -> None:
     """Defect A of round 3: `json.dumps` spells non-ASCII whitespace
@@ -5223,55 +5986,1901 @@ def test_property_json_fuzz_keeps_documents_and_dicts() -> None:
     assert broken == [], "\n".join(broken[:10])
     assert checked > 3000 and excluded > 0, (checked, excluded)
     assert main_types.count("dict") > 1000
+
+
+# === rev 10: regression tests, one per fix family ========================== #
+#
+# Each is red on rev 9 (`60ca193`) and green here; each fix is also pinned by a
+# mutant of its production change that these tests kill (the plan lists them).
+
+
+def _leaf(text: str) -> str:
+    """`process_output({"t": text})`'s leaf, which must still be a dict."""
+    result = _process({"t": text})
+    assert isinstance(result, dict), result
+    return str(result["t"])
+
+
+def _gone(text: str, secret: str) -> None:
+    for surface, out in _both(text):
+        assert secret not in out, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        {"token": float("nan")},
+        {"secret": float("inf")},
+        {"session": float("-inf")},
+        {"password": float("nan"), "x": 1},
+        {"stats": {"tokens": float("nan")}},
+        {"usage": {"input_tokens": 12, "output_tokens": 34}, "max_tokens": 1024},
+        {"sessions": 3, "secrets": 0, "Authorization": 7},
+    ],
+)
+def test_f5_f6_a_bare_json_scalar_after_a_quoted_key_is_unchanged(obj: dict) -> None:
+    """F5/F6 (the maintainer's decision 1): every scalar `json.dumps` emits,
+    `NaN` and `+-Infinity` included, stays as it is after a quoted key, as on
+    main: the result stays a dict and no leaf changes type. Numeric secrets
+    under a quoted key are Consiliency/pmcp#290's."""
+    result = _process(obj)
+    assert isinstance(result, dict), result
+    assert json.dumps(result, sort_keys=True) == json.dumps(obj, sort_keys=True)
+    for text in ('{"token": NaN}', '{"token": -Infinity}', '{"Authorization": 1e+20}'):
+        for surface, out in _both(text):
+            assert out == text, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "pre",
+    ["\xa0", "\x08", "\x0c", "\x0b", "\x1b", "\x7f", "\x85", "\u3000", "\u2028"]
+    + ["\xe9", "\u2022", "\u201c", "\u5bc6", "\U0001f642", "\\", '"'],
+    ids=lambda c: f"U+{ord(c):04X}",
+)
+@pytest.mark.parametrize(
+    ("body", "secret"),
+    [
+        ("password=hunter22x", "hunter22x"),
+        ("Token hunter2tok", "hunter2tok"),
+        ("Secret abc123def456", "abc123def456"),
+        ("Bearer hunter2tok", "hunter2tok"),
+    ],
+)
+def test_f3_a_json_escape_before_a_key_is_a_boundary(
+    pre: str, body: str, secret: str
+) -> None:
+    """F3: `process_output` serialises a dict leaf with `ensure_ascii=True`,
+    so every control, non-ASCII and escaped whitespace character before a key
+    arrives as an escape whose tail is alphanumeric (`\\u00a0password`,
+    `\\bToken`); main's `\\b[A-Za-z0-9_-]*` swallowed the tail and redacted."""
+    assert secret not in _leaf(pre + body)
+    for surface, out in _both(json.dumps({"t": pre + body})):
+        assert secret not in out, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"t": "\\u00a0password=hunter22x"}',
+        '{"t": "\\bsecret: hunter22x"}',
+        '{"t": "\\u2022token=hunter22x"}',
+        '{"t": "\\ftoken: hunter22x"}',
+    ],
+)
+def test_f3_the_policy_defaults_read_a_json_escape_as_a_boundary(text: str) -> None:
+    """F3 on the operator-visible defaults themselves (the engine covers the
+    policy surface too, so only the patterns can show it): `\\b` made a key
+    start right after an escape's alphanumeric tail on main."""
+    hits = [
+        m.group(m.lastindex)
+        for pattern in DEFAULT_REDACTION_PATTERNS
+        for m in re.finditer(pattern, text, re.IGNORECASE)
+        if m.lastindex
+    ]
+    assert any(h.startswith("hunter22x") for h in hits), hits
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("Cookie: session=bearer \u2006(t8B7fzJ0L)", "t8B7fzJ0L"),
+        ("token: BEARER \r{hM6odfJdqx}", "hM6odfJdqx"),
+        ("Authorization:\u2006'gn1y2tpo'", "gn1y2tpo"),
+        ("AUTHORIZATION:\u2006Bearer\n\n'ay47NjWsmUf'", "ay47NjWsmUf"),
+        ("authorization=\u2029bearer\t'gS6CJ7XD'", "gS6CJ7XD"),
+    ],
+)
+def test_f3_an_escaped_space_after_bearer_or_authorization_separates(
+    text: str, secret: str
+) -> None:
+    """F3's follow-up: in a serialised leaf the whitespace between
+    `Bearer`/`Authorization:` and the value is an escape (`\\u2006`, `\\r`,
+    `\\t`); main's `\\s+[^\\s,;]+` took it as part of the value and
+    redacted the token with it."""
+    assert secret not in _leaf(text)
+    for surface, out in _both(json.dumps({"t": text})):
+        assert secret not in out, (surface, out)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("password:\n\nhunter22x", "hunter22x"),
+        ("Temporary password:\n\n    hunter22x", "hunter22x"),
+        ("password:\r\n\r\nhunter22x", "hunter22x"),
+        ("password:\rhunter22x", "hunter22x"),
+        ("password:\n\rhunter22x", "hunter22x"),
+        ("Secret:\r\rhunter22x", "hunter22x"),
+        ("token\n\nhunter22tok", "hunter22tok"),
+        ("token\r\r\nhunter22tok", "hunter22tok"),
+        ("token:\n\n  abc123def456", "abc123def456"),
+        ("Authorization:\n\nhunter22x", "hunter22x"),
+        # F4b: the break BEFORE the operator
+        ("password\n: hunter22x", "hunter22x"),
+        ("Authorization\r\n: hunter22x", "hunter22x"),
+        ("api_key\n=\nhunter22x", "hunter22x"),
+    ],
+)
+def test_f4_any_line_break_run_separates(text: str, secret: str) -> None:
+    """F4: a blank line, a bare CR, `\\n\\r` or `\\r\\r\\n`, on either side of
+    the operator: main's `[\\s:=]+` accepted any run. The unindented-break gate
+    still keeps prose (`token:\\n\\nThe next paragraph`, the FP table)."""
+    _gone(text, secret)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("X-Auth: Bearer hunter22x", "hunter22x"),
+        ("X-Auth:Bearer hunter22x", "hunter22x"),
+        ("auth: bearer\thunter2tok", "hunter2tok"),
+        ("token: Bearer abc123def456", "abc123def456"),
+        ("X-Access-Token: Bearer hunter2tok", "hunter2tok"),
+        ("session=Bearer hunter2tok", "hunter2tok"),
+        ("Cookie: session=Bearer hunter2tok", "hunter2tok"),
+        ("headers: {X-Auth: Bearer hunter2tok}", "hunter2tok"),
+    ],
+)
+def test_f2_bearer_after_a_key_and_separator(text: str, secret: str) -> None:
+    """F2: a header or field whose value is `Bearer <token>`. The lookahead
+    and the plain-word gate already keep `token_type=Bearer expires_in=3600`
+    (the FP table)."""
+    _gone(text, secret)
+    assert secret not in _leaf(text)
+
+
+def test_f9_the_pem_rule_is_linear() -> None:
+    """F9: every BEGIN without an END scanned to the end of the text (rev 9:
+    5.6 s on 264 KB; main 0.05 s). The bound is generous against CI noise and
+    still an order of magnitude under rev 9."""
+    import time
+
+    text = "-----BEGIN RSA PRIVATE KEY-----\n" * 8250  # 264 KB
+    for surface, redact in (("engine", _engine), ("policy", _policy)):
+        start = time.perf_counter()
+        redact(text)
+        elapsed = time.perf_counter() - start
+        assert elapsed < 2.0, (surface, elapsed)
+    block = "-----BEGIN RSA PRIVATE KEY-----\nMIIEabc\n-----END RSA PRIVATE KEY-----"
+    assert _engine(f"key: {block} end") == "key: [REDACTED] end"
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("Database:Password=hunter22x", "hunter22x"),
+        ("ConnectionStrings:Password=hunter22x", "hunter22x"),
+        ("--Database:Password=hunter22x", "hunter22x"),
+        ("App:ClientSecret=hunter22x", "hunter22x"),
+        ("vault:secret=hunter22x", "hunter22x"),
+        ("env:SECRET=hunter22x", "hunter22x"),
+        ("mongodb:password: hunter22x", "hunter22x"),
+    ],
+)
+def test_f1_a_colon_qualified_key_is_a_key(text: str, secret: str) -> None:
+    """F1: `Section:Key` (.NET configuration, namespaced log fields). Not
+    `::` (a path) and not a key inside an `arn:`/`urn:` name (the FP table)."""
+    _gone(text, secret)
+    assert secret not in _leaf(text)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("password===hunter22x", "hunter22x"),
+        ("password====hunter22x", "hunter22x"),
+        ("password:: hunter22x", "hunter22x"),
+        ("password=:\u205fhunter22x", "hunter22x"),
+        ("Database:Password=:hunter22x", "hunter22x"),
+        ("token:==abc123def456", "abc123def456"),
+    ],
+)
+def test_n1_an_operator_run_separates(text: str, secret: str) -> None:
+    """N1: main's `[\\s:=]+` took any run; a run holding `==` or `::` is a
+    comparison or a path unless the value is credential-shaped
+    (`if (token === expected)`, `token::Type`: the FP table)."""
+    _gone(text, secret)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("password_=hunter22x", "hunter22x"),
+        ("password-=hunter22x", "hunter22x"),
+        ("password__=hunter22x", "hunter22x"),
+        ("id_token__Xv=hunter22x", "hunter22x"),
+        ("api_keyNf--sKOs: hunter22x", "hunter22x"),
+        ("password__ abc123def456", "abc123def456"),
+    ],
+)
+def test_n2_a_trailing_joiner_or_joiner_run_in_the_suffix(
+    text: str, secret: str
+) -> None:
+    _gone(text, secret)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ('password="hunter22x', "hunter22x"),
+        ("api_key='hunter22x", "hunter22x"),
+        ('secret: "hunter22x', "hunter22x"),
+        ("aws_secret='hunter22x more", "hunter22x"),
+    ],
+)
+def test_n5_an_unterminated_opening_quote(text: str, secret: str) -> None:
+    """N5: main's policy defaults took the run after an opening quote."""
+    _gone(text, secret)
+    assert _engine('password="hunter22x') == 'password="[REDACTED]'
+    for kept in ('password="', 'He said "token', "it's the password's fault"):
+        for surface, out in _both(kept):
+            assert out == kept, (surface, out)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ('Bearer "hunter22x"', 'Bearer "[REDACTED]"'),
+        ("Bearer 'hunter22x'", "Bearer '[REDACTED]'"),
+        ("Bearer (hunter22x)", "Bearer ([REDACTED])"),
+        ("Bearer [hunter22x]", "Bearer [[REDACTED]]"),
+        ("Bearer {hunter22x}", "Bearer {[REDACTED]}"),
+        ("Authorization: [hunter22x]", "Authorization: [[REDACTED]]"),
+        ("Authorization: {hunter22x}", "Authorization: {[REDACTED]}"),
+        ('Authorization: Bearer "hunter22x"', 'Authorization: Bearer "[REDACTED]"'),
+    ],
+)
+def test_n6_n7_a_wrapped_bearer_or_authorization_value(
+    text: str, expected: str
+) -> None:
+    """N6/N7: the inside of a wrapped value is redacted and the wrapping
+    kept. After a quoted key a bracket is JSON structure."""
+    for surface, out in _both(text):
+        assert out == expected, (surface, out)
+    for obj in ({"Authorization": [1.5]}, {"Authorization": {"a": "b"}}):
+        assert _process(obj) == obj
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "otp_code",
+        "verification_code",
+        "mfa_code",
+        "recovery_code",
+        "sms_code",
+        "invite_code",
+        # a key or a redeemable value is not a status
+        "key_code",
+        "promo_code",
+        "coupon_code",
+        "discount_code",
+    ],
+)
+def test_n8_code_under_a_non_status_qualifier_is_a_weak_key(key: str) -> None:
+    """N8: `code` under a qualifier that is not a diagnostic word redacts a
+    credential-shaped value, as main did; plain words and numbers are kept
+    (a weak key), and a diagnostic qualifier keeps its value (class C12)."""
+    _gone(f"{key}=abc123def456", "abc123def456")
+    _gone(f'{{"{key}": "abc123def456"}}', "abc123def456")
+    for kept in (
+        f"{key}=expired",
+        f"{key}=401",
+        "status_code=401",
+        "error_code=invalid_grant",
+        "sqlstate_code=42P01",
+    ):
+        for surface, out in _both(kept):
+            assert out == kept, (surface, out)
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("C:\\secret=hunter22x", "hunter22x"),
+        ("DOMAIN\\password=hunter22x", "hunter22x"),
+        ("\\password hunter22x", "hunter22x"),
+        ("\\0WM9qpSecret_old=tEDvZ67S1", "tEDvZ67S1"),
+        ("\\token=hunter22x", "hunter22x"),
+        ("\\tenant_id: hunter22x", "hunter22x"),
+    ],
+)
+def test_f8_a_key_after_a_backslash(text: str, secret: str) -> None:
+    """F8: a backslash is a key boundary, as `\\b` made it on main; only the
+    tail of a JSON escape (`\\u00a0`, `\\n`) is never part of a key."""
+    _gone(text, secret)
+    assert secret not in _leaf(text)
+    assert _leaf("\u2022-code-id=:hunter22x") == "\u2022-code-id=:[REDACTED]"
+
+
+@pytest.mark.parametrize(
+    ("text", "secret"),
+    [
+        ("java -jar x.jar -password hunter22x -user bob", "hunter22x"),
+        ("-token abc123def456", "abc123def456"),
+        ("_token hunter22x", "hunter22x"),
+        ("-secret\thunter22x", "hunter22x"),
+        ("---secret abc123def456", "abc123def456"),
+        ("_-password hunter22x", "hunter22x"),
+        ("a-b-c-d-e-f-g-h-i-j-password hunter22x", "hunter22x"),
+    ],
+)
+def test_n9_a_single_dash_flag_before_whitespace(text: str, secret: str) -> None:
+    """N9: a single-dash or `_` flag (any run of them), and a qualifier of
+    any number of joined segments, before a whitespace-separated value."""
+    _gone(text, secret)
+    for kept in ("-token bucket", "-secret santa", "_token ok", "use -session expired"):
+        for surface, out in _both(kept):
+            assert out == kept, (surface, out)
+
+
+@pytest.mark.parametrize(
+    "text", ["PGPassword abc123def456", "DBPassword hunter22x", "APIToken abc123def456"]
+)
+def test_n4b_an_acronym_glued_to_a_titlecase_key(text: str) -> None:
+    """N4b: `PGPassword` (libpq) is a key; `Ed25519PrivateKey X509Cert` and
+    random-case glued keys (`gby3zPassword x`, the maintainer's decision 4)
+    stay prose."""
+    _gone(text, text.split()[-1])
+    for kept in ("Ed25519PrivateKey X509Cert", "RSAPrivateKey Rsa2048Key"):
+        for surface, out in _both(kept):
+            assert out == kept, (surface, out)
+
+
+def test_n8_the_diagnostic_qualifiers_are_the_stated_class() -> None:
+    """The qualifiers under which `code` keeps its value are exactly the ones
+    the differential's class C12 states, and none names a credential."""
+    from pmcp.auth import _STATUS_CODE_QUALIFIERS
+
+    assert set(_STATUS_CODE_QUALIFIERS) == set(G.DIAGNOSTIC_CODE_QUALIFIERS)
+    assert not set(G.CREDENTIAL_CODE_QUALIFIERS) & set(_STATUS_CODE_QUALIFIERS)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        'see https://:v1OW9iGwM@h.example:99999?SID=%69wX2caGkT7Xjb8Ll"',
+        'https://h.example/?token=abc123def456"',
+        'url https://h.example/?q=1&sid=hunter22x" more',
+    ],
+)
+def test_a_url_never_ends_on_the_backslash_of_an_escaped_quote(text: str) -> None:
+    """In a serialised leaf a URL runs up to the `\\` of the closing `\\"`; a
+    query-value span that ate it broke the JSON, and the dict came back as a
+    string (the URL axis found it; main kept such a URL when its port did not
+    parse)."""
+    result = _process({"t": text})
+    assert isinstance(result, dict), result
+    for surface, out in _both(json.dumps({"t": text})):
+        json.loads(out)
+
+
+#: The false positives each rev-9 narrowing was written for (the rev-10
+#: audit's guard list): `(text, engine, policy, dict leaf)`, `None` meaning
+#: unchanged. Four entries changed from rev 9, each commented; every other
+#: entry is exactly rev 9's output.
+_FALSE_POSITIVE_TABLE: list[tuple[str, str | None, str | None, str | None]] = [
+    ("token_type=Bearer expires_in=3600", None, None, None),
+    ('{"token_type": "Bearer"}', None, None, None),
+    ("token_type: Bearer, expires_in: 3600", None, None, None),
+    ('{"token_type":"Bearer","expires_in":3600}', None, None, None),
+    ("token_type=bearer&expires_in=3600", None, None, None),
+    ("Missing bearer token", None, None, None),
+    ("the bearer of bad news", None, None, None),
+    ('Bearer realm="api"', None, None, None),
+    ('WWW-Authenticate: Bearer realm="x", error="invalid_token"', None, None, None),
+    (
+        "token_type: Bearer\nexpires_in: 3600",
+        "token_type: Bearer\nexpires_in: 3600",
+        "token_type: Bearer\nexpires_in: 3600",
+        "token_type: [REDACTED] 3600",
+    ),
+    ("auth: Bearer", None, None, None),
+    ("scheme=Bearer scope=read", None, None, None),
+    (
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:MyDbPassword-AbCdEf",
+        None,
+        None,
+        None,
+    ),
+    (
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:prod/db/password-Xk9mQ2",
+        None,
+        None,
+        None,
+    ),
+    ("arn:aws:iam::123456789012:role/token-refresher", None, None, None),
+    ("urn:ietf:params:oauth:token-type:access_token", None, None, None),
+    ("urn:ietf:params:oauth:grant-type:token-exchange", None, None, None),
+    ("at 12:30:token expired", None, None, None),
+    ("ns:token bucket", None, None, None),
+    (
+        "token:\nthe bearer of",
+        "token:\nthe bearer of",
+        "token:\nthe bearer of",
+        "token:[REDACTED] bearer of",
+    ),
+    (
+        "token:\n  - item",
+        "token:\n  - item",
+        "token:\n  - item",
+        "token:[REDACTED]  - item",
+    ),
+    (
+        "Set the Authorization:\nheader first",
+        "Set the Authorization:\nheader first",
+        "Set the Authorization:\nheader first",
+        "Set the Authorization:[REDACTED] first",
+    ),
+    (
+        "password:\n\n- bullet",
+        "password:\n\n- bullet",
+        "password:\n\n- bullet",
+        "password:[REDACTED] bullet",
+    ),
+    (
+        "token:\n\nThe next paragraph",
+        "token:\n\nThe next paragraph",
+        "token:\n\nThe next paragraph",
+        "token:[REDACTED] next paragraph",
+    ),
+    ("Secret\n\nIngredient list", None, None, None),
+    (
+        "password:\r\n\r\nSee the docs",
+        "password:\r\n\r\nSee the docs",
+        "password:\r\n\r\nSee the docs",
+        "password:[REDACTED] the docs",
+    ),
+    ("session\n\nexpired", None, None, None),
+    ("token\n\n", None, None, None),
+    (
+        "Enter your password:\n\n> ",
+        "Enter your password:\n\n> ",
+        "Enter your password:\n\n> ",
+        "Enter your password:[REDACTED] ",
+    ),
+    (
+        "token:\n\n  - a\n  - b",
+        "token:\n\n  - a\n  - b",
+        "token:\n\n  - a\n  - b",
+        "token:[REDACTED]  - a\n  - b",
+    ),
+    ("caf\xe9 tokenizer=bert", None, None, None),
+    ("na\xefve session expired", None, None, None),
+    ("\u201ctoken\u201d bucket", None, None, None),
+    ("\u2022token bucket", None, None, None),
+    (
+        "\u5bc6\u7801 token \u8fc7\u671f",
+        "\u5bc6\u7801 token \u8fc7\u671f",
+        "\u5bc6\u7801 token \u8fc7\u671f",
+        "\u5bc6\u7801 token [REDACTED]",
+    ),
+    ("if (token === expected)", None, None, None),
+    ("if token == expected:", None, None, None),
+    # rev 10 (N1): `::` is a path -- the engine keeps it; the `token` policy default still reads `:` as its separator
+    ("token::Type", "token::Type", "token: [REDACTED]", "token: [REDACTED]"),
+    ("std::secret::Holder", None, None, None),
+    # rev 10 (N1): as `token::Type`
+    ("secret::new()", "secret::new()", "secret: [REDACTED]", "secret: [REDACTED]"),
+    ("password === confirm", None, None, None),
+    ("a::token::b", "a::token::b", "a::token: [REDACTED]", "a::token: [REDACTED]"),
+    ('password="', None, None, None),
+    (
+        'He said "token: x',
+        'He said "token: [REDACTED]',
+        'He said "token:[REDACTED]',
+        'He said "token:[REDACTED]',
+    ),
+    ('"password": "', None, None, None),
+    ("token='", None, None, None),
+    ("it's the password's fault", None, None, None),
+    ("Bearer (see RFC 6750)", None, None, None),
+    # rev 10 (N6): the inside of a bracketed Authorization value is redacted, as main redacted `[required]`
+    (
+        "Authorization: [required]",
+        "Authorization: [[REDACTED]]",
+        "Authorization: [[REDACTED]]",
+        "Authorization: [[REDACTED]]",
+    ),
+    ('authorization: {"type": "bearer"}', None, None, None),
+    ('"authorization": ["read", "write"]', None, None, None),
+    ('Bearer "realm"', None, None, None),
+    ("use the Bearer [scheme]", None, None, None),
+    # rev 10 (N6): the bracket stays; rev 9 ate the opening one
+    (
+        "Authorization: (none)",
+        "Authorization: ([REDACTED])",
+        "Authorization: ([REDACTED])",
+        "Authorization: ([REDACTED])",
+    ),
+    ("error_code=E_TIMEOUT_42", None, None, None),
+    ("status_code=HTTP_401", None, None, None),
+    ("exit_code=137", None, None, None),
+    ("zip_code=94105", None, None, None),
+    ("country_code=US", None, None, None),
+    ("lang_code=en-US", None, None, None),
+    ("response_code=ERR_42x", None, None, None),
+    ("error_code=invalid_grant", None, None, None),
+    ("-token bucket", None, None, None),
+    ("-secret santa", None, None, None),
+    ("_token ok", None, None, None),
+    ("use -session expired", None, None, None),
+    ("token-based auth", None, None, None),
+    ("password_ reset", None, None, None),
+    ("the tokenizer=bert", None, None, None),
+    ("token bucket", None, None, None),
+    ("session expired", None, None, None),
+]
+
+
+def test_the_false_positive_guard_list_holds() -> None:
+    assert (
+        len(_FALSE_POSITIVE_TABLE) == len({t for t, *_ in _FALSE_POSITIVE_TABLE}) == 71
+    )
+    assert sum(1 for _, e, *_ in _FALSE_POSITIVE_TABLE if e is None) >= 55
+    policy = PolicyManager()
+    for text, engine, pol, leaf in _FALSE_POSITIVE_TABLE:
+        assert _engine(text) == (text if engine is None else engine), text
+        assert policy.redact_secrets(text) == (text if pol is None else pol), text
+        result = policy.process_output({"t": text}, redact=True)["result"]
+        assert result == {"t": text if leaf is None else leaf}, (text, result)
+
+
+def test_sources_hold_no_literal_control_or_separator_characters() -> None:
+    """Review tooling refuses a bundle containing a transport-active control
+    character (a literal U+2028 in this file blocked every external seat on
+    plan rev 9): write such characters as escapes, in code and tests."""
+    import unicodedata
+
+    root = Path(__file__).resolve().parents[1]
+    offenders = []
+    for path in [
+        root / "src" / "pmcp" / "auth.py",
+        root / "src" / "pmcp" / "policy" / "policy.py",
+        Path(__file__),
+        Path(__file__).parent / "_redaction_grammar.py",
+    ]:
+        for lineno, line in enumerate(path.read_text("utf-8").split("\n"), 1):
+            for ch in line:
+                if (
+                    unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") and ch != "\t"
+                ) or ch == "\x85":
+                    offenders.append(f"{path.name}:{lineno}: {ch!r}")
+    assert offenders == [], offenders
 ```
 
 ## Oracle regenerator
 
-The script that recorded `tests/fixtures/redaction_main_oracle.b64` from `main`,
-verbatim (the test agent's adapted regenerator; sha256 `6a134195…aebd2`). See
-*How to apply* for the procedure.
+`tests/fixtures/regen_redaction_main_oracle.py`, verbatim from
+`origin/wip/234-redactor-rev10-code` @ `e79d75f` (committed in rev 10; sha256
+`31f5cc1f…2c36`). It replaces rev 9's scratch regenerator. See *How to apply*
+for the procedure.
 
 ```python
-"""Record main's oracle over the differential corpora. Run from a MAIN checkout:
-  PYTHONPATH=src python regen_fixture.py <rev-9 tests/test_redaction.py> <out.b64>
-Offline and deterministic (seeded corpora, gzip mtime=0, base64 wrapped at 76).
-Keys: string[i] = [engine_removed, policy_removed]; dict[i] = removed pieces of the
-serialised result; dict_types[i] / fuzz_types[i] = type name of
-process_output(obj, redact=True)['result'] for the dict and JSON-fuzz corpora."""
-import ast, base64, gzip, io, json, random, re, string, sys, uuid
+"""Record `main`'s oracle over the redaction differential corpora
+(Consiliency/pmcp#234). Run it from this checkout against a MAIN tree:
+
+  PYTHONPATH=<main checkout>/src python tests/fixtures/regen_redaction_main_oracle.py \
+      <main checkout>/src tests/fixtures/redaction_main_oracle.b64
+
+then copy the output to `.consiliency/plans/detailed-234-redactor-main-oracle.b64`
+(the two stay `cmp`-identical). Not collected by pytest.
+
+Offline and deterministic (seeded corpora, gzip mtime=0, sorted keys, base64
+wrapped at 76). Keys:
+  grammar[i]     tests/_redaction_grammar.py's observe() code for row i of
+                 corpus(2) (tier 1 is its prefix);
+  grammar_fingerprint  {"1": ..., "2": ...}: fingerprint() of each tier;
+  dict[i]        pieces main's process_output removed from the serialised
+                 result of _dict_corpus() row i;
+  dict_types[i]  / fuzz_types[i]: type name of process_output(obj)['result']
+                 for the dict and JSON-fuzz corpora.
+"""
+
+import ast
+import base64
+import gzip
+import importlib.util
+import io
+import json
+import multiprocessing
+import random
+import re
+import string
+import sys
+import uuid
+from pathlib import Path
+
 import pmcp
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.policy.policy import PolicyManager
-assert "/pmcp-234/" not in pmcp.__file__, pmcp.__file__
-tree = ast.parse(open(sys.argv[1]).read())
-FUNCS = {"_differential_corpus", "_dict_corpus", "_json_fuzz_corpus"}
+
+MAIN_SRC = str(Path(sys.argv[1]).absolute())
+assert pmcp.__file__.startswith(MAIN_SRC), (pmcp.__file__, MAIN_SRC)
+TESTS = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location(
+    "_redaction_grammar", TESTS / "_redaction_grammar.py"
+)
+G = importlib.util.module_from_spec(spec)
+assert spec is not None and spec.loader is not None
+spec.loader.exec_module(G)
+
+tree = ast.parse((TESTS / "test_redaction.py").read_text())
+FUNCS = {"_dict_corpus", "_json_fuzz_corpus"}
+
+
 def keep(n):
     if isinstance(n, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
         t = n.targets[0] if isinstance(n, ast.Assign) else n.target
         return isinstance(t, ast.Name) and t.id.startswith("_DIFF_")
     return isinstance(n, ast.FunctionDef) and n.name in FUNCS
+
+
 ns = {"random": random, "json": json, "re": re, "string": string, "uuid": uuid}
 body = [n for n in tree.body if keep(n)]
 assert {n.name for n in body if isinstance(n, ast.FunctionDef)} == FUNCS
 exec(compile(ast.Module(body=body, type_ignores=[]), "c", "exec"), ns)
-TOK = ns["_DIFF_TOKEN"]; pm = PolicyManager()
-rem = lambda a, b: sorted(set(TOK.findall(a)) - set(TOK.findall(b)))
-out = {"string": [], "dict": [], "dict_types": [], "fuzz_types": []}
-for text, *_ in ns["_differential_corpus"]():
-    out["string"].append([rem(text, sanitize_auth_diagnostic(text, max_length=None)), rem(text, pm.redact_secrets(text))])
-for obj, *_ in ns["_dict_corpus"]():
-    r = pm.process_output(obj, redact=True)["result"]
-    out["dict"].append(rem(json.dumps(obj, indent=2), r if isinstance(r, str) else json.dumps(r, indent=2)))
-    out["dict_types"].append(type(r).__name__)
-for obj in ns["_json_fuzz_corpus"]():
-    out["fuzz_types"].append(type(pm.process_output(obj, redact=True)["result"]).__name__)
-buf = io.BytesIO()
-with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as g:
-    g.write(json.dumps(out, separators=(",", ":")).encode())
-open(sys.argv[2], "w").write(base64.encodebytes(buf.getvalue()).decode())
-print("recorded from", pmcp.__file__, {k: len(v) for k, v in out.items()},
-      "dict_types", {t: out["dict_types"].count(t) for t in set(out["dict_types"])},
-      "fuzz_types", {t: out["fuzz_types"].count(t) for t in set(out["fuzz_types"])})
+TOK = ns["_DIFF_TOKEN"]
+pm = PolicyManager()
+ROWS = G.corpus(2)
+
+
+def _po(obj):
+    return pm.process_output(obj, redact=True, max_bytes=G.BIG)["result"]
+
+
+def observe(i):
+    return G.observe(
+        ROWS[i],
+        lambda t: sanitize_auth_diagnostic(t, max_length=None),
+        pm.redact_secrets,
+        _po,
+    )
+
+
+def rem(a, b):
+    return sorted(set(TOK.findall(a)) - set(TOK.findall(b)))
+
+
+if __name__ == "__main__":
+    with multiprocessing.get_context("fork").Pool(20) as pool:
+        grammar = pool.map(observe, range(len(ROWS)), chunksize=500)
+    out = {
+        "grammar": grammar,
+        "grammar_fingerprint": {
+            "1": G.fingerprint(G.corpus(1)),
+            "2": G.fingerprint(ROWS),
+        },
+        "dict": [],
+        "dict_types": [],
+        "fuzz_types": [],
+    }
+    for obj, *_ in ns["_dict_corpus"]():
+        r = pm.process_output(obj, redact=True)["result"]
+        out["dict"].append(
+            rem(
+                json.dumps(obj, indent=2),
+                r if isinstance(r, str) else json.dumps(r, indent=2),
+            )
+        )
+        out["dict_types"].append(type(r).__name__)
+    for obj in ns["_json_fuzz_corpus"]():
+        out["fuzz_types"].append(
+            type(pm.process_output(obj, redact=True)["result"]).__name__
+        )
+    buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as g:
+        g.write(json.dumps(out, sort_keys=True, separators=(",", ":")).encode())
+    Path(sys.argv[2]).write_text(base64.encodebytes(buf.getvalue()).decode())
+    print(
+        "recorded from",
+        pmcp.__file__,
+        {k: len(v) for k, v in out.items()},
+        "tier1",
+        len(G.corpus(1)),
+        "dict_types",
+        {t: out["dict_types"].count(t) for t in sorted(set(out["dict_types"]))},
+        "fuzz_types",
+        {t: out["fuzz_types"].count(t) for t in sorted(set(out["fuzz_types"]))},
+    )
+```
+
+## Grammar module
+
+`tests/_redaction_grammar.py`, verbatim from `e79d75f` (new in rev 10; sha256
+`0671e9d5…33d1`): the generator, the observation code and the accepted-class
+classifier of the grammar-derived differential. Stdlib only; it imports
+nothing from `pmcp`.
+
+```python
+"""The grammar-derived never-worse-than-main differential (Consiliency/pmcp#234, rev 10).
+
+Revs 8 and 9 each passed a differential whose axes were listed by hand from
+past findings, with zero unaccepted rows, and each was then blocked by inputs
+on an axis nobody had listed. This corpus is derived from the ORACLE's
+grammar instead -- main's rules plus what `json.dumps` emits -- so an axis
+cannot be missing because nobody thought of it.
+
+Main's rules (`main:src/pmcp/auth.py`, `main:src/pmcp/policy/policy.py`):
+
+* the keyword rule
+  `(?i)\\b[A-Za-z0-9_-]*(?:KEYS|api[_-]?key)[A-Za-z0-9_-]*[\\s:=]+[A-Za-z0-9._~+/=-]{3,}`;
+* `(?i)authorization\\s*[:=]\\s*(bearer\\s+)?[^\\s,;]+` and `(?i)\\bbearer\\s+[^\\s,;]+`;
+* the policy defaults' key words (`passwd`, `pwd`, `aws_secret`, `aws_access`);
+* `process_output(dict)`: `json.dumps(obj, indent=2)` (`ensure_ascii=True`),
+  whose escapes are `\\" \\\\ \\b \\f \\n \\r \\t` and `\\uXXXX`, and whose bare
+  scalars are `null true false`, integers, floats, `NaN` and `+-Infinity`.
+
+A text row is `pre + qual + name + suffix + sep + value`, each part drawn from
+the construct it stands for:
+
+=========  ================================================================
+axis       alphabet / grammar
+=========  ================================================================
+pre        the character before the key: none; every ASCII punctuation
+           character but the joiners (`-`, `_`); `:`; `\\`; all 29
+           `str.isspace()` characters; control characters (serialised as
+           `\\u0000 \\u0001 \\b \\u001b \\u007f`); non-ASCII letters,
+           punctuation and an astral character (serialised as `\\uXXXX` or a
+           surrogate pair); an `arn:` / `urn:` resource-name context. Each
+           optionally after the word `abc`.
+qual       main's `[A-Za-z0-9_-]*` prefix: joined (`x_`, `x-`), glued in
+           random case (1-8), glued past the 24 bound (25-32), a leading
+           joiner run (`_ - -- --- _-`), 2-10 joined segments.
+name       main's 20 keys plus the policy keys, lower / UPPER / Title /
+           rAnDoM case; 30% of name-focus rows are `code` under a
+           qualifier: a random word, a diagnostic one
+           (`DIAGNOSTIC_CODE_QUALIFIERS`, class C12) or a credential one
+           (`key otp mfa sms verification recovery invite promo coupon
+           discount api access secret`), in any case, `_`- or `-`-joined.
+suffix     main's `[A-Za-z0-9_-]*` suffix: declared (`s _id _key Key -id id
+           key`), a trailing joiner or joiner run, descriptive (`_new 2 Hash
+           _type _length ized ...`), random, and past the 24 bound.
+sep        main's `[\\s:=]+`: EVERY 1- and 2-character string over the 31
+           characters `str.isspace()` + `:` + `=`, plus sampled 3-character
+           ones; focus rows draw 1-3 characters, half operator, half space.
+value      main's value class `[A-Za-z0-9._~+/=-]{3,14}`, plain words,
+           integers, quoted, unterminated-quote, bracketed, JSON literals and
+           punctuated values.
+bearer     `bearer\\s+[^\\s,;]+` after 13 contexts (`X-Auth: `, `x=`,
+           `token: `, ...) or a random punctuation/non-ASCII/space character,
+           a 1-3 character `\\s` run, a credential optionally wrapped in
+           `"" '' () [] {} <>`.
+authz      `authorization\\s*[:=]\\s*(bearer\\s+)?[^\\s,;]+`: a prefix, 0-2
+           `\\s` characters each side of the operator, a scheme (or none, or
+           one followed by a blank line), a credential or plain value,
+           optionally wrapped.
+wrap       where the pair sits: bare; in prose (a word and one ASCII
+           punctuation or `str.isspace()` character on each side -- what
+           ends main's `\\b` and value class); or in each position of a URL
+           main's URL rule reads: path, query pair, query value, fragment.
+url        main's URL grammar itself (`https?://[^\\s"'<>]+`, trailing
+           `).,;` handed back, then `redact_auth_url`): userinfo (user,
+           user:password, :password), hosts (one whose port does not parse,
+           which makes main keep the URL as written), 0-3 query pairs whose
+           key is or is not in `AUTH_SECRET_QUERY_KEYS` (any case, optionally
+           percent-encoded) with a credential, plain, percent-encoded or
+           empty value, and a fragment (none, a word, a secret,
+           `access_token=` + a secret), in prose. The secrets are what main
+           removes.
+scalars    every scalar `json.dumps` emits under 37 keys (the 24 above plus
+           `auth credentials authorization Authorization bearer tokens
+           input_tokens max_tokens token_type Password API_KEY privateKey
+           aws_secret_access_key`), top-level, nested and in a list of
+           objects.
+=========  ================================================================
+
+Every text row is observed on 12 surfaces: `E`/`P` (`sanitize_auth_diagnostic`,
+`PolicyManager.redact_secrets`) on the raw text; `E`/`P` on each of the four
+spellings `json.dumps({"t": text}, ensure_ascii in (True, False), indent in
+(None, 2))` (`EjAC EjAI EjUC EjUI PjAC PjAI PjUC PjUI`); `process_output(text)`
+(`POs`); and `process_output({"t": text})` (`POd`, the dict-leaf path), whose
+result type is recorded too. A scalar row is observed on `POo`, with its type.
+A piece counts as present in an output as written or percent-decoded (a query
+value's `+` read as a space): main's URL rule re-encodes what it keeps, and
+a re-encoded secret is still there.
+
+Sampling density (`corpus(tier)`; tier 2 is tier 1 followed by the rest):
+
+===============  =====================================  ======================
+block            tier 1 (the default suite)             tier 2 adds (`slow`)
+===============  =====================================  ======================
+sep              the 992 1- and 2-character separators  the 992 x `secret`,
+                 x `password`, `token` x {credential,   `api_key`, `session`
+                 plain}: 3 968                          x 2, and 3 000 sampled
+                                                        3-character ones x 5
+                                                        keys x 2: 35 952
+pre              each of the 77 pre characters x        lead `abc` x 5 keys,
+                 `password`, `token` x (`=`, `: `,      no lead x 3 more
+                 ` `) x {credential, plain}: 924        keys: 3 696
+code             `code` under each of the 37 diagnostic  --
+                 and 13 credential qualifiers x (`=`,
+                 `: `) x {credential, plain}: 200
+focus:<axis>     500 per axis (pre qual name suffix     9 500 per axis:
+                 sep value wrap bearer authz url):      95 000
+                 5 000
+mix              1 000 (every axis at once, the wrap    19 000
+                 included)
+scalar           13 scalars x 37 keys x 3 shapes:       --
+                 1 443
+===============  =====================================  ======================
+
+Tier 1 is 12 535 rows; tier 2 is 166 183. A focus row varies one axis and
+keeps the others benign (no pre, qualifier, suffix or wrap; `=` or `: `; a
+credential value), so a failure is attributed to one axis; mix rows vary
+them all at once (`-password hunter22x` was found only there).
+
+How it runs: tier 1 is `test_grammar_differential_never_worse_than_main_
+except_by_stated_class` in the default suite. Tier 2 is
+`test_grammar_differential_full_set`, marked `slow`: `pytest
+tests/test_redaction.py -m slow` (about 2-3 minutes). `addopts` excludes
+`slow` by default, so CI -- which runs `pytest tests/` with `addopts` --
+does NOT run it.
+
+This module is stdlib-only and imports nothing from `pmcp`: the fixture is
+recorded by running it against `main`'s tree.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import random
+import re
+from collections.abc import Callable
+from typing import Any
+from urllib.parse import unquote
+
+# ---------------------------------------------------------------- alphabets
+
+#: Every character `str.isspace()` accepts -- Python's `\s` (pinned against a
+#: full enumeration by the axis test, not computed here: the enumeration
+#: depends on the interpreter's Unicode version).
+SPACES = (
+    "\t\n\x0b\x0c\r\x1c\x1d\x1e\x1f \x85\xa0\u1680\u2000\u2001\u2002\u2003"
+    "\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"
+)
+#: main's `[\s:=]`.
+SEP_ALPHABET = SPACES + ":="
+#: Every ASCII punctuation character but the identifier joiners `-`/`_`
+#: (the `qual` axis) and `:`/`\` (classes of their own).
+ASCII_PUNCT = "!\"#$%&'()*+,./;<=>?@[]^`{|}~"
+#: -> `\u0000 \u0001 \b \u001b \u007f` in `json.dumps` output.
+CONTROL = "\x00\x01\x08\x1b\x7f"
+#: A letter, CJK, bullet, curly quote, dash, middle dot, astral emoji (a
+#: surrogate pair when escaped), sharp s, Greek and Cyrillic.
+NON_ASCII = "\xe9\u5bc6\u2022\u201c\u2014\xb7\U0001f642\xdf\u03a9\u0418"
+#: A resource-name context: a key inside it names a resource.
+RESOURCE = ("arn:aws:secretsmanager:us-east-1:1:secret:", "urn:ietf:params:oauth:")
+PRE_CHARS: dict[str, tuple[str, ...]] = {
+    "start": ("",),
+    "ascii-punct": tuple(ASCII_PUNCT),
+    "colon": (":",),
+    "backslash": ("\\",),
+    "isspace": tuple(SPACES),
+    "control": tuple(CONTROL),
+    "non-ascii": tuple(NON_ASCII),
+    "resource": RESOURCE,
+}
+MAIN_KEYS = (
+    "access_token",
+    "api_key",
+    "api-key",
+    "apikey",
+    "assertion",
+    "client_secret",
+    "code",
+    "cookie",
+    "id_token",
+    "jwt",
+    "password",
+    "refresh_token",
+    "saml",
+    "secret",
+    "session",
+    "set-cookie",
+    "sid",
+    "tenant-id",
+    "tenant_id",
+    "token",
+)
+POLICY_KEYS = ("passwd", "pwd", "aws_secret", "aws_access")
+KEYS = MAIN_KEYS + POLICY_KEYS
+IDENT = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+MAIN_VALUE = IDENT + "._~+/=-"
+PLAIN_WORDS = (
+    "letmeinnow",
+    "expired",
+    "required",
+    "bucket",
+    "none",
+    "hunter",
+    "changeme",
+    "Basic",
+)
+DIGITS = "0123456789"
+SCALARS: dict[str, object] = {
+    "null": None,
+    "true": True,
+    "false": False,
+    "0": 0,
+    "-1": -1,
+    "2**100": 2**100,
+    "1.5": 1.5,
+    "-0.0": -0.0,
+    "1e+20": 1e20,
+    "1e-07": 1e-7,
+    "NaN": float("nan"),
+    "Infinity": float("inf"),
+    "-Infinity": float("-inf"),
+}
+SCALAR_KEYS = KEYS + (
+    "auth",
+    "credentials",
+    "authorization",
+    "Authorization",
+    "bearer",
+    "tokens",
+    "input_tokens",
+    "max_tokens",
+    "token_type",
+    "Password",
+    "API_KEY",
+    "privateKey",
+    "aws_secret_access_key",
+)
+BEARER_PRE = (
+    "",
+    "X-Auth: ",
+    "X-Auth:",
+    "x=",
+    "token: ",
+    "session=",
+    "Cookie: session=",
+    "(",
+    '"',
+    "use a ",
+    "headers: {X-Auth: ",
+    "X-Api-Token: ",
+    "auth: ",
+)
+FOCI = ("pre", "qual", "name", "suffix", "sep", "value", "wrap")
+#: main's `AUTH_SECRET_QUERY_KEYS`: the query keys `redact_auth_url` redacts
+#: (after `parse_qsl` decodes them, case-insensitively).
+MAIN_QUERY_KEYS = (
+    "access_token",
+    "api_key",
+    "apikey",
+    "auth",
+    "auth_code",
+    "authorization",
+    "bearer",
+    "client_secret",
+    "code",
+    "id_token",
+    "assertion",
+    "key",
+    "password",
+    "refresh_token",
+    "saml",
+    "secret",
+    "session",
+    "sid",
+    "ticket",
+    "token",
+    "jwt",
+)
+#: The stated diagnostic class (C12): `code` under one of these qualifiers
+#: (its last `_`/`-` segment) names a status or a descriptive code and keeps
+#: its value. Pinned equal to `pmcp.auth._STATUS_CODE_QUALIFIERS` by a test.
+DIAGNOSTIC_CODE_QUALIFIERS = frozenset(
+    {
+        "area",
+        "byte",
+        "char",
+        "color",
+        "colour",
+        "country",
+        "currency",
+        "err",
+        "errno",
+        "error",
+        "event",
+        "exception",
+        "exit",
+        "fault",
+        "http",
+        "iso",
+        "item",
+        "lang",
+        "language",
+        "locale",
+        "op",
+        "opcode",
+        "postal",
+        "product",
+        "rc",
+        "reason",
+        "region",
+        "response",
+        "result",
+        "ret",
+        "return",
+        "sku",
+        "source",
+        "sqlstate",
+        "state",
+        "status",
+        "zip",
+    }
+)
+#: Qualifiers under which `code` names a credential or a redeemable value.
+CREDENTIAL_CODE_QUALIFIERS = (
+    "key",
+    "otp",
+    "mfa",
+    "sms",
+    "verification",
+    "recovery",
+    "invite",
+    "promo",
+    "coupon",
+    "discount",
+    "api",
+    "access",
+    "secret",
+)
+EXHAUSTIVE_KEYS = ("password", "token", "secret", "api_key", "session")
+
+Row = dict[str, Any]
+
+
+def recase(rng: random.Random, word: str, how: str | None = None) -> str:
+    how = how or rng.choice(["lower", "upper", "title", "random"])
+    if how == "lower":
+        return word.lower()
+    if how == "upper":
+        return word.upper()
+    if how == "title":
+        return word[:1].upper() + word[1:]
+    return "".join(c.upper() if rng.random() < 0.5 else c.lower() for c in word)
+
+
+def cred(rng: random.Random) -> str:
+    """A credential-shaped value from main's value class: alphanumerics with a
+    digit after the first character, which is a lower-case letter."""
+    n = rng.randint(8, 16)
+    s = [rng.choice(IDENT) for _ in range(n)]
+    s[0] = rng.choice("abcdefghijkmnpqrstuvwxyz")
+    s[rng.randrange(1, n)] = rng.choice(DIGITS)
+    return "".join(s)
+
+
+def ident_run(rng: random.Random, lo: int, hi: int, joiners: bool = True) -> str:
+    alphabet = IDENT + ("_-" if joiners else "")
+    return "".join(rng.choice(alphabet) for _ in range(rng.randint(lo, hi)))
+
+
+def sep_kind(sep: str) -> str:
+    if any(c in "\r\n" for c in sep):
+        return "line-break"
+    if sep.count("=") >= 2 or sep.count(":") >= 2:
+        return "operator-run"
+    if sep.isspace():
+        return "whitespace-only"
+    return "mixed"
+
+
+def _sample_pre(rng: random.Random, focus: bool) -> tuple[str, str]:
+    if not focus:
+        return "start", ""
+    cls = rng.choice(list(PRE_CHARS))
+    lead = "" if cls == "resource" else rng.choice(["", "abc"])
+    return cls, lead + rng.choice(PRE_CHARS[cls])
+
+
+def _sample_qual(rng: random.Random, focus: bool) -> tuple[str, str]:
+    if not focus:
+        return "none", ""
+    kind = rng.choice(
+        ["joined", "glued", "glued-long", "leading-joiner", "multi-segment"]
+    )
+    if kind == "joined":
+        return kind, ident_run(rng, 1, 6, False) + rng.choice("_-")
+    if kind == "glued":
+        return kind, recase(rng, ident_run(rng, 1, 8, False))
+    if kind == "glued-long":
+        return kind, ident_run(rng, 25, 32, False)
+    if kind == "leading-joiner":
+        return kind, rng.choice(["_", "-", "--", "---", "_-"])
+    segments = rng.randint(2, 10)
+    return kind, "".join(
+        ident_run(rng, 1, 3, False) + rng.choice("_-") for _ in range(segments)
+    )
+
+
+def _sample_suffix(rng: random.Random, focus: bool) -> tuple[str, str]:
+    if not focus:
+        return "none", ""
+    kind = rng.choice(["declared", "trailing-joiner", "descriptive", "random", "long"])
+    if kind == "declared":
+        return kind, rng.choice(["s", "_id", "_key", "Key", "-id", "id", "key"])
+    if kind == "trailing-joiner":
+        return kind, rng.choice(["_", "-", "__", "_-", "--"])
+    if kind == "descriptive":
+        return kind, rng.choice(
+            [
+                "_new",
+                "_old",
+                "2",
+                "Hash",
+                "_hash",
+                "_PROD",
+                "_type",
+                "_length",
+                "ized",
+                "_value",
+            ]
+        )
+    if kind == "long":
+        return kind, "_" + ident_run(rng, 25, 30, False)
+    return kind, ident_run(rng, 1, 8)
+
+
+def _sample_sep(rng: random.Random, focus: bool) -> tuple[str, str]:
+    if not focus:
+        return "default", rng.choice(["=", ": "])
+    n = rng.choice([1, 2, 2, 3, 3])
+    sep = "".join(
+        rng.choice(":=") if rng.random() < 0.5 else rng.choice(SPACES) for _ in range(n)
+    )
+    return sep_kind(sep), sep
+
+
+def _sample_value(rng: random.Random, focus: bool) -> tuple[str, str]:
+    if not focus:
+        return "default", cred(rng)
+    kind = rng.choice(
+        [
+            "main-class",
+            "plain",
+            "number",
+            "quoted",
+            "unterminated-quote",
+            "bracketed",
+            "json-literal",
+            "punctuated",
+        ]
+    )
+    if kind == "main-class":
+        v = "".join(rng.choice(MAIN_VALUE) for _ in range(rng.randint(3, 14)))
+    elif kind == "plain":
+        v = rng.choice(PLAIN_WORDS)
+    elif kind == "number":
+        v = str(rng.randint(0, 10 ** rng.randint(1, 12)))
+    elif kind == "quoted":
+        q = rng.choice("\"'")
+        v = q + cred(rng) + q
+    elif kind == "unterminated-quote":
+        v = rng.choice("\"'") + cred(rng)
+    elif kind == "bracketed":
+        a, b = rng.choice(["()", "[]", "{}", "<>"])
+        v = a + cred(rng) + b
+    elif kind == "json-literal":
+        v = rng.choice(
+            ["null", "true", "false", "NaN", "Infinity", "-Infinity", "-0.0", "1e+20"]
+        )
+    else:
+        v = cred(rng) + rng.choice(["!", "@x", "#1", "$", "%2F", "&x", "*"])
+    return kind, v
+
+
+def _text(f: dict[str, str]) -> str:
+    return (
+        f"{f.get('left', '')}{f['pre']}{f['qual']}{f['name']}{f['suffix']}"
+        f"{f['sep']}{f['value']}{f.get('right', '')}"
+    )
+
+
+def _pct(rng: random.Random, text: str) -> str:
+    """Percent-encode one to three characters of ``text`` (as `parse_qsl`
+    decodes it)."""
+    chars = list(text)
+    for i in rng.sample(range(len(chars)), min(len(chars), rng.randint(1, 3))):
+        chars[i] = "%{:02X}".format(ord(chars[i]))
+    return "".join(chars)
+
+
+_URL_BASE = ("https://h.example", "http://h.example:8443", "https://127.0.0.1")
+
+
+def _sample_wrap(rng: random.Random, focus: bool) -> tuple[str, str, str]:
+    """Where the pair sits: bare, in prose (a word and a delimiter each side:
+    what ends main's `\\b` and value class), or in each position of a URL
+    main's URL rule reads (path, query pair, query value, fragment)."""
+    if not focus:
+        return "none", "", ""
+    kind = rng.choice(
+        [
+            "none",
+            "none",
+            "prose",
+            "prose",
+            "url-path",
+            "url-query-pair",
+            "url-query-value",
+        ]
+        + ["url-fragment"]
+    )
+    if kind == "none":  # so the mix block keeps unwrapped pairs too
+        return kind, "", ""
+    base = rng.choice(_URL_BASE)
+    if kind == "prose":
+        left = rng.choice(["", "abc", "error:", "log"]) + rng.choice(
+            ASCII_PUNCT + SPACES
+        )
+        right = rng.choice(ASCII_PUNCT + SPACES) + rng.choice(["", "tail", "x=1"])
+    elif kind == "url-path":
+        left, right = base + "/p/", rng.choice(["", "/v1", "?q=1"])
+    elif kind == "url-query-pair":
+        left = base + "/?" + rng.choice(["", "x=1&"])
+        right = rng.choice(["", "&y=2", "#f"])
+    elif kind == "url-query-value":
+        left, right = base + "/?q=", rng.choice(["", "&y=2"])
+    else:
+        left, right = base + "/#", ""
+    return kind, left, right
+
+
+def _url_row(rng: random.Random) -> Row:
+    """A URL from main's URL grammar (`https?://[^\\s"'<>]+`, trailing `).,;`
+    handed back, then `redact_auth_url`): userinfo (dropped), a host (one
+    whose port does not parse makes main keep the URL as written), query
+    pairs whose key is or is not in `AUTH_SECRET_QUERY_KEYS` (any case,
+    optionally percent-encoded) with a credential, plain, percent-encoded or
+    empty value, and a fragment (dropped). The pieces are what main removes:
+    userinfo passwords, values under a secret key, fragment secrets -- one
+    per secret, so at most five."""
+    secrets: list[str] = []
+
+    def secret(value: str) -> str:
+        secrets.append(value)
+        return value
+
+    kinds = []
+    ui = rng.choice(["none", "user", "user-pass", "pass-only"])
+    userinfo = {"none": "", "user": "user@"}.get(ui) or (
+        ("user:" if ui == "user-pass" else ":") + secret(cred(rng)) + "@"
+    )
+    if ui != "none":
+        kinds.append("userinfo")
+    host = rng.choice(
+        ["h.example", "h.example:8443", "127.0.0.1", "[::1]", "h.example:99999"]
+    )
+    path = rng.choice(["", "/", "/v1/items", "/cb"])
+    pairs = []
+    for _ in range(rng.randint(0, 3)):
+        key_kind = rng.choice(["secret", "secret", "secret-encoded", "other"])
+        if key_kind == "other":
+            key = rng.choice(["q", "page", "access", "next", "redirect", "u"])
+        else:
+            key = recase(rng, rng.choice(MAIN_QUERY_KEYS))
+            if key_kind == "secret-encoded":
+                key = _pct(rng, key)
+        value_kind = rng.choice(["cred", "plain", "encoded", "empty"])
+        value = {
+            "cred": cred(rng),
+            # a non-secret key's plain value never repeats a secret's word,
+            # or a kept `redirect=Basic` would read as a kept secret `Basic`
+            "plain": rng.choice(
+                PLAIN_WORDS if key_kind != "other" else ("home", "en", "2")
+            ),
+            "encoded": _pct(rng, cred(rng)),
+            "empty": "",
+        }[value_kind]
+        if key_kind != "other" and value:
+            secret(value)
+        kinds.append(f"query-{key_kind}-{value_kind}")
+        pairs.append(f"{key}={value}")
+    query = ("?" + "&".join(pairs)) if pairs else rng.choice(["", "?"])
+    fragment = rng.choice(["", "#top", "#access_token=", "#"])
+    if fragment in ("#access_token=", "#"):
+        fragment += secret(cred(rng))
+        kinds.append("fragment")
+    left = rng.choice(["", "GET ", "see ", "(", '"', "url="])
+    right = rng.choice(["", ".", ")", ",", ";", " failed", '"'])
+    text = f"{left}{rng.choice(['http', 'https'])}://{userinfo}{host}{path}{query}{fragment}{right}"
+    return {
+        "block": "focus:url",
+        "bucket": "url",
+        "kinds": kinds,
+        "f": None,
+        "t": text,
+        "value": " ".join(secrets),
+        # one piece per secret: the longest run of an encoded one
+        "pieces": [max(PIECE_RE.findall(v) or [v], key=len) for v in secrets],
+    }
+
+
+def _text_row(rng: random.Random, focus: str | None, block: str) -> Row:
+    pre_k, pre = _sample_pre(rng, focus == "pre")
+    qual_k, qual = _sample_qual(rng, focus == "qual")
+    name_k = "case" if focus == "name" else "lower"
+    name = rng.choice(KEYS)
+    if focus == "name" and rng.random() < 0.3:
+        name = "code"
+        name_k = rng.choice(["code-qualified", "code-diagnostic", "code-credential"])
+        if name_k == "code-diagnostic":
+            word = rng.choice(sorted(DIAGNOSTIC_CODE_QUALIFIERS))
+        elif name_k == "code-credential":
+            word = rng.choice(CREDENTIAL_CODE_QUALIFIERS)
+        else:
+            word = ident_run(rng, 2, 10, False)
+        qual = recase(rng, word, rng.choice(["lower", "upper", "title"])) + rng.choice(
+            "_-"
+        )
+    if focus == "name" and name_k == "case":
+        name = recase(rng, name)
+    suf_k, suffix = _sample_suffix(rng, focus == "suffix")
+    sep_k, sep = _sample_sep(rng, focus == "sep")
+    val_k, value = _sample_value(rng, focus == "value")
+    wrap_k, left, right = _sample_wrap(rng, focus == "wrap")
+    kinds = {
+        "wrap": wrap_k,
+        "pre": pre_k,
+        "qual": qual_k,
+        "name": name_k,
+        "suffix": suf_k,
+        "sep": sep_k,
+        "value": val_k,
+    }
+    f = {
+        "pre": pre,
+        "qual": qual,
+        "name": name,
+        "suffix": suffix,
+        "sep": sep,
+        "value": value,
+        "left": left,
+        "right": right,
+    }
+    bucket = f"{focus}:{kinds[focus]}" if focus in kinds else block
+    return {"block": block, "bucket": bucket, "f": f, "t": _text(f), "value": value}
+
+
+def _mix_row(rng: random.Random) -> Row:
+    row = _text_row(rng, None, "mix")
+    for focus in FOCI:
+        other = _text_row(rng, focus, "mix")["f"]
+        for part in ("left", "right") if focus == "wrap" else (focus,):
+            row["f"][part] = other[part]
+    row["t"] = _text(row["f"])
+    row["value"] = row["f"]["value"]
+    row["bucket"] = "mix"
+    return row
+
+
+def _bearer_row(rng: random.Random) -> Row:
+    pre = rng.choice(list(BEARER_PRE) + [rng.choice(ASCII_PUNCT + NON_ASCII + SPACES)])
+    ws = "".join(rng.choice(SPACES) for _ in range(rng.randint(1, 3)))
+    v = cred(rng)
+    wrap = rng.choice(["", "", "", '""', "''", "()", "[]", "{}", "<>"])
+    val = (wrap[0] + v + wrap[1]) if wrap else v
+    if pre.rstrip().endswith((":", "=")):
+        kind = "after-:/="
+    elif any(c in "\r\n" for c in ws):
+        kind = "line-break"
+    else:
+        kind = "wrapped-value" if wrap else "plain-context"
+    f = {
+        "pre": pre,
+        "qual": "",
+        "name": recase(rng, "bearer"),
+        "suffix": "",
+        "sep": ws,
+        "value": val,
+    }
+    return {
+        "block": "focus:bearer",
+        "bucket": f"bearer:{kind}",
+        "f": f,
+        "t": _text(f),
+        "value": v,
+    }
+
+
+def _authz_row(rng: random.Random) -> Row:
+    pre = rng.choice(["", "", "Proxy-", "x", "(", '"', "X-"])
+    ws1 = "".join(rng.choice(SPACES) for _ in range(rng.choice([0, 0, 1, 2])))
+    ws2 = "".join(rng.choice(SPACES) for _ in range(rng.choice([0, 1, 1, 2])))
+    scheme = rng.choice(
+        ["", "", "Bearer ", "bearer\t", "Basic ", "Token ", "Bearer\n\n"]
+    )
+    v = cred(rng) if rng.random() < 0.7 else rng.choice(PLAIN_WORDS)
+    wrap = rng.choice(["", "", "", '""', "''", "()", "[]", "{}"])
+    val = (wrap[0] + v + wrap[1]) if wrap else v
+    sep = ws1 + rng.choice(":=") + ws2
+    if any(c in "\r\n" for c in sep + scheme):
+        kind = "line-break"
+    else:
+        kind = "wrapped-value" if wrap else "scheme" if scheme else "plain"
+    f = {
+        "pre": pre,
+        "qual": "",
+        "name": recase(rng, "authorization"),
+        "suffix": "",
+        "sep": sep + scheme,
+        "value": val,
+    }
+    return {
+        "block": "focus:authz",
+        "bucket": f"authorization:{kind}",
+        "f": f,
+        "t": _text(f),
+        "value": v,
+    }
+
+
+def _fixed_row(block: str, bucket: str, value: str, **parts: str) -> Row:
+    f = {
+        "pre": "",
+        "qual": "",
+        "name": "password",
+        "suffix": "",
+        "sep": "=",
+        "value": value,
+    }
+    f.update(parts)
+    return {"block": block, "bucket": bucket, "f": f, "t": _text(f), "value": value}
+
+
+def _sep_rows(rng: random.Random, seps: list[str], keys: tuple[str, ...]) -> list[Row]:
+    return [
+        _fixed_row("sep", f"sep:{sep_kind(sep)}", v, name=k, sep=sep)
+        for sep in seps
+        for k in keys
+        for v in (cred(rng), rng.choice(PLAIN_WORDS))
+    ]
+
+
+def _pre_rows(
+    rng: random.Random, leads: tuple[str, ...], keys: tuple[str, ...]
+) -> list[Row]:
+    return [
+        _fixed_row("pre", f"pre:{cls}", v, pre=lead + ch, name=k, sep=sep)
+        for cls, chars in PRE_CHARS.items()
+        for ch in chars
+        for lead in (("",) if cls == "resource" else leads)
+        for k in keys
+        for sep in ("=", ": ", " ")
+        for v in (cred(rng), rng.choice(PLAIN_WORDS))
+    ]
+
+
+def _code_rows(rng: random.Random) -> list[Row]:
+    """`code` under every diagnostic and every credential qualifier, with a
+    credential and a plain value, after `=` and `: `."""
+    return [
+        _fixed_row("code", f"code:{kind}", v, qual=word + "_", name="code", sep=sep)
+        for kind, words in (
+            ("diagnostic", sorted(DIAGNOSTIC_CODE_QUALIFIERS)),
+            ("credential", CREDENTIAL_CODE_QUALIFIERS),
+        )
+        for word in words
+        for sep in ("=", ": ")
+        for v in (cred(rng), rng.choice(PLAIN_WORDS))
+    ]
+
+
+def _scalar_rows() -> list[Row]:
+    rows = []
+    for sname, s in SCALARS.items():
+        for k in SCALAR_KEYS:
+            for shape in ("top", "nested", "list"):
+                if shape == "top":
+                    obj: object = {k: s}
+                elif shape == "nested":
+                    obj = {"a": 1, "x": {k: s, "n": 2}}
+                else:
+                    obj = {"items": [{"id": 1, k: s}, {"id": 2}]}
+                rows.append(
+                    {
+                        "block": "scalar",
+                        "bucket": f"scalar:{sname}",
+                        "f": None,
+                        "o": obj,
+                        "value": None,
+                    }
+                )
+    return rows
+
+
+def _focus_rows(rng: random.Random, per_axis: int) -> list[Row]:
+    rows = []
+    for focus in FOCI:
+        rows += [_text_row(rng, focus, f"focus:{focus}") for _ in range(per_axis)]
+    rows += [_bearer_row(rng) for _ in range(per_axis)]
+    rows += [_authz_row(rng) for _ in range(per_axis)]
+    rows += [_url_row(rng) for _ in range(per_axis)]
+    return rows
+
+
+PAIRS = list(SEP_ALPHABET) + [a + b for a in SEP_ALPHABET for b in SEP_ALPHABET]
+BLOCKS = (
+    ("sep", "pre", "code")
+    + tuple(f"focus:{f}" for f in (*FOCI, "bearer", "authz", "url"))
+    + ("mix", "scalar")
+)
+
+
+def corpus(tier: int) -> list[Row]:
+    """Tier 1 (the default suite), or tier 2: tier 1 followed by the rest."""
+    rng = random.Random(2026_09_26)
+    rows = _sep_rows(rng, PAIRS, ("password", "token"))
+    rows += _pre_rows(rng, ("",), ("password", "token"))
+    rows += _code_rows(rng)
+    rows += _focus_rows(rng, 500)
+    rows += [_mix_row(rng) for _ in range(1000)]
+    rows += _scalar_rows()
+    if tier == 1:
+        return rows
+    rng = random.Random(2026_09_27)
+    triples = ["".join(rng.choice(SEP_ALPHABET) for _ in range(3)) for _ in range(3000)]
+    rows += _sep_rows(rng, PAIRS, ("secret", "api_key", "session"))
+    rows += _sep_rows(rng, triples, EXHAUSTIVE_KEYS)
+    rows += _pre_rows(rng, ("",), ("secret", "api_key", "session"))
+    rows += _pre_rows(rng, ("abc",), EXHAUSTIVE_KEYS)
+    rows += _focus_rows(rng, 9500)
+    rows += [_mix_row(rng) for _ in range(19000)]
+    return rows
+
+
+def fingerprint(rows: list[Row]) -> str:
+    """A digest of the rows as written: the fixture records the digest of the
+    corpus it was recorded over, so a corpus change without a new fixture
+    fails instead of comparing rows against another row's oracle."""
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(repr(row.get("t", row.get("o"))).encode("utf-8", "surrogatepass"))
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+# ------------------------------------------------------------ observation
+
+#: The pieces of a value that count as the secret: main's value class, 3+.
+PIECE_RE = re.compile(r"[A-Za-z0-9_.+/~=-]{3,}")
+TEXT_SURFACES = (
+    "E",
+    "P",
+    "EjAC",
+    "EjAI",
+    "EjUC",
+    "EjUI",
+    "PjAC",
+    "PjAI",
+    "PjUC",
+    "PjUI",
+    "POs",
+    "POd",
+)
+SERIALISED = frozenset(TEXT_SURFACES[2:10] + ("POd", "POo"))
+_DIGITS32 = "0123456789abcdefghijklmnopqrstuv"
+_SPELLINGS = (
+    ("AC", True, None),
+    ("AI", True, 2),
+    ("UC", False, None),
+    ("UI", False, 2),
+)
+BIG = 10**7
+
+
+def pieces(row: Row) -> list[str]:
+    if "pieces" in row:
+        return list(row["pieces"])
+    return PIECE_RE.findall(row["value"]) if row["value"] else []
+
+
+def observe(
+    row: Row,
+    engine: Callable[[str], str],
+    redact_secrets: Callable[[str], str],
+    process_output: Callable[[object], object],
+) -> str:
+    """What survives on each surface, as one base-32 digit per surface (bit i:
+    piece i is still in the output, as written or percent-decoded -- main's
+    URL rule re-encodes what it keeps, which is not a removal) and a final type letter for the dict
+    path (`d` dict, `s` str). A piece's spelling is the same on every surface:
+    nothing in `PIECE_RE`'s alphabet is escaped by `json.dumps`."""
+    ps = pieces(row)
+    assert len(ps) <= 5, ps
+
+    def mask(out: str) -> str:
+        decoded = unquote(out)
+        return _DIGITS32[
+            sum(
+                1 << i
+                for i, p in enumerate(ps)
+                # a query value's `+` is a space once decoded
+                if p in out or p in decoded or p.replace("+", " ") in decoded
+            )
+        ]
+
+    def po(obj: object) -> tuple[str, str]:
+        r = process_output(obj)
+        if isinstance(r, str):
+            return "s", r
+        return ("d" if isinstance(r, dict) else "o"), json.dumps(r, indent=2)
+
+    if "o" in row:
+        kind, out = po(row["o"])
+        return mask(out) + kind
+    t = row["t"]
+    outs = [engine(t), redact_secrets(t)]
+    dumped = [json.dumps({"t": t}, ensure_ascii=a, indent=i) for _, a, i in _SPELLINGS]
+    outs += [engine(d) for d in dumped] + [redact_secrets(d) for d in dumped]
+    outs.append(po(t)[1])
+    kind, out = po({"t": t})
+    outs.append(out)
+    return "".join(mask(o) for o in outs) + kind
+
+
+def worse_surfaces(row: Row, main: str, here: str) -> list[str]:
+    """The surfaces where `here` keeps a piece `main` removed, and `POd.type`
+    / `POo.type` where main's result was a dict and this one's is not."""
+    names = ("POo",) if "o" in row else TEXT_SURFACES
+    worse = [s for s, m, h in zip(names, main, here) if int(h, 32) & ~int(m, 32)]
+    if main[-1] == "d" and here[-1] != "d":
+        worse.append(names[-1] + ".type")
+    return worse
+
+
+def removed_by_main(row: Row, main: str) -> bool:
+    """The positive control: main removed some piece on some surface."""
+    full = (1 << len(pieces(row))) - 1
+    return any(int(m, 32) != full for m in main[:-1])
+
+
+# ---------------------------------------------------- the accepted classes
+
+
+def _plain(value: str) -> bool:
+    v = value.strip("\"'").rstrip(".:!?")
+    return bool(
+        re.fullmatch(r"[A-Za-z_]+", v)
+        or re.fullmatch(r"[+-]?[0-9]+|0[xX][0-9a-fA-F]+", v)
+    )
+
+
+def credential(value: str) -> bool:
+    """D2, restated: not a plain word or number, and digit-bearing and 6+
+    characters or punctuated and 8+."""
+    value = value.strip("\"'")
+    if _plain(value):
+        return False
+    return len(value) >= (6 if any(c.isdigit() for c in value) else 8)
+
+
+_DECLARED = frozenset(
+    {
+        "access_token",
+        "api_key",
+        "apikey",
+        "api-key",
+        "assertion",
+        "auth",
+        "aws_access",
+        "aws_secret",
+        "client_secret",
+        "code",
+        "cookie",
+        "credential",
+        "credentials",
+        "id_token",
+        "jwt",
+        "passwd",
+        "password",
+        "private_key",
+        "privatekey",
+        "private-key",
+        "pwd",
+        "refresh_token",
+        "saml",
+        "secret",
+        "secret_access_key",
+        "session",
+        "set-cookie",
+        "sid",
+        "tenant-id",
+        "tenant_id",
+        "token",
+    }
+)
+_WEAK = frozenset({"code", "auth", "credential", "credentials"})
+
+
+def _declared(name: str, suffix: str) -> bool:
+    if (name + suffix).lower() in _DECLARED:
+        return True
+    return (
+        bool(re.fullmatch(r"[_-]?(?:id|key)|s", suffix.lower()))
+        and name.lower() in _DECLARED
+    )
+
+
+def _single_case(word: str) -> bool:
+    word = word.lstrip("-_")
+    return (
+        word.isupper() or word.islower() or (word[:1].isupper() and word[1:].islower())
+    )
+
+
+def _acronym_title(word: str) -> bool:
+    return re.fullmatch(r"[A-Z0-9]{1,8}[A-Z][a-z]+", word.lstrip("-_")) is not None
+
+
+def _inner_key(name: str, suffix: str) -> bool:
+    """The key as written holds another secret-key word that starts inside the
+    written name and ends inside the suffix (`aws_access` + `id` holds
+    `sid`): main's containing match read that inner key."""
+    word = (name + suffix).lower()
+    for key in KEYS:
+        start = word.find(key, 1)
+        while start != -1:
+            if start < len(name) < start + len(key):
+                return True
+            start = word.find(key, start + 1)
+    return False
+
+
+#: The stated classes (Consiliency/pmcp#234 rev 10: the audit's accept list
+#: and the maintainer's four decisions). Each is decided from the row as
+#: written -- `pre`, `qual`, `name`, `suffix`, `sep`, `value` -- and the
+#: surface it is read on (a serialisation is a wrap), never from any output.
+CLASSES = {
+    "N3": "a glued prefix or a suffix of more than 24 alphanumerics: an identifier, not a key (a cost bound)",
+    "N10": "a key inside an `arn:`/`urn:` resource name names a resource",
+    "C3a": "`code` never fires on a whitespace-only separator",
+    "C3": "a whitespace-only separator with a non-credential-shaped value (D2)",
+    "N11": "a `name=value` token after a keyword and whitespace is its own pair",
+    "N4": "a glued mixed-case key before whitespace is an identifier, not a key (`Ed25519PrivateKey X509Cert`, `gby3zPassword x`)",
+    "N4c": "the key as written holds another key word starting inside the written name (`aws_accessid` holds `sid`)",
+    "C4": "an operator run holding `==` or `::` with a non-credential-shaped value is a comparison or a path",
+    "C5": "a suffixed key with a non-credential-shaped value names metadata",
+    "C6": "a glued key (no joiner before the name, any case) counts only with a credential-shaped value that is not a URL or ARN",
+    "C7": "after an unquoted key a value starting on `,`/`}` is JSON structure",
+    "C8": "a separator whose last line break is unindented, with a non-credential-shaped unquoted value, ends a sentence",
+    "N6b": "a quoted value on a serialised surface is JSON inside a leaf (Consiliency/pmcp#290)",
+    "C10": "a weak key keeps a plain word or number; `code` under a non-OAuth qualifier keeps any non-credential-shaped value (N8's gate)",
+    "C11": "`Authorization`/`Bearer` followed by a plain word, bare or wrapped in quotes or brackets, is prose",
+    "C12": "a `code` key qualified by a diagnostic or descriptive word (`DIAGNOSTIC_CODE_QUALIFIERS`, the qualifier's last segment) keeps its value (`error_code=E_TIMEOUT_42`, `sqlstate_code=42P01`)",
+}
+
+
+def accepted(f: dict[str, str], surface: str) -> str | None:
+    """The accepted class of a (row, surface) this redactor is worse on than
+    main, or None: a defect."""
+    pre, qual, name, suffix = f["pre"], f["qual"], f["name"], f["suffix"]
+    pre = f.get("left", "") + pre  # the wrap's text before the pair
+    glue_m = re.search(r"[A-Za-z0-9]*$", pre)
+    full_qual = (glue_m.group(0) if glue_m else "") + qual
+    sep, value = f["sep"], f["value"]
+    lead_m = re.match(r"[:=]*", value)
+    lead = lead_m.group(0) if lead_m else ""
+    sep, value = sep + lead, value[len(lead) :] or value
+    lname = name.lower()
+    cred = credential(value)
+    glued_run = re.search(r"[A-Za-z0-9]*$", full_qual)
+    glued = glued_run.group(0) if glued_run else ""
+    key = glued + name + suffix
+    if len(glued) > 24 or sum(c.isalnum() for c in suffix) > 24:
+        return "N3"
+    if re.search(r"\b[au]rn:[^\s\"'<>]*$", pre, re.IGNORECASE):
+        return "N10"
+    if lname == "code" and re.split(r"[_-]", full_qual.strip("_-").lower())[-1] in (
+        DIAGNOSTIC_CODE_QUALIFIERS
+    ):
+        return "C12"
+    if sep.isspace():
+        if lname == "code":
+            return "C3a"
+        if not cred:
+            return "C3"
+        # the value as written runs on into the wrap (`x=1`, `=tail`)
+        if re.match(r"[A-Za-z_-]+=[^=]", value + f.get("right", "")):
+            return "N11"
+        if glued and not _single_case(key) and not _acronym_title(key):
+            return "N4"
+    if ("==" in sep or "::" in sep) and not cred:
+        return "C4"
+    if suffix and not _declared(name, suffix) and not cred:
+        return "C5"
+    if glued and (not cred or "://" in value or value.lower().startswith("arn:")):
+        return "C6"
+    if not sep.startswith('"') and value.startswith((",", "}")):
+        return "C7"
+    if (
+        re.search(r"[\r\n][^ \t\xa0]*$", sep)
+        and not value.startswith(('"', "'"))
+        and not cred
+    ):
+        return "C8"
+    if surface in SERIALISED and re.match(
+        r"(?:(?:bearer|basic|digest|negotiate|ntlm|token)\s+)?\"", value, re.IGNORECASE
+    ):
+        return "N6b"
+    if surface in SERIALISED and '\\"' in sep:
+        return "N6b"
+    if lname in _WEAK and (not suffix or _declared(name, suffix)):
+        if _plain(value):
+            return "C10"
+        qualifier = full_qual.strip("_-").lower()
+        if lname == "code" and qualifier not in _OAUTH_QUALIFIERS and not cred:
+            return "C10"
+    if lname in ("authorization", "bearer") and _plain(_unwrap(value)):
+        return "C11"
+    if _inner_key(name, suffix):
+        return "N4c"
+    return None
+
+
+_OAUTH_QUALIFIERS = frozenset({"", "auth", "authorization", "oauth", "device", "user"})
+
+
+def _unwrap(value: str) -> str:
+    if len(value) >= 2 and value[0] + value[-1] in ('""', "''", "()", "[]", "{}", "<>"):
+        return value[1:-1]
+    return value
+```
+
+## pyproject.toml change
+
+`git diff 9ca081e origin/wip/234-redactor-rev10-code -- pyproject.toml`,
+verbatim (the `slow` marker, excluded by default; `pyproject.toml` is unchanged
+between `9ca081e` and today's `main`).
+
+```diff
+diff --git a/pyproject.toml b/pyproject.toml
+index 500a26d..9b3dc88 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -146,7 +146,7 @@ artifacts = ["src/pmcp/manifest/_npm_resolve.js"]
+ [tool.pytest.ini_options]
+ asyncio_mode = "auto"
+ testpaths = ["tests"]
+-addopts = "-m 'not live'"
++addopts = "-m 'not live and not slow'"
+ # Consiliency/pmcp#200 -- diagnostics for the intermittent runtime hang. Five
+ # `test (3.x)` jobs in the week to 2026-09-01 stalled and were killed by the
+ # job's `timeout-minutes: 25`; GitHub reports a timed-out job as *cancelled*,
+@@ -186,6 +186,7 @@ timeout = 700
+ timeout_method = "signal"
+ markers = [
+     "live: opt-in live integration tests (require network and package managers)",
++    "slow: opt-in long-running tests (the full grammar-derived redaction differential; run with -m slow)",
+     "timeout(seconds): expected maximum runtime for slow opt-in tests",
+     "real_cwd: run from the invocation directory, opting out of the autouse isolate_cwd fixture (only for tests whose subject IS the working directory)",
+ ]
 ```
 
 ## Documentation impact
@@ -5325,6 +7934,11 @@ print("recorded from", pmcp.__file__, {k: len(v) for k, v in out.items()},
   written; `sanitize_public_auth_url`/elicitation URLs keep `main`'s form.
 - SECURITY.md's key list (line 120-122) should name the widened set, or
   refer to `AUTH_DIAGNOSTIC_SECRET_KEYS` / `WEAK_SECRET_KEYS` — implementer.
+- `pyproject.toml` gains a `slow` pytest marker, excluded by default in
+  `addopts` (`-m 'not live and not slow'`); CI runs `pytest tests/` with
+  `addopts`, so it does not run the slow tier (decision 7). CONTRIBUTING or
+  the test docs should say `pytest tests/test_redaction.py -m slow` runs
+  it — implementer.
 - No README change: operators see the same `[REDACTED]` marker; the
   `redaction.patterns` policy key is unchanged in shape (operators who set their
   own patterns still displace the defaults, including the fixed `token` one).
@@ -5337,7 +7951,10 @@ print("recorded from", pmcp.__file__, {k: len(v) for k, v in out.items()},
 2. `src/pmcp/policy/policy.py` — `_REDACTION_WINDOW_SLACK`, the defaults,
    `truncate_output`, `_truncation_marker`, `_pattern_matches`,
    `redaction_spans`, `redact_secrets`, `process_output`.
-3. `tests/test_redaction.py` from `## Test bodies`, and
+3. `tests/test_redaction.py` from `## Test bodies`,
+   `tests/_redaction_grammar.py` from `## Grammar module`,
+   `tests/fixtures/regen_redaction_main_oracle.py` from
+   `## Oracle regenerator`, the `pyproject.toml` marker diff, and
    `tests/fixtures/redaction_main_oracle.b64` copied from
    `.consiliency/plans/detailed-234-redactor-main-oracle.b64`.
 4. `uv run pytest tests/test_redaction.py tests/test_auth.py tests/test_policy.py tests/test_project_source_consent_policy.py tests/test_trust_boundaries_e2e.py`
@@ -5349,24 +7966,34 @@ print("recorded from", pmcp.__file__, {k: len(v) for k, v in out.items()},
 
 ```bash
 cd <worktree>
-uv run pytest tests/test_redaction.py -q --cov-fail-under=0                      # 306 passed
+uv run pytest tests/test_redaction.py -q --cov-fail-under=0                      # 472 passed, 15 deselected (slow)
 uv run pytest tests/test_auth.py -q --cov-fail-under=0                           # 128 passed, file byte-identical to main
 uv run pytest tests/test_policy.py tests/test_project_source_consent_policy.py \
               tests/test_trust_boundaries_e2e.py -q --cov-fail-under=0           # C-13 proofs + truncation pins
-uv run pytest --collect-only -q tests/test_redaction.py | grep -c '::'            # 306 (a -k that matches nothing exits 0)
+uv run pytest --collect-only -q tests/test_redaction.py | grep -c '::'            # 472 (a -k that matches nothing exits 0)
+# tier 2 of the grammar differential -- the `slow` marker; NOT run by CI (decision 7):
+uv run pytest tests/test_redaction.py -m slow -q --cov-fail-under=0               # 15 passed, ~3 min (-m on the command line overrides addopts)
 uv run ruff check src/ tests/                                                     # CI gate
 uv run ruff format --check src/ tests/                                            # CI gate
 uv run mypy src/                                                                  # CI gate -- measured: Success: no issues found in 49 source files
 uv run python3 scripts/check_security_claims.py                                   # after the SECURITY.md edit
 uv run python3 scripts/check_plan_consistency.py plans/phase-plan-v13-*.md        # blocking inconsistencies: 0
 # full suite -- as a background task that notifies on exit (never `nohup … & disown`,
-# which notifies no one); npm env vars unset; ~4 400 tests, ~8 min
-uv run pytest tests/ -q -m 'not live' > <scratch>/pmcp-234-full.log 2>&1; echo EXIT=$? >> <scratch>/pmcp-234-full.log
+# which notifies no one); npm env vars unset; ~4 500 tests, ~10 min. Plain `pytest tests/`
+# uses addopts (`not live and not slow`); `-m 'not live'` on the command line REPLACES
+# addopts and so also runs the 15 slow cases.
+uv run pytest tests/ -q > <scratch>/pmcp-234-full.log 2>&1; echo EXIT=$? >> <scratch>/pmcp-234-full.log
 tail -n 3 <scratch>/pmcp-234-full.log
 ```
 
-Measured on the rev-9 code (`origin/wip/234-redactor-rev9-code` @ `8e7d98c`,
-a scratch worktree): `test_redaction.py` **306 passed** (~10 s);
+Measured on the rev-10 code (`origin/wip/234-redactor-rev10-code` @
+`e79d75f`, a scratch worktree): `test_redaction.py` **472 passed, 15
+deselected** (21 s); the slow tier **15 passed in 195 s**; `test_auth.py`
+(unmodified) **128 passed**; the five targeted files **658 passed, 15
+deselected**; `ruff check`, `ruff format --check` clean; `mypy src/`
+**Success: no issues found in 49 source files**. Full suite: see
+Unverified. Rev 9 (history): on
+`8e7d98c`, `test_redaction.py` **306 passed** (~10 s);
 `test_auth.py` (unmodified) **128 passed**; the five targeted files above
 together **492 passed**; `ruff check` and `ruff format --check` on
 `src/ tests/` clean; `mypy src/` **Success: no issues found in 49 source
@@ -5387,6 +8014,11 @@ tests/test_project_source_consent_policy.py tests/test_trust_boundaries_e2e.py`
 collected): **4136 passed, 3 skipped, 25 deselected in 11:20**.
 
 ## Mutation evidence
+
+> **Rev 10.** The 21 rev-10 mutants, each run over the whole default-tier
+> file, are in "Mutants" under the rev-10 section (all killed). The rows
+> below (rev 9's seven round-3 mutants, D1, D2, Q1-Q3, and M01-M38) were
+> **not re-run on rev 10**; their evidence is the revision named with each.
 
 Each mutation was applied to the revised tree with a scripted single-occurrence
 text replacement, **confirmed applied** by `diff -u` against the scratchpad
@@ -5616,24 +8248,40 @@ Rev 7's final run, all 35 rows:
       at `max_bytes=300` contains no `hunter2`; a 4 000-char value straddling
       the cap is `[REDACTED]` (`test_truncation_after_a_backslash_cannot_expose_a_password`,
       `test_the_redaction_window_reaches_past_the_cap`); M26 and M19 red.
-- [ ] **Differential.** `test_differential_against_main_never_worse_except_by_stated_class`:
-      8 000 rows, 0 unaccepted; the accepted classes and counts match the
-      rev-9 table in this plan (1 792 row-surfaces, 10 classes); > 1 500 rows
-      where rev 9 removes more than `main` (measured 1 902);
-      `test_the_differential_corpus_covers_every_axis` green (every stated
-      axis generated).
+- [ ] **Grammar differential (rev 10; replaces rev 9's hand-listed
+      differential).** `test_grammar_differential_never_worse_than_main_except_by_stated_class`
+      (tier 1, 12 535 rows × 12 surfaces): 0 unaccepted, the oracle's
+      fingerprint equal to the corpus's, the positive control above 85 % of
+      text rows (measured 10 070 of 11 070); `test_grammar_differential_full_set`
+      (`-m slow`, 15 blocks, 166 183 rows): 0 unaccepted;
+      `test_the_grammar_corpus_covers_every_axis` green. Every row of tables
+      A and B is ⊇ or names its class; the class counts match the rev-10
+      table. The slow tier is run by the implementer before merge (it is
+      not in CI).
+- [ ] **Rev 10 findings.** Each named test green, each red on rev 9
+      (157 red nodes in 21 functions): F1-F5, F8, F9, N1, N2, N4b, N5,
+      N6/N7, N8 (including `key_code` redacted, decision 5), N9, the
+      escaped-space and policy-default F3 tests, the URL backslash; the
+      scalar rows unchanged (decision 1); the 71-string false-positive
+      guard list holds; the 21 mutants killed.
+- [ ] **No literal control or separator characters** in the sources
+      (`test_sources_hold_no_literal_control_or_separator_characters`) or
+      in this plan (categories Cc, Cf, Zl, Zp except tab and newline, and
+      U+0085: 0).
+- [ ] `test_the_differential_corpus_covers_every_axis` (rev 9's string
+      corpus, still generated for the JSON-validity test) green.
 - [ ] **Dict differential.** `test_differential_on_structured_results_never_worse_than_main`:
       800 dict results through `process_output(dict, redact=True)`, 0
       unaccepted; wherever `main`'s result is a dict (the oracle's
-      `dict_types`, 786 of 800) rev 9's is a dict too (measured: dict → dict
-      786, str → dict 14, dict → str 0).
+      `dict_types`, 786 of 800) rev 10's is a dict too (measured on rev 10:
+      dict → dict 786, str → dict 14, dict → str 0).
 - [ ] **JSON fuzz.** `test_property_json_fuzz_keeps_documents_and_dicts`:
       seed 7, 1 500 objects × 4 serialisations; every document without `\"`
       (> 3 000; measured 3 272) still parses on both surfaces, and
       `process_output` returns a dict wherever `main` did (1 181 objects).
 - [ ] **Rev 9 board classes.** Each named test green, each red on rev 8:
-      B1 (`{"token": 42}` → `{"token": "[REDACTED]"}`, `null`/`true`/`false`
-      kept), B2, B3 (`db.password=`), B4 (`AccessToken=`), B5 (all 27
+      B1 (`null`/`true`/`false` kept; since rev 10 every bare scalar is
+      kept, decision 1, so `{"token": 42}` is unchanged), B2, B3 (`db.password=`), B4 (`AccessToken=`), B5 (all 27
       non-line-break `str.isspace()` characters), N1-N4 (`"a_" * 33000`
       under 2 s), G1 (`password == hunter2` redacted, `if token ==
       expected:` kept), C2, C4, C6, C7, the policy defaults, list straddle,
@@ -5735,7 +8383,25 @@ Rev 7's final run, all 35 rows:
 
 ## Unverified
 
-- **Full suite: verified.** rev 9: **4370 passed, 3 skipped, 25 deselected in 459.38s (0:07:39)**, `DONE-EXIT=0`, `-m 'not live'`, run by the coordinator on `8e7d98c` (the log names no tree; the count is consistent with +157 tests over rev 8). `ruff check`, `ruff format --check` and `mypy src/` (49 files) clean on `8e7d98c`, run for this plan. Rows M01-M38 were **not** re-run on rev 9; the seven round-3 mutants and D1, D2, Q1-Q3 were.
+- **Full suite: verified.** rev 10, run for this plan on `e79d75f` (a
+  scratch worktree, npm env vars unset, plain `pytest tests/`, i.e. with
+  `addopts` = `not live and not slow`): **4536 passed, 3 skipped, 40
+  deselected in 435.27s (0:07:15)**, `DONE-EXIT=0`. The coordinator's run of
+  the same tree with `-m 'not live'` on the command line (which replaces
+  `addopts` and so also ran the 15 slow cases) reported **4551 passed, 3
+  skipped, 25 deselected, 1 error**: 4 551 − 4 536 = 15, the slow tier; the
+  one error is **environmental**, a teardown assertion in
+  `tests/runtime/harness.py` (`test_workflow_guards.py::TestMutationHelperContract::test_an_unknown_mutant_name_is_refused`:
+  the host's live gateway on :3344 went down during the run, `before=3254
+  after=None`), not a redaction test. `ruff check`, `ruff format --check`,
+  `mypy src/` clean on `e79d75f`.
+- **Rev 10 counts that differ slightly from the implementation agent's
+  report:** `main`'s URL rows, 8 897 / 1 687 here vs 8 895 / 1 686 reported
+  (never-worse holds on both); the slow tier took 195 s here vs 171 s. The
+  agent's recorded second-seed run used the previous generator (145 983
+  rows) and code; the second seed here (7, 77) is on `e79d75f` and the
+  final generator: 0 unaccepted on both tiers.
+- History: rev 9: **4370 passed, 3 skipped, 25 deselected in 459.38s (0:07:39)**, `DONE-EXIT=0`, `-m 'not live'`, run by the coordinator on `8e7d98c` (the log names no tree; the count is consistent with +157 tests over rev 8). `ruff check`, `ruff format --check` and `mypy src/` (49 files) clean on `8e7d98c`, run for this plan. Rows M01-M38 were **not** re-run on rev 9; the seven round-3 mutants and D1, D2, Q1-Q3 were.
 - **Fuzz numbers in the rev-9 commit messages are the seat's draw, not the committed corpus:** `9b5c86a`/`2855e6c` report `main` breaking 1 005 / 1 276 of the seat's 6 000 documents; on the committed `_json_fuzz_corpus` this plan measured 1 026 / 1 311 (all 6 000) and 358 / 398 (the 3 272 in scope). Rev 9's 4 / 4 reproduces.
 - The `977fd49` escape sweep ("0 of 117") was not re-run; the committed `test_no_span_starts_inside_a_json_escape` (24 cases) was, red on rev 8 and green on rev 9.
 - History: rev 8: **4213 passed, 3 skipped, 25 deselected in 421.04s (0:07:01)**, `-m 'not live'`, npm env vars unset, on a scratch worktree of `origin/wip/234-redactor-rev8-code` @ `d316364` (the parent of the embedded `56d7f80`; they differ only in comments, a docstring and a no-op check; oracle fixture in place); `ruff check`, `ruff format --check` clean and `uv run mypy src/` Success, 49 source files, on the same tree. Rows M01-M38 were **not** re-run on rev 8 (see Mutation evidence); Q1-Q3, D1, D2 were. History: rev 7: **4200 passed, 3 skipped, 25 deselected in 651.87s (10:51)**, run detached with `-m 'not live'` on the rev-7 tree (the exact `src/` hashes embedded above, with the oracle fixture at `tests/fixtures/redaction_main_oracle.b64`) after the 35-row mutation table; `uv run mypy src/` on the same tree: Success, 49 source files.
