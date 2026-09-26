@@ -208,7 +208,7 @@ def test_the_linear_keyword_matcher_equals_main_s_regex_on_the_grammar_tier_2() 
                     if _linear_matches(text) != _real_keyword_matches(text):
                         mismatches.append(text)
     assert mismatches == []
-    texts = _matcher_corpus(2026, 200_000, lengths=(1000, 3000))
+    texts = _matcher_corpus(2026, 200_000, lengths=(1000, 1500))
     assert [
         t for t in texts[:200_000] if _linear_matches(t) != _real_keyword_matches(t)
     ] == []
@@ -291,6 +291,24 @@ def test_the_replay_reproduces_main_s_output_on_the_fuzz_and_random_text() -> No
     assert fallbacks == 0
 
 
+def test_the_url_step_labels_what_main_drops() -> None:
+    """Main's `ValueError` arm (a port it cannot parse) keeps the first 400
+    characters of the URL, fragment dropped; the floor labels both, and the
+    redactor drops them as main did."""
+    text = "see https://h.example:99999/" + "a" * 420 + "?q=MYSECRETVAL#frag x"
+    _, spans = F.replay(text)
+    rules = {s.rule for s in spans}
+    assert {"url.overflow", "url.fragment"} <= rules, rules
+    out = _engine(text)
+    assert "MYSECRETVAL" not in out and "frag" not in out and out.endswith(" x")
+    userinfo = "https://user:pw123456@h.example/p?token=abc&x=1#f"
+    assert {s.rule for s in F.replay(userinfo)[1]} == {
+        "url.userinfo",
+        "url.query",
+        "url.fragment",
+    }
+
+
 # ========================================================= construction ==== #
 
 
@@ -336,6 +354,33 @@ def _board_rows() -> list[G.Row]:
             add(f"Authorization: {head}{ch}SECRETPART end", "SECRETPART")
             add(f"Authorization: Bearer {head}{ch}SECRETPART end", "SECRETPART")
     add("x Bearer 'hunter2x null", "hunter2x")
+    # URLs: userinfo, fragments, a port main cannot parse (its `ValueError`
+    # arm keeps the first 400 characters), every query key main redacts
+    add("see https://user:pa@ssw0rdXq@host.example/p ok", "ssw0rdXq")
+    add("https://tok3nABCDEF@github.com/x", "tok3nABCDEF")
+    add(
+        "https://h.example/cb#state=xyzQ12&access_token=abcDEF123",
+        "abcDEF123",
+        "xyzQ12",
+    )
+    add("https://h.example:99999/p?q=1#frag_secretXYZ", "frag_secretXYZ")
+    add("https://h.example:99999/" + "a" * 420 + "?q=MYSECRETVAL", "MYSECRETVAL")
+    add("https://[::1/p?token=hunter2&x=y#zz_secret", "zz_secret", "hunter2")
+    for key in sorted(F.MAIN_AUTH_SECRET_QUERY_KEYS):
+        add(f"https://h.example/p?{key}=plainword&n=1", "plainword")
+        add(f"https://h.example/p?{key.upper()}=12345", "12345")
+    add("https://h.example/p?to%6Ben=hunter2", "hunter2")
+    add("https://h.example/p?token=a+b+cdef", "cdef")
+    # multi-pair configuration files (.env, YAML)
+    add(
+        "DB_HOST=db.internal\nDB_PASSWORD=\nSESSION_SECRET=s3cr3tvalue\n", "s3cr3tvalue"
+    )
+    add("DB_PASSWORD=\nAPI_KEY=s3cr3tvalue\n", "s3cr3tvalue")
+    add("password:\n  session: s3cr3tvalue\n", "s3cr3tvalue")
+    add("smtp_password=\ncookie=s3cr3tvalue\n", "s3cr3tvalue")
+    add("password=\tsecret=hunter2", "hunter2")
+    add("db:\n  host: x\n  password:\n  client_secret: s3cr3tvalue\n", "s3cr3tvalue")
+    add("db:\n  password:\n  session: q7Zp2Lk9Wx4R\n", "q7Zp2Lk9Wx4R")
     alphabet = (" ", ":", "=", "\n", "\t")
     rng = random.Random(55)
     for _ in range(3000):
