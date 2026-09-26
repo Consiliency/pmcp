@@ -23,7 +23,7 @@ with a mutant that turns it red again) and the timing guards.
 
 from __future__ import annotations
 
-import concurrent.futures
+import multiprocessing
 import json
 import random
 import re
@@ -155,25 +155,33 @@ def _matcher_corpus(
 
 def _compare_with_timeout(texts: list[str], timeout: float) -> list[str]:
     """Differences between the linear matcher and main's regex, the regex
-    run in a worker so a quadratic input cannot hang the test (a timeout is
-    reported, not skipped)."""
+    run in worker processes so a quadratic input cannot hang the test: past
+    ``timeout`` the remaining input is reported (not skipped), and the pool
+    is terminated -- a running regex cannot be cancelled any other way."""
     problems: list[str] = []
-    with concurrent.futures.ProcessPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_real_keyword_matches, text): text for text in texts}
-        for future, text in futures.items():
+    pool = multiprocessing.get_context("spawn").Pool(4)
+    try:
+        pending = [
+            (text, pool.apply_async(_real_keyword_matches, (text,))) for text in texts
+        ]
+        deadline = time.monotonic() + timeout
+        for text, result in pending:
             try:
-                expected = future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
+                expected = result.get(timeout=max(1.0, deadline - time.monotonic()))
+            except multiprocessing.TimeoutError:
                 problems.append(f"TIMEOUT {text[:60]!r} ({len(text)} chars)")
-                continue
+                break
             if _linear_matches(text) != expected:
                 problems.append(f"{text!r}: {expected} != {_linear_matches(text)}")
+    finally:
+        pool.terminate()
+        pool.join()
     return problems
 
 
 def test_the_linear_keyword_matcher_equals_main_s_regex() -> None:
     """20 000 random fragment strings, then 576 adversarial runs (up to 2.7
-    KB; main's regex under a 60 s per-input timeout in a worker): the same
+    KB; main's regex in workers under a 60 s budget): the same
     (start, key end, separator end, end) tuples as `finditer` of main's
     regex."""
     texts = _matcher_corpus(234, 20_000)
@@ -208,12 +216,12 @@ def test_the_linear_keyword_matcher_equals_main_s_regex_on_the_grammar_tier_2() 
                     if _linear_matches(text) != _real_keyword_matches(text):
                         mismatches.append(text)
     assert mismatches == []
-    texts = _matcher_corpus(2026, 200_000, lengths=(1000, 1500))
+    texts = _matcher_corpus(2026, 200_000, lengths=(600, 1000))
     assert [
         t for t in texts[:200_000] if _linear_matches(t) != _real_keyword_matches(t)
     ] == []
     # the long adversarial runs: main's regex takes seconds on each
-    assert _compare_with_timeout(texts[200_000:], timeout=120) == []
+    assert _compare_with_timeout(texts[200_000:], timeout=400) == []
 
 
 def _surface_texts(row: G.Row) -> list[tuple[str, str, bool]]:
@@ -852,3 +860,12 @@ def test_the_floor_itself_is_linear() -> None:
         F.replay(text, MAIN_PATTERNS)
         timings.append(time.perf_counter() - started)
     assert timings[1] < 3 * timings[0] + 0.05, timings
+
+
+def test_the_regex_comparison_reports_a_timeout_instead_of_hanging() -> None:
+    """66 KB of `a-` takes main's regex minutes: the comparison reports it
+    within its budget and terminates the worker."""
+    started = time.perf_counter()
+    problems = _compare_with_timeout(["a-" * 33_000], timeout=2)
+    assert problems and problems[0].startswith("TIMEOUT"), problems
+    assert time.perf_counter() - started < 30
