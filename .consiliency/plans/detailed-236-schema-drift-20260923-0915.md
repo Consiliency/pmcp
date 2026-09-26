@@ -5,14 +5,19 @@
 > (`schema.py` and the test module as whole files; `types.py`, `handlers.py`
 > and `server.py` as `git apply` patches against `origin/main` @ `9ca081e`)
 > plus the generated snapshot are byte-identical to the frozen, verified
-> piece-A code (`wip/236-schema-drift-rev2-code` @ `3d0d437`; ancestors
-> `37da099`, `7a71a52`, `c79bf1a`, `a25dce0`, `972bc90`, `40b2ed5`, `d0722f4`,
+> piece-A code (`wip/236-schema-drift-rev2-code` @ `cb6afa4`; ancestors
+> `3d0d437`, `37da099`, `7a71a52`, `c79bf1a`, `a25dce0`, `972bc90`, `40b2ed5`, `d0722f4`,
 > `72eaa76`). `37da099` moves `task.ttl`'s lower bound to −2^63+1 (board round
 > 6, N6-1). **`3d0d437` differs from `37da099` only in the module docstring of
 > `tests/test_gateway_tool_schemas.py`** (+5 lines naming the two deferred
 > classes, Consiliency/pmcp#297 and Consiliency/pmcp#298), so every runtime
 > measurement cited for `37da099` (full suite, mutants, gates, probes, the
 > re-run differential) stands for `3d0d437` and was deliberately not re-run.
+> **`cb6afa4` differs from `3d0d437` only in that same docstring** (+8/−6:
+> the ttl bounds stated exactly as −2^63+1 … 2^63−1, the surrogate as
+> passing the gate on every transport and delivered only by the newer HTTP
+> entry, and the poll-interval class as both signs; board round 7, N7-3). The
+> `37da099` runtime results stand for `cb6afa4` too.
 > `a25dce0` differed from `972bc90` only in the test module's docstring.
 > `c79bf1a` added board round 4's F1 fix (an int64 `le=` on `task.ttl`), and
 > `7a71a52` adds round 5's G1 fix (the matching `ge=`, negative test cases,
@@ -56,9 +61,11 @@
 >     length-limited strings passes the gate, and the model refuses it with
 >     `string_unicode`, echoing the value. Reachable only via the SDK's
 >     modern streamable-HTTP entry. Tracked on **Consiliency/pmcp#297**.
->   - **N6-3**, a new class: a JSON integer ≥ 2^1024−2^970 sent to the
->     unbounded `number` `task.poll_interval` passes the gate, and the model
->     refuses it with `float_type`. Tracked on **Consiliency/pmcp#298**.
+>   - **N6-3**, a new class: a JSON integer with **|n| ≥ 2^1024−2^970, either
+>     sign** (e.g. `10**400` or `-10**400`) sent to the unbounded `number`
+>     `task.poll_interval` passes the gate, and the model refuses it with
+>     `float_type`. Tracked on **Consiliency/pmcp#298**. (Stated one-sided
+>     until board round 7, N7-1.)
 > - **Board rounds 4–5 (`b308e57`, `749185a`) findings F1 and G1 folded in
 >   (code at `7a71a52`):** a sixth gate/model disagreement class, **integer
 >   range**. `task.ttl` was the only integer property missing a bound, and it
@@ -584,7 +591,9 @@ negative `task.ttl` (e.g. `-5`) and `NaN`/`Infinity` for `task.poll_interval`
 (`client/manager.py:1639-1642`). Tightening them (`ge=0` for a TTL, finite
 floats for the poll interval) is a semantic change, not drift, and is listed
 under *Non-goals* and tracked on **Consiliency/pmcp#298**, together with
-N6-3 below (any finite `ge`/`le` on `poll_interval` closes both).
+N6-3 below. That needs **a finite bound on each side** of `poll_interval`
+(e.g. `gt=0` plus `le=`): an `le=` alone closes only the positive side and
+leaves `-10**400` passing the gate (measured under N7-1 below).
 
 ### Gate/model disagreement classes (board round 6 differential, authoritative)
 
@@ -606,10 +615,14 @@ description, enum, items, maxLength, maximum, minLength, minimum, pattern,
 required, type`, so format-checker, `uniqueItems`, `exclusive*`,
 `multipleOf` and `const` classes cannot arise. The seat ran it at `7a71a52`
 (A 237, `main` 1023). **It was re-run here at `37da099` with the seat's
-case spec: A 236.** The only changes are `task.ttl = float(-2**63)` moving
-from disagree to agree (N6-1) and the integer `-2**63` moving from
-agree-accept to agree-reject (the stated narrowing). Buckets at `37da099`:
-116 coercion, 96 `value_error`, 24 `string_unicode`.
+case spec: A 236.** In the A column, the only changes are `task.ttl =
+float(-2**63)` moving from disagree to agree (N6-1) and the integer `-2**63`
+moving from agree-accept to agree-reject (the stated narrowing). Buckets at
+`37da099`: 116 coercion, 96 `value_error`, 24 `string_unicode`. Because
+`float(-2**63)` still disagrees on `main`, it moves into row 8 (drift A
+closes). Recounted case by case against the seat's `main.jsonl`, row 8 is
+**804** at `37da099` (`int_parsing_size` **20**), up from 803/19 at
+`7a71a52` (board round 7, N7-2).
 
 | # | Class (gate vs model) | A @ `37da099` | `main` | A only | Where on A | Status |
 |---|---|---|---|---|---|---|
@@ -619,8 +632,8 @@ agree-accept to agree-reject (the stated narrowing). Buckets at `37da099`:
 | 4 | **Regex dialect** (`$` before a final `\n`) | 0 | 2 | 0 | none | closed (N2) |
 | 5 | **Integer range** (an integral float at or past an int64 bound: the gate accepts, pydantic refuses with `int_parsing_size`) | **0** (1 at `7a71a52`: `float(-2**63)`) | 1 | 0 | none | **closed at both float edges** (F1, G1, N6-1) |
 | 6 | **Lone UTF-16 surrogate in a length-limited string** (the gate counts it as a character; pydantic-core cannot encode it and raises `string_unicode`, echoing the whole value) | 24 (25 fields by the seat's per-field probe) | 29 (25 fields) | 0 | every `minLength`/`maxLength` string except `evidence_label_digest` (whose `pattern` rejects first), **including `auth_connect.credential`** | **new, N6-2**. Pre-existing and fail-safe; not expressible in JSON Schema. Reachable only through the SDK's modern streamable-HTTP entry (`json.loads` keeps lone surrogates); stdio, SSE and legacy HTTP reject the message. The echo is tracked on **Consiliency/pmcp#297**. |
-| 7 | **JSON integer beyond float range into an unbounded `number`** (≥ 2^1024−2^970: the gate accepts, the model raises `float_type`) | 1 field (targeted probe) | 1 field | 0 | `invoke.task.poll_interval` | **new, N6-3**. Pre-existing and fail-safe; tracked on **Consiliency/pmcp#298** (with `NaN`/`Infinity`) |
-| 8 | Drift that A closes: disagreements on `main` that agree on A (`dict_type` 315, `string_type` 90, `model_type` 90, `string_too_short` 48, `ge`/`le` 50, `string_too_long` 30, `int_*`/`float_*`/`bool_*` 120, coercion `type` 28, `int_parsing_size` 19, `finite_number` 6, `string_unicode` 5, `string_pattern_mismatch` 2) | 0 | 803 | 0 | none | what A closes |
+| 7 | **JSON integer beyond float range into an unbounded `number`** (|n| ≥ 2^1024−2^970, **either sign**: the gate accepts, the model raises `float_type`) | 1 field (targeted probe) | 1 field | 0 | `invoke.task.poll_interval` | **new, N6-3**. Pre-existing and fail-safe; tracked on **Consiliency/pmcp#298** (with `NaN`/`Infinity`) |
+| 8 | Drift that A closes: disagreements on `main` that agree on A (`dict_type` 315, `string_type` 90, `model_type` 90, `string_too_short` 48, `ge`/`le` 50, `string_too_long` 30, `int_*`/`float_*`/`bool_*` 120, coercion `type` 28, `int_parsing_size` 20, `finite_number` 6, `string_unicode` 5, `string_pattern_mismatch` 2) | 0 | 804 (803 at `7a71a52`) | 0 | none | what A closes |
 | — | Unknown keys (no `additionalProperties` at the gate) | argless tools: 147 of 147 extra-key sets reach the handler | same | 0 | all 26 | B's scope |
 | — | `meta` via `populate_by_name` | | | | `InvokeInput` only (the only alias in the 27 models is `_meta`) | B removes it |
 
@@ -635,6 +648,27 @@ Rows 6 and 7 were confirmed here at the gate and model level
   N6-3 task.poll_interval=10**400: gate accepts | model rejects (float_type)   <-- DISAGREE
 ```
 
+**Row 7 is two-sided (board round 7, N7-1), measured with `probe_n71.py` at
+`cb6afa4`.** `T0` = 2^1024−2^970. The `LeOnly` and `GtAndLe` rows are
+synthetic models run through `input_schema_for`. They check the remedy
+claim, not the tree:
+
+```text
+  poll_interval=T0             gate=accept                   model=float_type   <-- DISAGREE
+  poll_interval=T0-1           gate=accept                   model=accept
+  poll_interval=-T0            gate=accept                   model=float_type   <-- DISAGREE
+  poll_interval=-T0-1          gate=accept                   model=float_type   <-- DISAGREE
+  poll_interval=-10**400       gate=accept                   model=float_type   <-- DISAGREE
+  LeOnly x=T0                  gate=reject:maximum           model=float_type
+  LeOnly x=-T0                 gate=accept                   model=float_type   <-- DISAGREE
+  GtAndLe x=T0                 gate=reject:maximum           model=float_type
+  GtAndLe x=-T0                gate=reject:exclusiveMinimum  model=float_type
+```
+
+(The seat's round-7 output shows `-T0-1` as accepted by the model. Measured
+here, `-T0-1` is refused (`float_type`), as `|n| ≥ T0` predicts; it is
+`-(T0-1)` that is accepted. Either way the class is two-sided.)
+
 The seat's end-to-end reachability probes (`probe_wire6.py`, and
 `probe_http.py` through pmcp's `create_http_app` with
 `MCP-Protocol-Version: 2026-07-28`) are its measurements and were not re-run
@@ -642,8 +676,9 @@ here. **So the claim is not "everything the projection can express agrees
 except coercion".** The gate and model agree everywhere except rows 1, 2, 6
 and 7. Row 1 fails safe in the gate's favour. Rows 2, 6 and 7 fail safe in
 the model's favour, but echo the value, and are tracked on
-Consiliency/pmcp#297 and Consiliency/pmcp#298. As of `3d0d437` the test
-module's docstring names all of them: coercion, regex dialect and integer
+Consiliency/pmcp#297 and Consiliency/pmcp#298. As of `3d0d437` (wording
+corrected at `cb6afa4`: row 6 passes the gate on every transport, and row 7
+is two-sided) the test module's docstring names all of them: coercion, regex dialect and integer
 range as closed or stated, and rows 6 and 7 as open and deferred to those two
 issues.
 
@@ -865,7 +900,7 @@ issues.
   (`Unknown tool` else-branch `:392`→`:401`, `except Exception` `:427`→`:436`).
   Where this plan cites `server.py` lines without "post-A", they are `main`'s.
 
-### `tests/test_gateway_tool_schemas.py` (add, 591 lines; whole file verbatim under *Verbatim bodies → A*)
+### `tests/test_gateway_tool_schemas.py` (add, 593 lines; whole file verbatim under *Verbatim bodies → A*)
 
 **220 tests** at `37da099` (measured: `220 passed`, collect-only counts in brackets; 218 at `7a71a52`, 213 at `c79bf1a`, 211 at `972bc90`/`a25dce0`, 209 at `40b2ed5`, 208 before the X1 guard test). The
 three-link chain plus shape, snapshot, normalisation, gate, and the revision-2
@@ -1497,7 +1532,9 @@ callers 264 passed; snapshot 712 lines, 31 × `additionalProperties: false`,
   forwarded downstream as `ttl` / `pollInterval` (`client/manager.py:1639-1642`).
   `ge=0` on the TTL and finite-only floats on the poll interval would be
   behaviour changes beyond drift. Tracked on **Consiliency/pmcp#298**, which
-  also covers N6-3 (a JSON integer beyond float range on `poll_interval`).
+  also covers N6-3 (a JSON integer with |n| ≥ 2^1024−2^970, either sign, on
+  `poll_interval`). Closing it needs a finite bound on each side (e.g.
+  `gt=0` plus `le=`), not an `le=` alone.
 - **Lone surrogates in length-limited strings (N6-2)**: not expressible in
   JSON Schema, reachable only via the SDK's modern streamable-HTTP entry, and
   echoed by the model. Tracked on **Consiliency/pmcp#297**, whose
@@ -1518,7 +1555,7 @@ callers 264 passed; snapshot 712 lines, 31 × `additionalProperties: false`,
   gated on Consiliency/pmcp#296 (A3) and on X1's guard test.
 - Every PR to main needs panel CR + reconcile first (repo rule).
 
-## Embedding proof (revision 2, re-measured 2026-09-26 against `3d0d437`)
+## Embedding proof (revision 2, re-measured 2026-09-26 against `cb6afa4`)
 
 Proves that the A bodies below, applied exactly as *A — how an executor
 applies these* instructs, reproduce the frozen, verified piece-A code byte for
@@ -1526,23 +1563,23 @@ byte. Fresh detached worktree at `origin/main` (`9ca081e`, 0 changes) →
 `uv sync --all-extras -p 3.10` → the extractor taken **out of this plan**
 (not a local copy) → the five extract commands → `git apply --check` + `git
 apply` of the three patches → the snapshot generation command → `cmp` each of
-the six resulting files against `git show 3d0d437:<path>`
+the six resulting files against `git show cb6afa4:<path>`
 (= `origin/wip/236-schema-drift-rev2-code`) → the schema test file:
 
 ```text
 base: 9ca081e674806202dfa41864489cb9e3ae225dd9  clean: 0 changes
 src/pmcp/tools/schema.py: 99 lines
-tests/test_gateway_tool_schemas.py: 591 lines
+tests/test_gateway_tool_schemas.py: 593 lines
 <scratch>/types.patch: 638 lines
 <scratch>/handlers.patch: 866 lines
 <scratch>/server.patch: 20 lines
-1 passed, 219 deselected in 0.17s
-===== cmp against 3d0d437 (= origin/wip/236-schema-drift-rev2-code)
+1 passed, 219 deselected in 0.15s
+===== cmp against cb6afa4 (= origin/wip/236-schema-drift-rev2-code)
 cmp OK  src/pmcp/tools/schema.py  sha256=ddc7a14d17b91bcb
 cmp OK  src/pmcp/tools/handlers.py  sha256=9b8c18905828826e
 cmp OK  src/pmcp/types.py  sha256=25c761fda4335a39
 cmp OK  src/pmcp/server.py  sha256=b6d1f494a7186c39
-cmp OK  tests/test_gateway_tool_schemas.py  sha256=618858f02f6e1599
+cmp OK  tests/test_gateway_tool_schemas.py  sha256=7a5f7b1ab5cc5ac7
 cmp OK  tests/fixtures/gateway_tool_schemas.json  sha256=5d1fc4e7ff8f87d3
 changed vs base:  M src/pmcp/server.py  M src/pmcp/tools/handlers.py  M src/pmcp/types.py ?? src/pmcp/tools/schema.py ?? tests/fixtures/gateway_tool_schemas.json ?? tests/test_gateway_tool_schemas.py
 ===== pytest
@@ -1557,8 +1594,8 @@ re-extracted from the final plan text and re-`cmp`ed. The proof worktree was
 removed afterwards. (Earlier proofs against `72eaa76`, `d0722f4` (five files
 each, 208 tests), `40b2ed5` (six files, 209 tests), `972bc90` and `a25dce0`
 (six files, 211 tests), `c79bf1a` (six files, 213 tests), `7a71a52` (six
-files, 218 tests) and `37da099` (six files, 220 tests) also passed every
-`cmp`.)
+files, 218 tests), `37da099` and `3d0d437` (six files, 220 tests) also passed
+every `cmp`.)
 
 **Consistency gate.** `uv run python ~/code/pmcp/scripts/check_plan_consistency.py
 .consiliency/plans/detailed-236-schema-drift-20260923-0915.md` →
@@ -1592,7 +1629,7 @@ PMCP_UPDATE_SCHEMA_SNAPSHOT=1 uv run pytest tests/test_gateway_tool_schemas.py -
 uv run pytest tests/test_gateway_tool_schemas.py -q                     # expect 220 passed
 ```
 
-The three patches are `git diff origin/main 3d0d437 -- <file>` (identical to `37da099` for these files) against
+The three patches are `git diff origin/main cb6afa4 -- <file>` (identical to `37da099` for these files) against
 `origin/main` @ `9ca081e` (identical for these files to `860636a` and
 `8dec131`). Their blank context lines carry one leading space. An editor that
 strips trailing whitespace breaks them, and `git apply --check` then fails
@@ -1731,7 +1768,7 @@ def _collapse_nullable(node: dict[str, Any]) -> dict[str, Any]:
     return out
 ```
 
-### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 591 lines, 220 tests)
+### A — `tests/test_gateway_tool_schemas.py` (new module, whole file, 593 lines, 220 tests)
 
 ```python
 """Advertised gateway tool schemas are derived from, and agree with, the
@@ -1760,13 +1797,15 @@ itself, on a regex `pattern`: the gate's Python `$` matches before a final
 newline and pydantic's Rust `$` does not -- closed for the one `pattern` field
 (`evidence_label_digest`) by length bounds, pinned by
 `test_digest_pattern_agrees_between_gate_and_model`.
-Nor on an integer's range: pydantic refuses a float past int64, so an
-unbounded integer field (`task.ttl`) gets that range (both sides) advertised, pinned by
-`test_ttl_range_agrees_between_gate_and_model`.
+Nor on an integer's range: pydantic refuses a float outside int64, so an
+unbounded integer field (`task.ttl`) gets bounds on both sides -- -2**63 + 1
+(one short of int64's minimum, because `float(-2**63)` is exact and refused)
+to 2**63 - 1 -- pinned by `test_ttl_range_agrees_between_gate_and_model`.
 Two classes stay open, both refused by the model and deferred: a lone
-surrogate in a length-limited string passes the gate on the SDK's
-newer-protocol HTTP entry (the model echoes it -- Consiliency/pmcp#297), and
-an unbounded float (`task.poll_interval`, a JSON integer >= 2**1024 - 2**970)
+surrogate in a length-limited string passes the gate on every transport, and
+the SDK's newer-protocol HTTP entry is the one that delivers it to the model,
+which echoes it (Consiliency/pmcp#297); and an unbounded float
+(`task.poll_interval`: a JSON integer with |n| >= 2**1024 - 2**970, either sign)
 passes the gate (Consiliency/pmcp#298).
 """
 
@@ -4883,4 +4922,33 @@ both("gateway.describe", DescribeInput, {"tool_id": "Bearer sk-SAMPLE-abc\ud800"
 both("gateway.auth_connect", AuthConnectInput, {"server_name": "s", "credential": "sk-SAMPLE-cred\ud800"}, "N6-2 auth_connect.credential=<lone surrogate>")
 for v, lab in ((2**1024 - 2**970 - 1, "2**1024-2**970-1"), (2**1024 - 2**970, "2**1024-2**970"), (10**400, "10**400")):
     both("gateway.invoke", InvokeInput, {"tool_id": "a::b", "task": {"poll_interval": v}}, f"N6-3 task.poll_interval={lab}")
+```
+
+### Board round 7 probe (N7-1: row 7 on both signs, and the remedy)
+
+```python
+"""N7-1: task.poll_interval out of float range, both signs; and whether an
+le-only bound vs gt+le closes it (Consiliency/pmcp#236)."""
+import jsonschema
+from pydantic import BaseModel, Field, ValidationError
+from pmcp.tools.handlers import get_gateway_tool_definitions
+from pmcp.tools.schema import input_schema_for
+from pmcp.types import InvokeInput
+T0 = 2**1024 - 2**970
+inv = {t.name: t for t in get_gateway_tool_definitions()}["gateway.invoke"].input_schema
+def cmp(schema, model, args, label):
+    try: jsonschema.validate(args, schema); g = "accept"
+    except jsonschema.ValidationError as e: g = f"reject:{e.validator}"
+    try: model.model_validate(args); m = "accept"
+    except ValidationError as e: m = e.errors()[0]["type"]
+    print(f"  {label:28s} gate={g:24s} model={m}{'   <-- DISAGREE' if (g=='accept') != (m=='accept') else ''}")
+for v, lab in ((T0, "T0"), (T0 - 1, "T0-1"), (-T0, "-T0"), (-T0 - 1, "-T0-1"), (-(10**400), "-10**400")):
+    cmp(inv, InvokeInput, {"tool_id": "a::b", "task": {"poll_interval": v}}, f"poll_interval={lab}")
+class LeOnly(BaseModel):
+    x: float | None = Field(default=None, le=86400)
+class GtAndLe(BaseModel):
+    x: float | None = Field(default=None, gt=0, le=86400)
+for M in (LeOnly, GtAndLe):
+    for v, lab in ((T0, "T0"), (-T0, "-T0")):
+        cmp(input_schema_for(M), M, {"x": v}, f"{M.__name__} x={lab}")
 ```

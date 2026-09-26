@@ -1497,6 +1497,15 @@
             "revision": 2
           },
           "transition": "committed"
+        },
+        {
+          "at": "2026-09-26T18:00:00+00:00",
+          "by": "claude-plan-detailed",
+          "metadata": {
+            "reason": "board round 7 on 76c41a0 (N7-1..3, text only): row 7 two-sided (|n| >= 2^1024-2^970, either sign; remedy needs a finite bound on each side); row 8 = 804 (int_parsing_size 20); test module re-embedded from cb6afa4 (docstring-only); runtime results cited from 37da099",
+            "revision": 2
+          },
+          "transition": "committed"
         }
       ],
       "owner_skill": "claude-plan-detailed",
@@ -1507,7 +1516,7 @@
       "status": "committed",
       "task_summary": "Derive every gateway tool inputSchema from its argument model (A), then extra=\"forbid\" on the argument models (B) for Consiliency/pmcp#236; A and B land as separate PRs.",
       "type": "detailed",
-      "updated_at": "2026-09-26T17:00:00+00:00"
+      "updated_at": "2026-09-26T18:00:00+00:00"
     }
   ],
   "schema_version": 1
