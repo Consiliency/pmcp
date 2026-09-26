@@ -174,6 +174,20 @@ def test_server_dispatch_agrees_with_registry(name: str) -> None:
         assert f"self._gateway_tools.{method}()" not in source
 
 
+def test_every_dispatched_gateway_name_is_registered() -> None:
+    """X1: `_handle_call_tool` validates only names it finds in the registry,
+    so a dispatch branch for an unregistered name would skip the schema gate
+    and hand raw arguments to its handler. Pin the two sets equal, both ways
+    (the parametrised test above only proves registry -> dispatch)."""
+    source = inspect.getsource(GatewayServer._handle_call_tool)
+    dispatched = set(re.findall(r'\bname == "(gateway\.[a-z_]+)"', source))
+    assert len(dispatched) >= len(TOOL_NAMES) - 1  # the pattern matched the branches
+    assert dispatched == set(TOOL_NAMES), {
+        "dispatched, not registered": sorted(dispatched - set(TOOL_NAMES)),
+        "registered, not dispatched": sorted(set(TOOL_NAMES) - dispatched),
+    }
+
+
 @pytest.mark.parametrize("name", TOOLS_WITHOUT_MODELS)
 def test_no_argument_tools_advertise_an_empty_object(name: str) -> None:
     assert _tool(name).input_schema == NO_ARGUMENTS_SCHEMA
