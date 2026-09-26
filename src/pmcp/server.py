@@ -327,20 +327,21 @@ class GatewayServer:
                         TextContent(type="text", text=json.dumps(payload, indent=2))
                     ]
 
+                if tool is None:
+                    # Fail closed on any name the registry does not list: only
+                    # a registered name went through the schema gate above, so
+                    # nothing below -- the scoped-audit model check or a
+                    # dispatch branch -- may run for anything else. This
+                    # raises inside the audited path, like an unknown name
+                    # always has (Consiliency/pmcp#236, X1).
+                    raise ValueError(f"Unknown tool: {name}")
+
                 if self._scoped_advisor_audit is not None and name == "gateway.invoke":
                     scoped_input = InvokeInput.model_validate(arguments)
                     if scoped_input.run_correlation_id is None:
                         raise ValueError(
                             "scoped advisor invoke requires run, seat, and evidence correlations"
                         )
-
-                if tool is None:
-                    # Fail closed on any name the registry does not list: only
-                    # a registered name went through the schema gate above, so
-                    # no dispatch branch below may run for anything else. This
-                    # raises inside the audited path, like an unknown name
-                    # always has (Consiliency/pmcp#236, X1).
-                    raise ValueError(f"Unknown tool: {name}")
 
                 if name == "gateway.catalog_search":
                     result = await self._gateway_tools.catalog_search(arguments)

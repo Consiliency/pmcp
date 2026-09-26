@@ -858,6 +858,11 @@ class InvokeInput(GatewayArguments):
     )
     evidence_label_digest: str | None = Field(
         default=None,
+        # the lengths pin what the pattern means in both regex dialects: the
+        # gate's Python `$` also matches before a final newline, pydantic's
+        # Rust `$` does not (Consiliency/pmcp#236, board round 3)
+        min_length=64,
+        max_length=64,
         pattern=r"^[0-9a-f]{64}$",
         description="SHA-256 digest of the caller evidence label",
     )

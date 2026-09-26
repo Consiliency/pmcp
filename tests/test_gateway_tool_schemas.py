@@ -482,3 +482,50 @@ async def test_a_dispatch_branch_for_an_unregistered_name_fails_closed(
     assert called == [], "an ungated name reached its handler"
     text = " ".join(getattr(c, "text", "") for c in result.content)
     assert "Unknown tool: gateway.health" in text, text
+
+
+@pytest.mark.asyncio
+async def test_an_unregistered_invoke_never_reaches_the_scoped_audit_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fail-closed guard runs BEFORE the scoped-audit `InvokeInput` check:
+    were `gateway.invoke` ever unregistered, its ungated arguments would
+    otherwise reach pydantic, whose error echoes the value into the response
+    and the log (board round 3, N1)."""
+    from mcp.types import CallToolRequestParams
+
+    srv = GatewayServer()
+    srv._scoped_advisor_audit = object()  # type: ignore[assignment]
+    monkeypatch.setattr(srv, "_require_scoped_audit", lambda: None)
+    real_find = srv._find_gateway_tool
+    monkeypatch.setattr(
+        srv,
+        "_find_gateway_tool",
+        lambda name: None if name == "gateway.invoke" else real_find(name),
+    )
+    monkeypatch.setattr(srv, "_record_scoped_invocation", lambda **_kw: None)
+    secret = "SECRETVALUE-" + "x" * 40
+    result = await srv._handle_call_tool(
+        None,  # type: ignore[arg-type]
+        CallToolRequestParams(
+            name="gateway.invoke",
+            arguments={"tool_id": "a::b", "run_correlation_id": secret + "!"},
+        ),
+    )
+    text = " ".join(getattr(c, "text", "") for c in result.content)
+    assert "Unknown tool: gateway.invoke" in text, text
+    assert "SECRETVALUE" not in text, text
+
+
+def test_digest_pattern_agrees_between_gate_and_model() -> None:
+    """A trailing newline passes Python's `$` but not pydantic's: the length
+    bounds make the gate reject it too (board round 3, N2)."""
+    from pmcp.types import InvokeInput
+
+    schema = _tool("gateway.invoke").input_schema
+    value = "a" * 64 + "\n"
+    args = {"tool_id": "a::b", "evidence_label_digest": value}
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(args, schema)
+    with pytest.raises(Exception):
+        InvokeInput.model_validate(args)
