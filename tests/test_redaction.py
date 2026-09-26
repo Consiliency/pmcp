@@ -1583,8 +1583,6 @@ def _accepted_regression_class(
         return "weak key keeps a plain word or number"
     if base in ("authorization", "bearer") and plain:
         return "`Authorization`/`Bearer` followed by a plain word is prose"
-    if "&" in kept[0] or any("&" in piece for piece in kept):
-        return "a bare value stops at `&`"
     return None
 
 

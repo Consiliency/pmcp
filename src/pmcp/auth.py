@@ -419,7 +419,7 @@ _KEYWORD_KEY_SEP = (
     r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?)"
     rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?"
     r"(?P<extra>(?:[_-]?[A-Za-z0-9]){0,24}))"
-    r"(?P<sep>[\"']?[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))"
+    r"(?P<sep>[\"']?[^\S\r\n]*(?:=>|:=|==(?!=)|[:=](?!=))"
     r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=[^\s\-*#>])|[^\S\r\n]*))"
 )
 _KEYWORD_SEP_RE = re.compile(
@@ -438,7 +438,9 @@ _DECLARED_KEY_RE = re.compile(
     rf"(?:{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?", re.IGNORECASE
 )
 _KEYWORD_LIST_RE = re.compile(
-    _KEYWORD_KEY_SEP + r"(?P<list>\[[^\[\]{}]*\])", re.IGNORECASE
+    _KEYWORD_KEY_SEP
+    + r"(?P<list>\[(?:[^\[\]{}\"']|\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*')*\])",
+    re.IGNORECASE,
 )
 _QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
 
@@ -457,7 +459,7 @@ _KEYWORD_WS_RE = re.compile(
     r"(?:(?-i:[A-Za-z][a-z]*(?=[A-Z])))?"
     rf"(?P<name>{_secret_key_alternation()})(?:[_-]?(?:id|key)|s)?)"
     r"(?P<sep>[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]*)"
-    r"(?![A-Za-z_-]+=[^=])(?![-*#>])(?P<value>[^\s\"',;()\[\]{}]+)",
+    r"(?![A-Za-z_-]+=[^=])(?![-*#>])(?P<value>[^\s\"',;()\[\]{}]*[^\s\"',;()\[\]{}\\])",
     re.IGNORECASE,
 )
 
@@ -474,7 +476,7 @@ _KEYWORD_WS_RE = re.compile(
 #: `Bearer hunter2tok\"`, and eating the `\` un-escapes the quote.
 _BEARER_RE = re.compile(
     r"(?<![=:])(?<![=:] )(?<![A-Za-z0-9_-])"
-    r"(?P<key>bearer(?:[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]+))(?![A-Za-z_-]+=[^=])(?P<value>[^\s,;\"'()\[\]{}]*[^\s,;\"'()\[\]{}\\])",
+    r"(?P<key>bearer(?:[^\S\r\n]+|[^\S\r\n]*\r?\n[^\S\r\n]*))(?![A-Za-z_-]+=[^=])(?P<value>[^\s,;\"'()\[\]{}]*[^\s,;\"'()\[\]{}\\])",
     re.IGNORECASE,
 )
 
@@ -493,7 +495,7 @@ _AUTHORIZATION_RE = re.compile(
     r"(?:[^\S\r\n]*\r?\n[^\S\r\n]*(?=[^\s\-*#>])|[^\S\r\n]*)"
     r"(?:(?P<quoted>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_]))"
     r"|(?P<bare>(?![\[{])(?:(?:bearer|basic|digest|negotiate|ntlm|token)[^\S\r\n]+)?"
-    r"[^\s,;\"']*[^\s,;\"')\]}]))",
+    r"[^\s,;\"']*[^\s,;\"')\]}\\]))",
     re.IGNORECASE,
 )
 
@@ -522,6 +524,10 @@ def _keyword_sep_spans(text: str) -> list[Span]:
                 continue
         start, end = match.start("value"), match.end("value")
         value = match.group("value")
+        if "==" in match.group("sep") and not _value_could_be_a_credential(
+            value.strip("\"'")
+        ):
+            continue  # `if token == expected:` compares; `password == hunter2` assigns
         if match.group("extra") and not _DECLARED_KEY_RE.fullmatch(
             text, match.start("name"), match.end("extra")
         ):
@@ -564,6 +570,10 @@ def _keyword_list_spans(text: str) -> list[Span]:
     spans: list[Span] = []
     for match in _KEYWORD_LIST_RE.finditer(text):
         name = match.group("name").lower()
+        if name == "code" and (
+            match.group("qualifier").rstrip("_-").lower() not in _CODE_QUALIFIERS
+        ):
+            continue  # `error_codes: [...]` are diagnostics, as in the scalar pass
         base = match.start("list")
         for element in _QUOTED_RE.finditer(match.group("list")):
             inner = element.group()[1:-1]
@@ -590,6 +600,13 @@ def _bearer_spans(text: str) -> list[Span]:
         (match.start("value"), match.end("value"), REDACTED)
         for match in _BEARER_RE.finditer(text)
         if not _is_plain_word_or_number(match.group("value"))
+        and not (
+            _UNINDENTED_BREAK_RE.search(match.group("key"))
+            and (
+                match.group("value")[0] in "-*#>"  # a flag or bullet on the next line
+                or not _value_could_be_a_credential(match.group("value"))
+            )
+        )
     ]
 
 
@@ -662,6 +679,17 @@ def _url_component_spans(
             key, equals, value = pair.partition("=")
             value_start = position + len(key) + 1
             if equals and value and unquote(key).lower() in AUTH_SECRET_QUERY_KEYS:
+                spans.append(
+                    (base + value_start, base + value_start + len(value), REDACTED)
+                )
+            elif (
+                equals
+                and value
+                and "%" in key
+                and _covers_anything(f"{unquote(key)}={unquote(value)}", depth, covers)
+            ):
+                # `?api%2Dkey=hunter2`: the encoded key hides it from the
+                # keyword passes, which read the raw text
                 spans.append(
                     (base + value_start, base + value_start + len(value), REDACTED)
                 )
