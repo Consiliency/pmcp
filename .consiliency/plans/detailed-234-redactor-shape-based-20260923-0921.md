@@ -594,10 +594,9 @@ The rules' purpose is covered as well:
     - Treating `:` like `=` would take the account and resource of a
       secretsmanager ARN, whose body ends in `…:secretsmanager:` right
       before the redactor's region marker. So it stays disclosed.
-  - So "a value marked twice keeps no tail" holds only when no ARN body
-    sits between the two markers. With an ARN body between, it holds only
-    when the second key uses `=` and the ARN has no marker of the
-    redactor's inside it.
+  - So "a value marked twice keeps no tail" holds when no ARN body sits
+    between the two markers, or when the second key uses `=` and the ARN
+    has no marker of the redactor's inside it.
 - **A punctuation-only tail** (D1, adopted in rev 18.1): a glued run
   without a letter or a digit is not replaced, so `token=abcdef!` →
   `token=[REDACTED]!`. The same rule leaves the punctuation after the
