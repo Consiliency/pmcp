@@ -19,6 +19,7 @@ import aiohttp
 import jwt
 from jwt import PyJWKSet
 
+from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
 
@@ -86,6 +87,9 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
     "tenant_id",
     "token",
 }
+
+#: Where a secret key starts, for the keyword rule in `sanitize_auth_diagnostic`.
+_KEYWORD_KEY_START = key_start_pattern(AUTH_DIAGNOSTIC_SECRET_KEYS)
 
 _JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])"
@@ -592,18 +596,7 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> 
         text,
     )
     text = re.sub(r"(?i)(\bbearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
-    secret_keys = "|".join(
-        [
-            *[re.escape(key) for key in AUTH_DIAGNOSTIC_SECRET_KEYS],
-            r"api[_-]?key",
-        ]
-    )
-    text = re.sub(
-        rf"(?i)\b([A-Za-z0-9_-]*(?:{secret_keys})[A-Za-z0-9_-]*)"
-        r"([\s:=]+)([A-Za-z0-9._~+/=-]{3,})",
-        r"\1\2[REDACTED]",
-        text,
-    )
+    text = redact_keyword_values(text, _KEYWORD_KEY_START)
     text = _JWT_RE.sub("[REDACTED]", text)
     return text if max_length is None else text[:max_length]
 
