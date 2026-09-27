@@ -1,15 +1,27 @@
 # Detailed plan: record `tools/call` gate rejections in the scoped-advisor audit, without argument values
 
-> **Revision 2 (2026-09-26).** Consiliency/pmcp#296, the prerequisite for
+> **Revision 3 (2026-09-26).** Consiliency/pmcp#296, the prerequisite for
 > piece B (`extra="forbid"`) of Consiliency/pmcp#236. The change is
 > **embedded, not described**: the five blocks under *Verbatim bodies* are
 > `git apply` patches against `origin/main` @ `959d4d4`, byte-identical to the
-> verified code on the local-only branch `wip/296-code` @ `e10304a` (not
-> pushed; rev 1 was `9ced94f`). Proven by extracting them from this file,
+> verified code on the local-only branch `wip/296-code` @ `e4e1bbb` (not
+> pushed; rev 1 was `9ced94f`, rev 2 `e10304a`). Proven by extracting them from this file,
 > `git apply --check` on a clean `959d4d4` tree, applying, and `cmp` against
 > `wip/296-code` (see *Embedding proof*).
 >
-> **What rev 2 changes** (the rev 1 board's claude seat returned DISAGREE; every
+> **What rev 3 changes** (the rev 2 board's claude seat: PARTIALLY AGREE, no
+> code defect, four non-equivalent mutants survived): **tests and plan text
+> only — `src/` is byte-identical to rev 2** (`git diff e10304a e4e1bbb --
+> src/` is empty). New tests pin what the declared-keys filter must keep for
+> the ledger (every field agent-harness's reducer reads, derived from
+> `research.py`; the source hash from `invoke.arguments`) and what it must not
+> read (a blocked tool's declared key; the `except` arm of an allowed tool);
+> E16 is pinned for `KeyError`/`TypeError` too; a CHANGELOG cross-reference is
+> corrected; the `source_reference_hash` channel on non-invoke tools is
+> recorded as a follow-up. See *Rev 2 board findings — before/after*. Line
+> numbers into `src/` below are therefore still those of `e10304a`.
+>
+> **What rev 2 changed** (the rev 1 board's claude seat returned DISAGREE; every
 > finding is resolved in *Rev 1 board findings — before/after*): the
 > policy-denied arm handed unvalidated arguments to `record_invocation`, and
 > "policy first" widened that to malformed blocked calls (B1). Rev 2 fixes the
@@ -96,6 +108,39 @@ rev 2 does — each "after" measured on `wip/296-code` @ `e10304a`.
 | Nit: E4 "same code" hides that its input domain changed | — | E4 row states the new domain and what it records | §5 |
 | Nit: E13 unverified | *Unverified* | read by rev 1 and the seat (`policy.py:410-423,524-534`); still not proven by test | §5 |
 | Q1, Q3, Q4 | seat AGREEs (rejection record itself, reader, TOCTOU) | unchanged; Q3's reader run repeated on rev 2 | — |
+
+## Rev 2 board findings — before/after
+
+Board 2 on rev 2 (`2911ff5`): the native claude seat (claude-opus-5-5,
+correctness) returned **PARTIALLY AGREE**. It found no code defect: B1,
+X1–X7, Q2/E16, the E4 nit and E13 were verified closed, `29/29` of the plan's
+mutants were reproduced killed, and the suite reproduced exactly. It found
+**four non-equivalent mutants that survived** the tests, each with a
+demonstrated consequence, plus nits. Rev 3 changes tests and plan text only;
+`src/` is unchanged from rev 2.
+
+| finding | rev 2 (before) | rev 3 (after) | evidence |
+|---|---|---|---|
+| **Y1** filter drops `evidence_label_digest` → the reducer returns `('failed', 'audit_correlation_mismatch')` for every research seat | survived: the end-to-end test asserted `run`/`seat` but not the evidence digest | `_LEDGER_READ_FIELDS` — every field the reducer reads, **derived from `research.py`** by `ledger_fields.py` (AST over its `record.get(...)` calls; `equal: True` against the test's constant @ `18a324a4`, whose `research.py` is byte-identical to `~/code/agent-harness`) — asserted non-null on the e2e invoke record, plus `evidence_label_digest == "a" * 64` | Y1 KILLED |
+| **Y3** filter drops `invoke.arguments` → source hash lost when the result carries no URL (`('failed', None, unverified)`) | survived: the e2e mocked result itself contains a URL | `test_an_invoke_source_hash_comes_from_its_declared_arguments`: URL only in `arguments`, hash asserted equal to its sha256 | Y3 KILLED |
+| **Y4** filter applied *before* the gate → a blocked tool's declared key is read (`provision {"server_name": <URL>}` → `denied src=…`), reopening B1 through a declared key | survived: the blocked cases put the URL in undeclared keys only | blocked differential cases carry a per-call URL in `server_name` (list when malformed, string when well-formed) | Y4 KILLED |
+| **Y9** `except` arm records full gate-passed arguments → a registered, allowed tool's error path records an undeclared caller correlation and URL | survived: C3 was pinned only for the unregistered name, where `audited_arguments` is `None` anyway | `test_an_allowed_call_that_raises_records_only_declared_keys` (differential over a raising `describe`) | Y9 KILLED |
+| **Y6** E16 catches only `ValueError` | survived: the test raised only `ValueError` | E16 test parametrized over `ValueError`, `KeyError`, `TypeError` (the latter two from `absolute_path`, since the walk tolerates them on a lookup) | Y6 KILLED |
+| Y2, Y7, Y8 | killed | killed | — |
+| Y5, Y10–Y13 | survived; the seat judged them equivalent or harmless | agreed, not added: Y10/Y11 pass `name` where it equals `tool.name` (registered path); Y12's walk never misses on a real error path; Y13's denied result digest is a constant either way; Y5's nested names collide with no field the record reads | — |
+| Nit: CHANGELOG #236 entry says "see the #296 entry **below**"; it is above | wrong | "above" | CHANGELOG patch |
+| Note: `source_reference_hash` from declared free text on non-invoke tools (`catalog_search.query`, `filters.tags`) — same as main | §6 claimed the URL scan's purpose generally | §6 now scopes that claim to `gateway.invoke`; *Non-goals* records the follow-up (restrict correlation/`tool_id`/URL reads to `gateway.invoke`) | — |
+| Note: `meta` (alias name) no longer scanned for a URL; `_meta` still is | unstated | *Non-goals*, harmless to the ledger | — |
+
+The five added mutants, from the rev 3 run (full log in *Mutation evidence*):
+
+```text
+Y1 declared filter drops evidence_label_digest: KILLED | 2 failed, 39 passed in 2.88s | test_an_invoke_source_hash_comes_from_its_declared_arguments, test_scoped_server_filters_controls_and_writes_private_complete_audit
+Y3 declared filter drops invoke's arguments: KILLED | 1 failed, 40 passed in 2.87s | test_an_invoke_source_hash_comes_from_its_declared_arguments
+Y4 declared filter applied before the gate: KILLED | 2 failed, 39 passed in 3.03s | test_an_ungated_call_records_nothing_the_caller_chose
+Y6 E16 catches only ValueError: KILLED | 2 failed, 39 passed in 2.96s | test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink
+Y9 except arm records full gate-passed arguments: KILLED | 1 failed, 40 passed in 2.91s | test_an_allowed_call_that_raises_records_only_declared_keys
+```
 
 ## Research summary (all measured this session)
 
@@ -567,7 +612,14 @@ Why top-level declared keys and not the full schema walk: every field
 `record_invocation` reads is a top-level key (`tool_id`, the two correlations,
 `evidence_label_digest`) or the public-URL scan; the scan over a declared
 value (e.g. `invoke.arguments`, `additionalProperties: true`) is where the
-intended `source_reference_hash` comes from, so it must keep working. When
+intended `source_reference_hash` comes from, so it must keep working — for
+`gateway.invoke`, the only tool the ledger reads. (Rev 3, per the rev 2 seat:
+on other tools the same scan still hashes a URL in a *declared* free-text
+field, e.g. `catalog_search.query`; unchanged from main, recorded under
+*Non-goals* as a follow-up.) What the ledger needs from the filter is pinned
+by test, not argued: every field its reducer reads survives on an invoke
+record (Y1), and the source hash is taken from `invoke.arguments` when the
+result has no URL (Y3). When
 piece B makes the gate reject undeclared keys, the filter becomes a no-op for
 every payload that reaches it — it is not a substitute for B, and B does not
 make it wrong.
@@ -602,10 +654,12 @@ once; the `except jsonschema.ValidationError` arm records the rejection
 `_record_scoped_invocation` call sites; the denied arm records `result=None`;
 `_record_scoped_invocation(gateway_tool: str | None, ...)`.
 
-### `tests/test_scoped_advisor_audit.py` (modify; patch under *Verbatim bodies*, +573 / −0)
+### `tests/test_scoped_advisor_audit.py` (modify; patch under *Verbatim bodies*, +709 / −0)
 
-Adds `import jsonschema`, `import logging`, `import traceback` and 25 test
-items (bodies in the patch). Rev 1's thirteen, with rev 2's added cases
+Adds `import hashlib`, `import jsonschema`, `import logging`, `import
+traceback`, the constant `_LEDGER_READ_FIELDS` (with two assertions in the
+existing `test_scoped_server_filters_controls_and_writes_private_complete_audit`,
+rev 3) and 29 test items (bodies in the patch). Rev 1's thirteen, with rev 2's added cases
 marked:
 
 | test | pins |
@@ -626,7 +680,16 @@ Rev 2's new tests (B1, the class of B1, X1/X4/X6, E16):
 | `test_a_gated_call_records_only_the_keys_its_schema_declares` | **C2.** A well-formed `describe` carrying undeclared correlation-shaped keys and a URL: equal records across two calls, `downstream_tool_id` (declared) kept, the rest `null` |
 | `test_rejected_and_denied_calls_never_log_argument_values` | **X1, X6.** `caplog` at `DEBUG` over E1, E2 (dead sink, value-echoing `type` error), and the three E4 variants: no argument value, no `is not of type`, no `Input validation error` in any log record; asserts something *was* logged |
 | `test_the_rejection_names_only_a_scoped_gateway_tool` | **X4.** `record_rejected_arguments(gateway_tool="gateway.provision")` → `gateway_tool: null` |
-| `test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink` | **E16.** A nested mapping whose `__getitem__` raises `ValueError`: `ScopedAdvisorAuditError`, the caller string absent from `traceback.format_exception` of it, nothing written, `require_available()` passes, and the next rejection is recorded |
+| `test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink[ValueError, KeyError, TypeError]` | **E16.** `ValueError`: a nested mapping whose `__getitem__` raises; **(rev 3, Y6)** `KeyError` / `TypeError`: an error whose `absolute_path` raises it (the walk itself tolerates those two on a lookup, so they must come from elsewhere). Each: `ScopedAdvisorAuditError`, the caller string absent from `traceback.format_exception` of it, nothing written, `require_available()` passes, and the next rejection is recorded |
+
+Rev 3's additions (the rev 2 seat's surviving mutants):
+
+| test / assertion | pins |
+|---|---|
+| `_LEDGER_READ_FIELDS` + `test_scoped_server_filters_controls_and_writes_private_complete_audit` | **Y1.** Every field agent-harness's reducer reads is non-null on the end-to-end firecrawl `invoke` record, and `evidence_label_digest == "a" * 64`. The set is not written by hand from memory: `ledger_fields.py` (below) derives it from `research.py`'s `record.get(...)` calls and compares it with the test's constant — `equal: True` @ `18a324a4` |
+| `test_an_invoke_source_hash_comes_from_its_declared_arguments` | **Y3 (and Y1).** The stubbed downstream result carries no URL; the record's `source_reference_hash` equals `sha256("https://source.example/article")`, the URL in the declared `invoke.arguments`; all ledger fields non-null |
+| `test_an_ungated_call_records_nothing_the_caller_chose[blocked-*]` (changed) | **Y4.** The blocked cases' URL now also sits in `server_name`, the one key `provision` declares, varied per call — as a list (malformed) and as a string (well-formed) — so a filter run before the gate breaks the differential |
+| `test_an_allowed_call_that_raises_records_only_declared_keys` | **Y9 (C3 for a registered tool).** A registered, allowed `describe` whose handler raises (E9): two calls differing only in undeclared correlation-shaped keys and a URL leave equal `failure` records; `downstream_tool_id` kept, the rest `null` |
 
 Sample secrets are identifier-like strings that are not shaped like any
 provider's token (`caller_chosen_*`, `CallerChosenKey42`), so GitHub push
@@ -641,8 +704,9 @@ appended after `test_capability_probe_is_machine_readable` under the banners
 `# --- rev 2: nothing the caller chose reaches a denied record (Consiliency/pmcp#296) ---`,
 with the helpers `_REJECTION_RECORD_KEYS`, `_scoped_server`, `_call`,
 `_first_error`, `_record_one`, `_EqualsEverything`, `_CALLER_KEYED_SCHEMA`,
-`_PoisonedError`, `_VOLATILE_KEYS`, `_caller_values`, `_stable` and
-`_RaisingDict`. What each test pins is in the tables above; which mutant each
+`_PoisonedError`, `_VOLATILE_KEYS`, `_caller_values`, `_stable`,
+`_RaisingDict` and (rev 3) `_LEDGER_READ_FIELDS`, `_format_tag`,
+`_raising_path_error`. What each test pins is in the tables above; which mutant each
 kills is in *Mutation evidence*.
 
 ### `CHANGELOG.md` (modify) — `[Unreleased]` → `### Fixed`
@@ -650,7 +714,8 @@ kills is in *Mutation evidence*.
 A new first entry under `### Fixed`, and the piece-A entry's "Scoped-audit
 change until Consiliency/pmcp#296 lands" sentence is replaced by one
 sentence pointing at it (both are unreleased, so the release notes must not
-contradict each other). (rev 2) The new entry also states what denied and
+contradict each other; rev 3 corrects its pointer to the new entry, which
+sits *above* it, not below). (rev 2) The new entry also states what denied and
 undeclared-key invocation records no longer carry. Patch under *Verbatim
 bodies*.
 
@@ -667,7 +732,7 @@ cd <fresh worktree of origin/main @ 959d4d4>
 uv sync --all-extras -p 3.10                    # fresh worktree: else pytest is the system one
 # apply (see *Verbatim bodies → how to apply*)
 uv run pytest tests/test_scoped_advisor_audit.py -p no:cacheprovider --cov-fail-under=0 -q
-                                                # expect 37 passed (12 existing + 25 new)
+                                                # expect 41 passed (12 existing + 29 new)
 uv run ruff check src/ tests/                   # expect "All checks passed!"
 uv run ruff format --check src/ tests/          # expect "163 files already formatted"
 uv run mypy src/pmcp --exclude baml_client     # CI gate (test.yml:388); expect "no issues found in 50 source files"
@@ -675,39 +740,45 @@ uv run mypy src/                                # same result on this tree
 env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir \
   uv run pytest -m 'not live and not slow' -p no:cacheprovider -q
                                                 # full suite; run as a background task that notifies on exit
-python3 <scratch>/mutants.py <scratch>/mut     # from the worktree root; expect "29/29 killed"
+python3 <scratch>/mutants.py <scratch>/mut     # from the worktree root; expect "34/34 killed"
+python3 <scratch>/ledger_fields.py <agent-harness>/phase-loop-runtime/src/phase_loop_runtime/advisor_board/research.py \
+  tests/test_scoped_advisor_audit.py            # expect "equal: True"
 ```
 
 ## Acceptance criteria — measured this session
 
-Tree: `wip/296-code` @ `e10304a` (rev 2), base `959d4d4`; the gates marked
-*proof tree* ran in a fresh `959d4d4` worktree with the five patches
-extracted from this file applied (*Embedding proof*).
+Tree: `wip/296-code` @ `e4e1bbb` (rev 3; `src/` identical to rev 2's
+`e10304a`), base `959d4d4`; the gates marked *proof tree* ran in a fresh
+`959d4d4` worktree with the five patches extracted from this file applied
+(*Embedding proof*).
 
-- [x] **Red on main.** The rev 2 test module against main's `src/`
-  (`PYTHONPATH=<git archive 959d4d4 src>`, `pmcp.server` resolved there):
-  `25 failed, 12 passed in 3.33s` — exactly the 25 new items fail, the 12
-  existing pass.
-- [x] **Red on rev 1.** The rev 2 test module against rev 1's `src/`
-  (`9ced94f`): `6 failed, 31 passed in 3.11s` — the four
-  `test_an_ungated_call_records_nothing_the_caller_chose` cases,
-  `test_a_gated_call_records_only_the_keys_its_schema_declares` and
-  `test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink`.
-  The other rev 2 additions (the `caplog` test, the X2/X3/X5 cases, the X4
-  test) pin properties rev 1 already had; they are mutant-killers, measured in
-  *Mutation evidence*.
-- [x] **Green with the patch** (proof tree): `37 passed in 3.19s`.
+- [x] **Red on main.** The rev 3 test module against main's `src/`
+  (`PYTHONPATH=<git archive 959d4d4 src>`): `28 failed, 13 passed in 3.34s`.
+  The 13 passing are the 12 existing tests plus
+  `test_an_invoke_source_hash_comes_from_its_declared_arguments`, which main
+  satisfies because it reads *all* arguments; it guards the filter, not a
+  main defect (Y3).
+- [x] **Red on rev 1** (`9ced94f` `src/`): `9 failed, 32 passed in 3.20s` —
+  the four `test_an_ungated_call_records_nothing_the_caller_chose` cases,
+  `test_a_gated_call_records_only_the_keys_its_schema_declares`,
+  `test_an_allowed_call_that_raises_records_only_declared_keys`, and the three
+  `test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink`
+  cases.
+- [x] **Rev 2** (`e10304a` `src/`): `41 passed in 3.02s` — expected, since rev
+  3 changes no code; its additions are measured by the Y mutants.
+- [x] **Green with the patch** (proof tree): `41 passed in 3.15s`.
 - [x] `ruff check src/ tests/` (proof tree): `All checks passed!`
 - [x] `ruff format --check src/ tests/` (proof tree): `163 files already formatted`
 - [x] `mypy src/pmcp --exclude baml_client` (proof tree): `Success: no issues found in 50 source files`;
   `mypy src/`: `Success: no issues found in 50 source files`
-- [x] Full suite, patched (proof tree): `4361 passed, 3 skipped, 25 deselected in 424.34s (0:07:04)` (`exit=0`)
+- [x] Full suite, patched (proof tree, `env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir`): `4365 passed, 3 skipped, 25 deselected in 416.76s (0:06:56)` (`exit=0`)
 - [x] Full suite, main `959d4d4` (rev 1's measurement, same host, same command; the base is unchanged): `4336 passed, 3 skipped, 25 deselected in 419.27s (0:06:59) (exit=0)`
-  Difference: +25 passed = exactly the 25 new test items; skips and deselections unchanged.
-- [x] Mutation run: `29/29 killed` (rev 1's 14 + the seat's X1–X7 + N1–N8; see *Mutation evidence*).
-- [x] Reader: agent-harness `reduce_research_audit` @ `18a324a4` on a rev 2 stream → `ledger: success None [('success', 'verified')]`.
+  Difference: +29 passed = exactly the 29 new test items; skips and deselections unchanged.
+- [x] Mutation run: `34/34 killed` (rev 1's 14 + X1–X7 + N1–N8 + Y1, Y3, Y4, Y6, Y9; see *Mutation evidence*).
+- [x] Ledger fields: `ledger_fields.py` → `equal: True` (agent-harness @ `18a324a4`).
+- [x] Reader: agent-harness `reduce_research_audit` @ `18a324a4` on a rev 2 stream → `ledger: success None [('success', 'verified')]` (`src/` unchanged since).
 - [x] Embedding proof: five patches extracted from this file apply to
-  `959d4d4` and the result is `cmp`-equal to `wip/296-code` @ `e10304a` on all five files.
+  `959d4d4` and the result is `cmp`-equal to `wip/296-code` @ `e4e1bbb` on all five files.
 - [ ] Panel CR + reconcile before merge (repo rule).
 - [ ] Piece B of Consiliency/pmcp#236 does not merge before this.
 
@@ -715,52 +786,54 @@ extracted from this file applied (*Embedding proof*).
 
 `mutants.py` (below) applies each mutant as one exact-string replacement to a
 saved copy, runs `tests/test_scoped_advisor_audit.py`, and restores from the
-saved copy (never `git checkout`). Rev 2 runs one merged set: rev 1's 14
-(M1–M13, M4b; every anchor still unique), the rev 1 board seat's X1–X7
-(`mutants2.py`, same method), and rev 2's N1–N8. Run on `wip/296-code` @
-`e10304a`; output, verbatim from the log:
+saved copy (never `git checkout`). Rev 3 runs one merged set: rev 1's 14
+(M1–M13, M4b), the rev 1 board seat's X1–X7, rev 2's N1–N8, and the rev 2
+board seat's surviving non-equivalent Y1, Y3, Y4, Y6, Y9 (anchors from its
+`mutants3.py`). Every anchor is unique. Run on `wip/296-code` @ `e4e1bbb`;
+output, verbatim from the log:
 
 ```text
-M1 policy not judged before the gate: KILLED | 3 failed, 34 passed in 2.97s | test_an_ungated_call_records_nothing_the_caller_chose, test_policy_is_judged_before_the_gate, test_the_policy_verdict_is_read_once_per_call
-M2 call_tool re-reads the policy verdict: KILLED | 1 failed, 36 passed in 2.95s | test_the_policy_verdict_is_read_once_per_call
-M3 relative .path instead of .absolute_path: KILLED | 1 failed, 36 passed in 2.81s | test_rejected_argument_path_redacts_caller_chosen_keys
-M4 caller keys not checked against declared names: KILLED | 6 failed, 31 passed in 3.46s | test_rejected_argument_path_redacts_caller_chosen_keys, test_the_rejection_record_never_reads_the_message_or_the_instance
-M4b str subclass accepted by isinstance: KILLED | 1 failed, 36 passed in 2.83s | test_rejected_argument_path_redacts_caller_chosen_keys
-M5 int segment kept without a list container: KILLED | 1 failed, 36 passed in 2.94s | test_rejected_argument_path_redacts_caller_chosen_keys
-M6 validator keyword not bounded: KILLED | 2 failed, 35 passed in 2.98s | test_an_unknown_validator_keyword_is_not_recorded
-M7 gate rejection not recorded: KILLED | 3 failed, 34 passed in 2.92s | test_gate_rejection_with_a_dead_sink_fails_closed, test_gate_rejections_are_audited_without_argument_values, test_rejected_and_denied_calls_never_log_argument_values
-M8 dead sink not caught at the gate: KILLED | 2 failed, 35 passed in 3.47s | test_gate_rejection_with_a_dead_sink_fails_closed, test_rejected_and_denied_calls_never_log_argument_values
-M9 correlation copied from unvalidated arguments: KILLED | 2 failed, 35 passed in 2.92s | test_gate_rejections_are_audited_without_argument_values, test_the_rejection_record_never_reads_the_message_or_the_instance
-M10 jsonschema message recorded: KILLED | 2 failed, 35 passed in 2.86s | test_gate_rejections_are_audited_without_argument_values, test_the_rejection_record_never_reads_the_message_or_the_instance
-M11 terminal_status failure: KILLED | 1 failed, 36 passed in 3.13s | test_gate_rejections_are_audited_without_argument_values
-M13 rejection written as an audit.invocation: KILLED | 2 failed, 35 passed in 3.57s | test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink, test_gate_rejections_are_audited_without_argument_values
-M12 declared names from the top level only: KILLED | 2 failed, 35 passed in 3.20s | test_gate_rejections_are_audited_without_argument_values, test_rejected_argument_path_redacts_caller_chosen_keys
-X1 dead-sink branch logs the ValidationError: KILLED | 1 failed, 36 passed in 2.90s | test_rejected_and_denied_calls_never_log_argument_values
-X2 caller key kept when it looks like an identifier: KILLED | 3 failed, 34 passed in 3.18s | test_rejected_argument_path_redacts_caller_chosen_keys
-X3 validator kept when it looks like an identifier: KILLED | 1 failed, 36 passed in 2.88s | test_an_unknown_validator_keyword_is_not_recorded
-X4 gateway_tool not bounded to the scoped set: KILLED | 1 failed, 36 passed in 2.99s | test_the_rejection_names_only_a_scoped_gateway_tool
-X5 declared names = every dict key in the schema: KILLED | 1 failed, 36 passed in 3.01s | test_rejected_argument_path_redacts_caller_chosen_keys
-X6 gate logs the rejected arguments at debug: KILLED | 1 failed, 36 passed in 2.86s | test_rejected_and_denied_calls_never_log_argument_values
-X7 caller key kept when shorter than 16 chars: KILLED | 3 failed, 34 passed in 3.15s | test_rejected_argument_path_redacts_caller_chosen_keys, test_the_rejection_record_never_reads_the_message_or_the_instance
-N1 denied arm records the caller's arguments (rev 1; board B1): KILLED | 3 failed, 34 passed in 2.91s | test_an_ungated_call_records_nothing_the_caller_chose
-N2 denied arm digests the payload that echoes the caller's name: KILLED | 1 failed, 36 passed in 3.03s | test_an_ungated_call_records_nothing_the_caller_chose
-N3 gated record reads undeclared keys: KILLED | 1 failed, 36 passed in 2.87s | test_a_gated_call_records_only_the_keys_its_schema_declares
-N4 audit names the tool by the caller's string: KILLED | 2 failed, 35 passed in 2.93s | test_an_ungated_call_records_nothing_the_caller_chose
-N5 except arm records ungated arguments: KILLED | 1 failed, 36 passed in 2.88s | test_an_ungated_call_records_nothing_the_caller_chose
-N6 an exception describing the rejection escapes: KILLED | 1 failed, 36 passed in 3.20s | test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink
-N7 the describing exception is chained: KILLED | 1 failed, 36 passed in 2.90s | test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink
-N8 post-dispatch record reads the caller's arguments: KILLED | 1 failed, 36 passed in 2.95s | test_a_gated_call_records_only_the_keys_its_schema_declares
-29/29 killed
+M1 policy not judged before the gate: KILLED | 4 failed, 37 passed in 3.19s | test_an_ungated_call_records_nothing_the_caller_chose, test_policy_is_judged_before_the_gate, test_the_policy_verdict_is_read_once_per_call
+M2 call_tool re-reads the policy verdict: KILLED | 1 failed, 40 passed in 2.91s | test_the_policy_verdict_is_read_once_per_call
+M3 relative .path instead of .absolute_path: KILLED | 3 failed, 38 passed in 2.96s | test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink, test_rejected_argument_path_redacts_caller_chosen_keys
+M4 caller keys not checked against declared names: KILLED | 6 failed, 35 passed in 3.02s | test_rejected_argument_path_redacts_caller_chosen_keys, test_the_rejection_record_never_reads_the_message_or_the_instance
+M4b str subclass accepted by isinstance: KILLED | 1 failed, 40 passed in 3.07s | test_rejected_argument_path_redacts_caller_chosen_keys
+M5 int segment kept without a list container: KILLED | 1 failed, 40 passed in 2.99s | test_rejected_argument_path_redacts_caller_chosen_keys
+M6 validator keyword not bounded: KILLED | 2 failed, 39 passed in 3.04s | test_an_unknown_validator_keyword_is_not_recorded
+M7 gate rejection not recorded: KILLED | 3 failed, 38 passed in 3.05s | test_gate_rejection_with_a_dead_sink_fails_closed, test_gate_rejections_are_audited_without_argument_values, test_rejected_and_denied_calls_never_log_argument_values
+M8 dead sink not caught at the gate: KILLED | 2 failed, 39 passed in 2.99s | test_gate_rejection_with_a_dead_sink_fails_closed, test_rejected_and_denied_calls_never_log_argument_values
+M9 correlation copied from unvalidated arguments: KILLED | 2 failed, 39 passed in 2.91s | test_gate_rejections_are_audited_without_argument_values, test_the_rejection_record_never_reads_the_message_or_the_instance
+M10 jsonschema message recorded: KILLED | 2 failed, 39 passed in 3.11s | test_gate_rejections_are_audited_without_argument_values, test_the_rejection_record_never_reads_the_message_or_the_instance
+M11 terminal_status failure: KILLED | 1 failed, 40 passed in 3.06s | test_gate_rejections_are_audited_without_argument_values
+M13 rejection written as an audit.invocation: KILLED | 4 failed, 37 passed in 2.96s | test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink, test_gate_rejections_are_audited_without_argument_values
+M12 declared names from the top level only: KILLED | 2 failed, 39 passed in 3.01s | test_gate_rejections_are_audited_without_argument_values, test_rejected_argument_path_redacts_caller_chosen_keys
+X1 dead-sink branch logs the ValidationError: KILLED | 1 failed, 40 passed in 2.96s | test_rejected_and_denied_calls_never_log_argument_values
+X2 caller key kept when it looks like an identifier: KILLED | 3 failed, 38 passed in 3.31s | test_rejected_argument_path_redacts_caller_chosen_keys
+X3 validator kept when it looks like an identifier: KILLED | 1 failed, 40 passed in 2.90s | test_an_unknown_validator_keyword_is_not_recorded
+X4 gateway_tool not bounded to the scoped set: KILLED | 1 failed, 40 passed in 2.96s | test_the_rejection_names_only_a_scoped_gateway_tool
+X5 declared names = every dict key in the schema: KILLED | 1 failed, 40 passed in 2.88s | test_rejected_argument_path_redacts_caller_chosen_keys
+X6 gate logs the rejected arguments at debug: KILLED | 1 failed, 40 passed in 3.18s | test_rejected_and_denied_calls_never_log_argument_values
+X7 caller key kept when shorter than 16 chars: KILLED | 3 failed, 38 passed in 2.95s | test_rejected_argument_path_redacts_caller_chosen_keys, test_the_rejection_record_never_reads_the_message_or_the_instance
+N1 denied arm records the caller's arguments (rev 1; board B1): KILLED | 3 failed, 38 passed in 2.97s | test_an_ungated_call_records_nothing_the_caller_chose
+N2 denied arm digests the payload that echoes the caller's name: KILLED | 1 failed, 40 passed in 2.90s | test_an_ungated_call_records_nothing_the_caller_chose
+N3 gated record reads undeclared keys: KILLED | 2 failed, 39 passed in 3.14s | test_a_gated_call_records_only_the_keys_its_schema_declares, test_an_allowed_call_that_raises_records_only_declared_keys
+N4 audit names the tool by the caller's string: KILLED | 2 failed, 39 passed in 3.05s | test_an_ungated_call_records_nothing_the_caller_chose
+N5 except arm records ungated arguments: KILLED | 2 failed, 39 passed in 2.90s | test_an_allowed_call_that_raises_records_only_declared_keys, test_an_ungated_call_records_nothing_the_caller_chose
+N6 an exception describing the rejection escapes: KILLED | 2 failed, 39 passed in 3.00s | test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink
+N7 the describing exception is chained: KILLED | 3 failed, 38 passed in 3.42s | test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink
+N8 post-dispatch record reads the caller's arguments: KILLED | 1 failed, 40 passed in 2.94s | test_a_gated_call_records_only_the_keys_its_schema_declares
+Y1 declared filter drops evidence_label_digest: KILLED | 2 failed, 39 passed in 2.88s | test_an_invoke_source_hash_comes_from_its_declared_arguments, test_scoped_server_filters_controls_and_writes_private_complete_audit
+Y3 declared filter drops invoke's arguments: KILLED | 1 failed, 40 passed in 2.87s | test_an_invoke_source_hash_comes_from_its_declared_arguments
+Y4 declared filter applied before the gate: KILLED | 2 failed, 39 passed in 3.03s | test_an_ungated_call_records_nothing_the_caller_chose
+Y6 E16 catches only ValueError: KILLED | 2 failed, 39 passed in 2.96s | test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink
+Y9 except arm records full gate-passed arguments: KILLED | 1 failed, 40 passed in 2.91s | test_an_allowed_call_that_raises_records_only_declared_keys
+34/34 killed
 ```
 
-Rev 1 → rev 2 on the seat's set: X1–X6 went from SURVIVED to KILLED; X7
-was already killed. N1 is rev 1's own denied arm (board B1): it survived rev 1
-by construction and is now killed by three of the four differential cases
-(`unregistered-allowed` reaches the `except` arm, which N5 covers). N7 first
-**survived** rev 2's initial test (`__cause__ is None` holds with or without
-`from None`, because the original stays on `__context__`); the test now
-asserts on `traceback.format_exception`, which prints an unsuppressed
-context, and the run above is after that change.
+History: X1–X6 survived rev 1 and are killed since rev 2. N7 survived rev 2's
+first E16 test (`__cause__ is None` holds either way) until the test asserted
+on `traceback.format_exception`. Y1, Y3, Y4, Y6 and Y9 survived rev 2
+(board 2) and are killed since rev 3.
 
 ## Non-goals
 
@@ -792,6 +865,23 @@ context, and the run above is after that change.
   The new `caplog` test covers every path this plan adds or reroutes (E1, E2,
   E4) and E16's exception is never logged.
 - Piece B itself.
+- **Follow-up (rev 2 seat): URL hashing on non-invoke tools.**
+  `record_invocation` runs its public-URL scan (`source_reference_hash`) over
+  the arguments of *every* tool, so a declared free-text field of a gated,
+  allowed non-invoke call — `catalog_search {"query": "see https://…"}`, or a
+  URL in `filters.tags` — is still hashed into the record. Same as main; this
+  plan neither widens nor narrows it (the declared-keys filter lets declared
+  fields through by design), and the ledger ignores non-invoke records.
+  Proposed follow-up issue: have `record_invocation` read the correlations,
+  `tool_id`, `evidence_label_digest` and the URL scan **only for
+  `gateway.invoke`**, keeping just `gateway_tool`, its digest, the status and
+  the result digest on other tools.
+- **`meta` vs `_meta` on `invoke` (rev 2 seat, harmless).** `InvokeInput`
+  has `populate_by_name=True` with `meta` aliased to `_meta`, so a caller
+  sending `meta` passes the gate as an undeclared key and the handler accepts
+  it; the audit's URL scan now skips it (main scanned it). Research sources
+  travel in `invoke.arguments`, which is scanned, so the ledger is unaffected
+  (seat's reducer runs A–C: `success`).
 
 ## Unverified
 
@@ -815,26 +905,26 @@ context, and the run above is after that change.
 
 ## Embedding proof
 
-Rev 2, run after the patches were regenerated with
-`git diff 959d4d4 e10304a -- <file>` and embedded; fresh worktree
-`$WORKTREE_ROOT/pmcp-296-rev2-proof` (removed afterwards):
+Rev 3, run after the patches were regenerated with
+`git diff 959d4d4 e4e1bbb -- <file>` and embedded; fresh worktree
+`$WORKTREE_ROOT/pmcp-296-rev3-proof` (removed afterwards):
 
 ```text
 $ git -C <fresh worktree> rev-parse --short HEAD
 959d4d4
 <scratch>/emb/server.patch: 119 lines
 <scratch>/emb/scoped_advisor_audit.patch: 158 lines
-<scratch>/emb/test_scoped_advisor_audit.patch: 596 lines
+<scratch>/emb/test_scoped_advisor_audit.patch: 746 lines
 <scratch>/emb/CHANGELOG.patch: 14 lines
 <scratch>/emb/README.patch: 18 lines
 $ git apply --check <scratch>/emb/*.patch
 check: ok
 applied
-cmp src/pmcp/server.py: identical to wip/296-code@e10304a
-cmp src/pmcp/scoped_advisor_audit.py: identical to wip/296-code@e10304a
-cmp tests/test_scoped_advisor_audit.py: identical to wip/296-code@e10304a
-cmp CHANGELOG.md: identical to wip/296-code@e10304a
-cmp README.md: identical to wip/296-code@e10304a
+cmp src/pmcp/server.py: identical to wip/296-code@e4e1bbb
+cmp src/pmcp/scoped_advisor_audit.py: identical to wip/296-code@e4e1bbb
+cmp tests/test_scoped_advisor_audit.py: identical to wip/296-code@e4e1bbb
+cmp CHANGELOG.md: identical to wip/296-code@e4e1bbb
+cmp README.md: identical to wip/296-code@e4e1bbb
 $ git status --short
  M CHANGELOG.md
  M README.md
@@ -1182,12 +1272,13 @@ index 8dfb4ee..76d96e6 100644
 
 ````diff
 diff --git a/tests/test_scoped_advisor_audit.py b/tests/test_scoped_advisor_audit.py
-index 6ae178c..75bb7d8 100644
+index 6ae178c..f58d0aa 100644
 --- a/tests/test_scoped_advisor_audit.py
 +++ b/tests/test_scoped_advisor_audit.py
-@@ -1,14 +1,17 @@
+@@ -1,14 +1,18 @@
  from __future__ import annotations
  
++import hashlib
  import json
 +import logging
  import os
@@ -1203,7 +1294,47 @@ index 6ae178c..75bb7d8 100644
  import pytest
  from mcp.server.connection import Connection
  from mcp.server.context import ServerRequestContext
-@@ -578,3 +581,573 @@ def test_capability_probe_is_machine_readable() -> None:
+@@ -62,6 +66,28 @@ def _write_scoped_policy(path: Path) -> Path:
+     return path
+ 
+ 
++#: Every record field agent-harness's research reducer reads
++#: (`phase_loop_runtime/advisor_board/research.py`, its `record.get(...)`
++#: calls @ 18a324a4). A `gateway.invoke` invocation record must carry each
++#: one, or the seat's ledger fails. Consiliency/pmcp#296's plan derives this
++#: set from that file with `ledger_fields.py` and compares it to this one.
++_LEDGER_READ_FIELDS = frozenset(
++    {
++        "sequence",
++        "event",
++        "audit_session_id",
++        "policy_digest",
++        "gateway_tool",
++        "downstream_tool_id",
++        "terminal_status",
++        "source_reference_hash",
++        "evidence_label_digest",
++        "run_correlation_id",
++        "seat_correlation_id",
++    }
++)
++
++
+ def _correlations() -> dict[str, str]:
+     return {
+         "run_correlation_id": "run-103",
+@@ -324,6 +350,10 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
+     assert firecrawl_record["run_correlation_id"] == "run-103"
+     assert firecrawl_record["seat_correlation_id"] == "seat-codex"
+     assert firecrawl_record["source_reference_hash"]
++    # Everything the board ledger reads survives the declared-keys filter.
++    for field in _LEDGER_READ_FIELDS:
++        assert firecrawl_record[field] is not None, field
++    assert firecrawl_record["evidence_label_digest"] == "a" * 64
+     assert records[-1]["record_count"] == len(records)
+     raw_audit = audit_path.read_text()
+     for forbidden in (
+@@ -578,3 +608,682 @@ def test_capability_probe_is_machine_readable() -> None:
      assert (
          "terminal_completion_fsync" in payload["capabilities"][0]["activation_requires"]
      )
@@ -1544,6 +1675,14 @@ index 6ae178c..75bb7d8 100644
 +    }
 +
 +
++def _format_tag(value: Any, tag: str) -> Any:
++    if isinstance(value, str):
++        return value.format(tag=tag)
++    if isinstance(value, list):
++        return [_format_tag(item, tag) for item in value]
++    return value
++
++
 +def _stable(record: dict[str, Any]) -> dict[str, Any]:
 +    return {k: v for k, v in record.items() if k not in _VOLATILE_KEYS}
 +
@@ -1555,14 +1694,16 @@ index 6ae178c..75bb7d8 100644
 +        (
 +            "blocked, malformed",
 +            ("gateway.provision", "gateway.provision"),
-+            {"server_name": 12345},
++            # Malformed (not a string) yet URL-bearing, in the one key
++            # `provision` declares: a filter run before the gate would read it.
++            {"server_name": ["https://caller-chosen-server-{tag}.example.com/p"]},
 +            False,
 +            "blocked by policy",
 +        ),
 +        (
 +            "blocked, well-formed",
 +            ("gateway.provision", "gateway.provision"),
-+            {"server_name": "x"},
++            {"server_name": "https://caller-chosen-server-{tag}.example.com/p"},
 +            False,
 +            "blocked by policy",
 +        ),
@@ -1611,7 +1752,8 @@ index 6ae178c..75bb7d8 100644
 +            lambda name: True
 +        )
 +    for name, tag in zip(names, ("a", "b")):
-+        result = await _call(server, name, {**base, **_caller_values(tag)})
++        tagged = {key: _format_tag(value, tag) for key, value in base.items()}
++        result = await _call(server, name, {**tagged, **_caller_values(tag)})
 +        assert response in result.content[0].text, label
 +    await server.shutdown()
 +
@@ -1740,24 +1882,47 @@ index 6ae178c..75bb7d8 100644
 +        raise ValueError("caller_chosen_lookup_failure")
 +
 +
++def _raising_path_error(exc_type: type[Exception]) -> jsonschema.ValidationError:
++    """An error whose `absolute_path` raises `exc_type` when read."""
++
++    class _RaisingPath(jsonschema.ValidationError):
++        @property  # type: ignore[override]
++        def absolute_path(self) -> Any:
++            raise exc_type("caller_chosen_lookup_failure")
++
++    error = _first_error({"env": {"k": "v"}}, _CALLER_KEYED_SCHEMA)
++    error.__class__ = _RaisingPath
++    return error
++
++
++@pytest.mark.parametrize("exc_type", [ValueError, KeyError, TypeError])
 +def test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink(
-+    tmp_path: Path,
++    tmp_path: Path, exc_type: type[Exception]
 +) -> None:
 +    """Any exception while describing the rejection is an audit failure.
 +
 +    It surfaces as `ScopedAdvisorAuditError`, which the gate answers with
 +    "channel failed", instead of escaping `_handle_call_tool` unaudited; it
-+    writes nothing, and the sink stays live for the next call.
++    writes nothing, and the sink stays live for the next call. `ValueError`
++    comes from a caller's mapping during the path walk; `KeyError` and
++    `TypeError` -- which the walk itself tolerates on a lookup -- from reading
++    the error's path.
 +    """
 +    error = _first_error({"env": {"k": "v"}}, _CALLER_KEYED_SCHEMA)
 +    path = tmp_path / "audit.jsonl"
 +    audit = ScopedAdvisorAudit(path, policy_digest="e" * 64)
++    if exc_type is ValueError:
++        failing_error = error
++        arguments: dict[str, Any] = {"env": _RaisingDict({"k": "v"})}
++    else:
++        failing_error = _raising_path_error(exc_type)
++        arguments = {"env": {"k": "v"}}
 +    with pytest.raises(ScopedAdvisorAuditError) as raised:
 +        audit.record_rejected_arguments(
 +            gateway_tool="gateway.invoke",
-+            error=error,
++            error=failing_error,
 +            schema=_CALLER_KEYED_SCHEMA,
-+            arguments={"env": _RaisingDict({"k": "v"})},
++            arguments=arguments,
 +        )
 +    # Not in the message, and not in a logged traceback either: the original
 +    # exception is neither the cause nor displayed as the context.
@@ -1777,13 +1942,88 @@ index 6ae178c..75bb7d8 100644
 +        "audit.rejection",
 +        "audit.completed",
 +    ]
++
++
++@pytest.mark.asyncio
++async def test_an_invoke_source_hash_comes_from_its_declared_arguments(
++    tmp_path: Path,
++) -> None:
++    """`invoke.arguments` is declared, so its URL still reaches the record.
++
++    The downstream result carries no URL here, so the only source for
++    `source_reference_hash` -- which the ledger needs to verify a claim -- is
++    the declared `arguments` object.
++    """
++    server, audit_path = _scoped_server(tmp_path)
++
++    async def stub_invoke(arguments: dict) -> dict:
++        return {"ok": True, "result": "a page with no link in it"}
++
++    server._gateway_tools.invoke = stub_invoke  # type: ignore[method-assign]
++    result = await _call(
++        server,
++        "gateway.invoke",
++        {
++            "tool_id": "firecrawl::web_search",
++            "arguments": {"url": "https://source.example/article"},
++            **_correlations(),
++        },
++    )
++    assert json.loads(result.content[0].text)["ok"] is True
++    await server.shutdown()
++
++    records = validate_scoped_advisor_audit(audit_path)
++    (record,) = [r for r in records if r["event"] == "audit.invocation"]
++    assert (
++        record["source_reference_hash"]
++        == hashlib.sha256(b"https://source.example/article").hexdigest()
++    )
++    for field in _LEDGER_READ_FIELDS:
++        assert record[field] is not None, field
++
++
++@pytest.mark.asyncio
++async def test_an_allowed_call_that_raises_records_only_declared_keys(
++    tmp_path: Path,
++) -> None:
++    """The `except` arm (E9) of a registered, allowed tool reads the filter too."""
++    server, audit_path = _scoped_server(tmp_path)
++
++    async def failing_describe(arguments: dict) -> dict:
++        raise ValueError("downstream describe failed")
++
++    server._gateway_tools.describe = failing_describe  # type: ignore[method-assign]
++    for tag in ("a", "b"):
++        undeclared = {k: v for k, v in _caller_values(tag).items() if k != "tool_id"}
++        await _call(
++            server,
++            "gateway.describe",
++            {"tool_id": "firecrawl::web_search", **undeclared},
++        )
++    await server.shutdown()
++
++    records = validate_scoped_advisor_audit(audit_path)
++    first, second = [r for r in records if r["event"] == "audit.invocation"]
++    assert first["terminal_status"] == "failure"
++    assert _stable(first) == _stable(second)
++    assert first["downstream_tool_id"] == "firecrawl::web_search"
++    for field in (
++        "run_correlation_id",
++        "seat_correlation_id",
++        "evidence_label_digest",
++        "source_reference_hash",
++    ):
++        assert first[field] is None, field
++    raw_audit = audit_path.read_text()
++    for forbidden in ("caller_chosen", "caller-chosen", "0" * 64):
++        assert forbidden not in raw_audit, forbidden
 ````
 
 ### Patch — `CHANGELOG.md`
 
 ````diff
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 12ec2d4..4c5c322 100644
+index 12ec2d4..c6973ff 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -367,7 +367,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
@@ -1792,7 +2032,7 @@ index 12ec2d4..4c5c322 100644
  ### Fixed
 -- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree (Consiliency/pmcp#236).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` now advertises its range on both sides, so `1e20`, `-1e20` and `float(±2**63)` are rejected at the gate, and so is any integer outside [−2^63+1, 2^63−1] (including `-2**63` itself), which the handler previously accepted. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. **Scoped-audit change until Consiliency/pmcp#296 lands:** gate rejections are not written to the scoped-advisor audit. So a *malformed* call to a *policy-blocked* gateway tool now gets `Input validation error: …` instead of "Gateway tool blocked by policy", and it is **no longer recorded as `denied`**. The same holds for the other inputs the gate now rejects that previously reached the handler and were recorded as `failure`. Well-formed calls to blocked tools are still recorded `denied`. Unknown keys are still ignored in this release — see the following entry once B lands. Argument descriptions agents already saw are unchanged, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description.
 +- **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values (Consiliency/pmcp#296).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name, `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
-+- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree (Consiliency/pmcp#236).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` now advertises its range on both sides, so `1e20`, `-1e20` and `float(±2**63)` are rejected at the gate, and so is any integer outside [−2^63+1, 2^63−1] (including `-2**63` itself), which the handler previously accepted. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the Consiliency/pmcp#296 entry below). Unknown keys are still ignored in this release — see the following entry once B lands. Argument descriptions agents already saw are unchanged, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description.
++- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree (Consiliency/pmcp#236).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` now advertises its range on both sides, so `1e20`, `-1e20` and `float(±2**63)` are rejected at the gate, and so is any integer outside [−2^63+1, 2^63−1] (including `-2**63` itself), which the handler previously accepted. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the Consiliency/pmcp#296 entry above). Unknown keys are still ignored in this release — see the following entry once B lands. Argument descriptions agents already saw are unchanged, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description.
  - **Exact-version validation follows npm's classification of package specs.** `is_valid_package_version` now refuses a version ending in `.tgz`, `.tar` or `.tar.gz` (any case), matching npm-package-arg's `isFileType` rule, which npm applies before reading a selector as a registry version; and a version whose major, minor or patch exceeds 2^53 - 1 (JavaScript's `Number.MAX_SAFE_INTEGER`), which node-semver refuses and npm-package-arg then reads as a dist-tag. It uses npm 10's pattern (npm-package-arg 12.x, whose `.` before `gz` is unescaped), a superset of npm 11's, since pmcp runs whichever `npx` is on PATH. The provision gate, package approvals, the CLI and the `gateway.provision` handler inherit it. **Upgrade note:** a package approval recorded earlier at either kind of version now approves nothing; it is ignored with a warning naming it (the rest of the store keeps working) and dropped on the next write to the store; re-approving the package at a registry version is that write. (`pmcp trust revoke-package <name>` also clears it, but a bare name revokes that package's valid approvals too.) A record with any other defect still fails the store closed.
  - **A downstream MCP server can no longer hang a caller by sending a request, being cancelled, or timing out — the remaining "the server hangs" runtime gaps are closed.** A server→client JSON-RPC request (a frame carrying both `method` and `id`) is now answered rather than dropped: `ping` gets an empty result and any other method a `-32601` "Method not found" refusal (the gateway advertises no client capabilities, so it does not forward an untrusted server's request to the agent), and classifying by `method` first also stops a downstream request whose id collides with one of ours from being misrouted as our response. `_send_request` no longer leaks a `pending_requests` entry when the caller is cancelled or the write itself raises — the entry is popped in a `finally` and a mid-write error still propagates. Cancellation is now propagated downstream as `notifications/cancelled` on `gateway.cancel`, on idle/ceiling timeout, and on caller cancellation (never for `initialize`, per spec; exactly once per cancellation). Replies and cancellation notifications go through a bounded per-server outbound queue drained by a single writer task whose lifecycle is torn down with the connection, so a downstream that stalls its own sink cannot make the gateway allocate unbounded tasks or buffer unbounded frames (review findings C-01, C-02, C-04). See [#232](https://github.com/Consiliency/pmcp/issues/232).
  - **A non-ASCII `Authorization` header no longer turns any request into a 500.** `hmac.compare_digest` raises `TypeError` on `str` containing non-ASCII, so an unauthenticated caller could crash any request with one header byte; the shared-secret comparison now happens on bytes and a bad header is simply unauthorized (review finding S-09). See [#231](https://github.com/Consiliency/pmcp/issues/231).
@@ -1943,6 +2183,55 @@ unregistered name, secret
     audit.invocation denied run= None seat= None src= None
 ```
 
+### `ledger_fields.py` (rev 3)
+
+````python
+"""Derive the audit fields agent-harness's research reducer reads, and compare
+them with the test module's `_LEDGER_READ_FIELDS` (Consiliency/pmcp#296).
+
+usage: python ledger_fields.py <research.py> <tests/test_scoped_advisor_audit.py>
+"""
+import ast
+import sys
+from pathlib import Path
+
+research = ast.parse(Path(sys.argv[1]).read_text())
+read = sorted(
+    {
+        node.args[0].value
+        for node in ast.walk(research)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "record"
+        and node.args
+        and isinstance(node.args[0], ast.Constant)
+    }
+)
+tests = ast.parse(Path(sys.argv[2]).read_text())
+(pinned_node,) = [
+    node.value
+    for node in tests.body
+    if isinstance(node, ast.Assign)
+    and any(isinstance(t, ast.Name) and t.id == "_LEDGER_READ_FIELDS" for t in node.targets)
+]
+pinned = sorted(ast.literal_eval(pinned_node.args[0]))
+print("research.py reads:", read)
+print("test pins:        ", pinned)
+print("equal:", read == pinned)
+````
+
+Output on the pinned install (`~/.local/share/agent-harness` @ `18a324a4`;
+its `research.py` `cmp`-equal to `~/code/agent-harness`'s) against
+`wip/296-code` @ `e4e1bbb`:
+
+```text
+research.py reads: ['audit_session_id', 'downstream_tool_id', 'event', 'evidence_label_digest', 'gateway_tool', 'policy_digest', 'run_correlation_id', 'seat_correlation_id', 'sequence', 'source_reference_hash', 'terminal_status']
+test pins:         ['audit_session_id', 'downstream_tool_id', 'event', 'evidence_label_digest', 'gateway_tool', 'policy_digest', 'run_correlation_id', 'seat_correlation_id', 'sequence', 'source_reference_hash', 'terminal_status']
+equal: True
+```
+
 ### `survey.py`
 
 ````python
@@ -1965,8 +2254,9 @@ for t in tools:
 ### `mutants.py`
 
 ````python
-"""Mutation run for Consiliency/pmcp#296, rev 2: rev 1's 14 (M1-M13, M4b), the
-rev 1 board seat's X1-X7 and rev 2's N1-N8. Each mutant is one exact-string
+"""Mutation run for Consiliency/pmcp#296, rev 3: rev 1's 14 (M1-M13, M4b), the
+rev 1 board seat's X1-X7, rev 2's N1-N8 and the rev 2 board seat's Y1, Y3, Y4,
+Y6, Y9. Each mutant is one exact-string
 replacement; the file is restored from a saved copy after every run."""
 import shutil, subprocess, sys
 from pathlib import Path
@@ -2055,6 +2345,22 @@ MUTANTS = [
     ("N8 post-dispatch record reads the caller's arguments", SERVER,
      "                    arguments=audited_arguments,\n                    result=result,\n",
      "                    arguments=arguments,\n                    result=result,\n"),
+    # --- the rev 2 board seat's surviving non-equivalent mutants (review of 2911ff5) ---
+    ("Y1 declared filter drops evidence_label_digest", SERVER,
+     "key: value for key, value in arguments.items() if key in declared\n",
+     "key: value for key, value in arguments.items() if key in declared and key != \"evidence_label_digest\"\n"),
+    ("Y3 declared filter drops invoke's arguments", SERVER,
+     "key: value for key, value in arguments.items() if key in declared\n",
+     "key: value for key, value in arguments.items() if key in declared and key != \"arguments\"\n"),
+    ("Y4 declared filter applied before the gate", SERVER,
+     "        audited_arguments: dict[str, Any] | None = None\n",
+     "        audited_arguments: dict[str, Any] | None = (\n            {k: v for k, v in arguments.items() if k in (tool.input_schema.get(\"properties\") or {})}\n            if tool is not None else None\n        )\n"),
+    ("Y6 E16 catches only ValueError", AUDIT,
+     "        except Exception:\n            raise ScopedAdvisorAuditError(\n",
+     "        except ValueError:\n            raise ScopedAdvisorAuditError(\n"),
+    ("Y9 except arm records full gate-passed arguments", SERVER,
+     "                        terminal_status=failure_status,\n                        arguments=audited_arguments,\n",
+     "                        terminal_status=failure_status,\n                        arguments=arguments if audited_arguments is not None else None,\n"),
 ]
 scratch = Path(sys.argv[1])
 saved = {p: scratch / (p.name + ".orig") for p in (SERVER, AUDIT)}
