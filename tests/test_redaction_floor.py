@@ -945,3 +945,316 @@ def test_the_regex_comparison_reports_a_timeout_instead_of_hanging() -> None:
     problems = _compare_with_timeout(["x"], timeout=2, reference=_never_returns)
     assert problems and problems[0].startswith("TIMEOUT"), problems
     assert time.perf_counter() - started < 30
+
+
+# ================================================ rev 11's board, round 1 ==== #
+#
+# Each finding: a check that is red on rev 11 (`3e49b95`) and green here, and
+# a mutant that restores rev 11's mechanism and turns the check red.
+
+
+def _time(run: Callable[[str], object], text: str) -> float:
+    best = float("inf")
+    for _ in range(2):
+        started = time.perf_counter()
+        run(text)
+        best = min(best, time.perf_counter() - started)
+    return best
+
+
+def _entry_points() -> dict[str, Callable[[str], object]]:
+    policy = PolicyManager()
+    return {
+        "E": lambda t: sanitize_auth_diagnostic(t, max_length=None),
+        "P": policy.redact_secrets,
+        "POs": lambda t: policy.process_output(t, redact=True, max_bytes=G.BIG),
+        "POd": lambda t: policy.process_output({"t": t}, redact=True, max_bytes=G.BIG),
+    }
+
+
+def _growth(shape: Callable[[int], str], small: int, large: int) -> list[str]:
+    """Entry points on which ``shape`` grows super-linearly from ``small`` to
+    ``large`` characters: time ratio over 1.6x the size ratio (a linear path
+    is ~1x, a quadratic one ~ the size ratio). Times under 30 ms at the
+    large size are below what one host measures reliably and pass."""
+    factor = large / small
+    slow = []
+    for name, run in _entry_points().items():
+        t_small = _time(run, shape(small))
+        t_large = _time(run, shape(large))
+        if t_large >= 0.03 and t_large / max(t_small, 1e-4) > 1.6 * factor:
+            slow.append(f"{name}: {t_small:.3f}s -> {t_large:.3f}s")
+    return slow
+
+
+#: The board's three shapes and the families the generated sweep found
+#: (`tests/_redaction_shapes.py`; the full sweep is the slow tier's).
+LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
+    "B-1 closers after a Bearer value": lambda n: "Bearer x" + ")" * n + "a",
+    "B-1 escaped quotes after Authorization": lambda n: "Authorization: x" + '\\"' * (n // 2) + "a",
+    "B-1 each closer after Authorization": lambda n: "Authorization: x" + ">" * n + "=",
+    "B-1b line breaks before a Bearer value": lambda n: "x Bearer" + "\n" * n + " abc",
+    "B-1b line breaks before a keyword value": lambda n: "token" + "\n" * n + " abc12",
+    "B-1c one policy value over many markers": lambda n: "arn:" + "secret:" * (n // 7) + "=abc123",
+    "empty query pairs": lambda n: "https://h/?" + "&" * n + "a",
+    "key words after Bearer": lambda n: "x Bearer" + "api_key" * (n // 7) + '"',
+    "joined key run": lambda n: "token-" * (n // 6) + "=abc123def",
+    "word boundaries": lambda n: "a-" * (n // 2),
+    "operator run": lambda n: "password" + ":=" * (n // 2),
+}  # fmt: skip
+
+
+@pytest.mark.parametrize("name", sorted(LINEAR_SHAPES))
+def test_every_shape_grows_linearly_on_every_entry_point(name: str) -> None:
+    """16 KB -> 64 KB on the engine, the policy surface and `process_output`
+    (string and dict): the growth is linear, and 64 KB stays under 2 s."""
+    shape = LINEAR_SHAPES[name]
+    assert _growth(shape, 16_384, 65_536) == []
+    for label, run in _entry_points().items():
+        assert _time(run, shape(65_536)) < 2.0, label
+
+
+def _old_wrap_close_start(text: str, start: int, end: int) -> int:
+    match = re.compile(r"(?:\\?[\"')\]}>])+[.:!?]*\Z").search(text, start, end)
+    return match.start() if match is not None else -1
+
+
+def _old_unindented_break(text: str) -> bool:
+    return re.search(r"[\r\n][^ \t\xa0]*\Z", text) is not None
+
+
+LINEARITY_MUTANTS: dict[str, tuple[str, Callable[[pytest.MonkeyPatch], None]]] = {
+    "B-1": (
+        "B-1 closers after a Bearer value",
+        lambda mp: mp.setattr(F, "_wrap_close_start", _old_wrap_close_start),
+    ),
+    "B-1b": (
+        "B-1b line breaks before a Bearer value",
+        lambda mp: (
+            mp.setattr(F, "unindented_break", _old_unindented_break),
+            mp.setattr("pmcp.auth.unindented_break", _old_unindented_break),
+        ),
+    ),
+    "B-1c": (
+        "B-1c one policy value over many markers",
+        lambda mp: mp.setattr(F, "_decision_key", id),
+    ),
+}
+
+
+@pytest.mark.parametrize("finding", sorted(LINEARITY_MUTANTS))
+def test_each_linearity_finding_has_a_killing_mutant(
+    finding: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Rev 11's mechanism restored, the shape grows quadratically again
+    (measured at 2 KB -> 8 KB, where the quadratic path is still quick)."""
+    shape_name, mutate = LINEARITY_MUTANTS[finding]
+    shape = LINEAR_SHAPES[shape_name]
+    assert _growth(shape, 2_048, 8_192) == []
+    mutate(monkeypatch)
+    assert _growth(shape, 2_048, 8_192) != []
+
+
+#: B-2: a key AFTER a resource name in the same run is a key. Each delimiter
+#: that ends a resource name, between a URN/ARN and a keyed credential.
+_RESOURCE_NAMES = (
+    "urn:ietf:params:oauth:grant-type:token-exchange",
+    "urn:ietf:params:oauth:grant-type:jwt-bearer",
+    "arn:aws:rds:us-east-1:1:db:prod",
+    "urn:db",
+)
+_NAME_DELIMITERS = ("&", ",", ";", "(", ")", "?", "=", " ", "&x=1&")
+
+
+def _b2_cases() -> list[tuple[str, str]]:
+    cases = [
+        (
+            "grant_type=urn:ietf:params:oauth:grant-type:token-exchange"
+            "&client_secret=Hunter2abcX9",
+            "Hunter2abcX9",
+        ),
+        ("connect urn:db;user=admin;password=Hunter2abcX9", "Hunter2abcX9"),
+        ("(arn:aws:x)token=Hunter2abcX9", "Hunter2abcX9"),
+    ]
+    for name in _RESOURCE_NAMES:
+        for delimiter in _NAME_DELIMITERS:
+            for key in ("client_secret", "password", "token", "api_key"):
+                cases.append((f"x={name}{delimiter}{key}=Hunter2abcX9", "Hunter2abcX9"))
+    return cases
+
+
+def _b2() -> None:
+    for text, secret in _b2_cases():
+        for surface in (_engine, _policy):
+            assert secret not in surface(text), (text, surface(text))
+        assert secret not in json.dumps(_process({"detail": text})), text
+
+
+def _old_n10(span: F.FloorSpan) -> bool:
+    """Rev 11's N10: the input before the VALUE, read back to the last
+    whitespace or quote, across `& , ; ( ) ? =`, ends inside a resource
+    name."""
+    before = (span.raw_key_before or "") + span.key + span.sep
+    return (
+        span.rule in F._KEYED_RULES
+        and span.part == "value"
+        and span.raw_key_before is not None
+        and re.search(r"(?i)\b[au]rn:[^\s\"'<>]*\Z", before) is not None
+    )
+
+
+def test_b2_n10_fires_only_on_a_segment_of_a_resource_name() -> None:
+    _b2()
+    # the approved class still holds: a key that IS a segment of the name
+    for text in (
+        "arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret-a1b2c3",
+        "arn:aws:iam::1:secret:hunter22x",
+    ):
+        assert _engine(text) == text and _policy(text) == text, text
+
+
+def test_b2_mutant_rev_11_n10(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(F.SUPPRESSIONS, "N10", _old_n10)
+    with pytest.raises(AssertionError):
+        _b2()
+
+
+_N1_CASES = (
+    "DATABASE_PASSWORD_FOR_REPLICATION_USER_ACCOUNT=Hunter2abcX9",
+    "api_key_for_the_production_database_server: Hunter2abcX9",
+    "client_secret_for_the_staging_environment_x=Hunter2abcX9",
+)
+
+
+def _n1() -> None:
+    for text in _N1_CASES:
+        for surface in (_engine, _policy):
+            assert "Hunter2abcX9" not in surface(text), (text, surface(text))
+
+
+def _old_n3(span: F.FloorSpan) -> bool:
+    return span.rule in F._KEYED_RULES and F._for_every_reading(
+        span,
+        lambda r: len(r.glued) > 24 or sum(c.isalnum() for c in r.suffix) > 24,
+    )
+
+
+def test_n1_n3_counts_only_a_glued_run() -> None:
+    _n1()
+    glued = "password" + "x" * 25 + "=hunter"
+    assert _fired(glued, False).get("N3"), _fired(glued, False)
+
+
+def test_n1_mutant_rev_11_n3(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(F.SUPPRESSIONS, "N3", _old_n3)
+    with pytest.raises(AssertionError):
+        _n1()
+
+
+_N2_CASES = (
+    ("Bearer " + "1" * 24, "1" * 24),
+    ("Authorization: " + "7" * 24, "7" * 24),
+    ("Bearer 0x" + "ab" * 32, "ab" * 32),
+    ("password " + "9" * 24, "9" * 24),
+    ("secret 0x" + "cd" * 32, "cd" * 32),
+    ("secret_hex=0x" + "ef" * 32, "ef" * 32),
+    ("auth_code=" + "3" * 24, "3" * 24),
+)
+
+
+def _n2() -> None:
+    for text, secret in _N2_CASES:
+        for surface in (_engine, _policy):
+            assert secret not in surface(text), (text, surface(text))
+
+
+def test_n2_a_plain_number_is_short_and_decimal() -> None:
+    _n2()
+    for prose in ("code=401", "exit code 137", '{"code": -32601}', "Bearer 2"):
+        assert _engine(prose) == prose and _policy(prose) == prose, prose
+    assert F.is_plain("1234567890") and not F.is_plain("12345678901")
+    assert not F.is_plain("0x1F")
+
+
+def test_n2_mutant_rev_11_plain_number(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        F, "_PLAIN_NUMBER_RE", re.compile(r"[+-]?[0-9]+|0[xX][0-9a-fA-F]+")
+    )
+    with pytest.raises(AssertionError):
+        _n2()
+
+
+_N4_URLS = (
+    "https://h/?a=1&",
+    "https://h/?a=1&&b=2",
+    "https://h/?&a=1",
+    "https://h/?&&&",
+    "https://h/?a=1&&",
+    "https://u:p@h/p;q?token=x&&next=y&#frag",
+)
+
+
+def _n4() -> None:
+    for url in _N4_URLS:
+        result = F._url_pieces(url, 0)
+        assert result is not None, url
+        pieces, dropped = result
+        covered = bytearray(len(url))
+        for piece in pieces:
+            if piece[0] == "keep":
+                covered[piece[1] : piece[2]] = b"\x01" * (piece[2] - piece[1])
+            elif piece[0] == "atom":
+                covered[piece[2] : piece[3]] = b"\x01" * (piece[3] - piece[2])
+        for start, stop, _ in dropped:
+            covered[start:stop] = b"\x01" * (stop - start)
+        assert all(covered), (url, [i for i, c in enumerate(covered) if not c])
+
+
+def test_n4_every_url_position_is_kept_or_labelled() -> None:
+    _n4()
+
+
+def test_n4_mutant_no_complement(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(F, "_label_uncovered", lambda *args: None)
+    with pytest.raises(AssertionError):
+        _n4()
+
+
+@pytest.mark.slow
+def test_generated_shapes_grow_linearly() -> None:
+    """The full generated sweep (`tests/_redaction_shapes.py`: every unit of
+    every redactor regex, repeated, after each trigger word, before each
+    failing tail): screened at 4 KB -> 16 KB on every entry point in worker
+    processes; any shape over 8x is re-measured at 16 KB -> 64 KB here and
+    must be linear."""
+    from tests import _redaction_shapes as S
+
+    names = sorted(S.shapes(S.redactor_patterns()))
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
+        flagged = [
+            name
+            for chunk in pool.imap_unordered(_screen_shape, names, chunksize=20)
+            for name in chunk
+        ]
+    shapes = S.shapes(S.redactor_patterns())
+    confirmed = {name: _growth(shapes[name], 16_384, 65_536) for name in flagged}
+    assert {k: v for k, v in confirmed.items() if v} == {}, confirmed
+    assert len(names) > 40_000
+
+
+def _screen_shape(name: str) -> list[str]:
+    from tests import _redaction_shapes as S
+
+    global _SCREEN_SHAPES
+    try:
+        shapes = _SCREEN_SHAPES
+    except NameError:
+        shapes = _SCREEN_SHAPES = S.shapes(S.redactor_patterns())
+    shape = shapes[name]
+    for run in _entry_points().values():
+        t_small = _time(run, shape(4_096))
+        t_large = _time(run, shape(16_384))
+        if t_large > 0.03 and t_large / max(t_small, 1e-4) > 8:
+            return [name]
+    return []

@@ -20,7 +20,7 @@ import aiohttp
 import jwt
 from jwt import PyJWKSet
 
-from pmcp.redaction_floor import floor_spans
+from pmcp.redaction_floor import floor_spans, unindented_break
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
 
@@ -668,8 +668,9 @@ _AUTHORIZATION_RE = re.compile(
 _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 
 
-#: A separator whose (last) line break is followed by no indentation.
-_UNINDENTED_BREAK_RE = re.compile(r"[\r\n][^ \t\xa0]*$")
+#: A separator whose (last) line break is followed by no indentation:
+#: `pmcp.redaction_floor.unindented_break`, one reverse search (a regex
+#: anchored at the end restarts at every break).
 
 
 def _in_resource_name(text: str) -> Callable[[int], bool]:
@@ -686,7 +687,7 @@ def _keyword_sep_spans(text: str) -> list[Span]:
         name = match.group("name").lower()
         if name in WEAK_SECRET_KEYS and _is_plain_word_or_number(match.group("value")):
             continue
-        if _UNINDENTED_BREAK_RE.search(match.group("sep")) and not (
+        if unindented_break(match.group("sep")) and not (
             match.group("value")[0] in "\"'"
             or _value_could_be_a_credential(match.group("value"))
         ):
@@ -828,7 +829,7 @@ def _bearer_spans(text: str) -> list[Span]:
         for match in _BEARER_RE.finditer(text)
         if not _is_plain_word_or_number(match.group("value"))
         and not (
-            _UNINDENTED_BREAK_RE.search(match.group("key"))
+            unindented_break(match.group("key"))
             and (
                 # a flag or a lone bullet on the next line (the value holds no
                 # whitespace, so a one-character marker is the bullet case)

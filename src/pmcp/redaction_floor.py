@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import re
+from typing import Any
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass, field
 from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
@@ -166,9 +167,16 @@ class FloorSpan:
     before: str = ""
     #: the intermediate text just after the match (at most 256 characters)
     after: str = ""
-    #: the input text this span covers, and the input just before it
+    #: the input text this part of the match removed (all its spans)
     removed: str = ""
-    raw_before: str = ""
+    #: the input just before the match's key (where the key came from the
+    #: input; None where main's own text produced it)
+    raw_key_before: str | None = None
+    #: the spans of one part of one match share a group: the predicates are
+    #: asked once per group, on its first span (every span of it carries the
+    #: same key, separator and value)
+    group: int = 0
+    raw_key_start: int = -1
     replacement: str = REDACTED
     suppressed_by: str | None = None
     #: characters the JSON adjustment kept (syntax only; see `adjust_for_json`)
@@ -193,6 +201,7 @@ class _Tracked:
         #: was removed is decided by `org` alone.
         self.rep: list[int] = list(range(len(text)))
         self.atoms: list[tuple[int, int]] = []
+        self.groups = 0
 
     def atom_range(self, atom: int) -> tuple[int, int]:
         n = len(self.raw)
@@ -288,10 +297,23 @@ def _context(text: str, start: int) -> str:
 
 
 def _spans_for(
-    tracked: _Tracked, a: int, b: int, rule: str, **info: str
+    tracked: _Tracked, a: int, b: int, rule: str, *, key_at: int = -1, **info: Any
 ) -> list[FloorSpan]:
+    """The floor spans of cur[a:b], one part of one match whose key starts at
+    cur[key_at] (-1: no key)."""
+    tracked.groups += 1
+    raw_key_start = -1
+    if 0 <= key_at < len(tracked.org) and tracked.org[key_at] >= 0:
+        raw_key_start = tracked.atom_range(tracked.org[key_at])[0]
     return [
-        FloorSpan(start, end, rule, **info)  # type: ignore[arg-type]
+        FloorSpan(
+            start,
+            end,
+            rule,
+            group=tracked.groups,
+            raw_key_start=raw_key_start,
+            **info,  # type: ignore[arg-type]
+        )
         for start, end in tracked.raw_ranges(a, b)
     ]
 
@@ -378,11 +400,7 @@ def _url_pieces(
             pair_start = position
             position += len(pair) + 1
             if not pair:
-                if pair_start < rest_end:
-                    dropped.append(
-                        (base + pair_start, base + pair_start + 1, "url.normal")
-                    )
-                continue
+                continue  # an empty pair: its `&` is labelled below
             key, equals, value = pair.partition("=")
             key_start = pair_start
             value_start = key_start + len(key) + len(equals)
@@ -453,9 +471,34 @@ def _url_pieces(
     )
     if rebuilt != expected:
         return None
-    # A dropped `&` of an empty pair between two kept ones is listed above;
-    # every input position is either kept by a piece or dropped by a label.
+    _label_uncovered(raw, base, pieces, dropped)
     return pieces, dropped
+
+
+def _label_uncovered(
+    raw: str, base: int, pieces: list[_Piece], dropped: list[tuple[int, int, str]]
+) -> None:
+    """Every input position is either kept by a piece or dropped by a label:
+    whatever no piece keeps and no label names (the `&` of an empty, doubled
+    or trailing pair) is labelled `url.normal` here."""
+    covered = bytearray(len(raw))
+    for piece in pieces:
+        if piece[0] == "keep":
+            covered[piece[1] - base : piece[2] - base] = b"\x01" * (piece[2] - piece[1])
+        elif piece[0] == "atom":
+            covered[piece[2] - base : piece[3] - base] = b"\x01" * (piece[3] - piece[2])
+    for start, stop, _ in dropped:
+        covered[start - base : stop - base] = b"\x01" * (stop - start)
+    position = 0
+    while position < len(raw):
+        if covered[position]:
+            position += 1
+            continue
+        stop = position
+        while stop < len(raw) and not covered[stop]:
+            stop += 1
+        dropped.append((base + position, base + stop, "url.normal"))
+        position = stop
 
 
 def main_redact_auth_url(url: str) -> str:
@@ -519,11 +562,28 @@ def _url_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
 #: the value: opening quotes and brackets before it, closing ones (an escaped
 #: quote included) after it. Split off so `wrapper_syntax` can keep them.
 _WRAP_OPEN_RE = re.compile(r"[\"'(\[{<]+")
-_WRAP_CLOSE_RE = re.compile(r"(?:\\?[\"')\]}>])+[.:!?]*\Z")
+_WRAP_CLOSERS = frozenset("\"')]}>")
+
+
+def _wrap_close_start(text: str, start: int, end: int) -> int:
+    """Where the closing wrapping of text[start:end] begins -- one or more
+    closing quotes or brackets, each optionally escaped, then sentence
+    punctuation, running to ``end`` -- or -1. One right-to-left scan (a
+    search anchored at the end restarts at every closer)."""
+    k = end
+    while k > start and text[k - 1] in ".:!?":
+        k -= 1
+    found = -1
+    while k > start and text[k - 1] in _WRAP_CLOSERS:
+        k -= 1
+        if k > start and text[k - 1] == "\\":
+            k -= 1
+        found = k
+    return found
 
 
 def _header_value_spans(
-    tracked: _Tracked, a: int, end: int, rule: str, scheme_end: int, **info: str
+    tracked: _Tracked, a: int, end: int, rule: str, scheme_end: int, **info: Any
 ) -> list[FloorSpan]:
     """Floor spans of one Bearer/Authorization value cur[a:end]: the scheme
     word main took with it (`Authorization: Bearer x` lost `Bearer `), the
@@ -531,8 +591,8 @@ def _header_value_spans(
     cur = tracked.cur
     opening = _WRAP_OPEN_RE.match(cur, scheme_end, end)
     value_start = opening.end() if opening is not None else scheme_end
-    closing = _WRAP_CLOSE_RE.search(cur, value_start, end)
-    value_end = closing.start() if closing is not None else end
+    closing = _wrap_close_start(cur, value_start, end)
+    value_end = closing if closing >= 0 else end
     if value_end <= value_start:
         value_start, value_end = scheme_end, end  # nothing but wrapping: one value
     value = tracked.source(value_start, value_end)
@@ -606,6 +666,7 @@ def _keyword_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
                 value_start,
                 end,
                 "keyword",
+                key_at=start,
                 key=cur[start:key_end],
                 sep=cur[key_end:value_start],
                 value=tracked.source(value_start, end),
@@ -655,7 +716,7 @@ def _policy_step(
     for m in regex.finditer(cur):
         full = m.group(0)
         separator = next((i for i, char in enumerate(full) if char in ":="), -1)
-        info = {
+        info: dict[str, Any] = {
             "before": _context(cur, m.start()),
             "after": cur[m.end() : m.end() + 256],
         }
@@ -676,6 +737,7 @@ def _policy_step(
                     a,
                     syntax_end,
                     rule,
+                    key_at=m.start(),
                     part="syntax",
                     key=key,
                     sep=sep,
@@ -689,6 +751,7 @@ def _policy_step(
                     syntax_end,
                     m.end(),
                     rule,
+                    key_at=m.start(),
                     key=key,
                     sep=sep,
                     value=value,
@@ -899,7 +962,11 @@ DECLARED_KEYS = frozenset(
 )  # fmt: skip
 
 _PLAIN_WORD_RE = re.compile(r"[A-Za-z_]+")
-_PLAIN_NUMBER_RE = re.compile(r"[+-]?[0-9]+|0[xX][0-9a-fA-F]+")
+#: A plain number: a short decimal (a status, an exit code, a JSON-RPC
+#: error: at most 10 digits). A longer digit run or any `0x` hex is not
+#: plain: it may be a numeric token or a hex key, and main's redaction of it
+#: stands.
+_PLAIN_NUMBER_RE = re.compile(r"[+-]?[0-9]{1,10}")
 
 
 def is_plain(value: str) -> bool:
@@ -1012,6 +1079,14 @@ def suppression(name: str) -> Callable[[Predicate], Predicate]:
     return register
 
 
+def _decision_key(span: FloorSpan) -> int:
+    """The predicates are asked once per part of a match (its group): one
+    match can split into many spans around main's own markers, and asking
+    each would rescan the shared value once per span (B-1c of rev 11's
+    board)."""
+    return span.group
+
+
 def floor_spans(
     text: str, patterns: Sequence[re.Pattern[str]] | None = None
 ) -> tuple[list[FloorSpan], list[tuple[int, int, str]]]:
@@ -1021,13 +1096,23 @@ def floor_spans(
     _, spans = replay(text, patterns)
     layout = json_layout(text) if spans else None
     applied: list[tuple[int, int, str]] = []
+    removed: dict[int, list[str]] = {}
     for span in spans:
-        span.removed = text[span.start : span.end]
-        span.raw_before = _context(text, span.start)
-        for name, predicate in SUPPRESSIONS.items():
-            if predicate(span):
-                span.suppressed_by = name
-                break
+        removed.setdefault(span.group, []).append(text[span.start : span.end])
+    joined = {group: "".join(parts) for group, parts in removed.items()}
+    decided: dict[int, str | None] = {}
+    for span in spans:
+        # what the whole part of the match removed, shared by its spans
+        span.removed = joined[span.group]
+        key = _decision_key(span)
+        if key not in decided:
+            if span.raw_key_start >= 0:
+                span.raw_key_before = _context(text, span.raw_key_start)
+            decided[key] = next(
+                (name for name, predicate in SUPPRESSIONS.items() if predicate(span)),
+                None,
+            )
+        span.suppressed_by = decided[key]
         if span.suppressed_by is not None:
             continue
         if layout is not None:
@@ -1096,28 +1181,51 @@ def _wrapper_syntax(span: FloorSpan) -> bool:
     )
 
 
+_GLUED_SUFFIX_RE = re.compile(r"[A-Za-z0-9]*")
+
+
 @suppression("N3")
 def _n3(span: FloorSpan) -> bool:
-    """A glued prefix or a suffix of more than 24 alphanumerics: an
-    identifier, not a key (the additive rules' cost bound)."""
+    """A prefix or suffix GLUED to the key word -- more than 24 alphanumerics
+    with no joiner between them and the key word (`<25 letters>password=`,
+    `password<25 letters>=`) -- is an identifier, not a key (the additive
+    rules' cost bound). Joined segments are not glued:
+    `DATABASE_PASSWORD_FOR_REPLICATION_USER_ACCOUNT=` is a key."""
     return span.rule in _KEYED_RULES and _for_every_reading(
         span,
-        lambda r: len(r.glued) > 24 or sum(c.isalnum() for c in r.suffix) > 24,
+        lambda r: len(r.glued) > 24
+        or len(_GLUED_SUFFIX_RE.match(r.suffix).group(0)) > 24,  # type: ignore[union-attr]
     )
 
 
-_RESOURCE_TAIL_RE = re.compile(r"(?i)\b[au]rn:[^\s\"'<>]*\Z")
+#: The text before a key that is itself a segment of an `arn:`/`urn:`
+#: resource name: the name's start, then only name characters -- no
+#: whitespace, quote, bracket or pair/list delimiter (`& , ; ( ) ? =`) -- and
+#: the key right after a `:` or `/` segment boundary.
+_NAME_DELIMITER_RE = re.compile(r"[\s\"'<>&,;()?=]")
+_RESOURCE_SEGMENT_RE = re.compile(r"(?i)\b[au]rn:[^\s\"'<>&,;()?=]*[:/]\Z")
 
 
 @suppression("N10")
 def _n10(span: FloorSpan) -> bool:
-    """A key inside an `arn:`/`urn:` resource name names a resource
-    (`arn:aws:secretsmanager:...:secret:Name`). Read on the INPUT: an earlier
-    step of main's may already have rewritten the `arn` itself."""
+    """A key that is a segment of an `arn:`/`urn:` resource name, with its
+    separator and value inside the name too, names a resource
+    (`arn:aws:secretsmanager:...:secret:Name`), and only such a key: a key
+    after the name in the same run (`...:token-exchange&client_secret=x`,
+    `urn:db;password=x`) is a key, and so is a pair that leaves the name
+    (`...:token-exchange=client_secret=x`). Read on the INPUT
+    before the key: an earlier step of main's may already have rewritten the
+    `arn` itself."""
     return (
         span.rule in _KEYED_RULES
         and span.part == "value"
-        and _RESOURCE_TAIL_RE.search(span.raw_before) is not None
+        and span.raw_key_before is not None
+        and _RESOURCE_SEGMENT_RE.search(span.raw_key_before) is not None
+        # the separator and the value are in the name too: `:` only, and a
+        # value with no name delimiter (`...:token-exchange=client_secret=x`
+        # leaves the name at the `=`)
+        and span.sep.strip(":") == ""
+        and _NAME_DELIMITER_RE.search(span.value) is None
     )
 
 
@@ -1278,7 +1386,12 @@ def _c7(span: FloorSpan) -> bool:
     )
 
 
-_UNINDENTED_BREAK_RE = re.compile(r"[\r\n][^ \t\xa0]*\Z")
+def unindented_break(text: str) -> bool:
+    """Does ``text`` hold a line break with no space, tab or no-break space
+    after it (the last break decides: an indent after it is after every
+    earlier one too)? One reverse search, not a regex anchored at the end."""
+    last = max(text.rfind("\r"), text.rfind("\n"))
+    return last >= 0 and not any(c in " \t\xa0" for c in text[last + 1 :])
 
 
 @suppression("C8")
@@ -1290,7 +1403,7 @@ def _c8(span: FloorSpan) -> bool:
     return (
         span.rule in (*_KEYED_RULES, "policy:2", "bearer")
         and span.part == "value"
-        and _UNINDENTED_BREAK_RE.search(span.key + sep) is not None
+        and unindented_break(span.key + sep)
         and not value.startswith(('"', "'"))
         and not looks_like_credential(value)
     )
