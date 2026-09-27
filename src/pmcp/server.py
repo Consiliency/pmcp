@@ -233,7 +233,7 @@ class GatewayServer:
     def _record_scoped_invocation(
         self,
         *,
-        gateway_tool: str,
+        gateway_tool: str | None,
         terminal_status: str,
         arguments: dict[str, Any] | None,
         result: Any,
@@ -294,10 +294,47 @@ class GatewayServer:
         arguments = params.arguments or {}
 
         tool = self._find_gateway_tool(name)
-        if tool is not None:
+        # Policy is judged once, before the schema (Consiliency/pmcp#296): a
+        # blocked name is recorded `denied` by `call_tool` whatever its
+        # arguments, and its schema is never disclosed through a validation
+        # message. `call_tool` reads this same verdict, so no name can skip
+        # the gate as "blocked" and then be dispatched as "allowed".
+        allowed = self._policy_manager.is_gateway_tool_allowed(name)
+        # What the scoped audit may read from this call: the registry's name
+        # (never the caller's string), and only the top-level keys the tool's
+        # schema declares, of arguments that passed the gate. A blocked or
+        # unregistered call never met a schema, so nothing in it is vouched
+        # for; and until the gate forbids undeclared keys (piece B of
+        # Consiliency/pmcp#236), an undeclared key passes it unexamined.
+        audited_name = tool.name if tool is not None else None
+        audited_arguments: dict[str, Any] | None = None
+        if tool is not None and allowed:
             try:
                 jsonschema.validate(instance=arguments, schema=tool.input_schema)
             except jsonschema.ValidationError as e:
+                try:
+                    if self._scoped_advisor_audit is not None:
+                        self._scoped_advisor_audit.record_rejected_arguments(
+                            gateway_tool=tool.name,
+                            error=e,
+                            schema=tool.input_schema,
+                            arguments=arguments,
+                        )
+                except ScopedAdvisorAuditError:
+                    logger.error("Scoped advisor audit channel failed")
+                    return CallToolResult(
+                        content=[
+                            TextContent(
+                                type="text",
+                                text=json.dumps(
+                                    {
+                                        "error": True,
+                                        "message": "Scoped advisor audit channel failed",
+                                    }
+                                ),
+                            )
+                        ]
+                    )
                 return CallToolResult(
                     is_error=True,
                     content=[
@@ -306,22 +343,28 @@ class GatewayServer:
                         )
                     ],
                 )
+            declared = tool.input_schema.get("properties") or {}
+            audited_arguments = {
+                key: value for key, value in arguments.items() if key in declared
+            }
 
         async def call_tool(name: str, arguments: dict[str, Any]) -> list[ContentBlock]:
             try:
                 result: Any
                 self._require_scoped_audit()
 
-                if not self._policy_manager.is_gateway_tool_allowed(name):
+                if not allowed:
                     payload = {
                         "error": True,
                         "message": f"Gateway tool blocked by policy: {name}",
                     }
+                    # Nothing from the call: `audited_arguments` is None
+                    # here, and `payload` echoes the caller's name.
                     self._record_scoped_invocation(
-                        gateway_tool=name,
+                        gateway_tool=audited_name,
                         terminal_status="denied",
-                        arguments=arguments,
-                        result=payload,
+                        arguments=audited_arguments,
+                        result=None,
                     )
                     return [
                         TextContent(type="text", text=json.dumps(payload, indent=2))
@@ -412,9 +455,9 @@ class GatewayServer:
                         else "failure"
                     )
                 self._record_scoped_invocation(
-                    gateway_tool=name,
+                    gateway_tool=audited_name,
                     terminal_status=terminal_status,
-                    arguments=arguments,
+                    arguments=audited_arguments,
                     result=result,
                 )
 
@@ -443,9 +486,9 @@ class GatewayServer:
                         else "failure"
                     )
                     self._record_scoped_invocation(
-                        gateway_tool=name,
+                        gateway_tool=audited_name,
                         terminal_status=failure_status,
-                        arguments=arguments,
+                        arguments=audited_arguments,
                         result={"error_type": type(e).__name__},
                     )
                 except ScopedAdvisorAuditError:

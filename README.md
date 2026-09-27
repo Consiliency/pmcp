@@ -1517,7 +1517,13 @@ supply `run_correlation_id`, `seat_correlation_id`, and a SHA-256
 `evidence_label_digest` together. The append-only audit stores correlations,
 tool/status/policy/result digests, and a hashed public-source reference—not raw
 URLs, queries, arguments, credentials, or result bodies—and ends with one
-fsynced completeness marker.
+fsynced completeness marker. A call whose arguments fail the tool's input schema
+is recorded as a separate `audit.rejection` event (`terminal_status:
+"invalid_arguments"`) carrying only the tool, the failing JSON path
+(caller-chosen keys shown as `null`) and the failing schema keyword. Only
+arguments that passed the tool's input schema, and only the top-level keys it
+declares, are read into any record; a call denied by policy records none of its
+arguments.
 
 Consumers can fail closed on older installations with:
 
