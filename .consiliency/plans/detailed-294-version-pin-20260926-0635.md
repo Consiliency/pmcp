@@ -11,12 +11,16 @@
 > version in error hints) are **named follow-up slices** with a design note each. They are
 > not planned here.
 >
-> **Base: `origin/main` = `876fd33`** (revisions 7-9, re-fetched for revision 9; `959d4d4` since revision 5). The reference patch applies to
-> `876fd33` and to `959d4d4`, both of which carry Consiliency/pmcp#299 (the exact-version check follows
+> **Base: `origin/main` = `260cc1a`** (re-fetched for revision 10; `876fd33` for revisions 7-9; `959d4d4` since revision 5). The reference patch applies to
+> `260cc1a`, `876fd33` and `959d4d4`, all of which carry Consiliency/pmcp#299 (the exact-version check follows
 > npm's classification) and Consiliency/pmcp#300 (gateway tool schemas derived from their
 > models). The plan branch itself still descends from `9ca081e`, and its commits change
-> only this file and `plans/manifest.json`. The revision-9 numbers were **measured this
-> session** on throwaway spike worktrees off `959d4d4`. Re-fetched for revision 7, main had
+> only this file and `plans/manifest.json`. The revision-10 numbers were **measured this
+> session** on throwaway spike worktrees. For revision 10, main moved from `876fd33` to
+> **`260cc1a`** (Consiliency/pmcp#304, Consiliency/pmcp#306: scoped audit, `server.py`, a new test file;
+> nothing this plan touches, and no new spawn site: the spawn-site test passes there). The
+> patch applies to `260cc1a` byte-identically, and gates, pin tests and the full suite were
+> re-run on it. Before that, the spikes were off `959d4d4`. Re-fetched for revision 7, main had
 > moved to **`876fd33`** (Consiliency/pmcp#303: `auth.py`, `keyword_matcher.py`, a new test
 > file and CHANGELOG, none of them touched by this plan). The patch applies to `876fd33`
 > unchanged (byte-identical `git diff`), and the gates and the full suite were re-run there
@@ -24,7 +28,123 @@
 > embedded verbatim below as the reference patch; extracting both from this file and
 > `cmp`-ing them against the spike is part of Verification (step 11).
 
+## Revision 10 (2026-09-27): board round 8 on `bdc13ca`: the whole spawn set before any exemption
+
+The round-8 claude seat confirmed that round 7's B1 and B2 are closed. It returned
+DISAGREE on one new blocker (B-1) and three non-blocking items (N-1 to N-3). B-1 was
+**reproduced first** against revision 9 (`repro_r10.py`, appendix).
+
+**B-1 is the same class as round 7's B1: a spawn path escaping the check.** Revision 9
+judged the install argvs only on the exact-pin path. The local-binary early return
+(`if launcher not in ("npx", "npm"): return None`) came before it. So an overlay copying
+the shipped `firecrawl` with `command: firecrawl-mcp`, `args: []` kept the shipped
+`install.linux: npx -y firecrawl-mcp`, which `gateway.provision` spawns and adopts. It
+was silent while latest ran. The same held for a `uvx` install and an absolute-path
+command. **The structural fix:**
+
+1. **The spawn set is computed first.** `_spawn_set(manifest_server, resolved)` lists
+   every argv that can spawn or be adopted as this server, with its env and cwd. It is
+   built from `_SERVER_SPAWN_SITES`, the spawning sites of the table below, and it is
+   computed before any verdict:
+   - `args` (`ClientManager._connect_stdio`), with the entry's env and cwd;
+   - for a manifest-sourced server, every non-empty `install[platform]`
+     (`JobManager.start_install`, adopted by `_finalize_server_ready`), with the same
+     env and pmcp's cwd.
+2. **Every member is judged before any exemption.** On the exact-pin path, each
+   non-args member must run the same exact pin (`_install_argv_problem`, which now walks
+   the spawn set). The **local-binary exemption** (a command pmcp does not model is the
+   host's) now applies **only when every member is literally the entry's `[command,
+   *args]`**. Any other member makes it loud: `its linux install argv (`npx -y
+   firecrawl-mcp`), which gateway.provision spawns and adopts as the live server, is not
+   the entry's own command (`firecrawl-mcp`), so the local-binary exemption does not
+   apply`. That includes a **pinned** install argv under a local command. The seat noted
+   that its silence in revision 9 was an accident, because nothing looked at it.
+3. **A new spawn path fails a test.** `test_every_spawn_site_is_classified` walks
+   `src/pmcp` with `ast`. It finds every spawn primitive (`create_subprocess_exec`,
+   `Popen`, `subprocess.run`/`call`/`check_*`, `StdioServerParameters`, `adopt_process`,
+   `exec*`, `spawn*`, `posix_spawn`) with its enclosing `file:qualname`. It asserts that
+   the set equals the test's classification table (this plan's spawn-site table below),
+   and that exactly the sites classified "judged" are `handlers._SERVER_SPAWN_SITES`. A
+   new call site fails until someone classifies it.
+
+**The spawn-site table (derived from the code; the test holds the same list).**
+
+| site (`src/pmcp/...:qualname`) | spawns | disposition |
+|---|---|---|
+| `client/manager.py:ClientManager._connect_stdio` | the resolved config's `command` + `args`, entry env and cwd: connect, lazy connect, restart, reconnect, the respawn after `gateway.refresh`, and `update_server`'s restart | **in the spawn set** ("its args") |
+| `manifest/installer.py:JobManager.start_install` | `install[detect_platform()]` (`wsl` → `linux`), entry env; `gateway.provision` | **in the spawn set** for a manifest-sourced server, every non-empty platform |
+| `tools/handlers.py:GatewayTools._finalize_server_ready` | nothing; it **adopts** `start_install`'s process | covered through `start_install`. See N-3 |
+| `manifest/installer.py:install_server`, `:verify_installation` | `install[platform]`; `command args[:1] --help` | **library functions with no production caller** (exported from `pmcp.manifest`, used only by tests; there is no `pmcp install` command). N-2 corrects revision 9's text. |
+| `manifest/refresher.py:refresh_server` | the **manifest** entry's `command` + `args` (startup `refresh_all(servers=connected_names)`, `pmcp refresh`), built with **no `env`** (the mcp SDK default environment) | **not in the spawn set**; see N-1 |
+| `tools/handlers.py:GatewayTools._run_update_probe_command` | `<pkg>@latest --help` and the like | an update probe of latest, by design; not the server |
+| `manifest/environment.py:check_cli`, `:get_cli_help` | host CLI probes | not a server |
+| `manifest/npm_resolver.py:NpmResolver._spawn` | the npm identity helper (`node _npm_resolve.js`) | not a server |
+| `cli.py:_is_pmcp_system_service_active`, `:_restart_local_pmcp_service`, `:run_upgrade` | systemctl/launchctl; pmcp's own upgrade | not a server |
+
+**N-1 (descriptions refresh).** `refresh_server` spawns the **manifest** argv even for a
+server connected from `.mcp.json`/`.pmcp.json` with a different, pinned argv, so revision
+9's "the same argv, already judged" was true only for manifest-sourced servers. It is
+**not in the spawn set**, and that is correct for this warning, for three reasons:
+- it is never adopted and never serves requests;
+- `StdioServerParameters` is built with no `env`, so the child gets only the SDK's default
+  environment, with no relaxer and no credential, and so no identity to talk to the
+  self-hosted backend with;
+- it exits after listing tools.
+
+What it can do is execute an unpinned client once, and cache tool **descriptions** from a
+version other than the one served. That is the existing descriptions-cache limit (Non-goal
+and R2), now also stated for configured servers. Restricting the refresh to the connected
+config is a descriptions-cache change and is left to that follow-up.
+
+**N-2.** Fixed: the table and docstrings no longer mention `pmcp install`. `install_server`
+and `verify_installation` are library functions without a production caller.
+
+**N-3 (the handoff re-reads the manifest).** `_finalize_server_ready` re-reads
+`load_manifest()` at handoff and records that config for the adopted process. If an
+overlay is edited **during the install window**, the process came from the old install
+argv while health judges the new entry. Revision 10 **documents this as a non-goal (R15)**
+rather than threading the spawned config through `JobManager`, which is a provisioning
+change outside this plan. It is pre-existing, needs an operator edit mid-install, and is
+visible on the next restart. A clean follow-up is to snapshot the `ServerConfig` at
+`start_install` and adopt with it.
+
+| # | finding (round 8) | resolution | evidence (rev 9 → rev 10, `repro_r10.py`) |
+|---|---|---|---|
+| **B-1** (blocking) | The local-binary early return skipped the install argvs, which `gateway.provision` adopts. | Spawn set first; every member judged; the local exemption applies only when every member is the entry's own argv; a static test pins the spawn sites. | Local command `firecrawl-mcp` with `install.linux` `npx -y firecrawl-mcp`, with `uvx firecrawl-mcp`, with an absolute path and `--stdio`, and with a **pinned** npx install: `None` → `... its linux install argv (...), which gateway.provision spawns and adopts as the live server, is not the entry's own command ...`. Controls (a local command whose install argvs are the same argv; the shipped pinned firecrawl): `None` → `None`. Tests `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts` (4), `test_a_local_command_is_exempt_only_when_it_is_the_whole_spawn_set` (control, which also shows a configured local binary's spawn set is args only), `test_every_spawn_site_is_classified`. Mutants M104 (an early return skips the spawn set), M105 (install argvs left out of the set), M106 (the set judged only in part), M107 (a spawning site dropped from `_SERVER_SPAWN_SITES`). |
+| **N-1** | The refresher spawns the manifest argv for configured servers. | Table corrected. Not in the spawn set: not adopted, no entry env, descriptions only (R2). | Documentation. |
+| **N-2** | There is no `pmcp install`. | Text fixed. | Documentation. |
+| **N-3** | The handoff re-reads the manifest. | Non-goal R15 with its risk. | Documentation. |
+
+**Shipped cost:** **0 of 77** (`shipped_cost.py` now walks `_spawn_set` for the install
+argvs). The new local-command rule affects no shipped entry: **0 shipped entries** have a
+local command whose install argvs differ from it (the same script lists them). Step 7:
+`77 pinnable, 30 refused`.
+
+**Tests:** the revision-10 file has **236 tests** (230 in revision 9). Against the
+revision-9 code it gives **5 failed, 231 passed**: the 4 B-1 ids, plus the spawn-site
+test, which references `_SERVER_SPAWN_SITES`. The control is green on both.
+
+## Rev 9 board findings — before/after, measured
+
+`repro_r10.py` (appendix), one fresh process per row, with a manifest-sourced entry named
+`firecrawl`, its shipped declarations, and the relaxer set. Trees: `876fd33` + the
+revision-9 patch (`bdc13ca`), and `876fd33` + the revision-10 patch.
+
+| case | rev 9 | rev 10 |
+|---|---|---|
+| `command: firecrawl-mcp`, `args: []`, `install.linux: npx -y firecrawl-mcp` | `None` | cannot verify: `its linux install argv (`npx -y firecrawl-mcp`), which gateway.provision spawns and adopts as the live server, is not the entry's own command (`firecrawl-mcp`) ...` |
+| same, `install.linux: uvx firecrawl-mcp` | `None` | cannot verify (the same message, `uvx firecrawl-mcp`) |
+| `command: /opt/fc/bin/firecrawl-mcp`, `args: [--stdio]`, npx install | `None` | cannot verify (the same message) |
+| `command: firecrawl-mcp`, `install.linux: npx -y firecrawl-mcp@3.25.5` (pinned) | `None` (an accident) | cannot verify: the install argv is not the entry's own command |
+| control: a local command whose install argvs are all `[command, *args]` | `None` | `None` |
+| control: shipped `firecrawl`, args and every install argv pinned | `None` | `None` |
+
 ## Revision 9 (2026-09-27): board round 7 on `253445a`: every spawning argv; shipped declarations only
+
+> **Corrected by revision 10.** The spawn-site table below is superseded by revision 10's
+> (N-1: the descriptions refresh spawns the manifest argv; N-2: there is no `pmcp install`),
+> and install argvs are now judged before the local-binary exemption, not only on the
+> exact-pin path.
 
 The round-7 claude seat returned DISAGREE, with two blocking findings inside the trust
 boundary (B1, B2) and three non-blocking ones (N1-N3). Both blockers were **reproduced
@@ -1139,6 +1259,12 @@ The same check gates `[PINNED]`. (b) `declared` comes from `_declared_env_keys(s
 the **shipped** manifest's declarations for that name, never from the entry, an overlay or
 a config file. The namespace guard is removed.
 
+**Revision 10 (board round 8).** The warning first computes `_spawn_set(manifest_server,
+resolved)`, every argv that can spawn or be adopted as the server (`_SERVER_SPAWN_SITES`),
+and judges every member before any exemption. On the exact-pin path, every non-args member
+must run the same pin. The local-binary exemption applies only when every member is
+literally `[command, *args]`. `update_server` walks the same set before `[PINNED]`.
+
 The warning appears in two places:
 
 - **`gateway.health`.** `ServerHealthInfo.warnings: list[str]` (default `[]`) is filled by
@@ -1220,6 +1346,8 @@ The warning appears in two places:
 | `_TOOL_ENV_PREFIXES`, `_TOOL_ENV_NAMES`, `_in_tool_namespace`; `_declared_env_keys(server)` (rev 9) | **remove**; `_declared_env_keys(server_name)` reads `_shipped_manifest_declarations()` (the packaged `manifest.yaml`, `lru_cache`d) | Revision 9 (2): B2 |
 | `_read_spawn_pin`, `_install_argv_problem` (rev 9) | add; called by the warning and by `update_server` for a manifest-sourced server | Revision 9 (1): B1 |
 | `_NPX_INERT_FLAGS` gains `--yes=true`; the docker shape accepts combined inert short flags (`-it`) (rev 9) | modify | Revision 9 (3): N2 |
+| `_SERVER_SPAWN_SITES`, `_Spawn`, `_spawn_set` (rev 10) | add; `_install_argv_problem(members, package_type, package, pin, declared)` walks the spawn set; the warning's local-binary branch requires every member to equal `[command, *args]`; `update_server` passes `_spawn_set(...)` | Revision 10: B-1 |
+| `from dataclasses import dataclass` (rev 10) | add import | `_Spawn` |
 
 ### `src/pmcp/cli.py` (modify)
 
@@ -1746,10 +1874,18 @@ index 9837e82..016e0bb 100644
          version=data.get("version", "1.0"),
          cli_alternatives=cli_alternatives,
 diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
-index 45a956c..71afb23 100644
+index 45a956c..3294cfb 100644
 --- a/src/pmcp/tools/handlers.py
 +++ b/src/pmcp/tools/handlers.py
-@@ -68,6 +68,7 @@ from pmcp.validation import (
+@@ -11,6 +11,7 @@ import asyncio
+ import time
+ import platform
+ from collections import deque
++from dataclasses import dataclass
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from collections.abc import Callable, Mapping
+@@ -68,6 +69,7 @@ from pmcp.validation import (
      env_var_allowed,
      is_valid_package_name,
      is_valid_package_version,
@@ -1757,7 +1893,7 @@ index 45a956c..71afb23 100644
  )
  from pmcp.identity import filter_self_references
  from pmcp.manifest.code_patterns_loader import get_code_hint
-@@ -102,13 +103,16 @@ from pmcp.manifest.version_checker import (
+@@ -102,13 +104,16 @@ from pmcp.manifest.version_checker import (
      _docker_image_tag,
      _npm_package_arg,
      _npm_tag,
@@ -1774,7 +1910,7 @@ index 45a956c..71afb23 100644
      ProvisionSource,
      evaluate_provision,
      operator_safe,
-@@ -196,8 +200,11 @@ from pmcp.manifest.loader import (
+@@ -196,8 +201,11 @@ from pmcp.manifest.loader import (
      Manifest,
      ServerConfig,
      credential_lookup_keys,
@@ -1786,7 +1922,7 @@ index 45a956c..71afb23 100644
      requires_credential,
  )
  
-@@ -446,6 +453,868 @@ def _detect_effective_version_pin(
+@@ -446,6 +454,951 @@ def _detect_effective_version_pin(
      return None
  
  
@@ -2416,38 +2552,102 @@ index 45a956c..71afb23 100644
 +    return "npm", plain[0], plain[1] if plain[1] and plain[1] != "latest" else None
 +
 +
++#: Every code site that spawns, or adopts, a process as THIS server, and which
++#: argv it spawns (#295 board rounds 7-8). The plan's spawn-site table lists
++#: every spawn primitive in ``src/pmcp`` with its disposition, and
++#: ``tests/test_version_pin.py::test_every_spawn_site_is_classified`` walks
++#: the source with ``ast`` and fails on any site the table does not list, so a
++#: new spawn path cannot escape the check unnoticed.
++_SERVER_SPAWN_SITES: dict[str, str] = {
++    # connect, lazy connect, restart, reconnect, the respawn after refresh,
++    # and update_server's restart: the resolved config's command + args.
++    "client/manager.py:ClientManager._connect_stdio": "args",
++    # gateway.provision -> start_install spawns install[platform];
++    # GatewayTools._finalize_server_ready adopts that process as the server.
++    "manifest/installer.py:JobManager.start_install": "install",
++}
++
++
++@dataclass(frozen=True)
++class _Spawn:
++    """One argv that can spawn, or be adopted as, the server."""
++
++    label: str
++    site: str
++    argv: tuple[str, ...]
++    env: Mapping[str, str] | None
++    cwd: str | None
++
++    def where(self) -> str:
++        if self.site.endswith("start_install"):
++            return (
++                f"{self.label} (`{' '.join(self.argv)}`), which gateway.provision "
++                "spawns and adopts as the live server,"
++            )
++        return f"{self.label} (`{' '.join(self.argv)}`)"
++
++
++def _spawn_set(
++    manifest_server: ServerConfig | None, resolved: ResolvedServerConfig
++) -> list[_Spawn]:
++    """EVERY argv that can spawn or be adopted as this server, args first.
++
++    Computed before any verdict, so no early return can skip a member (#295
++    board round 8, B-1). ``args``: what ``_connect_stdio`` spawns, with the
++    entry's env and cwd. For a MANIFEST-sourced server, also each non-empty
++    ``install[platform]`` (every platform, a superset of ``detect_platform()``
++    and its ``wsl`` -> ``linux`` fallback), which ``gateway.provision``
++    spawns and adopts, with the same env (``build_install_child_env``: the
++    same ``extra_env`` and credential) and pmcp's own cwd. A configured server
++    is lazy-started from its own args by ``ClientManager``; provision never
++    runs a manifest install argv for it.
++    """
++    config = resolved.config
++    if not isinstance(config, LocalMcpServerConfig):
++        return []
++    members = [
++        _Spawn(
++            "its args",
++            "client/manager.py:ClientManager._connect_stdio",
++            (config.command, *config.args),
++            config.env,
++            config.cwd,
++        )
++    ]
++    if resolved.source == "manifest" and manifest_server is not None:
++        for target, argv in sorted(manifest_server.install.items()):
++            if argv:
++                members.append(
++                    _Spawn(
++                        f"its {target} install argv",
++                        "manifest/installer.py:JobManager.start_install",
++                        tuple(argv),
++                        config.env,
++                        None,
++                    )
++                )
++    return members
++
++
 +def _install_argv_problem(
-+    manifest_server: ServerConfig | None,
++    members: list[_Spawn],
 +    package_type: str,
 +    package: str,
 +    pin: str,
-+    env: Mapping[str, str] | None,
 +    declared: frozenset[str],
 +) -> str | None:
-+    """Does every ``install`` argv run *package* at *pin*, in a known shape?
++    """Does every spawn-set member besides args run *package* at *pin*?
 +
-+    ``gateway.provision`` spawns ``install[platform]`` and adopts that
-+    process as the live server (``JobManager.start_install`` ->
-+    ``_finalize_server_ready``), and ``pmcp install`` runs it too, so for a
-+    manifest-sourced server it is a spawning argv exactly like ``args``
-+    (#295 board round 7, B1). Each non-empty platform argv must pass the
-+    same pin, exactness, shape and env rules and name the same package at
-+    the same pin -- the rule ``provision_gate._config_runs_exactly`` applies
-+    to approvals. ``None`` when all do; else the first failure, naming the
-+    platform and the argv. Its env is the entry's (``build_install_child_env``
-+    carries the same ``extra_env`` and credential); its cwd is pmcp's own.
++    Each must pass the same pin, exactness, shape and env rules as ``args``
++    and name the same package at the same pin -- the rule
++    ``provision_gate._config_runs_exactly`` applies to approvals (#295 board
++    round 7, B1). ``None`` when all do; else the first failure, naming the
++    member's argv.
 +    """
-+    if manifest_server is None:
-+        return None
-+    for target, argv in sorted(manifest_server.install.items()):
-+        if not argv:
-+            continue
-+        where = (
-+            f"its {target} install argv (`{' '.join(argv)}`), which "
-+            "gateway.provision spawns and adopts as the live server,"
-+        )
-+        command, rest = argv[0], list(argv[1:])
-+        read = _read_spawn_pin(command, rest, env, None)
++    for member in members[1:]:
++        where = member.where()
++        command, rest = member.argv[0], list(member.argv[1:])
++        read = _read_spawn_pin(command, rest, member.env, member.cwd)
 +        if read is None:
 +            return f"{where} runs something pmcp cannot read"
 +        install_type, install_package, install_pin = read
@@ -2466,8 +2666,8 @@ index 45a956c..71afb23 100644
 +            rest,
 +            install_package,
 +            pin,
-+            env,
-+            None,
++            member.env,
++            member.cwd,
 +            declared,
 +        )
 +        if problem is not None:
@@ -2550,6 +2750,9 @@ index 45a956c..71afb23 100644
 +        # `uv tool run` is uvx (round 6, N2): judge it as uvx.
 +        command, args = "uvx", args[2:]
 +    declared = _declared_env_keys(server_name)
++    # The whole spawn set first: every verdict below, including the
++    # local-binary exemption, is judged against all of it (round 8, B-1).
++    spawns = _spawn_set(manifest_server, resolved)
 +    package_type, package_name = detect_package_type(command, args, env, cwd)
 +    note = ""
 +    if package_type == "unknown" or not package_name:
@@ -2580,6 +2783,22 @@ index 45a956c..71afb23 100644
 +        # grammar, and say so; if even that cannot name a plain registry
 +        # package, warn that the pin cannot be verified.
 +        if launcher not in ("npx", "npm"):
++            # A command pmcp does not model (a locally installed server
++            # binary) is the host's -- but only when it is the ONLY thing that
++            # can run as this server. Any other spawn-set member (an install
++            # argv gateway.provision adopts) that is not literally the same
++            # argv is entry-controlled and unjudged: loud (round 8, B-1).
++            own = spawns[0].argv if spawns else ()
++            for member in spawns[1:]:
++                if member.argv != own:
++                    return (
++                        f"'{server_name}' talks to a self-hosted backend "
++                        f"({relaxed_by} is set), but pmcp cannot verify that its "
++                        f"client is pinned: {member.where()} is not the entry's "
++                        f"own command (`{' '.join(own)}`), so the local-binary "
++                        "exemption does not apply. Make every install argv run "
++                        "the same exactly pinned client."
++                    )
 +            return None
 +        cause = _npm_identity_refusal_cause(command)
 +        # Only an npx argv has a structural slot pmcp can read (the provision
@@ -2617,7 +2836,7 @@ index 45a956c..71afb23 100644
 +            # argvs (gateway.provision adopts that process): every one must
 +            # run the same pin (#295 board round 7, B1).
 +            redirect = _install_argv_problem(
-+                manifest_server, package_type, package_name, pin, env, declared
++                spawns, package_type, package_name, pin, declared
 +            )
 +        if redirect is None:
 +            return None
@@ -2655,7 +2874,7 @@ index 45a956c..71afb23 100644
  # Human-readable label for a ResolvedServerConfig.source, used in messages
  # that need to point an operator at the file a pin (or other override) came
  # from.
-@@ -2254,6 +3123,8 @@ class GatewayTools:
+@@ -2254,6 +3207,8 @@ class GatewayTools:
                  )
              )
  
@@ -2664,7 +2883,7 @@ index 45a956c..71afb23 100644
          diagnostics = self._transport_diagnostics.model_copy()
          diagnostics.audit_buffer_size = self._audit_events.maxlen or len(
              self._audit_events
-@@ -2276,6 +3147,69 @@ class GatewayTools:
+@@ -2276,6 +3231,69 @@ class GatewayTools:
              audit_events=list(self._audit_events) or None,
          )
  
@@ -2734,7 +2953,7 @@ index 45a956c..71afb23 100644
      def _config_source_paths_by_server(self) -> dict[str, tuple[str, str]]:
          paths: dict[str, tuple[str, str]] = {}
          for source in load_config_sources(
-@@ -4898,8 +5832,29 @@ class GatewayTools:
+@@ -4898,8 +5916,29 @@ class GatewayTools:
          Freezing the ambient environment across the update is deliberately NOT
          done here; it would mean threading a frozen env through ClientManager,
          which is a separate concern from this TOCTOU.
@@ -2764,7 +2983,7 @@ index 45a956c..71afb23 100644
          server_name = parsed.server_name
  
          # Resolve the server's EFFECTIVE config through the exact same
-@@ -4994,14 +5949,101 @@ class GatewayTools:
+@@ -4994,14 +6033,102 @@ class GatewayTools:
              source_desc = _CONFIG_SOURCE_LABELS.get(
                  resolved_config.source, f"the {resolved_config.source} config"
              )
@@ -2801,11 +3020,12 @@ index 45a956c..71afb23 100644
 +                # What gateway.provision spawns and adopts must run the same pin,
 +                # or the report would call a latest client [PINNED] (round 7, B1).
 +                shape_problem = _install_argv_problem(
-+                    load_manifest().get_server(server_name),
++                    _spawn_set(
++                        load_manifest().get_server(server_name), resolved_config
++                    ),
 +                    package_type,
 +                    package_name,
 +                    pinned_to,
-+                    server_env,
 +                    _declared_env_keys(server_name),
 +                )
 +            if shape_problem is not None:
@@ -5186,6 +5406,170 @@ async def test_common_inert_spellings_are_recognised(
     assert (
         await _one_warning(monkeypatch, tmp_path, _launch("ok1", command, args)) == []
     )
+
+
+# ---------------------------------------------------------------------------
+# Board round 8 (rev 10): the whole spawn set before any exemption
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "args", "install"),
+    [
+        ("fc-mcp", [], ["npx", "-y", "fc-mcp"]),
+        ("fc-mcp", [], ["uvx", "fc-mcp"]),
+        ("/opt/fc/bin/fc-mcp", ["--stdio"], ["npx", "-y", "fc-mcp"]),
+        # Pinned, but still not the entry's own command: the exemption is for a
+        # local binary that is the ONLY thing that can run as the server.
+        ("fc-mcp", [], ["npx", "-y", "fc-mcp@3.25.5"]),
+    ],
+    ids=[
+        "local-command-npx-install",
+        "local-command-uvx-install",
+        "absolute-path",
+        "pinned-install",
+    ],
+)
+@pytest.mark.asyncio
+async def test_a_local_command_does_not_exempt_an_install_argv_provision_adopts(
+    command: str,
+    args: list[str],
+    install: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    npm_tables: None,
+) -> None:
+    """Round 8 B-1: an overlay copying the shipped entry with `command:
+    firecrawl-mcp` kept `install.linux: npx -y firecrawl-mcp`; gateway.provision
+    spawned and adopted that (latest) while the warning's local-binary early
+    return never looked at it."""
+    server = _server("fc", list(args))
+    server.command = command
+    server.install = {**{p: [command, *args] for p in PLATFORMS}, "linux": install}
+    gateway = _gateway(monkeypatch, tmp_path, {"fc": server}, online=["fc"])
+
+    health = await gateway.health()
+
+    (info,) = [s for s in health.servers if s.name == "fc"]
+    assert len(info.warnings) == 1
+    assert "its linux install argv" in info.warnings[0]
+    assert "is not the entry's own command" in info.warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_a_local_command_is_exempt_only_when_it_is_the_whole_spawn_set(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, npm_tables: None
+) -> None:
+    """Controls: a local binary whose install argvs are that same argv (or
+    empty) is the host's; a CONFIGURED local binary is lazy-started from its
+    own args, so the manifest's install argv is not in its spawn set."""
+    own = _server("ow", ["--stdio"])
+    own.command = "/opt/fc/bin/fc-mcp"
+    own.install = {p: ["/opt/fc/bin/fc-mcp", "--stdio"] for p in PLATFORMS}
+    own.install["windows"] = []
+    manifest_entry = _server("cf", ["-y", "fc-mcp"])
+    configured = ResolvedServerConfig(
+        name="cf",
+        source="user",
+        config=LocalMcpServerConfig(
+            command="/opt/fc/bin/fc-mcp",
+            args=[],
+            env={"SELFHOST_API_URL": "http://self-hosted.internal:3002"},
+        ),
+    )
+    gateway = _gateway(
+        monkeypatch,
+        tmp_path,
+        {"ow": own, "cf": manifest_entry},
+        configured=[configured],
+        online=["ow", "cf"],
+    )
+
+    health = await gateway.health()
+
+    assert all(s.warnings == [] for s in health.servers if s.name in ("ow", "cf"))
+
+
+# Every spawn primitive in src/pmcp, by `file:qualname`, and why it is (or is
+# not) in the warning's spawn set -- the plan's spawn-site table. A new call
+# site fails `test_every_spawn_site_is_classified` until it is classified.
+_SPAWN_SITE_TABLE = {
+    "client/manager.py:ClientManager._connect_stdio": "server: args (judged)",
+    "manifest/installer.py:JobManager.start_install": "server: install, adopted (judged)",
+    "tools/handlers.py:GatewayTools._finalize_server_ready": "adopts start_install's process",
+    "manifest/installer.py:install_server": "library function, no production caller",
+    "manifest/installer.py:verify_installation": "library function, no production caller",
+    "manifest/refresher.py:refresh_server": "descriptions refresh: not adopted, no entry env",
+    "tools/handlers.py:GatewayTools._run_update_probe_command": "update probe of latest",
+    "manifest/environment.py:check_cli": "CLI probe, not a server",
+    "manifest/environment.py:get_cli_help": "CLI probe, not a server",
+    "manifest/npm_resolver.py:NpmResolver._spawn": "npm identity helper, not a server",
+    "cli.py:_is_pmcp_system_service_active": "service manager, not a server",
+    "cli.py:_restart_local_pmcp_service": "service manager, not a server",
+    "cli.py:run_upgrade": "pmcp self-upgrade, not a server",
+}
+
+
+def _spawn_call_sites() -> set[str]:
+    import ast
+
+    import pmcp
+
+    root = Path(pmcp.__file__).parent
+    spawn_names = {
+        "create_subprocess_exec",
+        "create_subprocess_shell",
+        "Popen",
+        "run",
+        "call",
+        "check_call",
+        "check_output",
+        "StdioServerParameters",
+        "adopt_process",
+        "execv",
+        "execvp",
+        "execvpe",
+        "spawnv",
+        "posix_spawn",
+    }
+    found: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        rel = path.relative_to(root).as_posix()
+
+        def walk(node: ast.AST, stack: list[str]) -> None:
+            for child in ast.iter_child_nodes(node):
+                scope = stack
+                if isinstance(
+                    child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+                ):
+                    scope = [*stack, child.name]
+                if isinstance(child, ast.Call):
+                    func = child.func
+                    name = (
+                        func.attr
+                        if isinstance(func, ast.Attribute)
+                        else func.id
+                        if isinstance(func, ast.Name)
+                        else None
+                    )
+                    text = ast.unparse(func)
+                    if name in spawn_names and not text.startswith("asyncio.run"):
+                        if name != "run" or text.startswith("subprocess."):
+                            found.add(f"{rel}:{'.'.join(scope)}")
+                walk(child, scope)
+
+        walk(ast.parse(path.read_text()), [])
+    return found
+
+
+def test_every_spawn_site_is_classified() -> None:
+    """Round 8: the spawn set is derived from the code's spawn sites. Every
+    spawn primitive in src/pmcp must be classified here, and exactly the sites
+    that spawn or adopt the server are in the warning's `_SERVER_SPAWN_SITES`,
+    so a new spawn path fails this test instead of escaping the check."""
+    assert _spawn_call_sites() == set(_SPAWN_SITE_TABLE)
+    judged = {site for site, why in _SPAWN_SITE_TABLE.items() if "(judged)" in why}
+    assert judged == set(handlers_module._SERVER_SPAWN_SITES)
 ```
 
 ## Documentation impact
@@ -5234,7 +5618,9 @@ async def test_common_inert_spellings_are_recognised(
   >   as the live server; each must run the same exact pin in a recognised shape.
   > - **The launcher.** `bunx`, `pnpx`, `pnpm dlx`, `yarn dlx`, `uv run`, `node`, shells and
   >   `env` wrappers are "cannot verify", pinned or not. Any other command (a locally
-  >   installed server binary) is not judged.
+  >   installed server binary) is not judged, but only when it is the *only* thing that
+  >   can run as the server: if the entry's `install` argv is something else,
+  >   `gateway.provision` would run that instead, so the warning says it cannot verify.
   >
   > It trusts your machine: npmrc files at any level, your shell environment,
   > version-manager shims (asdf, Volta, mise), the npx cache and global bin, proxy/CA
@@ -5352,7 +5738,7 @@ cd "$WORKTREE"   # a fresh worktree off origin/main, with the diff + test file a
 
 # 0. The new tests exist.
 uv run pytest tests/test_version_pin.py --collect-only -q --cov-fail-under=0 | tail -1
-#   -> 230 tests collected   (rev 9; rev 8: 219; rev 7: 190; first rev-7 cut: 186; rev 6: 153; rev 5: 112)
+#   -> 236 tests collected   (rev 10; rev 9: 230; rev 8: 219; rev 7: 190; first rev-7 cut: 186; rev 6: 153; rev 5: 112)
 
 # 1. Red on HEAD (before the diff; the test file alone).
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
@@ -5365,6 +5751,7 @@ unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
 #      an inertness guard that is green on HEAD by design)
 #   Against the REVISION-1 spike: 19 failed, 38 passed; exactly the 19 new rev-2 cases
 #   (Revision 2 table).
+#   Rev 10: against the REVISION-9 code (bdc13ca): 5 failed, 231 passed.
 #   Rev 9: against the REVISION-8 code (253445a): 11 failed, 219 passed.
 #   Rev 8: against the REVISION-7 code (15dae94): 24 failed, 195 passed.
 #   Rev 7 (cwd ruling): against the FIRST rev-7 cut (1073923): 3 failed, 187 passed.
@@ -5382,7 +5769,7 @@ unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
 # 2. Green with the diff.
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
   uv run pytest tests/test_version_pin.py -q --cov-fail-under=0 | tail -1
-#   -> 230 passed   (rev 9; rev 8: 219; rev 7: 190; first rev-7 cut: 186; rev 6: 153; rev 5: 112)
+#   -> 236 passed   (rev 10; rev 9: 230; rev 8: 219; rev 7: 190; first rev-7 cut: 186; rev 6: 153; rev 5: 112)
 
 # 3. CI gates (all three are in .github/workflows).
 uv run ruff check src/ tests/                 # -> All checks passed!
@@ -5407,7 +5794,7 @@ unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
 #    nohup/disown. Use a lane-unique log path.
 unset npm_config_cache npm_config_store_dir pnpm_config_store_dir; \
   uv run pytest tests/ -q --cov-fail-under=0 -p no:cacheprovider -m 'not live and not slow' > "$LOGDIR/294-suite.log" 2>&1
-#   -> 4583 passed, 3 skipped, 25 deselected in 464.14s (0:07:44)   (rev 9 on 876fd33; rev 8: 4572 passed in 729.81s, run concurrently with the mutants; rev 7 incl. the cwd ruling on 876fd33: 4543 passed in 457.95s; first rev-7 cut on 876fd33: 4539 passed in 453.66s; on 959d4d4: 4522 passed in 453.77s; marker `-m 'not live and not slow'`; rev 6: 4489 passed in 456.55s; rev 5: 4448 passed in 443.28s; board revision 4: 4178 passed in 427.75s; revision 3: 4160 passed in 442.33s; revision 2: 4128 passed, 3 skipped, 25 deselected in 422.12s; earlier: 4108 passed; the first spike was 1 failed / 4107 passed -- see the mutation-table note;
+#   -> 4739 passed, 3 skipped, 25 deselected in 483.40s (0:08:03)   (rev 10 on origin/main 260cc1a; on 876fd33: 4589 passed in 643.93s, run concurrently with the mutants; rev 9: 4583 passed in 464.14s; rev 8: 4572 passed in 729.81s, run concurrently with the mutants; rev 7 incl. the cwd ruling on 876fd33: 4543 passed in 457.95s; first rev-7 cut on 876fd33: 4539 passed in 453.66s; on 959d4d4: 4522 passed in 453.77s; marker `-m 'not live and not slow'`; rev 6: 4489 passed in 456.55s; rev 5: 4448 passed in 443.28s; board revision 4: 4178 passed in 427.75s; revision 3: 4160 passed in 442.33s; revision 2: 4128 passed, 3 skipped, 25 deselected in 422.12s; earlier: 4108 passed; the first spike was 1 failed / 4107 passed -- see the mutation-table note;
 #      revision 3 adds only the offline stub in test_pkgid_panel_fixes.py, re-measured by step 5b)
 
 # 5b. Hermeticity: no update_server/health test may reach a real registry. The plugin
@@ -5443,7 +5830,7 @@ res = {n: _materialize_version_pin(replace(s, version="1.0.0")).version for n, s
 print(sum(v is not None for v in res.values()), "pinnable,", sum(v is None for v in res.values()), "refused")
 assert res["firecrawl"] == "1.0.0"
 EOF
-#   -> 77 pinnable, 30 refused   (re-measured rev 9: shipped_cost.py incl. install argvs and shipped-only declarations, 0 of 77 on rev 9 and on rev 8; rev 8: shipped_cost.py: 0 of 77 exact pins not silent on rev 8 and on rev 7; rev 7 after the cwd ruling, rev 7 and rev 6; 19 uvx, 9 remote/empty command, cloudflare (url), context7 (windows `cmd /c npx`))
+#   -> 77 pinnable, 30 refused   (re-measured rev 10: shipped_cost.py walks _spawn_set, 0 of 77, and 0 local-command entries with a differing install; rev 9: shipped_cost.py incl. install argvs and shipped-only declarations, 0 of 77 on rev 9 and on rev 8; rev 8: shipped_cost.py: 0 of 77 exact pins not silent on rev 8 and on rev 7; rev 7 after the cwd ruling, rev 7 and rev 6; 19 uvx, 9 remote/empty command, cloudflare (url), context7 (windows `cmd /c npx`))
 
 # 8. Mutation table below: each mutant applied to the implemented tree, then
 #    `uv run pytest tests/test_version_pin.py -q --tb=line`, then restored and `cmp`-verified.
@@ -5484,6 +5871,8 @@ done
 git -C <clone at origin/main 959d4d4> apply --check <extracted.patch>   # -> clean
 cmp <extracted.patch> <(git -C <spike> diff -- src/ tests/test_pkgid_panel_fixes.py)   # -> identical
 cmp <extracted test file> <spike>/tests/test_version_pin.py              # -> identical
+#   Measured rev 10: `git apply --check` clean on the re-fetched origin/main 260cc1a; applied there,
+#   its `git diff` is byte-identical to the patch, and gates, 236 pin tests and the full suite pass.
 #   Measured rev 7: all three clean on 959d4d4, and `git apply --check` clean on the re-fetched
 #   origin/main 876fd33, where the applied tree's `git diff` is byte-identical to the patch.
 
@@ -5622,88 +6011,98 @@ checked with `cmp` (`restored=True` for every row). The driver script is
 
 | # | mutation | applied (file:diff hunk) | result | first `E` line (truncated at 160) / failing tests |
 |---|---|---|---|---|
-| M1 | grammar accepts any string | `loader.py:583c583` | **20 failed, 210 passed** (restored=True) | `AssertionError: assert '^3.25.5' is None`; `test_a_tarball_shaped_version_is_never_an_exact_pin`, `test_server_version_refuses_anything_but_one_exact_version["*"]`, `test_server_version_refuses_anything_but_one_exact_version["../../tmp/x"]`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-a.tar.gz"]`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-x.TAR"]`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-x.tar-gz"]`, `test_server_version_refuses_anything_but_one_exact_version["1.2.3-X.Tar.Gz"]`, `test_server_version_refuses_anything_but_one_exact_version["3.25"]`, `test_server_version_refuses_anything_but_one_exact_version["3.25.5 --registry=http://evil.test"]`, `test_server_version_refuses_anything_but_one_exact_version["3.25.5-evil.tgz"]` (+10 more) |
-| M2 | install argv not pinned | `loader.py:747c747` | **3 failed, 227 passed** (restored=True) | `AssertionError: assert {'mac': ['npx...recrawl-mcp']} == {'mac': ['npx...-mcp@3.25.5']}`; `test_server_version_pins_the_shipped_firecrawl_entry_everywhere_it_spawns`, `test_version_key_on_a_whole_servers_entry_is_materialised`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
-| M3 | existing tag not replaced | `loader.py:692c692` | **7 failed, 223 passed** (restored=True) | `AssertionError: assert ['-y', '@play...latest@1.2.3'] == ['-y', '@play...ht/mcp@1.2.3']`; `test_version_pins_every_plain_registry_class[@s/p@latest-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[t@1.0.0-rc.1-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@1.0.0-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@beta-2.tgzx-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@next-t@3.25.5]`, `test_version_replaces_a_dist_tag_slot`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
-| M4 | servers: version: key ignored | `loader.py:867c867` | **52 failed, 178 passed** (restored=True) | `AssertionError: assert ['-y', 'custo...port', '3000'] == ['-y', 'custo...port', '3000']`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: "npx"\n    args: ["-y", "ok-mcp"]\n    install:\n      linux: ["npx", "-y", 123]]`, `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: "npx"\n    args: ["-y", 123]]`, `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: 123\n    args: ["-y", "ok-mcp"]]`, `test_version_key_on_a_whole_servers_entry_is_materialised`, `test_version_pins_every_plain_registry_class[@s/p-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[@s/p.tgz-@s/p.tgz@3.25.5]`, `test_version_pins_every_plain_registry_class[@s/p@latest-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[t-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@1.0.0-rc.1-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@1.0.0-t@3.25.5]` (+42 more) |
-| M5 | unapproved project overlay applied | `loader.py:1142c1142` | **2 failed, 228 passed** (restored=True) | `AssertionError: assert '3.25.5' is None`; `test_fingerprint_changes_when_the_project_overlay_is_approved`, `test_unapproved_project_server_version_contributes_nothing` |
-| M6 | non-npx command accepted | `loader.py:720c720` | **2 failed, 228 passed** (restored=True) | `assert False`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: 123\n    args: ["-y", "ok-mcp"]]`, `test_version_on_a_uvx_server_is_refused_with_the_escape_hatch` |
-| M7 | install may name another package | `loader.py:742c742` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert '1.0.0' is None`; `test_version_is_refused_when_an_install_argv_names_another_package` |
-| M8 | comparison arguments swapped | `handlers.py:6006c6006` | **2 failed, 228 passed** (restored=True) | `AssertionError: assert 'not_newer' == 'newer'`; `test_update_server_labels_build_metadata_with_what_npm_runs`, `test_update_server_reports_a_newer_version_for_a_pinned_server` |
-| M9 | relaxer not required for the warning | `handlers.py:1208,1209d1207` | **1 failed, 229 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_is_silent_when_the_relaxer_is_not_active` |
-| M10 | pin not consulted for the warning | `handlers.py:1271c1271` | **17 failed, 213 passed** (restored=True) | `assert 'unpinned' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: the ...which can change w`; `test_a_uvx_url_requirement_is_never_an_exact_pin`, `test_docker_digest_labels_and_the_entrys_docker_env`, `test_health_still_warns_when_npm_identity_is_disabled`, `test_health_warns_on_a_docker_tag_however_version_like`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@3.x]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@^3.25.5]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@next]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@~3.25.5]`, `test_health_warns_when_a_self_hosted_backend_client_is_unpinned`, `test_the_cause_names_a_launcher_identity_does_not_read[abs-npx-active (npm 11.19.0)]` (+7 more) |
-| M11 | health judges the manifest, not the connected config | `handlers.py:3202c3202` | **5 failed, 225 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_a_docker_digest_ignores_an_entry_set_cwd_and_an_inherited_cwd_is_the_hosts`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[cargo]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[npx]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[uvx]`, `test_health_judges_the_configured_entry_not_the_manifest` |
-| M12 | update_server drops the warning | `handlers.py:5850,5851d5849` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_update_server_carries_the_unpinned_self_hosted_warning` |
-| M13 | CLI keys the status off ok | `cli.py:1033c1033` | **2 failed, 228 passed** (restored=True) | `assert False`; `test_pmcp_update_renders_a_pinned_server_as_pinned_not_failed`, `test_update_server_reports_a_docker_tag_as_floating` |
-| M14 | health never attaches warnings | `handlers.py:3126d3125` | **91 failed, 139 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_a_uvx_url_requirement_is_never_an_exact_pin`, `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[docker-unknown-flag]`, `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[uvx-non-bare]`, `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[uvx-unknown-flag]`, `test_an_entry_key_not_proven_inert_is_unverifiable[empty-path]`, `test_an_entry_key_not_proven_inert_is_unverifiable[ld-preload]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-cache-home]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-config-dirs]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[cargo]` (+81 more) |
-| M15 | P1: any selector accepted (alias/url/git/file/dir/range) | `loader.py:666c666` | **21 failed, 209 passed** (restored=True) | `AssertionError: assert ('myalias', 'npm:firecrawl-mcp@3.25.5') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[absolute-dir]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[alias]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[file-prefix]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-ssh]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-url]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[home-dir]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-path]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-shortcut]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[not-uri-safe-tag]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[oversized-core-is-a-tag]` (+11 more) |
-| M16 | P1: dist-tag slots refused | `loader.py:662c662` | **5 failed, 225 passed** (restored=True) | `AssertionError: assert ['-y', '@play...t/mcp@latest'] == ['-y', '@play...ht/mcp@1.2.3']`; `test_version_pins_every_plain_registry_class[@s/p@latest-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[t@beta-2.tgzx-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@next-t@3.25.5]`, `test_version_replaces_a_dist_tag_slot`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
-| M17 | P2: any npm selector counts as exact | `handlers.py:494c494` | **6 failed, 224 passed** (restored=True) | `assert 'floats on' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: the ...which can change `; `test_a_tarball_shaped_version_is_never_an_exact_pin`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@3.x]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@^3.25.5]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@next]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@~3.25.5]`, `test_the_floating_label_claims_only_what_every_npm_reads` |
-| M18 | P2: update reports a range as pinned | `handlers.py:5964c5964` | **1 failed, 229 passed** (restored=True) | `assert 'a docker tag' in "'dk' is held at '3.25.5' in the manifest entry (docker run --pull=always example/client:3.25.5). '3.25.5' does not ho..._server will n`; `test_update_server_reports_a_docker_tag_as_floating` |
-| M19 | P3: materialisation not contained per entry | `loader.py:1211c1211` | **1 failed, 229 passed** (restored=True) | `TypeError: expected str, bytes or os.PathLike object, not int`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: 123\n    args: ["-y", "ok-mcp"]]` |
-| M20 | F2: inherited env ignored | `handlers.py:1206c1206` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_warns_when_the_relaxer_comes_from_the_gateway_environment` |
-| M21 | F3: no cache | `handlers.py:3175c3175` | **1 failed, 229 passed** (restored=True) | `assert 3 == 1`; `test_health_loads_the_manifest_once_until_a_source_changes` |
-| M22 | F3: fingerprint misses the user overlay | `loader.py:792d791` | **1 failed, 229 passed** (restored=True) | `assert 1 == 2`; `test_health_loads_the_manifest_once_until_a_source_changes` |
-| M23 | N2: build metadata accepted | `loader.py:583c583` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert '3.25.5+evil' is None`; `test_server_version_refuses_anything_but_one_exact_version["3.25.5+evil"]` |
-| M24 | CLI labels a range [FAILED] | `cli.py:1027c1027` | **4 failed, 226 passed** (restored=True) | `assert False`; `test_pmcp_update_renders_a_range_as_floating`, `test_update_server_never_labels_a_container_command_pinned`, `test_update_server_never_labels_a_divergent_install_argv_pinned`, `test_update_server_reports_a_docker_tag_as_floating` |
-| M25 | B1: selector file check removed from split | `loader.py:658,659d657` | **3 failed, 227 passed** (restored=True) | `AssertionError: assert ('t', 'corp.tgz') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-TGZ-mixed]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-npm10-tar-gz]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-tgz]` |
-| M26 | B1: bare-tarball / tarball-NAME slot accepted | `loader.py:650,651d649` | **3 failed, 227 passed** (restored=True) | `AssertionError: assert ('corp.tgz', None) is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[bare-tarball-TAR]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[bare-tarball-tgz]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-name-with-version]` |
-| M27 | N4: x/X/v1.2.x range words accepted as tags | `loader.py:662,664c662` | **7 failed, 223 passed** (restored=True) | `AssertionError: assert ('t', 'x') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-X]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-v-partial]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-v-xbeta]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-vvX]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-vv]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-x]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[version-vv]` |
-| M28 | N4: match instead of fullmatch (trailing newline) | `loader.py:662c662` | **8 failed, 222 passed** (restored=True) | `AssertionError: assert ('myalias', 'npm:firecrawl-mcp@3.25.5') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[alias]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[file-prefix]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-ssh]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-url]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-path]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-shortcut]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[not-uri-safe-tag]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tag-trailing-newline]` |
-| M29 | N2: silent when npm identity is disabled | `handlers.py:1245,1246c1245` | **23 failed, 207 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-cache]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-call]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-extra-ca]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-home]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-https-proxy-lower]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-https-proxy]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-node-options]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-package]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-registry-uppercase]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-tag]` (+13 more) |
-| M30 | N2: silent when the slot cannot be read either | `handlers.py:1253a1254` | **5 failed, 225 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_fails_loud_for_an_npm_exec_launch_without_identity`, `test_health_says_it_cannot_verify_an_unreadable_slot_without_identity`, `test_health_warns_on_a_semver_tarball_argv_in_both_identity_modes`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-not started (test)]` |
-| M31 | N3: label keeps +metadata | `handlers.py:6000c6000` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert ('3.25.5+evil', 'newer') == ('3.25.5', 'newer')`; `test_update_server_labels_build_metadata_with_what_npm_runs` |
-| M32 | N1: fingerprint misses the project overlay | `loader.py:795c795` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert (('/mnt/workspace/worktrees/viperjuice/pmcp-294-rev9-spike/src/pmcp/manifest/manifest.yaml', 1790487765550327522, 7826...', None, None), `; `test_fingerprint_changes_when_a_project_overlay_appears` |
-| M33 | N1: fingerprint misses the trust store | `loader.py:801c801` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert (('/mnt/workspace/worktrees/viperjuice/pmcp-294-rev9-spike/src/pmcp/manifest/manifest.yaml', 1790487765550327522, 7826...viperjuice/pytes`; `test_fingerprint_changes_when_the_project_overlay_is_approved` |
-| M34 | B1': pin value checked with the bare SemVer grammar instead of main's npm-aware is_valid_package_version | `loader.py:583c583 loader.py:17a18` | **7 failed, 223 passed** (restored=True) | `AssertionError: assert '3.25.5-evil.tgz' is None`; `test_a_tarball_shaped_version_is_never_an_exact_pin`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-a.tar.gz"]`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-x.TAR"]`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-x.tar-gz"]`, `test_server_version_refuses_anything_but_one_exact_version["1.2.3-X.Tar.Gz"]`, `test_server_version_refuses_anything_but_one_exact_version["3.25.5-evil.tgz"]`, `test_server_version_refuses_anything_but_one_exact_version["9007199254740992.0.0"]` |
-| M35 | B1': the REV-3 ORDER restored in the split (bare SemVer accepted before the file check) | `loader.py:657a658,659 loader.py:17a18` | **7 failed, 223 passed** (restored=True) | `AssertionError: assert ('firecrawl-mcp', '3.25.5-corp.tgz') is None`; `test_health_warns_on_a_semver_tarball_argv_in_both_identity_modes`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[oversized-core-is-a-tag]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[semver-tarball-TAR]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[semver-tarball-build]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[semver-tarball-npm10-tar-gz]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[semver-tarball-prerelease]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[semver-tarball-scoped]` |
-| M40 | B1': _is_exact_pin trusts the bare SemVer grammar | `handlers.py:494c494 handlers.py:70a71` | **2 failed, 228 passed** (restored=True) | `AssertionError: assert True is False`; `test_a_tarball_shaped_version_is_never_an_exact_pin`, `test_the_floating_label_claims_only_what_every_npm_reads` |
-| M36 | N-c: excluded names accepted | `loader.py:652,653d651` | **3 failed, 227 passed** (restored=True) | `AssertionError: assert ('node_modules', None) is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[excluded-Node_Modules-versioned]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[excluded-favicon]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[excluded-node_modules]` |
-| M37 | N-a: only one leading v | `loader.py:625c625` | **3 failed, 227 passed** (restored=True) | `AssertionError: assert ('t', 'vv1') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-vvX]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-vv]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[version-vv]` |
-| M38 | N-b: npm exec silent | `handlers.py:1245c1245` | **3 failed, 227 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_fails_loud_for_an_npm_exec_launch_without_identity`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-not started (test)]` |
-| M39 | N-d: cause always 'unavailable' | `handlers.py:1043c1043` | **1 failed, 229 passed** (restored=True) | `assert "npm's own parser did not identify" in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: `; `test_health_warns_on_a_semver_tarball_argv_in_both_identity_modes` |
-| M43 | C2: the generic SemVer check restored ahead of the launcher branches | `handlers.py:492a493,494` | **3 failed, 227 passed** (restored=True) | `AssertionError: assert True is False`; `test_exactness_is_decided_per_launcher`, `test_health_warns_on_a_docker_tag_however_version_like`, `test_update_server_reports_a_docker_tag_as_floating` |
-| M44 | NB-1: cause keyed on the resolver status again | `handlers.py:1037c1037` | **8 failed, 222 passed** (restored=True) | `assert 'reads only a bare 'npx'/'npm' command' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set) but its client npm:fc-mcp is unpinned (read fro`; `test_the_cause_names_a_launcher_identity_does_not_read[abs-npx-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[abs-npx-not started (test)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-not started (test)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npx.cmd-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npx.cmd-not started (test)]`, `test_the_cause_names_a_launcher_identity_does_not_read[windows-npx-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[windows-npx-not started (test)]` |
-| M51 | C1: a matching @scope:registry counted harmless | `handlers.py:714c714` | **1 failed, 229 passed** (restored=True) | `AssertionError: npm_config_@corp:registry`; `test_the_entry_env_allowlist` |
-| M52 | NB-2: the old floating label | `handlers.py:563c563` | **1 failed, 229 passed** (restored=True) | `assert 'not one exact version on every npm release' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set) but its client npm:fc-mcp floats on '1.0.0`; `test_the_floating_label_claims_only_what_every_npm_reads` |
-| M53 | C2: any sha256: prefix counted a digest | `handlers.py:496c496` | **2 failed, 228 passed** (restored=True) | `AssertionError: assert True is False`; `test_docker_digest_labels_and_the_entrys_docker_env`, `test_exactness_is_decided_per_launcher` |
-| M57 | C1/B2: an exact argv suppresses whatever the entry sets | `handlers.py:1275,1277c1275` | **28 failed, 202 passed** (restored=True) | `assert 0 == 1`; `test_an_entry_key_not_proven_inert_is_unverifiable[empty-path]`, `test_an_entry_key_not_proven_inert_is_unverifiable[ld-preload]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-cache-home]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-config-dirs]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[cargo]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[npx]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[uvx]`, `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-git]`, `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-registry]` (+18 more) |
-| M66 | N5: a uvx URL requirement counted exact | `handlers.py:526c526` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert True is False`; `test_a_uvx_url_requirement_is_never_an_exact_pin` |
-| M67 | N5: an unreadable docker/uvx argv silent | `handlers.py:1228c1228` | **3 failed, 227 passed** (restored=True) | `assert 0 == 1`; `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[docker-unknown-flag]`, `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[uvx-non-bare]`, `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[uvx-unknown-flag]` |
-| M68 | trust boundary: the HOST environment judged too | `handlers.py:1276c1276` | **79 failed, 151 passed** (restored=True) | `assert ["'fc' talks ...ned version."] == []`; `test_a_docker_digest_ignores_an_entry_set_cwd_and_an_inherited_cwd_is_the_hosts`, `test_a_recognised_shape_with_an_exact_pin_is_silent[cargo]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[docker-digest]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[docker-tagged-digest]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[npx]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-from-own-command]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-pep503-name]`, `test_an_entry_key_not_proven_inert_is_unverifiable[empty-path]`, `test_an_entry_key_not_proven_inert_is_unverifiable[ld-preload]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]` (+69 more) |
-| M69 | N5: a malformed digest labelled a tag | `handlers.py:550c550` | **1 failed, 229 passed** (restored=True) | `assert 'a malformed content digest' in "'du' talks to a self-hosted backend (SELFHOST_API_URL is set) but its client docker:example/client floats on 'sha256:...`; `test_docker_digest_labels_and_the_entrys_docker_env` |
-| M72 | cwd: an entry-set cwd ignored | `handlers.py:1011c1011` | **3 failed, 227 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[cargo]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[npx]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[uvx]` |
-| M73 | cwd: docker counted cwd-sensitive | `handlers.py:1021c1021` | **1 failed, 229 passed** (restored=True) | `assert False`; `test_a_docker_digest_ignores_an_entry_set_cwd_and_an_inherited_cwd_is_the_hosts` |
-| M74 | cwd: the inherited (host) cwd judged too | `handlers.py:1276c1276` | **39 failed, 191 passed** (restored=True) | `assert ["'fc' talks ...ned version."] == []`; `test_a_docker_digest_ignores_an_entry_set_cwd_and_an_inherited_cwd_is_the_hosts`, `test_a_recognised_shape_with_an_exact_pin_is_silent[cargo]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[npx]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-from-own-command]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-pep503-name]`, `test_an_exact_cargo_pin_is_silent_without_an_entry_redirect`, `test_an_exact_uvx_pin_is_silent_without_an_entry_redirect`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[other-version]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[package-then-sh]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[sh-wrapper]` (+29 more) |
-| M75 | ENV allowlist: an unknown key counted inert | `handlers.py:745c745` | **16 failed, 214 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-extra-ca]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-home]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-https-proxy-lower]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-https-proxy]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-node-options]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-extra-ca]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-home]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-https-proxy-lower]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-https-proxy]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-node-options]` (+6 more) |
-| M77 | ENV: the server's declared keys not inert | `handlers.py:730,731d729` | **69 failed, 161 passed** (restored=True) | `AssertionError: assert (None, '3.26.0') == ('3.25.5', '3.26.0')`; `test_a_docker_digest_ignores_an_entry_set_cwd_and_an_inherited_cwd_is_the_hosts`, `test_a_recognised_shape_with_an_exact_pin_is_silent[cargo]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[docker-digest]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[docker-tagged-digest]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[npx]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-from-own-command]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-pep503-name]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-cache-home]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-config-dirs]` (+59 more) |
-| M78 | ENV: locale/terminal keys not inert | `handlers.py:733c733` | **3 failed, 227 passed** (restored=True) | `assert ["'fc' talks ...ned version."] == []`; `test_entry_settings_that_cannot_redirect_keep_an_exact_pin_silent[identity-off]`, `test_entry_settings_that_cannot_redirect_keep_an_exact_pin_silent[identity-on]`, `test_the_entry_env_allowlist` |
-| M79 | ENV: every npm_config_* key counted inert | `handlers.py:736c736` | **13 failed, 217 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-cache]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-call]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-package]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-registry-uppercase]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-tag]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-userconfig]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-cache]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-call]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-package]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-registry-uppercase]` (+3 more) |
-| M80 | ENV: every key counted inert for uv | `handlers.py:738c738` | **9 failed, 221 passed** (restored=True) | `AssertionError: UV_OVERRIDE`; `test_an_entry_key_not_proven_inert_is_unverifiable[empty-path]`, `test_an_entry_key_not_proven_inert_is_unverifiable[ld-preload]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-cache-home]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-config-dirs]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[env-index]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[env-override]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[env-xdg]`, `test_the_entry_env_allowlist` |
-| M81 | ENV: every key counted inert for cargo | `handlers.py:742c742` | **3 failed, 227 passed** (restored=True) | `AssertionError: CARGO_HOME`; `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[env-registry-index]`, `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[env-rustc-wrapper]`, `test_the_entry_env_allowlist` |
-| M82 | SHAPE npx: an unknown flag counted inert | `handlers.py:795c795` | **2 failed, 228 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[npx-package-then-sh]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[package-then-sh]` |
-| M84 | SHAPE uvx: an unknown flag counted inert | `handlers.py:833c833` | **4 failed, 226 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[uvx-python]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[argv-index]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[argv-overrides]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[argv-with]` |
-| M85 | SHAPE uvx: --from with another command counted the package | `handlers.py:842c842` | **1 failed, 229 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[uvx-from-then-sh]` |
-| M86 | SHAPE cargo: an unknown flag counted inert | `handlers.py:885c885` | **2 failed, 228 passed** (restored=True) | `assert 'argv passes --git' in "'cg' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: the ...which can`; `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-git]`, `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-registry]` |
-| M87 | SHAPE cargo: a +toolchain / non-install argv not refused up front | `handlers.py:857c857` | **1 failed, 229 passed** (restored=True) | `assert 'selects toolchain +nightly' in "'sh1' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: the...`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[cargo-toolchain]` |
-| M88 | SHAPE docker: a container command after the image counted inert | `handlers.py:940c940` | **2 failed, 228 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-command-after-image]`, `test_update_server_never_labels_a_container_command_pinned` |
-| M89 | SHAPE docker: an unknown flag (--entrypoint, -v...) counted inert | `handlers.py:935c935` | **3 failed, 227 passed** (restored=True) | `assert 'argv passes --entrypoint' in "'sh1' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: the...wh`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-entrypoint]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-env-file]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-volume]` |
-| M90 | SHAPE docker: -e KEY not judged | `handlers.py:927c927` | **1 failed, 229 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-env-node-options]` |
-| M91 | N2: an unmodelled runner or wrapper silent | `handlers.py:1220c1220` | **7 failed, 223 passed** (restored=True) | `assert 0 == 1`; `test_an_unmodelled_runner_or_wrapper_is_unverifiable[bunx]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[env]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[node]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[pnpm-dlx]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[pnpx]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[sh-c]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[uv-run]` |
-| M92 | N2: `uv tool run` not judged as uvx | `handlers.py:1212c1212` | **1 failed, 229 passed** (restored=True) | `assert ["'ut1' talks...n exact pin."] == []`; `test_uv_tool_run_is_judged_as_uvx` |
-| M93 | X1: update_server labels an unrecognised shape [PINNED] | `handlers.py:5992,5993d5991` | **2 failed, 228 passed** (restored=True) | `AssertionError: assert ('sha256:ffff...ffffff', None) == (None, 'sha25...ffffffffffff')`; `test_update_server_never_labels_a_container_command_pinned`, `test_update_server_never_labels_a_divergent_install_argv_pinned` |
-| M94 | X1: the warning ignores the argv shape | `handlers.py:1002,1004d1001` | **15 failed, 215 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-git]`, `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-registry]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[cargo-toolchain]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-command-after-image]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-entrypoint]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-env-file]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-env-node-options]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-volume]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[npx-package-then-sh]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[uvx-from-then-sh]` (+5 more) |
-| M95 | ENV: the entry's env block not judged | `handlers.py:1009c1009` | **36 failed, 194 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_entry_key_not_proven_inert_is_unverifiable[empty-path]`, `test_an_entry_key_not_proven_inert_is_unverifiable[ld-preload]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-cache-home]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-config-dirs]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-cache]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-call]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-extra-ca]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-home]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-https-proxy-lower]` (+26 more) |
-| M96 | B2: an overlay declaration exempts a key | `handlers.py:1215c1215,1217` | **3 failed, 227 passed** (restored=True) | `assert 0 == 1`; `test_an_overlay_declaration_exempts_no_key[env-var-openssl-conf]`, `test_an_overlay_declaration_exempts_no_key[env-var-target-cc]`, `test_an_overlay_declaration_exempts_no_key[relaxer-openssl-conf]` |
-| M97 | B1: install argvs not judged by the warning | `handlers.py:1278c1278` | **4 failed, 226 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[other-version]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[package-then-sh]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[sh-wrapper]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[unpinned]` |
-| M98 | B1: install argvs not judged by update_server ([PINNED]) | `handlers.py:5981c5981` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert ('3.25.5', None) == (None, '3.25.5')`; `test_update_server_never_labels_a_divergent_install_argv_pinned` |
-| M99 | B1: an install argv may name another package/version | `handlers.py:1117c1117` | **2 failed, 228 passed** (restored=True) | `assert 'does not run fc-mcp@3.25.5 (it names fc-mcp@latest)' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its `; `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[other-version]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[unpinned]` |
-| M100 | B1: an unreadable install argv counted fine | `handlers.py:1115c1115` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[sh-wrapper]` |
-| M101 | B1: install argv shape/env not judged | `handlers.py:1136,1137d1135` | **1 failed, 229 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[package-then-sh]` |
-| M102 | N2: combined docker short flags not modelled | `handlers.py:914c914` | **1 failed, 229 passed** (restored=True) | `assert ["'ok1' talks...ned version."] == []`; `test_common_inert_spellings_are_recognised[docker-it]` |
-| M103 | N2: npx --yes=true not modelled | `handlers.py:756c756` | **1 failed, 229 passed** (restored=True) | `assert ["'ok1' talks...ned version."] == []`; `test_common_inert_spellings_are_recognised[npx-yes-true]` |
+| M1 | grammar accepts any string | `loader.py:583c583` | **20 failed, 216 passed** (restored=True) | `AssertionError: assert '^3.25.5' is None`; `test_a_tarball_shaped_version_is_never_an_exact_pin`, `test_server_version_refuses_anything_but_one_exact_version["*"]`, `test_server_version_refuses_anything_but_one_exact_version["../../tmp/x"]`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-a.tar.gz"]`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-x.TAR"]`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-x.tar-gz"]`, `test_server_version_refuses_anything_but_one_exact_version["1.2.3-X.Tar.Gz"]`, `test_server_version_refuses_anything_but_one_exact_version["3.25"]`, `test_server_version_refuses_anything_but_one_exact_version["3.25.5 --registry=http://evil.test"]`, `test_server_version_refuses_anything_but_one_exact_version["3.25.5-evil.tgz"]` (+10 more) |
+| M2 | install argv not pinned | `loader.py:747c747` | **3 failed, 233 passed** (restored=True) | `AssertionError: assert {'mac': ['npx...recrawl-mcp']} == {'mac': ['npx...-mcp@3.25.5']}`; `test_server_version_pins_the_shipped_firecrawl_entry_everywhere_it_spawns`, `test_version_key_on_a_whole_servers_entry_is_materialised`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
+| M3 | existing tag not replaced | `loader.py:692c692` | **7 failed, 229 passed** (restored=True) | `AssertionError: assert ['-y', '@play...latest@1.2.3'] == ['-y', '@play...ht/mcp@1.2.3']`; `test_version_pins_every_plain_registry_class[@s/p@latest-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[t@1.0.0-rc.1-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@1.0.0-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@beta-2.tgzx-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@next-t@3.25.5]`, `test_version_replaces_a_dist_tag_slot`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
+| M4 | servers: version: key ignored | `loader.py:867c867` | **52 failed, 184 passed** (restored=True) | `AssertionError: assert ['-y', 'custo...port', '3000'] == ['-y', 'custo...port', '3000']`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: "npx"\n    args: ["-y", "ok-mcp"]\n    install:\n      linux: ["npx", "-y", 123]]`, `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: "npx"\n    args: ["-y", 123]]`, `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: 123\n    args: ["-y", "ok-mcp"]]`, `test_version_key_on_a_whole_servers_entry_is_materialised`, `test_version_pins_every_plain_registry_class[@s/p-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[@s/p.tgz-@s/p.tgz@3.25.5]`, `test_version_pins_every_plain_registry_class[@s/p@latest-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[t-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@1.0.0-rc.1-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@1.0.0-t@3.25.5]` (+42 more) |
+| M5 | unapproved project overlay applied | `loader.py:1142c1142` | **2 failed, 234 passed** (restored=True) | `AssertionError: assert '3.25.5' is None`; `test_fingerprint_changes_when_the_project_overlay_is_approved`, `test_unapproved_project_server_version_contributes_nothing` |
+| M6 | non-npx command accepted | `loader.py:720c720` | **2 failed, 234 passed** (restored=True) | `assert False`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: 123\n    args: ["-y", "ok-mcp"]]`, `test_version_on_a_uvx_server_is_refused_with_the_escape_hatch` |
+| M7 | install may name another package | `loader.py:742c742` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert '1.0.0' is None`; `test_version_is_refused_when_an_install_argv_names_another_package` |
+| M8 | comparison arguments swapped | `handlers.py:6091c6091` | **2 failed, 234 passed** (restored=True) | `AssertionError: assert 'not_newer' == 'newer'`; `test_update_server_labels_build_metadata_with_what_npm_runs`, `test_update_server_reports_a_newer_version_for_a_pinned_server` |
+| M9 | relaxer not required for the warning | `handlers.py:1273,1274d1272` | **1 failed, 235 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_health_is_silent_when_the_relaxer_is_not_active` |
+| M10 | pin not consulted for the warning | `handlers.py:1355c1355` | **17 failed, 219 passed** (restored=True) | `assert 'unpinned' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: the ...which can change w`; `test_a_uvx_url_requirement_is_never_an_exact_pin`, `test_docker_digest_labels_and_the_entrys_docker_env`, `test_health_still_warns_when_npm_identity_is_disabled`, `test_health_warns_on_a_docker_tag_however_version_like`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@3.x]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@^3.25.5]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@next]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@~3.25.5]`, `test_health_warns_when_a_self_hosted_backend_client_is_unpinned`, `test_the_cause_names_a_launcher_identity_does_not_read[abs-npx-active (npm 11.19.0)]` (+7 more) |
+| M11 | health judges the manifest, not the connected config | `handlers.py:3286c3286` | **6 failed, 230 passed** (restored=True) | `assert ["'fc' talks ...nifest.yaml."] == []`; `test_a_docker_digest_ignores_an_entry_set_cwd_and_an_inherited_cwd_is_the_hosts`, `test_a_local_command_is_exempt_only_when_it_is_the_whole_spawn_set`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[cargo]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[npx]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[uvx]`, `test_health_judges_the_configured_entry_not_the_manifest` |
+| M12 | update_server drops the warning | `handlers.py:5934,5935d5933` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_update_server_carries_the_unpinned_self_hosted_warning` |
+| M13 | CLI keys the status off ok | `cli.py:1033c1033` | **2 failed, 234 passed** (restored=True) | `assert False`; `test_pmcp_update_renders_a_pinned_server_as_pinned_not_failed`, `test_update_server_reports_a_docker_tag_as_floating` |
+| M14 | health never attaches warnings | `handlers.py:3210d3209` | **95 failed, 141 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[absolute-path]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[local-command-npx-install]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[local-command-uvx-install]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[pinned-install]`, `test_a_uvx_url_requirement_is_never_an_exact_pin`, `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[docker-unknown-flag]`, `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[uvx-non-bare]`, `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[uvx-unknown-flag]`, `test_an_entry_key_not_proven_inert_is_unverifiable[empty-path]`, `test_an_entry_key_not_proven_inert_is_unverifiable[ld-preload]` (+85 more) |
+| M15 | P1: any selector accepted (alias/url/git/file/dir/range) | `loader.py:666c666` | **21 failed, 215 passed** (restored=True) | `AssertionError: assert ('myalias', 'npm:firecrawl-mcp@3.25.5') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[absolute-dir]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[alias]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[file-prefix]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-ssh]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-url]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[home-dir]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-path]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-shortcut]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[not-uri-safe-tag]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[oversized-core-is-a-tag]` (+11 more) |
+| M16 | P1: dist-tag slots refused | `loader.py:662c662` | **5 failed, 231 passed** (restored=True) | `AssertionError: assert ['-y', '@play...t/mcp@latest'] == ['-y', '@play...ht/mcp@1.2.3']`; `test_version_pins_every_plain_registry_class[@s/p@latest-@s/p@3.25.5]`, `test_version_pins_every_plain_registry_class[t@beta-2.tgzx-t@3.25.5]`, `test_version_pins_every_plain_registry_class[t@next-t@3.25.5]`, `test_version_replaces_a_dist_tag_slot`, `test_version_replaces_an_existing_tag_on_a_scoped_package` |
+| M17 | P2: any npm selector counts as exact | `handlers.py:495c495` | **6 failed, 230 passed** (restored=True) | `assert 'floats on' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: the ...which can change `; `test_a_tarball_shaped_version_is_never_an_exact_pin`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@3.x]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@^3.25.5]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@next]`, `test_health_warns_on_a_range_or_dist_tag[fc-mcp@~3.25.5]`, `test_the_floating_label_claims_only_what_every_npm_reads` |
+| M18 | P2: update reports a range as pinned | `handlers.py:6048c6048` | **1 failed, 235 passed** (restored=True) | `assert 'a docker tag' in "'dk' is held at '3.25.5' in the manifest entry (docker run --pull=always example/client:3.25.5). '3.25.5' does not ho..._server will n`; `test_update_server_reports_a_docker_tag_as_floating` |
+| M19 | P3: materialisation not contained per entry | `loader.py:1211c1211` | **1 failed, 235 passed** (restored=True) | `TypeError: expected str, bytes or os.PathLike object, not int`; `test_a_pin_on_a_malformed_entry_costs_only_that_entry[command: 123\n    args: ["-y", "ok-mcp"]]` |
+| M20 | F2: inherited env ignored | `handlers.py:1271c1271` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_warns_when_the_relaxer_comes_from_the_gateway_environment` |
+| M21 | F3: no cache | `handlers.py:3259c3259` | **1 failed, 235 passed** (restored=True) | `assert 3 == 1`; `test_health_loads_the_manifest_once_until_a_source_changes` |
+| M22 | F3: fingerprint misses the user overlay | `loader.py:792d791` | **1 failed, 235 passed** (restored=True) | `assert 1 == 2`; `test_health_loads_the_manifest_once_until_a_source_changes` |
+| M23 | N2: build metadata accepted | `loader.py:583c583` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert '3.25.5+evil' is None`; `test_server_version_refuses_anything_but_one_exact_version["3.25.5+evil"]` |
+| M24 | CLI labels a range [FAILED] | `cli.py:1027c1027` | **4 failed, 232 passed** (restored=True) | `assert False`; `test_pmcp_update_renders_a_range_as_floating`, `test_update_server_never_labels_a_container_command_pinned`, `test_update_server_never_labels_a_divergent_install_argv_pinned`, `test_update_server_reports_a_docker_tag_as_floating` |
+| M25 | B1: selector file check removed from split | `loader.py:658,659d657` | **3 failed, 233 passed** (restored=True) | `AssertionError: assert ('t', 'corp.tgz') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-TGZ-mixed]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-npm10-tar-gz]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-tgz]` |
+| M26 | B1: bare-tarball / tarball-NAME slot accepted | `loader.py:650,651d649` | **3 failed, 233 passed** (restored=True) | `AssertionError: assert ('corp.tgz', None) is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[bare-tarball-TAR]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[bare-tarball-tgz]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tarball-name-with-version]` |
+| M27 | N4: x/X/v1.2.x range words accepted as tags | `loader.py:662,664c662` | **7 failed, 229 passed** (restored=True) | `AssertionError: assert ('t', 'x') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-X]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-v-partial]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-v-xbeta]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-vvX]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-vv]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-x]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[version-vv]` |
+| M28 | N4: match instead of fullmatch (trailing newline) | `loader.py:662c662` | **8 failed, 228 passed** (restored=True) | `AssertionError: assert ('myalias', 'npm:firecrawl-mcp@3.25.5') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[alias]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[file-prefix]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-ssh]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[git-url]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-path]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[hosted-shortcut]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[not-uri-safe-tag]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[tag-trailing-newline]` |
+| M29 | N2: silent when npm identity is disabled | `handlers.py:1312a1313` | **27 failed, 209 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[absolute-path]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[local-command-npx-install]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[local-command-uvx-install]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[pinned-install]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-cache]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-call]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-extra-ca]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-home]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-https-proxy-lower]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-https-proxy]` (+17 more) |
+| M30 | N2: silent when the slot cannot be read either | `handlers.py:1337a1338` | **5 failed, 231 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_health_fails_loud_for_an_npm_exec_launch_without_identity`, `test_health_says_it_cannot_verify_an_unreadable_slot_without_identity`, `test_health_warns_on_a_semver_tarball_argv_in_both_identity_modes`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-not started (test)]` |
+| M31 | N3: label keeps +metadata | `handlers.py:6085c6085` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert ('3.25.5+evil', 'newer') == ('3.25.5', 'newer')`; `test_update_server_labels_build_metadata_with_what_npm_runs` |
+| M32 | N1: fingerprint misses the project overlay | `loader.py:795c795` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert (('/mnt/workspace/worktrees/viperjuice/pmcp-294-rev10-spike/src/pmcp/manifest/manifest.yaml', 1790493535186967859, 782...', None, None), `; `test_fingerprint_changes_when_a_project_overlay_appears` |
+| M33 | N1: fingerprint misses the trust store | `loader.py:801c801` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert (('/mnt/workspace/worktrees/viperjuice/pmcp-294-rev10-spike/src/pmcp/manifest/manifest.yaml', 1790493535186967859, 782...viperjuice/pytes`; `test_fingerprint_changes_when_the_project_overlay_is_approved` |
+| M34 | B1': pin value checked with the bare SemVer grammar instead of main's npm-aware is_valid_package_version | `loader.py:583c583 loader.py:17a18` | **7 failed, 229 passed** (restored=True) | `AssertionError: assert '3.25.5-evil.tgz' is None`; `test_a_tarball_shaped_version_is_never_an_exact_pin`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-a.tar.gz"]`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-x.TAR"]`, `test_server_version_refuses_anything_but_one_exact_version["1.0.0-x.tar-gz"]`, `test_server_version_refuses_anything_but_one_exact_version["1.2.3-X.Tar.Gz"]`, `test_server_version_refuses_anything_but_one_exact_version["3.25.5-evil.tgz"]`, `test_server_version_refuses_anything_but_one_exact_version["9007199254740992.0.0"]` |
+| M35 | B1': the REV-3 ORDER restored in the split (bare SemVer accepted before the file check) | `loader.py:657a658,659 loader.py:17a18` | **7 failed, 229 passed** (restored=True) | `AssertionError: assert ('firecrawl-mcp', '3.25.5-corp.tgz') is None`; `test_health_warns_on_a_semver_tarball_argv_in_both_identity_modes`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[oversized-core-is-a-tag]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[semver-tarball-TAR]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[semver-tarball-build]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[semver-tarball-npm10-tar-gz]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[semver-tarball-prerelease]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[semver-tarball-scoped]` |
+| M40 | B1': _is_exact_pin trusts the bare SemVer grammar | `handlers.py:495c495 handlers.py:71a72` | **2 failed, 234 passed** (restored=True) | `AssertionError: assert True is False`; `test_a_tarball_shaped_version_is_never_an_exact_pin`, `test_the_floating_label_claims_only_what_every_npm_reads` |
+| M36 | N-c: excluded names accepted | `loader.py:652,653d651` | **3 failed, 233 passed** (restored=True) | `AssertionError: assert ('node_modules', None) is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[excluded-Node_Modules-versioned]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[excluded-favicon]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[excluded-node_modules]` |
+| M37 | N-a: only one leading v | `loader.py:625c625` | **3 failed, 233 passed** (restored=True) | `AssertionError: assert ('t', 'vv1') is None`; `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-vvX]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[range-vv]`, `test_version_refuses_a_slot_that_is_not_a_plain_registry_spec[version-vv]` |
+| M38 | N-b: npm exec silent | `handlers.py:1313c1313` | **3 failed, 233 passed** (restored=True) | `assert 'launches with npm' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: its ...-y fc-mcp`; `test_health_fails_loud_for_an_npm_exec_launch_without_identity`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-not started (test)]` |
+| M39 | N-d: cause always 'unavailable' | `handlers.py:1044c1044` | **1 failed, 235 passed** (restored=True) | `assert "npm's own parser did not identify" in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: `; `test_health_warns_on_a_semver_tarball_argv_in_both_identity_modes` |
+| M43 | C2: the generic SemVer check restored ahead of the launcher branches | `handlers.py:493a494,495` | **3 failed, 233 passed** (restored=True) | `AssertionError: assert True is False`; `test_exactness_is_decided_per_launcher`, `test_health_warns_on_a_docker_tag_however_version_like`, `test_update_server_reports_a_docker_tag_as_floating` |
+| M44 | NB-1: cause keyed on the resolver status again | `handlers.py:1038c1038` | **8 failed, 228 passed** (restored=True) | `assert 'reads only a bare 'npx'/'npm' command' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set) but its client npm:fc-mcp is unpinned (read fro`; `test_the_cause_names_a_launcher_identity_does_not_read[abs-npx-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[abs-npx-not started (test)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npm.cmd-not started (test)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npx.cmd-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[npx.cmd-not started (test)]`, `test_the_cause_names_a_launcher_identity_does_not_read[windows-npx-active (npm 11.19.0)]`, `test_the_cause_names_a_launcher_identity_does_not_read[windows-npx-not started (test)]` |
+| M51 | C1: a matching @scope:registry counted harmless | `handlers.py:715c715` | **1 failed, 235 passed** (restored=True) | `AssertionError: npm_config_@corp:registry`; `test_the_entry_env_allowlist` |
+| M52 | NB-2: the old floating label | `handlers.py:564c564` | **1 failed, 235 passed** (restored=True) | `assert 'not one exact version on every npm release' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set) but its client npm:fc-mcp floats on '1.0.0`; `test_the_floating_label_claims_only_what_every_npm_reads` |
+| M53 | C2: any sha256: prefix counted a digest | `handlers.py:497c497` | **2 failed, 234 passed** (restored=True) | `AssertionError: assert True is False`; `test_docker_digest_labels_and_the_entrys_docker_env`, `test_exactness_is_decided_per_launcher` |
+| M57 | C1/B2: an exact argv suppresses whatever the entry sets | `handlers.py:1359,1361c1359` | **28 failed, 208 passed** (restored=True) | `assert 0 == 1`; `test_an_entry_key_not_proven_inert_is_unverifiable[empty-path]`, `test_an_entry_key_not_proven_inert_is_unverifiable[ld-preload]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-cache-home]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-config-dirs]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[cargo]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[npx]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[uvx]`, `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-git]`, `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-registry]` (+18 more) |
+| M66 | N5: a uvx URL requirement counted exact | `handlers.py:527c527` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert True is False`; `test_a_uvx_url_requirement_is_never_an_exact_pin` |
+| M67 | N5: an unreadable docker/uvx argv silent | `handlers.py:1296c1296` | **3 failed, 233 passed** (restored=True) | `assert 0 == 1`; `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[docker-unknown-flag]`, `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[uvx-non-bare]`, `test_an_argv_pmcp_cannot_read_fails_loud_for_every_read_launcher[uvx-unknown-flag]` |
+| M68 | trust boundary: the HOST environment judged too | `handlers.py:1360c1360` | **79 failed, 157 passed** (restored=True) | `assert ["'fc' talks ...ned version."] == []`; `test_a_docker_digest_ignores_an_entry_set_cwd_and_an_inherited_cwd_is_the_hosts`, `test_a_recognised_shape_with_an_exact_pin_is_silent[cargo]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[docker-digest]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[docker-tagged-digest]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[npx]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-from-own-command]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-pep503-name]`, `test_an_entry_key_not_proven_inert_is_unverifiable[empty-path]`, `test_an_entry_key_not_proven_inert_is_unverifiable[ld-preload]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]` (+69 more) |
+| M69 | N5: a malformed digest labelled a tag | `handlers.py:551c551` | **1 failed, 235 passed** (restored=True) | `assert 'a malformed content digest' in "'du' talks to a self-hosted backend (SELFHOST_API_URL is set) but its client docker:example/client floats on 'sha256:...`; `test_docker_digest_labels_and_the_entrys_docker_env` |
+| M72 | cwd: an entry-set cwd ignored | `handlers.py:1012c1012` | **3 failed, 233 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[cargo]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[npx]`, `test_an_entry_set_cwd_makes_an_exact_pin_unverifiable[uvx]` |
+| M73 | cwd: docker counted cwd-sensitive | `handlers.py:1022c1022` | **1 failed, 235 passed** (restored=True) | `assert False`; `test_a_docker_digest_ignores_an_entry_set_cwd_and_an_inherited_cwd_is_the_hosts` |
+| M74 | cwd: the inherited (host) cwd judged too | `handlers.py:1360c1360` | **39 failed, 197 passed** (restored=True) | `assert ["'fc' talks ...ned version."] == []`; `test_a_docker_digest_ignores_an_entry_set_cwd_and_an_inherited_cwd_is_the_hosts`, `test_a_recognised_shape_with_an_exact_pin_is_silent[cargo]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[npx]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-from-own-command]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-pep503-name]`, `test_an_exact_cargo_pin_is_silent_without_an_entry_redirect`, `test_an_exact_uvx_pin_is_silent_without_an_entry_redirect`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[other-version]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[package-then-sh]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[sh-wrapper]` (+29 more) |
+| M75 | ENV allowlist: an unknown key counted inert | `handlers.py:746c746` | **16 failed, 220 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-extra-ca]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-home]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-https-proxy-lower]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-https-proxy]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-node-options]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-extra-ca]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-home]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-https-proxy-lower]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-https-proxy]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-node-options]` (+6 more) |
+| M77 | ENV: the server's declared keys not inert | `handlers.py:731,732d730` | **69 failed, 167 passed** (restored=True) | `AssertionError: assert (None, '3.26.0') == ('3.25.5', '3.26.0')`; `test_a_docker_digest_ignores_an_entry_set_cwd_and_an_inherited_cwd_is_the_hosts`, `test_a_recognised_shape_with_an_exact_pin_is_silent[cargo]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[docker-digest]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[docker-tagged-digest]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[npx]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-from-own-command]`, `test_a_recognised_shape_with_an_exact_pin_is_silent[uvx-pep503-name]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-cache-home]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-config-dirs]` (+59 more) |
+| M78 | ENV: locale/terminal keys not inert | `handlers.py:734c734` | **3 failed, 233 passed** (restored=True) | `assert ["'fc' talks ...ned version."] == []`; `test_entry_settings_that_cannot_redirect_keep_an_exact_pin_silent[identity-off]`, `test_entry_settings_that_cannot_redirect_keep_an_exact_pin_silent[identity-on]`, `test_the_entry_env_allowlist` |
+| M79 | ENV: every npm_config_* key counted inert | `handlers.py:737c737` | **13 failed, 223 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-cache]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-call]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-package]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-registry-uppercase]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-tag]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-userconfig]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-cache]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-call]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-package]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-on-entry-registry-uppercase]` (+3 more) |
+| M80 | ENV: every key counted inert for uv | `handlers.py:739c739` | **9 failed, 227 passed** (restored=True) | `AssertionError: UV_OVERRIDE`; `test_an_entry_key_not_proven_inert_is_unverifiable[empty-path]`, `test_an_entry_key_not_proven_inert_is_unverifiable[ld-preload]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-cache-home]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-config-dirs]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[env-index]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[env-override]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[env-xdg]`, `test_the_entry_env_allowlist` |
+| M81 | ENV: every key counted inert for cargo | `handlers.py:743c743` | **3 failed, 233 passed** (restored=True) | `AssertionError: CARGO_HOME`; `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[env-registry-index]`, `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[env-rustc-wrapper]`, `test_the_entry_env_allowlist` |
+| M82 | SHAPE npx: an unknown flag counted inert | `handlers.py:796c796` | **2 failed, 234 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[npx-package-then-sh]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[package-then-sh]` |
+| M84 | SHAPE uvx: an unknown flag counted inert | `handlers.py:834c834` | **4 failed, 232 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[uvx-python]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[argv-index]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[argv-overrides]`, `test_an_exact_uvx_pin_is_not_called_pinned_when_the_entry_redirects_uv[argv-with]` |
+| M85 | SHAPE uvx: --from with another command counted the package | `handlers.py:843c843` | **1 failed, 235 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[uvx-from-then-sh]` |
+| M86 | SHAPE cargo: an unknown flag counted inert | `handlers.py:886c886` | **2 failed, 234 passed** (restored=True) | `assert 'argv passes --git' in "'cg' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: the ...which can`; `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-git]`, `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-registry]` |
+| M87 | SHAPE cargo: a +toolchain / non-install argv not refused up front | `handlers.py:858c858` | **1 failed, 235 passed** (restored=True) | `assert 'selects toolchain +nightly' in "'sh1' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: the...`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[cargo-toolchain]` |
+| M88 | SHAPE docker: a container command after the image counted inert | `handlers.py:941c941` | **2 failed, 234 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-command-after-image]`, `test_update_server_never_labels_a_container_command_pinned` |
+| M89 | SHAPE docker: an unknown flag (--entrypoint, -v...) counted inert | `handlers.py:936c936` | **3 failed, 233 passed** (restored=True) | `assert 'argv passes --entrypoint' in "'sh1' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its client is pinned: the...wh`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-entrypoint]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-env-file]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-volume]` |
+| M90 | SHAPE docker: -e KEY not judged | `handlers.py:928c928` | **1 failed, 235 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-env-node-options]` |
+| M91 | N2: an unmodelled runner or wrapper silent | `handlers.py:1288c1288` | **7 failed, 229 passed** (restored=True) | `assert 0 == 1`; `test_an_unmodelled_runner_or_wrapper_is_unverifiable[bunx]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[env]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[node]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[pnpm-dlx]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[pnpx]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[sh-c]`, `test_an_unmodelled_runner_or_wrapper_is_unverifiable[uv-run]` |
+| M92 | N2: `uv tool run` not judged as uvx | `handlers.py:1277c1277` | **1 failed, 235 passed** (restored=True) | `assert ["'ut1' talks...n exact pin."] == []`; `test_uv_tool_run_is_judged_as_uvx` |
+| M93 | X1: update_server labels an unrecognised shape [PINNED] | `handlers.py:6077,6078d6076` | **2 failed, 234 passed** (restored=True) | `AssertionError: assert ('sha256:ffff...ffffff', None) == (None, 'sha25...ffffffffffff')`; `test_update_server_never_labels_a_container_command_pinned`, `test_update_server_never_labels_a_divergent_install_argv_pinned` |
+| M94 | X1: the warning ignores the argv shape | `handlers.py:1003,1005d1002` | **15 failed, 221 passed** (restored=True) | `assert 0 == 1`; `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-git]`, `test_an_exact_cargo_pin_is_not_called_pinned_when_the_entry_redirects_cargo[argv-registry]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[cargo-toolchain]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-command-after-image]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-entrypoint]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-env-file]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-env-node-options]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[docker-volume]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[npx-package-then-sh]`, `test_an_exact_pin_in_an_unrecognised_argv_shape_is_unverifiable[uvx-from-then-sh]` (+5 more) |
+| M95 | ENV: the entry's env block not judged | `handlers.py:1010c1010` | **36 failed, 200 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_entry_key_not_proven_inert_is_unverifiable[empty-path]`, `test_an_entry_key_not_proven_inert_is_unverifiable[ld-preload]`, `test_an_entry_key_not_proven_inert_is_unverifiable[unknown-key]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-cache-home]`, `test_an_entry_key_not_proven_inert_is_unverifiable[xdg-config-dirs]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-cache]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-call]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-extra-ca]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-home]`, `test_an_exact_argv_is_not_called_pinned_when_the_entry_env_redirects_npm[identity-off-entry-https-proxy-lower]` (+26 more) |
+| M96 | B2: an overlay declaration exempts a key | `handlers.py:1280c1280,1282` | **3 failed, 233 passed** (restored=True) | `assert 0 == 1`; `test_an_overlay_declaration_exempts_no_key[env-var-openssl-conf]`, `test_an_overlay_declaration_exempts_no_key[env-var-target-cc]`, `test_an_overlay_declaration_exempts_no_key[relaxer-openssl-conf]` |
+| M97 | B1: install argvs not judged by the warning | `handlers.py:1362c1362` | **4 failed, 232 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[other-version]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[package-then-sh]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[sh-wrapper]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[unpinned]` |
+| M98 | B1: install argvs not judged by update_server ([PINNED]) | `handlers.py:6065c6065` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert ('3.25.5', None) == (None, '3.25.5')`; `test_update_server_never_labels_a_divergent_install_argv_pinned` |
+| M99 | B1: an install argv may name another package/version | `handlers.py:1182c1182` | **2 failed, 234 passed** (restored=True) | `assert 'does not run fc-mcp@3.25.5 (it names fc-mcp@latest)' in "'fc' talks to a self-hosted backend (SELFHOST_API_URL is set), but pmcp cannot verify that its `; `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[other-version]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[unpinned]` |
+| M100 | B1: an unreadable install argv counted fine | `handlers.py:1180c1180` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[sh-wrapper]` |
+| M101 | B1: install argv shape/env not judged | `handlers.py:1201,1202d1200` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[package-then-sh]` |
+| M102 | N2: combined docker short flags not modelled | `handlers.py:915c915` | **1 failed, 235 passed** (restored=True) | `assert ["'ok1' talks...ned version."] == []`; `test_common_inert_spellings_are_recognised[docker-it]` |
+| M103 | N2: npx --yes=true not modelled | `handlers.py:757c757` | **1 failed, 235 passed** (restored=True) | `assert ["'ok1' talks...ned version."] == []`; `test_common_inert_spellings_are_recognised[npx-yes-true]` |
+| M104 | B-1: an early return skips the spawn set (local-binary exemption unconditional) | `handlers.py:1320c1320` | **4 failed, 232 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[absolute-path]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[local-command-npx-install]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[local-command-uvx-install]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[pinned-install]` |
+| M105 | B-1: install argvs left out of the spawn set | `handlers.py:1145c1145` | **9 failed, 227 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[absolute-path]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[local-command-npx-install]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[local-command-uvx-install]`, `test_a_local_command_does_not_exempt_an_install_argv_provision_adopts[pinned-install]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[other-version]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[package-then-sh]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[sh-wrapper]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[unpinned]`, `test_update_server_never_labels_a_divergent_install_argv_pinned` |
+| M106 | the spawn set judged only in part | `handlers.py:1175c1175` | **5 failed, 231 passed** (restored=True) | `AssertionError: assert 0 == 1`; `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[other-version]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[package-then-sh]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[sh-wrapper]`, `test_an_install_argv_that_does_not_run_the_pin_is_unverifiable[unpinned]`, `test_update_server_never_labels_a_divergent_install_argv_pinned` |
+| M107 | a spawning site dropped from _SERVER_SPAWN_SITES | `handlers.py:1095d1094` | **1 failed, 235 passed** (restored=True) | `AssertionError: assert {'client/mana...tart_install'} == {'client/mana...onnect_stdio'}`; `test_every_spawn_site_is_classified` |
 
-**80 of 80 mutants red** on the revision-9 spike (origin/main `876fd33` + patch). Each ran
+**84 of 84 mutants red** on the revision-10 spike (origin/main `876fd33` + patch). Each ran
+against the 236-test file, was restored and `cmp`-checked, with 0 tracebacks. Revision 10 adds
+M104 (an early return skips the spawn set), M105 (install argvs left out of the set), M106
+(the set judged only in part) and M107 (a spawning site dropped from `_SERVER_SPAWN_SITES`), and
+re-targets M29 at the rewritten local-binary branch.
+
+Revision 9 (for the record): 80 of 80 mutants red on the revision-9 spike (origin/main `876fd33` + patch). Each ran
 against the 230-test file, was restored and `cmp`-checked, with 0 tracebacks. Revision 9 adds
 M96 (an overlay declaration exempts a key), M97-M101 (install argvs not judged, or judged
 weakly) and M102-M103 (N2 spellings). It retires M76 with the namespace guard and
@@ -5746,7 +6145,7 @@ must not move that docstring.**
 
 ## Acceptance criteria
 
-- [ ] `tests/test_version_pin.py` passes: 230 tests (rev 9), Verification step 2.
+- [ ] `tests/test_version_pin.py` passes: 236 tests (rev 10), Verification step 2.
 - [ ] A user overlay line `server_version: {firecrawl: "3.25.5"}` makes
   `load_manifest().servers["firecrawl"].args == ["-y", "firecrawl-mcp@3.25.5"]`, every
   `install` argv equal to `["npx", "-y", "firecrawl-mcp@3.25.5"]`, and
@@ -5783,6 +6182,12 @@ must not move that docstring.**
   plus Verification step 10: 0 violations). Both fingerprint components have tests. With
   npm identity disabled, the warning still fires or says it cannot verify. A configured
   `+metadata` pin is labelled with what npm runs.
+
+- [ ] Board revision 10 (round 8): the warning computes the whole spawn set (args, and for
+  a manifest server every install argv) before any verdict. The local-binary exemption
+  holds only when every member is the entry's own argv. `test_every_spawn_site_is_classified`
+  fails on any unclassified spawn call site in `src/pmcp`. Shipped cost 0 of 77. Proven by
+  the tests and mutants M104-M107 in the Revision 10 table.
 
 - [ ] Board revision 9 (round 7): for a manifest-sourced server, every non-empty install
   argv runs the same exact pin in a recognised shape with an inert env, or the warning
@@ -5904,6 +6309,16 @@ must not move that docstring.**
 - **R6: the `_OverlayDocument` 4-tuple.** Any out-of-tree caller that unpacks the
   3-tuple breaks. There are none in-tree (grep), and it is a private name.
 
+- **R15 (rev 10): the adopted process's recorded config is re-read at handoff.**
+  `_finalize_server_ready` records `manifest_server_to_config(load_manifest()...)` for the
+  process `start_install` spawned earlier. An overlay edit during the install window can
+  make health judge a config other than the one that ran, until the next restart. This is
+  pre-existing and needs an edit mid-install. Follow-up: snapshot the `ServerConfig` at
+  `start_install` and adopt with it.
+- **R16 (rev 10): the descriptions refresh runs the manifest argv.** For a configured
+  server, `refresh_server` spawns the manifest's `command`/`args`, with no entry env, to
+  list tools. It is not adopted and never serves, so it cannot move the served client;
+  it can cache descriptions from another version (R2).
 - **R13 (rev 9 restatement): only the shipped manifest's declarations exempt a key.** An
   overlay or config that injects an application key warns "cannot verify" unless pmcp's
   shipped entry of that name declares it. An overlay-only self-hosted server always warns,
@@ -5981,7 +6396,7 @@ must not move that docstring.**
   remain open.
 - PR: cross-vendor panel CR plus reconcile before merge (repo rule).
 
-## Appendix: mutation driver (`mutants.py`; revision 9 runs it in a spike worktree off origin/main `876fd33`, with pristine copies of the spike files under `src9/`)
+## Appendix: mutation driver (`mutants.py`; revision 10 runs it in a spike worktree off origin/main `876fd33`, with pristine copies of the spike files under `src10/`)
 
 ```python
 """Apply one mutant at a time to the spike, run the pin tests, restore, cmp.
@@ -5992,9 +6407,9 @@ one-occurrence replacements, applied together (M35 spans two files).
 import filecmp, shutil, subprocess, sys
 from pathlib import Path
 
-WT = Path("/home/viperjuice/workspace/worktrees/pmcp-294-rev9-spike")  # the rev-9 spike, off origin/main 876fd33 worktree off origin/main
+WT = Path("/home/viperjuice/workspace/worktrees/pmcp-294-rev10-spike")  # the rev-10 spike, off origin/main 876fd33 worktree off origin/main
 S = Path(sys.argv[0]).parent
-SPIKE = S / "src9"  # pristine copies of the spike files
+SPIKE = S / "src10"  # pristine copies of the spike files
 L, H, C, V = (
     "src/pmcp/manifest/loader.py",
     "src/pmcp/tools/handlers.py",
@@ -6030,7 +6445,7 @@ MUTANTS = [
     ("M26", [(L, '    if not name.startswith("@") and _NPM_FILE_TYPE_RE.search(name):\n        return None\n', "")], "B1: bare-tarball / tarball-NAME slot accepted"),
     ("M27", [(L, " and not _PARTIAL_VERSION_WORD_RE.fullmatch(\n        selector\n    ):", ":")], "N4: x/X/v1.2.x range words accepted as tags"),
     ("M28", [(L, "    if _TAG_WORD_RE.fullmatch(selector) and not", "    if _TAG_WORD_RE.match(selector) and not")], "N4: match instead of fullmatch (trailing newline)"),
-    ("M29", [(H, '        if launcher not in ("npx", "npm"):\n            return None\n', "        return None\n")], "N2: silent when npm identity is disabled"),
+    ("M29", [(H, '        if launcher not in ("npx", "npm"):\n            # A command pmcp does not model', '        return None\n        if launcher not in ("npx", "npm"):\n            # A command pmcp does not model')], "N2: silent when npm identity is disabled"),
     ("M30", [(H, "        if plain is None:\n            where = (", "        if plain is None:\n            return None\n            where = (")], "N2: silent when the slot cannot be read either"),
     ("M31", [(H, '            if exact and package_type in ("npm", "cargo") and "+" in pinned_to:', "            if False:")], "N3: label keeps +metadata"),
     ("M32", [(L, "    parts.append(stat(project) if project is not None else None)", "    parts.append(None)")], "N1: fingerprint misses the project overlay"),
@@ -6092,6 +6507,11 @@ MUTANTS = [
     ("M101", [(H, '        if problem is not None:\n            return f"{where} is not proven to run the pin: {problem}"\n', "")], "B1: install argv shape/env not judged"),
     ("M102", [(H, '            and all(f"-{letter}" in _DOCKER_INERT_BOOLEAN_FLAGS for letter in arg[1:])', "            and False")], "N2: combined docker short flags not modelled"),
     ("M103", [(H, '_NPX_INERT_FLAGS = frozenset({"-y", "--yes", "--yes=true", "-q", "--quiet"})', '_NPX_INERT_FLAGS = frozenset({"-y", "--yes", "-q", "--quiet"})')], "N2: npx --yes=true not modelled"),
+    # --- board round 8 (rev 10): the whole spawn set before any exemption -----
+    ("M104", [(H, "            for member in spawns[1:]:\n                if member.argv != own:\n", "            for member in []:\n                if member.argv != own:\n")], "B-1: an early return skips the spawn set (local-binary exemption unconditional)"),
+    ("M105", [(H, '    if resolved.source == "manifest" and manifest_server is not None:', "    if False:")], "B-1: install argvs left out of the spawn set"),
+    ("M106", [(H, "    for member in members[1:]:\n        where = member.where()", "    for member in members[2:]:\n        where = member.where()")], "the spawn set judged only in part"),
+    ("M107", [(H, '    "manifest/installer.py:JobManager.start_install": "install",\n', "")], "a spawning site dropped from _SERVER_SPAWN_SITES"),
 ]
 only = set(sys.argv[1:])
 for mid, edits, desc in MUTANTS:
@@ -6434,4 +6854,110 @@ for name, s in m.servers.items():
 print(f"{h.__file__}\n  pinnable {pinned}; exact pin NOT silent for {loud}; of those with a relaxer: {relaxer_loud}")
 for n, r in sorted(reasons.items())[:10]:
     print("   ", n, "->", r[:140])
+```
+
+## Appendix: board-round-8 reproduction and shipped cost (`repro_r10.py`, `shipped_cost.py`; revision 10)
+
+```python
+"""Round-8 findings (rev 10 adds the B-1 local-command cases): the warning on the tree under test, one case per process.
+usage: repro_r9.py <case>. The entry is a manifest entry (source "manifest"), so its
+install argvs are spawning argvs; npm identity is read with the node-less tables."""
+import sys
+from pmcp.manifest import version_checker as vc
+import pmcp.tools.handlers as h
+from pmcp.config.loader import manifest_server_to_config
+from pmcp.manifest.loader import ServerConfig
+tables = lambda a, c, e=None, w=None: vc._npm_package_arg_from_tables(a, c)
+vc._npm_package_arg = tables; h._npm_package_arg = tables
+P = ["mac", "linux", "wsl", "windows"]
+D = "sha256:" + "a" * 64
+FC = dict(env_var="FIRECRAWL_API_KEY", api_key_optional_when=["FIRECRAWL_API_URL"])
+CASES = {
+    # name: (server name, command, args, install, env_var, relaxers, extra_env)
+    "B-1 command firecrawl-mcp, install.linux npx -y firecrawl-mcp": ("firecrawl", "firecrawl-mcp", [],
+        {"linux": ["npx", "-y", "firecrawl-mcp"]}, "FIRECRAWL_API_KEY", ["FIRECRAWL_API_URL"], {}),
+    "B-1 command firecrawl-mcp, install.linux uvx firecrawl-mcp": ("firecrawl", "firecrawl-mcp", [],
+        {"linux": ["uvx", "firecrawl-mcp"]}, "FIRECRAWL_API_KEY", ["FIRECRAWL_API_URL"], {}),
+    "B-1 command /opt/fc/bin/firecrawl-mcp --stdio, npx install": ("firecrawl", "/opt/fc/bin/firecrawl-mcp", ["--stdio"],
+        {"linux": ["npx", "-y", "firecrawl-mcp"]}, "FIRECRAWL_API_KEY", ["FIRECRAWL_API_URL"], {}),
+    "B-1 command firecrawl-mcp, install pinned npx": ("firecrawl", "firecrawl-mcp", [],
+        {"linux": ["npx", "-y", "firecrawl-mcp@3.25.5"]}, "FIRECRAWL_API_KEY", ["FIRECRAWL_API_URL"], {}),
+    "control local command, every install argv the same": ("firecrawl", "/opt/fc/bin/firecrawl-mcp", ["--stdio"],
+        None, "FIRECRAWL_API_KEY", ["FIRECRAWL_API_URL"], {}),
+    "control shipped firecrawl, all argvs pinned": ("firecrawl", "npx", ["-y", "firecrawl-mcp@3.25.5"], None,
+        "FIRECRAWL_API_KEY", ["FIRECRAWL_API_URL"], {}),
+}
+name = sys.argv[1]
+server_name, command, args, install, env_var, relaxers, extra = CASES[name]
+if install is None:
+    install = {p: [command, *args] for p in P}
+else:
+    install = {p: install.get(p, [command, *args]) for p in P}
+relaxer_env = {k: "http://self-hosted:3002" for k in relaxers if k not in extra}
+server = ServerConfig(name=server_name, description="x", keywords=["x"], install=install, command=command,
+                      args=args, requires_api_key=True, env_var=env_var, api_key_optional_when=relaxers,
+                      extra_env={**relaxer_env, **extra})
+resolved = manifest_server_to_config(server)
+w = h._unpinned_self_hosted_warning(server_name, server, resolved, None)
+print(f"{name}\t{'None' if w is None else w}")
+```
+
+```python
+"""Shipped-coverage cost (rev 9: also every install argv, and only shipped declarations): for every shipped manifest entry that a `version:` pin can
+reach (step 7's 77), pin it at 1.0.0, build the config the gateway would spawn, and ask
+the tree under test whether an EXACT pin there is silent. npm identity is read with the
+node-less tables, so the result does not depend on the host's npm."""
+import inspect, os
+from dataclasses import replace
+from pathlib import Path
+from pmcp.config.loader import manifest_server_to_config
+from pmcp.manifest import version_checker as vc
+from pmcp.manifest.loader import load_manifest, _materialize_version_pin
+import pmcp.tools.handlers as h
+import logging; logging.disable(logging.WARNING)
+tables = lambda a, c, e=None, w=None: vc._npm_package_arg_from_tables(a, c)
+vc._npm_package_arg = tables; h._npm_package_arg = tables
+m = load_manifest(Path(os.environ["MANIFEST"]))
+sig = inspect.signature(h._entry_redirect).parameters
+pinned = loud = 0; relaxer_loud = []; reasons = {}
+for name, s in m.servers.items():
+    p = _materialize_version_pin(replace(s, version="1.0.0"))
+    if p.version is None:
+        continue
+    pinned += 1
+    cfg = manifest_server_to_config(p).config
+    ptype, pkg = vc.detect_package_type(cfg.command, list(cfg.args), cfg.env, cfg.cwd)
+    kw = dict(package_type=ptype, command=cfg.command, args=list(cfg.args), package=pkg,
+              config_env=cfg.env)
+    if "pin" in sig: kw["pin"] = "1.0.0"
+    if "cwd" in sig: kw["cwd"] = cfg.cwd
+    if "declared" in sig:
+        kw["declared"] = (h._declared_env_keys(name) if hasattr(h, "_shipped_manifest_declarations")
+                          else h._declared_env_keys(p))
+    r = h._entry_redirect(**kw)
+    if r is None and hasattr(h, "_spawn_set"):
+        r = h._install_argv_problem(h._spawn_set(p, manifest_server_to_config(p)), ptype, pkg, "1.0.0", kw["declared"])
+    elif r is None and hasattr(h, "_install_argv_problem"):
+        r = h._install_argv_problem(p, ptype, pkg, "1.0.0", cfg.env, kw["declared"])
+    if r is not None:
+        loud += 1; reasons[name] = r
+        if p.api_key_optional_when: relaxer_loud.append(name)
+print(f"{h.__file__}\n  pinnable {pinned}; exact pin NOT silent for {loud}; of those with a relaxer: {relaxer_loud}")
+for n, r in sorted(reasons.items())[:10]:
+    print("   ", n, "->", r[:140])
+
+# Rev 10: shipped entries whose command pmcp does not model (a local binary) and
+# whose install argvs differ from [command, *args] -- the local-binary exemption
+# would no longer apply to them (only matters for a relaxer entry).
+local = []
+for name, s in m.servers.items():
+    if s.url or not s.command:
+        continue
+    launcher = h.normalized_executable_name(s.command)
+    if launcher in ("npx", "npm", "uvx", "pip", "pip3", "cargo", "docker", "uv") or launcher in getattr(h, "_UNMODELLED_RUNNERS", ()):
+        continue
+    own = [s.command, *s.args]
+    if any(argv and list(argv) != own for argv in s.install.values()):
+        local.append((name, bool(s.api_key_optional_when)))
+print(f"  local-command entries whose install differs: {local}")
 ```
