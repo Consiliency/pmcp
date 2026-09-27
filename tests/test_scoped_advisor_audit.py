@@ -4,10 +4,12 @@ import hashlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
 import traceback
+import zlib
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -1420,9 +1422,10 @@ def _generated(keys: list[str], shape: str, tag: str) -> dict[str, Any]:
 
 
 def _mixed(keys: list[str], tag: str) -> dict[str, Any]:
-    """Every shape in one call: key `i` gets shape `i` mod the shape count."""
+    """Every shape in one call. A key's shape follows from its name, so a key
+    both tags carry (e.g. `meta`) has the same shape in both calls."""
     return {
-        key: _generated_value(_SHAPES[i % len(_SHAPES)], tag, i)
+        key: _generated_value(_SHAPES[zlib.crc32(key.encode()) % len(_SHAPES)], tag, i)
         for i, key in enumerate(keys)
     }
 
@@ -1576,11 +1579,14 @@ def _invocations(audit_path: Path, event: str) -> list[dict[str, Any]]:
 def _assert_nothing_generated_leaked(
     raw_audit: str, log_text: str, count: int, *, url_hash: bool = True
 ) -> None:
+    """Neither the audit nor the formatted log carries a generated value or
+    any hash of one (the same set for both, per the review panel on
+    Consiliency/pmcp#304). Lengths and key counts are covered by the pair
+    differential on each call's log (`_LoggedCalls`)."""
     for tag in _TAGS:
         for forbidden in _forbidden_in_audit(count + 12, tag, url_hash=url_hash):
             assert forbidden not in raw_audit, forbidden
-    for marker in _MARKERS:
-        assert marker not in log_text, marker
+            assert forbidden not in log_text, ("log", forbidden)
 
 
 def _is_foreign(message: str) -> bool:
@@ -1623,6 +1629,40 @@ def _log_text(caplog: pytest.LogCaptureFixture) -> str:
     )
 
 
+_VOLATILE_LOG = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:[.,]\d+)?|0x[0-9a-fA-F]+")
+
+
+def _normalized_log(records: list[logging.LogRecord]) -> str:
+    """Records as pmcp's formatters render them, timestamps and addresses
+    removed, the one foreign #297 line shape left out."""
+    return "\n".join(
+        _VOLATILE_LOG.sub("<v>", formatter.format(record))
+        for record in records
+        if not _is_foreign(record.getMessage())
+        for formatter in _pmcp_formatters()
+    )
+
+
+class _LoggedCalls:
+    """Makes calls and keeps the log each one produced, for a pair
+    differential on logs as on records: two calls that differ only in the
+    generated content -- whose tags differ in length and key count -- must
+    log the same thing, so no value, hash, length or count of it is logged."""
+
+    def __init__(self, server: GatewayServer, caplog: pytest.LogCaptureFixture) -> None:
+        self.server = server
+        self.caplog = caplog
+
+    async def pair(self, label: str, calls: list[tuple[str, dict]]) -> list[Any]:
+        logs, results = [], []
+        for name, arguments in calls:
+            start = len(self.caplog.records)
+            results.append(await _call(self.server, name, arguments))
+            logs.append(_normalized_log(self.caplog.records[start:]))
+        assert all(log == logs[0] for log in logs), (label, logs)
+        return results
+
+
 def _assert_pair(
     tool_name: str, label: str, first: dict, second: dict, exempt: frozenset
 ) -> None:
@@ -1648,7 +1688,13 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
 ) -> None:
     """Allowed paths E7 (handler returns) and E9 (handler raises every raised
     exception type), with generated keys at top level and inside every open
-    declared container."""
+    declared container.
+
+    Scope: this sweep runs against `_StubGatewayTools`, whose handlers return
+    a constant or raise, so it reaches every tool's record site without a
+    downstream but never sees a real handler's result. The four tools the
+    scoped policy allows are also swept against the real `GatewayTools` in
+    `test_generated_caller_values_on_the_real_scoped_handlers`."""
     caplog.set_level(logging.DEBUG)
     tool = _gateway_tools_by_name()[tool_name]
     declared = set(tool.input_schema.get("properties") or {})
@@ -1656,6 +1702,7 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
     exempt = _INVOKE_ONLY_EXEMPT if tool_name == "gateway.invoke" else frozenset()
     server, audit_path, real_tools = _allowed_server(tmp_path)
     stub = server._gateway_tools
+    calls = _LoggedCalls(server, caplog)
 
     # (label, exempt fields, payload for each tag); the reference is `baseline`.
     cases: list[tuple[str, frozenset, dict[str, dict]]] = []
@@ -1699,16 +1746,19 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
         reference = await _call(server, tool_name, baseline)
         del reference
         if error is None:
-            for _, _, payloads in cases:
-                for tag in _TAGS:
-                    await _call(server, tool_name, payloads[tag])
+            for label, _, payloads in cases:
+                await calls.pair(label, [(tool_name, payloads[tag]) for tag in _TAGS])
         else:
-            for tag in _TAGS:
-                await _call(
-                    server,
-                    tool_name,
-                    {**baseline, **_mixed(_generated_keys(declared, tag), tag)},
-                )
+            await calls.pair(
+                f"raises {error!r}",
+                [
+                    (
+                        tool_name,
+                        {**baseline, **_mixed(_generated_keys(declared, tag), tag)},
+                    )
+                    for tag in _TAGS
+                ],
+            )
         records_per_case.append(error)
     server._gateway_tools = real_tools
     await server.shutdown()
@@ -1728,9 +1778,7 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
         errors, zip(raised[::3], raised[1::3], raised[2::3])
     ):
         label = f"raises {error!r}"
-        # Mixed shapes shift with the key count, so on invoke `meta` may be a
-        # dict in one call and not in the other: the invoke-only exemption.
-        _assert_pair(tool_name, label, first, second, exempt)
+        _assert_pair(tool_name, label, first, second, frozenset())
         _assert_pair(tool_name, label, first, reference, exempt)
     _assert_nothing_generated_leaked(
         audit_path.read_text(),
@@ -1751,13 +1799,22 @@ async def test_generated_caller_values_never_reach_an_uncorrelated_invoke_record
     declared = set(tool.input_schema.get("properties") or {})
     baseline = _declared_baseline(tool, correlated=False)
     server, audit_path = _scoped_server(tmp_path)
+    calls = _LoggedCalls(server, caplog)
     await _call(server, "gateway.invoke", baseline)
     for shape in _SHAPES:
-        for tag in _TAGS:
-            keys = _generated_keys(declared, tag)
-            await _call(
-                server, "gateway.invoke", {**baseline, **_generated(keys, shape, tag)}
-            )
+        await calls.pair(
+            f"E6 {shape}",
+            [
+                (
+                    "gateway.invoke",
+                    {
+                        **baseline,
+                        **_generated(_generated_keys(declared, tag), shape, tag),
+                    },
+                )
+                for tag in _TAGS
+            ],
+        )
     await server.shutdown()
 
     records = _invocations(audit_path, "audit.invocation")
@@ -1806,14 +1863,15 @@ async def test_generated_caller_values_never_reach_a_rejection_record(
     server._policy_manager.is_gateway_tool_allowed = (  # type: ignore[method-assign]
         lambda name: True
     )
+    calls = _LoggedCalls(server, caplog)
     for shape in _SHAPES:
+        payloads = []
         for tag in _TAGS:
             invalid = _invalid_declared(tool, baseline, tag)
             assert invalid is not None
             keys = _generated_keys(declared, tag)
-            result = await _call(
-                server, tool_name, {**invalid, **_generated(keys, shape, tag)}
-            )
+            payloads.append((tool_name, {**invalid, **_generated(keys, shape, tag)}))
+        for result in await calls.pair(f"rejected {shape}", payloads):
             assert result.is_error is True
     await server.shutdown()
 
@@ -1869,13 +1927,16 @@ async def test_generated_caller_values_never_reach_an_ungated_record(
         lambda name: policy == "allowed"
     )
     names = _UNREGISTERED_NAME_PAIRS if tool is None else ((tool_name, tool_name),)
+    calls = _LoggedCalls(server, caplog)
     for shape in _SHAPES:
         for pair in names:
+            payloads = []
             for name, tag in zip(pair, _TAGS):
                 keys = _generated_keys(declared, tag) + sorted(declared)
                 generated = _generated(keys, shape, tag)
                 arguments = generated if position == "top-level" else {host: generated}
-                await _call(server, name, arguments)
+                payloads.append((name, arguments))
+            await calls.pair(f"{pair} {shape}", payloads)
     await server.shutdown()
 
     records = _invocations(audit_path, "audit.invocation")
@@ -1888,4 +1949,54 @@ async def test_generated_caller_values_never_reach_an_ungated_record(
         audit_path.read_text(),
         _log_text(caplog),
         len(_generated_keys(declared, _TAGS[1])) + len(declared),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "tool_name",
+    ["gateway.health", "gateway.catalog_search", "gateway.describe", "gateway.invoke"],
+)
+async def test_generated_caller_values_on_the_real_scoped_handlers(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, tool_name: str
+) -> None:
+    """The allowed-path sweep once more, against the real `GatewayTools` under
+    the real scoped policy (no stubs, no downstream servers), for the four
+    tools that policy allows: generated keys at top level, every shape, each
+    pair of calls compared on records and on logs, and each record against
+    the declared arguments alone (review panel on Consiliency/pmcp#304)."""
+    caplog.set_level(logging.DEBUG)
+    tool = _gateway_tools_by_name()[tool_name]
+    declared = set(tool.input_schema.get("properties") or {})
+    baseline = _declared_baseline(tool)
+    exempt = _INVOKE_ONLY_EXEMPT if tool_name == "gateway.invoke" else frozenset()
+    server, audit_path = _scoped_server(tmp_path)
+    calls = _LoggedCalls(server, caplog)
+    await _call(server, tool_name, baseline)
+    for shape in _SHAPES:
+        await calls.pair(
+            f"real {shape}",
+            [
+                (
+                    tool_name,
+                    {
+                        **baseline,
+                        **_generated(_generated_keys(declared, tag), shape, tag),
+                    },
+                )
+                for tag in _TAGS
+            ],
+        )
+    await server.shutdown()
+
+    records = _invocations(audit_path, "audit.invocation")
+    assert len(records) == 1 + len(_TAGS) * len(_SHAPES)
+    reference, generated = records[0], records[1:]
+    for shape, first, second in zip(_SHAPES, generated[::2], generated[1::2]):
+        _assert_pair(tool_name, f"real {shape}", first, second, frozenset())
+        _assert_pair(tool_name, f"real {shape}", first, reference, exempt)
+    _assert_nothing_generated_leaked(
+        audit_path.read_text(),
+        _log_text(caplog),
+        len(_generated_keys(declared, _TAGS[1])),
     )
