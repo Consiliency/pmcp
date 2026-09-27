@@ -1637,11 +1637,35 @@ def _log_text(
     assert caplog.records, "nothing was logged, so the log oracle proves nothing"
     excluded = calls.foreign if calls is not None else set()
     return "\n".join(
-        formatter.format(record)
+        formatter.format(shown)
         for record in caplog.records
-        if id(record) not in excluded and not _is_foreign(record.getMessage())
+        if (shown := _oracle_view(record, excluded)) is not None
         for formatter in _pmcp_formatters()
     )
+
+
+#: What stands in for an excluded message when its record carries diagnostics.
+_EXCLUDED_MESSAGE = "<excluded pre-existing line>"
+
+
+def _has_diagnostics(record: logging.LogRecord) -> bool:
+    return bool(record.exc_info or record.exc_text or record.stack_info)
+
+
+def _oracle_view(
+    record: logging.LogRecord, excluded: set[int]
+) -> logging.LogRecord | None:
+    """The record as the log oracle sees it. An excluded line (one of the
+    exact foreign messages above) is dropped only when it carries no
+    traceback, exception text or stack; otherwise only its message is
+    replaced, and the rendered diagnostics stay in the oracle."""
+    if id(record) not in excluded and not _is_foreign(record.getMessage()):
+        return record
+    if not _has_diagnostics(record):
+        return None
+    shown = logging.makeLogRecord(record.__dict__)
+    shown.msg, shown.args = _EXCLUDED_MESSAGE, None
+    return shown
 
 
 #: A default object repr, the one volatile part a message can carry besides
@@ -1655,15 +1679,16 @@ def _normalized(record: logging.LogRecord, formatter: logging.Formatter) -> str:
     the same for every call -- no pattern over the rendered text."""
     fixed = logging.makeLogRecord(record.__dict__)
     fixed.created, fixed.msecs, fixed.relativeCreated = 0.0, 0.0, 0.0
-    fixed.exc_text = None
+    if fixed.exc_info:
+        fixed.exc_text = None  # re-rendered from exc_info
     return _OBJECT_REPR.sub(r"\1 at ADDRESS>", formatter.format(fixed))
 
 
 def _normalized_log(records: list[logging.LogRecord], excluded: set[int]) -> str:
     return "\n".join(
-        _normalized(record, formatter)
+        _normalized(shown, formatter)
         for record in records
-        if id(record) not in excluded and not _is_foreign(record.getMessage())
+        if (shown := _oracle_view(record, excluded)) is not None
         for formatter in _pmcp_formatters()
     )
 
@@ -2080,3 +2105,77 @@ def test_the_foreign_log_exclusion_matches_only_the_exact_lines() -> None:
     payload = "Tool execution error: Unknown tool: payload={'k': 'caller_marker_x'}"
     assert not _is_foreign(payload)
     assert not _is_foreign(payload, "gateway.caller_name")
+
+
+class _Records:
+    """Stands in for `caplog` where `_log_text` needs only `.records`."""
+
+    def __init__(self, records: list[logging.LogRecord]) -> None:
+        self.records = records
+
+
+def _excluded_record(message: str, marker: str, diagnostics: str) -> logging.LogRecord:
+    record = logging.LogRecord(
+        "pmcp.server", logging.ERROR, __file__, 1, message, None, None
+    )
+    if diagnostics == "exc_info":
+        try:
+            raise ValueError(marker)
+        except ValueError:
+            record.exc_info = sys.exc_info()
+    elif diagnostics == "exc_text":
+        record.exc_text = f"Traceback (most recent call last):\nValueError: {marker}"
+    else:
+        record.stack_info = f"Stack (most recent call last):\n  {marker}"
+    return record
+
+
+def _invoke_input_line() -> str:
+    with pytest.raises(ValidationError) as raised:
+        InvokeInput.model_validate({"tool_id": "a::b", "meta": "not-a-dict"})
+    return f"Tool execution error: {raised.value}"
+
+
+@pytest.mark.parametrize("diagnostics", ["exc_info", "exc_text", "stack_info"])
+@pytest.mark.parametrize("shape", ["invoke-input", "unknown-tool"])
+def test_an_excluded_line_keeps_its_traceback_and_stack_in_the_oracle(
+    shape: str, diagnostics: str
+) -> None:
+    """Regression (PR 306 board, round 2): an exactly-excluded message may
+    hide only itself. A traceback, exception text or stack attached to it is
+    rendered into the oracle, so a caller value there is caught by both the
+    forbidden-set check and the pair differential."""
+    name = "gateway.caller_name"
+    message = (
+        _invoke_input_line()
+        if shape == "invoke-input"
+        else f"Tool execution error: Unknown tool: {name}"
+    )
+    assert _is_foreign(message, name)
+    records = {
+        tag: _excluded_record(message, f"caller_marker_{tag}", diagnostics)
+        for tag in _TAGS
+    }
+    excluded = (
+        {id(record) for record in records.values()}
+        if shape == "unknown-tool"
+        else set()
+    )
+    normalized = {
+        tag: _normalized_log([record], excluded) for tag, record in records.items()
+    }
+    for tag in _TAGS:
+        assert f"caller_marker_{tag}" in normalized[tag], (shape, diagnostics)
+        assert _EXCLUDED_MESSAGE in normalized[tag]
+        assert message.splitlines()[0] not in normalized[tag]
+    assert normalized[_TAGS[0]] != normalized[_TAGS[1]]
+    calls = _LoggedCalls.__new__(_LoggedCalls)
+    calls.foreign = excluded
+    text = _log_text(_Records(list(records.values())), calls)  # type: ignore[arg-type]
+    with pytest.raises(AssertionError):
+        _assert_nothing_generated_leaked("", text, 1)
+    # Without diagnostics the excluded line is dropped entirely.
+    bare = logging.LogRecord(
+        "pmcp.server", logging.ERROR, __file__, 1, message, None, None
+    )
+    assert _normalized_log([bare], excluded | {id(bare)}) == ""
