@@ -540,6 +540,29 @@ def test_floor_nothing_main_removes_survives_on_any_surface() -> None:
     assert bad == [], bad[:20]
 
 
+def test_floor_with_the_default_400_character_cut() -> None:
+    """`sanitize_auth_diagnostic` cuts after both passes. The cut output is
+    still the redactor's output with markers written in: every stretch of
+    it outside a marker occurs, in order, in the redactor's FULL output.
+    (It can show text past the redactor's own 400-character window when an
+    additive marker is shorter than what it replaced -- text the redactor
+    kept, only cut.)"""
+    texts = _texts(G.corpus(1)[::5]) + _board_texts()
+    texts.append(
+        "-----BEGIN RSA PRIVATE KEY-----\n"
+        + "A" * 300
+        + "\n-----END RSA PRIVATE KEY-----"
+        + " word" * 120
+        + " TAIL"
+    )
+    bad = [
+        t[:80]
+        for t in texts
+        if not _is_additive_of(sanitize_auth_diagnostic(t), _main_e(t))
+    ]
+    assert bad == [], bad[:10]
+
+
 @pytest.mark.slow
 def test_floor_on_tier_2() -> None:
     rows = [row for i, row in enumerate(G.corpus(1)) if i % 3] + G.corpus(2)[
@@ -624,39 +647,113 @@ def test_json_mutant_without_clipping_breaks_a_document(
         test_a_span_across_a_string_boundary_is_confined_to_the_string()
 
 
+def test_object_keys_are_left_alone_so_entries_never_collide() -> None:
+    """Two random-looking keys redacted to the same marker collapsed a map to
+    its last entry (rev 15's board). The additive pass writes only into
+    string VALUES of a document."""
+    obj = {"Xk9mQ2vLp3RtY7wBaaQ1": 1, "Pq7rS2tUv9WxY3zAbC4d": 2}
+    assert _ours_process(obj) == obj
+    doc = json.dumps({"Xk9mQ2vLp3RtY7wBaaQ1": "Pq7rS2tUv9WxY3zAbC4d"})
+    assert json.loads(_ours_e(doc)) == {"Xk9mQ2vLp3RtY7wBaaQ1": "[REDACTED]"}
+
+
+def test_object_keys_mutant_clipping_into_keys(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rev 15's clipping, which let spans into object keys, collides them."""
+    monkeypatch.setattr(A, "_is_object_key", lambda text, end: False)
+    with pytest.raises(AssertionError):
+        test_object_keys_are_left_alone_so_entries_never_collide()
+
+
 # ================================================================ markers ==== #
 
 
-def test_markers_are_never_split_or_respelled() -> None:
-    """Every `REDACTED` in the output belongs to a whole marker; every marker
-    of the base output is still there, whole or inside a larger replaced
-    stretch; and the additive pass is idempotent."""
+def _four_surfaces() -> dict[str, tuple[Callable[[str], str], Callable[[str], str]]]:
+    """(ours, the redactor's) for E, P, POs and POd, each as text."""
     policy = PolicyManager()
-    texts = _texts(G.corpus(1)[::3]) + _board_texts()
-    texts += [
-        "password=[REDACTED]",
-        "token=%5BREDACTED%5D&x=1",
-        "[REDACTED]abc123def456",
-    ]
+
+    def ours_pod(text: str) -> str:
+        return json.dumps(_ours_process({"t": text}))
+
+    def main_pod(text: str) -> str:
+        return json.dumps(_main_process({"t": text}))
+
+    return {
+        "E": (_ours_e, _main_e),
+        "P": (policy.redact_secrets, _main_p),
+        "POs": (lambda t: str(_ours_process(t)), lambda t: str(_main_process(t))),
+        "POd": (ours_pod, main_pod),
+    }
+
+
+_MARKER_TEXTS = [
+    "see https://h.example/cb?token=abc123def456&page=2 now",
+    "https://api.example.com/v1/items?token=abc&page=3&limit=50",
+    "https://h/?api_key=k1&password=p2&secret=s3&pwd=p4&passwd=p5&x=1",
+    "password=[REDACTED] then token: [REDACTED] and Bearer [REDACTED]",
+    "token=%5BREDACTED%5D&next=https://h/?q=1",
+    "[REDACTED]abc123def456 [REDACTED] ghp_16C7e42F292c6912E7710c838347Ae178B4a",
+]
+
+
+def _marker_problems(texts: list[str]) -> list[str]:
+    """On all four surfaces: every marker of the redactor's output is still
+    there, whole and with its spelling, in order; no `REDACTED` appears
+    outside a whole marker; and (E, P) the additive pass leaves its own
+    output as it is -- it never marks a marker again."""
+    bad = []
     for text in texts:
-        for base, ours in (
-            (_main_e(text), _ours_e(text)),
-            (_main_p(text), policy.redact_secrets(text)),
-        ):
-            stray = _MARKER_SPLIT_RE.sub("", ours).count(
-                "REDACTED"
-            ) - _MARKER_SPLIT_RE.sub("", base).count("REDACTED")
-            assert stray <= 0, (text, ours)
-            assert A.redact_additive(ours) == ours or "REDACTED" in ours, (text, ours)
-            assert len(_MARKER_SPLIT_RE.findall(ours)) >= min(
-                1, len(_MARKER_SPLIT_RE.findall(base))
-            ), (text, ours)
+        for label, (ours, main) in _four_surfaces().items():
+            base, out = main(text), ours(text)
+            base_markers = _MARKER_SPLIT_RE.findall(base)
+            out_markers = _MARKER_SPLIT_RE.findall(out)
+            position = 0
+            for marker in base_markers:
+                found = out.find(marker, position)
+                if found < 0:
+                    bad.append(
+                        f"{label}: lost or re-spelled {marker} in {text!r} -> {out!r}"
+                    )
+                    break
+                position = found + len(marker)
+            if "REDACTED" in _MARKER_SPLIT_RE.sub("", out):
+                bad.append(f"{label}: a split marker in {out!r}")
+            if len(out_markers) < len(base_markers):
+                bad.append(f"{label}: fewer markers in {out!r}")
+            again = (
+                A.redact_additive(out)
+                if label == "E"
+                else PolicyManager()._redact_additive(out)
+                if label == "P"
+                else out
+            )
+            if again != out:
+                bad.append(f"{label}: the additive pass changes its own output {out!r}")
+    return bad
 
 
-def test_a_marker_the_url_rule_wrote_keeps_its_spelling() -> None:
-    text = "see https://h.example/cb?token=abc123def456&page=2 now"
-    assert _ours_e(text) == _main_e(text)
-    assert "%5BREDACTED%5D" in _ours_e(text)
+def test_markers_are_kept_whole_and_spelled_as_written_on_every_surface() -> None:
+    texts = _MARKER_TEXTS + _texts(G.corpus(1)[::7]) + _board_texts()
+    assert _marker_problems(texts) == [], _marker_problems(texts)[:10]
+
+
+def test_markers_mutant_a_policy_value_run_through_a_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rev 15's policy pass (no marker skip, no stop at `&` in a query, and
+    a merge that swallowed markers) re-spelled the URL marker and lost the
+    rest of the query."""
+    import pmcp.policy.policy as P
+
+    monkeypatch.setattr(P, "starts_with_marker", lambda value: False)
+    monkeypatch.setattr(P, "_url_query_ranges", lambda text: [])
+    monkeypatch.setattr(A, "_MARKER_RE", re.compile(r"(?!)"))
+    assert _marker_problems(_MARKER_TEXTS[:2]) != []
+
+
+def test_a_policy_value_in_a_query_ends_at_the_next_parameter() -> None:
+    policy = PolicyManager()
+    out = policy.redact_secrets("x https://h/?q=1&token=abc123def456zz&page=2#top y")
+    assert "abc123def456zz" not in out and "&page=2" in out, out
 
 
 # ============================================================= what it adds ==== #
@@ -691,6 +788,13 @@ def test_keyed_passwords_from_every_printable_character_are_removed() -> None:
                 continue
             for surface in (_ours_e, _ours_p):
                 assert probe not in surface(text), (text, surface(text))
+
+
+def test_an_upper_case_scheme_does_not_hide_userinfo() -> None:
+    for text in ("HTTPS://user:s3cr3tpass@h.example/p", "Http://u:hunter2x@h.example/"):
+        for surface in (_ours_e, _ours_p):
+            out = surface(text)
+            assert "s3cr3tpass" not in out and "hunter2x" not in out, out
 
 
 def test_operator_pattern_padding_is_kept_whole() -> None:
@@ -760,6 +864,8 @@ LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
     "Bearer values in a JSON document": lambda n: json.dumps({f"k{i}": "Bearer x" for i in range(n // 20)}),
     "tokens in a JSON document": lambda n: json.dumps({f"k{i}": "ghp_abcdefghij1234" for i in range(n // 30)}),
     "long joined keys": lambda n: ("a" * 170 + "_token" * 14 + "=Hunter2abc9 ") * (n // 267),
+    "an unterminated keyword list": lambda n: "tokens: [" + " " * n + "x",
+    "a list in a JSON leaf": lambda n: json.dumps({"t": "tokens: [" + " " * n}),
 }  # fmt: skip
 
 
@@ -937,19 +1043,154 @@ def _board_texts() -> list[str]:
     return texts
 
 
-def test_the_key_prefilter_folds_as_the_keyword_patterns_do() -> None:
-    """The keyword passes are skipped when no key literal occurs; that is a
-    necessary condition only if the prefilter folds every character
-    `re.IGNORECASE` folds onto an ASCII letter."""
-    import string as _string
+def _fold_variants() -> list[str]:
+    """Every key word with each of its letters replaced by every character
+    Python's `re.IGNORECASE` treats as equal to it, plus the multi-character
+    folds (`ß` for `ss`, `ẞ`, `ﬁ`/`ﬂ`/`ﬀ` ligatures) that full case
+    folding has and simple folding does not."""
+    ascii_class = re.compile("[a-z0-9_-]", re.IGNORECASE)
+    fold: dict[str, set[str]] = {}
+    for letter in string.ascii_lowercase:
+        fold[letter] = {letter.upper()}
+    for i in range(0x80, 0x110000):
+        char = chr(i)
+        if ascii_class.fullmatch(char):
+            for letter in string.ascii_lowercase:
+                if re.fullmatch(letter, char, re.IGNORECASE):
+                    fold[letter].add(char)
+    texts = []
+    for key in sorted(A.ADDITIVE_SECRET_KEYS) + ["api_key", "apikey", "private_key"]:
+        for index, letter in enumerate(key):
+            for other in sorted(fold.get(letter.lower(), set())):
+                texts.append(key[:index] + other + key[index + 1 :])
+        texts.append(key.replace("ss", "\u00df").replace("s", "\u017f", 1))
+        texts.append(key.replace("ss", "\u1e9e"))
+        texts.append(key.replace("fi", "\ufb01").replace("ff", "\ufb00"))
+    return texts
 
-    ascii_class = re.compile("(?i)[a-z]")
-    extra = {
-        chr(i)
-        for i in range(0x110000)
-        if ascii_class.fullmatch(chr(i))
-        and not (len(chr(i).lower()) == 1 and chr(i).lower() in _string.ascii_lowercase)
-    }
-    assert extra <= set(map(chr, A._FOLDS))
-    for key in ("paſſword=hunter22x", "İd_token=abc123def", "apiKey=abc123def"):
-        assert A._may_hold_a_key(key), key
+
+def test_the_key_prefilter_never_hides_a_keyword_match() -> None:
+    """The keyword passes are skipped only when the prefilter finds no key.
+    The prefilter IS their key alternation under their flag, so it can only
+    miss what they miss: checked here against the passes' own patterns, on
+    every key with every case-fold variant of each letter and the
+    multi-character folds, each in a separator and a whitespace context."""
+    for key in _fold_variants():
+        for text in (f"{key}=hunter22x", f"{key} abc123def456", f'{key}: ["a1b2c3d4"]'):
+            matched = any(
+                pattern.search(text) is not None
+                for pattern in (A._KEYWORD_SEP_RE, A._KEYWORD_LIST_RE, A._KEYWORD_WS_RE)
+            )
+            if matched:
+                assert A._may_hold_a_key(text), text
+
+
+def test_multi_character_folds_do_not_match_on_this_interpreter() -> None:
+    """Python's `re` applies simple case folding only: `(?i)password` does not
+    match `paßword` (nor `paẞword`), so neither the redactor's keyword rule nor
+    the additive rules read it as a key -- the prefilter changes nothing
+    there (a reported multi-character-fold gap, checked and not present)."""
+    assert re.search("(?i)password", "pa\u00dfword") is None
+    assert re.search("(?i)password", "pa\u1e9eword") is None
+    for surface in (_ours_e, _main_e):
+        assert "hunter2" in surface("pa\u00dfword=@hunter2")
+
+
+# ============================================= regex quantifier structure ==== #
+
+
+def _quantifier_shapes() -> dict[str, Callable[[int], str]]:
+    from tests import _redaction_shapes as S
+
+    return S.quantifier_shapes(S.redactor_patterns())
+
+
+_CAPS = {4_096: 1.0, 16_384: 2.0, 65_536: 5.0}
+
+
+def _over_cap(name: str, sizes: tuple[int, ...], leaf: bool = True) -> list[str]:
+    import time
+
+    shape = _QSHAPES[name] if _QSHAPES else _quantifier_shapes()[name]
+    over = []
+    surfaces = dict(_entry_points())
+    if leaf:
+        surfaces["E-leaf"] = lambda t: sanitize_auth_diagnostic(
+            json.dumps({"t": t}), max_length=None
+        )
+    for size in sizes:
+        text = shape(size)
+        for label, run in surfaces.items():
+            started = time.perf_counter()
+            run(text)
+            elapsed = time.perf_counter() - started
+            if elapsed > _CAPS[size]:
+                over.append(f"{name} {label} {size}: {elapsed:.2f}s")
+    return over
+
+
+_QSHAPES: dict[str, Callable[[int], str]] = {}
+
+
+def _screen_quantifier(name: str) -> list[str]:
+    if not _QSHAPES:
+        _QSHAPES.update(_quantifier_shapes())
+    return _over_cap(name, (4_096,), leaf=False)
+
+
+def test_no_regex_backtracks_on_its_own_quantifier_structure() -> None:
+    """Every quantifier of every redactor regex, reached by the shortest text
+    that leads to it, one unit repeated to 4 KB, and each of six failing
+    tails: on the engine, in worker processes, under a 1 s cap (rev 15's
+    list body took 30 s here; now every shape takes milliseconds). The work
+    counter cannot see a regex's own backtracking; this can."""
+    names = sorted(_quantifier_shapes())
+    assert len(names) > 500
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
+        over = [
+            o
+            for found in pool.imap_unordered(_screen_quantifier, names, chunksize=10)
+            for o in found
+        ]
+    assert over == [], over[:10]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("chunk", range(4))
+def test_no_regex_backtracks_at_64_kb_on_any_surface(chunk: int) -> None:
+    """The same shapes at 4, 16 and 64 KB on every entry point and inside a
+    JSON string leaf, under generous caps (1, 2 and 5 s)."""
+    names = sorted(_quantifier_shapes())[chunk::4]
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
+        over = [
+            o
+            for found in pool.imap_unordered(_full_quantifier, names, chunksize=5)
+            for o in found
+        ]
+    assert over == [], over[:10]
+
+
+def _full_quantifier(name: str) -> list[str]:
+    if not _QSHAPES:
+        _QSHAPES.update(_quantifier_shapes())
+    return _over_cap(name, (4_096, 16_384, 65_536))
+
+
+def test_list_backtracking_mutant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rev 15's list body (three `\\s*` that could split one run) restored:
+    `tokens: [` + 2 KB of spaces and no `]` is over the cap again."""
+    old_body = (
+        r"(?P<list>\[\s*(?:(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|-?[0-9][0-9.eE+-]*"
+        r"|null|true|false)\s*,\s*)*(?:(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'"
+        r"|-?[0-9][0-9.eE+-]*|null|true|false))?\s*,?\s*\])"
+    )
+    monkeypatch.setattr(
+        A, "_KEYWORD_LIST_RE", re.compile(A._KEYWORD_KEY_SEP + old_body, re.IGNORECASE)
+    )
+    import time
+
+    started = time.perf_counter()
+    sanitize_auth_diagnostic("tokens: [" + " " * 2048 + "x", max_length=None)
+    assert time.perf_counter() - started > 1.0

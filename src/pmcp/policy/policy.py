@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import hashlib
 import json
@@ -25,8 +26,10 @@ from pmcp.types import (
 from pmcp.auth import _sanitize_base
 from pmcp.redaction_additive import (
     REDACTED,
+    URL_RE,
     Span,
     redact_additive,
+    starts_with_marker,
     widen_over_escapes,
     work,
 )
@@ -93,6 +96,18 @@ _ADDITIVE_FOR_DEFAULT = {
         DEFAULT_REDACTION_PATTERNS, _ADDITIVE_DEFAULT_PATTERNS, strict=True
     )
 }
+
+
+def _url_query_ranges(text: str) -> list[tuple[int, int]]:
+    """Where each URL's query runs in ``text``: from after its `?` to the
+    URL's end (disjoint, ascending)."""
+    work(len(text))
+    ranges = []
+    for match in URL_RE.finditer(text):
+        mark = text.find("?", match.start(), match.end())
+        if mark >= 0:
+            ranges.append((mark + 1, match.end()))
+    return ranges
 
 
 def _value_separator(full_match: str) -> int:
@@ -777,8 +792,13 @@ class PolicyManager:
 
             result = regex.sub(replace_match, result)
 
+        return self._redact_additive(result)
+
+    def _redact_additive(self, text: str) -> str:
+        """The additive pass alone, over text the redactor's own rules have
+        already redacted."""
         return redact_additive(
-            result, covers=self._pattern_matches, extra=self._additive_spans(result)
+            text, covers=self._pattern_matches, extra=self._additive_spans(text)
         )
 
     def _additive_regexes(self) -> list[re.Pattern[str]]:
@@ -800,7 +820,15 @@ class PolicyManager:
         )
 
     def _additive_spans(self, text: str) -> list[Span]:
+        """Spans of the additive form of each effective pattern, over the
+        output the patterns already redacted. Like the engine's additive
+        rules, a value that starts on a marker is left alone (the redactor
+        already took it; running on would only swallow what follows), and
+        inside a URL's query a value ends at `&` or `#` -- the next
+        parameter is not part of it."""
         spans: list[Span] = []
+        query_ranges = _url_query_ranges(text)
+        query_starts = [start for start, _ in query_ranges]
         for regex in self._additive_regexes():
             work(len(text))  # the pattern's scan
             for match in regex.finditer(text):
@@ -808,12 +836,19 @@ class PolicyManager:
                 work(2 * len(full_match) + 1)  # the match, the split
                 split = _value_separator(full_match)
                 start = match.start() + split + 1 if split >= 0 else match.start()
-                # the value after the separator's own whitespace: a value that
-                # is already a marker (`key: [REDACTED]`) is then the marker's
-                # own span, and is kept exactly as it is
                 while start < match.end() and text[start].isspace():
                     start += 1
-                spans.append((start, match.end(), REDACTED))
+                end = match.end()
+                if starts_with_marker(text[start:end]):
+                    continue
+                i = bisect.bisect_right(query_starts, start) - 1
+                if i >= 0 and start < query_ranges[i][1]:
+                    for stop in "&#":
+                        cut = text.find(stop, start, end)
+                        if cut >= 0:
+                            end = cut
+                if start < end:
+                    spans.append((start, end, REDACTED))
         return widen_over_escapes(text, spans)
 
     def process_output(

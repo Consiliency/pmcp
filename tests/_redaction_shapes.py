@@ -16,7 +16,7 @@ Stdlib only.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 
 try:  # Python 3.11+
     import re._parser as sre_parse  # type: ignore[import-not-found]
@@ -374,4 +374,84 @@ def atom_repeats() -> dict[str, Callable[[int], str]]:
                     )
 
                 out[f"atom({context!r})+{unit!r}*k+{tail!r}"] = make
+    return out
+
+
+# ------------------------------------------------- from quantifier structure
+#
+# A regex backtracks super-linearly where one run of text can be divided in
+# many ways between quantifiers (adjacent or nested quantifiers over
+# overlapping classes, an optional element between repeated ones), and a
+# later element then fails. So for every quantifier of every pattern the
+# fourth family builds: the shortest text that brings the pattern to that
+# quantifier, one unit the quantifier repeats, many times, and a tail that
+# fails (rev 15's board: `tokens: [` + spaces with no `]` was cubic).
+
+
+def _sample(tree: Iterable[tuple[object, object]]) -> str:
+    """A short text the subtree matches (assertions contribute nothing)."""
+    out = []
+    for op, arg in tree:
+        if op is sre_constants.LITERAL:
+            out.append(chr(arg))  # type: ignore[arg-type]
+        elif op is sre_constants.IN:
+            chars = _class_chars(arg)  # type: ignore[arg-type]
+            out.append(chars[:1] or "a")
+        elif op is sre_constants.CATEGORY:
+            out.append(_CATEGORY_CHARS.get(arg, "a")[:1])  # type: ignore[arg-type]
+        elif op is sre_constants.ANY:
+            out.append("a")
+        elif op in (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT):
+            low = arg[0]  # type: ignore[index]
+            out.append(_sample(arg[2]) * max(low, 0))  # type: ignore[index]
+        elif op is sre_constants.SUBPATTERN:
+            out.append(_sample(arg[-1]))  # type: ignore[index]
+        elif op is sre_constants.BRANCH:
+            out.append(_sample(arg[1][0]))  # type: ignore[index]
+    return "".join(out)
+
+
+def _quantifier_leads(
+    tree: list[tuple[object, object]], prefix: str
+) -> Iterator[tuple[str, str]]:
+    """(text that brings the pattern to a quantifier, one unit it repeats),
+    for every quantifier in ``tree``."""
+    for index, (op, arg) in enumerate(tree):
+        before = prefix + _sample(tree[:index])
+        if op in (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT):
+            body = list(arg[2])  # type: ignore[index]
+            unit = _sample(body) or "a"
+            yield before, unit
+            yield from _quantifier_leads(body, before)
+        elif op is sre_constants.SUBPATTERN:
+            yield from _quantifier_leads(list(arg[-1]), before)  # type: ignore[index]
+        elif op is sre_constants.BRANCH:
+            for branch in arg[1]:  # type: ignore[index]
+                yield from _quantifier_leads(list(branch), before)
+
+
+QUANTIFIER_TAILS = ("", "!", "\n", '"', "]", "x")
+
+
+def quantifier_shapes(
+    patterns: Iterable[re.Pattern[str]],
+) -> dict[str, Callable[[int], str]]:
+    out: dict[str, Callable[[int], str]] = {}
+    for pattern in patterns:
+        tree = list(sre_parse.parse(pattern.pattern, pattern.flags))
+        for lead, unit in set(_quantifier_leads(tree, "")):
+            if len(lead) > 200:
+                continue
+            for tail in QUANTIFIER_TAILS:
+
+                def make(
+                    n: int, lead: str = lead, unit: str = unit, tail: str = tail
+                ) -> str:
+                    return (
+                        lead
+                        + unit * max(1, (n - len(lead) - len(tail)) // len(unit))
+                        + tail
+                    )
+
+                out[f"q({lead!r})+{unit!r}*k+{tail!r}"] = make
     return out

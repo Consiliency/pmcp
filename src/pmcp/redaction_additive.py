@@ -566,7 +566,7 @@ _KEYWORD_KEY_SEP = (
 _BARE_RUN = r"[^\s\"',;&]*[^\s\"',;&)\]}\\]"
 _KEYWORD_SEP_RE = re.compile(
     _KEYWORD_KEY_SEP
-    + r"(?P<value>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_])"
+    + r"(?P<value>\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\"(?![A-Za-z0-9_])|'[^'\\\n]*(?:\\.[^'\\\n]*)*'(?![A-Za-z0-9_])"
     # an unterminated opening quote, then a bare run to whitespace, a list
     # separator, the end, or a double quote (the end of the JSON string a
     # single-quoted value sits in)
@@ -591,12 +591,24 @@ _DECLARED_KEY_RE = re.compile(
 #: nothing bare. `[x", "b": "]` after `token: ` inside a string leaf is not an
 #: array (the scan would run past the string's closing quote), while
 #: `["first]", "hunter2"]` is one (a `]` inside a quoted element is text).
-_LIST_BODY = r"(?P<list>\[\s*(?:(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|-?[0-9][0-9.eE+-]*|null|true|false)\s*,\s*)*(?:(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|-?[0-9][0-9.eE+-]*|null|true|false))?\s*,?\s*\])"
+_LIST_ELEMENT = r"(?:\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\"|'[^'\\\n]*(?:\\.[^'\\\n]*)*'|-?[0-9][0-9.eE+-]*|null|true|false)"
+#: Unambiguous: each run of whitespace has exactly one place to go (a
+#: missing `]` backtracks over it once, not over every way of splitting it
+#: between three `\s*`, which was cubic -- rev 15's board).
+_LIST_BODY = (
+    r"(?P<list>\[\s*(?:"
+    + _LIST_ELEMENT
+    + r"\s*(?:,\s*"
+    + _LIST_ELEMENT
+    + r"\s*)*(?:,\s*)?)?\])"
+)
 _KEYWORD_LIST_RE = re.compile(
     _KEYWORD_KEY_SEP + _LIST_BODY,
     re.IGNORECASE,
 )
-_QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
+_QUOTED_RE = re.compile(
+    r"\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\"|'[^'\\\n]*(?:\\.[^'\\\n]*)*'"
+)
 
 #: A bare keyword (or `--keyword` flag) followed by whitespace and a value that
 #: could be a credential (`_value_could_be_a_credential`). This is what keeps
@@ -655,6 +667,9 @@ _BEARER_RE = re.compile(
     r"(?P<key>bearer(?:(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")+|" + _BREAK + r"))"
     r"(?![A-Za-z_-]+=[^=])"
     r"(?:[\"'(\[{<](?=[^\s,;\"'()\[\]{}<>\\]+[\"')\]}>]))?"
+    # a whitespace escape is separator, never the start of a value (the
+    # separator's own `+` gives one back when what follows is no value)
+    r"(?!" + _JSON_SPACE_ESCAPE + r")"
     r"(?P<value>[^\s,;\"'()\[\]{}<>]*[^\s,;\"'()\[\]{}<>\\])",
     re.IGNORECASE,
 )
@@ -677,7 +692,7 @@ _AUTHORIZATION_RE = re.compile(
     r"authorization[\"']?(?:\s|" + _JSON_SPACE_ESCAPE + r")*[:=]"
     r"(?:" + _BREAK + r"(?=\S)(?!--|[-*#>](?:\s|$))"
     r"|(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")*)"
-    r"(?:(?P<quoted>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_]))"
+    r"(?:(?P<quoted>\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\"(?![A-Za-z0-9_])|'[^'\\\n]*(?:\\.[^'\\\n]*)*'(?![A-Za-z0-9_]))"
     r"|(?:(?:bearer|basic|digest|negotiate|ntlm|token)"
     r"(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")+)?"
     r"[\"'(\[{<](?P<inner>[^\s,;\"'()\[\]{}<>\\]+)[\"')\]}>]"
@@ -687,7 +702,7 @@ _AUTHORIZATION_RE = re.compile(
 )
 
 #: A URL in free text; trailing sentence punctuation is handed back.
-_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
+URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 
 
 #: A separator whose (last) line break is followed by no indentation:
@@ -712,7 +727,7 @@ def _in_resource_name(text: str) -> Callable[[int], bool]:
     return inside
 
 
-def _starts_with_marker(value: str) -> bool:
+def starts_with_marker(value: str) -> bool:
     """A value the redactor before these rules already replaced: extending
     the marker over what follows it only hides more of the text around it
     (`secret_arn=[REDACTED]:aws:...`)."""
@@ -726,7 +741,7 @@ def _keyword_sep_spans(text: str) -> list[Span]:
     for match in _counted(_KEYWORD_SEP_RE.finditer(text)):
         if in_resource_name(match.start()):
             continue  # `arn:…:secret:Name` names a secret, it is not one
-        if _starts_with_marker(match.group("value")):
+        if starts_with_marker(match.group("value")):
             continue  # the redactor before these rules already took it
         name = match.group("name").lower()
         if name in WEAK_SECRET_KEYS and _is_plain_word_or_number(match.group("value")):
@@ -855,7 +870,7 @@ def _keyword_ws_spans(text: str) -> list[Span]:
         (match.start("value"), match.end("value"), REDACTED)
         for match in _counted(_KEYWORD_WS_RE.finditer(text))
         if match.group("name").lower() != "code"
-        and not _starts_with_marker(match.group("value"))
+        and not starts_with_marker(match.group("value"))
         and _value_could_be_a_credential(match.group("value"))
         # a glued prefix (`CLIENTSECRET abc…`) only on a single-case key or
         # an acronym + Titlecase one (`PGPassword abc…`): any other
@@ -1009,7 +1024,7 @@ def _covers_anything(text: str, depth: int, covers: Covers | None) -> bool:
 
 def _url_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
     spans: list[Span] = []
-    for match in _counted(_URL_RE.finditer(text)):
+    for match in _counted(URL_RE.finditer(text)):
         raw_url = match.group(0)
         # Trailing sentence punctuation is handed back, and so is a trailing
         # backslash: in a serialised leaf it escapes the closing quote
@@ -1030,22 +1045,17 @@ def collect_redaction_spans(
     return _additive_spans(text, _depth, covers)
 
 
-#: Characters `re.IGNORECASE` folds onto an ASCII letter that `str.lower`
-#: does not: the long s, the Kelvin sign, dotless and dotted i.
-_FOLDS = str.maketrans({"\u017f": "s", "\u212a": "k", "\u0131": "i", "\u0130": "i"})
-#: A literal every keyword match contains, lower-cased: each key, and the
-#: fixed part of `api[_-]?key` and `private[_-]?key`.
-_KEY_LITERALS = tuple(
-    sorted({*(k.lower() for k in ADDITIVE_SECRET_KEYS), "api", "private"})
-)
+#: Any key word, as the keyword patterns read it: the same alternation under
+#: the same flag (`re.IGNORECASE`), so every case fold the patterns apply is
+#: applied here too -- it is their `name` group on its own.
+_ANY_KEY_RE = re.compile(rf"(?:{_secret_key_alternation()})", re.IGNORECASE)
 
 
 def _may_hold_a_key(text: str) -> bool:
-    """A necessary condition for a keyword match: some key literal occurs,
-    case-folded as the keyword patterns fold."""
-    work(len(text) * (2 + len(_KEY_LITERALS)))
-    folded = text.translate(_FOLDS).lower()
-    return any(literal in folded for literal in _KEY_LITERALS)
+    """A necessary condition for a keyword match: the patterns' own key
+    alternation occurs somewhere (one search)."""
+    work(len(text))
+    return _ANY_KEY_RE.search(text) is not None
 
 
 def _additive_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
@@ -1098,20 +1108,35 @@ _COVERING = frozenset({*_MARKERS, ""})
 
 
 def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
-    """The disjoint spans `apply_redaction_spans` applies, ascending (see
-    there for the overlap rules)."""
+    """The disjoint spans `apply_redaction_spans` applies, ascending.
+
+    Every marker already in the text -- `[REDACTED]`, and the URL rule's
+    `%5BREDACTED%5D` -- is left exactly as it is: a span that overlaps a
+    marker is dropped. It reads a value the redactor already replaced (a
+    keyword or scheme before the marker, a value running into it), and
+    extending the marker only hides the text around it. So a marker is never
+    split, swallowed into a larger one or re-spelled, and the pass leaves its
+    own output as it is. The rest merge: overlapping or nested spans become
+    one `[REDACTED]`, except that a span inside one whose replacement covers
+    it (the marker, or the empty string) is dropped.
+    """
     work(len(text) + len(spans) * max(1, len(spans).bit_length()))  # scan, sort
-    # Every marker already in the text -- `[REDACTED]`, and the URL rule's
-    # `%5BREDACTED%5D` -- is a span replaced by itself, first among spans of
-    # the same range, so a rule that re-finds it keeps it as it is and a rule
-    # that overlaps it swallows it whole: a marker is never split.
-    markers: list[Span] = [
-        (m.start(), m.end(), m.group(0)) for m in _MARKER_RE.finditer(text)
-    ]
-    candidates = [*markers, *spans]
+    markers = [m.span() for m in _MARKER_RE.finditer(text)]
+    marker_starts = [start for start, _ in markers]
+    pieces: list[Span] = []
+    for start, end, replacement in spans:
+        work(1)
+        i = bisect.bisect_left(marker_starts, end) - 1
+        if i >= 0 and markers[i][1] > start:
+            continue  # overlaps the marker that starts last before its end
+        pieces.append((start, end, replacement))
     ordered = sorted(
-        (span for span in candidates if span[0] < span[1]),
-        key=lambda span: (span[0], -span[1], span[2] not in _MARKERS),
+        (
+            piece
+            for piece in pieces
+            if piece[0] < piece[1] and not text[piece[0] : piece[1]].isspace()
+        ),
+        key=lambda span: (span[0], -span[1], span[2] != REDACTED),
     )
     merged: list[Span] = []
     for start, end, replacement in ordered:
@@ -1158,17 +1183,31 @@ def apply_redaction_spans(text: str, spans: list[Span]) -> str:
 
 # --------------------------------------------------------------- JSON text
 
-_JSON_STRING_RE = re.compile(r"\"(?:[^\"\\]|\\.)*\"")
-_JSON_ESCAPE_TOKEN_RE = re.compile(r"\\u[0-9a-fA-F]{4}|\\.|[^\\]", re.DOTALL)
+#: A JSON string token, the loop unrolled: a run of plain characters is one
+#: step, not one per character (the per-character alternation kept engine
+#: state for every character of a long string).
+_JSON_STRING_RE = re.compile(r"\"[^\"\\]*(?:\\.[^\"\\]*)*\"")
+_JSON_ESCAPE_RE = re.compile(r"\\u[0-9a-fA-F]{4}|\\.", re.DOTALL)
+
+
+def _is_object_key(text: str, end: int) -> bool:
+    """Is the string token ending at ``end`` an object key (the next
+    non-whitespace character is `:`)?"""
+    rest = end
+    while rest < len(text) and text[rest] in " \t\r\n":
+        rest += 1
+    return rest < len(text) and text[rest] == ":"
 
 
 def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
-    """When ``text`` is a JSON document, confine every span to string
-    contents, whole escapes at a time: a replacement then never touches a
-    delimiting quote, a bracket, a separator or a bare scalar, and never
-    splits an escape, so the document stays a document. Anything a span
-    covered outside a string is left as it is (syntax, or a scalar the
-    redactor before these rules left too)."""
+    """When ``text`` is a JSON document, confine every span to the contents
+    of string VALUES, whole escapes at a time: a replacement then never
+    touches a delimiting quote, a bracket, a separator, a bare scalar or an
+    object key, and never splits an escape. So the document stays a
+    document, and no two keys of an object can collide into one (rev 15's
+    board: random-looking keys redacted to the same marker collapsed a map
+    to its last entry). Anything a span covered outside a string value is
+    left as it is."""
     head = text.lstrip()[:1]
     if head not in ("{", "[", '"') or not spans:
         return spans
@@ -1177,18 +1216,25 @@ def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
     except (ValueError, RecursionError):
         return spans
     work(3 * len(text))
-    strings = [m.span() for m in _JSON_STRING_RE.finditer(text)]
-    starts = [start for start, _ in strings]
-    boundary = bytearray(len(text) + 1)
-    for start, end in strings:
-        for token in _JSON_ESCAPE_TOKEN_RE.finditer(text, start + 1, end - 1):
-            boundary[token.start()] = 1
-        boundary[end - 1] = 1
+    values: list[tuple[int, int]] = []
+    for match in _JSON_STRING_RE.finditer(text):
+        start, end = match.span()
+        if _is_object_key(text, end):
+            continue
+        values.append((start, end))
+    starts = [start for start, _ in values]
+    # a position inside a string is a boundary unless it is inside an escape
+    # (backslashes only occur in strings in a valid document)
+    boundary = bytearray(b"\x01") * (len(text) + 1)
+    for escape in _JSON_ESCAPE_RE.finditer(text):
+        boundary[escape.start() + 1 : escape.end()] = bytes(
+            escape.end() - escape.start() - 1
+        )
     clipped: list[Span] = []
     for a, b, replacement in spans:
         i = max(0, bisect.bisect_right(starts, a) - 1)
-        while i < len(strings) and strings[i][0] < b:
-            start, end = strings[i]
+        while i < len(values) and values[i][0] < b:
+            start, end = values[i]
             low, high = max(a, start + 1), min(b, end - 1)
             work(1)
             if low < high:
