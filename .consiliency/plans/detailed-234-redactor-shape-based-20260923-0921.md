@@ -391,6 +391,25 @@ The two tests at 60 s in the default tier are `tests/test_progressive_disclosure
 `test_invoke_query_docs` and `test_invoke_query_docs_conceptual` (not
 touched by this plan). No `test_workflow_guards` error occurred.
 
+**Embedding proof** (run for this plan): `origin/main` re-fetched (still
+`876fd33`); the patch was extracted from this file with the commands under
+"Patch against `main`", compared `cmp`-equal to the generated diff,
+`git apply --check` and `git apply` on a fresh worktree of `876fd33`
+succeeded, and with the oracle copied from the sibling file `pyproject.toml`
+is `cmp`-identical and `diff -rq` of `src/` and `tests/` against the floor
+branch at `b7b071d` shows no differences. On that tree (`pmcp.__file__`
+printed from it): `ruff check` All checks passed!, `ruff format --check`
+172 files already formatted, `mypy src/` no issues in 52 source files, and
+`test_redaction.py`, `test_redaction_floor.py`, `test_keyword_matcher.py`,
+`test_auth.py`, `test_policy.py`, `test_project_source_consent_policy.py`
+and `test_trust_boundaries_e2e.py` (default tier): **757 passed, 48
+deselected in 205.19s** and **757 passed, 48 deselected in 203.47s** (two
+runs). The first run on that tree, right after `uv sync`, reported **1
+failed, 756 passed, 48 deselected in 208.77s**; the failing node id was
+not captured, and it did not reproduce in those two full reruns, a
+`--last-failed` rerun, or three reruns of the 46 timing-sensitive tests
+(46 passed each). It is listed under Unverified.
+
 ## Acceptance criteria
 
 1. The embedded patch applies to `main` @ `876fd33`; the result matches the
@@ -433,6 +452,11 @@ touched by this plan). No `test_workflow_guards` error occurred.
 ## Unverified
 
 - Timings are from one host (dev0), one run each.
+- One default-tier run of the redaction files on the embedding-proof tree
+  had a single failure that did not reproduce and whose node id was not
+  captured (see Verification). The timing assertions are the likely source
+  on a shared host; they measure the best of two runs and allow 1.6x the
+  size ratio.
 - The slow tier is not run in CI; its results here are from one run.
 - The floor is computed over the text the redactor sees; `main` truncated
   before redacting, so on output longer than the cap the two see different
