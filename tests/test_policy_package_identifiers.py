@@ -365,3 +365,78 @@ def test_a_project_denied_package_is_denied_even_when_the_user_allows_it(
 
     assert manager.evaluate_package_policy(_identity("shared-pkg")) == "denied"
     assert manager.evaluate_package_policy(_identity("other-pkg")) == "allowed"
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        "1.0.0-x.tgz",
+        "1.0.0-X.TGZ",
+        "1.0.0-x.tar",
+        "3.25.5+b.tar.gz",
+        "2.0.0-rc.TaR.Gz",
+        # npm 10 (npm-package-arg 12.x) leaves the `.` in `tar.gz` unescaped
+        "1.0.0-x.tar-gz",
+        "1.0.0-a.tarXgz",
+        "1.0.0+b.tar0gz",
+    ],
+)
+def test_a_version_npm_reads_as_a_tarball_file_is_not_a_version(version: str) -> None:
+    """npm-package-arg classifies `name@<spec>` as a tarball spec, not a registry
+    version, when it matches `isFileType` -- tested before version parsing, and a
+    SemVer prerelease/build tail can match. Covers npm 10's looser pattern too."""
+    assert is_valid_package_version(version) is False
+
+
+@pytest.mark.parametrize(
+    "version", ["1.0.0-tgz", "1.0.0-x.tgzz", "1.0.0-tar.1", "1.0.0+tar"]
+)
+def test_versions_that_merely_mention_tar_are_still_versions(version: str) -> None:
+    """The suffix rule is npm's, anchored at the end: nothing else is refused."""
+    assert is_valid_package_version(version) is True
+
+
+def test_the_provision_gate_refuses_a_tarball_shaped_resolved_version() -> None:
+    from pmcp.provision_gate import _identity_is_argv_safe
+
+    assert _identity_is_argv_safe(PackageIdentity("npm", "legit", "1.0.0", None))
+    assert not _identity_is_argv_safe(
+        PackageIdentity("npm", "legit", "1.0.0-x.tgz", None)
+    )
+
+
+_MAX_SAFE = 2**53 - 1
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        f"{_MAX_SAFE + 1}.0.0",
+        f"0.{_MAX_SAFE + 1}.0",
+        f"0.0.{_MAX_SAFE + 1}",
+        "1" * 17 + ".0.0",
+        "9" * 16 + ".0.0",
+        f"{_MAX_SAFE + 1}.0.0-rc.1",
+    ],
+)
+def test_a_core_part_npm_reads_as_a_dist_tag_is_not_a_version(version: str) -> None:
+    """node-semver refuses a major/minor/patch above Number.MAX_SAFE_INTEGER and
+    npm-package-arg then classifies `name@<that>` as a dist-TAG: the registry's
+    dist-tags map, not the version string, decides what runs."""
+    assert is_valid_package_version(version) is False
+
+
+@pytest.mark.parametrize(
+    "version",
+    [
+        f"{_MAX_SAFE}.0.0",
+        f"0.0.{_MAX_SAFE}",
+        f"1.0.0-{_MAX_SAFE + 1}",
+        "1.0.0-rc." + "9" * 40,
+        "1.0.0+" + "9" * 40,
+    ],
+)
+def test_prerelease_and_build_numbers_are_not_bounded(version: str) -> None:
+    """Only the three core parts are bounded (checked against npm-package-arg
+    12.x and 13.x: each of these classifies as `version`)."""
+    assert is_valid_package_version(version) is True

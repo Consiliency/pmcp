@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
 import tempfile
 from collections.abc import Iterator
@@ -39,8 +40,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+
 from pmcp.trust_store import TrustStoreError, trust_store_path
-from pmcp.validation import is_valid_package_name, is_valid_package_version
+from pmcp.validation import (
+    is_valid_package_name,
+    is_valid_package_version,
+    matches_package_version_grammar,
+)
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     # Annotation only: `pmcp.manifest`'s package `__init__` imports the loader
@@ -147,10 +155,17 @@ def _read_store(path: Path) -> list[PackageApproval]:
     """Every record in the store, or raise ``PackageApprovalError``.
 
     An absent store is empty: an operator who has approved nothing is the
-    normal starting state.
+    normal starting state. A stale record (``_is_stale_record``) is left out.
     """
+    return _read_store_and_stale(path)[0]
+
+
+def _read_store_and_stale(
+    path: Path,
+) -> tuple[list[PackageApproval], list[tuple[str, str]]]:
+    """``_read_store``, plus the ``(name, version)`` of each stale record left out."""
     if not path.exists():
-        return []
+        return [], []
     try:
         raw = path.read_text(encoding="utf-8")
     except OSError as exc:
@@ -168,7 +183,53 @@ def _read_store(path: Path) -> list[PackageApproval]:
     entries = data.get("records")
     if not isinstance(entries, list):
         raise PackageApprovalError(f"Package approvals {path} has no records list")
-    return [_decode(entry) for entry in entries]
+    records: list[PackageApproval] = []
+    stale: list[tuple[str, str]] = []
+    for entry in entries:
+        if _is_stale_record(entry):
+            # Recorded before the exact-version check followed npm's version
+            # rules (tarball suffix, core-part bound): it approves nothing now. Leaving it out (rather than
+            # refusing the whole store) keeps every other approval working; the
+            # next write drops it. Every OTHER invalid record -- including one
+            # with a tarball-shaped version and any other defect -- still
+            # fails the store in `_decode`.
+            logger.warning(
+                "Ignoring package approval %r@%r in %s: npm does not read this "
+                "version as a registry version (a tarball spec or a dist-tag), "
+                "so it approves nothing; re-approve the package at a registry "
+                "version",
+                entry["name"],
+                entry["resolved_version"],
+                path,
+            )
+            stale.append((entry["name"], entry["resolved_version"]))
+            continue
+        records.append(_decode(entry))
+    return records, stale
+
+
+def _is_stale_record(entry: Any) -> bool:
+    """A record that is valid in every respect except npm's version rules.
+
+    Its version must match the SemVer grammar (what the store accepted before
+    those rules) and be refused now -- npm reads it as a tarball spec or a
+    dist-tag, not a registry version; with the version replaced, the whole
+    entry must decode. Anything else is corruption, left to ``_decode``.
+    """
+    if not isinstance(entry, dict):
+        return False
+    version = entry.get("resolved_version")
+    if (
+        not isinstance(version, str)
+        or not matches_package_version_grammar(version)
+        or is_valid_package_version(version)
+    ):
+        return False
+    try:
+        _decode({**entry, "resolved_version": "0.0.0"})
+    except PackageApprovalError:
+        return False
+    return True
 
 
 def _ensure_store_dir(parent: Path) -> None:
@@ -339,12 +400,14 @@ def revoke_package(name: str, version: str | None = None) -> bool:
     """Drop the records for *name* (at *version*, or at every version).
 
     Returns whether anything was removed. Revoking returns the identity to
-    *absent*, which the gate already refuses. Raises ``TrustStoreError`` if the
+    *absent*, which the gate already refuses. A stale record
+    (``_is_stale_record``) matching *name* (and *version*) counts as removed;
+    like every write, this one also drops stale records for other names. Raises ``TrustStoreError`` if the
     store is unusable.
     """
     store = package_approvals_path()
     with _store_lock(store):
-        records = _read_store(store)
+        records, stale = _read_store_and_stale(store)
         kept = [
             rec
             for rec in records
@@ -353,9 +416,13 @@ def revoke_package(name: str, version: str | None = None) -> bool:
                 and (version is None or rec.resolved_version == version)
             )
         ]
-        if len(kept) == len(records):
+        stale_hit = any(
+            stale_name == name and (version is None or stale_version == version)
+            for stale_name, stale_version in stale
+        )
+        if len(kept) == len(records) and not stale_hit:
             return False
-        _write_store(store, kept)
+        _write_store(store, kept)  # a stale record is never written back
     return True
 
 
