@@ -486,9 +486,9 @@ def _url_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
     text = tracked.cur
     edits: list[tuple[int, int, list[_Piece]]] = []
     for match in _MAIN_URL_RE.finditer(text):
-        raw = match.group(0)
-        while raw and raw[-1] in ").,;":
-            raw = raw[:-1]
+        # main's `redact_url_match`: trailing sentence punctuation is handed
+        # back, stripped in one pass
+        raw = match.group(0).rstrip(").,;")
         start = match.start()
         end = start + len(raw)
         result = _url_pieces(raw, start)

@@ -1,45 +1,32 @@
-"""Main's keyword redaction rule in linear time (Consiliency/pmcp#234).
+"""The auth redactor's keyword rule, matched in one linear pass.
 
-Main's `sanitize_auth_diagnostic` redacts `<key><sep><value>` with
+`sanitize_auth_diagnostic` redacts `<key><sep><value>` as
 
     (?i)\\b([A-Za-z0-9_-]*(?:KEYS)[A-Za-z0-9_-]*)([\\s:=]+)([A-Za-z0-9._~+/=-]{3,})
 
-which is quadratic in the number of word boundaries in a joiner-rich run:
-at every `\\b` inside `a-a-a-...` the leading `[A-Za-z0-9_-]*` scans to the
-end of the run and backtracks through it looking for a key (8 KB of `a-`
-takes 3 s on main, 66 KB several minutes). `keyword_matches` yields exactly
-the matches `finditer` of that regex yields, in linear time;
-`redact_keyword_values` is the drop-in for main's `re.sub(...,
-r"\\1\\2[REDACTED]", text)`.
+`keyword_matches` yields exactly the matches `finditer` of that pattern
+yields, left to right, but scans each identifier run once instead of letting
+the regex engine re-scan it from every word boundary, so the cost stays
+linear in the length of the text. `redact_keyword_values` is the drop-in for
+`re.sub(<pattern>, r"\\1\\2[REDACTED]", text)`.
 
-Standalone on purpose: it imports nothing from `pmcp`, so it can be lifted
-into a fix for main on its own. `tests/test_redaction_floor.py` compares it
-with the real regex (run under a per-input timeout) on the grammar corpora,
-random fragment strings and adversarial runs.
-
-Why this is the same match set, left to right:
+Why this is the same match set:
 
 * Group 1 is made of identifier characters W = [A-Za-z0-9_-] (under (?i),
-  which also admits the case-fold partners of those letters: `ſ K ı İ`), and
-  group 2 starts with a character of [\\s:=], which W never contains. So
-  group 1 always ends exactly where the maximal W-run it starts in ends (r),
-  and a match needs text[r] in [\\s:=].
-* Group 1 must hold a key, and a key is made of W characters, so the key
-  lies inside the run. The match starts at the leftmost position s of the
-  run where `\\b` holds and a key starts at or after s.
+  which also admits the case-fold partners of those letters), and group 2
+  starts with a character of [\\s:=], which W never contains. So group 1 always
+  ends exactly where the maximal W-run it starts in ends (r), and a match
+  needs text[r] in [\\s:=].
+* Group 1 must hold a key, and a key is made of W characters, so the key lies
+  inside the run. The match starts at the leftmost position s of the run
+  where `\\b` holds and a key starts at or after s.
 * Group 2 is greedy: it takes the maximal [\\s:=] run [r, q) and backtracks
   one character at a time. The value V = [A-Za-z0-9._~+/=-] shares only `=`
   with it, so a value starting at p < q is the `=` run from p, continuing
-  past q only if every character in between is `=`. The first p, from q
-  down to r + 1, whose V-run is 3+ long is main's.
+  past q only if every character in between is `=`. The first p, from q down
+  to r + 1, whose V-run is 3+ long is the regex's.
 * A value ends at a character outside V, which is outside W too (W is a
-  subset of V), so the next match's run starts after it: runs inside a
-  consumed value are skipped.
-
-Linear: each W-run is scanned once for keys and boundaries, each separator
-run belongs to one W-run, and the value run after it is scanned only when
-that run holds a key -- in which case the match consumes it, or it is under
-3 characters long.
+  subset of V), so the next match's run starts after it.
 """
 
 from __future__ import annotations
@@ -54,7 +41,9 @@ _WORD_CHAR_RE = re.compile(r"\w")
 
 
 def keys_alternation(keys: Iterable[str]) -> str:
-    """Main's key alternation: the escaped keys and `api[_-]?key`."""
+    """The key alternation: the escaped keys (sorted; order cannot change a
+    match, since group 1 always runs to the end of its identifier run) and
+    `api[_-]?key`."""
     return "|".join([*sorted(re.escape(key) for key in keys), r"api[_-]?key"])
 
 

@@ -7,6 +7,7 @@ import contextlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import signal
@@ -24,6 +25,8 @@ from pmcp.client.manager import (
     _OUTBOUND_QUEUE_MAXSIZE,
     ClientManager,
     DEFAULT_SCHEMA_DIALECT,
+    HEARTBEAT_STALL_THRESHOLD,
+    HEARTBEAT_WARN_THRESHOLD,
     ManagedClient,
     PendingRequest,
     PREFERRED_PROTOCOL_VERSION,
@@ -44,6 +47,7 @@ from pmcp.types import (
     McpTaskRecord,
     PromptInfo,
     RemoteMcpServerConfig,
+    RequestState,
     ResourceInfo,
     ResolvedServerConfig,
     RiskHint,
@@ -3259,8 +3263,36 @@ class TestReconnectStormGuard:
         assert len(tasks_created) == 1, "Only one reconnect task should be created"
 
 
+class _FakeClock:
+    """The request clock a test advances by hand (slice C3 of Consiliency/pmcp#235).
+
+    ``now`` is what ``ClientManager(clock=...)`` reads; ``reads`` counts those
+    reads, so a driver task can step the clock exactly once per idle check
+    (``eventually(lambda: clock.reads >= k, interval=0)``) instead of racing a
+    real timer. Nothing here consults wall time.
+    """
+
+    def __init__(self, start: float = 1_000.0) -> None:
+        self.value = start
+        self.reads = 0
+
+    def now(self) -> float:
+        self.reads += 1
+        return self.value
+
+    def advance(self, seconds: float) -> float:
+        self.value += seconds
+        return self.value
+
+
 class TestIdleTimeout:
-    """Tests for the inactivity (idle) timeout on downstream requests (#79/1a)."""
+    """Tests for the inactivity (idle) timeout on downstream requests (#79/1a).
+
+    Time is a ``_FakeClock`` injected into ``ClientManager``; the real slice
+    (``IDLE_POLL_SLICE_S``) is shrunk to 1 ms so the loop re-checks quickly, but
+    every outcome is decided by fake-clock values alone. Steps are dyadic
+    (0.125 s) so every ``>=`` comparison is exact.
+    """
 
     @staticmethod
     def _managed(remote: bool = False) -> ManagedClient:
@@ -3278,92 +3310,275 @@ class TestIdleTimeout:
             config=config, process=process, status=status, is_remote=remote
         )
 
-    @pytest.mark.asyncio
-    async def test_idle_timeout_survives_periodic_output(self) -> None:
-        """A call that keeps producing output past the idle window completes."""
-        manager = ClientManager()
-        managed = self._managed()
-        future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
-        now = time.time()
-        pending = PendingRequest(
+    @staticmethod
+    def _pending(clock: _FakeClock, timeout_ms: int) -> PendingRequest:
+        """A PendingRequest stamped from the fake clock, as _send_request would."""
+        return PendingRequest(
             request_id=1,
             server_name="test",
             tool_id="t::x",
-            started_at=now,
-            last_heartbeat=now,
-            timeout_ms=300,
-            future=future,
+            started_at=clock.value,
+            last_heartbeat=clock.value,
+            timeout_ms=timeout_ms,
+            future=asyncio.get_running_loop().create_future(),
         )
+
+    @staticmethod
+    def _fail_pending(managed: ManagedClient, exc: BaseException) -> None:
+        """Fail every in-flight future with the driver's own exception.
+
+        A driver that dies (its `eventually` hang guard, an assertion) must end
+        the awaited call by name; otherwise the main coroutine keeps spinning
+        on 1 ms slices until pytest-timeout, and CI's job timeout cancels the
+        run with no red test (Consiliency/pmcp#200).
+        """
+        for req in managed.pending_requests.values():
+            if not req.future.done():
+                req.future.set_exception(exc)
+
+    def test_default_request_clock_is_wall_time(self) -> None:
+        """Without injection the request clock is the epoch, not monotonic.
+
+        gateway.list_pending renders ``started_at`` with ``datetime.fromtimestamp``
+        and ``pmcp status`` subtracts ``time.time()`` from it, so the default
+        is a cross-module contract; moving it to a monotonic clock is a
+        separate change, not a test seam.
+        """
+        assert ClientManager()._clock is time.time
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_survives_periodic_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A call that keeps producing output past the idle window completes.
+
+        Five idle checks each find a heartbeat at most 0.125 s old (window 0.25 s)
+        while the request itself ages to 0.5 s: liveness is per-heartbeat, not
+        per-request. The driver records what every check saw.
+        """
+        monkeypatch.setattr("pmcp.client.manager.IDLE_POLL_SLICE_S", 0.001)
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
+        managed = self._managed()
+        pending = self._pending(clock, timeout_ms=250)
         managed.pending_requests[1] = pending
+        seen: list[tuple[int, float]] = []
 
         async def keepalive() -> None:
-            # Bump well past the 0.3s idle window, then resolve.
-            for _ in range(5):
-                await asyncio.sleep(0.1)
-                pending.last_heartbeat = time.time()
-            future.set_result({"ok": True})
+            # One step per idle check: once read k has happened nothing else
+            # moves the clock, so `value - last_heartbeat` is exactly the age
+            # check k computed. Then "emit output" and move 0.125 s on.
+            try:
+                for k in range(1, 5):
+                    await eventually(lambda: clock.reads >= k, interval=0)
+                    seen.append((clock.reads, clock.value - pending.last_heartbeat))
+                    pending.last_heartbeat = clock.value
+                    clock.advance(0.125)
+                await eventually(lambda: clock.reads >= 5, interval=0)
+                seen.append((clock.reads, clock.value - pending.last_heartbeat))
+                pending.future.set_result({"ok": True})
+            except BaseException as exc:
+                self._fail_pending(managed, exc)
+                raise
 
         task = asyncio.create_task(keepalive())
         result = await manager._await_with_idle_timeout(
-            managed, 1, pending, future, idle_timeout_s=0.3, ceiling_s=100.0
+            managed, 1, pending, pending.future, idle_timeout_s=0.25, ceiling_s=100.0
         )
         await task
         assert result == {"ok": True}
+        assert seen == [(1, 0.0), (2, 0.125), (3, 0.125), (4, 0.125), (5, 0.125)]
+        assert clock.value - pending.started_at == 0.5  # outlived the 0.25 s window
 
     @pytest.mark.asyncio
-    async def test_idle_timeout_fires_when_silent(self) -> None:
-        """A silent downstream times out at the idle threshold and is removed."""
-        manager = ClientManager()
+    async def test_idle_timeout_fires_when_silent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A silent downstream times out exactly at the idle threshold and is removed."""
+        monkeypatch.setattr("pmcp.client.manager.IDLE_POLL_SLICE_S", 0.001)
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
         managed = self._managed()
+        start = clock.value
 
+        async def silence() -> None:
+            # No output ever: each idle check finds the clock 0.125 s further on.
+            # Bounded in fake steps so a broken idle path fails by name.
+            try:
+                for k in range(1, 9):
+                    await eventually(
+                        lambda: clock.reads >= k or not managed.pending_requests,
+                        interval=0,
+                    )
+                    if not managed.pending_requests:
+                        return
+                    clock.advance(0.125)
+                self._fail_pending(
+                    managed,
+                    AssertionError(
+                        "idle timeout never fired in 1.0 s of request-clock"
+                    ),
+                )
+            except BaseException as exc:
+                self._fail_pending(managed, exc)
+                raise
+
+        task = asyncio.create_task(silence())
         with pytest.raises(TimeoutError):
             await manager._send_request(
-                managed, "tools/call", {}, tool_id="t::x", timeout_ms=200
+                managed, "tools/call", {}, tool_id="t::x", timeout_ms=250
             )
+        await task
 
+        # Read 1 stamped the request; checks 1 and 2 saw ages 0.125 and 0.25.
+        assert (clock.reads, clock.value - start) == (3, 0.25)
         assert managed.pending_requests == {}
         assert managed.status.pending_request_count == 0
 
     @pytest.mark.asyncio
     async def test_absolute_ceiling_fires_for_chatty_call(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A continuously-heartbeating call that never resolves hits the ceiling."""
-        monkeypatch.setenv("PMCP_REQUEST_CEILING_MS", "200")
-        manager = ClientManager()
+        monkeypatch.setenv("PMCP_REQUEST_CEILING_MS", "250")
+        monkeypatch.setattr("pmcp.client.manager.IDLE_POLL_SLICE_S", 0.001)
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
         managed = self._managed()
+        start = clock.value
 
         async def chatty() -> None:
+            # Fresh output before every idle check for 0.5 s of fake time (the
+            # 0.5 s idle window never elapses), then silence, so a ceiling that
+            # never fires still ends the request -- by the idle path, late.
             try:
-                while True:
-                    await asyncio.sleep(0.05)
-                    for req in managed.pending_requests.values():
-                        req.last_heartbeat = time.time()
-            except asyncio.CancelledError:
-                pass
+                for k in range(1, 13):
+                    await eventually(
+                        lambda: clock.reads >= k or not managed.pending_requests,
+                        interval=0,
+                    )
+                    if not managed.pending_requests:
+                        return
+                    if k <= 4:
+                        for req in managed.pending_requests.values():
+                            req.last_heartbeat = clock.value
+                    clock.advance(0.125)
+                self._fail_pending(
+                    managed,
+                    AssertionError(
+                        "neither the ceiling nor the idle timeout fired in "
+                        "1.5 s of request-clock"
+                    ),
+                )
+            except BaseException as exc:
+                self._fail_pending(managed, exc)
+                raise
 
         task = asyncio.create_task(chatty())
-        try:
+        with caplog.at_level(logging.WARNING, logger="pmcp.client.manager"):
             with pytest.raises(TimeoutError):
-                # idle window (400ms) never elapses thanks to chatty bumps, so the
-                # 200ms ceiling is what fires.
                 await manager._send_request(
-                    managed, "tools/call", {}, tool_id="t::x", timeout_ms=400
+                    managed, "tools/call", {}, tool_id="t::x", timeout_ms=500
                 )
-        finally:
-            task.cancel()
-            await task
+        await task
 
+        assert "hit absolute ceiling" in caplog.text
+        # Read 1 stamped the request; check 2 saw 0.25 s of age, the ceiling.
+        assert (clock.reads, clock.value - start) == (3, 0.25)
         assert managed.pending_requests == {}
 
     @pytest.mark.asyncio
+    async def test_request_state_reads_the_request_clock(self) -> None:
+        """get_request_state ages a request on the injected clock."""
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
+        pending = self._pending(clock, timeout_ms=1_000_000)
+        # Started long before its last heartbeat: the state must age the
+        # heartbeat, so reading started_at here instead would say STALLED.
+        pending.started_at = clock.value - (HEARTBEAT_STALL_THRESHOLD + 100)
+
+        assert manager.get_request_state(pending) is RequestState.PENDING
+        clock.advance(HEARTBEAT_WARN_THRESHOLD + 1)
+        assert manager.get_request_state(pending) is RequestState.ACTIVE
+        clock.advance(HEARTBEAT_STALL_THRESHOLD - HEARTBEAT_WARN_THRESHOLD)
+        assert manager.get_request_state(pending) is RequestState.STALLED
+        clock.advance(1_000)
+        assert manager.get_request_state(pending) is RequestState.TIMEOUT
+
+    @pytest.mark.asyncio
+    async def test_cancel_request_reads_the_request_clock(self) -> None:
+        """cancel_request judges staleness and reports elapsed on the injected clock."""
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
+        managed = self._managed()
+        manager._clients["test"] = managed
+        managed.pending_requests[1] = self._pending(clock, timeout_ms=1_000_000)
+
+        clock.advance(HEARTBEAT_STALL_THRESHOLD + 1)
+        status, _message, was_stalled, elapsed = await manager.cancel_request("test::1")
+        assert (status, was_stalled, elapsed) == ("cancelled", True, 121.0)
+
+    @pytest.mark.asyncio
+    async def test_cancel_request_refuses_a_healthy_request_on_the_request_clock(
+        self,
+    ) -> None:
+        """The refuse-if-healthy check ages the heartbeat on the injected clock.
+
+        Started long ago but heard from recently: healthy, so an unforced cancel
+        is refused. Wall time for either age, or ageing started_at instead of
+        last_heartbeat, makes it look stalled (or past its timeout) and cancels.
+        """
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
+        managed = self._managed()
+        manager._clients["test"] = managed
+        pending = self._pending(clock, timeout_ms=1_000_000)
+        pending.started_at = clock.value - (HEARTBEAT_STALL_THRESHOLD + 100)
+        managed.pending_requests[1] = pending
+
+        clock.advance(1)
+        status, _message, was_stalled, elapsed = await manager.cancel_request("test::1")
+        assert (status, was_stalled, elapsed) == ("refused", False, 221.0)
+        assert 1 in managed.pending_requests
+
+    @pytest.mark.asyncio
+    async def test_health_monitor_reads_the_request_clock(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The health monitor's stall warning ages a request on the injected clock."""
+        monkeypatch.setattr("pmcp.client.manager.HEALTH_CHECK_INTERVAL", 0.001)
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
+        managed = self._managed()
+        manager._clients["test"] = managed
+        pending = self._pending(clock, timeout_ms=1_000_000)
+        # Started long before its last heartbeat: the logged age must be the
+        # heartbeat's (121 s), not the request's (1121 s).
+        pending.started_at = clock.value - 1_000
+        managed.pending_requests[1] = pending
+        clock.advance(HEARTBEAT_STALL_THRESHOLD + 1)
+
+        task = asyncio.create_task(manager._health_monitor_loop())
+        try:
+            with caplog.at_level(logging.WARNING, logger="pmcp.client.manager"):
+                await eventually(
+                    lambda: "Request test::1 stalled (no heartbeat for 121s)"
+                    in caplog.text,
+                    message="stall warning never logged with the fake-clock age",
+                )
+        finally:
+            task.cancel()
+            await task  # the loop turns CancelledError into a clean return
+
+    @pytest.mark.asyncio
     async def test_progress_notification_bumps_pending_heartbeat_stdout(self) -> None:
-        """An id:null JSON notification advances in-flight last_heartbeat (stdio)."""
-        manager = ClientManager()
+        """An id:null JSON notification stamps last_heartbeat from the clock (stdio)."""
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
         managed = self._managed()
         # Graceful branch in finally; avoid scheduling a reconnect task.
         managed.status.status = ServerStatusEnum.OFFLINE
-        stale = time.time() - 10
+        stale = clock.value - 10
         future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
         pending = PendingRequest(
             request_id=1,
@@ -3392,18 +3607,20 @@ class TestIdleTimeout:
 
         await manager._read_stdout("test", managed)
 
-        assert pending.last_heartbeat > stale
+        assert pending.last_heartbeat == clock.value
+        assert managed.status.last_activity_at == clock.value
         # Retrieve the ConnectionError set by the EOF finally so it is not logged.
         with contextlib.suppress(Exception):
             pending.future.exception()
 
     @pytest.mark.asyncio
     async def test_progress_notification_bumps_pending_heartbeat_sse(self) -> None:
-        """An id:null JSON notification advances in-flight last_heartbeat (SSE)."""
-        manager = ClientManager()
+        """An id:null JSON notification stamps last_heartbeat from the clock (SSE)."""
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
         managed = self._managed(remote=True)
         managed.status.status = ServerStatusEnum.OFFLINE
-        stale = time.time() - 10
+        stale = clock.value - 10
         future: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
         pending = PendingRequest(
             request_id=1,
@@ -3428,9 +3645,53 @@ class TestIdleTimeout:
 
         await manager._read_sse("test", managed, stream())
 
-        assert pending.last_heartbeat > stale
+        assert pending.last_heartbeat == clock.value
+        assert managed.status.last_activity_at == clock.value
         with contextlib.suppress(Exception):
             pending.future.exception()
+
+    @pytest.mark.asyncio
+    async def test_response_time_reads_the_request_clock_stdout(self) -> None:
+        """A response's recorded latency is measured on the request clock (stdio)."""
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
+        managed = self._managed()
+        managed.status.status = ServerStatusEnum.OFFLINE
+        pending = self._pending(clock, timeout_ms=30000)
+        pending.started_at = pending.last_heartbeat = clock.value - 2.5
+        managed.pending_requests[1] = pending
+
+        response = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {}}) + "\n"
+        cast(Any, managed.process).stdout.read = AsyncMock(
+            side_effect=[response.encode(), b""]
+        )
+
+        await manager._read_stdout("test", managed)
+
+        assert list(managed.response_times) == [2500.0]
+        assert managed.status.avg_response_time_ms == 2500.0
+
+    @pytest.mark.asyncio
+    async def test_response_time_reads_the_request_clock_sse(self) -> None:
+        """A response's recorded latency is measured on the request clock (SSE)."""
+        clock = _FakeClock()
+        manager = ClientManager(clock=clock.now)
+        managed = self._managed(remote=True)
+        managed.status.status = ServerStatusEnum.OFFLINE
+        pending = self._pending(clock, timeout_ms=30000)
+        pending.started_at = pending.last_heartbeat = clock.value - 2.5
+        managed.pending_requests[1] = pending
+
+        msg = MagicMock()
+        msg.message.model_dump.return_value = {"jsonrpc": "2.0", "id": 1, "result": {}}
+
+        async def stream() -> Any:
+            yield msg
+
+        await manager._read_sse("test", managed, stream())
+
+        assert list(managed.response_times) == [2500.0]
+        assert managed.status.avg_response_time_ms == 2500.0
 
     def test_request_ceiling_ms_env_parsing(self) -> None:
         """_request_ceiling_ms parses valid values and falls back on bad ones."""

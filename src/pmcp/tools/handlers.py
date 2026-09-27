@@ -14,11 +14,12 @@ from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Callable, Mapping
-from typing import Any, Literal, cast
+from typing import Any, Literal, cast, NamedTuple
 
 import anyio
 from dotenv import load_dotenv
 from mcp.types import Tool
+from pydantic import BaseModel
 from pmcp import __version__ as PMCP_VERSION
 from pmcp.auth import (
     UNVERIFIED_URL_CAVEAT,
@@ -190,6 +191,7 @@ from pmcp.types import (
     UrlElicitationInfo,
 )
 
+from pmcp.tools.schema import input_schema_for
 from pmcp.manifest.loader import (
     Manifest,
     ServerConfig,
@@ -467,647 +469,224 @@ TRACE_VALUE_DENY_PATTERN = re.compile(
 )
 
 
+class _GatewayToolSpec(NamedTuple):
+    """One advertised gateway tool: its name, argument model, and description."""
+
+    name: str
+    input_model: type[BaseModel] | None
+    description: str
+
+
+# The single source of each gateway tool's advertised inputSchema is the
+# pydantic model its handler validates with (Consiliency/pmcp#236). `None`
+# marks the tools dispatched with no arguments (see server.py call_tool).
+_GATEWAY_TOOL_SPECS: tuple[_GatewayToolSpec, ...] = (
+    _GatewayToolSpec(
+        name="gateway.catalog_search",
+        input_model=CatalogSearchInput,
+        description=(
+            "Search for available tools across all connected MCP servers. Returns compact capability cards without full schemas. Use filters to narrow results by server, tags, or risk level. Set include_offline=True to also discover provisionable servers not yet running. This is the primary tool discovery entry point."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.describe",
+        input_model=DescribeInput,
+        description=(
+            "Get detailed information about a specific tool, including its arguments and constraints. Use this before invoking a tool to understand its requirements."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.invoke",
+        input_model=InvokeInput,
+        description=(
+            "Invoke a tool on a downstream MCP server. Arguments are validated against the tool schema before execution. Output is automatically truncated if too large."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.refresh",
+        input_model=RefreshInput,
+        description=(
+            "Reload backend MCP server configurations and reconnect. Use this when new MCP servers have been configured or to recover from connection errors. Refuses by default while downstream requests are pending; set force=true to cancel them."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.connect_server",
+        input_model=ConnectServerInput,
+        description=(
+            "Connect or start a known downstream MCP server by name. Resolves configured, provisioned manifest, and registered discovered servers."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.disconnect_server",
+        input_model=DisconnectServerInput,
+        description=(
+            "Disconnect a running downstream MCP server without changing persistent config. Refuses by default when that server has pending requests; set force=true to cancel them."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.restart_server",
+        input_model=RestartServerInput,
+        description=(
+            "Restart a known downstream MCP server without changing persistent config. Refuses by default when that server has pending requests; set force=true to cancel them."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.health",
+        input_model=None,
+        description=(
+            "Get the health status of the gateway and all connected MCP servers. Shows server status, tool counts, and last refresh time."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.config_status",
+        input_model=None,
+        description=(
+            "Show read-only effective configuration and startup policy status with source attribution and non-secret diagnostics."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.get_startup_policy",
+        input_model=None,
+        description=(
+            "Return persisted autoStart and legacy disableAutoStart entries grouped by config source."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.set_startup_policy",
+        input_model=StartupPolicyOperation,
+        description=(
+            "Preview or explicitly apply an autoStart add/remove/set operation against one selected config source or path."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.request_capability",
+        input_model=CapabilityRequestInput,
+        description=(
+            "Recommend the right tool for a task — describe what you need in natural language. Examples: 'scrape a website', 'search Slack messages', 'query Postgres', 'browse the web'. Matches against installed CLIs and 90+ provisionable MCP servers and returns ranked candidates; it does NOT start anything — call gateway.provision to actually install/start the recommended server. Prefer this over gateway.provision when you don't already know the exact server name."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.sync_environment",
+        input_model=SyncEnvironmentInput,
+        description=(
+            "Sync environment information from the host. Detects the platform (mac/wsl/linux/windows) and probes for installed CLIs. This information is used to prefer CLIs over MCP servers when matching capabilities."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.provision",
+        input_model=ProvisionInput,
+        description=(
+            "Provision (install and start) a specific MCP server from the manifest. Use this after reviewing candidates from gateway.request_capability. Returns immediately with a job_id for tracking. Poll gateway.provision_status to check progress. Use gateway.request_capability instead if you don't know the exact server name."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.update_server",
+        input_model=UpdateServerInput,
+        description=(
+            "Update a subordinate MCP server package to latest version and restart it so the new version is actually running. Call this to check for and apply an update -- the gateway does not volunteer update notices, so nothing will prompt you. Refuses to restart by default when the server has pending requests; set force=true to cancel them."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.auth_connect",
+        input_model=AuthConnectInput,
+        description=(
+            "Store credentials for a server and make them available to provisioning. Use this when gateway.provision reports missing authentication."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.submit_feedback",
+        input_model=SubmitFeedbackInput,
+        description=(
+            "Prepare a PMCP feedback issue for GitHub. Returns an exact preview payload and a browser URL an operator can open. pmcp posts nothing itself unless the operator has enabled submission (`pmcp guidance --feedback-submission on`) and exported PMCP_FEEDBACK_TOKEN; confirm_submission=true records the user's consent and is not by itself authority to post."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.provision_status",
+        input_model=ProvisionStatusInput,
+        description=(
+            "Check the status of a running server installation. Use after gateway.provision returns a job_id. Returns progress percentage, output log, and final tools when complete."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.list_pending",
+        input_model=ListPendingInput,
+        description=(
+            "List all pending tool invocations with health status. Shows elapsed time, heartbeat age, and current state for each request. Use this to monitor long-running operations before deciding to cancel."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.cancel",
+        input_model=CancelInput,
+        description=(
+            "Cancel a pending tool invocation. By default, refuses to cancel healthy requests (recent heartbeat). Use force=true to cancel anyway. Use gateway.list_pending first to see request IDs and health status."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.tasks_list",
+        input_model=TasksListInput,
+        description=(
+            "List brokered downstream MCP tasks. MCP task IDs are opaque downstream task identifiers, not PMCP request IDs."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.tasks_get",
+        input_model=TasksGetInput,
+        description=("Get current status for one downstream MCP task."),
+    ),
+    _GatewayToolSpec(
+        name="gateway.tasks_result",
+        input_model=TasksResultInput,
+        description=(
+            "Fetch a downstream MCP task result and apply the same output redaction and truncation options as gateway.invoke."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.tasks_cancel",
+        input_model=TasksCancelInput,
+        description=(
+            "Cancel a downstream MCP task by opaque task ID. Use gateway.cancel only for PMCP request IDs from gateway.list_pending."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.search_registry",
+        input_model=SearchRegistryInput,
+        description=(
+            "Search the public MCP Registry for external servers not in the local manifest. Use this when gateway.request_capability returns not_available. Returns package names and metadata; call gateway.register_discovered_server then gateway.provision to install."
+        ),
+    ),
+    _GatewayToolSpec(
+        name="gateway.register_discovered_server",
+        input_model=RegisterDiscoveredServerInput,
+        description=(
+            "Register an externally-discovered MCP server package so it can be provisioned. Call this after gateway.search_registry to register the chosen package, then call gateway.provision to install and start it."
+        ),
+    ),
+)
+
+#: Advertised tool name -> the model its handler validates arguments with.
+GATEWAY_TOOL_INPUT_MODELS: dict[str, type[BaseModel] | None] = {
+    spec.name: spec.input_model for spec in _GATEWAY_TOOL_SPECS
+}
+
+
+@functools.cache
+def _derived_gateway_tools() -> tuple[Tool, ...]:
+    """Derive every Tool once per process: ``input_schema_for`` walks 23 model
+    schemas (~13 ms), and ``GatewayServer`` looks the list up on every
+    ``tools/call`` and ``tools/list``."""
+    return tuple(
+        Tool(
+            name=spec.name,
+            description=spec.description,
+            input_schema=input_schema_for(spec.input_model),
+        )
+        for spec in _GATEWAY_TOOL_SPECS
+    )
+
+
 def get_gateway_tool_definitions() -> list[Tool]:
-    """Get MCP tool definitions for the gateway."""
-    return [
-        Tool(
-            name="gateway.catalog_search",
-            description=(
-                "Search for available tools across all connected MCP servers. "
-                "Returns compact capability cards without full schemas. "
-                "Use filters to narrow results by server, tags, or risk level. "
-                "Set include_offline=True to also discover provisionable servers not yet running. "
-                "This is the primary tool discovery entry point."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Search query to match against tool names, descriptions, and tags",
-                    },
-                    "filters": {
-                        "type": "object",
-                        "properties": {
-                            "server": {
-                                "type": "string",
-                                "description": "Filter to tools from a specific server",
-                            },
-                            "tags": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "Filter to tools with any of these tags",
-                            },
-                            "risk_max": {
-                                "type": "string",
-                                "enum": ["low", "medium", "high"],
-                                "description": "Maximum risk level to include",
-                            },
-                        },
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 100,
-                        "default": 20,
-                        "description": "Maximum number of results to return",
-                    },
-                    "include_offline": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Include tools from offline servers",
-                    },
-                },
-            },
-        ),
-        Tool(
-            name="gateway.describe",
-            description=(
-                "Get detailed information about a specific tool, including its arguments and constraints. "
-                "Use this before invoking a tool to understand its requirements."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "tool_id": {
-                        "type": "string",
-                        "description": 'The tool ID in format "server_name::tool_name"',
-                    },
-                },
-                "required": ["tool_id"],
-            },
-        ),
-        Tool(
-            name="gateway.invoke",
-            description=(
-                "Invoke a tool on a downstream MCP server. "
-                "Arguments are validated against the tool schema before execution. "
-                "Output is automatically truncated if too large."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "tool_id": {
-                        "type": "string",
-                        "description": 'The tool ID in format "server_name::tool_name"',
-                    },
-                    "arguments": {
-                        "type": "object",
-                        "description": "Arguments to pass to the tool (must match tool schema)",
-                    },
-                    "run_correlation_id": {
-                        "type": "string",
-                        "description": "Scoped-advisor run correlation ID",
-                    },
-                    "seat_correlation_id": {
-                        "type": "string",
-                        "description": "Scoped-advisor seat correlation ID",
-                    },
-                    "evidence_label_digest": {
-                        "type": "string",
-                        "pattern": "^[0-9a-f]{64}$",
-                        "description": "SHA-256 digest of the caller evidence label",
-                    },
-                    "options": {
-                        "type": "object",
-                        "properties": {
-                            "timeout_ms": {
-                                "type": "integer",
-                                "minimum": 1000,
-                                "maximum": 300000,
-                                "default": 30000,
-                                "description": "Timeout in milliseconds",
-                            },
-                            "max_output_chars": {
-                                "type": "integer",
-                                "minimum": 100,
-                                "maximum": 100000,
-                                "description": "Maximum output characters (truncated if exceeded)",
-                            },
-                            "redact_secrets": {
-                                "type": "boolean",
-                                "default": False,
-                                "description": "Redact detected secrets from output",
-                            },
-                        },
-                    },
-                },
-                "required": ["tool_id"],
-            },
-        ),
-        Tool(
-            name="gateway.refresh",
-            description=(
-                "Reload backend MCP server configurations and reconnect. "
-                "Use this when new MCP servers have been configured or to recover from connection errors. "
-                "Refuses by default while downstream requests are pending; set force=true to cancel them."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "source": {
-                        "type": "string",
-                        "enum": ["claude_config", "custom"],
-                        "description": "Config source to reload from",
-                    },
-                    "reason": {
-                        "type": "string",
-                        "description": "Reason for refresh (for logging)",
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Cancel pending downstream requests before refreshing",
-                    },
-                },
-            },
-        ),
-        Tool(
-            name="gateway.connect_server",
-            description=(
-                "Connect or start a known downstream MCP server by name. "
-                "Resolves configured, provisioned manifest, and registered discovered servers."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type": "string",
-                        "description": "Name of the server to connect",
-                    },
-                },
-                "required": ["server_name"],
-            },
-        ),
-        Tool(
-            name="gateway.disconnect_server",
-            description=(
-                "Disconnect a running downstream MCP server without changing persistent config. "
-                "Refuses by default when that server has pending requests; set force=true to cancel them."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type": "string",
-                        "description": "Name of the server to disconnect",
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Cancel this server's pending requests before disconnecting",
-                    },
-                },
-                "required": ["server_name"],
-            },
-        ),
-        Tool(
-            name="gateway.restart_server",
-            description=(
-                "Restart a known downstream MCP server without changing persistent config. "
-                "Refuses by default when that server has pending requests; set force=true to cancel them."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type": "string",
-                        "description": "Name of the server to restart",
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Cancel this server's pending requests before restarting",
-                    },
-                },
-                "required": ["server_name"],
-            },
-        ),
-        Tool(
-            name="gateway.health",
-            description=(
-                "Get the health status of the gateway and all connected MCP servers. "
-                "Shows server status, tool counts, and last refresh time."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {},
-            },
-        ),
-        Tool(
-            name="gateway.config_status",
-            description=(
-                "Show read-only effective configuration and startup policy status "
-                "with source attribution and non-secret diagnostics."
-            ),
-            input_schema={"type": "object", "properties": {}},
-        ),
-        Tool(
-            name="gateway.get_startup_policy",
-            description=(
-                "Return persisted autoStart and legacy disableAutoStart entries "
-                "grouped by config source."
-            ),
-            input_schema={"type": "object", "properties": {}},
-        ),
-        Tool(
-            name="gateway.set_startup_policy",
-            description=(
-                "Preview or explicitly apply an autoStart add/remove/set operation "
-                "against one selected config source or path."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "operation": {
-                        "type": "string",
-                        "enum": ["add", "remove", "set"],
-                    },
-                    "names": {"type": "array", "items": {"type": "string"}},
-                    "source": {
-                        "type": "string",
-                        "enum": ["project", "user", "custom"],
-                    },
-                    "path": {"type": "string"},
-                    "dry_run": {"type": "boolean", "default": True},
-                    "apply": {"type": "boolean", "default": False},
-                },
-                "required": ["operation"],
-            },
-        ),
-        Tool(
-            name="gateway.request_capability",
-            description=(
-                "Recommend the right tool for a task — describe what you need in natural language. "
-                "Examples: 'scrape a website', 'search Slack messages', 'query Postgres', 'browse the web'. "
-                "Matches against installed CLIs and 90+ provisionable MCP servers and returns ranked candidates; "
-                "it does NOT start anything — call gateway.provision to actually install/start the recommended server. "
-                "Prefer this over gateway.provision when you don't already know the exact server name."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural language description of the capability needed (e.g., 'I need to scrape a website', 'browser automation')",
-                    },
-                    "available_clis": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Optional: CLIs known to be available in the environment",
-                    },
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="gateway.sync_environment",
-            description=(
-                "Sync environment information from the host. "
-                "Detects the platform (mac/wsl/linux/windows) and probes for installed CLIs. "
-                "This information is used to prefer CLIs over MCP servers when matching capabilities."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "platform": {
-                        "type": "string",
-                        "enum": ["mac", "wsl", "linux", "windows"],
-                        "description": "Override detected platform (optional)",
-                    },
-                    "detected_clis": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Override detected CLIs (optional)",
-                    },
-                },
-            },
-        ),
-        Tool(
-            name="gateway.provision",
-            description=(
-                "Provision (install and start) a specific MCP server from the manifest. "
-                "Use this after reviewing candidates from gateway.request_capability. "
-                "Returns immediately with a job_id for tracking. "
-                "Poll gateway.provision_status to check progress. "
-                "Use gateway.request_capability instead if you don't know the exact server name."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type": "string",
-                        "description": "Name of the server to provision (from manifest)",
-                    },
-                },
-                "required": ["server_name"],
-            },
-        ),
-        Tool(
-            name="gateway.update_server",
-            description=(
-                "Update a subordinate MCP server package to latest version and restart it "
-                "so the new version is actually running. "
-                "Call this to check for and apply an update -- the gateway does not "
-                "volunteer update notices, so nothing will prompt you. "
-                "Refuses to restart by default when the server has pending requests; "
-                "set force=true to cancel them."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type": "string",
-                        "description": "Name of server to update",
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Cancel this server's pending requests before restarting",
-                    },
-                },
-                "required": ["server_name"],
-            },
-        ),
-        Tool(
-            name="gateway.auth_connect",
-            description=(
-                "Store credentials for a server and make them available to provisioning. "
-                "Use this when gateway.provision reports missing authentication."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type": "string",
-                        "description": "Server name that needs authentication",
-                    },
-                    "credential": {
-                        "type": "string",
-                        "description": "API key, token, or subscription credential to store",
-                    },
-                    "auth_mode": {
-                        "type": "string",
-                        "enum": ["api_key", "url_elicitation"],
-                        "default": "api_key",
-                        "description": "API-key storage or URL-mode elicitation acknowledgement",
-                    },
-                    "elicitation_id": {
-                        "type": "string",
-                        "description": "URL-mode elicitation identifier",
-                    },
-                    "elicitation_url": {
-                        "type": "string",
-                        "description": "Sanitized URL-mode elicitation URL",
-                    },
-                    "consent_acknowledged": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Acknowledge that the out-of-band URL flow was completed",
-                    },
-                    "env_var": {
-                        "type": "string",
-                        "description": "Optional explicit environment variable key",
-                    },
-                    "scope": {
-                        "type": "string",
-                        "enum": ["user", "project"],
-                        "default": "user",
-                        "description": "Where to store the credential",
-                    },
-                },
-                "required": ["server_name"],
-            },
-        ),
-        Tool(
-            name="gateway.submit_feedback",
-            description=(
-                "Prepare a PMCP feedback issue for GitHub. Returns an exact "
-                "preview payload and a browser URL an operator can open. pmcp "
-                "posts nothing itself unless the operator has enabled submission "
-                "(`pmcp guidance --feedback-submission on`) and exported "
-                "PMCP_FEEDBACK_TOKEN; confirm_submission=true records the user's "
-                "consent and is not by itself authority to post."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "title": {
-                        "type": "string",
-                        "description": "Issue title",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Issue details (technical data only)",
-                    },
-                    "issue_type": {
-                        "type": "string",
-                        "enum": ["bug", "feature_request"],
-                        "default": "bug",
-                    },
-                    "subordinate_server": {
-                        "type": "string",
-                        "description": "Subordinate MCP server involved (if known)",
-                    },
-                    "failed_tool_call": {
-                        "type": "string",
-                        "description": "Specific failed tool call (if known)",
-                    },
-                    "confirm_submission": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Set true only after user confirms submission",
-                    },
-                },
-                "required": ["title", "description"],
-            },
-        ),
-        Tool(
-            name="gateway.provision_status",
-            description=(
-                "Check the status of a running server installation. "
-                "Use after gateway.provision returns a job_id. "
-                "Returns progress percentage, output log, and final tools when complete."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "job_id": {
-                        "type": "string",
-                        "description": "Job ID from gateway.provision response",
-                    },
-                },
-                "required": ["job_id"],
-            },
-        ),
-        Tool(
-            name="gateway.list_pending",
-            description=(
-                "List all pending tool invocations with health status. "
-                "Shows elapsed time, heartbeat age, and current state for each request. "
-                "Use this to monitor long-running operations before deciding to cancel."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server": {
-                        "type": "string",
-                        "description": "Filter to pending requests on a specific server (optional)",
-                    },
-                },
-            },
-        ),
-        Tool(
-            name="gateway.cancel",
-            description=(
-                "Cancel a pending tool invocation. "
-                "By default, refuses to cancel healthy requests (recent heartbeat). "
-                "Use force=true to cancel anyway. "
-                "Use gateway.list_pending first to see request IDs and health status."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "request_id": {
-                        "type": "string",
-                        "description": 'Request ID in format "server_name::local_id" from gateway.list_pending',
-                    },
-                    "force": {
-                        "type": "boolean",
-                        "default": False,
-                        "description": "Force cancel even if request is healthy (has recent heartbeat)",
-                    },
-                },
-                "required": ["request_id"],
-            },
-        ),
-        Tool(
-            name="gateway.tasks_list",
-            description=(
-                "List brokered downstream MCP tasks. "
-                "MCP task IDs are opaque downstream task identifiers, not PMCP request IDs."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server_name": {
-                        "type": "string",
-                        "description": "Optional server filter",
-                    },
-                    "cursor": {
-                        "type": "string",
-                        "description": "Optional downstream pagination cursor",
-                    },
-                },
-            },
-        ),
-        Tool(
-            name="gateway.tasks_get",
-            description="Get current status for one downstream MCP task.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server_name": {"type": "string"},
-                    "task_id": {"type": "string"},
-                },
-                "required": ["server_name", "task_id"],
-            },
-        ),
-        Tool(
-            name="gateway.tasks_result",
-            description=(
-                "Fetch a downstream MCP task result and apply the same output "
-                "redaction and truncation options as gateway.invoke."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server_name": {"type": "string"},
-                    "task_id": {"type": "string"},
-                    "options": {
-                        "type": "object",
-                        "properties": {
-                            "max_output_chars": {"type": "integer"},
-                            "redact_secrets": {"type": "boolean"},
-                        },
-                    },
-                },
-                "required": ["server_name", "task_id"],
-            },
-        ),
-        Tool(
-            name="gateway.tasks_cancel",
-            description=(
-                "Cancel a downstream MCP task by opaque task ID. "
-                "Use gateway.cancel only for PMCP request IDs from gateway.list_pending."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "server_name": {"type": "string"},
-                    "task_id": {"type": "string"},
-                    "force": {"type": "boolean", "default": False},
-                },
-                "required": ["server_name", "task_id"],
-            },
-        ),
-        Tool(
-            name="gateway.search_registry",
-            description=(
-                "Search the public MCP Registry for external servers not in the local manifest. "
-                "Use this when gateway.request_capability returns not_available. "
-                "Returns package names and metadata; call gateway.register_discovered_server then gateway.provision to install."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Natural language description of the capability needed",
-                    },
-                    "limit": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 20,
-                        "default": 5,
-                        "description": "Maximum number of results to return",
-                    },
-                },
-                "required": ["query"],
-            },
-        ),
-        Tool(
-            name="gateway.register_discovered_server",
-            description=(
-                "Register an externally-discovered MCP server package so it can be provisioned. "
-                "Call this after gateway.search_registry to register the chosen package, "
-                "then call gateway.provision to install and start it."
-            ),
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "package": {
-                        "type": "string",
-                        "description": "npm package identifier (e.g. '@modelcontextprotocol/server-github')",
-                    },
-                    "server_name": {
-                        "type": "string",
-                        "description": "Logical name for this server (e.g. 'github') used with gateway.provision",
-                    },
-                    "env_vars": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                        "description": "Required environment variable names (e.g. ['GITHUB_TOKEN'])",
-                    },
-                    "description": {
-                        "type": "string",
-                        "description": "Short description of the server's purpose",
-                    },
-                },
-                "required": ["package", "server_name"],
-            },
-        ),
-    ]
+    """Get MCP tool definitions for the gateway, schemas derived from the models."""
+    return list(_derived_gateway_tools())
 
 
 def _summarize_arg_schema(

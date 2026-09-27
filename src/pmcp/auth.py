@@ -962,8 +962,7 @@ def _url_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
         # Trailing sentence punctuation is handed back, and so is a trailing
         # backslash: in a serialised leaf it escapes the closing quote
         # (`…?sid=x\\"`), and a query-value span that ate it broke the JSON.
-        while raw_url and raw_url[-1] in ").,;\\":
-            raw_url = raw_url[:-1]
+        raw_url = raw_url.rstrip(").,;\\")  # in one pass, as main does
         spans.extend(_url_component_spans(match.start(), raw_url, depth, covers))
     return spans
 
