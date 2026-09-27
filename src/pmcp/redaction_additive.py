@@ -667,11 +667,14 @@ _BEARER_RE = re.compile(
     r"(?P<key>bearer(?:(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")+|" + _BREAK + r"))"
     r"(?![A-Za-z_-]+=[^=])"
     r"(?:[\"'(\[{<](?=[^\s,;\"'()\[\]{}<>\\]+[\"')\]}>]))?"
-    # a value is never whitespace escapes alone (the separator's own `+`
-    # gives one back when what follows is no value: `Bearer\u3000[...]`);
-    # an escape before a value is part of it, as before (`Bearer\r\na-b=x`
-    # inside a JSON string)
-    r"(?!(?:" + _JSON_SPACE_ESCAPE + r")+(?:[\s,;\"'()\[\]{}<>]|$))"
+    # a value never starts on a whitespace escape: the separator's own `+`
+    # would give one back and read it as the value (`Bearer\u3000[...]`).
+    # One character of lookahead; asking whether a run of escapes is
+    # followed by a value instead rescanned the run at every split of the
+    # separator -- quadratic on `bearer` + many `\n` escapes, which the
+    # quantifier sweep caught. So `Bearer\r\na-b=x` inside a JSON string
+    # (a pair after the scheme, escapes between) is left to the base pass.
+    r"(?!" + _JSON_SPACE_ESCAPE + r")"
     r"(?P<value>[^\s,;\"'()\[\]{}<>]*[^\s,;\"'()\[\]{}<>\\])",
     re.IGNORECASE,
 )

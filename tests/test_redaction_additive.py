@@ -1312,3 +1312,28 @@ def test_a_pem_block_with_a_marker_inside_is_redacted_whole() -> None:
         for line in body.split("\n"):
             assert line not in out, out
         assert "eXno5n8I" not in out, out
+
+
+def test_bearer_value_lookahead_mutant() -> None:
+    """A lookahead that asks whether a run of whitespace escapes is followed
+    by a value rescans the run at every split of the separator: quadratic on
+    `bearer` + many `\\n` escapes in a JSON string (the slow-tier sweep found
+    it during rev 17). The one-character form is linear."""
+    import time
+
+    text = json.dumps({"t": "bearer" + "\n" * 16_384})
+    started = time.perf_counter()
+    sanitize_auth_diagnostic(text, max_length=None)
+    assert time.perf_counter() - started < 1.0
+    one_char = "(?!" + A._JSON_SPACE_ESCAPE + ")"
+    assert one_char in A._BEARER_RE.pattern
+    slow = re.compile(
+        A._BEARER_RE.pattern.replace(
+            one_char,
+            "(?!(?:" + A._JSON_SPACE_ESCAPE + r")+(?:[\s,;\"'()\[\]{}<>]|$))",
+        ),
+        A._BEARER_RE.flags,
+    )
+    started = time.perf_counter()
+    list(slow.finditer(json.dumps({"t": "bearer" + "\n" * 16_384})))
+    assert time.perf_counter() - started > 0.3
