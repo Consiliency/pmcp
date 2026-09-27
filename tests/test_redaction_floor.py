@@ -1220,27 +1220,32 @@ def test_n4_mutant_no_complement(monkeypatch: pytest.MonkeyPatch) -> None:
         _n4()
 
 
+_SWEEP_CHUNKS = 16
+
+
 @pytest.mark.slow
-def test_generated_shapes_grow_linearly() -> None:
+@pytest.mark.parametrize("chunk", range(_SWEEP_CHUNKS))
+def test_generated_shapes_grow_linearly(chunk: int) -> None:
     """The full generated sweep (`tests/_redaction_shapes.py`: every unit of
     every redactor regex, repeated, after each trigger word, before each
-    failing tail): screened at 4 KB -> 16 KB on every entry point in worker
-    processes; any shape over 8x is re-measured at 16 KB -> 64 KB here and
-    must be linear."""
+    failing tail), in 16 chunks so each stays inside the per-test timeout:
+    screened at 4 KB -> 16 KB on every entry point in worker processes; any
+    shape over 8x is re-measured at 16 KB -> 64 KB here and must be
+    linear."""
     from tests import _redaction_shapes as S
 
-    names = sorted(S.shapes(S.redactor_patterns()))
+    shapes = S.shapes(S.redactor_patterns())
+    assert len(shapes) > 40_000
+    names = sorted(shapes)[chunk::_SWEEP_CHUNKS]
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
         flagged = [
             name
-            for chunk in pool.imap_unordered(_screen_shape, names, chunksize=20)
-            for name in chunk
+            for found in pool.imap_unordered(_screen_shape, names, chunksize=20)
+            for name in found
         ]
-    shapes = S.shapes(S.redactor_patterns())
     confirmed = {name: _growth(shapes[name], 16_384, 65_536) for name in flagged}
     assert {k: v for k, v in confirmed.items() if v} == {}, confirmed
-    assert len(names) > 40_000
 
 
 def _screen_shape(name: str) -> list[str]:
