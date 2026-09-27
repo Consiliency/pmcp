@@ -22,7 +22,14 @@ from pmcp.types import (
     ServerPolicy,
     ToolPolicy,
 )
-from pmcp.auth import sanitize_auth_diagnostic
+from pmcp.auth import _sanitize_base
+from pmcp.redaction_additive import (
+    REDACTED,
+    Span,
+    redact_additive,
+    widen_over_escapes,
+    work,
+)
 
 if TYPE_CHECKING:
     # Annotation only. `pmcp.manifest`'s package `__init__` imports the loader and
@@ -54,6 +61,59 @@ DEFAULT_REDACTION_PATTERNS = [
     r"\bghp_[A-Za-z0-9_]{10,}\b",
     r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
 ]
+
+#: Rev 10's forms of the defaults, entry for entry (Consiliency/pmcp#234):
+#: applied IN ADDITION to the default they stand beside, whenever that
+#: default is effective, over the output the defaults already redacted. They
+#: only add redactions.
+_ADDITIVE_DEFAULT_PATTERNS = [
+    # Common secret patterns (case-insensitive). The separator mirrors the
+    # engine's: `:`, `=`, `=>`, `:=`, or `==` followed directly by the value,
+    # on the same line (`[ \t]*`, not `[\s]*`, which let `token:\nthe` -- a
+    # sentence ending in the keyword -- redact the first word of the next
+    # line; `token == expected` is a comparison on this surface too).
+    r"(api[_-]?key|apikey)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
+    # Not after `:` or `.`: `arn:…:secret:Name` names a secret, it is not one.
+    # Right after a JSON escape it is a key (`\u00a0password=` in a
+    # serialised leaf), as `\b` made it on main.
+    r"(?:(?<![A-Za-z0-9:])|(?<=\\[nrtbf/\"\\])|(?<=\\u[0-9a-fA-F]{4}))(secret|password|passwd|pwd)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
+    # `token` needs a real separator: the pre-#234 `(bearer|token)\s+…` form
+    # redacted the word after "token" in prose ("token bucket"). Bearer values
+    # are handled unconditionally by `sanitize_auth_diagnostic`.
+    r"(?:\b|(?<=\\[nrtbf/\"\\])|(?<=\\u[0-9a-fA-F]{4}))token[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
+    r"(aws_secret|aws_access)[^\S\r\n]*(?:=>|:=|==(?![^\S\r\n]|=)|[:=](?!=))[^\S\r\n]*(?![\"'])([^\s\"']*[^\s\"'\\])",
+    r"\bsk-[A-Za-z0-9_-]{6,}\b",
+    r"\bghp_[A-Za-z0-9_]{10,}\b",
+    r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
+]
+
+_ADDITIVE_FOR_DEFAULT = {
+    default: re.compile(additive, re.IGNORECASE)
+    for default, additive in zip(
+        DEFAULT_REDACTION_PATTERNS, _ADDITIVE_DEFAULT_PATTERNS, strict=True
+    )
+}
+
+
+def _value_separator(full_match: str) -> int:
+    """Where an additive pattern's match splits into key and value: the first
+    separator (`:` or `=`) that has a value after it, or -1. A separator
+    with nothing but separators after it is base64 padding
+    (`dXNlcjpwYXNzd29yZA==`); splitting there kept the whole secret and
+    replaced the `=`.
+
+    Linear: "a value after it" is one comparison with where the trailing run
+    of separators starts. Rev 10 re-stripped the rest of the match at every
+    position, which is quadratic in a run of `:=` (B3 of its board: 58 s on
+    264 KB, reachable from callers with no window)."""
+    content_end = len(full_match.rstrip(" \t:="))
+    for i, char in enumerate(full_match):
+        if i + 1 >= content_end:
+            return -1
+        if char in ":=":
+            return i
+    return -1
+
 
 # Search order for an auto-discovered policy. The project-local entries are kept
 # RELATIVE on purpose: they are resolved against `Path.cwd()` when a
@@ -694,8 +754,16 @@ class PolicyManager:
         return (truncated_str, True, original_size)
 
     def redact_secrets(self, output: str) -> str:
-        """Redact secrets from output."""
-        result = sanitize_auth_diagnostic(output, max_length=None)
+        """Redact secrets from output.
+
+        The redactor's own rules run first, unchanged: the engine's
+        (`_sanitize_base`), then each effective pattern, split at its first
+        `:`/`=`. The additive rules then run over that output
+        (Consiliency/pmcp#234): the engine's, and rev 10's forms of the
+        effective patterns (`_additive_spans`). They can only replace more of
+        it with the marker.
+        """
+        result = _sanitize_base(output)
 
         for regex in self._redaction_regexes:
 
@@ -709,7 +777,44 @@ class PolicyManager:
 
             result = regex.sub(replace_match, result)
 
-        return result
+        return redact_additive(
+            result, covers=self._pattern_matches, extra=self._additive_spans(result)
+        )
+
+    def _additive_regexes(self) -> list[re.Pattern[str]]:
+        """The additive form of each effective pattern: rev 10's form of a
+        default (`_ADDITIVE_DEFAULT_PATTERNS`), an operator's pattern as it
+        is -- applied with `_value_separator`, which keeps base64 padding
+        whole where the first-separator split does not."""
+        return [
+            _ADDITIVE_FOR_DEFAULT.get(r.pattern, r) for r in self._redaction_regexes
+        ]
+
+    def _pattern_matches(self, text: str) -> bool:
+        """Does any effective or additive pattern match ``text``? Asked of a
+        percent-decoded query value, so an encoded token cannot evade a
+        pattern written for its decoded shape."""
+        return any(
+            regex.search(text)
+            for regex in (*self._redaction_regexes, *self._additive_regexes())
+        )
+
+    def _additive_spans(self, text: str) -> list[Span]:
+        spans: list[Span] = []
+        for regex in self._additive_regexes():
+            work(len(text))  # the pattern's scan
+            for match in regex.finditer(text):
+                full_match = match.group(0)
+                work(2 * len(full_match) + 1)  # the match, the split
+                split = _value_separator(full_match)
+                start = match.start() + split + 1 if split >= 0 else match.start()
+                # the value after the separator's own whitespace: a value that
+                # is already a marker (`key: [REDACTED]`) is then the marker's
+                # own span, and is kept exactly as it is
+                while start < match.end() and text[start].isspace():
+                    start += 1
+                spans.append((start, match.end(), REDACTED))
+        return widen_over_escapes(text, spans)
 
     def process_output(
         self,
