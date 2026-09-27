@@ -125,6 +125,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. See [#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
+- **Additive shape-based secret redaction on top of the existing redactor.**
+  The existing redactor runs unchanged; new rules then run over its output
+  and can only replace more of it with `[REDACTED]`, so every piece it
+  removes stays removed. They add vendor token shapes (AWS, Slack, Google,
+  `sk-`/`ghp_`/`glpat-`-style prefixes), JWTs, PEM private-key blocks,
+  high-entropy runs, values under a wider set of secret keys and in keyword
+  lists, URL userinfo, fragments and secret-keyed query values (judged after
+  percent-decoding), and the rest of a value after an existing marker. The
+  existing markers are kept exactly as written, a JSON document stays
+  valid (only string values are touched), and the added work is linear in
+  the input. The four entry points are `sanitize_auth_diagnostic`,
+  `PolicyManager.redact_secrets`, and `process_output` on a string and on a
+  structured result. A new `slow` pytest marker holds the large
+  differentials and regex sweeps (`pytest -m 'slow and not live'`). The
+  residual classes are listed in the plan. See Consiliency/pmcp#234.
 - **Bumped `anyio` 4.12.0 → 4.14.2** to clear advisories `GHSA-82r6-8w77-94w6` and `GHSA-5p39-cfhj-2xmp`. Lockfile-only; the D-01 `pip-audit --strict` gate is green again.
 - **`SECURITY.md` now states the v13 trust boundary, and every claim in it is
   bound to a test that proves it.** A new *The v13 trust boundary* section

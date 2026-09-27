@@ -1177,6 +1177,11 @@ def _is_resource_name_tail(text: str, marker: tuple[int, int], glued: int) -> bo
     )
 
 
+def _key_before_the_next_marker(text: str, glued: int) -> bool:
+    """The run ends in a key's `=`, glued to the next marker."""
+    return text[glued - 1] == "="
+
+
 def _runs_on_into(markers: list[tuple[int, int]], i: int, glued: int, end: int) -> bool:
     """The glued run after marker ``i`` ends AT the next marker, inside the
     span: the value goes on after that marker."""
@@ -1192,7 +1197,10 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
     * a span that starts ON a marker keeps the marker and replaces only the
       run glued to its end, up to whitespace, `&`, `#`, a quote, a
       backslash, `,`, `;`, `(`, `[`, `{`, `<` or the next marker, and on
-      across a marker it ends at, up to the span's end: the redactor's keyword rule stops at the
+      across a marker it ends at, up to the span's end -- except after an
+      ARN body, which it goes past only when the body ends in a key's `=`
+      (so a key inside an ARN's resource after the redactor's marker in the
+      ARN keeps its tail; disclosed): the redactor's keyword rule stops at the
       first character outside its value class, so `token=qVwYS81V!7Hb1DX8pP`
       reached this pass as `token=[REDACTED]!7Hb1DX8pP` (rev 17 left the
       tail). The run is replaced only if it holds a letter or a digit:
@@ -1225,13 +1233,25 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
             # When the run ends AT the next marker (the redactor wrote two
             # markers into one value: `password=KtJ0R$secret=KOmx@Zq9JTe`),
             # the run glued to that marker is the same value: follow it, up
-            # to the span's end. One step per adjacent marker.
+            # to the span's end. One step per adjacent marker. An ARN body
+            # stops it unless the body ends in a key's `=` (below).
             while True:
                 glued = _glued_run_end(text, markers[i][1], end)
                 if glued > markers[i][1] and _is_resource_name_tail(
                     text, markers[i], glued
                 ):
-                    break  # an ARN's body: the rest is its resource name
+                    # an ARN's body is kept. The chain goes on past it only
+                    # when a key's `=` is glued to the next marker
+                    # (`token=[REDACTED]:aws:s3:::x/token=[REDACTED]!TAIL`):
+                    # that marker starts another value. Otherwise (the
+                    # redactor's marker inside the ARN, `…:secretsmanager:`
+                    # then the region) the rest is the ARN's own.
+                    if _key_before_the_next_marker(text, glued) and _runs_on_into(
+                        markers, i, glued, end
+                    ):
+                        i += 1
+                        continue
+                    break
                 if glued > markers[i][1] and _is_a_tail(text[markers[i][1] : glued]):
                     pieces.append((markers[i][1], glued, replacement))
                 if _runs_on_into(markers, i, glued, end):

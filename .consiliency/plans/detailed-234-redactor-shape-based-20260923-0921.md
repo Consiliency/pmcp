@@ -568,6 +568,19 @@ The rules' purpose is covered as well:
     after the marker (F-3), including a resource name. A secret shaped
     like an ARN body (`x:aws:svc::…`) keeps that part, as the redactor
     does.
+  - **N-1: an ARN body ends the follow-on across markers** (implementation
+    board). As embedded above, the chain stops at an ARN body, so a second
+    key's tail after it survived
+    (`token=Ab3cd:aws:s3:::x/token=Zz9!TAIL77` →
+    `…/token=[REDACTED]!TAIL77`). The implementation PR goes on past an ARN
+    body when it ends in a key's `=` glued to the next marker, which closes
+    that shape (test and mutant). What stays: a key inside an ARN's
+    resource after the redactor's marker inside the ARN, such as its
+    region. There the chain stops at the ARN's own colon, so
+    `SECRET_ID=arn:aws:secretsmanager:us-east-1:…:secret:x/password=Kt!J0RTAIL9`
+    keeps `!J0RTAIL9` on E, as the redactor does. A test pins it. So
+    "a value marked twice keeps no tail" holds when no ARN body with an
+    inner marker sits between the markers.
 - **A punctuation-only tail** (D1, adopted in rev 18.1): a glued run
   without a letter or a digit is not replaced, so `token=abcdef!` →
   `token=[REDACTED]!`. The same rule leaves the punctuation after the

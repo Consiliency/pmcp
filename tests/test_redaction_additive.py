@@ -1616,7 +1616,10 @@ def test_code_and_log_mutant_rev_18_1_stops(monkeypatch: pytest.MonkeyPatch) -> 
 # When the redactor writes two markers into one value (a key word inside
 # it: `password=KtJ0R$secret=KOmx@Zq9JTe`), the run glued to the first
 # marker ends at the second; the glued run follows on after it (rev 18.1's
-# board, F-2).
+# board, F-2). The claim is narrower next to an ARN body: the follow-on
+# goes past one only when it ends in a key's `=` (tested below); a key in
+# an ARN's resource after the redactor's marker inside the ARN keeps its
+# tail (pinned below, disclosed).
 
 _INNER_KEYS = ("secret", "password", "code", "token", "api_key")
 _INNER_PUNCT = "!@$%^*|:~+/._-"
@@ -1682,6 +1685,40 @@ def test_an_arn_body_needs_a_service_field() -> None:
         assert "tailtail" not in out, (label, out)
     for label, out in _tail_surfaces("token=Pa55wd:aws:tailtail end").items():
         assert "tailtail" not in out, (label, out)
+
+
+@pytest.mark.parametrize(
+    ("text", "tail"),
+    [
+        ("token=Ab3cd:aws:s3:::x/token=Zz9!TAIL77", "TAIL77"),
+        ("secret=arn:aws:s3:::b/password=Ab3!cdTAIL9x", "cdTAIL9x"),
+        ("token=arn:aws-cn:s3:::bucket/api_key=Qq7$rrTAIL55 end", "rrTAIL55"),
+    ],
+)
+def test_the_follow_on_goes_past_an_arn_body_to_the_next_key(
+    text: str, tail: str
+) -> None:
+    """An ARN body glued between two markers is kept, and when it ends in a
+    key's `=` the next marker starts another value: its tail is removed
+    (the implementation board's N-1)."""
+    for label, out in _tail_surfaces(text).items():
+        assert tail not in out, (label, out)
+    assert ":aws" in _ours_e(text), _ours_e(text)
+
+
+def test_the_follow_on_past_an_arn_body_mutant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The rev 19 rule: the chain always stopped at an ARN body."""
+    monkeypatch.setattr(A, "_key_before_the_next_marker", lambda text, glued: False)
+    out = _ours_e("token=Ab3cd:aws:s3:::x/token=Zz9!TAIL77")
+    assert "TAIL77" in out, out
+
+
+def test_disclosed_a_key_inside_an_arn_after_its_inner_marker_keeps_its_tail() -> None:
+    """Pins a disclosed residual: when the redactor's marker sits INSIDE the
+    ARN (the region), the chain stops at the ARN's own colon, and a key in
+    the resource after a later marker keeps its tail on E."""
+    text = "SECRET_ID=arn:aws:secretsmanager:us-east-1:123456789012:secret:x/password=Kt!J0RTAIL9"
+    assert "!J0RTAIL9" in _ours_e(text)
 
 
 def test_arn_body_mutant(monkeypatch: pytest.MonkeyPatch) -> None:
