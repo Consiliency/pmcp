@@ -779,16 +779,51 @@ def test_the_additive_rules_remove_each_credential(
         assert secret not in out, (label, out)
 
 
-def test_prose_the_redactor_keeps_the_additive_rules_keep_too() -> None:
-    """The additive rules' own false positives: none on the prose corpus or
-    on 2 000 generated prose lines (the base pass's own stand)."""
-    assert _ours_e(PROSE) == _main_e(PROSE)
-    assert _ours_p(PROSE) == _main_p(PROSE)
+#: A key word, a plain word the redactor takes as its value, then
+#: punctuation: `token bucket?`, `secret=sauce!`. The glued run must leave
+#: that punctuation as the redactor wrote it.
+_KEYWORD_PUNCTUATION_LINES = [
+    f"{lead}{word}{sep}{follow}{mark}{trail}"
+    for word in ("secret", "token", "password", "key", "auth", "credential", "session")
+    for follow in ("sauce", "bucket", "reset", "rotation", "expired", "holder")
+    for mark in "!?.:;,)"
+    for lead in ("", "the ")
+    for trail in ("", " done")
+    for sep in (" ", "=")
+]
+
+
+def _prose_differences() -> list[str]:
+    bad = [
+        label
+        for label, same in (
+            ("E", _ours_e(PROSE) == _main_e(PROSE)),
+            ("P", _ours_p(PROSE) == _main_p(PROSE)),
+        )
+        if not same
+    ]
     rng = random.Random(9234)
-    for _ in range(2000):
-        text = _random_prose(rng)
-        assert _ours_e(text) == _main_e(text), text
-        assert _ours_p(text) == _main_p(text), text
+    for text in [_random_prose(rng) for _ in range(2000)] + _KEYWORD_PUNCTUATION_LINES:
+        if _ours_e(text) != _main_e(text) or _ours_p(text) != _main_p(text):
+            bad.append(text)
+    return bad
+
+
+def test_prose_the_redactor_keeps_the_additive_rules_keep_too() -> None:
+    """The additive rules' own false positives: none on the prose corpus, on
+    2 000 generated prose lines, or on key words followed by a word and
+    punctuation (the base pass's own stand)."""
+    bad = _prose_differences()
+    assert bad == [], bad[:10]
+
+
+def test_prose_mutant_a_glued_run_without_a_letter_or_digit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rev 18's first glued run (punctuation alone replaced too) marks the
+    punctuation after the redactor's own false positives."""
+    monkeypatch.setattr(A, "_is_a_tail", lambda run: True)
+    assert _prose_differences() != []
 
 
 def test_keyed_passwords_from_every_printable_character_are_removed() -> None:
@@ -1441,12 +1476,14 @@ def test_disclosed_a_whitespace_keyed_value_keeps_its_tail() -> None:
         assert "[REDACTED]!7Hb1DX8pP" in out, (label, out)
 
 
-def test_disclosed_punctuation_after_a_redactor_false_positive_is_marked() -> None:
-    """Pins a disclosed side effect of the glued run: after a marker the
-    redactor wrote over a word (`token=bucket!`), the glued punctuation is
-    replaced too."""
+def test_disclosed_a_punctuation_only_tail_stays() -> None:
+    """Pins a disclosed residual: a glued run of punctuation alone is not
+    replaced, so after a word the redactor took (`token=bucket!`) the output
+    is the redactor's, and a password's punctuation-only tail stays."""
     for label, out in _tail_surfaces("token=bucket!").items():
-        assert "[REDACTED][REDACTED]" in out, (label, out)
+        assert out.endswith(("token=[REDACTED]!", 'token=[REDACTED]!"}')), (label, out)
+    for label, out in _tail_surfaces("token=abcdef!").items():
+        assert "[REDACTED]!" in out and "abcdef" not in out, (label, out)
 
 
 def test_the_end_of_a_value_mutant_rev_17_skip(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1122,6 +1122,14 @@ def _glued_run_end(text: str, start: int, end: int) -> int:
     return position
 
 
+def _is_a_tail(run: str) -> bool:
+    """A glued run is the rest of a value only if it holds a letter or a
+    digit. Punctuation alone (`token=[REDACTED]!` after a word the redactor
+    took, `[REDACTED]:` before the next key) is left as written."""
+    work(len(run) + 1)
+    return any(c.isalnum() for c in run)
+
+
 #: An ARN's partition right after the marker the redactor wrote over its
 #: literal `arn`, under a key that names one (`secret_arn=[REDACTED]:aws:
 #: secretsmanager:...`, `"SecretArn": "[REDACTED]:aws:..."`): the rest is the
@@ -1152,7 +1160,8 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
       backslash or the next marker: the redactor's keyword rule stops at the
       first character outside its value class, so `token=qVwYS81V!7Hb1DX8pP`
       reached this pass as `token=[REDACTED]!7Hb1DX8pP` (rev 17 left the
-      tail). The rest of a query (`&page=2`) is not glued, and neither is an
+      tail). The run is replaced only if it holds a letter or a digit:
+      punctuation alone after a marker (`token=[REDACTED]!`) stays. The rest of a query (`&page=2`) is not glued, and neither is an
       ARN's resource name after the redacted `arn` (`:aws:...`);
     * a span that starts BEFORE a marker keeps its reach: each stretch of it
       outside the markers it overlaps is replaced, and each marker stays as
@@ -1178,7 +1187,11 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
             # its end -- the rest of a value the redactor cut short at a
             # character outside its value class (`token=[REDACTED]!7Hb1DX8pP`)
             glued = _glued_run_end(text, markers[i][1], end)
-            if glued > markers[i][1] and not _is_resource_name_tail(text, markers[i]):
+            if (
+                glued > markers[i][1]
+                and _is_a_tail(text[markers[i][1] : glued])
+                and not _is_resource_name_tail(text, markers[i])
+            ):
                 pieces.append((markers[i][1], glued, replacement))
             continue
         position = start
