@@ -115,7 +115,7 @@ def test_the_keyword_regex_is_main_s_verbatim() -> None:
 
 
 #: Fragments that exercise every decision the matcher makes: joiners and
-#: key fragments in a run (the boundary restart that makes main quadratic),
+#: key fragments in a run (a word boundary at every joiner),
 #: separators over `[\s:=]` whose greedy backtracking hands `=` back to the
 #: value, value characters, Unicode `\w` characters glued before a run (no
 #: `\b`), and the case-fold partners `(?i)` admits (`ſ K ı İ`).
@@ -154,17 +154,21 @@ def _matcher_corpus(
     return texts
 
 
-def _compare_with_timeout(texts: list[str], timeout: float) -> list[str]:
-    """Differences between the linear matcher and main's regex, the regex
-    run in worker processes so a quadratic input cannot hang the test: past
-    ``timeout`` the remaining input is reported (not skipped), and the pool
-    is terminated -- a running regex cannot be cancelled any other way."""
+def _compare_with_timeout(
+    texts: list[str],
+    timeout: float,
+    reference: Callable[[str], list[tuple[int, int, int, int]]] | None = None,
+) -> list[str]:
+    """Differences between the linear matcher and the regex (``reference``),
+    the regex run in worker processes so a long input cannot hang the test:
+    past ``timeout`` the remaining input is reported (not skipped), and the
+    pool is terminated -- a running regex cannot be cancelled any other
+    way."""
+    reference = reference or _real_keyword_matches
     problems: list[str] = []
     pool = multiprocessing.get_context("spawn").Pool(4)
     try:
-        pending = [
-            (text, pool.apply_async(_real_keyword_matches, (text,))) for text in texts
-        ]
+        pending = [(text, pool.apply_async(reference, (text,))) for text in texts]
         deadline = time.monotonic() + timeout
         for text, result in pending:
             try:
@@ -897,9 +901,8 @@ _ADVERSARIAL = {
 @pytest.mark.parametrize("name", sorted(_ADVERSARIAL))
 def test_timing_guard_on_every_surface(name: str) -> None:
     """66 KB of each adversarial shape on the engine, the policy surface and
-    `process_output` (string and dict): under 1 s for `a-`, 2 s for the rest. Main takes 3 s on 8 KB of
-    `a-` (its keyword regex restarts at every boundary); rev 10 took 3.5 s on
-    `password:=` (B3)."""
+    `process_output` (string and dict): under 1 s for `a-`, 2 s for the
+    rest. Rev 10 took 3.5 s on `password:=` (B3)."""
     text = _ADVERSARIAL[name]
     policy = PolicyManager()
     for label, run in (
@@ -911,9 +914,9 @@ def test_timing_guard_on_every_surface(name: str) -> None:
         started = time.perf_counter()
         run()
         elapsed = time.perf_counter() - started
-        # `a-` is main's own quadratic input: held to 1 s, as the linear
-        # matcher's guard; the rest to rev 10's 2 s bound (its additive
-        # keyword rules cost ~0.6 s on `token-` x 11 000 here)
+        # `a-` is held to 1 s, as the keyword matcher's own guard; the rest
+        # to rev 10's 2 s bound (its additive keyword rules cost ~0.6 s on
+        # `token-` x 11 000 here)
         assert elapsed < (1.0 if name == "a-" else 2.0), (name, label, elapsed)
 
 
@@ -929,10 +932,16 @@ def test_the_floor_itself_is_linear() -> None:
     assert timings[1] < 3 * timings[0] + 0.05, timings
 
 
+def _never_returns(text: str) -> list[tuple[int, int, int, int]]:
+    """A stand-in reference that outlives any budget."""
+    time.sleep(3600)
+    return []
+
+
 def test_the_regex_comparison_reports_a_timeout_instead_of_hanging() -> None:
-    """66 KB of `a-` takes main's regex minutes: the comparison reports it
-    within its budget and terminates the worker."""
+    """A reference past the budget is reported as a TIMEOUT within it, and
+    its worker is terminated."""
     started = time.perf_counter()
-    problems = _compare_with_timeout(["a-" * 33_000], timeout=2)
+    problems = _compare_with_timeout(["x"], timeout=2, reference=_never_returns)
     assert problems and problems[0].startswith("TIMEOUT"), problems
     assert time.perf_counter() - started < 30

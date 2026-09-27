@@ -21,9 +21,9 @@ tests (`tests/test_redaction_floor.py` against `tests/_main_redactor.py`,
 main's functions vendored verbatim): the intermediate text must equal what
 main's functions return, byte for byte, at the end of the replay.
 
-* Main's keyword rule is quadratic in the number of word boundaries in a
-  joiner-rich run (`a-a-a-...`: 8 KB takes 3 s on main), so it is replayed by
-  `main_keyword_matches`, a linear matcher proven equivalent to the regex.
+* Main's keyword rule is replayed by `main_keyword_matches`: main's own
+  linear matcher (`pmcp.keyword_matcher`), which yields exactly the matches
+  of the rule's regular expression, with main's frozen key set.
 * Main's URL rewrite (`redact_auth_url`) re-encodes what it keeps; it is
   called for real, and the output is aligned with the input component by
   component (`_url_pieces`). If the alignment does not reproduce main's
@@ -124,8 +124,7 @@ _MAIN_JWT_RE = re.compile(
 
 
 # --------------------------------------------------------------------------
-# main's keyword rule, linear: `pmcp.keyword_matcher` (standalone, so it can
-# replace main's quadratic regex on its own).
+# main's keyword rule: `pmcp.keyword_matcher`, as main runs it.
 
 
 def _main_keys_alternation(keys: frozenset[str]) -> str:

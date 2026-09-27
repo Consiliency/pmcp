@@ -1,9 +1,9 @@
 """`main`'s redactor, vendored VERBATIM from `origin/main` (1fb36f2) for the
 floor's fidelity tests (Consiliency/pmcp#234): `pmcp.redaction_floor` replays
 main's rules with origin tracking, and its intermediate text must equal what
-these functions return, byte for byte. Test-only: main's keyword rule is
-quadratic on joiner-rich runs (`a-a-a-...`), which is why production replays
-it with a linear matcher instead of calling it.
+these functions return, byte for byte. Test-only. The keyword rule here is
+the regular expression; main now runs the same rule through
+`pmcp.keyword_matcher`, which yields exactly its matches.
 
 Only `redact_secrets` is adapted: it is a method on main, here a function of
 the text and the effective compiled patterns.
