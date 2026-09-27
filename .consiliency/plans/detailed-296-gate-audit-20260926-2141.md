@@ -1,13 +1,29 @@
 # Detailed plan: record `tools/call` gate rejections in the scoped-advisor audit, without argument values
 
-> **Revision 4 (2026-09-26).** Consiliency/pmcp#296, the prerequisite for
-> piece B (`extra="forbid"`) of Consiliency/pmcp#236. The change is
-> **embedded, not described**: the five blocks under *Verbatim bodies* are
-> `git apply` patches against `origin/main` @ `959d4d4`, byte-identical to the
-> verified code on the local-only branch `wip/296-code` @ `6ab3db9` (not
-> pushed; rev 1 was `9ced94f`, rev 2 `e10304a`, rev 3 `e4e1bbb`). Proven by extracting them from this file,
-> `git apply --check` on a clean `959d4d4` tree, applying, and `cmp` against
-> `wip/296-code` (see *Embedding proof*).
+> **Revision 4 (2026-09-26), rebased on main `876fd33` (2026-09-27).**
+> Consiliency/pmcp#296, the prerequisite for piece B (`extra="forbid"`) of
+> Consiliency/pmcp#236. The change is **embedded, not described**: the five
+> blocks under *Verbatim bodies* are `git apply` patches against
+> `origin/main` @ `876fd33`, byte-identical to the verified code on the
+> local-only branch `wip/296-code` @ `80d0f93` (not pushed; rev 1 was
+> `9ced94f`, rev 2 `e10304a`, rev 3 `e4e1bbb`, rev 4 `6ab3db9`). Proven by
+> extracting them from this file, `git apply --check` on a clean `876fd33`
+> tree, applying, and `cmp` against `wip/296-code` (see *Embedding proof*).
+>
+> **Base move.** Revisions 1–4 were written against `959d4d4`. Main moved to
+> `876fd33` (PR 303: `auth.py`, `keyword_matcher.py`,
+> `tests/test_keyword_matcher.py`, one CHANGELOG line). `origin/main` was
+> merged into `wip/296-code` (merge commit `80d0f93`, no rebase). The one
+> conflict was CHANGELOG `[Unreleased]` → `### Fixed`, resolved as: the
+> Consiliency/pmcp#296 entry first, then main's new `sanitize_auth_diagnostic`
+> entry, then the rewritten Consiliency/pmcp#236 entry (main had not changed
+> that line). `git diff 6ab3db9 80d0f93` touches none of this plan's four
+> other files, so `src/` and the tests are byte-identical to rev 4; the
+> server, audit, test and README patches are byte-identical too, and only
+> the CHANGELOG patch was regenerated. Measurements below name the tree they
+> ran on: research, probes and mutants ran on `959d4d4`-based trees (the
+> plan's code is unchanged since); the embedding proof, gates, test module and
+> full suite were rerun on `876fd33`.
 >
 > **What rev 4 changes** (the rev 3 board's claude seat: PARTIALLY AGREE, no
 > code defect, four fresh mutants survived — the third round in a row from one
@@ -827,14 +843,14 @@ section.
 ## Verification
 
 ```bash
-cd <fresh worktree of origin/main @ 959d4d4>
+cd <fresh worktree of origin/main @ 876fd33>
 uv sync --all-extras -p 3.10                    # fresh worktree: else pytest is the system one
 # apply (see *Verbatim bodies → how to apply*)
 uv run pytest tests/test_scoped_advisor_audit.py -p no:cacheprovider --cov-fail-under=0 -q
                                                 # expect 175 passed (12 existing + 163 new)
 uv run ruff check src/ tests/                   # expect "All checks passed!"
-uv run ruff format --check src/ tests/          # expect "163 files already formatted"
-uv run mypy src/pmcp --exclude baml_client     # CI gate (test.yml:388); expect "no issues found in 50 source files"
+uv run ruff format --check src/ tests/          # expect "165 files already formatted" (163 on 959d4d4)
+uv run mypy src/pmcp --exclude baml_client     # CI gate (test.yml:388); expect "no issues found in 51 source files" (50 on 959d4d4)
 uv run mypy src/                                # same result on this tree
 env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir \
   uv run pytest -m 'not live and not slow' -p no:cacheprovider -q
@@ -846,34 +862,38 @@ python3 <scratch>/ledger_fields.py <agent-harness>/phase-loop-runtime/src/phase_
 
 ## Acceptance criteria — measured this session
 
-Tree: `wip/296-code` @ `6ab3db9` (rev 4; `src/` identical to rev 2's
-`e10304a`), base `959d4d4`; the gates marked *proof tree* ran in a fresh
-`959d4d4` worktree with the five patches extracted from this file applied
-(*Embedding proof*).
+Tree: `wip/296-code` @ `80d0f93` (rev 4 merged with main `876fd33`; this
+plan's `src/` identical to rev 2's `e10304a`, its tests to rev 4's `6ab3db9`),
+base `876fd33`; the gates marked *proof tree* ran in a fresh `876fd33`
+worktree with the five patches extracted from this file applied
+(*Embedding proof*), which `git diff --quiet 80d0f93` confirms equal to the
+merged branch as a whole tree.
 
-- [x] **Red on main** (`PYTHONPATH=<git archive 959d4d4 src>`): `159 failed, 16 passed in 10.41s`.
-  The 16 passing: the 12 existing tests, the Y3 retention test (main reads
-  all arguments), and the rejection sweep for the three tools that declare no
-  property (no rejection path; the test asserts that and returns).
+- [x] **Red on main** `876fd33` (`PYTHONPATH=<git archive 876fd33 src>`): `159 failed, 16 passed in 9.75s`
+  (on `959d4d4`: `159 failed, 16 passed in 10.41s`). The 16 passing: the 12
+  existing tests, the Y3 retention test (main reads all arguments), and the
+  rejection sweep for the three tools that declare no property (no rejection
+  path; the test asserts that and returns).
 - [x] **Red on rev 1** (`9ced94f` `src/`): `117 failed, 58 passed in 8.29s` —
   all 52 allowed-sweep and 56 ungated-sweep items, plus the 9 targeted items
   listed for rev 3. The rejection sweep passes on rev 1: its rejection record
   was already clean; the sweep pins it.
 - [x] **Rev 2/3 `src/`** (`e10304a`): `175 passed in 5.70s` — expected, rev 4
   changes no code; its additions are measured by the Z mutants.
-- [x] **Green with the patch** (proof tree): `175 passed in 5.73s`.
+- [x] **Green with the patch** (proof tree, `876fd33`): `175 passed in 6.05s`.
 - [x] `ruff check src/ tests/` (proof tree): `All checks passed!`
-- [x] `ruff format --check src/ tests/` (proof tree): `163 files already formatted`
-- [x] `mypy src/pmcp --exclude baml_client` (proof tree): `Success: no issues found in 50 source files`;
-  `mypy src/`: `Success: no issues found in 50 source files`
-- [x] Full suite, patched (proof tree, `env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir`): `4499 passed, 3 skipped, 25 deselected in 438.69s (0:07:18)` (`exit=0`; a first run was killed by the harness at 81% and rerun detached)
-- [x] Full suite, main `959d4d4` (rev 1's measurement, same host, same command; the base is unchanged): `4336 passed, 3 skipped, 25 deselected in 419.27s (0:06:59) (exit=0)`
+- [x] `ruff format --check src/ tests/` (proof tree): `165 files already formatted`
+- [x] `mypy src/pmcp --exclude baml_client` (proof tree): `Success: no issues found in 51 source files`;
+  `mypy src/`: `Success: no issues found in 51 source files`
+- [x] Full suite, patched (proof tree `876fd33`, `env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir`): `4516 passed, 3 skipped, 25 deselected in 460.19s (0:07:40)` (`exit=0`)
+- [x] Full suite, main `876fd33` (fresh worktree, same host, same command): `4353 passed, 3 skipped, 25 deselected in 427.14s (0:07:07)` (`exit=0`)
   Difference: +163 passed = exactly the 163 new test items; skips and deselections unchanged.
-- [x] Mutation run: `40/40 killed`; the sweep alone `19/40`, every survivor outside the class (§7).
+  (On `959d4d4`, rev 4: `4499` patched vs `4336` main, the same +163.)
+- [x] Mutation run (on `6ab3db9`, `959d4d4`-based; not rerun after the merge, since this plan's `src/` and tests are unchanged by it): `40/40 killed`; the sweep alone `19/40`, every survivor outside the class (§7).
 - [x] Ledger fields: `ledger_fields.py` → `equal: True` @ `18a324a4`; self-tests renamed `equal: True`, helper `equal: True`, dropped `equal: False`.
 - [x] Reader: agent-harness `reduce_research_audit` @ `18a324a4` on a rev 2 stream → `ledger: success None [('success', 'verified')]` (`src/` unchanged since).
 - [x] Embedding proof: five patches extracted from this file apply to
-  `959d4d4` and the result is `cmp`-equal to `wip/296-code` @ `6ab3db9` on all five files.
+  `876fd33` and the result is `cmp`-equal to `wip/296-code` @ `80d0f93` on all five files.
 - [ ] Panel CR + reconcile before merge (repo rule).
 - [ ] Piece B of Consiliency/pmcp#236 does not merge before this.
 
@@ -1063,41 +1083,44 @@ Z6 survived rev 3 (killed since rev 4, by the sweep).
 
 ## Embedding proof
 
-Rev 4, run after the patches were regenerated with
-`git diff 959d4d4 6ab3db9 -- <file>` and embedded (`server`,
-`scoped_advisor_audit`, `CHANGELOG` and `README` patches are `cmp`-equal to
-rev 3's; only the test patch changed); fresh worktree
-`$WORKTREE_ROOT/pmcp-296-rev4-proof` (removed afterwards):
+Rev 4 on main `876fd33`: patches regenerated with
+`git diff 876fd33 80d0f93 -- <file>` and embedded (`server`,
+`scoped_advisor_audit`, `test_scoped_advisor_audit` and `README` patches are
+`cmp`-equal to rev 4's against `959d4d4`; only the CHANGELOG patch changed,
+for main's new entry); fresh worktree `$WORKTREE_ROOT/pmcp-296-876-proof`
+(removed afterwards):
 
 ```text
 $ git -C <fresh worktree> rev-parse --short HEAD
-959d4d4
+876fd33
 <scratch>/emb/server.patch: 119 lines
 <scratch>/emb/scoped_advisor_audit.patch: 158 lines
 <scratch>/emb/test_scoped_advisor_audit.patch: 1089 lines
-<scratch>/emb/CHANGELOG.patch: 14 lines
+<scratch>/emb/CHANGELOG.patch: 15 lines
 <scratch>/emb/README.patch: 18 lines
 $ git apply --check <scratch>/emb/*.patch
 check: ok
 applied
-cmp src/pmcp/server.py: identical to wip/296-code@6ab3db9
-cmp src/pmcp/scoped_advisor_audit.py: identical to wip/296-code@6ab3db9
-cmp tests/test_scoped_advisor_audit.py: identical to wip/296-code@6ab3db9
-cmp CHANGELOG.md: identical to wip/296-code@6ab3db9
-cmp README.md: identical to wip/296-code@6ab3db9
+cmp src/pmcp/server.py: identical to wip/296-code@80d0f93
+cmp src/pmcp/scoped_advisor_audit.py: identical to wip/296-code@80d0f93
+cmp tests/test_scoped_advisor_audit.py: identical to wip/296-code@80d0f93
+cmp CHANGELOG.md: identical to wip/296-code@80d0f93
+cmp README.md: identical to wip/296-code@80d0f93
 $ git status --short
  M CHANGELOG.md
  M README.md
  M src/pmcp/scoped_advisor_audit.py
  M src/pmcp/server.py
  M tests/test_scoped_advisor_audit.py
+$ git diff --quiet 80d0f93 && echo "proof tree == 80d0f93 (whole tree)"
+proof tree == 80d0f93 (whole tree)
 ```
 
 ## Verbatim bodies
 
 ### How to apply (and the extractor)
 
-From a fresh worktree of `origin/main` @ `959d4d4`:
+From a fresh worktree of `origin/main` @ `876fd33`:
 
 ```bash
 PLAN=.consiliency/plans/detailed-296-gate-audit-20260926-2141.md   # read from branch plan/296-gate-audit
@@ -2526,15 +2549,16 @@ index 6ae178c..478e445 100644
 
 ````diff
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 12ec2d4..c6973ff 100644
+index ee5bacd..fae154f 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
-@@ -367,7 +367,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+@@ -367,8 +367,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  
  
  ### Fixed
--- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree (Consiliency/pmcp#236).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` now advertises its range on both sides, so `1e20`, `-1e20` and `float(±2**63)` are rejected at the gate, and so is any integer outside [−2^63+1, 2^63−1] (including `-2**63` itself), which the handler previously accepted. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. **Scoped-audit change until Consiliency/pmcp#296 lands:** gate rejections are not written to the scoped-advisor audit. So a *malformed* call to a *policy-blocked* gateway tool now gets `Input validation error: …` instead of "Gateway tool blocked by policy", and it is **no longer recorded as `denied`**. The same holds for the other inputs the gate now rejects that previously reached the handler and were recorded as `failure`. Well-formed calls to blocked tools are still recorded `denied`. Unknown keys are still ignored in this release — see the following entry once B lands. Argument descriptions agents already saw are unchanged, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description.
 +- **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values (Consiliency/pmcp#296).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name, `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
+ - **`sanitize_auth_diagnostic` does its keyword and URL-punctuation work in linear time.** The keyword rule now runs through `pmcp.keyword_matcher` (the same matches as the regular expression it replaces, pinned by a seeded corpus), and trailing punctuation is split off a URL in one pass. Output is unchanged.
+-- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree (Consiliency/pmcp#236).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` now advertises its range on both sides, so `1e20`, `-1e20` and `float(±2**63)` are rejected at the gate, and so is any integer outside [−2^63+1, 2^63−1] (including `-2**63` itself), which the handler previously accepted. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. **Scoped-audit change until Consiliency/pmcp#296 lands:** gate rejections are not written to the scoped-advisor audit. So a *malformed* call to a *policy-blocked* gateway tool now gets `Input validation error: …` instead of "Gateway tool blocked by policy", and it is **no longer recorded as `denied`**. The same holds for the other inputs the gate now rejects that previously reached the handler and were recorded as `failure`. Well-formed calls to blocked tools are still recorded `denied`. Unknown keys are still ignored in this release — see the following entry once B lands. Argument descriptions agents already saw are unchanged, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description.
 +- **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree (Consiliency/pmcp#236).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` now advertises its range on both sides, so `1e20`, `-1e20` and `float(±2**63)` are rejected at the gate, and so is any integer outside [−2^63+1, 2^63−1] (including `-2**63` itself), which the handler previously accepted. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the Consiliency/pmcp#296 entry above). Unknown keys are still ignored in this release — see the following entry once B lands. Argument descriptions agents already saw are unchanged, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description.
  - **Exact-version validation follows npm's classification of package specs.** `is_valid_package_version` now refuses a version ending in `.tgz`, `.tar` or `.tar.gz` (any case), matching npm-package-arg's `isFileType` rule, which npm applies before reading a selector as a registry version; and a version whose major, minor or patch exceeds 2^53 - 1 (JavaScript's `Number.MAX_SAFE_INTEGER`), which node-semver refuses and npm-package-arg then reads as a dist-tag. It uses npm 10's pattern (npm-package-arg 12.x, whose `.` before `gz` is unescaped), a superset of npm 11's, since pmcp runs whichever `npx` is on PATH. The provision gate, package approvals, the CLI and the `gateway.provision` handler inherit it. **Upgrade note:** a package approval recorded earlier at either kind of version now approves nothing; it is ignored with a warning naming it (the rest of the store keeps working) and dropped on the next write to the store; re-approving the package at a registry version is that write. (`pmcp trust revoke-package <name>` also clears it, but a bare name revokes that package's valid approvals too.) A record with any other defect still fails the store closed.
  - **A downstream MCP server can no longer hang a caller by sending a request, being cancelled, or timing out — the remaining "the server hangs" runtime gaps are closed.** A server→client JSON-RPC request (a frame carrying both `method` and `id`) is now answered rather than dropped: `ping` gets an empty result and any other method a `-32601` "Method not found" refusal (the gateway advertises no client capabilities, so it does not forward an untrusted server's request to the agent), and classifying by `method` first also stops a downstream request whose id collides with one of ours from being misrouted as our response. `_send_request` no longer leaks a `pending_requests` entry when the caller is cancelled or the write itself raises — the entry is popped in a `finally` and a mid-write error still propagates. Cancellation is now propagated downstream as `notifications/cancelled` on `gateway.cancel`, on idle/ceiling timeout, and on caller cancellation (never for `initialize`, per spec; exactly once per cancellation). Replies and cancellation notifications go through a bounded per-server outbound queue drained by a single writer task whose lifecycle is torn down with the connection, so a downstream that stalls its own sink cannot make the gateway allocate unbounded tasks or buffer unbounded frames (review findings C-01, C-02, C-04). See [#232](https://github.com/Consiliency/pmcp/issues/232).
