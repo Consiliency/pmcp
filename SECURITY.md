@@ -129,7 +129,8 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   shapes (AWS, Slack, Google, prefixed tokens such as `glpat-`), JWTs, PEM
   private-key blocks, high-entropy runs, values under a wider set of secret
   keys, URL userinfo, fragments and secret-keyed query values (judged after
-  percent-decoding), and the rest of a value after an existing marker. Every
+  percent-decoding), and the text glued to the end of an existing marker
+  (up to a delimiter; see the residuals). Every
   piece the keyword rules remove stays removed, markers are kept as
   written, and a JSON document stays valid. The residual classes (for
   example a tail after `,`, `;`, `&` or `#`, and a value under a

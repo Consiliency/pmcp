@@ -578,9 +578,26 @@ The rules' purpose is covered as well:
     resource after the redactor's marker inside the ARN, such as its
     region. There the chain stops at the ARN's own colon, so
     `SECRET_ID=arn:aws:secretsmanager:us-east-1:…:secret:x/password=Kt!J0RTAIL9`
-    keeps `!J0RTAIL9` on E, as the redactor does. A test pins it. So
-    "a value marked twice keeps no tail" holds when no ARN body with an
-    inner marker sits between the markers.
+    keeps `!J0RTAIL9` on E, as the redactor does. A test pins it.
+  - **A `:`-keyed second value after an ARN body.** The follow-on goes past
+    an ARN body only when it ends in `=`. A second key written with `:`
+    keeps its tail after its marker:
+    `token=Ab3cd:aws:s3:::x/token:Zz9!TAIL77` →
+    `token=[REDACTED]:aws:s3:::x/token:[REDACTED]!TAIL77` on E and P, as
+    the redactor gives it. Without the ARN, the same value is removed
+    (`token=[REDACTED][REDACTED]`).
+    - Measured on the implementation board's matrix (5 keys × 5 keys × 5 ARN
+      bodies × 12 punctuation characters, 1 500 cases per row), the tail
+      survives in:
+      - 875 E / 112 P with a `:` separator and an ARN between;
+      - 0 / 0 with `=`, and 0 / 0 without an ARN.
+    - Treating `:` like `=` would take the account and resource of a
+      secretsmanager ARN, whose body ends in `…:secretsmanager:` right
+      before the redactor's region marker. So it stays disclosed.
+  - So "a value marked twice keeps no tail" holds only when no ARN body
+    sits between the two markers. With an ARN body between, it holds only
+    when the second key uses `=` and the ARN has no marker of the
+    redactor's inside it.
 - **A punctuation-only tail** (D1, adopted in rev 18.1): a glued run
   without a letter or a digit is not replaced, so `token=abcdef!` →
   `token=[REDACTED]!`. The same rule leaves the punctuation after the

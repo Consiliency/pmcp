@@ -132,7 +132,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sk-`/`ghp_`/`glpat-`-style prefixes), JWTs, PEM private-key blocks,
   high-entropy runs, values under a wider set of secret keys and in keyword
   lists, URL userinfo, fragments and secret-keyed query values (judged after
-  percent-decoding), and the rest of a value after an existing marker. The
+  percent-decoding), and the text glued to the end of an existing marker
+  (up to a delimiter; see the residuals). The
   existing markers are kept exactly as written, a JSON document stays
   valid (only string values are touched), and the added work is linear in
   the input. The four entry points are `sanitize_auth_diagnostic`,
