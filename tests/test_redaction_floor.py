@@ -840,6 +840,42 @@ def test_each_board_finding_has_a_killing_mutant(
         check()
 
 
+def _n11_after_bearer() -> None:
+    """N11 narrowed (maintainer, after rev 11's report): a `name=value` token
+    right after `Bearer`/`Authorization` is the credential, and a pair whose
+    value is credential-shaped is not prose -- both redacted, as on main;
+    `token expires_in=3600` stays prose."""
+    for text, secret in (
+        ("x Bearer abcdef=SECRETPART end", "SECRETPART"),
+        ("Authorization: Bearer abcdef=SECRETPART", "SECRETPART"),
+        ("token code=abcdefg1234x", "abcdefg1234x"),
+    ):
+        for surface in (_engine, _policy):
+            assert secret not in surface(text), (text, surface(text))
+    for prose in ("token expires_in=3600", "token code=404"):
+        assert _engine(prose) == prose and _policy(prose) == prose
+
+
+def _old_n11(span: F.FloorSpan) -> bool:
+    return (
+        span.rule in ("keyword", "policy:2", "bearer")
+        and span.part == "value"
+        and F._whitespace_sep(span)
+        and re.match(r"[A-Za-z_-]+=[^=]", F._sep_and_value(span)[1] + span.after)
+        is not None
+    )
+
+
+def test_n11_never_fires_after_a_scheme_or_on_a_credential() -> None:
+    _n11_after_bearer()
+
+
+def test_the_old_n11_is_killed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(F.SUPPRESSIONS, "N11", _old_n11)
+    with pytest.raises(AssertionError):
+        _n11_after_bearer()
+
+
 # ============================================================== timing ==== #
 
 

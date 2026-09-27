@@ -77,11 +77,10 @@ httpx.HTTPStatusError: Client error '401 Unauthorized' for url 'https://api.exam
 JSONDecodeError SSLCertVerificationError IPv6Address Ed25519PrivateKey X509Cert
 Rsa2048Key Oauth2ClientError Base64UrlEncoder Sha256HashAlgorithm parseJSON2Dict
 
-status_code=401 error_code=invalid_grant token_type=Bearer expires_in=3600
+status_code=401 error_code=invalid_grant
 token_endpoint=https://auth.example/oauth/token code=404 token v2 is out
 {"code": -32601, "message": "Method not found", "data": {"code": "not_found"}}
 {"code": "not_found", "message": "no such tool", "request_id": "550e8400-e29b-41d4-a716-446655440000"}
-WWW-Authenticate: Bearer realm="api", error="insufficient_scope", scope="read write"
 secret_arn=arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret-a1b2c3
 exit code 137; error code 0x80070005; zip code 94105; status code 503
 error_code=AADSTS50011 sqlstate_code=42P01 error_codes=[50011] reason_code=E-1234
@@ -345,9 +344,13 @@ def test_bearer_is_a_scheme_not_a_word() -> None:
     # credential-shaped value there is not in any stated class, so the floor
     # keeps main's redaction (B2 of rev 10's board: `--bearer s3cr3tvalue`)
     assert _engine("non-bearer 2024-01-01 report") == "non-bearer [REDACTED] report"
-    assert _engine('Bearer realm="api", error="x"') == 'Bearer realm="api", error="x"'
+    # a `name=value` pair right after the scheme is its value, as on main
+    # (the maintainer's N11 decision after rev 11: never directly after
+    # Bearer/Authorization; `expires_in=3600` and `realm="api"` go as main's
+    # `bearer\\s+[^\\s,;]+` took them)
+    assert _engine('Bearer realm="api", error="x"') == 'Bearer [REDACTED]", error="x"'
     assert _engine("token_type=Bearer expires_in=3600") == (
-        "token_type=Bearer expires_in=3600"
+        "token_type=Bearer [REDACTED]"
     )
 
 
@@ -881,8 +884,16 @@ def _random_prose(rng: random.Random) -> str:
         lambda: f"run --{rng.choice(_PROSE_WORDS)} {rng.choice(_PROSE_WORDS)}",
         lambda: f'{{"code": -{rng.randint(32000, 32768)}, "message": "{words()}"}}',
     ]
+
+    def clause() -> str:
+        text = rng.choice(clauses)()
+        # whatever follows the word `bearer` is its value on main (a
+        # `name=value` clause too: the maintainer's N11 decision), so the
+        # word never ends a clause here
+        return text + " of bad news" if text.lower().endswith("bearer") else text
+
     return rng.choice([" ", ", ", "; ", ". ", "\n"]).join(
-        rng.choice(clauses)() for _ in range(rng.randint(3, 6))
+        clause() for _ in range(rng.randint(3, 6))
     )
 
 
@@ -1365,7 +1376,7 @@ def test_quoted_bearer_and_httpie_and_ruby_separators() -> None:
         ("password==hunter2", "password==[REDACTED]"),
         ('{"password"=>"hunter2"}', '{"password"=>"[REDACTED]"}'),
         ("if token == expected:", "if token == expected:"),
-        ("token_type=Bearer expires_in=3600", "token_type=Bearer expires_in=3600"),
+        ("token_type=Bearer expires_in=3600", "token_type=Bearer [REDACTED]"),
     ]:
         assert _engine(text) == expected, text
         assert "hunter2" not in _policy(text) and "abc123def456" not in _policy(text), (
@@ -3105,18 +3116,38 @@ def test_a_url_never_ends_on_the_backslash_of_an_escaped_quote(text: str) -> Non
 
 #: The false positives each rev-9 narrowing was written for (the rev-10
 #: audit's guard list): `(text, engine, policy, dict leaf)`, `None` meaning
-#: unchanged. Four entries changed from rev 9, each commented; every other
+#: unchanged. Four entries changed from rev 9, each commented (and four more
+#: after rev 11: a pair right after `Bearer`, as on main); every other
 #: entry is exactly rev 9's output.
 _FALSE_POSITIVE_TABLE: list[tuple[str, str | None, str | None, str | None]] = [
-    ("token_type=Bearer expires_in=3600", None, None, None),
+    # N11 is never read directly after the scheme (the maintainer's decision
+    # after rev 11): what follows `Bearer` is its value, as on main
+    (
+        "token_type=Bearer expires_in=3600",
+        *(
+            "token_type=Bearer [REDACTED]",
+            "token_type=Bearer [REDACTED]",
+            "token_type=Bearer [REDACTED]",
+        ),
+    ),
     ('{"token_type": "Bearer"}', None, None, None),
     ("token_type: Bearer, expires_in: 3600", None, None, None),
     ('{"token_type":"Bearer","expires_in":3600}', None, None, None),
     ("token_type=bearer&expires_in=3600", None, None, None),
     ("Missing bearer token", None, None, None),
     ("the bearer of bad news", None, None, None),
-    ('Bearer realm="api"', None, None, None),
-    ('WWW-Authenticate: Bearer realm="x", error="invalid_token"', None, None, None),
+    (
+        'Bearer realm="api"',
+        *('Bearer [REDACTED]"', 'Bearer [REDACTED]"', 'Bearer [REDACTED]"'),
+    ),
+    (
+        'WWW-Authenticate: Bearer realm="x", error="invalid_token"',
+        *(
+            'WWW-Authenticate: Bearer [REDACTED]", error="invalid_token"',
+            'WWW-Authenticate: Bearer [REDACTED]", error="invalid_token"',
+            'WWW-Authenticate: Bearer [REDACTED]", error="invalid_token"',
+        ),
+    ),
     (
         "token_type: Bearer\nexpires_in: 3600",
         "token_type: Bearer\nexpires_in: 3600",
@@ -3124,7 +3155,14 @@ _FALSE_POSITIVE_TABLE: list[tuple[str, str | None, str | None, str | None]] = [
         "token_type: [REDACTED] 3600",
     ),
     ("auth: Bearer", None, None, None),
-    ("scheme=Bearer scope=read", None, None, None),
+    (
+        "scheme=Bearer scope=read",
+        *(
+            "scheme=Bearer [REDACTED]",
+            "scheme=Bearer [REDACTED]",
+            "scheme=Bearer [REDACTED]",
+        ),
+    ),
     (
         "arn:aws:secretsmanager:us-east-1:123456789012:secret:MyDbPassword-AbCdEf",
         None,
@@ -3265,7 +3303,8 @@ def test_the_false_positive_guard_list_holds() -> None:
     assert (
         len(_FALSE_POSITIVE_TABLE) == len({t for t, *_ in _FALSE_POSITIVE_TABLE}) == 71
     )
-    assert sum(1 for _, e, *_ in _FALSE_POSITIVE_TABLE if e is None) >= 55
+    # four fewer unchanged entries after rev 11: a pair right after `Bearer`
+    assert sum(1 for _, e, *_ in _FALSE_POSITIVE_TABLE if e is None) >= 51
     policy = PolicyManager()
     for text, engine, pol, leaf in _FALSE_POSITIVE_TABLE:
         assert _engine(text) == (text if engine is None else engine), text

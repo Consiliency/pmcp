@@ -165,7 +165,7 @@ class FloorSpan:
     sep: str = ""
     value: str = ""
     before: str = ""
-    #: the intermediate text just after the match (a few characters)
+    #: the intermediate text just after the match (at most 256 characters)
     after: str = ""
     #: the input text this span covers, and the input just before it
     removed: str = ""
@@ -568,7 +568,7 @@ def _authorization_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
                 key=m.group(1),
                 sep=scheme,
                 before=_context(cur, m.start()),
-                after=cur[m.end() : m.end() + 8],
+                after=cur[m.end() : m.end() + 256],
             )
         )
     tracked.rewrite(edits)
@@ -590,7 +590,7 @@ def _bearer_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
                 key=m.group(1).rstrip(),
                 sep=m.group(1)[len(m.group(1).rstrip()) :],
                 before=_context(cur, m.start()),
-                after=cur[m.end() : m.end() + 8],
+                after=cur[m.end() : m.end() + 256],
             )
         )
     tracked.rewrite(edits)
@@ -611,7 +611,7 @@ def _keyword_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
                 sep=cur[key_end:value_start],
                 value=tracked.source(value_start, end),
                 before=_context(cur, start),
-                after=cur[end : end + 8],
+                after=cur[end : end + 256],
             )
         )
     tracked.rewrite(edits)
@@ -656,7 +656,10 @@ def _policy_step(
     for m in regex.finditer(cur):
         full = m.group(0)
         separator = next((i for i, char in enumerate(full) if char in ":="), -1)
-        info = {"before": _context(cur, m.start()), "after": cur[m.end() : m.end() + 8]}
+        info = {
+            "before": _context(cur, m.start()),
+            "after": cur[m.end() : m.end() + 256],
+        }
         if separator >= 0:
             a = m.start() + separator + 1
             edits.append(
@@ -1166,17 +1169,24 @@ def _c3(span: FloorSpan) -> bool:
 _PAIR_RE = re.compile(r"[A-Za-z_-]+=[^=]")
 
 
+_PAIR_VALUE_RE = re.compile(r"[A-Za-z_-]+=([^\s\"',;]*)")
+
+
 @suppression("N11")
 def _n11(span: FloorSpan) -> bool:
-    """After a keyword and whitespace, a `name=value` token is its own pair,
-    not the keyword's value (`token expires_in=3600`, `Bearer realm="api"`,
-    `token code=404`)."""
-    return (
-        span.rule in ("keyword", "policy:2", "bearer")
-        and span.part == "value"
-        and _whitespace_sep(span)
-        and _PAIR_RE.match(_sep_and_value(span)[1] + span.after) is not None
-    )
+    """After a keyword and whitespace, a `name=value` token whose value is
+    not credential-shaped is its own pair, not the keyword's value (`token
+    expires_in=3600`, `token code=404`). Never after `Bearer` or
+    `Authorization`: whatever follows the scheme is the credential
+    (`Bearer abcdef=SECRETPART`), as main read it."""
+    if span.rule not in ("keyword", "policy:2") or span.part != "value":
+        return False
+    if span.key.strip().lower() in ("bearer", "authorization"):
+        return False
+    if not _whitespace_sep(span):
+        return False
+    pair = _PAIR_VALUE_RE.match(_sep_and_value(span)[1] + span.after)
+    return pair is not None and not looks_like_credential(pair.group(1))
 
 
 def _single_case(word: str) -> bool:
