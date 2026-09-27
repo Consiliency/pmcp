@@ -1358,13 +1358,23 @@ _MARKERS = (
 #: The index of the one generated value that sits in a declared key the gate
 #: rejects (see `_invalid_declared`).
 _INVALID_INDEX = 99
-#: The one pre-existing log line this plan does not own, and exactly it:
-#: `call_tool`'s `except Exception` logs `f"Tool execution error: {e}"`, which
-#: echoes a pydantic `InvokeInput` error's input -- e.g. a non-dict `meta`
-#: reaching the model by alias, on main too (Consiliency/pmcp#297 names it) --
-#: and an unknown tool's name (unreachable under the scoped policy).
-_FOREIGN_LOG_PREFIX = "Tool execution error: "
-_FOREIGN_LOG_CHANNELS = ("validation error for InvokeInput", "Unknown tool:")
+#: The pre-existing log lines this plan does not own, matched as whole
+#: messages so that one carrying anything more stays in the oracle. Both come
+#: from `call_tool`'s `except Exception`, `f"Tool execution error: {e}"`:
+#: - pydantic's `InvokeInput` error for a non-dict `meta` (it reaches the
+#:   model by alias), which echoes the value -- on main too; the channel
+#:   Consiliency/pmcp#297 names. It is the only `InvokeInput` error the sweep
+#:   produces (measured: 216 lines, all this shape);
+#: - `Unknown tool: <name>`, excluded only for the exact name of the call
+#:   that produced it (see `_LoggedCalls`); unreachable under the scoped
+#:   policy, whose allowlist is four registered names.
+_FOREIGN_INVOKE_INPUT = re.compile(
+    r"Tool execution error: 1 validation error for InvokeInput\n"
+    r"meta\n"
+    r"  Input should be a valid dictionary "
+    r"\[type=dict_type, input_value=[^\n]*, input_type=[A-Za-z_]+\]\n"
+    r"    For further information visit https://errors\.pydantic\.dev/[0-9.]+/v/dict_type"
+)
 #: Only for `gateway.invoke` may a generated key change the status and so the
 #: result digest: an undeclared `meta` reaches `InvokeInput` by alias.
 _INVOKE_ONLY_EXEMPT = frozenset({"terminal_status", "redacted_result_digest"})
@@ -1589,10 +1599,12 @@ def _assert_nothing_generated_leaked(
             assert forbidden not in log_text, ("log", forbidden)
 
 
-def _is_foreign(message: str) -> bool:
-    return message.startswith(_FOREIGN_LOG_PREFIX) and any(
-        channel in message for channel in _FOREIGN_LOG_CHANNELS
-    )
+def _is_foreign(message: str, name: str | None = None) -> bool:
+    """Whether `message` is exactly one of the lines above -- the whole of it.
+    `name` is the tool name of the call that logged it, if known."""
+    if _FOREIGN_INVOKE_INPUT.fullmatch(message):
+        return True
+    return name is not None and message == f"Tool execution error: Unknown tool: {name}"
 
 
 _PMCP_FORMATTERS: list[logging.Formatter] = []
@@ -1615,30 +1627,43 @@ def _pmcp_formatters() -> list[logging.Formatter]:
     return _PMCP_FORMATTERS
 
 
-def _log_text(caplog: pytest.LogCaptureFixture) -> str:
+def _log_text(
+    caplog: pytest.LogCaptureFixture, calls: _LoggedCalls | None = None
+) -> str:
     """Every log record as pmcp's formatters render it -- message, and any
-    `exc_info` traceback -- bar the one foreign line shape above."""
+    `exc_info` traceback -- bar the exact foreign lines above."""
     # The capture is live (DEBUG, root), so an empty result is not vacuous
     # by accident: the gateway logs on start-up and shutdown.
     assert caplog.records, "nothing was logged, so the log oracle proves nothing"
+    excluded = calls.foreign if calls is not None else set()
     return "\n".join(
         formatter.format(record)
         for record in caplog.records
-        if not _is_foreign(record.getMessage())
+        if id(record) not in excluded and not _is_foreign(record.getMessage())
         for formatter in _pmcp_formatters()
     )
 
 
-_VOLATILE_LOG = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:[.,]\d+)?|0x[0-9a-fA-F]+")
+#: A default object repr, the one volatile part a message can carry besides
+#: the time (none measured in the sweep's logs; kept exact, never a bare hex).
+_OBJECT_REPR = re.compile(r"(<[A-Za-z_][\w.]* object) at 0x[0-9a-f]+>")
 
 
-def _normalized_log(records: list[logging.LogRecord]) -> str:
-    """Records as pmcp's formatters render them, timestamps and addresses
-    removed, the one foreign #297 line shape left out."""
+def _normalized(record: logging.LogRecord, formatter: logging.Formatter) -> str:
+    """`record` as `formatter` renders it at a fixed time, so the timestamp
+    both pmcp formatters print (`asctime` / `ts`, from `record.created`) is
+    the same for every call -- no pattern over the rendered text."""
+    fixed = logging.makeLogRecord(record.__dict__)
+    fixed.created, fixed.msecs, fixed.relativeCreated = 0.0, 0.0, 0.0
+    fixed.exc_text = None
+    return _OBJECT_REPR.sub(r"\1 at ADDRESS>", formatter.format(fixed))
+
+
+def _normalized_log(records: list[logging.LogRecord], excluded: set[int]) -> str:
     return "\n".join(
-        _VOLATILE_LOG.sub("<v>", formatter.format(record))
+        _normalized(record, formatter)
         for record in records
-        if not _is_foreign(record.getMessage())
+        if id(record) not in excluded and not _is_foreign(record.getMessage())
         for formatter in _pmcp_formatters()
     )
 
@@ -1652,13 +1677,22 @@ class _LoggedCalls:
     def __init__(self, server: GatewayServer, caplog: pytest.LogCaptureFixture) -> None:
         self.server = server
         self.caplog = caplog
+        #: Records that are exactly `Tool execution error: Unknown tool: <name>`
+        #: for the name of the call that logged them.
+        self.foreign: set[int] = set()
 
     async def pair(self, label: str, calls: list[tuple[str, dict]]) -> list[Any]:
         logs, results = [], []
         for name, arguments in calls:
             start = len(self.caplog.records)
             results.append(await _call(self.server, name, arguments))
-            logs.append(_normalized_log(self.caplog.records[start:]))
+            produced = self.caplog.records[start:]
+            self.foreign |= {
+                id(record)
+                for record in produced
+                if _is_foreign(record.getMessage(), name)
+            }
+            logs.append(_normalized_log(produced, self.foreign))
         assert all(log == logs[0] for log in logs), (label, logs)
         return results
 
@@ -1782,7 +1816,7 @@ async def test_generated_caller_values_never_reach_an_allowed_record(
         _assert_pair(tool_name, label, first, reference, exempt)
     _assert_nothing_generated_leaked(
         audit_path.read_text(),
-        _log_text(caplog),
+        _log_text(caplog, calls),
         len(_generated_keys(declared, _TAGS[1])),
         url_hash=not containers,
     )
@@ -1828,7 +1862,7 @@ async def test_generated_caller_values_never_reach_an_uncorrelated_invoke_record
         )
     _assert_nothing_generated_leaked(
         audit_path.read_text(),
-        _log_text(caplog),
+        _log_text(caplog, calls),
         len(_generated_keys(declared, _TAGS[1])),
     )
 
@@ -1882,7 +1916,7 @@ async def test_generated_caller_values_never_reach_a_rejection_record(
         assert first == second, (tool_name, shape)
     _assert_nothing_generated_leaked(
         audit_path.read_text(),
-        _log_text(caplog),
+        _log_text(caplog, calls),
         len(_generated_keys(declared, _TAGS[1])),
     )
 
@@ -1947,7 +1981,7 @@ async def test_generated_caller_values_never_reach_an_ungated_record(
         assert records[0].get(field) is None, field
     _assert_nothing_generated_leaked(
         audit_path.read_text(),
-        _log_text(caplog),
+        _log_text(caplog, calls),
         len(_generated_keys(declared, _TAGS[1])) + len(declared),
     )
 
@@ -1997,6 +2031,52 @@ async def test_generated_caller_values_on_the_real_scoped_handlers(
         _assert_pair(tool_name, f"real {shape}", first, reference, exempt)
     _assert_nothing_generated_leaked(
         audit_path.read_text(),
-        _log_text(caplog),
+        _log_text(caplog, calls),
         len(_generated_keys(declared, _TAGS[1])),
     )
+
+
+def _log_record(message: str, created: float) -> logging.LogRecord:
+    record = logging.LogRecord(
+        "pmcp.server", logging.DEBUG, __file__, 1, message, None, None
+    )
+    record.created = created
+    return record
+
+
+def test_the_log_normalisation_keeps_a_hex_count_and_drops_only_the_time() -> None:
+    """Regression (PR 306 board): a caller-derived count logged in hex must
+    survive normalisation; only the time and a default object repr's address
+    are volatile."""
+    count_a = _normalized_log([_log_record("argument_count=0x28", 1.0)], set())
+    count_b = _normalized_log([_log_record("argument_count=0x2e", 2.0)], set())
+    assert count_a != count_b
+    assert "0x28" in count_a and "0x2e" in count_b
+    same_a = _normalized_log([_log_record("started", 1.0)], set())
+    same_b = _normalized_log([_log_record("started", 1_000_000.5)], set())
+    assert same_a == same_b
+    repr_a = _normalized_log([_log_record("<a.B object at 0x7f00aa>", 1.0)], set())
+    repr_b = _normalized_log([_log_record("<a.B object at 0x7f00bb>", 1.0)], set())
+    assert repr_a == repr_b
+    # A hex span that is not an object repr's address is kept.
+    assert _normalized_log(
+        [_log_record("fp 0x7f00aa>", 1.0)], set()
+    ) != _normalized_log([_log_record("fp 0x7f00bb>", 1.0)], set())
+
+
+def test_the_foreign_log_exclusion_matches_only_the_exact_lines() -> None:
+    """Regression (PR 306 board): a line that starts like a foreign one but
+    carries anything more stays in the oracle."""
+    with pytest.raises(ValidationError) as raised:
+        InvokeInput.model_validate({"tool_id": "a::b", "meta": "caller_marker_x"})
+    invoke_input = f"Tool execution error: {raised.value}"
+    assert _is_foreign(invoke_input)
+    assert not _is_foreign(invoke_input + " (3 args)")
+    assert not _is_foreign(invoke_input.replace("meta\n", "meta\npayload=x\n", 1))
+    unknown = "Tool execution error: Unknown tool: gateway.caller_name"
+    assert _is_foreign(unknown, "gateway.caller_name")
+    assert not _is_foreign(unknown)
+    assert not _is_foreign(unknown, "gateway.other")
+    payload = "Tool execution error: Unknown tool: payload={'k': 'caller_marker_x'}"
+    assert not _is_foreign(payload)
+    assert not _is_foreign(payload, "gateway.caller_name")
