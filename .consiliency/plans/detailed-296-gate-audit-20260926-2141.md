@@ -5,7 +5,7 @@
 > Consiliency/pmcp#236. The change is **embedded, not described**: the five
 > blocks under *Verbatim bodies* are `git apply` patches against
 > `origin/main` @ `876fd33`, byte-identical to the verified code on the
-> local-only branch `wip/296-code` @ `80d0f93` (not pushed; rev 1 was
+> local-only branch `wip/296-code` @ `6ceff9a` (not pushed; rev 1 was
 > `9ced94f`, rev 2 `e10304a`, rev 3 `e4e1bbb`, rev 4 `6ab3db9`). Proven by
 > extracting them from this file, `git apply --check` on a clean `876fd33`
 > tree, applying, and `cmp` against `wip/296-code` (see *Embedding proof*).
@@ -13,7 +13,10 @@
 > **Base move.** Revisions 1–4 were written against `959d4d4`. Main moved to
 > `876fd33` (PR 303: `auth.py`, `keyword_matcher.py`,
 > `tests/test_keyword_matcher.py`, one CHANGELOG line). `origin/main` was
-> merged into `wip/296-code` (merge commit `80d0f93`, no rebase). The one
+> merged into `wip/296-code` (merge commit `80d0f93`, no rebase; then
+> `6ceff9a`, which writes the sweep's zero-width space and Cyrillic
+> look-alikes as `\u` escapes so the test source and this plan are
+> ASCII-visible — same strings, test-only). The one
 > conflict was CHANGELOG `[Unreleased]` → `### Fixed`, resolved as: the
 > Consiliency/pmcp#296 entry first, then main's new `sanitize_auth_diagnostic`
 > entry, then the rewritten Consiliency/pmcp#236 entry (main had not changed
@@ -893,7 +896,11 @@ merged branch as a whole tree.
 - [x] Ledger fields: `ledger_fields.py` → `equal: True` @ `18a324a4`; self-tests renamed `equal: True`, helper `equal: True`, dropped `equal: False`.
 - [x] Reader: agent-harness `reduce_research_audit` @ `18a324a4` on a rev 2 stream → `ledger: success None [('success', 'verified')]` (`src/` unchanged since).
 - [x] Embedding proof: five patches extracted from this file apply to
-  `876fd33` and the result is `cmp`-equal to `wip/296-code` @ `80d0f93` on all five files.
+  `876fd33` and the result is `cmp`-equal to `wip/296-code` @ `6ceff9a` on all five files.
+- [x] After the escape commit `6ceff9a` (fresh `876fd33` proof tree): test module `175 passed in 6.74s`;
+  `ruff check`: `All checks passed!`; `ruff format --check`: `165 files already formatted`. The
+  full suite and mypy above ran on `80d0f93`; `6ceff9a` changes only four string
+  literals in the test file to equivalent escapes.
 - [ ] Panel CR + reconcile before merge (repo rule).
 - [ ] Piece B of Consiliency/pmcp#236 does not merge before this.
 
@@ -1083,12 +1090,12 @@ Z6 survived rev 3 (killed since rev 4, by the sweep).
 
 ## Embedding proof
 
-Rev 4 on main `876fd33`: patches regenerated with
-`git diff 876fd33 80d0f93 -- <file>` and embedded (`server`,
-`scoped_advisor_audit`, `test_scoped_advisor_audit` and `README` patches are
-`cmp`-equal to rev 4's against `959d4d4`; only the CHANGELOG patch changed,
-for main's new entry); fresh worktree `$WORKTREE_ROOT/pmcp-296-876-proof`
-(removed afterwards):
+Rev 4 on main `876fd33`, after the escape commit: patches regenerated with
+`git diff 876fd33 6ceff9a -- <file>` (only the test patch changed from the
+`80d0f93` proof, and it is now pure ASCII) and embedded; fresh worktree
+`$WORKTREE_ROOT/pmcp-296-esc-proof` (removed afterwards). No character of
+category Cc (other than tab), Cf, Zl or Zp, no U+0085 and no Cyrillic letter
+remains anywhere in this plan (`unicodedata` scan).
 
 ```text
 $ git -C <fresh worktree> rev-parse --short HEAD
@@ -1101,19 +1108,19 @@ $ git -C <fresh worktree> rev-parse --short HEAD
 $ git apply --check <scratch>/emb/*.patch
 check: ok
 applied
-cmp src/pmcp/server.py: identical to wip/296-code@80d0f93
-cmp src/pmcp/scoped_advisor_audit.py: identical to wip/296-code@80d0f93
-cmp tests/test_scoped_advisor_audit.py: identical to wip/296-code@80d0f93
-cmp CHANGELOG.md: identical to wip/296-code@80d0f93
-cmp README.md: identical to wip/296-code@80d0f93
+cmp src/pmcp/server.py: identical to wip/296-code@6ceff9a
+cmp src/pmcp/scoped_advisor_audit.py: identical to wip/296-code@6ceff9a
+cmp tests/test_scoped_advisor_audit.py: identical to wip/296-code@6ceff9a
+cmp CHANGELOG.md: identical to wip/296-code@6ceff9a
+cmp README.md: identical to wip/296-code@6ceff9a
 $ git status --short
  M CHANGELOG.md
  M README.md
  M src/pmcp/scoped_advisor_audit.py
  M src/pmcp/server.py
  M tests/test_scoped_advisor_audit.py
-$ git diff --quiet 80d0f93 && echo "proof tree == 80d0f93 (whole tree)"
-proof tree == 80d0f93 (whole tree)
+$ git diff --quiet 6ceff9a && echo "proof tree == 6ceff9a (whole tree)"
+proof tree == 6ceff9a (whole tree)
 ```
 
 ## Verbatim bodies
@@ -1455,7 +1462,7 @@ index 8dfb4ee..76d96e6 100644
 
 ````diff
 diff --git a/tests/test_scoped_advisor_audit.py b/tests/test_scoped_advisor_audit.py
-index 6ae178c..478e445 100644
+index 6ae178c..b4b6fed 100644
 --- a/tests/test_scoped_advisor_audit.py
 +++ b/tests/test_scoped_advisor_audit.py
 @@ -1,14 +1,18 @@
@@ -2275,8 +2282,8 @@ index 6ae178c..478e445 100644
 +        "_" + name,
 +        name.upper(),
 +        name.title(),
-+        name.replace("e", "е", 1).replace("a", "а", 1),
-+        name + "​",
++        name.replace("e", "\u0435", 1).replace("a", "\u0430", 1),
++        name + "\u200b",
 +    }
 +
 +
@@ -2487,8 +2494,8 @@ index 6ae178c..478e445 100644
 +_UNREGISTERED_NAME_PAIRS = (
 +    ("gateway.caller_marker_a", "gateway.caller_marker_b"),
 +    ("GATEWAY.HEALTH", "Gateway.Health"),
-+    ("_gateway.health", "gateway.health​"),
-+    ("gateway.hеalth", "gateway.heаlth"),
++    ("_gateway.health", "gateway.health\u200b"),
++    ("gateway.h\u0435alth", "gateway.he\u0430lth"),
 +    ("gateway.run_correlation_id", "gateway.tool_id"),
 +)
 +
