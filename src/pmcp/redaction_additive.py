@@ -667,9 +667,11 @@ _BEARER_RE = re.compile(
     r"(?P<key>bearer(?:(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")+|" + _BREAK + r"))"
     r"(?![A-Za-z_-]+=[^=])"
     r"(?:[\"'(\[{<](?=[^\s,;\"'()\[\]{}<>\\]+[\"')\]}>]))?"
-    # a whitespace escape is separator, never the start of a value (the
-    # separator's own `+` gives one back when what follows is no value)
-    r"(?!" + _JSON_SPACE_ESCAPE + r")"
+    # a value is never whitespace escapes alone (the separator's own `+`
+    # gives one back when what follows is no value: `Bearer\u3000[...]`);
+    # an escape before a value is part of it, as before (`Bearer\r\na-b=x`
+    # inside a JSON string)
+    r"(?!(?:" + _JSON_SPACE_ESCAPE + r")+(?:[\s,;\"'()\[\]{}<>]|$))"
     r"(?P<value>[^\s,;\"'()\[\]{}<>]*[^\s,;\"'()\[\]{}<>\\])",
     re.IGNORECASE,
 )
@@ -1111,25 +1113,47 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
     """The disjoint spans `apply_redaction_spans` applies, ascending.
 
     Every marker already in the text -- `[REDACTED]`, and the URL rule's
-    `%5BREDACTED%5D` -- is left exactly as it is: a span that overlaps a
-    marker is dropped. It reads a value the redactor already replaced (a
-    keyword or scheme before the marker, a value running into it), and
-    extending the marker only hides the text around it. So a marker is never
-    split, swallowed into a larger one or re-spelled, and the pass leaves its
-    own output as it is. The rest merge: overlapping or nested spans become
-    one `[REDACTED]`, except that a span inside one whose replacement covers
-    it (the marker, or the empty string) is dropped.
+    `%5BREDACTED%5D` -- is left exactly as it is:
+
+    * a span that starts ON a marker is dropped: it reads a value the
+      redactor already replaced, and extending the marker would only hide
+      the text after it (the rest of a query);
+    * a span that starts BEFORE a marker keeps its reach: each stretch of it
+      outside the markers it overlaps is replaced, and each marker stays as
+      written (`{"password": "Secret [REDACTED] 2024!"}` -- the redactor's
+      keyword rule wrote a marker inside a strong key's value -- becomes
+      `{"password": "[REDACTED][REDACTED][REDACTED]"}`; rev 16 dropped the
+      whole span and left `Secret` and `2024!`). A stretch of only
+      whitespace between markers is left.
+
+    So a marker is never split, swallowed or re-spelled; run again over its
+    own output, the pass keeps every marker and only adds. The rest merge: overlapping or nested spans
+    become one `[REDACTED]`, except that a span inside one whose replacement
+    covers it (the marker, or the empty string) is dropped.
     """
     work(len(text) + len(spans) * max(1, len(spans).bit_length()))  # scan, sort
     markers = [m.span() for m in _MARKER_RE.finditer(text)]
     marker_starts = [start for start, _ in markers]
     pieces: list[Span] = []
     for start, end, replacement in spans:
-        work(1)
-        i = bisect.bisect_left(marker_starts, end) - 1
+        i = bisect.bisect_right(marker_starts, start) - 1
         if i >= 0 and markers[i][1] > start:
-            continue  # overlaps the marker that starts last before its end
-        pieces.append((start, end, replacement))
+            continue  # starts on a marker
+        position = start
+        i += 1
+        while i < len(markers) and markers[i][0] < end:
+            work(1)
+            if markers[i][0] > position:
+                pieces.append((position, markers[i][0], replacement))
+            position = max(position, markers[i][1])
+            i += 1
+        if position < end:
+            pieces.append((position, end, replacement))
+    return _merge_unmarked(text, pieces)
+
+
+def _merge_unmarked(text: str, pieces: list[Span]) -> list[Span]:
+    """Merge spans that overlap no marker (see `merge_redaction_spans`)."""
     ordered = sorted(
         (
             piece

@@ -698,8 +698,10 @@ _MARKER_TEXTS = [
 def _marker_problems(texts: list[str]) -> list[str]:
     """On all four surfaces: every marker of the redactor's output is still
     there, whole and with its spelling, in order; no `REDACTED` appears
-    outside a whole marker; and (E, P) the additive pass leaves its own
-    output as it is -- it never marks a marker again."""
+    outside a whole marker; and (E, P) a second additive pass over the
+    output keeps every one of its markers and only adds. (It is monotone,
+    not idempotent: next to a marker it wrote, a second pass may mark a
+    scheme word or a value prefix the first pass left.)"""
     bad = []
     for text in texts:
         for label, (ours, main) in _four_surfaces().items():
@@ -726,8 +728,18 @@ def _marker_problems(texts: list[str]) -> list[str]:
                 if label == "P"
                 else out
             )
-            if again != out:
-                bad.append(f"{label}: the additive pass changes its own output {out!r}")
+            # run again, the additive pass only adds: it keeps every marker
+            # of its own output whole, in order and in its spelling, and
+            # every other stretch it keeps comes from that output
+            position = 0
+            for marker in out_markers:
+                found = again.find(marker, position)
+                if found < 0:
+                    bad.append(f"{label}: a second pass lost {marker} in {out!r}")
+                    break
+                position = found + len(marker)
+            if not _is_additive_of(again, out):
+                bad.append(f"{label}: a second pass restored text in {out!r}")
     return bad
 
 
@@ -1194,3 +1206,109 @@ def test_list_backtracking_mutant(monkeypatch: pytest.MonkeyPatch) -> None:
     started = time.perf_counter()
     sanitize_auth_diagnostic("tokens: [" + " " * 2048 + "x", max_length=None)
     assert time.perf_counter() - started > 1.0
+
+
+# ======================================= values the redactor partly marked ==== #
+#
+# The redactor's keyword rule accepts whitespace as a separator, so a key word
+# it lists, followed by a word, writes a marker INSIDE a strong key's value
+# (`{"password": "Secret Garden 2024!"}` -> `"Secret [REDACTED] 2024!"`). Rev 16
+# dropped any additive span overlapping a marker, and the rest of the value
+# showed (rev 16's board, F1). Derived from the redactor's own key list.
+
+_STRONG_KEYS = sorted(
+    k for k in A.ADDITIVE_SECRET_KEYS if k not in A.WEAK_SECRET_KEYS and k != "code"
+)
+_BASE_KEY_WORDS = sorted({*M.AUTH_DIAGNOSTIC_SECRET_KEYS, "api_key"})
+_VALUE_TEMPLATES = ("{w} Garden 2024!", "the {w} was 1999 mild", "x9 {w}=q7Zp2 tail")
+
+
+def _value_leftovers(value: str) -> str:
+    return _MARKER_SPLIT_RE.sub("", value).strip()
+
+
+def _partly_marked_failures() -> list[str]:
+    bad = []
+    policy = PolicyManager()
+    for key in _STRONG_KEYS:
+        for word in _BASE_KEY_WORDS:
+            for template in _VALUE_TEMPLATES:
+                value = template.format(w=word)
+                if _MARKER_SPLIT_RE.search(_main_e(json.dumps({key: value}))) is None:
+                    continue  # the redactor wrote no marker in it: not this class
+                doc = json.dumps({key: value})
+                for label, out in (
+                    ("E", _ours_e(doc)),
+                    ("P", policy.redact_secrets(doc)),
+                    ("POd", json.dumps(_ours_process({key: value}))),
+                ):
+                    left = _value_leftovers(json.loads(out)[key])
+                    if left:
+                        bad.append(f"{label} {doc} -> {left!r}")
+                plain = f'{key}: "{value}"'
+                out = _ours_e(plain)
+                inner = out[out.index('"') + 1 : out.rindex('"')]
+                if _value_leftovers(inner):
+                    bad.append(f"E {plain} -> {out}")
+    return bad
+
+
+def test_a_value_the_redactor_partly_marked_is_redacted_whole() -> None:
+    """For every strong key and every key word the redactor reacts to, a
+    value holding that word (then a word or `=`) keeps no character outside
+    the markers, on E, P and the structured path; the markers stay as
+    written."""
+    bad = _partly_marked_failures()
+    assert bad == [], bad[:10]
+
+
+def _rev16_merge(text: str, spans: list[A.Span]) -> list[A.Span]:
+    """Rev 16's merge: a span overlapping any marker was dropped."""
+    markers = [m.span() for m in A._MARKER_RE.finditer(text)]
+    kept = [
+        (start, end, r)
+        for start, end, r in spans
+        if not any(m0 < end and start < m1 for m0, m1 in markers)
+    ]
+    return A._merge_unmarked(text, kept)
+
+
+def test_partly_marked_mutant_rev_16_merge(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(A, "merge_redaction_spans", _rev16_merge)
+    assert _partly_marked_failures() != []
+
+
+_HEX_TICKET = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+
+
+@pytest.mark.parametrize("header", ["Cookie", "cookie", "Set-Cookie", "set-cookie"])
+@pytest.mark.parametrize(
+    "first", ["csrftoken=abc123", "sid=abc123", "session=abc123", "token=x1y2z3"]
+)
+@pytest.mark.parametrize("name", [".ASPXAUTH", "auth", "ticket", "remember_me", "ID"])
+def test_a_cookie_header_keeps_no_ticket(header: str, first: str, name: str) -> None:
+    value = f"{first}; {name}={_HEX_TICKET}; Path=/"
+    obj = {"headers": {header: value}}
+    for out in (
+        _ours_e(json.dumps(obj)),
+        _ours_p(json.dumps(obj)),
+        json.dumps(_ours_process(obj)),
+    ):
+        assert _HEX_TICKET not in out, out
+
+
+def test_a_pem_block_with_a_marker_inside_is_redacted_whole() -> None:
+    body = "\n".join(
+        [
+            "MIIEpAIBAAKCAQEA3Tz2mr7SZiAMfQyuvBjM9Oi",
+            "Zq1x0sid",
+            "eXno5n8Iq7Zp2Lk9Wx4RAbCdEf01",
+        ]
+    )
+    block = f"-----BEGIN RSA PRIVATE KEY-----\n{body}\n-----END RSA PRIVATE KEY-----"
+    assert _MARKER_SPLIT_RE.search(_main_e(block)) is not None  # the case at issue
+    for surface in (_ours_e, _ours_p):
+        out = surface(block)
+        for line in body.split("\n"):
+            assert line not in out, out
+        assert "eXno5n8I" not in out, out
