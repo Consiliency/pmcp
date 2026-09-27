@@ -751,12 +751,11 @@ def test_markers_are_kept_whole_and_spelled_as_written_on_every_surface() -> Non
 def test_markers_mutant_a_policy_value_run_through_a_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Rev 15's policy pass (no marker skip, no stop at `&` in a query, and
-    a merge that swallowed markers) re-spelled the URL marker and lost the
-    rest of the query."""
+    """Rev 15's policy pass (no stop at `&` in a query, and a merge that
+    swallowed markers) re-spelled the URL marker and lost the rest of the
+    query."""
     import pmcp.policy.policy as P
 
-    monkeypatch.setattr(P, "starts_with_marker", lambda value: False)
     monkeypatch.setattr(P, "_url_query_ranges", lambda text: [])
     monkeypatch.setattr(A, "_MARKER_RE", re.compile(r"(?!)"))
     assert _marker_problems(_MARKER_TEXTS[:2]) != []
@@ -1276,6 +1275,185 @@ def _rev16_merge(text: str, spans: list[A.Span]) -> list[A.Span]:
 def test_partly_marked_mutant_rev_16_merge(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(A, "merge_redaction_spans", _rev16_merge)
     assert _partly_marked_failures() != []
+
+
+# ================================================= the end of a value ======== #
+#
+# The redactor's keyword rule replaces a value only up to the first character
+# outside its value class, so `token=qVwYS81V!7Hb1DX8pP` reaches the additive
+# pass as `token=[REDACTED]!7Hb1DX8pP`. Rev 17 skipped an additive span that
+# started on that marker and the tail survived (rev 17's board, F-A); rev 18
+# replaces the run glued to the marker's end. A probe of a value's first
+# characters cannot see this -- the redactor always takes those -- so these
+# tests read the END of the value.
+#
+# What still survives, disclosed in the plan: a tail that begins at one of
+# the delimiters the keyed grammars end a value at (`;`, `,`, `&`, `#`: `a=1;
+# b=2`, a form body, a fragment), or at a bracket or parenthesis; and the
+# tail of a value under a whitespace-keyed flag (`--password x`), whose
+# additive rule cannot start on the marker (pinned below).
+
+_TAIL_STOPS = frozenset(";,&#()[]{}")
+_TAIL_PUNCT = "!@$%^*()[]{}|;:,<>?#&~+=/._-"
+_TAIL_FORMS = (
+    "password={v}",
+    "token={v} end",
+    "X-Api-Key: {v}",
+    "client_secret={v}&x=1",
+    "https://h.example:99999/cb?token={v}",
+    "Authorization: Bearer {v}",
+    '{{"password": "{v}"}}',
+    '{{"client_secret": "{v}", "n": 1}}',
+)
+
+
+def _tail_value(rng: random.Random, punct: str) -> str:
+    """A value of letters and digits, punctuation from ``punct`` and `%xx`
+    escapes, beginning and ending on a run of letters and digits (what the
+    redactor's keyword rule takes before the first other character)."""
+    alnum = string.ascii_letters + string.digits
+    parts = ["".join(rng.choice(alnum) for _ in range(rng.randint(4, 8)))]
+    for _ in range(rng.randint(2, 5)):
+        roll = rng.random()
+        if roll < 0.15:
+            parts.append(
+                "%" + rng.choice("0123456789ABCDEF") + rng.choice("0123456789ABCDEF")
+            )
+        elif roll < 0.45 and punct:
+            parts.append(rng.choice(punct))
+        else:
+            parts.append(
+                "".join(
+                    rng.choice(string.ascii_letters + string.digits)
+                    for _ in range(rng.randint(3, 8))
+                )
+            )
+    return "".join(parts) + "Z9q"
+
+
+def _tail_left(value: str, text: str, out: str) -> int | None:
+    """Where the longest suffix of ``value`` (3 characters or more) that
+    ``out`` still holds begins, or None; a suffix found in the text outside
+    the value does not count."""
+    rest = text.replace(value, "", 1)
+    return next(
+        (
+            i
+            for i in range(len(value) - 2)
+            if value[i:] in out and value[i:] not in rest
+        ),
+        None,
+    )
+
+
+def _tail_surfaces(text: str) -> dict[str, str]:
+    """The four entry points. A JSON form goes to the structured path as the
+    object it spells (a JSON document inside a JSON string is a class of its
+    own, disclosed in the plan)."""
+    policy = PolicyManager()
+    obj = json.loads(text) if text.startswith("{") else {"t": text}
+    return {
+        "E": _ours_e(text),
+        "P": policy.redact_secrets(text),
+        "POs": str(policy.process_output(text, redact=True, max_bytes=G.BIG)["result"]),
+        "POd": json.dumps(_ours_process(obj)),
+    }
+
+
+def _tail_failures(punct: str, count: int, seed: int) -> list[str]:
+    rng = random.Random(seed)
+    bad = []
+    for _ in range(count):
+        value = _tail_value(rng, punct)
+        for form in _TAIL_FORMS:
+            text = form.format(v=value)
+            for label, out in _tail_surfaces(text).items():
+                k = _tail_left(value, text, out)
+                if k is not None and not any(c in _TAIL_STOPS for c in value[: k + 1]):
+                    bad.append(f"{label} {text!r} -> {out!r}")
+    return bad
+
+
+def test_the_end_of_a_value_is_removed_on_every_surface() -> None:
+    """Values from letters, digits, `%xx` and every punctuation character
+    but the disclosed stops: on E, P and both structured paths no three
+    characters of the value's end survive, in any form."""
+    punct = "".join(c for c in _TAIL_PUNCT if c not in _TAIL_STOPS)
+    bad = _tail_failures(punct, 150, 18)
+    assert bad == [], bad[:10]
+
+
+def test_a_value_tail_survives_only_after_a_disclosed_stop() -> None:
+    """With the stops in the mix too, whatever survives of a value begins
+    at or after one of them."""
+    bad = _tail_failures(_TAIL_PUNCT, 150, 1834)
+    assert bad == [], bad[:10]
+
+
+@pytest.mark.parametrize(
+    ("text", "tail"),
+    [
+        ("token=qVwYS81V!7Hb1DX8pP", "7Hb1DX8pP"),
+        ("https://h.example:99999/cb?token=abcd%41%48XYZ123", "XYZ123"),
+        ("password=Summer2024!Sunny", "Sunny"),
+    ],
+)
+def test_rev_17_board_tails(text: str, tail: str) -> None:
+    for label, out in _tail_surfaces(text).items():
+        assert tail not in out, (label, out)
+
+
+def test_the_rest_of_a_query_is_not_glued_to_a_marker() -> None:
+    for label, out in _tail_surfaces(
+        "see https://h.example/cb?token=abc123def456&page=2 now"
+    ).items():
+        assert "&page=2 now" in out, (label, out)
+
+
+def test_an_arn_under_an_arn_key_keeps_its_resource_name() -> None:
+    """The redactor writes over an ARN's literal `arn` (a key word it lists);
+    the partition after that marker is the resource name, not a tail -- but
+    only under a key that names an ARN."""
+    arn = "arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret-a1b2c3"
+    for text in (f"secret_arn={arn}", json.dumps({"SecretArn": arn})):
+        for label, out in _tail_surfaces(text).items():
+            assert ":aws:secretsmanager:" in out, (label, out)
+    for label, out in _tail_surfaces("password=Pa55wd:aws:tailtail").items():
+        assert "tailtail" not in out, (label, out)
+
+
+def test_arn_exemption_mutant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the exemption the prose corpus's ARN line differs from the
+    redactor's output (rev 17 board: 2 of 2 002 prose lines)."""
+    monkeypatch.setattr(A, "_is_resource_name_tail", lambda text, marker: False)
+    assert _ours_e(PROSE) != _main_e(PROSE)
+
+
+def test_disclosed_a_whitespace_keyed_value_keeps_its_tail() -> None:
+    """Pins a disclosed residual: the additive whitespace-keyword rule's
+    value class has no `[`, so it never starts on the redactor's marker and
+    no glued run is replaced. Extending it is a maintainer decision (the
+    plan: it also marks punctuation after the redactor's own whitespace
+    false positives, `secret sauce!`)."""
+    for label, out in _tail_surfaces(
+        "mycli --password qVwYS81V!7Hb1DX8pP --verbose"
+    ).items():
+        assert "[REDACTED]!7Hb1DX8pP" in out, (label, out)
+
+
+def test_disclosed_punctuation_after_a_redactor_false_positive_is_marked() -> None:
+    """Pins a disclosed side effect of the glued run: after a marker the
+    redactor wrote over a word (`token=bucket!`), the glued punctuation is
+    replaced too."""
+    for label, out in _tail_surfaces("token=bucket!").items():
+        assert "[REDACTED][REDACTED]" in out, (label, out)
+
+
+def test_the_end_of_a_value_mutant_rev_17_skip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rev 17's rule (a span that starts on a marker is dropped) restored."""
+    monkeypatch.setattr(A, "_glued_run_end", lambda text, start, end: start)
+    punct = "".join(c for c in _TAIL_PUNCT if c not in _TAIL_STOPS)
+    assert _tail_failures(punct, 30, 18) != []
 
 
 _HEX_TICKET = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"

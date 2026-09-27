@@ -29,7 +29,6 @@ from pmcp.redaction_additive import (
     URL_RE,
     Span,
     redact_additive,
-    starts_with_marker,
     widen_over_escapes,
     work,
 )
@@ -821,11 +820,10 @@ class PolicyManager:
 
     def _additive_spans(self, text: str) -> list[Span]:
         """Spans of the additive form of each effective pattern, over the
-        output the patterns already redacted. Like the engine's additive
-        rules, a value that starts on a marker is left alone (the redactor
-        already took it; running on would only swallow what follows), and
-        inside a URL's query a value ends at `&` or `#` -- the next
-        parameter is not part of it."""
+        output the patterns already redacted. Inside a URL's query a value
+        ends at `&` or `#` -- the next parameter is not part of it. A value
+        that starts on a marker is handled by the merge: only the run glued
+        to the marker's end is replaced."""
         spans: list[Span] = []
         query_ranges = _url_query_ranges(text)
         query_starts = [start for start, _ in query_ranges]
@@ -839,8 +837,6 @@ class PolicyManager:
                 while start < match.end() and text[start].isspace():
                     start += 1
                 end = match.end()
-                if starts_with_marker(text[start:end]):
-                    continue
                 i = bisect.bisect_right(query_starts, start) - 1
                 if i >= 0 and start < query_ranges[i][1]:
                     for stop in "&#":

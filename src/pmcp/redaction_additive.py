@@ -732,13 +732,6 @@ def _in_resource_name(text: str) -> Callable[[int], bool]:
     return inside
 
 
-def starts_with_marker(value: str) -> bool:
-    """A value the redactor before these rules already replaced: extending
-    the marker over what follows it only hides more of the text around it
-    (`secret_arn=[REDACTED]:aws:...`)."""
-    return value.lstrip("\"'").startswith(("[REDACTED]", "%5BREDACTED%5D"))
-
-
 def _keyword_sep_spans(text: str) -> list[Span]:
     work(len(text))  # the pass's scan
     spans: list[Span] = []
@@ -746,8 +739,6 @@ def _keyword_sep_spans(text: str) -> list[Span]:
     for match in _counted(_KEYWORD_SEP_RE.finditer(text)):
         if in_resource_name(match.start()):
             continue  # `arn:…:secret:Name` names a secret, it is not one
-        if starts_with_marker(match.group("value")):
-            continue  # the redactor before these rules already took it
         name = match.group("name").lower()
         if name in WEAK_SECRET_KEYS and _is_plain_word_or_number(match.group("value")):
             continue
@@ -875,7 +866,6 @@ def _keyword_ws_spans(text: str) -> list[Span]:
         (match.start("value"), match.end("value"), REDACTED)
         for match in _counted(_KEYWORD_WS_RE.finditer(text))
         if match.group("name").lower() != "code"
-        and not starts_with_marker(match.group("value"))
         and _value_could_be_a_credential(match.group("value"))
         # a glued prefix (`CLIENTSECRET abc…`) only on a single-case key or
         # an acronym + Titlecase one (`PGPassword abc…`): any other
@@ -1112,15 +1102,58 @@ _MARKER_RE = re.compile(r"\[REDACTED\]|%5BREDACTED%5D")
 _COVERING = frozenset({*_MARKERS, ""})
 
 
+#: What ends the run glued to a marker's end: whitespace, a query or
+#: fragment delimiter, a quote, a backslash (an escape in a JSON string).
+_GLUED_STOPS = frozenset("&#\"'\\")
+
+
+def _glued_run_end(text: str, start: int, end: int) -> int:
+    """Where the run glued to a marker's end (at ``start``) stops: at
+    whitespace, `&`, `#`, a quote, a backslash, the next marker or ``end``."""
+    position = start
+    while (
+        position < end
+        and not text[position].isspace()
+        and text[position] not in _GLUED_STOPS
+        and _MARKER_RE.match(text, position) is None
+    ):
+        position += 1
+    work(position - start + 1)
+    return position
+
+
+#: An ARN's partition right after the marker the redactor wrote over its
+#: literal `arn`, under a key that names one (`secret_arn=[REDACTED]:aws:
+#: secretsmanager:...`, `"SecretArn": "[REDACTED]:aws:..."`): the rest is the
+#: resource name, not the rest of a secret.
+_ARN_TAIL_RE = re.compile(r":aws(?:-[a-z]+)*:", re.IGNORECASE)
+_ARN_KEY_BEFORE_RE = re.compile(
+    r"arn\\?[\"']?[ \t]*[:=][ \t]*\\?[\"']?\Z", re.IGNORECASE
+)
+_ARN_KEY_REACH = 16
+
+
+def _is_resource_name_tail(text: str, marker: tuple[int, int]) -> bool:
+    before = text[max(0, marker[0] - _ARN_KEY_REACH) : marker[0]]
+    return (
+        _ARN_TAIL_RE.match(text, marker[1]) is not None
+        and _ARN_KEY_BEFORE_RE.search(before) is not None
+    )
+
+
 def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
     """The disjoint spans `apply_redaction_spans` applies, ascending.
 
     Every marker already in the text -- `[REDACTED]`, and the URL rule's
     `%5BREDACTED%5D` -- is left exactly as it is:
 
-    * a span that starts ON a marker is dropped: it reads a value the
-      redactor already replaced, and extending the marker would only hide
-      the text after it (the rest of a query);
+    * a span that starts ON a marker keeps the marker and replaces only the
+      run glued to its end, up to whitespace, `&`, `#`, a quote, a
+      backslash or the next marker: the redactor's keyword rule stops at the
+      first character outside its value class, so `token=qVwYS81V!7Hb1DX8pP`
+      reached this pass as `token=[REDACTED]!7Hb1DX8pP` (rev 17 left the
+      tail). The rest of a query (`&page=2`) is not glued, and neither is an
+      ARN's resource name after the redacted `arn` (`:aws:...`);
     * a span that starts BEFORE a marker keeps its reach: each stretch of it
       outside the markers it overlaps is replaced, and each marker stays as
       written (`{"password": "Secret [REDACTED] 2024!"}` -- the redactor's
@@ -1141,7 +1174,13 @@ def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
     for start, end, replacement in spans:
         i = bisect.bisect_right(marker_starts, start) - 1
         if i >= 0 and markers[i][1] > start:
-            continue  # starts on a marker
+            # starts on a marker: keep it, and replace only the run glued to
+            # its end -- the rest of a value the redactor cut short at a
+            # character outside its value class (`token=[REDACTED]!7Hb1DX8pP`)
+            glued = _glued_run_end(text, markers[i][1], end)
+            if glued > markers[i][1] and not _is_resource_name_tail(text, markers[i]):
+                pieces.append((markers[i][1], glued, replacement))
+            continue
         position = start
         i += 1
         while i < len(markers) and markers[i][0] < end:
