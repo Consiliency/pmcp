@@ -1,5 +1,53 @@
 # Detailed plan: secret redaction — `main`'s redactor as a floor, shape-based rules on top (Consiliency/pmcp#234)
 
+> **Revision 13 (2026-09-27) — rev 12's board, round 2 (claude seat,
+> DISAGREE).** Round 1's findings stayed closed, and the floor held again
+> on the seat's 967 032-case differential. The seat found two more
+> quadratic paths that the rev-12 sweep could not build, because they sit
+> in Python loops that only a COMPOSITION of passes reaches:
+>
+> - **B-3:** a marker that the URL step synthesised stood for the whole
+>   URL, so a later match over k such markers built a value k times the
+>   URL long, in both time and memory.
+> - **B-4:** every keyword match asked every resource name.
+>
+> It also showed that rev 12's timing tests flake under load (T-1, very
+> likely the one failure rev 12 left unexplained), and that N3 still read
+> a camelCase multi-word key as glued (N-5).
+>
+> Rev 13:
+>
+> - **B-3:** each synthesised marker stands for exactly the input it
+>   replaced, or for nothing, and `source()` emits each input character
+>   once.
+> - **B-4:** a binary search per question. `widen_over_escapes`, which
+>   the audit found in the same class, now reads backslash runs from one
+>   precomputed pass.
+> - **Linearity is asserted on a deterministic work count, not on the
+>   clock.** Every loop and string build of the redactor adds what it
+>   iterates over or copies to a counter that only the tests switch on.
+>   The tests assert that this count grows linearly from 16 KB to 64 KB
+>   to 256 KB on every entry point.
+>   - A regex's own backtracking is the one cost a count cannot see. It is
+>     argued pattern by pattern ("Complexity argument") and checked on the
+>     clock, with a 64× bound over 16× the input (linear gives 16×,
+>     quadratic 256×).
+>   - The only clock tests left in the default tier are smoke caps or use
+>     that ratio bound.
+> - **Shapes from the loops, not only from the regexes.** 24 120
+>   compositions join the 46 096 regex-derived shapes: two leads that arm
+>   different passes, interleaved units, markers inside markers, and
+>   nested JSON and header contexts. Every repro from both rounds runs in
+>   the default tier.
+> - **N-5:** a case change joins words, as `_` and `-` do.
+>
+> Each finding fails on rev 12 (`b7b071d`), passes here, and is killed by
+> a mutant ("Rev 12 board findings"). Code:
+> `origin/wip/234-redactor-floor-code` @ `4b5cac8`, embedded below as a
+> patch against `main` @ `876fd33`. `main` is now at `8de49e4`, which
+> differs from `876fd33` only by one plan document, so the patch applies
+> to it unchanged.
+>
 > **Revision 12 (2026-09-27) — rev 11's board, round 1 (claude seat,
 > DISAGREE).** The floor held: the seat's own differential (967 032
 > surface cases, generators independent of this plan's) found no input
@@ -25,8 +73,8 @@
 >   `&` was neither kept nor labelled).
 >
 > Each is red on rev 11 (`3e49b95`), green here, and killed by a mutant
-> ("Rev 11 board findings" below). Code: `origin/wip/234-redactor-floor-code`
-> @ `b7b071d`, embedded below against `main` @ `876fd33`.
+> ("Rev 11 board findings" below). Code (rev 12): `origin/wip/234-redactor-floor-code`
+> @ `b7b071d`.
 >
 > **Revision 11 (2026-09-26) — never worse than `main`, by construction.**
 > Revisions 7 to 10 each re-implemented `main`'s redaction rules, passed their
@@ -52,7 +100,7 @@
 >    joiner before `bearer`, a policy value across a JSON string boundary,
 >    and a `name=value` pair right after `Bearer`.
 >
-> Code: `origin/wip/234-redactor-floor-code` @ `b7b071d` (merged with
+> Code (rev 11): `origin/wip/234-redactor-floor-code` @ `3e49b95` (merged with
 > `main` @ `876fd33`), embedded below as one patch against `876fd33`, proven
 > to apply and to reproduce the branch's files byte for byte. `main` already
 > carries the linear keyword matcher (`src/pmcp/keyword_matcher.py`, PR 303);
@@ -122,7 +170,7 @@ predicate that fires is recorded on the span.
 | `policy_keyword_word` | the literal `token`/`bearer` word `main`'s `(bearer|token)\s+…` default replaced with its value | new, approved |
 | `scheme_word` | the `bearer ` word `main`'s Authorization rule took with the value | new, approved |
 | `wrapper_syntax` | quotes, brackets and an escaping backslash at the **edges** of a Bearer/Authorization value (a quote inside the value goes with it) | new, approved |
-| N3 | a prefix or suffix of more than 24 alphanumerics **glued** to the key word (no `_`/`-` between; an identifier; cost bound) | rev 10 decision 2 (narrowed, rev 12) |
+| N3 | a prefix or suffix of more than 24 alphanumerics **glued** to the key word (no `_`/`-` and no case change between; an identifier; cost bound) | rev 10 decision 2 (narrowed, revs 12 and 13) |
 | N10 | a key that is a **segment** of an `arn:`/`urn:` name (after a `:` or `/`, no `& , ; ( ) ? =` or whitespace since the name began), with a `:` separator and a value inside the name (read on the input) | N10 (narrowed, rev 12) |
 | C12 | `code` under a diagnostic qualifier (37, listed) | C12 |
 | C3a | `code` after a whitespace-only separator | C3a |
@@ -242,6 +290,83 @@ there: "–".)
 | B5 4–5 character mixed separators | `k password: : hunter2x e`, `token\t= : hunter2x` | red | green | the separator run capped at 3 |
 | N11 after the scheme (rev 11) | `x Bearer abcdef=SECRETPART end` | red (`SECRETPART` kept) | green | rev 10's N11 restored |
 
+## Rev 12 board findings → rev 13
+
+| id | finding | fix (the class) | red on rev 12 (`b7b071d`) | green | mutant that turns it red |
+|---|---|---|---|---|---|
+| B-3 | a URL-step marker stood for the whole URL, and `source()` expanded it once per marker (time and memory) | each synthesised piece stands for its own input range, or for none; `source()` emits each input character once, left to right | `process_output` on `https://h/?` + `password=x&`×n: 8 KB 0.222 s → 32 KB 3.498 s (15.8×); `Authorization: https://h/?q` + `&a+b`×n: 0.269 s → 2.716 s | 0.030 s → 0.145 s; the work count grows linearly at 16, 64 and 256 KB on every entry point | both of rev 12's mechanisms restored |
+| B-4 | `_in_resource_name` asked every name for every match | a binary search over the sorted, disjoint names | `arn:x `×n + `tokens: [...]`×m: 0.016 s → 0.114 s (7.1×) from 8 to 32 KB | 0.012 s → 0.050 s; the work count grows linearly | rev 12's scan, with its per-call cost counted |
+| — | `widen_over_escapes` scanned back from every span start (same class, found by the audit) | one precomputed pass | — | the work count grows linearly on a backslash run before escapes | — |
+| T-1 | the ratio timing asserts flaked under load (3 of 6 loaded runs) | a deterministic work count; the clock only for regex backtracking, at 64× over 16× | — | three default-tier runs, one under four CPU burners, all green | — |
+| N-5 | N3 read a camelCase or SHOUTING multi-word key as glued | a case change is a joiner for N3 | `passwordForTheProductionDatabaseServer=Hunter2abcX9` kept | 7 camelCase and SHOUTING keys redacted on E and P; a single-case glued run of 25 is still N3 | rev 12's N3 |
+| N-6 | a plain number of up to 10 digits includes signed and leading-zero values | not changed (D2 as approved in rev 12) | — | — | residual |
+| N-7 | a plain word has no length limit | not changed (D2) | — | — | residual |
+
+## Complexity argument
+
+n is the length of the text a surface redacts. Every function below does
+O(n) work, or O(n log n) where it sorts spans. Each one adds what it
+iterates over or copies to the test-only work counter
+(`pmcp.redaction_floor.WORK`), and the counter is what the default and
+slow tiers assert on.
+
+**The floor (`src/pmcp/redaction_floor.py`)**
+
+| function | iterates over | why bounded | counted as |
+|---|---|---|---|
+| `replay` | a fixed sequence of 5 steps, plus one per effective pattern | the pattern count comes from the operator's configuration, not from the input | per step |
+| `_url_step` / `_url_pieces` / `_label_uncovered` | each URL once: parse, rewrite, align the components, compare with `main`'s output, label the rest | URLs are disjoint `finditer` matches, and each pass over one URL is linear in its length | `len(text)`, plus 4× and 2× the URL |
+| regex steps (`_authorization_step`, `_bearer_step`, `_jwt_step`, `_policy_step`) | one `finditer` over `cur`, with O(match) work per match | the matches of one pass are disjoint | `len(cur)`, plus each match |
+| `_keyword_step` | `main`'s matcher (`pmcp.keyword_matcher`, equivalence-tested against the regex) | linear on `main` | `len(cur)`, plus each match |
+| `_Tracked.rewrite` | `cur` once, and each edit's replaced characters once | edits are disjoint | `len(cur)`, plus the pieces |
+| `_Tracked.raw_ranges` | the match's slice of `org`, then one sort | one slice per match, and the slices are disjoint | slice × log |
+| `_Tracked.source` | the match's slice of `rep`, copying each input character at most once | by induction over `rewrite`, every marker stands for an input range disjoint from every other marker's, in input order; so the copy is at most the input the match came from | the slice length |
+| `_context` | at most 256 characters back | a fixed window | 256 per call |
+| `_header_value_spans` / `_wrap_close_start` | the value's opening run forward and its closing run backward, once each | one pass each | the closing run |
+| `floor_spans` | each span once, and the predicates once per part of a match | the predicates read the match's own strings (key, separator, value, removed text, 256-character contexts) a bounded number of times; key readings are capped by `_MAX_READ_KEY` | 18 × the lengths of those strings, per decision |
+| `unindented_break` | one reverse search | — | its argument |
+| `json_layout` / `_JsonLayout` | `json.loads` once, and the string tokens once | — | 2 × the text |
+| `adjust_for_json` | each floor span's characters once, plus widening to escape boundaries (at most 6 characters) and a scalar's start | spans are disjoint within a match, and a scalar lookback is bounded by the scalar | each step |
+
+**The additive rules (`src/pmcp/auth.py`)**
+
+| function | iterates over | why bounded | counted as |
+|---|---|---|---|
+| `_keyword_sep_spans`, `_keyword_list_spans`, `_keyword_ws_spans`, `_bearer_spans`, `_authorization_spans`, `_url_spans`, `_shape_spans` | one `finditer` each, with predicates over the match's own groups | the matches of one pass are disjoint; the qualifier and glued runs in the key patterns are bounded (8 segments, 24 characters) | the text, plus each match |
+| `_in_resource_name` | one `finditer` for the names, then one binary search per question | — | the text, plus 1 per question |
+| `_run_spans` / `_run_is_opaque` / `_reads_as_route` | each opaque run once | runs are disjoint | the run |
+| `_url_component_spans` / `_covers_anything` | each URL's pairs; a percent-encoded value is decoded and redacted again, at most 3 levels deep | each level's text is a substring of the previous level's | the URL; each recursive call counts its own text |
+| `widen_over_escapes` | one pass computing the backslash runs, then each span once | — | the text, plus the spans |
+| `merge_redaction_spans` / `apply_redaction_spans` | the marker scan, one sort, one merge, one join | — | the text, plus spans × log |
+
+**The policy surface (`src/pmcp/policy/policy.py`).**
+- `redaction_spans` adds one `finditer` per additive pattern and, per match, one split (`_value_separator`, a single pass).
+- `process_output` redacts one window of `max_bytes + 16 384` characters and sorts its spans once.
+
+**Regular expressions and backtracking.** The work count sees each regex
+call only as the text it scans, not as the backtracking inside the engine.
+So each pattern has to be linear by its own structure:
+
+- **`main`'s patterns.** The URL, Authorization, Bearer, JWT and policy-default
+  patterns each put a literal or a single class ahead of every quantifier,
+  and none nests quantifiers. The keyword rule does not run as a regex:
+  the linear matcher replaces it.
+- **The floor's own patterns.** They are short literal alternations
+  (`_POLICY_KEYWORD_RE`, `_SCHEME_WORD_RE`), fully anchored single-class
+  runs (`_CONTEXT_RE`, bounded to 256 characters), JSON tokenisers with
+  disjoint alternatives, and key-word lookaheads over keys capped at 256
+  characters.
+- **The additive rules.** The qualifier and glued runs are bounded (`{1,8}`
+  segments, `{1,24}` characters), the value classes are single negated
+  classes, and the PEM body never scans past the next `BEGIN`.
+- **Replaced searches.** The earlier end-anchored searches (the
+  closing-wrapper search and the unindented-break regex) are now scans
+  (B-1 and B-1b).
+
+The clock checks this: the slow tier covers all 46 096 regex-derived
+shapes, and the default tier covers the two replaced searches, each with
+the 64× bound.
+
 ## Rev 11 board findings → rev 12
 
 | id | finding | fix (the class) | red on rev 11 (`3e49b95`) | green | mutant that turns it red |
@@ -256,7 +381,8 @@ there: "–".)
 | N-3 | a cut in `process_output` that creates `main`'s trailing `\b` | not changed | — | — | stated under Non-goals |
 | N-4 | a trailing or doubled `&` neither kept nor labelled | every uncovered position labelled `url.normal` | `https://h/?a=1&` position 14 | covered | the labelling skipped |
 
-**Generated timing sweep.** `tests/_redaction_shapes.py` parses each of the
+**Generated timing sweep (rev 12; in rev 13 the work count and the
+composition families replace its clock assertions).** `tests/_redaction_shapes.py` parses each of the
 66 compiled patterns in the redactor's modules (`re` parser) and collects
 every piece a quantifier can repeat: literal runs, representatives of each
 character class, every alternative. Shapes are `lead + unit×k + tail` over
@@ -298,7 +424,8 @@ the families the sweep found on rev 11, and the keyword-matcher shapes) at
 | 9 | generator widened along each finding | F1–F10: axes the generator never produced |
 | 10 | generator derived from `main`'s grammar | B1–B5: the re-implementation's gaps (a wider value class, a narrowed Bearer gate, bounded separators) |
 | 11 | `main`'s rules replayed as a floor; rev 10 only adds | floor held; three quadratic helpers, N10/N3/D2 wider than approved |
-| **12** | **each fixed as a class; generated timing sweep** | — |
+| 12 | each fixed as a class; generated timing sweep | floor held; two quadratic loops reached only by composed passes; flaky clock ratios |
+| **13** | **markers stand for what they replace; a work count, not the clock; shapes from the loops** | — |
 
 The lesson of 7–10: a differential is only as wide as its generator, and a
 re-implementation is only as good as its reviewer's imagination. Rev 11
@@ -316,6 +443,14 @@ each approved:
 - C10: bare `code` with a number or plain word (`code=123456789`): an OTP
   under a bare `code` key is kept, as every JSON-RPC and HTTP code is.
 - C3a, C12: `code` after whitespace or under a diagnostic qualifier.
+- D2's plain number (N-6 of rev 12's board): a value of up to 10 digits,
+  signed or with leading zeros, is plain, so a PIN-shaped value after a
+  bare keyword, a scheme, a weak or glued key is kept (`password
+  4829163750`, `Bearer 4829163750`, `dbpassword=04829163`).
+- D2's plain word (N-7): a word of letters and `_` of any length is plain,
+  so `Bearer <28 random lower-case letters>` is kept (C11), as are such
+  values after `password ` (C3) and a glued key (C6); the additive shape
+  score does not catch an all-lower-case run.
 - N3, N4, N10: identifiers and resource names, including a credential-shaped
   value under a key with more than 24 characters glued to the key word (a
   cost bound) and a credential-shaped value that is itself a segment of an
@@ -367,48 +502,59 @@ env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir \
   uv run pytest -m 'slow and not live' -q          # slow tier (not in CI)
 ```
 
-**CI cost.** CI runs the default tier. The redaction tests there take about
-3.5 minutes in all; the slowest are the tier-1 construction test (~42 s),
-the board-row construction test (~30 s) and the timing sweep's slowest shape
-(~16 s); no redaction test is over 60 s. The slow tier (tier 2 of the
-grammar differential, the fidelity oracle, the construction test, the
-matcher equivalence and the generated timing sweep in 16 chunks of ~100 s)
-takes about 47 minutes and is run by hand before a release of this code; its
-longest case is the tier-2 matcher equivalence (~214 s), inside the 700 s
-per-test timeout.
+**CI cost.** CI runs the default tier.
+- The redaction tests there take about 5 minutes in all. The slowest are
+  the tier-1 construction test (~46 s), the board-row construction test
+  (~33 s) and the work-count test on the `key words after Bearer` shape
+  (~18 s). No redaction test takes over 60 s.
+- The whole default tier took 11:50, 12:43 and 14:36 on dev0 in the three
+  runs below; it has not been timed on a GitHub runner.
+- The slow tier is run by hand before a release of this code and takes
+  about 63 minutes. It covers tier 2 of the grammar differential, the
+  fidelity oracle, the construction test, the matcher equivalence, the
+  work-count sweep of all 70 195 shapes in 32 chunks, and the
+  regex-backtracking clock sweep in 8 chunks. Its longest case is the tier-2
+  matcher equivalence at ~203 s, inside the 700 s per-test timeout.
 
-**Measured on the embedded code (`b7b071d`):**
+**Measured on the embedded code (`4b5cac8`):**
 
 | check | result (as read from the logs) |
 |---|---|
 | `ruff check src/ tests/` | All checks passed! |
 | `ruff format --check src/ tests/` | 172 files already formatted |
 | `mypy src/` | Success: no issues found in 52 source files |
-| default tier `-m 'not live and not slow'` | **4907 passed, 3 skipped, 73 deselected in 633.62s (0:10:33)** |
-| slow tier `-m 'slow and not live'` | **48 passed, 4935 deselected in 2818.77s (0:46:58)** |
+| default tier, run 1 | **4921 passed, 3 skipped, 97 deselected in 710.44s (0:11:50)** |
+| default tier, run 2 | **4921 passed, 3 skipped, 97 deselected in 763.09s (0:12:43)** |
+| default tier, run 3, under four CPU burners (killed afterwards) | **4921 passed, 3 skipped, 97 deselected in 876.38s (0:14:36)** |
+| slow tier `-m 'slow and not live'` | **72 passed, 4949 deselected in 3775.46s (1:02:55)** |
+| work-count screen of every generated shape (4 KB → 16 KB, all entry points) | 70 195 shapes, 0 over the bound |
 
-The two tests at 60 s in the default tier are `tests/test_progressive_disclosure.py`'s
-`test_invoke_query_docs` and `test_invoke_query_docs_conceptual` (not
-touched by this plan). No `test_workflow_guards` error occurred.
+Notes on these runs:
+- The default tier ran as `-m 'not live and not slow'` and the slow tier as
+  `-m 'slow and not live'`, both with `npm_config_cache`,
+  `npm_config_store_dir` and `pnpm_config_store_dir` unset.
+- The two 60 s tests in the default tier are
+  `tests/test_progressive_disclosure.py`'s `test_invoke_query_docs` and
+  `test_invoke_query_docs_conceptual`. This plan does not touch them.
+- No `test_workflow_guards` error occurred.
 
-**Embedding proof** (run for this plan): `origin/main` re-fetched (still
-`876fd33`); the patch was extracted from this file with the commands under
-"Patch against `main`", compared `cmp`-equal to the generated diff,
-`git apply --check` and `git apply` on a fresh worktree of `876fd33`
-succeeded, and with the oracle copied from the sibling file `pyproject.toml`
-is `cmp`-identical and `diff -rq` of `src/` and `tests/` against the floor
-branch at `b7b071d` shows no differences. On that tree (`pmcp.__file__`
-printed from it): `ruff check` All checks passed!, `ruff format --check`
-172 files already formatted, `mypy src/` no issues in 52 source files, and
-`test_redaction.py`, `test_redaction_floor.py`, `test_keyword_matcher.py`,
-`test_auth.py`, `test_policy.py`, `test_project_source_consent_policy.py`
-and `test_trust_boundaries_e2e.py` (default tier): **757 passed, 48
-deselected in 205.19s** and **757 passed, 48 deselected in 203.47s** (two
-runs). The first run on that tree, right after `uv sync`, reported **1
-failed, 756 passed, 48 deselected in 208.77s**; the failing node id was
-not captured, and it did not reproduce in those two full reruns, a
-`--last-failed` rerun, or three reruns of the 46 timing-sensitive tests
-(46 passed each). It is listed under Unverified.
+**Embedding proof** (run for this plan):
+- `origin/main` was re-fetched: it is `8de49e4`.
+- The patch was extracted from this file with the commands under "Patch
+  against `main`". It is `cmp`-equal to the generated diff.
+- `git apply --check` and `git apply` succeeded on a fresh worktree of
+  `8de49e4`.
+- With the oracle copied from its sibling file, `pyproject.toml` is
+  `cmp`-identical to the floor branch at `4b5cac8`, and `diff -rq` of
+  `src/` and `tests/` shows no differences.
+- On that tree (`pmcp.__file__` was printed from it): `ruff check` All
+  checks passed!, `ruff format --check` 172 files already formatted, and
+  `mypy src/` no issues in 52 source files.
+- Also on that tree, the default tier of `test_redaction.py`,
+  `test_redaction_floor.py`, `test_keyword_matcher.py`, `test_auth.py`,
+  `test_policy.py`, `test_project_source_consent_policy.py` and
+  `test_trust_boundaries_e2e.py`: **771 passed, 72 deselected in 292.98s
+  (0:04:52)**.
 
 ## Acceptance criteria
 
@@ -429,11 +575,13 @@ not captured, and it did not reproduce in those two full reruns, a
 9. The prose corpus survives both surfaces byte-identical; every surface
    keeps a JSON document JSON (the fuzz), and a dict result a dict wherever
    `main`'s was.
-10. Timing: every default-tier shape grows linearly from 16 KB to 64 KB on
-    every entry point and stays under 2 s at 64 KB; every generated shape
-    (slow tier) grows linearly; the policy split under 0.1 s.
-11. Each rev-11 board finding is red on `3e49b95`, green here, and killed
-    by its mutant.
+10. Linearity: the work count of every default-tier shape grows linearly
+    (up to the n log n of sorting) from 16 KB to 64 KB to 256 KB on every
+    entry point; every generated shape (slow tier) does too; no
+    regex-derived shape grows more than 64x over 16x the input on the
+    clock.
+11. Each rev-11 board finding is red on `3e49b95` and each rev-12 finding
+    red on `b7b071d`, green here, and killed by its mutant.
 
 ## Non-goals
 
@@ -452,11 +600,10 @@ not captured, and it did not reproduce in those two full reruns, a
 ## Unverified
 
 - Timings are from one host (dev0), one run each.
-- One default-tier run of the redaction files on the embedding-proof tree
-  had a single failure that did not reproduce and whose node id was not
-  captured (see Verification). The timing assertions are the likely source
-  on a shared host; they measure the best of two runs and allow 1.6x the
-  size ratio.
+- Rev 12's single unexplained default-tier failure was, on the seat's
+  evidence, one of its clock-ratio tests under load (T-1); those tests are
+  gone, and the three default-tier runs of rev 13 (one under load) were
+  green.
 - The slow tier is not run in CI; its results here are from one run.
 - The floor is computed over the text the redactor sees; `main` truncated
   before redacting, so on output longer than the cap the two see different
@@ -469,15 +616,25 @@ not captured, and it did not reproduce in those two full reruns, a
   is security-sensitive: re-run the fidelity oracle, the construction tests
   and the mutants on the implementer's tree rather than trusting this plan.
 
+
 ## Patch against `main` @ `876fd33`
 
-`git diff --full-index 876fd33 b7b071d -- pyproject.toml src tests`, less
-`tests/fixtures/redaction_main_oracle.b64`, which is the sibling
-`.consiliency/plans/detailed-234-redactor-main-oracle.b64` (`cmp`-identical)
-and is copied, not patched. `sha256` (first 16) of the result:
-`auth.py 62c04dfc882cf9ff`, `policy.py 1befb6a159ed4ddb`,
-`redaction_floor.py e601e789ab02c353`, `keyword_matcher.py 4c256b3d813bed15`
-(= `main`'s). To apply, on a fresh worktree of `876fd33`:
+This is `git diff --full-index 876fd33 4b5cac8 -- pyproject.toml src tests`,
+less `tests/fixtures/redaction_main_oracle.b64`. That file is the sibling
+`.consiliency/plans/detailed-234-redactor-main-oracle.b64` (`cmp`-identical),
+and it is copied, not patched.
+
+`main` is now `8de49e4`. It differs from `876fd33` only by
+`.consiliency/plans/detailed-296-gate-audit-20260926-2141.md`, and the patch
+applies to it unchanged (see the embedding proof).
+
+`sha256` (first 16 hex characters) of the patched files:
+- `auth.py`: `4efb39a197d6b2fd`
+- `policy.py`: `ab02d11f71b6bb84`
+- `redaction_floor.py`: `ab3eff50055bbdf6`
+- `keyword_matcher.py`: `4c256b3d813bed15` (the same as `main`'s)
+
+To apply, on a fresh worktree of `main`:
 
 ```bash
 sed -n '/^<!-- PATCH-BEGIN -->$/,/^<!-- PATCH-END -->$/p' <this plan> \
@@ -511,18 +668,21 @@ index 500a26dd9217b1dc365bfb098699316d289498f6..9b3dc88ce45a49c571b43b2165b498fd
      "real_cwd: run from the invocation directory, opting out of the autouse isolate_cwd fixture (only for tests whose subject IS the working directory)",
  ]
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e9ee91192 100644
+index 0e58d07734b410ce37d65f463f97437f186647c9..8ec77558e57e4bdf8d482b7e73af1a5e5c97eacc 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
-@@ -4,6 +4,7 @@ from __future__ import annotations
+@@ -2,8 +2,10 @@
  
+ from __future__ import annotations
+ 
++import bisect
  import json
  import re
-+from collections.abc import Callable, Sequence
++from collections.abc import Callable, Iterator, Sequence
  import time
  import asyncio
  from collections.abc import Mapping
-@@ -12,14 +13,14 @@ from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
+@@ -12,14 +14,14 @@ from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
  from itertools import product
  from typing import Any, Literal
  from urllib.error import HTTPError
@@ -535,11 +695,11 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
  from jwt import PyJWKSet
  
 -from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
-+from pmcp.redaction_floor import floor_spans, unindented_break
++from pmcp.redaction_floor import floor_spans, unindented_break, work
  from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
  
  
-@@ -71,15 +72,24 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
+@@ -71,15 +73,24 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
      "api_key",
      "apikey",
      "assertion",
@@ -564,7 +724,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
      "session",
      "set-cookie",
      "sid",
-@@ -88,8 +98,15 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
+@@ -88,8 +99,15 @@ AUTH_DIAGNOSTIC_SECRET_KEYS = {
      "token",
  }
  
@@ -582,7 +742,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
  
  _JWT_RE = re.compile(
      r"(?<![A-Za-z0-9_-])"
-@@ -97,6 +114,975 @@ _JWT_RE = re.compile(
+@@ -97,6 +115,1011 @@ _JWT_RE = re.compile(
      r"(?![A-Za-z0-9_-])"
  )
  
@@ -754,7 +914,16 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +REDACTED = "[REDACTED]"
 +
 +
++def _counted(matches: Iterator[re.Match[str]]) -> Iterator[re.Match[str]]:
++    """Each match of a pass, counted as the work of reading it (the
++    test-only work counter, `pmcp.redaction_floor.work`)."""
++    for match in matches:
++        work(match.end() - match.start() + 1)
++        yield match
++
++
 +def _run_spans(start: int, run: str) -> list[Span]:
++    work(len(run))
 +    if len(run) > _OPAQUE_MAX_RUN and not _reads_as_route(run):
 +        # A payload (JPEG base64 starts `/9j/` and carries a `/` every ~64
 +        # characters): the bound applies to the whole run BEFORE any path
@@ -787,13 +956,16 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +def _shape_spans(text: str) -> list[Span]:
 +    """Spans of every credential-shaped run in ``text``: JWTs, the vendor
 +    supplement, prefixed tokens and scored opaque runs."""
-+    spans: list[Span] = [(m.start(), m.end(), REDACTED) for m in _JWT_RE.finditer(text)]
++    work(len(text) * (3 + len(_VENDOR_SHAPE_RES)))  # one scan per pattern
++    spans: list[Span] = [
++        (m.start(), m.end(), REDACTED) for m in _counted(_JWT_RE.finditer(text))
++    ]
 +    for vendor_re in _VENDOR_SHAPE_RES:
 +        spans.extend((m.start(), m.end(), REDACTED) for m in vendor_re.finditer(text))
 +    spans.extend(
 +        (m.start(), m.end(), REDACTED) for m in _PREFIXED_TOKEN_RE.finditer(text)
 +    )
-+    for m in _OPAQUE_RUN_RE.finditer(text):
++    for m in _counted(_OPAQUE_RUN_RE.finditer(text)):
 +        spans.extend(_run_spans(m.start(), m.group(0)))
 +    return spans
 +
@@ -1146,14 +1318,27 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +
 +
 +def _in_resource_name(text: str) -> Callable[[int], bool]:
++    """Is a position inside an `arn:`/`urn:` resource name? The names are
++    disjoint and ascending (one `finditer`), so each question is one binary
++    search: asking every range for every keyword match was quadratic (B-4 of
++    rev 12's board)."""
 +    ranges = [(m.start(), m.end()) for m in _RESOURCE_NAME_RE.finditer(text)]
-+    return lambda position: any(a <= position < b for a, b in ranges)
++    starts = [a for a, _ in ranges]
++    work(len(text))
++
++    def inside(position: int) -> bool:
++        work(1)
++        i = bisect.bisect_right(starts, position) - 1
++        return i >= 0 and position < ranges[i][1]
++
++    return inside
 +
 +
 +def _keyword_sep_spans(text: str) -> list[Span]:
++    work(len(text))  # the pass's scan
 +    spans: list[Span] = []
 +    in_resource_name = _in_resource_name(text)
-+    for match in _KEYWORD_SEP_RE.finditer(text):
++    for match in _counted(_KEYWORD_SEP_RE.finditer(text)):
 +        if in_resource_name(match.start()):
 +            continue  # `arn:…:secret:Name` names a secret, it is not one
 +        name = match.group("name").lower()
@@ -1240,9 +1425,10 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +
 +
 +def _keyword_list_spans(text: str) -> list[Span]:
++    work(len(text))  # the pass's scan
 +    spans: list[Span] = []
 +    in_resource_name = _in_resource_name(text)
-+    for match in _KEYWORD_LIST_RE.finditer(text):
++    for match in _counted(_KEYWORD_LIST_RE.finditer(text)):
 +        if in_resource_name(match.start()):
 +            continue
 +        name = match.group("name").lower()
@@ -1277,9 +1463,10 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +
 +
 +def _keyword_ws_spans(text: str) -> list[Span]:
++    work(len(text))  # the pass's scan
 +    return [
 +        (match.start("value"), match.end("value"), REDACTED)
-+        for match in _KEYWORD_WS_RE.finditer(text)
++        for match in _counted(_KEYWORD_WS_RE.finditer(text))
 +        if match.group("name").lower() != "code"
 +        and _value_could_be_a_credential(match.group("value"))
 +        # a glued prefix (`CLIENTSECRET abc…`) only on a single-case key or
@@ -1296,9 +1483,10 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +
 +
 +def _bearer_spans(text: str) -> list[Span]:
++    work(len(text))  # the pass's scan
 +    return [
 +        (match.start("value"), match.end("value"), REDACTED)
-+        for match in _BEARER_RE.finditer(text)
++        for match in _counted(_BEARER_RE.finditer(text))
 +        if not _is_plain_word_or_number(match.group("value"))
 +        and not (
 +            unindented_break(match.group("key"))
@@ -1316,8 +1504,9 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +
 +
 +def _authorization_spans(text: str) -> list[Span]:
++    work(len(text))  # the pass's scan
 +    spans: list[Span] = []
-+    for match in _AUTHORIZATION_RE.finditer(text):
++    for match in _counted(_AUTHORIZATION_RE.finditer(text)):
 +        key_end = match.start() + len("authorization")
 +        quoted_key = text[key_end : key_end + 1] in ('"', "'")
 +        quoted = match.group("quoted")
@@ -1361,6 +1550,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +    "contained" -- rev 5's regression against main. The path is left to the
 +    shape pass, which sees it like any other text.
 +    """
++    work(len(raw_url))
 +    spans: list[Span] = []
 +    scheme_end = raw_url.find("://")
 +    netloc_start = scheme_end + 3 if scheme_end >= 0 else 0
@@ -1430,7 +1620,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +
 +def _url_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
 +    spans: list[Span] = []
-+    for match in _URL_RE.finditer(text):
++    for match in _counted(_URL_RE.finditer(text)):
 +        raw_url = match.group(0)
 +        # Trailing sentence punctuation is handed back, and so is a trailing
 +        # backslash: in a serialised leaf it escapes the closing quote
@@ -1492,12 +1682,16 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +    silently became a string. A span preceded by an escaping backslash (an
 +    odd run of them) takes the backslash too, so the whole escape goes.
 +    """
++    # the length of the backslash run ending just before each position, in
++    # one pass: scanning back from every span start was quadratic in a long
++    # run of backslashes with spans inside it
++    work(len(text) + len(spans))
++    runs = [0] * (len(text) + 1)
++    for i, char in enumerate(text):
++        runs[i + 1] = runs[i] + 1 if char == "\\" else 0
 +    widened: list[Span] = []
 +    for start, end, replacement in spans:
-+        run = 0
-+        while start - run - 1 >= 0 and text[start - run - 1] == "\\":
-+            run += 1
-+        if run % 2 == 1 and start < end:
++        if runs[start] % 2 == 1 and start < end:
 +            start -= 1
 +        widened.append((start, end, replacement))
 +    return widened
@@ -1506,6 +1700,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
 +    """The disjoint spans `apply_redaction_spans` applies, ascending (see
 +    there for the overlap rules)."""
++    work(len(text) + len(spans) * max(1, len(spans).bit_length()))  # scan, sort
 +    markers: list[Span] = [
 +        (m.start(), m.end(), REDACTED) for m in re.finditer(re.escape(REDACTED), text)
 +    ]
@@ -1546,6 +1741,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
 +    stays).
 +    """
 +    merged = merge_redaction_spans(text, spans)
++    work(len(text) + len(merged))
 +    pieces: list[str] = []
 +    position = 0
 +    for start, end, replacement in merged:
@@ -1558,7 +1754,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
  
  def redact_auth_url(url: str) -> str:
      """Strip URL userinfo and redact auth-bearing query values."""
-@@ -580,21 +1566,10 @@ def sanitize_url_elicitation_url(
+@@ -580,21 +1603,10 @@ def sanitize_url_elicitation_url(
  def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
      """Return a display-safe diagnostic string for auth failures."""
      text = str(value)
@@ -1585,14 +1781,15 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e
  
  
 diff --git a/src/pmcp/policy/policy.py b/src/pmcp/policy/policy.py
-index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c757888bec8 100644
+index cac27021c46dcd6c2a066fa779ccf58046bc0c94..669483aed797c075ccd0cb7ff3803bc289effcdd 100644
 --- a/src/pmcp/policy/policy.py
 +++ b/src/pmcp/policy/policy.py
-@@ -22,7 +22,13 @@ from pmcp.types import (
+@@ -22,7 +22,14 @@ from pmcp.types import (
      ServerPolicy,
      ToolPolicy,
  )
 -from pmcp.auth import sanitize_auth_diagnostic
++from pmcp.redaction_floor import work
 +from pmcp.auth import (
 +    REDACTED,
 +    Span,
@@ -1603,7 +1800,7 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c75
  
  if TYPE_CHECKING:
      # Annotation only. `pmcp.manifest`'s package `__init__` imports the loader and
-@@ -44,8 +50,21 @@ _ListPolicy = ServerPolicy | ToolPolicy | ResourcePolicy | PromptPolicy
+@@ -44,8 +51,21 @@ _ListPolicy = ServerPolicy | ToolPolicy | ResourcePolicy | PromptPolicy
  #: would otherwise return the wrong limit or raise at runtime.
  _LimitField = Literal["max_tools_per_server", "max_output_bytes", "max_output_tokens"]
  
@@ -1626,7 +1823,7 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c75
      r"(api[_-]?key|apikey)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
      r"(secret|password|passwd|pwd)[\s]*[:=][\s]*[\"']?([^\s\"']+)",
      r"(bearer|token)[\s]+[a-zA-Z0-9._-]+",
-@@ -55,6 +74,63 @@ DEFAULT_REDACTION_PATTERNS = [
+@@ -55,6 +75,63 @@ DEFAULT_REDACTION_PATTERNS = [
      r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
  ]
  
@@ -1690,7 +1887,7 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c75
  # Search order for an auto-discovered policy. The project-local entries are kept
  # RELATIVE on purpose: they are resolved against `Path.cwd()` when a
  # `PolicyManager` is constructed, not when this module is imported. Storing them
-@@ -666,18 +742,31 @@ class PolicyManager:
+@@ -666,18 +743,31 @@ class PolicyManager:
          return self._composed_limit("max_output_tokens")
  
      def truncate_output(
@@ -1724,7 +1921,7 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c75
  
          # Truncate to max bytes, being careful with UTF-8
          encoded = output.encode("utf-8")
-@@ -687,29 +776,63 @@ class PolicyManager:
+@@ -687,29 +777,65 @@ class PolicyManager:
          truncated_str = truncated_bytes.decode("utf-8", errors="ignore")
  
          # Add truncation indicator
@@ -1782,6 +1979,7 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c75
 +            floor_patterns=self._redaction_regexes,
 +        )
 +        for regex in self._additive_regexes():
++            work(len(output))  # the pattern's scan
 +            for match in regex.finditer(output):
                  full_match = match.group(0)
 -                # Find the separator (: or =)
@@ -1793,6 +1991,7 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c75
 -            result = regex.sub(replace_match, result)
 -
 -        return result
++                work(2 * len(full_match) + 1)  # the match, the split
 +                split = _value_separator(full_match)
 +                if split >= 0:
 +                    spans.append(
@@ -1804,7 +2003,7 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c75
  
      def process_output(
          self,
-@@ -731,11 +854,42 @@ class PolicyManager:
+@@ -731,11 +857,43 @@ class PolicyManager:
  
          raw_size = len(output_str.encode("utf-8"))
  
@@ -1833,6 +2032,7 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c75
 +            # escaped quotes the keyed rules do not read -- scoped out to
 +            # Consiliency/pmcp#290; the bar here is never worse than main.
 +            spans = self.redaction_spans(window)
++            work(2 * len(window) + len(spans) * max(1, len(spans).bit_length()))
 +            keep = len(
 +                window.encode("utf-8")[:max_size].decode("utf-8", errors="ignore")
 +            )
@@ -1854,10 +2054,10 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c75
          summary: str | None = None
 diff --git a/src/pmcp/redaction_floor.py b/src/pmcp/redaction_floor.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c8194482e
+index 0000000000000000000000000000000000000000..90fa2276380f97846d1fa67ace704155338b4c62
 --- /dev/null
 +++ b/src/pmcp/redaction_floor.py
-@@ -0,0 +1,1447 @@
+@@ -0,0 +1,1555 @@
 +"""Main's redaction rules as a floor (Consiliency/pmcp#234).
 +
 +Four review rounds of the redactor rewrite each found inputs it redacted less
@@ -1906,6 +2106,18 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +from pmcp.keyword_matcher import key_start_pattern, keys_alternation, keyword_matches
 +
 +REDACTED = "[REDACTED]"
++
++#: Test-only work counter (Consiliency/pmcp#234). None in production; the
++#: complexity tests set it to `[0]` and every loop and string build of the
++#: redactor adds what it iterates over or copies, so linear time is asserted
++#: on a deterministic count, not on the clock.
++WORK: list[int] | None = None
++
++
++def work(amount: int) -> None:
++    if WORK is not None:
++        WORK[0] += amount
++
 +
 +# --------------------------------------------------------------------------
 +# main's constants, frozen (origin/main 1fb36f2, src/pmcp/auth.py and
@@ -2044,7 +2256,8 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +
 +
 +# A piece of one step's output: ("keep", a, b) copies cur[a:b] with its
-+# origins; ("new", text) is synthesised; ("atom", text, raw_a, raw_b) is text
++# origins; ("new", text) is synthesised (("new", text, raw_a, raw_b): standing
++# for that input range only); ("atom", text, raw_a, raw_b) is text
 +# derived from the whole raw range (a re-encoded URL component).
 +_Piece = tuple
 +
@@ -2073,6 +2286,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +
 +    def raw_ranges(self, a: int, b: int) -> list[tuple[int, int]]:
 +        """The input ranges the characters cur[a:b] came from, merged."""
++        work((b - a) * max(1, (b - a).bit_length()))  # the slice, the sort
 +        ranges = sorted(self.atom_range(atom) for atom in self.org[a:b] if atom >= 0)
 +        merged: list[tuple[int, int]] = []
 +        for start, end in ranges:
@@ -2086,18 +2300,26 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +        """cur[a:b] as the input spelled it: a synthesised marker reads as
 +        the input text it replaced."""
 +        pieces: list[str] = []
-+        last = None
++        # Every character stands for input at or after its predecessor's, and
++        # no two markers stand for overlapping input (`rewrite`), so the
++        # input is emitted once, left to right: at most b - a characters of
++        # `cur` read and at most the input they came from copied.
++        covered_to = -1
 +        for atom in self.rep[a:b]:
-+            if atom < 0 or atom == last:
++            if atom < 0:
 +                continue
-+            last = atom
 +            start, end = self.atom_range(atom)
-+            pieces.append(self.raw[start:end])
++            if end <= covered_to:
++                continue
++            pieces.append(self.raw[max(start, covered_to) : end])
++            covered_to = end
++        work(b - a)
 +        return "".join(pieces)
 +
 +    def rewrite(self, edits: list[tuple[int, int, list[_Piece]]]) -> None:
 +        """Replace each cur[start:end] by its pieces (edits ascending,
 +        disjoint)."""
++        work(len(self.cur) + sum(len(pieces) for _, _, pieces in edits))
 +        out: list[str] = []
 +        org: list[int] = []
 +        rep: list[int] = []
@@ -2128,9 +2350,19 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +                    org.extend(self.org[piece[1] : piece[2]])
 +                    rep.extend(self.rep[piece[1] : piece[2]])
 +                elif piece[0] == "new":
++                    # a marker stands for what it replaced: the input range
++                    # the piece names (a URL's redacted value), nothing
++                    # (`-1`, a URL's added `=`), or the edit's replaced text
++                    marker = stands_for
++                    if len(piece) == 4:
++                        marker = (
++                            self.new_atom(piece[2], piece[3])
++                            if piece[2] < piece[3]
++                            else -1
++                        )
 +                    out.append(piece[1])
 +                    org.extend([-1] * len(piece[1]))
-+                    rep.extend([stands_for] * len(piece[1]))
++                    rep.extend([marker] * len(piece[1]))
 +                else:
 +                    atom = self.new_atom(piece[2], piece[3])
 +                    out.append(piece[1])
@@ -2152,8 +2384,16 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +
 +
 +def _context(text: str, start: int) -> str:
++    work(256)
 +    match = _CONTEXT_RE.search(text, max(0, start - 256), start)
 +    return match.group(0) if match is not None else ""
++
++
++def _counted(matches: Iterator[re.Match[str]]) -> Iterator[re.Match[str]]:
++    """Each match of a pass, counted as the work of reading it."""
++    for match in matches:
++        work(match.end() - match.start() + 1)
++        yield match
 +
 +
 +def _spans_for(
@@ -2192,6 +2432,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +    URL's offset), plus the labelled input ranges it drops. None when the
 +    alignment does not reproduce main's output exactly."""
 +    expected = main_redact_auth_url(raw)
++    work(4 * len(raw))  # parse, rewrite, align, compare
 +    pieces: list[_Piece] = []
 +    dropped: list[tuple[int, int, str]] = []
 +    try:
@@ -2283,10 +2524,17 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +                    ("keep", base + key_start + len(key), base + value_start)
 +                )
 +            else:
-+                pair_pieces.append(("new", "="))
++                pair_pieces.append(("new", "=", -1, -1))
 +            decoded_key = unquote(key.replace("+", " "))
 +            if decoded_key.lower() in MAIN_AUTH_SECRET_QUERY_KEYS:
-+                pair_pieces.append(("new", quote(REDACTED)))
++                pair_pieces.append(
++                    (
++                        "new",
++                        quote(REDACTED),
++                        base + value_start,
++                        base + value_start + len(value),
++                    )
++                )
 +                if value:
 +                    dropped.append(
 +                        (
@@ -2341,6 +2589,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +    """Every input position is either kept by a piece or dropped by a label:
 +    whatever no piece keeps and no label names (the `&` of an empty, doubled
 +    or trailing pair) is labelled `url.normal` here."""
++    work(2 * len(raw) + len(pieces) + len(dropped))
 +    covered = bytearray(len(raw))
 +    for piece in pieces:
 +        if piece[0] == "keep":
@@ -2386,8 +2635,9 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +def _url_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
 +    # The URL step is the first: cur is the input and every origin is itself.
 +    text = tracked.cur
++    work(len(text))
 +    edits: list[tuple[int, int, list[_Piece]]] = []
-+    for match in _MAIN_URL_RE.finditer(text):
++    for match in _counted(_MAIN_URL_RE.finditer(text)):
 +        # main's `redact_url_match`: trailing sentence punctuation is handed
 +        # back, stripped in one pass
 +        raw = match.group(0).rstrip(").,;")
@@ -2439,6 +2689,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +        if k > start and text[k - 1] == "\\":
 +            k -= 1
 +        found = k
++    work(end - k + 1)
 +    return found
 +
 +
@@ -2472,8 +2723,9 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +
 +def _authorization_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
 +    cur = tracked.cur
++    work(len(cur))  # the pass's scan
 +    edits = []
-+    for m in _MAIN_AUTHORIZATION_RE.finditer(cur):
++    for m in _counted(_MAIN_AUTHORIZATION_RE.finditer(cur)):
 +        a = m.end(1)
 +        edits.append((m.start(), m.end(), [("keep", m.start(), a), ("new", REDACTED)]))
 +        scheme = m.group(2) or ""
@@ -2495,8 +2747,9 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +
 +def _bearer_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
 +    cur = tracked.cur
++    work(len(cur))  # the pass's scan
 +    edits = []
-+    for m in _MAIN_BEARER_RE.finditer(cur):
++    for m in _counted(_MAIN_BEARER_RE.finditer(cur)):
 +        a = m.end(1)
 +        edits.append((m.start(), m.end(), [("keep", m.start(), a), ("new", REDACTED)]))
 +        spans.extend(
@@ -2518,7 +2771,9 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +def _keyword_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
 +    cur = tracked.cur
 +    edits = []
++    work(len(cur))  # the matcher's scan
 +    for start, key_end, value_start, end in main_keyword_matches(cur):
++        work(end - start + 1)
 +        edits.append((start, end, [("keep", start, value_start), ("new", REDACTED)]))
 +        spans.extend(
 +            _spans_for(
@@ -2539,8 +2794,9 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +
 +def _jwt_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
 +    cur = tracked.cur
++    work(len(cur))  # the pass's scan
 +    edits = []
-+    for m in _MAIN_JWT_RE.finditer(cur):
++    for m in _counted(_MAIN_JWT_RE.finditer(cur)):
 +        edits.append((m.start(), m.end(), [("new", REDACTED)]))
 +        spans.extend(
 +            _spans_for(
@@ -2566,6 +2822,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +    tracked: _Tracked, spans: list[FloorSpan], regex: re.Pattern[str], index: int
 +) -> None:
 +    cur = tracked.cur
++    work(len(cur))  # the pass's scan
 +    edits = []
 +    default = regex.pattern in MAIN_DEFAULT_REDACTION_PATTERNS
 +    rule = (
@@ -2573,7 +2830,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +        if default
 +        else f"policy:custom{index}"
 +    )
-+    for m in regex.finditer(cur):
++    for m in _counted(regex.finditer(cur)):
 +        full = m.group(0)
 +        separator = next((i for i, char in enumerate(full) if char in ":="), -1)
 +        info: dict[str, Any] = {
@@ -2703,6 +2960,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +class _JsonLayout:
 +    def __init__(self, text: str) -> None:
 +        self.text = text
++        work(2 * len(text))
 +        #: (start, end) of every string token, quotes included
 +        self.strings = [m.span() for m in _JSON_STRING_RE.finditer(text)]
 +        self._starts = [start for start, _ in self.strings]
@@ -2714,6 +2972,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +            self.token_start[end - 1] = 1
 +
 +    def string_at(self, index: int) -> tuple[int, int] | None:
++        work(max(1, len(self._starts).bit_length()))
 +        import bisect
 +
 +        i = bisect.bisect_right(self._starts, index) - 1
@@ -2724,6 +2983,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +
 +def json_layout(text: str) -> _JsonLayout | None:
 +    """The layout of ``text`` when it is a JSON document, else None."""
++    work(len(text))
 +    head = text.lstrip()[:1]
 +    if head not in ("{", "[", '"'):
 +        return None
@@ -2741,11 +3001,13 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +    applied: list[tuple[int, int, str]] = []
 +    position = span.start
 +    while position < span.end:
++        work(1)
 +        string = layout.string_at(position)
 +        if string is not None and string[0] < position < string[1] - 1:
 +            stop = min(span.end, string[1] - 1)
 +            start, end = position, stop
 +            while not layout.token_start[start]:
++                work(1)
 +                start -= 1
 +            if (
 +                end - 1 >= start
@@ -2757,6 +3019,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +                span.json_kept.append((end - 1, end))
 +                end -= 1
 +            while not layout.token_start[end]:
++                work(1)
 +                end += 1
 +            applied.append((start, end, span.replacement))
 +            position = stop
@@ -2770,6 +3033,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +            # a bare scalar (outside strings nothing else is not syntax)
 +            back = position
 +            while back > 0 and text[back - 1] not in JSON_SYNTAX:
++                work(1)
 +                back -= 1
 +            scalar = _JSON_SCALAR_TOKEN_RE.match(text, back)
 +        else:
@@ -2956,6 +3220,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +    _, spans = replay(text, patterns)
 +    layout = json_layout(text) if spans else None
 +    applied: list[tuple[int, int, str]] = []
++    work(len(text) + len(spans))
 +    removed: dict[int, list[str]] = {}
 +    for span in spans:
 +        removed.setdefault(span.group, []).append(text[span.start : span.end])
@@ -2966,6 +3231,20 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +        span.removed = joined[span.group]
 +        key = _decision_key(span)
 +        if key not in decided:
++            # each predicate reads the match's own strings a bounded number of
++            # times (key readings are bounded by `_MAX_READ_KEY`)
++            work(
++                len(SUPPRESSIONS)
++                * (
++                    len(span.key)
++                    + len(span.sep)
++                    + len(span.value)
++                    + len(span.removed)
++                    + len(span.before)
++                    + len(span.after)
++                    + 256
++                )
++            )
 +            if span.raw_key_start >= 0:
 +                span.raw_key_before = _context(text, span.raw_key_start)
 +            decided[key] = next(
@@ -3044,18 +3323,46 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +_GLUED_SUFFIX_RE = re.compile(r"[A-Za-z0-9]*")
 +
 +
++def _case(char: str) -> int:
++    return 1 if char.isupper() else 2 if char.islower() else 0
++
++
++def _same_case_run(text: str, *, from_end: bool, neighbour: str) -> int:
++    """How long the run of ``text`` next to the key word is before a case
++    change (`production` + `Password`, `PRODUCTION` + `password`, `Server` in
++    `passwordForServer`): a case change joins words as `_` and `-` do (N-5
++    of rev 12's board: camelCase and SHOUTING multi-word keys). Digits
++    continue a run. ``neighbour`` is the key word's letter on that side."""
++    chars = reversed(text) if from_end else iter(text)
++    previous = _case(neighbour)
++    length = 0
++    for char in chars:
++        case = _case(char)
++        if case and previous and case != previous:
++            break
++        if case:
++            previous = case
++        length += 1
++    return length
++
++
 +@suppression("N3")
 +def _n3(span: FloorSpan) -> bool:
-+    """A prefix or suffix GLUED to the key word -- more than 24 alphanumerics
-+    with no joiner between them and the key word (`<25 letters>password=`,
-+    `password<25 letters>=`) -- is an identifier, not a key (the additive
-+    rules' cost bound). Joined segments are not glued:
-+    `DATABASE_PASSWORD_FOR_REPLICATION_USER_ACCOUNT=` is a key."""
-+    return span.rule in _KEYED_RULES and _for_every_reading(
-+        span,
-+        lambda r: len(r.glued) > 24
-+        or len(_GLUED_SUFFIX_RE.match(r.suffix).group(0)) > 24,  # type: ignore[union-attr]
-+    )
++    """A prefix or suffix of more than 24 alphanumerics GLUED to the key word
++    -- no `_`/`-` and no case change between them and the key word
++    (`<25 letters>password=`, `password<25 letters>=`) -- is an identifier,
++    not a key (the additive rules' cost bound). Joined words are not glued:
++    `DATABASE_PASSWORD_FOR_REPLICATION_USER_ACCOUNT=`,
++    `passwordForTheProductionDatabaseServer=` and
++    `PRODUCTIONDATABASEREPLICATIONpassword=` are keys."""
++
++    def glued_too_long(r: KeyReading) -> bool:
++        prefix = _same_case_run(r.glued, from_end=True, neighbour=r.name[:1])
++        suffix_run = _GLUED_SUFFIX_RE.match(r.suffix).group(0)  # type: ignore[union-attr]
++        suffix = _same_case_run(suffix_run, from_end=False, neighbour=r.name[-1:])
++        return prefix > 24 or suffix > 24
++
++    return span.rule in _KEYED_RULES and _for_every_reading(span, glued_too_long)
 +
 +
 +#: The text before a key that is itself a segment of an `arn:`/`urn:`
@@ -3250,6 +3557,7 @@ index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c
 +    """Does ``text`` hold a line break with no space, tab or no-break space
 +    after it (the last break decides: an indent after it is after every
 +    earlier one too)? One reverse search, not a regex anchored at the end."""
++    work(len(text))
 +    last = max(text.rfind("\r"), text.rfind("\n"))
 +    return last >= 0 and not any(c in " \t\xa0" for c in text[last + 1 :])
 +
@@ -4621,10 +4929,10 @@ index 0000000000000000000000000000000000000000..997d19fc87ac309681275ed9b8244f16
 +    return value
 diff --git a/tests/_redaction_shapes.py b/tests/_redaction_shapes.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..480560d3a22e8f500b5beeb97a9cc566d5e0f3b3
+index 0000000000000000000000000000000000000000..713e2cb0eca112c932e33cb6dd01cf601200243a
 --- /dev/null
 +++ b/tests/_redaction_shapes.py
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,309 @@
 +"""Adversarial input shapes derived from the redactor's own regular
 +expressions (Consiliency/pmcp#234).
 +
@@ -4835,6 +5143,105 @@ index 0000000000000000000000000000000000000000..480560d3a22e8f500b5beeb97a9cc566
 +    )
 +    unique = {(p.pattern, p.flags): p for p in found if isinstance(p.pattern, str)}
 +    return list(unique.values())
++
++
++# ------------------------------------------------------------ compositions
++#
++# The shapes above come from the regular expressions alone, one lead at a
++# time. The replay and the additive rules also have Python loops whose cost
++# depends on how passes COMPOSE: a match of one pass that spans many
++# markers left by an earlier one (a Bearer value over a URL's rewritten
++# pairs), a lookup per match over structures built by another pass (every
++# keyword match asking every resource name), a scan per span over text
++# other spans share (the backslash run before every escape). So the second
++# family is built from the loop structure: two leads that arm different
++# passes, a repeated unit that makes one pass leave many markers or ranges
++# for the other, units interleaved, and each composition nested inside a
++# JSON string and after a header.
++
++CONTEXTS = (
++    "",
++    "Authorization: ",
++    "Bearer ",
++    "password=",
++    "token ",
++    "https://h/?",
++    "https://h/?password=x",
++    "Authorization: https://h/?q",
++    "Bearer https://h/?password=x",
++    "see https://h/?password=x",
++    "arn:x ",
++    "x=urn:a:b&",
++    '{"t": "',
++    "code ",
++    "\\",
++)
++#: Units that make one pass leave many markers, ranges or spans behind.
++LOOP_UNITS = (
++    "&a+b",
++    "password=x&",
++    "&a",
++    "a=%41&",
++    "&token=%2541",
++    "token=x ",
++    "arn:x ",
++    "arn:x:secret=abc123 ",
++    "password=abc123 ",
++    'tokens: ["a1b2c3d4"] ',
++    "[REDACTED]",
++    "\\u00e9",
++    '\\"',
++    "\\\\",
++    "Bearer x ",
++    "Authorization: x ",
++    "secret:",
++    "a-",
++    "=:",
++    ")",
++    "\n",
++    "%25",
++    "ghp_abcdefghij1234 ",
++    "https://u:p@h/?a=1 ",
++)
++COMPOSITION_TAILS = ("", " end", '"')
++
++
++def compositions() -> dict[str, Callable[[int], str]]:
++    """Two leads + a repeated unit (or two interleaved) + a tail, and each
++    nested in a JSON string."""
++    import json
++
++    out: dict[str, Callable[[int], str]] = {}
++
++    def add(name: str, lead: str, unit: str, tail: str, nest: bool) -> None:
++        def make(n: int, lead: str = lead, unit: str = unit, tail: str = tail) -> str:
++            text = lead + unit * max(1, (n - len(lead) - len(tail)) // len(unit)) + tail
++            return json.dumps({"t": text}) if nest else text
++
++        out[name] = make
++
++    for first in CONTEXTS:
++        for second in CONTEXTS:
++            for unit in LOOP_UNITS:
++                for tail in COMPOSITION_TAILS:
++                    lead = first + second
++                    add(f"{lead!r}+{unit!r}*k+{tail!r}", lead, unit, tail, False)
++    for lead in CONTEXTS:
++        for a in LOOP_UNITS:
++            for b in LOOP_UNITS:
++                if a != b:
++                    add(f"{lead!r}+{a + b!r}*k", lead, a + b, "", False)
++    for lead in CONTEXTS:
++        for unit in LOOP_UNITS:
++            add(f"json({lead!r}+{unit!r}*k)", lead, unit, "", True)
++            add(
++                f"hdr+json({lead!r}+{unit!r}*k)",
++                "Authorization: " + lead,
++                unit,
++                "",
++                True,
++            )
++    return out
 diff --git a/tests/fixtures/regen_redaction_main_oracle.py b/tests/fixtures/regen_redaction_main_oracle.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..8c761da34fafaefcc584f9c73c47476febecf8ac
@@ -4969,10 +5376,10 @@ index 0000000000000000000000000000000000000000..8c761da34fafaefcc584f9c73c47476f
 +    )
 diff --git a/tests/test_redaction.py b/tests/test_redaction.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..051eeab4334473ce5dbc60288b306ba8691b0176
+index 0000000000000000000000000000000000000000..d2d2252cb9050035de4b6ca98e11d0dd3fa1a913
 --- /dev/null
 +++ b/tests/test_redaction.py
-@@ -0,0 +1,3336 @@
+@@ -0,0 +1,3347 @@
 +"""Both directions of secret redaction, pinned together (Consiliency/pmcp#234).
 +
 +The redactor stands between a downstream server's error text and a
@@ -5004,6 +5411,7 @@ index 0000000000000000000000000000000000000000..051eeab4334473ce5dbc60288b306ba8
 +import string
 +import uuid
 +from pathlib import Path
++from collections.abc import Callable
 +from typing import Any
 +
 +import pytest
@@ -7414,18 +7822,30 @@ index 0000000000000000000000000000000000000000..051eeab4334473ce5dbc60288b306ba8
 +        assert json.loads(out) == {"password": REDACTED}, (surface, out)
 +
 +
-+def test_n4_the_key_qualifier_is_bounded() -> None:
-+    """N4: rev 8 took ~216 s on this; main and rev 9 take well under 1 s.
-+    The 2 s bound is generous against CI noise and still catches the quadratic
-+    shape by two orders of magnitude."""
++def _clock_growth(
++    run: Callable[[str], object], shape: Callable[[int], str], small: int, large: int
++) -> float:
 +    import time
 +
-+    text = "a_" * 33000
++    def best(text: str) -> float:
++        times = []
++        for _ in range(2):
++            start = time.perf_counter()
++            run(text)
++            times.append(time.perf_counter() - start)
++        return min(times)
++
++    return best(shape(large)) / max(best(shape(small)), 1e-4)
++
++
++def test_n4_the_key_qualifier_is_bounded() -> None:
++    """N4: rev 8 took ~216 s on 66 KB of this. Growth over 16x the input,
++    best of two at each size: linear is ~16x, quadratic ~256x; the bound of
++    64x is a factor of four from either, so host load cannot flip it (rev
++    12's board, T-1: an absolute bound near the measured time can)."""
 +    for surface, redact in (("engine", _engine), ("policy", _policy)):
-+        start = time.perf_counter()
-+        redact(text)
-+        elapsed = time.perf_counter() - start
-+        assert elapsed < 2.0, (surface, elapsed)
++        ratio = _clock_growth(redact, lambda n: "a_" * (n // 2), 4_096, 65_536)
++        assert ratio < 64, (surface, ratio)
 +
 +
 +@pytest.mark.parametrize(
@@ -7865,16 +8285,14 @@ index 0000000000000000000000000000000000000000..051eeab4334473ce5dbc60288b306ba8
 +
 +def test_f9_the_pem_rule_is_linear() -> None:
 +    """F9: every BEGIN without an END scanned to the end of the text (rev 9:
-+    5.6 s on 264 KB; main 0.05 s). The bound is generous against CI noise and
-+    still an order of magnitude under rev 9."""
-+    import time
-+
-+    text = "-----BEGIN RSA PRIVATE KEY-----\n" * 8250  # 264 KB
++    5.6 s on 264 KB). Growth over 16x the input (16.5 KB -> 264 KB), best of
++    two at each size, under 64x: linear is ~16x, quadratic ~256x."""
++    unit = "-----BEGIN RSA PRIVATE KEY-----\n"
 +    for surface, redact in (("engine", _engine), ("policy", _policy)):
-+        start = time.perf_counter()
-+        redact(text)
-+        elapsed = time.perf_counter() - start
-+        assert elapsed < 2.0, (surface, elapsed)
++        ratio = _clock_growth(
++            redact, lambda n: unit * (n // len(unit)), 16_896, 270_336
++        )
++        assert ratio < 64, (surface, ratio)
 +    block = "-----BEGIN RSA PRIVATE KEY-----\nMIIEabc\n-----END RSA PRIVATE KEY-----"
 +    assert _engine(f"key: {block} end") == "key: [REDACTED] end"
 +
@@ -8311,10 +8729,10 @@ index 0000000000000000000000000000000000000000..051eeab4334473ce5dbc60288b306ba8
 +    assert offenders == [], offenders
 diff --git a/tests/test_redaction_floor.py b/tests/test_redaction_floor.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b051418280d06e
+index 0000000000000000000000000000000000000000..0c54e1596722fe2e289c7a67ab7379a6bce43446
 --- /dev/null
 +++ b/tests/test_redaction_floor.py
-@@ -0,0 +1,1265 @@
+@@ -0,0 +1,1458 @@
 +"""Main's rules as the redactor's floor (Consiliency/pmcp#234).
 +
 +`pmcp.redaction_floor` replays main's redaction rules and hands the redactor
@@ -9049,17 +9467,15 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +
 +def _b3_split(split: Callable[[str], int]) -> float:
 +    started = time.perf_counter()
-+    split("password" + ":=" * 33_000 + "x")
++    split("password" + ":=" * 33_000)
 +    return time.perf_counter() - started
 +
 +
 +def _b3() -> None:
-+    """B3: the policy split loop is linear (rev 10: 3.5 s on 66 KB)."""
-+    policy = PolicyManager()
-+    started = time.perf_counter()
-+    policy.redact_secrets("password" + ":=" * 33_000)
-+    assert time.perf_counter() - started < 1.0
-+    assert _b3_split(policy_module._value_separator) < 0.1
++    """B3: the policy split loop is linear (rev 10: seconds on 66 KB). The
++    split alone, on 66 KB of `:=`: a linear scan takes milliseconds, the
++    quadratic one seconds -- two orders of magnitude either side of 0.5 s."""
++    assert _b3_split(policy_module._value_separator) < 0.5
 +
 +
 +def _b4() -> None:
@@ -9198,6 +9614,54 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +
 +
 +# ============================================================== timing ==== #
++#
++# Linear time is asserted on a DETERMINISTIC work count, never on the clock
++# (rev 12's ratio tests flaked on a loaded host, T-1 of its board). Every
++# loop and string build of the redactor adds what it iterates over or copies
++# to `pmcp.redaction_floor.WORK` while a test holds it; a regex pass adds the
++# text it scans. The plan's complexity table says, per function, what each
++# count stands for and why it is bounded. What a count cannot see is a
++# regex's own backtracking: that is argued per pattern in the plan and
++# swept on the clock in the slow tier, with margins of an order of
++# magnitude. The wall-clock tests left in the default tier are smoke caps.
++
++
++def _entry_points() -> dict[str, Callable[[str], object]]:
++    policy = PolicyManager()
++    return {
++        "E": lambda t: sanitize_auth_diagnostic(t, max_length=None),
++        "P": policy.redact_secrets,
++        "POs": lambda t: policy.process_output(t, redact=True, max_bytes=G.BIG),
++        "POd": lambda t: policy.process_output({"t": t}, redact=True, max_bytes=G.BIG),
++    }
++
++
++def _work(run: Callable[[str], object], text: str) -> int:
++    F.WORK = [0]
++    try:
++        run(text)
++        return F.WORK[0]
++    finally:
++        F.WORK = None
++
++
++#: Allowed growth of the work count per 4x the input: 4x for linear work,
++#: plus the n log n of sorting spans (log2 of the size grows by 2 per 4x:
++#: at 16 KB -> 64 KB that is 16/14), plus 5%. A quadratic term gives 16x.
++_PER_4X = 4 * (16 / 14) * 1.05
++
++
++def _superlinear(shape: Callable[[int], str], sizes: tuple[int, ...]) -> list[str]:
++    """Entry points on which the work count of ``shape`` grows faster than
++    ``_PER_4X`` per step between consecutive ``sizes`` (each 4x the last)."""
++    assert all(n1 == 4 * n0 for n0, n1 in zip(sizes, sizes[1:])), sizes
++    found = []
++    for name, run in _entry_points().items():
++        counts = [_work(run, shape(n)) for n in sizes]
++        for n0, c0, c1 in zip(sizes, counts, counts[1:]):
++            if c1 > _PER_4X * max(c0, 1):
++                found.append(f"{name}: {n0}->{4 * n0} work {c0}->{c1}")
++    return found
 +
 +
 +_ADVERSARIAL = {
@@ -9216,37 +9680,33 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +
 +
 +@pytest.mark.parametrize("name", sorted(_ADVERSARIAL))
-+def test_timing_guard_on_every_surface(name: str) -> None:
-+    """66 KB of each adversarial shape on the engine, the policy surface and
-+    `process_output` (string and dict): under 1 s for `a-`, 2 s for the
-+    rest. Rev 10 took 3.5 s on `password:=` (B3)."""
++def test_timing_smoke_on_every_surface(name: str) -> None:
++    """A smoke cap, not the linearity proof: 66 KB of each adversarial shape
++    on every entry point in under 10 s (they take 0.1-1.3 s on dev0)."""
 +    text = _ADVERSARIAL[name]
-+    policy = PolicyManager()
-+    for label, run in (
-+        ("E", lambda: sanitize_auth_diagnostic(text, max_length=None)),
-+        ("P", lambda: policy.redact_secrets(text)),
-+        ("POs", lambda: policy.process_output(text, redact=True)),
-+        ("POd", lambda: policy.process_output({"t": text}, redact=True)),
-+    ):
++    for label, run in _entry_points().items():
 +        started = time.perf_counter()
-+        run()
-+        elapsed = time.perf_counter() - started
-+        # `a-` is held to 1 s, as the keyword matcher's own guard; the rest
-+        # to rev 10's 2 s bound (its additive keyword rules cost ~0.6 s on
-+        # `token-` x 11 000 here)
-+        assert elapsed < (1.0 if name == "a-" else 2.0), (name, label, elapsed)
++        run(text)
++        assert time.perf_counter() - started < 10.0, (name, label)
 +
 +
 +def test_the_floor_itself_is_linear() -> None:
-+    """The replay alone, doubling the input: the time at 132 KB is under 3x
-+    the time at 66 KB (a quadratic replay would be 4x)."""
-+    timings = []
-+    for n in (33_000, 66_000):
-+        text = "a-" * n
-+        started = time.perf_counter()
-+        F.replay(text, MAIN_PATTERNS)
-+        timings.append(time.perf_counter() - started)
-+    assert timings[1] < 3 * timings[0] + 0.05, timings
++    """The replay alone, on the work count: 16 KB -> 64 KB -> 256 KB."""
++    for shape in (
++        lambda n: "a-" * (n // 2),
++        lambda n: "https://h/?" + "password=x&" * (n // 11),
++    ):
++        counts = []
++        for n in (16_384, 65_536, 262_144):
++            F.WORK = [0]
++            try:
++                F.floor_spans(shape(n), MAIN_PATTERNS)
++                counts.append(F.WORK[0])
++            finally:
++                F.WORK = None
++        assert counts[1] <= _PER_4X * counts[0] and counts[2] <= _PER_4X * counts[1], (
++            counts
++        )
 +
 +
 +def _never_returns(text: str) -> list[tuple[int, int, int, int]]:
@@ -9270,42 +9730,31 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +# a mutant that restores rev 11's mechanism and turns the check red.
 +
 +
-+def _time(run: Callable[[str], object], text: str) -> float:
-+    best = float("inf")
-+    for _ in range(2):
-+        started = time.perf_counter()
-+        run(text)
-+        best = min(best, time.perf_counter() - started)
-+    return best
++def _time_ratio(
++    run: Callable[[str], object],
++    shape: Callable[[int], str],
++    small: int = 1_024,
++    large: int = 16_384,
++) -> float:
++    """Wall-clock growth over 16x the input, best of three at each size: a
++    linear path gives ~16x, a quadratic one ~256x. Used only where the work
++    count cannot see the cost (a regex's own backtracking) and only with a
++    threshold of 64x -- a factor of four from either."""
++
++    def best(text: str) -> float:
++        times = []
++        for _ in range(3):
++            started = time.perf_counter()
++            run(text)
++            times.append(time.perf_counter() - started)
++        return min(times)
++
++    return best(shape(large)) / max(best(shape(small)), 1e-4)
 +
 +
-+def _entry_points() -> dict[str, Callable[[str], object]]:
-+    policy = PolicyManager()
-+    return {
-+        "E": lambda t: sanitize_auth_diagnostic(t, max_length=None),
-+        "P": policy.redact_secrets,
-+        "POs": lambda t: policy.process_output(t, redact=True, max_bytes=G.BIG),
-+        "POd": lambda t: policy.process_output({"t": t}, redact=True, max_bytes=G.BIG),
-+    }
-+
-+
-+def _growth(shape: Callable[[int], str], small: int, large: int) -> list[str]:
-+    """Entry points on which ``shape`` grows super-linearly from ``small`` to
-+    ``large`` characters: time ratio over 1.6x the size ratio (a linear path
-+    is ~1x, a quadratic one ~ the size ratio). Times under 30 ms at the
-+    large size are below what one host measures reliably and pass."""
-+    factor = large / small
-+    slow = []
-+    for name, run in _entry_points().items():
-+        t_small = _time(run, shape(small))
-+        t_large = _time(run, shape(large))
-+        if t_large >= 0.03 and t_large / max(t_small, 1e-4) > 1.6 * factor:
-+            slow.append(f"{name}: {t_small:.3f}s -> {t_large:.3f}s")
-+    return slow
-+
-+
-+#: The board's three shapes and the families the generated sweep found
-+#: (`tests/_redaction_shapes.py`; the full sweep is the slow tier's).
++#: Every shape the boards and the sweeps found, both rounds, and the
++#: composition families: the default tier's linearity proof, on the work
++#: count, at 16 KB -> 64 KB -> 256 KB on every entry point.
 +LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
 +    "B-1 closers after a Bearer value": lambda n: "Bearer x" + ")" * n + "a",
 +    "B-1 escaped quotes after Authorization": lambda n: "Authorization: x" + '\\"' * (n // 2) + "a",
@@ -9313,22 +9762,30 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +    "B-1b line breaks before a Bearer value": lambda n: "x Bearer" + "\n" * n + " abc",
 +    "B-1b line breaks before a keyword value": lambda n: "token" + "\n" * n + " abc12",
 +    "B-1c one policy value over many markers": lambda n: "arn:" + "secret:" * (n // 7) + "=abc123",
++    "B-3 Authorization over a rewritten URL": lambda n: "Authorization: https://h/?q" + "&a+b" * (n // 4),
++    "B-3 Bearer over a rewritten URL": lambda n: "Bearer https://h/?password=x" + "&a+b" * (n // 4),
++    "B-3 secret-keyed query pairs": lambda n: "https://h/?" + "password=x&" * (n // 11),
++    "B-3 policy value over a rewritten URL": lambda n: "see https://h/?password=x" + "&a+b" * (n // 4) + " end",
++    "B-4 keyword matches after resource names": lambda n: "arn:x " * (n // 12) + "password=abc123 " * (n // 32),
++    "B-4 keyword lists after resource names": lambda n: "arn:x " * (n // 12) + 'tokens: ["a1b2c3d4"] ' * (n // 42),
++    "B-4 keys inside resource names": lambda n: "arn:x:secret=abc123 " * (n // 20),
++    "backslash run before escapes": lambda n: "\\" * (n // 2) + "\\u00e9password=x" * 8,
 +    "empty query pairs": lambda n: "https://h/?" + "&" * n + "a",
 +    "key words after Bearer": lambda n: "x Bearer" + "api_key" * (n // 7) + '"',
 +    "joined key run": lambda n: "token-" * (n // 6) + "=abc123def",
 +    "word boundaries": lambda n: "a-" * (n // 2),
 +    "operator run": lambda n: "password" + ":=" * (n // 2),
++    "markers in the input": lambda n: "password=" + "[REDACTED]" * (n // 10),
++    "Bearer values in a JSON document": lambda n: json.dumps({f"k{i}": "Bearer x" for i in range(n // 20)}),
 +}  # fmt: skip
 +
 +
 +@pytest.mark.parametrize("name", sorted(LINEAR_SHAPES))
-+def test_every_shape_grows_linearly_on_every_entry_point(name: str) -> None:
-+    """16 KB -> 64 KB on the engine, the policy surface and `process_output`
-+    (string and dict): the growth is linear, and 64 KB stays under 2 s."""
-+    shape = LINEAR_SHAPES[name]
-+    assert _growth(shape, 16_384, 65_536) == []
-+    for label, run in _entry_points().items():
-+        assert _time(run, shape(65_536)) < 2.0, label
++def test_every_shape_does_linear_work_on_every_entry_point(name: str) -> None:
++    """The work count grows linearly (up to the n log n of sorting spans)
++    from 16 KB to 64 KB to 256 KB on the engine, the policy surface and
++    `process_output` (string and dict). Deterministic: no clock."""
++    assert _superlinear(LINEAR_SHAPES[name], (16_384, 65_536, 262_144)) == []
 +
 +
 +def _old_wrap_close_start(text: str, start: int, end: int) -> int:
@@ -9340,13 +9797,56 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +    return re.search(r"[\r\n][^ \t\xa0]*\Z", text) is not None
 +
 +
-+LINEARITY_MUTANTS: dict[str, tuple[str, Callable[[pytest.MonkeyPatch], None]]] = {
++def _without_marker_ranges(original: Callable[..., object]) -> Callable[..., object]:
++    """Rev 12's URL step: every synthesised piece stands for the whole edit."""
++
++    def pieces(raw: str, base: int) -> object:
++        result = original(raw, base)
++        if result is None:
++            return None
++        found, dropped = result  # type: ignore[misc]
++        return [p[:2] if p[0] == "new" else p for p in found], dropped
++
++    return pieces
++
++
++def _rev12_source(self: F._Tracked, a: int, b: int) -> str:
++    pieces: list[str] = []
++    last = None
++    for atom in self.rep[a:b]:
++        if atom < 0 or atom == last:
++            continue
++        last = atom
++        start, end = self.atom_range(atom)
++        pieces.append(self.raw[start:end])
++    F.work(b - a)
++    return "".join(pieces)
++
++
++def _rev12_in_resource_name(text: str) -> Callable[[int], bool]:
++    import pmcp.auth as A
++
++    ranges = [(m.start(), m.end()) for m in A._RESOURCE_NAME_RE.finditer(text)]
++
++    def inside(position: int) -> bool:
++        F.work(len(ranges))  # rev 12 asked every range
++        return any(a <= position < b for a, b in ranges)
++
++    return inside
++
++
++#: Each linearity finding's mutant, restoring the earlier mechanism. `work`
++#: mutants are caught by the work count; `clock` mutants (a regex's own
++#: backtracking, which the count cannot see) by the 64x wall-clock bound.
++LINEARITY_MUTANTS: dict[str, tuple[str, str, Callable[[pytest.MonkeyPatch], None]]] = {
 +    "B-1": (
 +        "B-1 closers after a Bearer value",
++        "clock",
 +        lambda mp: mp.setattr(F, "_wrap_close_start", _old_wrap_close_start),
 +    ),
 +    "B-1b": (
 +        "B-1b line breaks before a Bearer value",
++        "clock",
 +        lambda mp: (
 +            mp.setattr(F, "unindented_break", _old_unindented_break),
 +            mp.setattr("pmcp.auth.unindented_break", _old_unindented_break),
@@ -9354,7 +9854,21 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +    ),
 +    "B-1c": (
 +        "B-1c one policy value over many markers",
++        "work",
 +        lambda mp: mp.setattr(F, "_decision_key", id),
++    ),
++    "B-3": (
++        "B-3 secret-keyed query pairs",
++        "work",
++        lambda mp: (
++            mp.setattr(F, "_url_pieces", _without_marker_ranges(F._url_pieces)),
++            mp.setattr(F._Tracked, "source", _rev12_source),
++        ),
++    ),
++    "B-4": (
++        "B-4 keyword lists after resource names",
++        "work",
++        lambda mp: mp.setattr("pmcp.auth._in_resource_name", _rev12_in_resource_name),
 +    ),
 +}
 +
@@ -9363,13 +9877,19 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +def test_each_linearity_finding_has_a_killing_mutant(
 +    finding: str, monkeypatch: pytest.MonkeyPatch
 +) -> None:
-+    """Rev 11's mechanism restored, the shape grows quadratically again
-+    (measured at 2 KB -> 8 KB, where the quadratic path is still quick)."""
-+    shape_name, mutate = LINEARITY_MUTANTS[finding]
++    """The earlier mechanism restored, the shape grows quadratically again
++    (small sizes, where the quadratic path is still quick)."""
++    shape_name, measure, mutate = LINEARITY_MUTANTS[finding]
 +    shape = LINEAR_SHAPES[shape_name]
-+    assert _growth(shape, 2_048, 8_192) == []
-+    mutate(monkeypatch)
-+    assert _growth(shape, 2_048, 8_192) != []
++    run = _entry_points()["P"]
++    if measure == "work":
++        assert _superlinear(shape, (2_048, 8_192)) == []
++        mutate(monkeypatch)
++        assert _superlinear(shape, (2_048, 8_192)) != []
++    else:
++        assert _time_ratio(run, shape) < 64
++        mutate(monkeypatch)
++        assert _time_ratio(run, shape) > 64
 +
 +
 +#: B-2: a key AFTER a resource name in the same run is a key. Each delimiter
@@ -9400,7 +9920,7 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +    return cases
 +
 +
-+def _b2() -> None:
++def _b2_n10() -> None:
 +    for text, secret in _b2_cases():
 +        for surface in (_engine, _policy):
 +            assert secret not in surface(text), (text, surface(text))
@@ -9421,7 +9941,7 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +
 +
 +def test_b2_n10_fires_only_on_a_segment_of_a_resource_name() -> None:
-+    _b2()
++    _b2_n10()
 +    # the approved class still holds: a key that IS a segment of the name
 +    for text in (
 +        "arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret-a1b2c3",
@@ -9433,7 +9953,7 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +def test_b2_mutant_rev_11_n10(monkeypatch: pytest.MonkeyPatch) -> None:
 +    monkeypatch.setitem(F.SUPPRESSIONS, "N10", _old_n10)
 +    with pytest.raises(AssertionError):
-+        _b2()
++        _b2_n10()
 +
 +
 +_N1_CASES = (
@@ -9466,6 +9986,46 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +    monkeypatch.setitem(F.SUPPRESSIONS, "N3", _old_n3)
 +    with pytest.raises(AssertionError):
 +        _n1()
++
++
++_N5_CASES = (
++    "passwordForTheProductionDatabaseServer=Hunter2abcX9",
++    "dbPasswordForTheProductionReplicaServer=Hunter2abcX9",
++    "theProductionElasticsearchClusterPassword=Hunter2abcX9",
++    "secretAccessKeyForTheProductionAwsAccount=Hunter2abcX9",
++    "apikeyForTheProductionPaymentsGatewayX=Hunter2abcX9",
++    "PRODUCTIONDATABASEREPLICATIONpassword=Hunter2abcX9",
++    "tokenForTheProductionDeploymentPipelineX Hunter2abcX9",
++)
++
++
++def _n5() -> None:
++    for text in _N5_CASES:
++        for surface in (_engine, _policy):
++            assert "Hunter2abcX9" not in surface(text), (text, surface(text))
++
++
++def _rev12_n3(span: F.FloorSpan) -> bool:
++    return span.rule in F._KEYED_RULES and F._for_every_reading(
++        span,
++        lambda r: len(r.glued) > 24
++        or len(re.match(r"[A-Za-z0-9]*", r.suffix).group(0)) > 24,  # type: ignore[union-attr]
++    )
++
++
++def test_n5_a_case_change_joins_words_like_a_joiner() -> None:
++    """N-5 of rev 12's board: camelCase and SHOUTING multi-word keys are
++    keys, as `_`-joined ones are (N-1); a long single-case glued run is
++    still an identifier (N3)."""
++    _n5()
++    for glued in ("password" + "x" * 25 + "=hunter", "x" * 26 + "password=hunter"):
++        assert _fired(glued, False).get("N3"), (glued, _fired(glued, False))
++
++
++def test_n5_mutant_rev_12_n3(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setitem(F.SUPPRESSIONS, "N3", _rev12_n3)
++    with pytest.raises(AssertionError):
++        _n5()
 +
 +
 +_N2_CASES = (
@@ -9537,48 +10097,99 @@ index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b05141
 +        _n4()
 +
 +
-+_SWEEP_CHUNKS = 16
++_SWEEP_CHUNKS = 32
++
++
++def _all_shapes() -> dict[str, Callable[[int], str]]:
++    from tests import _redaction_shapes as S
++
++    return {**S.shapes(S.redactor_patterns()), **S.compositions()}
 +
 +
 +@pytest.mark.slow
 +@pytest.mark.parametrize("chunk", range(_SWEEP_CHUNKS))
-+def test_generated_shapes_grow_linearly(chunk: int) -> None:
-+    """The full generated sweep (`tests/_redaction_shapes.py`: every unit of
-+    every redactor regex, repeated, after each trigger word, before each
-+    failing tail), in 16 chunks so each stays inside the per-test timeout:
-+    screened at 4 KB -> 16 KB on every entry point in worker processes; any
-+    shape over 8x is re-measured at 16 KB -> 64 KB here and must be
-+    linear."""
-+    from tests import _redaction_shapes as S
-+
-+    shapes = S.shapes(S.redactor_patterns())
-+    assert len(shapes) > 40_000
++def test_generated_shapes_do_linear_work(chunk: int) -> None:
++    """The full generated sweep (`tests/_redaction_shapes.py`): every shape
++    derived from the redactor's regular expressions and every composition
++    derived from its loops, in 32 chunks. Screened on the work count at 4 KB
++    -> 16 KB on every entry point in worker processes; any shape over the
++    bound is re-measured at 16 KB -> 64 KB -> 256 KB here and must be
++    linear. Deterministic."""
++    shapes = _all_shapes()
++    assert len(shapes) > 70_000
 +    names = sorted(shapes)[chunk::_SWEEP_CHUNKS]
 +    ctx = multiprocessing.get_context("spawn")
 +    with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
 +        flagged = [
 +            name
-+            for found in pool.imap_unordered(_screen_shape, names, chunksize=20)
++            for found in pool.imap_unordered(_screen_work, names, chunksize=25)
 +            for name in found
 +        ]
-+    confirmed = {name: _growth(shapes[name], 16_384, 65_536) for name in flagged}
++    confirmed = {
++        name: _superlinear(shapes[name], (16_384, 65_536, 262_144)) for name in flagged
++    }
 +    assert {k: v for k, v in confirmed.items() if v} == {}, confirmed
 +
 +
-+def _screen_shape(name: str) -> list[str]:
++@pytest.mark.slow
++@pytest.mark.parametrize("chunk", range(8))
++def test_generated_regex_shapes_do_not_backtrack(chunk: int) -> None:
++    """What the work count cannot see: a regex's own backtracking. Every
++    regex-derived shape is screened on the clock at 2 KB -> 8 KB (flagged
++    over 10x; linear is 4x, quadratic 16x); a flagged shape is re-measured
++    at 1 KB -> 16 KB, best of three, and must stay under 64x (linear 16x,
++    quadratic 256x) on every entry point."""
 +    from tests import _redaction_shapes as S
 +
-+    global _SCREEN_SHAPES
-+    try:
-+        shapes = _SCREEN_SHAPES
-+    except NameError:
-+        shapes = _SCREEN_SHAPES = S.shapes(S.redactor_patterns())
-+    shape = shapes[name]
++    shapes = S.shapes(S.redactor_patterns())
++    names = sorted(shapes)[chunk::8]
++    ctx = multiprocessing.get_context("spawn")
++    with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
++        flagged = [
++            name
++            for found in pool.imap_unordered(_screen_clock, names, chunksize=25)
++            for name in found
++        ]
++    slow = {
++        name: [
++            label
++            for label, run in _entry_points().items()
++            if _time_ratio(run, shapes[name]) > 64
++        ]
++        for name in flagged
++    }
++    assert {k: v for k, v in slow.items() if v} == {}, slow
++
++
++_SCREEN_SHAPES: dict[str, Callable[[int], str]] = {}
++
++
++def _screen_work(name: str) -> list[str]:
++    if not _SCREEN_SHAPES:
++        _SCREEN_SHAPES.update(_all_shapes())
++    shape = _SCREEN_SHAPES[name]
++    bound = 4 * (14 / 12) * 1.05  # 4 KB -> 16 KB, with the sort's log
 +    for run in _entry_points().values():
-+        t_small = _time(run, shape(4_096))
-+        t_large = _time(run, shape(16_384))
-+        if t_large > 0.03 and t_large / max(t_small, 1e-4) > 8:
++        if _work(run, shape(16_384)) > bound * max(_work(run, shape(4_096)), 1):
 +            return [name]
 +    return []
++
++
++def _screen_clock(name: str) -> list[str]:
++    if not _SCREEN_SHAPES:
++        _SCREEN_SHAPES.update(_all_shapes())
++    shape = _SCREEN_SHAPES[name]
++    for run in _entry_points().values():
++        small = min(_clock(run, shape(2_048)) for _ in range(2))
++        large = min(_clock(run, shape(8_192)) for _ in range(2))
++        if large > 0.02 and large / max(small, 1e-4) > 10:
++            return [name]
++    return []
++
++
++def _clock(run: Callable[[str], object], text: str) -> float:
++    started = time.perf_counter()
++    run(text)
++    return time.perf_counter() - started
 ```
 <!-- PATCH-END -->
