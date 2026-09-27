@@ -1,13 +1,30 @@
 # Detailed plan: secret redaction, additive rules over the redactor's own output (Consiliency/pmcp#234)
 
+> **Revision 18.1 (2026-09-27): maintainer decisions on rev 18.**
+> - **D1, adopted:** a glued run is replaced only if it holds a letter or a
+>   digit. Punctuation alone after a marker stays as written: after a word
+>   the redactor took (`token=bucket!` → `token=[REDACTED]!`, as the
+>   redactor gives it), and as a password's punctuation-only tail
+>   (`token=abcdef!` → `token=[REDACTED]!`, disclosed). The prose-equality
+>   test now also covers 2 352 generated `key word` + word + punctuation
+>   lines: 0 lines differ from the redactor. With rev 18's rule as the
+>   mutant, 360 lines differ, so the test fails. The end-of-value tests and
+>   the tail counts are unchanged.
+> - **D2, not approved:** the tail under a whitespace-keyed flag
+>   (`--password v`) stays disclosed. The whitespace rule is not extended
+>   to start on a marker.
+>
+> Code: `origin/wip/234-additive` @ `05feaad`, embedded against `main` @
+> `260cc1a`. Rev 18's code was `eacfdb7`.
+>
 > **Revision 18 (2026-09-27): rev 17's board, round 3.** The merge rule
 > held: about 2.8M differential cases with no floor violation, a 200 000-case
 > direct merge fuzz with no failure, and linear cost.
 >
 > One finding, F-A: the residual rev 17 disclosed as one shape is a class.
-> The redactor's keyword rule replaces a value only up to its first
-> character outside `[A-Za-z0-9._~+/=-]`. Rev 17 dropped an additive span
-> that started on that marker, so the rest of the value stayed:
+> The redactor's keyword rule replaces a value up to the end of its value
+> class. Rev 17 dropped an additive span that started on that marker, so
+> the rest of the value stayed:
 > - `token=qVwYS81V!7Hb1DX8pP` → `token=[REDACTED]!7Hb1DX8pP`;
 > - `https://h.example:99999/cb?token=abcd%41%48XYZ123` →
 >   `…token=[REDACTED]%41%48XYZ123`;
@@ -27,11 +44,8 @@
 > one credential shape was left did not hold either. Both are superseded by
 > the rev 15 against rev 18 differential below.
 >
-> Two further changes are measured but **not taken**; they are left to the
-> maintainer (Residuals, "Decisions").
->
-> Code: `origin/wip/234-additive` @ `eacfdb7`, embedded against `main` @
-> `260cc1a`.
+> Two further changes were measured and left to the maintainer; see
+> rev 18.1 for the decisions (Residuals, "Decisions").
 >
 > **Revision 17 (2026-09-27): rev 16's board, round 2.** Held again:
 > - the floor (0 violations on about 2.8M cases);
@@ -113,6 +127,7 @@ Surfaces (unchanged):
 | F-A (blocking) | after a marker the redactor wrote at a character outside its value class, rev 17 dropped the additive span that started on the marker, and the tail stayed | the span keeps the marker and replaces the run glued to its end, up to whitespace, `&`, `#`, a quote, a backslash or the next marker; the three `starts_with_marker` skips (two keyword passes, the policy pass) are removed | end-of-value test: 902 of 4 800 (value, form, surface) cases keep 3+ characters of the value's end; with the stop characters in the mix, 711 of 4 800 outside the disclosed class; the three board reproductions keep their tails on every surface (`Summer2024!Sunny` on E) | 0; 0; removed | rev 17's rule (`_glued_run_end` returns its start): failures again |
 | F-A cost | the glued run replaced the ARN resource name after the marker the redactor wrote over `arn` (the prose corpus's ARN line; the seat counted 2 of 2 002 checks) | exempt a run that starts with an AWS partition (`:aws:`, `:aws-cn:`, …) when the 16 characters before the marker end in an `…arn` key and its separator. This is narrower than exempting ARNs: `password=Pa55wd:aws:tailtail` is still redacted | the prose test differs from the redactor on the ARN line | equal on the prose corpus and 2 000 generated lines | exemption off: the prose corpus differs |
 | F-A tests | the keyed-password test read the first four characters of a value | end-of-value tests (below); the first-characters test stays, but the end-of-value tests are the ones that answer F-A | — | — | — |
+| D1 (18.1) | the glued run also replaced punctuation after a word the redactor took (`token=bucket!` → `token=[REDACTED][REDACTED]`; the redactor gives `token=[REDACTED]!`) | a glued run is replaced only if it holds a letter or a digit | on `eacfdb7`: 360 of 4 352 generated lines differ from the redactor (the 2 000 prose lines plus 2 352 `key word` + word + punctuation lines); rev 15 against rev 18 has E 646, P 169 punctuation-only differences | 0; the rev 15 differential below | rev 18's rule (`_is_a_tail` always true): the prose-equality test fails |
 | count | rev 17's split (248 = 124 + 80 + 44) and "one credential shape" did not reproduce (337 = 155 + 118 + 64) | superseded by the rev 15 against rev 18 differential | — | — | — |
 
 **The end-of-value tests.**
@@ -134,8 +149,8 @@ Surfaces (unchanged):
     begins at or after the value's first stop character. That is broader
     than "begins at a stop".
 - **Pinned:** two disclosed behaviours have tests of their own (Residuals):
-  the tail under a whitespace-keyed flag, and punctuation after a
-  redactor false positive.
+  the tail under a whitespace-keyed flag, and a punctuation-only tail
+  (`token=bucket!` and `token=abcdef!` both give `token=[REDACTED]!`).
 
 **Tails, measured.**
 
@@ -167,31 +182,40 @@ whose end (3+ characters) survives, as E / P:
 - POs and POd equal P on every row.
 - There is no (value, form, surface) case, of 14 000 including a JSON
   form, where rev 18 keeps a longer tail than rev 17.
+- Rev 18.1 gives the same counts on every row, and the same 0 of 14 000.
 
-**Rev 15 against rev 18, on the credential corpora.**
-- **Corpora:** rev 17's corpora plus 300 end-of-value values in every form,
-  the prose corpus and 2 000 generated prose lines: 38 894 texts, on E and P.
-- **Unchanged:** E 34 107, P 35 123.
-- **Rev 18 removes more:**
+**Rev 15 against rev 18.1, on the credential corpora.**
+- **Corpora:** rev 17's corpora, 300 end-of-value values in every form
+  (the `--password` form included), the prose corpus and 2 000 generated
+  prose lines: 38 894 texts, on E and P.
+- **Unchanged:** E 34 533, P 35 291.
+- **Rev 18.1 removes more:**
   - letters or digits: E 779, P 118. These are tails after a marker, such
     as `code=j55S99K4Il0Q9vjE%2F`, which rev 15 left as
     `code=[REDACTED]%2F`.
-  - punctuation only: E 646, P 169. A glued separator after a marker:
-    `password=\npassword: hunter2x` → `password=\n[REDACTED][REDACTED]
-    hunter2x`. Both revisions keep `hunter2x`; see Decision D1.
-- **Different markers, same text kept:** E 3 334, P 3 188. Rev 15 wrote one
-  marker where rev 18 writes two, such as a marker the redactor wrote plus
-  one for the glued run.
-- **Rev 15 removes more:** E 28, P 296.
-  - P 141: rev 15 swallowed or re-spelled a marker (rev 16's F1). Guarantee
+  - punctuation only: E 217, P 0. This is a span that starts before a
+    marker and is cut around it, so a character between two markers of one
+    value is replaced: `password=k7kUd3)CaFQ…` → rev 15
+    `password=[REDACTED])[REDACTED]`, rev 18.1
+    `password=[REDACTED][REDACTED]`. Rev 18's glued separators (E 646,
+    P 169, such as `[REDACTED]:` before the next key) are gone under D1.
+- **Different markers, same text kept:** E 3 333, P 3 155. Rev 15 wrote one
+  marker where rev 18.1 writes two.
+- **Rev 15 removes more:** E 32, P 330.
+  - P 152: rev 15 swallowed or re-spelled a marker (rev 16's F1). Guarantee
     4 forbids that.
-  - E 28, P 134: no credential-shaped piece. These are whitespace escapes,
-    a separator, or `&x` after a marker.
-  - P 21: a run of 6+ letters and digits that rev 15 removed. 15 are the
-    Bearer class: a scheme word after a key, then a whitespace escape
-    (`token: bearer\u2009[tawn87Sc]`). 6 follow `&` or `#` after a marker
-    (`token=[REDACTED]#%A3RsqSbeB%95Z9q end`), where the glued run stops so
-    that the rest of a query stays. Both are disclosed.
+  - E 32, P 156: no credential-shaped piece. These are whitespace escapes,
+    a separator or punctuation after a marker, or `&x` after a marker.
+  - P 22: a run of 6+ letters and digits that rev 15 removed:
+    - 15 are the Bearer class: a scheme word after a key, then a
+      whitespace escape (`token: bearer\u2009[tawn87Sc]`);
+    - 6 follow `&` or `#` after a marker
+      (`token=[REDACTED]#%A3RsqSbeB%95Z9q end`), where the glued run stops
+      so that the rest of a query stays;
+    - 1 is an escape (`\u00a0`) re-encoded inside a URL query of the JSON
+      fuzz.
+
+    All three are disclosed.
 
 ## Rev 16 board findings → rev 17
 
@@ -281,9 +305,9 @@ that machinery, and gives the floor by construction.
    - A marker already in the text (`[REDACTED]`, or the URL rule's
      `%5BREDACTED%5D`) is left exactly as it is, on every surface:
      - a span that starts on a marker keeps the marker, and only the run
-       glued to the marker's end is replaced. The run stops at whitespace,
-       `&`, `#`, a quote, a backslash or the next marker, and never passes
-       the span's own end. The additive rules end a keyed value at `;`, `,`
+       glued to the marker's end is replaced, if it holds a letter or a
+       digit. The run stops at whitespace, `&`, `#`, a quote, a backslash
+       or the next marker, and never passes the span's own end. The additive rules end a keyed value at `;`, `,`
        and the brackets, so in practice those stop it too. An AWS partition
        (`:aws:`) after a marker under an `…arn` key is the resource name,
        not a tail, and is kept (`secret_arn=[REDACTED]:aws:…`);
@@ -297,7 +321,8 @@ that machinery, and gives the floor by construction.
      The redactor's keyword rule stops at the first character outside its
      value class, so `token=qVwYS81V!7Hb1DX8pP` reaches the additive pass
      as `token=[REDACTED]!7Hb1DX8pP`. The glued run takes `!7Hb1DX8pP`. The
-     rest of a query (`&page=2`) is not glued to the marker.
+     rest of a query (`&page=2`) is not glued to the marker. Punctuation
+     alone (`token=[REDACTED]!`) is left as written (D1).
 
      Run again over its own output, the pass keeps every marker and only
      adds. It is monotone, not idempotent: next to a marker it wrote, a
@@ -328,9 +353,10 @@ The rules' purpose is covered as well:
   every punctuation character. With the stop characters mixed in, whatever
   survives begins at or after the value's first stop. Rev 17's rule is the
   mutant. (Rev 17 board, above.)
-- **Prose:** on the prose corpus and 2 000 generated prose lines, the final
-  output equals the base output. The additive rules add no false positive
-  of their own there.
+- **Prose:** on the prose corpus, 2 000 generated prose lines and 2 352
+  generated `key word` + word + punctuation lines, the final output equals
+  the base output. The additive rules add no false positive of their own
+  there. Rev 18's glued run (punctuation alone replaced) is the mutant.
 
 **Linear by construction (per function).**
 - Each additive pass is one `finditer` over the text, with O(match) work
@@ -387,14 +413,15 @@ The rules' purpose is covered as well:
   was measured on the end-of-value corpus: 400 values × 7 forms = 2 800 per
   surface, counted as E / P, with POs and POd equal to P.
   - A tail that begins at a character where the additive keyed rules end a
-    value: `;` 59 / 15, `,` 47 / 15, `&` 39 / 16, `#` 39 / 15. These are
+    value: `;` 59 / 15, `,` 47 / 15, `#` 39 / 15, `&` 34 / 14, and 12 / 9
+    where punctuation alone precedes the `&` (rev 18.1). These are
     `a=1;b=2`, lists, form bodies and fragments. `&` and `#` are also
     where the glued run stops, so the rest of a query stays.
   - Under a whitespace-keyed flag (`mycli --password v --verbose`), the
     tail after the marker stays: 197 of 400 values on every surface, the
     same as rev 17. The additive whitespace-keyword rule's value class has
-    no `[`, so it never starts on the marker. A test pins this. Decision D2
-    measures the change that would cover it.
+    no `[`, so it never starts on the marker. A test pins this. The change
+    that would cover it (D2) was not approved.
   - Brackets and parentheses: a tail beginning at `(`, `)`, `[`, `]`, `{`,
     `}` stays, 3-8 values each, all on the whitespace-keyed form.
   - Whole values the redactor keeps too: 49 of 400 on the whitespace-keyed
@@ -409,27 +436,27 @@ The rules' purpose is covered as well:
   - A JSON document inside a JSON string (`{"t": "{\"password\": \"…\"}"}`):
     the keyed rules do not read an escaped key. A value with punctuation is
     kept whole there, as by the redactor (Consiliency/pmcp#290).
-- **Decisions (measured, not taken).**
-  - **D1: punctuation glued to a marker over a redactor false positive.**
-    The glued run also replaces punctuation after a word the redactor
-    marked: `token=bucket!` → `token=[REDACTED][REDACTED]` (the redactor
-    gives `token=[REDACTED]!`), and `password=\npassword: hunter2x` →
-    `password=\n[REDACTED][REDACTED] hunter2x`. On the prose corpus, 2 000
-    generated prose lines and 5 040 generated `keyword word` +
-    punctuation lines, 600 of 7 079 lines differ from the redactor. The
-    rev 15 against rev 18 differential has E 646, P 169 punctuation-only
-    cases. A test pins this.
-    - Option: replace the glued run only when it holds a letter or a
-      digit. Measured: 0 of 7 079 lines differ from the redactor, and the
-      end-of-value tests still pass. What stays is a punctuation-only
-      tail, such as `token=abcdef!` → `token=[REDACTED]!`.
-  - **D2: the tail under a whitespace-keyed flag.** Let the whitespace
-    rule's value start on the marker, and let the merge take the glued run.
-    Measured: `mycli --password v` tails go from 327 to 68 of the seat's
-    400. Without D1's option, it also marks punctuation after the
-    redactor's own whitespace false positives (`secret sauce!` → `secret
-    [REDACTED][REDACTED]`): 1 080 of 7 079 lines differ from the redactor.
-    With D1's option, 0 differ.
+- **A punctuation-only tail** (D1, adopted in rev 18.1): a glued run
+  without a letter or a digit is not replaced, so `token=abcdef!` →
+  `token=[REDACTED]!`. The same rule leaves the punctuation after the
+  redactor's own false positives as the redactor wrote it
+  (`token=bucket!` → `token=[REDACTED]!`). A punctuation run before a
+  stop is kept too: `password=3WETjimG|&_(Z9q` keeps `|&_(Z9q` on E.
+  On the end-of-value corpus, 12 E / 9 P tails begin with such a run
+  before `&`, counted under `&` in rev 18.
+- **Decisions.**
+  - **D1: punctuation glued to a marker (adopted, rev 18.1).** Rev 18's
+    glued run also replaced punctuation after a word the redactor marked
+    (`token=bucket!` → `token=[REDACTED][REDACTED]`). A run is now
+    replaced only if it holds a letter or a digit. Measured on the prose
+    corpus, 2 000 generated prose lines and 2 352 `key word` + word +
+    punctuation lines: 0 lines differ from the redactor, against 360 with
+    rev 18's rule. The end-of-value tests pass, with the same tail counts.
+  - **D2: the tail under a whitespace-keyed flag (not approved).** The
+    change would let the whitespace rule's value start on the marker and
+    let the merge take the glued run. It would take `mycli --password v`
+    tails from 327 to 68 of the seat's 400. It is not made, and the tail
+    stays disclosed.
 - Shape false positives (rev 10's class): a short opaque path segment
   (`https://youtu.be/<id>` → `https://youtu.[REDACTED]`), opaque query
   values, cursors and `req_…` ids, and base64 images under 256 characters.
@@ -491,15 +518,15 @@ env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir \
   uv run pytest -m 'slow and not live' -q          # slow tier
 ```
 
-**Measured on the embedded code (`eacfdb7`)**, as read from the logs:
+**Measured on the embedded code (`05feaad`)**, as read from the logs:
 
 | check | result |
 |---|---|
 | `ruff check src/ tests/` | All checks passed! |
 | `ruff format --check src/ tests/` | 170 files already formatted |
 | `mypy src/` | Success: no issues found in 52 source files |
-| default tier (dev0) | **4691 passed, 3 skipped, 80 deselected in 508.51s (0:08:28)** |
-| slow tier (dev0) | **55 passed, 4719 deselected in 363.77s (0:06:03)** |
+| default tier (dev0) | **4692 passed, 3 skipped, 80 deselected in 536.17s (0:08:56)** |
+| slow tier (dev0) | **55 passed, 4720 deselected in 377.24s (0:06:17)** |
 
 How these ran:
 - Both tiers ran with `npm_config_cache`, `npm_config_store_dir` and
@@ -507,7 +534,7 @@ How these ran:
 - The two 60 s tests in the default tier are
   `tests/test_progressive_disclosure.py`'s `test_invoke_query_docs` and
   `test_invoke_query_docs_conceptual`, which this plan does not touch.
-- The slow tier's longest case is the tier-2 floor differential (129 s).
+- The slow tier's longest case is the tier-2 floor differential (138 s).
   It passes `faulthandler_timeout = 120`, so the log starts with a stack
   dump at 2:00. That dump is a diagnostic, not a failure; rev 17's log has
   the same one.
@@ -521,9 +548,9 @@ tier:
 | rev 15 | `ff73fd0` | 14m20s | 12m23s | 12m59s |
 | `main` for comparison | `260cc1a` | 9m08s | 14m23s | 8m27s |
 
-Rev 18's default tier was not re-timed on runners. Locally it took 8:28,
-against rev 17's 8:37, rev 16's 8:20 and rev 15's 8:45, so it has not grown
-materially.
+Rev 18.1's default tier was not re-timed on runners. Locally it took 8:56,
+against rev 18's 8:28, rev 17's 8:37, rev 16's 8:20 and rev 15's 8:45, so it
+has not grown materially.
 
 **Embedding proof** (run for this plan):
 
@@ -532,7 +559,7 @@ materially.
   against `main`" is `cmp`-equal to the generated diff.
 - `git apply --check` and `git apply` succeeded on a fresh worktree of
   `260cc1a`.
-- The result matches `wip/234-additive` at `eacfdb7`: `pyproject.toml` is
+- The result matches `wip/234-additive` at `05feaad`: `pyproject.toml` is
   `cmp`-identical, and `diff -rq` of `src/` and `tests/` shows no
   differences.
 - On that tree (`pmcp.__file__` printed from it):
@@ -542,8 +569,8 @@ materially.
   - default tier of `test_redaction_additive.py`,
     `test_keyword_matcher.py`, `test_auth.py`, `test_policy.py`,
     `test_project_source_consent_policy.py` and
-    `test_trust_boundaries_e2e.py`: **391 passed, 55 deselected in 55.76s**
-  - `test_keyword_matcher.py` with `--cov=pmcp`: **17 passed in 2.54s**
+    `test_trust_boundaries_e2e.py`: **392 passed, 55 deselected in 60.14s (0:01:00)**
+  - `test_keyword_matcher.py` with `--cov=pmcp`: **17 passed in 2.71s**
 
 ## Acceptance criteria
 
@@ -578,7 +605,7 @@ materially.
 
 ## Patch against `main` @ `260cc1a`
 
-This is `git diff --full-index 260cc1a eacfdb7`, the whole change.
+This is `git diff --full-index 260cc1a 05feaad`, the whole change.
 
 `sha256` of the patched files (first 16 hex digits):
 
@@ -586,7 +613,7 @@ This is `git diff --full-index 260cc1a eacfdb7`, the whole change.
 |---|---|
 | `auth.py` | `4976402fabcf92b7` |
 | `policy.py` | `200cfc132eec0d70` |
-| `redaction_additive.py` | `867ba20d76896a4c` |
+| `redaction_additive.py` | `6dc7f8aacbd846e2` |
 | `keyword_matcher.py` | `4c256b3d813bed15` (unchanged) |
 
 To apply, on a fresh worktree of `main`:
@@ -849,10 +876,10 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..ec5ee42ef29783ef6b31d9345e8024ce
          self,
 diff --git a/src/pmcp/redaction_additive.py b/src/pmcp/redaction_additive.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..b8576e6eb627fb327cf67e6b37d7fe0aac7a6256
+index 0000000000000000000000000000000000000000..6933036be782da447c0150e840def59e21fef1ce
 --- /dev/null
 +++ b/src/pmcp/redaction_additive.py
-@@ -0,0 +1,1324 @@
+@@ -0,0 +1,1337 @@
 +"""The additive redaction rules (Consiliency/pmcp#234).
 +
 +`sanitize_auth_diagnostic` and `PolicyManager.redact_secrets` first run the
@@ -1977,6 +2004,14 @@ index 0000000000000000000000000000000000000000..b8576e6eb627fb327cf67e6b37d7fe0a
 +    return position
 +
 +
++def _is_a_tail(run: str) -> bool:
++    """A glued run is the rest of a value only if it holds a letter or a
++    digit. Punctuation alone (`token=[REDACTED]!` after a word the redactor
++    took, `[REDACTED]:` before the next key) is left as written."""
++    work(len(run) + 1)
++    return any(c.isalnum() for c in run)
++
++
 +#: An ARN's partition right after the marker the redactor wrote over its
 +#: literal `arn`, under a key that names one (`secret_arn=[REDACTED]:aws:
 +#: secretsmanager:...`, `"SecretArn": "[REDACTED]:aws:..."`): the rest is the
@@ -2007,7 +2042,8 @@ index 0000000000000000000000000000000000000000..b8576e6eb627fb327cf67e6b37d7fe0a
 +      backslash or the next marker: the redactor's keyword rule stops at the
 +      first character outside its value class, so `token=qVwYS81V!7Hb1DX8pP`
 +      reached this pass as `token=[REDACTED]!7Hb1DX8pP` (rev 17 left the
-+      tail). The rest of a query (`&page=2`) is not glued, and neither is an
++      tail). The run is replaced only if it holds a letter or a digit:
++      punctuation alone after a marker (`token=[REDACTED]!`) stays. The rest of a query (`&page=2`) is not glued, and neither is an
 +      ARN's resource name after the redacted `arn` (`:aws:...`);
 +    * a span that starts BEFORE a marker keeps its reach: each stretch of it
 +      outside the markers it overlaps is replaced, and each marker stays as
@@ -2033,7 +2069,11 @@ index 0000000000000000000000000000000000000000..b8576e6eb627fb327cf67e6b37d7fe0a
 +            # its end -- the rest of a value the redactor cut short at a
 +            # character outside its value class (`token=[REDACTED]!7Hb1DX8pP`)
 +            glued = _glued_run_end(text, markers[i][1], end)
-+            if glued > markers[i][1] and not _is_resource_name_tail(text, markers[i]):
++            if (
++                glued > markers[i][1]
++                and _is_a_tail(text[markers[i][1] : glued])
++                and not _is_resource_name_tail(text, markers[i])
++            ):
 +                pieces.append((markers[i][1], glued, replacement))
 +            continue
 +        position = start
@@ -3727,10 +3767,10 @@ index 0000000000000000000000000000000000000000..cd149c199d61ad3b81c62dd315093808
 +    return out
 diff --git a/tests/test_redaction_additive.py b/tests/test_redaction_additive.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..90f4b4ab864e6869e1135dd10e09209b1b8d90c6
+index 0000000000000000000000000000000000000000..463d34cca3b2f21ffa09ac336d07029338a6e1b9
 --- /dev/null
 +++ b/tests/test_redaction_additive.py
-@@ -0,0 +1,1517 @@
+@@ -0,0 +1,1554 @@
 +"""The additive redaction rules (Consiliency/pmcp#234).
 +
 +`sanitize_auth_diagnostic` and `PolicyManager.redact_secrets` run the
@@ -4512,16 +4552,51 @@ index 0000000000000000000000000000000000000000..90f4b4ab864e6869e1135dd10e09209b
 +        assert secret not in out, (label, out)
 +
 +
-+def test_prose_the_redactor_keeps_the_additive_rules_keep_too() -> None:
-+    """The additive rules' own false positives: none on the prose corpus or
-+    on 2 000 generated prose lines (the base pass's own stand)."""
-+    assert _ours_e(PROSE) == _main_e(PROSE)
-+    assert _ours_p(PROSE) == _main_p(PROSE)
++#: A key word, a plain word the redactor takes as its value, then
++#: punctuation: `token bucket?`, `secret=sauce!`. The glued run must leave
++#: that punctuation as the redactor wrote it.
++_KEYWORD_PUNCTUATION_LINES = [
++    f"{lead}{word}{sep}{follow}{mark}{trail}"
++    for word in ("secret", "token", "password", "key", "auth", "credential", "session")
++    for follow in ("sauce", "bucket", "reset", "rotation", "expired", "holder")
++    for mark in "!?.:;,)"
++    for lead in ("", "the ")
++    for trail in ("", " done")
++    for sep in (" ", "=")
++]
++
++
++def _prose_differences() -> list[str]:
++    bad = [
++        label
++        for label, same in (
++            ("E", _ours_e(PROSE) == _main_e(PROSE)),
++            ("P", _ours_p(PROSE) == _main_p(PROSE)),
++        )
++        if not same
++    ]
 +    rng = random.Random(9234)
-+    for _ in range(2000):
-+        text = _random_prose(rng)
-+        assert _ours_e(text) == _main_e(text), text
-+        assert _ours_p(text) == _main_p(text), text
++    for text in [_random_prose(rng) for _ in range(2000)] + _KEYWORD_PUNCTUATION_LINES:
++        if _ours_e(text) != _main_e(text) or _ours_p(text) != _main_p(text):
++            bad.append(text)
++    return bad
++
++
++def test_prose_the_redactor_keeps_the_additive_rules_keep_too() -> None:
++    """The additive rules' own false positives: none on the prose corpus, on
++    2 000 generated prose lines, or on key words followed by a word and
++    punctuation (the base pass's own stand)."""
++    bad = _prose_differences()
++    assert bad == [], bad[:10]
++
++
++def test_prose_mutant_a_glued_run_without_a_letter_or_digit(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Rev 18's first glued run (punctuation alone replaced too) marks the
++    punctuation after the redactor's own false positives."""
++    monkeypatch.setattr(A, "_is_a_tail", lambda run: True)
++    assert _prose_differences() != []
 +
 +
 +def test_keyed_passwords_from_every_printable_character_are_removed() -> None:
@@ -5174,12 +5249,14 @@ index 0000000000000000000000000000000000000000..90f4b4ab864e6869e1135dd10e09209b
 +        assert "[REDACTED]!7Hb1DX8pP" in out, (label, out)
 +
 +
-+def test_disclosed_punctuation_after_a_redactor_false_positive_is_marked() -> None:
-+    """Pins a disclosed side effect of the glued run: after a marker the
-+    redactor wrote over a word (`token=bucket!`), the glued punctuation is
-+    replaced too."""
++def test_disclosed_a_punctuation_only_tail_stays() -> None:
++    """Pins a disclosed residual: a glued run of punctuation alone is not
++    replaced, so after a word the redactor took (`token=bucket!`) the output
++    is the redactor's, and a password's punctuation-only tail stays."""
 +    for label, out in _tail_surfaces("token=bucket!").items():
-+        assert "[REDACTED][REDACTED]" in out, (label, out)
++        assert out.endswith(("token=[REDACTED]!", 'token=[REDACTED]!"}')), (label, out)
++    for label, out in _tail_surfaces("token=abcdef!").items():
++        assert "[REDACTED]!" in out and "abcdef" not in out, (label, out)
 +
 +
 +def test_the_end_of_a_value_mutant_rev_17_skip(monkeypatch: pytest.MonkeyPatch) -> None:
