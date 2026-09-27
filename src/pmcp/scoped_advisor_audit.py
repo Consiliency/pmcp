@@ -13,7 +13,16 @@ from pathlib import Path
 from typing import Any, TextIO
 from urllib.parse import urlsplit, urlunsplit
 
+import jsonschema
+
 SCOPED_ADVISOR_AUDIT_CAPABILITY = "scoped_advisor_audit.v1"
+#: Event of a ``tools/call`` the input-schema gate rejected before dispatch
+#: (Consiliency/pmcp#296). Not an ``audit.invocation``: nothing was invoked, and
+#: a reader that correlates invocations to a run must not see an uncorrelated
+#: one (agent-harness ``advisor_board/research.py`` filters on this field).
+REJECTION_EVENT = "audit.rejection"
+#: Its ``terminal_status``. The invocation vocabulary stays success/failure/denied.
+INVALID_ARGUMENTS_STATUS = "invalid_arguments"
 _CORRELATION_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _TOOL_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+::[A-Za-z0-9_.-]{1,192}$")
@@ -129,6 +138,70 @@ def _public_source_hash(value: Any) -> str | None:
     return None
 
 
+def _declared_property_names(schema: Any) -> frozenset[str]:
+    """Every key of every ``properties`` map anywhere in ``schema``.
+
+    These strings are written by the schema's author, never by a caller, so a
+    path segment equal to one of them discloses nothing the schema does not.
+    """
+    names: set[str] = set()
+
+    def collect(node: Any) -> None:
+        if isinstance(node, dict):
+            properties = node.get("properties")
+            if isinstance(properties, dict):
+                names.update(key for key in properties if isinstance(key, str))
+            for child in node.values():
+                collect(child)
+        elif isinstance(node, list):
+            for child in node:
+                collect(child)
+
+    collect(schema)
+    return frozenset(names)
+
+
+def _rejected_argument_path(
+    error: jsonschema.ValidationError, schema: Any, arguments: Any
+) -> list[str | int | None]:
+    """The failing instance location, with every caller-chosen key redacted.
+
+    Walks ``error.absolute_path`` (not ``.path``, which is relative when
+    ``best_match`` returns an ``anyOf`` child). A segment survives only as an
+    array index (an ``int`` whose container is a list) or as a key the schema
+    declares under some ``properties``. Any other key -- one matched by
+    ``additionalProperties`` or ``patternProperties``, or a non-``str`` key a
+    caller built in-process (an ``int``, or a ``str`` subclass whose ``__eq__``
+    could pass the membership test) -- is chosen by the caller and may itself
+    be a secret, so it becomes ``None``. The walk reads only container types
+    from ``arguments``, never a value.
+    """
+    declared = _declared_property_names(schema)
+    path: list[str | int | None] = []
+    node = arguments
+    for segment in error.absolute_path:
+        if isinstance(node, list) and type(segment) is int:
+            path.append(segment)
+        elif isinstance(node, dict) and type(segment) is str and segment in declared:
+            path.append(segment)
+        else:
+            path.append(None)
+        try:
+            node = node[segment]
+        except (KeyError, IndexError, TypeError):
+            node = None
+    return path
+
+
+def _rejected_argument_validator(
+    error: jsonschema.ValidationError, schema: Any
+) -> str | None:
+    """The failing keyword, if it is one the schema's draft defines."""
+    keywords = jsonschema.validators.validator_for(schema).VALIDATORS
+    validator = error.validator
+    return validator if isinstance(validator, str) and validator in keywords else None
+
+
 class ScopedAdvisorAudit:
     """Append-only JSONL writer with a single fsynced terminal marker."""
 
@@ -182,7 +255,7 @@ class ScopedAdvisorAudit:
     def record_invocation(
         self,
         *,
-        gateway_tool: str,
+        gateway_tool: str | None,
         terminal_status: str,
         arguments: dict[str, Any] | None,
         result: Any,
@@ -224,6 +297,56 @@ class ScopedAdvisorAudit:
                 if isinstance(evidence_label_digest, str)
                 and _DIGEST_PATTERN.fullmatch(evidence_label_digest)
                 else None,
+            }
+        )
+
+    def record_rejected_arguments(
+        self,
+        *,
+        gateway_tool: str,
+        error: jsonschema.ValidationError,
+        schema: dict[str, Any],
+        arguments: dict[str, Any],
+    ) -> None:
+        """Record a ``tools/call`` the input-schema gate rejected (Consiliency/pmcp#296).
+
+        The record names the tool, the failing JSON path and the validator
+        keyword, and nothing else from the call. It never reads the error's
+        ``message``, ``instance``, ``validator_value`` or ``context``: a
+        ``type``/``pattern``/``enum`` message echoes the rejected value, which
+        can be a secret. It carries no correlation, source hash or digest of
+        any argument either, because an unvalidated payload is exactly where a
+        caller can put a secret in a correlation-shaped field. It is its own
+        event, not an ``audit.invocation``, for the same reason: without
+        correlations it would read as a mismatched invocation.
+
+        Any exception while describing the rejection (a mapping built
+        in-process whose lookup raises, say) becomes
+        ``ScopedAdvisorAuditError``, so the gate fails closed instead of the
+        exception escaping unaudited. It is raised ``from None``: the original
+        may carry a caller value, and nothing chains it into a log.
+        """
+        try:
+            argument_path = _rejected_argument_path(error, schema, arguments)
+            validator = _rejected_argument_validator(error, schema)
+        except Exception:
+            raise ScopedAdvisorAuditError(
+                "scoped advisor audit could not describe a rejected call"
+            ) from None
+        self._write(
+            {
+                "event": REJECTION_EVENT,
+                "schema": SCOPED_ADVISOR_AUDIT_CAPABILITY,
+                "audit_session_id": self.audit_session_id,
+                "timestamp": time.time(),
+                "policy_digest": self.policy_digest,
+                "gateway_tool": gateway_tool
+                if gateway_tool in _SCOPED_GATEWAY_TOOLS
+                else None,
+                "gateway_tool_digest": _digest(gateway_tool),
+                "terminal_status": INVALID_ARGUMENTS_STATUS,
+                "rejected_argument_path": argument_path,
+                "rejected_argument_validator": validator,
             }
         )
 

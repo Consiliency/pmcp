@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import subprocess
 import sys
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import jsonschema
 import pytest
 from mcp.server.connection import Connection
 from mcp.server.context import ServerRequestContext
@@ -60,6 +64,36 @@ def _write_scoped_policy(path: Path) -> Path:
         )
     )
     return path
+
+
+#: The fields agent-harness's research reducer
+#: (`phase_loop_runtime/advisor_board/research.py` @ 18a324a4) reads from a
+#: `gateway.invoke` invocation record, or checks on every record. Each must
+#: survive on an invoke record, or the seat's ledger fails. It also reads
+#: `_COMPLETION_RECORD_FIELDS`, from the `audit.completed` record only.
+#: Consiliency/pmcp#296's plan derives the union of both sets from that file
+#: with `ledger_fields.py` (every string-keyed read on any name holding audit
+#: data, in the reducer and its helpers) and compares it with this file.
+_LEDGER_READ_FIELDS = frozenset(
+    {
+        "sequence",
+        "event",
+        "audit_session_id",
+        "policy_digest",
+        "gateway_tool",
+        "downstream_tool_id",
+        "terminal_status",
+        "source_reference_hash",
+        "evidence_label_digest",
+        "run_correlation_id",
+        "seat_correlation_id",
+    }
+)
+
+
+_COMPLETION_RECORD_FIELDS = frozenset(
+    {"first_sequence", "last_sequence", "record_count"}
+)
 
 
 def _correlations() -> dict[str, str]:
@@ -324,7 +358,13 @@ async def test_scoped_server_filters_controls_and_writes_private_complete_audit(
     assert firecrawl_record["run_correlation_id"] == "run-103"
     assert firecrawl_record["seat_correlation_id"] == "seat-codex"
     assert firecrawl_record["source_reference_hash"]
+    # Everything the board ledger reads survives the declared-keys filter.
+    for field in _LEDGER_READ_FIELDS:
+        assert firecrawl_record[field] is not None, field
+    assert firecrawl_record["evidence_label_digest"] == "a" * 64
     assert records[-1]["record_count"] == len(records)
+    for field in _COMPLETION_RECORD_FIELDS:
+        assert records[-1][field] is not None, field
     raw_audit = audit_path.read_text()
     for forbidden in (
         "example.com",
@@ -577,4 +617,1275 @@ def test_capability_probe_is_machine_readable() -> None:
     assert payload["capabilities"][0]["name"] == SCOPED_ADVISOR_AUDIT_CAPABILITY
     assert (
         "terminal_completion_fsync" in payload["capabilities"][0]["activation_requires"]
+    )
+
+
+# --- gate rejections reach the audit (Consiliency/pmcp#296) --------------------
+
+#: The exact key set of every ``audit.rejection`` record. A new key is a new
+#: channel out of an unvalidated payload, so it must be added here on purpose.
+_REJECTION_RECORD_KEYS = frozenset(
+    {
+        "sequence",
+        "event",
+        "schema",
+        "audit_session_id",
+        "timestamp",
+        "policy_digest",
+        "gateway_tool",
+        "gateway_tool_digest",
+        "terminal_status",
+        "rejected_argument_path",
+        "rejected_argument_validator",
+    }
+)
+
+
+def _scoped_server(tmp_path: Path) -> tuple[GatewayServer, Path]:
+    audit_path = tmp_path / "audit.jsonl"
+    server = GatewayServer(
+        policy_path=_write_scoped_policy(tmp_path / "policy.json"),
+        audit_jsonl=audit_path,
+    )
+    server._create_server()
+    return server, audit_path
+
+
+async def _call(server: GatewayServer, name: str, arguments: dict) -> Any:
+    assert server._server is not None
+    entry = server._server.get_request_handler("tools/call")
+    assert entry is not None
+    return await entry.handler(
+        _make_ctx(), CallToolRequestParams(name=name, arguments=arguments)
+    )
+
+
+@pytest.mark.asyncio
+async def test_gate_rejections_are_audited_without_argument_values(
+    tmp_path: Path,
+) -> None:
+    server, audit_path = _scoped_server(tmp_path)
+    dispatched: list[dict] = []
+
+    async def recording_invoke(arguments: dict) -> dict:
+        dispatched.append(arguments)
+        return {"ok": True}
+
+    server._gateway_tools.invoke = recording_invoke  # type: ignore[method-assign]
+    cases = [
+        # (arguments, expected path, expected keyword)
+        (
+            {"tool_id": "firecrawl::web_search", "arguments": "sk-TYPE-SECRET"},
+            ["arguments"],
+            "type",
+        ),
+        (
+            {
+                "tool_id": "firecrawl::web_search",
+                **_correlations(),
+                "evidence_label_digest": "sk-PATTERN-SECRET" + "Z" * 47,
+            },
+            ["evidence_label_digest"],
+            "pattern",
+        ),
+        (
+            {
+                "tool_id": "firecrawl::web_search",
+                **_correlations(),
+                "run_correlation_id": ["run-LIST-SECRET"],
+            },
+            ["run_correlation_id"],
+            "type",
+        ),
+        (
+            {"tool_id": "firecrawl::web_search", "task": {"enabled": "sk-ENUM"}},
+            ["task", "enabled"],
+            "type",
+        ),
+        ({"arguments": {"q": "sk-MISSING-SECRET"}}, [], "required"),
+    ]
+    for arguments, _, _ in cases:
+        result = await _call(server, "gateway.invoke", arguments)
+        # The caller still gets the gate's own message, unchanged.
+        assert result.is_error is True
+        assert result.content[0].text.startswith("Input validation error: ")
+    assert dispatched == []
+    await server.shutdown()
+
+    records = validate_scoped_advisor_audit(audit_path)
+    # No `audit.invocation` at all: agent-harness's board ledger
+    # (`advisor_board/research.py:465-481` @ b9627d53) correlates every
+    # `gateway.invoke` invocation to its run, and a record without
+    # correlations would fail the seat as `audit_correlation_mismatch`.
+    assert [r for r in records if r["event"] == "audit.invocation"] == []
+    rejections = [r for r in records if r["event"] == "audit.rejection"]
+    assert [r["terminal_status"] for r in rejections] == ["invalid_arguments"] * len(
+        cases
+    )
+    assert [
+        (r["rejected_argument_path"], r["rejected_argument_validator"])
+        for r in rejections
+    ] == [(path, keyword) for _, path, keyword in cases]
+    for record in rejections:
+        assert set(record) == _REJECTION_RECORD_KEYS
+        assert record["gateway_tool"] == "gateway.invoke"
+    raw_audit = audit_path.read_text()
+    for forbidden in (
+        "sk-TYPE-SECRET",
+        "sk-PATTERN-SECRET",
+        "run-LIST-SECRET",
+        "sk-ENUM",
+        "sk-MISSING-SECRET",
+        "run-103",
+        "seat-codex",
+        "firecrawl::web_search",
+        "is not of type",
+        "does not match",
+    ):
+        assert forbidden not in raw_audit
+
+
+@pytest.mark.asyncio
+async def test_policy_is_judged_before_the_gate(tmp_path: Path) -> None:
+    """A malformed call to a blocked tool is `denied`, not `invalid_arguments`.
+
+    `gateway.provision` is outside the scoped policy. Its argument is the
+    wrong type, which the gate would reject, but policy answers first and
+    the blocked tool's schema is not disclosed.
+    """
+    server, audit_path = _scoped_server(tmp_path)
+    result = await _call(
+        server, "gateway.provision", {"server_name": 12345, "api_key": "sk-X"}
+    )
+    text = result.content[0].text
+    assert "blocked by policy" in json.loads(text)["message"]
+    assert "Input validation error" not in text
+    await server.shutdown()
+    records = validate_scoped_advisor_audit(audit_path)
+    assert [
+        r["terminal_status"] for r in records if r["event"] == "audit.invocation"
+    ] == ["denied"]
+    assert "sk-X" not in audit_path.read_text()
+
+
+@pytest.mark.asyncio
+async def test_the_policy_verdict_is_read_once_per_call(tmp_path: Path) -> None:
+    """No name can skip the gate as blocked and then be dispatched as allowed.
+
+    The stub answers "blocked" the first time and "allowed" after. Reading
+    the verdict twice would skip the schema gate and then dispatch the
+    malformed arguments to the handler.
+    """
+    server, _ = _scoped_server(tmp_path)
+    verdicts = iter([False, True, True, True])
+    server._policy_manager.is_gateway_tool_allowed = (  # type: ignore[method-assign]
+        lambda name: next(verdicts)
+    )
+    dispatched: list[dict] = []
+
+    async def recording_describe(arguments: dict) -> dict:
+        dispatched.append(arguments)
+        return {"ok": True}
+
+    server._gateway_tools.describe = recording_describe  # type: ignore[method-assign]
+    result = await _call(server, "gateway.describe", {"tool_id": ""})
+    assert "blocked by policy" in json.loads(result.content[0].text)["message"]
+    assert dispatched == []
+    await server.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_gate_rejection_with_a_dead_sink_fails_closed(tmp_path: Path) -> None:
+    server, _ = _scoped_server(tmp_path)
+    assert server._scoped_advisor_audit is not None
+    assert server._scoped_advisor_audit._file is not None
+    server._scoped_advisor_audit._file.close()
+    result = await _call(server, "gateway.describe", {"tool_id": ""})
+    assert json.loads(result.content[0].text) == {
+        "error": True,
+        "message": "Scoped advisor audit channel failed",
+    }
+    assert not result.is_error
+
+
+def _first_error(instance: Any, schema: dict[str, Any]) -> jsonschema.ValidationError:
+    error = jsonschema.exceptions.best_match(
+        jsonschema.validators.validator_for(schema)(schema).iter_errors(instance)
+    )
+    assert error is not None
+    return error
+
+
+def _record_one(
+    tmp_path: Path,
+    error: jsonschema.ValidationError,
+    schema: dict[str, Any],
+    arguments: Any,
+) -> dict[str, Any]:
+    path = tmp_path / f"audit-{len(list(tmp_path.iterdir()))}.jsonl"
+    audit = ScopedAdvisorAudit(path, policy_digest="e" * 64)
+    audit.record_rejected_arguments(
+        gateway_tool="gateway.invoke", error=error, schema=schema, arguments=arguments
+    )
+    audit.complete()
+    records = validate_scoped_advisor_audit(path)
+    assert "sk-" not in path.read_text()
+    return records[1]
+
+
+class _EqualsEverything(str):
+    """A ``str`` subclass that claims to equal any declared name."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __hash__(self) -> int:
+        return hash("tool_id")
+
+
+_CALLER_KEYED_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "env": {"type": "object", "additionalProperties": {"type": "integer"}},
+        "hdrs": {
+            "type": "object",
+            "patternProperties": {"^x-": {"type": "integer"}},
+        },
+        "names": {"type": "array", "items": {"type": "string"}},
+        "tool_id": {"type": "string"},
+        "a": {
+            "anyOf": [
+                {"type": "object", "properties": {"b": {"type": "string"}}},
+                {"type": "integer"},
+            ]
+        },
+    },
+}
+
+
+@pytest.mark.parametrize(
+    ("arguments", "expected_path", "keyword"),
+    [
+        # A key the caller chose under additionalProperties is itself redacted.
+        ({"env": {"sk-KEY-SECRET": "v"}}, ["env", None], "type"),
+        # ... whatever its shape: an identifier-like key is no more public.
+        ({"env": {"caller_chosen_key_value": "v"}}, ["env", None], "type"),
+        ({"env": {"CallerChosenKey42": "v"}}, ["env", None], "type"),
+        # A schema keyword is not a declared property name either.
+        ({"env": {"additionalProperties": "v"}}, ["env", None], "type"),
+        # ... and so is one matched by patternProperties.
+        ({"hdrs": {"x-sk-HEADER": "v"}}, ["hdrs", None], "type"),
+        # A caller key that equals a declared name elsewhere discloses nothing.
+        ({"env": {"tool_id": "v"}}, ["env", "tool_id"], "type"),
+        # An in-process int key is not an array index.
+        ({"env": {12345: "v"}}, ["env", None], "type"),
+        # A str subclass cannot smuggle its content past the membership test.
+        ({"env": {_EqualsEverything("sk-EQ-SECRET"): "v"}}, ["env", None], "type"),
+        # An array index survives, as a position.
+        ({"names": ["ok", 7]}, ["names", 1], "type"),
+        # best_match returns an anyOf child: its `.path` is relative (["b"]).
+        ({"a": {"b": 1}}, ["a", "b"], "type"),
+    ],
+)
+def test_rejected_argument_path_redacts_caller_chosen_keys(
+    tmp_path: Path, arguments: dict, expected_path: list, keyword: str
+) -> None:
+    error = _first_error(arguments, _CALLER_KEYED_SCHEMA)
+    record = _record_one(tmp_path, error, _CALLER_KEYED_SCHEMA, arguments)
+    assert record["rejected_argument_path"] == expected_path
+    assert record["rejected_argument_validator"] == keyword
+
+
+@pytest.mark.parametrize("keyword", ["sk-KEYWORD-SECRET", "caller_chosen_keyword"])
+def test_an_unknown_validator_keyword_is_not_recorded(
+    tmp_path: Path, keyword: str
+) -> None:
+    error = jsonschema.ValidationError("m", validator=keyword, path=["tool_id"])
+    record = _record_one(tmp_path, error, _CALLER_KEYED_SCHEMA, {"tool_id": "x"})
+    assert record["rejected_argument_validator"] is None
+    assert record["rejected_argument_path"] == ["tool_id"]
+
+
+class _PoisonedError(jsonschema.ValidationError):
+    """Every attribute that can carry the rejected value raises on access."""
+
+    def _poisoned(self: Any) -> Any:
+        raise AssertionError("the audit read a value-bearing error attribute")
+
+    message = property(_poisoned)  # type: ignore[assignment]
+    instance = property(_poisoned)  # type: ignore[assignment]
+    validator_value = property(_poisoned)  # type: ignore[assignment]
+    context = property(_poisoned)  # type: ignore[assignment]
+    cause = property(_poisoned)  # type: ignore[assignment]
+    json_path = property(_poisoned)  # type: ignore[assignment]
+    schema = property(_poisoned)  # type: ignore[assignment]
+
+
+def test_the_rejection_record_never_reads_the_message_or_the_instance(
+    tmp_path: Path,
+) -> None:
+    arguments = {"env": {"sk-KEY": "sk-VALUE"}}
+    error = _first_error(arguments, _CALLER_KEYED_SCHEMA)
+    error.__class__ = _PoisonedError
+    record = _record_one(tmp_path, error, _CALLER_KEYED_SCHEMA, arguments)
+    assert set(record) == _REJECTION_RECORD_KEYS
+    assert record["rejected_argument_path"] == ["env", None]
+
+
+# --- rev 2: nothing the caller chose reaches a denied record (Consiliency/pmcp#296) ---
+
+#: Everything in a record that does not come from the writer's clock or counter.
+_VOLATILE_KEYS = frozenset({"sequence", "timestamp"})
+
+
+def _caller_values(tag: str) -> dict[str, str]:
+    """Values shaped to pass every filter `record_invocation` applies.
+
+    Each fits the correlation charset, the tool-id pattern, the 64-hex digest
+    pattern or the public-URL scan, so a record that reads the field at all
+    carries it. Identifier-like on purpose: a secret need not contain `-`.
+    """
+    digit = {"a": "0", "b": "1"}[tag]
+    return {
+        "run_correlation_id": f"caller_chosen_run_value_{tag}",
+        "seat_correlation_id": f"caller_chosen_seat_value_{tag}",
+        "evidence_label_digest": digit * 64,
+        "tool_id": f"caller::chosen_tool_value_{tag}",
+        "note": f"https://caller-chosen-host-{tag}.example.com/caller_chosen_path",
+    }
+
+
+def _format_tag(value: Any, tag: str) -> Any:
+    if isinstance(value, str):
+        return value.format(tag=tag)
+    if isinstance(value, list):
+        return [_format_tag(item, tag) for item in value]
+    return value
+
+
+def _stable(record: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in record.items() if k not in _VOLATILE_KEYS}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("label", "names", "base", "allow_everything", "response"),
+    [
+        (
+            "blocked, malformed",
+            ("gateway.provision", "gateway.provision"),
+            # Malformed (not a string) yet URL-bearing, in the one key
+            # `provision` declares: a filter run before the gate would read it.
+            {"server_name": ["https://caller-chosen-server-{tag}.example.com/p"]},
+            False,
+            "blocked by policy",
+        ),
+        (
+            "blocked, well-formed",
+            ("gateway.provision", "gateway.provision"),
+            {"server_name": "https://caller-chosen-server-{tag}.example.com/p"},
+            False,
+            "blocked by policy",
+        ),
+        (
+            "unregistered name, blocked",
+            ("gateway.caller_chosen_name_a", "gateway.caller_chosen_name_b"),
+            {},
+            False,
+            "blocked by policy",
+        ),
+        (
+            # Unreachable under the scoped policy (it allows four registered
+            # names), so pinned with a policy that allows every name: the
+            # arguments never met a schema, so they never reach the record.
+            "unregistered name, allowed",
+            ("gateway.caller_chosen_name_a", "gateway.caller_chosen_name_b"),
+            {},
+            True,
+            "Unknown tool",
+        ),
+    ],
+    ids=[
+        "blocked-malformed",
+        "blocked-wellformed",
+        "unregistered",
+        "unregistered-allowed",
+    ],
+)
+async def test_an_ungated_call_records_nothing_the_caller_chose(
+    tmp_path: Path,
+    label: str,
+    names: tuple[str, str],
+    base: dict[str, Any],
+    allow_everything: bool,
+    response: str,
+) -> None:
+    """Two calls that differ only in what the caller chose leave equal records.
+
+    The differential is the oracle: it does not depend on knowing which field
+    `record_invocation` reads, so a new channel fails it too. Every value is
+    shaped to survive that method's charset filters.
+    """
+    server, audit_path = _scoped_server(tmp_path)
+    if allow_everything:
+        server._policy_manager.is_gateway_tool_allowed = (  # type: ignore[method-assign]
+            lambda name: True
+        )
+    for name, tag in zip(names, ("a", "b")):
+        tagged = {key: _format_tag(value, tag) for key, value in base.items()}
+        result = await _call(server, name, {**tagged, **_caller_values(tag)})
+        assert response in result.content[0].text, label
+    await server.shutdown()
+
+    records = validate_scoped_advisor_audit(audit_path)
+    first, second = [r for r in records if r["event"] == "audit.invocation"]
+    assert _stable(first) == _stable(second), label
+    for field in (
+        "run_correlation_id",
+        "seat_correlation_id",
+        "evidence_label_digest",
+        "downstream_tool_id",
+        "source_reference_hash",
+    ):
+        assert first[field] is None, (label, field)
+    raw_audit = audit_path.read_text()
+    for forbidden in ("caller_chosen", "caller::chosen", "caller-chosen", "0" * 64):
+        assert forbidden not in raw_audit, (label, forbidden)
+
+
+@pytest.mark.asyncio
+async def test_a_gated_call_records_only_the_keys_its_schema_declares(
+    tmp_path: Path,
+) -> None:
+    """The gate ignores undeclared keys (until piece B of Consiliency/pmcp#236).
+
+    `gateway.describe` declares only `tool_id`, so the correlation-shaped keys
+    and the URL below pass the gate unexamined. They must not reach the record.
+    """
+    server, audit_path = _scoped_server(tmp_path)
+
+    async def stub_describe(arguments: dict) -> dict:
+        return {"ok": True}
+
+    server._gateway_tools.describe = stub_describe  # type: ignore[method-assign]
+    for tag in ("a", "b"):
+        undeclared = {k: v for k, v in _caller_values(tag).items() if k != "tool_id"}
+        result = await _call(
+            server,
+            "gateway.describe",
+            {"tool_id": "firecrawl::web_search", **undeclared},
+        )
+        assert json.loads(result.content[0].text) == {"ok": True}
+    await server.shutdown()
+
+    records = validate_scoped_advisor_audit(audit_path)
+    first, second = [r for r in records if r["event"] == "audit.invocation"]
+    assert _stable(first) == _stable(second)
+    assert first["terminal_status"] == "success"
+    # A declared, gate-checked field still reaches the record.
+    assert first["downstream_tool_id"] == "firecrawl::web_search"
+    for field in (
+        "run_correlation_id",
+        "seat_correlation_id",
+        "evidence_label_digest",
+        "source_reference_hash",
+    ):
+        assert first[field] is None, field
+    raw_audit = audit_path.read_text()
+    for forbidden in ("caller_chosen", "caller-chosen", "0" * 64):
+        assert forbidden not in raw_audit, forbidden
+
+
+@pytest.mark.asyncio
+async def test_rejected_and_denied_calls_never_log_argument_values(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """No rejection or denial path logs a value or the jsonschema message."""
+    caplog.set_level(logging.DEBUG)
+    secret = "caller_chosen_logged_value"
+    (tmp_path / "live").mkdir()
+    (tmp_path / "dead").mkdir()
+    live, _ = _scoped_server(tmp_path / "live")
+    await _call(  # E1: an allowed tool's gate rejection echoes the value
+        live,
+        "gateway.invoke",
+        {"tool_id": "firecrawl::web_search", "arguments": secret, **_correlations()},
+    )
+    await _call(  # E4: blocked, malformed
+        live, "gateway.provision", {"server_name": 12345, "run_correlation_id": secret}
+    )
+    await _call(  # E4: blocked, well-formed
+        live, "gateway.provision", {"server_name": "x", "run_correlation_id": secret}
+    )
+    await _call(  # E4: unregistered name
+        live, f"gateway.{secret}", {"run_correlation_id": secret}
+    )
+    await live.shutdown()
+
+    dead, _ = _scoped_server(tmp_path / "dead")
+    assert dead._scoped_advisor_audit is not None
+    assert dead._scoped_advisor_audit._file is not None
+    dead._scoped_advisor_audit._file.close()
+    result = await _call(  # E2: the same rejection with a dead sink
+        dead,
+        "gateway.invoke",
+        {"tool_id": "firecrawl::web_search", "arguments": secret, **_correlations()},
+    )
+    assert "Scoped advisor audit channel failed" in result.content[0].text
+
+    assert caplog.records, "nothing was logged, so this test proves nothing"
+    for forbidden in (secret, "is not of type", "Input validation error"):
+        assert forbidden not in caplog.text, forbidden
+
+
+def test_the_rejection_names_only_a_scoped_gateway_tool(tmp_path: Path) -> None:
+    arguments = {"tool_id": 1}
+    error = _first_error(arguments, _CALLER_KEYED_SCHEMA)
+    path = tmp_path / "audit.jsonl"
+    audit = ScopedAdvisorAudit(path, policy_digest="e" * 64)
+    audit.record_rejected_arguments(
+        gateway_tool="gateway.provision",
+        error=error,
+        schema=_CALLER_KEYED_SCHEMA,
+        arguments=arguments,
+    )
+    audit.complete()
+    record = validate_scoped_advisor_audit(path)[1]
+    assert record["gateway_tool"] is None
+    assert record["rejected_argument_path"] == ["tool_id"]
+
+
+class _RaisingDict(dict):
+    """A mapping an in-process caller built, whose lookups raise."""
+
+    def __getitem__(self, key: Any) -> Any:
+        raise ValueError("caller_chosen_lookup_failure")
+
+
+def _raising_path_error(exc_type: type[Exception]) -> jsonschema.ValidationError:
+    """An error whose `absolute_path` raises `exc_type` when read."""
+
+    class _RaisingPath(jsonschema.ValidationError):
+        @property  # type: ignore[override]
+        def absolute_path(self) -> Any:
+            raise exc_type("caller_chosen_lookup_failure")
+
+    error = _first_error({"env": {"k": "v"}}, _CALLER_KEYED_SCHEMA)
+    error.__class__ = _RaisingPath
+    return error
+
+
+@pytest.mark.parametrize("exc_type", [ValueError, KeyError, TypeError])
+def test_a_rejection_that_cannot_be_described_fails_closed_and_keeps_the_sink(
+    tmp_path: Path, exc_type: type[Exception]
+) -> None:
+    """Any exception while describing the rejection is an audit failure.
+
+    It surfaces as `ScopedAdvisorAuditError`, which the gate answers with
+    "channel failed", instead of escaping `_handle_call_tool` unaudited; it
+    writes nothing, and the sink stays live for the next call. `ValueError`
+    comes from a caller's mapping during the path walk; `KeyError` and
+    `TypeError` -- which the walk itself tolerates on a lookup -- from reading
+    the error's path.
+    """
+    error = _first_error({"env": {"k": "v"}}, _CALLER_KEYED_SCHEMA)
+    path = tmp_path / "audit.jsonl"
+    audit = ScopedAdvisorAudit(path, policy_digest="e" * 64)
+    if exc_type is ValueError:
+        failing_error = error
+        arguments: dict[str, Any] = {"env": _RaisingDict({"k": "v"})}
+    else:
+        failing_error = _raising_path_error(exc_type)
+        arguments = {"env": {"k": "v"}}
+    with pytest.raises(ScopedAdvisorAuditError) as raised:
+        audit.record_rejected_arguments(
+            gateway_tool="gateway.invoke",
+            error=failing_error,
+            schema=_CALLER_KEYED_SCHEMA,
+            arguments=arguments,
+        )
+    # Not in the message, and not in a logged traceback either: the original
+    # exception is neither the cause nor displayed as the context.
+    logged = "".join(traceback.format_exception(raised.value))
+    assert "caller_chosen" not in logged
+    audit.require_available()
+    audit.record_rejected_arguments(
+        gateway_tool="gateway.invoke",
+        error=error,
+        schema=_CALLER_KEYED_SCHEMA,
+        arguments={"env": {"k": "v"}},
+    )
+    audit.complete()
+    records = validate_scoped_advisor_audit(path)
+    assert [r["event"] for r in records] == [
+        "audit.started",
+        "audit.rejection",
+        "audit.completed",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_invoke_source_hash_comes_from_its_declared_arguments(
+    tmp_path: Path,
+) -> None:
+    """`invoke.arguments` is declared, so its URL still reaches the record.
+
+    The downstream result carries no URL here, so the only source for
+    `source_reference_hash` -- which the ledger needs to verify a claim -- is
+    the declared `arguments` object.
+    """
+    server, audit_path = _scoped_server(tmp_path)
+
+    async def stub_invoke(arguments: dict) -> dict:
+        return {"ok": True, "result": "a page with no link in it"}
+
+    server._gateway_tools.invoke = stub_invoke  # type: ignore[method-assign]
+    result = await _call(
+        server,
+        "gateway.invoke",
+        {
+            "tool_id": "firecrawl::web_search",
+            "arguments": {"url": "https://source.example/article"},
+            **_correlations(),
+        },
+    )
+    assert json.loads(result.content[0].text)["ok"] is True
+    await server.shutdown()
+
+    records = validate_scoped_advisor_audit(audit_path)
+    (record,) = [r for r in records if r["event"] == "audit.invocation"]
+    assert (
+        record["source_reference_hash"]
+        == hashlib.sha256(b"https://source.example/article").hexdigest()
+    )
+    for field in _LEDGER_READ_FIELDS:
+        assert record[field] is not None, field
+
+
+@pytest.mark.asyncio
+async def test_an_allowed_call_that_raises_records_only_declared_keys(
+    tmp_path: Path,
+) -> None:
+    """The `except` arm (E9) of a registered, allowed tool reads the filter too."""
+    server, audit_path = _scoped_server(tmp_path)
+
+    async def failing_describe(arguments: dict) -> dict:
+        raise ValueError("downstream describe failed")
+
+    server._gateway_tools.describe = failing_describe  # type: ignore[method-assign]
+    for tag in ("a", "b"):
+        undeclared = {k: v for k, v in _caller_values(tag).items() if k != "tool_id"}
+        await _call(
+            server,
+            "gateway.describe",
+            {"tool_id": "firecrawl::web_search", **undeclared},
+        )
+    await server.shutdown()
+
+    records = validate_scoped_advisor_audit(audit_path)
+    first, second = [r for r in records if r["event"] == "audit.invocation"]
+    assert first["terminal_status"] == "failure"
+    assert _stable(first) == _stable(second)
+    assert first["downstream_tool_id"] == "firecrawl::web_search"
+    for field in (
+        "run_correlation_id",
+        "seat_correlation_id",
+        "evidence_label_digest",
+        "source_reference_hash",
+    ):
+        assert first[field] is None, field
+    raw_audit = audit_path.read_text()
+    for forbidden in ("caller_chosen", "caller-chosen", "0" * 64):
+        assert forbidden not in raw_audit, forbidden
+
+
+# --- rev 4/5: a generated sweep of caller values over every tool and path --
+#
+# Rounds 1-4 of the board each found a mutant the caller values missed. This
+# sweep generates them, for every registered gateway tool on every path
+# through `_handle_call_tool` that writes a record, over these axes:
+#
+# - key spelling: every name `record_invocation` reads (`_RECORD_READ_NAMES`),
+#   every name the tool declares, `meta`/`_meta`, and a caller key whose own
+#   name varies per call -- each as is, `_`-prefixed, upper-case, title-case,
+#   with a Cyrillic look-alike letter, and with a zero-width suffix; minus the
+#   names the tool declares where the gate vouches for them;
+# - value shape: a correlation-shaped string, a `tool::id`-shaped string, a
+#   64-hex digest, a public URL, a dict and a list nesting a URL, a number;
+# - position: top level; nested inside every declared object-typed key the
+#   gate accepts extra content in (rev 5); nested in a declared key on
+#   ungated paths;
+# - the two calls' size: the tags differ in length and the second call
+#   carries more keys, so a length or a key count of the input is not
+#   invariant across the pair (rev 5);
+# - exception type on the `except` arm: every exception class raised anywhere
+#   in `src/pmcp`, found by AST, and `GatewayException` with every
+#   `ErrorCode` (rev 5);
+# - exit E6: a scoped `gateway.invoke` without correlations (rev 5).
+#
+# The oracle is differential, so it needs no list of channels: two calls that
+# differ only in the generated values must leave equal records, and on an
+# allowed tool that record must equal the one for the declared arguments
+# alone. On top, no generated marker, URL, or hash of either appears in the
+# audit, and no marker appears in any log record as pmcp's own text and JSON
+# formatters render it, traceback included (rev 5).
+#
+# One documented exception (F1, *Non-goals*): a URL nested under a declared
+# object key on an allowed path still reaches `source_reference_hash` through
+# the recursive URL scan, as on main, until piece B of Consiliency/pmcp#236
+# forbids the undeclared nested key. That one field is exempt only there.
+
+#: Argument names `record_invocation` reads by name.
+_RECORD_READ_NAMES = (
+    "tool_id",
+    "run_correlation_id",
+    "seat_correlation_id",
+    "evidence_label_digest",
+)
+_SHAPES = ("correlation", "tool_id", "digest", "url", "dict", "list", "number")
+#: Two tags of different length; the second call also carries more keys.
+_TAGS = ("a", "bbbbbbb")
+_NUMBERS = {"a": 7, "bbbbbbb": 40353607}
+_MARKERS = (
+    "caller_marker",
+    "caller::marker",
+    "caller-host",
+    "caller_path",
+    "caller_key",
+)
+#: The index of the one generated value that sits in a declared key the gate
+#: rejects (see `_invalid_declared`).
+_INVALID_INDEX = 99
+#: The one pre-existing log line this plan does not own, and exactly it:
+#: `call_tool`'s `except Exception` logs `f"Tool execution error: {e}"`, which
+#: echoes a pydantic `InvokeInput` error's input -- e.g. a non-dict `meta`
+#: reaching the model by alias, on main too (Consiliency/pmcp#297 names it) --
+#: and an unknown tool's name (unreachable under the scoped policy).
+_FOREIGN_LOG_PREFIX = "Tool execution error: "
+_FOREIGN_LOG_CHANNELS = ("validation error for InvokeInput", "Unknown tool:")
+#: Only for `gateway.invoke` may a generated key change the status and so the
+#: result digest: an undeclared `meta` reaches `InvokeInput` by alias.
+_INVOKE_ONLY_EXEMPT = frozenset({"terminal_status", "redacted_result_digest"})
+
+
+def _gateway_tools_by_name() -> dict[str, Any]:
+    from pmcp.tools.handlers import get_gateway_tool_definitions
+
+    return {tool.name: tool for tool in get_gateway_tool_definitions()}
+
+
+def _spellings(name: str) -> set[str]:
+    return {
+        name,
+        "_" + name,
+        name.upper(),
+        name.title(),
+        name.replace("e", "\u0435", 1).replace("a", "\u0430", 1),
+        name + "\u200b",
+    }
+
+
+def _generated_keys(declared: set[str], tag: str) -> list[str]:
+    """Key spellings; the caller's own key names vary with `tag`, and the
+    second tag brings one more of them, so the key count differs too."""
+    names = set(_RECORD_READ_NAMES) | declared | {"meta", "_meta", f"caller_key_{tag}"}
+    if tag == _TAGS[1]:
+        names.add(f"caller_key_{tag}_extra")
+    keys: set[str] = set()
+    for name in names:
+        keys |= _spellings(name)
+    return sorted(keys - declared)
+
+
+def _generated_value(shape: str, tag: str, index: int) -> Any:
+    url = f"https://caller-host-{tag}{index}.example.com/caller_path_{tag}{index}"
+    if shape == "correlation":
+        return f"caller_marker_{tag}{index}"
+    if shape == "tool_id":
+        return f"caller::marker_{tag}{index}"
+    if shape == "digest":
+        return hashlib.sha256(f"caller_marker_{tag}{index}".encode()).hexdigest()
+    if shape == "url":
+        return url
+    if shape == "dict":
+        return {"caller_marker_inner": {"deep": url}}
+    if shape == "list":
+        return [f"caller_marker_{tag}{index}", [url]]
+    assert shape == "number"
+    return _NUMBERS[tag] + index
+
+
+def _generated(keys: list[str], shape: str, tag: str) -> dict[str, Any]:
+    return {key: _generated_value(shape, tag, i) for i, key in enumerate(keys)}
+
+
+def _mixed(keys: list[str], tag: str) -> dict[str, Any]:
+    """Every shape in one call: key `i` gets shape `i` mod the shape count."""
+    return {
+        key: _generated_value(_SHAPES[i % len(_SHAPES)], tag, i)
+        for i, key in enumerate(keys)
+    }
+
+
+def _url_hash(url: str) -> str:
+    return hashlib.sha256(url.lower().split("?")[0].encode()).hexdigest()
+
+
+def _forbidden_in_audit(count: int, tag: str, *, url_hash: bool = True) -> set[str]:
+    """Every generated string, and each hash of one, the audit could carry."""
+    forbidden = set(_MARKERS)
+    for i in [*range(count), _INVALID_INDEX]:
+        forbidden.add(_generated_value("digest", tag, i))
+        if url_hash:
+            forbidden.add(_url_hash(_generated_value("url", tag, i)))
+        for shape in (
+            ("correlation", "tool_id", "url")
+            if url_hash
+            else ("correlation", "tool_id")
+        ):
+            value = _generated_value(shape, tag, i)
+            forbidden.add(hashlib.sha256(value.encode()).hexdigest())
+            forbidden.add(hashlib.sha256(json.dumps(value).encode()).hexdigest())
+    return forbidden
+
+
+def _declared_baseline(tool: Any, *, correlated: bool = True) -> dict[str, Any]:
+    """The smallest arguments the tool's schema accepts, from its schema."""
+    schema = tool.input_schema
+    baseline: dict[str, Any] = {}
+    for name in schema.get("required") or []:
+        prop = schema["properties"][name]
+        if "enum" in prop:
+            baseline[name] = prop["enum"][0]
+        else:
+            baseline[name] = "x" * max(prop.get("minLength", 1), 1)
+    if tool.name == "gateway.invoke" and correlated:
+        # Correlated, so the scoped `InvokeInput` check passes and the
+        # allowed path reaches the handler.
+        baseline.update(_correlations())
+    jsonschema.validate(baseline, schema)
+    return baseline
+
+
+def _open_containers(tool: Any, baseline: dict[str, Any]) -> list[str]:
+    """Declared object-typed keys the gate lets generated content into."""
+    containers = []
+    for name, prop in sorted((tool.input_schema.get("properties") or {}).items()):
+        types = prop.get("type")
+        types = types if isinstance(types, list) else [types]
+        if "object" not in types:
+            continue
+        probe = {**baseline, name: _mixed(_generated_keys(set(), _TAGS[1]), _TAGS[1])}
+        try:
+            jsonschema.validate(probe, tool.input_schema)
+        except jsonschema.ValidationError:
+            continue
+        containers.append(name)
+    return containers
+
+
+#: Constructor arguments for raised exception classes whose `__init__` needs
+#: more than a message. A new such class fails `_raised_exceptions` loudly.
+_EXCEPTION_ARGS: dict[str, tuple[Any, ...]] = {
+    "HTTPError": ("https://example.invalid/", 500, "stub handler failed", None, None),
+    "ResourceServerAuthError": ("invalid_token", "stub handler failed"),
+    "MissingRemoteHeaderAuthError": ("stub", ["STUB_VAR"]),
+    "MissingApiKeyError": ("STUB_VAR", "stub", "stub"),
+}
+
+
+def _raised_exceptions() -> list[BaseException]:
+    """One instance of every exception class `src/pmcp` raises (by AST), and
+    a `GatewayException` for every `ErrorCode`.
+
+    `ScopedAdvisorAuditError` is left out: from a handler it takes E8, which
+    writes no record by design and has its own tests.
+    """
+    import ast
+    import importlib
+
+    from pmcp.errors import ErrorCode, GatewayException
+
+    root = _REPO_ROOT / "src"
+    classes: dict[type, None] = {}
+    for path in sorted((root / "pmcp").rglob("*.py")):
+        if "baml_client" in path.parts:
+            continue
+        expressions = {
+            ast.unparse(node.exc.func if isinstance(node.exc, ast.Call) else node.exc)
+            for node in ast.walk(ast.parse(path.read_text()))
+            if isinstance(node, ast.Raise)
+            and node.exc is not None
+            and isinstance(
+                node.exc.func if isinstance(node.exc, ast.Call) else node.exc,
+                (ast.Name, ast.Attribute),
+            )
+        }
+        if not expressions:
+            continue
+        parts = path.relative_to(root).with_suffix("").parts
+        module = importlib.import_module(
+            ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
+        )
+        for expression in sorted(expressions):
+            try:
+                value = eval(expression, vars(module))  # noqa: S307
+            except Exception:
+                continue  # a re-raised variable, not a class
+            if isinstance(value, type) and issubclass(value, Exception):
+                classes[value] = None
+    assert GatewayException in classes and KeyError in classes, sorted(
+        map(str, classes)
+    )
+    instances: list[BaseException] = []
+    for cls in classes:
+        if cls is ScopedAdvisorAuditError:
+            continue
+        if cls is GatewayException:
+            instances.extend(GatewayException(code) for code in ErrorCode)
+            continue
+        instances.append(
+            cls(*_EXCEPTION_ARGS.get(cls.__name__, ("stub handler failed",)))
+        )
+    return instances
+
+
+class _StubGatewayTools:
+    """Stands in for `GatewayTools`: every handler returns, or raises `error`."""
+
+    def __init__(self, error: BaseException | None = None) -> None:
+        self.error = error
+
+    def __getattr__(self, name: str) -> Any:
+        async def handler(*args: Any, **kwargs: Any) -> dict:
+            if self.error is not None:
+                raise self.error
+            return {"ok": True}
+
+        return handler
+
+
+def _invocations(audit_path: Path, event: str) -> list[dict[str, Any]]:
+    return [
+        _stable(r)
+        for r in validate_scoped_advisor_audit(audit_path)
+        if r["event"] == event
+    ]
+
+
+def _assert_nothing_generated_leaked(
+    raw_audit: str, log_text: str, count: int, *, url_hash: bool = True
+) -> None:
+    for tag in _TAGS:
+        for forbidden in _forbidden_in_audit(count + 12, tag, url_hash=url_hash):
+            assert forbidden not in raw_audit, forbidden
+    for marker in _MARKERS:
+        assert marker not in log_text, marker
+
+
+def _is_foreign(message: str) -> bool:
+    return message.startswith(_FOREIGN_LOG_PREFIX) and any(
+        channel in message for channel in _FOREIGN_LOG_CHANNELS
+    )
+
+
+_PMCP_FORMATTERS: list[logging.Formatter] = []
+
+
+def _pmcp_formatters() -> list[logging.Formatter]:
+    """pmcp's own text and JSON formatters, as `setup_logging` builds them."""
+    if not _PMCP_FORMATTERS:
+        from pmcp.cli import setup_logging
+
+        root = logging.getLogger()
+        level, before = root.level, list(root.handlers)
+        for log_format in ("text", "json"):
+            setup_logging("DEBUG", log_to_file=False, log_format=log_format)
+            for handler in [h for h in root.handlers if h not in before]:
+                assert handler.formatter is not None
+                _PMCP_FORMATTERS.append(handler.formatter)
+                root.removeHandler(handler)
+        root.setLevel(level)
+    return _PMCP_FORMATTERS
+
+
+def _log_text(caplog: pytest.LogCaptureFixture) -> str:
+    """Every log record as pmcp's formatters render it -- message, and any
+    `exc_info` traceback -- bar the one foreign line shape above."""
+    # The capture is live (DEBUG, root), so an empty result is not vacuous
+    # by accident: the gateway logs on start-up and shutdown.
+    assert caplog.records, "nothing was logged, so the log oracle proves nothing"
+    return "\n".join(
+        formatter.format(record)
+        for record in caplog.records
+        if not _is_foreign(record.getMessage())
+        for formatter in _pmcp_formatters()
+    )
+
+
+def _assert_pair(
+    tool_name: str, label: str, first: dict, second: dict, exempt: frozenset
+) -> None:
+    for field in set(first) | set(second):
+        if field not in exempt:
+            assert first.get(field) == second.get(field), (tool_name, label, field)
+
+
+def _allowed_server(tmp_path: Path) -> tuple[GatewayServer, Path, Any]:
+    server, audit_path = _scoped_server(tmp_path)
+    server._policy_manager.is_gateway_tool_allowed = (  # type: ignore[method-assign]
+        lambda name: True
+    )
+    real_tools = server._gateway_tools
+    server._gateway_tools = _StubGatewayTools()  # type: ignore[assignment]
+    return server, audit_path, real_tools
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", sorted(_gateway_tools_by_name()))
+async def test_generated_caller_values_never_reach_an_allowed_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, tool_name: str
+) -> None:
+    """Allowed paths E7 (handler returns) and E9 (handler raises every raised
+    exception type), with generated keys at top level and inside every open
+    declared container."""
+    caplog.set_level(logging.DEBUG)
+    tool = _gateway_tools_by_name()[tool_name]
+    declared = set(tool.input_schema.get("properties") or {})
+    baseline = _declared_baseline(tool)
+    exempt = _INVOKE_ONLY_EXEMPT if tool_name == "gateway.invoke" else frozenset()
+    server, audit_path, real_tools = _allowed_server(tmp_path)
+    stub = server._gateway_tools
+
+    # (label, exempt fields, payload for each tag); the reference is `baseline`.
+    cases: list[tuple[str, frozenset, dict[str, dict]]] = []
+    for shape in _SHAPES:
+        cases.append(
+            (
+                f"top-level {shape}",
+                exempt,
+                {
+                    tag: {
+                        **baseline,
+                        **_generated(_generated_keys(declared, tag), shape, tag),
+                    }
+                    for tag in _TAGS
+                },
+            )
+        )
+    containers = _open_containers(tool, baseline)
+    for container in containers:
+        for shape in _SHAPES:
+            cases.append(
+                (
+                    f"inside {container} {shape}",
+                    exempt | {"source_reference_hash"},  # F1
+                    {
+                        tag: {
+                            **baseline,
+                            container: {
+                                **(baseline.get(container) or {}),
+                                **_generated(_generated_keys(set(), tag), shape, tag),
+                            },
+                        }
+                        for tag in _TAGS
+                    },
+                )
+            )
+
+    records_per_case = []
+    for error in [None, *_raised_exceptions()]:
+        stub.error = error
+        reference = await _call(server, tool_name, baseline)
+        del reference
+        if error is None:
+            for _, _, payloads in cases:
+                for tag in _TAGS:
+                    await _call(server, tool_name, payloads[tag])
+        else:
+            for tag in _TAGS:
+                await _call(
+                    server,
+                    tool_name,
+                    {**baseline, **_mixed(_generated_keys(declared, tag), tag)},
+                )
+        records_per_case.append(error)
+    server._gateway_tools = real_tools
+    await server.shutdown()
+
+    records = _invocations(audit_path, "audit.invocation")
+    ok_count = 1 + len(_TAGS) * len(cases)
+    ok, raised = records[:ok_count], records[ok_count:]
+    reference, generated = ok[0], ok[1:]
+    for (label, case_exempt, _), first, second in zip(
+        cases, generated[::2], generated[1::2]
+    ):
+        _assert_pair(tool_name, label, first, second, case_exempt - _INVOKE_ONLY_EXEMPT)
+        _assert_pair(tool_name, label, first, reference, case_exempt)
+    errors = records_per_case[1:]
+    assert len(raised) == 3 * len(errors)
+    for error, (reference, first, second) in zip(
+        errors, zip(raised[::3], raised[1::3], raised[2::3])
+    ):
+        label = f"raises {error!r}"
+        # Mixed shapes shift with the key count, so on invoke `meta` may be a
+        # dict in one call and not in the other: the invoke-only exemption.
+        _assert_pair(tool_name, label, first, second, exempt)
+        _assert_pair(tool_name, label, first, reference, exempt)
+    _assert_nothing_generated_leaked(
+        audit_path.read_text(),
+        _log_text(caplog),
+        len(_generated_keys(declared, _TAGS[1])),
+        url_hash=not containers,
+    )
+
+
+@pytest.mark.asyncio
+async def test_generated_caller_values_never_reach_an_uncorrelated_invoke_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Exit E6: a scoped `gateway.invoke` without correlations raises before
+    dispatch, inside the audited path; its record and log are caller-free."""
+    caplog.set_level(logging.DEBUG)
+    tool = _gateway_tools_by_name()["gateway.invoke"]
+    declared = set(tool.input_schema.get("properties") or {})
+    baseline = _declared_baseline(tool, correlated=False)
+    server, audit_path = _scoped_server(tmp_path)
+    await _call(server, "gateway.invoke", baseline)
+    for shape in _SHAPES:
+        for tag in _TAGS:
+            keys = _generated_keys(declared, tag)
+            await _call(
+                server, "gateway.invoke", {**baseline, **_generated(keys, shape, tag)}
+            )
+    await server.shutdown()
+
+    records = _invocations(audit_path, "audit.invocation")
+    assert len(records) == 1 + len(_TAGS) * len(_SHAPES)
+    reference, generated = records[0], records[1:]
+    assert reference["terminal_status"] == "failure"
+    for shape, first, second in zip(_SHAPES, generated[::2], generated[1::2]):
+        _assert_pair("gateway.invoke", f"E6 {shape}", first, second, frozenset())
+        _assert_pair(
+            "gateway.invoke", f"E6 {shape}", first, reference, _INVOKE_ONLY_EXEMPT
+        )
+    _assert_nothing_generated_leaked(
+        audit_path.read_text(),
+        _log_text(caplog),
+        len(_generated_keys(declared, _TAGS[1])),
+    )
+
+
+def _invalid_declared(tool: Any, baseline: dict[str, Any], tag: str) -> dict | None:
+    """The baseline with one declared value the gate rejects, or None."""
+    for name in sorted(tool.input_schema.get("properties") or {}):
+        for shape in ("dict", "list", "number", "correlation"):
+            candidate = {**baseline, name: _generated_value(shape, tag, _INVALID_INDEX)}
+            try:
+                jsonschema.validate(candidate, tool.input_schema)
+            except jsonschema.ValidationError:
+                return candidate
+    return None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool_name", sorted(_gateway_tools_by_name()))
+async def test_generated_caller_values_never_reach_a_rejection_record(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, tool_name: str
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    tool = _gateway_tools_by_name()[tool_name]
+    declared = set(tool.input_schema.get("properties") or {})
+    baseline = _declared_baseline(tool)
+    if _invalid_declared(tool, baseline, _TAGS[0]) is None:
+        # No declared property -- the gate accepts any object until piece B
+        # of Consiliency/pmcp#236 -- so this tool has no rejection path.
+        assert not declared, tool_name
+        return
+    server, audit_path = _scoped_server(tmp_path)
+    server._policy_manager.is_gateway_tool_allowed = (  # type: ignore[method-assign]
+        lambda name: True
+    )
+    for shape in _SHAPES:
+        for tag in _TAGS:
+            invalid = _invalid_declared(tool, baseline, tag)
+            assert invalid is not None
+            keys = _generated_keys(declared, tag)
+            result = await _call(
+                server, tool_name, {**invalid, **_generated(keys, shape, tag)}
+            )
+            assert result.is_error is True
+    await server.shutdown()
+
+    assert _invocations(audit_path, "audit.invocation") == []
+    records = _invocations(audit_path, "audit.rejection")
+    assert len(records) == len(_TAGS) * len(_SHAPES)
+    for shape, first, second in zip(_SHAPES, records[::2], records[1::2]):
+        assert first == second, (tool_name, shape)
+    _assert_nothing_generated_leaked(
+        audit_path.read_text(),
+        _log_text(caplog),
+        len(_generated_keys(declared, _TAGS[1])),
+    )
+
+
+#: Pairs of unregistered names over the same spelling axes as the keys.
+_UNREGISTERED_NAME_PAIRS = (
+    ("gateway.caller_marker_a", "gateway.caller_marker_bbbbbbb"),
+    ("GATEWAY.HEALTH", "Gateway.Health"),
+    ("_gateway.health", "gateway.health\u200b"),
+    ("gateway.h\u0435alth", "gateway.he\u0430lth"),
+    ("gateway.run_correlation_id", "gateway.tool_id"),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("position", ["top-level", "nested-in-declared"])
+@pytest.mark.parametrize(
+    ("tool_name", "policy"),
+    [
+        *((name, "blocked") for name in sorted(_gateway_tools_by_name())),
+        ("<unregistered>", "blocked"),
+        ("<unregistered>", "allowed"),
+    ],
+)
+async def test_generated_caller_values_never_reach_an_ungated_record(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    tool_name: str,
+    position: str,
+    policy: str,
+) -> None:
+    """Blocked tools, and unregistered names blocked or allowed: nothing met a
+    schema, so every argument -- declared keys included -- and the name are
+    the caller's alone."""
+    caplog.set_level(logging.DEBUG)
+    tools = _gateway_tools_by_name()
+    tool = tools.get(tool_name)
+    declared = set(tool.input_schema.get("properties") or {}) if tool else set()
+    host = sorted(declared)[0] if declared else "arguments"
+    server, audit_path = _scoped_server(tmp_path)
+    server._policy_manager.is_gateway_tool_allowed = (  # type: ignore[method-assign]
+        lambda name: policy == "allowed"
+    )
+    names = _UNREGISTERED_NAME_PAIRS if tool is None else ((tool_name, tool_name),)
+    for shape in _SHAPES:
+        for pair in names:
+            for name, tag in zip(pair, _TAGS):
+                keys = _generated_keys(declared, tag) + sorted(declared)
+                generated = _generated(keys, shape, tag)
+                arguments = generated if position == "top-level" else {host: generated}
+                await _call(server, name, arguments)
+    await server.shutdown()
+
+    records = _invocations(audit_path, "audit.invocation")
+    assert len(records) == len(_TAGS) * len(_SHAPES) * len(names)
+    # Nothing in any record depends on the call: all are equal.
+    assert all(record == records[0] for record in records), tool_name
+    for field in (*_RECORD_READ_NAMES, "downstream_tool_id", "source_reference_hash"):
+        assert records[0].get(field) is None, field
+    _assert_nothing_generated_leaked(
+        audit_path.read_text(),
+        _log_text(caplog),
+        len(_generated_keys(declared, _TAGS[1])) + len(declared),
     )
