@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import bisect
 import json
 import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 import time
 import asyncio
 from collections.abc import Mapping
@@ -20,7 +21,7 @@ import aiohttp
 import jwt
 from jwt import PyJWKSet
 
-from pmcp.redaction_floor import floor_spans, unindented_break
+from pmcp.redaction_floor import floor_spans, unindented_break, work
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
 
@@ -282,7 +283,16 @@ Span = tuple[int, int, str]
 REDACTED = "[REDACTED]"
 
 
+def _counted(matches: Iterator[re.Match[str]]) -> Iterator[re.Match[str]]:
+    """Each match of a pass, counted as the work of reading it (the
+    test-only work counter, `pmcp.redaction_floor.work`)."""
+    for match in matches:
+        work(match.end() - match.start() + 1)
+        yield match
+
+
 def _run_spans(start: int, run: str) -> list[Span]:
+    work(len(run))
     if len(run) > _OPAQUE_MAX_RUN and not _reads_as_route(run):
         # A payload (JPEG base64 starts `/9j/` and carries a `/` every ~64
         # characters): the bound applies to the whole run BEFORE any path
@@ -315,13 +325,16 @@ _WORDY_PIECES_RE = re.compile(r"(?:^|/)[a-z]{3,}/(?:[^/]*/)*[a-z]{3,}(?:/|$)")
 def _shape_spans(text: str) -> list[Span]:
     """Spans of every credential-shaped run in ``text``: JWTs, the vendor
     supplement, prefixed tokens and scored opaque runs."""
-    spans: list[Span] = [(m.start(), m.end(), REDACTED) for m in _JWT_RE.finditer(text)]
+    work(len(text) * (3 + len(_VENDOR_SHAPE_RES)))  # one scan per pattern
+    spans: list[Span] = [
+        (m.start(), m.end(), REDACTED) for m in _counted(_JWT_RE.finditer(text))
+    ]
     for vendor_re in _VENDOR_SHAPE_RES:
         spans.extend((m.start(), m.end(), REDACTED) for m in vendor_re.finditer(text))
     spans.extend(
         (m.start(), m.end(), REDACTED) for m in _PREFIXED_TOKEN_RE.finditer(text)
     )
-    for m in _OPAQUE_RUN_RE.finditer(text):
+    for m in _counted(_OPAQUE_RUN_RE.finditer(text)):
         spans.extend(_run_spans(m.start(), m.group(0)))
     return spans
 
@@ -674,14 +687,27 @@ _URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 
 
 def _in_resource_name(text: str) -> Callable[[int], bool]:
+    """Is a position inside an `arn:`/`urn:` resource name? The names are
+    disjoint and ascending (one `finditer`), so each question is one binary
+    search: asking every range for every keyword match was quadratic (B-4 of
+    rev 12's board)."""
     ranges = [(m.start(), m.end()) for m in _RESOURCE_NAME_RE.finditer(text)]
-    return lambda position: any(a <= position < b for a, b in ranges)
+    starts = [a for a, _ in ranges]
+    work(len(text))
+
+    def inside(position: int) -> bool:
+        work(1)
+        i = bisect.bisect_right(starts, position) - 1
+        return i >= 0 and position < ranges[i][1]
+
+    return inside
 
 
 def _keyword_sep_spans(text: str) -> list[Span]:
+    work(len(text))  # the pass's scan
     spans: list[Span] = []
     in_resource_name = _in_resource_name(text)
-    for match in _KEYWORD_SEP_RE.finditer(text):
+    for match in _counted(_KEYWORD_SEP_RE.finditer(text)):
         if in_resource_name(match.start()):
             continue  # `arn:…:secret:Name` names a secret, it is not one
         name = match.group("name").lower()
@@ -768,9 +794,10 @@ def _keyword_sep_spans(text: str) -> list[Span]:
 
 
 def _keyword_list_spans(text: str) -> list[Span]:
+    work(len(text))  # the pass's scan
     spans: list[Span] = []
     in_resource_name = _in_resource_name(text)
-    for match in _KEYWORD_LIST_RE.finditer(text):
+    for match in _counted(_KEYWORD_LIST_RE.finditer(text)):
         if in_resource_name(match.start()):
             continue
         name = match.group("name").lower()
@@ -805,9 +832,10 @@ _ACRONYM_TITLE_RE = re.compile(r"[A-Z0-9]{1,8}[A-Z][a-z]+")
 
 
 def _keyword_ws_spans(text: str) -> list[Span]:
+    work(len(text))  # the pass's scan
     return [
         (match.start("value"), match.end("value"), REDACTED)
-        for match in _KEYWORD_WS_RE.finditer(text)
+        for match in _counted(_KEYWORD_WS_RE.finditer(text))
         if match.group("name").lower() != "code"
         and _value_could_be_a_credential(match.group("value"))
         # a glued prefix (`CLIENTSECRET abc…`) only on a single-case key or
@@ -824,9 +852,10 @@ def _keyword_ws_spans(text: str) -> list[Span]:
 
 
 def _bearer_spans(text: str) -> list[Span]:
+    work(len(text))  # the pass's scan
     return [
         (match.start("value"), match.end("value"), REDACTED)
-        for match in _BEARER_RE.finditer(text)
+        for match in _counted(_BEARER_RE.finditer(text))
         if not _is_plain_word_or_number(match.group("value"))
         and not (
             unindented_break(match.group("key"))
@@ -844,8 +873,9 @@ def _bearer_spans(text: str) -> list[Span]:
 
 
 def _authorization_spans(text: str) -> list[Span]:
+    work(len(text))  # the pass's scan
     spans: list[Span] = []
-    for match in _AUTHORIZATION_RE.finditer(text):
+    for match in _counted(_AUTHORIZATION_RE.finditer(text)):
         key_end = match.start() + len("authorization")
         quoted_key = text[key_end : key_end + 1] in ('"', "'")
         quoted = match.group("quoted")
@@ -889,6 +919,7 @@ def _url_component_spans(
     "contained" -- rev 5's regression against main. The path is left to the
     shape pass, which sees it like any other text.
     """
+    work(len(raw_url))
     spans: list[Span] = []
     scheme_end = raw_url.find("://")
     netloc_start = scheme_end + 3 if scheme_end >= 0 else 0
@@ -958,7 +989,7 @@ def _covers_anything(text: str, depth: int, covers: Covers | None) -> bool:
 
 def _url_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
     spans: list[Span] = []
-    for match in _URL_RE.finditer(text):
+    for match in _counted(_URL_RE.finditer(text)):
         raw_url = match.group(0)
         # Trailing sentence punctuation is handed back, and so is a trailing
         # backslash: in a serialised leaf it escapes the closing quote
@@ -1020,12 +1051,16 @@ def widen_over_escapes(text: str, spans: list[Span]) -> list[Span]:
     silently became a string. A span preceded by an escaping backslash (an
     odd run of them) takes the backslash too, so the whole escape goes.
     """
+    # the length of the backslash run ending just before each position, in
+    # one pass: scanning back from every span start was quadratic in a long
+    # run of backslashes with spans inside it
+    work(len(text) + len(spans))
+    runs = [0] * (len(text) + 1)
+    for i, char in enumerate(text):
+        runs[i + 1] = runs[i] + 1 if char == "\\" else 0
     widened: list[Span] = []
     for start, end, replacement in spans:
-        run = 0
-        while start - run - 1 >= 0 and text[start - run - 1] == "\\":
-            run += 1
-        if run % 2 == 1 and start < end:
+        if runs[start] % 2 == 1 and start < end:
             start -= 1
         widened.append((start, end, replacement))
     return widened
@@ -1034,6 +1069,7 @@ def widen_over_escapes(text: str, spans: list[Span]) -> list[Span]:
 def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
     """The disjoint spans `apply_redaction_spans` applies, ascending (see
     there for the overlap rules)."""
+    work(len(text) + len(spans) * max(1, len(spans).bit_length()))  # scan, sort
     markers: list[Span] = [
         (m.start(), m.end(), REDACTED) for m in re.finditer(re.escape(REDACTED), text)
     ]
@@ -1074,6 +1110,7 @@ def apply_redaction_spans(text: str, spans: list[Span]) -> str:
     stays).
     """
     merged = merge_redaction_spans(text, spans)
+    work(len(text) + len(merged))
     pieces: list[str] = []
     position = 0
     for start, end, replacement in merged:

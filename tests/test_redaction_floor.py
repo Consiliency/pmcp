@@ -732,17 +732,15 @@ def _b2() -> None:
 
 def _b3_split(split: Callable[[str], int]) -> float:
     started = time.perf_counter()
-    split("password" + ":=" * 33_000 + "x")
+    split("password" + ":=" * 33_000)
     return time.perf_counter() - started
 
 
 def _b3() -> None:
-    """B3: the policy split loop is linear (rev 10: 3.5 s on 66 KB)."""
-    policy = PolicyManager()
-    started = time.perf_counter()
-    policy.redact_secrets("password" + ":=" * 33_000)
-    assert time.perf_counter() - started < 1.0
-    assert _b3_split(policy_module._value_separator) < 0.1
+    """B3: the policy split loop is linear (rev 10: seconds on 66 KB). The
+    split alone, on 66 KB of `:=`: a linear scan takes milliseconds, the
+    quadratic one seconds -- two orders of magnitude either side of 0.5 s."""
+    assert _b3_split(policy_module._value_separator) < 0.5
 
 
 def _b4() -> None:
@@ -881,6 +879,54 @@ def test_the_old_n11_is_killed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 # ============================================================== timing ==== #
+#
+# Linear time is asserted on a DETERMINISTIC work count, never on the clock
+# (rev 12's ratio tests flaked on a loaded host, T-1 of its board). Every
+# loop and string build of the redactor adds what it iterates over or copies
+# to `pmcp.redaction_floor.WORK` while a test holds it; a regex pass adds the
+# text it scans. The plan's complexity table says, per function, what each
+# count stands for and why it is bounded. What a count cannot see is a
+# regex's own backtracking: that is argued per pattern in the plan and
+# swept on the clock in the slow tier, with margins of an order of
+# magnitude. The wall-clock tests left in the default tier are smoke caps.
+
+
+def _entry_points() -> dict[str, Callable[[str], object]]:
+    policy = PolicyManager()
+    return {
+        "E": lambda t: sanitize_auth_diagnostic(t, max_length=None),
+        "P": policy.redact_secrets,
+        "POs": lambda t: policy.process_output(t, redact=True, max_bytes=G.BIG),
+        "POd": lambda t: policy.process_output({"t": t}, redact=True, max_bytes=G.BIG),
+    }
+
+
+def _work(run: Callable[[str], object], text: str) -> int:
+    F.WORK = [0]
+    try:
+        run(text)
+        return F.WORK[0]
+    finally:
+        F.WORK = None
+
+
+#: Allowed growth of the work count per 4x the input: 4x for linear work,
+#: plus the n log n of sorting spans (log2 of the size grows by 2 per 4x:
+#: at 16 KB -> 64 KB that is 16/14), plus 5%. A quadratic term gives 16x.
+_PER_4X = 4 * (16 / 14) * 1.05
+
+
+def _superlinear(shape: Callable[[int], str], sizes: tuple[int, ...]) -> list[str]:
+    """Entry points on which the work count of ``shape`` grows faster than
+    ``_PER_4X`` per step between consecutive ``sizes`` (each 4x the last)."""
+    assert all(n1 == 4 * n0 for n0, n1 in zip(sizes, sizes[1:])), sizes
+    found = []
+    for name, run in _entry_points().items():
+        counts = [_work(run, shape(n)) for n in sizes]
+        for n0, c0, c1 in zip(sizes, counts, counts[1:]):
+            if c1 > _PER_4X * max(c0, 1):
+                found.append(f"{name}: {n0}->{4 * n0} work {c0}->{c1}")
+    return found
 
 
 _ADVERSARIAL = {
@@ -899,37 +945,33 @@ _ADVERSARIAL = {
 
 
 @pytest.mark.parametrize("name", sorted(_ADVERSARIAL))
-def test_timing_guard_on_every_surface(name: str) -> None:
-    """66 KB of each adversarial shape on the engine, the policy surface and
-    `process_output` (string and dict): under 1 s for `a-`, 2 s for the
-    rest. Rev 10 took 3.5 s on `password:=` (B3)."""
+def test_timing_smoke_on_every_surface(name: str) -> None:
+    """A smoke cap, not the linearity proof: 66 KB of each adversarial shape
+    on every entry point in under 10 s (they take 0.1-1.3 s on dev0)."""
     text = _ADVERSARIAL[name]
-    policy = PolicyManager()
-    for label, run in (
-        ("E", lambda: sanitize_auth_diagnostic(text, max_length=None)),
-        ("P", lambda: policy.redact_secrets(text)),
-        ("POs", lambda: policy.process_output(text, redact=True)),
-        ("POd", lambda: policy.process_output({"t": text}, redact=True)),
-    ):
+    for label, run in _entry_points().items():
         started = time.perf_counter()
-        run()
-        elapsed = time.perf_counter() - started
-        # `a-` is held to 1 s, as the keyword matcher's own guard; the rest
-        # to rev 10's 2 s bound (its additive keyword rules cost ~0.6 s on
-        # `token-` x 11 000 here)
-        assert elapsed < (1.0 if name == "a-" else 2.0), (name, label, elapsed)
+        run(text)
+        assert time.perf_counter() - started < 10.0, (name, label)
 
 
 def test_the_floor_itself_is_linear() -> None:
-    """The replay alone, doubling the input: the time at 132 KB is under 3x
-    the time at 66 KB (a quadratic replay would be 4x)."""
-    timings = []
-    for n in (33_000, 66_000):
-        text = "a-" * n
-        started = time.perf_counter()
-        F.replay(text, MAIN_PATTERNS)
-        timings.append(time.perf_counter() - started)
-    assert timings[1] < 3 * timings[0] + 0.05, timings
+    """The replay alone, on the work count: 16 KB -> 64 KB -> 256 KB."""
+    for shape in (
+        lambda n: "a-" * (n // 2),
+        lambda n: "https://h/?" + "password=x&" * (n // 11),
+    ):
+        counts = []
+        for n in (16_384, 65_536, 262_144):
+            F.WORK = [0]
+            try:
+                F.floor_spans(shape(n), MAIN_PATTERNS)
+                counts.append(F.WORK[0])
+            finally:
+                F.WORK = None
+        assert counts[1] <= _PER_4X * counts[0] and counts[2] <= _PER_4X * counts[1], (
+            counts
+        )
 
 
 def _never_returns(text: str) -> list[tuple[int, int, int, int]]:
@@ -953,42 +995,31 @@ def test_the_regex_comparison_reports_a_timeout_instead_of_hanging() -> None:
 # a mutant that restores rev 11's mechanism and turns the check red.
 
 
-def _time(run: Callable[[str], object], text: str) -> float:
-    best = float("inf")
-    for _ in range(2):
-        started = time.perf_counter()
-        run(text)
-        best = min(best, time.perf_counter() - started)
-    return best
+def _time_ratio(
+    run: Callable[[str], object],
+    shape: Callable[[int], str],
+    small: int = 1_024,
+    large: int = 16_384,
+) -> float:
+    """Wall-clock growth over 16x the input, best of three at each size: a
+    linear path gives ~16x, a quadratic one ~256x. Used only where the work
+    count cannot see the cost (a regex's own backtracking) and only with a
+    threshold of 64x -- a factor of four from either."""
+
+    def best(text: str) -> float:
+        times = []
+        for _ in range(3):
+            started = time.perf_counter()
+            run(text)
+            times.append(time.perf_counter() - started)
+        return min(times)
+
+    return best(shape(large)) / max(best(shape(small)), 1e-4)
 
 
-def _entry_points() -> dict[str, Callable[[str], object]]:
-    policy = PolicyManager()
-    return {
-        "E": lambda t: sanitize_auth_diagnostic(t, max_length=None),
-        "P": policy.redact_secrets,
-        "POs": lambda t: policy.process_output(t, redact=True, max_bytes=G.BIG),
-        "POd": lambda t: policy.process_output({"t": t}, redact=True, max_bytes=G.BIG),
-    }
-
-
-def _growth(shape: Callable[[int], str], small: int, large: int) -> list[str]:
-    """Entry points on which ``shape`` grows super-linearly from ``small`` to
-    ``large`` characters: time ratio over 1.6x the size ratio (a linear path
-    is ~1x, a quadratic one ~ the size ratio). Times under 30 ms at the
-    large size are below what one host measures reliably and pass."""
-    factor = large / small
-    slow = []
-    for name, run in _entry_points().items():
-        t_small = _time(run, shape(small))
-        t_large = _time(run, shape(large))
-        if t_large >= 0.03 and t_large / max(t_small, 1e-4) > 1.6 * factor:
-            slow.append(f"{name}: {t_small:.3f}s -> {t_large:.3f}s")
-    return slow
-
-
-#: The board's three shapes and the families the generated sweep found
-#: (`tests/_redaction_shapes.py`; the full sweep is the slow tier's).
+#: Every shape the boards and the sweeps found, both rounds, and the
+#: composition families: the default tier's linearity proof, on the work
+#: count, at 16 KB -> 64 KB -> 256 KB on every entry point.
 LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
     "B-1 closers after a Bearer value": lambda n: "Bearer x" + ")" * n + "a",
     "B-1 escaped quotes after Authorization": lambda n: "Authorization: x" + '\\"' * (n // 2) + "a",
@@ -996,22 +1027,30 @@ LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
     "B-1b line breaks before a Bearer value": lambda n: "x Bearer" + "\n" * n + " abc",
     "B-1b line breaks before a keyword value": lambda n: "token" + "\n" * n + " abc12",
     "B-1c one policy value over many markers": lambda n: "arn:" + "secret:" * (n // 7) + "=abc123",
+    "B-3 Authorization over a rewritten URL": lambda n: "Authorization: https://h/?q" + "&a+b" * (n // 4),
+    "B-3 Bearer over a rewritten URL": lambda n: "Bearer https://h/?password=x" + "&a+b" * (n // 4),
+    "B-3 secret-keyed query pairs": lambda n: "https://h/?" + "password=x&" * (n // 11),
+    "B-3 policy value over a rewritten URL": lambda n: "see https://h/?password=x" + "&a+b" * (n // 4) + " end",
+    "B-4 keyword matches after resource names": lambda n: "arn:x " * (n // 12) + "password=abc123 " * (n // 32),
+    "B-4 keyword lists after resource names": lambda n: "arn:x " * (n // 12) + 'tokens: ["a1b2c3d4"] ' * (n // 42),
+    "B-4 keys inside resource names": lambda n: "arn:x:secret=abc123 " * (n // 20),
+    "backslash run before escapes": lambda n: "\\" * (n // 2) + "\\u00e9password=x" * 8,
     "empty query pairs": lambda n: "https://h/?" + "&" * n + "a",
     "key words after Bearer": lambda n: "x Bearer" + "api_key" * (n // 7) + '"',
     "joined key run": lambda n: "token-" * (n // 6) + "=abc123def",
     "word boundaries": lambda n: "a-" * (n // 2),
     "operator run": lambda n: "password" + ":=" * (n // 2),
+    "markers in the input": lambda n: "password=" + "[REDACTED]" * (n // 10),
+    "Bearer values in a JSON document": lambda n: json.dumps({f"k{i}": "Bearer x" for i in range(n // 20)}),
 }  # fmt: skip
 
 
 @pytest.mark.parametrize("name", sorted(LINEAR_SHAPES))
-def test_every_shape_grows_linearly_on_every_entry_point(name: str) -> None:
-    """16 KB -> 64 KB on the engine, the policy surface and `process_output`
-    (string and dict): the growth is linear, and 64 KB stays under 2 s."""
-    shape = LINEAR_SHAPES[name]
-    assert _growth(shape, 16_384, 65_536) == []
-    for label, run in _entry_points().items():
-        assert _time(run, shape(65_536)) < 2.0, label
+def test_every_shape_does_linear_work_on_every_entry_point(name: str) -> None:
+    """The work count grows linearly (up to the n log n of sorting spans)
+    from 16 KB to 64 KB to 256 KB on the engine, the policy surface and
+    `process_output` (string and dict). Deterministic: no clock."""
+    assert _superlinear(LINEAR_SHAPES[name], (16_384, 65_536, 262_144)) == []
 
 
 def _old_wrap_close_start(text: str, start: int, end: int) -> int:
@@ -1023,13 +1062,56 @@ def _old_unindented_break(text: str) -> bool:
     return re.search(r"[\r\n][^ \t\xa0]*\Z", text) is not None
 
 
-LINEARITY_MUTANTS: dict[str, tuple[str, Callable[[pytest.MonkeyPatch], None]]] = {
+def _without_marker_ranges(original: Callable[..., object]) -> Callable[..., object]:
+    """Rev 12's URL step: every synthesised piece stands for the whole edit."""
+
+    def pieces(raw: str, base: int) -> object:
+        result = original(raw, base)
+        if result is None:
+            return None
+        found, dropped = result  # type: ignore[misc]
+        return [p[:2] if p[0] == "new" else p for p in found], dropped
+
+    return pieces
+
+
+def _rev12_source(self: F._Tracked, a: int, b: int) -> str:
+    pieces: list[str] = []
+    last = None
+    for atom in self.rep[a:b]:
+        if atom < 0 or atom == last:
+            continue
+        last = atom
+        start, end = self.atom_range(atom)
+        pieces.append(self.raw[start:end])
+    F.work(b - a)
+    return "".join(pieces)
+
+
+def _rev12_in_resource_name(text: str) -> Callable[[int], bool]:
+    import pmcp.auth as A
+
+    ranges = [(m.start(), m.end()) for m in A._RESOURCE_NAME_RE.finditer(text)]
+
+    def inside(position: int) -> bool:
+        F.work(len(ranges))  # rev 12 asked every range
+        return any(a <= position < b for a, b in ranges)
+
+    return inside
+
+
+#: Each linearity finding's mutant, restoring the earlier mechanism. `work`
+#: mutants are caught by the work count; `clock` mutants (a regex's own
+#: backtracking, which the count cannot see) by the 64x wall-clock bound.
+LINEARITY_MUTANTS: dict[str, tuple[str, str, Callable[[pytest.MonkeyPatch], None]]] = {
     "B-1": (
         "B-1 closers after a Bearer value",
+        "clock",
         lambda mp: mp.setattr(F, "_wrap_close_start", _old_wrap_close_start),
     ),
     "B-1b": (
         "B-1b line breaks before a Bearer value",
+        "clock",
         lambda mp: (
             mp.setattr(F, "unindented_break", _old_unindented_break),
             mp.setattr("pmcp.auth.unindented_break", _old_unindented_break),
@@ -1037,7 +1119,21 @@ LINEARITY_MUTANTS: dict[str, tuple[str, Callable[[pytest.MonkeyPatch], None]]] =
     ),
     "B-1c": (
         "B-1c one policy value over many markers",
+        "work",
         lambda mp: mp.setattr(F, "_decision_key", id),
+    ),
+    "B-3": (
+        "B-3 secret-keyed query pairs",
+        "work",
+        lambda mp: (
+            mp.setattr(F, "_url_pieces", _without_marker_ranges(F._url_pieces)),
+            mp.setattr(F._Tracked, "source", _rev12_source),
+        ),
+    ),
+    "B-4": (
+        "B-4 keyword lists after resource names",
+        "work",
+        lambda mp: mp.setattr("pmcp.auth._in_resource_name", _rev12_in_resource_name),
     ),
 }
 
@@ -1046,13 +1142,19 @@ LINEARITY_MUTANTS: dict[str, tuple[str, Callable[[pytest.MonkeyPatch], None]]] =
 def test_each_linearity_finding_has_a_killing_mutant(
     finding: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Rev 11's mechanism restored, the shape grows quadratically again
-    (measured at 2 KB -> 8 KB, where the quadratic path is still quick)."""
-    shape_name, mutate = LINEARITY_MUTANTS[finding]
+    """The earlier mechanism restored, the shape grows quadratically again
+    (small sizes, where the quadratic path is still quick)."""
+    shape_name, measure, mutate = LINEARITY_MUTANTS[finding]
     shape = LINEAR_SHAPES[shape_name]
-    assert _growth(shape, 2_048, 8_192) == []
-    mutate(monkeypatch)
-    assert _growth(shape, 2_048, 8_192) != []
+    run = _entry_points()["P"]
+    if measure == "work":
+        assert _superlinear(shape, (2_048, 8_192)) == []
+        mutate(monkeypatch)
+        assert _superlinear(shape, (2_048, 8_192)) != []
+    else:
+        assert _time_ratio(run, shape) < 64
+        mutate(monkeypatch)
+        assert _time_ratio(run, shape) > 64
 
 
 #: B-2: a key AFTER a resource name in the same run is a key. Each delimiter
@@ -1083,7 +1185,7 @@ def _b2_cases() -> list[tuple[str, str]]:
     return cases
 
 
-def _b2() -> None:
+def _b2_n10() -> None:
     for text, secret in _b2_cases():
         for surface in (_engine, _policy):
             assert secret not in surface(text), (text, surface(text))
@@ -1104,7 +1206,7 @@ def _old_n10(span: F.FloorSpan) -> bool:
 
 
 def test_b2_n10_fires_only_on_a_segment_of_a_resource_name() -> None:
-    _b2()
+    _b2_n10()
     # the approved class still holds: a key that IS a segment of the name
     for text in (
         "arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret-a1b2c3",
@@ -1116,7 +1218,7 @@ def test_b2_n10_fires_only_on_a_segment_of_a_resource_name() -> None:
 def test_b2_mutant_rev_11_n10(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(F.SUPPRESSIONS, "N10", _old_n10)
     with pytest.raises(AssertionError):
-        _b2()
+        _b2_n10()
 
 
 _N1_CASES = (
@@ -1149,6 +1251,46 @@ def test_n1_mutant_rev_11_n3(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setitem(F.SUPPRESSIONS, "N3", _old_n3)
     with pytest.raises(AssertionError):
         _n1()
+
+
+_N5_CASES = (
+    "passwordForTheProductionDatabaseServer=Hunter2abcX9",
+    "dbPasswordForTheProductionReplicaServer=Hunter2abcX9",
+    "theProductionElasticsearchClusterPassword=Hunter2abcX9",
+    "secretAccessKeyForTheProductionAwsAccount=Hunter2abcX9",
+    "apikeyForTheProductionPaymentsGatewayX=Hunter2abcX9",
+    "PRODUCTIONDATABASEREPLICATIONpassword=Hunter2abcX9",
+    "tokenForTheProductionDeploymentPipelineX Hunter2abcX9",
+)
+
+
+def _n5() -> None:
+    for text in _N5_CASES:
+        for surface in (_engine, _policy):
+            assert "Hunter2abcX9" not in surface(text), (text, surface(text))
+
+
+def _rev12_n3(span: F.FloorSpan) -> bool:
+    return span.rule in F._KEYED_RULES and F._for_every_reading(
+        span,
+        lambda r: len(r.glued) > 24
+        or len(re.match(r"[A-Za-z0-9]*", r.suffix).group(0)) > 24,  # type: ignore[union-attr]
+    )
+
+
+def test_n5_a_case_change_joins_words_like_a_joiner() -> None:
+    """N-5 of rev 12's board: camelCase and SHOUTING multi-word keys are
+    keys, as `_`-joined ones are (N-1); a long single-case glued run is
+    still an identifier (N3)."""
+    _n5()
+    for glued in ("password" + "x" * 25 + "=hunter", "x" * 26 + "password=hunter"):
+        assert _fired(glued, False).get("N3"), (glued, _fired(glued, False))
+
+
+def test_n5_mutant_rev_12_n3(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(F.SUPPRESSIONS, "N3", _rev12_n3)
+    with pytest.raises(AssertionError):
+        _n5()
 
 
 _N2_CASES = (
@@ -1220,46 +1362,97 @@ def test_n4_mutant_no_complement(monkeypatch: pytest.MonkeyPatch) -> None:
         _n4()
 
 
-_SWEEP_CHUNKS = 16
+_SWEEP_CHUNKS = 32
+
+
+def _all_shapes() -> dict[str, Callable[[int], str]]:
+    from tests import _redaction_shapes as S
+
+    return {**S.shapes(S.redactor_patterns()), **S.compositions()}
 
 
 @pytest.mark.slow
 @pytest.mark.parametrize("chunk", range(_SWEEP_CHUNKS))
-def test_generated_shapes_grow_linearly(chunk: int) -> None:
-    """The full generated sweep (`tests/_redaction_shapes.py`: every unit of
-    every redactor regex, repeated, after each trigger word, before each
-    failing tail), in 16 chunks so each stays inside the per-test timeout:
-    screened at 4 KB -> 16 KB on every entry point in worker processes; any
-    shape over 8x is re-measured at 16 KB -> 64 KB here and must be
-    linear."""
-    from tests import _redaction_shapes as S
-
-    shapes = S.shapes(S.redactor_patterns())
-    assert len(shapes) > 40_000
+def test_generated_shapes_do_linear_work(chunk: int) -> None:
+    """The full generated sweep (`tests/_redaction_shapes.py`): every shape
+    derived from the redactor's regular expressions and every composition
+    derived from its loops, in 32 chunks. Screened on the work count at 4 KB
+    -> 16 KB on every entry point in worker processes; any shape over the
+    bound is re-measured at 16 KB -> 64 KB -> 256 KB here and must be
+    linear. Deterministic."""
+    shapes = _all_shapes()
+    assert len(shapes) > 70_000
     names = sorted(shapes)[chunk::_SWEEP_CHUNKS]
     ctx = multiprocessing.get_context("spawn")
     with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
         flagged = [
             name
-            for found in pool.imap_unordered(_screen_shape, names, chunksize=20)
+            for found in pool.imap_unordered(_screen_work, names, chunksize=25)
             for name in found
         ]
-    confirmed = {name: _growth(shapes[name], 16_384, 65_536) for name in flagged}
+    confirmed = {
+        name: _superlinear(shapes[name], (16_384, 65_536, 262_144)) for name in flagged
+    }
     assert {k: v for k, v in confirmed.items() if v} == {}, confirmed
 
 
-def _screen_shape(name: str) -> list[str]:
+@pytest.mark.slow
+@pytest.mark.parametrize("chunk", range(8))
+def test_generated_regex_shapes_do_not_backtrack(chunk: int) -> None:
+    """What the work count cannot see: a regex's own backtracking. Every
+    regex-derived shape is screened on the clock at 2 KB -> 8 KB (flagged
+    over 10x; linear is 4x, quadratic 16x); a flagged shape is re-measured
+    at 1 KB -> 16 KB, best of three, and must stay under 64x (linear 16x,
+    quadratic 256x) on every entry point."""
     from tests import _redaction_shapes as S
 
-    global _SCREEN_SHAPES
-    try:
-        shapes = _SCREEN_SHAPES
-    except NameError:
-        shapes = _SCREEN_SHAPES = S.shapes(S.redactor_patterns())
-    shape = shapes[name]
+    shapes = S.shapes(S.redactor_patterns())
+    names = sorted(shapes)[chunk::8]
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
+        flagged = [
+            name
+            for found in pool.imap_unordered(_screen_clock, names, chunksize=25)
+            for name in found
+        ]
+    slow = {
+        name: [
+            label
+            for label, run in _entry_points().items()
+            if _time_ratio(run, shapes[name]) > 64
+        ]
+        for name in flagged
+    }
+    assert {k: v for k, v in slow.items() if v} == {}, slow
+
+
+_SCREEN_SHAPES: dict[str, Callable[[int], str]] = {}
+
+
+def _screen_work(name: str) -> list[str]:
+    if not _SCREEN_SHAPES:
+        _SCREEN_SHAPES.update(_all_shapes())
+    shape = _SCREEN_SHAPES[name]
+    bound = 4 * (14 / 12) * 1.05  # 4 KB -> 16 KB, with the sort's log
     for run in _entry_points().values():
-        t_small = _time(run, shape(4_096))
-        t_large = _time(run, shape(16_384))
-        if t_large > 0.03 and t_large / max(t_small, 1e-4) > 8:
+        if _work(run, shape(16_384)) > bound * max(_work(run, shape(4_096)), 1):
             return [name]
     return []
+
+
+def _screen_clock(name: str) -> list[str]:
+    if not _SCREEN_SHAPES:
+        _SCREEN_SHAPES.update(_all_shapes())
+    shape = _SCREEN_SHAPES[name]
+    for run in _entry_points().values():
+        small = min(_clock(run, shape(2_048)) for _ in range(2))
+        large = min(_clock(run, shape(8_192)) for _ in range(2))
+        if large > 0.02 and large / max(small, 1e-4) > 10:
+            return [name]
+    return []
+
+
+def _clock(run: Callable[[str], object], text: str) -> float:
+    started = time.perf_counter()
+    run(text)
+    return time.perf_counter() - started

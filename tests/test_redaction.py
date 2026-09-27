@@ -29,6 +29,7 @@ import re
 import string
 import uuid
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 
 import pytest
@@ -2439,18 +2440,30 @@ def test_n3_a_quote_opening_on_structure_is_not_a_value() -> None:
         assert json.loads(out) == {"password": REDACTED}, (surface, out)
 
 
-def test_n4_the_key_qualifier_is_bounded() -> None:
-    """N4: rev 8 took ~216 s on this; main and rev 9 take well under 1 s.
-    The 2 s bound is generous against CI noise and still catches the quadratic
-    shape by two orders of magnitude."""
+def _clock_growth(
+    run: Callable[[str], object], shape: Callable[[int], str], small: int, large: int
+) -> float:
     import time
 
-    text = "a_" * 33000
+    def best(text: str) -> float:
+        times = []
+        for _ in range(2):
+            start = time.perf_counter()
+            run(text)
+            times.append(time.perf_counter() - start)
+        return min(times)
+
+    return best(shape(large)) / max(best(shape(small)), 1e-4)
+
+
+def test_n4_the_key_qualifier_is_bounded() -> None:
+    """N4: rev 8 took ~216 s on 66 KB of this. Growth over 16x the input,
+    best of two at each size: linear is ~16x, quadratic ~256x; the bound of
+    64x is a factor of four from either, so host load cannot flip it (rev
+    12's board, T-1: an absolute bound near the measured time can)."""
     for surface, redact in (("engine", _engine), ("policy", _policy)):
-        start = time.perf_counter()
-        redact(text)
-        elapsed = time.perf_counter() - start
-        assert elapsed < 2.0, (surface, elapsed)
+        ratio = _clock_growth(redact, lambda n: "a_" * (n // 2), 4_096, 65_536)
+        assert ratio < 64, (surface, ratio)
 
 
 @pytest.mark.parametrize(
@@ -2890,16 +2903,14 @@ def test_f2_bearer_after_a_key_and_separator(text: str, secret: str) -> None:
 
 def test_f9_the_pem_rule_is_linear() -> None:
     """F9: every BEGIN without an END scanned to the end of the text (rev 9:
-    5.6 s on 264 KB; main 0.05 s). The bound is generous against CI noise and
-    still an order of magnitude under rev 9."""
-    import time
-
-    text = "-----BEGIN RSA PRIVATE KEY-----\n" * 8250  # 264 KB
+    5.6 s on 264 KB). Growth over 16x the input (16.5 KB -> 264 KB), best of
+    two at each size, under 64x: linear is ~16x, quadratic ~256x."""
+    unit = "-----BEGIN RSA PRIVATE KEY-----\n"
     for surface, redact in (("engine", _engine), ("policy", _policy)):
-        start = time.perf_counter()
-        redact(text)
-        elapsed = time.perf_counter() - start
-        assert elapsed < 2.0, (surface, elapsed)
+        ratio = _clock_growth(
+            redact, lambda n: unit * (n // len(unit)), 16_896, 270_336
+        )
+        assert ratio < 64, (surface, ratio)
     block = "-----BEGIN RSA PRIVATE KEY-----\nMIIEabc\n-----END RSA PRIVATE KEY-----"
     assert _engine(f"key: {block} end") == "key: [REDACTED] end"
 

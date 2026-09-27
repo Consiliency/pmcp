@@ -22,6 +22,7 @@ from pmcp.types import (
     ServerPolicy,
     ToolPolicy,
 )
+from pmcp.redaction_floor import work
 from pmcp.auth import (
     REDACTED,
     Span,
@@ -823,8 +824,10 @@ class PolicyManager:
             floor_patterns=self._redaction_regexes,
         )
         for regex in self._additive_regexes():
+            work(len(output))  # the pattern's scan
             for match in regex.finditer(output):
                 full_match = match.group(0)
+                work(2 * len(full_match) + 1)  # the match, the split
                 split = _value_separator(full_match)
                 if split >= 0:
                     spans.append(
@@ -874,6 +877,7 @@ class PolicyManager:
             # escaped quotes the keyed rules do not read -- scoped out to
             # Consiliency/pmcp#290; the bar here is never worse than main.
             spans = self.redaction_spans(window)
+            work(2 * len(window) + len(spans) * max(1, len(spans).bit_length()))
             keep = len(
                 window.encode("utf-8")[:max_size].decode("utf-8", errors="ignore")
             )

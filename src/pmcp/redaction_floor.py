@@ -47,6 +47,18 @@ from pmcp.keyword_matcher import key_start_pattern, keys_alternation, keyword_ma
 
 REDACTED = "[REDACTED]"
 
+#: Test-only work counter (Consiliency/pmcp#234). None in production; the
+#: complexity tests set it to `[0]` and every loop and string build of the
+#: redactor adds what it iterates over or copies, so linear time is asserted
+#: on a deterministic count, not on the clock.
+WORK: list[int] | None = None
+
+
+def work(amount: int) -> None:
+    if WORK is not None:
+        WORK[0] += amount
+
+
 # --------------------------------------------------------------------------
 # main's constants, frozen (origin/main 1fb36f2, src/pmcp/auth.py and
 # src/pmcp/policy/policy.py).
@@ -184,7 +196,8 @@ class FloorSpan:
 
 
 # A piece of one step's output: ("keep", a, b) copies cur[a:b] with its
-# origins; ("new", text) is synthesised; ("atom", text, raw_a, raw_b) is text
+# origins; ("new", text) is synthesised (("new", text, raw_a, raw_b): standing
+# for that input range only); ("atom", text, raw_a, raw_b) is text
 # derived from the whole raw range (a re-encoded URL component).
 _Piece = tuple
 
@@ -213,6 +226,7 @@ class _Tracked:
 
     def raw_ranges(self, a: int, b: int) -> list[tuple[int, int]]:
         """The input ranges the characters cur[a:b] came from, merged."""
+        work((b - a) * max(1, (b - a).bit_length()))  # the slice, the sort
         ranges = sorted(self.atom_range(atom) for atom in self.org[a:b] if atom >= 0)
         merged: list[tuple[int, int]] = []
         for start, end in ranges:
@@ -226,18 +240,26 @@ class _Tracked:
         """cur[a:b] as the input spelled it: a synthesised marker reads as
         the input text it replaced."""
         pieces: list[str] = []
-        last = None
+        # Every character stands for input at or after its predecessor's, and
+        # no two markers stand for overlapping input (`rewrite`), so the
+        # input is emitted once, left to right: at most b - a characters of
+        # `cur` read and at most the input they came from copied.
+        covered_to = -1
         for atom in self.rep[a:b]:
-            if atom < 0 or atom == last:
+            if atom < 0:
                 continue
-            last = atom
             start, end = self.atom_range(atom)
-            pieces.append(self.raw[start:end])
+            if end <= covered_to:
+                continue
+            pieces.append(self.raw[max(start, covered_to) : end])
+            covered_to = end
+        work(b - a)
         return "".join(pieces)
 
     def rewrite(self, edits: list[tuple[int, int, list[_Piece]]]) -> None:
         """Replace each cur[start:end] by its pieces (edits ascending,
         disjoint)."""
+        work(len(self.cur) + sum(len(pieces) for _, _, pieces in edits))
         out: list[str] = []
         org: list[int] = []
         rep: list[int] = []
@@ -268,9 +290,19 @@ class _Tracked:
                     org.extend(self.org[piece[1] : piece[2]])
                     rep.extend(self.rep[piece[1] : piece[2]])
                 elif piece[0] == "new":
+                    # a marker stands for what it replaced: the input range
+                    # the piece names (a URL's redacted value), nothing
+                    # (`-1`, a URL's added `=`), or the edit's replaced text
+                    marker = stands_for
+                    if len(piece) == 4:
+                        marker = (
+                            self.new_atom(piece[2], piece[3])
+                            if piece[2] < piece[3]
+                            else -1
+                        )
                     out.append(piece[1])
                     org.extend([-1] * len(piece[1]))
-                    rep.extend([stands_for] * len(piece[1]))
+                    rep.extend([marker] * len(piece[1]))
                 else:
                     atom = self.new_atom(piece[2], piece[3])
                     out.append(piece[1])
@@ -292,8 +324,16 @@ _CONTEXT_RE = re.compile(r"[^\s\"'<>]{0,256}\Z")
 
 
 def _context(text: str, start: int) -> str:
+    work(256)
     match = _CONTEXT_RE.search(text, max(0, start - 256), start)
     return match.group(0) if match is not None else ""
+
+
+def _counted(matches: Iterator[re.Match[str]]) -> Iterator[re.Match[str]]:
+    """Each match of a pass, counted as the work of reading it."""
+    for match in matches:
+        work(match.end() - match.start() + 1)
+        yield match
 
 
 def _spans_for(
@@ -332,6 +372,7 @@ def _url_pieces(
     URL's offset), plus the labelled input ranges it drops. None when the
     alignment does not reproduce main's output exactly."""
     expected = main_redact_auth_url(raw)
+    work(4 * len(raw))  # parse, rewrite, align, compare
     pieces: list[_Piece] = []
     dropped: list[tuple[int, int, str]] = []
     try:
@@ -423,10 +464,17 @@ def _url_pieces(
                     ("keep", base + key_start + len(key), base + value_start)
                 )
             else:
-                pair_pieces.append(("new", "="))
+                pair_pieces.append(("new", "=", -1, -1))
             decoded_key = unquote(key.replace("+", " "))
             if decoded_key.lower() in MAIN_AUTH_SECRET_QUERY_KEYS:
-                pair_pieces.append(("new", quote(REDACTED)))
+                pair_pieces.append(
+                    (
+                        "new",
+                        quote(REDACTED),
+                        base + value_start,
+                        base + value_start + len(value),
+                    )
+                )
                 if value:
                     dropped.append(
                         (
@@ -481,6 +529,7 @@ def _label_uncovered(
     """Every input position is either kept by a piece or dropped by a label:
     whatever no piece keeps and no label names (the `&` of an empty, doubled
     or trailing pair) is labelled `url.normal` here."""
+    work(2 * len(raw) + len(pieces) + len(dropped))
     covered = bytearray(len(raw))
     for piece in pieces:
         if piece[0] == "keep":
@@ -526,8 +575,9 @@ def main_redact_auth_url(url: str) -> str:
 def _url_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
     # The URL step is the first: cur is the input and every origin is itself.
     text = tracked.cur
+    work(len(text))
     edits: list[tuple[int, int, list[_Piece]]] = []
-    for match in _MAIN_URL_RE.finditer(text):
+    for match in _counted(_MAIN_URL_RE.finditer(text)):
         # main's `redact_url_match`: trailing sentence punctuation is handed
         # back, stripped in one pass
         raw = match.group(0).rstrip(").,;")
@@ -579,6 +629,7 @@ def _wrap_close_start(text: str, start: int, end: int) -> int:
         if k > start and text[k - 1] == "\\":
             k -= 1
         found = k
+    work(end - k + 1)
     return found
 
 
@@ -612,8 +663,9 @@ def _header_value_spans(
 
 def _authorization_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
     cur = tracked.cur
+    work(len(cur))  # the pass's scan
     edits = []
-    for m in _MAIN_AUTHORIZATION_RE.finditer(cur):
+    for m in _counted(_MAIN_AUTHORIZATION_RE.finditer(cur)):
         a = m.end(1)
         edits.append((m.start(), m.end(), [("keep", m.start(), a), ("new", REDACTED)]))
         scheme = m.group(2) or ""
@@ -635,8 +687,9 @@ def _authorization_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
 
 def _bearer_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
     cur = tracked.cur
+    work(len(cur))  # the pass's scan
     edits = []
-    for m in _MAIN_BEARER_RE.finditer(cur):
+    for m in _counted(_MAIN_BEARER_RE.finditer(cur)):
         a = m.end(1)
         edits.append((m.start(), m.end(), [("keep", m.start(), a), ("new", REDACTED)]))
         spans.extend(
@@ -658,7 +711,9 @@ def _bearer_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
 def _keyword_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
     cur = tracked.cur
     edits = []
+    work(len(cur))  # the matcher's scan
     for start, key_end, value_start, end in main_keyword_matches(cur):
+        work(end - start + 1)
         edits.append((start, end, [("keep", start, value_start), ("new", REDACTED)]))
         spans.extend(
             _spans_for(
@@ -679,8 +734,9 @@ def _keyword_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
 
 def _jwt_step(tracked: _Tracked, spans: list[FloorSpan]) -> None:
     cur = tracked.cur
+    work(len(cur))  # the pass's scan
     edits = []
-    for m in _MAIN_JWT_RE.finditer(cur):
+    for m in _counted(_MAIN_JWT_RE.finditer(cur)):
         edits.append((m.start(), m.end(), [("new", REDACTED)]))
         spans.extend(
             _spans_for(
@@ -706,6 +762,7 @@ def _policy_step(
     tracked: _Tracked, spans: list[FloorSpan], regex: re.Pattern[str], index: int
 ) -> None:
     cur = tracked.cur
+    work(len(cur))  # the pass's scan
     edits = []
     default = regex.pattern in MAIN_DEFAULT_REDACTION_PATTERNS
     rule = (
@@ -713,7 +770,7 @@ def _policy_step(
         if default
         else f"policy:custom{index}"
     )
-    for m in regex.finditer(cur):
+    for m in _counted(regex.finditer(cur)):
         full = m.group(0)
         separator = next((i for i, char in enumerate(full) if char in ":="), -1)
         info: dict[str, Any] = {
@@ -843,6 +900,7 @@ JSON_SYNTAX = frozenset(' \t\r\n"{}[],:')
 class _JsonLayout:
     def __init__(self, text: str) -> None:
         self.text = text
+        work(2 * len(text))
         #: (start, end) of every string token, quotes included
         self.strings = [m.span() for m in _JSON_STRING_RE.finditer(text)]
         self._starts = [start for start, _ in self.strings]
@@ -854,6 +912,7 @@ class _JsonLayout:
             self.token_start[end - 1] = 1
 
     def string_at(self, index: int) -> tuple[int, int] | None:
+        work(max(1, len(self._starts).bit_length()))
         import bisect
 
         i = bisect.bisect_right(self._starts, index) - 1
@@ -864,6 +923,7 @@ class _JsonLayout:
 
 def json_layout(text: str) -> _JsonLayout | None:
     """The layout of ``text`` when it is a JSON document, else None."""
+    work(len(text))
     head = text.lstrip()[:1]
     if head not in ("{", "[", '"'):
         return None
@@ -881,11 +941,13 @@ def adjust_for_json(layout: _JsonLayout, span: FloorSpan) -> list[tuple[int, int
     applied: list[tuple[int, int, str]] = []
     position = span.start
     while position < span.end:
+        work(1)
         string = layout.string_at(position)
         if string is not None and string[0] < position < string[1] - 1:
             stop = min(span.end, string[1] - 1)
             start, end = position, stop
             while not layout.token_start[start]:
+                work(1)
                 start -= 1
             if (
                 end - 1 >= start
@@ -897,6 +959,7 @@ def adjust_for_json(layout: _JsonLayout, span: FloorSpan) -> list[tuple[int, int
                 span.json_kept.append((end - 1, end))
                 end -= 1
             while not layout.token_start[end]:
+                work(1)
                 end += 1
             applied.append((start, end, span.replacement))
             position = stop
@@ -910,6 +973,7 @@ def adjust_for_json(layout: _JsonLayout, span: FloorSpan) -> list[tuple[int, int
             # a bare scalar (outside strings nothing else is not syntax)
             back = position
             while back > 0 and text[back - 1] not in JSON_SYNTAX:
+                work(1)
                 back -= 1
             scalar = _JSON_SCALAR_TOKEN_RE.match(text, back)
         else:
@@ -1096,6 +1160,7 @@ def floor_spans(
     _, spans = replay(text, patterns)
     layout = json_layout(text) if spans else None
     applied: list[tuple[int, int, str]] = []
+    work(len(text) + len(spans))
     removed: dict[int, list[str]] = {}
     for span in spans:
         removed.setdefault(span.group, []).append(text[span.start : span.end])
@@ -1106,6 +1171,20 @@ def floor_spans(
         span.removed = joined[span.group]
         key = _decision_key(span)
         if key not in decided:
+            # each predicate reads the match's own strings a bounded number of
+            # times (key readings are bounded by `_MAX_READ_KEY`)
+            work(
+                len(SUPPRESSIONS)
+                * (
+                    len(span.key)
+                    + len(span.sep)
+                    + len(span.value)
+                    + len(span.removed)
+                    + len(span.before)
+                    + len(span.after)
+                    + 256
+                )
+            )
             if span.raw_key_start >= 0:
                 span.raw_key_before = _context(text, span.raw_key_start)
             decided[key] = next(
@@ -1184,18 +1263,46 @@ def _wrapper_syntax(span: FloorSpan) -> bool:
 _GLUED_SUFFIX_RE = re.compile(r"[A-Za-z0-9]*")
 
 
+def _case(char: str) -> int:
+    return 1 if char.isupper() else 2 if char.islower() else 0
+
+
+def _same_case_run(text: str, *, from_end: bool, neighbour: str) -> int:
+    """How long the run of ``text`` next to the key word is before a case
+    change (`production` + `Password`, `PRODUCTION` + `password`, `Server` in
+    `passwordForServer`): a case change joins words as `_` and `-` do (N-5
+    of rev 12's board: camelCase and SHOUTING multi-word keys). Digits
+    continue a run. ``neighbour`` is the key word's letter on that side."""
+    chars = reversed(text) if from_end else iter(text)
+    previous = _case(neighbour)
+    length = 0
+    for char in chars:
+        case = _case(char)
+        if case and previous and case != previous:
+            break
+        if case:
+            previous = case
+        length += 1
+    return length
+
+
 @suppression("N3")
 def _n3(span: FloorSpan) -> bool:
-    """A prefix or suffix GLUED to the key word -- more than 24 alphanumerics
-    with no joiner between them and the key word (`<25 letters>password=`,
-    `password<25 letters>=`) -- is an identifier, not a key (the additive
-    rules' cost bound). Joined segments are not glued:
-    `DATABASE_PASSWORD_FOR_REPLICATION_USER_ACCOUNT=` is a key."""
-    return span.rule in _KEYED_RULES and _for_every_reading(
-        span,
-        lambda r: len(r.glued) > 24
-        or len(_GLUED_SUFFIX_RE.match(r.suffix).group(0)) > 24,  # type: ignore[union-attr]
-    )
+    """A prefix or suffix of more than 24 alphanumerics GLUED to the key word
+    -- no `_`/`-` and no case change between them and the key word
+    (`<25 letters>password=`, `password<25 letters>=`) -- is an identifier,
+    not a key (the additive rules' cost bound). Joined words are not glued:
+    `DATABASE_PASSWORD_FOR_REPLICATION_USER_ACCOUNT=`,
+    `passwordForTheProductionDatabaseServer=` and
+    `PRODUCTIONDATABASEREPLICATIONpassword=` are keys."""
+
+    def glued_too_long(r: KeyReading) -> bool:
+        prefix = _same_case_run(r.glued, from_end=True, neighbour=r.name[:1])
+        suffix_run = _GLUED_SUFFIX_RE.match(r.suffix).group(0)  # type: ignore[union-attr]
+        suffix = _same_case_run(suffix_run, from_end=False, neighbour=r.name[-1:])
+        return prefix > 24 or suffix > 24
+
+    return span.rule in _KEYED_RULES and _for_every_reading(span, glued_too_long)
 
 
 #: The text before a key that is itself a segment of an `arn:`/`urn:`
@@ -1390,6 +1497,7 @@ def unindented_break(text: str) -> bool:
     """Does ``text`` hold a line break with no space, tab or no-break space
     after it (the last break decides: an indent after it is after every
     earlier one too)? One reverse search, not a regex anchored at the end."""
+    work(len(text))
     last = max(text.rfind("\r"), text.rfind("\n"))
     return last >= 0 and not any(c in " \t\xa0" for c in text[last + 1 :])
 

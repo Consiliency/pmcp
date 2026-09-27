@@ -208,3 +208,102 @@ def redactor_patterns() -> list[re.Pattern[str]]:
     )
     unique = {(p.pattern, p.flags): p for p in found if isinstance(p.pattern, str)}
     return list(unique.values())
+
+
+# ------------------------------------------------------------ compositions
+#
+# The shapes above come from the regular expressions alone, one lead at a
+# time. The replay and the additive rules also have Python loops whose cost
+# depends on how passes COMPOSE: a match of one pass that spans many
+# markers left by an earlier one (a Bearer value over a URL's rewritten
+# pairs), a lookup per match over structures built by another pass (every
+# keyword match asking every resource name), a scan per span over text
+# other spans share (the backslash run before every escape). So the second
+# family is built from the loop structure: two leads that arm different
+# passes, a repeated unit that makes one pass leave many markers or ranges
+# for the other, units interleaved, and each composition nested inside a
+# JSON string and after a header.
+
+CONTEXTS = (
+    "",
+    "Authorization: ",
+    "Bearer ",
+    "password=",
+    "token ",
+    "https://h/?",
+    "https://h/?password=x",
+    "Authorization: https://h/?q",
+    "Bearer https://h/?password=x",
+    "see https://h/?password=x",
+    "arn:x ",
+    "x=urn:a:b&",
+    '{"t": "',
+    "code ",
+    "\\",
+)
+#: Units that make one pass leave many markers, ranges or spans behind.
+LOOP_UNITS = (
+    "&a+b",
+    "password=x&",
+    "&a",
+    "a=%41&",
+    "&token=%2541",
+    "token=x ",
+    "arn:x ",
+    "arn:x:secret=abc123 ",
+    "password=abc123 ",
+    'tokens: ["a1b2c3d4"] ',
+    "[REDACTED]",
+    "\\u00e9",
+    '\\"',
+    "\\\\",
+    "Bearer x ",
+    "Authorization: x ",
+    "secret:",
+    "a-",
+    "=:",
+    ")",
+    "\n",
+    "%25",
+    "ghp_abcdefghij1234 ",
+    "https://u:p@h/?a=1 ",
+)
+COMPOSITION_TAILS = ("", " end", '"')
+
+
+def compositions() -> dict[str, Callable[[int], str]]:
+    """Two leads + a repeated unit (or two interleaved) + a tail, and each
+    nested in a JSON string."""
+    import json
+
+    out: dict[str, Callable[[int], str]] = {}
+
+    def add(name: str, lead: str, unit: str, tail: str, nest: bool) -> None:
+        def make(n: int, lead: str = lead, unit: str = unit, tail: str = tail) -> str:
+            text = lead + unit * max(1, (n - len(lead) - len(tail)) // len(unit)) + tail
+            return json.dumps({"t": text}) if nest else text
+
+        out[name] = make
+
+    for first in CONTEXTS:
+        for second in CONTEXTS:
+            for unit in LOOP_UNITS:
+                for tail in COMPOSITION_TAILS:
+                    lead = first + second
+                    add(f"{lead!r}+{unit!r}*k+{tail!r}", lead, unit, tail, False)
+    for lead in CONTEXTS:
+        for a in LOOP_UNITS:
+            for b in LOOP_UNITS:
+                if a != b:
+                    add(f"{lead!r}+{a + b!r}*k", lead, a + b, "", False)
+    for lead in CONTEXTS:
+        for unit in LOOP_UNITS:
+            add(f"json({lead!r}+{unit!r}*k)", lead, unit, "", True)
+            add(
+                f"hdr+json({lead!r}+{unit!r}*k)",
+                "Authorization: " + lead,
+                unit,
+                "",
+                True,
+            )
+    return out
