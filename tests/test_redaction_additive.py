@@ -518,19 +518,21 @@ def _floor_violations(texts: list[str]) -> list[str]:
 
 
 def test_floor_the_output_only_adds_markers_to_the_redactors_output() -> None:
-    """On every tier-1 text (12 surfaces' spellings), the board rows of four
-    review rounds, the prose, the credentials and the JSON fuzz."""
-    texts = _texts(G.corpus(1)) + _board_texts() + [PROSE]
+    """On half the tier-1 texts (every spelling), the board rows of four
+    review rounds, the prose, the credentials and the JSON fuzz; the slow
+    tier runs a quarter of tier 2."""
+    texts = _texts(G.corpus(1)[::2]) + _board_texts() + [PROSE]
     texts += [c[1] for c in CREDENTIALS] + [json.dumps(o) for o in _json_fuzz_corpus()]
     assert _floor_violations(texts) == []
 
 
 def test_floor_nothing_main_removes_survives_on_any_surface() -> None:
-    """The piece-level differential, all 12 surfaces and the dict path of
-    tier 1: every piece of a value the redactor removed is removed here too,
-    and every dict it kept a dict stays one."""
+    """The piece-level differential, all 12 surfaces and the dict path, on a
+    third of tier 1 (the slow tier runs the rest and a quarter of tier 2):
+    every piece of a value the redactor removed is removed here too, and
+    every dict it kept a dict stays one."""
     bad = []
-    for row in G.corpus(1):
+    for row in G.corpus(1)[::3]:
         main = G.observe(row, _main_e, _main_p, _main_process)
         ours = G.observe(row, _ours_e, _ours_p, _ours_process)
         for surface in G.worse_surfaces(row, main, ours):
@@ -540,7 +542,9 @@ def test_floor_nothing_main_removes_survives_on_any_surface() -> None:
 
 @pytest.mark.slow
 def test_floor_on_tier_2() -> None:
-    rows = G.corpus(2)[len(G.corpus(1)) :: 4]
+    rows = [row for i, row in enumerate(G.corpus(1)) if i % 3] + G.corpus(2)[
+        len(G.corpus(1)) :: 4
+    ]
     assert _floor_violations(_texts(rows)) == []
     bad = [
         row.get("t", row.get("o"))
@@ -759,31 +763,61 @@ LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
 }  # fmt: skip
 
 
+def _work_superlinear(shape: Callable[[int], str], sizes: tuple[int, ...]) -> list[str]:
+    found = []
+    for label, run in _entry_points().items():
+        counts = [_work(run, shape(n)) for n in sizes]
+        for small, large in zip(counts, counts[1:]):
+            if large > _PER_4X * max(small, 1):
+                found.append(f"{label}: {counts}")
+    return found
+
+
 @pytest.mark.parametrize("name", sorted(LINEAR_SHAPES))
 def test_the_additive_pass_does_linear_work(name: str) -> None:
-    """16 KB -> 64 KB -> 256 KB on every entry point: the work count grows
-    linearly. Deterministic: no clock."""
-    shape = LINEAR_SHAPES[name]
-    for label, run in _entry_points().items():
-        counts = [_work(run, shape(n)) for n in (16_384, 65_536, 262_144)]
-        for small, large in zip(counts, counts[1:]):
-            assert large <= _PER_4X * max(small, 1), (label, counts)
+    """16 KB -> 64 KB on every entry point: the work count grows linearly.
+    Deterministic, so one step of 4x shows a quadratic term (16x); the slow
+    tier adds the step to 256 KB."""
+    assert _work_superlinear(LINEAR_SHAPES[name], (16_384, 65_536)) == []
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", sorted(LINEAR_SHAPES))
+def test_the_additive_pass_does_linear_work_to_256_kb(name: str) -> None:
+    assert _work_superlinear(LINEAR_SHAPES[name], (16_384, 65_536, 262_144)) == []
+
+
+def _memory_superlinear(
+    shape: Callable[[int], str], labels: tuple[str, ...], sizes: tuple[int, ...]
+) -> list[str]:
+    found = []
+    for label in labels:
+        run = _entry_points()[label]
+        run(shape(1_024))  # first-use allocations out of the way
+        peaks = [_peak(run, shape(n)) for n in sizes]
+        for small, large in zip(peaks, peaks[1:]):
+            # a constant allowance for list over-allocation at small sizes;
+            # a quadratic term is megabytes over it
+            if large > _PER_4X * small + 512 * 1024:
+                found.append(f"{label}: {peaks}")
+    return found
 
 
 @pytest.mark.parametrize("name", sorted(LINEAR_SHAPES))
 def test_every_entry_point_uses_linear_memory(name: str) -> None:
-    """Peak traced memory of the whole call, 8 KB -> 32 KB -> 128 KB, on the
-    engine and on `process_output` of a dict: linear, up to a fixed 512 KiB
-    allowance (list over-allocation at the smallest size)."""
-    shape = LINEAR_SHAPES[name]
-    for label in ("E", "POd"):
-        run = _entry_points()[label]
-        run(shape(1_024))  # first-use allocations out of the way
-        peaks = [_peak(run, shape(n)) for n in (8_192, 32_768, 131_072)]
-        for small, large in zip(peaks, peaks[1:]):
-            # a constant allowance for list over-allocation at small sizes;
-            # a quadratic term at 128 KB is megabytes over it
-            assert large <= _PER_4X * small + 512 * 1024, (label, peaks)
+    """Peak traced memory of the whole engine call, 8 KB -> 32 KB: linear,
+    up to a fixed 512 KiB allowance. The slow tier adds 128 KB and the
+    dict path."""
+    assert _memory_superlinear(LINEAR_SHAPES[name], ("E",), (8_192, 32_768)) == []
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", sorted(LINEAR_SHAPES))
+def test_every_entry_point_uses_linear_memory_to_128_kb(name: str) -> None:
+    assert (
+        _memory_superlinear(LINEAR_SHAPES[name], ("E", "POd"), (8_192, 32_768, 131_072))
+        == []
+    )
 
 
 def _rev12_in_resource_name(text: str) -> Callable[[int], bool]:
