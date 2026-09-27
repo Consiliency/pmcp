@@ -1,5 +1,33 @@
 # Detailed plan: secret redaction — `main`'s redactor as a floor, shape-based rules on top (Consiliency/pmcp#234)
 
+> **Revision 12 (2026-09-27) — rev 11's board, round 1 (claude seat,
+> DISAGREE).** The floor held: the seat's own differential (967 032
+> surface cases, generators independent of this plan's) found no input
+> where rev 11 keeps a secret `main` removed without a named predicate
+> firing. It found instead (a) three inputs whose cost grew quadratically
+> in the floor's own helpers and one predicate, and (b) predicates that
+> fired wider than their approved class. Rev 12 fixes each class, not the
+> instance:
+>
+> - **Linearity.** The closing-wrapper search, the unindented-break test
+>   (floor and additive rules) and per-span predicate evaluation are now
+>   one pass each; predicates are asked once per part of a match. A
+>   **generated timing sweep** derives 46 096 adversarial shapes from the
+>   redactor's own 66 regular expressions (every repeatable unit, after
+>   each trigger word, before each failing tail) and runs them through
+>   every entry point, asserting linear growth.
+> - **N10** fires only on a key that is a segment of an `arn:`/`urn:`
+>   name, with its separator and value inside the name.
+> - **N3** counts only the run glued to the key word, never across `_`/`-`.
+> - **D2's plain number** is at most 10 decimal digits; longer digit runs
+>   and `0x` hex follow `main`.
+> - The URL alignment labels every input position (a trailing or doubled
+>   `&` was neither kept nor labelled).
+>
+> Each is red on rev 11 (`3e49b95`), green here, and killed by a mutant
+> ("Rev 11 board findings" below). Code: `origin/wip/234-redactor-floor-code`
+> @ `b7b071d`, embedded below against `main` @ `876fd33`.
+>
 > **Revision 11 (2026-09-26) — never worse than `main`, by construction.**
 > Revisions 7 to 10 each re-implemented `main`'s redaction rules, passed their
 > own never-worse differential, and were then shown by a fresh reviewer to
@@ -24,7 +52,7 @@
 >    joiner before `bearer`, a policy value across a JSON string boundary,
 >    and a `name=value` pair right after `Bearer`.
 >
-> Code: `origin/wip/234-redactor-floor-code` @ `3e49b95` (merged with
+> Code: `origin/wip/234-redactor-floor-code` @ `b7b071d` (merged with
 > `main` @ `876fd33`), embedded below as one patch against `876fd33`, proven
 > to apply and to reproduce the branch's files byte for byte. `main` already
 > carries the linear keyword matcher (`src/pmcp/keyword_matcher.py`, PR 303);
@@ -94,8 +122,8 @@ predicate that fires is recorded on the span.
 | `policy_keyword_word` | the literal `token`/`bearer` word `main`'s `(bearer|token)\s+…` default replaced with its value | new, approved |
 | `scheme_word` | the `bearer ` word `main`'s Authorization rule took with the value | new, approved |
 | `wrapper_syntax` | quotes, brackets and an escaping backslash at the **edges** of a Bearer/Authorization value (a quote inside the value goes with it) | new, approved |
-| N3 | a glued prefix or suffix of more than 24 alphanumerics (an identifier; cost bound) | rev 10 decision 2 |
-| N10 | a key inside an `arn:`/`urn:` resource name (read on the input) | N10 |
+| N3 | a prefix or suffix of more than 24 alphanumerics **glued** to the key word (no `_`/`-` between; an identifier; cost bound) | rev 10 decision 2 (narrowed, rev 12) |
+| N10 | a key that is a **segment** of an `arn:`/`urn:` name (after a `:` or `/`, no `& , ; ( ) ? =` or whitespace since the name began), with a `:` separator and a value inside the name (read on the input) | N10 (narrowed, rev 12) |
 | C12 | `code` under a diagnostic qualifier (37, listed) | C12 |
 | C3a | `code` after a whitespace-only separator | C3a |
 | C3 | a whitespace-only separator before a value that is not credential-shaped (`token bucket`) | C3 |
@@ -110,7 +138,9 @@ predicate that fires is recorded on the span.
 | C11 | Authorization/Bearer followed by a plain word, bare or wrapped | C11 |
 
 "Credential-shaped" is D2 throughout: not a plain word or number, and
-digit-bearing and 6+ characters or punctuated and 8+. N6b (a quoted value in
+digit-bearing and 6+ characters or punctuated and 8+. A **plain number**
+is at most 10 decimal digits, optionally signed (rev 12): a longer run or
+any `0x` hex is not plain, so C3, C10 and C11 never keep one. N6b (a quoted value in
 a JSON leaf) is **not** a predicate: the floor redacts those values inside
 their string.
 
@@ -169,8 +199,8 @@ or prefix (B2, 120), punctuation inside Bearer/Authorization values (B4,
 query key `main` redacts, an encoded key) and the `.env`/YAML multi-pair
 rows.
 
-**Suppressions fired** (floor spans dropped / worse pieces explained, after
-the N11 narrowing):
+**Suppressions fired on rev 12** (floor spans dropped / worse pieces
+explained):
 
 | predicate | tier 1 | board | tier 2 (beyond tier 1) | fuzz |
 |---|---|---|---|---|
@@ -178,20 +208,25 @@ the N11 narrowing):
 | `wrapper_syntax` | 7 754 / – | 408 / – | 146 950 / – | 222 / – |
 | `scheme_word` | 862 / – | 600 / – | 16 376 / – | 0 |
 | `policy_keyword_word` | 77 / – | 252 / – | 751 / – | 38 / – |
-| C3 | 10 530 / 10 472 | 9 / 0 | 74 885 / 73 615 | 37 / – |
-| N3 | 2 839 / 1 230 | 0 | 52 800 / 22 669 | 0 |
-| N10 | 2 538 / 283 | 0 | 38 814 / 3 876 | 0 |
-| C12 | 2 400 / 1 272 | 0 | 11 400 / 3 252 | 0 |
+| C3 | 10 564 / 10 506 | 9 / 0 | 75 274 / 74 018 | 37 / – |
+| C12 | 2 400 / 1 272 | 0 | 11 407 / 3 259 | 0 |
+| N10 | 1 941 / 41 (rev 11: 2 538 / 283) | 0 | 27 732 / 632 (rev 11: 38 814 / 3 876) | 0 |
 | C11 | 1 398 / 209 | 675 / 0 | 26 316 / 3 383 | 45 / – |
-| C10 | 460 / 384 | 135 / 0 | 3 085 / 2 282 | 0 |
-| C5 | 437 / 331 | 0 | 9 899 / 6 697 | 0 |
-| C4 | 280 / 185 | 55 / 0 | 3 873 / 2 606 | 5 / – |
-| C3a | 137 / 90 | 0 | 2 673 / 1 891 | 0 |
-| C8 | 48 / 33 | 4 860 / 0 | 1 170 / 966 | 0 |
-| C6 | 33 / 13 | 0 | 885 / 612 | 82 / – |
-| N4 | 13 / 0 | 0 | 248 / 142 | 0 |
+| N3 | 1 353 / 596 (rev 11: 2 839 / 1 230) | 0 | 24 664 / 10 299 (rev 11: 52 800 / 22 669) | 0 |
+| C5 | 555 / 439 | 0 | 12 262 / 9 122 | 0 |
+| C10 | 463 / 387 | 135 / 0 | 2 884 / 2 118 | 0 |
+| C4 | 338 / 236 | 55 / 0 | 4 536 / 3 329 | 5 / – |
+| C3a | 168 / 114 | 0 | 3 179 / 2 259 | 0 |
+| C8 | 48 / 33 | 4 860 / 0 | 1 164 / 963 | 0 |
+| C6 | 30 / 13 | 0 | 861 / 595 | 82 / – |
+| N4 | 13 / 0 | 0 | 344 / 212 | 0 |
 | C7 | 7 / 0 | 0 | 61 / 0 | 24 / – |
-| **N11** | **0 / 0** | **0 / 0** (was 12) | **7 / 7** (was 21) | **0** (was 12) |
+| N11 | 0 / 0 | 0 / 0 | 14 / 14 | 0 |
+
+Narrowing N3 and N10 moves a span to the next predicate that holds for it
+(C3, C4, C5, C3a, N11 rise) or leaves it unsuppressed; no span is kept that
+no approved class covers. Problems: 0 on every corpus; 5 tier-2 pieces are
+`main`'s own re-encoding, counted apart.
 
 (Fuzz objects carry no planted pieces, so part B has nothing to explain
 there: "–".)
@@ -206,6 +241,35 @@ there: "–".)
 | B4 value stops at a quote or bracket | `x Bearer q7Zp2Lk9Wx4R"SECRETPART`, `Authorization: Bearer abcdef'SECRETPART`, `x Bearer 'hunter2x null` | red | green | the floor's Bearer/Authorization values cut at quotes and brackets |
 | B5 4–5 character mixed separators | `k password: : hunter2x e`, `token\t= : hunter2x` | red | green | the separator run capped at 3 |
 | N11 after the scheme (rev 11) | `x Bearer abcdef=SECRETPART end` | red (`SECRETPART` kept) | green | rev 10's N11 restored |
+
+## Rev 11 board findings → rev 12
+
+| id | finding | fix (the class) | red on rev 11 (`3e49b95`) | green | mutant that turns it red |
+|---|---|---|---|---|---|
+| B-1 | closing-wrapper search anchored at the end, in the floor | `_wrap_close_start`: one right-to-left scan | `Bearer x` + `)`×n: 2 KB → 8 KB grows 15× (E 0.044 → 0.675 s) | linear, 64 KB ≈ 0.1 s | the anchored regex restored |
+| B-1 | the same, escaped quotes after `Authorization:` | same | 0.030 → 0.436 s | linear | same |
+| B-1b | unindented-break regex anchored at the end (floor C8 and additive rules) | `unindented_break`: one reverse search | `x Bearer` + `\n`×n + ` abc`: 0.016 → 0.204 s | linear | the regex restored in both modules |
+| B-1c | predicates asked per span, rescanning a value shared by O(n) spans | decided once per part of a match (`_decision_key`) | `arn:` + `secret:`×n + `=abc123` (P): 0.021 → 0.207 s | linear | a key per span |
+| B-2 | N10 fired on a key after a resource name, across `& , ; ( ) ? =` | segment of the name only, separator and value inside it | `grant_type=urn:…:token-exchange&client_secret=Hunter2abcX9` kept | redacted; 147 generated cases (4 names × 9 delimiters × 4 keys + 3 seat repros), E, P and POd | rev 11's N10 |
+| N-1 | N3 summed a suffix across joiners | glued run only | `DATABASE_PASSWORD_FOR_REPLICATION_USER_ACCOUNT=Hunter2abcX9` kept | redacted | rev 11's N3 |
+| N-2 | plain number unbounded, `0x` hex plain | ≤ 10 decimal digits | `Bearer ` + 24 digits, `Bearer 0x` + 64 hex, `password` + 24 digits, `auth_code=` + 24 digits kept | redacted; `code=401`, `exit code 137`, `{"code": -32601}` still kept | rev 11's number pattern |
+| N-3 | a cut in `process_output` that creates `main`'s trailing `\b` | not changed | — | — | stated under Non-goals |
+| N-4 | a trailing or doubled `&` neither kept nor labelled | every uncovered position labelled `url.normal` | `https://h/?a=1&` position 14 | covered | the labelling skipped |
+
+**Generated timing sweep.** `tests/_redaction_shapes.py` parses each of the
+66 compiled patterns in the redactor's modules (`re` parser) and collects
+every piece a quantifier can repeat: literal runs, representatives of each
+character class, every alternative. Shapes are `lead + unit×k + tail` over
+10 leads (nothing, `token`, `password=`, `Bearer x`, `x Bearer`,
+`Authorization: x`, `arn:`, `https://h/?`, `code `, `x `) and 11 tails,
+every two-character alternation of single-character units, and every key
+word glued to a separator or joiner: 46 096 shapes. The slow tier screens
+all of them at 4 KB → 16 KB on E, P, POs and POd in worker processes and
+re-measures any over 8× at 16 KB → 64 KB, where growth over 1.6× the size
+ratio fails. On rev 12, 40 shapes were flagged by the noisy screen and all
+40 measured linear. The default tier holds 11 shapes (the seat's three,
+the families the sweep found on rev 11, and the keyword-matcher shapes) at
+16 KB → 64 KB with the same assertion and a 2 s cap.
 
 ## Rev-10 findings → rev-11 resolution
 
@@ -233,7 +297,8 @@ there: "–".)
 | 8 | wider continuation, bounded decoding | JSON literals, dotted/glued keys, Unicode whitespace, encoded keys: all outside the generator |
 | 9 | generator widened along each finding | F1–F10: axes the generator never produced |
 | 10 | generator derived from `main`'s grammar | B1–B5: the re-implementation's gaps (a wider value class, a narrowed Bearer gate, bounded separators) |
-| **11** | **`main`'s rules replayed as a floor; rev 10 only adds** | — |
+| 11 | `main`'s rules replayed as a floor; rev 10 only adds | floor held; three quadratic helpers, N10/N3/D2 wider than approved |
+| **12** | **each fixed as a class; generated timing sweep** | — |
 
 The lesson of 7–10: a differential is only as wide as its generator, and a
 re-implementation is only as good as its reviewer's imagination. Rev 11
@@ -252,7 +317,9 @@ each approved:
   under a bare `code` key is kept, as every JSON-RPC and HTTP code is.
 - C3a, C12: `code` after whitespace or under a diagnostic qualifier.
 - N3, N4, N10: identifiers and resource names, including a credential-shaped
-  value under a >24-character glued key (a cost bound) and under an ARN.
+  value under a key with more than 24 characters glued to the key word (a
+  cost bound) and a credential-shaped value that is itself a segment of an
+  ARN or URN.
 - The false positives rev 10 removed and rev 11 gives back to `main`
   (decision 4): `non-bearer 2024-01-01 report`, `secret --bucket`,
   `Bearer\n--flag12345`, `password:\n  * item` (P), a policy value across a
@@ -301,46 +368,28 @@ env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir \
 ```
 
 **CI cost.** CI runs the default tier. The redaction tests there take about
-2.5 minutes in all; the slowest are the tier-1 construction test (~42 s) and
-the board-row construction test (~33 s); no redaction test is over 60 s.
-The slow tier (tier 2 of the grammar differential, the fidelity oracle, the
-construction test and the matcher equivalence) takes about 22 minutes and is
-run by hand before a release of this code; its longest case is ~200 s,
-inside the 700 s per-test timeout.
+3.5 minutes in all; the slowest are the tier-1 construction test (~42 s),
+the board-row construction test (~30 s) and the timing sweep's slowest shape
+(~16 s); no redaction test is over 60 s. The slow tier (tier 2 of the
+grammar differential, the fidelity oracle, the construction test, the
+matcher equivalence and the generated timing sweep in 16 chunks of ~100 s)
+takes about 47 minutes and is run by hand before a release of this code; its
+longest case is the tier-2 matcher equivalence (~214 s), inside the 700 s
+per-test timeout.
 
-**Measured on the embedded code (`3e49b95`):**
+**Measured on the embedded code (`b7b071d`):**
 
 | check | result (as read from the logs) |
 |---|---|
 | `ruff check src/ tests/` | All checks passed! |
-| `ruff format --check src/ tests/` | 171 files already formatted |
+| `ruff format --check src/ tests/` | 172 files already formatted |
 | `mypy src/` | Success: no issues found in 52 source files |
-| default tier `-m 'not live and not slow'` | **4885 passed, 3 skipped, 57 deselected in 573.13s (0:09:33)** |
-| slow tier `-m 'slow and not live'` | **32 passed, 4913 deselected in 1312.83s (0:21:52)** |
+| default tier `-m 'not live and not slow'` | **4907 passed, 3 skipped, 73 deselected in 633.62s (0:10:33)** |
+| slow tier `-m 'slow and not live'` | **48 passed, 4935 deselected in 2818.77s (0:46:58)** |
 
 The two tests at 60 s in the default tier are `tests/test_progressive_disclosure.py`'s
 `test_invoke_query_docs` and `test_invoke_query_docs_conceptual` (not
 touched by this plan). No `test_workflow_guards` error occurred.
-
-The rev-10 board seat's own probes (`p1`–`p10`), re-run on this code
-against their recorded `main` outputs: 0 worse on the URL, Bearer-punctuation,
-B2, separator, B1-grid and multi-pair sets; on the Unicode/number set 15 of
-1 445, each an approved class (14 × C10 bare `code` with a number, word or
-JSON literal; 1 × C6 `csrftoken=abcdef`, a glued key with a plain value).
-
-**Embedding proof** (run for this plan): the patch was extracted from this
-file with the commands under "Patch against `main`", compared `cmp`-equal to
-the generated diff, `git apply --check` and `git apply` on a fresh worktree
-of `876fd33` succeeded, and with the oracle copied from the sibling file every
-file the patch touches, plus `keyword_matcher.py` and
-`tests/test_keyword_matcher.py`, is `cmp`-identical to the floor branch at
-`3e49b95` (`diff -rq` of `src/` and `tests/`: no differences). On that tree
-(`pmcp.__file__` printed from it): `ruff check` All checks passed!,
-`ruff format --check` 171 files already formatted, `mypy src/` no issues in
-52 source files, and `test_redaction.py`, `test_redaction_floor.py`,
-`test_keyword_matcher.py`, `test_auth.py`, `test_policy.py`,
-`test_project_source_consent_policy.py` and `test_trust_boundaries_e2e.py`
-(default tier): **735 passed, 32 deselected in 152.75s (0:02:32)**.
 
 ## Acceptance criteria
 
@@ -361,8 +410,11 @@ file the patch touches, plus `keyword_matcher.py` and
 9. The prose corpus survives both surfaces byte-identical; every surface
    keeps a JSON document JSON (the fuzz), and a dict result a dict wherever
    `main`'s was.
-10. Timing guards: every 66 KB adversarial shape under 2 s per surface
-    (under 1 s for the joiner run), the policy split under 0.1 s.
+10. Timing: every default-tier shape grows linearly from 16 KB to 64 KB on
+    every entry point and stays under 2 s at 64 KB; every generated shape
+    (slow tier) grows linearly; the policy split under 0.1 s.
+11. Each rev-11 board finding is red on `3e49b95`, green here, and killed
+    by its mutant.
 
 ## Non-goals
 
@@ -372,7 +424,10 @@ file the patch touches, plus `keyword_matcher.py` and
 - Redacting a structured result as structure before it is serialised, and
   JSON text inside a string leaf (Consiliency/pmcp#290).
 - Modelling `main`'s cut-then-redact order in `process_output`: the floor is
-  computed on the window the redactor sees.
+  computed on the window the redactor sees. The board's N-3 is this shape:
+  a cut that happens to fall between a prefixed token and a glued non-ASCII
+  letter creates a word boundary `main` then matched; rev 12 sees the
+  un-cut window.
 - Entropy scoring; MIME-wrapped base64 detection.
 
 ## Unverified
@@ -392,12 +447,12 @@ file the patch touches, plus `keyword_matcher.py` and
 
 ## Patch against `main` @ `876fd33`
 
-`git diff --full-index 876fd33 3e49b95 -- pyproject.toml src tests`, less
+`git diff --full-index 876fd33 b7b071d -- pyproject.toml src tests`, less
 `tests/fixtures/redaction_main_oracle.b64`, which is the sibling
 `.consiliency/plans/detailed-234-redactor-main-oracle.b64` (`cmp`-identical)
 and is copied, not patched. `sha256` (first 16) of the result:
-`auth.py 1dfcca197bd230f1`, `policy.py 1befb6a159ed4ddb`,
-`redaction_floor.py 9ea4bb0f213eddab`, `keyword_matcher.py 4c256b3d813bed15`
+`auth.py 62c04dfc882cf9ff`, `policy.py 1befb6a159ed4ddb`,
+`redaction_floor.py e601e789ab02c353`, `keyword_matcher.py 4c256b3d813bed15`
 (= `main`'s). To apply, on a fresh worktree of `876fd33`:
 
 ```bash
@@ -432,7 +487,7 @@ index 500a26dd9217b1dc365bfb098699316d289498f6..9b3dc88ce45a49c571b43b2165b498fd
      "real_cwd: run from the invocation directory, opting out of the autouse isolate_cwd fixture (only for tests whose subject IS the working directory)",
  ]
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index 0e58d07734b410ce37d65f463f97437f186647c9..3109903c25fed22036a0e5049bec1b2303f65971 100644
+index 0e58d07734b410ce37d65f463f97437f186647c9..77ab9a4511137d6849e515472346176e9ee91192 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
 @@ -4,6 +4,7 @@ from __future__ import annotations
@@ -456,7 +511,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..3109903c25fed22036a0e5049bec1b23
  from jwt import PyJWKSet
  
 -from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
-+from pmcp.redaction_floor import floor_spans
++from pmcp.redaction_floor import floor_spans, unindented_break
  from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
  
  
@@ -503,7 +558,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..3109903c25fed22036a0e5049bec1b23
  
  _JWT_RE = re.compile(
      r"(?<![A-Za-z0-9_-])"
-@@ -97,6 +114,974 @@ _JWT_RE = re.compile(
+@@ -97,6 +114,975 @@ _JWT_RE = re.compile(
      r"(?![A-Za-z0-9_-])"
  )
  
@@ -1061,8 +1116,9 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..3109903c25fed22036a0e5049bec1b23
 +_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 +
 +
-+#: A separator whose (last) line break is followed by no indentation.
-+_UNINDENTED_BREAK_RE = re.compile(r"[\r\n][^ \t\xa0]*$")
++#: A separator whose (last) line break is followed by no indentation:
++#: `pmcp.redaction_floor.unindented_break`, one reverse search (a regex
++#: anchored at the end restarts at every break).
 +
 +
 +def _in_resource_name(text: str) -> Callable[[int], bool]:
@@ -1079,7 +1135,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..3109903c25fed22036a0e5049bec1b23
 +        name = match.group("name").lower()
 +        if name in WEAK_SECRET_KEYS and _is_plain_word_or_number(match.group("value")):
 +            continue
-+        if _UNINDENTED_BREAK_RE.search(match.group("sep")) and not (
++        if unindented_break(match.group("sep")) and not (
 +            match.group("value")[0] in "\"'"
 +            or _value_could_be_a_credential(match.group("value"))
 +        ):
@@ -1221,7 +1277,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..3109903c25fed22036a0e5049bec1b23
 +        for match in _BEARER_RE.finditer(text)
 +        if not _is_plain_word_or_number(match.group("value"))
 +        and not (
-+            _UNINDENTED_BREAK_RE.search(match.group("key"))
++            unindented_break(match.group("key"))
 +            and (
 +                # a flag or a lone bullet on the next line (the value holds no
 +                # whitespace, so a one-character marker is the bullet case)
@@ -1478,7 +1534,7 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..3109903c25fed22036a0e5049bec1b23
  
  def redact_auth_url(url: str) -> str:
      """Strip URL userinfo and redact auth-bearing query values."""
-@@ -580,21 +1565,10 @@ def sanitize_url_elicitation_url(
+@@ -580,21 +1566,10 @@ def sanitize_url_elicitation_url(
  def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
      """Return a display-safe diagnostic string for auth failures."""
      text = str(value)
@@ -1774,10 +1830,10 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..d9571f4ba62f18b0d4ea261a7f4f5c75
          summary: str | None = None
 diff --git a/src/pmcp/redaction_floor.py b/src/pmcp/redaction_floor.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657469e320a
+index 0000000000000000000000000000000000000000..c8262cf1c3e4ade0d0462a2bed75db3c8194482e
 --- /dev/null
 +++ b/src/pmcp/redaction_floor.py
-@@ -0,0 +1,1334 @@
+@@ -0,0 +1,1447 @@
 +"""Main's redaction rules as a floor (Consiliency/pmcp#234).
 +
 +Four review rounds of the redactor rewrite each found inputs it redacted less
@@ -1818,6 +1874,7 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +
 +import json
 +import re
++from typing import Any
 +from collections.abc import Callable, Iterator, Sequence
 +from dataclasses import dataclass, field
 +from urllib.parse import parse_qsl, quote, unquote, urlparse, urlunparse
@@ -1946,9 +2003,16 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +    before: str = ""
 +    #: the intermediate text just after the match (at most 256 characters)
 +    after: str = ""
-+    #: the input text this span covers, and the input just before it
++    #: the input text this part of the match removed (all its spans)
 +    removed: str = ""
-+    raw_before: str = ""
++    #: the input just before the match's key (where the key came from the
++    #: input; None where main's own text produced it)
++    raw_key_before: str | None = None
++    #: the spans of one part of one match share a group: the predicates are
++    #: asked once per group, on its first span (every span of it carries the
++    #: same key, separator and value)
++    group: int = 0
++    raw_key_start: int = -1
 +    replacement: str = REDACTED
 +    suppressed_by: str | None = None
 +    #: characters the JSON adjustment kept (syntax only; see `adjust_for_json`)
@@ -1973,6 +2037,7 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +        #: was removed is decided by `org` alone.
 +        self.rep: list[int] = list(range(len(text)))
 +        self.atoms: list[tuple[int, int]] = []
++        self.groups = 0
 +
 +    def atom_range(self, atom: int) -> tuple[int, int]:
 +        n = len(self.raw)
@@ -2068,10 +2133,23 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +
 +
 +def _spans_for(
-+    tracked: _Tracked, a: int, b: int, rule: str, **info: str
++    tracked: _Tracked, a: int, b: int, rule: str, *, key_at: int = -1, **info: Any
 +) -> list[FloorSpan]:
++    """The floor spans of cur[a:b], one part of one match whose key starts at
++    cur[key_at] (-1: no key)."""
++    tracked.groups += 1
++    raw_key_start = -1
++    if 0 <= key_at < len(tracked.org) and tracked.org[key_at] >= 0:
++        raw_key_start = tracked.atom_range(tracked.org[key_at])[0]
 +    return [
-+        FloorSpan(start, end, rule, **info)  # type: ignore[arg-type]
++        FloorSpan(
++            start,
++            end,
++            rule,
++            group=tracked.groups,
++            raw_key_start=raw_key_start,
++            **info,  # type: ignore[arg-type]
++        )
 +        for start, end in tracked.raw_ranges(a, b)
 +    ]
 +
@@ -2158,11 +2236,7 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +            pair_start = position
 +            position += len(pair) + 1
 +            if not pair:
-+                if pair_start < rest_end:
-+                    dropped.append(
-+                        (base + pair_start, base + pair_start + 1, "url.normal")
-+                    )
-+                continue
++                continue  # an empty pair: its `&` is labelled below
 +            key, equals, value = pair.partition("=")
 +            key_start = pair_start
 +            value_start = key_start + len(key) + len(equals)
@@ -2233,9 +2307,34 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +    )
 +    if rebuilt != expected:
 +        return None
-+    # A dropped `&` of an empty pair between two kept ones is listed above;
-+    # every input position is either kept by a piece or dropped by a label.
++    _label_uncovered(raw, base, pieces, dropped)
 +    return pieces, dropped
++
++
++def _label_uncovered(
++    raw: str, base: int, pieces: list[_Piece], dropped: list[tuple[int, int, str]]
++) -> None:
++    """Every input position is either kept by a piece or dropped by a label:
++    whatever no piece keeps and no label names (the `&` of an empty, doubled
++    or trailing pair) is labelled `url.normal` here."""
++    covered = bytearray(len(raw))
++    for piece in pieces:
++        if piece[0] == "keep":
++            covered[piece[1] - base : piece[2] - base] = b"\x01" * (piece[2] - piece[1])
++        elif piece[0] == "atom":
++            covered[piece[2] - base : piece[3] - base] = b"\x01" * (piece[3] - piece[2])
++    for start, stop, _ in dropped:
++        covered[start - base : stop - base] = b"\x01" * (stop - start)
++    position = 0
++    while position < len(raw):
++        if covered[position]:
++            position += 1
++            continue
++        stop = position
++        while stop < len(raw) and not covered[stop]:
++            stop += 1
++        dropped.append((base + position, base + stop, "url.normal"))
++        position = stop
 +
 +
 +def main_redact_auth_url(url: str) -> str:
@@ -2299,11 +2398,28 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +#: the value: opening quotes and brackets before it, closing ones (an escaped
 +#: quote included) after it. Split off so `wrapper_syntax` can keep them.
 +_WRAP_OPEN_RE = re.compile(r"[\"'(\[{<]+")
-+_WRAP_CLOSE_RE = re.compile(r"(?:\\?[\"')\]}>])+[.:!?]*\Z")
++_WRAP_CLOSERS = frozenset("\"')]}>")
++
++
++def _wrap_close_start(text: str, start: int, end: int) -> int:
++    """Where the closing wrapping of text[start:end] begins -- one or more
++    closing quotes or brackets, each optionally escaped, then sentence
++    punctuation, running to ``end`` -- or -1. One right-to-left scan (a
++    search anchored at the end restarts at every closer)."""
++    k = end
++    while k > start and text[k - 1] in ".:!?":
++        k -= 1
++    found = -1
++    while k > start and text[k - 1] in _WRAP_CLOSERS:
++        k -= 1
++        if k > start and text[k - 1] == "\\":
++            k -= 1
++        found = k
++    return found
 +
 +
 +def _header_value_spans(
-+    tracked: _Tracked, a: int, end: int, rule: str, scheme_end: int, **info: str
++    tracked: _Tracked, a: int, end: int, rule: str, scheme_end: int, **info: Any
 +) -> list[FloorSpan]:
 +    """Floor spans of one Bearer/Authorization value cur[a:end]: the scheme
 +    word main took with it (`Authorization: Bearer x` lost `Bearer `), the
@@ -2311,8 +2427,8 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +    cur = tracked.cur
 +    opening = _WRAP_OPEN_RE.match(cur, scheme_end, end)
 +    value_start = opening.end() if opening is not None else scheme_end
-+    closing = _WRAP_CLOSE_RE.search(cur, value_start, end)
-+    value_end = closing.start() if closing is not None else end
++    closing = _wrap_close_start(cur, value_start, end)
++    value_end = closing if closing >= 0 else end
 +    if value_end <= value_start:
 +        value_start, value_end = scheme_end, end  # nothing but wrapping: one value
 +    value = tracked.source(value_start, value_end)
@@ -2386,6 +2502,7 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +                value_start,
 +                end,
 +                "keyword",
++                key_at=start,
 +                key=cur[start:key_end],
 +                sep=cur[key_end:value_start],
 +                value=tracked.source(value_start, end),
@@ -2435,7 +2552,7 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +    for m in regex.finditer(cur):
 +        full = m.group(0)
 +        separator = next((i for i, char in enumerate(full) if char in ":="), -1)
-+        info = {
++        info: dict[str, Any] = {
 +            "before": _context(cur, m.start()),
 +            "after": cur[m.end() : m.end() + 256],
 +        }
@@ -2456,6 +2573,7 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +                    a,
 +                    syntax_end,
 +                    rule,
++                    key_at=m.start(),
 +                    part="syntax",
 +                    key=key,
 +                    sep=sep,
@@ -2469,6 +2587,7 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +                    syntax_end,
 +                    m.end(),
 +                    rule,
++                    key_at=m.start(),
 +                    key=key,
 +                    sep=sep,
 +                    value=value,
@@ -2679,7 +2798,11 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +)  # fmt: skip
 +
 +_PLAIN_WORD_RE = re.compile(r"[A-Za-z_]+")
-+_PLAIN_NUMBER_RE = re.compile(r"[+-]?[0-9]+|0[xX][0-9a-fA-F]+")
++#: A plain number: a short decimal (a status, an exit code, a JSON-RPC
++#: error: at most 10 digits). A longer digit run or any `0x` hex is not
++#: plain: it may be a numeric token or a hex key, and main's redaction of it
++#: stands.
++_PLAIN_NUMBER_RE = re.compile(r"[+-]?[0-9]{1,10}")
 +
 +
 +def is_plain(value: str) -> bool:
@@ -2792,6 +2915,14 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +    return register
 +
 +
++def _decision_key(span: FloorSpan) -> int:
++    """The predicates are asked once per part of a match (its group): one
++    match can split into many spans around main's own markers, and asking
++    each would rescan the shared value once per span (B-1c of rev 11's
++    board)."""
++    return span.group
++
++
 +def floor_spans(
 +    text: str, patterns: Sequence[re.Pattern[str]] | None = None
 +) -> tuple[list[FloorSpan], list[tuple[int, int, str]]]:
@@ -2801,13 +2932,23 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +    _, spans = replay(text, patterns)
 +    layout = json_layout(text) if spans else None
 +    applied: list[tuple[int, int, str]] = []
++    removed: dict[int, list[str]] = {}
 +    for span in spans:
-+        span.removed = text[span.start : span.end]
-+        span.raw_before = _context(text, span.start)
-+        for name, predicate in SUPPRESSIONS.items():
-+            if predicate(span):
-+                span.suppressed_by = name
-+                break
++        removed.setdefault(span.group, []).append(text[span.start : span.end])
++    joined = {group: "".join(parts) for group, parts in removed.items()}
++    decided: dict[int, str | None] = {}
++    for span in spans:
++        # what the whole part of the match removed, shared by its spans
++        span.removed = joined[span.group]
++        key = _decision_key(span)
++        if key not in decided:
++            if span.raw_key_start >= 0:
++                span.raw_key_before = _context(text, span.raw_key_start)
++            decided[key] = next(
++                (name for name, predicate in SUPPRESSIONS.items() if predicate(span)),
++                None,
++            )
++        span.suppressed_by = decided[key]
 +        if span.suppressed_by is not None:
 +            continue
 +        if layout is not None:
@@ -2876,28 +3017,51 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +    )
 +
 +
++_GLUED_SUFFIX_RE = re.compile(r"[A-Za-z0-9]*")
++
++
 +@suppression("N3")
 +def _n3(span: FloorSpan) -> bool:
-+    """A glued prefix or a suffix of more than 24 alphanumerics: an
-+    identifier, not a key (the additive rules' cost bound)."""
++    """A prefix or suffix GLUED to the key word -- more than 24 alphanumerics
++    with no joiner between them and the key word (`<25 letters>password=`,
++    `password<25 letters>=`) -- is an identifier, not a key (the additive
++    rules' cost bound). Joined segments are not glued:
++    `DATABASE_PASSWORD_FOR_REPLICATION_USER_ACCOUNT=` is a key."""
 +    return span.rule in _KEYED_RULES and _for_every_reading(
 +        span,
-+        lambda r: len(r.glued) > 24 or sum(c.isalnum() for c in r.suffix) > 24,
++        lambda r: len(r.glued) > 24
++        or len(_GLUED_SUFFIX_RE.match(r.suffix).group(0)) > 24,  # type: ignore[union-attr]
 +    )
 +
 +
-+_RESOURCE_TAIL_RE = re.compile(r"(?i)\b[au]rn:[^\s\"'<>]*\Z")
++#: The text before a key that is itself a segment of an `arn:`/`urn:`
++#: resource name: the name's start, then only name characters -- no
++#: whitespace, quote, bracket or pair/list delimiter (`& , ; ( ) ? =`) -- and
++#: the key right after a `:` or `/` segment boundary.
++_NAME_DELIMITER_RE = re.compile(r"[\s\"'<>&,;()?=]")
++_RESOURCE_SEGMENT_RE = re.compile(r"(?i)\b[au]rn:[^\s\"'<>&,;()?=]*[:/]\Z")
 +
 +
 +@suppression("N10")
 +def _n10(span: FloorSpan) -> bool:
-+    """A key inside an `arn:`/`urn:` resource name names a resource
-+    (`arn:aws:secretsmanager:...:secret:Name`). Read on the INPUT: an earlier
-+    step of main's may already have rewritten the `arn` itself."""
++    """A key that is a segment of an `arn:`/`urn:` resource name, with its
++    separator and value inside the name too, names a resource
++    (`arn:aws:secretsmanager:...:secret:Name`), and only such a key: a key
++    after the name in the same run (`...:token-exchange&client_secret=x`,
++    `urn:db;password=x`) is a key, and so is a pair that leaves the name
++    (`...:token-exchange=client_secret=x`). Read on the INPUT
++    before the key: an earlier step of main's may already have rewritten the
++    `arn` itself."""
 +    return (
 +        span.rule in _KEYED_RULES
 +        and span.part == "value"
-+        and _RESOURCE_TAIL_RE.search(span.raw_before) is not None
++        and span.raw_key_before is not None
++        and _RESOURCE_SEGMENT_RE.search(span.raw_key_before) is not None
++        # the separator and the value are in the name too: `:` only, and a
++        # value with no name delimiter (`...:token-exchange=client_secret=x`
++        # leaves the name at the `=`)
++        and span.sep.strip(":") == ""
++        and _NAME_DELIMITER_RE.search(span.value) is None
 +    )
 +
 +
@@ -3058,7 +3222,12 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +    )
 +
 +
-+_UNINDENTED_BREAK_RE = re.compile(r"[\r\n][^ \t\xa0]*\Z")
++def unindented_break(text: str) -> bool:
++    """Does ``text`` hold a line break with no space, tab or no-break space
++    after it (the last break decides: an indent after it is after every
++    earlier one too)? One reverse search, not a regex anchored at the end."""
++    last = max(text.rfind("\r"), text.rfind("\n"))
++    return last >= 0 and not any(c in " \t\xa0" for c in text[last + 1 :])
 +
 +
 +@suppression("C8")
@@ -3070,7 +3239,7 @@ index 0000000000000000000000000000000000000000..7f445eb6e2bc5cbe5be4023c7b934657
 +    return (
 +        span.rule in (*_KEYED_RULES, "policy:2", "bearer")
 +        and span.part == "value"
-+        and _UNINDENTED_BREAK_RE.search(span.key + sep) is not None
++        and unindented_break(span.key + sep)
 +        and not value.startswith(('"', "'"))
 +        and not looks_like_credential(value)
 +    )
@@ -4426,6 +4595,222 @@ index 0000000000000000000000000000000000000000..997d19fc87ac309681275ed9b8244f16
 +    if len(value) >= 2 and value[0] + value[-1] in ('""', "''", "()", "[]", "{}", "<>"):
 +        return value[1:-1]
 +    return value
+diff --git a/tests/_redaction_shapes.py b/tests/_redaction_shapes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..480560d3a22e8f500b5beeb97a9cc566d5e0f3b3
+--- /dev/null
++++ b/tests/_redaction_shapes.py
+@@ -0,0 +1,210 @@
++"""Adversarial input shapes derived from the redactor's own regular
++expressions (Consiliency/pmcp#234).
++
++A super-linear path in a regex or a scan needs an input the path can consume
++over and over and then fail on. So each pattern is parsed (`re._parser`) and
++every piece a quantifier can repeat -- a literal run, a representative of
++each character class, each key word of an alternation -- becomes a unit;
++each unit is repeated to the target length, with each of a few failing tails
++and after each of the redactor's trigger words. The timing sweep in
++`tests/test_redaction_floor.py` runs every shape through every public entry
++point at growing sizes and asserts the growth is linear.
++
++Stdlib only.
++"""
++
++from __future__ import annotations
++
++import re
++from collections.abc import Callable, Iterable
++
++try:  # Python 3.11+
++    import re._parser as sre_parse  # type: ignore[import-not-found]
++    from re import _constants as sre_constants  # type: ignore[attr-defined]
++except ImportError:  # Python 3.10
++    import sre_constants  # type: ignore[no-redef]
++    import sre_parse  # type: ignore[no-redef]
++
++#: Characters after a repeated unit that make a match fail late: a letter, a
++#: space, a line break, an operator, each quote and closing bracket.
++TAILS = ("", "a", " ", "\n", "=", '"', "'", ")", "\\", " abc", "=abc123")
++#: What precedes the run: nothing, or a word that arms one of the rules.
++LEADS = (
++    "",
++    "x ",
++    "token",
++    "password=",
++    "Bearer x",
++    "x Bearer",
++    "Authorization: x",
++    "arn:",
++    "https://h/?",
++    "code ",
++)
++
++_CATEGORY_CHARS = {
++    sre_constants.CATEGORY_SPACE: " \n",
++    sre_constants.CATEGORY_NOT_SPACE: "a",
++    sre_constants.CATEGORY_DIGIT: "1",
++    sre_constants.CATEGORY_NOT_DIGIT: "a",
++    sre_constants.CATEGORY_WORD: "a_",
++    sre_constants.CATEGORY_NOT_WORD: " -",
++}
++_FALLBACK = "a1-_ :=\n\"')]}.,;/\\&"
++
++
++def _class_chars(items: list[tuple[object, object]]) -> str:
++    chars = ""
++    negate = False
++    members: set[str] = set()
++    for op, arg in items:
++        if op is sre_constants.NEGATE:
++            negate = True
++        elif op is sre_constants.LITERAL:
++            members.add(chr(arg))  # type: ignore[arg-type]
++        elif op is sre_constants.RANGE:
++            lo, hi = arg  # type: ignore[misc]
++            members.update({chr(lo), chr(hi)})
++        elif op is sre_constants.CATEGORY:
++            members.update(_CATEGORY_CHARS.get(arg, ""))  # type: ignore[arg-type]
++    if negate:
++        excluded = members
++        chars = "".join(c for c in _FALLBACK if c not in excluded)[:3]
++    else:
++        chars = "".join(sorted(members))[:4]
++    return chars
++
++
++def units(pattern: str, flags: int = 0) -> set[str]:
++    """The repeatable pieces of ``pattern``: literal runs, one to four
++    representatives of each class, each alternative of an alternation."""
++    found: set[str] = set()
++
++    def walk(tree: Iterable[tuple[object, object]]) -> str:
++        """Returns the literal text the subtree always starts with."""
++        literal = ""
++        for op, arg in tree:
++            if op is sre_constants.LITERAL:
++                literal += chr(arg)  # type: ignore[arg-type]
++                continue
++            if literal:
++                found.add(literal)
++                literal = ""
++            if op is sre_constants.IN:
++                found.update(_class_chars(arg))  # type: ignore[arg-type]
++            elif op is sre_constants.CATEGORY:
++                found.update(_CATEGORY_CHARS.get(arg, ""))  # type: ignore[arg-type]
++            elif op in (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT):
++                walk(arg[2])  # type: ignore[index]
++            elif op is sre_constants.SUBPATTERN:
++                walk(arg[-1])  # type: ignore[index]
++            elif op is sre_constants.BRANCH:
++                for branch in arg[1]:  # type: ignore[index]
++                    walk(branch)
++            elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
++                walk(arg[1])  # type: ignore[index]
++        if literal:
++            found.add(literal)
++        return literal
++
++    walk(sre_parse.parse(pattern, flags))
++    return {u for u in found if u}
++
++
++def shapes(patterns: Iterable[re.Pattern[str]]) -> dict[str, Callable[[int], str]]:
++    """Every shape, keyed by a readable name: ``lead + unit * k + tail``,
++    sized to ``n`` characters."""
++    all_units: set[str] = set()
++    for pattern in patterns:
++        all_units |= units(pattern.pattern, pattern.flags)
++    out: dict[str, Callable[[int], str]] = {}
++    for unit in sorted(all_units):
++        for lead in LEADS:
++            for tail in TAILS:
++                name = f"{lead!r}+{unit!r}*k+{tail!r}"
++
++                def make(
++                    n: int, lead: str = lead, unit: str = unit, tail: str = tail
++                ) -> str:
++                    return (
++                        lead
++                        + unit * max(1, (n - len(lead) - len(tail)) // len(unit))
++                        + tail
++                    )
++
++                out[name] = make
++    # a key word glued to a separator or joiner (`secret:secret:...`,
++    # `token-token-...`): a key and a separator at every step
++    words = sorted(u for u in all_units if len(u) >= 3 and u.isalpha())
++    for word in words:
++        for glue in (":", "-", "=", "_", " ", "/"):
++            for lead in ("", "arn:", "x "):
++                for tail in ("", "=abc123", " abc"):
++                    name = f"{lead!r}+{word + glue!r}*k+{tail!r}"
++
++                    def make3(
++                        n: int,
++                        lead: str = lead,
++                        unit: str = word + glue,
++                        tail: str = tail,
++                    ) -> str:
++                        return (
++                            lead
++                            + unit * max(1, (n - len(lead) - len(tail)) // len(unit))
++                            + tail
++                        )
++
++                    out[name] = make3
++    # two-unit alternations (`a-`, `=:`, `\"`): a word boundary or a
++    # backtracking point at every step
++    singles = sorted(u for u in all_units if len(u) == 1)
++    for a in singles:
++        for b in singles:
++            if a == b:
++                continue
++            for lead in ("", "x ", "token", "Bearer x"):
++                for tail in ("", "a", " "):
++                    name = f"{lead!r}+{a + b!r}*k+{tail!r}"
++
++                    def make2(
++                        n: int, lead: str = lead, unit: str = a + b, tail: str = tail
++                    ) -> str:
++                        return (
++                            lead
++                            + unit * max(1, (n - len(lead) - len(tail)) // 2)
++                            + tail
++                        )
++
++                    out[name] = make2
++    return out
++
++
++def redactor_patterns() -> list[re.Pattern[str]]:
++    """Every compiled pattern the redactor's modules hold."""
++    import pmcp.auth
++    import pmcp.keyword_matcher
++    import pmcp.policy.policy
++    import pmcp.redaction_floor
++
++    found: list[re.Pattern[str]] = []
++    for module in (
++        pmcp.redaction_floor,
++        pmcp.keyword_matcher,
++        pmcp.auth,
++        pmcp.policy.policy,
++    ):
++        for value in vars(module).values():
++            candidates = (
++                value
++                if isinstance(value, (tuple, list))
++                else value.values()
++                if isinstance(value, dict)
++                else [value]
++            )
++            found.extend(c for c in candidates if isinstance(c, re.Pattern))
++    found.extend(
++        re.compile(p, re.IGNORECASE)
++        for p in pmcp.policy.policy.DEFAULT_REDACTION_PATTERNS
++    )
++    unique = {(p.pattern, p.flags): p for p in found if isinstance(p.pattern, str)}
++    return list(unique.values())
 diff --git a/tests/fixtures/regen_redaction_main_oracle.py b/tests/fixtures/regen_redaction_main_oracle.py
 new file mode 100644
 index 0000000000000000000000000000000000000000..8c761da34fafaefcc584f9c73c47476febecf8ac
@@ -7902,10 +8287,10 @@ index 0000000000000000000000000000000000000000..051eeab4334473ce5dbc60288b306ba8
 +    assert offenders == [], offenders
 diff --git a/tests/test_redaction_floor.py b/tests/test_redaction_floor.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..f134b49011f1553daa0cd8383b0c7de17374d7ff
+index 0000000000000000000000000000000000000000..353b2973b22f139dcbeac582a6b051418280d06e
 --- /dev/null
 +++ b/tests/test_redaction_floor.py
-@@ -0,0 +1,947 @@
+@@ -0,0 +1,1265 @@
 +"""Main's rules as the redactor's floor (Consiliency/pmcp#234).
 +
 +`pmcp.redaction_floor` replays main's redaction rules and hands the redactor
@@ -8853,5 +9238,323 @@ index 0000000000000000000000000000000000000000..f134b49011f1553daa0cd8383b0c7de1
 +    problems = _compare_with_timeout(["x"], timeout=2, reference=_never_returns)
 +    assert problems and problems[0].startswith("TIMEOUT"), problems
 +    assert time.perf_counter() - started < 30
++
++
++# ================================================ rev 11's board, round 1 ==== #
++#
++# Each finding: a check that is red on rev 11 (`3e49b95`) and green here, and
++# a mutant that restores rev 11's mechanism and turns the check red.
++
++
++def _time(run: Callable[[str], object], text: str) -> float:
++    best = float("inf")
++    for _ in range(2):
++        started = time.perf_counter()
++        run(text)
++        best = min(best, time.perf_counter() - started)
++    return best
++
++
++def _entry_points() -> dict[str, Callable[[str], object]]:
++    policy = PolicyManager()
++    return {
++        "E": lambda t: sanitize_auth_diagnostic(t, max_length=None),
++        "P": policy.redact_secrets,
++        "POs": lambda t: policy.process_output(t, redact=True, max_bytes=G.BIG),
++        "POd": lambda t: policy.process_output({"t": t}, redact=True, max_bytes=G.BIG),
++    }
++
++
++def _growth(shape: Callable[[int], str], small: int, large: int) -> list[str]:
++    """Entry points on which ``shape`` grows super-linearly from ``small`` to
++    ``large`` characters: time ratio over 1.6x the size ratio (a linear path
++    is ~1x, a quadratic one ~ the size ratio). Times under 30 ms at the
++    large size are below what one host measures reliably and pass."""
++    factor = large / small
++    slow = []
++    for name, run in _entry_points().items():
++        t_small = _time(run, shape(small))
++        t_large = _time(run, shape(large))
++        if t_large >= 0.03 and t_large / max(t_small, 1e-4) > 1.6 * factor:
++            slow.append(f"{name}: {t_small:.3f}s -> {t_large:.3f}s")
++    return slow
++
++
++#: The board's three shapes and the families the generated sweep found
++#: (`tests/_redaction_shapes.py`; the full sweep is the slow tier's).
++LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
++    "B-1 closers after a Bearer value": lambda n: "Bearer x" + ")" * n + "a",
++    "B-1 escaped quotes after Authorization": lambda n: "Authorization: x" + '\\"' * (n // 2) + "a",
++    "B-1 each closer after Authorization": lambda n: "Authorization: x" + ">" * n + "=",
++    "B-1b line breaks before a Bearer value": lambda n: "x Bearer" + "\n" * n + " abc",
++    "B-1b line breaks before a keyword value": lambda n: "token" + "\n" * n + " abc12",
++    "B-1c one policy value over many markers": lambda n: "arn:" + "secret:" * (n // 7) + "=abc123",
++    "empty query pairs": lambda n: "https://h/?" + "&" * n + "a",
++    "key words after Bearer": lambda n: "x Bearer" + "api_key" * (n // 7) + '"',
++    "joined key run": lambda n: "token-" * (n // 6) + "=abc123def",
++    "word boundaries": lambda n: "a-" * (n // 2),
++    "operator run": lambda n: "password" + ":=" * (n // 2),
++}  # fmt: skip
++
++
++@pytest.mark.parametrize("name", sorted(LINEAR_SHAPES))
++def test_every_shape_grows_linearly_on_every_entry_point(name: str) -> None:
++    """16 KB -> 64 KB on the engine, the policy surface and `process_output`
++    (string and dict): the growth is linear, and 64 KB stays under 2 s."""
++    shape = LINEAR_SHAPES[name]
++    assert _growth(shape, 16_384, 65_536) == []
++    for label, run in _entry_points().items():
++        assert _time(run, shape(65_536)) < 2.0, label
++
++
++def _old_wrap_close_start(text: str, start: int, end: int) -> int:
++    match = re.compile(r"(?:\\?[\"')\]}>])+[.:!?]*\Z").search(text, start, end)
++    return match.start() if match is not None else -1
++
++
++def _old_unindented_break(text: str) -> bool:
++    return re.search(r"[\r\n][^ \t\xa0]*\Z", text) is not None
++
++
++LINEARITY_MUTANTS: dict[str, tuple[str, Callable[[pytest.MonkeyPatch], None]]] = {
++    "B-1": (
++        "B-1 closers after a Bearer value",
++        lambda mp: mp.setattr(F, "_wrap_close_start", _old_wrap_close_start),
++    ),
++    "B-1b": (
++        "B-1b line breaks before a Bearer value",
++        lambda mp: (
++            mp.setattr(F, "unindented_break", _old_unindented_break),
++            mp.setattr("pmcp.auth.unindented_break", _old_unindented_break),
++        ),
++    ),
++    "B-1c": (
++        "B-1c one policy value over many markers",
++        lambda mp: mp.setattr(F, "_decision_key", id),
++    ),
++}
++
++
++@pytest.mark.parametrize("finding", sorted(LINEARITY_MUTANTS))
++def test_each_linearity_finding_has_a_killing_mutant(
++    finding: str, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Rev 11's mechanism restored, the shape grows quadratically again
++    (measured at 2 KB -> 8 KB, where the quadratic path is still quick)."""
++    shape_name, mutate = LINEARITY_MUTANTS[finding]
++    shape = LINEAR_SHAPES[shape_name]
++    assert _growth(shape, 2_048, 8_192) == []
++    mutate(monkeypatch)
++    assert _growth(shape, 2_048, 8_192) != []
++
++
++#: B-2: a key AFTER a resource name in the same run is a key. Each delimiter
++#: that ends a resource name, between a URN/ARN and a keyed credential.
++_RESOURCE_NAMES = (
++    "urn:ietf:params:oauth:grant-type:token-exchange",
++    "urn:ietf:params:oauth:grant-type:jwt-bearer",
++    "arn:aws:rds:us-east-1:1:db:prod",
++    "urn:db",
++)
++_NAME_DELIMITERS = ("&", ",", ";", "(", ")", "?", "=", " ", "&x=1&")
++
++
++def _b2_cases() -> list[tuple[str, str]]:
++    cases = [
++        (
++            "grant_type=urn:ietf:params:oauth:grant-type:token-exchange"
++            "&client_secret=Hunter2abcX9",
++            "Hunter2abcX9",
++        ),
++        ("connect urn:db;user=admin;password=Hunter2abcX9", "Hunter2abcX9"),
++        ("(arn:aws:x)token=Hunter2abcX9", "Hunter2abcX9"),
++    ]
++    for name in _RESOURCE_NAMES:
++        for delimiter in _NAME_DELIMITERS:
++            for key in ("client_secret", "password", "token", "api_key"):
++                cases.append((f"x={name}{delimiter}{key}=Hunter2abcX9", "Hunter2abcX9"))
++    return cases
++
++
++def _b2() -> None:
++    for text, secret in _b2_cases():
++        for surface in (_engine, _policy):
++            assert secret not in surface(text), (text, surface(text))
++        assert secret not in json.dumps(_process({"detail": text})), text
++
++
++def _old_n10(span: F.FloorSpan) -> bool:
++    """Rev 11's N10: the input before the VALUE, read back to the last
++    whitespace or quote, across `& , ; ( ) ? =`, ends inside a resource
++    name."""
++    before = (span.raw_key_before or "") + span.key + span.sep
++    return (
++        span.rule in F._KEYED_RULES
++        and span.part == "value"
++        and span.raw_key_before is not None
++        and re.search(r"(?i)\b[au]rn:[^\s\"'<>]*\Z", before) is not None
++    )
++
++
++def test_b2_n10_fires_only_on_a_segment_of_a_resource_name() -> None:
++    _b2()
++    # the approved class still holds: a key that IS a segment of the name
++    for text in (
++        "arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret-a1b2c3",
++        "arn:aws:iam::1:secret:hunter22x",
++    ):
++        assert _engine(text) == text and _policy(text) == text, text
++
++
++def test_b2_mutant_rev_11_n10(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setitem(F.SUPPRESSIONS, "N10", _old_n10)
++    with pytest.raises(AssertionError):
++        _b2()
++
++
++_N1_CASES = (
++    "DATABASE_PASSWORD_FOR_REPLICATION_USER_ACCOUNT=Hunter2abcX9",
++    "api_key_for_the_production_database_server: Hunter2abcX9",
++    "client_secret_for_the_staging_environment_x=Hunter2abcX9",
++)
++
++
++def _n1() -> None:
++    for text in _N1_CASES:
++        for surface in (_engine, _policy):
++            assert "Hunter2abcX9" not in surface(text), (text, surface(text))
++
++
++def _old_n3(span: F.FloorSpan) -> bool:
++    return span.rule in F._KEYED_RULES and F._for_every_reading(
++        span,
++        lambda r: len(r.glued) > 24 or sum(c.isalnum() for c in r.suffix) > 24,
++    )
++
++
++def test_n1_n3_counts_only_a_glued_run() -> None:
++    _n1()
++    glued = "password" + "x" * 25 + "=hunter"
++    assert _fired(glued, False).get("N3"), _fired(glued, False)
++
++
++def test_n1_mutant_rev_11_n3(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setitem(F.SUPPRESSIONS, "N3", _old_n3)
++    with pytest.raises(AssertionError):
++        _n1()
++
++
++_N2_CASES = (
++    ("Bearer " + "1" * 24, "1" * 24),
++    ("Authorization: " + "7" * 24, "7" * 24),
++    ("Bearer 0x" + "ab" * 32, "ab" * 32),
++    ("password " + "9" * 24, "9" * 24),
++    ("secret 0x" + "cd" * 32, "cd" * 32),
++    ("secret_hex=0x" + "ef" * 32, "ef" * 32),
++    ("auth_code=" + "3" * 24, "3" * 24),
++)
++
++
++def _n2() -> None:
++    for text, secret in _N2_CASES:
++        for surface in (_engine, _policy):
++            assert secret not in surface(text), (text, surface(text))
++
++
++def test_n2_a_plain_number_is_short_and_decimal() -> None:
++    _n2()
++    for prose in ("code=401", "exit code 137", '{"code": -32601}', "Bearer 2"):
++        assert _engine(prose) == prose and _policy(prose) == prose, prose
++    assert F.is_plain("1234567890") and not F.is_plain("12345678901")
++    assert not F.is_plain("0x1F")
++
++
++def test_n2_mutant_rev_11_plain_number(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(
++        F, "_PLAIN_NUMBER_RE", re.compile(r"[+-]?[0-9]+|0[xX][0-9a-fA-F]+")
++    )
++    with pytest.raises(AssertionError):
++        _n2()
++
++
++_N4_URLS = (
++    "https://h/?a=1&",
++    "https://h/?a=1&&b=2",
++    "https://h/?&a=1",
++    "https://h/?&&&",
++    "https://h/?a=1&&",
++    "https://u:p@h/p;q?token=x&&next=y&#frag",
++)
++
++
++def _n4() -> None:
++    for url in _N4_URLS:
++        result = F._url_pieces(url, 0)
++        assert result is not None, url
++        pieces, dropped = result
++        covered = bytearray(len(url))
++        for piece in pieces:
++            if piece[0] == "keep":
++                covered[piece[1] : piece[2]] = b"\x01" * (piece[2] - piece[1])
++            elif piece[0] == "atom":
++                covered[piece[2] : piece[3]] = b"\x01" * (piece[3] - piece[2])
++        for start, stop, _ in dropped:
++            covered[start:stop] = b"\x01" * (stop - start)
++        assert all(covered), (url, [i for i, c in enumerate(covered) if not c])
++
++
++def test_n4_every_url_position_is_kept_or_labelled() -> None:
++    _n4()
++
++
++def test_n4_mutant_no_complement(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(F, "_label_uncovered", lambda *args: None)
++    with pytest.raises(AssertionError):
++        _n4()
++
++
++_SWEEP_CHUNKS = 16
++
++
++@pytest.mark.slow
++@pytest.mark.parametrize("chunk", range(_SWEEP_CHUNKS))
++def test_generated_shapes_grow_linearly(chunk: int) -> None:
++    """The full generated sweep (`tests/_redaction_shapes.py`: every unit of
++    every redactor regex, repeated, after each trigger word, before each
++    failing tail), in 16 chunks so each stays inside the per-test timeout:
++    screened at 4 KB -> 16 KB on every entry point in worker processes; any
++    shape over 8x is re-measured at 16 KB -> 64 KB here and must be
++    linear."""
++    from tests import _redaction_shapes as S
++
++    shapes = S.shapes(S.redactor_patterns())
++    assert len(shapes) > 40_000
++    names = sorted(shapes)[chunk::_SWEEP_CHUNKS]
++    ctx = multiprocessing.get_context("spawn")
++    with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
++        flagged = [
++            name
++            for found in pool.imap_unordered(_screen_shape, names, chunksize=20)
++            for name in found
++        ]
++    confirmed = {name: _growth(shapes[name], 16_384, 65_536) for name in flagged}
++    assert {k: v for k, v in confirmed.items() if v} == {}, confirmed
++
++
++def _screen_shape(name: str) -> list[str]:
++    from tests import _redaction_shapes as S
++
++    global _SCREEN_SHAPES
++    try:
++        shapes = _SCREEN_SHAPES
++    except NameError:
++        shapes = _SCREEN_SHAPES = S.shapes(S.redactor_patterns())
++    shape = shapes[name]
++    for run in _entry_points().values():
++        t_small = _time(run, shape(4_096))
++        t_large = _time(run, shape(16_384))
++        if t_large > 0.03 and t_large / max(t_small, 1e-4) > 8:
++            return [name]
++    return []
 ```
 <!-- PATCH-END -->
