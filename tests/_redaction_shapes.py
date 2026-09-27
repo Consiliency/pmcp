@@ -307,3 +307,71 @@ def compositions() -> dict[str, Callable[[int], str]]:
                 True,
             )
     return out
+
+
+# ------------------------------------------------ inside one atomised piece
+#
+# The replay turns some input into ONE piece that stands for all of it: a
+# URL query key or value that changes when it is re-encoded (`+`, `%xx`), a
+# host that is re-cased, a marker standing for what it replaced, the whole
+# URL when its alignment falls back. A match INSIDE such a piece spans the
+# whole piece, so the third family repeats each match-producing unit inside
+# each context that makes a piece (B-5 of rev 13's board: every unit of the
+# compositions above held a space or `&`, which ends a URL component).
+
+ATOM_CONTEXTS = (
+    "https://h/?q=+",
+    "https://h/?q=%41",
+    "https://h/?+",
+    "https://h/?%41",
+    "https://H.EXAMPLE/",
+    "https://h:99999/",
+    "https://u:p@h/?token=x&q=+",
+    "Authorization: https://h/?q=+",
+    "Bearer https://h/?q=%41",
+    '{"t": "https://h/?q=+',
+    "password=",
+    "Authorization: ",
+    "Bearer ",
+    '{"t": "',
+)
+#: Units that each produce a match of some pass and survive re-encoding
+#: (letters, digits, `_ . - ~ /`), and a few that re-encoding changes.
+MATCH_UNITS = (
+    "aaaaaaaaaa.bbbbbbbbbb.cccccccccc/",
+    "sk-abcdef/",
+    "ghp_abcdefghij/",
+    "github_pat_abcdefghij/",
+    "AKIAABCDEFGHIJKLMNOP/",
+    "xoxb-1234567890/",
+    "glpat-abcdefgh12345678/",
+    "Ab3dE6gH9jK2mN5pQ8/",
+    "token/",
+    "bearer/",
+    "token=abc123/",
+    "password:x1/",
+    "Bearer%20x/",
+    "api_key=x/",
+    "[REDACTED]/",
+    "%41%42/",
+    "+x+/",
+)
+
+
+def atom_repeats() -> dict[str, Callable[[int], str]]:
+    out: dict[str, Callable[[int], str]] = {}
+    for context in ATOM_CONTEXTS:
+        for unit in MATCH_UNITS:
+            for tail in ("", " end"):
+
+                def make(
+                    n: int, lead: str = context, unit: str = unit, tail: str = tail
+                ) -> str:
+                    return (
+                        lead
+                        + unit * max(1, (n - len(lead) - len(tail)) // len(unit))
+                        + tail
+                    )
+
+                out[f"atom({context!r})+{unit!r}*k+{tail!r}"] = make
+    return out

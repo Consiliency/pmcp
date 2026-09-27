@@ -189,6 +189,8 @@ class FloorSpan:
     #: same key, separator and value)
     group: int = 0
     raw_key_start: int = -1
+    #: `key_readings`, computed once per decision
+    readings_cache: list[KeyReading] | None = None
     replacement: str = REDACTED
     suppressed_by: str | None = None
     #: characters the JSON adjustment kept (syntax only; see `adjust_for_json`)
@@ -215,6 +217,7 @@ class _Tracked:
         self.rep: list[int] = list(range(len(text)))
         self.atoms: list[tuple[int, int]] = []
         self.groups = 0
+        self.step_covered_to = -1
 
     def atom_range(self, atom: int) -> tuple[int, int]:
         n = len(self.raw)
@@ -240,21 +243,38 @@ class _Tracked:
         """cur[a:b] as the input spelled it: a synthesised marker reads as
         the input text it replaced."""
         pieces: list[str] = []
-        # Every character stands for input at or after its predecessor's, and
-        # no two markers stand for overlapping input (`rewrite`), so the
-        # input is emitted once, left to right: at most b - a characters of
-        # `cur` read and at most the input they came from copied.
-        covered_to = -1
-        for atom in self.rep[a:b]:
+        # Every character stands for input at or after its predecessor's
+        # (`rewrite` keeps that order), and a step asks in match order, so the
+        # input already spelled out for an earlier match of THIS step is not
+        # copied again: those characters read as the intermediate text itself.
+        # Without that, a many-character piece (a re-encoded URL component, a
+        # marker standing for it) was copied whole once per match inside it:
+        # k x n (B-3 and B-5 of revs 12 and 13). A step copies at most the
+        # input once, plus its own matches' text.
+        copied = 0
+        earlier = self.step_covered_to  # spelled out by an earlier match
+        for position in range(a, b):
+            atom = self.rep[position]
             if atom < 0:
                 continue
             start, end = self.atom_range(atom)
-            if end <= covered_to:
+            if end <= earlier:
+                pieces.append(self.cur[position])
+                copied += 1
                 continue
-            pieces.append(self.raw[max(start, covered_to) : end])
-            covered_to = end
-        work(b - a)
+            if end <= self.step_covered_to:
+                continue  # spelled out already by this match
+            piece = self.raw[max(start, self.step_covered_to) : end]
+            pieces.append(piece)
+            copied += len(piece)
+            self.step_covered_to = end
+        work(b - a + copied)
         return "".join(pieces)
+
+    def begin_step(self) -> None:
+        """A new pass reads the text afresh: its matches may spell out any
+        input again, once."""
+        self.step_covered_to = -1
 
     def rewrite(self, edits: list[tuple[int, int, list[_Piece]]]) -> None:
         """Replace each cur[start:end] by its pieces (edits ascending,
@@ -320,13 +340,19 @@ class _Tracked:
 #: What a predicate may read before a match: back to the last whitespace,
 #: quote or angle bracket (a resource name or a glued prefix never crosses
 #: one), at most 256 characters.
-_CONTEXT_RE = re.compile(r"[^\s\"'<>]{0,256}\Z")
+_CONTEXT_STOPS = frozenset(" \t\n\r\f\v\"'<>")
 
 
 def _context(text: str, start: int) -> str:
-    work(256)
-    match = _CONTEXT_RE.search(text, max(0, start - 256), start)
-    return match.group(0) if match is not None else ""
+    """The text before ``start`` back to the last whitespace, quote or angle
+    bracket, at most 256 characters: one backward walk (a regex anchored at
+    the end restarted at every position of the window)."""
+    k = start
+    limit = max(0, start - 256)
+    while k > limit and text[k - 1] not in _CONTEXT_STOPS and not text[k - 1].isspace():
+        k -= 1
+    work(start - k + 1)
+    return text[k:start]
 
 
 def _counted(matches: Iterator[re.Match[str]]) -> Iterator[re.Match[str]]:
@@ -862,12 +888,17 @@ def replay(
     `PolicyManager.redact_secrets` with those effective compiled patterns."""
     tracked = _Tracked(text)
     spans: list[FloorSpan] = []
-    _url_step(tracked, spans)
-    _authorization_step(tracked, spans)
-    _bearer_step(tracked, spans)
-    _keyword_step(tracked, spans)
-    _jwt_step(tracked, spans)
+    for step in (
+        _url_step,
+        _authorization_step,
+        _bearer_step,
+        _keyword_step,
+        _jwt_step,
+    ):
+        tracked.begin_step()
+        step(tracked, spans)
     for index, regex in enumerate(patterns or ()):
+        tracked.begin_step()
         _policy_step(tracked, spans, regex, index)
     return tracked.cur, spans
 
@@ -1066,7 +1097,6 @@ _KEY_WORD_RE = re.compile(
     rf"(?i)(?=({_main_keys_alternation(MAIN_DIAGNOSTIC_SECRET_KEYS | {'passwd', 'pwd', 'aws_secret', 'aws_access', 'bearer', 'authorization'})}))"
 )
 _ESCAPE_TAIL_RE = re.compile(r"(?:[nrtbf]|u[0-9a-fA-F]{4})")
-_GLUED_RE = re.compile(r"[A-Za-z0-9]*\Z")
 
 
 #: A key longer than this is read no way at all, so every predicate that
@@ -1075,16 +1105,31 @@ _GLUED_RE = re.compile(r"[A-Za-z0-9]*\Z")
 _MAX_READ_KEY = 256
 
 
+_ALNUM = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+
+
+def _glued_tail(text: str) -> str:
+    """The run of ASCII letters and digits ``text`` ends with: one backward
+    walk (a regex anchored at the end restarted at every position)."""
+    k = len(text)
+    while k > 0 and text[k - 1] in _ALNUM:
+        k -= 1
+    work(len(text) - k + 1)
+    return text[k:]
+
+
 def key_readings(span: FloorSpan) -> list[KeyReading]:
     """Every reading of the span's key: each key word in it, and -- when the
     key starts on the tail of a JSON escape (`\\npassword`) -- with and
     without that tail. A predicate that reads the key fires only if it fires
     on EVERY reading, so an ambiguous key is never read the lenient way."""
+    if span.readings_cache is not None:
+        return span.readings_cache
     key = span.key.rstrip()
     before = span.before
     if len(key) > _MAX_READ_KEY:
         return []  # no reading: no key-reading predicate fires (a cost bound)
-    variants = [(_GLUED_RE.search(before).group(0), key)]  # type: ignore[union-attr]
+    variants = [(_glued_tail(before), key)]
     if (len(before) - len(before.rstrip("\\"))) % 2 == 1:
         tail = _ESCAPE_TAIL_RE.match(key)
         if tail is not None:
@@ -1094,10 +1139,11 @@ def key_readings(span: FloorSpan) -> list[KeyReading]:
         for word in _KEY_WORD_RE.finditer(text):
             name = word.group(1)
             qualifier = text[: word.start()]
-            glued = _GLUED_RE.search(qualifier).group(0) if qualifier else context_glue  # type: ignore[union-attr]
+            glued = _glued_tail(qualifier) if qualifier else context_glue
             readings.append(
                 KeyReading(qualifier, glued, name, text[word.start() + len(name) :])
             )
+    span.readings_cache = readings
     return readings
 
 
@@ -1151,6 +1197,10 @@ def _decision_key(span: FloorSpan) -> int:
     return span.group
 
 
+#: The parts of a match whose removed text a predicate reads.
+_SYNTAX_PARTS = frozenset({"syntax", "keyword", "scheme", "wrap_open", "wrap_close"})
+
+
 def floor_spans(
     text: str, patterns: Sequence[re.Pattern[str]] | None = None
 ) -> tuple[list[FloorSpan], list[tuple[int, int, str]]]:
@@ -1161,14 +1211,24 @@ def floor_spans(
     layout = json_layout(text) if spans else None
     applied: list[tuple[int, int, str]] = []
     work(len(text) + len(spans))
+    # What a part of a match removed is read only by the syntax predicates,
+    # and only for the syntax parts (a separator's whitespace and quote, a
+    # scheme word, a wrapper): those are bounded by the match. A value part
+    # can be one of many spans over the same many-character input (every
+    # match inside one re-encoded URL component spans all of it), so its
+    # text is never copied here (B-5 of rev 13's board).
     removed: dict[int, list[str]] = {}
     for span in spans:
-        removed.setdefault(span.group, []).append(text[span.start : span.end])
+        if span.part in _SYNTAX_PARTS:
+            piece = text[span.start : span.end]
+            work(len(piece))
+            removed.setdefault(span.group, []).append(piece)
     joined = {group: "".join(parts) for group, parts in removed.items()}
     decided: dict[int, str | None] = {}
+    applied_once: set[tuple[int, int, str]] = set()
     for span in spans:
         # what the whole part of the match removed, shared by its spans
-        span.removed = joined[span.group]
+        span.removed = joined.get(span.group, "")
         key = _decision_key(span)
         if key not in decided:
             # each predicate reads the match's own strings a bounded number of
@@ -1194,6 +1254,11 @@ def floor_spans(
         span.suppressed_by = decided[key]
         if span.suppressed_by is not None:
             continue
+        # one application per input range: many matches inside one
+        # re-encoded component each span all of it
+        if (span.start, span.end, span.replacement) in applied_once:
+            continue
+        applied_once.add((span.start, span.end, span.replacement))
         if layout is not None:
             applied.extend(adjust_for_json(layout, span))
         else:
@@ -1310,7 +1375,26 @@ def _n3(span: FloorSpan) -> bool:
 #: whitespace, quote, bracket or pair/list delimiter (`& , ; ( ) ? =`) -- and
 #: the key right after a `:` or `/` segment boundary.
 _NAME_DELIMITER_RE = re.compile(r"[\s\"'<>&,;()?=]")
-_RESOURCE_SEGMENT_RE = re.compile(r"(?i)\b[au]rn:[^\s\"'<>&,;()?=]*[:/]\Z")
+_NAME_DELIMITERS = frozenset("\"'<>&,;()?=")
+_RESOURCE_START_RE = re.compile(r"(?i)\b[au]rn:")
+
+
+def _key_is_resource_segment(before: str) -> bool:
+    """Does the text before a key end inside an `arn:`/`urn:` name, right
+    after a `:` or `/` segment boundary? The name's tail is the run back to
+    the last whitespace or name delimiter (`& , ; ( ) ? =`, a quote or angle
+    bracket); it must hold the name's start. One backward walk and one
+    forward search over the tail (a regex anchored at the end restarted at
+    every position)."""
+    if not before or before[-1] not in ":/":
+        return False
+    k = len(before)
+    while (
+        k > 0 and before[k - 1] not in _NAME_DELIMITERS and not before[k - 1].isspace()
+    ):
+        k -= 1
+    work(len(before) - k + 1)
+    return _RESOURCE_START_RE.search(before, k) is not None
 
 
 @suppression("N10")
@@ -1327,7 +1411,7 @@ def _n10(span: FloorSpan) -> bool:
         span.rule in _KEYED_RULES
         and span.part == "value"
         and span.raw_key_before is not None
-        and _RESOURCE_SEGMENT_RE.search(span.raw_key_before) is not None
+        and _key_is_resource_segment(span.raw_key_before)
         # the separator and the value are in the name too: `:` only, and a
         # value with no name delimiter (`...:token-exchange=client_secret=x`
         # leaves the name at the `=`)

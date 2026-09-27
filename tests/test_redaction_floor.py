@@ -631,7 +631,7 @@ def _fired(text: str, policy: bool) -> dict[str, list[str]]:
     fired: dict[str, list[str]] = {}
     for span in spans:
         if span.suppressed_by is not None:
-            fired.setdefault(span.suppressed_by, []).append(span.removed)
+            fired.setdefault(span.suppressed_by, []).append(text[span.start : span.end])
     return fired
 
 
@@ -1042,6 +1042,10 @@ LINEAR_SHAPES: dict[str, Callable[[int], str]] = {
     "operator run": lambda n: "password" + ":=" * (n // 2),
     "markers in the input": lambda n: "password=" + "[REDACTED]" * (n // 10),
     "Bearer values in a JSON document": lambda n: json.dumps({f"k{i}": "Bearer x" for i in range(n // 20)}),
+    "B-5 JWTs inside one re-encoded query value": lambda n: "https://h/?q=+" + "aaaaaaaaaa.bbbbbbbbbb.cccccccccc/" * (n // 33),
+    "B-5 sk- tokens inside one re-encoded query value": lambda n: "https://h/?q=+" + "sk-abcdef/" * (n // 10),
+    "B-5 tokens inside one re-encoded query key": lambda n: "https://h/?%41" + "ghp_abcdefghij/" * (n // 15),
+    "S-1 long joined keys": lambda n: ("a" * 170 + "_token" * 14 + "=Hunter2abc9 ") * (n // 267),
 }  # fmt: skip
 
 
@@ -1051,6 +1055,53 @@ def test_every_shape_does_linear_work_on_every_entry_point(name: str) -> None:
     from 16 KB to 64 KB to 256 KB on the engine, the policy surface and
     `process_output` (string and dict). Deterministic: no clock."""
     assert _superlinear(LINEAR_SHAPES[name], (16_384, 65_536, 262_144)) == []
+
+
+def _peak_memory(run: Callable[[str], object], text: str) -> int:
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        run(text)
+        return tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+
+
+def _memory_superlinear(
+    shape: Callable[[int], str], labels: tuple[str, ...], sizes: tuple[int, ...]
+) -> list[str]:
+    entry = _entry_points()
+    found = []
+    for label in labels:
+        run = entry[label]
+        run(shape(1_024))  # first-use allocations (regex caches) out of the way
+        peaks = [_peak_memory(run, shape(n)) for n in sizes]
+        for n, small, large in zip(sizes, peaks, peaks[1:]):
+            if large > _PER_4X * small:
+                found.append(f"{label}: {n}->{4 * n} peak {small}->{large}")
+    return found
+
+
+@pytest.mark.parametrize("name", sorted(LINEAR_SHAPES))
+def test_every_shape_uses_linear_memory(name: str) -> None:
+    """Peak traced memory grows linearly from 8 KB to 32 KB to 128 KB on the
+    engine and on `process_output` of a dict (B-3 and B-5 were quadratic in
+    memory as well as time). Deterministic: the same allocations every run.
+    The slow tier repeats it at 16 KB -> 256 KB on three entry points."""
+    assert (
+        _memory_superlinear(LINEAR_SHAPES[name], ("E", "POd"), (8_192, 32_768, 131_072))
+        == []
+    )
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("name", sorted(LINEAR_SHAPES))
+def test_every_shape_uses_linear_memory_at_256_kb(name: str) -> None:
+    shape = LINEAR_SHAPES[name]
+    assert (
+        _memory_superlinear(shape, ("E", "P", "POd"), (16_384, 65_536, 262_144)) == []
+    )
 
 
 def _old_wrap_close_start(text: str, start: int, end: int) -> int:
@@ -1103,6 +1154,25 @@ def _rev12_in_resource_name(text: str) -> Callable[[int], bool]:
 #: Each linearity finding's mutant, restoring the earlier mechanism. `work`
 #: mutants are caught by the work count; `clock` mutants (a regex's own
 #: backtracking, which the count cannot see) by the 64x wall-clock bound.
+def _rev13_source(self: F._Tracked, a: int, b: int) -> str:
+    """Rev 13's `source`: input once per CALL, so a many-character piece is
+    copied whole again by every match inside it."""
+    pieces: list[str] = []
+    covered_to = -1
+    copied = 0
+    for atom in self.rep[a:b]:
+        if atom < 0:
+            continue
+        start, end = self.atom_range(atom)
+        if end <= covered_to:
+            continue
+        pieces.append(self.raw[max(start, covered_to) : end])
+        copied += len(pieces[-1])
+        covered_to = end
+    F.work(b - a + copied)
+    return "".join(pieces)
+
+
 LINEARITY_MUTANTS: dict[str, tuple[str, str, Callable[[pytest.MonkeyPatch], None]]] = {
     "B-1": (
         "B-1 closers after a Bearer value",
@@ -1134,6 +1204,11 @@ LINEARITY_MUTANTS: dict[str, tuple[str, str, Callable[[pytest.MonkeyPatch], None
         "B-4 keyword lists after resource names",
         "work",
         lambda mp: mp.setattr("pmcp.auth._in_resource_name", _rev12_in_resource_name),
+    ),
+    "B-5": (
+        "B-5 sk- tokens inside one re-encoded query value",
+        "work",
+        lambda mp: mp.setattr(F._Tracked, "source", _rev13_source),
     ),
 }
 
@@ -1368,7 +1443,7 @@ _SWEEP_CHUNKS = 32
 def _all_shapes() -> dict[str, Callable[[int], str]]:
     from tests import _redaction_shapes as S
 
-    return {**S.shapes(S.redactor_patterns()), **S.compositions()}
+    return {**S.shapes(S.redactor_patterns()), **S.compositions(), **S.atom_repeats()}
 
 
 @pytest.mark.slow
