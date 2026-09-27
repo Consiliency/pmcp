@@ -117,3 +117,27 @@ def test_long_identifier_runs_stay_fast(text: str) -> None:
     started = time.perf_counter()
     sanitize_auth_diagnostic(text, max_length=None)
     assert time.perf_counter() - started < 2.0
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "see https://h.example/a?b=1).",
+        "https://h.example/x,;.)",
+        "(https://u:p@h.example/path?token=abc123def456);",
+        "https://h.example",
+        "https://)",
+    ],
+)
+def test_url_trailing_punctuation_is_kept_outside_the_url(text: str) -> None:
+    """Trailing `).,;` after a URL stays in the text, after the redacted URL."""
+    out = sanitize_auth_diagnostic(text, max_length=None)
+    stripped = text.rstrip(").,;")
+    assert out.endswith(text[len(stripped) :])
+    assert "abc123def456" not in out and ":p@" not in out
+
+
+def test_a_url_with_a_long_punctuation_tail_stays_fast() -> None:
+    started = time.perf_counter()
+    sanitize_auth_diagnostic("http://a" + ")" * 1_000_000, max_length=None)
+    assert time.perf_counter() - started < 2.0

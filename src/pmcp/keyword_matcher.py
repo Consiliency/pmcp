@@ -41,7 +41,9 @@ _WORD_CHAR_RE = re.compile(r"\w")
 
 
 def keys_alternation(keys: Iterable[str]) -> str:
-    """Main's key alternation: the escaped keys and `api[_-]?key`."""
+    """The key alternation: the escaped keys (sorted; order cannot change a
+    match, since group 1 always runs to the end of its identifier run) and
+    `api[_-]?key`."""
     return "|".join([*sorted(re.escape(key) for key in keys), r"api[_-]?key"])
 
 

@@ -582,12 +582,9 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> 
     text = str(value)
 
     def redact_url_match(match: re.Match[str]) -> str:
-        raw_url = match.group(0)
-        suffix = ""
-        while raw_url and raw_url[-1] in ").,;":
-            suffix = raw_url[-1] + suffix
-            raw_url = raw_url[:-1]
-        return redact_auth_url(raw_url) + suffix
+        whole = match.group(0)
+        raw_url = whole.rstrip(").,;")  # trailing sentence punctuation, in one pass
+        return redact_auth_url(raw_url) + whole[len(raw_url) :]
 
     text = re.sub(r"https?://[^\s\"'<>]+", redact_url_match, text)
     text = re.sub(
