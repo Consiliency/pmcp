@@ -1,5 +1,30 @@
 # Detailed plan: secret redaction, additive rules over the redactor's own output (Consiliency/pmcp#234)
 
+> **Revision 16 (2026-09-27): rev 15's board.** Every seat held the floor
+> by construction: the claude seat ran a 2.8M-case differential with no
+> floor violation.
+>
+> The board found five defects in the additive layer itself:
+>
+> - on the policy surface, markers were swallowed and re-spelled, and a
+>   value ran through `&` into the next query parameter;
+> - an ambiguous list pattern backtracked cubically (codex);
+> - JSON object keys were redacted into collisions (claude);
+> - peak memory was high on long JSON strings;
+> - the rules missed userinfo behind an upper-case URL scheme.
+>
+> Each is fixed as a class ("Rev 15 board findings"). A sweep over every
+> quantifier of every redactor regex now guards what the work counter cannot
+> see.
+>
+> One reported gap was checked and does not exist: the key prefilter missing
+> multi-character case folds (`ß`). Python's `re` does not match those.
+> Even so, the prefilter is now the keyword patterns' own alternation under
+> their flag, tested against the patterns on every fold variant.
+>
+> Code: `origin/wip/234-additive` @ `e77c691`, embedded against `main` @
+> `260cc1a`.
+>
 > **Revision 15 (2026-09-27): additive only (maintainer decision).**
 >
 > The redactor runs its own rules unchanged. Rev 10's shape-based and
@@ -12,9 +37,7 @@
 > 10-14 are dropped and listed under Residuals as possible future,
 > separately reviewed changes.
 >
-> Code: `origin/wip/234-additive` @ `ff73fd0` (a new branch from `main`),
-> embedded below as a patch against `main` @ `260cc1a`. CI cost was
-> measured on GitHub runners through a draft do-not-merge PR ("Verification").
+> Rev 15's code was `wip/234-additive` @ `ff73fd0`.
 
 ## Task
 
@@ -29,6 +52,18 @@ Surfaces (unchanged):
 - `sanitize_auth_diagnostic` (E);
 - `PolicyManager.redact_secrets` (P);
 - `process_output` on a string (POs) and on a structured result (POd).
+
+## Rev 15 board findings → rev 16
+
+| source | finding | fix (the class) | red on rev 15 (`ff73fd0`) | green | mutant |
+|---|---|---|---|---|---|
+| grok, claude F1 | policy surface: no marker skip, and a value ran through `&`, so a query tail was lost and `%5BREDACTED%5D` re-spelled | spans overlapping a marker are dropped on every surface; a value starting on a marker is skipped; a policy value inside a query ends at `&`/`#` | `redact_secrets("see https://h.example/cb?token=abc123def456&page=2 now")` → `…?token=[REDACTED] now`; the marker check fails on P, POs, POd | `…?token=%5BREDACTED%5D&page=2 now`; the check passes on all four surfaces | rev 15's policy pass |
+| codex | `_LIST_BODY`: three `\s*` could split one whitespace run; a missing `]` backtracked cubically | an unambiguous list body; every quantified pattern checked (sweep below) | `tokens: [` + 2 KB of spaces: 2.57 s; the quantifier sweep: 10 of 648 shapes over 0.5 s at 4 KB (~30 s each) | ms; 0 of 798 over the cap at 4 and 64 KB | rev 15's list body |
+| claude F2 | JSON object keys redacted into collisions | spans confined to string values | `{"Xk9m…": 1, "Pq7r…": 2}` → `{'[REDACTED]': 2}` | unchanged dict | keys clipped as values |
+| claude F3 | slow-input cost understated; ~155/260 MB peak from the per-character string pattern | string patterns unrolled; the residual restated | 1 MB `token_` run: 9.3 s E, 14.5 s POd, peaks ~155/260 MB | 8.8 s E, 8.9 s POd, peaks 39/40 MB | — |
+| claude F4 | an upper-case scheme hid userinfo from the URL rule | the additive URL pattern is case-insensitive | `HTTPS://user:s3cr3tpass@h.example/p` kept | `HTTPS://[REDACTED]@h.example/p` | — |
+| claude F4 | the 400-character cut can show base text past the base's own window | documented; a differential with the cut added | — | the cut output's stretches occur, in order, in the base's full output | — |
+| grok | the prefilter's single-character folds miss `ß`/`ẞ` multi-character folds | checked: Python's `re` (3.10 to 3.14) does not match them, so no key is missed; the prefilter is now the patterns' own alternation, tested on every fold variant | no leak on any surface (`paßword=@hunter2` is kept by the base pass too) | — | — |
 
 ## Why the replay-based floor was abandoned
 
@@ -78,13 +113,18 @@ that machinery, and gives the floor by construction.
 3. **Merge.**
    - All additive spans over the base output are applied in one step.
    - A marker already in the text (`[REDACTED]`, or the URL rule's
-     `%5BREDACTED%5D`) is a span replaced by itself, first among equal
-     ranges. So it is never split or re-spelled, and a keyword value that
-     starts on a marker is left alone. Extending the marker would only hide
-     the text around it, such as `secret_arn=[REDACTED]:aws:…`.
+     `%5BREDACTED%5D`) is left exactly as it is, on every surface:
+     - a span that overlaps a marker is dropped;
+     - a keyword or policy value that starts on a marker is left alone;
+     - on the policy surface, a value inside a URL query ends at the next
+       `&` or `#`.
+
+     Extending a marker would only hide the text around it, such as
+     `secret_arn=[REDACTED]:aws:…` or the rest of a query.
 4. **JSON.** When the base output is a JSON document, every additive span is
-   confined to string contents, widened to whole escapes. The replacement
-   never touches a delimiting quote, a bracket, a separator or a scalar.
+   confined to the contents of string **values**, widened to whole escapes.
+   It never touches a delimiting quote, a bracket, a separator, a scalar or
+   an object key, so two keys can never collapse into one.
 
 ## Guarantees and how each is proven
 
@@ -92,8 +132,8 @@ that machinery, and gives the floor by construction.
 |---|---|---|
 | 1 | **Floor**: the final output is the base output with markers written over some of it | `_sanitize_base` equals the vendored redactor (`tests/_main_redactor.py`, `main`'s code verbatim) on every tier-1 text, the prose, the credentials and the JSON fuzz. Every stretch of the final output outside a marker occurs, in order, in the base output: tier 1, the board rows of four review rounds, the prose, the credentials and the fuzz. A piece-level differential on all 12 surfaces of tier 1, and a quarter of tier 2 in the slow tier, checks that nothing the redactor removed survives and that no dict turns into a string. Mutant: an additive pass that returns its input unredacted is caught. |
 | 2 | **JSON**: a document the base pass keeps valid stays valid | The 1 500-object fuzz, compact and indented, on E and P: wherever the base output parses, the final output parses too. `process_output` keeps every dict the base returned as a dict. A direct check confines a span that crosses a string boundary to the string. Mutant: without the clipping, that document breaks. |
-| 3 | **Linear** time and memory of the additive pass | A deterministic work count: every loop and string build adds what it iterates over or copies to `pmcp.redaction_additive.WORK`. Across 19 shapes from four review rounds and the rules' own loops, the count grows linearly at 16, 64 and 256 KB on all four entry points. The tracemalloc peak of the whole call grows linearly at 8, 32 and 128 KB on E and POd. Mutant: asking every resource name per match is caught. The slow tier sweeps a sample of 70 000+ generated shapes on the work count. `main`'s own timing guards (`tests/test_keyword_matcher.py`) pass unchanged, with coverage on. |
-| 4 | **Markers** never split, re-spelled or doubled into one another | On a third of tier 1, the board rows and hand cases: no `REDACTED` outside a whole marker beyond the base output's; the base output's markers remain; the URL rule's `%5BREDACTED%5D` keeps its spelling. |
+| 3 | **Linear** time and memory of the additive pass, and no regex backtracks | A deterministic work count: every loop and string build adds what it iterates over or copies to `pmcp.redaction_additive.WORK`. Across 19 shapes from four review rounds and the rules' own loops, the count grows linearly at 16, 64 and 256 KB on all four entry points. The tracemalloc peak of the whole call grows linearly at 8, 32 and 128 KB on E and POd. Mutant: asking every resource name per match is caught. The slow tier sweeps a sample of 70 000+ generated shapes on the work count. `main`'s own timing guards (`tests/test_keyword_matcher.py`) pass unchanged, with coverage on. What the counter cannot see, a regex's own backtracking, is swept from each regex's quantifier structure. For every quantifier of every redactor regex (798 shapes), the input is the shortest text that reaches it, one unit repeated, then one of six failing tails. The engine must stay under 1 s at 4 KB (default tier). Every surface and a JSON string leaf must stay under 1/2/5 s at 4/16/64 KB (slow tier). Mutant: rev 15's list body. |
+| 4 | **Markers** never split, swallowed, re-spelled or marked again | On all four surfaces (E, P, POs, POd), over URL queries under every policy-default key, a seventh of tier 1 and the board rows: every marker of the base output is still there in order, whole and in its own spelling; no `REDACTED` appears outside a whole marker; and the additive pass leaves its own output unchanged. Mutant: rev 15's policy pass. |
 
 The rules' purpose is covered as well:
 - **Credentials:** every entry of rev 10's credential corpus is removed on E
@@ -132,8 +172,20 @@ The rules' purpose is covered as well:
   - the four syntax predicates;
   - rev 10's fixes for a flag or bullet after a keyword and a joiner before
     `bearer`.
-- Linear but slow: on 1 MB of a joined key run (`token-`…), the additive
-  keyword regexes cost several seconds (the key-qualifier bound).
+- Linear but slow: on 1 MB of a joined key run (`token_`…), the additive
+  keyword regexes take about 9 s (E and POd, dev0), against 0.14 s for the
+  base pass. Other 1 MB shapes: an `a-` run 0.3 s; a URL with many
+  `token=` pairs 2.4 s (E) and 2.8 s (POd). Peak memory at 1 MB is about
+  40 MB. `process_output` is capped at 50 KB by default, which keeps it
+  under a second there. `sanitize_auth_diagnostic` redacts the whole text
+  before its 400-character cut, so the diagnostic path can reach these
+  times.
+- The 400-character cut: when an additive marker is shorter than what it
+  replaced, the cut output can show base text past the base pass's own
+  400-character window. That text was kept, not removed, by the base pass.
+- Shape false positives (rev 10's class): a short opaque path segment
+  (`https://youtu.be/<id>` → `https://youtu.[REDACTED]`), opaque query
+  values, cursors and `req_…` ids, and base64 images under 256 characters.
 - Truncation: `process_output` truncates before it redacts, as before. A
   cut inside a token can leave its prefix; shape rules still catch a
   prefix that is itself credential-shaped.
@@ -152,19 +204,23 @@ The rules' purpose is covered as well:
 
 ## Changes
 
-- `src/pmcp/redaction_additive.py` (new): rev 10's rules, the merge with
-  markers, the JSON clipping, the key prefilter and the work counter.
+- `src/pmcp/redaction_additive.py` (new): rev 10's rules (quoted-string
+  patterns unrolled, the list body unambiguous, the URL pattern
+  case-insensitive), the merge that leaves markers whole, the JSON clipping
+  to string values, the key prefilter and the work counter.
 - `src/pmcp/auth.py`: `_sanitize_base` (the old body, moved);
   `sanitize_auth_diagnostic` = base, then additive, then the cut.
 - `src/pmcp/policy/policy.py`: `redact_secrets` = base, then patterns, then
   additive (the engine's rules plus rev 10's forms of the defaults, with the
-  linear `_value_separator`). `DEFAULT_REDACTION_PATTERNS` is unchanged.
+  linear `_value_separator`, a marker skip and a stop at `&`/`#` inside a
+  query). `DEFAULT_REDACTION_PATTERNS` is unchanged.
 - Tests:
   - `tests/test_redaction_additive.py` (new);
   - `tests/_main_redactor.py` (the redactor, vendored verbatim);
   - `tests/_redaction_grammar.py` (rev 10's corpus generator, without its
     classifier);
-  - `tests/_redaction_shapes.py` (the shape generator);
+  - `tests/_redaction_shapes.py` (the shape generators, including the
+    quantifier-structure family);
   - `pyproject.toml`: a `slow` marker, excluded by `addopts`.
 - No recorded oracle fixture and no `redaction_floor.py`.
 
@@ -186,43 +242,36 @@ env -u npm_config_cache -u npm_config_store_dir -u pnpm_config_store_dir \
   uv run pytest -m 'slow and not live' -q          # slow tier
 ```
 
-**Measured on the embedded code (`ff73fd0`)**, as read from the logs:
+**Measured on the embedded code (`e77c691`)**, as read from the logs:
 
 | check | result |
 |---|---|
 | `ruff check src/ tests/` | All checks passed! |
 | `ruff format --check src/ tests/` | 170 files already formatted |
 | `mypy src/` | Success: no issues found in 52 source files |
-| default tier (dev0) | **4584 passed, 3 skipped, 72 deselected in 525.55s (0:08:45)** |
-| slow tier (dev0) | **47 passed, 4612 deselected in 311.18s (0:05:11)** |
-| `tests/test_keyword_matcher.py` with `--cov` (dev0) | 17 passed; `test_long_identifier_runs_stay_fast` longest case 0.60 s, `test_a_url_with_a_long_punctuation_tail_stays_fast` 0.29 s (2 s bound) |
+| default tier (dev0) | **4596 passed, 3 skipped, 80 deselected in 500.22s (0:08:20)** |
+| slow tier (dev0) | **55 passed, 4624 deselected in 348.89s (0:05:48)** |
 
-Notes on these runs:
+How these ran:
 - Both tiers ran with `npm_config_cache`, `npm_config_store_dir` and
   `pnpm_config_store_dir` unset.
 - The two 60 s tests in the default tier are
   `tests/test_progressive_disclosure.py`'s `test_invoke_query_docs` and
   `test_invoke_query_docs_conceptual`. This plan does not touch them.
-- The slow tier's longest case is the floor differential on the rest of
-  tier 1 plus a quarter of tier 2 (134 s).
+- No redaction test in the default tier takes 8 s or more.
+- The slow tier's longest case is the tier-2 floor differential (126 s).
 
-**CI cost, measured on GitHub runners.** A draft do-not-merge PR (#309,
-now closed) ran the `test (3.x)` jobs. They run `pytest tests/ --cov` on
-the default tier.
+**CI cost.** Rev 15 was measured on GitHub runners through a draft
+do-not-merge PR (#309, closed). It ran `pytest tests/ --cov` on the
+default tier.
 
 | run | commit | `test (3.10)` | `test (3.11)` | `test (3.12)` |
 |---|---|---|---|---|
-| first cut | `e9e4392` | 20m08s | 20m34s | 18m27s |
-| the embedded code | `ff73fd0` | **14m20s** | **12m23s** | **12m59s** |
-| `main` for comparison (`260cc1a`) | — | 9m08s | 14m23s | 8m27s |
+| rev 15 | `ff73fd0` | 14m20s | 12m23s | 12m59s |
+| `main` for comparison | `260cc1a` | 9m08s | 14m23s | 8m27s |
 
-The first cut's redaction tests cost 117 s locally. The embedded code
-keeps a deterministic one-step work check (16 → 64 KB), an 8 → 32 KB
-memory check on the engine, and a third of tier 1 for the piece
-differential in the default tier (39 s locally), and moves the rest to
-the slow tier. All three jobs finish 10 to 12 minutes inside the
-25-minute limit. The `changelog` check failed on the draft because it
-carried no CHANGELOG entry (documentation is the implementer's).
+Rev 16's default tier did not grow: it took 8:20 locally against rev 15's
+8:45. So it was not re-timed on runners, and the rev-15 figures stand.
 
 **Embedding proof** (run for this plan):
 
@@ -231,18 +280,17 @@ carried no CHANGELOG entry (documentation is the implementer's).
   against `main`". It is `cmp`-equal to the generated diff.
 - `git apply --check` and `git apply` succeeded on a fresh worktree of
   `260cc1a`.
-- The result matches `wip/234-additive` at `ff73fd0`: `pyproject.toml` is
+- The result matches `wip/234-additive` at `e77c691`: `pyproject.toml` is
   `cmp`-identical, and `diff -rq` of `src/` and `tests/` shows no
   differences.
-- Checks on that tree (`pmcp.__file__` printed from it):
+- On that tree (`pmcp.__file__` printed from it):
   - `ruff check`: All checks passed!
   - `ruff format --check`: 170 files already formatted
   - `mypy src/`: no issues in 52 source files
-  - `test_redaction_additive.py`, `test_keyword_matcher.py`,
-    `test_auth.py`, `test_policy.py`,
+  - the default tier of `test_redaction_additive.py`,
+    `test_keyword_matcher.py`, `test_auth.py`, `test_policy.py`,
     `test_project_source_consent_policy.py` and
-    `test_trust_boundaries_e2e.py` (default tier): **284 passed, 47
-    deselected in 41.45s**.
+    `test_trust_boundaries_e2e.py`: **296 passed, 55 deselected in 49.27s**.
 
 ## Acceptance criteria
 
@@ -276,15 +324,15 @@ carried no CHANGELOG entry (documentation is the implementer's).
 
 ## Patch against `main` @ `260cc1a`
 
-This is `git diff --full-index 260cc1a ff73fd0`, the whole change.
+This is `git diff --full-index 260cc1a e77c691`, the whole change.
 
 `sha256` of the patched files (first 16 hex digits):
 
 | file | sha256 |
 |---|---|
 | `auth.py` | `4976402fabcf92b7` |
-| `policy.py` | `d9602899c6095972` |
-| `redaction_additive.py` | `ec81e49786832b7e` |
+| `policy.py` | `d1081ce93ba64da4` |
+| `redaction_additive.py` | `ba92a58ca9159a6d` |
 | `keyword_matcher.py` | `4c256b3d813bed15` (unchanged) |
 
 To apply, on a fresh worktree of `main`:
@@ -363,10 +411,18 @@ index 0e58d07734b410ce37d65f463f97437f186647c9..ccb5e365b4dfe2ce5ac18ca687dee11c
  
  def _parse_www_auth_params(raw: str) -> dict[str, str]:
 diff --git a/src/pmcp/policy/policy.py b/src/pmcp/policy/policy.py
-index cac27021c46dcd6c2a066fa779ccf58046bc0c94..2985ec2d6cd6eada9451e53fea8418ad68f405e4 100644
+index cac27021c46dcd6c2a066fa779ccf58046bc0c94..56704e3f8a2b196bae5ca3d97a15b3a912f46b0e 100644
 --- a/src/pmcp/policy/policy.py
 +++ b/src/pmcp/policy/policy.py
-@@ -22,7 +22,14 @@ from pmcp.types import (
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import bisect
+ import fnmatch
+ import hashlib
+ import json
+@@ -22,7 +23,16 @@ from pmcp.types import (
      ServerPolicy,
      ToolPolicy,
  )
@@ -374,15 +430,17 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..2985ec2d6cd6eada9451e53fea8418ad
 +from pmcp.auth import _sanitize_base
 +from pmcp.redaction_additive import (
 +    REDACTED,
++    URL_RE,
 +    Span,
 +    redact_additive,
++    starts_with_marker,
 +    widen_over_escapes,
 +    work,
 +)
  
  if TYPE_CHECKING:
      # Annotation only. `pmcp.manifest`'s package `__init__` imports the loader and
-@@ -55,6 +62,59 @@ DEFAULT_REDACTION_PATTERNS = [
+@@ -55,6 +65,71 @@ DEFAULT_REDACTION_PATTERNS = [
      r"\bgithub_pat_[A-Za-z0-9_]{10,}\b",
  ]
  
@@ -419,6 +477,18 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..2985ec2d6cd6eada9451e53fea8418ad
 +}
 +
 +
++def _url_query_ranges(text: str) -> list[tuple[int, int]]:
++    """Where each URL's query runs in ``text``: from after its `?` to the
++    URL's end (disjoint, ascending)."""
++    work(len(text))
++    ranges = []
++    for match in URL_RE.finditer(text):
++        mark = text.find("?", match.start(), match.end())
++        if mark >= 0:
++            ranges.append((mark + 1, match.end()))
++    return ranges
++
++
 +def _value_separator(full_match: str) -> int:
 +    """Where an additive pattern's match splits into key and value: the first
 +    separator (`:` or `=`) that has a value after it, or -1. A separator
@@ -442,7 +512,7 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..2985ec2d6cd6eada9451e53fea8418ad
  # Search order for an auto-discovered policy. The project-local entries are kept
  # RELATIVE on purpose: they are resolved against `Path.cwd()` when a
  # `PolicyManager` is constructed, not when this module is imported. Storing them
-@@ -694,8 +754,16 @@ class PolicyManager:
+@@ -694,8 +769,16 @@ class PolicyManager:
          return (truncated_str, True, original_size)
  
      def redact_secrets(self, output: str) -> str:
@@ -461,13 +531,18 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..2985ec2d6cd6eada9451e53fea8418ad
  
          for regex in self._redaction_regexes:
  
-@@ -709,7 +777,44 @@ class PolicyManager:
+@@ -709,7 +792,64 @@ class PolicyManager:
  
              result = regex.sub(replace_match, result)
  
 -        return result
++        return self._redact_additive(result)
++
++    def _redact_additive(self, text: str) -> str:
++        """The additive pass alone, over text the redactor's own rules have
++        already redacted."""
 +        return redact_additive(
-+            result, covers=self._pattern_matches, extra=self._additive_spans(result)
++            text, covers=self._pattern_matches, extra=self._additive_spans(text)
 +        )
 +
 +    def _additive_regexes(self) -> list[re.Pattern[str]]:
@@ -489,7 +564,15 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..2985ec2d6cd6eada9451e53fea8418ad
 +        )
 +
 +    def _additive_spans(self, text: str) -> list[Span]:
++        """Spans of the additive form of each effective pattern, over the
++        output the patterns already redacted. Like the engine's additive
++        rules, a value that starts on a marker is left alone (the redactor
++        already took it; running on would only swallow what follows), and
++        inside a URL's query a value ends at `&` or `#` -- the next
++        parameter is not part of it."""
 +        spans: list[Span] = []
++        query_ranges = _url_query_ranges(text)
++        query_starts = [start for start, _ in query_ranges]
 +        for regex in self._additive_regexes():
 +            work(len(text))  # the pattern's scan
 +            for match in regex.finditer(text):
@@ -497,22 +580,29 @@ index cac27021c46dcd6c2a066fa779ccf58046bc0c94..2985ec2d6cd6eada9451e53fea8418ad
 +                work(2 * len(full_match) + 1)  # the match, the split
 +                split = _value_separator(full_match)
 +                start = match.start() + split + 1 if split >= 0 else match.start()
-+                # the value after the separator's own whitespace: a value that
-+                # is already a marker (`key: [REDACTED]`) is then the marker's
-+                # own span, and is kept exactly as it is
 +                while start < match.end() and text[start].isspace():
 +                    start += 1
-+                spans.append((start, match.end(), REDACTED))
++                end = match.end()
++                if starts_with_marker(text[start:end]):
++                    continue
++                i = bisect.bisect_right(query_starts, start) - 1
++                if i >= 0 and start < query_ranges[i][1]:
++                    for stop in "&#":
++                        cut = text.find(stop, start, end)
++                        if cut >= 0:
++                            end = cut
++                if start < end:
++                    spans.append((start, end, REDACTED))
 +        return widen_over_escapes(text, spans)
  
      def process_output(
          self,
 diff --git a/src/pmcp/redaction_additive.py b/src/pmcp/redaction_additive.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4df8d6c97
+index 0000000000000000000000000000000000000000..9b41493a89ab2dba2f951f269cc46ad910411504
 --- /dev/null
 +++ b/src/pmcp/redaction_additive.py
-@@ -0,0 +1,1212 @@
+@@ -0,0 +1,1258 @@
 +"""The additive redaction rules (Consiliency/pmcp#234).
 +
 +`sanitize_auth_diagnostic` and `PolicyManager.redact_secrets` first run the
@@ -1081,7 +1171,7 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +_BARE_RUN = r"[^\s\"',;&]*[^\s\"',;&)\]}\\]"
 +_KEYWORD_SEP_RE = re.compile(
 +    _KEYWORD_KEY_SEP
-+    + r"(?P<value>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_])"
++    + r"(?P<value>\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\"(?![A-Za-z0-9_])|'[^'\\\n]*(?:\\.[^'\\\n]*)*'(?![A-Za-z0-9_])"
 +    # an unterminated opening quote, then a bare run to whitespace, a list
 +    # separator, the end, or a double quote (the end of the JSON string a
 +    # single-quoted value sits in)
@@ -1106,12 +1196,24 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +#: nothing bare. `[x", "b": "]` after `token: ` inside a string leaf is not an
 +#: array (the scan would run past the string's closing quote), while
 +#: `["first]", "hunter2"]` is one (a `]` inside a quoted element is text).
-+_LIST_BODY = r"(?P<list>\[\s*(?:(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|-?[0-9][0-9.eE+-]*|null|true|false)\s*,\s*)*(?:(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|-?[0-9][0-9.eE+-]*|null|true|false))?\s*,?\s*\])"
++_LIST_ELEMENT = r"(?:\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\"|'[^'\\\n]*(?:\\.[^'\\\n]*)*'|-?[0-9][0-9.eE+-]*|null|true|false)"
++#: Unambiguous: each run of whitespace has exactly one place to go (a
++#: missing `]` backtracks over it once, not over every way of splitting it
++#: between three `\s*`, which was cubic -- rev 15's board).
++_LIST_BODY = (
++    r"(?P<list>\[\s*(?:"
++    + _LIST_ELEMENT
++    + r"\s*(?:,\s*"
++    + _LIST_ELEMENT
++    + r"\s*)*(?:,\s*)?)?\])"
++)
 +_KEYWORD_LIST_RE = re.compile(
 +    _KEYWORD_KEY_SEP + _LIST_BODY,
 +    re.IGNORECASE,
 +)
-+_QUOTED_RE = re.compile(r"\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'")
++_QUOTED_RE = re.compile(
++    r"\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\"|'[^'\\\n]*(?:\\.[^'\\\n]*)*'"
++)
 +
 +#: A bare keyword (or `--keyword` flag) followed by whitespace and a value that
 +#: could be a credential (`_value_could_be_a_credential`). This is what keeps
@@ -1170,6 +1272,9 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +    r"(?P<key>bearer(?:(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")+|" + _BREAK + r"))"
 +    r"(?![A-Za-z_-]+=[^=])"
 +    r"(?:[\"'(\[{<](?=[^\s,;\"'()\[\]{}<>\\]+[\"')\]}>]))?"
++    # a whitespace escape is separator, never the start of a value (the
++    # separator's own `+` gives one back when what follows is no value)
++    r"(?!" + _JSON_SPACE_ESCAPE + r")"
 +    r"(?P<value>[^\s,;\"'()\[\]{}<>]*[^\s,;\"'()\[\]{}<>\\])",
 +    re.IGNORECASE,
 +)
@@ -1192,7 +1297,7 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +    r"authorization[\"']?(?:\s|" + _JSON_SPACE_ESCAPE + r")*[:=]"
 +    r"(?:" + _BREAK + r"(?=\S)(?!--|[-*#>](?:\s|$))"
 +    r"|(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")*)"
-+    r"(?:(?P<quoted>\"(?:[^\"\\\n]|\\.)*\"(?![A-Za-z0-9_])|'(?:[^'\\\n]|\\.)*'(?![A-Za-z0-9_]))"
++    r"(?:(?P<quoted>\"[^\"\\\n]*(?:\\.[^\"\\\n]*)*\"(?![A-Za-z0-9_])|'[^'\\\n]*(?:\\.[^'\\\n]*)*'(?![A-Za-z0-9_]))"
 +    r"|(?:(?:bearer|basic|digest|negotiate|ntlm|token)"
 +    r"(?:[^\S\r\n]|" + _JSON_SPACE_ESCAPE + r")+)?"
 +    r"[\"'(\[{<](?P<inner>[^\s,;\"'()\[\]{}<>\\]+)[\"')\]}>]"
@@ -1202,7 +1307,7 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +)
 +
 +#: A URL in free text; trailing sentence punctuation is handed back.
-+_URL_RE = re.compile(r"https?://[^\s\"'<>]+")
++URL_RE = re.compile(r"https?://[^\s\"'<>]+", re.IGNORECASE)
 +
 +
 +#: A separator whose (last) line break is followed by no indentation:
@@ -1227,7 +1332,7 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +    return inside
 +
 +
-+def _starts_with_marker(value: str) -> bool:
++def starts_with_marker(value: str) -> bool:
 +    """A value the redactor before these rules already replaced: extending
 +    the marker over what follows it only hides more of the text around it
 +    (`secret_arn=[REDACTED]:aws:...`)."""
@@ -1241,7 +1346,7 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +    for match in _counted(_KEYWORD_SEP_RE.finditer(text)):
 +        if in_resource_name(match.start()):
 +            continue  # `arn:…:secret:Name` names a secret, it is not one
-+        if _starts_with_marker(match.group("value")):
++        if starts_with_marker(match.group("value")):
 +            continue  # the redactor before these rules already took it
 +        name = match.group("name").lower()
 +        if name in WEAK_SECRET_KEYS and _is_plain_word_or_number(match.group("value")):
@@ -1370,7 +1475,7 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +        (match.start("value"), match.end("value"), REDACTED)
 +        for match in _counted(_KEYWORD_WS_RE.finditer(text))
 +        if match.group("name").lower() != "code"
-+        and not _starts_with_marker(match.group("value"))
++        and not starts_with_marker(match.group("value"))
 +        and _value_could_be_a_credential(match.group("value"))
 +        # a glued prefix (`CLIENTSECRET abc…`) only on a single-case key or
 +        # an acronym + Titlecase one (`PGPassword abc…`): any other
@@ -1524,7 +1629,7 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +
 +def _url_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
 +    spans: list[Span] = []
-+    for match in _counted(_URL_RE.finditer(text)):
++    for match in _counted(URL_RE.finditer(text)):
 +        raw_url = match.group(0)
 +        # Trailing sentence punctuation is handed back, and so is a trailing
 +        # backslash: in a serialised leaf it escapes the closing quote
@@ -1545,22 +1650,17 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +    return _additive_spans(text, _depth, covers)
 +
 +
-+#: Characters `re.IGNORECASE` folds onto an ASCII letter that `str.lower`
-+#: does not: the long s, the Kelvin sign, dotless and dotted i.
-+_FOLDS = str.maketrans({"\u017f": "s", "\u212a": "k", "\u0131": "i", "\u0130": "i"})
-+#: A literal every keyword match contains, lower-cased: each key, and the
-+#: fixed part of `api[_-]?key` and `private[_-]?key`.
-+_KEY_LITERALS = tuple(
-+    sorted({*(k.lower() for k in ADDITIVE_SECRET_KEYS), "api", "private"})
-+)
++#: Any key word, as the keyword patterns read it: the same alternation under
++#: the same flag (`re.IGNORECASE`), so every case fold the patterns apply is
++#: applied here too -- it is their `name` group on its own.
++_ANY_KEY_RE = re.compile(rf"(?:{_secret_key_alternation()})", re.IGNORECASE)
 +
 +
 +def _may_hold_a_key(text: str) -> bool:
-+    """A necessary condition for a keyword match: some key literal occurs,
-+    case-folded as the keyword patterns fold."""
-+    work(len(text) * (2 + len(_KEY_LITERALS)))
-+    folded = text.translate(_FOLDS).lower()
-+    return any(literal in folded for literal in _KEY_LITERALS)
++    """A necessary condition for a keyword match: the patterns' own key
++    alternation occurs somewhere (one search)."""
++    work(len(text))
++    return _ANY_KEY_RE.search(text) is not None
 +
 +
 +def _additive_spans(text: str, depth: int, covers: Covers | None) -> list[Span]:
@@ -1613,20 +1713,35 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +
 +
 +def merge_redaction_spans(text: str, spans: list[Span]) -> list[Span]:
-+    """The disjoint spans `apply_redaction_spans` applies, ascending (see
-+    there for the overlap rules)."""
++    """The disjoint spans `apply_redaction_spans` applies, ascending.
++
++    Every marker already in the text -- `[REDACTED]`, and the URL rule's
++    `%5BREDACTED%5D` -- is left exactly as it is: a span that overlaps a
++    marker is dropped. It reads a value the redactor already replaced (a
++    keyword or scheme before the marker, a value running into it), and
++    extending the marker only hides the text around it. So a marker is never
++    split, swallowed into a larger one or re-spelled, and the pass leaves its
++    own output as it is. The rest merge: overlapping or nested spans become
++    one `[REDACTED]`, except that a span inside one whose replacement covers
++    it (the marker, or the empty string) is dropped.
++    """
 +    work(len(text) + len(spans) * max(1, len(spans).bit_length()))  # scan, sort
-+    # Every marker already in the text -- `[REDACTED]`, and the URL rule's
-+    # `%5BREDACTED%5D` -- is a span replaced by itself, first among spans of
-+    # the same range, so a rule that re-finds it keeps it as it is and a rule
-+    # that overlaps it swallows it whole: a marker is never split.
-+    markers: list[Span] = [
-+        (m.start(), m.end(), m.group(0)) for m in _MARKER_RE.finditer(text)
-+    ]
-+    candidates = [*markers, *spans]
++    markers = [m.span() for m in _MARKER_RE.finditer(text)]
++    marker_starts = [start for start, _ in markers]
++    pieces: list[Span] = []
++    for start, end, replacement in spans:
++        work(1)
++        i = bisect.bisect_left(marker_starts, end) - 1
++        if i >= 0 and markers[i][1] > start:
++            continue  # overlaps the marker that starts last before its end
++        pieces.append((start, end, replacement))
 +    ordered = sorted(
-+        (span for span in candidates if span[0] < span[1]),
-+        key=lambda span: (span[0], -span[1], span[2] not in _MARKERS),
++        (
++            piece
++            for piece in pieces
++            if piece[0] < piece[1] and not text[piece[0] : piece[1]].isspace()
++        ),
++        key=lambda span: (span[0], -span[1], span[2] != REDACTED),
 +    )
 +    merged: list[Span] = []
 +    for start, end, replacement in ordered:
@@ -1673,17 +1788,31 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +
 +# --------------------------------------------------------------- JSON text
 +
-+_JSON_STRING_RE = re.compile(r"\"(?:[^\"\\]|\\.)*\"")
-+_JSON_ESCAPE_TOKEN_RE = re.compile(r"\\u[0-9a-fA-F]{4}|\\.|[^\\]", re.DOTALL)
++#: A JSON string token, the loop unrolled: a run of plain characters is one
++#: step, not one per character (the per-character alternation kept engine
++#: state for every character of a long string).
++_JSON_STRING_RE = re.compile(r"\"[^\"\\]*(?:\\.[^\"\\]*)*\"")
++_JSON_ESCAPE_RE = re.compile(r"\\u[0-9a-fA-F]{4}|\\.", re.DOTALL)
++
++
++def _is_object_key(text: str, end: int) -> bool:
++    """Is the string token ending at ``end`` an object key (the next
++    non-whitespace character is `:`)?"""
++    rest = end
++    while rest < len(text) and text[rest] in " \t\r\n":
++        rest += 1
++    return rest < len(text) and text[rest] == ":"
 +
 +
 +def _clip_to_json_strings(text: str, spans: list[Span]) -> list[Span]:
-+    """When ``text`` is a JSON document, confine every span to string
-+    contents, whole escapes at a time: a replacement then never touches a
-+    delimiting quote, a bracket, a separator or a bare scalar, and never
-+    splits an escape, so the document stays a document. Anything a span
-+    covered outside a string is left as it is (syntax, or a scalar the
-+    redactor before these rules left too)."""
++    """When ``text`` is a JSON document, confine every span to the contents
++    of string VALUES, whole escapes at a time: a replacement then never
++    touches a delimiting quote, a bracket, a separator, a bare scalar or an
++    object key, and never splits an escape. So the document stays a
++    document, and no two keys of an object can collide into one (rev 15's
++    board: random-looking keys redacted to the same marker collapsed a map
++    to its last entry). Anything a span covered outside a string value is
++    left as it is."""
 +    head = text.lstrip()[:1]
 +    if head not in ("{", "[", '"') or not spans:
 +        return spans
@@ -1692,18 +1821,25 @@ index 0000000000000000000000000000000000000000..897193e89f573c355ad6a06eb4a18fc4
 +    except (ValueError, RecursionError):
 +        return spans
 +    work(3 * len(text))
-+    strings = [m.span() for m in _JSON_STRING_RE.finditer(text)]
-+    starts = [start for start, _ in strings]
-+    boundary = bytearray(len(text) + 1)
-+    for start, end in strings:
-+        for token in _JSON_ESCAPE_TOKEN_RE.finditer(text, start + 1, end - 1):
-+            boundary[token.start()] = 1
-+        boundary[end - 1] = 1
++    values: list[tuple[int, int]] = []
++    for match in _JSON_STRING_RE.finditer(text):
++        start, end = match.span()
++        if _is_object_key(text, end):
++            continue
++        values.append((start, end))
++    starts = [start for start, _ in values]
++    # a position inside a string is a boundary unless it is inside an escape
++    # (backslashes only occur in strings in a valid document)
++    boundary = bytearray(b"\x01") * (len(text) + 1)
++    for escape in _JSON_ESCAPE_RE.finditer(text):
++        boundary[escape.start() + 1 : escape.end()] = bytes(
++            escape.end() - escape.start() - 1
++        )
 +    clipped: list[Span] = []
 +    for a, b, replacement in spans:
 +        i = max(0, bisect.bisect_right(starts, a) - 1)
-+        while i < len(strings) and strings[i][0] < b:
-+            start, end = strings[i]
++        while i < len(values) and values[i][0] < b:
++            start, end = values[i]
 +            low, high = max(a, start + 1), min(b, end - 1)
 +            work(1)
 +            if low < high:
@@ -2812,10 +2948,10 @@ index 0000000000000000000000000000000000000000..b87368d77d02649381ed9a8411544601
 +    return any(int(m, 32) != full for m in main[:-1])
 diff --git a/tests/_redaction_shapes.py b/tests/_redaction_shapes.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..8b6ba53705820a6fd6483d17d1dd43953e181ed8
+index 0000000000000000000000000000000000000000..cd149c199d61ad3b81c62dd3150938084e65f1f6
 --- /dev/null
 +++ b/tests/_redaction_shapes.py
-@@ -0,0 +1,377 @@
+@@ -0,0 +1,457 @@
 +"""Adversarial input shapes derived from the redactor's own regular
 +expressions (Consiliency/pmcp#234).
 +
@@ -2834,7 +2970,7 @@ index 0000000000000000000000000000000000000000..8b6ba53705820a6fd6483d17d1dd4395
 +from __future__ import annotations
 +
 +import re
-+from collections.abc import Callable, Iterable
++from collections.abc import Callable, Iterable, Iterator
 +
 +try:  # Python 3.11+
 +    import re._parser as sre_parse  # type: ignore[import-not-found]
@@ -3193,12 +3329,92 @@ index 0000000000000000000000000000000000000000..8b6ba53705820a6fd6483d17d1dd4395
 +
 +                out[f"atom({context!r})+{unit!r}*k+{tail!r}"] = make
 +    return out
++
++
++# ------------------------------------------------- from quantifier structure
++#
++# A regex backtracks super-linearly where one run of text can be divided in
++# many ways between quantifiers (adjacent or nested quantifiers over
++# overlapping classes, an optional element between repeated ones), and a
++# later element then fails. So for every quantifier of every pattern the
++# fourth family builds: the shortest text that brings the pattern to that
++# quantifier, one unit the quantifier repeats, many times, and a tail that
++# fails (rev 15's board: `tokens: [` + spaces with no `]` was cubic).
++
++
++def _sample(tree: Iterable[tuple[object, object]]) -> str:
++    """A short text the subtree matches (assertions contribute nothing)."""
++    out = []
++    for op, arg in tree:
++        if op is sre_constants.LITERAL:
++            out.append(chr(arg))  # type: ignore[arg-type]
++        elif op is sre_constants.IN:
++            chars = _class_chars(arg)  # type: ignore[arg-type]
++            out.append(chars[:1] or "a")
++        elif op is sre_constants.CATEGORY:
++            out.append(_CATEGORY_CHARS.get(arg, "a")[:1])  # type: ignore[arg-type]
++        elif op is sre_constants.ANY:
++            out.append("a")
++        elif op in (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT):
++            low = arg[0]  # type: ignore[index]
++            out.append(_sample(arg[2]) * max(low, 0))  # type: ignore[index]
++        elif op is sre_constants.SUBPATTERN:
++            out.append(_sample(arg[-1]))  # type: ignore[index]
++        elif op is sre_constants.BRANCH:
++            out.append(_sample(arg[1][0]))  # type: ignore[index]
++    return "".join(out)
++
++
++def _quantifier_leads(
++    tree: list[tuple[object, object]], prefix: str
++) -> Iterator[tuple[str, str]]:
++    """(text that brings the pattern to a quantifier, one unit it repeats),
++    for every quantifier in ``tree``."""
++    for index, (op, arg) in enumerate(tree):
++        before = prefix + _sample(tree[:index])
++        if op in (sre_constants.MAX_REPEAT, sre_constants.MIN_REPEAT):
++            body = list(arg[2])  # type: ignore[index]
++            unit = _sample(body) or "a"
++            yield before, unit
++            yield from _quantifier_leads(body, before)
++        elif op is sre_constants.SUBPATTERN:
++            yield from _quantifier_leads(list(arg[-1]), before)  # type: ignore[index]
++        elif op is sre_constants.BRANCH:
++            for branch in arg[1]:  # type: ignore[index]
++                yield from _quantifier_leads(list(branch), before)
++
++
++QUANTIFIER_TAILS = ("", "!", "\n", '"', "]", "x")
++
++
++def quantifier_shapes(
++    patterns: Iterable[re.Pattern[str]],
++) -> dict[str, Callable[[int], str]]:
++    out: dict[str, Callable[[int], str]] = {}
++    for pattern in patterns:
++        tree = list(sre_parse.parse(pattern.pattern, pattern.flags))
++        for lead, unit in set(_quantifier_leads(tree, "")):
++            if len(lead) > 200:
++                continue
++            for tail in QUANTIFIER_TAILS:
++
++                def make(
++                    n: int, lead: str = lead, unit: str = unit, tail: str = tail
++                ) -> str:
++                    return (
++                        lead
++                        + unit * max(1, (n - len(lead) - len(tail)) // len(unit))
++                        + tail
++                    )
++
++                out[f"q({lead!r})+{unit!r}*k+{tail!r}"] = make
++    return out
 diff --git a/tests/test_redaction_additive.py b/tests/test_redaction_additive.py
 new file mode 100644
-index 0000000000000000000000000000000000000000..53f0c17f3a7443778d7f8b9c6f6ab58c2c719f6f
+index 0000000000000000000000000000000000000000..4fc20e25d687810b8033e632f31eddc34da1bbe8
 --- /dev/null
 +++ b/tests/test_redaction_additive.py
-@@ -0,0 +1,955 @@
+@@ -0,0 +1,1196 @@
 +"""The additive redaction rules (Consiliency/pmcp#234).
 +
 +`sanitize_auth_diagnostic` and `PolicyManager.redact_secrets` run the
@@ -3741,6 +3957,29 @@ index 0000000000000000000000000000000000000000..53f0c17f3a7443778d7f8b9c6f6ab58c
 +    assert bad == [], bad[:20]
 +
 +
++def test_floor_with_the_default_400_character_cut() -> None:
++    """`sanitize_auth_diagnostic` cuts after both passes. The cut output is
++    still the redactor's output with markers written in: every stretch of
++    it outside a marker occurs, in order, in the redactor's FULL output.
++    (It can show text past the redactor's own 400-character window when an
++    additive marker is shorter than what it replaced -- text the redactor
++    kept, only cut.)"""
++    texts = _texts(G.corpus(1)[::5]) + _board_texts()
++    texts.append(
++        "-----BEGIN RSA PRIVATE KEY-----\n"
++        + "A" * 300
++        + "\n-----END RSA PRIVATE KEY-----"
++        + " word" * 120
++        + " TAIL"
++    )
++    bad = [
++        t[:80]
++        for t in texts
++        if not _is_additive_of(sanitize_auth_diagnostic(t), _main_e(t))
++    ]
++    assert bad == [], bad[:10]
++
++
 +@pytest.mark.slow
 +def test_floor_on_tier_2() -> None:
 +    rows = [row for i, row in enumerate(G.corpus(1)) if i % 3] + G.corpus(2)[
@@ -3825,39 +4064,113 @@ index 0000000000000000000000000000000000000000..53f0c17f3a7443778d7f8b9c6f6ab58c
 +        test_a_span_across_a_string_boundary_is_confined_to_the_string()
 +
 +
++def test_object_keys_are_left_alone_so_entries_never_collide() -> None:
++    """Two random-looking keys redacted to the same marker collapsed a map to
++    its last entry (rev 15's board). The additive pass writes only into
++    string VALUES of a document."""
++    obj = {"Xk9mQ2vLp3RtY7wBaaQ1": 1, "Pq7rS2tUv9WxY3zAbC4d": 2}
++    assert _ours_process(obj) == obj
++    doc = json.dumps({"Xk9mQ2vLp3RtY7wBaaQ1": "Pq7rS2tUv9WxY3zAbC4d"})
++    assert json.loads(_ours_e(doc)) == {"Xk9mQ2vLp3RtY7wBaaQ1": "[REDACTED]"}
++
++
++def test_object_keys_mutant_clipping_into_keys(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Rev 15's clipping, which let spans into object keys, collides them."""
++    monkeypatch.setattr(A, "_is_object_key", lambda text, end: False)
++    with pytest.raises(AssertionError):
++        test_object_keys_are_left_alone_so_entries_never_collide()
++
++
 +# ================================================================ markers ==== #
 +
 +
-+def test_markers_are_never_split_or_respelled() -> None:
-+    """Every `REDACTED` in the output belongs to a whole marker; every marker
-+    of the base output is still there, whole or inside a larger replaced
-+    stretch; and the additive pass is idempotent."""
++def _four_surfaces() -> dict[str, tuple[Callable[[str], str], Callable[[str], str]]]:
++    """(ours, the redactor's) for E, P, POs and POd, each as text."""
 +    policy = PolicyManager()
-+    texts = _texts(G.corpus(1)[::3]) + _board_texts()
-+    texts += [
-+        "password=[REDACTED]",
-+        "token=%5BREDACTED%5D&x=1",
-+        "[REDACTED]abc123def456",
-+    ]
++
++    def ours_pod(text: str) -> str:
++        return json.dumps(_ours_process({"t": text}))
++
++    def main_pod(text: str) -> str:
++        return json.dumps(_main_process({"t": text}))
++
++    return {
++        "E": (_ours_e, _main_e),
++        "P": (policy.redact_secrets, _main_p),
++        "POs": (lambda t: str(_ours_process(t)), lambda t: str(_main_process(t))),
++        "POd": (ours_pod, main_pod),
++    }
++
++
++_MARKER_TEXTS = [
++    "see https://h.example/cb?token=abc123def456&page=2 now",
++    "https://api.example.com/v1/items?token=abc&page=3&limit=50",
++    "https://h/?api_key=k1&password=p2&secret=s3&pwd=p4&passwd=p5&x=1",
++    "password=[REDACTED] then token: [REDACTED] and Bearer [REDACTED]",
++    "token=%5BREDACTED%5D&next=https://h/?q=1",
++    "[REDACTED]abc123def456 [REDACTED] ghp_16C7e42F292c6912E7710c838347Ae178B4a",
++]
++
++
++def _marker_problems(texts: list[str]) -> list[str]:
++    """On all four surfaces: every marker of the redactor's output is still
++    there, whole and with its spelling, in order; no `REDACTED` appears
++    outside a whole marker; and (E, P) the additive pass leaves its own
++    output as it is -- it never marks a marker again."""
++    bad = []
 +    for text in texts:
-+        for base, ours in (
-+            (_main_e(text), _ours_e(text)),
-+            (_main_p(text), policy.redact_secrets(text)),
-+        ):
-+            stray = _MARKER_SPLIT_RE.sub("", ours).count(
-+                "REDACTED"
-+            ) - _MARKER_SPLIT_RE.sub("", base).count("REDACTED")
-+            assert stray <= 0, (text, ours)
-+            assert A.redact_additive(ours) == ours or "REDACTED" in ours, (text, ours)
-+            assert len(_MARKER_SPLIT_RE.findall(ours)) >= min(
-+                1, len(_MARKER_SPLIT_RE.findall(base))
-+            ), (text, ours)
++        for label, (ours, main) in _four_surfaces().items():
++            base, out = main(text), ours(text)
++            base_markers = _MARKER_SPLIT_RE.findall(base)
++            out_markers = _MARKER_SPLIT_RE.findall(out)
++            position = 0
++            for marker in base_markers:
++                found = out.find(marker, position)
++                if found < 0:
++                    bad.append(
++                        f"{label}: lost or re-spelled {marker} in {text!r} -> {out!r}"
++                    )
++                    break
++                position = found + len(marker)
++            if "REDACTED" in _MARKER_SPLIT_RE.sub("", out):
++                bad.append(f"{label}: a split marker in {out!r}")
++            if len(out_markers) < len(base_markers):
++                bad.append(f"{label}: fewer markers in {out!r}")
++            again = (
++                A.redact_additive(out)
++                if label == "E"
++                else PolicyManager()._redact_additive(out)
++                if label == "P"
++                else out
++            )
++            if again != out:
++                bad.append(f"{label}: the additive pass changes its own output {out!r}")
++    return bad
 +
 +
-+def test_a_marker_the_url_rule_wrote_keeps_its_spelling() -> None:
-+    text = "see https://h.example/cb?token=abc123def456&page=2 now"
-+    assert _ours_e(text) == _main_e(text)
-+    assert "%5BREDACTED%5D" in _ours_e(text)
++def test_markers_are_kept_whole_and_spelled_as_written_on_every_surface() -> None:
++    texts = _MARKER_TEXTS + _texts(G.corpus(1)[::7]) + _board_texts()
++    assert _marker_problems(texts) == [], _marker_problems(texts)[:10]
++
++
++def test_markers_mutant_a_policy_value_run_through_a_marker(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Rev 15's policy pass (no marker skip, no stop at `&` in a query, and
++    a merge that swallowed markers) re-spelled the URL marker and lost the
++    rest of the query."""
++    import pmcp.policy.policy as P
++
++    monkeypatch.setattr(P, "starts_with_marker", lambda value: False)
++    monkeypatch.setattr(P, "_url_query_ranges", lambda text: [])
++    monkeypatch.setattr(A, "_MARKER_RE", re.compile(r"(?!)"))
++    assert _marker_problems(_MARKER_TEXTS[:2]) != []
++
++
++def test_a_policy_value_in_a_query_ends_at_the_next_parameter() -> None:
++    policy = PolicyManager()
++    out = policy.redact_secrets("x https://h/?q=1&token=abc123def456zz&page=2#top y")
++    assert "abc123def456zz" not in out and "&page=2" in out, out
 +
 +
 +# ============================================================= what it adds ==== #
@@ -3892,6 +4205,13 @@ index 0000000000000000000000000000000000000000..53f0c17f3a7443778d7f8b9c6f6ab58c
 +                continue
 +            for surface in (_ours_e, _ours_p):
 +                assert probe not in surface(text), (text, surface(text))
++
++
++def test_an_upper_case_scheme_does_not_hide_userinfo() -> None:
++    for text in ("HTTPS://user:s3cr3tpass@h.example/p", "Http://u:hunter2x@h.example/"):
++        for surface in (_ours_e, _ours_p):
++            out = surface(text)
++            assert "s3cr3tpass" not in out and "hunter2x" not in out, out
 +
 +
 +def test_operator_pattern_padding_is_kept_whole() -> None:
@@ -3961,6 +4281,8 @@ index 0000000000000000000000000000000000000000..53f0c17f3a7443778d7f8b9c6f6ab58c
 +    "Bearer values in a JSON document": lambda n: json.dumps({f"k{i}": "Bearer x" for i in range(n // 20)}),
 +    "tokens in a JSON document": lambda n: json.dumps({f"k{i}": "ghp_abcdefghij1234" for i in range(n // 30)}),
 +    "long joined keys": lambda n: ("a" * 170 + "_token" * 14 + "=Hunter2abc9 ") * (n // 267),
++    "an unterminated keyword list": lambda n: "tokens: [" + " " * n + "x",
++    "a list in a JSON leaf": lambda n: json.dumps({"t": "tokens: [" + " " * n}),
 +}  # fmt: skip
 +
 +
@@ -4138,21 +4460,156 @@ index 0000000000000000000000000000000000000000..53f0c17f3a7443778d7f8b9c6f6ab58c
 +    return texts
 +
 +
-+def test_the_key_prefilter_folds_as_the_keyword_patterns_do() -> None:
-+    """The keyword passes are skipped when no key literal occurs; that is a
-+    necessary condition only if the prefilter folds every character
-+    `re.IGNORECASE` folds onto an ASCII letter."""
-+    import string as _string
++def _fold_variants() -> list[str]:
++    """Every key word with each of its letters replaced by every character
++    Python's `re.IGNORECASE` treats as equal to it, plus the multi-character
++    folds (`ß` for `ss`, `ẞ`, `ﬁ`/`ﬂ`/`ﬀ` ligatures) that full case
++    folding has and simple folding does not."""
++    ascii_class = re.compile("[a-z0-9_-]", re.IGNORECASE)
++    fold: dict[str, set[str]] = {}
++    for letter in string.ascii_lowercase:
++        fold[letter] = {letter.upper()}
++    for i in range(0x80, 0x110000):
++        char = chr(i)
++        if ascii_class.fullmatch(char):
++            for letter in string.ascii_lowercase:
++                if re.fullmatch(letter, char, re.IGNORECASE):
++                    fold[letter].add(char)
++    texts = []
++    for key in sorted(A.ADDITIVE_SECRET_KEYS) + ["api_key", "apikey", "private_key"]:
++        for index, letter in enumerate(key):
++            for other in sorted(fold.get(letter.lower(), set())):
++                texts.append(key[:index] + other + key[index + 1 :])
++        texts.append(key.replace("ss", "\u00df").replace("s", "\u017f", 1))
++        texts.append(key.replace("ss", "\u1e9e"))
++        texts.append(key.replace("fi", "\ufb01").replace("ff", "\ufb00"))
++    return texts
 +
-+    ascii_class = re.compile("(?i)[a-z]")
-+    extra = {
-+        chr(i)
-+        for i in range(0x110000)
-+        if ascii_class.fullmatch(chr(i))
-+        and not (len(chr(i).lower()) == 1 and chr(i).lower() in _string.ascii_lowercase)
-+    }
-+    assert extra <= set(map(chr, A._FOLDS))
-+    for key in ("paſſword=hunter22x", "İd_token=abc123def", "apiKey=abc123def"):
-+        assert A._may_hold_a_key(key), key
++
++def test_the_key_prefilter_never_hides_a_keyword_match() -> None:
++    """The keyword passes are skipped only when the prefilter finds no key.
++    The prefilter IS their key alternation under their flag, so it can only
++    miss what they miss: checked here against the passes' own patterns, on
++    every key with every case-fold variant of each letter and the
++    multi-character folds, each in a separator and a whitespace context."""
++    for key in _fold_variants():
++        for text in (f"{key}=hunter22x", f"{key} abc123def456", f'{key}: ["a1b2c3d4"]'):
++            matched = any(
++                pattern.search(text) is not None
++                for pattern in (A._KEYWORD_SEP_RE, A._KEYWORD_LIST_RE, A._KEYWORD_WS_RE)
++            )
++            if matched:
++                assert A._may_hold_a_key(text), text
++
++
++def test_multi_character_folds_do_not_match_on_this_interpreter() -> None:
++    """Python's `re` applies simple case folding only: `(?i)password` does not
++    match `paßword` (nor `paẞword`), so neither the redactor's keyword rule nor
++    the additive rules read it as a key -- the prefilter changes nothing
++    there (a reported multi-character-fold gap, checked and not present)."""
++    assert re.search("(?i)password", "pa\u00dfword") is None
++    assert re.search("(?i)password", "pa\u1e9eword") is None
++    for surface in (_ours_e, _main_e):
++        assert "hunter2" in surface("pa\u00dfword=@hunter2")
++
++
++# ============================================= regex quantifier structure ==== #
++
++
++def _quantifier_shapes() -> dict[str, Callable[[int], str]]:
++    from tests import _redaction_shapes as S
++
++    return S.quantifier_shapes(S.redactor_patterns())
++
++
++_CAPS = {4_096: 1.0, 16_384: 2.0, 65_536: 5.0}
++
++
++def _over_cap(name: str, sizes: tuple[int, ...], leaf: bool = True) -> list[str]:
++    import time
++
++    shape = _QSHAPES[name] if _QSHAPES else _quantifier_shapes()[name]
++    over = []
++    surfaces = dict(_entry_points())
++    if leaf:
++        surfaces["E-leaf"] = lambda t: sanitize_auth_diagnostic(
++            json.dumps({"t": t}), max_length=None
++        )
++    for size in sizes:
++        text = shape(size)
++        for label, run in surfaces.items():
++            started = time.perf_counter()
++            run(text)
++            elapsed = time.perf_counter() - started
++            if elapsed > _CAPS[size]:
++                over.append(f"{name} {label} {size}: {elapsed:.2f}s")
++    return over
++
++
++_QSHAPES: dict[str, Callable[[int], str]] = {}
++
++
++def _screen_quantifier(name: str) -> list[str]:
++    if not _QSHAPES:
++        _QSHAPES.update(_quantifier_shapes())
++    return _over_cap(name, (4_096,), leaf=False)
++
++
++def test_no_regex_backtracks_on_its_own_quantifier_structure() -> None:
++    """Every quantifier of every redactor regex, reached by the shortest text
++    that leads to it, one unit repeated to 4 KB, and each of six failing
++    tails: on the engine, in worker processes, under a 1 s cap (rev 15's
++    list body took 30 s here; now every shape takes milliseconds). The work
++    counter cannot see a regex's own backtracking; this can."""
++    names = sorted(_quantifier_shapes())
++    assert len(names) > 500
++    ctx = multiprocessing.get_context("spawn")
++    with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
++        over = [
++            o
++            for found in pool.imap_unordered(_screen_quantifier, names, chunksize=10)
++            for o in found
++        ]
++    assert over == [], over[:10]
++
++
++@pytest.mark.slow
++@pytest.mark.parametrize("chunk", range(4))
++def test_no_regex_backtracks_at_64_kb_on_any_surface(chunk: int) -> None:
++    """The same shapes at 4, 16 and 64 KB on every entry point and inside a
++    JSON string leaf, under generous caps (1, 2 and 5 s)."""
++    names = sorted(_quantifier_shapes())[chunk::4]
++    ctx = multiprocessing.get_context("spawn")
++    with ctx.Pool(min(20, multiprocessing.cpu_count())) as pool:
++        over = [
++            o
++            for found in pool.imap_unordered(_full_quantifier, names, chunksize=5)
++            for o in found
++        ]
++    assert over == [], over[:10]
++
++
++def _full_quantifier(name: str) -> list[str]:
++    if not _QSHAPES:
++        _QSHAPES.update(_quantifier_shapes())
++    return _over_cap(name, (4_096, 16_384, 65_536))
++
++
++def test_list_backtracking_mutant(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Rev 15's list body (three `\\s*` that could split one run) restored:
++    `tokens: [` + 2 KB of spaces and no `]` is over the cap again."""
++    old_body = (
++        r"(?P<list>\[\s*(?:(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'|-?[0-9][0-9.eE+-]*"
++        r"|null|true|false)\s*,\s*)*(?:(?:\"(?:[^\"\\\n]|\\.)*\"|'(?:[^'\\\n]|\\.)*'"
++        r"|-?[0-9][0-9.eE+-]*|null|true|false))?\s*,?\s*\])"
++    )
++    monkeypatch.setattr(
++        A, "_KEYWORD_LIST_RE", re.compile(A._KEYWORD_KEY_SEP + old_body, re.IGNORECASE)
++    )
++    import time
++
++    started = time.perf_counter()
++    sanitize_auth_diagnostic("tokens: [" + " " * 2048 + "x", max_length=None)
++    assert time.perf_counter() - started > 1.0
 ```
 <!-- PATCH-END -->
