@@ -30,6 +30,7 @@ import re
 import time
 from collections import Counter
 from collections.abc import Callable
+from urllib.parse import unquote
 
 import pytest
 
@@ -487,12 +488,38 @@ def _construction(rows: list[G.Row]) -> tuple[Counter[str], list[str]]:
                     for m in re.finditer(re.escape(piece), text)
                     if s.start < m.end() and m.start() < s.end
                 }
+                if not explained and _kept_with_insertions(
+                    piece, _main_output(surface, text)
+                ):
+                    counts["R:main kept it, re-encoded"] += 1
+                    continue
                 if not explained:
                     problems.append(
                         f"{surface} {piece!r} unexplained in {row.get('t', row.get('o'))!r}"
                     )
                 counts.update("B:" + name for name in explained)
     return counts, problems
+
+
+def _main_output(surface: str, text: str) -> str:
+    """Main's output for the text a surface's redactor reads (no truncation
+    in these corpora, so `process_output` is `redact_secrets`)."""
+    if surface.startswith("E"):
+        return M.sanitize_auth_diagnostic(text, max_length=None)
+    return M.redact_secrets(text, MAIN_PATTERNS)
+
+
+def _kept_with_insertions(piece: str, out: str) -> bool:
+    """Is ``piece`` in main's output with a few characters inserted into it
+    (as written or percent-decoded)? Main's URL rewrite gives a bare query
+    key an `=` (`?urn:x:tok.` becomes `?urn%3Ax%3Atok=.`): the piece's
+    characters are all still there, which the piece metric reads as a
+    removal. Decided from main's own output, not from the floor."""
+    pattern = re.compile(
+        re.escape(piece[0])
+        + "".join(r"[^\s]{0,3}?" + re.escape(char) for char in piece[1:])
+    )
+    return any(pattern.search(form) for form in (out, unquote(out)))
 
 
 def _process_with(policy: PolicyManager) -> Callable[[object], object]:
@@ -527,7 +554,9 @@ def test_construction_holds_on_the_grammar_tier_1_and_the_board_rows(rows: str) 
     classification anywhere."""
     counts, problems = _construction(G.corpus(1) if rows == "tier1" else _board_rows())
     assert problems == [], "\n".join(problems[:25])
-    assert {name.split(":", 1)[1] for name in counts} <= set(F.SUPPRESSIONS)
+    assert {
+        name.split(":", 1)[1] for name in counts if not name.startswith("R:")
+    } <= set(F.SUPPRESSIONS)
     assert sum(v for k, v in counts.items() if k.startswith("A:")) > 100, counts
 
 
@@ -537,7 +566,9 @@ def test_construction_holds_on_the_grammar_tier_2(block: str) -> None:
     rows = [row for row in G.corpus(2) if row["block"] == block]
     counts, problems = _construction(rows)
     assert problems == [], "\n".join(problems[:25])
-    assert {name.split(":", 1)[1] for name in counts} <= set(F.SUPPRESSIONS)
+    assert {
+        name.split(":", 1)[1] for name in counts if not name.startswith("R:")
+    } <= set(F.SUPPRESSIONS)
 
 
 def test_construction_holds_on_the_json_fuzz() -> None:
