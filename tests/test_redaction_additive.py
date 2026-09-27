@@ -1328,7 +1328,7 @@ def test_partly_marked_mutant_rev_16_merge(monkeypatch: pytest.MonkeyPatch) -> N
 # tail of a value under a whitespace-keyed flag (`--password x`), whose
 # additive rule cannot start on the marker (pinned below).
 
-_TAIL_STOPS = frozenset(";,&#()[]{}")
+_TAIL_STOPS = frozenset(";,&#()[]{}<")
 _TAIL_PUNCT = "!@$%^*()[]{}|;:,<>?#&~+=/._-"
 _TAIL_FORMS = (
     "password={v}",
@@ -1404,9 +1404,19 @@ def _tail_failures(punct: str, count: int, seed: int) -> list[str]:
             text = form.format(v=value)
             for label, out in _tail_surfaces(text).items():
                 k = _tail_left(value, text, out)
-                if k is not None and not any(c in _TAIL_STOPS for c in value[: k + 1]):
+                if k is not None and not _after_a_stop(value, k):
                     bad.append(f"{label} {text!r} -> {out!r}")
     return bad
+
+
+def _after_a_stop(value: str, k: int) -> bool:
+    """What survives from ``k`` on begins at or after the value's first
+    stop, or only punctuation lies between ``k`` and that stop (a glued
+    run of punctuation alone is left, D1: `[REDACTED]!(rest`)."""
+    first = next((j for j, c in enumerate(value) if c in _TAIL_STOPS), None)
+    if first is None:
+        return False
+    return first <= k or not any(c.isalnum() for c in value[k:first])
 
 
 def test_the_end_of_a_value_is_removed_on_every_surface() -> None:
@@ -1460,7 +1470,7 @@ def test_an_arn_under_an_arn_key_keeps_its_resource_name() -> None:
 def test_arn_exemption_mutant(monkeypatch: pytest.MonkeyPatch) -> None:
     """Without the exemption the prose corpus's ARN line differs from the
     redactor's output (rev 17 board: 2 of 2 002 prose lines)."""
-    monkeypatch.setattr(A, "_is_resource_name_tail", lambda text, marker: False)
+    monkeypatch.setattr(A, "_is_resource_name_tail", lambda text, marker, glued: False)
     assert _ours_e(PROSE) != _main_e(PROSE)
 
 
@@ -1484,6 +1494,200 @@ def test_disclosed_a_punctuation_only_tail_stays() -> None:
         assert out.endswith(("token=[REDACTED]!", 'token=[REDACTED]!"}')), (label, out)
     for label, out in _tail_surfaces("token=abcdef!").items():
         assert "[REDACTED]!" in out and "abcdef" not in out, (label, out)
+
+
+# ---------------------------------------------- code and log text (rev 19) --- #
+#
+# The glued run must not extend the redactor's own false positives in code
+# and delimited logs, nor take the next field (rev 18.1's board, F-1):
+# `f(token=[REDACTED],page=2)` keeps `,page=2`. It stops at `,`, `;`, `(`,
+# `[`, `{` and `<` besides whitespace, `&`, `#`, quotes and backslashes.
+
+_CODE_LINES = (
+    "tokens = self._tokenize(query)",
+    "f(token=abcdef,page=2)",
+    "(token=abcdef),next",
+    "tokens = tokenizer.encode(text)[0]",
+    "secret = load_secret(path)",
+    "Set-Cookie: session=abc123def;Path=/;HttpOnly",
+    'api_key = os.environ["API_KEY"]',
+    "let token = await getToken({ user })",
+    "INFO Token=bvp1Q11NE8</td><td>ok</td> done",
+    "auth_token=deadbeefcafe,user=bob,ip=10.0.0.1",
+)
+_LOG_KEYS = (
+    "token",
+    "access_token",
+    "id_token",
+    "refresh_token",
+    "auth_token",
+    "session_token",
+    "csrf_token",
+    "api_key",
+    "apikey",
+    "password",
+    "secret",
+    "client_secret",
+    "Token",
+    "TOKEN",
+)
+#: (what follows the value, the field that must stay): each begins at a
+#: stop, or at a closing bracket and then a stop.
+_LOG_TAILS = (
+    (",page=2", "page=2"),
+    (",next", "next"),
+    ("),next", "next"),
+    (";Path=/;HttpOnly", "Path=/"),
+    (";path=/", "path=/"),
+    ("</td><td>ok</td>", "<td>ok"),
+    ("],user=bob", "user=bob"),
+    ("},{id:2}", "id:2"),
+    (",expires_in=3600", "expires_in=3600"),
+    (",user=bob,ip=10.0.0.1", "user=bob"),
+    ("<br>next", "<br>next"),
+    (";expires=Wed, 21 Oct 2026 07:28:00 GMT", "expires=Wed"),
+)
+_LOG_PREFIXES = (
+    "",
+    "f(",
+    "[",
+    "user=bob,",
+    "ts=1 level=info ",
+    "Set-Cookie: ",
+    "cookie: a=1;",
+    "INFO ",
+    "(",
+    "{",
+)
+
+
+def _log_value(rng: random.Random) -> str:
+    alnum = string.ascii_letters + string.digits
+    roll = rng.random()
+    if roll < 0.5:
+        return "".join(rng.choice(alnum) for _ in range(rng.randint(8, 24)))
+    if roll < 0.7:
+        return "".join(rng.choice("0123456789abcdef") for _ in range(32))
+    if roll < 0.8:
+        return str(uuid.UUID(int=rng.getrandbits(128)))
+    return (
+        "".join(rng.choice(alnum) for _ in range(6))
+        + rng.choice("!@$*~^")
+        + "".join(rng.choice(alnum) for _ in range(6))
+    )
+
+
+def _code_and_log_failures() -> list[str]:
+    """Code lines must equal the redactor's output. In a generated log
+    line whose value the redactor marked, the field after it stays wherever
+    the redactor keeps it."""
+    bad = [
+        line
+        for line in _CODE_LINES
+        if _ours_e(line) != _main_e(line) or _ours_p(line) != _main_p(line)
+    ]
+    rng = random.Random(1918)
+    for i in range(1500):
+        tail, keep = rng.choice(_LOG_TAILS)
+        sep = rng.choice(["=", "=", ":", ": "])
+        line = f"{rng.choice(_LOG_PREFIXES)}{rng.choice(_LOG_KEYS)}{sep}{_log_value(rng)}{tail} done"
+        texts = [line, json.dumps({"log": line})] if i % 3 == 0 else [line]
+        for text in texts:
+            for label, ours, main in (("E", _ours_e, _main_e), ("P", _ours_p, _main_p)):
+                base = main(text)
+                if "[REDACTED]" in base and keep in base and keep not in ours(text):
+                    bad.append(f"{label} {text!r} -> {ours(text)!r}")
+    return bad
+
+
+def test_code_and_log_text_keep_the_next_field() -> None:
+    bad = _code_and_log_failures()
+    assert bad == [], bad[:10]
+
+
+def test_code_and_log_mutant_rev_18_1_stops(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rev 18.1's stops (whitespace, `&`, `#`, quotes, backslash)."""
+    monkeypatch.setattr(A, "_GLUED_STOPS", frozenset("&#\"'\\"))
+    assert _code_and_log_failures() != []
+
+
+# ------------------------------------ a value the redactor marked twice ------ #
+#
+# When the redactor writes two markers into one value (a key word inside
+# it: `password=KtJ0R$secret=KOmx@Zq9JTe`), the run glued to the first
+# marker ends at the second; the glued run follows on after it (rev 18.1's
+# board, F-2).
+
+_INNER_KEYS = ("secret", "password", "code", "token", "api_key")
+_INNER_PUNCT = "!@$%^*|:~+/._-"
+
+
+def _marked_twice_failures(count: int, seed: int) -> list[str]:
+    rng = random.Random(seed)
+    alnum = string.ascii_letters + string.digits
+    bad = []
+    for _ in range(count):
+        tail = "Zq9" + "".join(rng.choice(alnum) for _ in range(4))
+        value = (
+            "".join(rng.choice(alnum) for _ in range(rng.randint(4, 8)))
+            + rng.choice(_INNER_PUNCT)
+            + rng.choice(_INNER_KEYS)
+            + rng.choice("=:")
+            + "".join(rng.choice(alnum) for _ in range(rng.randint(4, 8)))
+            + rng.choice(_INNER_PUNCT)
+            + tail
+        )
+        for form in ("password={v}", "token={v} end", "X-Api-Key: {v}"):
+            text = form.format(v=value)
+            for label, out in _tail_surfaces(text).items():
+                if tail in out:
+                    bad.append(f"{label} {text!r} -> {out!r}")
+    return bad
+
+
+def test_a_value_marked_twice_keeps_no_tail() -> None:
+    bad = _marked_twice_failures(300, 19)
+    assert bad == [], bad[:10]
+
+
+def test_a_value_marked_twice_mutant_rev_18_1(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Rev 18.1's run, which stopped at the next marker."""
+    monkeypatch.setattr(A, "_runs_on_into", lambda markers, i, glued, end: False)
+    assert _marked_twice_failures(300, 19) != []
+
+
+# ------------------------------------------------ ARN under any key --------- #
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "SECRET_ID=arn:aws:secretsmanager:us-east-1:123456789012:secret:MySecret-a1b2c3",
+        "secret=arn:aws:secretsmanager:us-east-1:123456789012:secret:x",
+        "token=arn:aws-cn:s3:::bucket/key",
+        "see https://h.example/cb?secret_arn=arn%3Aaws%3Asecretsmanager%3Aus-east-1"
+        "%3A123456789012%3Asecret%3Ax&page=2",
+    ],
+)
+def test_an_arn_under_any_key_is_the_redactors_output(text: str) -> None:
+    """An ARN's body after the marker the redactor wrote over `arn` is kept
+    under any key, plain or percent-encoded (rev 18.1's board, F-3)."""
+    assert _ours_e(text) == _main_e(text)
+    assert _ours_p(text) == _main_p(text)
+
+
+def test_an_arn_body_needs_a_service_field() -> None:
+    """Narrow: a partition with no service field after it is a tail."""
+    for label, out in _tail_surfaces("password=Pa55wd:aws:tailtail").items():
+        assert "tailtail" not in out, (label, out)
+    for label, out in _tail_surfaces("token=Pa55wd:aws:tailtail end").items():
+        assert "tailtail" not in out, (label, out)
+
+
+def test_arn_body_mutant(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(A, "_ARN_BODY_RE", re.compile(r"(?!)"))
+    text = "SECRET_ID=arn:aws:secretsmanager:us-east-1:123456789012:secret:x"
+    assert _ours_e(text) != _main_e(text)
 
 
 def test_the_end_of_a_value_mutant_rev_17_skip(monkeypatch: pytest.MonkeyPatch) -> None:
