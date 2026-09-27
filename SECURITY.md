@@ -124,7 +124,18 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   Redaction is applied across every task-emitting surface — `gateway.invoke`,
   `gateway.tasks_result`, `gateway.tasks_list`, and `gateway.tasks_get`, including
   task `status_message` and raw fields — and truncation summaries are built from
-  post-redaction text. Treat all logs as operational data and avoid adding
+  post-redaction text. On top of those keyword rules, additive shape-based
+  rules run over their output and can only replace more of it: vendor token
+  shapes (AWS, Slack, Google, prefixed tokens such as `glpat-`), JWTs, PEM
+  private-key blocks, high-entropy runs, values under a wider set of secret
+  keys, URL userinfo, fragments and secret-keyed query values (judged after
+  percent-decoding), and the text glued to the end of an existing marker
+  (up to a delimiter; see the residuals). Every
+  piece the keyword rules remove stays removed, markers are kept as
+  written, and a JSON document stays valid. The residual classes (for
+  example a tail after `,`, `;`, `&` or `#`, and a value under a
+  whitespace-separated `--password` flag) are listed in the plan for
+  Consiliency/pmcp#234. Treat all logs as operational data and avoid adding
   secrets to server names, tool names, or free-form descriptions.
 - **Credential isolation is scoped, not identity-complete**: user-scope env-store files are owned by
   the local OS account, project-scope env-store files are owned by the project

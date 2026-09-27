@@ -20,6 +20,7 @@ import jwt
 from jwt import PyJWKSet
 
 from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
+from pmcp.redaction_additive import redact_additive
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
 
@@ -578,8 +579,20 @@ def sanitize_url_elicitation_url(
 
 
 def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
-    """Return a display-safe diagnostic string for auth failures."""
-    text = str(value)
+    """Return a display-safe diagnostic string for auth failures.
+
+    The redactor's own rules run first, unchanged (`_sanitize_base`); the
+    additive rules (`pmcp.redaction_additive`) then run over that output and
+    can only replace more of it with the marker (Consiliency/pmcp#234). The
+    cut is taken last, as before.
+    """
+    text = redact_additive(_sanitize_base(str(value)))
+    return text if max_length is None else text[:max_length]
+
+
+def _sanitize_base(text: str) -> str:
+    """The redactor's own rules, in order: URLs, Authorization, Bearer, the
+    keyword rule, JWTs."""
 
     def redact_url_match(match: re.Match[str]) -> str:
         whole = match.group(0)
@@ -595,7 +608,7 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> 
     text = re.sub(r"(?i)(\bbearer\s+)[^\s,;]+", r"\1[REDACTED]", text)
     text = redact_keyword_values(text, _KEYWORD_KEY_START)
     text = _JWT_RE.sub("[REDACTED]", text)
-    return text if max_length is None else text[:max_length]
+    return text
 
 
 def _parse_www_auth_params(raw: str) -> dict[str, str]:

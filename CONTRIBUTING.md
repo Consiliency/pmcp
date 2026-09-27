@@ -30,6 +30,10 @@ uv run pytest tests/test_policy.py -v
 
 # Run integration tests (uses manifest auto-start servers)
 uv run pytest tests/test_integration.py -v
+
+# Run the slow tier (excluded by default: the redactor's large
+# differentials and regex sweeps)
+uv run pytest -m 'slow and not live'
 ```
 
 ### Timing in tests
