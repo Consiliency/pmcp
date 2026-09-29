@@ -30,6 +30,7 @@ hash of the value is disclosed either.
 from __future__ import annotations
 
 import copy
+import functools
 from unittest import mock
 import hashlib
 import json
@@ -160,6 +161,16 @@ def _positions(
 
 def _invalid_values(node: dict[str, Any], s: str) -> list[tuple[str, Any]]:
     """Values this schema node rejects, each carrying `s` in every slot."""
+    return [
+        (label, value)
+        for label, value in _candidate_values(node, s)
+        if not jsonschema.validators.validator_for(node)(node).is_valid(value)
+    ]
+
+
+def _candidate_values(node: dict[str, Any], s: str) -> list[tuple[str, Any]]:
+    """The shapes `_invalid_values` tries (unchecked: a case's build reuses
+    the shape its construction already checked)."""
     types = _types(node)
     candidates: list[tuple[str, Any]] = []
     if types and "string" not in types:
@@ -176,11 +187,7 @@ def _invalid_values(node: dict[str, Any], s: str) -> list[tuple[str, Any]]:
             candidates.append(("maxLength", s * (node["maxLength"] // len(s) + 1)))
         if "enum" in node:
             candidates.append(("enum", s))
-    return [
-        (label, value)
-        for label, value in candidates
-        if not jsonschema.validators.validator_for(node)(node).is_valid(value)
-    ]
+    return candidates
 
 
 def _open_containers(schema: dict[str, Any]) -> list[tuple[str | int, ...]]:
@@ -200,6 +207,12 @@ def _open_content(s: str) -> dict[str, Any]:
 
 def _baseline(tool: Any) -> dict[str, Any]:
     """The smallest arguments the tool's schema accepts, from its schema."""
+    return copy.deepcopy(_checked_baseline(tool.name))
+
+
+@functools.cache
+def _checked_baseline(name: str) -> dict[str, Any]:
+    tool = _tools()[name]
     schema = tool.input_schema
     baseline: dict[str, Any] = {}
     for name in schema.get("required") or []:
@@ -246,8 +259,16 @@ def _decorated(tool: Any, s: str) -> dict[str, Any]:
     arguments[f"extra_{s}"] = {s: [s]}
     for path in _open_containers(tool.input_schema):
         _set(arguments, path, _open_content(s), s)
-    jsonschema.validate(arguments, tool.input_schema)
     return arguments
+
+
+@pytest.mark.parametrize("name", sorted(_tools()))
+def test_every_decorated_baseline_passes_the_gate(name: str) -> None:
+    """Decorations alone are accepted, so a case's rejection is its own."""
+    tool = _tools()[name]
+    for sentinels in _FAMILIES.values():
+        for s in sentinels:
+            jsonschema.validate(_decorated(tool, s), tool.input_schema)
 
 
 def _expected_path(path: tuple[str | int, ...]) -> str:
@@ -335,7 +356,7 @@ def _cases() -> list[_Case]:
 
                 def build(s: str, tool=tool, path=path, node=node, label=label) -> dict:
                     arguments = _decorated(tool, s)
-                    value = dict(_invalid_values(node, s))[label]
+                    value = dict(_candidate_values(node, s))[label]
                     _set(arguments, path, value, s)
                     return arguments
 
@@ -398,7 +419,7 @@ def _cases() -> list[_Case]:
                             # By name only: with the alias present too,
                             # pydantic reads the alias.
                             assert arguments.pop(alias, None) is not None
-                            arguments[field_name] = dict(_invalid_values(node, s))[
+                            arguments[field_name] = dict(_candidate_values(node, s))[
                                 label
                             ]
                             return arguments

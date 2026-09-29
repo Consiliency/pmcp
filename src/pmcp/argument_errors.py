@@ -38,6 +38,7 @@ unless the error is, or embeds the text of, a validation error, and
 from __future__ import annotations
 
 import json
+import sys
 import traceback
 from collections.abc import Iterable, Iterator
 from typing import Any
@@ -138,32 +139,42 @@ _CONSTRAINED_PHRASES: dict[str, tuple[str, str, str]] = {
 }
 
 
+#: `_declared_names` for a given set of loaded modules (its key).
+_declared_cache: tuple[int, frozenset[str]] | None = None
+
+
 def _declared_names() -> frozenset[str]:
     """Every field name and alias of every pydantic model pmcp defines.
 
     Written by pmcp's authors, never by a caller or a downstream server, so a
     location segment equal to one discloses nothing pmcp's own source does not.
+    Read from the ``pmcp.*`` modules' namespaces, and recomputed only when a
+    module has been imported since.
     """
+    global _declared_cache
     from pydantic import BaseModel
 
-    import pmcp.types  # noqa: F401 -- the models are defined on import
+    import pmcp.types  # noqa: F401 -- the argument models, at least
 
+    key = len(sys.modules)
+    if _declared_cache is not None and _declared_cache[0] == key:
+        return _declared_cache[1]
     names: set[str] = set()
-    seen: set[type] = set()
-    pending: list[type] = [BaseModel]
-    while pending:
-        model = pending.pop()
-        if model in seen:
+    for module_name, module in list(sys.modules.items()):
+        if module is None or not module_name.startswith("pmcp."):
             continue
-        seen.add(model)
-        pending.extend(model.__subclasses__())
-        if not model.__module__.startswith("pmcp."):
-            continue
-        for name, field in getattr(model, "model_fields", {}).items():
-            names.add(name)
-            if isinstance(field.alias, str):
-                names.add(field.alias)
-    return frozenset(names)
+        for value in list(vars(module).values()):
+            if (
+                isinstance(value, type)
+                and issubclass(value, BaseModel)
+                and value.__module__ == module_name
+            ):
+                for name, field in value.model_fields.items():
+                    names.add(name)
+                    if isinstance(field.alias, str):
+                        names.add(field.alias)
+    _declared_cache = (key, frozenset(names))
+    return _declared_cache[1]
 
 
 def _render_path(segments: Iterable[str | int | None]) -> str:
