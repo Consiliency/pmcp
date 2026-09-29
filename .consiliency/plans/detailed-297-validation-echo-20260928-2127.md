@@ -273,13 +273,16 @@ On the patched tree the same probe prints zero leaking lines, and e.g.
 `Invalid arguments: $: scoped advisor correlation fields must be supplied together`.
 
 The full sweep (`count_leaks.py`, the new test's generator run once per
-case, sentinel windows as the oracle), tests @ `19dac95`:
+case, hex family, sentinel windows as the oracle), tests @ `9c111c4`. `src/`
+is byte-identical between `9c111c4` and `929f693`: the two commits after it
+touch only `tests/test_argument_error_echo.py`. So this stands for the
+shipped tree.
 
 ```text
-== pmcp-297-main 7680445 (tests @19dac95)
+== pmcp-297-ref 7680445 (tests @9c111c4, hex family)
 plain {'gate': 248, 'model': 6} {('gate', 'response'): 225, ('model', 'log'): 6, ('model', 'response'): 6}
 audited {'gate': 248, 'model': 6} {('gate', 'response'): 225, ('model', 'audit'): 1, ('model', 'log'): 6, ('model', 'response'): 6}
-== pmcp-297-mut 19dac95 (tests @19dac95)
+== pmcp-297-code 9c111c4 (tests @9c111c4, hex family)
 plain {'gate': 248, 'model': 6} {}
 audited {'gate': 248, 'model': 6} {}
 ```
@@ -433,7 +436,10 @@ point, so an in-process `int` dict key is redacted as in #296.
 `ProvisionStatusInput.model_validate` moves above the `try` (L7), so a
 rejection raises into `call_tool`'s arm like every other handler instead of
 being logged with a traceback; the arm's fallback `job_id=` now uses the
-validated id.
+validated id. Since rev 2 this is belt and braces: the arm's own sinks
+(`_sanitize_error`, `exception_text`, `safe_exc_info`) would keep the value
+out of it anyway. That is why mutant M10 is killed on behaviour (the handler
+returns instead of raising), not on a leak.
 
 ### 5. Why not a regex scrub of `str(e)`
 
@@ -577,7 +583,7 @@ static test enforces it at every sink.
 These are the patches under *Verbatim bodies* (`git diff 7680445 929f693 -- <file>`):
 28 files, +2632 / −352. One concern, rendering validation errors from
 their structure, is applied at every sink. The bounded-plan threshold of
-about 8 files is exceeded on purpose. 19 of the source files carry only the
+about 8 files is exceeded on purpose. 16 of the source files carry only the
 mechanical §7 substitution plus an import, and splitting them into another
 plan would leave the class open between the two merges.
 
