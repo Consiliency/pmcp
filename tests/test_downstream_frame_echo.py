@@ -299,20 +299,16 @@ async def _request(server: Any, method: str) -> str:
             result = await entry.handler(
                 _make_ctx(), ReadResourceRequestParams(uri="x://r")
             )
-        except Exception as error:  # noqa: BLE001 -- the SDK renders it; so do we
-            from pmcp.argument_errors import exception_text
-
-            return f"raised {type(error).__name__}: {exception_text(error)}"
+        except Exception as error:  # noqa: BLE001 -- the SDK sends `str(error)`
+            return f"raised {type(error).__name__}: {error}"
     elif method == "prompts/get":
         entry = server._server.get_request_handler("prompts/get")
         try:
             result = await entry.handler(
                 _make_ctx(), GetPromptRequestParams(name="frames::p")
             )
-        except Exception as error:  # noqa: BLE001
-            from pmcp.argument_errors import exception_text
-
-            return f"raised {type(error).__name__}: {exception_text(error)}"
+        except Exception as error:  # noqa: BLE001 -- the SDK sends `str(error)`
+            return f"raised {type(error).__name__}: {error}"
     else:
         return ""  # a connect-time method: the connect result is the output
     return result.model_dump_json()
