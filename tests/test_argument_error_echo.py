@@ -1571,12 +1571,12 @@ def test_no_downstream_listing_value_reaches_the_log(
     _, parse, valid, nested = next(p for p in _listing_parsers() if p[0] == label)
     keys = [key for key in _payload_keys(function) if key]
     tap = _Tap(typing.cast(Any, MagicMockServer()), None, caplog, capfd, recwarn)
-    from pmcp.argument_errors import exception_text
 
     def rejection(entry: dict[str, Any]) -> BaseException | None:
-        """What the real parser raised for `entry`, via the model it builds."""
+        """What the real parser raised for `entry` (its `except` hands it to
+        `describe_exception`, recorded here and rendered as its type only)."""
         with mock.patch.object(
-            manager, "describe_exception", side_effect=exception_text
+            manager, "describe_exception", side_effect=lambda exc: type(exc).__name__
         ) as seen:
             parse([entry])
         return seen.call_args.args[0] if seen.call_args else None
