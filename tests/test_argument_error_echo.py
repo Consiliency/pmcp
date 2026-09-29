@@ -66,9 +66,17 @@ _GATE_PREFIX = "Input validation error: $"
 _MODEL_PREFIX = "Invalid arguments: $"
 
 
+#: pydantic truncates a long `input_value` repr in the middle
+#: (`'Sq3b2ee216cab4bcafa8599...e216cab4bcafa85997Zx'`), so the whole sentinel
+#: never appears in such a leak; every window of this many characters is
+#: searched for instead (48 bits of hex: no accidental match).
+_WINDOW = 12
+
+
 def _forbidden(sentinel: str) -> set[str]:
-    """The sentinel and each hash of it a log or record could carry."""
-    forms = {sentinel}
+    """Every window of the sentinel, and each hash of it, a log or record
+    could carry."""
+    forms = {sentinel[i : i + _WINDOW] for i in range(len(sentinel) - _WINDOW + 1)}
     for text in (sentinel, json.dumps(sentinel), sentinel.lower()):
         forms.add(hashlib.sha256(text.encode()).hexdigest())
         forms.add(hashlib.sha1(text.encode()).hexdigest())
@@ -422,16 +430,22 @@ async def _call(server: GatewayServer, name: str, arguments: dict) -> Any:
 
 def _rejection(result: Any, layer: str) -> str:
     """The rejection text, asserting the call was rejected by argument
-    validation on `layer` (and not, say, by a missing downstream server)."""
+    validation on `layer` (an `isError` gate result, or the `{"error": true}`
+    payload of `call_tool`'s `except` arm) and not, say, accepted."""
     text = "".join(block.text for block in result.content)
     if layer == "gate":
         assert result.is_error is True, text
-        assert text.startswith(_GATE_PREFIX), text
         return text
     payload = json.loads(text)
     assert payload.get("error") is True, text
-    assert payload["message"].startswith(_MODEL_PREFIX), text
     return str(payload["message"])
+
+
+def _useful(response: str, layer: str, expected: str) -> None:
+    """The rejection says where, and why, in the value-free form."""
+    prefix = _GATE_PREFIX if layer == "gate" else _MODEL_PREFIX
+    assert response.startswith(prefix), response
+    assert expected in response, response
 
 
 class _Observed(typing.NamedTuple):
@@ -496,8 +510,8 @@ async def test_no_rejected_argument_value_reaches_a_response_log_or_audit(
                     observed.raw_log,
                 )
                 assert form not in observed.raw_audit, (case.label, "audit")
-            # Useful: the rejection names where, and why.
-            assert case.expected in observed.response, (case.label, observed.response)
+        # Useful: the rejection names where, and why.
+        _useful(seen[0].response, case.layer, case.expected)
         # Nothing else about the value -- length, count or hash -- either.
         assert seen[0].response == seen[1].response, case.label
         assert seen[0].log == seen[1].log, (case.label, seen[0].log, seen[1].log)
@@ -529,8 +543,11 @@ async def test_every_handler_rejects_what_the_gate_rejects_without_logging_it(
         handler = getattr(tools, case.tool.removeprefix("gateway."))
         for s in _SENTINELS:
             start = len(caplog.records)
-            with pytest.raises(ValidationError):
+            raised: BaseException | None = None
+            try:
                 await handler(case.build(s))
+            except Exception as error:  # noqa: BLE001 - inspected below
+                raised = error
             logged = "\n".join(
                 formatter.format(record)
                 for record in caplog.records[start:]
@@ -538,6 +555,7 @@ async def test_every_handler_rejects_what_the_gate_rejects_without_logging_it(
             )
             for form in _forbidden(s):
                 assert form not in logged, (case.label, logged)
+            assert isinstance(raised, ValidationError), (case.label, raised)
         checked += 1
     assert checked > 100, checked
 
@@ -596,15 +614,16 @@ async def test_a_validation_error_raised_by_a_handler_is_described_not_echoed(
         result = await _call(server, tool.name, {"query": "q"})
         text = "".join(block.text for block in result.content)
         payload = json.loads(text)
-        assert payload["error"] is True and payload["message"].startswith(_MODEL_PREFIX)
+        assert payload["error"] is True, text
         log = "\n".join(
             formatter.format(record)
             for record in caplog.records[start:]
             for formatter in _pmcp_formatters()
         )
-        assert "invalid arguments for gateway.catalog_search" in log
         for form in _forbidden(s):
             assert form not in text and form not in log, form
+        assert payload["message"].startswith(_MODEL_PREFIX), text
+        assert "invalid arguments for gateway.catalog_search" in log
         texts.append(text)
         logs.append(
             "\n".join(
