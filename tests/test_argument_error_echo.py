@@ -30,6 +30,7 @@ hash of the value is disclosed either.
 from __future__ import annotations
 
 import copy
+import gc
 import functools
 from unittest import mock
 import hashlib
@@ -567,6 +568,10 @@ class _Tap:
     ) -> None:
         self.server, self.audit_path = server, audit_path
         self.caplog, self.capfd, self.recwarn = caplog, capfd, recwarn
+        # A server an earlier test left open is finalised by the collector at
+        # an arbitrary moment, and its `ResourceWarning` would land inside
+        # some pair. Collect now; each test here shuts its own servers down.
+        gc.collect()
 
     def _audit_text(self) -> str:
         path = self.audit_path
@@ -640,6 +645,15 @@ class _Observed(typing.NamedTuple):
         """What must be identical for two sentinels of different length."""
         return (self.response, self.log, self.streams, self.warnings, self.audit)
 
+    def differs(self, other: _Observed) -> list[tuple[str, Any, Any]]:
+        """The channels where `self` and `other` differ, for a readable failure."""
+        names = ("response", "log", "streams", "warnings", "audit")
+        return [
+            (name, mine, theirs)
+            for name, mine, theirs in zip(names, self.stable(), other.stable())
+            if mine != theirs
+        ]
+
 
 def _event_shape(events: str) -> list[dict[str, Any]]:
     return [
@@ -680,6 +694,7 @@ async def test_no_rejected_argument_value_reaches_a_response_log_or_audit(
             # Nothing else about the value -- length, count or hash -- either.
             assert seen[0].stable() == seen[1].stable(), (family, case.label)
             assert _event_shape(seen[0].events) == _event_shape(seen[1].events)
+    await server.shutdown()
     # The audit oracle is live, not empty by accident.
     if audit_path is not None:
         assert '"audit.rejection"' in audit_path.read_text()
@@ -721,6 +736,7 @@ async def test_every_handler_rejects_what_the_gate_rejects_without_logging_it(
                 assert form not in logged, (case.label, logged)
             assert isinstance(raised, ValidationError), (case.label, raised)
         checked += 1
+    await server.shutdown()
     assert checked > 100, checked
 
 
@@ -803,6 +819,7 @@ async def test_a_validation_error_raised_by_a_handler_is_described_not_echoed(
             assert _HANDLER_ERROR_TEXT[index].match(payload["message"]), payload
             assert f"Tool execution error: {payload['message']}" in observed.raw_log
             seen.append(observed.stable())
+    await server.shutdown()
     assert all(item == seen[0] for item in seen[1:])
 
 
@@ -1557,7 +1574,13 @@ async def test_no_downstream_value_reaches_a_response_log_or_audit(
                     key,
                     seen[0].response,
                 )
-                assert seen[0].stable() == seen[1].stable(), (name, key, shape, family)
+                assert not seen[0].differs(seen[1]), (
+                    name,
+                    key,
+                    shape,
+                    family,
+                    seen[0].differs(seen[1]),
+                )
                 assert _event_shape(seen[0].events) == _event_shape(seen[1].events)
                 rejected += 1
     assert rejected == expected > len(_task_calls()) * len(positions), (
@@ -1568,6 +1591,7 @@ async def test_no_downstream_value_reaches_a_response_log_or_audit(
     health = "".join(
         block.text for block in (await _call(server, "gateway.health", {})).content
     )
+    await server.shutdown()
     assert "audit_events" in health
     for sentinels in _FAMILIES.values():
         for s in sentinels:
