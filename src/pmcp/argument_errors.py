@@ -38,6 +38,7 @@ unless the error is, or embeds the text of, a validation error, and
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import traceback
 from collections.abc import Iterable, Iterator
@@ -530,6 +531,14 @@ def exception_text(error: BaseException) -> str:
     so does any exception whose own text embeds one it chains
     (``RuntimeError(f"... {e}") from e``). Either is described from its
     structure instead. Every other exception is ``str(error)`` unchanged.
+
+    The embedding check is an exact-substring backstop for wrappers built
+    with ``f"{e}"``/``f"{e!r}"``. It does not recognise a truncated or
+    reformatted copy (``str(e)[:200]``, ``e.errors()``), nor validation text
+    that arrives as a plain string -- which is why pmcp never builds such a
+    copy (``tests/test_exception_text_sinks.py`` flags the construction
+    site) and replaces the SDK's stringified parse errors where it receives
+    them (``pmcp.client.manager._downstream_error``).
     """
     if _is_validation_error(error):
         return _validation_text(error)
@@ -559,3 +568,54 @@ def safe_traceback_text(error: BaseException) -> str:
     if safe_exc_info(error) is None:
         return f"(traceback withheld: {exception_text(error)})"
     return "".join(traceback.format_exception(type(error), error, error.__traceback__))
+
+
+# --- the SDK's own log records (rev 3) --------------------------------------
+
+
+class ValidationLogScrubber(logging.Filter):
+    """A filter for loggers pmcp does not own (the MCP SDK's).
+
+    The SDK logs a downstream frame its models reject with
+    ``logger.exception(...)`` (``mcp/client/streamable_http.py``,
+    ``mcp/client/sse.py``), so the traceback renders the rejected value. A
+    record whose ``exc_info`` chain holds a validation error loses the
+    traceback and gets :func:`exception_text` appended to its message; an
+    exception passed as a ``%``-argument is replaced by its
+    :func:`exception_text`. Every other record passes unchanged.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        error = record.exc_info[1] if record.exc_info else None
+        if isinstance(error, BaseException) and safe_exc_info(error) is None:
+            record.msg = f"{record.getMessage()} ({exception_text(error)})"
+            record.args = None
+            record.exc_info = None
+            record.exc_text = None
+        if isinstance(record.args, tuple) and any(
+            isinstance(arg, BaseException) for arg in record.args
+        ):
+            record.args = tuple(
+                exception_text(arg) if isinstance(arg, BaseException) else arg
+                for arg in record.args
+            )
+        return True
+
+
+_SCRUBBER = ValidationLogScrubber()
+
+
+def scrub_sdk_loggers() -> None:
+    """Attach :class:`ValidationLogScrubber` to every ``mcp`` / ``mcp.*``
+    logger that exists now. A logger's filters run only for records it
+    creates itself, so this is called once the SDK modules pmcp uses are
+    imported (``pmcp.client.manager``, ``pmcp.server``); it is idempotent."""
+    names = [
+        name
+        for name in list(logging.Logger.manager.loggerDict)
+        if name == "mcp" or name.startswith("mcp.")
+    ]
+    for name in ["mcp", *names]:
+        logger = logging.getLogger(name)
+        if _SCRUBBER not in logger.filters:
+            logger.addFilter(_SCRUBBER)

@@ -1093,256 +1093,6 @@ def test_describe_exception_renders_a_grouped_validation_error_structurally(
         assert not any(form in text for form in _forbidden(s)), text
 
 
-# --- every exception-to-text sink in src/pmcp (rev 2, board finding B1/N3) ------
-
-#: Exception types an `except` clause names that also catch a pydantic
-#: (`ValueError`) or jsonschema (`_Error`) `ValidationError`.
-_CATCHES_VALIDATION = {
-    "Exception",
-    "BaseException",
-    "ValueError",
-    "ValidationError",
-    "_Error",
-}
-#: Renderers that describe a validation error from its structure.
-_SAFE_RENDERERS = {
-    "exception_text",
-    "safe_exc_info",
-    "safe_traceback_text",
-    "describe_exception",
-    "sanitize_auth_diagnostic",
-    "_sanitize_error",
-    "describe_argument_error",
-    "describe_schema_error",
-    "describe_model_error",
-    "type",
-    "isinstance",
-}
-#: Callees that receive an exception and do not render its text, each read:
-_NON_RENDERING_CALLEES = {
-    # auth.py: parses a JSON-RPC elicitation payload out of `args[0]` and
-    # returns structured URLs; never returns or logs the exception's text.
-    "parse_url_elicitation_error",
-    # manager.py: a boolean predicate over the message.
-    "_is_protocol_version_initialize_error",
-    # manager.py: hands the exception to the awaiting connect caller, whose
-    # own `except` is checked here like any other.
-    "set_exception",
-    # policy.py: renders its `error` argument with `exception_text`.
-    "_warn_unparseable",
-    # scoped_advisor_audit.py (#296): records path and keyword only.
-    "record_rejected_arguments",
-}
-#: Attributes of an exception that carry its text (or the value) themselves.
-_TEXT_ATTRIBUTES = {
-    "args",
-    "message",
-    "errors",
-    "json",
-    "instance",
-    "validator_value",
-    "context",
-    "cause",
-    "exceptions",
-    "__cause__",
-    "__context__",
-    "__traceback__",
-    "__str__",
-    "__repr__",
-}
-_TRACEBACK_RENDERERS = {
-    "format_exc",
-    "format_exception",
-    "print_exc",
-    "print_exception",
-}
-#: Functions that read an exception's text to parse it, and return no text:
-_NON_RENDERING_FUNCTIONS = {
-    # auth.py: looks for a JSON-RPC -32042 payload in `args[0]` / `str()`
-    # and returns structured `UrlElicitationInfo` (URLs the server sent).
-    "parse_url_elicitation_error",
-}
-
-
-def _sink_sources() -> list[Path]:
-    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
-    return [
-        path
-        for path in sorted(root.rglob("*.py"))
-        if not any(
-            part in ("cli.py", "cli_commands", "__main__.py", "baml_client")
-            for part in path.relative_to(root).parts
-        )
-        and path.name != "argument_errors.py"
-    ]
-
-
-def _caught_names(node: Any) -> set[str]:
-    import ast
-
-    if node is None:
-        return {"<bare>"}
-    if isinstance(node, ast.Tuple):
-        return set().union(*(_caught_names(item) for item in node.elts))
-    if isinstance(node, ast.Attribute):
-        return {node.attr}
-    if isinstance(node, ast.Name):
-        return {node.id}
-    return {"<expression>"}
-
-
-def _exception_sinks(source: str, label: str) -> list[str]:
-    """Every use of an exception that could render a validation error's text
-    without going through a renderer above. An exception name is: an
-    `except` clause's name, if the clause can catch a `ValidationError`; a
-    name assigned `<task>.exception()`; a name narrowed by
-    `isinstance(name, Exception|BaseException)`; and any alias of those."""
-    import ast
-
-    tree = ast.parse(source)
-    for function in ast.walk(tree):
-        if (
-            isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and function.name in _NON_RENDERING_FUNCTIONS
-        ):
-            function.body = [ast.Pass()]
-    parents = {
-        child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
-    }
-    found: list[str] = []
-    scopes: list[tuple[list[ast.stmt], set[str]]] = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ExceptHandler) and node.name:
-            if _caught_names(node.type) & (
-                _CATCHES_VALIDATION | {"<bare>", "<expression>"}
-            ):
-                scopes.append((node.body, {node.name}))
-        elif isinstance(node, ast.If):
-            test = node.test
-            if (
-                isinstance(test, ast.Call)
-                and getattr(test.func, "id", None) == "isinstance"
-                and isinstance(test.args[0], ast.Name)
-                and _caught_names(test.args[1]) & {"Exception", "BaseException"}
-            ):
-                scopes.append((node.body, {test.args[0].id}))
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            names = {
-                target.id
-                for stmt in ast.walk(node)
-                if isinstance(stmt, ast.Assign)
-                and isinstance(stmt.value, ast.Call)
-                and isinstance(stmt.value.func, ast.Attribute)
-                and stmt.value.func.attr == "exception"
-                and not stmt.value.args
-                for target in stmt.targets
-                if isinstance(target, ast.Name)
-            }
-            if names:
-                scopes.append((node.body, names))
-    for body, names in scopes:
-        module = ast.Module(body=body, type_ignores=[])
-        # Aliases (`last_error = e`) are exception names too.
-        for stmt in ast.walk(module):
-            if (
-                isinstance(stmt, ast.Assign)
-                and isinstance(stmt.value, ast.Name)
-                and stmt.value.id in names
-            ):
-                names |= {t.id for t in stmt.targets if isinstance(t, ast.Name)}
-        for use in ast.walk(module):
-            if not (
-                isinstance(use, ast.Name)
-                and use.id in names
-                and isinstance(use.ctx, ast.Load)
-            ):
-                continue
-            parent = parents.get(use)
-            if isinstance(parent, ast.keyword):
-                parent = parents.get(parent)
-            if isinstance(parent, ast.Call):
-                callee = getattr(parent.func, "id", None) or getattr(
-                    parent.func, "attr", None
-                )
-                if callee in _SAFE_RENDERERS | _NON_RENDERING_CALLEES:
-                    continue
-            elif isinstance(
-                parent, (ast.Raise, ast.Compare, ast.BoolOp, ast.If, ast.UnaryOp)
-            ):
-                continue
-            elif isinstance(parent, ast.Assign) and parent.value is use:
-                continue
-            elif (
-                isinstance(parent, ast.Attribute)
-                and parent.attr not in _TEXT_ATTRIBUTES
-            ):
-                continue
-            found.append(f"{label}:{use.lineno}: {type(parent).__name__} uses {use.id}")
-    for call in ast.walk(tree):
-        if not isinstance(call, ast.Call):
-            continue
-        callee = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
-        if callee == "exception" and (call.args or call.keywords):
-            found.append(f"{label}:{call.lineno}: logger.exception renders a traceback")
-        if callee in _TRACEBACK_RENDERERS:
-            found.append(f"{label}:{call.lineno}: traceback.{callee}")
-        for keyword in call.keywords:
-            if keyword.arg == "exc_info" and not (
-                isinstance(keyword.value, ast.Call)
-                and getattr(keyword.value.func, "id", None) == "safe_exc_info"
-            ):
-                found.append(
-                    f"{label}:{call.lineno}: exc_info= not through safe_exc_info"
-                )
-    return found
-
-
-def test_no_exception_reaches_text_except_through_the_renderer() -> None:
-    """Static half of the class (rev 2): every place `src/pmcp` (bar the
-    operator's CLI) turns an exception that may be a `ValidationError` into
-    text -- a response, a log line, a traceback, an audit or health field --
-    goes through `exception_text` / `safe_exc_info` or another renderer
-    above. The dynamic sweeps below exercise the reachable ones."""
-    sources = _sink_sources()
-    assert len(sources) > 40, len(sources)
-    found = [
-        sink
-        for path in sources
-        for sink in _exception_sinks(path.read_text(), str(path.name))
-    ]
-    assert found == [], "\n".join(found)
-
-
-@pytest.mark.parametrize(
-    "snippet",
-    [
-        "try:\n    f()\nexcept Exception as e:\n    log(f'{e}')\n",
-        "try:\n    f()\nexcept ValueError as e:\n    x = str(e)\n",
-        "try:\n    f()\nexcept Exception as e:\n    logger.warning('%s', e)\n",
-        "try:\n    f()\nexcept Exception as e:\n    y = e.args[0]\n",
-        "try:\n    f()\nexcept Exception as e:\n    last = e\n    out(last)\n",
-        "try:\n    f()\nexcept Exception:\n    logger.error('x', exc_info=True)\n",
-        "try:\n    f()\nexcept Exception:\n    logger.exception('x')\n",
-        "def g(t):\n    exc = t.exception()\n    log(f'{exc}')\n",
-        "def g(r):\n    if isinstance(r, Exception):\n        log(f'{r}')\n",
-        "import traceback\ntraceback.format_exc()\n",
-    ],
-)
-def test_the_sink_scanner_flags_each_shape(snippet: str) -> None:
-    """The static check is only as wide as its rules: each rule fires."""
-    assert _exception_sinks(snippet, "snippet"), snippet
-
-
-def test_the_sink_scanner_passes_the_renderers() -> None:
-    clean = (
-        "try:\n    f()\nexcept Exception as e:\n"
-        "    log(f'{exception_text(e)}', exc_info=safe_exc_info(e))\n"
-        "    if e.code == 1:\n        raise\n    raise X() from e\n"
-        "try:\n    f()\nexcept KeyError as e:\n    log(f'{e}')\n"
-    )
-    assert _exception_sinks(clean, "clean") == []
-
-
 # --- downstream data, through the real handlers (rev 2, board finding B1) ------
 #
 # A downstream server's payload is validated by pmcp's own models
@@ -1706,3 +1456,49 @@ class MagicMockServer:
     """A stand-in with no gateway tools, for `_Tap` outside a server."""
 
     _gateway_tools = None
+
+
+@pytest.mark.asyncio
+async def test_a_connect_failure_carrying_a_validation_error_is_described(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    capfd: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+) -> None:
+    """Dynamic half of the rev 2 board seat's surviving regression (a log
+    line in `_connect_with_retry` rendering `last_error`): a connect that
+    fails with a validation error, through retries, `connect_server`'s
+    result, the log and `gateway.health`."""
+    from pmcp.types import LocalMcpServerConfig, ResolvedServerConfig
+
+    caplog.set_level(logging.DEBUG)
+    monkeypatch.setattr("pmcp.client.manager.RETRY_DELAYS", [0.0, 0.0, 0.0])
+    server, _ = _server(tmp_path, audited=False)
+    manager = server._client_manager
+    tap = _Tap(server, None, caplog, capfd, recwarn)
+    config = ResolvedServerConfig(
+        name="flaky", source="custom", config=LocalMcpServerConfig(command="flaky")
+    )
+    seen = []
+    for family, sentinels in _FAMILIES.items():
+        for s in sentinels:
+
+            async def connect(_config: Any, s: str = s) -> None:
+                McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
+
+            monkeypatch.setattr(manager, "_connect_server", connect)
+            mark = tap.start()
+            errors = await manager.connect_server(config)
+            health = "".join(
+                b.text for b in (await _call(server, "gateway.health", {})).content
+            )
+            observed = tap.since(mark, json.dumps(errors) + health)
+            assert observed.leaks(s) == [], (family, observed)
+            assert (
+                "validation error for McpTaskInfo: $.ttl: must be an integer"
+                in (errors[0])
+            ), errors
+            seen.append((json.dumps(errors), observed.log))
+    await server.shutdown()
+    assert all(item == seen[0] for item in seen[1:])
