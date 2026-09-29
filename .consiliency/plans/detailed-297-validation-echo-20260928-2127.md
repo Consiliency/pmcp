@@ -1,17 +1,31 @@
 # Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 4 (2026-09-29), on main `7680445`** (re-fetched: `origin/main`
+> **Revision 5 (2026-09-29), on main `7680445`** (re-fetched: `origin/main`
 > is still `7680445`). Consiliency/pmcp#297, the prerequisite for piece B
 > (`extra="forbid"`) of Consiliency/pmcp#236. The change is **embedded, not
-> described**: the 31 blocks under *Verbatim bodies* are `git apply` patches
+> described**: the 32 blocks under *Verbatim bodies* are `git apply` patches
 > against `origin/main` @ `7680445`, byte-identical to the verified code on
-> the local-only branch `wip/297-code` @ `ee644a9`, which was never pushed
-> (rev 1 was `19dac95`, rev 2 `929f693`, rev 3 `026aadc`). *Embedding
+> the local-only branch `wip/297-code` @ `1824a09`, which was never pushed
+> (rev 1 was `19dac95`, rev 2 `929f693`, rev 3 `026aadc`, rev 4 `ee644a9`). *Embedding
 > proof* extracts them from this file with its own extractor, `git apply
 > --check`s them on a fresh `7680445` worktree, applies them and compares
-> the whole tree with `ee644a9`.
+> the whole tree with `1824a09`.
 >
-> **What rev 4 changes** (rev 3 board on Consiliency/pmcp#314 @ `4b5f1d4`:
+> **What rev 5 changes** (rev 4 board on Consiliency/pmcp#314 @ `a0508da`:
+> the claude seat DISAGREEd on one blocker, and every earlier probe held;
+> see *Rev 4 board findings — before/after*):
+> - **B1: `pmcp refresh` never installed the scrubber.** It reaches
+>   downstreams through the SDK's `ClientSession` without importing
+>   `pmcp.client.manager`. The install now happens on `import pmcp`
+>   (`pmcp/__init__.py`), so every entry point has it. A fresh interpreter
+>   per entry point (the modules, `python -m pmcp`, the declared console
+>   scripts) and the real `pmcp refresh` pin it.
+> - **N1:** the asyncio claim is withdrawn, and the limit is stated: text a
+>   library formats into the message string is out of reach (*Unverified*).
+> - **N2:** two more header echoes join the Consiliency/pmcp#315 list, and
+>   the CHANGELOG states the guarantee precisely.
+>
+> **What rev 4 changed** (rev 3 board on Consiliency/pmcp#314 @ `4b5f1d4`:
 > the claude seat DISAGREEd on one blocker, and everything else held; every
 > finding is answered in *Rev 3 board findings — before/after*):
 > - **B1: the SDK's `ClientSession` logs on `"client"`, outside `mcp.*`.**
@@ -100,9 +114,18 @@
 > - Responses keep their prefixes (`Input validation error: $...`,
 >   `Invalid arguments: $...`).
 
+## Rev 4 board findings — before/after
+
+| Finding | Rev 4 (`ee644a9`) | Rev 5 (`1824a09`) | Proven by |
+|---|---|---|---|
+| **claude B1 (blocking): the scrubber was installed only by `pmcp.client.manager` import or `GatewayServer()`.** `pmcp refresh` (`cli.py` `run_refresh` → `pmcp.manifest.refresher` → the SDK's `ClientSession`) never installed it, so a downstream's malformed notification wrote its value (in the pydantic traceback, logger `"client"`) to stderr and `.pmcp/logs/gateway.log`. After `import pmcp`, `pmcp.cli`, `pmcp.manifest.refresher` or `pmcp.transport.http` alone, it was not installed. The CLI exemption (the operator's own input) does not cover a downstream's rejected value. Seat probe `cli_refresh.py`. | Two install sites, both past the CLI's path. | **`pmcp/__init__.py` installs it**: every entry point imports the package first, so the gateway, every `pmcp` CLI command, `python -m pmcp` and any embedder have it before any library logs. The other two call sites stay, idempotent. | `test_every_entry_point_installs_the_scrubber` (a fresh interpreter each: `import pmcp`, `pmcp.cli`, `pmcp.manifest.refresher`, `pmcp.transport.http`, `python -m pmcp --version`, and every console script the distribution declares, read from its entry points): 6 passed; **all 6 red on main**. `test_pmcp_refresh_logs_no_downstream_value` (the real `pmcp.cli.main(["refresh", ...])` in a fresh interpreter, only the manifest lookup replaced; 3 notification kinds × 3 families; stderr, stdout and the log file): 3 passed; **3 red on main** on stderr. Mutant M31 ("install removed from `pmcp/__init__.py`") dies. |
+| **N1: asyncio's "Task exception was never retrieved"** puts the task's `repr` (value included) into the log *message*, which the scrubber cannot reach. | The docstring and §9 listed asyncio as covered. | The claim is removed from `install_log_scrubber`'s docstring and §9. The docstring now states the limit: text a library has already formatted into a message string is out of reach. Listed under *Unverified* with the reason: pmcp's `create_task` sites retrieve or catch their results, so pmcp cannot trigger it today. | — |
+| **N2: two more lookup echoes for Consiliency/pmcp#315.** | Not listed. | Added under *Non-goals*: the SDK's INFO `Rejected request with unknown or expired session ID: <id>` (`mcp/server/streamable_http_manager.py:364`, the caller's header, cut to 64 characters), and pmcp's DEBUG `handle_mcp [...] accept=%r` (`transport/http.py:495` on main). | — |
+| **The CHANGELOG** said "scrubs every log record at creation -- whatever logger makes it". | Imprecise. | It now states the guarantee: from `import pmcp` on (the gateway, every `pmcp` CLI command, `python -m pmcp`, embedders), for what a record carries; already-formatted message text is excluded. | — |
+
 ## Rev 3 board findings — before/after
 
-| Finding | Rev 3 (`026aadc`) | Rev 4 (`ee644a9`) | Proven by |
+| Finding | Rev 3 (`026aadc`) | Rev 4 (`1824a09`) | Proven by |
 |---|---|---|---|
 | **claude B1 (blocking): the SDK's `ClientSession` logs on `"client"`** (`mcp/client/session.py:70`), outside `mcp.*`. `_on_notify` logs `Failed to validate notification: %s` with `exc_info=True` (`:1418-1419`, `:1432-1433`), and the pydantic traceback carries `input_value`. Reached in production by the startup description refresh (`server.py:907-915` → `refresh_all` → `refresh_server` → the SDK's `stdio_client` + `ClientSession`, `manifest/refresher.py:288,353-354`), and written by the root handler to stderr and the log file. Seat probe `refresh_frame.py notif-level` / `notif-progress` / `notif-resupdated`. Pre-existing on main. | A filter on the `mcp`/`mcp.*` loggers, by name. The *Unverified* claim that "all 46 `mcp.*` loggers carry it" was true, and insufficient. | `install_log_scrubber()` wraps the `logging` **record factory**: every record, whatever logger creates it, passes `scrub_record`. `scrub_record` covers `exc_info` (the traceback is dropped and `exception_text` appended), `%`-args however nested (tuples, lists, sets, dicts, a `%(name)s` mapping), a `msg` that is itself an exception, and `stack_info` (no exception text by construction; pinned). It is idempotent and wraps the previous factory. The seat's three probe modes give `STDERR leak = False`, `WARN leak = False` and no LOG leak. | `test_no_malformed_session_message_value_reaches_the_log` (9 kinds, through the real `refresh_server`): **7 red on main**; the two `sampling`/`elicitation` requests are answered by the SDK without logging, on main too. `tests/test_log_record_scrubber.py` (59 tests: every branch, 8 logger names × 6 families). Mutants M24, M26–M30: "no scrubber", "keeps the traceback", "misses a non-`mcp` logger", "`%`-args branch removed", "`msg` branch removed", "nested containers not walked". |
 | **N1/N2: SDK messages quoting downstream text.** `-32600 Unexpected content type: <header>` (`streamable_http.py:387-388`) and `Unknown SSE event: <name>` (`:195`). | §9 said "every other error keeps the downstream's own message string". | §9 and *Non-goals* now name them: SDK-synthesised messages that *quote* a downstream's header or event name are downstream-authored and kept, by design. No caller value can reach them. | — |
@@ -633,6 +656,17 @@ structure has no text to scrub.
   vacuous: the SDK's rejection is observed, either as a scrubbed record
   (on `"client"` for the four notifications whose envelope is well formed)
   or as the SDK's error reply to the downstream's request.
+- **every entry point, and `pmcp refresh`** (rev 5): a fresh interpreter
+  per entry point asserts that the record factory is the scrubber:
+  - `import pmcp`, `pmcp.cli`, `pmcp.manifest.refresher`,
+    `pmcp.transport.http`;
+  - `python -m pmcp --version`;
+  - each console script the distribution declares.
+
+  The real `pmcp.cli.main(["refresh", ...])` runs against a downstream
+  sending 3 malformed notification kinds × 3 families. Only the manifest
+  lookup is replaced, and stdout, stderr and `.pmcp/logs/gateway.log` are
+  checked.
 - **the record scrubber, branch by branch** (rev 4):
   `tests/test_log_record_scrubber.py` covers:
   - `exc_info` on 8 logger names (`client`, `server`, `mcp.*`, `asyncio`,
@@ -758,9 +792,14 @@ static test enforces it at every sink.
   - Rev 4 does not enumerate loggers. `install_log_scrubber()` wraps the
     `logging` record factory (`logging.setLogRecordFactory`), keeping the
     previous factory, so every record any logger creates passes through
-    `scrub_record`. That covers the SDK's `"client"`/`"server"`, asyncio,
-    uvicorn, httpx, anyio and any other logger, regardless of handlers or
+    `scrub_record`. That covers the SDK's `"client"`/`"server"`, uvicorn,
+    httpx, anyio and any other logger, regardless of handlers or
     propagation.
+  - It covers what a record *carries*: the traceback, the arguments, an
+    exception passed as `msg`. Text a library has already formatted into
+    the message string is out of its reach, for example asyncio's "Task
+    exception was never retrieved", which embeds the task's `repr`. See
+    *Unverified*.
   - `scrub_record` handles:
     - a `msg` that is itself such an exception;
     - `args` (a tuple, or a `%(name)s` mapping), with exceptions found
@@ -771,8 +810,13 @@ static test enforces it at every sink.
     `stack_info` renders frames and source lines only, so it needs no
     scrub (pinned by a test). Every other record is untouched, so `%r` of
     a plain exception still reads `RuntimeError('...')`.
-  - The install is idempotent (a marker on the wrapper) and runs at
-    `pmcp.client.manager` import and in `GatewayServer.__init__`. A log
+  - The install is idempotent (a marker on the wrapper). **Rev 5:** it runs
+    when the `pmcp` package is imported (`pmcp/__init__.py`), so every entry
+    point has it before any library logs: the gateway, every `pmcp` CLI
+    command (`pmcp refresh` reaches downstreams through the SDK's
+    `ClientSession`), `python -m pmcp`, and an embedder. It runs again,
+    harmlessly, at `pmcp.client.manager` import and in
+    `GatewayServer.__init__`. A log
     call can never fail because of the scrub: it is wrapped, and on any
     error the record passes as it was.
 - **stdio's raw output** (non-JSON stdout lines, stderr) is still logged at
@@ -781,14 +825,14 @@ static test enforces it at every sink.
 
 ## Changes
 
-These are the patches under *Verbatim bodies* (`git diff 7680445 ee644a9 -- <file>`):
-31 files, +4128 / −359. One concern, rendering validation errors from
+These are the patches under *Verbatim bodies* (`git diff 7680445 1824a09 -- <file>`):
+32 files, +4284 / −359. One concern, rendering validation errors from
 their structure, is applied at every sink. The bounded-plan threshold of
 about 8 files is exceeded on purpose. 19 of the source files carry only the
 mechanical §7 substitution plus an import, and splitting them into another
 plan would leave the class open between the two merges.
 
-### `src/pmcp/argument_errors.py` (create, +654)
+### `src/pmcp/argument_errors.py` (create, +657)
 - validator errors (rev 1, unchanged):
   - `CORRELATION_ID_CHARSET`, `SCOPED_CORRELATION_INCOMPLETE`,
     `PACKAGE_NAME_INVALID`;
@@ -807,6 +851,10 @@ plan would leave the class open between the two merges.
 - every log record (rev 4, §9): `_scrubbed()`, `scrub_record()`,
   `_scrubbing_factory()` and `install_log_scrubber()` (the record-factory
   scrubber; it replaces rev 3's `mcp.*` logger filter).
+
+### `src/pmcp/__init__.py` (modify, +9 / −0, rev 5)
+- installs `install_log_scrubber()` on package import, before any entry
+  point's first log call.
 
 ### `src/pmcp/server.py` (modify, +84 / −13)
 - the gate return renders `describe_schema_error` (rev 1);
@@ -880,8 +928,9 @@ plan would leave the class open between the two merges.
 - rev 4: 9 malformed `ClientSession` messages through the real
   `refresh_server`.
 
-### `tests/test_log_record_scrubber.py` (create, +198, rev 4)
-- every branch of `scrub_record`, on 8 logger names; the factory's install.
+### `tests/test_log_record_scrubber.py` (create, +342, rev 4; rev 5)
+- every branch of `scrub_record`, on 8 logger names; the factory's install;
+- rev 5: every entry point, in a fresh interpreter; the real `pmcp refresh`.
 
 ### `tests/test_scoped_advisor_audit.py` (modify, +91 / −176, rev 1)
 - the foreign-line exclusions are removed;
@@ -902,7 +951,7 @@ plan would leave the class open between the two merges.
 - `README.md` (scoped-advisor audit paragraph) — modify (rev 1).
 
 ## Dependencies & order
-Apply all 31 patches together; they are one `git apply`.
+Apply all 32 patches together; they are one `git apply`.
 `pmcp.argument_errors` imports no `pmcp` module at load time.
 `_declared_names` imports `pmcp.types` lazily, so there are no import
 cycles: `pmcp.types`, `auth`, `client.manager` and the others import it at
@@ -923,11 +972,11 @@ unset npm_config_cache npm_config_store_dir pnpm_config_store_dir
 uv run pytest -m 'not live and not slow' -q
 ```
 
-Red on main: copy the six test files at `ee644a9` onto a clean `7680445`
+Red on main: copy the six test files at `1824a09` onto a clean `7680445`
 tree and run the same six modules. The result is under *Acceptance
 criteria*.
 
-## Acceptance criteria — measured this session (on `ee644a9`, red on `7680445`)
+## Acceptance criteria — measured this session (on `1824a09`, red on `7680445`)
 
 - [x] **Caller arguments**:
   `test_no_rejected_argument_value_reaches_a_response_log_or_audit`,
@@ -941,24 +990,28 @@ criteria*.
   (rev 4): `test_no_malformed_session_message_value_reaches_the_log`,
   9 passed. Red on main: 7 failed.
 - [x] **Every record scrubbed, every branch pinned** (rev 4):
-  `tests/test_log_record_scrubber.py`, 59 passed. On main the module
+  `tests/test_log_record_scrubber.py`, 68 passed. On main the unit tests
   cannot import `pmcp.argument_errors`.
+- [x] **Every entry point installs the scrubber, and `pmcp refresh` logs no
+  downstream value** (rev 5): 6 and 3 passed. Red on main: all 9 fail
+  (`('import pmcp', 'False` ...; `('notifications/message', 'hex',
+  'stderr', ...`).
 - [x] **Every exception-to-text sink goes through the renderer**:
   `tests/test_exception_text_sinks.py`, 49 passed (47 constructs). On main
   the `src/pmcp` check fails with 84 findings.
 - [x] **Gates and the full suite are clean** (lines under *Full suite and
   gates*).
 
-Red on main: the six test files @ `ee644a9` on a clean `7680445`,
+Red on main: the six test files @ `1824a09` on a clean `7680445`,
 `pytest ... -q --tb=line`. Identical lines are collapsed as `(xN)`, and
 long runs are summarised.
 
 ```text
 tests/test_exception_text_sinks.py:661: AssertionError: client/manager.py:1135: FormattedValue uses result
 (x2) tests/test_argument_error_echo.py:690: AssertionError: ('hex', '$.auth_mode:type-object', _Observed(response="Input validation error: {'Sqfee3b693849c460ce4e728Zx': 'Sqfe
-E   AssertionError: ('$.job_id:type-object', '[2026-09-29T01:21:21] [ERROR] provision_status handler failed: 1 validation error for Provis...ce4e728Zx\'}]}, input_type=di
+E   AssertionError: ('$.job_id:type-object', '[2026-09-29T02:14:09] [ERROR] provision_status handler failed: 1 validation error for Provis...ce4e728Zx\'}]}, input_type=di
 ERROR    pmcp.tools.handlers:handlers.py:5643 provision_status handler failed: 1 validation error for ProvisionStatusInput
-tests/test_argument_error_echo.py:736: AssertionError: ('$.job_id:type-object', '[2026-09-29T01:21:21] [ERROR] provision_status handler failed: 1 validation error for Pro
+tests/test_argument_error_echo.py:736: AssertionError: ('$.job_id:type-object', '[2026-09-29T02:14:09] [ERROR] provision_status handler failed: 1 validation error for Pro
 tests/test_argument_error_echo.py:817: AssertionError: ('hex', _Observed(response='{"error": true, "message": "2 validation errors for McpTaskInfo\
 tests/test_argument_error_echo.py:817: AssertionError: ('hex', _Observed(response='{"error": true, "message": "3 validation errors for InvokeInput\
 tests/test_argument_error_echo.py:817: AssertionError: ('hex', _Observed(response='{"error": true, "message": "{\'Sqfee3b693849c460ce4e728Zx\': \'Sqfee3b693849c460ce4e728
@@ -993,19 +1046,20 @@ tests/test_downstream_frame_echo.py:467: AssertionError: ('http-json', 'tasks/re
 (x62) DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=GeneratorExit()
 (x2) WARNING  pmcp.client.manager:manager.py:1498 Connection to frames failed (attempt 1/3), retrying in 0.0s: Failed to parse SSE message: 4 validation errors for union[JSONR
 (x2) WARNING  pmcp.client.manager:manager.py:1498 Connection to frames failed (attempt 2/3), retrying in 0.0s: Failed to parse SSE message: 4 validation errors for union[JSONR
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302d31c0 by <Task pending name='Task-603' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1f96950 by <Task pending name='Task-612' cor
 (x2) WARNING  pmcp.client.manager:manager.py:1498 Connection to frames failed (attempt 1/3), retrying in 0.0s: Server frames disconnected
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302d3d00 by <Task pending name='Task-605' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1f97ac0 by <Task pending name='Task-614' cor
 (x2) WARNING  pmcp.client.manager:manager.py:1498 Connection to frames failed (attempt 2/3), retrying in 0.0s: Server frames disconnected
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302c0dc0 by <Task pending name='Task-607' cor
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302d2a70 by <Task pending name='Task-674' cor
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302d37f0 by <Task pending name='Task-686' cor
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302d3370 by <Task pending name='Task-699' cor
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302d3a30 by <Task pending name='Task-712' cor
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302d25f0 by <Task pending name='Task-725' cor
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302d37f0 by <Task pending name='Task-738' cor
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302d3f40 by <Task pending name='Task-751' cor
-DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7b14302d2a70 by <Task pending name='Task-764' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1fccca0 by <Task pending name='Task-616' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_headers.failed exception=CancelledError("Cancelled via cancel scope 7eafa1fccee0 by <Task pending name='Task-635' 
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1c6dbd0 by <Task pending name='Task-683' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1f96f80 by <Task pending name='Task-695' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1c6df30 by <Task pending name='Task-708' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1c6d510 by <Task pending name='Task-721' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1c6dbd0 by <Task pending name='Task-734' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1c6dc60 by <Task pending name='Task-747' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1c6dea0 by <Task pending name='Task-760' cor
+DEBUG    httpcore2.http11:_trace.py:85 receive_response_body.failed exception=CancelledError("Cancelled via cancel scope 7eafa1c6da20 by <Task pending name='Task-773' cor
 (x6) WARNING  pmcp.client.manager:manager.py:1498 Connection to frames failed (attempt 1/3), retrying in 0.0s: 'str' object has no attribute 'get'
 (x6) WARNING  pmcp.client.manager:manager.py:1498 Connection to frames failed (attempt 2/3), retrying in 0.0s: 'str' object has no attribute 'get'
 (x12) WARNING  pmcp.client.manager:manager.py:1498 Connection to frames failed (attempt 1/3), retrying in 0.0s: m
@@ -1023,22 +1077,31 @@ tests/test_downstream_frame_echo.py:575: AssertionError: ('request:ping', 'hex',
 tests/test_downstream_frame_echo.py:575: AssertionError: ('request:roots/list', 'hex', _Observed(response="GeneratedServerDescriptions(package='/mnt/workspace/worktrees/v
 tests/test_log_record_scrubber.py:163: ModuleNotFoundError: No module named 'pmcp.argument_errors'
 tests/test_log_record_scrubber.py:196: AssertionError: assert False
+tests/test_log_record_scrubber.py:256: AssertionError: ('console script pmcp.cli:main', 'False
+tests/test_log_record_scrubber.py:256: AssertionError: ('import pmcp', 'False
+tests/test_log_record_scrubber.py:256: AssertionError: ('import pmcp.cli', 'False
+tests/test_log_record_scrubber.py:256: AssertionError: ('import pmcp.manifest.refresher', 'False
+tests/test_log_record_scrubber.py:256: AssertionError: ('import pmcp.transport.http', 'False
+tests/test_log_record_scrubber.py:256: AssertionError: ('python -m pmcp --version', 'pmcp 2.7.3
+tests/test_log_record_scrubber.py:331: AssertionError: ('notifications/message', 'hex', 'stderr', '[2026-09-29T02:14:40] [INFO] Refreshing capability descriptions...
+tests/test_log_record_scrubber.py:331: AssertionError: ('notifications/progress', 'hex', 'stderr', '[2026-09-29T02:14:41] [INFO] Refreshing capability descriptions...
+tests/test_log_record_scrubber.py:331: AssertionError: ('notifications/resources/updated', 'hex', 'stderr', '[2026-09-29T02:14:42] [INFO] Refreshing capability descriptio
 tests/test_scoped_advisor_audit.py:1692: AssertionError: ('top-level correlation', ['[1969-12-31T19:00:00] [ERROR] Tool execution error: 1 validation error for InvokeInpu
 tests/test_scoped_advisor_audit.py:1692: AssertionError: ('E6 correlation', ['[1969-12-31T19:00:00] [ERROR] Tool execution error: 1 validation error for InvokeInput
 (x2) tests/test_scoped_advisor_audit.py:1692: AssertionError: ("('gateway.caller_marker_a', 'gateway.caller_marker_bbbbbbb') correlation", ['[1969-12-31T19:00:00] [ERROR] Tool
 tests/test_scoped_advisor_audit.py:1692: AssertionError: ('real correlation', ['[1969-12-31T19:00:00] [ERROR] Tool execution error: 1 validation error for InvokeInput
-tests/test_scoped_advisor_audit.py:2086: AssertionError: [2026-09-29T01:22:08] [INFO] Loaded policy from /tmp/pytest-of-viperjuice/pytest-5974/test_the_formerly_excluded_
+tests/test_scoped_advisor_audit.py:2086: AssertionError: [2026-09-29T02:15:05] [INFO] Loaded policy from /tmp/pytest-of-viperjuice/pytest-6077/test_the_formerly_excluded_
 tests/test_gateway_tool_schemas.py:468: AssertionError: Input validation error: '' should be non-empty
 tests/test_gateway_tool_schemas.py:468: AssertionError: Input validation error: 'short' is too short
 tests/test_gateway_tool_schemas.py:468: AssertionError: Input validation error: 5 is less than the minimum of 100
-97 failed, 444 passed, 57 errors in 49.99s
+106 failed, 444 passed, 57 errors in 59.06s
 ```
 
-Green (patched): `598 passed in 117.01s (0:01:57)` for the six modules.
+Green (patched): `607 passed in 129.14s (0:02:09)` for the six modules.
 
 ## Mutation evidence
 
-`mutants.py` (below) runs on a worktree of `ee644a9`:
+`mutants.py` (below) runs on a worktree of `1824a09`:
 - It applies each mutant; the anchor must occur exactly once.
 - It runs the five test modules with `-x --tb=line`, the dynamic sweeps
   first and the static guard last, so the named reason is the first
@@ -1050,51 +1113,53 @@ Every mutant applied and went red:
 - M1–M22 are revs 1–2's, re-run.
 - M23–M26 and G1 are new for the rev 2 board: G1 is the seat's surviving
   `_connect_with_retry` regression.
+- M31 is new for the rev 4 board (the install removed from
+  `pmcp/__init__.py`).
 - M27–M30 are new for the rev 3 board. M24 is now "no record scrubber
   installed".
-- M27 was first written as `record.name.startswith("mcp")`, which
-  crashed on a record whose `name` is `None` rather than failing an
-  assertion. It was corrected to `str(record.name)` and re-run alone; the
-  line below is that re-run, killed by the `ClientSession` sweep (the
+- M27 was first written (rev 4) as `record.name.startswith("mcp")`,
+  which crashed on a record whose `name` is `None` instead of failing an
+  assertion. It now uses `str(record.name)`, and this run is of the
+  corrected mutant: it is killed by the `ClientSession` sweep (the
   `"client"` logger).
-- S5–S8 are the rev 1 seat's.
 
 ```text
-M1 gate renders e.message: applied=yes exit=1 | 1 failed, 27 passed in 0.73s | E   AssertionError: ('hex', '$.auth_mode:type-object', _Observed(response="Input validation error: {'Sqfee3b693849c460ce4e728Zx': 'Sqfee3b...ne of ['api_key', 'url_elicitation']", log='', raw_log='', streams='', warnings='', audit
-M2 except arm returns str(e): applied=yes exit=1 | 1 failed, 27 passed in 1.16s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response="1 validatio...=None
-M3 except arm logs str(e): applied=yes exit=1 | 1 failed, 27 passed in 1.13s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...=None
-M4 model rejection recorded as invocation: applied=yes exit=1 | 1 failed, 28 passed in 7.97s | E   AssertionError: ('hex', "validator:('InvokeInput', '_reject_partial_scoped_correlation', '')", _Observed(response='Invalid arguments: ..."sequence":222,"source_reference_hash":null,"terminal_status":"failure","timestamp":17906
-M5 model loc not redacted: applied=yes exit=1 | 1 failed, 40 passed in 14.35s | E   AssertionError: assert '$.env.sk-KEY...be an integer' == '$.env.*: must be an integer'
-M6 schema path not redacted: applied=yes exit=1 | 1 failed, 38 passed in 15.29s | E   AssertionError: assert '$.env.sk-KEY... type integer' == '$.env.*: mus... type integer'
-M7 phrase constraint from pydantic ctx: applied=yes exit=1 | 1 failed, 41 passed in 14.53s | E   assert '$.literal: m...: is required' == '$.literal: m...: is required'
-M8 missing-required reads an instance key: applied=yes exit=1 | 1 failed, 27 passed in 0.57s | E   AssertionError: ('hex', 'required:server_name', _Observed(response='Input validation error: $.extra_Sqfee3b693849c460ce4e728Zx: is required', log='', raw_log='', streams='', warnings='', audit=[], raw_audit='', events=''))
-M9 validator back to ValueError with value: applied=yes exit=1 | 1 failed, 27 passed in 1.08s | E   AssertionError: Invalid arguments: $.run_correlation_id: is invalid
-M10 provision_status validates inside its try: applied=yes exit=1 | 1 failed, 29 passed in 13.66s | E   AssertionError: ('required:job_id', None)
-M11 unknown tool name logged: applied=yes exit=1 | 1 failed, 321 passed in 120.74s (0:02:00) | E   AssertionError: ("('gateway.caller_marker_a', 'gateway.caller_marker_bbbbbbb') correlation", ['[1969-12-31T19:00:00] [ERROR] Tool exec...evel": "ERROR", "logger": "pmcp.server", "msg": "Tool execution error: Unknown tool: gate
-M12 type phrase is e.message: applied=yes exit=1 | 1 failed, 27 passed in 0.69s | E   AssertionError: ('hex', '$.consent_acknowledged:type-string', _Observed(response="Input validation error: $.consent_acknowledged: 'Sqf...0ce4e728Zx' is not of type 'boolean'", log='', raw_log='', streams='', warnings='', audit
-M13 model phrase is pydantic msg: applied=yes exit=1 | 1 failed, 30 passed in 19.66s | E   AssertionError: {'error': True, 'message': '2 validation errors for McpTaskInfo: $.task_id: Input should be a valid string; $.created_at: Input should be a valid number'}
-M14 audit model path from input: applied=yes exit=1 | 1 failed, 28 passed in 9.76s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...d_advisor_audit.v1","sequence":218,"terminal_status":"invalid_arguments","timestamp":1790
-M15 sanitize_auth_diagnostic uses str(value): applied=yes exit=1 | 1 failed, 55 passed in 14.54s | E   AssertionError: ('gateway.tasks_list', 'createdAt', '{
-M16 describe_exception leaf uses str(leaf): applied=yes exit=1 | 1 failed, 49 passed in 22.20s | E   assert 'validation error for McpTaskInfo: $.ttl: must be an integer' in "ExceptionGroup(1 sub-exception): ValidationError: 1 validation error for McpTaskInfo\nttl\n  Input should be a valid ...ErNBOfkoxABIALAEbZa'}, input_type
-M17 exception_text skips validation errors: applied=yes exit=1 | 1 failed, 30 passed in 14.95s | E   AssertionError: ('hex', _Observed(response='{"error": true, "message": "2 validation errors for McpTaskInfo\
-M18 safe_exc_info always returns the error: applied=yes exit=1 | 1 failed, 48 passed in 14.74s | E   pydantic_core._pydantic_core.ValidationError: 1 validation error for McpTaskInfo
-M19 tasks_get response uses str(e): applied=yes exit=1 | 1 failed, 55 passed in 16.19s | E   AssertionError: ('gateway.tasks_get', 'createdAt', 'string', 'hex', _Observed(response='{
-M20 tasks_get audit buffer uses str(e): applied=yes exit=1 | 1 failed, 55 passed in 14.41s | E   AssertionError: ('gateway.tasks_get', 'createdAt', 'string', 'spaced', _Observed(response='{
-M21 exception_text ignores an embedded validation error: applied=yes exit=1 | 1 failed, 48 passed in 14.46s | E   pydantic_core._pydantic_core.ValidationError: 1 validation error for McpTaskInfo
-M22 installer crash message uses raw exc (static guard): applied=yes exit=1 | 1 failed, 549 passed in 144.65s (0:02:24) | E   AssertionError: manifest/installer.py:256: FormattedValue uses exc
-M23 SDK parse error keeps its message: applied=yes exit=1 | 1 failed, 61 passed in 26.58s | E   AssertionError: ('http-json', 'initialize', 'result-type', 'alpha', _Observed(response='["Failed to connect to frames: Failed to parse...=None
-M24 no record scrubber installed: applied=yes exit=1 | 1 failed, 61 passed in 27.81s | E   AssertionError: ('http-json', 'initialize', 'result-type', 'hex', _Observed(response='["Failed to connect to frames: downstream sent a...=None
-M25 malformed error message kept: applied=yes exit=1 | 1 failed, 94 passed in 85.18s (0:01:25) | E   AssertionError: ('stdio', 'initialize', 'error-message', 'unicode', _Observed(response='["Failed to connect to frames: {\'\\u00e9\\u4e...=None
-M26 scrubber keeps the traceback: applied=yes exit=1 | 1 failed, 61 passed in 26.54s | E   AssertionError: ('http-json', 'initialize', 'result-type', 'hex', _Observed(response='["Failed to connect to frames: downstream sent a...=None
-M27 scrubber misses a non-mcp logger: applied=yes exit=1 | 1 failed, 105 passed in 95.34s (0:01:35) | E   AssertionError: ('notifications/cancelled', 'hex', _Observed(response="GeneratedServerDescriptions(package='/home/viperjuice/workspace
-M28 %-args branch removed: applied=yes exit=1 | 1 failed, 162 passed in 98.15s (0:01:38) | E   AssertionError: failed: 1 validation error for McpTaskInfo
-M29 msg-is-an-exception branch removed: applied=yes exit=1 | 1 failed, 168 passed in 98.26s (0:01:38) | E   assert False
-M30 nested containers not walked: applied=yes exit=1 | 1 failed, 163 passed in 95.95s (0:01:35) | E   AssertionError: failed: [1, 1 validation error for McpTaskInfo
-G1 connect retry logs last_error: applied=yes exit=1 | 1 failed, 60 passed in 26.23s | E   pydantic_core._pydantic_core.ValidationError: 1 validation error for McpTaskInfo
-S5 value in a log extra= field: applied=yes exit=1 | 1 failed, 27 passed in 1.06s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...=None
-S6 arguments printed to stderr: applied=yes exit=1 | 1 failed, 27 passed in 1.06s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...b693849c460ce4e728Zx', 7, {'Sqfee3b693849c460ce4e728Zx': None}]}}}
-S7 arguments in warnings.warn: applied=yes exit=1 | 1 failed, 27 passed in 1.09s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...ne}]}}} @ /mnt/workspace/worktrees/viperjuice/pmcp-297-mut/src/pmcp/server.py:519", audit
-S8 echo only isalpha values: applied=yes exit=1 | 1 failed, 27 passed in 1.57s | E   AssertionError: ('alpha', '$.auth_mode:enum', _Observed(response='Input validation error: $.auth_mode: must be one of ["api_key", "url...ation"] x AEaXjvOLkjBUhTKsJtXJSKWjIq', log='', raw_log='', streams='', warnings='', audit
+M1 gate renders e.message: applied=yes exit=1 | 1 failed, 27 passed in 0.78s | E   AssertionError: ('hex', '$.auth_mode:type-object', _Observed(response="Input validation error: {'Sqfee3b693849c460ce4e728Zx': 'Sqfee3b...ne of ['api_key', 'url_elicitation']", log='', raw_log='', streams='', warnings='', audit
+M2 except arm returns str(e): applied=yes exit=1 | 1 failed, 27 passed in 1.15s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response="1 validatio...=None
+M3 except arm logs str(e): applied=yes exit=1 | 1 failed, 27 passed in 1.15s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...=None
+M4 model rejection recorded as invocation: applied=yes exit=1 | 1 failed, 28 passed in 7.74s | E   AssertionError: ('hex', "validator:('InvokeInput', '_reject_partial_scoped_correlation', '')", _Observed(response='Invalid arguments: ...,"sequence":222,"source_reference_hash":null,"terminal_status":"failure","timestamp":1790
+M5 model loc not redacted: applied=yes exit=1 | 1 failed, 40 passed in 15.04s | E   AssertionError: assert '$.env.sk-KEY...be an integer' == '$.env.*: must be an integer'
+M6 schema path not redacted: applied=yes exit=1 | 1 failed, 38 passed in 15.14s | E   AssertionError: assert '$.env.sk-KEY... type integer' == '$.env.*: mus... type integer'
+M7 phrase constraint from pydantic ctx: applied=yes exit=1 | 1 failed, 41 passed in 20.89s | E   assert '$.literal: m...: is required' == '$.literal: m...: is required'
+M8 missing-required reads an instance key: applied=yes exit=1 | 1 failed, 27 passed in 0.60s | E   AssertionError: ('hex', 'required:server_name', _Observed(response='Input validation error: $.extra_Sqfee3b693849c460ce4e728Zx: is required', log='', raw_log='', streams='', warnings='', audit=[], raw_audit='', events=''))
+M9 validator back to ValueError with value: applied=yes exit=1 | 1 failed, 27 passed in 1.35s | E   AssertionError: Invalid arguments: $.run_correlation_id: is invalid
+M10 provision_status validates inside its try: applied=yes exit=1 | 1 failed, 29 passed in 14.75s | E   AssertionError: ('required:job_id', None)
+M11 unknown tool name logged: applied=yes exit=1 | 1 failed, 330 passed in 128.40s (0:02:08) | E   AssertionError: ("('gateway.caller_marker_a', 'gateway.caller_marker_bbbbbbb') correlation", ['[1969-12-31T19:00:00] [ERROR] Tool exec...evel": "ERROR", "logger": "pmcp.server", "msg": "Tool execution error: Unknown tool: gate
+M12 type phrase is e.message: applied=yes exit=1 | 1 failed, 27 passed in 0.52s | E   AssertionError: ('hex', '$.consent_acknowledged:type-string', _Observed(response="Input validation error: $.consent_acknowledged: 'Sqf...0ce4e728Zx' is not of type 'boolean'", log='', raw_log='', streams='', warnings='', audit
+M13 model phrase is pydantic msg: applied=yes exit=1 | 1 failed, 30 passed in 15.01s | E   AssertionError: {'error': True, 'message': '2 validation errors for McpTaskInfo: $.task_id: Input should be a valid string; $.created_at: Input should be a valid number'}
+M14 audit model path from input: applied=yes exit=1 | 1 failed, 28 passed in 7.96s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg..._advisor_audit.v1","sequence":218,"terminal_status":"invalid_arguments","timestamp":17906
+M15 sanitize_auth_diagnostic uses str(value): applied=yes exit=1 | 1 failed, 55 passed in 15.65s | E   AssertionError: ('gateway.tasks_list', 'createdAt', '{
+M16 describe_exception leaf uses str(leaf): applied=yes exit=1 | 1 failed, 49 passed in 15.42s | E   assert 'validation error for McpTaskInfo: $.ttl: must be an integer' in "ExceptionGroup(1 sub-exception): ValidationError: 1 validation error for McpTaskInfo\nttl\n  Input should be a valid ...ErNBOfkoxABIALAEbZa'}, input_type
+M17 exception_text skips validation errors: applied=yes exit=1 | 1 failed, 30 passed in 15.35s | E   AssertionError: ('hex', _Observed(response='{"error": true, "message": "2 validation errors for McpTaskInfo\
+M18 safe_exc_info always returns the error: applied=yes exit=1 | 1 failed, 48 passed in 16.22s | E   pydantic_core._pydantic_core.ValidationError: 1 validation error for McpTaskInfo
+M19 tasks_get response uses str(e): applied=yes exit=1 | 1 failed, 55 passed in 16.51s | E   AssertionError: ('gateway.tasks_get', 'createdAt', 'string', 'hex', _Observed(response='{
+M20 tasks_get audit buffer uses str(e): applied=yes exit=1 | 1 failed, 55 passed in 15.62s | E   AssertionError: ('gateway.tasks_get', 'createdAt', 'string', 'spaced', _Observed(response='{
+M21 exception_text ignores an embedded validation error: applied=yes exit=1 | 1 failed, 48 passed in 14.30s | E   pydantic_core._pydantic_core.ValidationError: 1 validation error for McpTaskInfo
+M22 installer crash message uses raw exc (static guard): applied=yes exit=1 | 1 failed, 558 passed in 135.68s (0:02:15) | E   AssertionError: manifest/installer.py:256: FormattedValue uses exc
+M23 SDK parse error keeps its message: applied=yes exit=1 | 1 failed, 61 passed in 31.18s | E   AssertionError: ('http-json', 'initialize', 'result-type', 'alpha', _Observed(response='["Failed to connect to frames: Failed to parse...=None
+M24 no record scrubber installed: applied=yes exit=1 | 1 failed, 61 passed in 30.45s | E   AssertionError: ('http-json', 'initialize', 'result-type', 'hex', _Observed(response='["Failed to connect to frames: downstream sent a...=None
+M25 malformed error message kept: applied=yes exit=1 | 1 failed, 94 passed in 86.06s (0:01:26) | E   AssertionError: ('stdio', 'initialize', 'error-message', 'unicode', _Observed(response='["Failed to connect to frames: {\'\\u00e9\\u4e...=None
+M26 scrubber keeps the traceback: applied=yes exit=1 | 1 failed, 61 passed in 30.07s | E   AssertionError: ('http-json', 'initialize', 'result-type', 'hex', _Observed(response='["Failed to connect to frames: downstream sent a...=None
+M27 scrubber misses a non-mcp logger: applied=yes exit=1 | 1 failed, 105 passed in 96.96s (0:01:36) | E   AssertionError: ('notifications/cancelled', 'hex', _Observed(response="GeneratedServerDescriptions(package='/home/viperjuice/workspace...=None
+M28 %-args branch removed: applied=yes exit=1 | 1 failed, 162 passed in 99.75s (0:01:39) | E   AssertionError: failed: 1 validation error for McpTaskInfo
+M29 msg-is-an-exception branch removed: applied=yes exit=1 | 1 failed, 168 passed in 95.35s (0:01:35) | E   assert False
+M30 nested containers not walked: applied=yes exit=1 | 1 failed, 163 passed in 96.18s (0:01:36) | E   AssertionError: failed: [1, 1 validation error for McpTaskInfo
+M31 install removed from pmcp/__init__.py: applied=yes exit=1 | 1 failed, 173 passed in 95.70s (0:01:35) | E   AssertionError: ('console script pmcp.cli:main', 'False
+G1 connect retry logs last_error: applied=yes exit=1 | 1 failed, 60 passed in 28.77s | E   pydantic_core._pydantic_core.ValidationError: 1 validation error for McpTaskInfo
+S5 value in a log extra= field: applied=yes exit=1 | 1 failed, 27 passed in 1.11s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...=None
+S6 arguments printed to stderr: applied=yes exit=1 | 1 failed, 27 passed in 1.14s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...b693849c460ce4e728Zx', 7, {'Sqfee3b693849c460ce4e728Zx': None}]}}}
+S7 arguments in warnings.warn: applied=yes exit=1 | 1 failed, 27 passed in 1.10s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...ne}]}}} @ /mnt/workspace/worktrees/viperjuice/pmcp-297-mut/src/pmcp/server.py:519", audit
+S8 echo only isalpha values: applied=yes exit=1 | 1 failed, 27 passed in 1.48s | E   AssertionError: ('alpha', '$.auth_mode:enum', _Observed(response='Input validation error: $.auth_mode: must be one of ["api_key", "url...ation"] x AEaXjvOLkjBUhTKsJtXJSKWjIq', log='', raw_log='', streams='', warnings='', audit
 ```
 
 The first `E` line the script prints is sometimes a traceback line rather
@@ -1112,11 +1177,11 @@ Second pass, with `NO_STATIC=1` (the static guard deselected), for the
 mutants the static guard could have been the only one to catch:
 
 ```text
-M11 unknown tool name logged: applied=yes exit=1 | 1 failed, 321 passed, 1 deselected in 144.02s (0:02:24) | E   AssertionError: ("('gateway.caller_marker_a', 'gateway.caller_marker_bbbbbbb') correlation", ['[1969-12-31T19:00:00] [ERROR] Tool exec...evel": "ERROR", "logger": "pmcp.server", "msg": "Tool execution error: Unknown tool: gate
-M19 tasks_get response uses str(e): applied=yes exit=1 | 1 failed, 55 passed, 1 deselected in 15.23s | E   AssertionError: ('gateway.tasks_get', 'createdAt', 'string', 'hex', _Observed(response='{
-M20 tasks_get audit buffer uses str(e): applied=yes exit=1 | 1 failed, 55 passed, 1 deselected in 23.12s | E   AssertionError: ('gateway.tasks_get', 'createdAt', 'string', 'spaced', _Observed(response='{
-M22 installer crash message uses raw exc (static guard): applied=yes exit=0 | 597 passed, 1 deselected in 125.38s (0:02:05) | 
-G1 connect retry logs last_error: applied=yes exit=1 | 1 failed, 60 passed, 1 deselected in 25.61s | E   pydantic_core._pydantic_core.ValidationError: 1 validation error for McpTaskInfo
+M11 unknown tool name logged: applied=yes exit=1 | 1 failed, 330 passed, 1 deselected in 121.66s (0:02:01) | E   AssertionError: ("('gateway.caller_marker_a', 'gateway.caller_marker_bbbbbbb') correlation", ['[1969-12-31T19:00:00] [ERROR] Tool exec...evel": "ERROR", "logger": "pmcp.server", "msg": "Tool execution error: Unknown tool: gate
+M19 tasks_get response uses str(e): applied=yes exit=1 | 1 failed, 55 passed, 1 deselected in 14.62s | E   AssertionError: ('gateway.tasks_get', 'createdAt', 'string', 'hex', _Observed(response='{
+M20 tasks_get audit buffer uses str(e): applied=yes exit=1 | 1 failed, 55 passed, 1 deselected in 14.46s | E   AssertionError: ('gateway.tasks_get', 'createdAt', 'string', 'spaced', _Observed(response='{
+M22 installer crash message uses raw exc (static guard): applied=yes exit=0 | 606 passed, 1 deselected in 126.21s (0:02:06) | 
+G1 connect retry logs last_error: applied=yes exit=1 | 1 failed, 60 passed, 1 deselected in 27.64s | E   pydantic_core._pydantic_core.ValidationError: 1 validation error for McpTaskInfo
 ```
 
 - M11, M19, M20 and **G1** die on dynamic tests alone.
@@ -1135,6 +1200,7 @@ Reasons, by what caught them:
   - M24 (no scrubber: the SDK's traceback in the log);
   - M25 (a non-string `message` kept: stdio);
   - M26 (the scrubber keeps `exc_info`);
+- **entry points**: M31 (`import pmcp` no longer installs the scrubber);
 - **record scrubber branches**: M27 (a non-`mcp` logger), M28 (`%`-args),
   M29 (`msg` an exception), M30 (nested containers);
 - **behaviour**: M10;
@@ -1171,6 +1237,11 @@ Reasons, by what caught them:
   >   - `:3888/:4044`, `:5585` (`Job '{job_id}' not found`);
   >   - `tasks_*` blocked-by-policy `:5938/:6021/:6065/:6157`;
   >   - `client/manager.py:3847/:3896` (`Task not found: {server}::{task_id}`).
+  > - **a caller's header echoed into a log** (rev 5, N2):
+  >   - the SDK's INFO `Rejected request with unknown or expired session
+  >     ID: {id[:64]}` (`mcp/server/streamable_http_manager.py:364`);
+  >   - pmcp's DEBUG `handle_mcp [%s]: %s method=%s session=%s accept=%r`
+  >     (`transport/http.py:495`).
   > - **a rejected downstream value in pmcp's own warning** (rev 3, N3):
   >   `client/manager.py:2031-2035`, `{kind}/list returned an unusable
   >   cursor ({raw_cursor!r})`. Render `type(raw_cursor).__name__` instead.
@@ -1255,6 +1326,13 @@ Reasons, by what caught them:
   tests left behind (`_only_pytests_log_handlers`). In production it needs
   a handler that raises in `emit`. Not fixed here; the only lever is
   `logging.raiseExceptions`, which is process-wide.
+- **Text a library formats into the message string** is not scrubbed
+  (rev 4 board N1). The case found is asyncio's "Task exception was never
+  retrieved", whose message embeds the task's `repr`, and with it a
+  coroutine's arguments or result. pmcp cannot trigger it today: every
+  `create_task` site in `src/pmcp` retrieves its result or catches its
+  exception (the static guard's `.exception()` tracking covers the
+  retrievals). The SDK's two f-string lines above are the same class.
 - **Code that replaces the record factory after pmcp installed its own**
   (without wrapping it) would drop the scrub. `GatewayServer.__init__`
   installs it again, idempotently. Nothing in pmcp or its dependencies was
@@ -1279,89 +1357,91 @@ Reasons, by what caught them:
 
 ## Embedding proof
 
-The patches were generated with `git diff 7680445 ee644a9 -- <file>` and embedded. Then, from **this file**, on a fresh worktree `$WORKTREE_ROOT/pmcp-297-proof` of re-fetched `origin/main` (still `7680445`), with `<scratch>` the session scratch dir:
+The patches were generated with `git diff 7680445 1824a09 -- <file>` and embedded. Then, from **this file**, on a fresh worktree `$WORKTREE_ROOT/pmcp-297-proof` of re-fetched `origin/main` (still `7680445`), with `<scratch>` the session scratch dir:
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
 7680445
-<scratch>/emb7/x2.py: 25 lines
+<scratch>/emb9/x2.py: 25 lines
 extractor self-extract: identical
-<scratch>/emb7/p/CHANGELOG.md.patch: 12 lines
-<scratch>/emb7/p/README.md.patch: 19 lines
-<scratch>/emb7/p/src_pmcp_argument_errors.py.patch: 660 lines
-<scratch>/emb7/p/src_pmcp_auth.py.patch: 24 lines
-<scratch>/emb7/p/src_pmcp_client_manager.py.patch: 123 lines
-<scratch>/emb7/p/src_pmcp_config_guidance.py.patch: 23 lines
-<scratch>/emb7/p/src_pmcp_config_loader.py.patch: 59 lines
-<scratch>/emb7/p/src_pmcp_manifest_code_patterns_loader.py.patch: 21 lines
-<scratch>/emb7/p/src_pmcp_manifest_environment.py.patch: 30 lines
-<scratch>/emb7/p/src_pmcp_manifest_installer.py.patch: 89 lines
-<scratch>/emb7/p/src_pmcp_manifest_loader.py.patch: 30 lines
-<scratch>/emb7/p/src_pmcp_manifest_npm_resolver.py.patch: 23 lines
-<scratch>/emb7/p/src_pmcp_manifest_package_identity.py.patch: 32 lines
-<scratch>/emb7/p/src_pmcp_manifest_refresher.py.patch: 39 lines
-<scratch>/emb7/p/src_pmcp_manifest_version_checker.py.patch: 48 lines
-<scratch>/emb7/p/src_pmcp_package_approvals.py.patch: 41 lines
-<scratch>/emb7/p/src_pmcp_policy_policy.py.patch: 52 lines
-<scratch>/emb7/p/src_pmcp_provision_gate.py.patch: 21 lines
-<scratch>/emb7/p/src_pmcp_scoped_advisor_audit.py.patch: 123 lines
-<scratch>/emb7/p/src_pmcp_server.py.patch: 182 lines
-<scratch>/emb7/p/src_pmcp_subscriptions.py.patch: 27 lines
-<scratch>/emb7/p/src_pmcp_templates_code_snippets_loader.py.patch: 21 lines
-<scratch>/emb7/p/src_pmcp_tools_handlers.py.patch: 252 lines
-<scratch>/emb7/p/src_pmcp_trust_store.py.patch: 34 lines
-<scratch>/emb7/p/src_pmcp_types.py.patch: 50 lines
-<scratch>/emb7/p/tests_test_argument_error_echo.py.patch: 1510 lines
-<scratch>/emb7/p/tests_test_downstream_frame_echo.py.patch: 614 lines
-<scratch>/emb7/p/tests_test_exception_text_sinks.py.patch: 767 lines
-<scratch>/emb7/p/tests_test_gateway_tool_schemas.py.patch: 28 lines
-<scratch>/emb7/p/tests_test_log_record_scrubber.py.patch: 204 lines
-<scratch>/emb7/p/tests_test_scoped_advisor_audit.py.patch: 402 lines
-$ git apply --check <scratch>/emb7/p/*.patch
+<scratch>/emb9/p/CHANGELOG.md.patch: 12 lines
+<scratch>/emb9/p/README.md.patch: 19 lines
+<scratch>/emb9/p/src_pmcp___init__.py.patch: 17 lines
+<scratch>/emb9/p/src_pmcp_argument_errors.py.patch: 663 lines
+<scratch>/emb9/p/src_pmcp_auth.py.patch: 24 lines
+<scratch>/emb9/p/src_pmcp_client_manager.py.patch: 123 lines
+<scratch>/emb9/p/src_pmcp_config_guidance.py.patch: 23 lines
+<scratch>/emb9/p/src_pmcp_config_loader.py.patch: 59 lines
+<scratch>/emb9/p/src_pmcp_manifest_code_patterns_loader.py.patch: 21 lines
+<scratch>/emb9/p/src_pmcp_manifest_environment.py.patch: 30 lines
+<scratch>/emb9/p/src_pmcp_manifest_installer.py.patch: 89 lines
+<scratch>/emb9/p/src_pmcp_manifest_loader.py.patch: 30 lines
+<scratch>/emb9/p/src_pmcp_manifest_npm_resolver.py.patch: 23 lines
+<scratch>/emb9/p/src_pmcp_manifest_package_identity.py.patch: 32 lines
+<scratch>/emb9/p/src_pmcp_manifest_refresher.py.patch: 39 lines
+<scratch>/emb9/p/src_pmcp_manifest_version_checker.py.patch: 48 lines
+<scratch>/emb9/p/src_pmcp_package_approvals.py.patch: 41 lines
+<scratch>/emb9/p/src_pmcp_policy_policy.py.patch: 52 lines
+<scratch>/emb9/p/src_pmcp_provision_gate.py.patch: 21 lines
+<scratch>/emb9/p/src_pmcp_scoped_advisor_audit.py.patch: 123 lines
+<scratch>/emb9/p/src_pmcp_server.py.patch: 182 lines
+<scratch>/emb9/p/src_pmcp_subscriptions.py.patch: 27 lines
+<scratch>/emb9/p/src_pmcp_templates_code_snippets_loader.py.patch: 21 lines
+<scratch>/emb9/p/src_pmcp_tools_handlers.py.patch: 252 lines
+<scratch>/emb9/p/src_pmcp_trust_store.py.patch: 34 lines
+<scratch>/emb9/p/src_pmcp_types.py.patch: 50 lines
+<scratch>/emb9/p/tests_test_argument_error_echo.py.patch: 1510 lines
+<scratch>/emb9/p/tests_test_downstream_frame_echo.py.patch: 614 lines
+<scratch>/emb9/p/tests_test_exception_text_sinks.py.patch: 767 lines
+<scratch>/emb9/p/tests_test_gateway_tool_schemas.py.patch: 28 lines
+<scratch>/emb9/p/tests_test_log_record_scrubber.py.patch: 348 lines
+<scratch>/emb9/p/tests_test_scoped_advisor_audit.py.patch: 402 lines
+$ git apply --check <scratch>/emb9/p/*.patch
 check: ok
 applied
-cmp CHANGELOG.md: identical to wip/297-code@ee644a9
-cmp README.md: identical to wip/297-code@ee644a9
-cmp src/pmcp/argument_errors.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/auth.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/client/manager.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/config/guidance.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/config/loader.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/manifest/code_patterns_loader.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/manifest/environment.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/manifest/installer.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/manifest/loader.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/manifest/npm_resolver.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/manifest/package_identity.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/manifest/refresher.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/manifest/version_checker.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/package_approvals.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/policy/policy.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/provision_gate.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/scoped_advisor_audit.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/server.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/subscriptions.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/templates/code_snippets_loader.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/tools/handlers.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/trust_store.py: identical to wip/297-code@ee644a9
-cmp src/pmcp/types.py: identical to wip/297-code@ee644a9
-cmp tests/test_argument_error_echo.py: identical to wip/297-code@ee644a9
-cmp tests/test_downstream_frame_echo.py: identical to wip/297-code@ee644a9
-cmp tests/test_exception_text_sinks.py: identical to wip/297-code@ee644a9
-cmp tests/test_gateway_tool_schemas.py: identical to wip/297-code@ee644a9
-cmp tests/test_log_record_scrubber.py: identical to wip/297-code@ee644a9
-cmp tests/test_scoped_advisor_audit.py: identical to wip/297-code@ee644a9
-proof tree == ee644a9 (whole tree)
+cmp CHANGELOG.md: identical to wip/297-code@1824a09
+cmp README.md: identical to wip/297-code@1824a09
+cmp src/pmcp/__init__.py: identical to wip/297-code@1824a09
+cmp src/pmcp/argument_errors.py: identical to wip/297-code@1824a09
+cmp src/pmcp/auth.py: identical to wip/297-code@1824a09
+cmp src/pmcp/client/manager.py: identical to wip/297-code@1824a09
+cmp src/pmcp/config/guidance.py: identical to wip/297-code@1824a09
+cmp src/pmcp/config/loader.py: identical to wip/297-code@1824a09
+cmp src/pmcp/manifest/code_patterns_loader.py: identical to wip/297-code@1824a09
+cmp src/pmcp/manifest/environment.py: identical to wip/297-code@1824a09
+cmp src/pmcp/manifest/installer.py: identical to wip/297-code@1824a09
+cmp src/pmcp/manifest/loader.py: identical to wip/297-code@1824a09
+cmp src/pmcp/manifest/npm_resolver.py: identical to wip/297-code@1824a09
+cmp src/pmcp/manifest/package_identity.py: identical to wip/297-code@1824a09
+cmp src/pmcp/manifest/refresher.py: identical to wip/297-code@1824a09
+cmp src/pmcp/manifest/version_checker.py: identical to wip/297-code@1824a09
+cmp src/pmcp/package_approvals.py: identical to wip/297-code@1824a09
+cmp src/pmcp/policy/policy.py: identical to wip/297-code@1824a09
+cmp src/pmcp/provision_gate.py: identical to wip/297-code@1824a09
+cmp src/pmcp/scoped_advisor_audit.py: identical to wip/297-code@1824a09
+cmp src/pmcp/server.py: identical to wip/297-code@1824a09
+cmp src/pmcp/subscriptions.py: identical to wip/297-code@1824a09
+cmp src/pmcp/templates/code_snippets_loader.py: identical to wip/297-code@1824a09
+cmp src/pmcp/tools/handlers.py: identical to wip/297-code@1824a09
+cmp src/pmcp/trust_store.py: identical to wip/297-code@1824a09
+cmp src/pmcp/types.py: identical to wip/297-code@1824a09
+cmp tests/test_argument_error_echo.py: identical to wip/297-code@1824a09
+cmp tests/test_downstream_frame_echo.py: identical to wip/297-code@1824a09
+cmp tests/test_exception_text_sinks.py: identical to wip/297-code@1824a09
+cmp tests/test_gateway_tool_schemas.py: identical to wip/297-code@1824a09
+cmp tests/test_log_record_scrubber.py: identical to wip/297-code@1824a09
+cmp tests/test_scoped_advisor_audit.py: identical to wip/297-code@1824a09
+proof tree == 1824a09 (whole tree)
 ```
 
 ## Full suite and gates
 
-On `wip/297-code` @ `ee644a9`, with `npm_config_cache`, `npm_config_store_dir` and
+On `wip/297-code` @ `1824a09`, with `npm_config_cache`, `npm_config_store_dir` and
 `pnpm_config_store_dir` unset (dev0 is a team host):
 
 ```text
 $ pytest -m 'not live and not slow' -q
-4923 passed, 3 skipped, 80 deselected in 740.69s (0:12:20)
+4932 passed, 3 skipped, 80 deselected in 697.22s (0:11:37)
 EXIT=0
 ```
 
@@ -1375,7 +1455,7 @@ $ ruff format --check src/ tests/
 $ mypy src/
 Success: no issues found in 53 source files
 $ pytest (six modules) -q
-598 passed in 121.51s (0:02:01)
+607 passed in 132.07s (0:02:12)
 ```
 
 ## Verbatim bodies
@@ -1392,6 +1472,7 @@ while read f; do
 done <<'LIST'
 CHANGELOG.md
 README.md
+src/pmcp/__init__.py
 src/pmcp/argument_errors.py
 src/pmcp/auth.py
 src/pmcp/client/manager.py
@@ -1468,14 +1549,14 @@ print(f"{out}: {j - i - 1} lines")
 
 ````diff
 diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 6ee53d7..ca4b0a9 100644
+index 6ee53d7..fd33d1c 100644
 --- a/CHANGELOG.md
 +++ b/CHANGELOG.md
 @@ -383,6 +383,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
  
  
  ### Fixed
-+- **A rejected gateway-tool argument no longer echoes its value into the response, the log or the scoped audit (Consiliency/pmcp#297).** Both validation layers rendered the value that failed: the input-schema gate returned jsonschema's message (`Input validation error: 'Bearer sk-…' is not of type 'object', 'null'`), and an argument model's pydantic error — returned as `str(e)[:400]` and logged as `Tool execution error: …` — carried `input_value=…` (the full value for `InvokeInput`'s correlation-ID charset check and a non-dict `meta`, a truncated repr of the whole argument dict for the all-or-none correlation check). Rejections are now described from their structure, as `<JSON path>: <reason>` — e.g. `Input validation error: $.options: must be of type object or null`, `Invalid arguments: $.run_correlation_id: correlation IDs may contain only alphanumerics and ._:-` — where the reason is a fixed phrase filled only from the tool's own schema or model (a type, a length, a pattern, the allowed values) and a key the caller chose is shown as `*`. The log line is `Tool execution error: invalid arguments for <tool>: <same description>`. **The same rule now holds wherever pmcp turns an exception into text** — tool responses, log lines and tracebacks, the in-memory audit-event buffer `gateway.health` exposes, and error fields such as `gateway.tasks_*` `errors`: a pydantic or jsonschema validation error (or an exception whose text embeds one) reads `N validation error(s) for <Model>: $.<path>: <reason>`, and a traceback whose chain holds one is not logged. This covers downstream data too: a task-capable server answering `tasks/get` with `{"taskId": "t", "ttl": "<secret>"}` used to get that value echoed back in `errors` and stored in the audit-event buffer. Operators see the same form for their own config files (policy, trust store, package approvals, `.mcp.json`): the failing field and why, not the value. A downstream that answers with a malformed JSON-RPC frame no longer has it echoed: the MCP SDK turns such a frame into a JSON-RPC `-32700` whose message is pydantic's text, and pmcp now replaces any `-32700` message (and a non-string `error.message`) with fixed text (`downstream sent a response that could not be parsed`), and scrubs every log record at creation -- whatever logger makes it, the MCP SDK's `ClientSession` (logger `client`) and any third party included -- when its traceback, `%`-arguments or message carry a validation error (the traceback is dropped and the structural description appended). This covers the startup description refresh, where a downstream's malformed notification used to put its value in the gateway log. A downstream's own, well-formed error message is still returned as before. **Wording change:** the text after `Input validation error: ` is no longer jsonschema's message; a client matching on phrases such as `is not of type` or `is too short` must match the new form. A call rejected by the tool's argument model (not the gate) is now recorded in the scoped audit as an `audit.rejection` like a gate rejection, with `rejected_argument_validator: null`, instead of an `audit.invocation` `failure` that copied its unvalidated correlation fields. An unregistered tool name is no longer written to the log (`Tool execution error: unknown gateway tool`); the response still names it. `gateway.provision_status` validates its arguments before its catch-all, which logged a traceback of the validation error.
++- **A rejected gateway-tool argument no longer echoes its value into the response, the log or the scoped audit (Consiliency/pmcp#297).** Both validation layers rendered the value that failed: the input-schema gate returned jsonschema's message (`Input validation error: 'Bearer sk-…' is not of type 'object', 'null'`), and an argument model's pydantic error — returned as `str(e)[:400]` and logged as `Tool execution error: …` — carried `input_value=…` (the full value for `InvokeInput`'s correlation-ID charset check and a non-dict `meta`, a truncated repr of the whole argument dict for the all-or-none correlation check). Rejections are now described from their structure, as `<JSON path>: <reason>` — e.g. `Input validation error: $.options: must be of type object or null`, `Invalid arguments: $.run_correlation_id: correlation IDs may contain only alphanumerics and ._:-` — where the reason is a fixed phrase filled only from the tool's own schema or model (a type, a length, a pattern, the allowed values) and a key the caller chose is shown as `*`. The log line is `Tool execution error: invalid arguments for <tool>: <same description>`. **The same rule now holds wherever pmcp turns an exception into text** — tool responses, log lines and tracebacks, the in-memory audit-event buffer `gateway.health` exposes, and error fields such as `gateway.tasks_*` `errors`: a pydantic or jsonschema validation error (or an exception whose text embeds one) reads `N validation error(s) for <Model>: $.<path>: <reason>`, and a traceback whose chain holds one is not logged. This covers downstream data too: a task-capable server answering `tasks/get` with `{"taskId": "t", "ttl": "<secret>"}` used to get that value echoed back in `errors` and stored in the audit-event buffer. Operators see the same form for their own config files (policy, trust store, package approvals, `.mcp.json`): the failing field and why, not the value. A downstream that answers with a malformed JSON-RPC frame no longer has it echoed: the MCP SDK turns such a frame into a JSON-RPC `-32700` whose message is pydantic's text, and pmcp now replaces any `-32700` message (and a non-string `error.message`) with fixed text (`downstream sent a response that could not be parsed`), and, from the moment the `pmcp` package is imported (so in the gateway, every `pmcp` CLI command such as `pmcp refresh`, `python -m pmcp` and any embedder), scrubs every log record at creation, whatever logger makes it -- the MCP SDK's `ClientSession` (logger `client`) and third parties included -- when its traceback, `%`-arguments or an exception passed as the message carry a validation error (the traceback is dropped and the structural description appended). Text a library has already formatted into a message string is not scrubbed. This covers the gateway's startup description refresh and `pmcp refresh`, where a downstream's malformed notification used to put its value in the log. A downstream's own, well-formed error message is still returned as before. **Wording change:** the text after `Input validation error: ` is no longer jsonschema's message; a client matching on phrases such as `is not of type` or `is too short` must match the new form. A call rejected by the tool's argument model (not the gate) is now recorded in the scoped audit as an `audit.rejection` like a gate rejection, with `rejected_argument_validator: null`, instead of an `audit.invocation` `failure` that copied its unvalidated correlation fields. An unregistered tool name is no longer written to the log (`Tool execution error: unknown gateway tool`); the response still names it. `gateway.provision_status` validates its arguments before its catch-all, which logged a traceback of the validation error.
  - **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values (Consiliency/pmcp#296).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name, `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
  - **`sanitize_auth_diagnostic` does its keyword and URL-punctuation work in linear time.** The keyword rule now runs through `pmcp.keyword_matcher` (the same matches as the regular expression it replaces, pinned by a seeded corpus), and trailing punctuation is split off a URL in one pass. Output is unchanged.
  - **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree (Consiliency/pmcp#236).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` now advertises its range on both sides, so `1e20`, `-1e20` and `float(±2**63)` are rejected at the gate, and so is any integer outside [−2^63+1, 2^63−1] (including `-2**63` itself), which the handler previously accepted. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the Consiliency/pmcp#296 entry above). Unknown keys are still ignored in this release — see the following entry once B lands. Argument descriptions agents already saw are unchanged, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description.
@@ -1505,15 +1586,37 @@ index 94542a3..f7145ea 100644
  arguments.
 ````
 
+### Patch — `src/pmcp/__init__.py`
+
+````diff
+diff --git a/src/pmcp/__init__.py b/src/pmcp/__init__.py
+index 5029f42..731fe41 100644
+--- a/src/pmcp/__init__.py
++++ b/src/pmcp/__init__.py
+@@ -1,3 +1,12 @@
+ """PMCP - A meta-server for minimal Claude Code tool bloat."""
+ 
++from pmcp.argument_errors import install_log_scrubber as _install_log_scrubber
++
+ __version__ = "2.7.3"
++
++# Every entry point imports this package first -- the gateway, the `pmcp`
++# CLI (`pmcp refresh` talks to downstreams through the MCP SDK's client),
++# `python -m pmcp` and any embedder -- so the log-record scrubber is in place
++# before any library can log a rejected value (Consiliency/pmcp#297).
++# Idempotent; `pmcp.client.manager` and `GatewayServer` call it too.
++_install_log_scrubber()
+````
+
 ### Patch — `src/pmcp/argument_errors.py`
 
 ````diff
 diff --git a/src/pmcp/argument_errors.py b/src/pmcp/argument_errors.py
 new file mode 100644
-index 0000000..aa92550
+index 0000000..e19fabb
 --- /dev/null
 +++ b/src/pmcp/argument_errors.py
-@@ -0,0 +1,654 @@
+@@ -0,0 +1,657 @@
 +"""Describe a rejected gateway-tool argument without the value that failed.
 +
 +A gateway tool's arguments are checked twice: by the advertised JSON Schema
@@ -2157,12 +2260,15 @@ index 0000000..aa92550
 +def install_log_scrubber() -> None:
 +    """Scrub every `LogRecord` at creation, whatever logger creates it.
 +
-+    Wraps the current ``logging`` record factory, so it covers the MCP SDK's
-+    loggers (including ``"client"``, which is outside ``mcp.*``), asyncio's,
-+    uvicorn's, httpx's and any other, and every handler sees the scrubbed
-+    record regardless of propagation. Idempotent: installing twice keeps one
-+    wrapper. Called at ``pmcp.client.manager`` import and in
-+    ``GatewayServer.__init__``.
++    Wraps the current ``logging`` record factory, so every record any logger
++    creates -- the MCP SDK's (including ``"client"``, outside ``mcp.*``),
++    uvicorn's, httpx's, any other -- is scrubbed before any handler sees it,
++    regardless of propagation. It scrubs what a record *carries* (its
++    traceback, arguments, an exception as ``msg``); text a library has
++    already formatted into the message string is out of its reach.
++    Idempotent: installing twice keeps one wrapper. Installed on ``import
++    pmcp`` (so by every entry point), and again at ``pmcp.client.manager``
++    import and in ``GatewayServer.__init__``.
 +    """
 +    current = logging.getLogRecordFactory()
 +    if getattr(current, "pmcp_validation_scrubber", False):
@@ -6568,10 +6674,10 @@ index e6ddeb9..94456d8 100644
 ````diff
 diff --git a/tests/test_log_record_scrubber.py b/tests/test_log_record_scrubber.py
 new file mode 100644
-index 0000000..ffab404
+index 0000000..1eaf856
 --- /dev/null
 +++ b/tests/test_log_record_scrubber.py
-@@ -0,0 +1,198 @@
+@@ -0,0 +1,342 @@
 +"""Every log record is scrubbed at creation, whoever logs it
 +(Consiliency/pmcp#297, rev 4).
 +
@@ -6770,6 +6876,150 @@ index 0000000..ffab404
 +        assert getattr(logging.getLogRecordFactory(), "pmcp_validation_scrubber", False)
 +    finally:
 +        logging.setLogRecordFactory(original)
++
++
++# --- every entry point installs it (rev 5, rev 4 board B1) --------------------
++
++_MARKER = "import logging; print(getattr(logging.getLogRecordFactory(), 'pmcp_validation_scrubber', False))"
++
++
++def _console_scripts() -> list[str]:
++    """The console scripts pmcp's distribution declares (pyproject's
++    `[project.scripts]`), as `module:attr`."""
++    from importlib.metadata import distribution
++
++    return sorted(
++        ep.value
++        for ep in distribution("pmcp").entry_points
++        if ep.group == "console_scripts"
++    )
++
++
++def _entry_points() -> dict[str, str]:
++    """A fresh interpreter per entry point: the snippet enters pmcp that way
++    and then prints whether the record factory is the scrubber."""
++    snippets = {
++        f"import {module}": f"import {module}\n{_MARKER}"
++        for module in (
++            "pmcp",
++            "pmcp.cli",
++            "pmcp.manifest.refresher",
++            "pmcp.transport.http",
++        )
++    }
++    snippets["python -m pmcp --version"] = (
++        "import runpy, sys\nsys.argv = ['pmcp', '--version']\n"
++        "try:\n    runpy.run_module('pmcp', run_name='__main__')\n"
++        "except SystemExit:\n    pass\n" + _MARKER
++    )
++    for value in _console_scripts():
++        module, _, attr = value.partition(":")
++        snippets[f"console script {value}"] = (
++            f"import importlib\ngetattr(importlib.import_module({module!r}), {attr!r})\n{_MARKER}"
++        )
++    return snippets
++
++
++@pytest.mark.parametrize("entry", sorted(_entry_points()))
++def test_every_entry_point_installs_the_scrubber(entry: str) -> None:
++    import subprocess
++    import sys
++
++    assert _console_scripts(), "pmcp declares no console script?"
++    result = subprocess.run(
++        [sys.executable, "-c", _entry_points()[entry]],
++        capture_output=True,
++        text=True,
++        timeout=120,
++    )
++    assert result.returncode == 0, result.stderr
++    assert result.stdout.strip().splitlines()[-1] == "True", (entry, result.stdout)
++
++
++_CLI_REFRESH = """
++import json, sys
++from pathlib import Path
++import pmcp.cli as cli
++import pmcp.manifest.refresher as refresher
++from pmcp.manifest.loader import ServerConfig
++
++tmp, script = Path(sys.argv[1]), sys.argv[2]
++config = ServerConfig(name="d", description="d", keywords=[], install={},
++                      command=sys.executable, args=[script, str(tmp / "case.json")])
++
++class _Manifest:
++    servers = {"d": config}
++    def get_server(self, name):
++        return self.servers.get(name)
++
++# Only the manifest lookup is replaced: the downstream is the test's.
++refresher.load_manifest = lambda *a, **k: _Manifest()
++sys.argv = ["pmcp", "refresh", "--server", "d", "--force",
++            "--cache-dir", str(tmp / "cache"), "-l", "info"]
++try:
++    cli.main()
++except SystemExit:
++    pass
++"""
++
++
++@pytest.mark.parametrize(
++    "kind",
++    [
++        "notifications/message",
++        "notifications/progress",
++        "notifications/resources/updated",
++    ],
++)
++def test_pmcp_refresh_logs_no_downstream_value(tmp_path: Any, kind: str) -> None:
++    """The operator's `pmcp refresh` (the real `pmcp.cli.main`, in a fresh
++    interpreter) against a downstream whose malformed notification the
++    SDK's `ClientSession` rejects: neither stderr nor `.pmcp/logs/gateway.log`
++    carries the value."""
++    import json
++    import os
++    import subprocess
++    import sys
++
++    from tests.test_downstream_frame_echo import _SESSION_MESSAGES, _SESSION_SCRIPT
++
++    script = tmp_path / "session_downstream.py"
++    script.write_text(_SESSION_SCRIPT)
++    driver = tmp_path / "cli_refresh.py"
++    driver.write_text(_CLI_REFRESH)
++    for family in ("hex", "alpha", "unicode"):
++        s = _FAMILIES[family][1]
++        (tmp_path / "case.json").write_text(
++            json.dumps([kind, _SESSION_MESSAGES[kind](s)])
++        )
++        (tmp_path / "case.json.in").unlink(missing_ok=True)
++        result = subprocess.run(
++            [sys.executable, str(driver), str(tmp_path), str(script)],
++            capture_output=True,
++            text=True,
++            timeout=120,
++            cwd=tmp_path,
++            env={**os.environ, "HOME": str(tmp_path)},
++        )
++        log_file = tmp_path / ".pmcp" / "logs" / "gateway.log"
++        log = log_file.read_text(errors="replace") if log_file.exists() else ""
++        for channel, text in (
++            ("stdout", result.stdout),
++            ("stderr", result.stderr),
++            ("log file", log),
++        ):
++            assert not any(form in text for form in _forbidden(s)), (
++                kind,
++                family,
++                channel,
++                text,
++            )
++        # No vacuous pass: the refresh ran, and the SDK rejected the message.
++        assert "Refreshing server: d" in result.stdout, result.stdout + result.stderr
++        assert "Failed to validate notification" in result.stderr + log, (
++            kind,
++            result.stderr,
++        )
 ````
 
 ### Patch — `tests/test_scoped_advisor_audit.py`
@@ -7311,7 +7561,7 @@ TESTS = ["tests/test_argument_error_echo.py", "tests/test_downstream_frame_echo.
          "tests/test_exception_text_sinks.py"]
 S = "src/pmcp/server.py"; A = "src/pmcp/argument_errors.py"; T = "src/pmcp/types.py"
 H = "src/pmcp/tools/handlers.py"; D = "src/pmcp/scoped_advisor_audit.py"
-U = "src/pmcp/auth.py"; C = "src/pmcp/client/manager.py"; I = "src/pmcp/manifest/installer.py"
+U = "src/pmcp/auth.py"; P = "src/pmcp/__init__.py"; C = "src/pmcp/client/manager.py"; I = "src/pmcp/manifest/installer.py"
 MUTANTS = [
  ("M1 gate renders e.message", S, [("+ describe_schema_error(e, tool.input_schema, arguments),", "+ e.message,")]),
  ("M2 except arm returns str(e)", S, [('"message": described[:400],', '"message": str(e)[:400],')]),
@@ -7343,6 +7593,7 @@ MUTANTS = [
  ("M28 %-args branch removed", A, [("        if record.args:\n            record.args = _scrubbed(record.args)\n", "")]),
  ("M29 msg-is-an-exception branch removed", A, [("        if isinstance(record.msg, BaseException):\n            record.msg = _scrubbed(record.msg)\n", "")]),
  ("M30 nested containers not walked", A, [("    if isinstance(value, tuple):\n        return tuple(_scrubbed(item, depth + 1) for item in value)\n", "    if isinstance(value, tuple):\n        return tuple(exception_text(i) if isinstance(i, BaseException) and safe_exc_info(i) is None else i for i in value)\n")]),
+ ("M31 install removed from pmcp/__init__.py", P, [("_install_log_scrubber()\n", "")]),
  ("G1 connect retry logs last_error", C, [("        if last_error:\n            raise last_error\n", "        if last_error:\n            logger.warning(f\"giving up: {last_error}\")\n            raise last_error\n")]),
  ("S5 value in a log extra= field", S, [("                        audited_name,\n                        reason,\n                    )\n", "                        audited_name,\n                        reason,\n                        extra={'args_dump': repr(arguments)},\n                    )\n")]),
  ("S6 arguments printed to stderr", S, [("                    reason = describe_model_error(e, tool.input_schema, arguments)\n", "                    reason = describe_model_error(e, tool.input_schema, arguments)\n                    print(arguments, file=sys.stderr)\n")]),
