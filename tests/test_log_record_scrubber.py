@@ -196,3 +196,147 @@ def test_the_gateway_installs_the_scrubber(tmp_path: Any) -> None:
         assert getattr(logging.getLogRecordFactory(), "pmcp_validation_scrubber", False)
     finally:
         logging.setLogRecordFactory(original)
+
+
+# --- every entry point installs it (rev 5, rev 4 board B1) --------------------
+
+_MARKER = "import logging; print(getattr(logging.getLogRecordFactory(), 'pmcp_validation_scrubber', False))"
+
+
+def _console_scripts() -> list[str]:
+    """The console scripts pmcp's distribution declares (pyproject's
+    `[project.scripts]`), as `module:attr`."""
+    from importlib.metadata import distribution
+
+    return sorted(
+        ep.value
+        for ep in distribution("pmcp").entry_points
+        if ep.group == "console_scripts"
+    )
+
+
+def _entry_points() -> dict[str, str]:
+    """A fresh interpreter per entry point: the snippet enters pmcp that way
+    and then prints whether the record factory is the scrubber."""
+    snippets = {
+        f"import {module}": f"import {module}\n{_MARKER}"
+        for module in (
+            "pmcp",
+            "pmcp.cli",
+            "pmcp.manifest.refresher",
+            "pmcp.transport.http",
+        )
+    }
+    snippets["python -m pmcp --version"] = (
+        "import runpy, sys\nsys.argv = ['pmcp', '--version']\n"
+        "try:\n    runpy.run_module('pmcp', run_name='__main__')\n"
+        "except SystemExit:\n    pass\n" + _MARKER
+    )
+    for value in _console_scripts():
+        module, _, attr = value.partition(":")
+        snippets[f"console script {value}"] = (
+            f"import importlib\ngetattr(importlib.import_module({module!r}), {attr!r})\n{_MARKER}"
+        )
+    return snippets
+
+
+@pytest.mark.parametrize("entry", sorted(_entry_points()))
+def test_every_entry_point_installs_the_scrubber(entry: str) -> None:
+    import subprocess
+    import sys
+
+    assert _console_scripts(), "pmcp declares no console script?"
+    result = subprocess.run(
+        [sys.executable, "-c", _entry_points()[entry]],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines()[-1] == "True", (entry, result.stdout)
+
+
+_CLI_REFRESH = """
+import json, sys
+from pathlib import Path
+import pmcp.cli as cli
+import pmcp.manifest.refresher as refresher
+from pmcp.manifest.loader import ServerConfig
+
+tmp, script = Path(sys.argv[1]), sys.argv[2]
+config = ServerConfig(name="d", description="d", keywords=[], install={},
+                      command=sys.executable, args=[script, str(tmp / "case.json")])
+
+class _Manifest:
+    servers = {"d": config}
+    def get_server(self, name):
+        return self.servers.get(name)
+
+# Only the manifest lookup is replaced: the downstream is the test's.
+refresher.load_manifest = lambda *a, **k: _Manifest()
+sys.argv = ["pmcp", "refresh", "--server", "d", "--force",
+            "--cache-dir", str(tmp / "cache"), "-l", "info"]
+try:
+    cli.main()
+except SystemExit:
+    pass
+"""
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "notifications/message",
+        "notifications/progress",
+        "notifications/resources/updated",
+    ],
+)
+def test_pmcp_refresh_logs_no_downstream_value(tmp_path: Any, kind: str) -> None:
+    """The operator's `pmcp refresh` (the real `pmcp.cli.main`, in a fresh
+    interpreter) against a downstream whose malformed notification the
+    SDK's `ClientSession` rejects: neither stderr nor `.pmcp/logs/gateway.log`
+    carries the value."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from tests.test_downstream_frame_echo import _SESSION_MESSAGES, _SESSION_SCRIPT
+
+    script = tmp_path / "session_downstream.py"
+    script.write_text(_SESSION_SCRIPT)
+    driver = tmp_path / "cli_refresh.py"
+    driver.write_text(_CLI_REFRESH)
+    for family in ("hex", "alpha", "unicode"):
+        s = _FAMILIES[family][1]
+        (tmp_path / "case.json").write_text(
+            json.dumps([kind, _SESSION_MESSAGES[kind](s)])
+        )
+        (tmp_path / "case.json.in").unlink(missing_ok=True)
+        result = subprocess.run(
+            [sys.executable, str(driver), str(tmp_path), str(script)],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=tmp_path,
+            env={**os.environ, "HOME": str(tmp_path)},
+        )
+        log_file = tmp_path / ".pmcp" / "logs" / "gateway.log"
+        log = log_file.read_text(errors="replace") if log_file.exists() else ""
+        for channel, text in (
+            ("stdout", result.stdout),
+            ("stderr", result.stderr),
+            ("log file", log),
+        ):
+            assert not any(form in text for form in _forbidden(s)), (
+                kind,
+                family,
+                channel,
+                text,
+            )
+        # No vacuous pass: the refresh ran, and the SDK rejected the message.
+        assert "Refreshing server: d" in result.stdout, result.stdout + result.stderr
+        assert "Failed to validate notification" in result.stderr + log, (
+            kind,
+            result.stderr,
+        )

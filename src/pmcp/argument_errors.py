@@ -641,12 +641,15 @@ def _scrubbing_factory(previous: Any) -> Any:
 def install_log_scrubber() -> None:
     """Scrub every `LogRecord` at creation, whatever logger creates it.
 
-    Wraps the current ``logging`` record factory, so it covers the MCP SDK's
-    loggers (including ``"client"``, which is outside ``mcp.*``), asyncio's,
-    uvicorn's, httpx's and any other, and every handler sees the scrubbed
-    record regardless of propagation. Idempotent: installing twice keeps one
-    wrapper. Called at ``pmcp.client.manager`` import and in
-    ``GatewayServer.__init__``.
+    Wraps the current ``logging`` record factory, so every record any logger
+    creates -- the MCP SDK's (including ``"client"``, outside ``mcp.*``),
+    uvicorn's, httpx's, any other -- is scrubbed before any handler sees it,
+    regardless of propagation. It scrubs what a record *carries* (its
+    traceback, arguments, an exception as ``msg``); text a library has
+    already formatted into the message string is out of its reach.
+    Idempotent: installing twice keeps one wrapper. Installed on ``import
+    pmcp`` (so by every entry point), and again at ``pmcp.client.manager``
+    import and in ``GatewayServer.__init__``.
     """
     current = logging.getLogRecordFactory()
     if getattr(current, "pmcp_validation_scrubber", False):
