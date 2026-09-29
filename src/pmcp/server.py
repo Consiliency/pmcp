@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import jsonschema
+import pydantic
 from mcp.server import Server
 from mcp.server.context import ServerRequestContext
 from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler
@@ -37,6 +38,7 @@ from mcp.types import (
     Tool,
 )
 
+from pmcp.argument_errors import describe_argument_error, describe_schema_error
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
@@ -69,7 +71,11 @@ from pmcp.scoped_advisor_audit import (
 )
 from pmcp.subscriptions import BusCatalogEventSink
 from pmcp.summary import generate_capability_summary
-from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
+from pmcp.tools.handlers import (
+    GATEWAY_TOOL_INPUT_MODELS,
+    GatewayTools,
+    get_gateway_tool_definitions,
+)
 from pmcp.types import (
     DescriptionsCache,
     GatewayDiagnosticsInfo,
@@ -335,11 +341,15 @@ class GatewayServer:
                             )
                         ]
                     )
+                # Never `e.message`: for `type`, `pattern`, `enum` and length
+                # errors it quotes the rejected value (Consiliency/pmcp#297).
                 return CallToolResult(
                     is_error=True,
                     content=[
                         TextContent(
-                            type="text", text=f"Input validation error: {e.message}"
+                            type="text",
+                            text="Input validation error: "
+                            + describe_schema_error(e, tool.input_schema, arguments),
                         )
                     ],
                 )
@@ -477,7 +487,24 @@ class GatewayServer:
                     )
                 ]
             except Exception as e:
-                logger.error(f"Tool execution error: {e}")
+                # An argument model's `ValidationError` renders `input_value=...`
+                # and a validator's own message; describe it from its structure
+                # instead, in the log and the response (Consiliency/pmcp#297).
+                described = describe_argument_error(
+                    e, tool.input_schema if tool is not None else None, arguments
+                )
+                if described is not None:
+                    logger.error(
+                        "Tool execution error: invalid arguments for %s: %s",
+                        audited_name,
+                        described,
+                    )
+                elif tool is None:
+                    # Only an unregistered name raises here; it is the
+                    # caller's string, so it is not logged (Consiliency/pmcp#297).
+                    logger.error("Tool execution error: unknown gateway tool")
+                else:
+                    logger.error(f"Tool execution error: {e}")
                 try:
                     failure_status = (
                         "denied"
@@ -485,12 +512,31 @@ class GatewayServer:
                         and e.code == ErrorCode.E402_TOOL_DENIED
                         else "failure"
                     )
-                    self._record_scoped_invocation(
-                        gateway_tool=audited_name,
-                        terminal_status=failure_status,
-                        arguments=audited_arguments,
-                        result={"error_type": type(e).__name__},
-                    )
+                    # The tool's own argument model rejected the call: like a
+                    # gate rejection it is an `audit.rejection` (tool, path,
+                    # nothing the caller sent), not an invocation whose
+                    # correlations nothing vouched for (Consiliency/pmcp#297).
+                    input_model = GATEWAY_TOOL_INPUT_MODELS.get(audited_name or "")
+                    if (
+                        isinstance(e, pydantic.ValidationError)
+                        and tool is not None
+                        and input_model is not None
+                        and e.title == input_model.__name__
+                    ):
+                        if self._scoped_advisor_audit is not None:
+                            self._scoped_advisor_audit.record_rejected_arguments(
+                                gateway_tool=tool.name,
+                                error=e,
+                                schema=tool.input_schema,
+                                arguments=arguments,
+                            )
+                    else:
+                        self._record_scoped_invocation(
+                            gateway_tool=audited_name,
+                            terminal_status=failure_status,
+                            arguments=audited_arguments,
+                            result={"error_type": type(e).__name__},
+                        )
                 except ScopedAdvisorAuditError:
                     logger.error("Scoped advisor audit channel failed")
                     return [
@@ -507,7 +553,14 @@ class GatewayServer:
                 return [
                     TextContent(
                         type="text",
-                        text=json.dumps({"error": True, "message": str(e)[:400]}),
+                        text=json.dumps(
+                            {
+                                "error": True,
+                                "message": f"Invalid arguments: {described}"
+                                if described is not None
+                                else str(e)[:400],
+                            }
+                        ),
                     )
                 ]
 
