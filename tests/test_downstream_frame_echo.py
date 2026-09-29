@@ -37,6 +37,7 @@ import re
 import sys
 import textwrap
 import threading
+import typing
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -478,3 +479,130 @@ async def test_no_malformed_frame_value_reaches_pmcps_output(
         await manager.disconnect_server("frames", force=True)
         await server.shutdown()
         downstream.close()
+
+
+# --- the SDK's own ClientSession (rev 4, rev 3 board B1) ----------------------
+#
+# `refresh_server` (the gateway's startup description refresh) talks to a
+# downstream through the SDK's `stdio_client` + `ClientSession`, whose logger
+# is named "client" -- outside `mcp.*` -- and which logs a notification it
+# rejects with `exc_info=True`. The downstream here sends one malformed
+# message of each kind before it answers `tools/list`.
+
+_SESSION_MESSAGES = {
+    "notifications/message": lambda s: {"level": s, "data": "x"},
+    "notifications/progress": lambda s: {"progressToken": {s: s}, "progress": 1},
+    "notifications/resources/updated": lambda s: {"uri": [s]},
+    "notifications/tools/list_changed": lambda s: s,
+    "notifications/cancelled": lambda s: {"requestId": {s: s}},
+    "request:roots/list": lambda s: s,
+    "request:sampling/createMessage": lambda s: {s: s},
+    "request:elicitation/create": lambda s: {"message": {s: s}},
+    "request:ping": lambda s: [s],
+}
+
+#: The kinds whose envelope is well formed, so `ClientSession` itself (on the
+#: "client" logger) is what rejects them.
+_SESSION_LEVEL = {
+    "notifications/message",
+    "notifications/progress",
+    "notifications/resources/updated",
+    "notifications/cancelled",
+}
+
+_SESSION_SCRIPT = textwrap.dedent(
+    """
+    import json, sys
+    with open(sys.argv[1]) as handle:  # the case, not on the command line:
+        kind, params = json.load(handle)  # pmcp records the command line
+    for line in sys.stdin:
+        with open(sys.argv[1] + ".in", "a") as seen:
+            seen.write(line)
+        request = json.loads(line)
+        rid, method = request.get("id"), request.get("method")
+        if rid is None or method is None:
+            continue
+        if method == "initialize":
+            result = {"protocolVersion": request["params"]["protocolVersion"],
+                      "capabilities": {"tools": {}}, "serverInfo": {"name": "d", "version": "1"}}
+        else:
+            if method == "tools/list":
+                if kind.startswith("request:"):
+                    frame = {"jsonrpc": "2.0", "id": 900, "method": kind[8:], "params": params}
+                else:
+                    frame = {"jsonrpc": "2.0", "method": kind, "params": params}
+                sys.stdout.write(json.dumps(frame) + "\\n")
+            result = {"tools": [{"name": "run", "inputSchema": {"type": "object"}}]} if method == "tools/list" else {}
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid, "result": result}) + "\\n")
+        sys.stdout.flush()
+    """
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", sorted(_SESSION_MESSAGES))
+async def test_no_malformed_session_message_value_reaches_the_log(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    capfd: pytest.CaptureFixture[str],
+    recwarn: pytest.WarningsRecorder,
+    kind: str,
+) -> None:
+    from pmcp.manifest.loader import ServerConfig
+    from pmcp.manifest.refresher import refresh_server
+
+    caplog.set_level(logging.DEBUG)
+    script = tmp_path / "session_downstream.py"
+    script.write_text(_SESSION_SCRIPT)
+    tap = _Tap(typing.cast(Any, _NoServer()), None, caplog, capfd, recwarn)
+    for family in _FRAME_FAMILIES:
+        seen = []
+        for s in _FAMILIES[family]:
+            config = ServerConfig(
+                name="d",
+                description="d",
+                keywords=[],
+                install={},
+                command=sys.executable,
+                args=[str(script), str(tmp_path / "case.json")],
+            )
+            (tmp_path / "case.json").write_text(
+                json.dumps([kind, _SESSION_MESSAGES[kind](s)])
+            )
+            mark = tap.start()
+            result = await asyncio.wait_for(refresh_server(config, force=True), 30)
+            observed = tap.since(mark, repr(result))
+            assert observed.leaks(s) == [], (kind, family, observed)
+            seen.append(
+                "\\n".join(
+                    sorted(
+                        _record_stable(r)
+                        for r in caplog.records[mark[0] :]
+                        if r.name == "client" or r.name.split(".")[0] == "pmcp"
+                    )
+                )
+            )
+        assert seen[0] == seen[1], (kind, family, seen)
+    # No vacuous pass: the SDK rejected the message -- in its envelope
+    # (`mcp.client.stdio`) or, for a well-formed envelope, in `ClientSession`
+    # (the "client" logger) -- and the scrubbed record says so.
+    rejected = {
+        r.name
+        for r in caplog.records
+        if r.name.split(".")[0] in ("client", "mcp")
+        and "validation error" in r.getMessage()
+    }
+    replies = [
+        json.loads(line)
+        for line in (tmp_path / "case.json.in").read_text().splitlines()
+    ]
+    answered = any(r.get("id") == 900 and "error" in r for r in replies)
+    assert rejected or answered, kind
+    if kind in _SESSION_LEVEL:
+        assert "client" in rejected, (kind, rejected)
+
+
+class _NoServer:
+    """`_Tap` outside a server: no gateway tools, so no audit-event buffer."""
+
+    _gateway_tools = None

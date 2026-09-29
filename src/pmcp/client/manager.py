@@ -28,7 +28,7 @@ from mcp.shared.message import SessionMessage
 from pmcp.argument_errors import (
     exception_text,
     safe_traceback_text,
-    scrub_sdk_loggers,
+    install_log_scrubber,
 )
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
@@ -70,9 +70,9 @@ except ImportError:
     HAS_RESOURCE = False
 
 logger = logging.getLogger(__name__)
-# The SDK's client transports, imported above, log rejected frames with a
-# traceback (Consiliency/pmcp#297); see `ValidationLogScrubber`.
-scrub_sdk_loggers()
+# The SDK logs rejected frames with a traceback (Consiliency/pmcp#297); every
+# record is scrubbed at creation (`install_log_scrubber`).
+install_log_scrubber()
 
 #: Executables that fetch and run the package they are given at spawn time,
 #: by NORMALIZED name (`normalized_executable_name`), so ``UVX.EXE``,

@@ -42,7 +42,7 @@ from pmcp.argument_errors import (
     describe_model_error,
     describe_schema_error,
     exception_text,
-    scrub_sdk_loggers,
+    install_log_scrubber,
 )
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
@@ -134,9 +134,9 @@ class GatewayServer:
         required_scopes: list[str] | None = None,
         allowed_origins: list[str] | None = None,
     ) -> None:
-        # Again at construction: SDK modules imported since `pmcp.client.manager`
-        # (the server transports) get the scrubber too (Consiliency/pmcp#297).
-        scrub_sdk_loggers()
+        # Idempotent; again here in case a record factory was replaced since
+        # import (Consiliency/pmcp#297).
+        install_log_scrubber()
         self._project_root = project_root
         self._custom_config_path = custom_config_path
         self._cache_dir = cache_dir or Path(".mcp-gateway")

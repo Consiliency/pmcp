@@ -256,19 +256,35 @@ def _scopes(tree: ast.Module) -> list[list[ast.stmt]]:
 
 
 def _own_nodes(body: list[ast.AST]) -> list[ast.AST]:
-    """Nodes of `body`, not descending into nested functions or classes
-    (their own scope); lambdas are part of the enclosing scope."""
+    """Nodes of `body`, including nested functions and lambdas -- a closure
+    sees the enclosing scope's names (rev 4: a `def` inside an `except`) --
+    but not nested classes. A nested function is also scanned as its own
+    scope; findings are de-duplicated."""
     found: list[ast.AST] = []
     pending: list[ast.AST] = list(body)
     while pending:
         node = pending.pop()
         found.append(node)
         for child in ast.iter_child_nodes(node):
-            if not isinstance(
-                child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            ):
+            if not isinstance(child, ast.ClassDef):
                 pending.append(child)
     return found
+
+
+def _is_context_exception(node: ast.AST) -> bool:
+    """`context["exception"]` / `context.get("exception")`: an asyncio loop
+    exception handler's exception (rev 4)."""
+    if isinstance(node, ast.Subscript):
+        key = node.slice
+        return isinstance(key, ast.Constant) and key.value == "exception"
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get"
+        and bool(node.args)
+        and isinstance(node.args[0], ast.Constant)
+        and node.args[0].value == "exception"
+    )
 
 
 #: A name's region: the ids of the nodes where it holds an exception, or
@@ -410,19 +426,23 @@ def _exception_regions(body: list[ast.stmt], namespace: dict[str, Any]) -> _Regi
         elif isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
             calls = [c for c in ast.walk(node.value) if isinstance(c, ast.Call)]
-            if any(
-                _callee(c) == "exception" and isinstance(c.func, ast.Attribute)
-                for c in calls
-            ) or any(
-                _callee(c) == "gather"
-                and any(
-                    k.arg == "return_exceptions"
-                    and not (
-                        isinstance(k.value, ast.Constant) and k.value.value is False
-                    )
-                    for k in c.keywords
+            if (
+                _is_context_exception(node.value)
+                or any(
+                    _callee(c) == "exception" and isinstance(c.func, ast.Attribute)
+                    for c in calls
                 )
-                for c in calls
+                or any(
+                    _callee(c) == "gather"
+                    and any(
+                        k.arg == "return_exceptions"
+                        and not (
+                            isinstance(k.value, ast.Constant) and k.value.value is False
+                        )
+                        for k in c.keywords
+                    )
+                    for c in calls
+                )
             ):
                 for t in targets:
                     if isinstance(t, ast.Name):
@@ -567,6 +587,22 @@ def exception_sinks(
                 if not (isinstance(grand, ast.Call) and grand.func is parent):
                     continue
             found.append(f"{label}:{use.lineno}: {type(parent).__name__} uses {use.id}")
+    for node in ast.walk(tree):
+        if _is_context_exception(node):
+            parent = parents.get(node)
+            if isinstance(parent, ast.Assign) and all(
+                isinstance(t, ast.Name) for t in parent.targets
+            ):
+                continue  # tracked as an exception name
+            if isinstance(parent, ast.Call) and _is_renderer_call(
+                parent, imported, label
+            ):
+                continue
+            if isinstance(
+                parent, (ast.Compare, ast.BoolOp, ast.If, ast.UnaryOp, ast.Raise)
+            ):
+                continue
+            found.append(f"{label}:{node.lineno}: context['exception'] used as text")
     for call in ast.walk(tree):
         if not isinstance(call, ast.Call):
             continue
@@ -608,7 +644,7 @@ def exception_sinks(
                 for k in ast.walk(keyword.value)
             ):
                 found.append(f"{label}:{call.lineno}: exc_info passed through **")
-    return found
+    return list(dict.fromkeys(found))
 
 
 def test_no_exception_reaches_text_except_through_the_renderer() -> None:
@@ -679,6 +715,15 @@ _FLAGGED = {
     "lambda_capture": "try:\n    f()\nexcept Exception as e:\n    cb = lambda: str(e)\n",
     "return_exception": "def g():\n    try:\n        f()\n    except Exception as e:\n        return e\n",
     "truncated_copy": "try:\n    f()\nexcept Exception as e:\n    raise RuntimeError(str(e)[:200]) from e\n",
+    "closure_in_except": (
+        "try:\n    f()\nexcept Exception as e:\n    def inner():\n        log(f'{e}')\n    later(inner)\n"
+    ),
+    "loop_exception_handler": (
+        "def handler(loop, context):\n    log(f\"{context['exception']}\")\n"
+    ),
+    "loop_exception_handler_alias": (
+        "def handler(loop, context):\n    exc = context.get('exception')\n    log(str(exc))\n"
+    ),
     "connect_with_retry_regression": (
         "async def _connect_with_retry(self, config):\n"
         "    last_error = None\n"

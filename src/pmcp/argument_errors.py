@@ -570,52 +570,85 @@ def safe_traceback_text(error: BaseException) -> str:
     return "".join(traceback.format_exception(type(error), error, error.__traceback__))
 
 
-# --- the SDK's own log records (rev 3) --------------------------------------
+# --- every log record, whoever logs it (rev 3, widened in rev 4) ------------
 
 
-class ValidationLogScrubber(logging.Filter):
-    """A filter for loggers pmcp does not own (the MCP SDK's).
+def _scrubbed(value: Any, depth: int = 0) -> Any:
+    """`value` with every exception whose chain holds a validation error
+    replaced by its :func:`exception_text`, looking inside tuples, lists,
+    sets and dicts (keys and values)."""
+    if isinstance(value, BaseException):
+        return exception_text(value) if safe_exc_info(value) is None else value
+    if depth > 8:
+        return value
+    if isinstance(value, tuple):
+        return tuple(_scrubbed(item, depth + 1) for item in value)
+    if isinstance(value, list):
+        return [_scrubbed(item, depth + 1) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return type(value)(_scrubbed(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        return {
+            _scrubbed(key, depth + 1): _scrubbed(item, depth + 1)
+            for key, item in value.items()
+        }
+    return value
 
-    The SDK logs a downstream frame its models reject with
-    ``logger.exception(...)`` (``mcp/client/streamable_http.py``,
-    ``mcp/client/sse.py``), so the traceback renders the rejected value. A
-    record whose ``exc_info`` chain holds a validation error loses the
-    traceback and gets :func:`exception_text` appended to its message; an
-    exception passed as a ``%``-argument is replaced by its
-    :func:`exception_text`. Every other record passes unchanged.
+
+def scrub_record(record: logging.LogRecord) -> logging.LogRecord:
+    """Remove a validation error's text from `record`, in place.
+
+    - ``msg`` that is itself such an exception becomes its
+      :func:`exception_text`;
+    - ``args`` -- a tuple, or the mapping of a ``%(name)s`` message -- have
+      every such exception, however nested in containers, replaced;
+    - ``exc_info`` whose chain holds one is dropped, and the message gets
+      the exception's :func:`exception_text` appended, so the record still
+      says what failed.
+
+    ``stack_info`` needs nothing: it renders frames and source lines, never
+    an exception's text. Every other record is returned unchanged.
     """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        error = record.exc_info[1] if record.exc_info else None
+    try:
+        if isinstance(record.msg, BaseException):
+            record.msg = _scrubbed(record.msg)
+        if record.args:
+            record.args = _scrubbed(record.args)
+        error = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
         if isinstance(error, BaseException) and safe_exc_info(error) is None:
-            record.msg = f"{record.getMessage()} ({exception_text(error)})"
+            try:
+                message = record.getMessage()
+            except Exception:
+                message = str(record.msg)
+            record.msg = f"{message} ({exception_text(error)})"
             record.args = None
             record.exc_info = None
             record.exc_text = None
-        if isinstance(record.args, tuple) and any(
-            isinstance(arg, BaseException) for arg in record.args
-        ):
-            record.args = tuple(
-                exception_text(arg) if isinstance(arg, BaseException) else arg
-                for arg in record.args
-            )
-        return True
+    except Exception:
+        pass  # a log call must never fail because of the scrub
+    return record
 
 
-_SCRUBBER = ValidationLogScrubber()
+def _scrubbing_factory(previous: Any) -> Any:
+    def factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+        return scrub_record(previous(*args, **kwargs))
+
+    factory.pmcp_validation_scrubber = True  # type: ignore[attr-defined]
+    factory.previous = previous  # type: ignore[attr-defined]
+    return factory
 
 
-def scrub_sdk_loggers() -> None:
-    """Attach :class:`ValidationLogScrubber` to every ``mcp`` / ``mcp.*``
-    logger that exists now. A logger's filters run only for records it
-    creates itself, so this is called once the SDK modules pmcp uses are
-    imported (``pmcp.client.manager``, ``pmcp.server``); it is idempotent."""
-    names = [
-        name
-        for name in list(logging.Logger.manager.loggerDict)
-        if name == "mcp" or name.startswith("mcp.")
-    ]
-    for name in ["mcp", *names]:
-        logger = logging.getLogger(name)
-        if _SCRUBBER not in logger.filters:
-            logger.addFilter(_SCRUBBER)
+def install_log_scrubber() -> None:
+    """Scrub every `LogRecord` at creation, whatever logger creates it.
+
+    Wraps the current ``logging`` record factory, so it covers the MCP SDK's
+    loggers (including ``"client"``, which is outside ``mcp.*``), asyncio's,
+    uvicorn's, httpx's and any other, and every handler sees the scrubbed
+    record regardless of propagation. Idempotent: installing twice keeps one
+    wrapper. Called at ``pmcp.client.manager`` import and in
+    ``GatewayServer.__init__``.
+    """
+    current = logging.getLogRecordFactory()
+    if getattr(current, "pmcp_validation_scrubber", False):
+        return
+    logging.setLogRecordFactory(_scrubbing_factory(current))
