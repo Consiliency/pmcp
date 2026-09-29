@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 
+from pmcp.argument_errors import exception_text
 from pmcp.trust_store import TrustStoreError, trust_store_path
 from pmcp.validation import (
     is_valid_package_name,
@@ -129,7 +130,9 @@ def _decode(entry: Any) -> PackageApproval:
     try:
         _require_identity_fields(registry, name, version)
     except ValueError as exc:
-        raise PackageApprovalError(f"Invalid package approval entry: {exc}") from exc
+        raise PackageApprovalError(
+            f"Invalid package approval entry: {exception_text(exc)}"
+        ) from exc
     if integrity is not None and not isinstance(integrity, str):
         raise PackageApprovalError("Package approval integrity is not a string")
     if decision not in DECISIONS:
@@ -138,7 +141,7 @@ def _decode(entry: Any) -> PackageApproval:
         parsed_at = datetime.fromisoformat(str(recorded_at))
     except ValueError as exc:
         raise PackageApprovalError(
-            f"Unparseable package approval timestamp: {exc}"
+            f"Unparseable package approval timestamp: {exception_text(exc)}"
         ) from exc
 
     return PackageApproval(
@@ -176,7 +179,7 @@ def _read_store_and_stale(
         data = json.loads(raw)
     except ValueError as exc:
         raise PackageApprovalError(
-            f"Cannot parse package approvals {path}: {exc}"
+            f"Cannot parse package approvals {path}: {exception_text(exc)}"
         ) from exc
     if not isinstance(data, dict):
         raise PackageApprovalError(f"Package approvals {path} is not a JSON object")

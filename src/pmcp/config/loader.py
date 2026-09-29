@@ -14,6 +14,7 @@ from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
+from pmcp.argument_errors import exception_text
 from pmcp.types import (
     ConfigSourceInfo,
     ConfigSourceName,
@@ -279,7 +280,7 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
             return None
         content = file_path.read_bytes()
     except Exception as e:
-        logger.warning(f"Failed to parse config file {file_path}: {e}")
+        logger.warning(f"Failed to parse config file {file_path}: {exception_text(e)}")
         return None
     return parse_config_bytes(content, file_path)
 
@@ -316,7 +317,7 @@ def parse_config_bytes(content: bytes, file_path: Path) -> McpConfigFile | None:
 
         return McpConfigFile.model_validate(data)
     except Exception as e:
-        logger.warning(f"Failed to parse config file {file_path}: {e}")
+        logger.warning(f"Failed to parse config file {file_path}: {exception_text(e)}")
         return None
 
 
@@ -354,7 +355,7 @@ def _read_config_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
     try:
         content = path.read_bytes()
     except Exception as exc:
-        return None, f"invalid_json: {exc}"
+        return None, f"invalid_json: {exception_text(exc)}"
     return _config_object_from_bytes(content)
 
 
@@ -365,7 +366,7 @@ def _config_object_from_bytes(
     try:
         data = json.loads(content)
     except Exception as exc:
-        return None, f"invalid_json: {exc}"
+        return None, f"invalid_json: {exception_text(exc)}"
     if not isinstance(data, dict):
         return None, "config_root_not_object"
     return data, None
@@ -1148,7 +1149,9 @@ def load_configs(
 
         manifest_servers = load_manifest().servers
     except Exception as e:
-        logger.debug(f"Manifest defaults unavailable during config load: {e}")
+        logger.debug(
+            f"Manifest defaults unavailable during config load: {exception_text(e)}"
+        )
 
     def build_resolved_config(
         name: str,

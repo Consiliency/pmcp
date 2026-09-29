@@ -11,6 +11,7 @@ from typing import Literal
 
 import yaml
 from pydantic import BaseModel, Field
+from pmcp.argument_errors import exception_text
 
 
 class GuidanceLayers(BaseModel):
@@ -175,7 +176,9 @@ def load_guidance_config(config_path: Path | None = None) -> GuidanceConfig:
         return GuidanceConfig(**data["guidance"])
     except Exception as e:
         # If config is invalid, log warning and use defaults
-        print(f"Warning: Failed to load guidance config from {config_path}: {e}")
+        print(
+            f"Warning: Failed to load guidance config from {config_path}: {exception_text(e)}"
+        )
         print("Using default guidance config (minimal mode)")
         return GuidanceConfig()
 

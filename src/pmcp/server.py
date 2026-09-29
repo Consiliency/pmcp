@@ -38,7 +38,11 @@ from mcp.types import (
     Tool,
 )
 
-from pmcp.argument_errors import describe_argument_error, describe_schema_error
+from pmcp.argument_errors import (
+    describe_model_error,
+    describe_schema_error,
+    exception_text,
+)
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
 from pmcp.config.loader import (
@@ -489,34 +493,39 @@ class GatewayServer:
             except Exception as e:
                 # A `ValidationError`'s text renders the rejected value
                 # (pydantic's `input_value=...`, a validator's own message,
-                # jsonschema's `message`); describe it from its structure
-                # instead, in the log, the response and the audit
+                # jsonschema's `message`), so it is described from its
+                # structure instead, in the log, the response and the audit
                 # (Consiliency/pmcp#297). The tool's own argument model
-                # rejecting the call is "invalid arguments"; any other (a
-                # downstream payload a handler parses) is a "validation error".
+                # rejecting the call is described against the tool's schema;
+                # anything else goes through `exception_text`, which is
+                # `str(e)` for every exception that is not (and does not
+                # embed) a validation error.
                 input_model = GATEWAY_TOOL_INPUT_MODELS.get(audited_name or "")
                 rejected_by_model = (
                     isinstance(e, pydantic.ValidationError)
                     and input_model is not None
                     and e.title == input_model.__name__
                 )
-                described = describe_argument_error(
-                    e, tool.input_schema if tool is not None else None, arguments
-                )
-                kind = "Invalid arguments" if rejected_by_model else "Validation error"
-                if described is not None:
+                if (
+                    isinstance(e, pydantic.ValidationError)
+                    and rejected_by_model
+                    and tool is not None
+                ):
+                    reason = describe_model_error(e, tool.input_schema, arguments)
+                    described = f"Invalid arguments: {reason}"
                     logger.error(
-                        "Tool execution error: %s for %s: %s",
-                        kind.lower(),
+                        "Tool execution error: invalid arguments for %s: %s",
                         audited_name,
-                        described,
+                        reason,
                     )
                 elif tool is None:
                     # Only an unregistered name raises here; it is the
                     # caller's string, so it is not logged (Consiliency/pmcp#297).
+                    described = exception_text(e)
                     logger.error("Tool execution error: unknown gateway tool")
                 else:
-                    logger.error(f"Tool execution error: {e}")
+                    described = exception_text(e)
+                    logger.error(f"Tool execution error: {described}")
                 try:
                     failure_status = (
                         "denied"
@@ -561,9 +570,7 @@ class GatewayServer:
                         text=json.dumps(
                             {
                                 "error": True,
-                                "message": f"{kind}: {described}"
-                                if described is not None
-                                else str(e)[:400],
+                                "message": described[:400],
                             }
                         ),
                     )
@@ -791,7 +798,9 @@ class GatewayServer:
             manifest = load_manifest()
             manifest_servers = manifest.servers
         except Exception as e:
-            logger.warning(f"Failed to load manifest startup configs: {e}")
+            logger.warning(
+                f"Failed to load manifest startup configs: {exception_text(e)}"
+            )
 
         enabled_auto_start = load_enabled_auto_start(
             project_root=self._project_root,
@@ -910,7 +919,7 @@ class GatewayServer:
                     f"Cached descriptions for {len(self._descriptions_cache.servers)} servers"
                 )
             except Exception as e:
-                logger.warning(f"Failed to auto-generate cache: {e}")
+                logger.warning(f"Failed to auto-generate cache: {exception_text(e)}")
 
         logger.debug("Capability summary:\n%s", self._capability_summary)
 
@@ -1076,7 +1085,7 @@ class GatewayServer:
         except asyncio.TimeoutError:
             logger.warning("Shutdown timed out, forcing disconnect")
         except Exception as e:
-            logger.error(f"Error during shutdown: {e}")
+            logger.error(f"Error during shutdown: {exception_text(e)}")
         finally:
             # Always release singleton lock
             release_singleton_lock()

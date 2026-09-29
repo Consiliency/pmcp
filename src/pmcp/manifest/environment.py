@@ -9,6 +9,7 @@ import platform
 import shutil
 from dataclasses import dataclass, field
 from typing import Literal
+from pmcp.argument_errors import exception_text
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +88,7 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
         logger.debug(f"Timeout checking CLI: {name}")
         return CLIInfo(name=name, path=path)
     except Exception as e:
-        logger.debug(f"Error checking CLI {name}: {e}")
+        logger.debug(f"Error checking CLI {name}: {exception_text(e)}")
         return None
 
 
@@ -111,7 +112,7 @@ async def get_cli_help(
         logger.debug(f"Timeout getting help for: {name}")
         return None
     except Exception as e:
-        logger.debug(f"Error getting help for {name}: {e}")
+        logger.debug(f"Error getting help for {name}: {exception_text(e)}")
         return None
 
 

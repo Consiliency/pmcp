@@ -40,6 +40,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 import semver
 
+from pmcp.argument_errors import exception_text
 from pmcp.validation import is_valid_package_name
 
 logger = logging.getLogger(__name__)
@@ -121,7 +122,7 @@ def _fetch_packument(name: str) -> dict[str, Any] | None:
             body = response.read(_MAX_PACKUMENT_BYTES)
         data = json.loads(body.decode("utf-8"))
     except Exception as exc:
-        logger.debug("npm packument fetch failed for %r: %s", name, exc)
+        logger.debug("npm packument fetch failed for %r: %s", name, exception_text(exc))
         return None
     return data if isinstance(data, dict) else None
 
@@ -203,7 +204,9 @@ def resolve_package_identity(spec: str) -> PackageIdentity | None:
     try:
         packument = _fetch_packument(name)
     except Exception as exc:  # pragma: no cover - the fetch handles its own
-        logger.debug("npm packument lookup raised for %r: %s", name, exc)
+        logger.debug(
+            "npm packument lookup raised for %r: %s", name, exception_text(exc)
+        )
         return None
     if not isinstance(packument, dict):
         return None

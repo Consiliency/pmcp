@@ -11,7 +11,6 @@ from pathlib import Path
 import random
 import re
 import signal
-import traceback
 import string
 import time
 from collections import deque
@@ -26,6 +25,7 @@ from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
 
+from pmcp.argument_errors import exception_text, safe_traceback_text
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
 from pmcp.env_store import sanitized_subprocess_env
@@ -130,7 +130,9 @@ def describe_exception(exc: BaseException) -> str:
 
     shown = leaves[:_MAX_DESCRIBED_LEAVES]
     rendered = "; ".join(
-        f"{type(leaf).__name__}: {leaf}" if str(leaf) else type(leaf).__name__
+        f"{type(leaf).__name__}: {exception_text(leaf)}"
+        if str(leaf)
+        else type(leaf).__name__
         for leaf in shown
     )
     if len(leaves) > len(shown):
@@ -1132,7 +1134,9 @@ class ClientManager:
         errors: list[str] = []
         for config, result in zip(configs, results):
             if isinstance(result, Exception):
-                error_msg = f"Failed to connect to {config.name}: {result}"
+                error_msg = (
+                    f"Failed to connect to {config.name}: {exception_text(result)}"
+                )
                 logger.error(error_msg)
                 errors.append(error_msg)
 
@@ -1941,7 +1945,9 @@ class ClientManager:
             ("prompts", listing_results[2]),
         ):
             if isinstance(result, BaseException):
-                logger.debug(f"Server {name} doesn't support {kind}: {result}")
+                logger.debug(
+                    f"Server {name} doesn't support {kind}: {exception_text(result)}"
+                )
                 listings[kind] = None
             else:
                 listings[kind] = result
@@ -2676,9 +2682,7 @@ class ClientManager:
                 # clean. Redaction here is best-effort defence in depth
                 # (SECURITY.md), and it cannot be applied to text the logging
                 # framework formats on its own.
-                traceback_text = "".join(
-                    traceback.format_exception(type(exc), exc, exc.__traceback__)
-                )
+                traceback_text = safe_traceback_text(exc)
                 logger.warning(
                     f"[{name}] remote transport failed to unwind while "
                     f"escalating our caller's cancellation: "

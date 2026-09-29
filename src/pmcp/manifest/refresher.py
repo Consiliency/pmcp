@@ -16,6 +16,7 @@ from pathlib import Path
 
 import yaml
 
+from pmcp.argument_errors import exception_text
 from pmcp.manifest.loader import (
     credential_lookup_keys,
     load_manifest,
@@ -89,7 +90,7 @@ def load_descriptions_cache(cache_path: Path | None = None) -> DescriptionsCache
         )
 
     except Exception as e:
-        logger.warning(f"Failed to load descriptions cache: {e}")
+        logger.warning(f"Failed to load descriptions cache: {exception_text(e)}")
         return None
 
 
@@ -395,7 +396,7 @@ async def refresh_server(
                 )
 
     except Exception as e:
-        logger.error(f"Failed to refresh {server_name}: {e}")
+        logger.error(f"Failed to refresh {server_name}: {exception_text(e)}")
         return None
 
 
@@ -493,7 +494,7 @@ async def refresh_all(
                 # Keep existing if refresh failed
                 return name, existing
         except Exception as e:
-            logger.error(f"Error refreshing {name}: {e}")
+            logger.error(f"Error refreshing {name}: {exception_text(e)}")
             if existing:
                 return name, existing
         return name, None

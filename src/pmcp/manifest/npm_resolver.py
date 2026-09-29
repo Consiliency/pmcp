@@ -62,6 +62,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from pmcp.argument_errors import exception_text
 
 logger = logging.getLogger(__name__)
 
@@ -498,7 +499,9 @@ class NpmResolver:
             proc.stdin.flush()
         except (BrokenPipeError, ValueError, OSError) as exc:
             self._terminate()
-            return _refused(f"npm resolver child died before the query: {exc}")
+            return _refused(
+                f"npm resolver child died before the query: {exception_text(exc)}"
+            )
 
         line = reader.read(_QUERY_TIMEOUT)
         if line is None:

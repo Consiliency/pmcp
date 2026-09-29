@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal
 
 import yaml
 
+from pmcp.argument_errors import exception_text
 from pmcp.project_consent import log_refusal, read_and_gate
 from pmcp.types import (
     GatewayPolicy,
@@ -360,7 +361,7 @@ class PolicyManager:
         except Exception as e:
             if fatal:
                 raise ValueError(
-                    f"Failed to load explicit policy {policy_path}: {e}"
+                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
                 ) from e
             self._warn_unparseable(policy_path, e)
             return None
@@ -380,7 +381,7 @@ class PolicyManager:
             else "No policy is in effect: the gateway is running unrestricted."
         )
         logger.warning(
-            f"Could not parse policy file {policy_path}: {error}. {consequence}"
+            f"Could not parse policy file {policy_path}: {exception_text(error)}. {consequence}"
         )
 
     def _parse_policy(
@@ -419,7 +420,7 @@ class PolicyManager:
         except Exception as e:
             if fatal:
                 raise ValueError(
-                    f"Failed to load explicit policy {policy_path}: {e}"
+                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
                 ) from e
             self._warn_unparseable(policy_path, e)
             return None
@@ -433,10 +434,10 @@ class PolicyManager:
         except Exception as e:
             if fatal:
                 raise ValueError(
-                    f"Failed to load explicit policy {policy_path}: {e}"
+                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
                 ) from e
             raise ValueError(
-                f"Invalid policy file {policy_path}: {e}. "
+                f"Invalid policy file {policy_path}: {exception_text(e)}. "
                 "Refusing to start rather than fall back to an unrestricted gateway."
             ) from e
 

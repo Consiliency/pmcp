@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from pmcp.argument_errors import exception_text
 
 
 class CodePatternsLoader:
@@ -64,7 +65,7 @@ class CodePatternsLoader:
         except Exception as e:
             # If loading fails, log warning but continue with empty patterns
             print(
-                f"Warning: Failed to load code patterns from {self._patterns_path}: {e}"
+                f"Warning: Failed to load code patterns from {self._patterns_path}: {exception_text(e)}"
             )
 
     def get_hint_for_tool(

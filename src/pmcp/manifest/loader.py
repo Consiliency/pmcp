@@ -13,6 +13,7 @@ from typing import Any, Literal, cast
 
 import yaml
 
+from pmcp.argument_errors import exception_text
 from pmcp.project_consent import log_refusal, read_and_gate
 
 logger = logging.getLogger(__name__)
@@ -780,7 +781,7 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
                 servers[name] = _parse_server_config(name, server_data)
             except Exception as exc:
                 logger.warning(
-                    f"Skipping invalid server entry '{name}' in overlay {path}: {exc}"
+                    f"Skipping invalid server entry '{name}' in overlay {path}: {exception_text(exc)}"
                 )
     elif raw_servers:
         logger.warning(f"Skipping 'servers' in overlay {path}: not a mapping")
@@ -794,7 +795,7 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
             except Exception as exc:
                 logger.warning(
                     f"Skipping invalid cli_alternative '{name}' in overlay "
-                    f"{path}: {exc}"
+                    f"{path}: {exception_text(exc)}"
                 )
     elif raw_clis:
         logger.warning(f"Skipping 'cli_alternatives' in overlay {path}: not a mapping")

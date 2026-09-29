@@ -42,6 +42,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from pmcp.argument_errors import exception_text
 
 APPROVED = "approved"
 DENIED = "denied"
@@ -269,7 +270,9 @@ def _decode(entry: Any) -> TrustRecord:
     try:
         parsed_at = datetime.fromisoformat(str(recorded_at))
     except ValueError as exc:
-        raise TrustStoreError(f"Unparseable trust timestamp: {exc}") from exc
+        raise TrustStoreError(
+            f"Unparseable trust timestamp: {exception_text(exc)}"
+        ) from exc
 
     return TrustRecord(
         absolute_path=Path(str(absolute_path)),
@@ -297,7 +300,9 @@ def _read_store(path: Path) -> list[TrustRecord]:
     try:
         data = json.loads(raw)
     except ValueError as exc:
-        raise TrustStoreError(f"Cannot parse trust store {path}: {exc}") from exc
+        raise TrustStoreError(
+            f"Cannot parse trust store {path}: {exception_text(exc)}"
+        ) from exc
 
     if not isinstance(data, dict):
         raise TrustStoreError(f"Trust store {path} is not a JSON object")

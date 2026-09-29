@@ -23,13 +23,23 @@ its text:
 
 Neither reads a value: not jsonschema's ``message``, ``instance``,
 ``validator_value``, ``context`` or ``cause``, and not pydantic's ``msg``,
-``input`` or any ``ctx`` entry outside :data:`_CONSTRAINT_CONTEXT`.
+``input`` or ``ctx`` (a constraint is read from the gateway's own schema, so
+a custom error that reuses a pydantic type cannot smuggle a value in through
+its context).
+
+The same rule covers every other place pmcp turns an exception into text
+(Consiliency/pmcp#297, rev 2): :func:`exception_text` is ``str(error)``
+unless the error is, or embeds the text of, a validation error, and
+:func:`safe_exc_info` withholds a traceback whose chain holds one.
+``tests/test_argument_error_echo.py`` checks every ``except`` in ``src/pmcp``
+(bar the CLI) that can catch one renders it only through these.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Iterable
+import traceback
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import jsonschema
@@ -74,21 +84,11 @@ def argument_error(error_type: str) -> PydanticCustomError:
 
 # --- pydantic ----------------------------------------------------------------
 
-#: The ``ctx`` keys a phrase below may name. Each is a constraint the model
-#: declares (a length, a bound, a pattern, the allowed literals), never read
-#: from the input. ``actual_length``, ``error``, ``tag`` and the rest are
-#: left out on purpose.
-_CONSTRAINT_CONTEXT = frozenset(
-    {"min_length", "max_length", "pattern", "expected", "gt", "ge", "lt", "le"}
-)
-
-_MODEL_PHRASES: dict[str, str] = {
+#: Error types whose phrase needs no constraint.
+_FIXED_PHRASES: dict[str, str] = {
     "missing": "is required",
     "extra_forbidden": "is not an accepted argument",
     "string_type": "must be a string",
-    "string_too_short": "must be at least {min_length} characters",
-    "string_too_long": "must be at most {max_length} characters",
-    "string_pattern_mismatch": "must match the pattern {pattern}",
     "int_type": "must be an integer",
     "int_parsing": "must be an integer",
     "int_from_float": "must be an integer",
@@ -100,31 +100,65 @@ _MODEL_PHRASES: dict[str, str] = {
     "model_type": "must be an object",
     "model_attributes_type": "must be an object",
     "list_type": "must be an array",
-    "too_short": "must have at least {min_length} items",
-    "too_long": "must have at most {max_length} items",
-    "literal_error": "must be {expected}",
-    "enum": "must be {expected}",
-    "greater_than": "must be greater than {gt}",
-    "greater_than_equal": "must be greater than or equal to {ge}",
-    "less_than": "must be less than {lt}",
-    "less_than_equal": "must be less than or equal to {le}",
     **_PMCP_MESSAGES,
 }
 
+#: Error types whose phrase names a constraint: ``(the JSON Schema keyword
+#: that holds it in the gateway's own schema, the phrase with it, the phrase
+#: without it)``. The constraint is read from the schema node at the error's
+#: location, never from pydantic's ``ctx`` (Consiliency/pmcp#297 rev 2, N2).
+_CONSTRAINED_PHRASES: dict[str, tuple[str, str, str]] = {
+    "string_too_short": ("minLength", "must be at least {characters}", "is too short"),
+    "string_too_long": ("maxLength", "must be at most {characters}", "is too long"),
+    "string_pattern_mismatch": (
+        "pattern",
+        "must match the pattern {text}",
+        "does not match the required pattern",
+    ),
+    "too_short": ("minItems", "must have at least {items}", "has too few items"),
+    "too_long": ("maxItems", "must have at most {items}", "has too many items"),
+    "literal_error": ("enum", "must be one of {json}", "is not an allowed value"),
+    "enum": ("enum", "must be one of {json}", "is not an allowed value"),
+    "greater_than": (
+        "exclusiveMinimum",
+        "must be greater than {number}",
+        "is too small",
+    ),
+    "greater_than_equal": (
+        "minimum",
+        "must be greater than or equal to {number}",
+        "is too small",
+    ),
+    "less_than": ("exclusiveMaximum", "must be less than {number}", "is too large"),
+    "less_than_equal": (
+        "maximum",
+        "must be less than or equal to {number}",
+        "is too large",
+    ),
+}
 
-def _argument_names() -> frozenset[str]:
-    """Every field name and alias of every gateway argument model.
 
-    Written by pmcp's authors, never by a caller, so a location segment equal
-    to one discloses nothing the advertised schemas do not.
+def _declared_names() -> frozenset[str]:
+    """Every field name and alias of every pydantic model pmcp defines.
+
+    Written by pmcp's authors, never by a caller or a downstream server, so a
+    location segment equal to one discloses nothing pmcp's own source does not.
     """
-    from pmcp.types import GatewayArguments
+    from pydantic import BaseModel
+
+    import pmcp.types  # noqa: F401 -- the models are defined on import
 
     names: set[str] = set()
-    pending: list[type] = [GatewayArguments]
+    seen: set[type] = set()
+    pending: list[type] = [BaseModel]
     while pending:
         model = pending.pop()
+        if model in seen:
+            continue
+        seen.add(model)
         pending.extend(model.__subclasses__())
+        if not model.__module__.startswith("pmcp."):
+            continue
         for name, field in getattr(model, "model_fields", {}).items():
             names.add(name)
             if isinstance(field.alias, str):
@@ -169,22 +203,54 @@ def model_error_path(
     error: ValidationError, schema: Any, arguments: Any
 ) -> list[str | int | None]:
     """The first error's location, redacted as :func:`schema_error_path` is."""
-    declared = _argument_names() | declared_property_names(schema)
+    declared = _declared_names() | declared_property_names(schema)
     items = error.errors(include_url=False, include_input=False, include_context=False)
     loc = tuple(items[0]["loc"]) if items else ()
     return _model_error_path(loc, arguments, declared)
 
 
-def _model_phrase(error_type: Any, ctx: Any) -> str:
-    phrase = _MODEL_PHRASES.get(error_type) if isinstance(error_type, str) else None
-    if phrase is None:
+def _schema_node_at(schema: Any, loc: tuple[Any, ...]) -> Any:
+    """The node of the gateway's own schema at a pydantic location, or None."""
+    node = schema
+    for segment in loc:
+        if not isinstance(node, dict):
+            return None
+        if type(segment) is int:
+            node = node.get("items")
+        else:
+            properties = node.get("properties")
+            node = properties.get(segment) if isinstance(properties, dict) else None
+    return node if isinstance(node, dict) else None
+
+
+def _constraint_text(kind: str, value: Any) -> str | None:
+    if kind in ("characters", "items"):
+        noun = kind[:-1]
+        return _count(value, noun) if type(value) is int else None
+    if kind == "number":
+        return str(value) if type(value) in (int, float) else None
+    if kind == "text":
+        return value if isinstance(value, str) else None
+    if isinstance(value, list):  # "json": an enum of the schema's literals
+        return json.dumps(value)
+    return None
+
+
+def _model_phrase(error_type: Any, node: Any) -> str:
+    """The phrase for ``error_type``, its constraint read from ``node`` (the
+    gateway's schema at the error's location; ``None`` when there is none)."""
+    if not isinstance(error_type, str):
         return "is invalid"
-    context = ctx if isinstance(ctx, dict) else {}
-    fields = {key: context.get(key) for key in _CONSTRAINT_CONTEXT if key in context}
-    try:
-        return phrase.format(**fields)
-    except (KeyError, IndexError, ValueError):
+    if error_type in _FIXED_PHRASES:
+        return _FIXED_PHRASES[error_type]
+    if error_type not in _CONSTRAINED_PHRASES:
         return "is invalid"
+    keyword, with_constraint, without = _CONSTRAINED_PHRASES[error_type]
+    if not isinstance(node, dict) or keyword not in node:
+        return without
+    kind = with_constraint.split("{", 1)[1].split("}", 1)[0]
+    text = _constraint_text(kind, node[keyword])
+    return without if text is None else with_constraint.replace("{" + kind + "}", text)
 
 
 def describe_model_error(error: ValidationError, schema: Any, arguments: Any) -> str:
@@ -196,13 +262,15 @@ def describe_model_error(error: ValidationError, schema: Any, arguments: Any) ->
 
 
 def _describe_model_error(error: ValidationError, schema: Any, arguments: Any) -> str:
-    declared = _argument_names() | declared_property_names(schema)
-    items = error.errors(include_url=False, include_input=False, include_context=True)
-    parts = [
-        f"{_render_path(_model_error_path(tuple(item['loc']), arguments, declared))}: "
-        f"{_model_phrase(item['type'], item.get('ctx'))}"
-        for item in items[:_MAX_MODEL_ERRORS]
-    ]
+    declared = _declared_names() | declared_property_names(schema)
+    items = error.errors(include_url=False, include_input=False, include_context=False)
+    parts = []
+    for item in items[:_MAX_MODEL_ERRORS]:
+        loc = tuple(item["loc"])
+        path = _render_path(_model_error_path(loc, arguments, declared))
+        parts.append(
+            f"{path}: {_model_phrase(item['type'], _schema_node_at(schema, loc))}"
+        )
     if len(items) > _MAX_MODEL_ERRORS:
         parts.append(f"and {len(items) - _MAX_MODEL_ERRORS} more")
     return "; ".join(parts)
@@ -380,9 +448,103 @@ def describe_argument_error(
     error: BaseException, schema: Any, arguments: Any
 ) -> str | None:
     """A value-free description of ``error`` if it is an argument-validation
-    error of either library, else ``None``."""
+    error of either library, checked against ``schema``, else ``None``."""
     if isinstance(error, ValidationError):
         return describe_model_error(error, schema, arguments)
     if isinstance(error, jsonschema.ValidationError):
         return describe_schema_error(error, schema, arguments)
     return None
+
+
+# --- any exception pmcp renders ------------------------------------------------
+
+
+def _is_validation_error(error: BaseException) -> bool:
+    return isinstance(error, (ValidationError, jsonschema.ValidationError))
+
+
+def _chain(error: BaseException) -> Iterator[BaseException]:
+    """``error``, its ``__cause__``/``__context__`` chain and every exception
+    in a group, each once."""
+    pending, seen = [error], set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for linked in (current.__cause__, current.__context__):
+            if linked is not None:
+                pending.append(linked)
+        members = getattr(current, "exceptions", None)
+        if isinstance(members, (tuple, list)):
+            pending.extend(m for m in members if isinstance(m, BaseException))
+
+
+def _validation_text(error: BaseException) -> str:
+    """A validation error described without the schema that raised it: the
+    path (names pmcp's models declare, list indexes, ``*``) and a phrase
+    without constraints, since the schema is not known here (rev 2, N6)."""
+    if isinstance(error, ValidationError):
+        count = error.error_count()
+        plural = "" if count == 1 else "s"
+        return (
+            f"{count} validation error{plural} for {error.title}: "
+            f"{describe_model_error(error, None, None)}"
+        )
+    assert isinstance(error, jsonschema.ValidationError)
+    try:
+        declared = _declared_names()
+        path = [
+            segment
+            if type(segment) is int or (type(segment) is str and segment in declared)
+            else None
+            for segment in error.absolute_path
+        ]
+        keyword = error.validator if isinstance(error.validator, str) else None
+        phrase = (
+            f"fails its {keyword} constraint"
+            if keyword in jsonschema.validators.Draft202012Validator.VALIDATORS
+            else "is invalid"
+        )
+        return f"schema validation error: {_render_path(path)}: {phrase}"
+    except Exception:
+        return f"schema validation error: {_UNDESCRIBED}"
+
+
+def exception_text(error: BaseException) -> str:
+    """``str(error)``, except where that would carry a validation error's text.
+
+    A pydantic or jsonschema ``ValidationError`` renders the rejected value;
+    so does any exception whose own text embeds one it chains
+    (``RuntimeError(f"... {e}") from e``). Either is described from its
+    structure instead. Every other exception is ``str(error)`` unchanged.
+    """
+    if _is_validation_error(error):
+        return _validation_text(error)
+    text = str(error)
+    for linked in _chain(error):
+        if linked is not error and _is_validation_error(linked):
+            try:
+                embedded = str(linked)
+            except Exception:
+                embedded = ""
+            if embedded and embedded in text:
+                return f"{type(error).__name__}: {_validation_text(linked)}"
+    return text
+
+
+def safe_exc_info(error: BaseException) -> BaseException | None:
+    """``exc_info=`` for a log call: the exception, unless its chain holds a
+    validation error, whose rendered traceback would carry the value."""
+    if any(_is_validation_error(linked) for linked in _chain(error)):
+        return None
+    return error
+
+
+def safe_traceback_text(error: BaseException) -> str:
+    """The formatted traceback, or a one-line stand-in when the chain holds a
+    validation error (see :func:`safe_exc_info`)."""
+    if safe_exc_info(error) is None:
+        return f"(traceback withheld: {exception_text(error)})"
+    return "".join(traceback.format_exception(type(error), error, error.__traceback__))

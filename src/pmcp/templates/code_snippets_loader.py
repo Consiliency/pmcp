@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import yaml
+from pmcp.argument_errors import exception_text
 
 if TYPE_CHECKING:
     from pmcp.types import ToolInfo
@@ -61,7 +62,7 @@ class CodeSnippetsLoader:
         except Exception as e:
             # If loading fails, log warning but continue with empty snippets
             print(
-                f"Warning: Failed to load code snippets from {self._templates_path}: {e}"
+                f"Warning: Failed to load code snippets from {self._templates_path}: {exception_text(e)}"
             )
 
     def get_snippet_for_tool(
