@@ -1,39 +1,77 @@
-# Detailed plan: describe rejected gateway-tool arguments from their structure, never their value
+# Detailed plan: describe validation errors from their structure, never their value — everywhere pmcp turns an exception into text
 
-> **Revision 1 (2026-09-28), on main `7680445`.** Consiliency/pmcp#297, the
-> prerequisite for piece B (`extra="forbid"`) of Consiliency/pmcp#236.
-> The change is **embedded, not described**: the ten blocks under *Verbatim
-> bodies* are `git apply` patches against `origin/main` @ `7680445`,
-> byte-identical to the verified code on the local-only branch
-> `wip/297-code` @ `19dac95` (never pushed). The *Embedding proof* extracts
-> them from this file with the extractor below, runs `git apply --check` on a
-> fresh `7680445` worktree, applies them and `cmp`s every file against
-> `19dac95`.
+> **Revision 2 (2026-09-28), on main `7680445`** (re-fetched: `origin/main`
+> is still `7680445`). Consiliency/pmcp#297, the prerequisite for piece B
+> (`extra="forbid"`) of Consiliency/pmcp#236. The change is **embedded, not
+> described**: the 28 blocks under *Verbatim bodies* are `git apply` patches
+> against `origin/main` @ `7680445`, byte-identical to the verified code on
+> the local-only branch `wip/297-code` @ `929f693` (never pushed; rev 1 was
+> `19dac95`). *Embedding proof* extracts them from this file with its own
+> extractor, `git apply --check`s them on a fresh `7680445` worktree,
+> applies them and compares the whole tree with `929f693`.
 >
-> Decisions, each argued in *Design*:
-> - **One renderer, two libraries.** A new module `pmcp.argument_errors`
->   turns a jsonschema or pydantic `ValidationError` into
->   `$.<path>: <reason>`. The path is the failing location with every key
->   the caller chose shown as `*`; the reason is a fixed phrase filled only
->   from the gateway's own schema node (jsonschema) or from an allowlist of
->   constraint `ctx` keys (pydantic). It never reads jsonschema's `message`,
->   `instance`, `validator_value`, `context`, `cause` or `schema`, nor
->   pydantic's `msg`, `input` or any other `ctx` entry.
-> - **pmcp's own validators stop being free text.** The three custom
->   validators on argument models raise `PydanticCustomError(<type>, <fixed
->   message>)` from a table in the renderer module, which the renderer reads
->   by type; a validator can no longer put its input into what is shown.
-> - **Same rule for the log and the audit.** `call_tool`'s `except` arm logs
->   the description, not `str(e)`; a call rejected by the tool's own argument
->   model is recorded as an `audit.rejection` (as the gate's are since
->   Consiliency/pmcp#296), not as an `audit.invocation` that copied its
->   unvalidated correlation fields; an unregistered tool name is no longer
+> **What rev 2 changes** (rev 1 board on Consiliency/pmcp#314: codex
+> BLOCKING, claude PARTIALLY AGREE, gemini no blocking finding; every finding
+> is answered in *Rev 1 board findings — before/after*):
+> - **B1 / N3: a validation error caught inside a handler bypassed the
+>   renderer.** Rev 1 fixed the three `server.py` channels. `tasks_*` (and
+>   every other handler arm) caught the exception themselves and rendered
+>   `str(e)` / `_sanitize_error(e)` into the response and the audit-event
+>   buffer that `gateway.health` exposes. So a downstream
+>   `{"taskId": "t", "ttl": "<secret>"}` came back verbatim. Rev 2 fixes the
+>   class: **every** place in `src/pmcp` (bar the operator CLI) that turns an
+>   exception into text now goes through `exception_text(e)` /
+>   `safe_exc_info(e)`. That covers 82 sinks in 19 modules, plus the three
+>   shared renderers `sanitize_auth_diagnostic`, `_sanitize_error` and
+>   `describe_exception`. A static test derived from the AST fails on any new
+>   sink. A second dynamic sweep drives the **real** handlers with only
+>   `ClientManager._send_request` replaced, at every downstream-payload
+>   position the real parsers reject.
+> - **N1: the log oracle now sees everything a handler could.** Raw
+>   `LogRecord`s (msg, args, every `extra=` attribute, `exc_info` and
+>   `stack_info` rendered in full), stdout/stderr (`capfd`), warnings
+>   (`recwarn`), and the audit-event buffer. **S8:** every case runs once per
+>   sentinel *family*: hex, letters only, a provider-token shape, spaced,
+>   non-ASCII, digits. The seat's mutants S5–S8 are in the mutation run and
+>   are all killed.
+> - **N2: a custom error cannot fill a phrase from its `ctx`.** A constraint
+>   (length, bound, pattern, allowed values) is now read from the gateway's
+>   own schema node at the error's location, never from pydantic's `ctx`.
+>   With no schema, the phrase names no constraint.
+> - **N6:** a validation error described without its schema names only its
+>   keyword or type (`fails its type constraint`). It never names a
+>   constraint read from the wrong schema.
+> - **N4, N5, N7** are decided under *Non-goals*. The accepted-value echo
+>   follow-up is filed there with its exact site list.
+>
+> Decisions (rev 1's stand; each argued in *Design*):
+> - One renderer module, `pmcp.argument_errors`, for both libraries. The
+>   failing location is shown with caller-chosen keys as `*`. The reason is a
+>   fixed phrase, and it never reads jsonschema's
+>   `message`/`instance`/`validator_value`/`context`/`cause`/`schema` or
+>   pydantic's `msg`/`input`/`ctx`.
+> - pmcp's three custom validators raise fixed-message
+>   `PydanticCustomError`s.
+> - Same rule for the log and the audit. A call rejected by the tool's own
+>   argument model is an `audit.rejection`. An unregistered tool name is not
 >   logged.
-> - **The response stays useful and keeps its prefixes.** `Input validation
->   error: $.options: must be of type object or null` (gate) and `{"error":
->   true, "message": "Invalid arguments: $.run_correlation_id: correlation
->   IDs may contain only alphanumerics and ._:-"}` (model). A validation
->   error from anything else a handler parses reads `Validation error: ...`.
+> - Responses keep their prefixes (`Input validation error: $...`,
+>   `Invalid arguments: $...`).
+
+## Rev 1 board findings — before/after
+
+| Finding | Rev 1 (`19dac95`) | Rev 2 (`929f693`) | Proven by |
+|---|---|---|---|
+| **codex B1 / claude N3**: validation errors caught *inside* handlers bypass the renderer (`tasks_get` `handlers.py:6050-6060` on main: `error=str(e)` into the audit-event buffer, `errors=[self._sanitize_error(e)]` into the response). The reproduction is a downstream `{"taskId":"t","ttl":"SENTINELzq9x"}` parsed into `McpTaskInfo` (`client/manager.py:1689-1705`). | Only `server.py`'s arm rendered structurally. The downstream test replaced the whole handler (`_RaisingTools`), so it never reached the handler arms. The L9 row claimed the scope anyway. | *Design §7*. Every exception-to-text sink in `src/pmcp` bar the CLI goes through `exception_text` / `safe_exc_info`: 82 sinks in 19 modules (*Research → Every exception-to-text sink*), plus the three shared renderers. The L9 row is rewritten. | `test_no_exception_reaches_text_except_through_the_renderer` (static, AST: red on main with 82 findings). `test_no_downstream_value_reaches_a_response_log_or_audit[plain/scoped-audit]` drives the **real** `tasks_list/get/result/cancel` and `invoke` (task-augmented) with only `_send_request` replaced, at every payload key the real parser reads × every shape it rejects × 6 families, and checks the response, log, stderr, warnings, audit JSONL, audit-event buffer and a final `gateway.health`. It is red on main (`('gateway.tasks_list', 'createdAt', ...)`). `test_no_downstream_listing_value_reaches_the_log[tools/resources/prompts]` does the same for the listing parsers (red on main). Mutants M15–M22. |
+| **claude N1**: the log oracle saw only pmcp-formatter output (the JSON formatter drops tracebacks, neither renders `extra=`), and not stderr or warnings. Seat mutants S5–S7 survived. | Formatter text only. | `_Tap` / `_record_text` scan both formatters, `msg`, `args`, `getMessage()`, **every** record attribute (so `extra=`), the full `exc_info` traceback via `traceback.format_exception` and `stack_info`, `capfd` stdout+stderr, `recwarn`, the scoped audit JSONL and the audit-event buffer. The pair differential also covers `extra=` attributes, stderr and warnings. | S5 (`extra=`), S6 (`print(..., file=sys.stderr)`), S7 (`warnings.warn`) are killed (*Mutation evidence*). |
+| **claude N1 / S8**: a leak conditional on the value's shape (`isalpha()`) never fired on hex sentinels. | One family (hex). | Six families (`_FAMILIES`): hex, letters only, `sk-proj-…`, `Bearer …` with spaces, non-ASCII (`\u` escapes in the source), digits only. Each has two lengths. The forbidden set adds JSON-, `repr`- and `unicode_escape`-escaped windows. | S8 is killed, by the `alpha` family. |
+| **claude N2**: `PydanticCustomError("literal_error", …, {"expected": value})` (or `string_too_short` with `min_length`) was rendered with the value, because a phrase read its constraint from `ctx`. | `_CONSTRAINT_CONTEXT` allowlisted `ctx` keys. | `_CONSTRAINED_PHRASES` maps each type to a **JSON Schema keyword**. The constraint is read from the gateway's own schema node at the error's location (`_schema_node_at`), with type checks, never from `ctx`. `errors()` is called with `include_context=False`. With no node, the phrase names no constraint. | `test_a_custom_error_cannot_fill_a_phrase_from_its_context[6 families]` (four colliding custom errors) and `test_every_constrained_phrase_names_a_schema_keyword`. Mutant M7 (constraint from `ctx`) is killed. |
+| **claude N3**: the L9 row was inaccurate. | "reach L2+L3". | L9 now names the handler-local catches (B1 above). | *Research*. |
+| **claude N4**: the SDK's legacy streamable-HTTP transport answers a malformed JSON-RPC envelope with `Validation error: {str(e)}` (`mcp/server/streamable_http.py:550`). | Silent. | Listed under *Not leaking to anyone but the sender* and *Non-goals*. It is SDK-owned, reaches only the sender, and no tool argument can reach it. | Seat measured it; read at `streamable_http.py:550`. |
+| **claude N5**: `resources/read` / `prompts/get` echo an unknown URI or name. The SDK then logs it with a traceback (`mcp/shared/jsonrpc_dispatcher.py:754` `logger.exception("handler for %r raised")`). | Not mentioned. | **Follow-up, not this plan** (*Non-goals*). It is a lookup echo of a caller's routing identifier, not a validation error. The log line is written by the SDK for *any* exception a request handler raises, so the only way to silence it is for pmcp to raise `MCPError`, which changes the error code on the wire for two methods. That is a protocol-visible change of a different class. The unknown-*tool* log line was fixed in rev 1 because it is pmcp's own logger and #296 handed it to #297. | — |
+| **claude N6**: a jsonschema error raised inside a handler was described against the *tool's* schema. | `describe_argument_error(e, tool.input_schema, …)` for any jsonschema error. | The arm describes only the tool's own **model** rejection against the tool's schema. Everything else goes through `exception_text`, whose schema-less form names only the keyword (`schema validation error: $.*: fails its type constraint`) and never a constraint. | `test_a_validation_error_raised_by_a_handler_is_described_not_echoed[jsonschema]`. |
+| **claude N7** (nit, pre-existing): a model rejection returns `isError: false` with `{"error": true}`, while a gate rejection returns `isError: true`. | Unchanged. | Unchanged, and noted under *Non-goals*: changing `isError` for the `call_tool` arm changes every handler exception's wire shape. | — |
+| **Coordinator: file the accepted-value echo follow-up** with its exact site list. | Listed as a non-goal. | *Non-goals → Follow-up issue text*, with every site `file:line` on main. | — |
 
 ## Task
 
@@ -64,7 +102,7 @@ Every site below was read on `7680445` (line numbers are main's).
 | L6 | `src/pmcp/server.py:491` `except` arm's `record_invocation(arguments=audited_arguments)` | audit | a call the model rejected still had its correlation-shaped fields copied: measured, the all-or-none case wrote the caller's `run_correlation_id` into an `audit.invocation` |
 | L7 | `src/pmcp/tools/handlers.py:5572-5651` `provision_status` validates inside a `try` whose arm logs `exc_info=True` (`:5643`) and renders `_sanitize_error(e)` (`:5650`, which does not strip `input_value`) | log (traceback), response | unreachable from `tools/call` (the gate rejects the same inputs first) but live for an in-process caller |
 | L8 | `src/pmcp/server.py:380`/`:444` `raise ValueError(f"Unknown tool: {name}")` into L2 | log | the caller's tool name (Consiliency/pmcp#296's Non-goals handed it here) |
-| L9 | any pydantic or jsonschema `ValidationError` a handler raises past validation (e.g. `McpTaskInfo.model_validate(task_data)` `handlers.py:6141` on downstream data) | L2+L3 | the parsed payload's values |
+| L9 (rev 2, corrected) | a `ValidationError` raised past argument validation (downstream data: `McpTaskInfo(...)` in `client/manager.py:1689-1705`, `McpTaskInfo.model_validate` `handlers.py:6141`; listing entries `client/manager.py:796/:843/:896`) is caught **inside** the handler or manager: `tasks_list/get/result/cancel` `handlers.py:6007-6016`, `:6050-6060`, `:6124-6134` put `str(e)` in the audit-event buffer (`gateway.health`'s `audit_events`) and `_sanitize_error(e)` (= `str(e)` through the redactor) in `errors`; the listing parsers log `describe_exception(e)` (= the same) | response, log, audit-event buffer / health | the downstream payload's values (a high-entropy value is sometimes masked by the redactor, a low-entropy one never is). *Every exception-to-text sink* below is the whole class |
 
 Not leaking (measured or read):
 - `ScopedAdvisorAudit.record_rejected_arguments` (`scoped_advisor_audit.py:303-351`, Consiliency/pmcp#296) records path + keyword only.
@@ -72,6 +110,147 @@ Not leaking (measured or read):
 - CLI paths: no subcommand in `src/pmcp/cli.py` / `src/pmcp/cli_commands/` routes through a gateway argument model (`grep model_validate|ValidationError|jsonschema` is empty there); argparse echoes the operator's own terminal input only.
 - `GatewayException.__str__` is its message only (`errors.py:141-156`); caller values live in `details`.
 - No `GatewayArguments` model sets `hide_input_in_errors`; the only other custom validators with a value in their message are `PackagesPolicy._reject_version_qualified_entries` (`types.py:1158-1166`, operator config, not reachable from `tools/call`) and `McpTaskInfo._normalize_task_timestamp` (`types.py:533`, downstream data).
+
+### Every exception-to-text sink (rev 2)
+
+The rev 1 board showed that L1–L9 were instances, not the class. The class
+is every place pmcp turns an exception that **may be a validation error**
+into text: a response field, a log line (message, argument or traceback),
+an audit or audit-event field. The guard test's scanner
+(`_exception_sinks`, below and in the test) enumerates it from the AST of
+every module in `src/pmcp` bar `cli.py`, `cli_commands/` and `__main__.py`.
+Those three are the operator's own terminal, and none of them routes through
+an argument model.
+
+An *exception name* is one of these:
+- an `except` clause's name, if the clause can catch a pydantic
+  (`ValueError` → `Exception` → `BaseException`) or jsonschema (`_Error` →
+  `Exception`) `ValidationError`;
+- a name assigned `<task>.exception()`;
+- a name narrowed by `isinstance(x, Exception|BaseException)`;
+- an alias of any of these.
+
+A *sink* is any use of such a name other than:
+- a renderer (`exception_text`, `safe_exc_info`, `describe_exception`,
+  `sanitize_auth_diagnostic`, `_sanitize_error`, the `describe_*` functions,
+  `type`, `isinstance`);
+- `raise`, a comparison or a truthiness test;
+- an attribute that is not text-bearing (`e.code`, not `e.args`);
+- one of five callees, each read and listed in the test with its reason.
+
+Also a sink: any `exc_info=` that is not `safe_exc_info(...)`, any
+`logger.exception(...)`, and any `traceback.format_*`/`print_*`. On main
+`7680445` the scanner reports **82** (verbatim, `sinks_main.txt`):
+
+```text
+src/pmcp/client/manager.py:2680: Call uses exc
+src/pmcp/client/manager.py:2680: Attribute uses exc
+src/pmcp/client/manager.py:1135: FormattedValue uses result
+src/pmcp/client/manager.py:1944: FormattedValue uses result
+src/pmcp/client/manager.py:2680: Call uses exc
+src/pmcp/client/manager.py:2680: Attribute uses exc
+src/pmcp/client/manager.py:2680: traceback.format_exception
+src/pmcp/config/guidance.py:178: FormattedValue uses e
+src/pmcp/config/loader.py:282: FormattedValue uses e
+src/pmcp/config/loader.py:319: FormattedValue uses e
+src/pmcp/config/loader.py:357: FormattedValue uses exc
+src/pmcp/config/loader.py:368: FormattedValue uses exc
+src/pmcp/config/loader.py:1151: FormattedValue uses e
+src/pmcp/manifest/code_patterns_loader.py:67: FormattedValue uses e
+src/pmcp/manifest/environment.py:90: FormattedValue uses e
+src/pmcp/manifest/environment.py:114: FormattedValue uses e
+src/pmcp/manifest/installer.py:250: FormattedValue uses exc
+src/pmcp/manifest/installer.py:253: FormattedValue uses exc
+src/pmcp/manifest/installer.py:240: Call uses e
+src/pmcp/manifest/installer.py:464: Call uses e
+src/pmcp/manifest/installer.py:462: FormattedValue uses e
+src/pmcp/manifest/installer.py:499: FormattedValue uses e
+src/pmcp/manifest/installer.py:299: FormattedValue uses e
+src/pmcp/manifest/installer.py:263: FormattedValue uses e
+src/pmcp/manifest/installer.py:425: FormattedValue uses e
+src/pmcp/manifest/installer.py:462: exc_info= not through safe_exc_info
+src/pmcp/manifest/loader.py:783: FormattedValue uses exc
+src/pmcp/manifest/loader.py:797: FormattedValue uses exc
+src/pmcp/manifest/npm_resolver.py:501: FormattedValue uses exc
+src/pmcp/manifest/package_identity.py:124: Call uses exc
+src/pmcp/manifest/package_identity.py:206: Call uses exc
+src/pmcp/manifest/refresher.py:92: FormattedValue uses e
+src/pmcp/manifest/refresher.py:398: FormattedValue uses e
+src/pmcp/manifest/refresher.py:496: FormattedValue uses e
+src/pmcp/manifest/version_checker.py:1415: FormattedValue uses e
+src/pmcp/manifest/version_checker.py:1457: FormattedValue uses e
+src/pmcp/manifest/version_checker.py:1501: FormattedValue uses e
+src/pmcp/manifest/version_checker.py:1555: FormattedValue uses e
+src/pmcp/package_approvals.py:132: FormattedValue uses exc
+src/pmcp/package_approvals.py:141: FormattedValue uses exc
+src/pmcp/package_approvals.py:179: FormattedValue uses exc
+src/pmcp/policy/policy.py:363: FormattedValue uses e
+src/pmcp/policy/policy.py:422: FormattedValue uses e
+src/pmcp/policy/policy.py:439: FormattedValue uses e
+src/pmcp/policy/policy.py:436: FormattedValue uses e
+src/pmcp/provision_gate.py:466: Call uses exc
+src/pmcp/server.py:736: FormattedValue uses e
+src/pmcp/server.py:1021: FormattedValue uses e
+src/pmcp/server.py:342: Attribute uses e
+src/pmcp/server.py:480: FormattedValue uses e
+src/pmcp/server.py:510: Call uses e
+src/pmcp/server.py:855: FormattedValue uses e
+src/pmcp/subscriptions.py:194: logger.exception renders a traceback
+src/pmcp/templates/code_snippets_loader.py:64: FormattedValue uses e
+src/pmcp/tools/handlers.py:988: FormattedValue uses e
+src/pmcp/tools/handlers.py:999: FormattedValue uses e
+src/pmcp/tools/handlers.py:1800: Call uses e
+src/pmcp/tools/handlers.py:2130: Call uses e
+src/pmcp/tools/handlers.py:2138: Call uses e
+src/pmcp/tools/handlers.py:4320: FormattedValue uses e
+src/pmcp/tools/handlers.py:4576: Call uses exc
+src/pmcp/tools/handlers.py:4581: Call uses exc
+src/pmcp/tools/handlers.py:4785: Call uses exc
+src/pmcp/tools/handlers.py:5056: FormattedValue uses e
+src/pmcp/tools/handlers.py:5455: Call uses exc
+src/pmcp/tools/handlers.py:5643: FormattedValue uses e
+src/pmcp/tools/handlers.py:5739: FormattedValue uses e
+src/pmcp/tools/handlers.py:5737: FormattedValue uses e
+src/pmcp/tools/handlers.py:5783: FormattedValue uses e
+src/pmcp/tools/handlers.py:6012: Call uses e
+src/pmcp/tools/handlers.py:6056: Call uses e
+src/pmcp/tools/handlers.py:6130: Call uses e
+src/pmcp/tools/handlers.py:1878: FormattedValue uses e
+src/pmcp/tools/handlers.py:1884: FormattedValue uses e
+src/pmcp/tools/handlers.py:4238: FormattedValue uses e
+src/pmcp/tools/handlers.py:4408: Call uses e
+src/pmcp/tools/handlers.py:4413: Call uses e
+src/pmcp/tools/handlers.py:5286: FormattedValue uses e
+src/pmcp/tools/handlers.py:5643: exc_info= not through safe_exc_info
+src/pmcp/tools/handlers.py:5737: exc_info= not through safe_exc_info
+src/pmcp/trust_store.py:272: FormattedValue uses exc
+src/pmcp/trust_store.py:300: FormattedValue uses exc
+```
+
+Plus the three shared renderers, which on main passed an exception's full
+text on:
+- `auth.py:589` `sanitize_auth_diagnostic(value)` → `str(value)`;
+- `client/manager.py:133` `describe_exception` → `f"{type(leaf).__name__}: {leaf}"`;
+- `handlers.py:920` `_sanitize_error(e)` → `sanitize_auth_diagnostic(e)`.
+
+On `929f693` the scanner reports none. The five allowlisted callees:
+- `parse_url_elicitation_error` (`auth.py:801`): it parses a JSON-RPC
+  `-32042` payload out of `args[0]` and returns structured URLs, never the
+  text;
+- `_is_protocol_version_initialize_error`: a boolean predicate;
+- `set_exception`: hands the exception to the awaiting caller, whose own
+  `except` is scanned;
+- `_warn_unparseable`: its body now uses `exception_text`;
+- `record_rejected_arguments`: #296's audit, path and keyword only.
+
+### Not leaking except to the sender (rev 2, N4)
+
+`mcp/server/streamable_http.py:550` (SDK, legacy streamable-HTTP transport)
+answers a malformed JSON-RPC *envelope* (e.g. `"params": "<string>"`) with
+HTTP 400 `Validation error: {str(e)}`, pydantic text included. Only the
+sender of that malformed envelope sees it, and no tool argument can reach
+it, because any `params` object passes the envelope. It is SDK-owned. See
+*Non-goals*.
 
 ### The probe (before)
 
@@ -196,13 +375,21 @@ point, so an in-process `int` dict key is redacted as in #296.
   parent path, **without the key** (piece B makes this reachable; the key
   may itself be the secret). Any other keyword: `fails the schema's <kw>
   constraint`; unknown: `is invalid`.
-- **pydantic**: `error.errors(include_input=False, include_url=False)`;
-  the error `type` selects a phrase from `_MODEL_PHRASES` (types whose
-  template takes no input: `missing`, `extra_forbidden`, `*_type`,
-  `*_parsing`, lengths, bounds, `literal_error`, `enum`, pattern); a
-  phrase may name only `ctx` keys in `_CONSTRAINT_CONTEXT = {min_length,
-  max_length, pattern, expected, gt, ge, lt, le}`. Any other type,
-  including `value_error`/`assertion_error`, reads `is invalid`.
+- **pydantic** (rev 2, N2): `error.errors(include_input=False,
+  include_url=False, include_context=False)`. The error `type` selects
+  either a fixed phrase (`_FIXED_PHRASES`: `missing`, `extra_forbidden`,
+  `*_type`, `*_parsing`, pmcp's own types) or a constrained one
+  (`_CONSTRAINED_PHRASES`: lengths, bounds, pattern, `literal_error`,
+  `enum`). A constrained phrase names the **JSON Schema keyword** that holds
+  its constraint (`minLength`, `maximum`, `pattern`, `enum`, ...). The value
+  is read from the gateway's own schema node at the error's location
+  (`_schema_node_at`: `properties` for a name, `items` for an index) and
+  type-checked. With no such node the phrase names no constraint (`is too
+  short`, `is not an allowed value`). pydantic's `ctx` is never read. So a
+  validator that raises `PydanticCustomError("literal_error", …,
+  {"expected": value})` renders the schema's enum, or nothing, and never the
+  value. Any other type, including `value_error`/`assertion_error`, reads
+  `is invalid`.
 - **pmcp's validators** (`InvokeInput._validate_correlation_id`,
   `InvokeInput._reject_partial_scoped_correlation`,
   `RegisterDiscoveredServerInput._validate_package`) now `raise
@@ -223,11 +410,11 @@ point, so an in-process `int` dict key is redacted as in #296.
   `tests/test_gateway_tool_schemas.py:463` match on it). `except` arm:
   `{"error": true, "message": "Invalid arguments: <description>"}` when the
   error is the tool's own argument model (`e.title ==
-  GATEWAY_TOOL_INPUT_MODELS[tool].__name__`), `Validation error:
-  <description>` for any other pydantic/jsonschema error (L9), and
-  `str(e)[:400]` unchanged for every non-validation exception.
+  GATEWAY_TOOL_INPUT_MODELS[tool].__name__`), and `exception_text(e)[:400]`
+  for everything else (rev 2, §7): `str(e)` unchanged for a non-validation
+  exception, `N validation error(s) for <Model>: ...` for any other.
 - **Log.** `Tool execution error: invalid arguments for <registry name>:
-  <description>` (or `validation error for ...`); an unregistered name logs
+  <description>`, or `Tool execution error: <exception_text(e)>`; an unregistered name logs
   `Tool execution error: unknown gateway tool` (the response still names it,
   pinned by `tests/test_gateway_tool_schemas.py:498/:530`,
   `tests/test_server.py:312`). Every other exception logs as before.
@@ -281,18 +468,51 @@ structure has no text to scrub.
   `requestor_context`), so a rejection anywhere cannot echo a neighbour;
 - **servers**: plain, and scoped-audit with every tool allowed (both with
   the real `GatewayTools`);
-- **oracle**: per case, (a) it was rejected (an `isError` gate result, or the
-  `{"error": true}` payload) - no vacuous pass; (b) no 12-character window
-  of the sentinel, nor a sha256/sha1/md5 of it (raw, JSON-quoted,
-  lower-cased), is in the response, the log (every record at DEBUG,
-  rendered by pmcp's own text **and** JSON formatters, tracebacks included)
-  or the audit JSONL; (c) with two sentinels of different length the
-  response, the time-normalised log and the audit records are identical;
-  (d) the rejection names the path (and, for validators, the reason).
+- **sentinel families** (rev 2, S8): every case runs once per family: hex,
+  letters only, `sk-proj-…`, `Bearer …` with spaces, non-ASCII, digits
+  only. Each family has two lengths.
+- **oracle** (rev 2, N1): per case,
+  - (a) it was rejected (an `isError` gate result, or the `{"error": true}`
+    payload), so there is no vacuous pass;
+  - (b) no 12-character window of the sentinel (raw, JSON-, `repr`- and
+    `unicode_escape`-escaped), and no sha256/sha1/md5 of it, is in any
+    channel `_Tap` watches. The channels are: the response; every log
+    record at DEBUG, as both pmcp formatters render it plus `msg`, `args`,
+    `getMessage()`, every attribute (so `extra=`) and the full `exc_info`
+    and `stack_info` tracebacks; stdout/stderr (`capfd`); warnings
+    (`recwarn`); the scoped audit JSONL; and the audit-event buffer;
+  - (c) with two sentinels of different length, the response, the
+    time-normalised log (with `extra=` attributes), the streams, the
+    warnings, the audit records and the event shapes are identical;
+  - (d) for the hex family, the rejection names the path (and, for
+    validators, the reason).
+
   (b)-(c) run before (d), so main goes red on the leak, not on wording.
 - **inside handlers**: a stub handler raising each validation-error type
   (downstream `McpTaskInfo`, an argument model, jsonschema) built from a
   sentinel value;
+- **downstream, through the real handlers** (rev 2, B1): `_task_server`
+  gives the real `GatewayServer` one task-capable downstream whose
+  `_send_request` answers with a crafted task payload. The rest is
+  unchanged: `ClientManager`, the handlers, the server arm and the audit.
+  - Positions are every literal key `ClientManager._task_info_from_payload`
+    reads, taken from its AST, × every bad shape the real parser rejects
+    with a `ValidationError`, found by running it.
+  - The paths are the five gateway tools that parse a task payload:
+    `tasks_list`, `tasks_get`, `tasks_result`, `tasks_cancel`, and `invoke`
+    with a task.
+  - Per case: the downstream method was called; nothing leaks into any
+    channel; the response says `validation error(s) for McpTaskInfo: $`, so
+    there is no vacuous pass; the pair differential holds; and at the end
+    `gateway.health`'s output carries no sentinel.
+  - A value the parser *accepts* (a digits-only `createdAt` is a number) is
+    downstream data returned by design and is skipped.
+  - The listing parsers get the same treatment (tool, resource and prompt
+    entries, and prompt arguments). The positions are the parser's own
+    literal keys, restricted to those whose rejection is a
+    `ValidationError`, as recorded from its `describe_exception` call.
+- **static** (rev 2): the scanner above as a test, plus a test per rule
+  that it fires and one that the renderers pass.
 - **past the gate**: every gate case sent straight to the real handler must
   raise the model's `ValidationError` without logging the value (this is
   what catches L7).
@@ -303,55 +523,156 @@ their machinery, so its log oracle now excludes nothing, and it accepts the
 one new record shape a generated key can cause (`_META_REJECTION`) instead
 of the `_INVOKE_ONLY_EXEMPT` field exemption, which is gone.
 
+### 7. Every other exception-to-text sink (rev 2, B1)
+
+`argument_errors` gains three functions, and every sink enumerated above
+uses them:
+- `exception_text(e)` is `str(e)`, except for a pydantic or jsonschema
+  `ValidationError`, or an exception whose own text *embeds* the text of one
+  it chains (`RuntimeError(f"... {e}") from e`). Those are described from
+  their structure **without a schema**: `N validation error(s) for <Model>:
+  $.<path>: <phrase>`, or `schema validation error: $.<path>: fails its
+  <keyword> constraint` (N6). The path keeps names that pmcp's own models
+  declare. These are read from the `pmcp.*` modules' namespaces, cached per
+  `len(sys.modules)`, and do not include caller or downstream keys. Every
+  other exception's text is unchanged, so no existing message changes.
+- `safe_exc_info(e)` is `e` for `exc_info=`. It returns `None` when the
+  chain (`__cause__`, `__context__`, group members) holds a validation
+  error, because that traceback would render the value. The message
+  carries `exception_text(e)` instead.
+- `safe_traceback_text(e)` is the formatted traceback, or a one-line
+  stand-in, for the one site that formats a traceback itself
+  (`client/manager.py:2680`).
+
+They are applied at the three shared renderers (`sanitize_auth_diagnostic`
+renders an exception with `exception_text`, and `describe_exception`'s
+leaves do too), so `_sanitize_error` and every `describe_exception` caller
+follow. They are also applied mechanically at the 82 sinks: `{e}` →
+`{exception_text(e)}`, `str(e)` → `exception_text(e)`, a logging argument
+`e` → `exception_text(e)`, `exc_info=True` → `exc_info=safe_exc_info(e)`,
+and `logger.exception(msg)` → `logger.error(msg, exc_info=safe_exc_info(exc))`.
+
+`server.py`'s arm is simplified. The tool's own model rejection is
+described against the tool's schema as `Invalid arguments: ...`. Everything
+else goes through `exception_text(e)`. That removes rev 1's
+`Validation error: ...` prefix, which is now the `N validation errors for
+<Model>: ...` form.
+
+The CLI is out of the static scope. There the operator reads their own
+input and config errors. The same config errors reached through the gateway
+(policy, trust store, package approvals, `.mcp.json`) are in scope and now
+read structurally, which the CHANGELOG states.
+
+### 8. Why sinks and not one choke point
+
+pydantic's `ValidationError.__str__` is a C type, so there is no global
+hook. `hide_input_in_errors` exists only per model, and the SDK's and
+jsonschema's errors have no such switch. A logging filter sees only records
+routed to the handlers it is attached to, and never sees a string built
+with `f"{e}"` before logging. What *is* one place is the rule, and the
+static test enforces it at every sink.
+
 ## Changes
 
-Patches under *Verbatim bodies* (`git diff 7680445 19dac95 -- <file>`).
-Ten files: five source, three tests, two docs. Source is over the ~3-concern
-line only in appearance: it is one concern (render rejections from
-structure) applied to its three channels.
+These are the patches under *Verbatim bodies* (`git diff 7680445 929f693 -- <file>`):
+28 files, +2632 / −352. One concern, rendering validation errors from
+their structure, is applied at every sink. The bounded-plan threshold of
+about 8 files is exceeded on purpose. 19 of the source files carry only the
+mechanical §7 substitution plus an import, and splitting them into another
+plan would leave the class open between the two merges.
 
-### `src/pmcp/argument_errors.py` (create, +388)
-- module docstring — add — the rule, the fields it never reads.
-- `CORRELATION_ID_CHARSET`, `SCOPED_CORRELATION_INCOMPLETE`, `PACKAGE_NAME_INVALID`, `_PMCP_MESSAGES`, `argument_error()` — add — fixed-message errors for pmcp's validators.
-- `_CONSTRAINT_CONTEXT`, `_MODEL_PHRASES`, `_argument_names()`, `_model_error_path()`, `model_error_path()`, `_model_phrase()`, `describe_model_error()` — add — pydantic rendering.
-- `declared_property_names()`, `schema_error_path()`, `schema_error_keyword()` — add (moved verbatim from `scoped_advisor_audit.py`, renamed public) — one path rule for text and audit.
-- `_schema_node()`, `_count()`, `_type_names()`, `_missing_required()`, `_schema_phrase()`, `describe_schema_error()` — add — jsonschema rendering.
-- `describe_argument_error()` — add — dispatch; `None` for any other exception.
+### `src/pmcp/argument_errors.py` (create, +561)
+- validator errors (rev 1, unchanged):
+  - `CORRELATION_ID_CHARSET`, `SCOPED_CORRELATION_INCOMPLETE`,
+    `PACKAGE_NAME_INVALID`;
+  - `_PMCP_MESSAGES`;
+  - `argument_error()`.
+- pydantic (rev 2, N2):
+  - `_FIXED_PHRASES` and `_CONSTRAINED_PHRASES` replace `_MODEL_PHRASES`
+    and `_CONSTRAINT_CONTEXT`;
+  - `_declared_names()`, cached, over every `pmcp.*` model;
+  - `_schema_node_at()`, `_constraint_text()`, `_model_phrase(type, node)`;
+  - `model_error_path()`, `describe_model_error()`.
+- jsonschema (rev 1): `declared_property_names()`, `schema_error_path()`,
+  `schema_error_keyword()`, `_schema_phrase()`, `describe_schema_error()`.
+- any exception (rev 2, §7): `_chain()`, `_validation_text()`,
+  `exception_text()`, `safe_exc_info()`, `safe_traceback_text()`.
 
-### `src/pmcp/server.py` (modify, +68 / -10)
-- imports — add `pydantic`, `describe_argument_error`, `describe_schema_error`, `GATEWAY_TOOL_INPUT_MODELS`.
-- `_handle_call_tool` gate return — modify — description instead of `e.message` (L1).
-- `call_tool` `except Exception` — modify — `rejected_by_model`, description in log and response (L2, L3, L9), `audit.rejection` for a model rejection (L6), no caller name in the unknown-tool log (L8).
+### `src/pmcp/server.py` (modify, +80 / −13)
+- the gate return renders `describe_schema_error` (rev 1);
+- the `call_tool` arm (rev 2): the model rejection is described against the
+  tool schema; everything else goes through `exception_text`; the audit
+  records `audit.rejection` for a model rejection; the unknown-tool log line
+  is fixed text;
+- three startup/shutdown sinks go through `exception_text`.
 
-### `src/pmcp/scoped_advisor_audit.py` (modify, +20 / -68)
-- `_declared_property_names`, `_rejected_argument_path`, `_rejected_argument_validator` — delete (moved).
-- `record_rejected_arguments` — modify — accepts a pydantic `ValidationError` too (path from `model_error_path`, validator `None`).
+### `src/pmcp/tools/handlers.py` (modify, +49 / −28)
+- `provision_status` validates before its `try` (rev 1);
+- 26 sinks go through `exception_text` / `safe_exc_info` (rev 2). These are
+  the `tasks_*` audit `error=` and `errors`, `auth_connect`, provisioning,
+  handoff, the registry and the update probe.
 
-### `src/pmcp/types.py` (modify, +9 / -9)
-- `InvokeInput._validate_correlation_id`, `InvokeInput._reject_partial_scoped_correlation`, `RegisterDiscoveredServerInput._validate_package` — modify — `raise argument_error(...)` (L4, L5).
+### `src/pmcp/client/manager.py` (modify, +11 / −7)
+- `describe_exception` leaves go through `exception_text`;
+- `_connect_all_unlocked` and `_fetch_server_listings` messages go through
+  `exception_text`;
+- the cancellation-unwind traceback goes through `safe_traceback_text`.
 
-### `src/pmcp/tools/handlers.py` (modify, +6 / -4)
-- `GatewayTools.provision_status` — modify — validate before the `try`; fallback `job_id` from the validated input (L7).
+### `src/pmcp/auth.py` (modify, +5 / −1)
+- `sanitize_auth_diagnostic` renders an exception with `exception_text`.
 
-### `tests/test_argument_error_echo.py` (create, +805) — see *Design §6*.
+### `src/pmcp/scoped_advisor_audit.py` (modify, +20 / −68, rev 1)
+- the path helpers moved to `argument_errors`;
+- `record_rejected_arguments` accepts a pydantic error.
 
-### `tests/test_scoped_advisor_audit.py` (modify, +91 / -176)
-- `_FOREIGN_INVOKE_INPUT`, `_is_foreign`, `_EXCLUDED_MESSAGE`, `_has_diagnostics`, `_oracle_view`, `_LoggedCalls.foreign`, `_INVOKE_ONLY_EXEMPT`, `test_the_foreign_log_exclusion_matches_only_the_exact_lines`, `test_an_excluded_line_keeps_its_traceback_and_stack_in_the_oracle` (+ `_Records`, `_excluded_record`, `_invoke_input_line`) — delete — nothing is excluded any more.
-- `_META_REJECTION`, `_call_records`, `_assert_against`, `test_the_formerly_excluded_log_echoes_are_gone` — add.
-- the three generated sweeps — modify — read invocation *and* rejection records, compare with `_assert_against`.
+### `src/pmcp/types.py` (modify, +9 / −9, rev 1)
+- the three validators raise `argument_error(...)`.
 
-### `tests/test_gateway_tool_schemas.py` (modify, +7 / -3)
-- `test_server_gate_rejects_what_the_model_rejects` fragments — modify — the new wording (`$.tool_id: must be at least 1 character`, `$.title: must be at least 8 characters`, `$.options.max_output_chars: must be greater than or equal to`).
+### Mechanical §7 sinks: `exception_text` / `safe_exc_info` plus the import (modify, rev 2)
+- `config/guidance.py`, `config/loader.py`;
+- `manifest/code_patterns_loader.py`, `manifest/environment.py`,
+  `manifest/installer.py` (including `task.exception()` and `exc_info`),
+  `manifest/loader.py`, `manifest/npm_resolver.py`,
+  `manifest/package_identity.py`, `manifest/refresher.py`,
+  `manifest/version_checker.py`;
+- `package_approvals.py`, `policy/policy.py` (including
+  `_warn_unparseable`), `provision_gate.py`;
+- `subscriptions.py` (`logger.exception` → `logger.error(...,
+  exc_info=safe_exc_info(exc))`);
+- `templates/code_snippets_loader.py`, `trust_store.py`.
+
+### `tests/test_argument_error_echo.py` (create, +1708)
+- rev 1: the argument sweep, handler-past-the-gate, and renderer unit tests;
+- rev 2 additions:
+  - `_FAMILIES`, `_Tap` / `_Observed` / `_record_text`;
+  - the N2 custom-error test, the wrapper test and the static sink guard
+    (with its rule tests);
+  - `test_every_decorated_baseline_passes_the_gate`;
+  - the downstream task sweep and the listing sweep.
+
+### `tests/test_scoped_advisor_audit.py` (modify, +91 / −176, rev 1)
+- the foreign-line exclusions are removed;
+- `_META_REJECTION` and `_assert_against` are added.
+
+### `tests/test_gateway_tool_schemas.py` (modify, +7 / −3, rev 1)
+- the three fragments use the new wording.
 
 ## Documentation impact
-- `CHANGELOG.md` — `[Unreleased]` -> `### Fixed`, first entry — add — the fix, the wording change for clients that match on jsonschema phrases, the audit disposition, the unknown-tool log line.
-- `README.md` (scoped-advisor audit paragraph, main `:1519-1524`) — modify — model rejections are `audit.rejection` too; the caller-facing text and log name the path and a schema reason, never the value.
+- `CHANGELOG.md` — `[Unreleased]` → `### Fixed`, first entry — modify:
+  - rev 1's fix, the wording change and the audit disposition;
+  - rev 2's sentence that the rule holds wherever pmcp renders an exception
+    (responses, logs and tracebacks, the audit-event buffer, `tasks_*`
+    `errors`), including downstream data and the operator's own config
+    files.
+- `README.md` (scoped-advisor audit paragraph) — modify (rev 1).
 
 ## Dependencies & order
-Apply all ten patches together (they are one `git apply`). `types.py`
-imports `pmcp.argument_errors`, which imports `pmcp.types` only lazily
-inside `_argument_names()` (no cycle); `scoped_advisor_audit.py` imports it
-at module level. No migration, no config.
+Apply all 28 patches together; they are one `git apply`.
+`pmcp.argument_errors` imports no `pmcp` module at load time.
+`_declared_names` imports `pmcp.types` lazily, so there are no import
+cycles: `pmcp.types`, `auth`, `client.manager` and the others import it at
+module level, and `python -c "import pmcp.server, pmcp.cli"` succeeds. No
+migration, no config.
 
 ## Verification
 
@@ -367,111 +688,233 @@ unset npm_config_cache npm_config_store_dir pnpm_config_store_dir
 uv run pytest -m 'not live and not slow' -q
 ```
 
-Red on main: copy the three test files at `19dac95` onto a clean
-`7680445` tree and run the same three modules (result under *Acceptance
-criteria*).
+Red on main: copy the three test files at `929f693` onto a clean `7680445`
+tree and run the same three modules. The result is under *Acceptance
+criteria*.
 
-## Acceptance criteria — measured this session
+## Acceptance criteria — measured this session (on `929f693`, red on `7680445`)
 
-- [x] For every registered gateway tool and every generated invalid
-  argument (254 cases), no 12-character window or hash of the sentinel
-  reaches the response, the log (text + JSON formatters, tracebacks) or the
-  scoped audit, on the plain and the scoped-audit server, and two sentinels
-  of different length give identical responses, logs and audit records —
-  `pytest tests/test_argument_error_echo.py::test_no_rejected_argument_value_reaches_a_response_log_or_audit` (2 passed patched; both red on main: `AssertionError: ('$.auth_mode:type-object', 'response')`).
-- [x] Each of those rejections names its path and reason: `Input validation error: $.options: must be of type object or null` for the issue's example — `test_a_schema_rejection_names_the_field_and_the_reason_only` (5 passed; on main these five fail with `ModuleNotFoundError: No module named 'pmcp.argument_errors'` since they call the renderer directly; the sweep's usefulness assertion `_useful` covers the same wording end to end).
-- [x] A model-rejected call is an `audit.rejection` with no argument value; nothing in `test_scoped_advisor_audit.py`'s log oracle is excluded — `pytest tests/test_scoped_advisor_audit.py` (156 passed patched; on main with the patched tests, 6 fail, e.g. `('top-level correlation', ['... Tool execution error: 1 validation error for InvokeInput ...`).
-- [x] Every handler, called past the gate, raises its model's `ValidationError` without logging the value — `test_every_handler_rejects_what_the_gate_rejects_without_logging_it` (passed; red on main at `provision_status`: `('$.job_id:type-object', '... provision_status handler failed: 1 validation error for Provis...fa85997Zx'}]}, input_type=dict]`).
-- [x] `ruff check src/ tests/`, `ruff format --check src/ tests/`, `mypy src/` clean; full `pytest -m 'not live and not slow'` green (lines below).
+- [x] **Caller arguments** (the rev 1 axes). 254 cases × 6 sentinel
+  families × 2 lengths, on the plain and the scoped-audit server.
+  - Nothing leaks into the response, the log (raw records, `extra=`,
+    tracebacks), stdout/stderr, warnings, the audit JSONL or the audit-event
+    buffer, and the pair differential holds.
+  - Command:
+    `pytest tests/test_argument_error_echo.py::test_no_rejected_argument_value_reaches_a_response_log_or_audit`.
+  - 2 passed. Red on main: `AssertionError: ('hex', '$.auth_mode:type-object', ...)`.
+- [x] **Downstream data through the real handlers** (B1).
+  - Tasks: every rejected payload key and shape, through all five task
+    paths. `test_no_downstream_value_reaches_a_response_log_or_audit`:
+    2 passed. Red on main: `('gateway.tasks_list', 'createdAt', ...)`.
+  - Listings: `test_no_downstream_listing_value_reaches_the_log`: 3 passed.
+    Red on main: `('tools', 'description', 'object', 'alpha', ...)`.
+- [x] **Every exception-to-text sink goes through the renderer.**
+  `test_no_exception_reaches_text_except_through_the_renderer` passes. On
+  main it fails, and the scanner lists 82 sinks. Each scanner rule fires:
+  `test_the_sink_scanner_flags_each_shape`, 10 passed.
+- [x] **A custom error cannot fill a phrase from its `ctx`** (N2):
+  `test_a_custom_error_cannot_fill_a_phrase_from_its_context`, 6 passed.
+  A group leaf and a wrapper that embeds a validation error are described,
+  not echoed: `test_describe_exception_renders_a_grouped_validation_error_structurally`
+  (6 passed) and `test_exception_text_describes_a_wrapper_that_embeds_a_validation_error`.
+- [x] **Gates and the full suite are clean.** `ruff check src/ tests/`,
+  `ruff format --check src/ tests/` and `mypy src/` pass, and
+  `pytest -m 'not live and not slow'` is green (lines under *Full suite and
+  gates*).
 
-Red on main, exact tail (`pytest tests/test_argument_error_echo.py tests/test_scoped_advisor_audit.py tests/test_gateway_tool_schemas.py -q --tb=line`, patched tests on `7680445`):
+Red on main, with the three test files @ `929f693` on a clean `7680445`
+(`pytest ... -q --tb=line`; identical lines collapsed as `(xN)`):
 
 ```text
-tests/test_argument_error_echo.py:506: AssertionError: ('$.auth_mode:type-object', 'response')
-tests/test_argument_error_echo.py:506: AssertionError: ('$.auth_mode:type-object', 'response')
-tests/test_argument_error_echo.py:557: AssertionError: ('$.job_id:type-object', '[2026-09-28T21:26:22] [ERROR] provision_status handler failed: 1 validation error for Provis...fa85997Zx\'}]}, input_type=dict]\
-tests/test_argument_error_echo.py:624: AssertionError: ab4bcafa8599
-tests/test_argument_error_echo.py:624: AssertionError: ab4bcafa8599
-tests/test_argument_error_echo.py:624: AssertionError: ab4bcafa8599
-tests/test_argument_error_echo.py:683: ModuleNotFoundError: No module named 'pmcp.argument_errors'   (x5, and :697, :727, :760, :777: the renderer's own unit tests)
+tests/test_argument_error_echo.py:690: AssertionError: ('hex', '$.auth_mode:type-object', _Observed(response="Input validation error: {'Sqfee3b693849c460ce4e728Zx': 'Sqfee3b...ne of ['api_key', 'url_e
+tests/test_argument_error_echo.py:690: AssertionError: ('hex', '$.auth_mode:type-object', _Observed(response="Input validation error: {'Sqfee3b693849c460ce4e728Zx': 'Sqfee3b...ped_advisor_audit.v1","s
+E   AssertionError: ('$.job_id:type-object', '[2026-09-28T22:53:17] [ERROR] provision_status handler failed: 1 validation error for Provis...ce4e728Zx\'}]}, input_type=dict]\
+ERROR    pmcp.tools.handlers:handlers.py:5643 provision_status handler failed: 1 validation error for ProvisionStatusInput
+tests/test_argument_error_echo.py:736: AssertionError: ('$.job_id:type-object', '[2026-09-28T22:53:17] [ERROR] provision_status handler failed: 1 validation error for Provis...ce4e728Zx\'}]}, input_ty
+tests/test_argument_error_echo.py:817: AssertionError: ('hex', _Observed(response='{"error": true, "message": "2 validation errors for McpTaskInfo\
+tests/test_argument_error_echo.py:817: AssertionError: ('hex', _Observed(response='{"error": true, "message": "3 validation errors for InvokeInput\
+tests/test_argument_error_echo.py:817: AssertionError: ('hex', _Observed(response='{"error": true, "message": "{\'Sqfee3b693849c460ce4e728Zx\': \'Sqfee3b693849c460ce4e728Zx\...=None
+(x5) tests/test_argument_error_echo.py:869: ModuleNotFoundError: No module named 'pmcp.argument_errors'
+tests/test_argument_error_echo.py:883: ModuleNotFoundError: No module named 'pmcp.argument_errors'
+tests/test_argument_error_echo.py:913: ModuleNotFoundError: No module named 'pmcp.argument_errors'
+tests/test_argument_error_echo.py:946: ModuleNotFoundError: No module named 'pmcp.argument_errors'
+(x6) tests/test_argument_error_echo.py:997: ModuleNotFoundError: No module named 'pmcp.argument_errors'
+tests/test_argument_error_echo.py:1037: ModuleNotFoundError: No module named 'pmcp.argument_errors'
+tests/test_argument_error_echo.py:1048: ModuleNotFoundError: No module named 'pmcp.argument_errors'
+(x6) tests/test_argument_error_echo.py:1092: assert 'validation error for McpTaskInfo: $.ttl: must be an integer' in "ExceptionGroup(1 sub-exception): ValidationError: 1 validation error for McpTaskInfo\nt
+tests/test_argument_error_echo.py:1313: AssertionError: manager.py:2680: Call uses exc
+(x2) tests/test_argument_error_echo.py:1570: AssertionError: ('gateway.tasks_list', 'createdAt', '{
+tests/test_argument_error_echo.py:1685: AssertionError: ('tools', 'description', 'object', 'alpha', _Observed(response='', log='[1969-12-31T19:00:00] [WARNING] [svc] Skipping...=None
+tests/test_argument_error_echo.py:1685: AssertionError: ('resources', 'annotations', 'string', 'spaced', _Observed(response='', log='[1969-12-31T19:00:00] [WARNING] [svc] Ski...=None
+tests/test_argument_error_echo.py:1685: AssertionError: ('prompts', 'annotations', 'string', 'spaced', _Observed(response='', log='[1969-12-31T19:00:00] [WARNING] [svc] Skipp...=None
 tests/test_scoped_advisor_audit.py:1692: AssertionError: ('top-level correlation', ['[1969-12-31T19:00:00] [ERROR] Tool execution error: 1 validation error for InvokeInput
 tests/test_scoped_advisor_audit.py:1692: AssertionError: ('E6 correlation', ['[1969-12-31T19:00:00] [ERROR] Tool execution error: 1 validation error for InvokeInput
-tests/test_scoped_advisor_audit.py:1692: AssertionError: ("('gateway.caller_marker_a', 'gateway.caller_marker_bbbbbbb') correlation", [... "msg": "Too
-tests/test_scoped_advisor_audit.py:1692: AssertionError: ("('gateway.caller_marker_a', 'gateway.caller_marker_bbbbbbb') correlation", [... "msg": "Too
+(x2) tests/test_scoped_advisor_audit.py:1692: AssertionError: ("('gateway.caller_marker_a', 'gateway.caller_marker_bbbbbbb') correlation", ['[1969-12-31T19:00:00] [ERROR] Tool exec...evel": "ERROR", "logge
 tests/test_scoped_advisor_audit.py:1692: AssertionError: ('real correlation', ['[1969-12-31T19:00:00] [ERROR] Tool execution error: 1 validation error for InvokeInput
-tests/test_scoped_advisor_audit.py:2086: AssertionError: [2026-09-28T21:26:45] [INFO] Loaded policy from ...
+tests/test_scoped_advisor_audit.py:2086: AssertionError: [2026-09-28T22:53:35] [INFO] Loaded policy from /tmp/pytest-of-viperjuice/pytest-5478/test_the_formerly_excluded_log0/policy.json
 tests/test_gateway_tool_schemas.py:468: AssertionError: Input validation error: '' should be non-empty
 tests/test_gateway_tool_schemas.py:468: AssertionError: Input validation error: 'short' is too short
 tests/test_gateway_tool_schemas.py:468: AssertionError: Input validation error: 5 is less than the minimum of 100
-24 failed, 368 passed in 25.98s
+43 failed, 405 passed in 18.79s
 ```
 
-The three `:624` lines are `test_a_validation_error_raised_by_a_handler_is_described_not_echoed` (downstream model, argument model, jsonschema): a sentinel window in main's response/log.
+The `ModuleNotFoundError` lines are the renderer's own unit tests, which
+import `pmcp.argument_errors`. Every sweep fails on a leak, not on an
+import.
 
-Green (patched): `392 passed in 36.73s` for the three modules; gates and the
-full suite in *Embedding proof*.
+Green (patched): `448 passed in 49.02s` for the three modules.
 
 ## Mutation evidence
 
-`mutants.py` (below) on a worktree of `19dac95`: each mutant is applied
-(the anchor must occur exactly once), the three test modules run with `-x
---tb=line`, and the file is restored **from a copy saved before the
-mutation** and `cmp`-checked; `git status --short | wc -l` was `0`
-afterwards. Every mutant applied and went red; the named reason is the first
-failing assertion.
+`mutants.py` (below) on a worktree of `929f693`. It applies each mutant,
+with the anchor required to occur exactly once, runs the three test modules
+with `-x --tb=line`, restores the file **from a copy saved before the
+mutation** and `cmp`-checks it. `git status --short | wc -l` was `0` after
+the run. Every mutant applied and went red; the named reason is the first
+failing assertion. M1–M14 are rev 1's, re-anchored where rev 2 moved the
+code (M7 now takes the constraint from `ctx`, and M10 also restores rev 1's
+fallback `job_id`). M15–M22 are new for B1. S5–S8 are the rev 1 board
+seat's surviving mutants.
 
 ```text
-M1 gate renders e.message: applied=yes exit=1 | 1 failed, 1 passed in 0.13s | E   AssertionError: ('$.auth_mode:type-object', 'response')
-M2 except arm returns str(e): applied=yes exit=1 | 1 failed, 1 passed in 1.98s | E   AssertionError: ("validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", 'response')
-M3 except arm logs str(e): applied=yes exit=1 | 1 failed, 1 passed in 2.12s | E   AssertionError: ("validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", 'log', '[2026-09-28T21:24:17] [ERROR] ...y alphanumerics and ._:- [type=correlation_id_charset, input_value=\'Sq3b2ee216cab4bcafa8
-M4 model rejection recorded as invocation: applied=yes exit=1 | 1 failed, 2 passed in 5.03s | E   AssertionError: ("validator:('InvokeInput', '_reject_partial_scoped_correlation', '')", 'audit')
-M5 model loc not redacted: applied=yes exit=1 | 1 failed, 14 passed in 13.49s | E   AssertionError: assert '$.env.sk-KEY...be an integer' == '$.env.*: must be an integer'
-M6 schema path not redacted: applied=yes exit=1 | 1 failed, 12 passed in 12.30s | E   AssertionError: assert '$.env.sk-KEY... type integer' == '$.env.*: mus... type integer'
-M7 phrase may read ctx error: applied=yes exit=1 | 1 failed, 15 passed in 7.35s | E   AssertionError: assert frozenset({'e...', 'lt', ...}) == {'expected', ..._length', ...}
-M8 missing-required reads an instance key: applied=yes exit=1 | 1 failed, 1 passed in 0.26s | E   AssertionError: ('required:server_name', 'response')
-M9 validator back to ValueError with value: applied=yes exit=1 | 1 failed, 1 passed in 1.92s | E   AssertionError: Invalid arguments: $.run_correlation_id: is invalid
-M10 provision_status validates inside its try: applied=yes exit=1 | 1 failed, 3 passed in 7.08s | E   AssertionError: ('$.job_id:type-object', '[2026-09-28T21:25:11] [ERROR] provision_status handler failed: 1 validation error for Provis...fa85997Zx\'}]}, input_type=dict]\
-M11 unknown tool name logged: applied=yes exit=1 | 1 failed, 164 passed in 31.05s | E   AssertionError: ("('gateway.caller_marker_a', 'gateway.caller_marker_bbbbbbb') correlation", ['[1969-12-31T19:00:00] [ERROR] Tool exec...evel": "ERROR", "logger": "pmcp.server", "msg": "Tool execution error: Unknown tool: gate
-M12 type phrase is e.message: applied=yes exit=1 | 1 failed, 1 passed in 0.12s | E   AssertionError: ('$.consent_acknowledged:type-string', 'response')
-M13 model phrase is pydantic msg: applied=yes exit=1 | 1 failed, 13 passed in 7.48s | E   AssertionError: assert '$.meta: Inpu...id dictionary' == '$.meta: must be an object'
-M14 audit model path from input: applied=yes exit=1 | 1 failed, 2 passed in 4.80s | E   AssertionError: ("validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", 'audit')
+M1 gate renders e.message: applied=yes exit=1 | 1 failed, 27 passed in 0.59s | E   AssertionError: ('hex', '$.auth_mode:type-object', _Observed(response="Input validation error: {'Sqfee3b693849c460ce4e728Zx': 'Sqfee3b...ne of ['api_key', 'url_elicitation']", log='', raw_log='', streams='', warnings='', audit
+M2 except arm returns str(e): applied=yes exit=1 | 1 failed, 27 passed in 1.14s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response="1 validatio...=None
+M3 except arm logs str(e): applied=yes exit=1 | 1 failed, 27 passed in 1.13s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...=None
+M4 model rejection recorded as invocation: applied=yes exit=1 | 1 failed, 28 passed in 7.65s | E   AssertionError: ('hex', "validator:('InvokeInput', '_reject_partial_scoped_correlation', '')", _Observed(response='Invalid arguments: ..."sequence":222,"source_reference_hash":null,"terminal_status":"failure","timestamp":17906
+M5 model loc not redacted: applied=yes exit=1 | 1 failed, 40 passed in 14.29s | E   AssertionError: assert '$.env.sk-KEY...be an integer' == '$.env.*: must be an integer'
+M6 schema path not redacted: applied=yes exit=1 | 1 failed, 38 passed in 14.15s | E   AssertionError: assert '$.env.sk-KEY... type integer' == '$.env.*: mus... type integer'
+M7 phrase constraint from pydantic ctx: applied=yes exit=1 | 1 failed, 41 passed in 14.95s | E   assert '$.literal: m...: is required' == '$.literal: m...: is required'
+M8 missing-required reads an instance key: applied=yes exit=1 | 1 failed, 27 passed in 0.51s | E   AssertionError: ('hex', 'required:server_name', _Observed(response='Input validation error: $.extra_Sqfee3b693849c460ce4e728Zx: is required', log='', raw_log='', streams='', warnings='', audit=[], raw_audit='', events=''))
+M9 validator back to ValueError with value: applied=yes exit=1 | 1 failed, 27 passed in 1.09s | E   AssertionError: Invalid arguments: $.run_correlation_id: is invalid
+M10 provision_status validates inside its try: applied=yes exit=1 | 1 failed, 29 passed in 14.57s | E   AssertionError: ('required:job_id', None)
+M11 unknown tool name logged: applied=yes exit=1 | 1 failed, 55 passed in 16.88s | E   AssertionError: server.py:525: FormattedValue uses e
+M12 type phrase is e.message: applied=yes exit=1 | 1 failed, 27 passed in 0.67s | E   AssertionError: ('hex', '$.consent_acknowledged:type-string', _Observed(response="Input validation error: $.consent_acknowledged: 'Sqf...0ce4e728Zx' is not of type 'boolean'", log='', raw_log='', streams='', warnings='', audit
+M13 model phrase is pydantic msg: applied=yes exit=1 | 1 failed, 30 passed in 16.87s | E   AssertionError: {'error': True, 'message': '2 validation errors for McpTaskInfo: $.task_id: Input should be a valid string; $.created_at: Input should be a valid number'}
+M14 audit model path from input: applied=yes exit=1 | 1 failed, 28 passed in 13.26s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg..._advisor_audit.v1","sequence":218,"terminal_status":"invalid_arguments","timestamp":17906
+M15 sanitize_auth_diagnostic uses str(value): applied=yes exit=1 | 1 failed, 67 passed in 23.07s | E   AssertionError: ('gateway.tasks_list', 'createdAt', '{
+M16 describe_exception leaf uses str(leaf): applied=yes exit=1 | 1 failed, 49 passed in 15.18s | E   assert 'validation error for McpTaskInfo: $.ttl: must be an integer' in "ExceptionGroup(1 sub-exception): ValidationError: 1 validation error for McpTaskInfo\nttl\n  Input should be a valid ...ErNBOfkoxABIALAEbZa'}, input_type
+M17 exception_text skips validation errors: applied=yes exit=1 | 1 failed, 30 passed in 23.82s | E   AssertionError: ('hex', _Observed(response='{"error": true, "message": "2 validation errors for McpTaskInfo\
+M18 safe_exc_info always returns the error: applied=yes exit=1 | 1 failed, 48 passed in 21.07s | E   pydantic_core._pydantic_core.ValidationError: 1 validation error for McpTaskInfo
+M19 tasks_get response uses str(e): applied=yes exit=1 | 1 failed, 55 passed in 15.15s | E   AssertionError: handlers.py:6079: Call uses e
+M20 tasks_get audit buffer uses str(e): applied=yes exit=1 | 1 failed, 55 passed in 34.15s | E   AssertionError: handlers.py:6077: Call uses e
+M21 exception_text ignores an embedded validation error: applied=yes exit=1 | 1 failed, 48 passed in 20.78s | E   pydantic_core._pydantic_core.ValidationError: 1 validation error for McpTaskInfo
+M22 installer crash message uses raw exc (static guard): applied=yes exit=1 | 1 failed, 55 passed in 26.30s | E   AssertionError: installer.py:256: FormattedValue uses exc
+S5 value in a log extra= field: applied=yes exit=1 | 1 failed, 27 passed in 2.39s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...=None
+S6 arguments printed to stderr: applied=yes exit=1 | 1 failed, 27 passed in 1.74s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...b693849c460ce4e728Zx', 7, {'Sqfee3b693849c460ce4e728Zx': None}]}}}
+S7 arguments in warnings.warn: applied=yes exit=1 | 1 failed, 27 passed in 1.49s | E   AssertionError: ('hex', "validator:('InvokeInput', '_validate_correlation_id', 'run_correlation_id')", _Observed(response='Invalid arg...ne}]}}} @ /mnt/workspace/worktrees/viperjuice/pmcp-297-mut/src/pmcp/server.py:515", audit
+S8 echo only isalpha values: applied=yes exit=1 | 1 failed, 27 passed in 1.48s | E   AssertionError: ('alpha', '$.auth_mode:enum', _Observed(response='Input validation error: $.auth_mode: must be one of ["api_key", "url...ation"] x AEaXjvOLkjBUhTKsJtXJSKWjIq', log='', raw_log='', streams='', warnings='', audit
 ```
 
-Reasons: M1/M2/M3/M8/M12 — the sweep finds a sentinel window in the
-response or log; M4/M14 — in the audit; M10 — in `provision_status`'s
-logged traceback; M11 — #296's pair differential (the two unregistered
-names differ in the log); M5/M6 — a caller key in the path (unit tests:
-the sweep's schemas have no failing caller-keyed position on main, as
-#296 measured); M7 — the constraint allowlist changed; M9 and M13 — the
-usefulness assertion (a `ValueError` validator degrades to `is invalid`
-and leaks nothing; pydantic's own `msg` for `dict_type` carries no value
-either, so M13 is caught by wording, not by the leak oracle). M4 was first
-run as `and e.title == ... -> and False`, which also flips the response
-prefix and went red on wording (`Validation error: ...`) before reaching
-the audit; the recorded M4 mutates only the audit branch (`if
-rejected_by_model and tool is not None: -> if False:`).
+The static guard sits earlier in the test file than the dynamic sweeps, so
+under `-x` it is what stops M11, M19, M20 and M22. Rerun without it
+(`NO_STATIC=1`, which deselects
+`test_no_exception_reaches_text_except_through_the_renderer`), the dynamic
+sweeps kill M11, M19 and M20 on their own:
+
+```text
+M11 unknown tool name logged: applied=yes exit=1 | 1 failed, 219 passed, 1 deselected in 54.51s | E   AssertionError: ("('gateway.caller_marker_a', 'gateway.caller_marker_bbbbbbb') correlation", ['[1969-12-31T19:00:00] [ERROR] Tool exec...evel": "ERROR", "logger": "pmcp.server", "msg": "Tool execution error: Unknown tool: gate
+M19 tasks_get response uses str(e): applied=yes exit=1 | 1 failed, 66 passed, 1 deselected in 19.43s | E   AssertionError: ('gateway.tasks_get', 'createdAt', 'string', 'hex', _Observed(response='{
+M20 tasks_get audit buffer uses str(e): applied=yes exit=1 | 1 failed, 66 passed, 1 deselected in 21.30s | E   AssertionError: ('gateway.tasks_get', 'createdAt', 'string', 'spaced', _Observed(response='{
+M22 installer crash message uses raw exc (static guard): applied=yes exit=0 | 447 passed, 1 deselected in 75.33s (0:01:15) | 
+```
+
+M22, the installer's monitor-crash message, **survives** this pass, as
+expected. No sweep drives a crashing install task, and the static guard is
+the only check on a sink that no dynamic path reaches; that is what M22
+shows. An earlier run of this pass also saw M22 go red, on a pair
+differential in the downstream sweep. That was flakiness, not detection: a
+`ResourceWarning` from an earlier test's unclosed audit file was finalised
+by the collector inside a pair. The fix is in `929f693`: `_Tap` runs
+`gc.collect()`, and every test shuts its servers down. After it, three
+parallel runs of the three modules under `-W error::ResourceWarning` were
+green (`447 passed, 1 deselected`, three times).
+
+Reasons, by channel:
+- **response**: M1, M2, M8, M12, M17 (sentinel window) and S8 (the `alpha`
+  family);
+- **log**: M3, S5 (`extra=`), S6 (stderr), S7 (warnings);
+- **audit**: M4, M14;
+- **downstream, through the real handlers**: M15, and M19/M20 in the second
+  pass;
+- **behaviour**: M10 (the handler returns instead of raising; rev 2's
+  renderers already keep the value out of that arm's log);
+- **wording**: M9 and M13;
+- **unit tests**: M5 and M6 (the path unit tests), M7 (the N2 custom-error
+  test), M16 (the group test), M18 and M21 (the wrapper test);
+- **static guard**: M11 (also #296's pair differential), M19, M20, M22.
 
 ## Non-goals
 
-- **Echo of schema-valid values** (the list under *Research summary*):
-  lookups, policy refusals, allowlist refusals and free text that the
-  handlers report back, most of them also in structured output fields by
-  design. They are not validation errors, and removing them site by site
-  would leave the structured fields. The class fix for "a token in the
-  wrong field" there is to make the field reject token-shaped input, i.e.
-  patterns on identifier fields (`tool_id` could reuse
-  `scoped_advisor_audit._TOOL_ID_PATTERN`; `server_name`, `request_id`,
-  `env_var`), which changes advertised schemas — proposed as a follow-up
-  issue alongside piece B of Consiliency/pmcp#236.
-- **The unknown/blocked tool name in the response** (`server.py:359`,
-  `:380`, `:444`): the caller's own routing name, pinned by three tests;
-  only the log line is fixed here.
-- **Downstream tools' own error text** returned as their result: the
-  product of `gateway.invoke`, covered by redaction (Consiliency/pmcp#234).
-- **`RecursionError` from `jsonschema.validate` on in-process nesting
-  (#296's E12)**: the wire cannot deliver it (#296 measured); unchanged.
-- **Piece B.** B's plan must re-run this sweep; see *Unverified* for how
-  its extra-key decorations are expected to interact with B.
+- **Echo of accepted values: a follow-up issue** (coordinator, rev 1
+  board). Its text, ready to file:
+
+  > **Accepted argument values are echoed into responses and logs.**
+  > Consiliency/pmcp#297 stops *validation errors* from echoing what they
+  > rejected. A value that *passes* validation, such as a token put in the
+  > wrong string field, is still echoed wherever a handler looks it up,
+  > refuses it or reports on it. Most of these are also returned in a
+  > structured output field by design. Sites on `7680445`:
+  >
+  > - **routing names**:
+  >   - `server.py:359` (`Gateway tool blocked by policy: {name}`);
+  >   - `server.py:380/:444` (`Unknown tool: {name}`, response only since
+  >     #297);
+  >   - `server.py:582/:609/:613/:683` (`resources/read`/`prompts/get`
+  >     unknown or blocked URI/name, which the SDK also logs with a
+  >     traceback: `mcp/shared/jsonrpc_dispatcher.py:754`);
+  >   - `client/manager.py:1277` (`Unknown server`, when lazy).
+  > - **lookups / policy refusals**:
+  >   - `handlers.py:1341/:1359` (describe, `details` only);
+  >   - `:1510/:1543/:1569` (`make_error(tool_id=...)` in `errors`);
+  >   - `:2426/:2541/:3010/:3083/:3192` (`Server '{server_name}' ...`, and
+  >     into the audit `error` via `_lifecycle_output` `:2898-2908`);
+  >   - `:3888/:4044`, `:5585` (`Job '{job_id}' not found`);
+  >   - `tasks_*` blocked-by-policy `:5938/:6021/:6065/:6157`;
+  >   - `client/manager.py:3847/:3896` (`Task not found: {server}::{task_id}`).
+  > - **format / allowlist refusals of a schema-valid string**:
+  >   - `handlers.py:4549/:4558` (`Env var '{env_var}' is not permitted`);
+  >   - `:4567-4581` via `env_store.py:23` (`{name!r}`);
+  >   - `:5410` (`unsafe package identifier {package!r}`);
+  >   - `:5427-5433` (disallowed `env_vars`, `operator_safe`);
+  >   - `client/manager.py:4208/:4217` (`Invalid request_id format:
+  >     {request_id}`, `Invalid local_id`);
+  >   - `config/loader.py:778-780/:854` (the policy `path`).
+  > - **free text echoed by design**:
+  >   - `refresh` `reason` (`handlers.py:1857`, INFO log);
+  >   - `request_capability` `query` (`:3860` log, `:3866/:3869` output);
+  >   - `search_registry` `query` (`:5384`);
+  >   - `submit_feedback` title/description (`:4681-4682`).
+  > - **invoke's own log lines** name `tool_id` (`:1657/:1688/:1734/:1817`).
+  >
+  > Proposed class fix: give identifier fields a pattern so token-shaped input
+  > fails validation (and is then described without its value by #297). For
+  > example `tool_id` can reuse `scoped_advisor_audit._TOOL_ID_PATTERN`; add
+  > patterns for `server_name`, `task_id`, `job_id`, `request_id` and
+  > `env_var`. Then route the routing-name log lines through a fixed text as
+  > #297 did for `Unknown tool`. This changes advertised schemas, so it
+  > belongs with, or after, piece B of Consiliency/pmcp#236.
+
+- **N5, `resources/read` / `prompts/get`**: this is part of the follow-up
+  above, not this plan. It is a lookup echo, not a validation error. The
+  SDK writes the traceback for any exception a request handler raises, so
+  silencing it means raising `MCPError`, which changes the wire error code.
+- **N4, the SDK's malformed-envelope echo** (`streamable_http.py:550`):
+  SDK-owned. Only the sender sees it, and tool arguments cannot trigger it.
+  The fix belongs upstream: the SDK's own `jsonrpc_dispatcher.py:100-101`
+  already maps a `ValidationError` to `data: ""`.
+- **N7, `isError: false` on the `call_tool` arm**: pre-existing. Changing it
+  changes every handler exception's wire shape.
+- **Downstream data that pmcp accepts** (a task's fields, a tool's
+  description) is returned or indexed by design. Only a *rejected*
+  downstream value is this plan's subject. The listing parsers' own
+  `_entry_label(entry)` (`client/manager.py:586-598`) logs a downstream
+  entry whose identity is unusable, by design, for diagnosis; that is not a
+  validation error's text.
+- **The operator's CLI** (`cli.py`, `cli_commands/`): the operator reads
+  their own input there.
+- **`RecursionError` from `jsonschema.validate` on in-process nesting**
+  (#296's E12): unchanged.
+- **Piece B.** B's plan must re-run this sweep (see *Unverified*).
 
 ## Unverified
 
@@ -479,17 +922,23 @@ rejected_by_model and tool is not None: -> if False:`).
   `additionalProperties` rejections. jsonschema's `best_match` is expected
   to prefer the deeper failing error, so the path assertions should hold,
   and an `additionalProperties`-only failure reads `$...: has a property
-  that is not accepted` without the key (the latter is unit-tested here;
-  the former is not measured).
-- That no client other than the tests above parses jsonschema's wording
-  after `Input validation error: ` (the CHANGELOG calls the change out).
-- Readers of `audit.rejection` other than agent-harness @ `18a324a4` (the
-  only one found); a model rejection now carries
-  `rejected_argument_validator: null`, a value #296's gate records already
-  allowed (unknown keyword).
-- pydantic error types outside `_MODEL_PHRASES` render `is invalid`; which
-  types a future model can raise was not enumerated beyond pydantic-core
-  2.41.5's 103.
+  that is not accepted` without the key. The latter is unit-tested; the
+  former is not measured.
+- **Exceptions from SDK code that pmcp never renders.** The SDK's own
+  loggers (e.g. `mcp/client/*` parsing a downstream frame) log with their
+  own formatting. pmcp's handlers on the root logger see those records, and
+  the sweeps would catch any that fired on their paths, but no sweep drives
+  a malformed downstream JSON-RPC frame through the SDK transport.
+- **The `initialize` path** (`ServerStatus(...)` built from a downstream's
+  `initialize` result) is covered by the static guard and by
+  `describe_exception`, not by a dynamic sweep, because it needs a
+  connected process.
+- **Readers of `audit.rejection`** other than agent-harness @ `18a324a4`.
+- **pydantic error types outside the two phrase tables** render `is
+  invalid`. This was not enumerated beyond pydantic-core 2.41.5.
+- **Clients that parse jsonschema's wording** after `Input validation
+  error: `, or rev 1's `Validation error: ` prefix (removed in rev 2; it
+  never shipped).
 
 ## Execution Policy
 
@@ -501,53 +950,84 @@ rejected_by_model and tool is not None: -> if False:`).
 
 ## Embedding proof
 
-Patches generated with `git diff 7680445 19dac95 -- <file>` and embedded;
-then, from **this file**, on a fresh worktree `$WORKTREE_ROOT/pmcp-297-proof`
-of `7680445` (`<scratch>` = the session scratch dir):
+The patches were generated with `git diff 7680445 929f693 -- <file>` and embedded. Then, from **this file**, on a fresh worktree `$WORKTREE_ROOT/pmcp-297-proof` of re-fetched `origin/main` (still `7680445`), with `<scratch>` the session scratch dir:
 
 ```text
 $ git -C <proof worktree> rev-parse --short HEAD
 7680445
-$ awk '/^#### Extractor/{...}' <plan> > <scratch>/emb/extract_plan_block.py
-$ python3 <scratch>/emb/extract_plan_block.py <plan> "#### Extractor" <scratch>/emb/x2.py && cmp ...
-<scratch>/emb/x2.py: 25 lines
+<scratch>/emb2/x2.py: 25 lines
 extractor self-extract: identical
-<scratch>/emb/argument_errors.patch: 394 lines
-<scratch>/emb/server.patch: 135 lines
-<scratch>/emb/scoped_advisor_audit.patch: 123 lines
-<scratch>/emb/types.patch: 50 lines
-<scratch>/emb/handlers.patch: 29 lines
-<scratch>/emb/test_argument_error_echo.patch: 811 lines
-<scratch>/emb/test_scoped_advisor_audit.patch: 402 lines
-<scratch>/emb/test_gateway_tool_schemas.patch: 28 lines
-<scratch>/emb/CHANGELOG.patch: 12 lines
-<scratch>/emb/README.patch: 19 lines
-$ git apply --check <scratch>/emb/*.patch
+<scratch>/emb2/p/CHANGELOG.md.patch: 12 lines
+<scratch>/emb2/p/README.md.patch: 19 lines
+<scratch>/emb2/p/src_pmcp_argument_errors.py.patch: 567 lines
+<scratch>/emb2/p/src_pmcp_auth.py.patch: 24 lines
+<scratch>/emb2/p/src_pmcp_client_manager.py.patch: 64 lines
+<scratch>/emb2/p/src_pmcp_config_guidance.py.patch: 23 lines
+<scratch>/emb2/p/src_pmcp_config_loader.py.patch: 59 lines
+<scratch>/emb2/p/src_pmcp_manifest_code_patterns_loader.py.patch: 21 lines
+<scratch>/emb2/p/src_pmcp_manifest_environment.py.patch: 30 lines
+<scratch>/emb2/p/src_pmcp_manifest_installer.py.patch: 89 lines
+<scratch>/emb2/p/src_pmcp_manifest_loader.py.patch: 30 lines
+<scratch>/emb2/p/src_pmcp_manifest_npm_resolver.py.patch: 23 lines
+<scratch>/emb2/p/src_pmcp_manifest_package_identity.py.patch: 32 lines
+<scratch>/emb2/p/src_pmcp_manifest_refresher.py.patch: 39 lines
+<scratch>/emb2/p/src_pmcp_manifest_version_checker.py.patch: 48 lines
+<scratch>/emb2/p/src_pmcp_package_approvals.py.patch: 41 lines
+<scratch>/emb2/p/src_pmcp_policy_policy.py.patch: 52 lines
+<scratch>/emb2/p/src_pmcp_provision_gate.py.patch: 21 lines
+<scratch>/emb2/p/src_pmcp_scoped_advisor_audit.py.patch: 123 lines
+<scratch>/emb2/p/src_pmcp_server.py.patch: 171 lines
+<scratch>/emb2/p/src_pmcp_subscriptions.py.patch: 27 lines
+<scratch>/emb2/p/src_pmcp_templates_code_snippets_loader.py.patch: 21 lines
+<scratch>/emb2/p/src_pmcp_tools_handlers.py.patch: 252 lines
+<scratch>/emb2/p/src_pmcp_trust_store.py.patch: 34 lines
+<scratch>/emb2/p/src_pmcp_types.py.patch: 50 lines
+<scratch>/emb2/p/tests_test_argument_error_echo.py.patch: 1714 lines
+<scratch>/emb2/p/tests_test_gateway_tool_schemas.py.patch: 28 lines
+<scratch>/emb2/p/tests_test_scoped_advisor_audit.py.patch: 402 lines
+$ git apply --check <scratch>/emb2/p/*.patch
 check: ok
 applied
-cmp src/pmcp/argument_errors.py: identical to wip/297-code@19dac95
-cmp src/pmcp/server.py: identical to wip/297-code@19dac95
-cmp src/pmcp/scoped_advisor_audit.py: identical to wip/297-code@19dac95
-cmp src/pmcp/types.py: identical to wip/297-code@19dac95
-cmp src/pmcp/tools/handlers.py: identical to wip/297-code@19dac95
-cmp tests/test_argument_error_echo.py: identical to wip/297-code@19dac95
-cmp tests/test_scoped_advisor_audit.py: identical to wip/297-code@19dac95
-cmp tests/test_gateway_tool_schemas.py: identical to wip/297-code@19dac95
-cmp CHANGELOG.md: identical to wip/297-code@19dac95
-cmp README.md: identical to wip/297-code@19dac95
-$ git status --short
- M CHANGELOG.md
- M README.md
- M src/pmcp/scoped_advisor_audit.py
- M src/pmcp/server.py
- M src/pmcp/tools/handlers.py
- M src/pmcp/types.py
- M tests/test_gateway_tool_schemas.py
- M tests/test_scoped_advisor_audit.py
-?? src/pmcp/argument_errors.py
-?? tests/test_argument_error_echo.py
-$ git add -N . && git diff --quiet 19dac95 && echo "proof tree == 19dac95 (whole tree)"
-proof tree == 19dac95 (whole tree)
+cmp CHANGELOG.md: identical to wip/297-code@929f693
+cmp README.md: identical to wip/297-code@929f693
+cmp src/pmcp/argument_errors.py: identical to wip/297-code@929f693
+cmp src/pmcp/auth.py: identical to wip/297-code@929f693
+cmp src/pmcp/client/manager.py: identical to wip/297-code@929f693
+cmp src/pmcp/config/guidance.py: identical to wip/297-code@929f693
+cmp src/pmcp/config/loader.py: identical to wip/297-code@929f693
+cmp src/pmcp/manifest/code_patterns_loader.py: identical to wip/297-code@929f693
+cmp src/pmcp/manifest/environment.py: identical to wip/297-code@929f693
+cmp src/pmcp/manifest/installer.py: identical to wip/297-code@929f693
+cmp src/pmcp/manifest/loader.py: identical to wip/297-code@929f693
+cmp src/pmcp/manifest/npm_resolver.py: identical to wip/297-code@929f693
+cmp src/pmcp/manifest/package_identity.py: identical to wip/297-code@929f693
+cmp src/pmcp/manifest/refresher.py: identical to wip/297-code@929f693
+cmp src/pmcp/manifest/version_checker.py: identical to wip/297-code@929f693
+cmp src/pmcp/package_approvals.py: identical to wip/297-code@929f693
+cmp src/pmcp/policy/policy.py: identical to wip/297-code@929f693
+cmp src/pmcp/provision_gate.py: identical to wip/297-code@929f693
+cmp src/pmcp/scoped_advisor_audit.py: identical to wip/297-code@929f693
+cmp src/pmcp/server.py: identical to wip/297-code@929f693
+cmp src/pmcp/subscriptions.py: identical to wip/297-code@929f693
+cmp src/pmcp/templates/code_snippets_loader.py: identical to wip/297-code@929f693
+cmp src/pmcp/tools/handlers.py: identical to wip/297-code@929f693
+cmp src/pmcp/trust_store.py: identical to wip/297-code@929f693
+cmp src/pmcp/types.py: identical to wip/297-code@929f693
+cmp tests/test_argument_error_echo.py: identical to wip/297-code@929f693
+cmp tests/test_gateway_tool_schemas.py: identical to wip/297-code@929f693
+cmp tests/test_scoped_advisor_audit.py: identical to wip/297-code@929f693
+proof tree == 929f693 (whole tree)
+```
+
+## Full suite and gates
+
+On `wip/297-code` @ `929f693`, with `npm_config_cache`, `npm_config_store_dir` and
+`pnpm_config_store_dir` unset (dev0 is a team host):
+
+```text
+$ pytest -m 'not live and not slow' -q
+4773 passed, 3 skipped, 80 deselected in 811.22s (0:13:31)
+EXIT=0
 ```
 
 Gates on the proof tree (after `uv sync --all-extras -p 3.10`):
@@ -560,19 +1040,7 @@ $ ruff format --check src/ tests/
 $ mypy src/
 Success: no issues found in 53 source files
 $ pytest tests/test_argument_error_echo.py tests/test_scoped_advisor_audit.py tests/test_gateway_tool_schemas.py -q
-392 passed in 24.53s
-```
-
-## Full suite and gates
-
-On `wip/297-code` @ `19dac95` (the tree the proof `cmp`s against),
-`npm_config_cache`, `npm_config_store_dir` and `pnpm_config_store_dir`
-unset (dev0 is a team host):
-
-```text
-$ pytest -m 'not live and not slow' -q
-4717 passed, 3 skipped, 80 deselected in 611.07s (0:10:11)
-EXIT=0
+448 passed in 54.75s
 ```
 
 ## Verbatim bodies
@@ -583,18 +1051,46 @@ From a fresh worktree of `origin/main` @ `7680445`:
 
 ```bash
 PLAN=.consiliency/plans/detailed-297-validation-echo-20260928-2127.md   # read from branch plan/297-validation-echo
-X=<scratch>/extract_plan_block.py        # the script below, saved verbatim
-for f in argument_errors server scoped_advisor_audit types handlers test_argument_error_echo test_scoped_advisor_audit test_gateway_tool_schemas CHANGELOG README; do
-  python3 $X $PLAN "### Patch — \`$f" <scratch>/$f.patch
-done
+X=<scratch>/extract_plan_block.py        # bootstrap it: see *Extractor* below
+while read f; do
+  python3 $X $PLAN "### Patch — \`$f\`" "<scratch>/$(echo $f | tr / _).patch"
+done <<'LIST'
+CHANGELOG.md
+README.md
+src/pmcp/argument_errors.py
+src/pmcp/auth.py
+src/pmcp/client/manager.py
+src/pmcp/config/guidance.py
+src/pmcp/config/loader.py
+src/pmcp/manifest/code_patterns_loader.py
+src/pmcp/manifest/environment.py
+src/pmcp/manifest/installer.py
+src/pmcp/manifest/loader.py
+src/pmcp/manifest/npm_resolver.py
+src/pmcp/manifest/package_identity.py
+src/pmcp/manifest/refresher.py
+src/pmcp/manifest/version_checker.py
+src/pmcp/package_approvals.py
+src/pmcp/policy/policy.py
+src/pmcp/provision_gate.py
+src/pmcp/scoped_advisor_audit.py
+src/pmcp/server.py
+src/pmcp/subscriptions.py
+src/pmcp/templates/code_snippets_loader.py
+src/pmcp/tools/handlers.py
+src/pmcp/trust_store.py
+src/pmcp/types.py
+tests/test_argument_error_echo.py
+tests/test_gateway_tool_schemas.py
+tests/test_scoped_advisor_audit.py
+LIST
 git apply --check <scratch>/*.patch && git apply <scratch>/*.patch
 ```
 
-Patches are fenced with **four** backticks, and the extractor closes on the
-same fence string. Blank context lines carry one leading space: an editor
-that strips trailing whitespace breaks them and `git apply --check` fails
-loudly. The test source is ASCII (non-ASCII test strings are `\u`
-escapes); the two doc patches carry pre-existing non-ASCII context.
+The patches are fenced with **four** backticks, and the extractor closes on
+the same fence string. Blank context lines carry one leading space. The test
+source is ASCII, with non-ASCII test strings written as `\u` escapes. The two
+doc patches carry pre-existing non-ASCII context.
 
 #### Extractor
 
@@ -630,15 +1126,56 @@ Path(out).write_text("".join(line + "\n" for line in lines[i + 1 : j]))
 print(f"{out}: {j - i - 1} lines")
 ```
 
-### Patch — `argument_errors` (`src/pmcp/argument_errors.py`)
+### Patch — `CHANGELOG.md`
+
+````diff
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index 6ee53d7..b390c72 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -383,6 +383,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
+ 
+ 
+ ### Fixed
++- **A rejected gateway-tool argument no longer echoes its value into the response, the log or the scoped audit (Consiliency/pmcp#297).** Both validation layers rendered the value that failed: the input-schema gate returned jsonschema's message (`Input validation error: 'Bearer sk-…' is not of type 'object', 'null'`), and an argument model's pydantic error — returned as `str(e)[:400]` and logged as `Tool execution error: …` — carried `input_value=…` (the full value for `InvokeInput`'s correlation-ID charset check and a non-dict `meta`, a truncated repr of the whole argument dict for the all-or-none correlation check). Rejections are now described from their structure, as `<JSON path>: <reason>` — e.g. `Input validation error: $.options: must be of type object or null`, `Invalid arguments: $.run_correlation_id: correlation IDs may contain only alphanumerics and ._:-` — where the reason is a fixed phrase filled only from the tool's own schema or model (a type, a length, a pattern, the allowed values) and a key the caller chose is shown as `*`. The log line is `Tool execution error: invalid arguments for <tool>: <same description>`. **The same rule now holds wherever pmcp turns an exception into text** — tool responses, log lines and tracebacks, the in-memory audit-event buffer `gateway.health` exposes, and error fields such as `gateway.tasks_*` `errors`: a pydantic or jsonschema validation error (or an exception whose text embeds one) reads `N validation error(s) for <Model>: $.<path>: <reason>`, and a traceback whose chain holds one is not logged. This covers downstream data too: a task-capable server answering `tasks/get` with `{"taskId": "t", "ttl": "<secret>"}` used to get that value echoed back in `errors` and stored in the audit-event buffer. Operators see the same form for their own config files (policy, trust store, package approvals, `.mcp.json`): the failing field and why, not the value. **Wording change:** the text after `Input validation error: ` is no longer jsonschema's message; a client matching on phrases such as `is not of type` or `is too short` must match the new form. A call rejected by the tool's argument model (not the gate) is now recorded in the scoped audit as an `audit.rejection` like a gate rejection, with `rejected_argument_validator: null`, instead of an `audit.invocation` `failure` that copied its unvalidated correlation fields. An unregistered tool name is no longer written to the log (`Tool execution error: unknown gateway tool`); the response still names it. `gateway.provision_status` validates its arguments before its catch-all, which logged a traceback of the validation error.
+ - **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values (Consiliency/pmcp#296).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name, `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
+ - **`sanitize_auth_diagnostic` does its keyword and URL-punctuation work in linear time.** The keyword rule now runs through `pmcp.keyword_matcher` (the same matches as the regular expression it replaces, pinned by a seeded corpus), and trailing punctuation is split off a URL in one pass. Output is unchanged.
+ - **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree (Consiliency/pmcp#236).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` now advertises its range on both sides, so `1e20`, `-1e20` and `float(±2**63)` are rejected at the gate, and so is any integer outside [−2^63+1, 2^63−1] (including `-2**63` itself), which the handler previously accepted. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the Consiliency/pmcp#296 entry above). Unknown keys are still ignored in this release — see the following entry once B lands. Argument descriptions agents already saw are unchanged, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description.
+````
+
+### Patch — `README.md`
+
+````diff
+diff --git a/README.md b/README.md
+index 94542a3..f7145ea 100644
+--- a/README.md
++++ b/README.md
+@@ -1518,9 +1518,11 @@ supply `run_correlation_id`, `seat_correlation_id`, and a SHA-256
+ tool/status/policy/result digests, and a hashed public-source reference—not raw
+ URLs, queries, arguments, credentials, or result bodies—and ends with one
+ fsynced completeness marker. A call whose arguments fail the tool's input schema
+-is recorded as a separate `audit.rejection` event (`terminal_status:
+-"invalid_arguments"`) carrying only the tool, the failing JSON path
+-(caller-chosen keys shown as `null`) and the failing schema keyword. Only
++or its argument model is recorded as a separate `audit.rejection` event
++(`terminal_status: "invalid_arguments"`) carrying only the tool, the failing JSON
++path (caller-chosen keys shown as `null`) and the failing schema keyword (`null`
++for a model rejection). The rejection the caller sees, and the log line, name the
++same path and a reason taken from the schema, never the rejected value. Only
+ arguments that passed the tool's input schema, and only the top-level keys it
+ declares, are read into any record; a call denied by policy records none of its
+ arguments.
+````
+
+### Patch — `src/pmcp/argument_errors.py`
 
 ````diff
 diff --git a/src/pmcp/argument_errors.py b/src/pmcp/argument_errors.py
 new file mode 100644
-index 0000000..03bbdeb
+index 0000000..6fdf622
 --- /dev/null
 +++ b/src/pmcp/argument_errors.py
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,561 @@
 +"""Describe a rejected gateway-tool argument without the value that failed.
 +
 +A gateway tool's arguments are checked twice: by the advertised JSON Schema
@@ -664,13 +1201,24 @@ index 0000000..03bbdeb
 +
 +Neither reads a value: not jsonschema's ``message``, ``instance``,
 +``validator_value``, ``context`` or ``cause``, and not pydantic's ``msg``,
-+``input`` or any ``ctx`` entry outside :data:`_CONSTRAINT_CONTEXT`.
++``input`` or ``ctx`` (a constraint is read from the gateway's own schema, so
++a custom error that reuses a pydantic type cannot smuggle a value in through
++its context).
++
++The same rule covers every other place pmcp turns an exception into text
++(Consiliency/pmcp#297, rev 2): :func:`exception_text` is ``str(error)``
++unless the error is, or embeds the text of, a validation error, and
++:func:`safe_exc_info` withholds a traceback whose chain holds one.
++``tests/test_argument_error_echo.py`` checks every ``except`` in ``src/pmcp``
++(bar the CLI) that can catch one renders it only through these.
 +"""
 +
 +from __future__ import annotations
 +
 +import json
-+from collections.abc import Iterable
++import sys
++import traceback
++from collections.abc import Iterable, Iterator
 +from typing import Any
 +
 +import jsonschema
@@ -715,21 +1263,11 @@ index 0000000..03bbdeb
 +
 +# --- pydantic ----------------------------------------------------------------
 +
-+#: The ``ctx`` keys a phrase below may name. Each is a constraint the model
-+#: declares (a length, a bound, a pattern, the allowed literals), never read
-+#: from the input. ``actual_length``, ``error``, ``tag`` and the rest are
-+#: left out on purpose.
-+_CONSTRAINT_CONTEXT = frozenset(
-+    {"min_length", "max_length", "pattern", "expected", "gt", "ge", "lt", "le"}
-+)
-+
-+_MODEL_PHRASES: dict[str, str] = {
++#: Error types whose phrase needs no constraint.
++_FIXED_PHRASES: dict[str, str] = {
 +    "missing": "is required",
 +    "extra_forbidden": "is not an accepted argument",
 +    "string_type": "must be a string",
-+    "string_too_short": "must be at least {min_length} characters",
-+    "string_too_long": "must be at most {max_length} characters",
-+    "string_pattern_mismatch": "must match the pattern {pattern}",
 +    "int_type": "must be an integer",
 +    "int_parsing": "must be an integer",
 +    "int_from_float": "must be an integer",
@@ -741,36 +1279,80 @@ index 0000000..03bbdeb
 +    "model_type": "must be an object",
 +    "model_attributes_type": "must be an object",
 +    "list_type": "must be an array",
-+    "too_short": "must have at least {min_length} items",
-+    "too_long": "must have at most {max_length} items",
-+    "literal_error": "must be {expected}",
-+    "enum": "must be {expected}",
-+    "greater_than": "must be greater than {gt}",
-+    "greater_than_equal": "must be greater than or equal to {ge}",
-+    "less_than": "must be less than {lt}",
-+    "less_than_equal": "must be less than or equal to {le}",
 +    **_PMCP_MESSAGES,
 +}
 +
++#: Error types whose phrase names a constraint: ``(the JSON Schema keyword
++#: that holds it in the gateway's own schema, the phrase with it, the phrase
++#: without it)``. The constraint is read from the schema node at the error's
++#: location, never from pydantic's ``ctx`` (Consiliency/pmcp#297 rev 2, N2).
++_CONSTRAINED_PHRASES: dict[str, tuple[str, str, str]] = {
++    "string_too_short": ("minLength", "must be at least {characters}", "is too short"),
++    "string_too_long": ("maxLength", "must be at most {characters}", "is too long"),
++    "string_pattern_mismatch": (
++        "pattern",
++        "must match the pattern {text}",
++        "does not match the required pattern",
++    ),
++    "too_short": ("minItems", "must have at least {items}", "has too few items"),
++    "too_long": ("maxItems", "must have at most {items}", "has too many items"),
++    "literal_error": ("enum", "must be one of {json}", "is not an allowed value"),
++    "enum": ("enum", "must be one of {json}", "is not an allowed value"),
++    "greater_than": (
++        "exclusiveMinimum",
++        "must be greater than {number}",
++        "is too small",
++    ),
++    "greater_than_equal": (
++        "minimum",
++        "must be greater than or equal to {number}",
++        "is too small",
++    ),
++    "less_than": ("exclusiveMaximum", "must be less than {number}", "is too large"),
++    "less_than_equal": (
++        "maximum",
++        "must be less than or equal to {number}",
++        "is too large",
++    ),
++}
 +
-+def _argument_names() -> frozenset[str]:
-+    """Every field name and alias of every gateway argument model.
 +
-+    Written by pmcp's authors, never by a caller, so a location segment equal
-+    to one discloses nothing the advertised schemas do not.
++#: `_declared_names` for a given set of loaded modules (its key).
++_declared_cache: tuple[int, frozenset[str]] | None = None
++
++
++def _declared_names() -> frozenset[str]:
++    """Every field name and alias of every pydantic model pmcp defines.
++
++    Written by pmcp's authors, never by a caller or a downstream server, so a
++    location segment equal to one discloses nothing pmcp's own source does not.
++    Read from the ``pmcp.*`` modules' namespaces, and recomputed only when a
++    module has been imported since.
 +    """
-+    from pmcp.types import GatewayArguments
++    global _declared_cache
++    from pydantic import BaseModel
 +
++    import pmcp.types  # noqa: F401 -- the argument models, at least
++
++    key = len(sys.modules)
++    if _declared_cache is not None and _declared_cache[0] == key:
++        return _declared_cache[1]
 +    names: set[str] = set()
-+    pending: list[type] = [GatewayArguments]
-+    while pending:
-+        model = pending.pop()
-+        pending.extend(model.__subclasses__())
-+        for name, field in getattr(model, "model_fields", {}).items():
-+            names.add(name)
-+            if isinstance(field.alias, str):
-+                names.add(field.alias)
-+    return frozenset(names)
++    for module_name, module in list(sys.modules.items()):
++        if module is None or not module_name.startswith("pmcp."):
++            continue
++        for value in list(vars(module).values()):
++            if (
++                isinstance(value, type)
++                and issubclass(value, BaseModel)
++                and value.__module__ == module_name
++            ):
++                for name, field in value.model_fields.items():
++                    names.add(name)
++                    if isinstance(field.alias, str):
++                        names.add(field.alias)
++    _declared_cache = (key, frozenset(names))
++    return _declared_cache[1]
 +
 +
 +def _render_path(segments: Iterable[str | int | None]) -> str:
@@ -810,22 +1392,54 @@ index 0000000..03bbdeb
 +    error: ValidationError, schema: Any, arguments: Any
 +) -> list[str | int | None]:
 +    """The first error's location, redacted as :func:`schema_error_path` is."""
-+    declared = _argument_names() | declared_property_names(schema)
++    declared = _declared_names() | declared_property_names(schema)
 +    items = error.errors(include_url=False, include_input=False, include_context=False)
 +    loc = tuple(items[0]["loc"]) if items else ()
 +    return _model_error_path(loc, arguments, declared)
 +
 +
-+def _model_phrase(error_type: Any, ctx: Any) -> str:
-+    phrase = _MODEL_PHRASES.get(error_type) if isinstance(error_type, str) else None
-+    if phrase is None:
++def _schema_node_at(schema: Any, loc: tuple[Any, ...]) -> Any:
++    """The node of the gateway's own schema at a pydantic location, or None."""
++    node = schema
++    for segment in loc:
++        if not isinstance(node, dict):
++            return None
++        if type(segment) is int:
++            node = node.get("items")
++        else:
++            properties = node.get("properties")
++            node = properties.get(segment) if isinstance(properties, dict) else None
++    return node if isinstance(node, dict) else None
++
++
++def _constraint_text(kind: str, value: Any) -> str | None:
++    if kind in ("characters", "items"):
++        noun = kind[:-1]
++        return _count(value, noun) if type(value) is int else None
++    if kind == "number":
++        return str(value) if type(value) in (int, float) else None
++    if kind == "text":
++        return value if isinstance(value, str) else None
++    if isinstance(value, list):  # "json": an enum of the schema's literals
++        return json.dumps(value)
++    return None
++
++
++def _model_phrase(error_type: Any, node: Any) -> str:
++    """The phrase for ``error_type``, its constraint read from ``node`` (the
++    gateway's schema at the error's location; ``None`` when there is none)."""
++    if not isinstance(error_type, str):
 +        return "is invalid"
-+    context = ctx if isinstance(ctx, dict) else {}
-+    fields = {key: context.get(key) for key in _CONSTRAINT_CONTEXT if key in context}
-+    try:
-+        return phrase.format(**fields)
-+    except (KeyError, IndexError, ValueError):
++    if error_type in _FIXED_PHRASES:
++        return _FIXED_PHRASES[error_type]
++    if error_type not in _CONSTRAINED_PHRASES:
 +        return "is invalid"
++    keyword, with_constraint, without = _CONSTRAINED_PHRASES[error_type]
++    if not isinstance(node, dict) or keyword not in node:
++        return without
++    kind = with_constraint.split("{", 1)[1].split("}", 1)[0]
++    text = _constraint_text(kind, node[keyword])
++    return without if text is None else with_constraint.replace("{" + kind + "}", text)
 +
 +
 +def describe_model_error(error: ValidationError, schema: Any, arguments: Any) -> str:
@@ -837,13 +1451,15 @@ index 0000000..03bbdeb
 +
 +
 +def _describe_model_error(error: ValidationError, schema: Any, arguments: Any) -> str:
-+    declared = _argument_names() | declared_property_names(schema)
-+    items = error.errors(include_url=False, include_input=False, include_context=True)
-+    parts = [
-+        f"{_render_path(_model_error_path(tuple(item['loc']), arguments, declared))}: "
-+        f"{_model_phrase(item['type'], item.get('ctx'))}"
-+        for item in items[:_MAX_MODEL_ERRORS]
-+    ]
++    declared = _declared_names() | declared_property_names(schema)
++    items = error.errors(include_url=False, include_input=False, include_context=False)
++    parts = []
++    for item in items[:_MAX_MODEL_ERRORS]:
++        loc = tuple(item["loc"])
++        path = _render_path(_model_error_path(loc, arguments, declared))
++        parts.append(
++            f"{path}: {_model_phrase(item['type'], _schema_node_at(schema, loc))}"
++        )
 +    if len(items) > _MAX_MODEL_ERRORS:
 +        parts.append(f"and {len(items) - _MAX_MODEL_ERRORS} more")
 +    return "; ".join(parts)
@@ -1021,155 +1637,780 @@ index 0000000..03bbdeb
 +    error: BaseException, schema: Any, arguments: Any
 +) -> str | None:
 +    """A value-free description of ``error`` if it is an argument-validation
-+    error of either library, else ``None``."""
++    error of either library, checked against ``schema``, else ``None``."""
 +    if isinstance(error, ValidationError):
 +        return describe_model_error(error, schema, arguments)
 +    if isinstance(error, jsonschema.ValidationError):
 +        return describe_schema_error(error, schema, arguments)
 +    return None
++
++
++# --- any exception pmcp renders ------------------------------------------------
++
++
++def _is_validation_error(error: BaseException) -> bool:
++    return isinstance(error, (ValidationError, jsonschema.ValidationError))
++
++
++def _chain(error: BaseException) -> Iterator[BaseException]:
++    """``error``, its ``__cause__``/``__context__`` chain and every exception
++    in a group, each once."""
++    pending, seen = [error], set()
++    while pending:
++        current = pending.pop()
++        if id(current) in seen:
++            continue
++        seen.add(id(current))
++        yield current
++        for linked in (current.__cause__, current.__context__):
++            if linked is not None:
++                pending.append(linked)
++        members = getattr(current, "exceptions", None)
++        if isinstance(members, (tuple, list)):
++            pending.extend(m for m in members if isinstance(m, BaseException))
++
++
++def _validation_text(error: BaseException) -> str:
++    """A validation error described without the schema that raised it: the
++    path (names pmcp's models declare, list indexes, ``*``) and a phrase
++    without constraints, since the schema is not known here (rev 2, N6)."""
++    if isinstance(error, ValidationError):
++        count = error.error_count()
++        plural = "" if count == 1 else "s"
++        return (
++            f"{count} validation error{plural} for {error.title}: "
++            f"{describe_model_error(error, None, None)}"
++        )
++    assert isinstance(error, jsonschema.ValidationError)
++    try:
++        declared = _declared_names()
++        path = [
++            segment
++            if type(segment) is int or (type(segment) is str and segment in declared)
++            else None
++            for segment in error.absolute_path
++        ]
++        keyword = error.validator if isinstance(error.validator, str) else None
++        phrase = (
++            f"fails its {keyword} constraint"
++            if keyword in jsonschema.validators.Draft202012Validator.VALIDATORS
++            else "is invalid"
++        )
++        return f"schema validation error: {_render_path(path)}: {phrase}"
++    except Exception:
++        return f"schema validation error: {_UNDESCRIBED}"
++
++
++def exception_text(error: BaseException) -> str:
++    """``str(error)``, except where that would carry a validation error's text.
++
++    A pydantic or jsonschema ``ValidationError`` renders the rejected value;
++    so does any exception whose own text embeds one it chains
++    (``RuntimeError(f"... {e}") from e``). Either is described from its
++    structure instead. Every other exception is ``str(error)`` unchanged.
++    """
++    if _is_validation_error(error):
++        return _validation_text(error)
++    text = str(error)
++    for linked in _chain(error):
++        if linked is not error and _is_validation_error(linked):
++            try:
++                embedded = str(linked)
++            except Exception:
++                embedded = ""
++            if embedded and embedded in text:
++                return f"{type(error).__name__}: {_validation_text(linked)}"
++    return text
++
++
++def safe_exc_info(error: BaseException) -> BaseException | None:
++    """``exc_info=`` for a log call: the exception, unless its chain holds a
++    validation error, whose rendered traceback would carry the value."""
++    if any(_is_validation_error(linked) for linked in _chain(error)):
++        return None
++    return error
++
++
++def safe_traceback_text(error: BaseException) -> str:
++    """The formatted traceback, or a one-line stand-in when the chain holds a
++    validation error (see :func:`safe_exc_info`)."""
++    if safe_exc_info(error) is None:
++        return f"(traceback withheld: {exception_text(error)})"
++    return "".join(traceback.format_exception(type(error), error, error.__traceback__))
 ````
 
-### Patch — `server` (`src/pmcp/server.py`)
+### Patch — `src/pmcp/auth.py`
 
 ````diff
-diff --git a/src/pmcp/server.py b/src/pmcp/server.py
-index 0a6ef28..45988f1 100644
---- a/src/pmcp/server.py
-+++ b/src/pmcp/server.py
-@@ -12,6 +12,7 @@ from pathlib import Path
- from typing import Any, Literal
+diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
+index ccb5e36..c0a4fec 100644
+--- a/src/pmcp/auth.py
++++ b/src/pmcp/auth.py
+@@ -19,6 +19,7 @@ import aiohttp
+ import jwt
+ from jwt import PyJWKSet
  
- import jsonschema
-+import pydantic
- from mcp.server import Server
- from mcp.server.context import ServerRequestContext
- from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler
-@@ -37,6 +38,7 @@ from mcp.types import (
-     Tool,
- )
++from pmcp.argument_errors import exception_text
+ from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
+ from pmcp.redaction_additive import redact_additive
+ from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
+@@ -586,7 +587,10 @@ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) ->
+     can only replace more of it with the marker (Consiliency/pmcp#234). The
+     cut is taken last, as before.
+     """
+-    text = redact_additive(_sanitize_base(str(value)))
++    # An exception goes through `exception_text`: a validation error's own
++    # text carries the rejected value (Consiliency/pmcp#297).
++    raw = exception_text(value) if isinstance(value, BaseException) else str(value)
++    text = redact_additive(_sanitize_base(raw))
+     return text if max_length is None else text[:max_length]
  
-+from pmcp.argument_errors import describe_argument_error, describe_schema_error
- from pmcp.client.manager import ClientManager
- from pmcp.config.guidance import GuidanceConfig, load_guidance_config
- from pmcp.config.loader import (
-@@ -69,7 +71,11 @@ from pmcp.scoped_advisor_audit import (
- )
- from pmcp.subscriptions import BusCatalogEventSink
- from pmcp.summary import generate_capability_summary
--from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
-+from pmcp.tools.handlers import (
-+    GATEWAY_TOOL_INPUT_MODELS,
-+    GatewayTools,
-+    get_gateway_tool_definitions,
-+)
- from pmcp.types import (
-     DescriptionsCache,
-     GatewayDiagnosticsInfo,
-@@ -335,11 +341,15 @@ class GatewayServer:
-                             )
-                         ]
-                     )
-+                # Never `e.message`: for `type`, `pattern`, `enum` and length
-+                # errors it quotes the rejected value (Consiliency/pmcp#297).
-                 return CallToolResult(
-                     is_error=True,
-                     content=[
-                         TextContent(
--                            type="text", text=f"Input validation error: {e.message}"
-+                            type="text",
-+                            text="Input validation error: "
-+                            + describe_schema_error(e, tool.input_schema, arguments),
-                         )
-                     ],
-                 )
-@@ -477,7 +487,36 @@ class GatewayServer:
-                     )
-                 ]
-             except Exception as e:
--                logger.error(f"Tool execution error: {e}")
-+                # A `ValidationError`'s text renders the rejected value
-+                # (pydantic's `input_value=...`, a validator's own message,
-+                # jsonschema's `message`); describe it from its structure
-+                # instead, in the log, the response and the audit
-+                # (Consiliency/pmcp#297). The tool's own argument model
-+                # rejecting the call is "invalid arguments"; any other (a
-+                # downstream payload a handler parses) is a "validation error".
-+                input_model = GATEWAY_TOOL_INPUT_MODELS.get(audited_name or "")
-+                rejected_by_model = (
-+                    isinstance(e, pydantic.ValidationError)
-+                    and input_model is not None
-+                    and e.title == input_model.__name__
-+                )
-+                described = describe_argument_error(
-+                    e, tool.input_schema if tool is not None else None, arguments
-+                )
-+                kind = "Invalid arguments" if rejected_by_model else "Validation error"
-+                if described is not None:
-+                    logger.error(
-+                        "Tool execution error: %s for %s: %s",
-+                        kind.lower(),
-+                        audited_name,
-+                        described,
-+                    )
-+                elif tool is None:
-+                    # Only an unregistered name raises here; it is the
-+                    # caller's string, so it is not logged (Consiliency/pmcp#297).
-+                    logger.error("Tool execution error: unknown gateway tool")
-+                else:
-+                    logger.error(f"Tool execution error: {e}")
-                 try:
-                     failure_status = (
-                         "denied"
-@@ -485,12 +524,24 @@ class GatewayServer:
-                         and e.code == ErrorCode.E402_TOOL_DENIED
-                         else "failure"
-                     )
--                    self._record_scoped_invocation(
--                        gateway_tool=audited_name,
--                        terminal_status=failure_status,
--                        arguments=audited_arguments,
--                        result={"error_type": type(e).__name__},
--                    )
-+                    if rejected_by_model and tool is not None:
-+                        # Like a gate rejection: an `audit.rejection` (tool,
-+                        # path, nothing the caller sent), not an invocation
-+                        # whose correlations nothing vouched for.
-+                        if self._scoped_advisor_audit is not None:
-+                            self._scoped_advisor_audit.record_rejected_arguments(
-+                                gateway_tool=tool.name,
-+                                error=e,
-+                                schema=tool.input_schema,
-+                                arguments=arguments,
-+                            )
-+                    else:
-+                        self._record_scoped_invocation(
-+                            gateway_tool=audited_name,
-+                            terminal_status=failure_status,
-+                            arguments=audited_arguments,
-+                            result={"error_type": type(e).__name__},
-+                        )
-                 except ScopedAdvisorAuditError:
-                     logger.error("Scoped advisor audit channel failed")
-                     return [
-@@ -507,7 +558,14 @@ class GatewayServer:
-                 return [
-                     TextContent(
-                         type="text",
--                        text=json.dumps({"error": True, "message": str(e)[:400]}),
-+                        text=json.dumps(
-+                            {
-+                                "error": True,
-+                                "message": f"{kind}: {described}"
-+                                if described is not None
-+                                else str(e)[:400],
-+                            }
-+                        ),
-                     )
-                 ]
  
 ````
 
-### Patch — `scoped_advisor_audit` (`src/pmcp/scoped_advisor_audit.py`)
+### Patch — `src/pmcp/client/manager.py`
+
+````diff
+diff --git a/src/pmcp/client/manager.py b/src/pmcp/client/manager.py
+index ba8068a..18daccd 100644
+--- a/src/pmcp/client/manager.py
++++ b/src/pmcp/client/manager.py
+@@ -11,7 +11,6 @@ from pathlib import Path
+ import random
+ import re
+ import signal
+-import traceback
+ import string
+ import time
+ from collections import deque
+@@ -26,6 +25,7 @@ from mcp.client.sse import sse_client
+ from mcp.client.streamable_http import streamable_http_client
+ from mcp.shared.message import SessionMessage
+ 
++from pmcp.argument_errors import exception_text, safe_traceback_text
+ from pmcp.auth import sanitize_auth_diagnostic
+ from pmcp.config.loader import make_tool_id
+ from pmcp.env_store import sanitized_subprocess_env
+@@ -130,7 +130,9 @@ def describe_exception(exc: BaseException) -> str:
+ 
+     shown = leaves[:_MAX_DESCRIBED_LEAVES]
+     rendered = "; ".join(
+-        f"{type(leaf).__name__}: {leaf}" if str(leaf) else type(leaf).__name__
++        f"{type(leaf).__name__}: {exception_text(leaf)}"
++        if str(leaf)
++        else type(leaf).__name__
+         for leaf in shown
+     )
+     if len(leaves) > len(shown):
+@@ -1132,7 +1134,9 @@ class ClientManager:
+         errors: list[str] = []
+         for config, result in zip(configs, results):
+             if isinstance(result, Exception):
+-                error_msg = f"Failed to connect to {config.name}: {result}"
++                error_msg = (
++                    f"Failed to connect to {config.name}: {exception_text(result)}"
++                )
+                 logger.error(error_msg)
+                 errors.append(error_msg)
+ 
+@@ -1941,7 +1945,9 @@ class ClientManager:
+             ("prompts", listing_results[2]),
+         ):
+             if isinstance(result, BaseException):
+-                logger.debug(f"Server {name} doesn't support {kind}: {result}")
++                logger.debug(
++                    f"Server {name} doesn't support {kind}: {exception_text(result)}"
++                )
+                 listings[kind] = None
+             else:
+                 listings[kind] = result
+@@ -2676,9 +2682,7 @@ class ClientManager:
+                 # clean. Redaction here is best-effort defence in depth
+                 # (SECURITY.md), and it cannot be applied to text the logging
+                 # framework formats on its own.
+-                traceback_text = "".join(
+-                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+-                )
++                traceback_text = safe_traceback_text(exc)
+                 logger.warning(
+                     f"[{name}] remote transport failed to unwind while "
+                     f"escalating our caller's cancellation: "
+````
+
+### Patch — `src/pmcp/config/guidance.py`
+
+````diff
+diff --git a/src/pmcp/config/guidance.py b/src/pmcp/config/guidance.py
+index 58976f6..ffe9695 100644
+--- a/src/pmcp/config/guidance.py
++++ b/src/pmcp/config/guidance.py
+@@ -11,6 +11,7 @@ from typing import Literal
+ 
+ import yaml
+ from pydantic import BaseModel, Field
++from pmcp.argument_errors import exception_text
+ 
+ 
+ class GuidanceLayers(BaseModel):
+@@ -175,7 +176,9 @@ def load_guidance_config(config_path: Path | None = None) -> GuidanceConfig:
+         return GuidanceConfig(**data["guidance"])
+     except Exception as e:
+         # If config is invalid, log warning and use defaults
+-        print(f"Warning: Failed to load guidance config from {config_path}: {e}")
++        print(
++            f"Warning: Failed to load guidance config from {config_path}: {exception_text(e)}"
++        )
+         print("Using default guidance config (minimal mode)")
+         return GuidanceConfig()
+ 
+````
+
+### Patch — `src/pmcp/config/loader.py`
+
+````diff
+diff --git a/src/pmcp/config/loader.py b/src/pmcp/config/loader.py
+index c71e7f8..8fb335e 100644
+--- a/src/pmcp/config/loader.py
++++ b/src/pmcp/config/loader.py
+@@ -14,6 +14,7 @@ from enum import Enum
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Any, Literal, cast
+ 
++from pmcp.argument_errors import exception_text
+ from pmcp.types import (
+     ConfigSourceInfo,
+     ConfigSourceName,
+@@ -279,7 +280,7 @@ def parse_json_file(file_path: Path) -> McpConfigFile | None:
+             return None
+         content = file_path.read_bytes()
+     except Exception as e:
+-        logger.warning(f"Failed to parse config file {file_path}: {e}")
++        logger.warning(f"Failed to parse config file {file_path}: {exception_text(e)}")
+         return None
+     return parse_config_bytes(content, file_path)
+ 
+@@ -316,7 +317,7 @@ def parse_config_bytes(content: bytes, file_path: Path) -> McpConfigFile | None:
+ 
+         return McpConfigFile.model_validate(data)
+     except Exception as e:
+-        logger.warning(f"Failed to parse config file {file_path}: {e}")
++        logger.warning(f"Failed to parse config file {file_path}: {exception_text(e)}")
+         return None
+ 
+ 
+@@ -354,7 +355,7 @@ def _read_config_object(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+     try:
+         content = path.read_bytes()
+     except Exception as exc:
+-        return None, f"invalid_json: {exc}"
++        return None, f"invalid_json: {exception_text(exc)}"
+     return _config_object_from_bytes(content)
+ 
+ 
+@@ -365,7 +366,7 @@ def _config_object_from_bytes(
+     try:
+         data = json.loads(content)
+     except Exception as exc:
+-        return None, f"invalid_json: {exc}"
++        return None, f"invalid_json: {exception_text(exc)}"
+     if not isinstance(data, dict):
+         return None, "config_root_not_object"
+     return data, None
+@@ -1148,7 +1149,9 @@ def load_configs(
+ 
+         manifest_servers = load_manifest().servers
+     except Exception as e:
+-        logger.debug(f"Manifest defaults unavailable during config load: {e}")
++        logger.debug(
++            f"Manifest defaults unavailable during config load: {exception_text(e)}"
++        )
+ 
+     def build_resolved_config(
+         name: str,
+````
+
+### Patch — `src/pmcp/manifest/code_patterns_loader.py`
+
+````diff
+diff --git a/src/pmcp/manifest/code_patterns_loader.py b/src/pmcp/manifest/code_patterns_loader.py
+index b89f67a..9b584aa 100644
+--- a/src/pmcp/manifest/code_patterns_loader.py
++++ b/src/pmcp/manifest/code_patterns_loader.py
+@@ -10,6 +10,7 @@ from pathlib import Path
+ from typing import Any
+ 
+ import yaml
++from pmcp.argument_errors import exception_text
+ 
+ 
+ class CodePatternsLoader:
+@@ -64,7 +65,7 @@ class CodePatternsLoader:
+         except Exception as e:
+             # If loading fails, log warning but continue with empty patterns
+             print(
+-                f"Warning: Failed to load code patterns from {self._patterns_path}: {e}"
++                f"Warning: Failed to load code patterns from {self._patterns_path}: {exception_text(e)}"
+             )
+ 
+     def get_hint_for_tool(
+````
+
+### Patch — `src/pmcp/manifest/environment.py`
+
+````diff
+diff --git a/src/pmcp/manifest/environment.py b/src/pmcp/manifest/environment.py
+index 613559f..6e0bab0 100644
+--- a/src/pmcp/manifest/environment.py
++++ b/src/pmcp/manifest/environment.py
+@@ -9,6 +9,7 @@ import platform
+ import shutil
+ from dataclasses import dataclass, field
+ from typing import Literal
++from pmcp.argument_errors import exception_text
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -87,7 +88,7 @@ async def check_cli(name: str, check_command: list[str]) -> CLIInfo | None:
+         logger.debug(f"Timeout checking CLI: {name}")
+         return CLIInfo(name=name, path=path)
+     except Exception as e:
+-        logger.debug(f"Error checking CLI {name}: {e}")
++        logger.debug(f"Error checking CLI {name}: {exception_text(e)}")
+         return None
+ 
+ 
+@@ -111,7 +112,7 @@ async def get_cli_help(
+         logger.debug(f"Timeout getting help for: {name}")
+         return None
+     except Exception as e:
+-        logger.debug(f"Error getting help for {name}: {e}")
++        logger.debug(f"Error getting help for {name}: {exception_text(e)}")
+         return None
+ 
+ 
+````
+
+### Patch — `src/pmcp/manifest/installer.py`
+
+````diff
+diff --git a/src/pmcp/manifest/installer.py b/src/pmcp/manifest/installer.py
+index 3454402..29b7ccc 100644
+--- a/src/pmcp/manifest/installer.py
++++ b/src/pmcp/manifest/installer.py
+@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Literal
+ 
++from pmcp.argument_errors import exception_text, safe_exc_info
+ from pmcp.env_store import resolve_scope_path, sanitized_subprocess_env
+ from pmcp.manifest.environment import Platform
+ from pmcp.manifest.loader import (
+@@ -237,7 +238,7 @@ class JobManager:
+ 
+         except Exception as e:
+             job.status = "failed"
+-            job.error = str(e)[:300]
++            job.error = exception_text(e)[:300]
+             logger.error(f"Install job {job_id} failed: {job.error}")
+ 
+         return job_id
+@@ -247,10 +248,12 @@ class JobManager:
+         try:
+             exc = task.exception()
+             if exc:
+-                logger.error(f"Install job {job.id} task crashed: {exc}")
++                logger.error(
++                    f"Install job {job.id} task crashed: {exception_text(exc)}"
++                )
+                 if job.status == "installing":
+                     job.status = "failed"
+-                    job.error = f"Monitor task crashed: {exc}"
++                    job.error = f"Monitor task crashed: {exception_text(exc)}"
+                 # Kill subprocess if still running (but NOT if server_ready - it's being handed off)
+                 if (
+                     job.status != "server_ready"
+@@ -260,7 +263,7 @@ class JobManager:
+                     try:
+                         job.process.kill()
+                     except Exception as e:
+-                        logger.debug(f"task cleanup error: {e}")
++                        logger.debug(f"task cleanup error: {exception_text(e)}")
+         except asyncio.CancelledError:
+             # Task was cancelled, not an error
+             pass
+@@ -296,7 +299,7 @@ class JobManager:
+                 line = await stream.readline()
+                 return (name, line)
+             except Exception as e:
+-                logger.debug(f"stream reader error: {e}")
++                logger.debug(f"stream reader error: {exception_text(e)}")
+                 return (name, None)
+ 
+         try:
+@@ -422,7 +425,7 @@ class JobManager:
+                                         return
+                                 except Exception as e:
+                                     logger.warning(
+-                                        f"Install {job.id}: Error in server detection: {e}"
++                                        f"Install {job.id}: Error in server detection: {exception_text(e)}"
+                                     )
+ 
+                 except asyncio.CancelledError:
+@@ -459,9 +462,12 @@ class JobManager:
+             job.error = "Installation cancelled"
+ 
+         except Exception as e:
+-            logger.error(f"Install job {job.id} monitor error: {e}", exc_info=True)
++            logger.error(
++                f"Install job {job.id} monitor error: {exception_text(e)}",
++                exc_info=safe_exc_info(e),
++            )
+             job.status = "failed"
+-            job.error = str(e)
++            job.error = exception_text(e)
+             # Try to clean up process
+             await self._safe_terminate_process(process, job.id, force=True)
+ 
+@@ -496,7 +502,9 @@ class JobManager:
+                     except asyncio.TimeoutError:
+                         logger.error(f"Install {job_id}: Process won't die!")
+         except Exception as e:
+-            logger.warning(f"Install {job_id}: Error terminating process: {e}")
++            logger.warning(
++                f"Install {job_id}: Error terminating process: {exception_text(e)}"
++            )
+ 
+     def _parse_progress(self, line: str, current: int) -> int:
+         """Try to parse progress percentage from output line."""
+````
+
+### Patch — `src/pmcp/manifest/loader.py`
+
+````diff
+diff --git a/src/pmcp/manifest/loader.py b/src/pmcp/manifest/loader.py
+index 9837e82..40f5b48 100644
+--- a/src/pmcp/manifest/loader.py
++++ b/src/pmcp/manifest/loader.py
+@@ -13,6 +13,7 @@ from typing import Any, Literal, cast
+ 
+ import yaml
+ 
++from pmcp.argument_errors import exception_text
+ from pmcp.project_consent import log_refusal, read_and_gate
+ 
+ logger = logging.getLogger(__name__)
+@@ -780,7 +781,7 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
+                 servers[name] = _parse_server_config(name, server_data)
+             except Exception as exc:
+                 logger.warning(
+-                    f"Skipping invalid server entry '{name}' in overlay {path}: {exc}"
++                    f"Skipping invalid server entry '{name}' in overlay {path}: {exception_text(exc)}"
+                 )
+     elif raw_servers:
+         logger.warning(f"Skipping 'servers' in overlay {path}: not a mapping")
+@@ -794,7 +795,7 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
+             except Exception as exc:
+                 logger.warning(
+                     f"Skipping invalid cli_alternative '{name}' in overlay "
+-                    f"{path}: {exc}"
++                    f"{path}: {exception_text(exc)}"
+                 )
+     elif raw_clis:
+         logger.warning(f"Skipping 'cli_alternatives' in overlay {path}: not a mapping")
+````
+
+### Patch — `src/pmcp/manifest/npm_resolver.py`
+
+````diff
+diff --git a/src/pmcp/manifest/npm_resolver.py b/src/pmcp/manifest/npm_resolver.py
+index 3382a1e..41631d6 100644
+--- a/src/pmcp/manifest/npm_resolver.py
++++ b/src/pmcp/manifest/npm_resolver.py
+@@ -62,6 +62,7 @@ from collections.abc import Mapping
+ from dataclasses import dataclass
+ from pathlib import Path
+ from typing import Literal
++from pmcp.argument_errors import exception_text
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -498,7 +499,9 @@ class NpmResolver:
+             proc.stdin.flush()
+         except (BrokenPipeError, ValueError, OSError) as exc:
+             self._terminate()
+-            return _refused(f"npm resolver child died before the query: {exc}")
++            return _refused(
++                f"npm resolver child died before the query: {exception_text(exc)}"
++            )
+ 
+         line = reader.read(_QUERY_TIMEOUT)
+         if line is None:
+````
+
+### Patch — `src/pmcp/manifest/package_identity.py`
+
+````diff
+diff --git a/src/pmcp/manifest/package_identity.py b/src/pmcp/manifest/package_identity.py
+index 29cf145..962b614 100644
+--- a/src/pmcp/manifest/package_identity.py
++++ b/src/pmcp/manifest/package_identity.py
+@@ -40,6 +40,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
+ 
+ import semver
+ 
++from pmcp.argument_errors import exception_text
+ from pmcp.validation import is_valid_package_name
+ 
+ logger = logging.getLogger(__name__)
+@@ -121,7 +122,7 @@ def _fetch_packument(name: str) -> dict[str, Any] | None:
+             body = response.read(_MAX_PACKUMENT_BYTES)
+         data = json.loads(body.decode("utf-8"))
+     except Exception as exc:
+-        logger.debug("npm packument fetch failed for %r: %s", name, exc)
++        logger.debug("npm packument fetch failed for %r: %s", name, exception_text(exc))
+         return None
+     return data if isinstance(data, dict) else None
+ 
+@@ -203,7 +204,9 @@ def resolve_package_identity(spec: str) -> PackageIdentity | None:
+     try:
+         packument = _fetch_packument(name)
+     except Exception as exc:  # pragma: no cover - the fetch handles its own
+-        logger.debug("npm packument lookup raised for %r: %s", name, exc)
++        logger.debug(
++            "npm packument lookup raised for %r: %s", name, exception_text(exc)
++        )
+         return None
+     if not isinstance(packument, dict):
+         return None
+````
+
+### Patch — `src/pmcp/manifest/refresher.py`
+
+````diff
+diff --git a/src/pmcp/manifest/refresher.py b/src/pmcp/manifest/refresher.py
+index b9bf8ff..b9f45fc 100644
+--- a/src/pmcp/manifest/refresher.py
++++ b/src/pmcp/manifest/refresher.py
+@@ -16,6 +16,7 @@ from pathlib import Path
+ 
+ import yaml
+ 
++from pmcp.argument_errors import exception_text
+ from pmcp.manifest.loader import (
+     credential_lookup_keys,
+     load_manifest,
+@@ -89,7 +90,7 @@ def load_descriptions_cache(cache_path: Path | None = None) -> DescriptionsCache
+         )
+ 
+     except Exception as e:
+-        logger.warning(f"Failed to load descriptions cache: {e}")
++        logger.warning(f"Failed to load descriptions cache: {exception_text(e)}")
+         return None
+ 
+ 
+@@ -395,7 +396,7 @@ async def refresh_server(
+                 )
+ 
+     except Exception as e:
+-        logger.error(f"Failed to refresh {server_name}: {e}")
++        logger.error(f"Failed to refresh {server_name}: {exception_text(e)}")
+         return None
+ 
+ 
+@@ -493,7 +494,7 @@ async def refresh_all(
+                 # Keep existing if refresh failed
+                 return name, existing
+         except Exception as e:
+-            logger.error(f"Error refreshing {name}: {e}")
++            logger.error(f"Error refreshing {name}: {exception_text(e)}")
+             if existing:
+                 return name, existing
+         return name, None
+````
+
+### Patch — `src/pmcp/manifest/version_checker.py`
+
+````diff
+diff --git a/src/pmcp/manifest/version_checker.py b/src/pmcp/manifest/version_checker.py
+index 19e71e6..7419b34 100644
+--- a/src/pmcp/manifest/version_checker.py
++++ b/src/pmcp/manifest/version_checker.py
+@@ -13,6 +13,7 @@ import aiohttp
+ from packaging.version import InvalidVersion, Version
+ from semver import Version as SemverVersion
+ 
++from pmcp.argument_errors import exception_text
+ from pmcp import __version__
+ from pmcp.manifest.npm_resolver import get_resolver
+ 
+@@ -1412,7 +1413,7 @@ async def get_npm_version(package_name: str, timeout: float = 10.0) -> str | Non
+         logger.debug(f"npm lookup timeout for {package_name}")
+         return None
+     except Exception as e:
+-        logger.debug(f"npm lookup error for {package_name}: {e}")
++        logger.debug(f"npm lookup error for {package_name}: {exception_text(e)}")
+         return None
+ 
+ 
+@@ -1454,7 +1455,7 @@ async def get_pypi_version(package_name: str, timeout: float = 10.0) -> str | No
+         logger.debug(f"PyPI lookup timeout for {package_name}")
+         return None
+     except Exception as e:
+-        logger.debug(f"PyPI lookup error for {package_name}: {e}")
++        logger.debug(f"PyPI lookup error for {package_name}: {exception_text(e)}")
+         return None
+ 
+ 
+@@ -1498,7 +1499,7 @@ async def get_cargo_version(crate_name: str, timeout: float = 10.0) -> str | Non
+         logger.debug(f"crates.io lookup timeout for {crate_name}")
+         return None
+     except Exception as e:
+-        logger.debug(f"crates.io lookup error for {crate_name}: {e}")
++        logger.debug(f"crates.io lookup error for {crate_name}: {exception_text(e)}")
+         return None
+ 
+ 
+@@ -1552,7 +1553,7 @@ async def get_docker_version(image_name: str, timeout: float = 10.0) -> str | No
+         logger.debug(f"Docker Hub lookup timeout for {image_name}")
+         return None
+     except Exception as e:
+-        logger.debug(f"Docker Hub lookup error for {image_name}: {e}")
++        logger.debug(f"Docker Hub lookup error for {image_name}: {exception_text(e)}")
+         return None
+ 
+ 
+````
+
+### Patch — `src/pmcp/package_approvals.py`
+
+````diff
+diff --git a/src/pmcp/package_approvals.py b/src/pmcp/package_approvals.py
+index 68d7685..6b90dd0 100644
+--- a/src/pmcp/package_approvals.py
++++ b/src/pmcp/package_approvals.py
+@@ -41,6 +41,7 @@ from pathlib import Path
+ from typing import TYPE_CHECKING, Any
+ 
+ 
++from pmcp.argument_errors import exception_text
+ from pmcp.trust_store import TrustStoreError, trust_store_path
+ from pmcp.validation import (
+     is_valid_package_name,
+@@ -129,7 +130,9 @@ def _decode(entry: Any) -> PackageApproval:
+     try:
+         _require_identity_fields(registry, name, version)
+     except ValueError as exc:
+-        raise PackageApprovalError(f"Invalid package approval entry: {exc}") from exc
++        raise PackageApprovalError(
++            f"Invalid package approval entry: {exception_text(exc)}"
++        ) from exc
+     if integrity is not None and not isinstance(integrity, str):
+         raise PackageApprovalError("Package approval integrity is not a string")
+     if decision not in DECISIONS:
+@@ -138,7 +141,7 @@ def _decode(entry: Any) -> PackageApproval:
+         parsed_at = datetime.fromisoformat(str(recorded_at))
+     except ValueError as exc:
+         raise PackageApprovalError(
+-            f"Unparseable package approval timestamp: {exc}"
++            f"Unparseable package approval timestamp: {exception_text(exc)}"
+         ) from exc
+ 
+     return PackageApproval(
+@@ -176,7 +179,7 @@ def _read_store_and_stale(
+         data = json.loads(raw)
+     except ValueError as exc:
+         raise PackageApprovalError(
+-            f"Cannot parse package approvals {path}: {exc}"
++            f"Cannot parse package approvals {path}: {exception_text(exc)}"
+         ) from exc
+     if not isinstance(data, dict):
+         raise PackageApprovalError(f"Package approvals {path} is not a JSON object")
+````
+
+### Patch — `src/pmcp/policy/policy.py`
+
+````diff
+diff --git a/src/pmcp/policy/policy.py b/src/pmcp/policy/policy.py
+index ec5ee42..530e974 100644
+--- a/src/pmcp/policy/policy.py
++++ b/src/pmcp/policy/policy.py
+@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any, Literal
+ 
+ import yaml
+ 
++from pmcp.argument_errors import exception_text
+ from pmcp.project_consent import log_refusal, read_and_gate
+ from pmcp.types import (
+     GatewayPolicy,
+@@ -360,7 +361,7 @@ class PolicyManager:
+         except Exception as e:
+             if fatal:
+                 raise ValueError(
+-                    f"Failed to load explicit policy {policy_path}: {e}"
++                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
+                 ) from e
+             self._warn_unparseable(policy_path, e)
+             return None
+@@ -380,7 +381,7 @@ class PolicyManager:
+             else "No policy is in effect: the gateway is running unrestricted."
+         )
+         logger.warning(
+-            f"Could not parse policy file {policy_path}: {error}. {consequence}"
++            f"Could not parse policy file {policy_path}: {exception_text(error)}. {consequence}"
+         )
+ 
+     def _parse_policy(
+@@ -419,7 +420,7 @@ class PolicyManager:
+         except Exception as e:
+             if fatal:
+                 raise ValueError(
+-                    f"Failed to load explicit policy {policy_path}: {e}"
++                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
+                 ) from e
+             self._warn_unparseable(policy_path, e)
+             return None
+@@ -433,10 +434,10 @@ class PolicyManager:
+         except Exception as e:
+             if fatal:
+                 raise ValueError(
+-                    f"Failed to load explicit policy {policy_path}: {e}"
++                    f"Failed to load explicit policy {policy_path}: {exception_text(e)}"
+                 ) from e
+             raise ValueError(
+-                f"Invalid policy file {policy_path}: {e}. "
++                f"Invalid policy file {policy_path}: {exception_text(e)}. "
+                 "Refusing to start rather than fall back to an unrestricted gateway."
+             ) from e
+ 
+````
+
+### Patch — `src/pmcp/provision_gate.py`
+
+````diff
+diff --git a/src/pmcp/provision_gate.py b/src/pmcp/provision_gate.py
+index ee8bbd4..2fb99f4 100644
+--- a/src/pmcp/provision_gate.py
++++ b/src/pmcp/provision_gate.py
+@@ -40,6 +40,7 @@ from dataclasses import dataclass
+ from pathlib import PurePath
+ from typing import TYPE_CHECKING, Literal
+ 
++from pmcp.argument_errors import exception_text
+ from pmcp.package_approvals import is_package_approved
+ from pmcp.validation import (
+     is_valid_package_name,
+@@ -463,7 +464,7 @@ def evaluate_provision(
+         logger.warning(
+             "Provisioning gate failed closed for %r: %s",
+             getattr(server_config, "name", None),
+-            exc,
++            exception_text(exc),
+         )
+         return _deny(
+             "not_approved", _fallback_remedy(server_config, identity), identity
+````
+
+### Patch — `src/pmcp/scoped_advisor_audit.py`
 
 ````diff
 diff --git a/src/pmcp/scoped_advisor_audit.py b/src/pmcp/scoped_advisor_audit.py
@@ -1297,7 +2538,537 @@ index 76d96e6..142ede6 100644
                  "scoped advisor audit could not describe a rejected call"
 ````
 
-### Patch — `types` (`src/pmcp/types.py`)
+### Patch — `src/pmcp/server.py`
+
+````diff
+diff --git a/src/pmcp/server.py b/src/pmcp/server.py
+index 0a6ef28..dce397b 100644
+--- a/src/pmcp/server.py
++++ b/src/pmcp/server.py
+@@ -12,6 +12,7 @@ from pathlib import Path
+ from typing import Any, Literal
+ 
+ import jsonschema
++import pydantic
+ from mcp.server import Server
+ from mcp.server.context import ServerRequestContext
+ from mcp.server.subscriptions import InMemorySubscriptionBus, ListenHandler
+@@ -37,6 +38,11 @@ from mcp.types import (
+     Tool,
+ )
+ 
++from pmcp.argument_errors import (
++    describe_model_error,
++    describe_schema_error,
++    exception_text,
++)
+ from pmcp.client.manager import ClientManager
+ from pmcp.config.guidance import GuidanceConfig, load_guidance_config
+ from pmcp.config.loader import (
+@@ -69,7 +75,11 @@ from pmcp.scoped_advisor_audit import (
+ )
+ from pmcp.subscriptions import BusCatalogEventSink
+ from pmcp.summary import generate_capability_summary
+-from pmcp.tools.handlers import GatewayTools, get_gateway_tool_definitions
++from pmcp.tools.handlers import (
++    GATEWAY_TOOL_INPUT_MODELS,
++    GatewayTools,
++    get_gateway_tool_definitions,
++)
+ from pmcp.types import (
+     DescriptionsCache,
+     GatewayDiagnosticsInfo,
+@@ -335,11 +345,15 @@ class GatewayServer:
+                             )
+                         ]
+                     )
++                # Never `e.message`: for `type`, `pattern`, `enum` and length
++                # errors it quotes the rejected value (Consiliency/pmcp#297).
+                 return CallToolResult(
+                     is_error=True,
+                     content=[
+                         TextContent(
+-                            type="text", text=f"Input validation error: {e.message}"
++                            type="text",
++                            text="Input validation error: "
++                            + describe_schema_error(e, tool.input_schema, arguments),
+                         )
+                     ],
+                 )
+@@ -477,7 +491,41 @@ class GatewayServer:
+                     )
+                 ]
+             except Exception as e:
+-                logger.error(f"Tool execution error: {e}")
++                # A `ValidationError`'s text renders the rejected value
++                # (pydantic's `input_value=...`, a validator's own message,
++                # jsonschema's `message`), so it is described from its
++                # structure instead, in the log, the response and the audit
++                # (Consiliency/pmcp#297). The tool's own argument model
++                # rejecting the call is described against the tool's schema;
++                # anything else goes through `exception_text`, which is
++                # `str(e)` for every exception that is not (and does not
++                # embed) a validation error.
++                input_model = GATEWAY_TOOL_INPUT_MODELS.get(audited_name or "")
++                rejected_by_model = (
++                    isinstance(e, pydantic.ValidationError)
++                    and input_model is not None
++                    and e.title == input_model.__name__
++                )
++                if (
++                    isinstance(e, pydantic.ValidationError)
++                    and rejected_by_model
++                    and tool is not None
++                ):
++                    reason = describe_model_error(e, tool.input_schema, arguments)
++                    described = f"Invalid arguments: {reason}"
++                    logger.error(
++                        "Tool execution error: invalid arguments for %s: %s",
++                        audited_name,
++                        reason,
++                    )
++                elif tool is None:
++                    # Only an unregistered name raises here; it is the
++                    # caller's string, so it is not logged (Consiliency/pmcp#297).
++                    described = exception_text(e)
++                    logger.error("Tool execution error: unknown gateway tool")
++                else:
++                    described = exception_text(e)
++                    logger.error(f"Tool execution error: {described}")
+                 try:
+                     failure_status = (
+                         "denied"
+@@ -485,12 +533,24 @@ class GatewayServer:
+                         and e.code == ErrorCode.E402_TOOL_DENIED
+                         else "failure"
+                     )
+-                    self._record_scoped_invocation(
+-                        gateway_tool=audited_name,
+-                        terminal_status=failure_status,
+-                        arguments=audited_arguments,
+-                        result={"error_type": type(e).__name__},
+-                    )
++                    if rejected_by_model and tool is not None:
++                        # Like a gate rejection: an `audit.rejection` (tool,
++                        # path, nothing the caller sent), not an invocation
++                        # whose correlations nothing vouched for.
++                        if self._scoped_advisor_audit is not None:
++                            self._scoped_advisor_audit.record_rejected_arguments(
++                                gateway_tool=tool.name,
++                                error=e,
++                                schema=tool.input_schema,
++                                arguments=arguments,
++                            )
++                    else:
++                        self._record_scoped_invocation(
++                            gateway_tool=audited_name,
++                            terminal_status=failure_status,
++                            arguments=audited_arguments,
++                            result={"error_type": type(e).__name__},
++                        )
+                 except ScopedAdvisorAuditError:
+                     logger.error("Scoped advisor audit channel failed")
+                     return [
+@@ -507,7 +567,12 @@ class GatewayServer:
+                 return [
+                     TextContent(
+                         type="text",
+-                        text=json.dumps({"error": True, "message": str(e)[:400]}),
++                        text=json.dumps(
++                            {
++                                "error": True,
++                                "message": described[:400],
++                            }
++                        ),
+                     )
+                 ]
+ 
+@@ -733,7 +798,9 @@ class GatewayServer:
+             manifest = load_manifest()
+             manifest_servers = manifest.servers
+         except Exception as e:
+-            logger.warning(f"Failed to load manifest startup configs: {e}")
++            logger.warning(
++                f"Failed to load manifest startup configs: {exception_text(e)}"
++            )
+ 
+         enabled_auto_start = load_enabled_auto_start(
+             project_root=self._project_root,
+@@ -852,7 +919,7 @@ class GatewayServer:
+                     f"Cached descriptions for {len(self._descriptions_cache.servers)} servers"
+                 )
+             except Exception as e:
+-                logger.warning(f"Failed to auto-generate cache: {e}")
++                logger.warning(f"Failed to auto-generate cache: {exception_text(e)}")
+ 
+         logger.debug("Capability summary:\n%s", self._capability_summary)
+ 
+@@ -1018,7 +1085,7 @@ class GatewayServer:
+         except asyncio.TimeoutError:
+             logger.warning("Shutdown timed out, forcing disconnect")
+         except Exception as e:
+-            logger.error(f"Error during shutdown: {e}")
++            logger.error(f"Error during shutdown: {exception_text(e)}")
+         finally:
+             # Always release singleton lock
+             release_singleton_lock()
+````
+
+### Patch — `src/pmcp/subscriptions.py`
+
+````diff
+diff --git a/src/pmcp/subscriptions.py b/src/pmcp/subscriptions.py
+index f05ef50..007b47b 100644
+--- a/src/pmcp/subscriptions.py
++++ b/src/pmcp/subscriptions.py
+@@ -48,6 +48,8 @@ from mcp.shared.subscriptions import (
+     ToolsListChanged,
+ )
+ 
++from pmcp.argument_errors import safe_exc_info
++
+ __all__ = ["CatalogEventSink", "BusCatalogEventSink"]
+ 
+ logger = logging.getLogger(__name__)
+@@ -187,8 +189,11 @@ class BusCatalogEventSink:
+     async def _publish(self, kind: _CatalogEventClass) -> None:
+         try:
+             await self._bus.publish(kind())
+-        except Exception:
++        except Exception as exc:
+             # Isolate a raising bus from the drain, matching
+             # `InMemorySubscriptionBus.publish`'s own listener-isolation
+             # contract -- one bad publish must not stop the next drain.
+-            logger.exception("subscription bus publish raised; catalog event dropped")
++            logger.error(
++                "subscription bus publish raised; catalog event dropped",
++                exc_info=safe_exc_info(exc),
++            )
+````
+
+### Patch — `src/pmcp/templates/code_snippets_loader.py`
+
+````diff
+diff --git a/src/pmcp/templates/code_snippets_loader.py b/src/pmcp/templates/code_snippets_loader.py
+index 00e741c..37322a5 100644
+--- a/src/pmcp/templates/code_snippets_loader.py
++++ b/src/pmcp/templates/code_snippets_loader.py
+@@ -11,6 +11,7 @@ from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+ import yaml
++from pmcp.argument_errors import exception_text
+ 
+ if TYPE_CHECKING:
+     from pmcp.types import ToolInfo
+@@ -61,7 +62,7 @@ class CodeSnippetsLoader:
+         except Exception as e:
+             # If loading fails, log warning but continue with empty snippets
+             print(
+-                f"Warning: Failed to load code snippets from {self._templates_path}: {e}"
++                f"Warning: Failed to load code snippets from {self._templates_path}: {exception_text(e)}"
+             )
+ 
+     def get_snippet_for_tool(
+````
+
+### Patch — `src/pmcp/tools/handlers.py`
+
+````diff
+diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
+index 45a956c..a9ab37f 100644
+--- a/src/pmcp/tools/handlers.py
++++ b/src/pmcp/tools/handlers.py
+@@ -20,6 +20,7 @@ import anyio
+ from dotenv import load_dotenv
+ from mcp.types import Tool
+ from pydantic import BaseModel
++from pmcp.argument_errors import exception_text, safe_exc_info
+ from pmcp import __version__ as PMCP_VERSION
+ from pmcp.auth import (
+     UNVERIFIED_URL_CAVEAT,
+@@ -985,7 +986,7 @@ class GatewayTools:
+                 data = json.load(f)
+             return {k: v for k, v in data.items() if isinstance(k, str)}
+         except Exception as e:
+-            logger.warning(f"Could not load provisioned registry: {e}")
++            logger.warning(f"Could not load provisioned registry: {exception_text(e)}")
+             return {}
+ 
+     def _save_provisioned_registry(self) -> None:
+@@ -996,7 +997,7 @@ class GatewayTools:
+             with open(path, "w") as f:
+                 json.dump(self._provisioned_registry, f)
+         except Exception as e:
+-            logger.warning(f"Could not save provisioned registry: {e}")
++            logger.warning(f"Could not save provisioned registry: {exception_text(e)}")
+ 
+     def _register_provisioned_server(
+         self, server_name: str, env_var: str | None
+@@ -1797,7 +1798,7 @@ class GatewayTools:
+                     next_step=url_elicitations[0].next_step,
+                     feedback_hint=self._feedback_hint(),
+                 )
+-            auth_challenge = self._auth_challenge_from_message(str(e))
++            auth_challenge = self._auth_challenge_from_message(exception_text(e))
+             auth_state = "none"
+             if auth_challenge:
+                 auth_state = (
+@@ -1875,13 +1876,17 @@ class GatewayTools:
+                 manifest = load_manifest()
+                 manifest_servers = manifest.servers
+             except Exception as e:
+-                logger.warning(f"Failed to load manifest startup configs: {e}")
++                logger.warning(
++                    f"Failed to load manifest startup configs: {exception_text(e)}"
++                )
+ 
+             provisioned: dict[str, str | None] = {}
+             try:
+                 provisioned = self._load_provisioned_registry()
+             except Exception as e:
+-                logger.warning(f"Failed to restore provisioned servers: {e}")
++                logger.warning(
++                    f"Failed to restore provisioned servers: {exception_text(e)}"
++                )
+ 
+             enabled_auto_start = load_enabled_auto_start(
+                 project_root=self._project_root,
+@@ -2127,7 +2132,7 @@ class GatewayTools:
+                 action="refresh",
+                 outcome="failure",
+                 started_at=audit_started_at,
+-                error=str(e),
++                error=exception_text(e),
+             )
+             return RefreshOutput(
+                 ok=False,
+@@ -2135,7 +2140,7 @@ class GatewayTools:
+                 servers_online=0,
+                 tools_indexed=0,
+                 revision_id="error",
+-                errors=[str(e)],
++                errors=[exception_text(e)],
+                 pending_requests_seen=pending_seen,
+                 pending_requests_cancelled=pending_cancelled,
+                 mcp_tasks_seen=active_tasks_seen,
+@@ -4235,7 +4240,9 @@ class GatewayTools:
+                         url_elicitations=url_elicitations,
+                         feedback_hint=self._feedback_hint(),
+                     )
+-                logger.error(f"Failed to connect remote server {server_name}: {e}")
++                logger.error(
++                    f"Failed to connect remote server {server_name}: {exception_text(e)}"
++                )
+                 self._record_feedback_event(
+                     "provision_failure",
+                     {
+@@ -4317,7 +4324,9 @@ class GatewayTools:
+             )
+ 
+         except Exception as e:
+-            logger.error(f"Failed to start provisioning {server_name}: {e}")
++            logger.error(
++                f"Failed to start provisioning {server_name}: {exception_text(e)}"
++            )
+             self._record_feedback_event(
+                 "provision_failure",
+                 {
+@@ -4405,12 +4414,12 @@ class GatewayTools:
+                         server_name=server_name,
+                         auth_state="elicitation_required",
+                         auth_event="url_elicitation_required",
+-                        error=str(e),
++                        error=exception_text(e),
+                     )
+                     return AuthConnectOutput(
+                         ok=False,
+                         server=server_name,
+-                        message=str(e),
++                        message=exception_text(e),
+                         auth_state="elicitation_required",
+                     )
+                 retry_step = f"Retry gateway.provision(server_name='{server_name}') or gateway.invoke."
+@@ -4573,12 +4582,12 @@ class GatewayTools:
+                 server_name=server_name,
+                 auth_state="missing_auth",
+                 auth_event="missing_credential",
+-                error=str(exc),
++                error=exception_text(exc),
+             )
+             return AuthConnectOutput(
+                 ok=False,
+                 server=server_name,
+-                message=str(exc),
++                message=exception_text(exc),
+                 auth_state="missing_auth",
+                 env_var=env_var,
+             )
+@@ -4782,7 +4791,7 @@ class GatewayTools:
+             # A transport that raises instead of returning an outcome is a bug, not a
+             # second door. Give up the same way, so the worker can never afterwards be
+             # granted permission to send.
+-            logger.warning("Feedback submission raised: %s", exc)
++            logger.warning("Feedback submission raised: %s", exception_text(exc))
+             result = progress.abandon()
+ 
+         # FeedbackProgress is constructed with no destination, so the snapshots IT
+@@ -5053,7 +5062,7 @@ class GatewayTools:
+                 server=server_name,
+                 package_type=package_type,
+                 package_name=package_name,
+-                message=f"Failed to run update probe: {e}",
++                message=f"Failed to run update probe: {exception_text(e)}",
+             )
+ 
+         if not ok:
+@@ -5283,7 +5292,7 @@ class GatewayTools:
+                             # reported result to failed.
+                             logger.warning(
+                                 f"Failed to persist descriptions cache after updating "
+-                                f"'{server_name}': {e}"
++                                f"'{server_name}': {exception_text(e)}"
+                             )
+ 
+             message = (
+@@ -5452,7 +5461,11 @@ class GatewayTools:
+         except TimeoutError:
+             timed_out = True
+         except Exception as exc:  # resolution fails closed; see package_identity
+-            logger.warning("Package identity lookup raised for %r: %s", package, exc)
++            logger.warning(
++                "Package identity lookup raised for %r: %s",
++                package,
++                exception_text(exc),
++            )
+ 
+         if resolved is None:
+             reason = (
+@@ -5569,10 +5582,12 @@ class GatewayTools:
+         """gateway.provision_status - Check status of a running installation."""
+         import time
+ 
++        # Outside the `try`: its arm logs a traceback and renders `str(e)`,
++        # and a `ValidationError`'s text carries the rejected value. Raised,
++        # it is described without it (Consiliency/pmcp#297).
++        parsed = ProvisionStatusInput.model_validate(input_data)
++        job_id = parsed.job_id
+         try:
+-            parsed = ProvisionStatusInput.model_validate(input_data)
+-            job_id = parsed.job_id
+-
+             job_manager = get_job_manager()
+             job = job_manager.get_job(job_id)
+ 
+@@ -5640,10 +5655,13 @@ class GatewayTools:
+             )
+ 
+         except Exception as e:
+-            logger.error(f"provision_status handler failed: {e}", exc_info=True)
++            logger.error(
++                f"provision_status handler failed: {exception_text(e)}",
++                exc_info=safe_exc_info(e),
++            )
+             # Return a safe error response instead of crashing
+             return ProvisionJobStatus(
+-                job_id=input_data.get("job_id", "unknown"),
++                job_id=job_id,
+                 server="unknown",
+                 status="failed",
+                 progress=0,
+@@ -5734,9 +5752,12 @@ class GatewayTools:
+             )
+ 
+         except Exception as e:
+-            logger.error(f"Handoff failed for {job_server_name}: {e}", exc_info=True)
++            logger.error(
++                f"Handoff failed for {job_server_name}: {exception_text(e)}",
++                exc_info=safe_exc_info(e),
++            )
+             job.status = "failed"
+-            job.error = f"Handoff failed: {e}"
++            job.error = f"Handoff failed: {exception_text(e)}"
+             # Kill the orphaned process
+             if process and process.returncode is None:
+                 try:
+@@ -5780,7 +5801,7 @@ class GatewayTools:
+                 if t.server_name == job_server_name
+             ]
+         except Exception as e:
+-            logger.error(f"Failed to refresh after install: {e}")
++            logger.error(f"Failed to refresh after install: {exception_text(e)}")
+             refresh_error = self._sanitize_error(e)
+ 
+         message = f"Server '{job_server_name}' installed"
+@@ -6009,7 +6030,7 @@ class GatewayTools:
+                 outcome="failure",
+                 started_at=audit_started_at,
+                 server_name=parsed.server_name,
+-                error=str(e),
++                error=exception_text(e),
+             )
+             return TasksListOutput(ok=False, errors=[self._sanitize_error(e)])
+ 
+@@ -6053,7 +6074,7 @@ class GatewayTools:
+                 started_at=audit_started_at,
+                 server_name=parsed.server_name,
+                 task_id=parsed.task_id,
+-                error=str(e),
++                error=exception_text(e),
+             )
+             return TasksGetOutput(ok=False, errors=[self._sanitize_error(e)])
+ 
+@@ -6127,7 +6148,7 @@ class GatewayTools:
+                 started_at=audit_started_at,
+                 server_name=parsed.server_name,
+                 task_id=parsed.task_id,
+-                error=str(e),
++                error=exception_text(e),
+             )
+             return TasksResultOutput(ok=False, errors=[self._sanitize_error(e)])
+ 
+````
+
+### Patch — `src/pmcp/trust_store.py`
+
+````diff
+diff --git a/src/pmcp/trust_store.py b/src/pmcp/trust_store.py
+index dd9ed8c..23f9a7d 100644
+--- a/src/pmcp/trust_store.py
++++ b/src/pmcp/trust_store.py
+@@ -42,6 +42,7 @@ from dataclasses import dataclass
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Any
++from pmcp.argument_errors import exception_text
+ 
+ APPROVED = "approved"
+ DENIED = "denied"
+@@ -269,7 +270,9 @@ def _decode(entry: Any) -> TrustRecord:
+     try:
+         parsed_at = datetime.fromisoformat(str(recorded_at))
+     except ValueError as exc:
+-        raise TrustStoreError(f"Unparseable trust timestamp: {exc}") from exc
++        raise TrustStoreError(
++            f"Unparseable trust timestamp: {exception_text(exc)}"
++        ) from exc
+ 
+     return TrustRecord(
+         absolute_path=Path(str(absolute_path)),
+@@ -297,7 +300,9 @@ def _read_store(path: Path) -> list[TrustRecord]:
+     try:
+         data = json.loads(raw)
+     except ValueError as exc:
+-        raise TrustStoreError(f"Cannot parse trust store {path}: {exc}") from exc
++        raise TrustStoreError(
++            f"Cannot parse trust store {path}: {exception_text(exc)}"
++        ) from exc
+ 
+     if not isinstance(data, dict):
+         raise TrustStoreError(f"Trust store {path} is not a JSON object")
+````
+
+### Patch — `src/pmcp/types.py`
 
 ````diff
 diff --git a/src/pmcp/types.py b/src/pmcp/types.py
@@ -1352,49 +3123,15 @@ index 95b5a53..874fa1f 100644
  
 ````
 
-### Patch — `handlers` (`src/pmcp/tools/handlers.py`)
-
-````diff
-diff --git a/src/pmcp/tools/handlers.py b/src/pmcp/tools/handlers.py
-index 45a956c..7bde5da 100644
---- a/src/pmcp/tools/handlers.py
-+++ b/src/pmcp/tools/handlers.py
-@@ -5569,10 +5569,12 @@ class GatewayTools:
-         """gateway.provision_status - Check status of a running installation."""
-         import time
- 
-+        # Outside the `try`: its arm logs a traceback and renders `str(e)`,
-+        # and a `ValidationError`'s text carries the rejected value. Raised,
-+        # it is described without it (Consiliency/pmcp#297).
-+        parsed = ProvisionStatusInput.model_validate(input_data)
-+        job_id = parsed.job_id
-         try:
--            parsed = ProvisionStatusInput.model_validate(input_data)
--            job_id = parsed.job_id
--
-             job_manager = get_job_manager()
-             job = job_manager.get_job(job_id)
- 
-@@ -5643,7 +5645,7 @@ class GatewayTools:
-             logger.error(f"provision_status handler failed: {e}", exc_info=True)
-             # Return a safe error response instead of crashing
-             return ProvisionJobStatus(
--                job_id=input_data.get("job_id", "unknown"),
-+                job_id=job_id,
-                 server="unknown",
-                 status="failed",
-                 progress=0,
-````
-
-### Patch — `test_argument_error_echo` (`tests/test_argument_error_echo.py`)
+### Patch — `tests/test_argument_error_echo.py`
 
 ````diff
 diff --git a/tests/test_argument_error_echo.py b/tests/test_argument_error_echo.py
 new file mode 100644
-index 0000000..86f8e00
+index 0000000..8922d0e
 --- /dev/null
 +++ b/tests/test_argument_error_echo.py
-@@ -0,0 +1,805 @@
+@@ -0,0 +1,1708 @@
 +"""A rejected gateway-tool argument never echoes its value (Consiliency/pmcp#297).
 +
 +The oracle is a generated sweep, not hand-picked cases. Its axes come from the
@@ -1427,10 +3164,14 @@ index 0000000..86f8e00
 +from __future__ import annotations
 +
 +import copy
++import gc
++import functools
++from unittest import mock
 +import hashlib
 +import json
++import re
 +import logging
-+import string
++import traceback
 +import typing
 +from pathlib import Path
 +from typing import Any
@@ -1438,7 +3179,8 @@ index 0000000..86f8e00
 +import jsonschema
 +import pytest
 +from mcp.types import CallToolRequestParams
-+from pydantic import BaseModel, ValidationError
++from pydantic import BaseModel, ValidationError, field_validator
++from pydantic_core import PydanticCustomError
 +
 +from pmcp.server import GatewayServer
 +from pmcp.tools.handlers import GATEWAY_TOOL_INPUT_MODELS, get_gateway_tool_definitions
@@ -1452,12 +3194,43 @@ index 0000000..86f8e00
 +    _write_scoped_policy,
 +)
 +
-+#: Two high-entropy sentinels of different length (ASCII alphanumerics, so no
-+#: renderer escapes them out of a substring search).
-+_SENTINELS = (
-+    "Sq" + hashlib.sha256(b"pmcp-297-a").hexdigest()[:22] + "Zx",
-+    "Sq" + hashlib.sha256(b"pmcp-297-b").hexdigest()[:38] + "Zx",
-+)
++
++def _digest(seed: str, length: int, alphabet: str = "0123456789abcdef") -> str:
++    """`length` deterministic high-entropy characters of `alphabet`."""
++    out, counter = "", 0
++    while len(out) < length:
++        block = hashlib.sha256(f"pmcp-297:{seed}:{counter}".encode()).digest()
++        out += "".join(alphabet[b % len(alphabet)] for b in block)
++        counter += 1
++    return out[:length]
++
++
++_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
++
++#: Sentinel families, two lengths each. A leak can be conditional on the
++#: value's shape (the rev 1 board's mutant S8 echoed only `isalpha()`
++#: values), so the sweep runs every case once per family: hex, letters only,
++#: a provider-token shape, a value with spaces, non-ASCII (written as `\u`
++#: escapes: the test source stays ASCII), and digits only.
++_FAMILIES: dict[str, tuple[str, str]] = {
++    "hex": (
++        "Sq" + _digest("hex-a", 22) + "Zx",
++        "Sq" + _digest("hex-b", 38) + "Zx",
++    ),
++    "alpha": (_digest("alpha-a", 26, _LETTERS), _digest("alpha-b", 42, _LETTERS)),
++    "token": ("sk-proj-" + _digest("token-a", 24), "sk-proj-" + _digest("token-b", 40)),
++    "spaced": (
++        "Bearer " + " ".join(_digest("sp-a", 24)[i : i + 6] for i in range(0, 24, 6)),
++        "Bearer " + " ".join(_digest("sp-b", 42)[i : i + 6] for i in range(0, 42, 6)),
++    ),
++    "unicode": (
++        "\u00e9\u4e2d" + _digest("uni-a", 24) + "\u00fc",
++        "\u00e9\u4e2d" + _digest("uni-b", 40) + "\u00fc",
++    ),
++    "digits": (_digest("dig-a", 26, "0123456789"), _digest("dig-b", 42, "0123456789")),
++}
++#: The hex pair, for the tests that need one family.
++_SENTINELS = _FAMILIES["hex"]
 +
 +_GATE_PREFIX = "Input validation error: $"
 +_MODEL_PREFIX = "Invalid arguments: $"
@@ -1471,9 +3244,16 @@ index 0000000..86f8e00
 +
 +
 +def _forbidden(sentinel: str) -> set[str]:
-+    """Every window of the sentinel, and each hash of it, a log or record
-+    could carry."""
-+    forms = {sentinel[i : i + _WINDOW] for i in range(len(sentinel) - _WINDOW + 1)}
++    """Every window of the sentinel -- raw, JSON-escaped, `repr`-escaped and
++    `unicode_escape`d -- and each hash of it, a log or record could carry."""
++    forms: set[str] = set()
++    for spelling in {
++        sentinel,
++        json.dumps(sentinel)[1:-1],
++        repr(sentinel)[1:-1],
++        sentinel.encode("unicode_escape").decode("ascii"),
++    }:
++        forms |= {spelling[i : i + _WINDOW] for i in range(len(spelling) - _WINDOW + 1)}
 +    for text in (sentinel, json.dumps(sentinel), sentinel.lower()):
 +        forms.add(hashlib.sha256(text.encode()).hexdigest())
 +        forms.add(hashlib.sha1(text.encode()).hexdigest())
@@ -1516,6 +3296,16 @@ index 0000000..86f8e00
 +
 +def _invalid_values(node: dict[str, Any], s: str) -> list[tuple[str, Any]]:
 +    """Values this schema node rejects, each carrying `s` in every slot."""
++    return [
++        (label, value)
++        for label, value in _candidate_values(node, s)
++        if not jsonschema.validators.validator_for(node)(node).is_valid(value)
++    ]
++
++
++def _candidate_values(node: dict[str, Any], s: str) -> list[tuple[str, Any]]:
++    """The shapes `_invalid_values` tries (unchecked: a case's build reuses
++    the shape its construction already checked)."""
 +    types = _types(node)
 +    candidates: list[tuple[str, Any]] = []
 +    if types and "string" not in types:
@@ -1532,11 +3322,7 @@ index 0000000..86f8e00
 +            candidates.append(("maxLength", s * (node["maxLength"] // len(s) + 1)))
 +        if "enum" in node:
 +            candidates.append(("enum", s))
-+    return [
-+        (label, value)
-+        for label, value in candidates
-+        if not jsonschema.validators.validator_for(node)(node).is_valid(value)
-+    ]
++    return candidates
 +
 +
 +def _open_containers(schema: dict[str, Any]) -> list[tuple[str | int, ...]]:
@@ -1556,6 +3342,12 @@ index 0000000..86f8e00
 +
 +def _baseline(tool: Any) -> dict[str, Any]:
 +    """The smallest arguments the tool's schema accepts, from its schema."""
++    return copy.deepcopy(_checked_baseline(tool.name))
++
++
++@functools.cache
++def _checked_baseline(name: str) -> dict[str, Any]:
++    tool = _tools()[name]
 +    schema = tool.input_schema
 +    baseline: dict[str, Any] = {}
 +    for name in schema.get("required") or []:
@@ -1602,8 +3394,16 @@ index 0000000..86f8e00
 +    arguments[f"extra_{s}"] = {s: [s]}
 +    for path in _open_containers(tool.input_schema):
 +        _set(arguments, path, _open_content(s), s)
-+    jsonschema.validate(arguments, tool.input_schema)
 +    return arguments
++
++
++@pytest.mark.parametrize("name", sorted(_tools()))
++def test_every_decorated_baseline_passes_the_gate(name: str) -> None:
++    """Decorations alone are accepted, so a case's rejection is its own."""
++    tool = _tools()[name]
++    for sentinels in _FAMILIES.values():
++        for s in sentinels:
++            jsonschema.validate(_decorated(tool, s), tool.input_schema)
 +
 +
 +def _expected_path(path: tuple[str | int, ...]) -> str:
@@ -1691,7 +3491,7 @@ index 0000000..86f8e00
 +
 +                def build(s: str, tool=tool, path=path, node=node, label=label) -> dict:
 +                    arguments = _decorated(tool, s)
-+                    value = dict(_invalid_values(node, s))[label]
++                    value = dict(_candidate_values(node, s))[label]
 +                    _set(arguments, path, value, s)
 +                    return arguments
 +
@@ -1754,7 +3554,7 @@ index 0000000..86f8e00
 +                            # By name only: with the alias present too,
 +                            # pydantic reads the alias.
 +                            assert arguments.pop(alias, None) is not None
-+                            arguments[field_name] = dict(_invalid_values(node, s))[
++                            arguments[field_name] = dict(_candidate_values(node, s))[
 +                                label
 +                            ]
 +                            return arguments
@@ -1845,74 +3645,190 @@ index 0000000..86f8e00
 +    assert expected in response, response
 +
 +
++#: The attributes every `LogRecord` has; anything else came in via `extra=`.
++_STANDARD_RECORD_KEYS = frozenset(
++    logging.LogRecord("x", logging.INFO, "x", 1, "x", None, None).__dict__
++) | {"message", "asctime"}
++
++
++def _record_text(record: logging.LogRecord) -> str:
++    """Everything a log handler could see in `record`, whatever formats it:
++    pmcp's text and JSON formatters, the raw message and args, every
++    attribute (`extra=` fields included), and the traceback of `exc_info`
++    and `stack_info` rendered in full (pmcp's JSON formatter drops them)."""
++    parts = [formatter.format(record) for formatter in _pmcp_formatters()]
++    parts.append(repr(record.msg))
++    parts.append(repr(record.args))
++    parts.append(record.getMessage())
++    for key, value in sorted(record.__dict__.items()):
++        if key == "exc_info" and value and value[1] is not None:
++            parts.append("".join(traceback.format_exception(*value)))
++        elif key not in ("msg", "args"):
++            parts.append(f"{key}={value!r}")
++    return "\n".join(parts)
++
++
++def _record_stable(record: logging.LogRecord) -> str:
++    """`record` for the pair differential: both formatters at a fixed time,
++    plus every `extra=` attribute."""
++    extras = {
++        key: repr(value)
++        for key, value in sorted(record.__dict__.items())
++        if key not in _STANDARD_RECORD_KEYS
++    }
++    rendered = [_normalized(record, formatter) for formatter in _pmcp_formatters()]
++    text = "\n".join(rendered) + (f"\nextra={extras!r}" if extras else "")
++    # The one volatile token a downstream call logs: its wall-clock latency.
++    return _ELAPSED.sub("elapsed_ms=N", text)
++
++
++#: Exactly `elapsed_ms=<digits>` in `handlers.py`'s `tool_call` line.
++_ELAPSED = re.compile(r"\belapsed_ms=[0-9]+\b")
++
++
++class _Tap:
++    """Every channel a call can leak into: the response (given), the log
++    (`caplog` at DEBUG, root), stdout/stderr (`capfd`), warnings
++    (`recwarn`), the gateway's in-memory audit-event buffer (what
++    `gateway.health` exposes), and the scoped-audit JSONL."""
++
++    def __init__(
++        self,
++        server: GatewayServer,
++        audit_path: Path | None,
++        caplog: pytest.LogCaptureFixture,
++        capfd: pytest.CaptureFixture[str],
++        recwarn: pytest.WarningsRecorder,
++    ) -> None:
++        self.server, self.audit_path = server, audit_path
++        self.caplog, self.capfd, self.recwarn = caplog, capfd, recwarn
++        # A server an earlier test left open is finalised by the collector at
++        # an arbitrary moment, and its `ResourceWarning` would land inside
++        # some pair. Collect now; each test here shuts its own servers down.
++        gc.collect()
++
++    def _audit_text(self) -> str:
++        path = self.audit_path
++        return path.read_text() if path is not None and path.exists() else ""
++
++    def _buffer(self) -> list[str]:
++        events = getattr(self.server._gateway_tools, "__dict__", {}).get(
++            "_audit_events", []
++        )
++        return [event.model_dump_json() for event in events]
++
++    def start(self) -> tuple[int, int, str, list[str]]:
++        self.capfd.readouterr()
++        return (
++            len(self.caplog.records),
++            len(self.recwarn),
++            self._audit_text(),
++            self._buffer(),
++        )
++
++    def since(self, mark: tuple[int, int, str, list[str]], response: str) -> _Observed:
++        records = self.caplog.records[mark[0] :]
++        captured = self.capfd.readouterr()
++        warned = [
++            f"{w.category.__name__}: {w.message} @ {w.filename}:{w.lineno}"
++            for w in list(self.recwarn)[mark[1] :]
++        ]
++        raw_audit = self._audit_text()[len(mark[2]) :]
++        buffer = self._buffer()
++        new_events = [event for event in buffer if event not in mark[3]]
++        return _Observed(
++            response=response,
++            log="\n".join(_record_stable(record) for record in records),
++            raw_log="\n".join(_record_text(record) for record in records),
++            streams=captured.out + captured.err,
++            warnings="\n".join(warned),
++            audit=[
++                _stable(json.loads(line)) for line in raw_audit.splitlines() if line
++            ],
++            raw_audit=raw_audit,
++            events="\n".join(new_events),
++        )
++
++
 +class _Observed(typing.NamedTuple):
 +    response: str
 +    log: str
 +    raw_log: str
++    streams: str
++    warnings: str
 +    audit: list[dict[str, Any]]
 +    raw_audit: str
++    events: str
++
++    def leaks(self, sentinel: str) -> list[str]:
++        """The channels that carry `sentinel` in any form."""
++        channels = {
++            "response": self.response,
++            "log": self.raw_log,
++            "stdout/stderr": self.streams,
++            "warnings": self.warnings,
++            "audit": self.raw_audit,
++            "audit-event buffer": self.events,
++        }
++        forms = _forbidden(sentinel)
++        return [
++            name for name, text in channels.items() if any(f in text for f in forms)
++        ]
++
++    def stable(self) -> tuple[Any, ...]:
++        """What must be identical for two sentinels of different length."""
++        return (self.response, self.log, self.streams, self.warnings, self.audit)
++
++    def differs(self, other: _Observed) -> list[tuple[str, Any, Any]]:
++        """The channels where `self` and `other` differ, for a readable failure."""
++        names = ("response", "log", "streams", "warnings", "audit")
++        return [
++            (name, mine, theirs)
++            for name, mine, theirs in zip(names, self.stable(), other.stable())
++            if mine != theirs
++        ]
 +
 +
-+async def _observe(
-+    server: GatewayServer,
-+    audit_path: Path | None,
-+    caplog: pytest.LogCaptureFixture,
-+    case: _Case,
-+    sentinel: str,
-+) -> _Observed:
-+    arguments = case.build(sentinel)
-+    before_log = len(caplog.records)
-+    before_audit = audit_path.read_text() if audit_path and audit_path.exists() else ""
-+    result = await _call(server, case.tool, arguments)
-+    records = caplog.records[before_log:]
-+    raw_log = "\n".join(
-+        formatter.format(record)
-+        for record in records
-+        for formatter in _pmcp_formatters()
-+    )
-+    log = "\n".join(
-+        _normalized(record, formatter)
-+        for record in records
-+        for formatter in _pmcp_formatters()
-+    )
-+    raw_audit = (audit_path.read_text() if audit_path else "")[len(before_audit) :]
-+    audit = [_stable(json.loads(line)) for line in raw_audit.splitlines() if line]
-+    return _Observed(
-+        response=_rejection(result, case.layer),
-+        log=log,
-+        raw_log=raw_log,
-+        audit=audit,
-+        raw_audit=raw_audit,
-+    )
++def _event_shape(events: str) -> list[dict[str, Any]]:
++    return [
++        {
++            k: v
++            for k, v in json.loads(line).items()
++            if k not in ("timestamp", "duration_ms", "latency_ms")
++        }
++        for line in events.splitlines()
++        if line
++    ]
 +
 +
 +@pytest.mark.asyncio
 +@pytest.mark.parametrize("audited", [False, True], ids=["plain", "scoped-audit"])
 +async def test_no_rejected_argument_value_reaches_a_response_log_or_audit(
-+    tmp_path: Path, caplog: pytest.LogCaptureFixture, audited: bool
++    tmp_path: Path,
++    caplog: pytest.LogCaptureFixture,
++    capfd: pytest.CaptureFixture[str],
++    recwarn: pytest.WarningsRecorder,
++    audited: bool,
 +) -> None:
 +    caplog.set_level(logging.DEBUG)
 +    server, audit_path = _server(tmp_path, audited=audited)
-+    for case in _CASES:
-+        seen = [
-+            await _observe(server, audit_path, caplog, case, sentinel)
-+            for sentinel in _SENTINELS
-+        ]
-+        for sentinel, observed in zip(_SENTINELS, seen):
-+            for form in _forbidden(sentinel):
-+                assert form not in observed.response, (case.label, "response")
-+                assert form not in observed.raw_log, (
-+                    case.label,
-+                    "log",
-+                    observed.raw_log,
-+                )
-+                assert form not in observed.raw_audit, (case.label, "audit")
-+        # Useful: the rejection names where, and why.
-+        _useful(seen[0].response, case.layer, case.expected)
-+        # Nothing else about the value -- length, count or hash -- either.
-+        assert seen[0].response == seen[1].response, case.label
-+        assert seen[0].log == seen[1].log, (case.label, seen[0].log, seen[1].log)
-+        assert seen[0].audit == seen[1].audit, case.label
++    tap = _Tap(server, audit_path, caplog, capfd, recwarn)
++    for family, sentinels in _FAMILIES.items():
++        for case in _CASES:
++            seen = []
++            for sentinel in sentinels:
++                mark = tap.start()
++                result = await _call(server, case.tool, case.build(sentinel))
++                seen.append(tap.since(mark, _rejection(result, case.layer)))
++            for sentinel, observed in zip(sentinels, seen):
++                assert observed.leaks(sentinel) == [], (family, case.label, observed)
++            if family == "hex":
++                # Useful: the rejection names where, and why.
++                _useful(seen[0].response, case.layer, case.expected)
++            # Nothing else about the value -- length, count or hash -- either.
++            assert seen[0].stable() == seen[1].stable(), (family, case.label)
++            assert _event_shape(seen[0].events) == _event_shape(seen[1].events)
++    await server.shutdown()
 +    # The audit oracle is live, not empty by accident.
 +    if audit_path is not None:
 +        assert '"audit.rejection"' in audit_path.read_text()
@@ -1954,6 +3870,7 @@ index 0000000..86f8e00
 +                assert form not in logged, (case.label, logged)
 +            assert isinstance(raised, ValidationError), (case.label, raised)
 +        checked += 1
++    await server.shutdown()
 +    assert checked > 100, checked
 +
 +
@@ -1979,7 +3896,8 @@ index 0000000..86f8e00
 +        errors.append(error)
 +    assert len(errors) == 3
 +    for error in errors:
-+        assert s in str(error)  # the raw text does carry it
++        # the raw text does carry it (pydantic truncates it in the middle)
++        assert any(form in str(error) for form in _forbidden(s)), error
 +    return errors
 +
 +
@@ -1994,44 +3912,49 @@ index 0000000..86f8e00
 +        return handler
 +
 +
++#: What `exception_text` makes of each of `_handler_validation_errors`.
++_HANDLER_ERROR_TEXT = (
++    re.compile(
++        r"2 validation errors for McpTaskInfo: \$\.task_id: must be a string; \$\.created_at: "
++    ),
++    re.compile(r"3 validation errors for InvokeInput: \$\.tool_id: must be a string; "),
++    # `x` is no name pmcp's models declare, so it reads as `*`.
++    re.compile(r"schema validation error: \$\.\*: fails its type constraint$"),
++)
++
++
 +@pytest.mark.asyncio
 +@pytest.mark.parametrize(
 +    "index", [0, 1, 2], ids=["downstream-model", "argument-model", "jsonschema"]
 +)
 +async def test_a_validation_error_raised_by_a_handler_is_described_not_echoed(
-+    tmp_path: Path, caplog: pytest.LogCaptureFixture, index: int
++    tmp_path: Path,
++    caplog: pytest.LogCaptureFixture,
++    capfd: pytest.CaptureFixture[str],
++    recwarn: pytest.WarningsRecorder,
++    index: int,
 +) -> None:
++    """Not the tool's own argument model, so not "Invalid arguments": the
++    server's arm renders it with `exception_text`, against no schema (rev 2,
++    N6: a jsonschema error names its keyword, never a constraint)."""
 +    caplog.set_level(logging.DEBUG)
 +    server, _ = _server(tmp_path, audited=False)
-+    tool = _tools()["gateway.catalog_search"]
-+    texts, logs = [], []
-+    for s in _SENTINELS:
-+        server._gateway_tools = _RaisingTools(_handler_validation_errors(s)[index])  # type: ignore[assignment]
-+        start = len(caplog.records)
-+        result = await _call(server, tool.name, {"query": "q"})
-+        text = "".join(block.text for block in result.content)
-+        payload = json.loads(text)
-+        assert payload["error"] is True, text
-+        log = "\n".join(
-+            formatter.format(record)
-+            for record in caplog.records[start:]
-+            for formatter in _pmcp_formatters()
-+        )
-+        for form in _forbidden(s):
-+            assert form not in text and form not in log, form
-+        # Not catalog_search's own argument model: a validation error, not
-+        # "invalid arguments".
-+        assert payload["message"].startswith("Validation error: $"), text
-+        assert "validation error for gateway.catalog_search: $" in log
-+        texts.append(text)
-+        logs.append(
-+            "\n".join(
-+                _normalized(r, f)
-+                for r in caplog.records[start:]
-+                for f in _pmcp_formatters()
-+            )
-+        )
-+    assert texts[0] == texts[1] and logs[0] == logs[1]
++    tap = _Tap(server, None, caplog, capfd, recwarn)
++    seen = []
++    for family, sentinels in _FAMILIES.items():
++        for s in sentinels:
++            server._gateway_tools = _RaisingTools(_handler_validation_errors(s)[index])  # type: ignore[assignment]
++            mark = tap.start()
++            result = await _call(server, "gateway.catalog_search", {"query": "q"})
++            payload = json.loads("".join(block.text for block in result.content))
++            observed = tap.since(mark, json.dumps(payload))
++            assert observed.leaks(s) == [], (family, observed)
++            assert payload["error"] is True
++            assert _HANDLER_ERROR_TEXT[index].match(payload["message"]), payload
++            assert f"Tool execution error: {payload['message']}" in observed.raw_log
++            seen.append(observed.stable())
++    await server.shutdown()
++    assert all(item == seen[0] for item in seen[1:])
 +
 +
 +# --- the renderers, directly ---------------------------------------------------------
@@ -2168,41 +4091,791 @@ index 0000000..86f8e00
 +    assert described == "$.env.*: must be an integer"
 +
 +
-+def test_a_model_phrase_reads_only_constraint_context() -> None:
-+    """Every placeholder a phrase names is a constraint the model declares;
-+    none is a value-derived `ctx` entry pydantic also offers."""
-+    from pmcp.argument_errors import _CONSTRAINT_CONTEXT, _MODEL_PHRASES
++class _CollidingErrors(BaseModel):
++    """A validator author reusing pydantic's own error types with the value
++    in the very `ctx` keys a naive renderer would fill a phrase from (the rev
++    1 board's N2)."""
 +
-+    placeholders = {
-+        name
-+        for phrase in _MODEL_PHRASES.values()
-+        for _, name, _, _ in string.Formatter().parse(phrase)
-+        if name
++    literal: str | None = None
++    short: str | None = None
++    bounded: int | None = None
++    nested: dict[str, str] | None = None
++
++    @field_validator("literal")
++    @classmethod
++    def _literal(cls, value: str) -> str:
++        raise PydanticCustomError("literal_error", "{expected}", {"expected": value})
++
++    @field_validator("short")
++    @classmethod
++    def _short(cls, value: str) -> str:
++        raise PydanticCustomError(
++            "string_too_short", "{min_length}", {"min_length": value}
++        )
++
++    @field_validator("bounded", mode="before")
++    @classmethod
++    def _bounded(cls, value: Any) -> int:
++        raise PydanticCustomError("greater_than", "{gt}", {"gt": value})
++
++    @field_validator("nested")
++    @classmethod
++    def _nested(cls, value: dict[str, str]) -> dict[str, str]:
++        raise PydanticCustomError("missing", "{input}", {"input": value})
++
++
++@pytest.mark.parametrize("family", sorted(_FAMILIES))
++def test_a_custom_error_cannot_fill_a_phrase_from_its_context(family: str) -> None:
++    """A constraint is read from the gateway's own schema, never from `ctx`,
++    so a colliding custom error renders the schema's constraint -- or none."""
++    from pmcp.argument_errors import describe_model_error, exception_text
++
++    s = _FAMILIES[family][1]
++    arguments = {"literal": s, "short": s, "bounded": s, "nested": {"k": s}}
++    with pytest.raises(ValidationError) as raised:
++        _CollidingErrors.model_validate(arguments)
++    assert any(form in str(raised.value) for form in _forbidden(s))
++    schema = {
++        "type": "object",
++        "properties": {
++            "literal": {"type": "string", "enum": ["a", "b"]},
++            "short": {"type": "string", "minLength": 3},
++            "bounded": {"type": "integer"},
++            "nested": {"type": "object"},
++        },
 +    }
-+    assert placeholders <= _CONSTRAINT_CONTEXT
-+    assert _CONSTRAINT_CONTEXT == {
-+        "min_length",
-+        "max_length",
-+        "pattern",
-+        "expected",
-+        "gt",
-+        "ge",
-+        "lt",
-+        "le",
-+    }
-+    # Offered by pydantic, derived from the input: never read.
-+    for derived in (
-+        "actual_length",
-+        "error",
-+        "tag",
-+        "input",
-+        "attribute",
-+        "class_name",
++    for rendered, expected in (
++        (
++            describe_model_error(raised.value, schema, arguments),
++            '$.literal: must be one of ["a", "b"]; $.short: must be at least 3 '
++            "characters; $.bounded: is too small; $.nested: is required",
++        ),
++        (
++            exception_text(raised.value),
++            # No schema here, and a test model's fields are no names pmcp
++            # declares, so the locations read as `*`.
++            "4 validation errors for _CollidingErrors: $.*: is not an "
++            "allowed value; $.*: is too short; $.*: is too small; "
++            "$.*: is required",
++        ),
 +    ):
-+        assert derived not in _CONSTRAINT_CONTEXT
++        assert rendered == expected
++        assert not any(form in rendered for form in _forbidden(s))
++
++
++def test_every_constrained_phrase_names_a_schema_keyword() -> None:
++    """Each constraint comes from a JSON Schema keyword of the gateway's own
++    schema; none from pydantic's `ctx`."""
++    import jsonschema.validators
++
++    from pmcp.argument_errors import _CONSTRAINED_PHRASES
++
++    keywords = jsonschema.validators.Draft202012Validator.VALIDATORS
++    for error_type, (keyword, with_constraint, without) in _CONSTRAINED_PHRASES.items():
++        assert keyword in keywords, error_type
++        assert "{" not in without, error_type
++        assert with_constraint.count("{") == 1, error_type
++
++
++def test_exception_text_describes_a_wrapper_that_embeds_a_validation_error() -> None:
++    """`RuntimeError(f"... {e}") from e` carries the value in its own text."""
++    from pmcp.argument_errors import exception_text, safe_exc_info
++
++    s = _SENTINELS[1]
++    try:
++        try:
++            McpTaskInfo.model_validate({"task_id": "t", "ttl": s})
++        except ValidationError as inner:
++            raise RuntimeError(f"task parse failed: {inner}") from inner
++    except RuntimeError as outer:
++        text = exception_text(outer)
++        assert text.startswith(
++            "RuntimeError: 1 validation error for McpTaskInfo: $.ttl: must be an integer"
++        ), text
++        assert not any(form in text for form in _forbidden(s))
++        assert safe_exc_info(outer) is None
++    plain = RuntimeError("no validation here")
++    assert exception_text(plain) == "no validation here"
++    assert safe_exc_info(plain) is plain
++
++
++@pytest.mark.parametrize("family", sorted(_FAMILIES))
++def test_describe_exception_renders_a_grouped_validation_error_structurally(
++    family: str,
++) -> None:
++    """`describe_exception` flattens an anyio task group into its leaves --
++    the remote-transport paths' shape -- and each leaf goes through
++    `exception_text`, so a validation error inside a group is described,
++    not echoed."""
++    import builtins
++
++    from pmcp.client.manager import describe_exception
++
++    group_type = getattr(builtins, "ExceptionGroup", None)
++    if group_type is None:  # Python 3.10: anyio's backport
++        from exceptiongroup import ExceptionGroup as group_type
++    s = _FAMILIES[family][1]
++    with pytest.raises(ValidationError) as raised:
++        McpTaskInfo.model_validate({"task_id": "t", "ttl": {"v": s}})
++    leaf = raised.value
++    for group in (
++        group_type("unhandled errors in a TaskGroup", [leaf]),
++        group_type("unhandled errors in a TaskGroup", [RuntimeError("boom"), leaf]),
++    ):
++        text = describe_exception(group)
++        assert "validation error for McpTaskInfo: $.ttl: must be an integer" in text
++        assert not any(form in text for form in _forbidden(s)), text
++
++
++# --- every exception-to-text sink in src/pmcp (rev 2, board finding B1/N3) ------
++
++#: Exception types an `except` clause names that also catch a pydantic
++#: (`ValueError`) or jsonschema (`_Error`) `ValidationError`.
++_CATCHES_VALIDATION = {
++    "Exception",
++    "BaseException",
++    "ValueError",
++    "ValidationError",
++    "_Error",
++}
++#: Renderers that describe a validation error from its structure.
++_SAFE_RENDERERS = {
++    "exception_text",
++    "safe_exc_info",
++    "safe_traceback_text",
++    "describe_exception",
++    "sanitize_auth_diagnostic",
++    "_sanitize_error",
++    "describe_argument_error",
++    "describe_schema_error",
++    "describe_model_error",
++    "type",
++    "isinstance",
++}
++#: Callees that receive an exception and do not render its text, each read:
++_NON_RENDERING_CALLEES = {
++    # auth.py: parses a JSON-RPC elicitation payload out of `args[0]` and
++    # returns structured URLs; never returns or logs the exception's text.
++    "parse_url_elicitation_error",
++    # manager.py: a boolean predicate over the message.
++    "_is_protocol_version_initialize_error",
++    # manager.py: hands the exception to the awaiting connect caller, whose
++    # own `except` is checked here like any other.
++    "set_exception",
++    # policy.py: renders its `error` argument with `exception_text`.
++    "_warn_unparseable",
++    # scoped_advisor_audit.py (#296): records path and keyword only.
++    "record_rejected_arguments",
++}
++#: Attributes of an exception that carry its text (or the value) themselves.
++_TEXT_ATTRIBUTES = {
++    "args",
++    "message",
++    "errors",
++    "json",
++    "instance",
++    "validator_value",
++    "context",
++    "cause",
++    "exceptions",
++    "__cause__",
++    "__context__",
++    "__traceback__",
++    "__str__",
++    "__repr__",
++}
++_TRACEBACK_RENDERERS = {
++    "format_exc",
++    "format_exception",
++    "print_exc",
++    "print_exception",
++}
++#: Functions that read an exception's text to parse it, and return no text:
++_NON_RENDERING_FUNCTIONS = {
++    # auth.py: looks for a JSON-RPC -32042 payload in `args[0]` / `str()`
++    # and returns structured `UrlElicitationInfo` (URLs the server sent).
++    "parse_url_elicitation_error",
++}
++
++
++def _sink_sources() -> list[Path]:
++    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
++    return [
++        path
++        for path in sorted(root.rglob("*.py"))
++        if not any(
++            part in ("cli.py", "cli_commands", "__main__.py", "baml_client")
++            for part in path.relative_to(root).parts
++        )
++        and path.name != "argument_errors.py"
++    ]
++
++
++def _caught_names(node: Any) -> set[str]:
++    import ast
++
++    if node is None:
++        return {"<bare>"}
++    if isinstance(node, ast.Tuple):
++        return set().union(*(_caught_names(item) for item in node.elts))
++    if isinstance(node, ast.Attribute):
++        return {node.attr}
++    if isinstance(node, ast.Name):
++        return {node.id}
++    return {"<expression>"}
++
++
++def _exception_sinks(source: str, label: str) -> list[str]:
++    """Every use of an exception that could render a validation error's text
++    without going through a renderer above. An exception name is: an
++    `except` clause's name, if the clause can catch a `ValidationError`; a
++    name assigned `<task>.exception()`; a name narrowed by
++    `isinstance(name, Exception|BaseException)`; and any alias of those."""
++    import ast
++
++    tree = ast.parse(source)
++    for function in ast.walk(tree):
++        if (
++            isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef))
++            and function.name in _NON_RENDERING_FUNCTIONS
++        ):
++            function.body = [ast.Pass()]
++    parents = {
++        child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)
++    }
++    found: list[str] = []
++    scopes: list[tuple[list[ast.stmt], set[str]]] = []
++    for node in ast.walk(tree):
++        if isinstance(node, ast.ExceptHandler) and node.name:
++            if _caught_names(node.type) & (
++                _CATCHES_VALIDATION | {"<bare>", "<expression>"}
++            ):
++                scopes.append((node.body, {node.name}))
++        elif isinstance(node, ast.If):
++            test = node.test
++            if (
++                isinstance(test, ast.Call)
++                and getattr(test.func, "id", None) == "isinstance"
++                and isinstance(test.args[0], ast.Name)
++                and _caught_names(test.args[1]) & {"Exception", "BaseException"}
++            ):
++                scopes.append((node.body, {test.args[0].id}))
++        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++            names = {
++                target.id
++                for stmt in ast.walk(node)
++                if isinstance(stmt, ast.Assign)
++                and isinstance(stmt.value, ast.Call)
++                and isinstance(stmt.value.func, ast.Attribute)
++                and stmt.value.func.attr == "exception"
++                and not stmt.value.args
++                for target in stmt.targets
++                if isinstance(target, ast.Name)
++            }
++            if names:
++                scopes.append((node.body, names))
++    for body, names in scopes:
++        module = ast.Module(body=body, type_ignores=[])
++        # Aliases (`last_error = e`) are exception names too.
++        for stmt in ast.walk(module):
++            if (
++                isinstance(stmt, ast.Assign)
++                and isinstance(stmt.value, ast.Name)
++                and stmt.value.id in names
++            ):
++                names |= {t.id for t in stmt.targets if isinstance(t, ast.Name)}
++        for use in ast.walk(module):
++            if not (
++                isinstance(use, ast.Name)
++                and use.id in names
++                and isinstance(use.ctx, ast.Load)
++            ):
++                continue
++            parent = parents.get(use)
++            if isinstance(parent, ast.keyword):
++                parent = parents.get(parent)
++            if isinstance(parent, ast.Call):
++                callee = getattr(parent.func, "id", None) or getattr(
++                    parent.func, "attr", None
++                )
++                if callee in _SAFE_RENDERERS | _NON_RENDERING_CALLEES:
++                    continue
++            elif isinstance(
++                parent, (ast.Raise, ast.Compare, ast.BoolOp, ast.If, ast.UnaryOp)
++            ):
++                continue
++            elif isinstance(parent, ast.Assign) and parent.value is use:
++                continue
++            elif (
++                isinstance(parent, ast.Attribute)
++                and parent.attr not in _TEXT_ATTRIBUTES
++            ):
++                continue
++            found.append(f"{label}:{use.lineno}: {type(parent).__name__} uses {use.id}")
++    for call in ast.walk(tree):
++        if not isinstance(call, ast.Call):
++            continue
++        callee = getattr(call.func, "attr", None) or getattr(call.func, "id", None)
++        if callee == "exception" and (call.args or call.keywords):
++            found.append(f"{label}:{call.lineno}: logger.exception renders a traceback")
++        if callee in _TRACEBACK_RENDERERS:
++            found.append(f"{label}:{call.lineno}: traceback.{callee}")
++        for keyword in call.keywords:
++            if keyword.arg == "exc_info" and not (
++                isinstance(keyword.value, ast.Call)
++                and getattr(keyword.value.func, "id", None) == "safe_exc_info"
++            ):
++                found.append(
++                    f"{label}:{call.lineno}: exc_info= not through safe_exc_info"
++                )
++    return found
++
++
++def test_no_exception_reaches_text_except_through_the_renderer() -> None:
++    """Static half of the class (rev 2): every place `src/pmcp` (bar the
++    operator's CLI) turns an exception that may be a `ValidationError` into
++    text -- a response, a log line, a traceback, an audit or health field --
++    goes through `exception_text` / `safe_exc_info` or another renderer
++    above. The dynamic sweeps below exercise the reachable ones."""
++    sources = _sink_sources()
++    assert len(sources) > 40, len(sources)
++    found = [
++        sink
++        for path in sources
++        for sink in _exception_sinks(path.read_text(), str(path.name))
++    ]
++    assert found == [], "\n".join(found)
++
++
++@pytest.mark.parametrize(
++    "snippet",
++    [
++        "try:\n    f()\nexcept Exception as e:\n    log(f'{e}')\n",
++        "try:\n    f()\nexcept ValueError as e:\n    x = str(e)\n",
++        "try:\n    f()\nexcept Exception as e:\n    logger.warning('%s', e)\n",
++        "try:\n    f()\nexcept Exception as e:\n    y = e.args[0]\n",
++        "try:\n    f()\nexcept Exception as e:\n    last = e\n    out(last)\n",
++        "try:\n    f()\nexcept Exception:\n    logger.error('x', exc_info=True)\n",
++        "try:\n    f()\nexcept Exception:\n    logger.exception('x')\n",
++        "def g(t):\n    exc = t.exception()\n    log(f'{exc}')\n",
++        "def g(r):\n    if isinstance(r, Exception):\n        log(f'{r}')\n",
++        "import traceback\ntraceback.format_exc()\n",
++    ],
++)
++def test_the_sink_scanner_flags_each_shape(snippet: str) -> None:
++    """The static check is only as wide as its rules: each rule fires."""
++    assert _exception_sinks(snippet, "snippet"), snippet
++
++
++def test_the_sink_scanner_passes_the_renderers() -> None:
++    clean = (
++        "try:\n    f()\nexcept Exception as e:\n"
++        "    log(f'{exception_text(e)}', exc_info=safe_exc_info(e))\n"
++        "    if e.code == 1:\n        raise\n    raise X() from e\n"
++        "try:\n    f()\nexcept KeyError as e:\n    log(f'{e}')\n"
++    )
++    assert _exception_sinks(clean, "clean") == []
++
++
++# --- downstream data, through the real handlers (rev 2, board finding B1) ------
++#
++# A downstream server's payload is validated by pmcp's own models
++# (`McpTaskInfo` for every task payload; `ToolInfo`/`ResourceInfo`/
++# `PromptInfo`/`PromptArgumentInfo` for listings). The handlers that catch the
++# failure used to render `str(e)` -- pydantic text with `input_value` -- into
++# the response, the log and the audit-event buffer `gateway.health` exposes.
++# Only the transport is replaced here: `ClientManager._send_request`.
++
++_DOWNSTREAM = "svc"
++
++
++def _payload_keys(function: Any) -> list[str]:
++    """Every literal key `function` reads from a mapping it is handed:
++    `x.get("k")`, `x["k"]`, and `helper(x, "k")` -- derived from its source,
++    so a new field the parser reads is swept without editing this test."""
++    import ast
++    import inspect
++    import textwrap
++
++    tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
++    keys: set[str] = set()
++    for node in ast.walk(tree):
++        if isinstance(node, ast.Call):
++            if (
++                isinstance(node.func, ast.Attribute)
++                and node.func.attr == "get"
++                and node.args
++                and isinstance(node.args[0], ast.Constant)
++                and isinstance(node.args[0].value, str)
++            ):
++                keys.add(node.args[0].value)
++            if (
++                len(node.args) == 2
++                and isinstance(node.args[1], ast.Constant)
++                and isinstance(node.args[1].value, str)
++            ):
++                keys.add(node.args[1].value)
++        elif (
++            isinstance(node, ast.Subscript)
++            and isinstance(node.slice, ast.Constant)
++            and isinstance(node.slice.value, str)
++        ):
++            keys.add(node.slice.value)
++    return sorted(keys)
++
++
++def _bad_values(s: str) -> dict[str, Any]:
++    return {
++        "string": s,
++        "object": {s: s, "k": [s]},
++        "array": [s, {s: s}],
++        "number-in-object": {"n": 7, s: [s]},
++    }
++
++
++def _task_positions() -> list[tuple[str, str]]:
++    """(payload key, bad-value shape) pairs the real task parser rejects with
++    a `ValidationError` -- found by running it, not by listing fields."""
++    from pmcp.client.manager import ClientManager
++
++    manager = ClientManager()
++    keys = _payload_keys(ClientManager._task_info_from_payload)
++    assert {"ttl", "pollInterval", "createdAt", "status"} <= set(keys), keys
++    positions = []
++    for key in keys:
++        for shape, value in _bad_values(_SENTINELS[0]).items():
++            payload = (
++                {"taskId": "t", key: value}
++                if key not in ("taskId", "task_id")
++                else {key: value}
++            )
++            try:
++                manager._task_info_from_payload(payload)
++            except ValidationError:
++                positions.append((key, shape))
++    assert len(positions) > 10, positions
++    return positions
++
++
++def _task_server(
++    tmp_path: Path, *, audited: bool
++) -> tuple[GatewayServer, Path | None, dict]:
++    """A server whose one downstream (`svc`) is task-capable and answers every
++    request with `state["payload"]` as its task."""
++    from unittest.mock import MagicMock
++
++    from pmcp.client.manager import ManagedClient
++    from pmcp.config.loader import make_tool_id
++    from pmcp.types import (
++        LocalMcpServerConfig,
++        ResolvedServerConfig,
++        RiskHint,
++        ServerStatus,
++        ServerStatusEnum,
++        ToolInfo,
++    )
++
++    server, audit_path = _server(tmp_path, audited=audited)
++    # The scoped policy allows two research servers; this one stands in.
++    policy = server._policy_manager
++    policy.is_server_allowed = lambda name: True  # type: ignore[method-assign]
++    policy.is_tool_allowed = lambda tool_id: True  # type: ignore[method-assign]
++    manager = server._client_manager
++    tool = ToolInfo(
++        tool_id=make_tool_id(_DOWNSTREAM, "run"),
++        server_name=_DOWNSTREAM,
++        tool_name="run",
++        description="run",
++        short_description="run",
++        input_schema={"type": "object", "properties": {}},
++        execution={"taskSupport": "required"},
++        tags=["svc"],
++        risk_hint=RiskHint.LOW,
++    )
++    manager._tools[tool.tool_id] = tool
++    status = ServerStatus(
++        name=_DOWNSTREAM,
++        status=ServerStatusEnum.ONLINE,
++        tool_count=1,
++        server_capabilities={"tasks": {"listChanged": True}},
++        protocol_version="2025-11-25",
++    )
++    manager._clients[_DOWNSTREAM] = ManagedClient(
++        config=ResolvedServerConfig(
++            name=_DOWNSTREAM,
++            source="custom",
++            config=LocalMcpServerConfig(command="svc"),
++        ),
++        is_remote=True,
++        write_stream=MagicMock(),
++        status=status,
++    )
++    manager._servers[_DOWNSTREAM] = status
++    state: dict[str, Any] = {"payload": {}, "methods": []}
++
++    async def send_request(managed: Any, method: str, params: Any, **_: Any) -> Any:
++        state["methods"].append(method)
++        payload = state["payload"]
++        if method == "tasks/list":
++            return {"tasks": [payload]}
++        if method == "tasks/result":
++            return {"task": payload, "result": {"content": []}}
++        return {"task": payload}
++
++    manager._send_request = send_request  # type: ignore[method-assign]
++    return server, audit_path, state
++
++
++def _task_calls() -> list[tuple[str, dict[str, Any], str]]:
++    """(gateway tool, arguments, downstream method) for every gateway tool
++    that parses a downstream task payload."""
++    target = {"server_name": _DOWNSTREAM, "task_id": "t"}
++    return [
++        ("gateway.tasks_list", {"server_name": _DOWNSTREAM}, "tasks/list"),
++        ("gateway.tasks_get", target, "tasks/get"),
++        ("gateway.tasks_result", target, "tasks/result"),
++        ("gateway.tasks_cancel", target, "tasks/cancel"),
++        (
++            "gateway.invoke",
++            {
++                "tool_id": f"{_DOWNSTREAM}::run",
++                "task": {"enabled": True},
++                **_correlations(),
++            },
++            "tools/call",
++        ),
++    ]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("audited", [False, True], ids=["plain", "scoped-audit"])
++async def test_no_downstream_value_reaches_a_response_log_or_audit(
++    tmp_path: Path,
++    caplog: pytest.LogCaptureFixture,
++    capfd: pytest.CaptureFixture[str],
++    recwarn: pytest.WarningsRecorder,
++    audited: bool,
++) -> None:
++    caplog.set_level(logging.DEBUG)
++    server, audit_path, state = _task_server(tmp_path, audited=audited)
++    tap = _Tap(server, audit_path, caplog, capfd, recwarn)
++    positions = _task_positions()
++    parser = server._client_manager._task_info_from_payload
++
++    def rejects(key: str, value: Any) -> bool:
++        try:
++            parser({"taskId": "t", "status": "working", key: value})
++        except ValidationError:
++            return True
++        return False
++
++    rejected = expected = 0
++    for name, arguments, method in _task_calls():
++        for key, shape in positions:
++            for family, sentinels in _FAMILIES.items():
++                # A value the parser accepts (a digits-only `createdAt` is a
++                # number) is downstream data pmcp returns by design, not a
++                # rejection; only rejected values are this sweep's subject.
++                if not all(rejects(key, _bad_values(s)[shape]) for s in sentinels):
++                    continue
++                expected += 1
++                seen = []
++                for s in sentinels:
++                    state["payload"] = {
++                        "taskId": "t",
++                        "status": "working",
++                        key: _bad_values(s)[shape],
++                    }
++                    state["methods"].clear()
++                    server._client_manager._tasks.clear()
++                    if method == "tasks/cancel":
++                        # Cancel asks downstream only for a live, known task.
++                        server._client_manager._record_task(
++                            _DOWNSTREAM, McpTaskInfo(task_id="t", status="working")
++                        )
++                    mark = tap.start()
++                    result = await _call(server, name, arguments)
++                    response = "".join(block.text for block in result.content)
++                    observed = tap.since(mark, response)
++                    assert method in state["methods"], (name, state["methods"])
++                    assert observed.leaks(s) == [], (name, key, shape, family, observed)
++                    seen.append(observed)
++                # No vacuous pass: the payload was rejected, and said so.
++                assert re.search(
++                    r"validation errors? for McpTaskInfo: \$", seen[0].response
++                ), (
++                    name,
++                    key,
++                    seen[0].response,
++                )
++                assert not seen[0].differs(seen[1]), (
++                    name,
++                    key,
++                    shape,
++                    family,
++                    seen[0].differs(seen[1]),
++                )
++                assert _event_shape(seen[0].events) == _event_shape(seen[1].events)
++                rejected += 1
++    assert rejected == expected > len(_task_calls()) * len(positions), (
++        rejected,
++        expected,
++    )
++    # What `gateway.health` exposes (the audit-event buffer, among the rest).
++    health = "".join(
++        block.text for block in (await _call(server, "gateway.health", {})).content
++    )
++    await server.shutdown()
++    assert "audit_events" in health
++    for sentinels in _FAMILIES.values():
++        for s in sentinels:
++            assert not any(form in health for form in _forbidden(s))
++
++
++def _listing_parsers() -> list[tuple[str, Any, dict[str, Any], str | None]]:
++    """(label, real parser, a valid entry, the nested list its keys may also
++    sit in) for every downstream listing pmcp parses into its own models."""
++    from pmcp.client import manager
++
++    return [
++        (
++            "tools",
++            lambda entries: manager._parse_tool_entries("svc", entries, 100),
++            {"name": "t", "inputSchema": {"type": "object"}},
++            None,
++        ),
++        (
++            "resources",
++            lambda entries: manager._parse_resource_entries("svc", entries),
++            {"uri": "x://r"},
++            None,
++        ),
++        (
++            "prompts",
++            lambda entries: manager._parse_prompt_entries("svc", entries),
++            {"name": "p", "arguments": [{"name": "a"}]},
++            "arguments",
++        ),
++    ]
++
++
++@pytest.mark.parametrize("label", ["tools", "resources", "prompts"])
++def test_no_downstream_listing_value_reaches_the_log(
++    label: str,
++    caplog: pytest.LogCaptureFixture,
++    capfd: pytest.CaptureFixture[str],
++    recwarn: pytest.WarningsRecorder,
++) -> None:
++    """The listing parsers skip an entry pmcp's model rejects and log why."""
++    from pmcp.client import manager
++
++    caplog.set_level(logging.DEBUG)
++    function = {
++        "tools": manager._parse_tool_entries,
++        "resources": manager._parse_resource_entries,
++        "prompts": manager._parse_prompt_entries,
++    }[label]
++    _, parse, valid, nested = next(p for p in _listing_parsers() if p[0] == label)
++    keys = [key for key in _payload_keys(function) if key]
++    tap = _Tap(typing.cast(Any, MagicMockServer()), None, caplog, capfd, recwarn)
++
++    def rejection(entry: dict[str, Any]) -> BaseException | None:
++        """What the real parser raised for `entry` (its `except` hands it to
++        `describe_exception`, recorded here and rendered as its type only)."""
++        with mock.patch.object(
++            manager, "describe_exception", side_effect=lambda exc: type(exc).__name__
++        ) as seen:
++            parse([entry])
++        return seen.call_args.args[0] if seen.call_args else None
++
++    rejected = 0
++    for key in keys:
++        for into_nested in [False, True] if nested else [False]:
++            for shape in _bad_values(_SENTINELS[0]):
++
++                def build(s: str) -> dict[str, Any]:
++                    entry = copy.deepcopy(valid)
++                    target = entry[nested][0] if into_nested else entry
++                    target[key] = _bad_values(s)[shape]
++                    return entry
++
++                # This sweep's subject is a validation error's text. An entry
++                # whose identity is unusable is skipped earlier, by
++                # `_required_identity`, and logged with `_entry_label` -- the
++                # downstream entry itself, by design (see the plan's
++                # Non-goals); an accepted value is indexed by design.
++                if not all(
++                    isinstance(rejection(build(s)), ValidationError)
++                    for sentinels in _FAMILIES.values()
++                    for s in sentinels
++                ):
++                    continue
++                for family, sentinels in _FAMILIES.items():
++                    pair = []
++                    for s in sentinels:
++                        mark = tap.start()
++                        parse([build(s)])
++                        observed = tap.since(mark, "")
++                        assert observed.leaks(s) == [], (
++                            label,
++                            key,
++                            shape,
++                            family,
++                            observed,
++                        )
++                        assert "validation error" in observed.log, observed.log
++                        pair.append(observed)
++                    assert pair[0].stable() == pair[1].stable(), (
++                        label,
++                        key,
++                        shape,
++                        family,
++                    )
++                rejected += 1
++    # No vacuous pass: pmcp's own model rejected some of the generated fields.
++    assert rejected > 3, (label, rejected)
++
++
++class MagicMockServer:
++    """A stand-in with no gateway tools, for `_Tap` outside a server."""
++
++    _gateway_tools = None
 ````
 
-### Patch — `test_scoped_advisor_audit` (`tests/test_scoped_advisor_audit.py`)
+### Patch — `tests/test_gateway_tool_schemas.py`
+
+````diff
+diff --git a/tests/test_gateway_tool_schemas.py b/tests/test_gateway_tool_schemas.py
+index e6ddeb9..94456d8 100644
+--- a/tests/test_gateway_tool_schemas.py
++++ b/tests/test_gateway_tool_schemas.py
+@@ -435,16 +435,20 @@ async def _call_through_gate(name: str, arguments: dict[str, Any]) -> Any:
+ @pytest.mark.parametrize(
+     ("name", "arguments", "fragment"),
+     [
+-        ("gateway.describe", {"tool_id": ""}, "should be non-empty"),
++        (
++            "gateway.describe",
++            {"tool_id": ""},
++            "$.tool_id: must be at least 1 character",
++        ),
+         (
+             "gateway.submit_feedback",
+             {"title": "short", "description": "d"},
+-            "is too short",
++            "$.title: must be at least 8 characters",
+         ),
+         (
+             "gateway.tasks_result",
+             {"server_name": "s", "task_id": "t", "options": {"max_output_chars": 5}},
+-            "less than the minimum",
++            "$.options.max_output_chars: must be greater than or equal to",
+         ),
+     ],
+ )
+````
+
+### Patch — `tests/test_scoped_advisor_audit.py`
 
 ````diff
 diff --git a/tests/test_scoped_advisor_audit.py b/tests/test_scoped_advisor_audit.py
@@ -2609,85 +5282,11 @@ index 138e06a..d2133be 100644
 +    assert "caller_marker" not in audit_path.read_text()
 ````
 
-### Patch — `test_gateway_tool_schemas` (`tests/test_gateway_tool_schemas.py`)
-
-````diff
-diff --git a/tests/test_gateway_tool_schemas.py b/tests/test_gateway_tool_schemas.py
-index e6ddeb9..94456d8 100644
---- a/tests/test_gateway_tool_schemas.py
-+++ b/tests/test_gateway_tool_schemas.py
-@@ -435,16 +435,20 @@ async def _call_through_gate(name: str, arguments: dict[str, Any]) -> Any:
- @pytest.mark.parametrize(
-     ("name", "arguments", "fragment"),
-     [
--        ("gateway.describe", {"tool_id": ""}, "should be non-empty"),
-+        (
-+            "gateway.describe",
-+            {"tool_id": ""},
-+            "$.tool_id: must be at least 1 character",
-+        ),
-         (
-             "gateway.submit_feedback",
-             {"title": "short", "description": "d"},
--            "is too short",
-+            "$.title: must be at least 8 characters",
-         ),
-         (
-             "gateway.tasks_result",
-             {"server_name": "s", "task_id": "t", "options": {"max_output_chars": 5}},
--            "less than the minimum",
-+            "$.options.max_output_chars: must be greater than or equal to",
-         ),
-     ],
- )
-````
-
-### Patch — `CHANGELOG` (`CHANGELOG.md`)
-
-````diff
-diff --git a/CHANGELOG.md b/CHANGELOG.md
-index 6ee53d7..a326c0b 100644
---- a/CHANGELOG.md
-+++ b/CHANGELOG.md
-@@ -383,6 +383,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
- 
- 
- ### Fixed
-+- **A rejected gateway-tool argument no longer echoes its value into the response, the log or the scoped audit (Consiliency/pmcp#297).** Both validation layers rendered the value that failed: the input-schema gate returned jsonschema's message (`Input validation error: 'Bearer sk-…' is not of type 'object', 'null'`), and an argument model's pydantic error — returned as `str(e)[:400]` and logged as `Tool execution error: …` — carried `input_value=…` (the full value for `InvokeInput`'s correlation-ID charset check and a non-dict `meta`, a truncated repr of the whole argument dict for the all-or-none correlation check). Rejections are now described from their structure, as `<JSON path>: <reason>` — e.g. `Input validation error: $.options: must be of type object or null`, `Invalid arguments: $.run_correlation_id: correlation IDs may contain only alphanumerics and ._:-` — where the reason is a fixed phrase filled only from the tool's own schema or model (a type, a length, a pattern, the allowed values) and a key the caller chose is shown as `*`. The log line is `Tool execution error: invalid arguments for <tool>: <same description>`; a validation error from anything else a handler parses (a downstream payload) reads `Validation error: …` and is described the same way. **Wording change:** the text after `Input validation error: ` is no longer jsonschema's message; a client matching on phrases such as `is not of type` or `is too short` must match the new form. A call rejected by the tool's argument model (not the gate) is now recorded in the scoped audit as an `audit.rejection` like a gate rejection, with `rejected_argument_validator: null`, instead of an `audit.invocation` `failure` that copied its unvalidated correlation fields. An unregistered tool name is no longer written to the log (`Tool execution error: unknown gateway tool`); the response still names it. `gateway.provision_status` validates its arguments before its catch-all, which logged a traceback of the validation error.
- - **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values (Consiliency/pmcp#296).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name, `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.
- - **`sanitize_auth_diagnostic` does its keyword and URL-punctuation work in linear time.** The keyword rule now runs through `pmcp.keyword_matcher` (the same matches as the regular expression it replaces, pinned by a seeded corpus), and trailing punctuation is split off a URL in one pass. Output is unchanged.
- - **Gateway tool `inputSchema`s are now derived from the pydantic models that validate the arguments, so the two can no longer disagree (Consiliency/pmcp#236).** Constraints the models always enforced are now advertised and enforced at the transport gate — `minLength` on identifiers, `submit_feedback.title` 8–160 chars, bounds on `tasks_result.options` — so those rejections now come back as an `isError` tool result reading `Input validation error: …` instead of an `{"error": true}` payload. `gateway.invoke` now advertises `task`, `trace_context` and `_meta`; `gateway.tasks_*` advertise `requestor_context`; `tasks_result.options` gains `timeout_ms`. Optional arguments are advertised as `type: [X, "null"]` and the transport gate now accepts an explicit `null` for them, as the handlers always did; 28 optional arguments (e.g. `catalog_search.query`, `invoke.options`, `auth_connect.credential`) were previously rejected at the gate when sent as `null`. The gate does not apply pydantic's lax coercion: values such as `1` for a boolean or `"5"` for an integer on the newly advertised `invoke.task` fields (`enabled`, `ttl`, `poll_interval`), which were previously accepted and coerced, are now rejected with `Input validation error: 1 is not of type 'boolean'`. `invoke.task.ttl` now advertises its range on both sides, so `1e20`, `-1e20` and `float(±2**63)` are rejected at the gate, and so is any integer outside [−2^63+1, 2^63−1] (including `-2**63` itself), which the handler previously accepted. `invoke.evidence_label_digest` now also advertises its exact length (64), so a digest with a trailing newline is rejected at the gate instead of by the handler. Inputs the gate now rejects that previously reached the handler were recorded in the scoped-advisor audit as `failure`; they are now recorded as `audit.rejection` events with `terminal_status: "invalid_arguments"` (see the Consiliency/pmcp#296 entry above). Unknown keys are still ignored in this release — see the following entry once B lands. Argument descriptions agents already saw are unchanged, except `gateway.update_server.force`, which now describes the task-aware behaviour; 19 previously undescribed arguments gain a description.
-````
-
-### Patch — `README` (`README.md`)
-
-````diff
-diff --git a/README.md b/README.md
-index 94542a3..f7145ea 100644
---- a/README.md
-+++ b/README.md
-@@ -1518,9 +1518,11 @@ supply `run_correlation_id`, `seat_correlation_id`, and a SHA-256
- tool/status/policy/result digests, and a hashed public-source reference—not raw
- URLs, queries, arguments, credentials, or result bodies—and ends with one
- fsynced completeness marker. A call whose arguments fail the tool's input schema
--is recorded as a separate `audit.rejection` event (`terminal_status:
--"invalid_arguments"`) carrying only the tool, the failing JSON path
--(caller-chosen keys shown as `null`) and the failing schema keyword. Only
-+or its argument model is recorded as a separate `audit.rejection` event
-+(`terminal_status: "invalid_arguments"`) carrying only the tool, the failing JSON
-+path (caller-chosen keys shown as `null`) and the failing schema keyword (`null`
-+for a model rejection). The rejection the caller sees, and the log line, name the
-+same path and a reason taken from the schema, never the rejected value. Only
- arguments that passed the tool's input schema, and only the top-level keys it
- declares, are read into any record; a call denied by policy records none of its
- arguments.
-````
-
 ## Measurement scripts
 
-Run from the repo root of the tree being measured (they import the test module).
+Run each from the repo root of the tree it measures. `probe.py` and `count_leaks.py` import the test module.
 
-### `probe.py` — the before/after probe (*Research summary*)
+### `probe.py` — rev 1's before/after probe
 
 ```python
 """Probe: which rejections echo a sentinel into the response or the log (main)."""
@@ -2763,7 +5362,7 @@ async def main():
 asyncio.run(main())
 ```
 
-### `count_leaks.py` — leak counts per layer and channel over the sweep's own cases
+### `count_leaks.py` — leak counts per layer and channel over the sweep's own cases (hex family)
 
 ```python
 """Run every sweep case once per server; count cases leaking per channel."""
@@ -2795,14 +5394,14 @@ async def main():
 asyncio.run(main())
 ```
 
-### `mutants.py` — the mutation run (*Mutation evidence*); `python mutants.py <worktree> <out-dir> [M4 ...]`
+### `mutants.py` — the mutation run; `python mutants.py <worktree> <out-dir> [M4 ...]`, `NO_STATIC=1` deselects the static guard
 
 ```python
 """Apply each mutant to a saved copy, run the tests, restore from the copy.
 
 usage: python mutants.py <worktree> <out-dir>
 """
-import filecmp, shutil, subprocess, sys
+import filecmp, os, shutil, subprocess, sys
 from pathlib import Path
 
 root, out = Path(sys.argv[1]), Path(sys.argv[2])
@@ -2811,21 +5410,34 @@ TESTS = ["tests/test_argument_error_echo.py", "tests/test_scoped_advisor_audit.p
          "tests/test_gateway_tool_schemas.py"]
 S = "src/pmcp/server.py"; A = "src/pmcp/argument_errors.py"; T = "src/pmcp/types.py"
 H = "src/pmcp/tools/handlers.py"; D = "src/pmcp/scoped_advisor_audit.py"
+U = "src/pmcp/auth.py"; C = "src/pmcp/client/manager.py"; I = "src/pmcp/manifest/installer.py"
 MUTANTS = [
  ("M1 gate renders e.message", S, [("+ describe_schema_error(e, tool.input_schema, arguments),", "+ e.message,")]),
- ("M2 except arm returns str(e)", S, [('"message": f"{kind}: {described}"', '"message": str(e)[:400]')]),
- ("M3 except arm logs str(e)", S, [("                        audited_name,\n                        described,\n", "                        audited_name,\n                        str(e),\n")]),
+ ("M2 except arm returns str(e)", S, [('"message": described[:400],', '"message": str(e)[:400],')]),
+ ("M3 except arm logs str(e)", S, [("                        audited_name,\n                        reason,\n", "                        audited_name,\n                        str(e),\n")]),
  ("M4 model rejection recorded as invocation", S, [("                    if rejected_by_model and tool is not None:\n", "                    if False:\n")]),
  ("M5 model loc not redacted", A, [("        elif type(segment) is str and segment in declared:\n", "        elif type(segment) is str:\n")]),
  ("M6 schema path not redacted", A, [("        elif isinstance(node, dict) and type(segment) is str and segment in declared:\n", "        elif isinstance(node, dict) and type(segment) is str:\n")]),
- ("M7 phrase may read ctx error", A, [('    {"min_length", "max_length", "pattern", "expected", "gt", "ge", "lt", "le"}\n', '    {"min_length", "max_length", "pattern", "expected", "gt", "ge", "lt", "le", "error"}\n'), ('    "missing": "is required",\n', '    "missing": "is required",\n    "value_error": "{error}",\n')]),
+ ("M7 phrase constraint from pydantic ctx", A, [("    items = error.errors(include_url=False, include_input=False, include_context=False)\n    parts = []\n", "    items = error.errors(include_url=False, include_input=False, include_context=True)\n    parts = []\n"), ("_model_phrase(item['type'], _schema_node_at(schema, loc))", "_model_phrase(item['type'], {'enum': [(item.get('ctx') or {}).get('expected')], 'minLength': (item.get('ctx') or {}).get('min_length'), 'exclusiveMinimum': (item.get('ctx') or {}).get('gt')})")]),
  ("M8 missing-required reads an instance key", A, [("    for name in required:\n        if isinstance(name, str) and name not in node:\n            return name\n    return None\n", "    return str(list(node)[-1])\n")]),
  ("M9 validator back to ValueError with value", T, [("            raise argument_error(CORRELATION_ID_CHARSET)\n", '            raise ValueError(f"correlation IDs may contain only alphanumerics and ._:-: {value}")\n')]),
- ("M10 provision_status validates inside its try", H, [("        parsed = ProvisionStatusInput.model_validate(input_data)\n        job_id = parsed.job_id\n        try:\n", "        try:\n            parsed = ProvisionStatusInput.model_validate(input_data)\n            job_id = parsed.job_id\n")]),
+ ("M10 provision_status validates inside its try", H, [("        parsed = ProvisionStatusInput.model_validate(input_data)\n        job_id = parsed.job_id\n        try:\n", "        try:\n            parsed = ProvisionStatusInput.model_validate(input_data)\n            job_id = parsed.job_id\n"), ("                job_id=job_id,\n                server=\"unknown\",", "                job_id=input_data.get(\"job_id\", \"unknown\"),\n                server=\"unknown\",")]),
  ("M11 unknown tool name logged", S, [('logger.error("Tool execution error: unknown gateway tool")', 'logger.error(f"Tool execution error: {e}")')]),
  ("M12 type phrase is e.message", A, [('        return f"must be of type {_type_names(constraint)}", None\n', "        return error.message, None\n")]),
- ("M13 model phrase is pydantic msg", A, [("f\"{_model_phrase(item['type'], item.get('ctx'))}\"", "f\"{item['msg']}\"")]),
+ ("M13 model phrase is pydantic msg", A, [("f\"{path}: {_model_phrase(item['type'], _schema_node_at(schema, loc))}\"", "f\"{path}: {item['msg']}\"")]),
  ("M14 audit model path from input", D, [("                argument_path = model_error_path(error, schema, arguments)\n", "                argument_path = [str(i.get('input')) for i in error.errors()]\n")]),
+ ("M15 sanitize_auth_diagnostic uses str(value)", U, [("    raw = exception_text(value) if isinstance(value, BaseException) else str(value)\n", "    raw = str(value)\n")]),
+ ("M16 describe_exception leaf uses str(leaf)", C, [('        f"{type(leaf).__name__}: {exception_text(leaf)}"\n', '        f"{type(leaf).__name__}: {leaf}"\n')]),
+ ("M17 exception_text skips validation errors", A, [("    if _is_validation_error(error):\n        return _validation_text(error)\n    text = str(error)\n", "    text = str(error)\n")]),
+ ("M18 safe_exc_info always returns the error", A, [("    if any(_is_validation_error(linked) for linked in _chain(error)):\n        return None\n    return error\n", "    return error\n")]),
+ ("M19 tasks_get response uses str(e)", H, [("            return TasksGetOutput(ok=False, errors=[self._sanitize_error(e)])\n", "            return TasksGetOutput(ok=False, errors=[str(e)])\n")]),
+ ("M20 tasks_get audit buffer uses str(e)", H, [("                task_id=parsed.task_id,\n                error=exception_text(e),\n            )\n            return TasksGetOutput(ok=False", "                task_id=parsed.task_id,\n                error=str(e),\n            )\n            return TasksGetOutput(ok=False")]),
+ ("M21 exception_text ignores an embedded validation error", A, [("            if embedded and embedded in text:\n", "            if False:\n")]),
+ ("M22 installer crash message uses raw exc (static guard)", I, [('job.error = f"Monitor task crashed: {exception_text(exc)}"', 'job.error = f"Monitor task crashed: {exc}"')]),
+ ("S5 value in a log extra= field", S, [("                        audited_name,\n                        reason,\n                    )\n", "                        audited_name,\n                        reason,\n                        extra={'args_dump': repr(arguments)},\n                    )\n")]),
+ ("S6 arguments printed to stderr", S, [("                    reason = describe_model_error(e, tool.input_schema, arguments)\n", "                    reason = describe_model_error(e, tool.input_schema, arguments)\n                    print(arguments, file=sys.stderr)\n")]),
+ ("S7 arguments in warnings.warn", S, [("                    reason = describe_model_error(e, tool.input_schema, arguments)\n", "                    reason = describe_model_error(e, tool.input_schema, arguments)\n                    __import__('warnings').warn(str(arguments))\n")]),
+ ("S8 echo only isalpha values", S, [("+ describe_schema_error(e, tool.input_schema, arguments),", "+ describe_schema_error(e, tool.input_schema, arguments) + ''.join(' ' + v for v in arguments.values() if isinstance(v, str) and v.isalpha()),")]),
 ]
 ONLY = sys.argv[3:]
 for label, rel, edits in MUTANTS:
@@ -2840,7 +5452,8 @@ for label, rel, edits in MUTANTS:
         text = text.replace(old, new)
     path.write_text(text)
     log = out / (label.split()[0] + ".log")
-    r = subprocess.run([str(root / ".venv/bin/python"), "-m", "pytest", *TESTS, "-q", "-p", "no:cacheprovider", "-x", "--tb=line"],
+    extra = ["--deselect", "tests/test_argument_error_echo.py::test_no_exception_reaches_text_except_through_the_renderer"] if os.environ.get("NO_STATIC") else []
+    r = subprocess.run([str(root / ".venv/bin/python"), "-m", "pytest", *TESTS, "-q", "-p", "no:cacheprovider", "-x", "--tb=line", *extra],
                        cwd=root, capture_output=True, text=True)
     log.write_text(r.stdout + r.stderr)
     shutil.copy2(saved, path)
@@ -2849,5 +5462,66 @@ for label, rel, edits in MUTANTS:
     first = next((l for l in lines if l.startswith(("E ", "/")) and ("Error" in l or "assert" in l)), "")
     summary = next((l for l in reversed(lines) if " passed" in l or " failed" in l), "")
     print(f"{label}: applied=yes exit={r.returncode} | {summary.strip()} | {first.strip()[:230]}")
+```
+
+### `codemod.py` — how the 82 mechanical sinks were rewritten (provenance; the patches above are authoritative)
+
+```python
+"""Route mechanical exception-to-text sinks through exception_text / safe_exc_info."""
+import ast, sys, re
+from pathlib import Path
+
+CATCHES = {"Exception", "BaseException", "ValueError", "ValidationError", "_Error", "<bare>", "?"}
+SAFE = {"exception_text", "safe_exc_info", "describe_exception", "sanitize_auth_diagnostic", "_sanitize_error", "type", "isinstance", "describe_argument_error", "describe_schema_error", "describe_model_error", "safe_traceback_text"}
+LOGF = {"debug", "info", "warning", "error", "critical", "exception", "log"}
+
+def caught(t):
+    if t is None: return {"<bare>"}
+    if isinstance(t, ast.Tuple): return set().union(*(caught(x) for x in t.elts))
+    if isinstance(t, ast.Attribute): return {t.attr}
+    if isinstance(t, ast.Name): return {t.id}
+    return {"?"}
+
+def edit(path):
+    src = path.read_text(); lines = src.split("\n"); tree = ast.parse(src)
+    parents = {c: p for p in ast.walk(tree) for c in ast.iter_child_nodes(p)}
+    reps = []  # (lineno, col, end_col, new)
+    needs = set()
+    for h in ast.walk(tree):
+        if not isinstance(h, ast.ExceptHandler) or not h.name or not (caught(h.type) & CATCHES): continue
+        for node in ast.walk(ast.Module(body=h.body, type_ignores=[])):
+            if not (isinstance(node, ast.Name) and node.id == h.name and isinstance(node.ctx, ast.Load)): continue
+            p = parents.get(node)
+            if isinstance(p, ast.FormattedValue):
+                reps.append((node.lineno, node.col_offset, node.end_col_offset, f"exception_text({h.name})")); needs.add("exception_text")
+                if p.conversion in (ord("r"), ord("s")):
+                    reps.append(("conv", node.lineno, node.end_col_offset))
+            elif isinstance(p, ast.Call) and getattr(p.func, "id", None) == "str" and len(p.args) == 1:
+                reps.append((p.lineno, p.col_offset, p.end_col_offset, f"exception_text({h.name})")); needs.add("exception_text")
+            elif isinstance(p, ast.Call) and isinstance(p.func, ast.Attribute) and p.func.attr in LOGF and node in p.args[1:]:
+                reps.append((node.lineno, node.col_offset, node.end_col_offset, f"exception_text({h.name})")); needs.add("exception_text")
+        for node in ast.walk(ast.Module(body=h.body, type_ignores=[])):
+            if isinstance(node, ast.Call):
+                for k in node.keywords:
+                    if k.arg == "exc_info" and isinstance(k.value, ast.Constant) and k.value.value is True:
+                        reps.append((k.value.lineno, k.value.col_offset, k.value.end_col_offset, f"safe_exc_info({h.name})")); needs.add("safe_exc_info")
+    # apply right-to-left per line
+    conv = {(r[1], r[2]) for r in reps if r[0] == "conv"}
+    reps = sorted({r for r in reps if r[0] != "conv"}, key=lambda r: (r[0], -r[1]))
+    for ln, c, e, new in reps:
+        line = lines[ln - 1]
+        tail = line[e:]
+        if (ln, e) in conv:
+            tail = re.sub(r"^![rs]", "", tail)
+        lines[ln - 1] = line[:c] + new + tail
+    if needs:
+        path.write_text("\n".join(lines))
+    return len(reps), needs
+
+root = Path(sys.argv[1])
+for path in sorted(root.rglob("*.py")):
+    if any(s in str(path) for s in ("cli.py", "cli_commands", "__main__.py", "baml_client", "argument_errors.py")): continue
+    n, needs = edit(path)
+    if n: print(path, n, sorted(needs))
 ```
 
