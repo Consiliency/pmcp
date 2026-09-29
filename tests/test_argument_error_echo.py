@@ -622,8 +622,10 @@ async def test_a_validation_error_raised_by_a_handler_is_described_not_echoed(
         )
         for form in _forbidden(s):
             assert form not in text and form not in log, form
-        assert payload["message"].startswith(_MODEL_PREFIX), text
-        assert "invalid arguments for gateway.catalog_search" in log
+        # Not catalog_search's own argument model: a validation error, not
+        # "invalid arguments".
+        assert payload["message"].startswith("Validation error: $"), text
+        assert "validation error for gateway.catalog_search: $" in log
         texts.append(text)
         logs.append(
             "\n".join(

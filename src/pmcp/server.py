@@ -487,15 +487,27 @@ class GatewayServer:
                     )
                 ]
             except Exception as e:
-                # An argument model's `ValidationError` renders `input_value=...`
-                # and a validator's own message; describe it from its structure
-                # instead, in the log and the response (Consiliency/pmcp#297).
+                # A `ValidationError`'s text renders the rejected value
+                # (pydantic's `input_value=...`, a validator's own message,
+                # jsonschema's `message`); describe it from its structure
+                # instead, in the log, the response and the audit
+                # (Consiliency/pmcp#297). The tool's own argument model
+                # rejecting the call is "invalid arguments"; any other (a
+                # downstream payload a handler parses) is a "validation error".
+                input_model = GATEWAY_TOOL_INPUT_MODELS.get(audited_name or "")
+                rejected_by_model = (
+                    isinstance(e, pydantic.ValidationError)
+                    and input_model is not None
+                    and e.title == input_model.__name__
+                )
                 described = describe_argument_error(
                     e, tool.input_schema if tool is not None else None, arguments
                 )
+                kind = "Invalid arguments" if rejected_by_model else "Validation error"
                 if described is not None:
                     logger.error(
-                        "Tool execution error: invalid arguments for %s: %s",
+                        "Tool execution error: %s for %s: %s",
+                        kind.lower(),
                         audited_name,
                         described,
                     )
@@ -512,17 +524,10 @@ class GatewayServer:
                         and e.code == ErrorCode.E402_TOOL_DENIED
                         else "failure"
                     )
-                    # The tool's own argument model rejected the call: like a
-                    # gate rejection it is an `audit.rejection` (tool, path,
-                    # nothing the caller sent), not an invocation whose
-                    # correlations nothing vouched for (Consiliency/pmcp#297).
-                    input_model = GATEWAY_TOOL_INPUT_MODELS.get(audited_name or "")
-                    if (
-                        isinstance(e, pydantic.ValidationError)
-                        and tool is not None
-                        and input_model is not None
-                        and e.title == input_model.__name__
-                    ):
+                    if rejected_by_model and tool is not None:
+                        # Like a gate rejection: an `audit.rejection` (tool,
+                        # path, nothing the caller sent), not an invocation
+                        # whose correlations nothing vouched for.
                         if self._scoped_advisor_audit is not None:
                             self._scoped_advisor_audit.record_rejected_arguments(
                                 gateway_tool=tool.name,
@@ -556,7 +561,7 @@ class GatewayServer:
                         text=json.dumps(
                             {
                                 "error": True,
-                                "message": f"Invalid arguments: {described}"
+                                "message": f"{kind}: {described}"
                                 if described is not None
                                 else str(e)[:400],
                             }
