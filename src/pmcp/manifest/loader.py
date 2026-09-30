@@ -702,15 +702,26 @@ def _parse_version_pin(name: str, raw: Any, field_label: str) -> str | None:
     if isinstance(raw, str) and is_valid_package_version(raw) and "+" not in raw:
         return raw
     # What happens to an EARLIER pin depends on the field, never on a value
-    # (Consiliency/pmcp#322, N1): an overlay's `server_version` only patches
-    # the entry, so an earlier pin stands; a `version:` rides on a whole
-    # `servers:` entry, which replaced the earlier entry and any pin with it.
+    # (Consiliency/pmcp#322). The merge order decides it: sources apply in
+    # order (shipped, user, project, PMCP_MANIFEST_PATH); within one source
+    # `servers:` entries replace whole entries first, then `server_version`
+    # patches apply; every pin is materialised once, after the last source.
+    # So an overlay's `server_version` leaves an earlier pin in place unless a
+    # `servers:` entry in this or a later source replaced the entry, or a
+    # later source set another pin; a `version:` rides on a whole `servers:`
+    # entry, which replaced the earlier entry and any pin with it, so only
+    # this source's `server_version` or a later source can pin it again.
     if field_label == "server_version":
-        consequence = "a pin from an earlier source, if any, stands"
+        consequence = (
+            "any pin from an earlier source stands, unless a 'servers:' entry "
+            "for this server in this or a later source replaced it, or a later "
+            "source set another pin"
+        )
     else:
         consequence = (
             "the whole entry that carries it replaced any earlier pin, so the "
-            "server is unpinned unless a later 'server_version' pins it"
+            "server is unpinned unless this source's 'server_version' or a "
+            "later source pins it"
         )
     logger.warning(
         f"Ignoring a '{field_label}' pin for {_server_label(name)}: a version "

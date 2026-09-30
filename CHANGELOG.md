@@ -403,15 +403,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Version pinning: the invalid-pin warning now names the right consequence, and the
-  README says when `[PINNED]` becomes `[FAILED]`.** A refused `server_version` still
-  says a pin from an earlier source, if any, stands. A refused `version:` now says its
-  whole entry replaced any earlier pin, so the server is unpinned unless a later
-  `server_version` pins it; previously it claimed an earlier pin stood even when a later
-  `servers:` entry had replaced it. The text is still fixed, with no pin values. The
-  README now also says that `pmcp update` prints `[FAILED] … Could not determine a registry
-  package` for a pinned server when the gateway's own environment sets any `npm_config_*`
-  variable or `NODE_OPTIONS`, which turns off package detection for the whole process;
-  nothing is moved, and the pin is still in every argv. See
+  README says when `[PINNED]` becomes `[FAILED]`.** The warning used to say "a pin from an
+  earlier source, if any, stands" for every refused pin, which was false whenever a
+  `servers:` entry replaced the server. The text now follows the loader's merge order, and
+  is still fixed, with no pin values.
+  - A refused `server_version` says any earlier pin stands, unless a `servers:` entry for
+    that server in the same or a later source replaced it, or a later source set another
+    pin.
+  - A refused `version:` says its whole entry replaced any earlier pin, so the server is
+    unpinned unless that source's `server_version` or a later source pins it.
+
+  The README now lists all three cases in which `pmcp update` prints `[FAILED] … Could not
+  determine a registry package` for a pinned server:
+  - the entry sets an npm setting;
+  - the gateway's own environment sets any `npm_config_*` variable or `NODE_OPTIONS`,
+    which turns off package detection for the whole process;
+  - the directory the gateway runs in, or any directory above it, contains a
+    `package.json` or a `node_modules` directory.
+
+  Nothing is moved in any of these cases, and the pin is still in every argv. See
   [Consiliency/pmcp#322](https://github.com/Consiliency/pmcp/issues/322) and
   [Consiliency/pmcp#294](https://github.com/Consiliency/pmcp/issues/294).
 - **`tools/call` input-schema rejections are now recorded in the scoped-advisor audit, without argument values (Consiliency/pmcp#296).** A call the transport gate rejects used to return `Input validation error: …` before the audit was reached, so an operator saw no attempt at all. It is now written as a new `audit.rejection` event (not an `audit.invocation`: nothing was invoked, and a reader that correlates invocations to a run skips it) with the tool name, `terminal_status: "invalid_arguments"`, `rejected_argument_path`, the failing location as a JSON array (a key the schema declares, an array index, or `null` for a key the caller chose, since that key can itself be a secret), and `rejected_argument_validator`, the failing JSON Schema keyword (`type`, `pattern`, `required`, …). The record never contains the validation message, the rejected value, correlation IDs, or any digest of the arguments. The capability stays `scoped_advisor_audit.v1`; readers that dispatch on `event` are unaffected. Policy is now judged **before** the schema: a call to a policy-blocked gateway tool is refused with "Gateway tool blocked by policy" and recorded `denied` whatever its arguments, instead of getting an `Input validation error` that described the blocked tool's schema. If the audit sink has failed, a malformed call now gets "Scoped advisor audit channel failed" like every other call, instead of its validation error. The response to a rejected call from an allowed tool is unchanged. An `audit.invocation` record now reads nothing the schema gate did not vouch for: a call refused by policy, or made to an unregistered name, is recorded `denied` with every argument-derived field (`run_correlation_id`, `seat_correlation_id`, `downstream_tool_id`, `evidence_label_digest`, `source_reference_hash`) `null`, a result digest that no longer covers the caller's tool name, and a `gateway_tool_digest` of the registered name (for an unregistered name, of nothing) — previously a correlation-shaped value or a public URL anywhere in such a call's arguments was copied or hashed into the audit. Every other invocation record reads only the top-level arguments the tool's schema declares, so a correlation-shaped key a tool does not declare (e.g. `run_correlation_id` on `gateway.describe`) is no longer recorded; `gateway.invoke` declares every field the record reads, so its records are unchanged.

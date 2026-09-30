@@ -1131,10 +1131,15 @@ server_version:
 or `version: "3.25.5"` on a whole `servers:` entry. pmcp writes the pin into the server's
 args and every install argv, keeping the package name. It must be one exact version: a
 range, a dist-tag such as `latest`, build metadata or a package spec is ignored with a
-warning. What happens to an earlier pin depends on where the bad pin sits. A bad
-`server_version` only patches the entry, so a pin from an earlier source, if any, stands. A
-bad `version:` rides on a whole `servers:` entry, which replaced the earlier entry and any
-pin with it, so the server is unpinned unless a later `server_version` pins it.
+warning. What happens to an earlier pin depends on where the bad pin sits. Sources apply in
+order (shipped, user, project, `PMCP_MANIFEST_PATH`), and within one source `servers:`
+entries replace whole entries before `server_version` patches apply.
+- **A bad `server_version`:** any pin from an earlier source stands, unless a `servers:`
+  entry for this server in this or a later source replaced it, or a later source set
+  another pin.
+- **A bad `version:`:** it rides on a whole `servers:` entry, which replaced the earlier
+  entry and any pin with it. So the server is unpinned unless this source's
+  `server_version` or a later source pins it.
 `server_version: {name: null}` sets nothing; to remove a pin, delete its line.
 
 Only npx servers whose package slot is a plain registry name (`pkg`, `pkg@1.2.3`,
@@ -1152,11 +1157,18 @@ The pin fixes the npm spec; npm resolves it in your own environment (your `.npmr
 cache, and a `node_modules` in the directory pmcp runs in; a `.npmrc` there can also set
 the npm keys allowed next to a pin). `gateway.update_server` does not move a pinned server.
 `pmcp update` shows it as `[PINNED]` with the version you wrote, except when npm
-configuration is set where pmcp cannot see past it. That happens when the entry itself sets
-an npm setting such as `npm_config_loglevel`, or when the gateway process's own environment
-sets any `npm_config_*` variable (for example an exported `npm_config_cache`) or
-`NODE_OPTIONS`, which turns off package detection for the whole process. In either case it prints `[FAILED] … Could not determine a
-registry package`, and still moves nothing: the pin is still in every argv.
+configuration is set where pmcp cannot see past it. That happens in three cases:
+- the entry itself sets an npm setting such as `npm_config_loglevel`;
+- the gateway process's own environment sets any `npm_config_*` variable (for example an
+  exported `npm_config_cache`) or `NODE_OPTIONS`, which turns off package detection for
+  the whole process;
+- the directory the gateway runs in, or any directory above it, contains a `package.json`
+  or a `node_modules` directory (npm would then read that project's `.npmrc` or run a
+  local bin). This covers running pmcp from inside a Node project, or anywhere under a
+  directory tree with a `node_modules` higher up.
+
+In each case it prints `[FAILED] … Could not determine a registry package`, and still moves
+nothing: the pin is still in every argv.
 
 ### Adding Custom Servers
 
