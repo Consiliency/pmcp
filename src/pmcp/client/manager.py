@@ -229,15 +229,33 @@ _PARSE_ERROR = -32700
 _PARSE_ERROR_MESSAGE = "downstream sent a response that could not be parsed"
 _MALFORMED_ERROR_MESSAGE = "downstream sent a malformed JSON-RPC error"
 
-#: A stdio line that starts a JSON-RPC message: an object, or a batch of
-#: objects. The reader logs a line it cannot parse raw only when it is NOT
-#: this shape -- the downstream's own non-protocol output (Consiliency/pmcp#297,
-#: rev 8). A banner or log line such as `[INFO] ...` is not this shape.
-_JSON_RPC_SHAPED = re.compile(rb"\s*(?:\{|\[\s*\{)")
+#: JSON's insignificant whitespace, plus a byte-order mark, which `json`
+#: rejects at position 0 ("Unexpected UTF-8 BOM") on an otherwise valid frame.
+_JSON_LEAD = " \t\r\n\ufeff"
 
 
-def _is_json_rpc_shaped(line: bytes) -> bool:
-    return _JSON_RPC_SHAPED.match(line) is not None
+def _is_downstream_output(text: str, error: BaseException) -> bool:
+    """Whether a stdio line the parser rejected is the downstream's own
+    output (a banner, a log line), which is logged as it is -- as opposed to
+    a frame: JSON that is malformed or hits a parser limit, whose content is
+    the downstream's data and is never logged (Consiliency/pmcp#297, rev 8).
+
+    The parser draws the line. It is output only when the parser rejected
+    its very first significant character on syntax, and that character does
+    not open a JSON object or array. Anything that began as JSON -- a syntax
+    error past the first token, or any limit (nesting depth, an integer's
+    digit count) -- is a frame.
+    """
+    body = text.lstrip(_JSON_LEAD)
+    if body[:1] in ("{", "["):
+        return False
+    start = len(text) - len(body)
+    return (
+        getattr(error, "cause", None) == "JSONDecodeError"
+        and getattr(error, "lineno", None) == 1
+        and getattr(error, "colno", None) == start + 1
+        and not text[:start].count("\ufeff")
+    )
 
 
 def _downstream_error(error: Any) -> DownstreamError:
@@ -2920,12 +2938,11 @@ class ClientManager:
                     pending.future.set_result(message.get("result", {}))
         except json.JSONDecodeError as error:
             # Already counted as a heartbeat by the caller.
-            if _is_json_rpc_shaped(line):
-                # A frame that is JSON-shaped but rejected -- a syntax error,
-                # or a parser limit (nesting depth, an integer's digit count)
-                # on otherwise valid JSON -- is a protocol frame, and its
-                # content is the downstream's data, not its output: described,
-                # never echoed (Consiliency/pmcp#297, rev 8).
+            if not _is_downstream_output(text, error):
+                # A frame the parser rejected -- a syntax error, or a parser
+                # limit (nesting depth, an integer's digit count) on otherwise
+                # valid JSON -- is the downstream's data, not its output:
+                # described, never echoed (Consiliency/pmcp#297, rev 8).
                 logger.debug(
                     f"[{name}] downstream sent a JSON-RPC frame that could not "
                     f"be parsed: {exception_text(error)}"

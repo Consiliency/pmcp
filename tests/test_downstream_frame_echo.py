@@ -369,16 +369,33 @@ _CLOSE_TIMEOUT = re.compile(
 _NON_JSON_PREFIX = "[frames] Non-JSON output: "
 
 
+def _is_output(line: str) -> bool:
+    """The test's own oracle for "the downstream's output, not a frame"
+    (rev 8): the real parser rejects the line's first significant character
+    on syntax, and that character opens no object or array and follows no
+    byte-order mark. Everything else began as JSON."""
+    body = line.lstrip(" \t\r\n\ufeff")
+    if body[:1] in ("{", "[") or "\ufeff" in line[: len(line) - len(body)]:
+        return False
+    try:
+        json.loads(line)
+    except json.JSONDecodeError as error:
+        return error.pos == len(line) - len(body)
+    except Exception:  # noqa: BLE001 -- a parser limit: it began as JSON
+        return False
+    return False
+
+
 def _non_json_line(record: logging.LogRecord) -> bool:
     """Exactly stdio's DEBUG line for a downstream's non-JSON output -- and
-    only for a line that is not JSON-RPC-shaped (rev 8): a JSON-shaped frame
-    the parser rejected is protocol data, and its record is never exempt."""
+    only for a line that is output by `_is_output` (rev 8): a frame the parser
+    rejected is the downstream's data, and its record is never exempt."""
     message = record.getMessage()
     return (
         record.name == "pmcp.client.manager"
         and record.levelno == logging.DEBUG
         and message.startswith(_NON_JSON_PREFIX)
-        and not re.match(r"\s*(?:\{|\[\s*\{)", message[len(_NON_JSON_PREFIX) :])
+        and _is_output(message[len(_NON_JSON_PREFIX) :])
         and not record.exc_info
     )
 
@@ -675,18 +692,22 @@ def _rejected_frames(s: str) -> list[tuple[str, bytes]]:
         ("depth", frame[:-1] + ',"d":' + "[" * 1500 + "0" + "]" * 1500 + "}")
     )
     variants.append(("digits", frame[:-1] + ',"n":' + "7" * 5000 + "}"))
+    # Codex's shapes without an object around them, and PR 321's bare array:
+    variants.append(("bare-depth", "[" * 1500 + json.dumps(s) + "]" * 1500))
+    variants.append(("bare-digits", "7" * 5000 + " " + json.dumps(s)))
+    variants.append(("scalar-then-data", "42 " + json.dumps(s)))
     out: list[tuple[str, bytes]] = []
     for label, text in variants:
         for prefix, suffix, shape in (
             ("", "", "object"),
             ("  ", "", "indented"),
             ("[", "]", "batch"),
+            ("\ufeff", "", "bom"),
         ):
             line = prefix + text + suffix
-            # The class is JSON-RPC-SHAPED lines: an object, or a batch of
-            # objects. A variant that lost its opening brace is not one; it
-            # is indistinguishable from the downstream's own output.
-            if not re.match(r"\s*(?:\{|\[\s*\{)", line):
+            # The class is every line that began as JSON; a line the parser
+            # rejects at its first significant character is output.
+            if _is_output(line):
                 continue
             try:
                 json.loads(line)
@@ -729,6 +750,10 @@ def test_no_rejected_json_rpc_frame_reaches_the_log(
         "digits",
         "batch",
         "indented",
+        "bom",
+        "bare-depth",
+        "bare-digits",
+        "scalar-then-data",
     ):
         assert kind in labels, kind
     described = 0
@@ -747,10 +772,21 @@ def test_no_rejected_json_rpc_frame_reaches_the_log(
     spelled = json.dumps(s)[1:-1].encode("ascii")
     carrying = [label for label, line in frames if spelled in line]
     assert described == len(frames) and len(carrying) > 100, (described, len(frames))
-    # The boundary: a non-JSON-RPC-shaped line is logged as it is, by design.
+    # The boundary, both ways. Output -- the parser rejects the first
+    # character, and it opens nothing -- is logged as it is, by design; a
+    # line that opens like JSON is described even if it is a log line.
     start = len(caplog.records)
-    manager._handle_stdout_line("srv", managed, f"[INFO] {s}".encode(), time.time())
+    manager._handle_stdout_line(
+        "srv", managed, f"server ready {s}".encode(), time.time()
+    )
     assert any(
-        r.getMessage() == f"[srv] Non-JSON output: [INFO] {s}"
+        r.getMessage() == f"[srv] Non-JSON output: server ready {s}"
         for r in caplog.records[start:]
     )
+    for described_line in (f"[INFO] {s}", f"\ufeffready {s}"):
+        start = len(caplog.records)
+        manager._handle_stdout_line(
+            "srv", managed, described_line.encode(), time.time()
+        )
+        text = "\n".join(_record_text(r) for r in caplog.records[start:])
+        assert not any(form in text for form in forbidden), (described_line, text)
