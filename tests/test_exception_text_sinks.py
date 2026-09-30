@@ -154,10 +154,7 @@ def _sources() -> list[Path]:
     return [
         path
         for path in sorted(root.rglob("*.py"))
-        if not any(
-            part in ("baml_client",)
-            for part in path.relative_to(root).parts
-        )
+        if not any(part in ("baml_client",) for part in path.relative_to(root).parts)
         and path.name != "argument_errors.py"
     ]
 
