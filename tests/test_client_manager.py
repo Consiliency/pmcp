@@ -7198,3 +7198,223 @@ async def test_cleanup_client_resets_outbound_queue_so_stale_frames_are_not_rede
     stale = [f for f in written if f.get("id") in (900, 901, 902)]
     assert stale == [], f"stale frames redelivered to the new generation: {stale}"
     assert old_queue is not managed.outbound
+
+
+# --- Consiliency/pmcp#287: the handshake-failure teardown path ---------------
+
+
+def _live_drain_outbound_tasks() -> list[asyncio.Task[Any]]:
+    """Every not-yet-finished `_drain_outbound` task on the running loop."""
+    return [
+        t
+        for t in asyncio.all_tasks()
+        if not t.done()
+        and getattr(t.get_coro(), "__qualname__", "").endswith("_drain_outbound")
+    ]
+
+
+def _handshake_that_starts_a_writer_then_fails(
+    mgr: ClientManager, started: list[asyncio.Task[None]]
+) -> Any:
+    """A `_send_initialize` stand-in: answer a server->client `ping` (which
+    starts the outbound writer, as a real peer pinging during `initialize`
+    would), wait until the writer is live, then fail the handshake."""
+
+    async def _send_initialize(managed: ManagedClient) -> None:
+        mgr._reply_to_downstream_request(managed.config.name, managed, 1, "ping")
+        await eventually(
+            lambda: managed.outbound_writer is not None,
+            timeout=2.0,
+            interval=0.005,
+            message="writer never started",
+        )
+        assert managed.outbound_writer is not None
+        started.append(managed.outbound_writer)
+        await asyncio.sleep(0.01)  # let it park in queue.get / a stalled sink
+        raise RuntimeError("handshake failed")
+
+    return _send_initialize
+
+
+@pytest.mark.asyncio
+async def test_outbound_writer_does_not_survive_failed_stdio_handshake() -> None:
+    mgr = ClientManager()
+    started: list[asyncio.Task[None]] = []
+    process = MagicMock()
+    process.returncode = None
+    process.stderr = None
+    process.stdin.write = MagicMock()
+    process.stdin.drain = _block  # stalled sink: the writer can never finish
+    captured: list[ManagedClient] = []
+
+    async def _read_stdout(name: str, managed: ManagedClient) -> None:
+        captured.append(managed)
+        await asyncio.Event().wait()
+
+    mgr._read_stdout = _read_stdout  # type: ignore[method-assign]
+    mgr._send_initialize = _handshake_that_starts_a_writer_then_fails(  # type: ignore[method-assign]
+        mgr, started
+    )
+    config = ResolvedServerConfig(
+        name="srv",
+        source="project",
+        config=LocalMcpServerConfig(command="fake", args=[]),
+    )
+    with (
+        patch("asyncio.create_subprocess_exec", AsyncMock(return_value=process)),
+        patch("pmcp.client.manager._terminate_process_tree", AsyncMock()),
+    ):
+        with pytest.raises(RuntimeError, match="handshake failed"):
+            await mgr._connect_stdio(config)
+
+    assert started, "the handshake stand-in never started a writer"
+    assert "srv" not in mgr._clients
+    assert started[0].done(), "outbound writer leaked past a failed stdio handshake"
+    assert _live_drain_outbound_tasks() == []
+    managed = captured[0]
+    assert managed.outbound is None, "outbound queue survived a failed handshake"
+    assert managed.outbound_writer is None, "writer ref survived a failed handshake"
+
+
+@pytest.mark.asyncio
+async def test_outbound_writer_does_not_survive_failed_remote_stream_handshake() -> (
+    None
+):
+    mgr = ClientManager()
+    started: list[asyncio.Task[None]] = []
+    write_stream = MagicMock()
+    write_stream.send = _block  # stalled sink: the writer can never finish
+
+    class _Transport:
+        async def __aenter__(self) -> tuple[Any, Any]:
+            return (MagicMock(), write_stream)
+
+        async def __aexit__(self, *exc_info: Any) -> None:
+            return None
+
+    captured: list[ManagedClient] = []
+
+    async def _read_sse(name: str, managed: ManagedClient, read_stream: Any) -> None:
+        captured.append(managed)
+        await asyncio.Event().wait()
+
+    mgr._read_sse = _read_sse  # type: ignore[method-assign]
+    mgr._send_initialize = _handshake_that_starts_a_writer_then_fails(  # type: ignore[method-assign]
+        mgr, started
+    )
+    mgr._close_remote_transport = AsyncMock()  # type: ignore[method-assign]
+    config = ResolvedServerConfig(
+        name="remote",
+        source="custom",
+        config=RemoteMcpServerConfig(
+            type="streamable-http", url="http://example.invalid/mcp"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="handshake failed"):
+        await mgr._connect_remote_stream(config, _Transport(), transport_name="test")
+
+    assert started, "the handshake stand-in never started a writer"
+    assert "remote" not in mgr._clients
+    assert started[0].done(), (
+        "outbound writer leaked past a failed remote-stream handshake"
+    )
+    assert _live_drain_outbound_tasks() == []
+    managed = captured[0]
+    assert managed.outbound is None, "outbound queue survived a failed handshake"
+    assert managed.outbound_writer is None, "writer ref survived a failed handshake"
+    # The transport owner is a separate, pre-existing concern; stop it so the
+    # test leaves nothing behind.
+    for t in list(mgr._background_tasks):
+        t.cancel()
+    await asyncio.gather(*mgr._background_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_outbound_writer_disconnect_server_resets_outbound_queue() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    managed.process.stdin.drain = _block  # type: ignore[assignment]
+    managed.process.returncode = 0
+    mgr._clients["srv"] = managed
+    mgr._servers["srv"] = managed.status
+    mgr._reply_to_downstream_request("srv", managed, 1, "ping")
+    await eventually(
+        lambda: managed.outbound_writer is not None,
+        timeout=2.0,
+        interval=0.005,
+        message="writer never started",
+    )
+    ok, _cancelled, _msg = await mgr.disconnect_server("srv", force=True)
+    assert ok
+    assert managed.outbound is None, "outbound queue survived disconnect_server"
+    assert managed.outbound_writer is None, "writer ref survived disconnect_server"
+
+
+def _pending(request_id: int) -> PendingRequest:
+    now = time.time()
+    return PendingRequest(
+        request_id=request_id,
+        server_name="srv",
+        tool_id="srv::t",
+        started_at=now,
+        last_heartbeat=now,
+        timeout_ms=30000,
+        future=asyncio.get_running_loop().create_future(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_non_string_method_does_not_resolve_pending() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    pending = _pending(7)
+    managed.pending_requests[7] = pending
+    for bad in (123, None, ["ping"], {"x": 1}):
+        line = json.dumps({"jsonrpc": "2.0", "id": 7, "method": bad}).encode()
+        mgr._handle_stdout_line("srv", managed, line, time.time())
+        assert not pending.future.done(), (
+            f"non-string method {bad!r} resolved our pending request"
+        )
+        assert 7 in managed.pending_requests, (
+            f"non-string method {bad!r} popped our pending request"
+        )
+    assert managed.outbound is None, "an invalid frame was answered"
+
+
+@pytest.mark.asyncio
+async def test_c01_sse_non_string_method_does_not_resolve_pending() -> None:
+    mgr = ClientManager()
+    sent: list[Any] = []
+    managed = _managed_remote("srv", sent)
+    managed.status.status = ServerStatusEnum.OFFLINE  # no reconnect on stream end
+    mgr._clients["srv"] = managed
+    pending = _pending(7)
+    managed.pending_requests[7] = pending
+    msgs = []
+    for bad in (123, None, ["ping"], {"x": 1}):
+        msg = MagicMock()
+        msg.message.model_dump.return_value = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": bad,
+        }
+        msgs.append(msg)
+
+    # Snapshot the state while the stream is still open: the loop's `finally`
+    # fails every pending request once the stream ends.
+    seen: dict[str, Any] = {}
+
+    async def stream() -> Any:
+        for m in msgs:
+            yield m
+        seen["done"] = pending.future.done()
+        seen["present"] = 7 in managed.pending_requests
+        seen["answered"] = managed.outbound is not None or bool(sent)
+
+    await mgr._read_sse("srv", managed, stream())
+    with contextlib.suppress(BaseException):
+        pending.future.exception()
+    assert seen["done"] is False, "non-string method resolved our pending request"
+    assert seen["present"] is True, "non-string method popped our pending request"
+    assert seen["answered"] is False, "an invalid frame was answered"

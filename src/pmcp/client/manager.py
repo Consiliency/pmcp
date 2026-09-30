@@ -1406,17 +1406,10 @@ class ClientManager:
 
             # Cancel the outbound writer explicitly (in addition to the
             # server-name sweep below), so teardown of this path does not
-            # depend on that sweep also matching it.
-            if managed.outbound_writer and not managed.outbound_writer.done():
-                managed.outbound_writer.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(managed.outbound_writer), timeout=1.0
-                    )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-                except Exception:
-                    pass
+            # depend on that sweep also matching it -- and reset
+            # `outbound`/`outbound_writer`, the same postcondition
+            # `_cleanup_client` holds (Consiliency/pmcp#287).
+            await self._teardown_outbound(managed, timeout=1.0)
 
             try:
                 if managed.is_remote:
@@ -2474,6 +2467,10 @@ class ClientManager:
                         await asyncio.shield(task)
                     except (asyncio.CancelledError, Exception):
                         pass
+            # A writer started before the handshake failed (e.g. a `ping`
+            # answered during `initialize`) must not survive this pop
+            # (Consiliency/pmcp#287).
+            await self._teardown_outbound(managed)
             await _terminate_process_tree(process, name)
             # Drop the stale ERROR client so it can't be found as a live
             # connection on the next connect attempt (issue: stale entry + leak).
@@ -2797,6 +2794,8 @@ class ClientManager:
                     await asyncio.shield(managed.read_task)
                 except (asyncio.CancelledError, Exception):
                     pass
+            # Same as the stdio handshake path (Consiliency/pmcp#287).
+            await self._teardown_outbound(managed)
             await self._close_remote_transport(name, managed)
             # Drop the stale ERROR client so it can't be found as a live
             # connection on the next connect attempt.
@@ -2856,6 +2855,17 @@ class ClientManager:
                 else:
                     # Server->client request: reply (ping -> {} else -32601).
                     self._reply_to_downstream_request(name, managed, msg_id, method)
+            elif "method" in message:
+                # A `method` that is present but not a string is not a valid
+                # JSON-RPC request -- and it is not a response either, so it
+                # must not fall through to the pending lookup, where an id
+                # colliding with one of ours would resolve that future with
+                # this frame's (absent) result. Drop it like any other
+                # unparseable line (Consiliency/pmcp#287).
+                logger.debug(
+                    f"[{name}] dropped invalid frame: non-string method "
+                    f"({type(message['method']).__name__})"
+                )
             elif msg_id is not None and msg_id in managed.pending_requests:
                 pending = managed.pending_requests.pop(msg_id)
 
@@ -3080,6 +3090,14 @@ class ClientManager:
                         self._handle_downstream_notification(name, managed, method)
                     else:
                         self._reply_to_downstream_request(name, managed, msg_id, method)
+                elif "method" in payload:
+                    # Non-string `method`: invalid, never a response -- drop it
+                    # rather than consult the pending table, as the stdio path
+                    # does (Consiliency/pmcp#287).
+                    logger.debug(
+                        f"[{name}] dropped invalid frame: non-string method "
+                        f"({type(payload['method']).__name__})"
+                    )
                 elif msg_id is not None and msg_id in managed.pending_requests:
                     pending = managed.pending_requests.pop(msg_id)
 
@@ -3150,6 +3168,41 @@ class ClientManager:
                 f"[{name}] failed to write outbound frame "
                 f"{payload.get('method') or payload.get('id')}: {describe_exception(e)}"
             )
+
+    async def _teardown_outbound(
+        self, managed: ManagedClient, *, timeout: float | None = None
+    ) -> None:
+        """Cancel a client's outbound writer and reset its outbound path.
+
+        The postcondition every teardown path owes (Consiliency/pmcp#287): no
+        live `_drain_outbound` task, and `managed.outbound` /
+        `managed.outbound_writer` both None. `_cleanup_client` states it inline;
+        `disconnect_server` and the handshake-failure paths of `_connect_stdio`
+        and `_connect_remote_stream` share it here. Before this, a writer
+        started during a failed handshake (a server->client `ping` answered
+        before `initialize` completed) survived the except-path pop, because
+        that path cancelled only the read/stderr tasks and -- deliberately --
+        runs no server-name background-task sweep.
+
+        The refs are dropped BEFORE the await, so a concurrent
+        `_enqueue_outbound` during the wait lazily builds a fresh
+        queue + writer rather than having its new writer's ref overwritten
+        with None (which would orphan it). Never raises for a non-cancellation
+        failure.
+        """
+        writer = managed.outbound_writer
+        managed.outbound = None
+        managed.outbound_writer = None
+        if writer is None or writer.done():
+            return
+        writer.cancel()
+        try:
+            if timeout is None:
+                await asyncio.shield(writer)
+            else:
+                await asyncio.wait_for(asyncio.shield(writer), timeout=timeout)
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def _drain_outbound(self, managed: ManagedClient) -> None:
         """The one writer task per client: drain the bounded outbound queue.
