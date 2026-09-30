@@ -755,6 +755,40 @@ def install_log_scrubber() -> None:
     if not getattr(current, "pmcp_validation_scrubber", False):
         logging.setLogRecordFactory(_scrubbing_factory(current))
     _install_excepthook()
+    _install_handle_error()
+
+
+def _install_handle_error() -> None:
+    """A handler whose ``emit`` raises makes ``logging.Handler.handleError``
+    print "--- Logging error ---" and the exception it is handling, chain and
+    all, to stderr -- past every scrub, and while an ``except`` block for a
+    validation or parse error is active that chain holds it (rev 6; rev 3
+    listed it as unverified). Such a chain is printed by
+    :func:`safe_traceback_text`; everything else by the original method.
+    Idempotent."""
+    original = logging.Handler.handleError
+    if getattr(original, "pmcp_validation_scrubber", False):
+        return
+
+    def handle_error(self: logging.Handler, record: logging.LogRecord) -> None:
+        error = sys.exc_info()[1]
+        if not isinstance(error, BaseException) or safe_exc_info(error) is not None:
+            original(self, record)
+            return
+        if not logging.raiseExceptions or sys.stderr is None:
+            return
+        try:
+            sys.stderr.write(
+                "--- Logging error ---\n"
+                + safe_traceback_text(error)
+                + f"Message: {scrub_record(record).msg!r}\n"
+            )
+        except OSError:  # pragma: no cover - stderr closed, as the original
+            pass
+
+    handle_error.pmcp_validation_scrubber = True  # type: ignore[attr-defined]
+    handle_error.original = original  # type: ignore[attr-defined]
+    logging.Handler.handleError = handle_error  # type: ignore[method-assign]
 
 
 def _install_excepthook() -> None:

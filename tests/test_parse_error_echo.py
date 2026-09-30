@@ -410,3 +410,40 @@ def test_parse_text_names_only_format_class_and_position() -> None:
             exception_text(error)
             == "could not parse JSON (JSONDecodeError) at line 1, column 7"
         )
+
+
+def test_a_failing_log_handler_prints_no_input(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """A handler whose `emit` raises while an `except` block for a parse
+    error is active: `logging.Handler.handleError` prints the active chain to
+    stderr. pmcp's wrapper prints it structurally."""
+    import yaml
+
+    import pmcp  # noqa: F401 -- installs the scrubber, excepthook and handleError
+
+    class _Broken(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            # As every stdlib handler does: a failing emit calls handleError.
+            try:
+                raise OSError("disk gone")
+            except Exception:
+                self.handleError(record)
+
+    s = _FAMILIES["hex"][1]
+    logger = logging.getLogger("pmcp.test.broken")
+    handler = _Broken()
+    logger.addHandler(handler)
+    try:
+        capfd.readouterr()
+        try:
+            yaml.safe_load(f"servers: [{s}}}")
+        except yaml.YAMLError:
+            logger.error("could not load")
+        err = capfd.readouterr().err
+    finally:
+        logger.removeHandler(handler)
+    assert "--- Logging error ---" in err
+    assert "could not parse YAML (ParserError)" in err, err
+    assert "OSError: disk gone" in err, err
+    assert not any(form in err for form in _forbidden(s)), err
