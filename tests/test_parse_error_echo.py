@@ -783,6 +783,45 @@ def test_a_thread_prints_no_input(tmp_path: Path) -> None:
     assert silent.stderr.count("Exception in thread") == 1, silent.stderr
 
 
+@pytest.mark.parametrize("origin", ["yaml", "pydantic"])
+def test_an_uncaught_chain_prints_no_input(tmp_path: Path, origin: str) -> None:
+    """``sys.excepthook`` prints an uncaught exception's chain. Since rev 7 a
+    pmcp parse failure chains nothing, so this pins the wrapper on the
+    chains that still can hold a value: a parser's own error raised outside
+    ``pmcp.parsing`` and a pydantic ``ValidationError`` (the rev 7 mutation
+    run found M34, "no excepthook", surviving without it)."""
+    s = _FAMILIES["token"][1]
+    raise_inner = {
+        "yaml": "    import yaml\n    yaml.safe_load(sys.argv[1])\n",
+        "pydantic": (
+            "    import pydantic\n"
+            "    pydantic.TypeAdapter(int).validate_python(sys.argv[1])\n"
+        ),
+    }[origin]
+    script = (
+        "import sys, pmcp\n"
+        "try:\n" + raise_inner + "except Exception as e:\n"
+        "    raise RuntimeError('boom') from e\n"
+    )
+    arg = f"servers: [{s}}}" if origin == "yaml" else s
+    result = subprocess.run(
+        [sys.executable, "-c", script, arg],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=tmp_path,
+    )
+    assert result.returncode == 1, result.stderr
+    assert "Traceback (most recent call last)" in result.stderr, result.stderr
+    assert "RuntimeError: boom" in result.stderr, result.stderr
+    expected = {
+        "yaml": "yaml.parser.ParserError: could not parse YAML (ParserError)",
+        "pydantic": "pydantic_core._pydantic_core.ValidationError: 1 validation error",
+    }[origin]
+    assert expected in result.stderr, result.stderr
+    assert not any(form in result.stderr for form in _forbidden(s)), result.stderr
+
+
 def test_an_uncaught_error_with_no_stderr_prints_nothing(tmp_path: Path) -> None:
     """The default excepthook is silent when ``sys.stderr`` is None; so is
     pmcp's wrapper (rev 7 nit), instead of raising AttributeError."""
