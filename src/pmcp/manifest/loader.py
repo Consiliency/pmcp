@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import re
@@ -9,6 +10,7 @@ import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from collections.abc import Iterable
 from typing import Any, Literal, cast
 
 import yaml
@@ -16,8 +18,132 @@ import yaml
 from pmcp.argument_errors import exception_text
 from pmcp.parsing import load_yaml
 from pmcp.project_consent import log_refusal, read_and_gate
+from pmcp.validation import (
+    NPM_FILE_TYPE_RE,
+    is_valid_package_version,
+    parse_package_spec,
+)
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=1)
+def _shipped_manifest_entries() -> dict[str, dict[str, Any]]:
+    """pmcp's OWN shipped ``manifest.yaml``, read directly.
+
+    Never through ``load_manifest``, which applies overlays: no user, project
+    or ``$PMCP_MANIFEST_PATH`` overlay can add a name or a declared key here.
+    The file ships with pmcp and does not change under a running process.
+    """
+    path = Path(__file__).parent / "manifest.yaml"
+    try:
+        shipped = load_yaml(path.read_bytes(), source="shipped manifest")
+        servers = (shipped or {}).get("servers") or {}
+    except (OSError, yaml.YAMLError, AttributeError):
+        return {}
+    return {
+        name: entry
+        for name, entry in servers.items()
+        if isinstance(name, str) and isinstance(entry, dict)
+    }
+
+
+def _server_label(name: object) -> str:
+    """How a version-pin log line names a server (Consiliency/pmcp#294 piece 1).
+
+    A name pmcp's SHIPPED manifest defines is shown; any other name is an
+    overlay's own key, which could be anything an operator pasted (a token),
+    so it is never shown. No grammar decides this: only the shipped list does.
+    """
+    if isinstance(name, str) and name in _shipped_manifest_entries():
+        return f"server '{name}'"
+    return "an overlay server (name not shown)"
+
+
+def _shipped_declared_keys(name: str) -> frozenset[str]:
+    """The env keys pmcp's SHIPPED manifest declares for *name*: its
+    ``env_var`` and its ``api_key_optional_when`` relaxers. An overlay's
+    declarations exempt nothing."""
+    entry = _shipped_manifest_entries().get(name) or {}
+    keys: set[str] = set()
+    if isinstance(entry.get("env_var"), str):
+        keys.add(entry["env_var"])
+    relaxers = entry.get("api_key_optional_when") or []
+    if isinstance(relaxers, list):
+        keys.update(k for k in relaxers if isinstance(k, str))
+    return frozenset(keys)
+
+
+# Env keys an entry may put in the child's environment without changing what
+# npm fetches or runs (an ALLOWLIST: every other key -- `npm_config_package`,
+# `npm_config_registry`, `NODE_OPTIONS`, `NODE_PATH`, `PATH`, `HOME`,
+# `PREFIX`, `XDG_*`, `nvm_*`, a proxy, a CA file, an unknown name -- may).
+# Locale, terminal and colour keys change how output looks, never what runs.
+_NPM_INERT_ENV_KEYS = frozenset(
+    {"LANG", "LANGUAGE", "TERM", "TZ", "NO_COLOR", "FORCE_COLOR"}
+)
+_NPM_INERT_ENV_PREFIXES = ("LC_",)
+# npm config keys (as npm reads them from `npm_config_*`, any case) that change
+# output, logging, network timing or the install prompt, never which package
+# or version runs. `cache` is NOT here: npx runs a cached package on its
+# package.json's word (Consiliency/pmcp#295 board, round 5).
+_NPM_CONFIG_KEYS_THAT_CANNOT_REDIRECT = frozenset(
+    {
+        "loglevel",
+        "color",
+        "progress",
+        "timing",
+        "unicode",
+        "logs-dir",
+        "logs-max",
+        "fund",
+        "audit",
+        "update-notifier",
+        "yes",
+        "fetch-retries",
+        "fetch-retry-factor",
+        "fetch-retry-maxtimeout",
+        "fetch-retry-mintimeout",
+        "fetch-timeout",
+        "maxsockets",
+    }
+)
+
+
+def _npm_config_key(env_key: str) -> str:
+    """The config key npm reads from an ``npm_config_*`` variable: npm's own
+    ``loadEnv`` rule (``@npmcli/config``, npm 10 and 11) -- strip the prefix
+    case-insensitively; unless the rest starts with ``//``, replace every ``_``
+    except a leading one with ``-`` and lowercase."""
+    key = env_key[len("npm_config_") :]
+    if key.startswith("//"):
+        return key
+    return (key[:1] + key[1:].replace("_", "-")).lower()
+
+
+def npm_env_may_redirect(server_name: str, keys: Iterable[str]) -> bool:
+    """Could an entry-supplied env key change what npm runs for *server_name*?
+
+    True unless EVERY key is proven inert: declared by pmcp's shipped manifest
+    for this server, a locale/terminal key, or an npm logging/timing config
+    key. Values are not consulted: an empty value of a non-inert key still
+    changes npm's reading (an empty ``PATH`` searches the cwd).
+    """
+    declared = _shipped_declared_keys(server_name)
+    for key in keys:
+        key = str(key)
+        if key in declared:
+            continue
+        upper = key.upper()
+        if upper in _NPM_INERT_ENV_KEYS or upper.startswith(_NPM_INERT_ENV_PREFIXES):
+            continue
+        if key.lower().startswith("npm_config_") and (
+            _npm_config_key(key) in _NPM_CONFIG_KEYS_THAT_CANNOT_REDIRECT
+        ):
+            continue
+        return True
+    return False
+
 
 Platform = Literal["mac", "wsl", "linux", "windows"]
 ServerTransport = Literal["local", "remote", "sse", "http", "streamable-http"]
@@ -90,6 +216,12 @@ class ServerConfig:
     status: str | None = None
     source: str | None = None
     replacement: str | None = None
+    # The exact client version this entry runs (Consiliency/pmcp#294). Set by
+    # `version:` on an entry or by an overlay's `server_version:` patch, and
+    # materialised by `load_manifest` into the npx package slot of `args` and
+    # of every `install` argv. ``None`` means unpinned -- including a pin that
+    # was refused, so "version is set" always means "the argv is pinned".
+    version: str | None = None
 
 
 def credential_storage_key(server: Any) -> str | None:
@@ -555,6 +687,248 @@ def _parse_api_key_optional_when(
     return parsed
 
 
+def _parse_version_pin(name: str, raw: Any, field_label: str) -> str | None:
+    """Parse a client version pin, fail-soft and fail-closed.
+
+    One exact SemVer version (``is_valid_package_version``, the grammar the
+    provision gate already requires of an argv pin) or nothing. Refused, with
+    a warning: a range (``^3.25.5``, ``3.x``) and a dist-tag (``latest``) --
+    both re-resolve at every ``npx -y`` spawn, which is the drift a pin exists
+    to stop -- a ``v`` prefix, a YAML number, and anything carrying a package
+    name, whitespace or a flag. The value never names a package: the name is
+    always taken from the entry's own argv (see `_materialize_version_pin`).
+    """
+    if raw is None:
+        return None
+    # SemVer build metadata (the `+...` segment) is refused too: npm ignores it
+    # when resolving, so `3.25.5+x` would run 3.25.5 while every report echoed
+    # a label that names nothing (Consiliency/pmcp#295 board, N2).
+    if isinstance(raw, str) and is_valid_package_version(raw) and "+" not in raw:
+        return raw
+    logger.warning(
+        f"Ignoring a '{field_label}' pin for {_server_label(name)}: a version "
+        'pin must be one exact version such as "3.25.5" -- not a range, a '
+        'dist-tag such as "latest", build metadata (+...), a name npm reads as '
+        "a local tarball (.tgz/.tar/.tar.gz), or a package spec. This pin is "
+        "ignored (the value is not logged); a pin from an earlier source, if "
+        "any, stands"
+    )
+    return None
+
+
+# npm-package-arg's classification, restated as the ALLOWLIST a pin may
+# rewrite (Consiliency/pmcp#295 board rounds 1-2). npa decides a spec's class
+# in a fixed order, and only its final branch, `fromRegistry`, fetches `name`
+# from the registry; every earlier branch (URL, git, alias, file, directory,
+# hosted git) names something else. The plan's class table maps each branch to
+# the clause below that refuses it.
+#
+# npa `isFileType`, as `validation.NPM_FILE_TYPE_RE` defines it (reused, never
+# restated here): a selector -- or an UNSCOPED bare name -- matching it is a
+# tarball FILE to npm. npa checks it BEFORE the registry branch, so before
+# "is this a version" too: `1.0.0-x.tgz` is valid SemVer and still a file,
+# which is why the selector is tested before `is_valid_package_version`
+# (itself tarball-aware) is consulted (round 3, B1').
+_NPM_FILE_TYPE_RE = NPM_FILE_TYPE_RE
+# validate-npm-package-name's exclusionList, compared case-insensitively as it
+# does: npa refuses these as names (round 3, N-c).
+_NPM_EXCLUDED_NAMES = frozenset({"node_modules", "favicon.ico"})
+# A dist-tag: npa's registry branch accepts any encodeURIComponent-safe word
+# that is neither a version nor a range; this is the letter-led subset of it
+# (fullmatch, so no trailing newline).
+_TAG_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9._-]*")
+# A letter-led word npm may read as a VERSION or RANGE, not a tag: semver's
+# loose grammar allows ANY run of leading `v`/`=` (`[v=\s]*`), then a partial
+# version whose parts are numbers or x/X/* wildcards, then a loose prerelease
+# with or without a hyphen (`x`, `X.x`, `v1`, `vv1.2.3`, `vvX`, `v1.X.xbeta`).
+# Refused like every range: rewriting it would be harmless to package identity
+# (still `fromRegistry`), but a range is not the version-or-tag class a pin
+# replaces. Deliberately broad -- any tail -- so a real tag it also matches
+# (`xyz`) only loses its pin, with a warning (round 3, N-a).
+_PARTIAL_VERSION_WORD_RE = re.compile(
+    r"[vV=]*(?:[0-9]+|[xX*])(?:\.(?:[0-9]+|[xX*])){0,2}.*"
+)
+
+
+def split_plain_registry_spec(arg: str) -> tuple[str, str | None] | None:
+    """``(name, selector)`` if npm would fetch *arg* from the registry as
+    ``name`` at an exact version or a dist-tag; else ``None``.
+
+    Accepted: ``name`` (npa: registry range ``*``), ``name@<exact SemVer>``
+    (npa: ``version``) and ``name@<dist-tag>`` (npa: ``tag``). Refused, by
+    class: anything ``parse_package_spec`` rejects (URLs, aliases, git, paths,
+    flags: their name half is not a package name, or they have no name); an
+    unscoped name ending in a tarball suffix (npa: ``file``); a selector that
+    is not an exact version or a tag word (``:`` / ``/`` / ``~`` / ``.``-led
+    forms, i.e. alias, git, URL, file, directory, and every range); a tag word
+    ending in a tarball suffix (npa: ``file``); and a tag word that npm reads as
+    a version or range (``x``, ``v1``, ``vvX``); a SemVer-shaped selector that
+    ends in a tarball suffix (npa: ``file``, checked first); and the names
+    npm excludes (``node_modules``, ``favicon.ico``). Pure grammar: it never asks the
+    resolver, so it works while npm package identity is disabled.
+    """
+    try:
+        name, selector = parse_package_spec(arg)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    if not name.startswith("@") and _NPM_FILE_TYPE_RE.search(name):
+        return None
+    if name.lower() in _NPM_EXCLUDED_NAMES:
+        return None
+    if selector is None:
+        return name, None
+    # npa's order: `isFileType` on the selector BEFORE any registry reading, so
+    # a SemVer-shaped tarball (`3.25.5-corp.tgz`) is a file, not a version.
+    if _NPM_FILE_TYPE_RE.search(selector):
+        return None
+    if is_valid_package_version(selector):
+        return name, selector
+    if _TAG_WORD_RE.fullmatch(selector) and not _PARTIAL_VERSION_WORD_RE.fullmatch(
+        selector
+    ):
+        return name, selector
+    return None
+
+
+def _pin_npx_args(args: list[str], version: str) -> tuple[list[str], str] | None:
+    """*args* with the npx package slot pinned to *version*, and the name.
+
+    The slot is the provision gate's (`provision_gate._package_slot`): the
+    first argument that is not an allowlisted leading flag. It must be a plain
+    registry spec (`split_plain_registry_spec`); its NAME is kept and only its
+    version suffix is replaced, so a pin can select a version of the package
+    the entry already runs and never a different one. ``None`` otherwise:
+    ``myalias@npm:firecrawl-mcp@3.25.5`` -> ``myalias@3.25.5`` would be the
+    registry package ``myalias`` (codex P1), and
+    ``firecrawl-mcp@corp-mcp.TGZ`` -> ``firecrawl-mcp@3.25.5`` would turn a
+    local tarball into a public-registry fetch (round-2 B1).
+    """
+    # Local import: provision_gate is a consumer of this module's ServerConfig.
+    from pmcp.provision_gate import _NPX_LEADING_FLAGS
+
+    for index, arg in enumerate(args):
+        if arg in _NPX_LEADING_FLAGS:
+            continue
+        plain = split_plain_registry_spec(arg)
+        if plain is None:
+            return None
+        name, _selector = plain
+        return [*args[:index], f"{name}@{version}", *args[index + 1 :]], name
+    return None
+
+
+def _on_windows() -> bool:
+    return os.name == "nt"
+
+
+def _is_bare_npx(command: object) -> bool:
+    """Is *command* npx spelled BARE -- the launcher the PATH resolves?
+
+    ``npx`` (and, on Windows only, ``npx.cmd`` / ``npx.exe``, any case). A
+    path (``/tmp/x/npx``, ``./npx``, ``node_modules/.bin/npx``,
+    ``/proc/self/cwd/npx``, ``~/bin/npx.cmd``) names some other program that
+    is merely called npx, so a pin written into its argv would not hold
+    (Consiliency/pmcp#294 piece 1, round 2). The basename is never evidence.
+    """
+    if not isinstance(command, str):
+        return False
+    if _on_windows():
+        return command.lower() in {"npx", "npx.cmd", "npx.exe"}
+    return command == "npx"
+
+
+def _materialize_version_pin(server: ServerConfig) -> ServerConfig:
+    """Write ``server.version`` into every argv that spawns the server.
+
+    Both ``args`` (what ``client/manager.py`` spawns) and every ``install``
+    argv (what ``start_install`` runs): pinning one and not the other approves
+    X and runs latest (`provision_gate._config_runs_exactly`). All or nothing:
+    if any argv cannot be pinned to the same package, the pin is dropped with
+    a warning and the entry is returned unpinned with ``version=None``.
+
+    The argv pin holds only if nothing the ENTRY puts in the child's
+    environment can make npm run something else: an ``npm_config_package``
+    turns the pinned spec into a shell command, an ``npm_config_registry``
+    fetches it from another registry (measured on npm 10 and 11). So any
+    ``extra_env`` key -- which also carries the overlays' ``server_env``
+    patches -- that ``npm_env_may_redirect`` cannot prove inert refuses the
+    pin, as does an ``env_var`` credential key the shipped manifest does not
+    declare. The host's own environment and npm configuration are trusted.
+    """
+    version = server.version
+    if version is None:
+        return server
+
+    def refuse(reason: str) -> ServerConfig:
+        # Fixed text: the reason CATEGORY and the server name only -- never
+        # the pin, an argv, a command or a package (piece 1).
+        logger.warning(
+            f"Ignoring the version pin for {_server_label(server.name)}: "
+            f"{reason}; the server stays unpinned"
+        )
+        return replace(server, version=None)
+
+    if server.url:
+        return refuse("it is a remote server, so there is no local client to pin")
+    if not _is_bare_npx(server.command):
+        return refuse(
+            "'version'/'server_version' pins servers launched as bare `npx` "
+            "only (not uvx/pip/cargo/docker, and not a path to a program named "
+            "npx); pin any other server with explicit command and args in "
+            ".mcp.json or .pmcp.json instead"
+        )
+    env_keys = [*server.extra_env, *([server.env_var] if server.env_var else [])]
+    if npm_env_may_redirect(server.name, env_keys):
+        return refuse(
+            "the entry's env may redirect npm (only keys pmcp's shipped manifest "
+            "declares for it, locale and terminal keys, and npm logging/timing "
+            "keys are allowed next to a pin)"
+        )
+    pinned = _pin_npx_args(list(server.args), version)
+    if pinned is None:
+        return refuse(
+            "its args name no plain registry package (name or name@version/tag) "
+            "to pin -- an alias, URL, git, file or range spec could change which "
+            "package runs"
+        )
+    args, package = pinned
+    install: dict[Platform, list[str]] = {}
+    for platform, argv in server.install.items():
+        if not argv:
+            install[platform] = argv
+            continue
+        if not _is_bare_npx(argv[0]):
+            return refuse("an install command is not bare `npx`")
+        pinned_install = _pin_npx_args(list(argv[1:]), version)
+        if pinned_install is None or pinned_install[1] != package:
+            return refuse(
+                "an install command does not run the plain registry package "
+                "its args run"
+            )
+        install[platform] = [argv[0], *pinned_install[0]]
+    return replace(server, args=args, install=install)
+
+
+def _materialize_version_pin_soft(server: ServerConfig) -> ServerConfig:
+    """`_materialize_version_pin`, contained to one entry.
+
+    Overlay entries are only shape-checked where a field is parsed, so an argv
+    can still carry a non-string (``args: ["-y", 123]``) or a non-string
+    ``command``. HEAD loads such an entry untouched; a pin on it must cost that
+    entry its pin, never the whole manifest (Consiliency/pmcp#295 board,
+    codex P3).
+    """
+    try:
+        return _materialize_version_pin(server)
+    except Exception as exc:
+        logger.warning(
+            f"Ignoring the version pin for {_server_label(server.name)}: "
+            f"its command/args/install could not be read "
+            f"({type(exc).__name__}); the server stays unpinned"
+        )
+        return replace(server, version=None)
+
+
 def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
     """Parse a server config from raw YAML data."""
     install_data = data.get("install", {})
@@ -615,6 +989,7 @@ def _parse_server_config(name: str, data: dict[str, Any]) -> ServerConfig:
         status=data.get("status"),
         source=data.get("source"),
         replacement=data.get("replacement"),
+        version=_parse_version_pin(name, data.get("version"), "version"),
     )
 
 
@@ -724,7 +1099,10 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
 
 
 _OverlayDocument = tuple[
-    dict[str, ServerConfig], dict[str, CLIAlternative], dict[str, dict[str, str]]
+    dict[str, ServerConfig],
+    dict[str, CLIAlternative],
+    dict[str, dict[str, str]],
+    dict[str, str],
 ]
 
 
@@ -741,7 +1119,7 @@ def _load_overlay_file(path: Path) -> _OverlayDocument:
         content = path.read_bytes()
     except OSError as exc:
         logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
     return _parse_overlay_document(path, content)
 
@@ -749,7 +1127,7 @@ def _load_overlay_file(path: Path) -> _OverlayDocument:
 def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
     """Parse overlay bytes, fail-soft. ``path`` is for messages only.
 
-    Returns ``(servers, cli_alternatives, server_env)``. A YAML error or a
+    Returns ``(servers, cli_alternatives, server_env, server_version)``. A YAML error or a
     non-mapping top-level document logs a warning naming the file and returns
     empty dicts. Each entry is parsed in its own try/except so one malformed
     entry is skipped without dropping siblings.
@@ -761,6 +1139,10 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
     operator can point a shipped server at a self-hosted endpoint without
     restating its command, args, and install block. It deliberately cannot
     create a server: ``servers:`` remains whole-entry replace.
+
+    ``server_version`` is the same kind of patch for ``version``: it pins an
+    existing server's client without restating its install matrix, and it
+    cannot create a server either (Consiliency/pmcp#294).
     """
     try:
         data = load_yaml(content, source="manifest overlay")
@@ -768,13 +1150,13 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
         logger.warning(
             f"Skipping unreadable manifest overlay {path}: {exception_text(exc)}"
         )
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
     if not isinstance(data, dict):
         logger.warning(
             f"Skipping manifest overlay {path}: top-level document is not a mapping"
         )
-        return {}, {}, {}
+        return {}, {}, {}, {}
 
     servers: dict[str, ServerConfig] = {}
     raw_servers = data.get("servers", {})
@@ -818,7 +1200,22 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
     elif raw_server_env:
         logger.warning(f"Skipping 'server_env' in overlay {path}: not a mapping")
 
-    return servers, cli_alternatives, server_env
+    server_version: dict[str, str] = {}
+    raw_server_version = data.get("server_version", {})
+    if isinstance(raw_server_version, dict):
+        for name, raw_version in raw_server_version.items():
+            if not isinstance(name, str) or not name:
+                logger.warning(
+                    f"Skipping non-string 'server_version' key in overlay {path}"
+                )
+                continue
+            version = _parse_version_pin(name, raw_version, "server_version")
+            if version is not None:
+                server_version[name] = version
+    elif raw_server_version:
+        logger.warning(f"Skipping 'server_version' in overlay {path}: not a mapping")
+
+    return servers, cli_alternatives, server_env, server_version
 
 
 def load_manifest(manifest_path: Path | None = None) -> Manifest:
@@ -872,19 +1269,31 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
                     continue
                 # Parse the bytes the gate judged. Re-opening `overlay_path`
                 # here would apply content nobody approved.
-                overlay_servers, overlay_clis, overlay_server_env = (
-                    _parse_overlay_document(overlay_path, content)
-                )
+                (
+                    overlay_servers,
+                    overlay_clis,
+                    overlay_server_env,
+                    overlay_server_version,
+                ) = _parse_overlay_document(overlay_path, content)
             else:
-                overlay_servers, overlay_clis, overlay_server_env = _load_overlay_file(
-                    overlay_path
-                )
-            if overlay_servers or overlay_clis or overlay_server_env:
+                (
+                    overlay_servers,
+                    overlay_clis,
+                    overlay_server_env,
+                    overlay_server_version,
+                ) = _load_overlay_file(overlay_path)
+            if (
+                overlay_servers
+                or overlay_clis
+                or overlay_server_env
+                or overlay_server_version
+            ):
                 logger.info(
                     f"Applying manifest overlay ({label}) from {overlay_path}: "
                     f"{len(overlay_servers)} servers, "
                     f"{len(overlay_clis)} CLI alternatives, "
-                    f"{len(overlay_server_env)} server_env patches"
+                    f"{len(overlay_server_env)} server_env patches, "
+                    f"{len(overlay_server_version)} server_version pins"
                 )
             for name in overlay_servers:
                 if name in servers:
@@ -909,6 +1318,26 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
                 servers[name] = replace(
                     existing, extra_env={**existing.extra_env, **patch}
                 )
+
+            # Same rules as server_env: after this source's replaces, and never
+            # for a server the manifest does not already define.
+            for name, version in overlay_server_version.items():
+                existing = servers.get(name)
+                if existing is None:
+                    logger.warning(
+                        f"Manifest overlay ({label}) from {overlay_path} has a "
+                        f"'server_version' pin for a server it does not "
+                        f"define ({_server_label(name)}): skipped"
+                    )
+                    continue
+                servers[name] = replace(existing, version=version)
+
+    # Materialise every pin once, after all overlays: a later source's
+    # whole-entry replace or server_version patch must be what gets written
+    # into argv, not an earlier one's.
+    servers = {
+        name: _materialize_version_pin_soft(entry) for name, entry in servers.items()
+    }
 
     manifest = Manifest(
         version=data.get("version", "1.0"),

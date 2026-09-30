@@ -1118,6 +1118,40 @@ crashing the gateway — the shipped manifest always still loads.
 > run when provisioned — treat an overlay file with the same trust as your own
 > `.mcp.json`. Policy still applies (denied servers stay denied).
 
+### Pinning a client version
+
+To hold an npx-launched server at one version, add to `~/.pmcp/manifest.yaml` (or an
+approved project overlay):
+
+```yaml
+server_version:
+  firecrawl: "3.25.5"
+```
+
+or `version: "3.25.5"` on a whole `servers:` entry. pmcp writes the pin into the server's
+args and every install argv, keeping the package name. It must be one exact version: a
+range, a dist-tag such as `latest`, build metadata or a package spec is ignored with a
+warning (a pin from an earlier source, if any, stands). `server_version: {name: null}`
+sets nothing; to remove a pin, delete its line.
+
+Only npx servers whose package slot is a plain registry name (`pkg`, `pkg@1.2.3`,
+`pkg@tag`) can be pinned this way, and only if the entry's own env cannot redirect npm:
+locale and terminal keys, npm's logging/timing settings and the keys pmcp ships for that
+server are fine; anything else (such as `npm_config_registry` or `NODE_OPTIONS`) makes pmcp
+ignore the pin. Only a bare `npx` launcher is pinned (not a path such as `./npx` or
+`node_modules/.bin/npx`; on Windows, `npx.cmd`/`npx.exe` too). The launcher of every
+`install` argv is judged by the rules of the host pmcp runs on, whatever platform key it sits
+under, so a `windows:` argv using `npx.cmd` refuses the pin on Linux or macOS. For uvx, pip,
+cargo or docker, or any other case, pin the version in the server's own `command`/`args` in
+`.mcp.json` or `.pmcp.json`.
+
+The pin fixes the npm spec; npm resolves it in your own environment (your `.npmrc`, npm's
+cache, and a `node_modules` in the directory pmcp runs in; a `.npmrc` there can also set
+the npm keys allowed next to a pin). `gateway.update_server` does not move a pinned server.
+`pmcp update` shows it as `[PINNED]` with the version you wrote, except when the entry
+also sets an npm setting such as `npm_config_loglevel`: then it prints `[FAILED] … Could not
+determine a registry package`, and still moves nothing.
+
 ### Adding Custom Servers
 
 For MCP servers not in the manifest, add them to `~/.mcp.json`:

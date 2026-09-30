@@ -1529,6 +1529,11 @@ class UpdateServerOutput(BaseModel):
     cancelled_request_count: int = 0
     cancelled_task_count: int = 0
     message: str
+    # Set only when the server's manifest entry carries a version pin that
+    # pmcp itself materialised into the argv that runs (Consiliency/pmcp#294
+    # piece 1): the validated exact version, so `pmcp update` can say
+    # [PINNED] instead of [FAILED]. None for every other refusal.
+    pinned_version: str | None = None
 
 
 class AuthConnectInput(GatewayArguments):
