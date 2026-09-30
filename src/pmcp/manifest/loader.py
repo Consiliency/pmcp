@@ -764,7 +764,9 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
     try:
         data = yaml.safe_load(content)
     except yaml.YAMLError as exc:
-        logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
+        logger.warning(
+            f"Skipping unreadable manifest overlay {path}: {exception_text(exc)}"
+        )
         return {}, {}, {}
 
     if not isinstance(data, dict):

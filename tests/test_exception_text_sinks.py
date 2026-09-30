@@ -5,8 +5,8 @@ A pydantic or jsonschema `ValidationError` renders the rejected value, so
 wherever pmcp renders an exception that may be one -- a response field, a
 log line or its traceback, an audit or audit-event field -- it must use
 `exception_text` / `safe_exc_info` (or a renderer built on them). This test
-enforces that statically, over every module in `src/pmcp` bar the operator's
-CLI.
+enforces that statically, over every module in `src/pmcp`, the CLI included
+(rev 6: `pmcp refresh` and the config commands read files and downstreams).
 
 The scanner tracks exceptions through a function, not just an `except`
 body (rev 3; the rev 2 board seat found 25 constructs rev 2's scanner
@@ -45,11 +45,22 @@ import typing
 from pathlib import Path
 from typing import Any
 
+import json
+
 import jsonschema
 import pydantic
+import yaml
 import pytest
 
-_VALIDATION_ERRORS = (pydantic.ValidationError, jsonschema.ValidationError)
+#: Exceptions whose own text can carry the input they rejected: validation
+#: errors, and (rev 6) the parse errors of every structured-text parser pmcp
+#: uses -- the same set `exception_text` renders structurally.
+_VALIDATION_ERRORS = (
+    pydantic.ValidationError,
+    jsonschema.ValidationError,
+    yaml.YAMLError,
+    json.JSONDecodeError,
+)
 
 #: Renderers, called by their bare name.
 _RENDERERS = {
@@ -144,7 +155,7 @@ def _sources() -> list[Path]:
         path
         for path in sorted(root.rglob("*.py"))
         if not any(
-            part in ("cli.py", "cli_commands", "__main__.py", "baml_client")
+            part in ("baml_client",)
             for part in path.relative_to(root).parts
         )
         and path.name != "argument_errors.py"

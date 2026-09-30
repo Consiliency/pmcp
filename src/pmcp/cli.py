@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
+from pmcp.argument_errors import exception_text, safe_exc_info
 from pmcp import package_approvals, trust_store
 from pmcp.auth import redact_auth_url, sanitize_auth_diagnostic
 from pmcp.cli_commands.doctor import collect_remote_header_diagnostics
@@ -935,8 +936,8 @@ async def run_refresh(args: argparse.Namespace) -> None:
         print(f"\nCache saved to: {cache_path}")
 
     except Exception as e:
-        logger.error(f"Refresh failed: {e}")
-        print(f"Error: {e}", file=sys.stderr)
+        logger.error(f"Refresh failed: {exception_text(e)}")
+        print(f"Error: {exception_text(e)}", file=sys.stderr)
         sys.exit(1)
 
 
@@ -1208,8 +1209,8 @@ async def _query_running_gateway_status(
                 snapshot["pending_requests"] = pending_requests
 
         return snapshot
-    except Exception:
-        logger.debug("Live gateway status query failed", exc_info=True)
+    except Exception as exc:
+        logger.debug("Live gateway status query failed", exc_info=safe_exc_info(exc))
         return None
     finally:
         await probe_manager.disconnect_all()
@@ -1867,7 +1868,7 @@ def run_setup(args: argparse.Namespace) -> None:
                 raise ValueError("Top-level config must be a JSON object")
         except Exception as exc:
             print(
-                f"Error: Could not parse existing config at {target_path}: {exc}",
+                f"Error: Could not parse existing config at {target_path}: {exception_text(exc)}",
                 file=sys.stderr,
             )
             sys.exit(1)
@@ -2085,7 +2086,7 @@ async def _probe_http_health(timeout_s: float) -> tuple[bool, str, int | None]:
         return (
             False,
             sanitize_auth_diagnostic(
-                f"{safe_url} unreachable ({exc.__class__.__name__}: {exc})"
+                f"{safe_url} unreachable ({exc.__class__.__name__}: {exception_text(exc)})"
             ),
             None,
         )
@@ -2497,7 +2498,7 @@ async def run_server(args: argparse.Namespace) -> None:
     except asyncio.CancelledError:
         logger.info("Server cancelled")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
+        logger.error(f"Fatal error: {exception_text(e)}")
         raise
 
 
@@ -2728,7 +2729,7 @@ def run_trust(args: argparse.Namespace) -> None:
     try:
         handler(args)
     except (trust_store.TrustStoreError, ValueError) as exc:
-        _trust_fail(str(exc))
+        _trust_fail(exception_text(exc))
 
 
 def _build_gateway_auth_client(args: argparse.Namespace) -> tuple[Any, Any]:
@@ -3068,7 +3069,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     except Exception as e:
-        print(f"Fatal error: {e}", file=sys.stderr)
+        print(f"Fatal error: {exception_text(e)}", file=sys.stderr)
         sys.exit(1)
 
 

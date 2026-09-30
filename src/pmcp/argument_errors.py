@@ -471,8 +471,73 @@ def describe_argument_error(
 # --- any exception pmcp renders ------------------------------------------------
 
 
+def _parse_error_types() -> tuple[type[BaseException], ...]:
+    """The parse errors of every structured-text parser pmcp uses (rev 6).
+
+    Their text can quote what they rejected: PyYAML's ``MarkedYAMLError``
+    renders a snippet of the input around the mark, and a constructor error
+    names the input's tag; ``tomllib``'s message can quote a key. JSON's
+    message is fixed vocabulary, but its ``doc`` holds the input, so it is
+    rendered the same way for one rule. python-dotenv does not raise on bad
+    input (it logs the line number only).
+    """
+    import yaml
+
+    types: list[type[BaseException]] = [yaml.YAMLError, json.JSONDecodeError]
+    try:
+        import tomllib  # Python 3.11+
+
+        types.append(tomllib.TOMLDecodeError)
+    except ImportError:  # pragma: no cover - Python 3.10
+        pass
+    return tuple(types)
+
+
+_PARSE_ERRORS: tuple[type[BaseException], ...] = ()
+
+
+def _is_parse_error(error: BaseException) -> bool:
+    global _PARSE_ERRORS
+    if not _PARSE_ERRORS:
+        _PARSE_ERRORS = _parse_error_types()
+    return isinstance(error, _PARSE_ERRORS)
+
+
 def _is_validation_error(error: BaseException) -> bool:
-    return isinstance(error, (ValidationError, jsonschema.ValidationError))
+    """A validation *or parse* error: one whose own text can carry the input
+    it rejected (the parse half since rev 6)."""
+    return isinstance(
+        error, (ValidationError, jsonschema.ValidationError)
+    ) or _is_parse_error(error)
+
+
+def _parse_text(error: BaseException) -> str:
+    """A parse error without the input: the format, the error's class and,
+    where the parser records it, the line and column (never PyYAML's
+    ``problem``/``context`` text or snippet, JSON's ``msg``/``doc``, or
+    TOML's message)."""
+    kind = "JSON" if isinstance(error, json.JSONDecodeError) else None
+    line = column = None
+    if kind == "JSON":
+        line, column = getattr(error, "lineno", None), getattr(error, "colno", None)
+    elif type(error).__module__.startswith("yaml"):
+        kind = "YAML"
+        mark = getattr(error, "problem_mark", None) or getattr(
+            error, "context_mark", None
+        )
+        if mark is not None:
+            line, column = getattr(mark, "line", None), getattr(mark, "column", None)
+            line = line + 1 if isinstance(line, int) else None
+            column = column + 1 if isinstance(column, int) else None
+    else:
+        kind = "TOML"
+        line, column = getattr(error, "lineno", None), getattr(error, "colno", None)
+    where = (
+        f" at line {line}, column {column}"
+        if isinstance(line, int) and isinstance(column, int)
+        else ""
+    )
+    return f"could not parse {kind} ({type(error).__name__}){where}"
 
 
 def _chain(error: BaseException) -> Iterator[BaseException]:
@@ -496,7 +561,10 @@ def _chain(error: BaseException) -> Iterator[BaseException]:
 def _validation_text(error: BaseException) -> str:
     """A validation error described without the schema that raised it: the
     path (names pmcp's models declare, list indexes, ``*``) and a phrase
-    without constraints, since the schema is not known here (rev 2, N6)."""
+    without constraints, since the schema is not known here (rev 2, N6).
+    A parse error is described by :func:`_parse_text` (rev 6)."""
+    if _is_parse_error(error):
+        return _parse_text(error)
     if isinstance(error, ValidationError):
         count = error.error_count()
         plural = "" if count == 1 else "s"
@@ -563,11 +631,43 @@ def safe_exc_info(error: BaseException) -> BaseException | None:
 
 
 def safe_traceback_text(error: BaseException) -> str:
-    """The formatted traceback, or a one-line stand-in when the chain holds a
-    validation error (see :func:`safe_exc_info`)."""
-    if safe_exc_info(error) is None:
-        return f"(traceback withheld: {exception_text(error)})"
-    return "".join(traceback.format_exception(type(error), error, error.__traceback__))
+    """The formatted traceback. When the chain holds a validation or parse
+    error, every exception in it is rendered as its frames (file, line,
+    source) and ``Type: exception_text(...)`` -- the frames never carry an
+    exception's text -- so it stays a usable traceback (rev 6)."""
+    if safe_exc_info(error) is not None:
+        return "".join(
+            traceback.format_exception(type(error), error, error.__traceback__)
+        )
+    parts: list[str] = []
+    seen: set[int] = set()
+
+    def render(current: BaseException) -> None:
+        seen.add(id(current))
+        cause, context = current.__cause__, current.__context__
+        if cause is not None and id(cause) not in seen:
+            render(cause)
+            parts.append(
+                "\nThe above exception was the direct cause of the following "
+                "exception:\n\n"
+            )
+        elif (
+            context is not None
+            and id(context) not in seen
+            and not current.__suppress_context__
+        ):
+            render(context)
+            parts.append(
+                "\nDuring handling of the above exception, another exception "
+                "occurred:\n\n"
+            )
+        if current.__traceback__ is not None:
+            parts.append("Traceback (most recent call last):\n")
+            parts.extend(traceback.format_tb(current.__traceback__))
+        parts.append(f"{type(current).__name__}: {exception_text(current)}\n")
+
+    render(error)
+    return "".join(parts)
 
 
 # --- every log record, whoever logs it (rev 3, widened in rev 4) ------------
@@ -652,6 +752,27 @@ def install_log_scrubber() -> None:
     import and in ``GatewayServer.__init__``.
     """
     current = logging.getLogRecordFactory()
-    if getattr(current, "pmcp_validation_scrubber", False):
+    if not getattr(current, "pmcp_validation_scrubber", False):
+        logging.setLogRecordFactory(_scrubbing_factory(current))
+    _install_excepthook()
+
+
+def _install_excepthook() -> None:
+    """An uncaught exception is printed by ``sys.excepthook``, chain and all:
+    a ``raise ValueError(...) from e`` whose cause is a validation or parse
+    error would print the input past every log scrub (rev 6). Such a chain is
+    printed by :func:`safe_traceback_text` instead; every other exception by
+    the previous hook, unchanged. Idempotent."""
+    previous = sys.excepthook
+    if getattr(previous, "pmcp_validation_scrubber", False):
         return
-    logging.setLogRecordFactory(_scrubbing_factory(current))
+
+    def hook(kind: Any, value: Any, tb: Any) -> None:
+        if isinstance(value, BaseException) and safe_exc_info(value) is None:
+            sys.stderr.write(safe_traceback_text(value) + "\n")
+            return
+        previous(kind, value, tb)
+
+    hook.pmcp_validation_scrubber = True  # type: ignore[attr-defined]
+    hook.previous = previous  # type: ignore[attr-defined]
+    sys.excepthook = hook
