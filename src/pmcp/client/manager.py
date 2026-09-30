@@ -2841,54 +2841,120 @@ class ClientManager:
                     "the line was decoded with replacement characters"
                 )
             message = json.loads(text)
-            msg_id = message.get("id")
-            method = message.get("method")
-            # Classify by `method` FIRST (C-01). A frame carrying a `method` can
-            # never resolve a pending future, so this both handles server->client
-            # requests (method + id) and fixes a latent misrouting: a downstream
-            # request whose id happens to collide with one of ours must not be
-            # mistaken for that response.
-            if isinstance(method, str):
-                if msg_id is None:
-                    # Notification: no id, nothing to resolve.
-                    self._handle_downstream_notification(name, managed, method)
-                else:
-                    # Server->client request: reply (ping -> {} else -32601).
-                    self._reply_to_downstream_request(name, managed, msg_id, method)
-            elif "method" in message:
-                # A `method` that is present but not a string is not a valid
-                # JSON-RPC request -- and it is not a response either, so it
-                # must not fall through to the pending lookup, where an id
-                # colliding with one of ours would resolve that future with
-                # this frame's (absent) result. Drop it like any other
-                # unparseable line (Consiliency/pmcp#287).
-                logger.debug(
-                    f"[{name}] dropped invalid frame: non-string method "
-                    f"({type(message['method']).__name__})"
-                )
-            elif msg_id is not None and msg_id in managed.pending_requests:
-                pending = managed.pending_requests.pop(msg_id)
-
-                # Track response time
-                elapsed_ms = (now - pending.started_at) * 1000
-                managed.response_times.append(elapsed_ms)
-                if managed.response_times:
-                    managed.status.avg_response_time_ms = sum(
-                        managed.response_times
-                    ) / len(managed.response_times)
-
-                # Update pending count
-                managed.status.pending_request_count = len(managed.pending_requests)
-
-                if "error" in message:
-                    pending.future.set_exception(_downstream_error(message["error"]))
-                else:
-                    pending.future.set_result(message.get("result", {}))
         except json.JSONDecodeError:
             # Non-JSON output already counted as a heartbeat by the caller.
             logger.debug(
                 f"[{name}] Non-JSON output: {line.decode(errors='replace').strip()}"
             )
+            return
+        except (ValueError, RecursionError) as e:
+            # Parses as neither JSON nor a JSONDecodeError: an integer over
+            # `sys.get_int_max_str_digits()` raises a plain ValueError, and
+            # deeply nested arrays/objects raise RecursionError. Both used to
+            # escape to the read loop's broad `except` and end it. Value-free:
+            # the line is attacker-sized (Consiliency/pmcp#287).
+            logger.debug(f"[{name}] dropped unparseable frame ({type(e).__name__})")
+            return
+        self._dispatch_downstream_frame(name, managed, message, now)
+
+    def _dispatch_downstream_frame(
+        self, name: str, managed: ManagedClient, frame: Any, now: float
+    ) -> None:
+        """Route one parsed downstream JSON-RPC frame; never raises.
+
+        Shared by the stdio (`_handle_stdout_line`) and remote (`_read_sse`)
+        read loops. The frame is untrusted, and both loops end -- dropping the
+        connection -- on any exception that reaches their broad `except`, so
+        one malformed frame must never be able to raise out of here
+        (Consiliency/pmcp#287). `_route_downstream_frame` rejects every shape
+        its own accesses depend on; this wrapper is the backstop for anything
+        they miss, and logs only the exception type -- never a frame value.
+        """
+        try:
+            self._route_downstream_frame(name, managed, frame, now)
+        except Exception as e:
+            logger.warning(
+                f"[{name}] dropped a downstream frame whose handling raised "
+                f"{type(e).__name__}; the connection stays up"
+            )
+
+    def _route_downstream_frame(
+        self, name: str, managed: ManagedClient, frame: Any, now: float
+    ) -> None:
+        """Classify one frame and act on it. See `_dispatch_downstream_frame`.
+
+        Each guard below exists because a later access depends on it, and each
+        drops the frame with a value-free debug log, as a non-JSON line is
+        dropped:
+
+        - `frame.get` / `"method" in frame` / `frame["error"]` need a JSON
+          object: `[]`, `42`, `"x"`, `null`, `true` all parse but are not one.
+        - `msg_id in managed.pending_requests` needs a hashable id, and must not
+          match one of our int ids by numeric equality: `True == 1` and
+          `1.0 == 1` both hash equal, so a bool or float id would resolve
+          request 1. JSON-RPC ids are strings, integers or null.
+        - `set_result` / `set_exception` raise `InvalidStateError` on a future
+          that is already settled (a caller cancelled it, and the response
+          raced its `finally` pop).
+        """
+        if not isinstance(frame, dict):
+            logger.debug(
+                f"[{name}] dropped invalid frame: not a JSON object "
+                f"({type(frame).__name__})"
+            )
+            return
+        msg_id = frame.get("id")
+        if msg_id is not None and (
+            isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
+        ):
+            logger.debug(
+                f"[{name}] dropped invalid frame: id of type {type(msg_id).__name__}"
+            )
+            return
+        method = frame.get("method")
+        # Classify by `method` FIRST (C-01). A frame carrying a `method` can
+        # never resolve a pending future, so this both handles server->client
+        # requests (method + id) and fixes a latent misrouting: a downstream
+        # request whose id happens to collide with one of ours must not be
+        # mistaken for that response.
+        if isinstance(method, str):
+            if msg_id is None:
+                # Notification: no id, nothing to resolve.
+                self._handle_downstream_notification(name, managed, method)
+            else:
+                # Server->client request: reply (ping -> {} else -32601).
+                self._reply_to_downstream_request(name, managed, msg_id, method)
+        elif "method" in frame:
+            # A `method` that is present but not a string is not a valid
+            # JSON-RPC request -- and it is not a response either, so it must
+            # not fall through to the pending lookup, where an id colliding with
+            # one of ours would resolve that future.
+            logger.debug(
+                f"[{name}] dropped invalid frame: non-string method "
+                f"({type(method).__name__})"
+            )
+        elif msg_id is not None and msg_id in managed.pending_requests:
+            pending = managed.pending_requests.pop(msg_id)
+
+            # Track response time
+            elapsed_ms = (now - pending.started_at) * 1000
+            managed.response_times.append(elapsed_ms)
+            if managed.response_times:
+                managed.status.avg_response_time_ms = sum(managed.response_times) / len(
+                    managed.response_times
+                )
+
+            # Update pending count
+            managed.status.pending_request_count = len(managed.pending_requests)
+
+            if pending.future.done():
+                logger.debug(
+                    f"[{name}] dropped a response for an already-settled request"
+                )
+            elif "error" in frame:
+                pending.future.set_exception(_downstream_error(frame["error"]))
+            else:
+                pending.future.set_result(frame.get("result", {}))
 
     def _fail_oversized_line(
         self, name: str, managed: ManagedClient, limit: int
@@ -3073,49 +3139,22 @@ class ClientManager:
                 if isinstance(message, Exception):
                     raise message
 
-                payload = message.message.model_dump(
-                    by_alias=True,
-                    mode="json",
-                    exclude_none=True,
-                )
-                msg_id = payload.get("id")
-                method = payload.get("method")
-                # Classify by `method` first, exactly as the stdio path (C-01).
-                # `_handle_downstream_notification` and the reply/notify helpers
-                # never raise, which matters more here -- this loop's blanket
-                # `except Exception` would tear the connection down and trigger a
-                # reconnect.
-                if isinstance(method, str):
-                    if msg_id is None:
-                        self._handle_downstream_notification(name, managed, method)
-                    else:
-                        self._reply_to_downstream_request(name, managed, msg_id, method)
-                elif "method" in payload:
-                    # Non-string `method`: invalid, never a response -- drop it
-                    # rather than consult the pending table, as the stdio path
-                    # does (Consiliency/pmcp#287).
-                    logger.debug(
-                        f"[{name}] dropped invalid frame: non-string method "
-                        f"({type(payload['method']).__name__})"
+                try:
+                    payload = message.message.model_dump(
+                        by_alias=True,
+                        mode="json",
+                        exclude_none=True,
                     )
-                elif msg_id is not None and msg_id in managed.pending_requests:
-                    pending = managed.pending_requests.pop(msg_id)
-
-                    elapsed_ms = (now - pending.started_at) * 1000
-                    managed.response_times.append(elapsed_ms)
-                    if managed.response_times:
-                        managed.status.avg_response_time_ms = sum(
-                            managed.response_times
-                        ) / len(managed.response_times)
-
-                    managed.status.pending_request_count = len(managed.pending_requests)
-
-                    if "error" in payload:
-                        pending.future.set_exception(
-                            _downstream_error(payload["error"])
-                        )
-                    else:
-                        pending.future.set_result(payload.get("result", {}))
+                except Exception as e:
+                    logger.debug(
+                        f"[{name}] dropped undumpable frame ({type(e).__name__})"
+                    )
+                    continue
+                # Same dispatcher as the stdio path, so the two cannot drift.
+                # It never raises for a frame's shape, which matters more here
+                # -- this loop's blanket `except Exception` would tear the
+                # connection down and trigger a reconnect.
+                self._dispatch_downstream_frame(name, managed, payload, now)
         except Exception as e:
             logger.debug(f"[{name}] SSE read error: {describe_exception(e)}")
         finally:

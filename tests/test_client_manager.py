@@ -7418,3 +7418,205 @@ async def test_c01_sse_non_string_method_does_not_resolve_pending() -> None:
     assert seen["done"] is False, "non-string method resolved our pending request"
     assert seen["present"] is True, "non-string method popped our pending request"
     assert seen["answered"] is False, "an invalid frame was answered"
+
+
+# --- Consiliency/pmcp#287: malformed downstream frames never end a read loop --
+#
+# The cases are derived from `_route_downstream_frame`'s own accesses on frame
+# data (`.get`, `in`, `["error"]`, the pending-table lookup, the future's
+# set_*), plus the parse step in `_handle_stdout_line` and the model dump in
+# `_read_sse`. Each test also proves the connection stays usable (a valid
+# response after the bad frames still resolves), that no frame value reaches
+# the logs, and -- via "no WARNING" -- that the specific guard, not the
+# dispatcher's backstop, rejected the frame.
+
+_FRAME_SENTINEL = "SENTINEL-c01-9f2e"
+
+
+def _stdio_reader_client(lines: list[bytes]) -> ManagedClient:
+    fake_stdout = AsyncMock()
+    fake_stdout.read = AsyncMock(side_effect=[*lines, b""])
+    process = MagicMock()
+    process.stdout = fake_stdout
+    process.returncode = None
+    process.stdin.write = MagicMock()
+    process.stdin.drain = AsyncMock()
+    # Not ONLINE: EOF then neither warns "disconnected unexpectedly" nor fails
+    # the pending table, so each assertion reads only what the frames did.
+    status = ServerStatus(name="srv", status=ServerStatusEnum.OFFLINE, tool_count=0)
+    managed = ManagedClient(config=MagicMock(), process=process, status=status)
+    managed.config = None  # no auto-reconnect
+    return managed
+
+
+def _frame_line(frame: Any) -> bytes:
+    return (json.dumps(frame) + "\n").encode()
+
+
+_VALID_RESPONSE = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+
+
+def _assert_clean_logs(caplog: pytest.LogCaptureFixture) -> None:
+    assert _FRAME_SENTINEL not in caplog.text, "a frame value reached the logs"
+    loud = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert loud == [], f"a bad frame escaped its guard to the backstop: {loud}"
+
+
+async def _run_stdio(
+    lines: list[bytes], caplog: pytest.LogCaptureFixture
+) -> tuple[ClientManager, ManagedClient, PendingRequest]:
+    mgr = ClientManager()
+    managed = _stdio_reader_client(lines)
+    mgr._clients["srv"] = managed
+    pending = _pending(1)
+    managed.pending_requests[1] = pending
+    with caplog.at_level(logging.DEBUG, logger="pmcp.client.manager"):
+        await mgr._read_stdout("srv", managed)
+    return mgr, managed, pending
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_non_object_frames_are_dropped_and_connection_survives(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bad = [[_FRAME_SENTINEL], 42, _FRAME_SENTINEL, None, True, 1.5, []]
+    lines = [_frame_line(b) for b in bad] + [_frame_line(_VALID_RESPONSE)]
+    _mgr, _managed, pending = await _run_stdio(lines, caplog)
+    assert pending.future.done() and pending.future.result() == {"ok": True}
+    _assert_clean_logs(caplog)
+    assert caplog.text.count("not a JSON object") == len(bad)
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_invalid_id_types_are_dropped_and_do_not_misroute(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # `True == 1` and `1.0 == 1` hash equal to our request id 1: without the
+    # guard they would resolve it with the sentinel. The list/dict ids are
+    # unhashable and raise TypeError in the pending lookup.
+    bad_ids: list[Any] = [True, 1.0, [1], {"k": _FRAME_SENTINEL}, [_FRAME_SENTINEL]]
+    lines = [
+        _frame_line({"jsonrpc": "2.0", "id": i, "result": _FRAME_SENTINEL})
+        for i in bad_ids
+    ]
+    # A request (method + bad id) must not be answered either.
+    lines.append(_frame_line({"jsonrpc": "2.0", "id": [1], "method": "ping"}))
+    lines.append(_frame_line(_VALID_RESPONSE))
+    _mgr, managed, pending = await _run_stdio(lines, caplog)
+    assert pending.future.done() and pending.future.result() == {"ok": True}
+    assert managed.outbound is None, "a request with an invalid id was answered"
+    _assert_clean_logs(caplog)
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_unparseable_json_does_not_end_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Neither raises json.JSONDecodeError: an over-long integer raises a plain
+    # ValueError (int max-str-digits) and deep nesting raises RecursionError.
+    lines = [
+        ("9" * 5000 + "\n").encode(),
+        ("[" * 100_000 + "]" * 100_000 + "\n").encode(),
+        _frame_line(_VALID_RESPONSE),
+    ]
+    _mgr, _managed, pending = await _run_stdio(lines, caplog)
+    assert pending.future.done(), "the read loop ended on an unparseable frame"
+    assert pending.future.result() == {"ok": True}
+    _assert_clean_logs(caplog)
+    assert "9" * 50 not in caplog.text, "the unparseable line reached the logs"
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_response_for_settled_request_does_not_end_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mgr = ClientManager()
+    lines = [
+        _frame_line({"jsonrpc": "2.0", "id": 2, "result": _FRAME_SENTINEL}),
+        _frame_line({"jsonrpc": "2.0", "id": 3, "error": {"message": "x"}}),
+        _frame_line(_VALID_RESPONSE),
+    ]
+    managed = _stdio_reader_client(lines)
+    mgr._clients["srv"] = managed
+    pending = _pending(1)
+    managed.pending_requests[1] = pending
+    for rid in (2, 3):
+        settled = _pending(rid)
+        settled.future.cancel()  # the caller gave up; its finally has not run
+        managed.pending_requests[rid] = settled
+    with caplog.at_level(logging.DEBUG, logger="pmcp.client.manager"):
+        await mgr._read_stdout("srv", managed)
+    assert pending.future.done() and pending.future.result() == {"ok": True}
+    _assert_clean_logs(caplog)
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_handler_exception_does_not_end_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The backstop: whatever a guard misses must not end the loop either."""
+    lines = [
+        _frame_line({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+        _frame_line(_VALID_RESPONSE),
+    ]
+    mgr = ClientManager()
+    managed = _stdio_reader_client(lines)
+    mgr._clients["srv"] = managed
+    pending = _pending(1)
+    managed.pending_requests[1] = pending
+
+    def _raise(*_a: Any, **_k: Any) -> bool:
+        raise RuntimeError(_FRAME_SENTINEL)
+
+    mgr._handle_downstream_notification = _raise  # type: ignore[method-assign]
+    with caplog.at_level(logging.DEBUG, logger="pmcp.client.manager"):
+        await mgr._read_stdout("srv", managed)
+    assert pending.future.done(), "a raising handler ended the read loop"
+    assert pending.future.result() == {"ok": True}
+    assert _FRAME_SENTINEL not in caplog.text, "an exception message reached the logs"
+    assert "handling raised RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_c01_sse_malformed_frames_are_dropped_and_connection_survives(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mgr = ClientManager()
+    sent: list[Any] = []
+    managed = _managed_remote("srv", sent)
+    managed.status.status = ServerStatusEnum.OFFLINE  # no reconnect on stream end
+    managed.config = None
+    mgr._clients["srv"] = managed
+    pending = _pending(1)
+    managed.pending_requests[1] = pending
+
+    payloads: list[Any] = [
+        [_FRAME_SENTINEL],
+        42,
+        None,
+        {"jsonrpc": "2.0", "id": True, "result": _FRAME_SENTINEL},
+        {"jsonrpc": "2.0", "id": [1], "result": _FRAME_SENTINEL},
+        {"jsonrpc": "2.0", "id": {"k": 1}, "method": "ping"},
+    ]
+    msgs: list[Any] = []
+    for p in payloads:
+        m = MagicMock()
+        m.message.model_dump.return_value = p
+        msgs.append(m)
+    undumpable = MagicMock()
+    undumpable.message.model_dump.side_effect = ValueError(_FRAME_SENTINEL)
+    msgs.append(undumpable)
+    valid = MagicMock()
+    valid.message.model_dump.return_value = _VALID_RESPONSE
+    msgs.append(valid)
+
+    async def stream() -> Any:
+        for m in msgs:
+            yield m
+
+    with caplog.at_level(logging.DEBUG, logger="pmcp.client.manager"):
+        await mgr._read_sse("srv", managed, stream())
+    assert pending.future.done(), "a malformed frame ended the SSE read loop"
+    assert pending.future.result() == {"ok": True}
+    assert sent == [] and managed.outbound is None, "an invalid frame was answered"
+    _assert_clean_logs(caplog)
