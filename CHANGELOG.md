@@ -125,6 +125,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. See [#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
+- **pyjwt raised to 2.15.** The dependency floor is now `pyjwt[crypto]>=2.15.0`
+  (was `>=2.13.0`) and the lock resolves 2.15.1, picking up the fixes for the
+  12 advisories `pip-audit` reports against 2.13.0 (GHSA-w6j9-cwv2-h6wq,
+  GHSA-2gx3-rcp4-g85q, GHSA-w2cx-738m-mc7w, GHSA-hxm8-2xgr-2p9m,
+  GHSA-9v7f-9g4p-ffgj, GHSA-ffc3-869f-jxw9, GHSA-r6x4-923q-g947,
+  GHSA-p4g4-x82p-q773, GHSA-8wjv-2p76-3863, GHSA-9j54-fg26-wv3r,
+  GHSA-jwrc-g2q2-pq5p, GHSA-42vr-xj54-vc7v). The floor matters because a
+  `pip install pmcp` resolves without the lock.
 - **Additive shape-based secret redaction on top of the existing redactor.**
   The existing redactor runs unchanged; new rules then run over its output
   and can only replace more of it with `[REDACTED]`, so every piece it
