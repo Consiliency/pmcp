@@ -1131,8 +1131,11 @@ server_version:
 or `version: "3.25.5"` on a whole `servers:` entry. pmcp writes the pin into the server's
 args and every install argv, keeping the package name. It must be one exact version: a
 range, a dist-tag such as `latest`, build metadata or a package spec is ignored with a
-warning (a pin from an earlier source, if any, stands). `server_version: {name: null}`
-sets nothing; to remove a pin, delete its line.
+warning. What happens to an earlier pin depends on where the bad pin sits. A bad
+`server_version` only patches the entry, so a pin from an earlier source, if any, stands. A
+bad `version:` rides on a whole `servers:` entry, which replaced the earlier entry and any
+pin with it, so the server is unpinned unless a later `server_version` pins it.
+`server_version: {name: null}` sets nothing; to remove a pin, delete its line.
 
 Only npx servers whose package slot is a plain registry name (`pkg`, `pkg@1.2.3`,
 `pkg@tag`) can be pinned this way, and only if the entry's own env cannot redirect npm:
@@ -1148,9 +1151,12 @@ cargo or docker, or any other case, pin the version in the server's own `command
 The pin fixes the npm spec; npm resolves it in your own environment (your `.npmrc`, npm's
 cache, and a `node_modules` in the directory pmcp runs in; a `.npmrc` there can also set
 the npm keys allowed next to a pin). `gateway.update_server` does not move a pinned server.
-`pmcp update` shows it as `[PINNED]` with the version you wrote, except when the entry
-also sets an npm setting such as `npm_config_loglevel`: then it prints `[FAILED] … Could not
-determine a registry package`, and still moves nothing.
+`pmcp update` shows it as `[PINNED]` with the version you wrote, except when npm
+configuration is set where pmcp cannot see past it. That happens when the entry itself sets
+an npm setting such as `npm_config_loglevel`, or when the gateway process's own environment
+sets any `npm_config_*` variable (for example an exported `npm_config_cache`) or
+`NODE_OPTIONS`, which turns off package detection for the whole process. In either case it prints `[FAILED] … Could not determine a
+registry package`, and still moves nothing: the pin is still in every argv.
 
 ### Adding Custom Servers
 

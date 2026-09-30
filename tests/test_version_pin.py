@@ -512,12 +512,35 @@ class _ClientManager:
         return {}
 
 
+def _no_host_npm_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove the HOST's npm configuration from this test's process env.
+
+    main's resolver turns off npm package detection for the whole gateway
+    process when its own environment sets any `npm_config_*` variable (any
+    case) or `NODE_OPTIONS` -- team hosts export `npm_config_cache` -- and then
+    `update_server` reports "Could not determine a registry package" instead
+    of reaching the pinned branch. The [PINNED] tests assert the pinned branch,
+    so they clear it themselves (Consiliency/pmcp#322, N2).
+    """
+    import os
+
+    for key in list(os.environ):
+        lowered = key.lower()
+        if (
+            lowered.startswith("npm_config_")
+            or lowered.startswith("pnpm_config_")
+            or key.upper() == "NODE_OPTIONS"
+        ):
+            monkeypatch.delenv(key)
+
+
 def _gateway(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     manifest: Manifest,
     configured: list[ResolvedServerConfig] | None = None,
 ) -> GatewayTools:
+    _no_host_npm_config(monkeypatch)
     monkeypatch.setattr(handlers_module, "load_manifest", lambda: manifest)
     monkeypatch.setattr(handlers_module, "load_configs", lambda **_: configured or [])
     policy_path = tmp_path / "gateway-policy.yaml"
@@ -1055,3 +1078,59 @@ def test_a_failure_while_materialising_costs_only_that_entry(
     assert manifest.servers["firecrawl"].args == ["-y", "firecrawl-mcp"]
     assert manifest.servers["playwright"].args == ["-y", "@playwright/mcp@1.2.3"]
     assert any("could not be read (RuntimeError)" in m for m in _warnings(caplog))
+
+
+# ---------------------------------------------------------------------------
+# Consiliency/pmcp#322: the invalid-pin warning names the right consequence
+# ---------------------------------------------------------------------------
+
+
+def test_a_bad_version_on_a_replacing_entry_does_not_claim_an_earlier_pin_stands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The issue's repro (N1): the user overlay pins firecrawl to 3.25.5, then a
+    `PMCP_MANIFEST_PATH` overlay replaces the whole entry with `version:
+    latest`. The server ends up unpinned, so the only pin warning must say
+    the entry replaced any earlier pin -- not that an earlier pin stands."""
+    _user_overlay('server_version:\n  firecrawl: "3.25.5"\n')
+    shipped = load_manifest().servers["firecrawl"]
+    explicit = tmp_path / "explicit.yaml"
+    entry = {
+        "description": "f",
+        "keywords": ["f"],
+        "command": "npx",
+        "args": ["-y", "firecrawl-mcp"],
+        "install": {"linux": ["npx", "-y", "firecrawl-mcp"]},
+        "version": "latest",
+    }
+    explicit.write_text(yaml.safe_dump({"servers": {"firecrawl": entry}}))
+    monkeypatch.setenv("PMCP_MANIFEST_PATH", str(explicit))
+
+    with caplog.at_level(logging.WARNING):
+        loaded = load_manifest().servers["firecrawl"]
+
+    assert shipped.version == "3.25.5"  # the earlier pin did exist
+    assert loaded.version is None
+    assert loaded.args == ["-y", "firecrawl-mcp"]
+    pin_lines = [m for m in _warnings(caplog) if "pin for server 'firecrawl'" in m]
+    assert len(pin_lines) == 1
+    assert "'version' pin" in pin_lines[0]
+    assert "replaced any earlier pin" in pin_lines[0]
+    assert "stands" not in pin_lines[0]
+    assert "latest" not in pin_lines[0].split("This pin is ignored")[1]
+
+
+def test_a_bad_server_version_still_says_an_earlier_pin_stands(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _user_overlay("server_version:\n  firecrawl: latest\n")
+
+    with caplog.at_level(logging.WARNING):
+        load_manifest()
+
+    pin_lines = [m for m in _warnings(caplog) if "pin for server 'firecrawl'" in m]
+    assert len(pin_lines) == 1
+    assert "'server_version' pin" in pin_lines[0]
+    assert "a pin from an earlier source, if any, stands" in pin_lines[0]

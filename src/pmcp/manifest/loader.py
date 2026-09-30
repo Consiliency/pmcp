@@ -7,10 +7,9 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from collections.abc import Iterable
 from typing import Any, Literal, cast
 
 import yaml
@@ -702,13 +701,23 @@ def _parse_version_pin(name: str, raw: Any, field_label: str) -> str | None:
     # a label that names nothing (Consiliency/pmcp#295 board, N2).
     if isinstance(raw, str) and is_valid_package_version(raw) and "+" not in raw:
         return raw
+    # What happens to an EARLIER pin depends on the field, never on a value
+    # (Consiliency/pmcp#322, N1): an overlay's `server_version` only patches
+    # the entry, so an earlier pin stands; a `version:` rides on a whole
+    # `servers:` entry, which replaced the earlier entry and any pin with it.
+    if field_label == "server_version":
+        consequence = "a pin from an earlier source, if any, stands"
+    else:
+        consequence = (
+            "the whole entry that carries it replaced any earlier pin, so the "
+            "server is unpinned unless a later 'server_version' pins it"
+        )
     logger.warning(
         f"Ignoring a '{field_label}' pin for {_server_label(name)}: a version "
         'pin must be one exact version such as "3.25.5" -- not a range, a '
         'dist-tag such as "latest", build metadata (+...), a name npm reads as '
         "a local tarball (.tgz/.tar/.tar.gz), or a package spec. This pin is "
-        "ignored (the value is not logged); a pin from an earlier source, if "
-        "any, stands"
+        f"ignored (the value is not logged); {consequence}"
     )
     return None
 
