@@ -141,9 +141,22 @@ def _qualified(node: ast.AST, bound: dict[str, str]) -> str | None:
     return ".".join([bound[node.id], *reversed(parts)])
 
 
+#: The parser packages: an attribute of any of their SUBMODULES
+#: (``yaml.loader.SafeLoader``, ``yaml.cyaml.CSafeLoader``,
+#: ``yaml.constructor.SafeConstructor``, ``json.decoder.JSONDecoder``) is a
+#: parser reference unless its name is safe in the package itself (rev 8,
+#: round-7 claude (3)).
+_PARSER_PACKAGES = ("json", "yaml", "tomllib")
+
+
 def _violation(qualified: str) -> bool:
     owner, _, attr = qualified.rpartition(".")
-    return owner in _SAFE_ATTRIBUTES and attr not in _SAFE_ATTRIBUTES[owner]
+    if owner in _SAFE_ATTRIBUTES:
+        return attr not in _SAFE_ATTRIBUTES[owner]
+    package = owner.split(".")[0]
+    if package in _PARSER_PACKAGES and owner != package:
+        return attr not in _SAFE_ATTRIBUTES[package]
+    return False
 
 
 def _parser_references(source: str) -> list[tuple[int, str]]:
@@ -164,14 +177,18 @@ def _parser_references(source: str) -> list[tuple[int, str]]:
                 found.append((node.lineno, qualified))
             elif node.attr in _PARSER_NAMES:
                 found.append((node.lineno, f".{node.attr}"))
+            elif (
+                isinstance(node.value, ast.Attribute)
+                and node.value.attr in _PARSER_PACKAGES
+                and node.attr not in _SAFE_ATTRIBUTES[node.value.attr]
+            ):
+                # A parser package reached through another module's attribute
+                # (``policy.yaml.load``), which the resolver cannot follow.
+                found.append((node.lineno, f".{node.value.attr}.{node.attr}"))
         elif isinstance(node, ast.Call):
             func = node.func
-            if (
-                isinstance(func, ast.Attribute)
-                and func.attr == "json"
-                and not node.args
-                and not node.keywords
-            ):
+            if isinstance(func, ast.Attribute) and func.attr == "json":
+                # With or without arguments (``resp.json(content_type=None)``).
                 found.append((node.lineno, ".json()"))
             elif isinstance(func, ast.Name) and (
                 func.id in _DOTENV or bound.get(func.id, "").startswith("dotenv.")
@@ -247,6 +264,13 @@ def test_no_parser_call_outside_the_helpers() -> None:
         "cls.fromisoformat(t)",
         "self._yaml.safe_load(t)",
         "response.json()",
+        "await resp.json(content_type=None)",
+        "from yaml.loader import SafeLoader\nSafeLoader(t).get_single_data()",
+        "from yaml.cyaml import CSafeLoader\nCSafeLoader(t).get_single_data()",
+        "from yaml.constructor import SafeConstructor\nSafeConstructor()",
+        "from json.decoder import JSONDecoder\nJSONDecoder().decode(t)",
+        "import yaml.loader\nyaml.loader.SafeLoader(t)",
+        "policy.yaml.load(t, Loader=policy.yaml.SafeLoader)",
         "from dotenv import load_dotenv as ld\nld(p)",
         "def f():\n    import yaml\n    return yaml.safe_load(t)",
     ],
@@ -264,6 +288,9 @@ def test_the_parse_site_check_sees_every_spelling(snippet: str) -> None:
         "from datetime import datetime, timezone\ndatetime.now(timezone.utc)",
         "import json\nexcept_types = (json.JSONDecodeError, ValueError)",
         "from pmcp.parsing import load_yaml\nload_yaml(t, source='x')",
+        "from json.decoder import JSONDecodeError\nexcept_types = (JSONDecodeError,)",
+        "from yaml.error import MarkedYAMLError\nisinstance(e, MarkedYAMLError)",
+        "self.yaml.safe_dump(v)",
     ],
 )
 def test_the_parse_site_check_passes_non_parsers(snippet: str) -> None:

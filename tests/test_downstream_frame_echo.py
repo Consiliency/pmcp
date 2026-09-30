@@ -56,6 +56,7 @@ from pmcp.types import (
 from tests.test_argument_error_echo import (
     _FAMILIES,
     _call,
+    _forbidden,
     _record_stable,
     _record_text,
     _server,
@@ -63,7 +64,23 @@ from tests.test_argument_error_echo import (
 )
 from tests.test_scoped_advisor_audit import _make_ctx
 
-_SHAPES = ("result-type", "error-code", "error-message", "jsonrpc", "not-json")
+_SHAPES = (
+    "result-type",
+    "error-code",
+    "error-message",
+    "jsonrpc",
+    "not-json",
+    # rev 8 (round-7 codex F028-F034): JSON-RPC-shaped frames a parser
+    # rejects -- on a limit (nesting depth, an integer's digit count) or on
+    # syntax. Each fails BEFORE the sentinel, so the failure's position does
+    # not depend on the sentinel's length (the pair differential holds).
+    "json-deep",
+    "json-bigint",
+    "json-syntax",
+)
+#: The shapes whose frame the parser rejects: stdio then also sends the real
+#: reply, so the request completes instead of timing out.
+_REJECTED_SHAPES = ("not-json", "json-deep", "json-bigint", "json-syntax")
 _METHODS = (
     "initialize",
     "tools/list",
@@ -134,6 +151,15 @@ _DOWNSTREAM_LOGIC = textwrap.dedent(
             frame = {"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": {s: s}}}
         elif state["shape"] == "jsonrpc":
             frame = {"jsonrpc": s, "id": rid, "result": {}}
+        elif state["shape"] == "json-deep":
+            head = '{"jsonrpc":"2.0","id":%s,"error":{"message":"m","data":' % json.dumps(rid)
+            return (head + "[" * 1500 + "0" + "]" * 1500 + ',"code":%s}}' % json.dumps(s)).encode()
+        elif state["shape"] == "json-bigint":
+            head = '{"jsonrpc":"2.0","id":%s,"error":{"message":"m","data":' % json.dumps(rid)
+            return (head + "7" * 5000 + ',"code":%s}}' % json.dumps(s)).encode()
+        elif state["shape"] == "json-syntax":
+            head = '{"jsonrpc":"2.0","id":%s,"error":{"message":"m",,' % json.dumps(rid)
+            return (head + '"code":%s}}' % json.dumps(s)).encode()
         else:
             return (s + " is not JSON {").encode()
         return json.dumps(frame).encode()
@@ -235,6 +261,7 @@ class _Downstream:
 _STDIO_SCRIPT = _DOWNSTREAM_LOGIC + textwrap.dedent(
     """
     import sys
+    REJECTED = @@REJECTED@@
     state_path = sys.argv[1]
     for line in sys.stdin:
         with open(state_path) as handle:
@@ -245,15 +272,15 @@ _STDIO_SCRIPT = _DOWNSTREAM_LOGIC + textwrap.dedent(
         data = reply(request, state)
         if data is None:
             continue
-        if not data.startswith(b"{"):
-            # stdio frames are lines: the garbage line, then the reply the
+        if request.get("method") == state["method"] and state["shape"] in REJECTED:
+            # stdio frames are lines: the rejected line, then the reply the
             # request is waiting for (else it would only time out).
             sys.stdout.buffer.write(data + b"\\n")
             data = reply(request, {**state, "method": None})
         sys.stdout.buffer.write(data + b"\\n")
         sys.stdout.flush()
     """
-)
+).replace("@@REJECTED@@", repr(_REJECTED_SHAPES))
 
 
 def _config(transport: str, downstream: _Downstream, tmp: Path) -> ResolvedServerConfig:
@@ -339,12 +366,19 @@ _CLOSE_TIMEOUT = re.compile(
 )
 
 
+_NON_JSON_PREFIX = "[frames] Non-JSON output: "
+
+
 def _non_json_line(record: logging.LogRecord) -> bool:
-    """Exactly stdio's DEBUG line for a downstream's non-JSON output."""
+    """Exactly stdio's DEBUG line for a downstream's non-JSON output -- and
+    only for a line that is not JSON-RPC-shaped (rev 8): a JSON-shaped frame
+    the parser rejected is protocol data, and its record is never exempt."""
+    message = record.getMessage()
     return (
         record.name == "pmcp.client.manager"
         and record.levelno == logging.DEBUG
-        and record.getMessage().startswith("[frames] Non-JSON output: ")
+        and message.startswith(_NON_JSON_PREFIX)
+        and not re.match(r"\s*(?:\{|\[\s*\{)", message[len(_NON_JSON_PREFIX) :])
         and not record.exc_info
     )
 
@@ -465,6 +499,14 @@ async def test_no_malformed_frame_value_reaches_pmcps_output(
                         if transport == "stdio" and leaks == ["response"] and accepted:
                             leaks = []  # accepted as the product, by design
                         assert leaks == [], (transport, method, shape, family, observed)
+                        if transport == "stdio" and shape.startswith("json-"):
+                            # No vacuous pass: the rejected frame reached the
+                            # reader and was described, not exempted.
+                            assert any(
+                                "sent a JSON-RPC frame that could not be parsed"
+                                in r.getMessage()
+                                for r in records
+                            ), (transport, method, shape, family)
                         seen.append(pair_view)
                     assert seen[0] == seen[1], (transport, method, shape, family, seen)
                     cases += 1
@@ -606,3 +648,109 @@ class _NoServer:
     """`_Tap` outside a server: no gateway tools, so no audit-event buffer."""
 
     _gateway_tools = None
+
+
+# --- rev 8: every JSON-RPC-shaped frame the stdio parser rejects ---------------
+
+
+def _rejected_frames(s: str) -> list[tuple[str, bytes]]:
+    """JSON-RPC-shaped stdio lines the real parser rejects, derived from the
+    grammar rather than from findings (round-7 codex F028-F034 are two of
+    them): every truncation point and every structural-character deletion of
+    a frame carrying the sentinel, a doubled separator at every structural
+    position, and both parser limits (nesting depth, an integer's digits),
+    as an object and as a batch, bare and after leading whitespace."""
+    frame = json.dumps(
+        {"jsonrpc": "2.0", "id": 7, "result": {"k": s, "list": [1, s], "o": {"s": s}}}
+    )
+    variants: list[tuple[str, str]] = []
+    for cut in range(1, len(frame)):
+        variants.append((f"truncated@{cut}", frame[:cut]))
+    for i, char in enumerate(frame):
+        if char in '{}[]:,"':
+            variants.append((f"deleted {char}@{i}", frame[:i] + frame[i + 1 :]))
+        if char in ":,":
+            variants.append((f"doubled {char}@{i}", frame[:i] + char + frame[i:]))
+    variants.append(
+        ("depth", frame[:-1] + ',"d":' + "[" * 1500 + "0" + "]" * 1500 + "}")
+    )
+    variants.append(("digits", frame[:-1] + ',"n":' + "7" * 5000 + "}"))
+    out: list[tuple[str, bytes]] = []
+    for label, text in variants:
+        for prefix, suffix, shape in (
+            ("", "", "object"),
+            ("  ", "", "indented"),
+            ("[", "]", "batch"),
+        ):
+            line = prefix + text + suffix
+            # The class is JSON-RPC-SHAPED lines: an object, or a batch of
+            # objects. A variant that lost its opening brace is not one; it
+            # is indistinguishable from the downstream's own output.
+            if not re.match(r"\s*(?:\{|\[\s*\{)", line):
+                continue
+            try:
+                json.loads(line)
+            except Exception:  # noqa: BLE001 -- any rejection counts
+                out.append((f"{shape} {label}", line.encode()))
+    return out
+
+
+@pytest.mark.parametrize("family", sorted(_FAMILIES))
+def test_no_rejected_json_rpc_frame_reaches_the_log(
+    caplog: pytest.LogCaptureFixture, family: str
+) -> None:
+    """A JSON-RPC-shaped stdio line that the parser rejects -- on syntax or a
+    limit -- is described, never logged raw; no record is exempted. A line
+    that is not JSON-RPC-shaped is still the downstream's own output, logged
+    as it is (the positive control for the boundary)."""
+    import time
+    from unittest.mock import MagicMock
+
+    from pmcp.client.manager import ClientManager, ManagedClient
+    from pmcp.types import ServerStatus, ServerStatusEnum
+
+    caplog.set_level(logging.DEBUG)
+    s = _FAMILIES[family][1]
+    forbidden = _forbidden(s)
+    manager = ClientManager()
+    managed = ManagedClient(
+        config=MagicMock(),
+        process=MagicMock(),
+        status=ServerStatus(name="srv", status=ServerStatusEnum.ONLINE, tool_count=0),
+    )
+    frames = _rejected_frames(s)
+    # No vacuous pass: the generator covers each class, and both limits.
+    labels = " ".join(label for label, _ in frames)
+    for kind in (
+        "truncated",
+        "deleted",
+        "doubled",
+        "depth",
+        "digits",
+        "batch",
+        "indented",
+    ):
+        assert kind in labels, kind
+    described = 0
+    for label, line in frames:
+        start = len(caplog.records)
+        manager._handle_stdout_line("srv", managed, line, time.time())
+        records = caplog.records[start:]
+        text = "\n".join(_record_text(r) for r in records)
+        assert not any(form in text for form in forbidden), (label, text[:300])
+        described += any(
+            "sent a JSON-RPC frame that could not be parsed" in r.getMessage()
+            for r in records
+        )
+    # The frames carry the sentinel as JSON spells it (`\\u` escapes for the
+    # non-ASCII family), which is what a raw log line would show.
+    spelled = json.dumps(s)[1:-1].encode("ascii")
+    carrying = [label for label, line in frames if spelled in line]
+    assert described == len(frames) and len(carrying) > 100, (described, len(frames))
+    # The boundary: a non-JSON-RPC-shaped line is logged as it is, by design.
+    start = len(caplog.records)
+    manager._handle_stdout_line("srv", managed, f"[INFO] {s}".encode(), time.time())
+    assert any(
+        r.getMessage() == f"[srv] Non-JSON output: [INFO] {s}"
+        for r in caplog.records[start:]
+    )

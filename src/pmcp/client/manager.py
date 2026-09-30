@@ -229,6 +229,16 @@ _PARSE_ERROR = -32700
 _PARSE_ERROR_MESSAGE = "downstream sent a response that could not be parsed"
 _MALFORMED_ERROR_MESSAGE = "downstream sent a malformed JSON-RPC error"
 
+#: A stdio line that starts a JSON-RPC message: an object, or a batch of
+#: objects. The reader logs a line it cannot parse raw only when it is NOT
+#: this shape -- the downstream's own non-protocol output (Consiliency/pmcp#297,
+#: rev 8). A banner or log line such as `[INFO] ...` is not this shape.
+_JSON_RPC_SHAPED = re.compile(rb"\s*(?:\{|\[\s*\{)")
+
+
+def _is_json_rpc_shaped(line: bytes) -> bool:
+    return _JSON_RPC_SHAPED.match(line) is not None
+
 
 def _downstream_error(error: Any) -> DownstreamError:
     """Build a `DownstreamError` from a JSON-RPC `error` member.
@@ -2908,8 +2918,21 @@ class ClientManager:
                     pending.future.set_exception(_downstream_error(message["error"]))
                 else:
                     pending.future.set_result(message.get("result", {}))
-        except json.JSONDecodeError:
-            # Non-JSON output already counted as a heartbeat by the caller.
+        except json.JSONDecodeError as error:
+            # Already counted as a heartbeat by the caller.
+            if _is_json_rpc_shaped(line):
+                # A frame that is JSON-shaped but rejected -- a syntax error,
+                # or a parser limit (nesting depth, an integer's digit count)
+                # on otherwise valid JSON -- is a protocol frame, and its
+                # content is the downstream's data, not its output: described,
+                # never echoed (Consiliency/pmcp#297, rev 8).
+                logger.debug(
+                    f"[{name}] downstream sent a JSON-RPC frame that could not "
+                    f"be parsed: {exception_text(error)}"
+                )
+                return
+            # The downstream's own non-protocol output (a banner, a log line),
+            # logged as it is by design.
             logger.debug(
                 f"[{name}] Non-JSON output: {line.decode(errors='replace').strip()}"
             )
