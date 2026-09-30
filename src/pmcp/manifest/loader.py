@@ -14,6 +14,7 @@ from typing import Any, Literal, cast
 import yaml
 
 from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_yaml
 from pmcp.project_consent import log_refusal, read_and_gate
 
 logger = logging.getLogger(__name__)
@@ -762,7 +763,7 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
     create a server: ``servers:`` remains whole-entry replace.
     """
     try:
-        data = yaml.safe_load(content)
+        data = load_yaml(content, source="manifest overlay")
     except yaml.YAMLError as exc:
         logger.warning(
             f"Skipping unreadable manifest overlay {path}: {exception_text(exc)}"
@@ -840,7 +841,7 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
     logger.info(f"Loading manifest from {manifest_path}")
 
     with open(manifest_path, "r") as f:
-        data = yaml.safe_load(f)
+        data = load_yaml(f, source="manifest")
 
     # Parse CLI alternatives
     cli_alternatives: dict[str, CLIAlternative] = {}

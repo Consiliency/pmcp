@@ -12,8 +12,6 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-import yaml
-
 from pmcp.argument_errors import exception_text
 from pmcp.project_consent import log_refusal, read_and_gate
 from pmcp.types import (
@@ -25,6 +23,7 @@ from pmcp.types import (
     ToolPolicy,
 )
 from pmcp.auth import _sanitize_base
+from pmcp.parsing import load_json, load_yaml
 from pmcp.redaction_additive import (
     REDACTED,
     URL_RE,
@@ -414,9 +413,9 @@ class PolicyManager:
         """
         try:
             if policy_path.suffix in (".yaml", ".yml"):
-                data = yaml.safe_load(content)
+                data = load_yaml(content, source="policy file")
             else:
-                data = json.loads(content)
+                data = load_json(content, source="policy file")
         except Exception as e:
             if fatal:
                 raise ValueError(
@@ -886,7 +885,7 @@ class PolicyManager:
         result: Any = final_str
         if not isinstance(output, str):
             try:
-                result = json.loads(final_str)
+                result = load_json(final_str, source="redacted output")
             except json.JSONDecodeError:
                 # Keep as string if truncation broke JSON
                 pass

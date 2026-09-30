@@ -21,6 +21,7 @@ from jwt import PyJWKSet
 
 from pmcp.argument_errors import exception_text
 from pmcp.keyword_matcher import key_start_pattern, redact_keyword_values
+from pmcp.parsing import load_json
 from pmcp.redaction_additive import redact_additive
 from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
 
@@ -451,7 +452,7 @@ class AsyncJWKS:
                 f"JWKS response too large for {self.url}."
             )
         try:
-            jwks = json.loads(content.decode("utf-8"))
+            jwks = load_json(content, source="JWKS response", encoding="utf-8")
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ResourceServerJWKSUnavailable(
                 f"Invalid JWKS JSON from {self.url}."
@@ -809,13 +810,13 @@ def parse_url_elicitation_error(payload: object) -> list[UrlElicitationInfo]:
     if isinstance(payload, str):
         payload_text = payload
         try:
-            payload = json.loads(payload_text)
+            payload = load_json(payload_text, source="URL elicitation payload")
         except json.JSONDecodeError:
             match = re.search(r"(\{.*\})", payload_text)
             if not match:
                 return []
             try:
-                payload = json.loads(match.group(1))
+                payload = load_json(match.group(1), source="URL elicitation payload")
             except json.JSONDecodeError:
                 return []
     if not isinstance(payload, Mapping):
@@ -903,7 +904,7 @@ def fetch_json_metadata(
             body = response.read(1024 * 256)
         if "json" not in content_type.lower():
             return None, f"{safe_url} returned non-JSON content"
-        data = json.loads(body.decode("utf-8"))
+        data = load_json(body, source="auth metadata response", encoding="utf-8")
         if not isinstance(data, dict):
             return None, f"{safe_url} returned JSON that was not an object"
         return data, None

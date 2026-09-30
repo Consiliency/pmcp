@@ -488,6 +488,52 @@ class TestHttpObservabilityContracts:
 
         assert foreign.status_code == 403
 
+    @pytest.mark.parametrize(
+        "client_kwargs",
+        [
+            {},
+            {"allowed_origins": ["https://app.example"]},
+            {"auth_token": "gateway-token"},
+        ],
+        ids=["default", "allowlist", "shared-secret"],
+    )
+    def test_malformed_origin_port_is_rejected_without_echo(
+        self,
+        client_kwargs: dict[str, object],
+        capfd: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """An unauthenticated Origin whose port is not a number is a 403, not a
+        500 whose log line quotes the port (Consiliency/pmcp#297, rev 7 B2)."""
+        import logging
+
+        # ASCII: an Origin header is Latin-1 on the wire.
+        sentinel = "Q7portSentinel" + "x" * 20
+        client = _make_contract_client(**client_kwargs)  # type: ignore[arg-type]
+        caplog.set_level(logging.DEBUG)
+
+        response = client.post(
+            "/mcp",
+            headers={"Origin": f"http://evil.example:{sentinel}"},
+            json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+        )
+
+        assert response.status_code == 403
+        out, err = capfd.readouterr()
+        observed = "\n".join(
+            [
+                response.text,
+                str(dict(response.headers)),
+                out,
+                err,
+                *(record.getMessage() for record in caplog.records),
+                *(str(record.exc_info) for record in caplog.records),
+            ]
+        )
+        assert len(sentinel) == 34
+        assert sentinel not in observed
+        assert sentinel.encode("utf-8").hex() not in observed.encode("utf-8").hex()
+
     def test_no_origin_and_loopback_and_same_origin_pass_by_default(self) -> None:
         """Normal MCP clients (no Origin) and loopback/same-origin browsers pass."""
         client = _make_contract_client()

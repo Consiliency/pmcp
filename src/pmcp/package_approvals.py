@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 
 
 from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_json, parse_timestamp
 from pmcp.trust_store import TrustStoreError, trust_store_path
 from pmcp.validation import (
     is_valid_package_name,
@@ -138,7 +139,7 @@ def _decode(entry: Any) -> PackageApproval:
     if decision not in DECISIONS:
         raise PackageApprovalError(f"Unknown package decision: {decision!r}")
     try:
-        parsed_at = datetime.fromisoformat(str(recorded_at))
+        parsed_at = parse_timestamp(str(recorded_at), source="package approval record")
     except ValueError as exc:
         raise PackageApprovalError(
             f"Unparseable package approval timestamp: {exception_text(exc)}"
@@ -176,7 +177,7 @@ def _read_store_and_stale(
             f"Cannot read package approvals {path}: {exc}"
         ) from exc
     try:
-        data = json.loads(raw)
+        data = load_json(raw, source="package approvals")
     except ValueError as exc:
         raise PackageApprovalError(
             f"Cannot parse package approvals {path}: {exception_text(exc)}"

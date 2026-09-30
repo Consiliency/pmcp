@@ -15,6 +15,7 @@ from pmcp.argument_errors import (
     SCOPED_CORRELATION_INCOMPLETE,
     argument_error,
 )
+from pmcp.parsing import parse_timestamp
 from pmcp.validation import is_valid_package_name, version_separator_index
 
 # === Transport Types ===
@@ -555,7 +556,7 @@ class McpTaskInfo(BaseModel):
                 pass
             if candidate.endswith("Z"):
                 candidate = f"{candidate[:-1]}+00:00"
-            return datetime.fromisoformat(candidate).timestamp()
+            return parse_timestamp(candidate, source="task timestamp").timestamp()
         return value
 
 

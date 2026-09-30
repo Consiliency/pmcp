@@ -95,6 +95,8 @@ _NON_RENDERING_CALLEES = {
     "_warn_unparseable",
     # scoped_advisor_audit.py (#296): records path and keyword only.
     "record_rejected_arguments",
+    # parsing.py (rev 7): reads a MarkedYAMLError's mark line and column only.
+    "_yaml_position",
     # manager.py: flattens a group into leaves; its callers render each leaf
     # with `exception_text` (`describe_exception`).
     "_iter_leaf_exceptions",

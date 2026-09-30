@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_json
 from pmcp.types import (
     ConfigSourceInfo,
     ConfigSourceName,
@@ -296,7 +297,7 @@ def parse_config_bytes(content: bytes, file_path: Path) -> McpConfigFile | None:
     for diagnostics only; nothing here touches the filesystem.
     """
     try:
-        data = json.loads(content)
+        data = load_json(content, source="config file")
 
         raw_servers = data.get("mcpServers")
         if isinstance(raw_servers, dict):
@@ -364,7 +365,7 @@ def _config_object_from_bytes(
 ) -> tuple[dict[str, Any] | None, str | None]:
     """The object form of config bytes already in hand. See ``parse_config_bytes``."""
     try:
-        data = json.loads(content)
+        data = load_json(content, source="config file")
     except Exception as exc:
         return None, f"invalid_json: {exception_text(exc)}"
     if not isinstance(data, dict):

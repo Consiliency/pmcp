@@ -63,6 +63,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_json
 
 logger = logging.getLogger(__name__)
 
@@ -375,7 +376,7 @@ class NpmResolver:
             self._terminate()
             return _refused("child produced no handshake")
         try:
-            handshake = json.loads(line)
+            handshake = load_json(line, source="npm resolver handshake")
         except ValueError:
             self._terminate()
             return _refused("child handshake was not JSON")
@@ -511,7 +512,7 @@ class NpmResolver:
             self._terminate()
             return _refused("npm resolver child timed out or died")
         try:
-            response = json.loads(line)
+            response = load_json(line, source="npm resolver response")
         except ValueError:
             self._terminate()
             return _refused("npm resolver child sent malformed JSON")

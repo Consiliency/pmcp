@@ -20,7 +20,6 @@ import collections
 import contextlib
 import hmac
 import ipaddress
-import json
 import logging
 import uuid
 from collections.abc import AsyncIterator, MutableMapping
@@ -42,6 +41,7 @@ from pmcp.auth import (
     sanitize_public_auth_url,
     validate_resource_server_token,
 )
+from pmcp.parsing import load_json
 from pmcp.types import GatewayDiagnosticsInfo
 
 if TYPE_CHECKING:
@@ -256,13 +256,24 @@ def _split_host_port(value: str, default_port: str) -> tuple[str, str]:
 
 
 def _origin_host_port(origin: str) -> tuple[str, str] | None:
-    """Return (hostname, port) for an Origin header value, or None if unparseable."""
-    parsed = urlparse(origin)
-    if not parsed.scheme or not parsed.hostname:
+    """Return (hostname, port) for an Origin header value, or None if unparseable.
+
+    ``urlparse`` and ``.port`` raise ``ValueError`` on a malformed authority
+    (``Port could not be cast to integer value as '<port>'``), quoting the
+    caller's header; an unparseable Origin is a rejected one, never a 500
+    (Consiliency/pmcp#297).
+    """
+    try:
+        parsed = urlparse(origin)
+        hostname = parsed.hostname
+        explicit_port = parsed.port
+    except ValueError:
+        return None
+    if not parsed.scheme or not hostname:
         return None
     default_port = "443" if parsed.scheme == "https" else "80"
-    port = str(parsed.port) if parsed.port is not None else default_port
-    return parsed.hostname, port
+    port = str(explicit_port) if explicit_port is not None else default_port
+    return hostname, port
 
 
 def create_http_app(
@@ -641,7 +652,7 @@ def create_http_app(
                 return Response("Payload Too Large", status_code=413)
 
             try:
-                body_method = json.loads(body_bytes).get("method")
+                body_method = load_json(body_bytes, source="request body").get("method")
             except Exception:
                 pass
 

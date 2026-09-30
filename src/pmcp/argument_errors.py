@@ -497,10 +497,16 @@ _PARSE_ERRORS: tuple[type[BaseException], ...] = ()
 
 
 def _is_parse_error(error: BaseException) -> bool:
+    """A parser's own error. Not :class:`pmcp.parsing.ParseError`, which
+    subclasses these types so callers' ``except`` clauses keep their meaning
+    but whose text is value-free by construction (rev 7): it is rendered as
+    ``str(error)``, source label included."""
+    from pmcp.parsing import ParseError
+
     global _PARSE_ERRORS
     if not _PARSE_ERRORS:
         _PARSE_ERRORS = _parse_error_types()
-    return isinstance(error, _PARSE_ERRORS)
+    return isinstance(error, _PARSE_ERRORS) and not isinstance(error, ParseError)
 
 
 def _is_validation_error(error: BaseException) -> bool:
@@ -630,6 +636,15 @@ def safe_exc_info(error: BaseException) -> BaseException | None:
     return error
 
 
+def _qualified_name(kind: type[BaseException]) -> str:
+    """``module.QualName`` as the interpreter prints it (bare for builtins)."""
+    module = getattr(kind, "__module__", None)
+    name = getattr(kind, "__qualname__", kind.__name__)
+    if module in (None, "builtins", "__main__"):
+        return str(name)
+    return f"{module}.{name}"
+
+
 def safe_traceback_text(error: BaseException) -> str:
     """The formatted traceback. When the chain holds a validation or parse
     error, every exception in it is rendered as its frames (file, line,
@@ -664,7 +679,7 @@ def safe_traceback_text(error: BaseException) -> str:
         if current.__traceback__ is not None:
             parts.append("Traceback (most recent call last):\n")
             parts.extend(traceback.format_tb(current.__traceback__))
-        parts.append(f"{type(current).__name__}: {exception_text(current)}\n")
+        parts.append(f"{_qualified_name(type(current))}: {exception_text(current)}\n")
 
     render(error)
     return "".join(parts)
@@ -755,6 +770,7 @@ def install_log_scrubber() -> None:
     if not getattr(current, "pmcp_validation_scrubber", False):
         logging.setLogRecordFactory(_scrubbing_factory(current))
     _install_excepthook()
+    _install_threading_excepthook()
     _install_handle_error()
 
 
@@ -803,10 +819,44 @@ def _install_excepthook() -> None:
 
     def hook(kind: Any, value: Any, tb: Any) -> None:
         if isinstance(value, BaseException) and safe_exc_info(value) is None:
-            sys.stderr.write(safe_traceback_text(value) + "\n")
+            # The default hook prints nothing when there is no stderr.
+            if sys.stderr is not None:
+                sys.stderr.write(safe_traceback_text(value) + "\n")
             return
         previous(kind, value, tb)
 
     hook.pmcp_validation_scrubber = True  # type: ignore[attr-defined]
     hook.previous = previous  # type: ignore[attr-defined]
     sys.excepthook = hook
+
+
+def _install_threading_excepthook() -> None:
+    """``threading.excepthook`` prints an uncaught exception in a thread the
+    same way (rev 7, N3): such a chain is printed by
+    :func:`safe_traceback_text` under the interpreter's own header; every
+    other exception by the previous hook, unchanged. Idempotent."""
+    import threading
+
+    previous = threading.excepthook
+    if getattr(previous, "pmcp_validation_scrubber", False):
+        return
+
+    def hook(args: Any) -> None:
+        value = getattr(args, "exc_value", None)
+        if (
+            getattr(args, "exc_type", None) is not SystemExit
+            and isinstance(value, BaseException)
+            and safe_exc_info(value) is None
+        ):
+            if sys.stderr is not None:
+                thread = getattr(args, "thread", None)
+                name = getattr(thread, "name", None) or "unknown"
+                sys.stderr.write(
+                    f"Exception in thread {name}:\n" + safe_traceback_text(value) + "\n"
+                )
+            return
+        previous(args)
+
+    hook.pmcp_validation_scrubber = True  # type: ignore[attr-defined]
+    hook.previous = previous  # type: ignore[attr-defined]
+    threading.excepthook = hook

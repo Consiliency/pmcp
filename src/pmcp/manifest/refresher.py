@@ -28,6 +28,7 @@ from pmcp.manifest.version_checker import (
     detect_package_type,
     get_package_version,
 )
+from pmcp.parsing import load_yaml
 from pmcp.types import (
     DescriptionsCache,
     GeneratedServerDescriptions,
@@ -63,7 +64,7 @@ def load_descriptions_cache(cache_path: Path | None = None) -> DescriptionsCache
 
     try:
         with open(cache_path, "r") as f:
-            data = yaml.safe_load(f)
+            data = load_yaml(f, source="descriptions cache")
 
         if not data:
             return None

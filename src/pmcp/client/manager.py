@@ -34,6 +34,7 @@ from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
 from pmcp.env_store import sanitized_subprocess_env
 from pmcp.manifest.installer import _operator_safe, _render_install_argv
+from pmcp.parsing import load_json
 from pmcp.remote_auth import (
     MissingRemoteHeaderAuthError,
     resolve_remote_headers_for_tenant,
@@ -2874,7 +2875,7 @@ class ClientManager:
                     f"[{name}] downstream sent undecodable bytes on stdout; "
                     "the line was decoded with replacement characters"
                 )
-            message = json.loads(text)
+            message = load_json(text, source="downstream stdio frame")
             msg_id = message.get("id")
             method = message.get("method")
             # Classify by `method` FIRST (C-01). A frame carrying a `method` can

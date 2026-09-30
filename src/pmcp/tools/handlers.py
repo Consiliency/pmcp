@@ -201,6 +201,7 @@ from pmcp.manifest.loader import (
     is_usable_credential_value,
     requires_credential,
 )
+from pmcp.parsing import load_json, load_json_file
 
 logger = logging.getLogger(__name__)
 
@@ -983,7 +984,7 @@ class GatewayTools:
             return {}
         try:
             with open(path) as f:
-                data = json.load(f)
+                data = load_json_file(f, source="provisioned registry")
             return {k: v for k, v in data.items() if isinstance(k, str)}
         except Exception as e:
             logger.warning(f"Could not load provisioned registry: {exception_text(e)}")
@@ -6110,7 +6111,9 @@ class GatewayTools:
             if isinstance(result_payload, str):
                 for _ in range(2):
                     try:
-                        decoded = json.loads(result_payload)
+                        decoded = load_json(
+                            result_payload, source="tool result payload"
+                        )
                     except json.JSONDecodeError:
                         break
                     result_payload = decoded

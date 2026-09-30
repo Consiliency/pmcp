@@ -9,8 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import yaml
 from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_yaml
 
 
 class CodePatternsLoader:
@@ -41,7 +41,7 @@ class CodePatternsLoader:
 
         try:
             with open(self._patterns_path) as f:
-                data = yaml.safe_load(f)
+                data = load_yaml(f, source="code patterns file")
 
             if not data:
                 return

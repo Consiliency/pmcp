@@ -10,8 +10,8 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import yaml
 from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_yaml
 
 if TYPE_CHECKING:
     from pmcp.types import ToolInfo
@@ -45,7 +45,7 @@ class CodeSnippetsLoader:
 
         try:
             with open(self._templates_path) as f:
-                data = yaml.safe_load(f)
+                data = load_yaml(f, source="code snippet templates")
 
             if not data:
                 return

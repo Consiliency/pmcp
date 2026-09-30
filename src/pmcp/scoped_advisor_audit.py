@@ -21,6 +21,7 @@ from pmcp.argument_errors import (
     schema_error_keyword,
     schema_error_path,
 )
+from pmcp.parsing import load_json
 
 SCOPED_ADVISOR_AUDIT_CAPABILITY = "scoped_advisor_audit.v1"
 #: Event of a ``tools/call`` the input-schema gate rejected before dispatch
@@ -49,7 +50,7 @@ def validate_scoped_advisor_audit(path: Path) -> list[dict[str, Any]]:
     """Validate contiguous records and the single terminal completeness marker."""
     try:
         records = [
-            json.loads(line)
+            load_json(line, source="scoped advisor audit record")
             for line in Path(path).read_text(encoding="utf-8").splitlines()
             if line.strip()
         ]

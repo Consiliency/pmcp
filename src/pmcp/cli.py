@@ -45,6 +45,7 @@ from pmcp.env_store import (
 )
 from pmcp.validation import is_valid_package_version, parse_package_spec
 from pmcp.manifest.loader import load_manifest
+from pmcp.parsing import load_json, load_json_file
 from pmcp.types import StartupPolicyOperation
 
 
@@ -1131,7 +1132,7 @@ def _extract_tool_payload(result: dict[str, object]) -> dict[str, object] | None
         if not isinstance(text, str):
             continue
         try:
-            parsed = json.loads(text)
+            parsed = load_json(text, source="tool result text")
         except json.JSONDecodeError:
             continue
         if isinstance(parsed, dict):
@@ -1861,7 +1862,7 @@ def run_setup(args: argparse.Namespace) -> None:
     existing: dict = {}
     if target_path.exists():
         try:
-            parsed = json.loads(target_path.read_text())
+            parsed = load_json(target_path.read_text(), source="client config")
             if isinstance(parsed, dict):
                 existing = parsed
             else:
@@ -1981,7 +1982,7 @@ def _load_local_mcp_json(project_root: Path | None) -> tuple[Path, dict | None]:
 
     try:
         with open(config_path) as f:
-            parsed = json.load(f)
+            parsed = load_json_file(f, source="client config")
             return config_path, parsed if isinstance(parsed, dict) else None
     except Exception:
         return config_path, None

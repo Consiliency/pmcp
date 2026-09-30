@@ -29,7 +29,6 @@ call, and one bare ``except Exception`` there reads as consent.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from dataclasses import dataclass
@@ -41,6 +40,7 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 import semver
 
 from pmcp.argument_errors import exception_text
+from pmcp.parsing import load_json
 from pmcp.validation import is_valid_package_name
 
 logger = logging.getLogger(__name__)
@@ -120,7 +120,7 @@ def _fetch_packument(name: str) -> dict[str, Any] | None:
     try:
         with _OPENER.open(request, timeout=_FETCH_TIMEOUT) as response:  # nosec B310
             body = response.read(_MAX_PACKUMENT_BYTES)
-        data = json.loads(body.decode("utf-8"))
+        data = load_json(body, source="npm packument", encoding="utf-8")
     except Exception as exc:
         logger.debug("npm packument fetch failed for %r: %s", name, exception_text(exc))
         return None
