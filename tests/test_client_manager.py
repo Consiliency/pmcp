@@ -17,6 +17,8 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx2
+from mcp.shared.message import SessionMessage
+from mcp.types import jsonrpc_message_adapter
 import pytest
 from pydantic import ValidationError
 
@@ -7620,3 +7622,170 @@ async def test_c01_sse_malformed_frames_are_dropped_and_connection_survives(
     assert pending.future.result() == {"ok": True}
     assert sent == [] and managed.outbound is None, "an invalid frame was answered"
     _assert_clean_logs(caplog)
+
+
+# --- Consiliency/pmcp#287: malformed frames on the REAL mcp remote transports --
+#
+# mcp validates every remote frame itself and, on failure, puts the pydantic
+# ValidationError on the read stream in place of the message. These tests go
+# through the library's own parse step -- the real `sse_client` over an httpx2
+# MockTransport, and the real streamable-HTTP `_handle_sse_event` (the GET
+# stream's handler) -- rather than mocked payloads the transport cannot produce.
+
+
+def _remote_bad_frames() -> list[str]:
+    s = _FRAME_SENTINEL
+    frames: list[Any] = [
+        [s],
+        42,
+        s,
+        None,
+        True,
+        {"jsonrpc": "2.0", "id": True, "result": {"v": s}},
+        {"jsonrpc": "2.0", "id": 1.0, "result": {"v": s}},
+        {"jsonrpc": "2.0", "id": [s], "result": {}},
+        {"jsonrpc": "2.0", "id": 1, "method": 123, "params": {"v": s}},
+        {"jsonrpc": "2.0", "id": 1, "error": s},
+        {"jsonrpc": "2.0", "id": 1, "result": s},
+        {"jsonrpc": "2.0", "method": "notifications/message", "params": s},
+    ]
+    raw = [json.dumps(f) for f in frames]
+    raw += [
+        s + "{not json",
+        "[" * 100_000 + "]" * 100_000,
+        '{"jsonrpc": "2.0", "id": ' + "9" * 5000 + ', "result": {}}',
+    ]
+    return raw
+
+
+def _assert_really_invalid(raw: list[str]) -> None:
+    """Guard against a vacuous test: mcp must reject every one of these."""
+    for r in raw:
+        with pytest.raises(ValidationError):
+            jsonrpc_message_adapter.validate_json(r, by_name=False)
+
+
+def _assert_pmcp_logs_clean(caplog: pytest.LogCaptureFixture) -> None:
+    ours = [r for r in caplog.records if r.name.startswith("pmcp")]
+    leaked = [r.getMessage() for r in ours if _FRAME_SENTINEL in r.getMessage()]
+    assert leaked == [], f"a frame value reached pmcp's logs: {leaked}"
+    loud = [r.getMessage() for r in ours if r.levelno >= logging.WARNING]
+    assert loud == [], f"a malformed frame was treated as a failure: {loud}"
+
+
+def _remote_reader_client() -> tuple[ManagedClient, PendingRequest]:
+    sent: list[Any] = []
+    managed = _managed_remote("srv", sent)
+    managed.config = None  # no auto-reconnect
+    pending = _pending(1)
+    managed.pending_requests[1] = pending
+    return managed, pending
+
+
+@pytest.mark.asyncio
+async def test_c01_legacy_sse_invalid_frames_do_not_end_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from mcp.client.sse import sse_client
+
+    bad = _remote_bad_frames()
+    _assert_really_invalid(bad)
+    events = "event: endpoint\ndata: /messages?session_id=abc\n\n"
+    for d in [*bad, json.dumps(_VALID_RESPONSE)]:
+        events += f"event: message\ndata: {d}\n\n"
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, content=events.encode()
+        )
+
+    def factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx2.Timeout | None = None,
+        auth: httpx2.Auth | None = None,
+    ) -> httpx2.AsyncClient:
+        return httpx2.AsyncClient(
+            transport=httpx2.MockTransport(handler),
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+        )
+
+    mgr = ClientManager()
+    managed, pending = _remote_reader_client()
+    mgr._clients["srv"] = managed
+    managed.status.status = ServerStatusEnum.ONLINE
+    # Resolving the valid response is the last thing the stream carries; mark
+    # the server offline then so the loop's normal end-of-stream is not read
+    # as an unexpected disconnect.
+    pending.future.add_done_callback(
+        lambda _f: setattr(managed.status, "status", ServerStatusEnum.OFFLINE)
+    )
+    with caplog.at_level(logging.DEBUG):
+        async with sse_client(
+            "http://example.invalid/sse", httpx_client_factory=factory
+        ) as (read_stream, _write_stream):
+            await mgr._read_sse("srv", managed, read_stream)
+    assert pending.future.done(), "a malformed SSE frame ended the read loop"
+    assert pending.future.result() == {"ok": True}
+    assert managed.status.status != ServerStatusEnum.ERROR
+    _assert_pmcp_logs_clean(caplog)
+    assert caplog.text.count("failed JSON-RPC validation") == len(bad)
+
+
+@pytest.mark.asyncio
+async def test_c01_streamable_http_get_stream_invalid_frames_do_not_end_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from httpx2 import ServerSentEvent
+    from mcp.client.streamable_http import StreamableHTTPTransport
+    from mcp.shared._context_streams import create_context_streams
+
+    bad = _remote_bad_frames()
+    _assert_really_invalid(bad)
+    transport = StreamableHTTPTransport("http://example.invalid/mcp")
+    writer, reader = create_context_streams[SessionMessage | Exception](1000)
+
+    async def produce() -> None:
+        # `_handle_sse_event` with no originating request id is exactly what the
+        # server-pushed GET stream (`handle_get_stream`) calls per event.
+        async with writer:
+            for d in [*bad, json.dumps(_VALID_RESPONSE)]:
+                await transport._handle_sse_event(ServerSentEvent(data=d), writer)
+
+    mgr = ClientManager()
+    managed, pending = _remote_reader_client()
+    mgr._clients["srv"] = managed
+    managed.status.status = ServerStatusEnum.ONLINE
+    pending.future.add_done_callback(
+        lambda _f: setattr(managed.status, "status", ServerStatusEnum.OFFLINE)
+    )
+    with caplog.at_level(logging.DEBUG):
+        await asyncio.gather(produce(), mgr._read_sse("srv", managed, reader))
+    assert pending.future.done(), "a malformed GET-stream frame ended the read loop"
+    assert pending.future.result() == {"ok": True}
+    assert managed.status.status != ServerStatusEnum.ERROR
+    _assert_pmcp_logs_clean(caplog)
+    assert caplog.text.count("failed JSON-RPC validation") == len(bad)
+
+
+@pytest.mark.asyncio
+async def test_c01_sse_transport_error_still_ends_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A real transport failure on the stream must still end the loop."""
+    mgr = ClientManager()
+    managed, pending = _remote_reader_client()
+    mgr._clients["srv"] = managed
+    managed.status.status = ServerStatusEnum.ONLINE
+    later = MagicMock()
+    later.message.model_dump.return_value = _VALID_RESPONSE
+
+    async def stream() -> Any:
+        yield httpx2.ReadError("connection reset")
+        yield later  # must never be reached
+
+    await mgr._read_sse("srv", managed, stream())
+    assert managed.status.status == ServerStatusEnum.ERROR
+    assert pending.future.done()
+    assert isinstance(pending.future.exception(), ConnectionError)

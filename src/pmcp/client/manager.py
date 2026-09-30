@@ -25,6 +25,7 @@ import mcp.types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
+from pydantic import ValidationError
 
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
@@ -3126,7 +3127,12 @@ class ClientManager:
     async def _read_sse(
         self, name: str, managed: ManagedClient, read_stream: Any
     ) -> None:
-        """Read JSON-RPC messages from an SSE stream."""
+        """Read JSON-RPC messages from an mcp read stream.
+
+        Serves both remote transports: legacy SSE (`sse_client`) and
+        streamable HTTP (`streamable_http_client`, including its server-pushed
+        GET stream).
+        """
         try:
             async for message in read_stream:
                 # Any output counts as per-request liveness, including progress
@@ -3136,7 +3142,27 @@ class ClientManager:
                 for req in managed.pending_requests.values():
                     req.last_heartbeat = now
 
+                if isinstance(message, ValidationError):
+                    # The mcp transports validate every incoming frame
+                    # themselves (`jsonrpc_message_adapter.validate_json`) and,
+                    # when that fails, put the pydantic `ValidationError` on the
+                    # read stream in place of the message and keep reading
+                    # (mcp/client/sse.py `sse_reader`, streamable_http.py
+                    # `_handle_sse_event` with no originating request). It is
+                    # one malformed frame -- non-JSON, not an object, a bad
+                    # `id`/`method`/`params`/`result`/`error` -- not a dead
+                    # transport, so drop it rather than end the loop. Only the
+                    # type is logged: the error's text carries the frame's
+                    # contents (`input_value=...`). Consiliency/pmcp#287.
+                    logger.debug(
+                        f"[{name}] dropped a downstream message that failed "
+                        f"JSON-RPC validation ({type(message).__name__})"
+                    )
+                    continue
                 if isinstance(message, Exception):
+                    # Anything else on the stream is a transport failure
+                    # (httpx/SSE errors, a broken stream): end the loop so the
+                    # server goes to ERROR and reconnects.
                     raise message
 
                 try:
