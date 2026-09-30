@@ -323,6 +323,7 @@ def test_no_parse_site_echoes_its_input(
         if _rejects(parser, bad)
     ]
     assert bads, (label, family)
+    silent: list[str] = []
     for bad in bads:
         start = len(caplog.records)
         capfd.readouterr()
@@ -341,12 +342,17 @@ def test_no_parse_site_echoes_its_input(
                 channel,
                 text,
             )
-        # No vacuous pass: pmcp said it could not parse, or said nothing at
-        # all (a site that falls back silently, e.g. a cache miss).
         everything = raised + shown + logged + streams.out + streams.err
-        assert "could not parse" in everything or not (
+        if "could not parse" not in everything and (
             raised or shown or streams.out.strip() or streams.err.strip()
-        ), (label, bad, everything)
+        ):
+            silent.append(bad)
+    # No vacuous pass, checked after every input's leak check: for each
+    # rejected input pmcp said it could not parse, or said nothing at all (a
+    # site that falls back silently, e.g. a cache miss). PyYAML reading a file
+    # omits the snippet but a constructor error still names the input's tag,
+    # so the leak half needs every input, not just the first.
+    assert not silent, (label, silent)
 
 
 def test_an_uncaught_fatal_policy_error_prints_no_input(tmp_path: Path) -> None:
