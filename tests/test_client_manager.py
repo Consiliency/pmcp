@@ -17,6 +17,8 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx2
+from mcp.shared.message import SessionMessage
+from mcp.types import jsonrpc_message_adapter
 import pytest
 from pydantic import ValidationError
 
@@ -7198,3 +7200,592 @@ async def test_cleanup_client_resets_outbound_queue_so_stale_frames_are_not_rede
     stale = [f for f in written if f.get("id") in (900, 901, 902)]
     assert stale == [], f"stale frames redelivered to the new generation: {stale}"
     assert old_queue is not managed.outbound
+
+
+# --- Consiliency/pmcp#287: the handshake-failure teardown path ---------------
+
+
+def _live_drain_outbound_tasks() -> list[asyncio.Task[Any]]:
+    """Every not-yet-finished `_drain_outbound` task on the running loop."""
+    return [
+        t
+        for t in asyncio.all_tasks()
+        if not t.done()
+        and getattr(t.get_coro(), "__qualname__", "").endswith("_drain_outbound")
+    ]
+
+
+def _handshake_that_starts_a_writer_then_fails(
+    mgr: ClientManager, started: list[asyncio.Task[None]]
+) -> Any:
+    """A `_send_initialize` stand-in: answer a server->client `ping` (which
+    starts the outbound writer, as a real peer pinging during `initialize`
+    would), wait until the writer is live, then fail the handshake."""
+
+    async def _send_initialize(managed: ManagedClient) -> None:
+        mgr._reply_to_downstream_request(managed.config.name, managed, 1, "ping")
+        await eventually(
+            lambda: managed.outbound_writer is not None,
+            timeout=2.0,
+            interval=0.005,
+            message="writer never started",
+        )
+        assert managed.outbound_writer is not None
+        started.append(managed.outbound_writer)
+        await asyncio.sleep(0.01)  # let it park in queue.get / a stalled sink
+        raise RuntimeError("handshake failed")
+
+    return _send_initialize
+
+
+@pytest.mark.asyncio
+async def test_outbound_writer_does_not_survive_failed_stdio_handshake() -> None:
+    mgr = ClientManager()
+    started: list[asyncio.Task[None]] = []
+    process = MagicMock()
+    process.returncode = None
+    process.stderr = None
+    process.stdin.write = MagicMock()
+    process.stdin.drain = _block  # stalled sink: the writer can never finish
+    captured: list[ManagedClient] = []
+
+    async def _read_stdout(name: str, managed: ManagedClient) -> None:
+        captured.append(managed)
+        await asyncio.Event().wait()
+
+    mgr._read_stdout = _read_stdout  # type: ignore[method-assign]
+    mgr._send_initialize = _handshake_that_starts_a_writer_then_fails(  # type: ignore[method-assign]
+        mgr, started
+    )
+    config = ResolvedServerConfig(
+        name="srv",
+        source="project",
+        config=LocalMcpServerConfig(command="fake", args=[]),
+    )
+    with (
+        patch("asyncio.create_subprocess_exec", AsyncMock(return_value=process)),
+        patch("pmcp.client.manager._terminate_process_tree", AsyncMock()),
+    ):
+        with pytest.raises(RuntimeError, match="handshake failed"):
+            await mgr._connect_stdio(config)
+
+    assert started, "the handshake stand-in never started a writer"
+    assert "srv" not in mgr._clients
+    assert started[0].done(), "outbound writer leaked past a failed stdio handshake"
+    assert _live_drain_outbound_tasks() == []
+    managed = captured[0]
+    assert managed.outbound is None, "outbound queue survived a failed handshake"
+    assert managed.outbound_writer is None, "writer ref survived a failed handshake"
+
+
+@pytest.mark.asyncio
+async def test_outbound_writer_does_not_survive_failed_remote_stream_handshake() -> (
+    None
+):
+    mgr = ClientManager()
+    started: list[asyncio.Task[None]] = []
+    write_stream = MagicMock()
+    write_stream.send = _block  # stalled sink: the writer can never finish
+
+    class _Transport:
+        async def __aenter__(self) -> tuple[Any, Any]:
+            return (MagicMock(), write_stream)
+
+        async def __aexit__(self, *exc_info: Any) -> None:
+            return None
+
+    captured: list[ManagedClient] = []
+
+    async def _read_sse(name: str, managed: ManagedClient, read_stream: Any) -> None:
+        captured.append(managed)
+        await asyncio.Event().wait()
+
+    mgr._read_sse = _read_sse  # type: ignore[method-assign]
+    mgr._send_initialize = _handshake_that_starts_a_writer_then_fails(  # type: ignore[method-assign]
+        mgr, started
+    )
+    mgr._close_remote_transport = AsyncMock()  # type: ignore[method-assign]
+    config = ResolvedServerConfig(
+        name="remote",
+        source="custom",
+        config=RemoteMcpServerConfig(
+            type="streamable-http", url="http://example.invalid/mcp"
+        ),
+    )
+    with pytest.raises(RuntimeError, match="handshake failed"):
+        await mgr._connect_remote_stream(config, _Transport(), transport_name="test")
+
+    assert started, "the handshake stand-in never started a writer"
+    assert "remote" not in mgr._clients
+    assert started[0].done(), (
+        "outbound writer leaked past a failed remote-stream handshake"
+    )
+    assert _live_drain_outbound_tasks() == []
+    managed = captured[0]
+    assert managed.outbound is None, "outbound queue survived a failed handshake"
+    assert managed.outbound_writer is None, "writer ref survived a failed handshake"
+    # The transport owner is a separate, pre-existing concern; stop it so the
+    # test leaves nothing behind.
+    for t in list(mgr._background_tasks):
+        t.cancel()
+    await asyncio.gather(*mgr._background_tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_outbound_writer_disconnect_server_resets_outbound_queue() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    managed.process.stdin.drain = _block  # type: ignore[assignment]
+    managed.process.returncode = 0
+    mgr._clients["srv"] = managed
+    mgr._servers["srv"] = managed.status
+    mgr._reply_to_downstream_request("srv", managed, 1, "ping")
+    await eventually(
+        lambda: managed.outbound_writer is not None,
+        timeout=2.0,
+        interval=0.005,
+        message="writer never started",
+    )
+    ok, _cancelled, _msg = await mgr.disconnect_server("srv", force=True)
+    assert ok
+    assert managed.outbound is None, "outbound queue survived disconnect_server"
+    assert managed.outbound_writer is None, "writer ref survived disconnect_server"
+
+
+def _pending(request_id: int) -> PendingRequest:
+    now = time.time()
+    return PendingRequest(
+        request_id=request_id,
+        server_name="srv",
+        tool_id="srv::t",
+        started_at=now,
+        last_heartbeat=now,
+        timeout_ms=30000,
+        future=asyncio.get_running_loop().create_future(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_non_string_method_does_not_resolve_pending() -> None:
+    mgr = ClientManager()
+    managed = _managed_stdio("srv")
+    mgr._clients["srv"] = managed
+    pending = _pending(7)
+    managed.pending_requests[7] = pending
+    for bad in (123, None, ["ping"], {"x": 1}):
+        line = json.dumps({"jsonrpc": "2.0", "id": 7, "method": bad}).encode()
+        mgr._handle_stdout_line("srv", managed, line, time.time())
+        assert not pending.future.done(), (
+            f"non-string method {bad!r} resolved our pending request"
+        )
+        assert 7 in managed.pending_requests, (
+            f"non-string method {bad!r} popped our pending request"
+        )
+    assert managed.outbound is None, "an invalid frame was answered"
+
+
+@pytest.mark.asyncio
+async def test_c01_sse_non_string_method_does_not_resolve_pending() -> None:
+    mgr = ClientManager()
+    sent: list[Any] = []
+    managed = _managed_remote("srv", sent)
+    managed.status.status = ServerStatusEnum.OFFLINE  # no reconnect on stream end
+    mgr._clients["srv"] = managed
+    pending = _pending(7)
+    managed.pending_requests[7] = pending
+    msgs = []
+    for bad in (123, None, ["ping"], {"x": 1}):
+        msg = MagicMock()
+        msg.message.model_dump.return_value = {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": bad,
+        }
+        msgs.append(msg)
+
+    # Snapshot the state while the stream is still open: the loop's `finally`
+    # fails every pending request once the stream ends.
+    seen: dict[str, Any] = {}
+
+    async def stream() -> Any:
+        for m in msgs:
+            yield m
+        seen["done"] = pending.future.done()
+        seen["present"] = 7 in managed.pending_requests
+        seen["answered"] = managed.outbound is not None or bool(sent)
+
+    await mgr._read_sse("srv", managed, stream())
+    with contextlib.suppress(BaseException):
+        pending.future.exception()
+    assert seen["done"] is False, "non-string method resolved our pending request"
+    assert seen["present"] is True, "non-string method popped our pending request"
+    assert seen["answered"] is False, "an invalid frame was answered"
+
+
+# --- Consiliency/pmcp#287: malformed downstream frames never end a read loop --
+#
+# The cases are derived from `_route_downstream_frame`'s own accesses on frame
+# data (`.get`, `in`, `["error"]`, the pending-table lookup, the future's
+# set_*), plus the parse step in `_handle_stdout_line` and the model dump in
+# `_read_sse`. Each test also proves the connection stays usable (a valid
+# response after the bad frames still resolves), that no frame value reaches
+# the logs, and -- via "no WARNING" -- that the specific guard, not the
+# dispatcher's backstop, rejected the frame.
+
+_FRAME_SENTINEL = "SENTINEL-c01-9f2e"
+
+
+def _stdio_reader_client(lines: list[bytes]) -> ManagedClient:
+    fake_stdout = AsyncMock()
+    fake_stdout.read = AsyncMock(side_effect=[*lines, b""])
+    process = MagicMock()
+    process.stdout = fake_stdout
+    process.returncode = None
+    process.stdin.write = MagicMock()
+    process.stdin.drain = AsyncMock()
+    # Not ONLINE: EOF then neither warns "disconnected unexpectedly" nor fails
+    # the pending table, so each assertion reads only what the frames did.
+    status = ServerStatus(name="srv", status=ServerStatusEnum.OFFLINE, tool_count=0)
+    managed = ManagedClient(config=MagicMock(), process=process, status=status)
+    managed.config = None  # no auto-reconnect
+    return managed
+
+
+def _frame_line(frame: Any) -> bytes:
+    return (json.dumps(frame) + "\n").encode()
+
+
+_VALID_RESPONSE = {"jsonrpc": "2.0", "id": 1, "result": {"ok": True}}
+
+
+def _assert_clean_logs(caplog: pytest.LogCaptureFixture) -> None:
+    assert _FRAME_SENTINEL not in caplog.text, "a frame value reached the logs"
+    loud = [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+    assert loud == [], f"a bad frame escaped its guard to the backstop: {loud}"
+
+
+async def _run_stdio(
+    lines: list[bytes], caplog: pytest.LogCaptureFixture
+) -> tuple[ClientManager, ManagedClient, PendingRequest]:
+    mgr = ClientManager()
+    managed = _stdio_reader_client(lines)
+    mgr._clients["srv"] = managed
+    pending = _pending(1)
+    managed.pending_requests[1] = pending
+    with caplog.at_level(logging.DEBUG, logger="pmcp.client.manager"):
+        await mgr._read_stdout("srv", managed)
+    return mgr, managed, pending
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_non_object_frames_are_dropped_and_connection_survives(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    bad = [[_FRAME_SENTINEL], 42, _FRAME_SENTINEL, None, True, 1.5, []]
+    lines = [_frame_line(b) for b in bad] + [_frame_line(_VALID_RESPONSE)]
+    _mgr, _managed, pending = await _run_stdio(lines, caplog)
+    assert pending.future.done() and pending.future.result() == {"ok": True}
+    _assert_clean_logs(caplog)
+    assert caplog.text.count("not a JSON object") == len(bad)
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_invalid_id_types_are_dropped_and_do_not_misroute(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # `True == 1` and `1.0 == 1` hash equal to our request id 1: without the
+    # guard they would resolve it with the sentinel. The list/dict ids are
+    # unhashable and raise TypeError in the pending lookup.
+    bad_ids: list[Any] = [True, 1.0, [1], {"k": _FRAME_SENTINEL}, [_FRAME_SENTINEL]]
+    lines = [
+        _frame_line({"jsonrpc": "2.0", "id": i, "result": _FRAME_SENTINEL})
+        for i in bad_ids
+    ]
+    # A request (method + bad id) must not be answered either.
+    lines.append(_frame_line({"jsonrpc": "2.0", "id": [1], "method": "ping"}))
+    lines.append(_frame_line(_VALID_RESPONSE))
+    _mgr, managed, pending = await _run_stdio(lines, caplog)
+    assert pending.future.done() and pending.future.result() == {"ok": True}
+    assert managed.outbound is None, "a request with an invalid id was answered"
+    _assert_clean_logs(caplog)
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_unparseable_json_does_not_end_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Neither raises json.JSONDecodeError: an over-long integer raises a plain
+    # ValueError (int max-str-digits) and deep nesting raises RecursionError.
+    lines = [
+        ("9" * 5000 + "\n").encode(),
+        ("[" * 100_000 + "]" * 100_000 + "\n").encode(),
+        _frame_line(_VALID_RESPONSE),
+    ]
+    _mgr, _managed, pending = await _run_stdio(lines, caplog)
+    assert pending.future.done(), "the read loop ended on an unparseable frame"
+    assert pending.future.result() == {"ok": True}
+    _assert_clean_logs(caplog)
+    assert "9" * 50 not in caplog.text, "the unparseable line reached the logs"
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_response_for_settled_request_does_not_end_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mgr = ClientManager()
+    lines = [
+        _frame_line({"jsonrpc": "2.0", "id": 2, "result": _FRAME_SENTINEL}),
+        _frame_line({"jsonrpc": "2.0", "id": 3, "error": {"message": "x"}}),
+        _frame_line(_VALID_RESPONSE),
+    ]
+    managed = _stdio_reader_client(lines)
+    mgr._clients["srv"] = managed
+    pending = _pending(1)
+    managed.pending_requests[1] = pending
+    for rid in (2, 3):
+        settled = _pending(rid)
+        settled.future.cancel()  # the caller gave up; its finally has not run
+        managed.pending_requests[rid] = settled
+    with caplog.at_level(logging.DEBUG, logger="pmcp.client.manager"):
+        await mgr._read_stdout("srv", managed)
+    assert pending.future.done() and pending.future.result() == {"ok": True}
+    _assert_clean_logs(caplog)
+
+
+@pytest.mark.asyncio
+async def test_c01_stdio_handler_exception_does_not_end_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The backstop: whatever a guard misses must not end the loop either."""
+    lines = [
+        _frame_line({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}),
+        _frame_line(_VALID_RESPONSE),
+    ]
+    mgr = ClientManager()
+    managed = _stdio_reader_client(lines)
+    mgr._clients["srv"] = managed
+    pending = _pending(1)
+    managed.pending_requests[1] = pending
+
+    def _raise(*_a: Any, **_k: Any) -> bool:
+        raise RuntimeError(_FRAME_SENTINEL)
+
+    mgr._handle_downstream_notification = _raise  # type: ignore[method-assign]
+    with caplog.at_level(logging.DEBUG, logger="pmcp.client.manager"):
+        await mgr._read_stdout("srv", managed)
+    assert pending.future.done(), "a raising handler ended the read loop"
+    assert pending.future.result() == {"ok": True}
+    assert _FRAME_SENTINEL not in caplog.text, "an exception message reached the logs"
+    assert "handling raised RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_c01_sse_malformed_frames_are_dropped_and_connection_survives(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    mgr = ClientManager()
+    sent: list[Any] = []
+    managed = _managed_remote("srv", sent)
+    managed.status.status = ServerStatusEnum.OFFLINE  # no reconnect on stream end
+    managed.config = None
+    mgr._clients["srv"] = managed
+    pending = _pending(1)
+    managed.pending_requests[1] = pending
+
+    payloads: list[Any] = [
+        [_FRAME_SENTINEL],
+        42,
+        None,
+        {"jsonrpc": "2.0", "id": True, "result": _FRAME_SENTINEL},
+        {"jsonrpc": "2.0", "id": [1], "result": _FRAME_SENTINEL},
+        {"jsonrpc": "2.0", "id": {"k": 1}, "method": "ping"},
+    ]
+    msgs: list[Any] = []
+    for p in payloads:
+        m = MagicMock()
+        m.message.model_dump.return_value = p
+        msgs.append(m)
+    undumpable = MagicMock()
+    undumpable.message.model_dump.side_effect = ValueError(_FRAME_SENTINEL)
+    msgs.append(undumpable)
+    valid = MagicMock()
+    valid.message.model_dump.return_value = _VALID_RESPONSE
+    msgs.append(valid)
+
+    async def stream() -> Any:
+        for m in msgs:
+            yield m
+
+    with caplog.at_level(logging.DEBUG, logger="pmcp.client.manager"):
+        await mgr._read_sse("srv", managed, stream())
+    assert pending.future.done(), "a malformed frame ended the SSE read loop"
+    assert pending.future.result() == {"ok": True}
+    assert sent == [] and managed.outbound is None, "an invalid frame was answered"
+    _assert_clean_logs(caplog)
+
+
+# --- Consiliency/pmcp#287: malformed frames on the REAL mcp remote transports --
+#
+# mcp validates every remote frame itself and, on failure, puts the pydantic
+# ValidationError on the read stream in place of the message. These tests go
+# through the library's own parse step -- the real `sse_client` over an httpx2
+# MockTransport, and the real streamable-HTTP `_handle_sse_event` (the GET
+# stream's handler) -- rather than mocked payloads the transport cannot produce.
+
+
+def _remote_bad_frames() -> list[str]:
+    s = _FRAME_SENTINEL
+    frames: list[Any] = [
+        [s],
+        42,
+        s,
+        None,
+        True,
+        {"jsonrpc": "2.0", "id": True, "result": {"v": s}},
+        {"jsonrpc": "2.0", "id": 1.0, "result": {"v": s}},
+        {"jsonrpc": "2.0", "id": [s], "result": {}},
+        {"jsonrpc": "2.0", "id": 1, "method": 123, "params": {"v": s}},
+        {"jsonrpc": "2.0", "id": 1, "error": s},
+        {"jsonrpc": "2.0", "id": 1, "result": s},
+        {"jsonrpc": "2.0", "method": "notifications/message", "params": s},
+    ]
+    raw = [json.dumps(f) for f in frames]
+    raw += [
+        s + "{not json",
+        "[" * 100_000 + "]" * 100_000,
+        '{"jsonrpc": "2.0", "id": ' + "9" * 5000 + ', "result": {}}',
+    ]
+    return raw
+
+
+def _assert_really_invalid(raw: list[str]) -> None:
+    """Guard against a vacuous test: mcp must reject every one of these."""
+    for r in raw:
+        with pytest.raises(ValidationError):
+            jsonrpc_message_adapter.validate_json(r, by_name=False)
+
+
+def _assert_pmcp_logs_clean(caplog: pytest.LogCaptureFixture) -> None:
+    ours = [r for r in caplog.records if r.name.startswith("pmcp")]
+    leaked = [r.getMessage() for r in ours if _FRAME_SENTINEL in r.getMessage()]
+    assert leaked == [], f"a frame value reached pmcp's logs: {leaked}"
+    loud = [r.getMessage() for r in ours if r.levelno >= logging.WARNING]
+    assert loud == [], f"a malformed frame was treated as a failure: {loud}"
+
+
+def _remote_reader_client() -> tuple[ManagedClient, PendingRequest]:
+    sent: list[Any] = []
+    managed = _managed_remote("srv", sent)
+    managed.config = None  # no auto-reconnect
+    pending = _pending(1)
+    managed.pending_requests[1] = pending
+    return managed, pending
+
+
+@pytest.mark.asyncio
+async def test_c01_legacy_sse_invalid_frames_do_not_end_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from mcp.client.sse import sse_client
+
+    bad = _remote_bad_frames()
+    _assert_really_invalid(bad)
+    events = "event: endpoint\ndata: /messages?session_id=abc\n\n"
+    for d in [*bad, json.dumps(_VALID_RESPONSE)]:
+        events += f"event: message\ndata: {d}\n\n"
+
+    def handler(request: httpx2.Request) -> httpx2.Response:
+        return httpx2.Response(
+            200, headers={"content-type": "text/event-stream"}, content=events.encode()
+        )
+
+    def factory(
+        headers: dict[str, str] | None = None,
+        timeout: httpx2.Timeout | None = None,
+        auth: httpx2.Auth | None = None,
+    ) -> httpx2.AsyncClient:
+        return httpx2.AsyncClient(
+            transport=httpx2.MockTransport(handler),
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+        )
+
+    mgr = ClientManager()
+    managed, pending = _remote_reader_client()
+    mgr._clients["srv"] = managed
+    managed.status.status = ServerStatusEnum.ONLINE
+    # Resolving the valid response is the last thing the stream carries; mark
+    # the server offline then so the loop's normal end-of-stream is not read
+    # as an unexpected disconnect.
+    pending.future.add_done_callback(
+        lambda _f: setattr(managed.status, "status", ServerStatusEnum.OFFLINE)
+    )
+    with caplog.at_level(logging.DEBUG):
+        async with sse_client(
+            "http://example.invalid/sse", httpx_client_factory=factory
+        ) as (read_stream, _write_stream):
+            await mgr._read_sse("srv", managed, read_stream)
+    assert pending.future.done(), "a malformed SSE frame ended the read loop"
+    assert pending.future.result() == {"ok": True}
+    assert managed.status.status != ServerStatusEnum.ERROR
+    _assert_pmcp_logs_clean(caplog)
+    assert caplog.text.count("failed JSON-RPC validation") == len(bad)
+
+
+@pytest.mark.asyncio
+async def test_c01_streamable_http_get_stream_invalid_frames_do_not_end_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from httpx2 import ServerSentEvent
+    from mcp.client.streamable_http import StreamableHTTPTransport
+    from mcp.shared._context_streams import create_context_streams
+
+    bad = _remote_bad_frames()
+    _assert_really_invalid(bad)
+    transport = StreamableHTTPTransport("http://example.invalid/mcp")
+    writer, reader = create_context_streams[SessionMessage | Exception](1000)
+
+    async def produce() -> None:
+        # `_handle_sse_event` with no originating request id is exactly what the
+        # server-pushed GET stream (`handle_get_stream`) calls per event.
+        async with writer:
+            for d in [*bad, json.dumps(_VALID_RESPONSE)]:
+                await transport._handle_sse_event(ServerSentEvent(data=d), writer)
+
+    mgr = ClientManager()
+    managed, pending = _remote_reader_client()
+    mgr._clients["srv"] = managed
+    managed.status.status = ServerStatusEnum.ONLINE
+    pending.future.add_done_callback(
+        lambda _f: setattr(managed.status, "status", ServerStatusEnum.OFFLINE)
+    )
+    with caplog.at_level(logging.DEBUG):
+        await asyncio.gather(produce(), mgr._read_sse("srv", managed, reader))
+    assert pending.future.done(), "a malformed GET-stream frame ended the read loop"
+    assert pending.future.result() == {"ok": True}
+    assert managed.status.status != ServerStatusEnum.ERROR
+    _assert_pmcp_logs_clean(caplog)
+    assert caplog.text.count("failed JSON-RPC validation") == len(bad)
+
+
+@pytest.mark.asyncio
+async def test_c01_sse_transport_error_still_ends_read_loop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A real transport failure on the stream must still end the loop."""
+    mgr = ClientManager()
+    managed, pending = _remote_reader_client()
+    mgr._clients["srv"] = managed
+    managed.status.status = ServerStatusEnum.ONLINE
+    later = MagicMock()
+    later.message.model_dump.return_value = _VALID_RESPONSE
+
+    async def stream() -> Any:
+        yield httpx2.ReadError("connection reset")
+        yield later  # must never be reached
+
+    await mgr._read_sse("srv", managed, stream())
+    assert managed.status.status == ServerStatusEnum.ERROR
+    assert pending.future.done()
+    assert isinstance(pending.future.exception(), ConnectionError)

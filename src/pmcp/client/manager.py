@@ -25,6 +25,7 @@ import mcp.types as mcp_types
 from mcp.client.sse import sse_client
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.message import SessionMessage
+from pydantic import ValidationError
 
 from pmcp.auth import sanitize_auth_diagnostic
 from pmcp.config.loader import make_tool_id
@@ -1406,17 +1407,10 @@ class ClientManager:
 
             # Cancel the outbound writer explicitly (in addition to the
             # server-name sweep below), so teardown of this path does not
-            # depend on that sweep also matching it.
-            if managed.outbound_writer and not managed.outbound_writer.done():
-                managed.outbound_writer.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(managed.outbound_writer), timeout=1.0
-                    )
-                except (asyncio.TimeoutError, asyncio.CancelledError):
-                    pass
-                except Exception:
-                    pass
+            # depend on that sweep also matching it -- and reset
+            # `outbound`/`outbound_writer`, the same postcondition
+            # `_cleanup_client` holds (Consiliency/pmcp#287).
+            await self._teardown_outbound(managed, timeout=1.0)
 
             try:
                 if managed.is_remote:
@@ -2474,6 +2468,10 @@ class ClientManager:
                         await asyncio.shield(task)
                     except (asyncio.CancelledError, Exception):
                         pass
+            # A writer started before the handshake failed (e.g. a `ping`
+            # answered during `initialize`) must not survive this pop
+            # (Consiliency/pmcp#287).
+            await self._teardown_outbound(managed)
             await _terminate_process_tree(process, name)
             # Drop the stale ERROR client so it can't be found as a live
             # connection on the next connect attempt (issue: stale entry + leak).
@@ -2797,6 +2795,8 @@ class ClientManager:
                     await asyncio.shield(managed.read_task)
                 except (asyncio.CancelledError, Exception):
                     pass
+            # Same as the stdio handshake path (Consiliency/pmcp#287).
+            await self._teardown_outbound(managed)
             await self._close_remote_transport(name, managed)
             # Drop the stale ERROR client so it can't be found as a live
             # connection on the next connect attempt.
@@ -2842,43 +2842,120 @@ class ClientManager:
                     "the line was decoded with replacement characters"
                 )
             message = json.loads(text)
-            msg_id = message.get("id")
-            method = message.get("method")
-            # Classify by `method` FIRST (C-01). A frame carrying a `method` can
-            # never resolve a pending future, so this both handles server->client
-            # requests (method + id) and fixes a latent misrouting: a downstream
-            # request whose id happens to collide with one of ours must not be
-            # mistaken for that response.
-            if isinstance(method, str):
-                if msg_id is None:
-                    # Notification: no id, nothing to resolve.
-                    self._handle_downstream_notification(name, managed, method)
-                else:
-                    # Server->client request: reply (ping -> {} else -32601).
-                    self._reply_to_downstream_request(name, managed, msg_id, method)
-            elif msg_id is not None and msg_id in managed.pending_requests:
-                pending = managed.pending_requests.pop(msg_id)
-
-                # Track response time
-                elapsed_ms = (now - pending.started_at) * 1000
-                managed.response_times.append(elapsed_ms)
-                if managed.response_times:
-                    managed.status.avg_response_time_ms = sum(
-                        managed.response_times
-                    ) / len(managed.response_times)
-
-                # Update pending count
-                managed.status.pending_request_count = len(managed.pending_requests)
-
-                if "error" in message:
-                    pending.future.set_exception(_downstream_error(message["error"]))
-                else:
-                    pending.future.set_result(message.get("result", {}))
         except json.JSONDecodeError:
             # Non-JSON output already counted as a heartbeat by the caller.
             logger.debug(
                 f"[{name}] Non-JSON output: {line.decode(errors='replace').strip()}"
             )
+            return
+        except (ValueError, RecursionError) as e:
+            # Parses as neither JSON nor a JSONDecodeError: an integer over
+            # `sys.get_int_max_str_digits()` raises a plain ValueError, and
+            # deeply nested arrays/objects raise RecursionError. Both used to
+            # escape to the read loop's broad `except` and end it. Value-free:
+            # the line is attacker-sized (Consiliency/pmcp#287).
+            logger.debug(f"[{name}] dropped unparseable frame ({type(e).__name__})")
+            return
+        self._dispatch_downstream_frame(name, managed, message, now)
+
+    def _dispatch_downstream_frame(
+        self, name: str, managed: ManagedClient, frame: Any, now: float
+    ) -> None:
+        """Route one parsed downstream JSON-RPC frame; never raises.
+
+        Shared by the stdio (`_handle_stdout_line`) and remote (`_read_sse`)
+        read loops. The frame is untrusted, and both loops end -- dropping the
+        connection -- on any exception that reaches their broad `except`, so
+        one malformed frame must never be able to raise out of here
+        (Consiliency/pmcp#287). `_route_downstream_frame` rejects every shape
+        its own accesses depend on; this wrapper is the backstop for anything
+        they miss, and logs only the exception type -- never a frame value.
+        """
+        try:
+            self._route_downstream_frame(name, managed, frame, now)
+        except Exception as e:
+            logger.warning(
+                f"[{name}] dropped a downstream frame whose handling raised "
+                f"{type(e).__name__}; the connection stays up"
+            )
+
+    def _route_downstream_frame(
+        self, name: str, managed: ManagedClient, frame: Any, now: float
+    ) -> None:
+        """Classify one frame and act on it. See `_dispatch_downstream_frame`.
+
+        Each guard below exists because a later access depends on it, and each
+        drops the frame with a value-free debug log, as a non-JSON line is
+        dropped:
+
+        - `frame.get` / `"method" in frame` / `frame["error"]` need a JSON
+          object: `[]`, `42`, `"x"`, `null`, `true` all parse but are not one.
+        - `msg_id in managed.pending_requests` needs a hashable id, and must not
+          match one of our int ids by numeric equality: `True == 1` and
+          `1.0 == 1` both hash equal, so a bool or float id would resolve
+          request 1. JSON-RPC ids are strings, integers or null.
+        - `set_result` / `set_exception` raise `InvalidStateError` on a future
+          that is already settled (a caller cancelled it, and the response
+          raced its `finally` pop).
+        """
+        if not isinstance(frame, dict):
+            logger.debug(
+                f"[{name}] dropped invalid frame: not a JSON object "
+                f"({type(frame).__name__})"
+            )
+            return
+        msg_id = frame.get("id")
+        if msg_id is not None and (
+            isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
+        ):
+            logger.debug(
+                f"[{name}] dropped invalid frame: id of type {type(msg_id).__name__}"
+            )
+            return
+        method = frame.get("method")
+        # Classify by `method` FIRST (C-01). A frame carrying a `method` can
+        # never resolve a pending future, so this both handles server->client
+        # requests (method + id) and fixes a latent misrouting: a downstream
+        # request whose id happens to collide with one of ours must not be
+        # mistaken for that response.
+        if isinstance(method, str):
+            if msg_id is None:
+                # Notification: no id, nothing to resolve.
+                self._handle_downstream_notification(name, managed, method)
+            else:
+                # Server->client request: reply (ping -> {} else -32601).
+                self._reply_to_downstream_request(name, managed, msg_id, method)
+        elif "method" in frame:
+            # A `method` that is present but not a string is not a valid
+            # JSON-RPC request -- and it is not a response either, so it must
+            # not fall through to the pending lookup, where an id colliding with
+            # one of ours would resolve that future.
+            logger.debug(
+                f"[{name}] dropped invalid frame: non-string method "
+                f"({type(method).__name__})"
+            )
+        elif msg_id is not None and msg_id in managed.pending_requests:
+            pending = managed.pending_requests.pop(msg_id)
+
+            # Track response time
+            elapsed_ms = (now - pending.started_at) * 1000
+            managed.response_times.append(elapsed_ms)
+            if managed.response_times:
+                managed.status.avg_response_time_ms = sum(managed.response_times) / len(
+                    managed.response_times
+                )
+
+            # Update pending count
+            managed.status.pending_request_count = len(managed.pending_requests)
+
+            if pending.future.done():
+                logger.debug(
+                    f"[{name}] dropped a response for an already-settled request"
+                )
+            elif "error" in frame:
+                pending.future.set_exception(_downstream_error(frame["error"]))
+            else:
+                pending.future.set_result(frame.get("result", {}))
 
     def _fail_oversized_line(
         self, name: str, managed: ManagedClient, limit: int
@@ -3050,7 +3127,12 @@ class ClientManager:
     async def _read_sse(
         self, name: str, managed: ManagedClient, read_stream: Any
     ) -> None:
-        """Read JSON-RPC messages from an SSE stream."""
+        """Read JSON-RPC messages from an mcp read stream.
+
+        Serves both remote transports: legacy SSE (`sse_client`) and
+        streamable HTTP (`streamable_http_client`, including its server-pushed
+        GET stream).
+        """
         try:
             async for message in read_stream:
                 # Any output counts as per-request liveness, including progress
@@ -3060,44 +3142,45 @@ class ClientManager:
                 for req in managed.pending_requests.values():
                     req.last_heartbeat = now
 
+                if isinstance(message, ValidationError):
+                    # The mcp transports validate every incoming frame
+                    # themselves (`jsonrpc_message_adapter.validate_json`) and,
+                    # when that fails, put the pydantic `ValidationError` on the
+                    # read stream in place of the message and keep reading
+                    # (mcp/client/sse.py `sse_reader`, streamable_http.py
+                    # `_handle_sse_event` with no originating request). It is
+                    # one malformed frame -- non-JSON, not an object, a bad
+                    # `id`/`method`/`params`/`result`/`error` -- not a dead
+                    # transport, so drop it rather than end the loop. Only the
+                    # type is logged: the error's text carries the frame's
+                    # contents (`input_value=...`). Consiliency/pmcp#287.
+                    logger.debug(
+                        f"[{name}] dropped a downstream message that failed "
+                        f"JSON-RPC validation ({type(message).__name__})"
+                    )
+                    continue
                 if isinstance(message, Exception):
+                    # Anything else on the stream is a transport failure
+                    # (httpx/SSE errors, a broken stream): end the loop so the
+                    # server goes to ERROR and reconnects.
                     raise message
 
-                payload = message.message.model_dump(
-                    by_alias=True,
-                    mode="json",
-                    exclude_none=True,
-                )
-                msg_id = payload.get("id")
-                method = payload.get("method")
-                # Classify by `method` first, exactly as the stdio path (C-01).
-                # `_handle_downstream_notification` and the reply/notify helpers
-                # never raise, which matters more here -- this loop's blanket
-                # `except Exception` would tear the connection down and trigger a
-                # reconnect.
-                if isinstance(method, str):
-                    if msg_id is None:
-                        self._handle_downstream_notification(name, managed, method)
-                    else:
-                        self._reply_to_downstream_request(name, managed, msg_id, method)
-                elif msg_id is not None and msg_id in managed.pending_requests:
-                    pending = managed.pending_requests.pop(msg_id)
-
-                    elapsed_ms = (now - pending.started_at) * 1000
-                    managed.response_times.append(elapsed_ms)
-                    if managed.response_times:
-                        managed.status.avg_response_time_ms = sum(
-                            managed.response_times
-                        ) / len(managed.response_times)
-
-                    managed.status.pending_request_count = len(managed.pending_requests)
-
-                    if "error" in payload:
-                        pending.future.set_exception(
-                            _downstream_error(payload["error"])
-                        )
-                    else:
-                        pending.future.set_result(payload.get("result", {}))
+                try:
+                    payload = message.message.model_dump(
+                        by_alias=True,
+                        mode="json",
+                        exclude_none=True,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"[{name}] dropped undumpable frame ({type(e).__name__})"
+                    )
+                    continue
+                # Same dispatcher as the stdio path, so the two cannot drift.
+                # It never raises for a frame's shape, which matters more here
+                # -- this loop's blanket `except Exception` would tear the
+                # connection down and trigger a reconnect.
+                self._dispatch_downstream_frame(name, managed, payload, now)
         except Exception as e:
             logger.debug(f"[{name}] SSE read error: {describe_exception(e)}")
         finally:
@@ -3150,6 +3233,41 @@ class ClientManager:
                 f"[{name}] failed to write outbound frame "
                 f"{payload.get('method') or payload.get('id')}: {describe_exception(e)}"
             )
+
+    async def _teardown_outbound(
+        self, managed: ManagedClient, *, timeout: float | None = None
+    ) -> None:
+        """Cancel a client's outbound writer and reset its outbound path.
+
+        The postcondition every teardown path owes (Consiliency/pmcp#287): no
+        live `_drain_outbound` task, and `managed.outbound` /
+        `managed.outbound_writer` both None. `_cleanup_client` states it inline;
+        `disconnect_server` and the handshake-failure paths of `_connect_stdio`
+        and `_connect_remote_stream` share it here. Before this, a writer
+        started during a failed handshake (a server->client `ping` answered
+        before `initialize` completed) survived the except-path pop, because
+        that path cancelled only the read/stderr tasks and -- deliberately --
+        runs no server-name background-task sweep.
+
+        The refs are dropped BEFORE the await, so a concurrent
+        `_enqueue_outbound` during the wait lazily builds a fresh
+        queue + writer rather than having its new writer's ref overwritten
+        with None (which would orphan it). Never raises for a non-cancellation
+        failure.
+        """
+        writer = managed.outbound_writer
+        managed.outbound = None
+        managed.outbound_writer = None
+        if writer is None or writer.done():
+            return
+        writer.cancel()
+        try:
+            if timeout is None:
+                await asyncio.shield(writer)
+            else:
+                await asyncio.wait_for(asyncio.shield(writer), timeout=timeout)
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def _drain_outbound(self, managed: ManagedClient) -> None:
         """The one writer task per client: drain the bounded outbound queue.
