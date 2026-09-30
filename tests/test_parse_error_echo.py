@@ -171,7 +171,18 @@ def _run(fn: Callable[[], Any]) -> tuple[str, str]:
     not the library's own `str()`, is what reaches a caller; a message pmcp
     builds itself (`ValueError(f"... {exception_text(e)}")`) is covered by
     the same call."""
-    from pmcp.argument_errors import exception_text, safe_traceback_text
+    try:
+        from pmcp.argument_errors import exception_text, safe_traceback_text
+    except ImportError:  # a tree without the renderer (main, for the red run)
+        import traceback
+
+        def exception_text(error: BaseException) -> str:
+            return str(error)
+
+        def safe_traceback_text(error: BaseException) -> str:
+            return "".join(
+                traceback.format_exception(type(error), error, error.__traceback__)
+            )
 
     try:
         fn()
