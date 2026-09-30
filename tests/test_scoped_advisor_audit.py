@@ -1495,6 +1495,10 @@ _EXCEPTION_ARGS: dict[str, tuple[Any, ...]] = {
     "ResourceServerAuthError": ("invalid_token", "stub handler failed"),
     "MissingRemoteHeaderAuthError": ("stub", ["STUB_VAR"]),
     "MissingApiKeyError": ("STUB_VAR", "stub", "stub"),
+    # `pmcp.parsing` (Consiliency/pmcp#297, rev 7): (kind, source).
+    "YAMLParseError": ("YAML", "stub handler failed"),
+    "JSONParseError": ("JSON", "stub handler failed"),
+    "TimestampParseError": ("timestamp", "stub handler failed"),
 }
 
 
