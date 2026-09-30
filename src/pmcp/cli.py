@@ -1005,13 +1005,24 @@ async def run_update(args: argparse.Namespace) -> None:
             return
 
         for item in results:
-            ok = bool(item.get("ok"))
-            status = "OK" if ok else "FAILED"
-            server = item.get("server", "unknown")
-            message = item.get("message", "")
-            print(f"[{status}] {server}: {message}")
+            print(_format_update_result(item))
     finally:
         await client_manager.disconnect_all()
+
+
+def _format_update_result(item: dict[str, object]) -> str:
+    """One `pmcp update` line: main's ``[OK]``/``[FAILED]``, or ``[PINNED]``.
+
+    A server whose manifest pin pmcp materialised was deliberately not moved,
+    so it is ``[PINNED]`` with that validated exact version, not ``[FAILED]``
+    (Consiliency/pmcp#294 piece 1). Every other result prints as before.
+    """
+    server = item.get("server", "unknown")
+    pinned = item.get("pinned_version")
+    if pinned:
+        return f"[PINNED] {server}: pinned at {pinned}"
+    status = "OK" if bool(item.get("ok")) else "FAILED"
+    return f"[{status}] {server}: {item.get('message', '')}"
 
 
 def _get_gateway_url() -> str:
