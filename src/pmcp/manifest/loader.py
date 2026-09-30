@@ -7,10 +7,9 @@ import logging
 import os
 import re
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from collections.abc import Iterable
 from typing import Any, Literal, cast
 
 import yaml
@@ -702,13 +701,34 @@ def _parse_version_pin(name: str, raw: Any, field_label: str) -> str | None:
     # a label that names nothing (Consiliency/pmcp#295 board, N2).
     if isinstance(raw, str) and is_valid_package_version(raw) and "+" not in raw:
         return raw
+    # What happens to an EARLIER pin depends on the field, never on a value
+    # (Consiliency/pmcp#322). The merge order decides it: sources apply in
+    # order (shipped, user, project, PMCP_MANIFEST_PATH); within one source
+    # `servers:` entries replace whole entries first, then `server_version`
+    # patches apply; every pin is materialised once, after the last source.
+    # So an overlay's `server_version` leaves an earlier pin in place unless a
+    # `servers:` entry in this or a later source replaced the entry, or a
+    # later source set another pin; a `version:` rides on a whole `servers:`
+    # entry, which replaced the earlier entry and any pin with it, so only
+    # this source's `server_version` or a later source can pin it again.
+    if field_label == "server_version":
+        consequence = (
+            "any pin from an earlier source stands, unless a 'servers:' entry "
+            "for this server in this or a later source replaced it, or a later "
+            "source set another pin"
+        )
+    else:
+        consequence = (
+            "the whole entry that carries it replaced any earlier pin, so the "
+            "server is unpinned unless this source's 'server_version' or a "
+            "later source pins it"
+        )
     logger.warning(
         f"Ignoring a '{field_label}' pin for {_server_label(name)}: a version "
         'pin must be one exact version such as "3.25.5" -- not a range, a '
         'dist-tag such as "latest", build metadata (+...), a name npm reads as '
         "a local tarball (.tgz/.tar/.tar.gz), or a package spec. This pin is "
-        "ignored (the value is not logged); a pin from an earlier source, if "
-        "any, stands"
+        f"ignored (the value is not logged); {consequence}"
     )
     return None
 
