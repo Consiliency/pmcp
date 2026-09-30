@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Version pinning, piece 1: pins only.** A manifest entry's `version:`, or an
+  overlay's `server_version: {<server>: <version>}`, holds an npx-launched server at one
+  exact version. pmcp writes the pin into the server's `args` and every platform's
+  `install` argv, keeping the package name, all or nothing. A pin is ignored with a
+  warning, and the entry is left unchanged, when it is not one exact version, the package
+  slot is not a plain registry spec, the launcher is not a bare `npx`, or the entry's own
+  env could redirect npm. Refusal warnings never include the pin value or an argv, and
+  name a server only if pmcp ships it. `gateway.update_server` does not move a pinned
+  server, and `pmcp update` reports it as `[PINNED]`. See
+  [Consiliency/pmcp#294](https://github.com/Consiliency/pmcp/issues/294); the plan merged
+  in [Consiliency/pmcp#317](https://github.com/Consiliency/pmcp/pull/317).
 - **`pmcp guidance --feedback-submission on|off`, and the
   `enable_feedback_submission` key it writes.** This is the only setting that lets
   PMCP post a feedback issue to GitHub on your behalf, and it is **off by default**.

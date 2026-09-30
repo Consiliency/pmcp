@@ -79,7 +79,7 @@ from pmcp.manifest.installer import (
     get_job_manager,
     InstallError,
 )
-from pmcp.manifest.loader import load_manifest
+from pmcp.manifest.loader import load_manifest, npm_env_may_redirect
 from pmcp.manifest.package_identity import PackageIdentity, resolve_package_identity
 from pmcp.manifest.matcher import (
     _keyword_match_score,
@@ -344,6 +344,38 @@ def _refresh_config_unchanged(
             and old_cfg.type == new_cfg.type
         )
     return False
+
+
+def _materialised_pin(
+    server_name: str, resolved: ResolvedServerConfig, pinned_to: str
+) -> str | None:
+    """The manifest pin pmcp materialised, if it is what this config runs.
+
+    Consiliency/pmcp#294 piece 1: ``[PINNED]`` only for a ``version:`` /
+    ``server_version:`` pin that ``load_manifest`` validated (one exact
+    version) and wrote into ``args`` and every ``install`` argv -- and only
+    when the config being updated runs exactly that argv (a manifest-sourced
+    config, or one that inherits the manifest's command and args) and main's
+    own pin reader names the same version -- and only when that config sets
+    no cwd (a project's ``.npmrc`` or ``node_modules`` there decides what npm
+    runs) and no env key ``npm_env_may_redirect`` cannot prove inert (the
+    same rule that gates materialisation, applied to the config's own env).
+    Everything else keeps main's reporting unchanged.
+    """
+    config = resolved.config
+    if not isinstance(config, LocalMcpServerConfig):
+        return None
+    if config.cwd or npm_env_may_redirect(server_name, (config.env or {}).keys()):
+        return None
+    manifest_server = load_manifest().get_server(server_name)
+    if manifest_server is None or manifest_server.version is None:
+        return None
+    if [config.command, *config.args] != [
+        manifest_server.command,
+        *manifest_server.args,
+    ]:
+        return None
+    return manifest_server.version if pinned_to == manifest_server.version else None
 
 
 def _detect_effective_version_pin(
@@ -4999,6 +5031,9 @@ class GatewayTools:
                 server=server_name,
                 package_type=package_type,
                 package_name=package_name,
+                pinned_version=_materialised_pin(
+                    server_name, resolved_config, pinned_to
+                ),
                 message=(
                     f"'{server_name}' is pinned to '{pinned_to}' in {source_desc} "
                     f"({command} {' '.join(args)}). gateway.update_server will not "
