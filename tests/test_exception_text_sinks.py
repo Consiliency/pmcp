@@ -97,6 +97,9 @@ _NON_RENDERING_CALLEES = {
     "record_rejected_arguments",
     # parsing.py (rev 7): reads a MarkedYAMLError's mark line and column only.
     "_yaml_position",
+    # manager.py (rev 8): reads a JSONParseError's `cause`, `lineno` and
+    # `colno` only, to tell a downstream's output from a rejected frame.
+    "_is_downstream_output",
     # manager.py: flattens a group into leaves; its callers render each leaf
     # with `exception_text` (`describe_exception`).
     "_iter_leaf_exceptions",
