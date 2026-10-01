@@ -1198,19 +1198,21 @@ def _memoized_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
     ``faulthandler_timeout`` (120 s) in CI, and the faulthandler dump of the
     still-running main thread then segfaulted the job (exit 139). Every
     overlay document is still parsed for real -- the cache is keyed on the
-    text, a parse error is never cached, and each caller gets a deep copy so
-    nothing the loader mutates can leak into the next case.
+    text, a parse error is never cached, and each caller gets a fresh copy so
+    nothing the loader mutates can leak into the next case. The copy is a
+    pickle round trip rather than ``copy.deepcopy``: deepcopy is pure Python
+    and, traced, costs a large share of the parse it replaces.
     """
-    import copy
+    import pickle
 
     real = yaml.safe_load
-    cache: dict[str | bytes, Any] = {}
+    cache: dict[str | bytes, bytes] = {}
 
     def safe_load(stream: Any) -> Any:
         text = stream if isinstance(stream, (str, bytes)) else stream.read()
         if text not in cache:
-            cache[text] = real(text)
-        return copy.deepcopy(cache[text])
+            cache[text] = pickle.dumps(real(text))
+        return pickle.loads(cache[text])
 
     monkeypatch.setattr(yaml, "safe_load", safe_load)
 
