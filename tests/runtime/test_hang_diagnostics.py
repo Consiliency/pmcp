@@ -24,8 +24,11 @@ diagnostic fires, mutant-style (`.consiliency/evidence/mutation-217.md`):
     the whole point: pytest prints `PASSED` when the test function returns,
     *before* teardown, so the likeliest hang site is after the last `PASSED`
     line in those five logs.
-  * a subprocess run proving `faulthandler_timeout` dumps a stack and lets the
-    session continue, and that the dump is scheduled strictly before the kill.
+  * two subprocess runs proving the ordering of the thread-stack dumps: a slow
+    test that is still running Python is failed by pytest-timeout (under the
+    GIL) before faulthandler fires, and a wedge pytest-timeout cannot reach is
+    dumped by faulthandler, which then ends the process. faulthandler sits
+    ABOVE the kill because its GIL-free dump of a running thread segfaulted CI.
   * an **async** hang — the shape the real one is believed to have — proving the
     watchdog in `_hang_watchdog.py` names the awaiting coroutine. Both
     `faulthandler` and `pytest-timeout` dump the *thread* stack, and a suspended
@@ -202,15 +205,36 @@ def test_passes_then_hangs_in_teardown(blocks_on_the_way_out):
     assert True
 """
 
-_FAULTHANDLER_MODULE = """
+# A slow test that is still RUNNING Python: pytest-timeout's handler can run,
+# so it must fail the item before faulthandler's GIL-free dump ever fires.
+_SLOW_TEST_MODULE = """
 import time
 
 
-def test_blocks_long_enough_to_be_dumped():
-    time.sleep(5)
+def test_runs_past_the_kill_timeout():
+    deadline = time.monotonic() + 8
+    while time.monotonic() < deadline:
+        sum(range(1000))
 
 
-def test_sentinel_still_runs_after_the_dump():
+def test_sentinel_still_runs_after_the_kill():
+    assert True
+"""
+
+# A wedge pytest-timeout cannot reach: SIGALRM is blocked, so its handler never
+# runs -- the stand-in for a thread stuck in C or holding the GIL. Only the
+# faulthandler last resort can report this one, and it must end the process.
+_WEDGED_MODULE = """
+import signal
+import time
+
+
+def test_wedged_where_the_signal_cannot_land():
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGALRM})
+    time.sleep(30)
+
+
+def test_sentinel_must_not_run_after_the_exit():
     assert True
 """
 
@@ -295,15 +319,10 @@ def test_a_teardown_hang_is_not_caught_without_the_plugin(tmp_path: Path) -> Non
         process.communicate()
 
 
-def test_faulthandler_dumps_a_stack_and_the_run_continues(tmp_path: Path) -> None:
-    """The zero-risk half: it kills nothing, it only prints the stacks.
-
-    Reading the ini value cannot prove either the dump or the continuation, so
-    this induces both: a blocking item under a 2 s `faulthandler_timeout`, then
-    a sentinel item that must still run, with the session exiting normally.
-    """
-    module = _write_module(tmp_path, _FAULTHANDLER_MODULE)
-    result = subprocess.run(
+def _run_ladder(tmp_path: Path, body: str) -> subprocess.CompletedProcess[str]:
+    """The committed ladder, scaled down: kill at 2 s, last-resort dump at 4 s."""
+    module = _write_module(tmp_path, body)
+    return subprocess.run(
         [
             sys.executable,
             "-m",
@@ -312,9 +331,13 @@ def test_faulthandler_dumps_a_stack_and_the_run_continues(tmp_path: Path) -> Non
             "-p",
             "no:cacheprovider",
             "-o",
-            "faulthandler_timeout=2",
+            "timeout=2",
             "-o",
-            "timeout=30",
+            "timeout_method=signal",
+            "-o",
+            "faulthandler_timeout=4",
+            "-o",
+            "faulthandler_exit_on_timeout=true",
             "-q",
         ],
         capture_output=True,
@@ -322,31 +345,70 @@ def test_faulthandler_dumps_a_stack_and_the_run_continues(tmp_path: Path) -> Non
         timeout=90,
         cwd=tmp_path,
     )
+
+
+def test_a_slow_running_test_is_killed_cleanly_before_faulthandler_fires(
+    tmp_path: Path,
+) -> None:
+    """A test still running Python is failed by pytest-timeout, under the GIL.
+
+    faulthandler's watchdog walks a running thread's frames without the GIL;
+    on 2026-10-01 that walk segfaulted four CI jobs (exit 139) when a slow test
+    crossed a faulthandler threshold that sat BELOW the kill. With the dump
+    above the kill, a slow test must instead fail as an ordinary item, the
+    faulthandler timer must be cancelled, and the session must carry on.
+    """
+    result = _run_ladder(tmp_path, _SLOW_TEST_MODULE)
     output = result.stdout + result.stderr
 
-    assert "Thread 0x" in output, output
-    assert "Timeout (0:00:02)" in output, output
-    assert "2 passed" in output, output
-    assert result.returncode == 0, output
+    assert "Timeout" in output and "1 failed, 1 passed" in output, output
+    assert "Timeout (0:00:04)" not in output, output  # faulthandler never fired
+    assert result.returncode == 1, output
 
 
-def test_faulthandler_timeout_is_below_the_kill_timeout(
+def test_a_wedge_the_kill_cannot_reach_is_dumped_and_ends_the_run(
+    tmp_path: Path,
+) -> None:
+    """Fail closed: a hang pytest-timeout cannot interrupt still ends red.
+
+    Without `faulthandler_exit_on_timeout` this would dump and then sit until
+    the job's 25-minute cap -- the silent cancel Consiliency/pmcp#200 exists to
+    replace. With it, the stacks are printed and the process exits non-zero,
+    so the sentinel after the wedge never runs.
+    """
+    result = _run_ladder(tmp_path, _WEDGED_MODULE)
+    output = result.stdout + result.stderr
+
+    assert "Timeout (0:00:04)!" in output, output
+    assert "Thread 0x" in output or "Current thread 0x" in output, output
+    assert "test_wedged_where_the_signal_cannot_land" in output, output
+    assert "passed" not in output, output
+    assert result.returncode != 0, output
+
+
+def test_faulthandler_is_a_last_resort_above_the_kill_timeout(
     pytestconfig: pytest.Config,
 ) -> None:
-    """So the stack dump always lands before the process-level kill.
+    """The committed ordering: kill first, GIL-free dump only after it.
+
+    `faulthandler_timeout` below `timeout` is the configuration that segfaulted
+    CI: any slow-but-running test crossing it got a GIL-free walk of a moving
+    frame chain. Above the kill, pytest-timeout fails the item first (and its
+    failure cancels the faulthandler timer), so faulthandler only fires for a
+    thread the kill could not reach -- and then it must exit, not continue.
 
     Compared numerically: `getini` hands back a float for one and a string for
-    the other (`[tool.pytest.ini_options]` scalars load as strings), so an
-    `isinstance(..., int)` check would be invalid either way.
+    the other (`[tool.pytest.ini_options]` scalars load as strings).
     """
     faulthandler_timeout = float(pytestconfig.getini("faulthandler_timeout"))
     kill_timeout = float(pytestconfig.getini("timeout"))
 
-    assert faulthandler_timeout > 0
-    assert faulthandler_timeout < kill_timeout
+    assert pytestconfig.getini("timeout_method") == "signal"
+    assert 0 < kill_timeout < faulthandler_timeout
+    assert pytestconfig.getini("faulthandler_exit_on_timeout") is True
     # Both must fit inside the `test` job's `timeout-minutes: 25`, or the
     # 25-minute silent cancel this change exists to replace happens anyway.
-    assert kill_timeout < 25 * 60
+    assert faulthandler_timeout < 25 * 60
 
 
 # The shape the real hang is believed to have: a coroutine suspended on an

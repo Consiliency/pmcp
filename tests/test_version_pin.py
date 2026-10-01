@@ -1194,11 +1194,11 @@ def _memoized_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
 
     The two tests below call ``load_manifest()`` 432 times, and >99% of each
     call is pure-Python ``yaml.safe_load`` re-parsing the same 78 KB shipped
-    manifest. Under coverage's C tracer on CPython 3.11 that alone ran past
-    ``faulthandler_timeout`` (120 s) in CI, and the faulthandler dump of the
-    still-running main thread then segfaulted the job (exit 139). Every
-    overlay document is still parsed for real -- the cache is keyed on the
-    text, a parse error is never cached, and each caller gets a fresh copy so
+    manifest. Under coverage in CI that ran past the old 120 s
+    ``faulthandler_timeout`` on 3.11 and 3.12, and the faulthandler dump of the
+    still-running main thread then segfaulted the job (exit 139). Each
+    distinct YAML text is still parsed for real, once -- the cache is keyed on
+    the text, a parse error is never cached, and each caller gets a fresh copy so
     nothing the loader mutates can leak into the next case. The copy is a
     pickle round trip rather than ``copy.deepcopy``: deepcopy is pure Python
     and, traced, costs a large share of the parse it replaces.

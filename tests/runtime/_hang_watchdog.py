@@ -21,12 +21,19 @@ that still could not tell `_tap()` from `connect_server()` from
 So: a watchdog thread that, when the current test item has been running too
 long, dumps every pending `asyncio.Task` on that item's event loop.
 
-Three ordered thresholds, each strictly below the next:
+Ordered thresholds, each strictly below the next:
 
     60 s   this watchdog        -> async stacks, names the awaiting coroutine
-    120 s  faulthandler_timeout -> every thread's stack, the run continues
-    700 s  pytest-timeout       -> the item fails and the run moves on
+    700 s  pytest-timeout       -> thread stacks (under the GIL); the item
+                                   fails and the run moves on
+    720 s  faulthandler_timeout -> last resort for a thread the kill could not
+                                   reach: C-level stacks, then the process exits
     25 min the job's cap        -> what used to happen instead of all of this
+
+faulthandler sits ABOVE the kill on purpose: its C watchdog walks a running
+thread's frames without the GIL, and below the kill that walk segfaulted CI
+(exit 139) whenever a slow test crossed it. This watchdog does not share that
+hazard -- it is a Python thread and renders under the GIL.
 
 60 s is the threshold because the slowest item in `tests/runtime` is 26.16 s
 (`--durations=25`, 2026-09-02), so this has >2x headroom over anything here
