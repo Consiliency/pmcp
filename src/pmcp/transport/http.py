@@ -421,7 +421,16 @@ def create_http_app(
         if metadata_url:
             parsed_metadata = urlparse(metadata_url)
             if parsed_metadata.scheme and parsed_metadata.netloc:
-                return f"{parsed_metadata.scheme}://{parsed_metadata.netloc}/mcp"
+                netloc = parsed_metadata.netloc
+                # Drop a port that is the scheme's default: `:443` names the
+                # same origin as none, so publish the canonical form.
+                default_port = {"https": 443, "http": 80}.get(parsed_metadata.scheme)
+                if default_port is not None and parsed_metadata.port == default_port:
+                    netloc = netloc.rsplit(":", 1)[0]
+                # `/mcp` with no path prefix: this app routes MCP at `/mcp`
+                # and the metadata route at the URL's literal path, so a
+                # prefix in the metadata URL is not a prefix of `/mcp`.
+                return f"{parsed_metadata.scheme}://{netloc}/mcp"
         return ""
 
     def _auth_headers(

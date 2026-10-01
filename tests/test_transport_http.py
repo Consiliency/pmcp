@@ -743,3 +743,26 @@ class TestProtectedResourceMetadataResource:
         assert resource == "https://[2606:4700::1]:8443/mcp", (
             f"fallback resource wrong: resource={resource!r}"
         )
+
+    def test_s10_metadata_resource_fallback_drops_default_port_and_prefix(
+        self,
+    ) -> None:
+        # The app routes MCP at `/mcp` and the metadata route at the metadata
+        # URL's literal path, so the fallback is origin + `/mcp`: no path
+        # prefix, and a scheme-default port is dropped (PR review F4).
+        client = _make_app(
+            protected_resource_metadata_url=(
+                "https://gw.example:443/tenant/a/.well-known/oauth-protected-resource"
+            ),
+        )
+
+        r = client.get(
+            "/tenant/a/.well-known/oauth-protected-resource",
+            headers={"host": "evil.example"},
+        )
+
+        assert r.status_code == 200
+        resource = r.json()["resource"]
+        assert resource == "https://gw.example/mcp", (
+            f"fallback resource not canonical: resource={resource!r}"
+        )

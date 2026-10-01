@@ -472,6 +472,19 @@ class AsyncJWKS:
             except ResourceServerJWKSUnavailable:
                 self._last_refresh_failure = time.monotonic()
                 raise
+            except Exception as exc:
+                # Any other failure is still a failed refresh: it opens the
+                # shared backoff and is the same value-free 503, never a 500
+                # that each queued waiter re-earns with its own fetch.
+                # Cancellation (a BaseException) is deliberately not caught:
+                # it says the caller went away, not that the endpoint failed,
+                # so it must not 503 everyone else for the backoff window. The
+                # lock and cache are left as they were; the cooldown stamp
+                # stays, because the attempt was made.
+                self._last_refresh_failure = time.monotonic()
+                raise ResourceServerJWKSUnavailable(
+                    f"JWKS fetch failed for {self.url}."
+                ) from exc
             self._last_refresh_failure = float("-inf")
             self._jwks = jwks
             self._expires_at = time.monotonic() + self._ttl_seconds
@@ -515,7 +528,9 @@ class AsyncJWKS:
             )
         try:
             jwks = json.loads(content.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (ValueError, RecursionError) as exc:
+            # ValueError covers JSONDecodeError and UnicodeDecodeError; a
+            # deeply nested body under the size cap raises RecursionError.
             raise ResourceServerJWKSUnavailable(
                 f"Invalid JWKS JSON from {self.url}."
             ) from exc
@@ -566,6 +581,55 @@ def _claim_scopes(claims: Mapping[str, Any]) -> list[str]:
     return sorted(scopes)
 
 
+# pyjwt claim-validation errors whose message is fixed text.
+_FIXED_TEXT_CLAIM_ERRORS: tuple[type[jwt.InvalidTokenError], ...] = (
+    jwt.ExpiredSignatureError,
+    jwt.ImmatureSignatureError,
+    jwt.InvalidIssuerError,
+    jwt.InvalidIssuedAtError,
+    jwt.MissingRequiredClaimError,
+    jwt.InvalidAlgorithmError,
+)
+
+
+def _decode_with_key(
+    token: str,
+    signing_key: Any,
+    *,
+    algorithms: list[str],
+    audience: str,
+    issuer: str,
+) -> dict[str, Any]:
+    """``jwt.decode`` with key-preparation failures mapped to ``invalid_token``.
+
+    The token's header picks the algorithm and its ``kid`` picks the key, so an
+    unauthenticated caller can pair any allowed algorithm with any published
+    key. When they do not fit, pyjwt/cryptography raise from key preparation or
+    verification -- ``TypeError`` ("Expecting a PEM-formatted key."),
+    ``ValueError``, or ``jwt.InvalidKeyError`` (a ``PyJWTError`` that is not an
+    ``InvalidTokenError``) -- which escaped as a 500 (see
+    Consiliency/pmcp#231, PR review F1). The ``try`` wraps only this one call,
+    whose inputs are the attacker's token and a published key, so a ``TypeError``
+    or ``ValueError`` from PMCP's own code elsewhere still surfaces.
+    ``InvalidTokenError`` passes through for the caller's own mapping.
+    """
+    try:
+        return jwt.decode(
+            token,
+            signing_key,
+            algorithms=algorithms,
+            audience=audience,
+            issuer=issuer,
+            options={"require": ["iss", "exp", "nbf", "aud"]},
+        )
+    except jwt.InvalidTokenError:
+        raise
+    except (jwt.PyJWTError, TypeError, ValueError) as exc:
+        raise ResourceServerAuthError(
+            "invalid_token", "Token could not be verified with the published key."
+        ) from exc
+
+
 def validate_resource_server_token(
     token: str,
     *,
@@ -588,20 +652,25 @@ def validate_resource_server_token(
         if jwks is None:
             raise ResourceServerAuthError("invalid_token", "JWKS URL is required.")
         signing_key = _select_jwk_key(token, jwks)
-        claims = jwt.decode(
+        claims = _decode_with_key(
             token,
             signing_key,
             algorithms=list(allowed_algorithms),
             audience=audience,
             issuer=issuer,
-            options={"require": ["iss", "exp", "nbf", "aud"]},
         )
     except ResourceServerAuthError:
         raise
     except jwt.InvalidAudienceError as exc:
         raise ResourceServerAuthError("invalid_token", "Invalid audience.") from exc
-    except jwt.InvalidTokenError as exc:
+    except _FIXED_TEXT_CLAIM_ERRORS as exc:
+        # pyjwt's text for these is fixed (or names a claim from PMCP's own
+        # required list), so it is safe to keep as the description.
         raise ResourceServerAuthError("invalid_token", str(exc)) from exc
+    except jwt.InvalidTokenError as exc:
+        # Every other token error may quote the token back (pyjwt names an
+        # unknown `crit` extension, for one), so the description is fixed.
+        raise ResourceServerAuthError("invalid_token", "Invalid token.") from exc
 
     scopes = _claim_scopes(claims)
     missing_scopes = sorted(set(required_scopes or []) - set(scopes))

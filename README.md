@@ -177,8 +177,12 @@ token with an unknown `kid` forces at most one refresh per 10 s; others in that
 window are checked against the cached keys. The `resource` published at
 `/.well-known/oauth-protected-resource` is the configured
 `resource_server_audience`, or, when that is unset, the origin of the configured
-protected-resource metadata URL plus `/mcp`; it is never taken from the request
-`Host`.
+protected-resource metadata URL plus `/mcp`, with a scheme-default port such as
+`:443` dropped. A path prefix in the metadata URL is not carried over, because
+PMCP serves MCP at `/mcp`. If MCP is reachable at a different public URL, set
+`--oauth-audience` to publish it. The `resource` is never taken from the
+request `Host`. A forged token, including one whose algorithm does not match
+the published key's type, gets `401`, never `500`.
 In public auth metadata URLs it rejects hosts written as non-public **IP
 literals** — private, CGNAT, link-local, loopback, multicast, site-local, and
 unspecified — including IPv4 addresses embedded in IPv6 literals and legacy

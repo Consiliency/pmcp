@@ -321,3 +321,58 @@ class TestJWKSWithoutUsableKeys:
         rendered = "\n".join([response.text, str(dict(response.headers)), caplog.text])
         for leak in ("malformed-key-kid", '"kty"', token):
             assert leak not in rendered
+
+
+class TestForgedTokenMatrixOverHTTP:
+    """Every forged-token case from the unit matrix, through the real app and
+    the real AsyncJWKS/validator path (only the network fetch is patched): never
+    a 500, always 401, and the sentinel planted in the tokens and the keys
+    never reaches the body, the headers, or the logs at any level (PR review
+    F1, see Consiliency/pmcp#231)."""
+
+    @pytest.mark.parametrize("allow_list", ["default", "wide"])
+    @pytest.mark.parametrize("key_name", ["rsa", "ec256", "ec384", "okp", "oct", "all"])
+    def test_forged_tokens_are_401_never_500_and_value_free(
+        self, allow_list: str, key_name: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from tests.test_auth import (
+            _SENTINEL,
+            FORGED_TOKEN_ALLOW_LISTS,
+            FORGED_TOKEN_KEYS,
+            forged_tokens_for,
+        )
+
+        keys = (
+            list(FORGED_TOKEN_KEYS.values())
+            if key_name == "all"
+            else [FORGED_TOKEN_KEYS[key_name]]
+        )
+        client = _resource_server_client(
+            resource_server_allowed_algorithms=FORGED_TOKEN_ALLOW_LISTS[allow_list]
+        )
+        wrong: list[str] = []
+        leaked: list[str] = []
+        with (
+            caplog.at_level(logging.DEBUG),
+            patch(
+                "pmcp.transport.http.AsyncJWKS._fetch",
+                new=AsyncMock(return_value={"keys": keys}),
+            ),
+        ):
+            for case, token in forged_tokens_for(keys[0]).items():
+                caplog.clear()
+                response = client.post(
+                    "/mcp",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+                )
+                if response.status_code != 401:
+                    wrong.append(f"{case}: {response.status_code}")
+                rendered = "\n".join(
+                    [response.text, str(dict(response.headers)), caplog.text]
+                )
+                if _SENTINEL in rendered or token in rendered:
+                    leaked.append(case)
+
+        assert not wrong, f"forged tokens not answered 401: {wrong}"
+        assert not leaked, f"token/key content in body, headers or logs: {leaked}"
