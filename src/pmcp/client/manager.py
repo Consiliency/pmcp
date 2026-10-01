@@ -259,6 +259,25 @@ def _significant_start(text: str) -> int:
     return len(text)
 
 
+def _is_protocol_frame(message: Any) -> bool:
+    """Whether a parsed stdio line is a JSON-RPC message the dispatcher
+    accepts: an object with `"jsonrpc": "2.0"`, an id that is a string or a
+    (non-bool) integer when present, and either a string `method` (a request
+    or notification) or an id with exactly one of `result` / `error` (a
+    response). Only such a line ends describe mode (Consiliency/pmcp#297,
+    rev 11)."""
+    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
+        return False
+    msg_id = message.get("id")
+    if msg_id is not None and (
+        isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
+    ):
+        return False
+    if "method" in message:
+        return isinstance(message["method"], str)
+    return msg_id is not None and (("result" in message) != ("error" in message))
+
+
 def _is_downstream_output(text: str) -> bool:
     """Whether a stdio line the parser rejected is the downstream's own
     output (a banner, a log line), as opposed to a frame, whose content is
@@ -2976,7 +2995,12 @@ class ClientManager:
             # the line is attacker-sized (Consiliency/pmcp#287).
             logger.debug(f"[{name}] dropped unparseable frame ({type(e).__name__})")
             return
-        managed.stdio_frame_broken = False
+        if managed.stdio_frame_broken and _is_protocol_frame(message):
+            # Recovery needs a valid protocol frame (rev 11): a bare scalar,
+            # an array, `{}` or an object the dispatcher would drop is just
+            # as likely the inside of the broken frame, and keeps the mode.
+            # The line after a valid frame is judged on its own rules.
+            managed.stdio_frame_broken = False
         self._dispatch_downstream_frame(name, managed, message, now)
 
     def _dispatch_downstream_frame(
@@ -3147,6 +3171,10 @@ class ClientManager:
                             if not skipping:
                                 self._fail_oversized_line(name, managed, limit)
                                 skipping = True
+                                # The dropped line may be the head of a frame
+                                # broken across lines: describe what follows
+                                # until a valid frame (rev 11).
+                                managed.stdio_frame_broken = True
                             buf.clear()
                         break
                     raw = bytes(buf[:nl])

@@ -628,6 +628,21 @@ def exception_text(error: BaseException) -> str:
     return text
 
 
+def message_text(message: str, error: BaseException) -> str:
+    """`message` (an error's own message field, such as an `MCPError`'s),
+    unless it embeds the text of a validation or parse error in `error`'s
+    chain; then that error's structural description (rev 11)."""
+    for linked in _chain(error):
+        if _is_validation_error(linked):
+            try:
+                embedded = str(linked)
+            except Exception:
+                embedded = ""
+            if embedded and embedded in message:
+                return _validation_text(linked)
+    return message
+
+
 def safe_exc_info(error: BaseException) -> BaseException | None:
     """``exc_info=`` for a log call: the exception, unless its chain holds a
     validation error, whose rendered traceback would carry the value."""

@@ -68,6 +68,7 @@ _RENDERERS = {
     "safe_exc_info",
     "safe_traceback_text",
     "describe_exception",
+    "message_text",
     "sanitize_auth_diagnostic",
     "describe_argument_error",
     "describe_schema_error",

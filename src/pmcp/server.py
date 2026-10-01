@@ -43,6 +43,7 @@ from pmcp.argument_errors import (
     describe_schema_error,
     exception_text,
     install_log_scrubber,
+    message_text,
     safe_exc_info,
 )
 from pmcp.client.manager import ClientManager
@@ -113,33 +114,55 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
 def _described_errors(handler: Any) -> Any:
     """Wrap a request handler so an exception it lets escape never carries a
     validation or parse error's text to the caller (Consiliency/pmcp#297,
-    rev 10).
+    rev 10; codes kept in rev 11).
 
-    The SDK answers an escaping exception with ``ErrorData(message=str(e))``
-    (`mcp/shared/jsonrpc_dispatcher.py`), so a pydantic error raised while a
-    handler builds its result from downstream data -- ``resources/read``'s
-    ``TextResourceContents``, ``prompts/get``'s ``PromptMessage`` -- sent its
-    ``input_value`` back to the caller. Such an exception (its chain holds a
-    validation or parse error) is re-raised as ``ValueError`` of its
-    :func:`exception_text`, outside the ``except``, so it chains nothing.
+    The SDK maps an escaping exception to the wire
+    (`mcp/shared/jsonrpc_dispatcher.py` `handler_exception_to_error_data`):
+    an `MCPError` carries its own `ErrorData`; a bare pydantic
+    `ValidationError` becomes `-32602 "Invalid request parameters"` with no
+    text; anything else becomes `code=0, message=str(e)`, which is where a
+    wrapper such as `ValueError(f"... {e}") from e` sends the value. When
+    the chain holds a validation or parse error, the replacement keeps that
+    mapping's code and changes only the text:
+    - an `MCPError` keeps its code, with its message (or, if the message
+      embeds the validation text, the structural description) and no
+      `data`;
+    - a bare `ValidationError` keeps `-32602`, now with the structural
+      description;
+    - anything else is a `ValueError` of its description (the SDK's
+      `code=0`).
+
+    The replacement is raised outside the `except`, so it chains nothing.
     Every other exception passes unchanged.
     """
     import functools
     import inspect
+
+    from mcp.shared.exceptions import MCPError
+    from mcp.types import INVALID_PARAMS
+    from pydantic import ValidationError
 
     if inspect.isasyncgenfunction(handler):
         return handler
 
     @functools.wraps(handler)
     async def wrapper(*args: Any, **kwargs: Any) -> Any:
-        described: str | None = None
+        replacement: Exception | None = None
         try:
             return await handler(*args, **kwargs)
         except Exception as error:
             if safe_exc_info(error) is not None:
                 raise
             described = exception_text(error)
-        raise ValueError(described)
+            if isinstance(error, MCPError):
+                replacement = MCPError(
+                    error.error.code, message_text(error.error.message, error)
+                )
+            elif isinstance(error, ValidationError):
+                replacement = MCPError(INVALID_PARAMS, described)
+            else:
+                replacement = ValueError(described)
+        raise replacement
 
     return wrapper
 

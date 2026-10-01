@@ -335,6 +335,19 @@ def _config(transport: str, downstream: _Downstream, tmp: Path) -> ResolvedServe
     return ResolvedServerConfig(name="frames", source="custom", config=config)
 
 
+def _wire_error(error: BaseException) -> str:
+    """What the SDK's dispatcher sends the caller for a handler's escaping
+    exception (`handler_exception_to_error_data`, else `code=0, str(e)`),
+    not `str(error)`: a bare `ValidationError` goes out as `-32602` with no
+    text (rev 11 correction)."""
+    from mcp.shared.jsonrpc_dispatcher import handler_exception_to_error_data
+
+    data = handler_exception_to_error_data(error)
+    if data is None:
+        return f"raised code 0: {error}"
+    return f"raised code {data.code}: {data.message} {data.data!r}"
+
+
 async def _request(server: Any, method: str) -> str:
     """Drive `method` through pmcp's own surface; return what the caller sees."""
     if method == "tools/call":
@@ -365,16 +378,16 @@ async def _request(server: Any, method: str) -> str:
             result = await entry.handler(
                 _make_ctx(), ReadResourceRequestParams(uri="x://r")
             )
-        except Exception as error:  # noqa: BLE001 -- the SDK sends `str(error)`
-            return f"raised {type(error).__name__}: {error}"
+        except Exception as error:  # noqa: BLE001 -- what the SDK sends
+            return _wire_error(error)
     elif method == "prompts/get":
         entry = server._server.get_request_handler("prompts/get")
         try:
             result = await entry.handler(
                 _make_ctx(), GetPromptRequestParams(name="frames::p")
             )
-        except Exception as error:  # noqa: BLE001 -- the SDK sends `str(error)`
-            return f"raised {type(error).__name__}: {error}"
+        except Exception as error:  # noqa: BLE001 -- what the SDK sends
+            return _wire_error(error)
     else:
         return ""  # a connect-time method: the connect result is the output
     return result.model_dump_json()
@@ -1188,3 +1201,203 @@ def test_a_frame_broken_across_lines_shows_none_of_it(
             label,
             shown,
         )
+
+
+# --- rev 11: describe mode ends only on a valid frame; oversized heads -------
+
+
+async def _read_stream(
+    manager: Any, managed: Any, data: bytes, monkeypatch: Any, limit: int | None = None
+) -> None:
+    """Feed `data` to the REAL `_read_stdout` loop, then EOF."""
+    from pmcp.types import ServerStatusEnum
+
+    if limit is not None:
+        monkeypatch.setattr("pmcp.client.manager._stdio_read_limit", lambda: limit)
+        # Chunks smaller than the limit, so a long line spans several reads
+        # and meets the limit before its newline, as a 10 MiB line does.
+        monkeypatch.setattr("pmcp.client.manager._STDIO_CHUNK_SIZE", limit // 2)
+    reader = asyncio.StreamReader()
+    reader.feed_data(data)
+    reader.feed_eof()
+    managed.process.stdout = reader
+    managed.config = None  # no reconnect at EOF
+    managed.status.status = ServerStatusEnum.OFFLINE
+    await manager._read_stdout("srv", managed)
+
+
+#: Lines that parse but are not a frame the dispatcher accepts: each kind of
+#: JSON value, and objects that fail its guards.
+_NOT_FRAMES = (
+    "42",
+    "-1",
+    "0.5",
+    "true",
+    "false",
+    "null",
+    "[]",
+    "[1, 2]",
+    "{}",
+    '"ok"',
+    '{"jsonrpc": "2.0"}',
+    '{"id": 7, "result": {}}',
+    '{"jsonrpc": "1.0", "id": 7, "result": {}}',
+    '{"jsonrpc": "2.0", "id": true, "result": {}}',
+    '{"jsonrpc": "2.0", "id": 1.5, "result": {}}',
+    '{"jsonrpc": "2.0", "method": 5}',
+    '{"jsonrpc": "2.0", "id": 7}',
+    '{"jsonrpc": "2.0", "id": 7, "result": {}, "error": {"code": 1, "message": "m"}}',
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ("hex", "alpha", "unicode"))
+async def test_describe_mode_ends_only_on_a_valid_frame(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    """Round-10 codex and claude N3-r10 (a): a broken frame head, then a
+    line that parses but is not a valid frame, then a continuation carrying
+    the sentinel -- through the real reader, no record exempt. The
+    continuation stays described. A valid frame does end describe mode,
+    and the line after it is judged on its own rules: a banner is shown, a
+    line that starts like JSON is described."""
+    caplog.set_level(logging.DEBUG)
+    s = _FAMILIES[family][1]
+    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
+    head = '{"jsonrpc":"2.0","id":7,"result":{"text":"start'
+    for middle in _NOT_FRAMES:
+        manager, managed = _stdio_manager()
+        start = len(caplog.records)
+        data = "\n".join([head, middle, f"API_KEY={s}", f'{s}"}}}}']) + "\n"
+        await _read_stream(manager, managed, data.encode(), monkeypatch)
+        text = "\n".join(_record_text(r) for r in caplog.records[start:])
+        assert not any(form in text for form in forbidden), (middle, text[:500])
+        assert "Non-JSON output" not in text, (middle, text[:500])
+    # A valid frame ends describe mode: the next line is judged on its own.
+    notification = json.dumps({"jsonrpc": "2.0", "method": "notifications/message"})
+    for after, shown in (
+        ("server ready banner-ok-7f3a", "server ready banner-ok-7f3a"),
+        (f'"{s}', None),  # starts like JSON: described by the per-line rule
+    ):
+        manager, managed = _stdio_manager()
+        start = len(caplog.records)
+        data = "\n".join([head, notification, after]) + "\n"
+        await _read_stream(manager, managed, data.encode(), monkeypatch)
+        messages = [r.getMessage() for r in caplog.records[start:]]
+        text = "\n".join(_record_text(r) for r in caplog.records[start:])
+        assert not any(form in text for form in forbidden), (after, text[:500])
+        outputs = [m for m in messages if m.startswith("[srv] Non-JSON output: ")]
+        expected = [] if shown is None else [f"[srv] Non-JSON output: {shown}"]
+        assert outputs == expected, (after, messages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ("hex", "alpha", "unicode"))
+async def test_an_oversized_frame_head_starts_describe_mode(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    """Round-10 codex and claude N3-r10 (b): a frame head longer than the
+    stdout line limit is dropped (its request failed); the continuation
+    after it carries the sentinel and must not be shown. A valid frame then
+    recovers, and a banner is shown again."""
+    caplog.set_level(logging.DEBUG)
+    s = _FAMILIES[family][1]
+    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
+    manager, managed = _stdio_manager()
+    head = '{"jsonrpc":"2.0","id":7,"result":{"text":"' + "A" * 5000
+    notification = json.dumps({"jsonrpc": "2.0", "method": "notifications/message"})
+    data = "\n".join(
+        [head, f"API_KEY={s}", f'{s}"}}}}', notification, "server ready banner-ok-7f3a"]
+    )
+    start = len(caplog.records)
+    await _read_stream(
+        manager, managed, (data + "\n").encode(), monkeypatch, limit=2048
+    )
+    messages = [r.getMessage() for r in caplog.records[start:]]
+    text = "\n".join(_record_text(r) for r in caplog.records[start:])
+    assert any("exceeded the 2048-byte stdout line limit" in m for m in messages), (
+        messages
+    )
+    assert not any(form in text for form in forbidden), text[:600]
+    assert [m for m in messages if m.startswith("[srv] Non-JSON output: ")] == [
+        "[srv] Non-JSON output: server ready banner-ok-7f3a"
+    ], messages
+
+
+# --- rev 11: the handler wrapper keeps the SDK's wire codes (claude N2-r10) ---
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ("hex", "alpha", "unicode"))
+async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
+    """`_described_errors` changes only the text the SDK would send, never
+    the code: a bare `ValidationError` stays `-32602` (now with a
+    structural message), an `MCPError` keeps its own code, any other
+    exception stays the SDK's `code=0`. No value reaches the message or
+    `data`; an unrelated exception passes unchanged."""
+    from mcp.shared.exceptions import MCPError
+    from mcp.shared.jsonrpc_dispatcher import handler_exception_to_error_data
+    from mcp.types import INVALID_PARAMS
+    from pydantic import ValidationError
+
+    from pmcp.server import _described_errors
+    from pmcp.types import McpTaskInfo
+
+    s = _FAMILIES[family][1]
+    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
+
+    def invalid() -> ValidationError:
+        try:
+            McpTaskInfo.model_validate({"task_id": "t", "ttl": s})
+        except ValidationError as error:
+            return error
+        raise AssertionError("did not reject")
+
+    async def bare() -> None:
+        raise invalid()
+
+    async def mcp_inside_except() -> None:
+        try:
+            raise invalid()
+        except ValidationError:
+            raise MCPError(-32002, "Resource not found") from None
+
+    async def mcp_from_error() -> None:
+        error = invalid()
+        raise MCPError(-32602, str(error)) from error
+
+    async def wrapped() -> None:
+        error = invalid()
+        raise ValueError(f"could not build the result: {error}") from error
+
+    async def unrelated() -> None:
+        raise RuntimeError("plain failure")
+
+    async def wire(handler: Any) -> tuple[int, str, Any]:
+        try:
+            await _described_errors(handler)()
+        except Exception as error:  # noqa: BLE001 -- inspected
+            data = handler_exception_to_error_data(error)
+            if data is None:
+                return 0, str(error), None
+            return data.code, data.message, data.data
+        raise AssertionError("did not raise")
+
+    cases = {
+        "bare": (INVALID_PARAMS, "validation error"),
+        "mcp_inside_except": (-32002, "Resource not found"),
+        "mcp_from_error": (-32602, "validation error"),
+        "wrapped": (0, "validation error"),
+    }
+    for name, handler in (
+        ("bare", bare),
+        ("mcp_inside_except", mcp_inside_except),
+        ("mcp_from_error", mcp_from_error),
+        ("wrapped", wrapped),
+    ):
+        code, message, data = await wire(handler)
+        expected_code, expected_text = cases[name]
+        assert code == expected_code, (name, code, message)
+        assert expected_text in message, (name, message)
+        assert not any(f in f"{message}{data!r}" for f in forbidden), (name, message)
+    assert await wire(unrelated) == (0, "plain failure", None)
