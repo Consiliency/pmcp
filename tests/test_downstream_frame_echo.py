@@ -200,6 +200,16 @@ class _Downstream:
                 if self.path.startswith("/messages"):
                     if data is not None and downstream.streams:
                         downstream.streams[-1].put(data)
+                        if request.get("method") == downstream.state["method"]:
+                            # The read loop drops a frame that fails JSON-RPC
+                            # validation and keeps reading (Consiliency/pmcp#287),
+                            # as stdio does: follow it with the real reply, or
+                            # the request only times out.
+                            downstream.streams[-1].put(
+                                _logic["reply"](
+                                    request, {**downstream.state, "method": None}
+                                )
+                            )
                     self.send_response(202)
                     self.send_header("content-length", "0")
                     self.end_headers()

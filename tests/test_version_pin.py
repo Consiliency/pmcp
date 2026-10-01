@@ -21,6 +21,7 @@ import yaml
 from pmcp.config.loader import _merge_manifest_defaults
 from pmcp.manifest.loader import (
     Manifest,
+    ServerConfig,
     load_manifest,
     split_plain_registry_spec,
 )
@@ -512,12 +513,35 @@ class _ClientManager:
         return {}
 
 
+def _no_host_npm_config(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Remove the HOST's npm configuration from this test's process env.
+
+    main's resolver turns off npm package detection for the whole gateway
+    process when its own environment sets any `npm_config_*` variable (any
+    case) or `NODE_OPTIONS` -- team hosts export `npm_config_cache` -- and then
+    `update_server` reports "Could not determine a registry package" instead
+    of reaching the pinned branch. The [PINNED] tests assert the pinned branch,
+    so they clear it themselves (Consiliency/pmcp#322, N2).
+    """
+    import os
+
+    for key in list(os.environ):
+        lowered = key.lower()
+        if (
+            lowered.startswith("npm_config_")
+            or lowered.startswith("pnpm_config_")
+            or key.upper() == "NODE_OPTIONS"
+        ):
+            monkeypatch.delenv(key)
+
+
 def _gateway(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     manifest: Manifest,
     configured: list[ResolvedServerConfig] | None = None,
 ) -> GatewayTools:
+    _no_host_npm_config(monkeypatch)
     monkeypatch.setattr(handlers_module, "load_manifest", lambda: manifest)
     monkeypatch.setattr(handlers_module, "load_configs", lambda **_: configured or [])
     policy_path = tmp_path / "gateway-policy.yaml"
@@ -930,7 +954,7 @@ def test_a_later_refused_pin_leaves_an_earlier_pin_standing(
     assert entry.args == ["-y", "firecrawl-mcp@1.0.0"]
     refusal = [m for m in _warnings(caplog) if "server_version" in m]
     assert refusal and all("stays unpinned" not in m for m in refusal)
-    assert any("an earlier source, if any, stands" in m for m in refusal)
+    assert any("any pin from an earlier source stands" in m for m in refusal)
 
 
 def test_server_version_null_sets_nothing(
@@ -1055,3 +1079,264 @@ def test_a_failure_while_materialising_costs_only_that_entry(
     assert manifest.servers["firecrawl"].args == ["-y", "firecrawl-mcp"]
     assert manifest.servers["playwright"].args == ["-y", "@playwright/mcp@1.2.3"]
     assert any("could not be read (RuntimeError)" in m for m in _warnings(caplog))
+
+
+# ---------------------------------------------------------------------------
+# Consiliency/pmcp#322: the invalid-pin warning names the right consequence
+# ---------------------------------------------------------------------------
+
+
+def test_a_bad_version_on_a_replacing_entry_does_not_claim_an_earlier_pin_stands(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The issue's repro (N1): the user overlay pins firecrawl to 3.25.5, then a
+    `PMCP_MANIFEST_PATH` overlay replaces the whole entry with `version:
+    latest`. The server ends up unpinned, so the only pin warning must say
+    the entry replaced any earlier pin -- not that an earlier pin stands."""
+    _user_overlay('server_version:\n  firecrawl: "3.25.5"\n')
+    shipped = load_manifest().servers["firecrawl"]
+    explicit = tmp_path / "explicit.yaml"
+    entry = {
+        "description": "f",
+        "keywords": ["f"],
+        "command": "npx",
+        "args": ["-y", "firecrawl-mcp"],
+        "install": {"linux": ["npx", "-y", "firecrawl-mcp"]},
+        "version": "latest",
+    }
+    explicit.write_text(yaml.safe_dump({"servers": {"firecrawl": entry}}))
+    monkeypatch.setenv("PMCP_MANIFEST_PATH", str(explicit))
+
+    with caplog.at_level(logging.WARNING):
+        loaded = load_manifest().servers["firecrawl"]
+
+    assert shipped.version == "3.25.5"  # the earlier pin did exist
+    assert loaded.version is None
+    assert loaded.args == ["-y", "firecrawl-mcp"]
+    pin_lines = [m for m in _warnings(caplog) if "pin for server 'firecrawl'" in m]
+    assert len(pin_lines) == 1
+    assert "'version' pin" in pin_lines[0]
+    assert "replaced any earlier pin" in pin_lines[0]
+    assert "stands" not in pin_lines[0]
+    assert "latest" not in pin_lines[0].split("This pin is ignored")[1]
+
+
+def test_a_bad_server_version_still_says_an_earlier_pin_stands(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _user_overlay("server_version:\n  firecrawl: latest\n")
+
+    with caplog.at_level(logging.WARNING):
+        load_manifest()
+
+    pin_lines = [m for m in _warnings(caplog) if "pin for server 'firecrawl'" in m]
+    assert len(pin_lines) == 1
+    assert "'server_version' pin" in pin_lines[0]
+    assert (
+        "any pin from an earlier source stands, unless a 'servers:' entry"
+        in pin_lines[0]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Consiliency/pmcp#322 round 1: the consequence text is true in EVERY
+# precedence case, derived from the loader's merge order
+# ---------------------------------------------------------------------------
+
+_ENTRY_KINDS = (None, "plain", "good", "bad")  # a `servers:` entry for firecrawl
+_SV_KINDS = (None, "good", "bad")  # a `server_version` for firecrawl
+_SV_TEXT = (
+    "any pin from an earlier source stands, unless a 'servers:' entry for this "
+    "server in this or a later source replaced it, or a later source set another pin"
+)
+_VERSION_TEXT = (
+    "the whole entry that carries it replaced any earlier pin, so the server is "
+    "unpinned unless this source's 'server_version' or a later source pins it"
+)
+
+
+def _merge_model(
+    sources: list[tuple[str | None, str | None]], goods: list[tuple[str, str]]
+) -> list[str | None]:
+    """The pin after each source, by the loader's merge order: shipped (no
+    pin), then each overlay source in order; within a source, a `servers:`
+    entry replaces the whole entry (and its pin) first, then `server_version`
+    patches it. A bad pin is ignored. Returns [before source 0, after 0, ...]."""
+    pin: str | None = None
+    states = [pin]
+    for (entry, sv), (entry_pin, sv_pin) in zip(sources, goods):
+        if entry is not None:
+            pin = entry_pin if entry == "good" else None
+        if sv == "good":
+            pin = sv_pin
+        states.append(pin)
+    return states
+
+
+def _entry_doc(shipped: ServerConfig, kind: str | None, pin: str) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "description": "f",
+        "keywords": ["f"],
+        "command": "npx",
+        "args": list(shipped.args),
+        "install": {k: list(v) for k, v in shipped.install.items()},
+    }
+    if kind in ("good", "bad"):
+        body["version"] = pin if kind == "good" else "latest"
+    return body
+
+
+def _check_precedence_case(
+    case: tuple[tuple[str | None, str | None], ...],
+    goods: list[tuple[str, str]],
+    writers: list[Any],
+    shipped: ServerConfig,
+    caplog: pytest.LogCaptureFixture,
+    checked: dict[str, int],
+) -> None:
+    """Write one overlay document per source (in merge order), load, and check
+    (1) the loader against the merge-order model, (2) the args against the
+    final pin, and (3) every invalid-pin warning is TRUE against that state."""
+    for (entry, sv), (entry_pin, sv_pin), write in zip(case, goods, writers):
+        doc: dict[str, Any] = {}
+        if entry is not None:
+            doc["servers"] = {"firecrawl": _entry_doc(shipped, entry, entry_pin)}
+        if sv is not None:
+            doc["server_version"] = {"firecrawl": sv_pin if sv == "good" else "^3"}
+        write(yaml.safe_dump(doc))
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        loaded = load_manifest().servers["firecrawl"]
+
+    states = _merge_model(list(case), goods)
+    final = states[-1]
+    assert loaded.version == final, case
+    expected_args = (
+        ["-y", f"firecrawl-mcp@{final}"] if final else ["-y", "firecrawl-mcp"]
+    )
+    assert loaded.args == expected_args, case
+
+    lines = [m for m in _warnings(caplog) if m.startswith("Ignoring a '")]
+    expected = [
+        (field, i)
+        for i, (entry, sv) in enumerate(case)
+        for field, bad in (("version", entry == "bad"), ("server_version", sv == "bad"))
+        if bad
+    ]
+    assert len(lines) == len(expected), (case, lines)
+    for line, (field, i) in zip(lines, expected):
+        assert line.startswith(f"Ignoring a '{field}' pin for server 'firecrawl'")
+        later_pins = any(e == "good" or s == "good" for e, s in case[i + 1 :])
+        if field == "server_version":
+            assert _SV_TEXT in line, (case, line)
+            replaced = any(e is not None for e, _s in case[i:])
+            earlier = states[i]
+            if earlier is not None and not replaced and not later_pins:
+                assert final == earlier, (case, line)  # "stands" is true
+        else:
+            assert _VERSION_TEXT in line, (case, line)
+            if case[i][1] != "good" and not later_pins:
+                assert final is None, (case, line)  # "unpinned" is true
+        checked[field] += 1
+
+
+def test_the_invalid_pin_text_is_true_in_every_two_source_case(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round 1 on Consiliency/pmcp#323 (F1, F2), same-file and later-file: two
+    overlay sources (the user overlay, then `PMCP_MANIFEST_PATH`), each with any
+    of {no entry, an entry without a pin, with a good pin, with a bad pin} x
+    {no `server_version`, a good one, a bad one}: all 144 cases."""
+    import itertools
+
+    shipped = load_manifest().servers["firecrawl"]
+    explicit = tmp_path / "explicit.yaml"
+    monkeypatch.setenv("PMCP_MANIFEST_PATH", str(explicit))
+    writers = [_user_overlay, explicit.write_text]
+    one = list(itertools.product(_ENTRY_KINDS, _SV_KINDS))
+    checked = {"server_version": 0, "version": 0}
+    for case in itertools.product(one, repeat=2):
+        _check_precedence_case(
+            case,
+            [("1.0.1", "1.0.2"), ("2.0.1", "2.0.2")],
+            writers,
+            shipped,
+            caplog,
+            checked,
+        )
+    assert checked == {"server_version": 96, "version": 72}
+
+
+def test_the_invalid_pin_text_is_true_with_sources_before_and_after_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    approve_project_file: Any,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Round 1 on Consiliency/pmcp#323 (c7): a bad pin with an earlier source
+    AND a later one -- user overlay, approved project overlay, then
+    `PMCP_MANIFEST_PATH`. The middle source always carries a bad pin (6
+    kinds); the first carries each earlier-pin shape (none, a `server_version`,
+    an entry with a pin, an entry without one); the last is any of all 12.
+    288 cases."""
+    import itertools
+
+    shipped = load_manifest().servers["firecrawl"]
+    project = tmp_path / "proj" / ".pmcp" / "manifest.yaml"
+    project.parent.mkdir(parents=True)
+    monkeypatch.chdir(tmp_path / "proj")
+    explicit = tmp_path / "explicit.yaml"
+    monkeypatch.setenv("PMCP_MANIFEST_PATH", str(explicit))
+
+    def write_project(text: str) -> None:
+        project.write_text(text)
+        approve_project_file(project)
+
+    writers = [_user_overlay, write_project, explicit.write_text]
+    firsts = [(None, None), (None, "good"), ("good", None), ("plain", None)]
+    middles = [
+        (e, s) for e, s in itertools.product(_ENTRY_KINDS, _SV_KINDS) if "bad" in (e, s)
+    ]
+    lasts = list(itertools.product(_ENTRY_KINDS, _SV_KINDS))
+    goods = [("1.0.1", "1.0.2"), ("2.0.1", "2.0.2"), ("3.0.1", "3.0.2")]
+    checked = {"server_version": 0, "version": 0}
+    for case in itertools.product(firsts, middles, lasts):
+        _check_precedence_case(case, goods, writers, shipped, caplog, checked)
+    assert len(middles) * len(firsts) * len(lasts) == 288
+    assert checked["server_version"] > 0 and checked["version"] > 0
+
+
+@pytest.mark.parametrize("cause", ["gateway-env-npm-config", "local-prefix"])
+@pytest.mark.asyncio
+async def test_a_pinned_server_reports_failed_when_npm_config_is_out_of_sight(
+    cause: str, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Round 1 on Consiliency/pmcp#323 (F4): locks the README's causes. With
+    `npm_config_cache` in the gateway's own environment, or with a
+    `package.json` in the directory the gateway runs in, main's resolver refuses
+    package detection. `update_server` reports "Could not determine a registry
+    package" instead of [PINNED], moves nothing, and the pin is still in args."""
+    monkeypatch.setenv("FIRECRAWL_API_KEY", "k-test")
+    _user_overlay('server_version:\n  firecrawl: "3.25.5"\n')
+    manifest = load_manifest()
+    gateway = _gateway(monkeypatch, tmp_path, manifest)  # clears host npm config
+    if cause == "gateway-env-npm-config":
+        monkeypatch.setenv("npm_config_cache", str(tmp_path / "npm-cache"))
+    else:
+        (Path.cwd() / "package.json").write_text("{}\n")
+
+    result = await gateway.update_server({"server_name": "firecrawl"})
+
+    assert result.ok is False
+    assert result.pinned_version is None
+    assert "Could not determine a registry package" in result.message
+    assert manifest.servers["firecrawl"].args == ["-y", "firecrawl-mcp@3.25.5"]
+    assert all(
+        argv[1:] == ["-y", "firecrawl-mcp@3.25.5"]
+        for argv in manifest.servers["firecrawl"].install.values()
+        if argv
+    )
