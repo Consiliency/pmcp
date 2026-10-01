@@ -3939,7 +3939,9 @@ class TestCapabilityAndProvision:
 
         assert result.ok is False
         assert result.auth_state == "missing_auth"
-        assert result.env_var == "BAD-NAME"
+        # rev 12 (Consiliency/pmcp#297): a rejected name is not echoed back.
+        assert result.env_var is None
+        assert "BAD-NAME" not in result.message
         assert "test-token" not in result.message
         assert not (tmp_path / ".env.pmcp").exists()
 

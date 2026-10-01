@@ -38,7 +38,6 @@ import sys
 import textwrap
 import threading
 import typing
-import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -82,6 +81,12 @@ _SHAPES = (
     # sentinel where the handler's own model rejects it -- the transport
     # accepts it, the SDK used to log it at DEBUG, then pmcp rejects it.
     "payload",
+    # rev 12 (round-11 codex P1): a pagination cursor pmcp rejects by hand,
+    # on every listing kind -- an object under `nextCursor`, a list under
+    # `next_cursor`, and a string cursor the downstream repeats.
+    "cursor-object",
+    "cursor-list",
+    "cursor-repeat",
 )
 #: The shapes whose frame the parser rejects: stdio then also sends the real
 #: reply, so the request completes instead of timing out.
@@ -183,6 +188,17 @@ _DOWNSTREAM_LOGIC = textwrap.dedent(
         elif state["shape"] == "json-bigint":
             head = '{"jsonrpc":"2.0","id":%s,"error":{"message":"m","data":' % json.dumps(rid)
             return (head + "7" * 5000 + ',"code":%s}}' % json.dumps(s)).encode()
+        elif state["shape"].startswith("cursor-") and method in ("tools/list", "resources/list", "prompts/list"):
+            result = normal(method, request.get("params") or {})
+            if state["shape"] == "cursor-object":
+                result["nextCursor"] = {"token": s}
+            elif state["shape"] == "cursor-list":
+                result["next_cursor"] = [s]
+            else:
+                result["nextCursor"] = s
+            frame = {"jsonrpc": "2.0", "id": rid, "result": result}
+        elif state["shape"].startswith("cursor-"):
+            frame = {"jsonrpc": "2.0", "id": rid, "result": normal(method, request.get("params") or {})}
         elif state["shape"] == "payload":
             frame = {"jsonrpc": "2.0", "id": rid, "result": invalid_payload(method, s, request.get("params") or {})}
         elif state["shape"] == "json-syntax":
@@ -417,59 +433,6 @@ _CLOSE_TIMEOUT = re.compile(
 )
 
 
-_NON_JSON_PREFIX = "[frames] Non-JSON output: "
-
-
-#: The test's own statement of the JSON grammar (RFC 8259 section 3), not
-#: the reader's: a value begins with one of these -- object, array, string,
-#: number, `true`/`false`/`null` -- plus Python's `NaN`/`Infinity`.
-_GRAMMAR_VALUE_START = '{["-0123456789tfnNI'
-#: What opens a container or a string, where frame content can begin.
-_GRAMMAR_OPENERS = '{["'
-
-
-def _first_significant(line: str) -> str:
-    """The first character a reader would see, written independently of the
-    reader: skip whatever `str.isspace` calls space (all `.strip` removes),
-    control and format characters (NUL, ESC, a BOM, ZWSP) and U+FFFD (an
-    undecodable byte)."""
-    for char in line:
-        if not (
-            char.isspace()
-            or char == "\ufffd"
-            or unicodedata.category(char) in ("Cc", "Cf")
-        ):
-            return char
-    return ""
-
-
-def _json_shaped(line: str) -> bool:
-    """Rev 9's rule, from the grammar: a line whose first significant
-    character can begin a JSON value is protocol data, never shown."""
-    return _first_significant(line) in tuple(_GRAMMAR_VALUE_START)
-
-
-def _carries_no_frame(shown: str) -> bool:
-    """A shown text can be exempt only if it holds no character that could
-    open frame content -- whatever the reader decided."""
-    return not any(opener in shown for opener in _GRAMMAR_OPENERS)
-    return False
-
-
-def _non_json_line(record: logging.LogRecord) -> bool:
-    """Exactly stdio's DEBUG line for a downstream's non-JSON output -- and
-    only when what it shows holds no frame-opening character (rev 9): a
-    record that could carry frame content is never exempt."""
-    message = record.getMessage()
-    return (
-        record.name == "pmcp.client.manager"
-        and record.levelno == logging.DEBUG
-        and message.startswith(_NON_JSON_PREFIX)
-        and _carries_no_frame(message[len(_NON_JSON_PREFIX) :])
-        and not record.exc_info
-    )
-
-
 @pytest.fixture(autouse=True)
 def _only_pytests_log_handlers() -> Any:
     """Detach root handlers other tests left behind (a CLI test's file
@@ -561,7 +524,6 @@ async def test_no_malformed_frame_value_reaches_pmcps_output(
                                     _record_stable(r)
                                     for r in caplog.records[mark[0] :]
                                     if r.name.split(".")[0] == "pmcp"
-                                    and not _non_json_line(r)
                                     and not _CLOSE_TIMEOUT.fullmatch(r.getMessage())
                                 )
                             ),
@@ -569,19 +531,6 @@ async def test_no_malformed_frame_value_reaches_pmcps_output(
                             observed.warnings,
                         )
                         records = caplog.records[mark[0] :]
-                        if transport == "stdio":
-                            observed = observed._replace(
-                                raw_log="\n".join(
-                                    _record_text(r)
-                                    for r in records
-                                    if not _non_json_line(r)
-                                ),
-                                log="\n".join(
-                                    _record_stable(r)
-                                    for r in records
-                                    if not _non_json_line(r)
-                                ),
-                            )
                         leaks = observed.leaks(s)
                         if (
                             (transport == "stdio" or shape == "payload")
@@ -594,10 +543,9 @@ async def test_no_malformed_frame_value_reaches_pmcps_output(
                         assert leaks == [], (transport, method, shape, family, observed)
                         if transport == "stdio" and shape.startswith("json-"):
                             # No vacuous pass: the rejected frame reached the
-                            # reader and was described, not exempted.
+                            # reader and got the fixed record (rev 12).
                             assert any(
-                                "sent a JSON-RPC frame that could not be parsed"
-                                in r.getMessage()
+                                "non-protocol stdout line" in r.getMessage()
                                 for r in records
                             ), (transport, method, shape, family)
                         seen.append(pair_view)
@@ -788,84 +736,11 @@ def _rejected_frames(s: str) -> list[tuple[str, bytes]]:
     return out
 
 
-@pytest.mark.parametrize("family", sorted(_FAMILIES))
-def test_no_rejected_json_rpc_frame_reaches_the_log(
-    caplog: pytest.LogCaptureFixture, family: str
-) -> None:
-    """A JSON-RPC-shaped stdio line that the parser rejects -- on syntax or a
-    limit -- is described, never logged raw; no record is exempted. A line
-    that is not JSON-RPC-shaped is still the downstream's own output, logged
-    as it is (the positive control for the boundary)."""
-    import time
-    from unittest.mock import MagicMock
+# --- stdout line generators (revs 8-11), feeding rev 12's property ----------
 
-    from pmcp.client.manager import ClientManager, ManagedClient
-    from pmcp.types import ServerStatus, ServerStatusEnum
-
-    caplog.set_level(logging.DEBUG)
-    s = _FAMILIES[family][1]
-    forbidden = _forbidden(s)
-    manager = ClientManager()
-    managed = ManagedClient(
-        config=MagicMock(),
-        process=MagicMock(),
-        status=ServerStatus(name="srv", status=ServerStatusEnum.ONLINE, tool_count=0),
-    )
-    frames = _rejected_frames(s)
-    # No vacuous pass: the generator covers each class, and both limits.
-    labels = " ".join(label for label, _ in frames)
-    for kind in (
-        "truncated",
-        "deleted",
-        "doubled",
-        "depth",
-        "digits",
-        "batch",
-        "indented",
-        "bom",
-        "bare-depth",
-        "bare-digits",
-        "scalar-then-data",
-    ):
-        assert kind in labels, kind
-    described = 0
-    for label, line in frames:
-        start = len(caplog.records)
-        manager._handle_stdout_line("srv", managed, line, time.time())
-        records = caplog.records[start:]
-        text = "\n".join(_record_text(r) for r in records)
-        assert not any(form in text for form in forbidden), (label, text[:300])
-        described += any(
-            "sent a JSON-RPC frame that could not be parsed" in r.getMessage()
-            for r in records
-        )
-    # The frames carry the sentinel as JSON spells it (`\\u` escapes for the
-    # non-ASCII family), which is what a raw log line would show.
-    spelled = json.dumps(s)[1:-1].encode("ascii")
-    carrying = [label for label, line in frames if spelled in line]
-    assert described == len(frames) and len(carrying) > 100, (described, len(frames))
-    # The boundary, both ways. Output -- the parser rejects the first
-    # character, and it opens nothing -- is logged as it is, by design; a
-    # line that opens like JSON is described even if it is a log line.
-    managed.stdio_frame_broken = False  # a fresh stream (rev 10)
-    start = len(caplog.records)
-    manager._handle_stdout_line(
-        "srv", managed, f"server ready {s}".encode(), time.time()
-    )
-    assert any(
-        r.getMessage() == f"[srv] Non-JSON output: server ready {s}"
-        for r in caplog.records[start:]
-    )
-    for described_line in (f"[INFO] {s}", f"true {s}"):
-        start = len(caplog.records)
-        manager._handle_stdout_line(
-            "srv", managed, described_line.encode(), time.time()
-        )
-        text = "\n".join(_record_text(r) for r in caplog.records[start:])
-        assert not any(form in text for form in forbidden), (described_line, text)
-
-
-# --- rev 9: where JSON starts, and what a shown line may hold -----------------
+#: Every character that can begin a JSON value, plus Python's NaN/Infinity:
+#: generator input only (rev 12 has no classifier to oracle).
+_VALUE_STARTS = '{["-0123456789tfnNI'
 
 #: Lead characters a line can start with before its first significant one:
 #: plain and Unicode whitespace (all of which `.strip` removes), control and
@@ -920,7 +795,7 @@ def _line_cases(s: str) -> list[tuple[str, bytes]]:
     out: list[tuple[str, bytes]] = []
     for lead in _LEADS:
         tag = repr(lead)
-        for char in _GRAMMAR_VALUE_START:
+        for char in _VALUE_STARTS:
             out.append(
                 (f"{tag} value-start {char!r}", (lead + char + spelled).encode())
             )
@@ -971,90 +846,6 @@ def _stdio_manager() -> tuple[Any, Any]:
         process=MagicMock(),
         status=ServerStatus(name="srv", status=ServerStatusEnum.ONLINE, tool_count=0),
     )
-
-
-@pytest.mark.parametrize("family", sorted(_FAMILIES))
-def test_no_stdio_line_shows_frame_content(
-    caplog: pytest.LogCaptureFixture, family: str
-) -> None:
-    """Rev 9 (round-8 codex P1 and claude N1): no line a downstream writes
-    shows frame content in the log. The expectation is the grammar's, not
-    the reader's: a line whose first significant character can begin a
-    JSON value is described; any other line is shown only up to its first
-    frame-opening character. No record is exempt from the leak check."""
-    import time
-
-    caplog.set_level(logging.DEBUG)
-    s = _FAMILIES[family][1]
-    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
-    manager, managed = _stdio_manager()
-    cases = _line_cases(s)
-    shaped = 0
-    for label, line in cases:
-        decoded = line.decode("utf-8", "replace")
-        # Each case is a stream of its own (rev 10: a rejected frame makes
-        # the reader describe the lines after it until one parses).
-        managed.stdio_frame_broken = False
-        start = len(caplog.records)
-        manager._handle_stdout_line("srv", managed, line, time.time())
-        records = caplog.records[start:]
-        text = "\n".join(_record_text(r) for r in records)
-        # No record exempt: the sentinel, and its NUL-interleaved UTF-16/32
-        # spelling, appear nowhere.
-        flat = text.replace("\x00", "")
-        assert not any(form in text or form in flat for form in forbidden), (
-            label,
-            text[:300],
-        )
-        shown = [
-            r.getMessage()[len("[srv] Non-JSON output: ") :]
-            for r in records
-            if r.getMessage().startswith("[srv] Non-JSON output: ")
-        ]
-        described = any(
-            "sent a JSON-RPC frame that could not be parsed" in r.getMessage()
-            for r in records
-        )
-        try:
-            json.loads(line)
-            parsed = True
-        except Exception:  # noqa: BLE001 -- any rejection
-            parsed = False
-        if parsed:
-            continue  # valid JSON: the dispatcher's business, not this test's
-        if _json_shaped(decoded):
-            shaped += 1
-            assert described and not shown, (label, [r.getMessage() for r in records])
-        else:
-            assert shown and not described, (label, [r.getMessage() for r in records])
-            assert all(_carries_no_frame(text) for text in shown), (label, shown)
-    # No vacuous pass: both sides of the boundary are exercised.
-    assert shaped > 100 and len(cases) - shaped > 20, (shaped, len(cases))
-
-
-def test_a_banner_stays_useful_on_stdio(caplog: pytest.LogCaptureFixture) -> None:
-    """The operator-facing controls: plain output is shown as it is, digits
-    included; a BOM or a control character before it is dropped; a banner
-    before a frame keeps its own text."""
-    import time
-
-    caplog.set_level(logging.DEBUG)
-    manager, managed = _stdio_manager()
-    frame = json.dumps({"jsonrpc": "2.0", "id": 7, "result": {"k": "frame-secret-9x"}})
-    for line, shown in (
-        ("server ready banner-ok-7f3a", "server ready banner-ok-7f3a"),
-        ("listening on port 8080", "listening on port 8080"),
-        ("﻿ready banner-ok-7f3a", "ready banner-ok-7f3a"),
-        ("\x00  ready", "ready"),
-        ("ready banner-ok-7f3a " + frame, "ready banner-ok-7f3a (rest omitted)"),
-        ("warning: value is 'quoted'", "warning: value is 'quoted'"),
-        ('warning: value is "quoted"', "warning: value is (rest omitted)"),
-    ):
-        managed.stdio_frame_broken = False  # each control is a fresh stream
-        start = len(caplog.records)
-        manager._handle_stdout_line("srv", managed, line.encode(), time.time())
-        messages = [r.getMessage() for r in caplog.records[start:]]
-        assert messages == [f"[srv] Non-JSON output: {shown}"], (line, messages)
 
 
 # --- rev 10: the SDK's traffic logging, outgoing --------------------------------
@@ -1164,45 +955,6 @@ def _broken_frame_streams(s: str) -> list[tuple[str, list[bytes]]]:
     return streams
 
 
-@pytest.mark.parametrize("family", sorted(_FAMILIES))
-def test_a_frame_broken_across_lines_shows_none_of_it(
-    caplog: pytest.LogCaptureFixture, family: str
-) -> None:
-    """Once a stdio line is described as a rejected frame, every following
-    unparseable line is described too, until a line parses: the rest of a
-    broken frame is frame data, not output. A banner after a well-formed
-    line is shown again."""
-    import time
-
-    caplog.set_level(logging.DEBUG)
-    s = _FAMILIES[family][1]
-    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
-    for label, lines in _broken_frame_streams(s):
-        manager, managed = _stdio_manager()
-        start = len(caplog.records)
-        for line in lines:
-            manager._handle_stdout_line("srv", managed, line, time.time())
-        records = caplog.records[start:]
-        text = "\n".join(_record_text(r) for r in records)
-        flat = text.replace("\x00", "")
-        assert not any(f in text or f in flat for f in forbidden), (label, text[:400])
-        shown = [
-            r.getMessage()
-            for r in records
-            if r.getMessage().startswith("[srv] Non-JSON output: ")
-        ]
-        # Only the banner after the well-formed frame is shown (and, for the
-        # stream whose frame began after a banner, that banner's prefix).
-        assert shown[-1:] == ["[srv] Non-JSON output: server ready banner-ok-7f3a"], (
-            label,
-            shown,
-        )
-        assert shown[:-1] in ([], ["[srv] Non-JSON output: ready (rest omitted)"]), (
-            label,
-            shown,
-        )
-
-
 # --- rev 11: describe mode ends only on a valid frame; oversized heads -------
 
 
@@ -1250,80 +1002,6 @@ _NOT_FRAMES = (
 )
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("family", ("hex", "alpha", "unicode"))
-async def test_describe_mode_ends_only_on_a_valid_frame(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, family: str
-) -> None:
-    """Round-10 codex and claude N3-r10 (a): a broken frame head, then a
-    line that parses but is not a valid frame, then a continuation carrying
-    the sentinel -- through the real reader, no record exempt. The
-    continuation stays described. A valid frame does end describe mode,
-    and the line after it is judged on its own rules: a banner is shown, a
-    line that starts like JSON is described."""
-    caplog.set_level(logging.DEBUG)
-    s = _FAMILIES[family][1]
-    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
-    head = '{"jsonrpc":"2.0","id":7,"result":{"text":"start'
-    for middle in _NOT_FRAMES:
-        manager, managed = _stdio_manager()
-        start = len(caplog.records)
-        data = "\n".join([head, middle, f"API_KEY={s}", f'{s}"}}}}']) + "\n"
-        await _read_stream(manager, managed, data.encode(), monkeypatch)
-        text = "\n".join(_record_text(r) for r in caplog.records[start:])
-        assert not any(form in text for form in forbidden), (middle, text[:500])
-        assert "Non-JSON output" not in text, (middle, text[:500])
-    # A valid frame ends describe mode: the next line is judged on its own.
-    notification = json.dumps({"jsonrpc": "2.0", "method": "notifications/message"})
-    for after, shown in (
-        ("server ready banner-ok-7f3a", "server ready banner-ok-7f3a"),
-        (f'"{s}', None),  # starts like JSON: described by the per-line rule
-    ):
-        manager, managed = _stdio_manager()
-        start = len(caplog.records)
-        data = "\n".join([head, notification, after]) + "\n"
-        await _read_stream(manager, managed, data.encode(), monkeypatch)
-        messages = [r.getMessage() for r in caplog.records[start:]]
-        text = "\n".join(_record_text(r) for r in caplog.records[start:])
-        assert not any(form in text for form in forbidden), (after, text[:500])
-        outputs = [m for m in messages if m.startswith("[srv] Non-JSON output: ")]
-        expected = [] if shown is None else [f"[srv] Non-JSON output: {shown}"]
-        assert outputs == expected, (after, messages)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("family", ("hex", "alpha", "unicode"))
-async def test_an_oversized_frame_head_starts_describe_mode(
-    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, family: str
-) -> None:
-    """Round-10 codex and claude N3-r10 (b): a frame head longer than the
-    stdout line limit is dropped (its request failed); the continuation
-    after it carries the sentinel and must not be shown. A valid frame then
-    recovers, and a banner is shown again."""
-    caplog.set_level(logging.DEBUG)
-    s = _FAMILIES[family][1]
-    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
-    manager, managed = _stdio_manager()
-    head = '{"jsonrpc":"2.0","id":7,"result":{"text":"' + "A" * 5000
-    notification = json.dumps({"jsonrpc": "2.0", "method": "notifications/message"})
-    data = "\n".join(
-        [head, f"API_KEY={s}", f'{s}"}}}}', notification, "server ready banner-ok-7f3a"]
-    )
-    start = len(caplog.records)
-    await _read_stream(
-        manager, managed, (data + "\n").encode(), monkeypatch, limit=2048
-    )
-    messages = [r.getMessage() for r in caplog.records[start:]]
-    text = "\n".join(_record_text(r) for r in caplog.records[start:])
-    assert any("exceeded the 2048-byte stdout line limit" in m for m in messages), (
-        messages
-    )
-    assert not any(form in text for form in forbidden), text[:600]
-    assert [m for m in messages if m.startswith("[srv] Non-JSON output: ")] == [
-        "[srv] Non-JSON output: server ready banner-ok-7f3a"
-    ], messages
-
-
 # --- rev 11: the handler wrapper keeps the SDK's wire codes (claude N2-r10) ---
 
 
@@ -1366,6 +1044,20 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
         error = invalid()
         raise MCPError(-32602, str(error)) from error
 
+    async def mcp_data_kept() -> None:
+        try:
+            raise invalid()
+        except ValidationError:
+            raise MCPError(-32002, "Resource not found", {"uri": "x://r"}) from None
+
+    async def mcp_data_carries() -> None:
+        error = invalid()
+        raise MCPError(-32602, "bad input", {"input": s}) from error
+
+    async def mcp_partial_message() -> None:
+        error = invalid()
+        raise MCPError(-32602, f"bad: {error.errors()[0]['input']}") from error
+
     async def wrapped() -> None:
         error = invalid()
         raise ValueError(f"could not build the result: {error}") from error
@@ -1373,7 +1065,7 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
     async def unrelated() -> None:
         raise RuntimeError("plain failure")
 
-    async def wire(handler: Any) -> tuple[int, str, Any]:
+    async def wire(handler: Any) -> tuple[int, str, Any]:  # (code, message, data)
         try:
             await _described_errors(handler)()
         except Exception as error:  # noqa: BLE001 -- inspected
@@ -1388,16 +1080,150 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
         "mcp_inside_except": (-32002, "Resource not found"),
         "mcp_from_error": (-32602, "validation error"),
         "wrapped": (0, "validation error"),
+        "mcp_data_kept": (-32002, "Resource not found"),
+        "mcp_data_carries": (-32602, "bad input"),
+        "mcp_partial_message": (-32602, ""),
     }
     for name, handler in (
         ("bare", bare),
         ("mcp_inside_except", mcp_inside_except),
         ("mcp_from_error", mcp_from_error),
         ("wrapped", wrapped),
+        ("mcp_data_kept", mcp_data_kept),
+        ("mcp_data_carries", mcp_data_carries),
+        ("mcp_partial_message", mcp_partial_message),
     ):
         code, message, data = await wire(handler)
         expected_code, expected_text = cases[name]
         assert code == expected_code, (name, code, message)
         assert expected_text in message, (name, message)
         assert not any(f in f"{message}{data!r}" for f in forbidden), (name, message)
+        if name == "mcp_data_kept":
+            # rev 12: `data` that carries nothing rejected is kept.
+            assert data == {"uri": "x://r"}, data
+        if name == "mcp_data_carries":
+            assert data is None, data
     assert await wire(unrelated) == (0, "plain failure", None)
+
+
+# --- rev 12: no non-protocol stdout line is shown, whatever it holds ----------
+
+
+def _is_valid_frame(line: bytes) -> bool:
+    """The test's own statement of a JSON-RPC message (it parses to an object
+    with `"jsonrpc": "2.0"`, a string `method`, or an id with a result or an
+    error) -- the only kind of stdout line the reader may act on."""
+    try:
+        value = json.loads(line)
+    except Exception:  # noqa: BLE001
+        return False
+    if not isinstance(value, dict) or value.get("jsonrpc") != "2.0":
+        return False
+    if "method" in value:
+        return isinstance(value["method"], str)
+    return value.get("id") is not None and ("result" in value or "error" in value)
+
+
+def _stdout_streams(s: str) -> list[tuple[str, list[bytes], int | None]]:
+    """Every stdout stream the earlier rounds' generators produce, as
+    (label, lines, line limit): grammar-derived rejected frames (rev 8),
+    value-start and prefix lines behind every lead (rev 9), frames broken
+    across lines (rev 10), a non-frame or a valid frame between a broken
+    head and its continuation (rounds 10 and 11), an oversized head, and
+    plain banners in each common shape."""
+    head = b'{"jsonrpc":"2.0","id":7,"result":{"text":"start'
+    tail = f'API_KEY={s} "}}}}'.encode()
+    reply = json.dumps({"jsonrpc": "2.0", "id": 8, "result": {}}).encode()
+    note = json.dumps({"jsonrpc": "2.0", "method": "notifications/message"}).encode()
+    streams: list[tuple[str, list[bytes], int | None]] = []
+    streams += [(label, [line], None) for label, line in _rejected_frames(s)]
+    streams += [(label, [line], None) for label, line in _line_cases(s)]
+    streams += [(label, lines, None) for label, lines in _broken_frame_streams(s)]
+    streams += [(f"middle {m}", [head, m.encode(), tail], None) for m in _NOT_FRAMES]
+    streams.append(("round-11 interleaved response", [head, reply, tail], None))
+    streams.append(("interleaved notification", [head, note, tail], None))
+    streams.append(("oversized head", [head + b"A" * 5000, tail, note], 2048))
+    for banner in (
+        f"server ready {s}",
+        f"INFO: {s}",
+        f"NOTICE {s}",
+        f"2026-10-01 12:00 ready {s}",
+        f"token={s}",
+        f"\x1b[32mready {s}\x1b[0m",
+        f"warning: value is '{s}'",
+    ):
+        streams.append((f"banner {banner[:12]!r}", [banner.encode()], None))
+    return streams
+
+
+def _windows(text: str, size: int = 12) -> set[str]:
+    return {text[i : i + size] for i in range(max(0, len(text) - size + 1))}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", sorted(_FAMILIES))
+async def test_no_record_shows_a_non_protocol_stdout_line(
+    caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch, family: str
+) -> None:
+    """Rev 12 (round-11 codex P1, the class claude proposed): for any bytes a
+    downstream writes to stdout that are not a valid JSON-RPC message, no log
+    record carries any part of them -- through the real `_read_stdout`, with
+    no record exempt. Each unparseable line gets the one fixed record."""
+    import time
+
+    from pmcp.client.manager import PendingRequest
+
+    caplog.set_level(logging.DEBUG)
+    s = _FAMILIES[family][1]
+    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
+    streams = _stdout_streams(s)
+    fixed = 0
+    for label, lines, limit in streams:
+        manager, managed = _stdio_manager()
+        future = asyncio.get_running_loop().create_future()
+        managed.pending_requests[8] = PendingRequest(
+            request_id=8,
+            server_name="srv",
+            tool_id="",
+            started_at=time.time(),
+            last_heartbeat=time.time(),
+            timeout_ms=1000,
+            future=future,
+        )
+        start = len(caplog.records)
+        await _read_stream(
+            manager, managed, b"\n".join(lines) + b"\n", monkeypatch, limit=limit
+        )
+        records = caplog.records[start:]
+        text = "\n".join(_record_text(r) for r in records)
+        flat = text.replace("\x00", "")
+        assert not any(f in text or f in flat for f in forbidden), (label, text[:400])
+        record_windows = _windows(text) | _windows(flat)
+        for line in lines:
+            if _is_valid_frame(line):
+                continue
+            decoded = line.decode("utf-8", "replace")
+            shown = _windows(decoded) & record_windows
+            assert not shown, (label, sorted(shown)[:3])
+        messages = [r.getMessage() for r in records]
+        assert not any("Non-JSON output" in m for m in messages), (label, messages)
+        fixed += sum("non-protocol stdout line" in m for m in messages)
+    # No vacuous pass: thousands of lines took the fixed record.
+    assert fixed > 1000, fixed
+
+
+def test_a_banner_line_gets_the_fixed_record(caplog: pytest.LogCaptureFixture) -> None:
+    """The operator-visibility control, rev 12: a non-conforming server's
+    stdout banner is no longer shown; it gets the fixed record (its log
+    belongs on stderr, which is unchanged)."""
+    import time
+
+    caplog.set_level(logging.DEBUG)
+    manager, managed = _stdio_manager()
+    manager._handle_stdout_line(
+        "srv", managed, b"server ready on port 8080", time.time()
+    )
+    assert [r.getMessage() for r in caplog.records] == [
+        "[srv] non-protocol stdout line: could not parse JSON downstream stdio "
+        "frame at line 1, column 1 (JSONDecodeError)"
+    ]

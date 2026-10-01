@@ -643,6 +643,65 @@ def message_text(message: str, error: BaseException) -> str:
     return message
 
 
+def _rejected_texts(error: BaseException) -> list[str]:
+    """Texts that would reveal what `error`'s chain rejected: each validation
+    or parse error's own text, and each input value it recorded (pydantic's
+    `input`, jsonschema's `instance`), as text, when it is at least 4
+    characters long."""
+    texts: list[str] = []
+    for linked in _chain(error):
+        if not _is_validation_error(linked):
+            continue
+        try:
+            texts.append(str(linked))
+        except Exception:
+            pass
+        inputs: list[Any] = []
+        if isinstance(linked, ValidationError):
+            try:
+                inputs = [item.get("input") for item in linked.errors()]
+            except Exception:
+                inputs = []
+        elif isinstance(linked, jsonschema.ValidationError):
+            inputs = [linked.instance]
+        for value in inputs:
+            for text in (value, json.dumps(value, default=str)):
+                if isinstance(text, str) and len(text) >= 4:
+                    texts.append(text)
+    return texts
+
+
+def carries_rejected_value(value: Any, error: BaseException) -> bool:
+    """Whether `value` (an error's message or `data`) carries what `error`'s
+    chain rejected, whole or in part (rev 12): a validation error's text, or
+    any input it recorded, found in the value's text or in any string inside
+    it."""
+    texts = _rejected_texts(error)
+    if not texts:
+        return False
+    haystacks: list[str] = []
+
+    def collect(item: Any, depth: int = 0) -> None:
+        if depth > 8:
+            return
+        if isinstance(item, str):
+            haystacks.append(item)
+        elif isinstance(item, dict):
+            for key, inner in item.items():
+                collect(key, depth + 1)
+                collect(inner, depth + 1)
+        elif isinstance(item, (list, tuple, set)):
+            for inner in item:
+                collect(inner, depth + 1)
+
+    collect(value)
+    try:
+        haystacks.append(json.dumps(value, default=str))
+    except Exception:
+        haystacks.append(str(value))
+    return any(text in hay for text in texts for hay in haystacks)
+
+
 def safe_exc_info(error: BaseException) -> BaseException | None:
     """``exc_info=`` for a log call: the exception, unless its chain holds a
     validation error, whose rendered traceback would carry the value."""
@@ -750,6 +809,16 @@ def _known_methods() -> frozenset[str]:
             found = set()
         _KNOWN_METHODS = frozenset(found)
     return _KNOWN_METHODS
+
+
+def describe_value(value: Any) -> str:
+    """A rejected value's structure, never its content (rev 12): an object's
+    key count, an array's length, or a scalar's type. A string is just "a
+    string": its length would follow the value's, which the sweeps' pair
+    differential treats as a channel."""
+    if isinstance(value, str):
+        return "a string"
+    return _shape(value)
 
 
 def _shape(value: Any) -> str:

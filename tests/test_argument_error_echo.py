@@ -1502,3 +1502,93 @@ async def test_a_connect_failure_carrying_a_validation_error_is_described(
             seen.append((json.dumps(errors), observed.log))
     await server.shutdown()
     assert all(item == seen[0] for item in seen[1:])
+
+
+# --- rev 12: values pmcp rejects by hand, without an exception ---------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("family", ("hex", "alpha", "token"))
+async def test_a_value_rejected_by_hand_is_described(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_npm_registry: dict[str, str],
+    family: str,
+) -> None:
+    """Round-11 codex P1's class (rev 12): a caller's value that a handler
+    rejects by hand -- a `gateway.cancel` request id, an `auth_connect`
+    env var that is not permitted or not a valid name, the env vars a
+    `register_discovered_server` may not declare -- is described, not echoed:
+    in the response's text, its structured fields and the audit-event
+    buffer. (A downstream's rejected pagination cursor is in the frame
+    sweep's `cursor-*` shapes.)"""
+    from pmcp.client.manager import ClientManager
+    from pmcp.manifest.loader import Manifest, ServerConfig
+    from pmcp.policy.policy import PolicyManager
+    from pmcp.tools.handlers import GatewayTools
+    from tests.conftest import MockClientManager
+
+    s = _FAMILIES[family][1]
+    forbidden = _forbidden(s)
+    seen: list[str] = []
+
+    manager = ClientManager()
+    for request_id in (s, f"srv::{s}"):
+        status, message, _, _ = await manager.cancel_request(request_id)
+        assert status == "not_found"
+        seen.append(message)
+
+    manifest = Manifest(
+        version="1.0",
+        cli_alternatives={},
+        servers={
+            "keyed": ServerConfig(
+                name="keyed",
+                description="d",
+                keywords=[],
+                install={},
+                command="uvx",
+                args=["keyed"],
+                requires_api_key=True,
+                env_var="KEYED_API_KEY",
+                env_instructions="Set KEYED_API_KEY",
+            )
+        },
+        discovery_queue_path=".mcp-gateway/discovery_queue.json",
+    )
+    monkeypatch.setattr("pmcp.tools.handlers.load_manifest", lambda: manifest)
+    monkeypatch.setattr("pmcp.tools.handlers.load_configs", lambda **_: [])
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    tools = GatewayTools(
+        client_manager=MockClientManager(),  # type: ignore[arg-type]
+        policy_manager=PolicyManager(),
+    )
+    upper = "".join(c for c in s.upper() if c.isalnum())
+    for env_var in (f"OTHER_{upper}", f"BAD-{upper}"):
+        result = await tools.auth_connect(
+            {
+                "server_name": "keyed",
+                "env_var": env_var,
+                "credential": "test-token",
+                "scope": "user",
+            }
+        )
+        assert result.ok is False
+        seen.append(result.model_dump_json())
+        forbidden |= _forbidden(env_var)
+    fake_npm_registry["@example/discovered-mcp"] = "1.0.0"
+    registered = await tools.register_discovered_server(
+        {
+            "server_name": "disc",
+            "package": "@example/discovered-mcp",
+            "env_vars": [f"NPM_CONFIG_{upper}"],
+        }
+    )
+    assert registered.registered is False
+    seen.append(registered.model_dump_json())
+    forbidden |= _forbidden(f"NPM_CONFIG_{upper}")
+    events = (await tools.health()).audit_events or []
+    seen.extend(event.model_dump_json() for event in events)
+    text = "\n".join(seen)
+    assert not any(form in text for form in forbidden), text[:600]

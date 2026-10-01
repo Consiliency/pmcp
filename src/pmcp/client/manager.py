@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 import random
 import re
-import unicodedata
 import signal
 import string
 import time
@@ -28,6 +27,7 @@ from mcp.shared.message import SessionMessage
 from pydantic import ValidationError
 
 from pmcp.argument_errors import (
+    describe_value,
     exception_text,
     safe_traceback_text,
     install_log_scrubber,
@@ -230,82 +230,6 @@ class DownstreamError(Exception):
 _PARSE_ERROR = -32700
 _PARSE_ERROR_MESSAGE = "downstream sent a response that could not be parsed"
 _MALFORMED_ERROR_MESSAGE = "downstream sent a malformed JSON-RPC error"
-
-#: Every character that can begin a JSON value (RFC 8259 section 3: object,
-#: array, string, number, `true`/`false`/`null`), plus the `NaN` and
-#: `Infinity` that Python's `json` also accepts.
-_JSON_VALUE_START = frozenset('{["-0123456789tfnNI')
-#: Characters that open a JSON object, array or string: where a frame's
-#: content can begin inside a line.
-_FRAME_OPENERS = ("{", "[", '"')
-_OMITTED = " (rest omitted)"
-
-
-def _carries_nothing(char: str) -> bool:
-    """A lead character that shows nothing a reader needs: whitespace (all
-    that `str.strip` removes, including NBSP and U+2028), a control or format
-    character (NUL, ESC, a byte-order mark, ZWSP) or U+FFFD, the replacement
-    for an undecodable byte (a UTF-16/32 BOM, say)."""
-    return (
-        char.isspace() or char == "\ufffd" or unicodedata.category(char) in ("Cc", "Cf")
-    )
-
-
-def _significant_start(text: str) -> int:
-    """The index of the line's first character that is not `_carries_nothing`."""
-    for index, char in enumerate(text):
-        if not _carries_nothing(char):
-            return index
-    return len(text)
-
-
-def _is_protocol_frame(message: Any) -> bool:
-    """Whether a parsed stdio line is a JSON-RPC message the dispatcher
-    accepts: an object with `"jsonrpc": "2.0"`, an id that is a string or a
-    (non-bool) integer when present, and either a string `method` (a request
-    or notification) or an id with exactly one of `result` / `error` (a
-    response). Only such a line ends describe mode (Consiliency/pmcp#297,
-    rev 11)."""
-    if not isinstance(message, dict) or message.get("jsonrpc") != "2.0":
-        return False
-    msg_id = message.get("id")
-    if msg_id is not None and (
-        isinstance(msg_id, bool) or not isinstance(msg_id, (str, int))
-    ):
-        return False
-    if "method" in message:
-        return isinstance(message["method"], str)
-    return msg_id is not None and (("result" in message) != ("error" in message))
-
-
-def _is_downstream_output(text: str) -> bool:
-    """Whether a stdio line the parser rejected is the downstream's own
-    output (a banner, a log line), as opposed to a frame, whose content is
-    the downstream's data and is never logged (Consiliency/pmcp#297).
-
-    Decided by where JSON could start, not by where the parser failed (rev 9:
-    an unterminated string fails AT its opening quote): the line is output
-    only if its first significant character cannot begin any JSON value. A
-    banner that starts like a value (`true story`, `-v`, `[INFO]`) is
-    therefore described rather than shown -- the price of never echoing a
-    malformed frame.
-    """
-    start = _significant_start(text)
-    return start == len(text) or text[start] not in _JSON_VALUE_START
-
-
-def _output_text(text: str) -> str:
-    """What is shown of a line that is output: its significant text up to the
-    first character that could open an embedded frame (`{`, `[`, `"`), then a
-    fixed marker. A banner written without a newline before a frame
-    (`ready{...}`), or a frame behind a stray prefix character (`,{...}`,
-    `\x1b[0m{...}`), shows its prefix only. Digits are kept: a port number
-    carries no frame."""
-    body = text[_significant_start(text) :]
-    cuts = [index for index in (body.find(c) for c in _FRAME_OPENERS) if index >= 0]
-    if not cuts:
-        return body.rstrip()
-    return body[: min(cuts)].rstrip() + _OMITTED
 
 
 def _downstream_error(error: Any) -> DownstreamError:
@@ -1120,12 +1044,6 @@ class ManagedClient:
     # after publishing its streams. Set by `_close_remote_transport` to ask the
     # owner to unwind its own stack, in its own task.
     transport_shutdown: asyncio.Event | None = None
-    #: Set when a stdio line was described as a rejected frame, until a line
-    #: parses: a frame a downstream broke across lines (a raw newline in a
-    #: string, or a UTF-16 code unit holding byte 0x0A) continues on the
-    #: following lines, which are frame data, not output (Consiliency/pmcp#297,
-    #: rev 10).
-    stdio_frame_broken: bool = False
     status: ServerStatus = field(
         default_factory=lambda: ServerStatus(
             name="",
@@ -2147,14 +2065,15 @@ class ClientManager:
             if not isinstance(raw_cursor, str) or not raw_cursor:
                 logger.warning(
                     f"[{managed.config.name}] {kind}/list returned an unusable "
-                    f"cursor ({raw_cursor!r}); treating as unreadable rather "
-                    f"than as the end of the listing"
+                    f"cursor ({describe_value(raw_cursor)}); treating as "
+                    f"unreadable rather than as the end of the listing"
                 )
                 return None
             if raw_cursor in seen_cursors:
                 logger.warning(
-                    f"[{managed.config.name}] {kind}/list repeated cursor "
-                    f"{raw_cursor!r}; treating as unreadable rather than looping"
+                    f"[{managed.config.name}] {kind}/list repeated a cursor "
+                    f"({describe_value(raw_cursor)}); treating as unreadable "
+                    f"rather than looping"
                 )
                 return None
             seen_cursors.add(raw_cursor)
@@ -2964,28 +2883,14 @@ class ClientManager:
                 )
             message = load_json(text, source="downstream stdio frame")
         except json.JSONDecodeError as error:
-            # Already counted as a heartbeat by the caller.
-            if managed.stdio_frame_broken or not _is_downstream_output(text):
-                managed.stdio_frame_broken = True
-                # A frame the parser rejected -- a syntax error, or a parser
-                # limit (nesting depth, an integer's digit count) on otherwise
-                # valid JSON -- is the downstream's data, not its output:
-                # described, never echoed (Consiliency/pmcp#297, rev 8). So is
-                # every unparseable line after it until one parses: the rest
-                # of a frame the downstream broke across lines (rev 10).
-                logger.debug(
-                    f"[{name}] downstream sent a JSON-RPC frame that could not "
-                    f"be parsed: {exception_text(error)}"
-                )
-                return
-            # The downstream's own non-protocol output (a banner, a log line),
-            # logged as it is by design.
-            shown = _output_text(text)
-            if shown.endswith(_OMITTED):
-                # A frame began after the banner: what follows, until a line
-                # parses, may be the rest of it (rev 10).
-                managed.stdio_frame_broken = True
-            logger.debug(f"[{name}] Non-JSON output: {shown}")
+            # Already counted as a heartbeat by the caller. A line that is not
+            # a JSON-RPC message is never shown, whatever it holds: a banner,
+            # a log line, or part of a frame the downstream broke across lines
+            # (Consiliency/pmcp#297, rev 12). MCP's stdio transport allows only
+            # newline-delimited messages on stdout; a server's own log belongs
+            # on stderr, which is logged as before. The record is fixed text
+            # plus the parser's value-free description.
+            logger.debug(f"[{name}] non-protocol stdout line: {exception_text(error)}")
             return
         except (ValueError, RecursionError) as e:
             # Parses as neither JSON nor a JSONDecodeError: an integer over
@@ -2995,12 +2900,6 @@ class ClientManager:
             # the line is attacker-sized (Consiliency/pmcp#287).
             logger.debug(f"[{name}] dropped unparseable frame ({type(e).__name__})")
             return
-        if managed.stdio_frame_broken and _is_protocol_frame(message):
-            # Recovery needs a valid protocol frame (rev 11): a bare scalar,
-            # an array, `{}` or an object the dispatcher would drop is just
-            # as likely the inside of the broken frame, and keeps the mode.
-            # The line after a valid frame is judged on its own rules.
-            managed.stdio_frame_broken = False
         self._dispatch_downstream_frame(name, managed, message, now)
 
     def _dispatch_downstream_frame(
@@ -3171,10 +3070,6 @@ class ClientManager:
                             if not skipping:
                                 self._fail_oversized_line(name, managed, limit)
                                 skipping = True
-                                # The dropped line may be the head of a frame
-                                # broken across lines: describe what follows
-                                # until a valid frame (rev 11).
-                                managed.stdio_frame_broken = True
                             buf.clear()
                         break
                     raw = bytes(buf[:nl])
@@ -4472,7 +4367,8 @@ class ClientManager:
         if "::" not in request_id:
             return (
                 "not_found",
-                f"Invalid request_id format: {request_id}",
+                "Invalid request_id format: expected server_name::local_id "
+                f"({describe_value(request_id)})",
                 False,
                 None,
             )
@@ -4481,7 +4377,12 @@ class ClientManager:
         try:
             local_id = int(local_id_str)
         except ValueError:
-            return ("not_found", f"Invalid local_id: {local_id_str}", False, None)
+            return (
+                "not_found",
+                f"Invalid local_id: expected an integer ({describe_value(local_id_str)})",
+                False,
+                None,
+            )
 
         managed = self._clients.get(server_name)
         if not managed:

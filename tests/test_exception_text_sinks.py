@@ -39,6 +39,7 @@ through `safe_exc_info`, `logger.exception`, `logging.exception`,
 from __future__ import annotations
 
 import ast
+import re
 import builtins
 import importlib
 import typing
@@ -98,6 +99,9 @@ _NON_RENDERING_CALLEES = {
     "record_rejected_arguments",
     # parsing.py (rev 7): reads a MarkedYAMLError's mark line and column only.
     "_yaml_position",
+    # server.py (rev 12): a predicate, whether a message or `data` carries
+    # what the chain rejected; it renders nothing.
+    "carries_rejected_value",
     # manager.py: flattens a group into leaves; its callers render each leaf
     # with `exception_text` (`describe_exception`).
     "_iter_leaf_exceptions",
@@ -770,3 +774,122 @@ def test_the_scanner_passes_the_renderers() -> None:
         "        log(exception_text(exc))\n        raise exc\n"
     )
     assert exception_sinks(clean, "clean") == []
+
+
+# --- rev 12: a value pmcp rejects by hand is never rendered with repr ---------
+
+#: Rejection wording: a message carrying one of these, built with `!r`,
+#: `repr(...)` or `%r` of a non-constant, is a hand-rendered rejection.
+_REJECTION_WORDS = re.compile(
+    r"(?i)(invalid|unusable|unexpected|malformed|reject|refus|ignor|unsupported"
+    r"|unknown|unsafe|not a valid|not permitted|not allowed|must be|expected"
+    r"|illegal|disallowed|forbidden|denied|blocked|skipping|unparseable"
+    r"|unreadable|repeated|not an? |does not |must match)"
+)
+
+#: Sites whose repr'd value is the operator's own (config, environment, CLI
+#: arguments, pmcp's own stores) or pmcp's own child: outside Consiliency/
+#: pmcp#297's caller/downstream class, and tracked in Consiliency/pmcp#315.
+#: A downstream's or a caller's value is described with `describe_value`.
+_REPR_REJECTION_EXEMPT: dict[str, str] = {
+    "cli.py::_exact_package_spec": "operator CLI argument",
+    "cli.py::_run_trust_revoke_package": "operator CLI argument",
+    "client/manager.py::_request_ceiling_ms": "operator environment",
+    "client/manager.py::_stdio_read_limit": "operator environment",
+    "config/loader.py::registry_allow_private_from_config": "operator config",
+    "manifest/npm_resolver.py::_query_locked": "pmcp's own resolver child",
+    "manifest/npm_resolver.py::resolve": "manifest/config command",
+    "manifest/refresher.py::check_staleness": "configured vs cached package",
+    "package_approvals.py::_decode": "pmcp's own approval store",
+    "package_approvals.py::_read_store_and_stale": "pmcp's own approval store",
+    "package_approvals.py::_require_identity_fields": "pmcp's own approval store",
+    "trust_store.py::_decode": "pmcp's own trust store",
+    "trust_store.py::record_resolved": "pmcp's own trust store",
+    "validation.py::parse_package_spec": "config/CLI/manifest package spec",
+}
+
+
+def _repr_rejections(source: str) -> list[int]:
+    """Lines in `source` that render a non-constant with `!r`, `repr()` or
+    `%r` inside a message carrying rejection wording."""
+    tree = ast.parse(source)
+    lines = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.JoinedStr):
+            text = "".join(
+                v.value
+                for v in node.values
+                if isinstance(v, ast.Constant) and isinstance(v.value, str)
+            )
+            if _REJECTION_WORDS.search(text) and any(
+                isinstance(v, ast.FormattedValue)
+                and not isinstance(v.value, ast.Constant)
+                and (
+                    v.conversion == ord("r")
+                    or (
+                        isinstance(v.value, ast.Call)
+                        and isinstance(v.value.func, ast.Name)
+                        and v.value.func.id == "repr"
+                    )
+                )
+                for v in node.values
+            ):
+                lines.append(node.lineno)
+        elif (
+            isinstance(node, ast.Call)
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and isinstance(node.args[0].value, str)
+            and "%r" in node.args[0].value
+            and _REJECTION_WORDS.search(node.args[0].value)
+        ):
+            lines.append(node.lineno)
+    return lines
+
+
+def test_no_rejected_value_is_rendered_with_repr() -> None:
+    """Round-11 codex P1's class, as a static rule (rev 12): `{x!r}`, `repr(x)`
+    or `%r` in a message that rejects something renders the value itself.
+    Every such site in `src/pmcp` is a named exemption with its provenance
+    (none is a caller's or a downstream's value), and every exemption must
+    still exist. The rule cannot see `{x}` without `!r`; those sites were
+    triaged by hand (the plan's table)."""
+    root = Path(__file__).resolve().parents[1] / "src" / "pmcp"
+    found: set[str] = set()
+    for path in sorted(root.rglob("*.py")):
+        if "baml_client" in path.parts:
+            continue
+        source = path.read_text()
+        tree = ast.parse(source)
+        functions = [
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ]
+        for line in _repr_rejections(source):
+            owners = [
+                f for f in functions if f.lineno <= line <= (f.end_lineno or f.lineno)
+            ]
+            owner = min(owners, key=lambda f: (f.end_lineno or f.lineno) - f.lineno)
+            found.add(f"{path.relative_to(root).as_posix()}::{owner.name}")
+    assert found == set(_REPR_REJECTION_EXEMPT), (
+        sorted(found - set(_REPR_REJECTION_EXEMPT)),
+        sorted(set(_REPR_REJECTION_EXEMPT) - found),
+    )
+
+
+@pytest.mark.parametrize(
+    "snippet, flagged",
+    [
+        ('f"unusable cursor ({raw!r})"', True),
+        ('f"invalid value {repr(v)}"', True),
+        ('logger.warning("Ignoring %s: got %r", k, v)', True),
+        ('f"unusable cursor ({describe_value(raw)})"', False),
+        ('f"connected to {name!r}"', False),
+        ("f\"invalid {'x'!r}\"", False),
+    ],
+)
+def test_the_repr_rejection_rule_sees_its_spellings(
+    snippet: str, flagged: bool
+) -> None:
+    assert bool(_repr_rejections(snippet)) is flagged, snippet

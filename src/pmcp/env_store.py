@@ -20,7 +20,9 @@ ENV_VAR_NAME_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def validate_env_var_name(name: str) -> str:
     """Validate and return a shell-compatible env var name."""
     if not ENV_VAR_NAME_PATTERN.fullmatch(name):
-        raise ValueError(f"Env var name must match ^[A-Za-z_][A-Za-z0-9_]*$: {name!r}")
+        # The rejected name is not quoted: through `gateway.auth_connect` it is
+        # a caller's value (Consiliency/pmcp#297, rev 12).
+        raise ValueError("Env var name must match ^[A-Za-z_][A-Za-z0-9_]*$")
     return name
 
 

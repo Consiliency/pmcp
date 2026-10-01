@@ -20,7 +20,7 @@ import anyio
 from dotenv import load_dotenv
 from mcp.types import Tool
 from pydantic import BaseModel
-from pmcp.argument_errors import exception_text, safe_exc_info
+from pmcp.argument_errors import describe_value, exception_text, safe_exc_info
 from pmcp import __version__ as PMCP_VERSION
 from pmcp.auth import (
     UNVERIFIED_URL_CAVEAT,
@@ -4588,7 +4588,10 @@ class GatewayTools:
                 server_name=server_name,
                 auth_state="missing_auth",
                 auth_event="policy_denied",
-                error=f"Env var '{env_var}' is not permitted for this server.",
+                error=(
+                    f"Env var ({describe_value(env_var)}) is not permitted for "
+                    "this server."
+                ),
             )
             expected = (
                 f" Expected '{declared_storage_key}'." if declared_storage_key else ""
@@ -4597,11 +4600,12 @@ class GatewayTools:
                 ok=False,
                 server=server_name,
                 message=(
-                    f"Env var '{env_var}' is not permitted for server "
-                    f"'{server_name}'.{expected} Refusing to store it."
+                    f"Env var ({describe_value(env_var)}) is not permitted for "
+                    f"server '{server_name}'.{expected} Refusing to store it."
                 ),
                 auth_state="missing_auth",
-                env_var=env_var,
+                # Not echoed: the caller's rejected value (rev 12).
+                env_var=None,
             )
 
         try:
@@ -4622,7 +4626,8 @@ class GatewayTools:
                 server=server_name,
                 message=exception_text(exc),
                 auth_state="missing_auth",
-                env_var=env_var,
+                # Not echoed: the caller's rejected value (rev 12).
+                env_var=None,
             )
         os.environ[env_var] = parsed.credential
         # Recorded in the SAME statement group as the write, with no await between:
@@ -5452,7 +5457,7 @@ class GatewayTools:
                 registered=False,
                 message=(
                     f"Refused to register '{server_name}': "
-                    f"unsafe package identifier {package!r}."
+                    f"unsafe package identifier ({describe_value(package)})."
                 ),
             )
 
@@ -5467,7 +5472,7 @@ class GatewayTools:
             name for name in parsed.env_vars if not discovered_env_var_allowed(name)
         ]
         if disallowed:
-            names = ", ".join(operator_safe(name) for name in disallowed)
+            names = f"{len(disallowed)} name{'' if len(disallowed) == 1 else 's'}"
             return RegisterDiscoveredServerOutput(
                 ok=False,
                 server_name=server_name,

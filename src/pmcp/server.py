@@ -42,6 +42,7 @@ from pmcp.argument_errors import (
     describe_model_error,
     describe_schema_error,
     exception_text,
+    carries_rejected_value,
     install_log_scrubber,
     message_text,
     safe_exc_info,
@@ -155,9 +156,18 @@ def _described_errors(handler: Any) -> Any:
                 raise
             described = exception_text(error)
             if isinstance(error, MCPError):
-                replacement = MCPError(
-                    error.error.code, message_text(error.error.message, error)
-                )
+                # Keep the code; keep message and `data` unless they carry
+                # what was rejected (rev 12: `data` used to be dropped
+                # whenever the chain held a validation error).
+                message = error.error.message
+                if carries_rejected_value(message, error):
+                    message = message_text(message, error)
+                    if carries_rejected_value(message, error):
+                        message = "the request failed on data that did not validate"
+                data = error.error.data
+                if data is not None and carries_rejected_value(data, error):
+                    data = None
+                replacement = MCPError(error.error.code, message, data)
             elif isinstance(error, ValidationError):
                 replacement = MCPError(INVALID_PARAMS, described)
             else:
