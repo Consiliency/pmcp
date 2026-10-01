@@ -66,6 +66,7 @@ from pmcp.feedback_egress import (
 )
 from pmcp.validation import (
     discovered_env_var_allowed,
+    discovered_env_var_refusal_reason,
     env_var_allowed,
     is_valid_package_name,
     is_valid_package_version,
@@ -5472,7 +5473,14 @@ class GatewayTools:
             name for name in parsed.env_vars if not discovered_env_var_allowed(name)
         ]
         if disallowed:
-            names = f"{len(disallowed)} name{'' if len(disallowed) == 1 else 's'}"
+            reasons: dict[str, int] = {}
+            for name in disallowed:
+                reason = discovered_env_var_refusal_reason(name)
+                reasons[reason] = reasons.get(reason, 0) + 1
+            # The rule each name broke, never the name (rev 12, §14).
+            names = "; ".join(
+                f"{count} {reason}" for reason, count in sorted(reasons.items())
+            )
             return RegisterDiscoveredServerOutput(
                 ok=False,
                 server_name=server_name,

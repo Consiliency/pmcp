@@ -256,3 +256,16 @@ def discovered_env_var_allowed(name: str) -> bool:
     if name.upper().startswith(_PACKAGE_MANAGER_ENV_PREFIXES):
         return False
     return bool(_CREDENTIAL_NAME_RE.fullmatch(name))
+
+
+def discovered_env_var_refusal_reason(name: str) -> str:
+    """Why ``discovered_env_var_allowed`` refuses *name*, in pmcp's own words
+    -- never the name, which is the caller's value (Consiliency/pmcp#297,
+    rev 12)."""
+    if name and not is_dangerous_env_var(name):
+        for prefix in _PACKAGE_MANAGER_ENV_PREFIXES:
+            if name.upper().startswith(prefix):
+                return f"in the {prefix}* family"
+    if not name or is_dangerous_env_var(name):
+        return "a variable pmcp never sets for a server"
+    return "not credential-shaped"
