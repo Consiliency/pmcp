@@ -1188,6 +1188,33 @@ def _entry_doc(shipped: ServerConfig, kind: str | None, pin: str) -> dict[str, A
     return body
 
 
+@pytest.fixture
+def _memoized_yaml(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Parse each distinct YAML text once for the exhaustive precedence tests.
+
+    The two tests below call ``load_manifest()`` 432 times, and >99% of each
+    call is pure-Python ``yaml.safe_load`` re-parsing the same 78 KB shipped
+    manifest. Under coverage's C tracer on CPython 3.11 that alone ran past
+    ``faulthandler_timeout`` (120 s) in CI, and the faulthandler dump of the
+    still-running main thread then segfaulted the job (exit 139). Every
+    overlay document is still parsed for real -- the cache is keyed on the
+    text, a parse error is never cached, and each caller gets a deep copy so
+    nothing the loader mutates can leak into the next case.
+    """
+    import copy
+
+    real = yaml.safe_load
+    cache: dict[str | bytes, Any] = {}
+
+    def safe_load(stream: Any) -> Any:
+        text = stream if isinstance(stream, (str, bytes)) else stream.read()
+        if text not in cache:
+            cache[text] = real(text)
+        return copy.deepcopy(cache[text])
+
+    monkeypatch.setattr(yaml, "safe_load", safe_load)
+
+
 def _check_precedence_case(
     case: tuple[tuple[str | None, str | None], ...],
     goods: list[tuple[str, str]],
@@ -1246,6 +1273,7 @@ def test_the_invalid_pin_text_is_true_in_every_two_source_case(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    _memoized_yaml: None,
 ) -> None:
     """Round 1 on Consiliency/pmcp#323 (F1, F2), same-file and later-file: two
     overlay sources (the user overlay, then `PMCP_MANIFEST_PATH`), each with any
@@ -1276,6 +1304,7 @@ def test_the_invalid_pin_text_is_true_with_sources_before_and_after_it(
     tmp_path: Path,
     approve_project_file: Any,
     caplog: pytest.LogCaptureFixture,
+    _memoized_yaml: None,
 ) -> None:
     """Round 1 on Consiliency/pmcp#323 (c7): a bad pin with an earlier source
     AND a later one -- user overlay, approved project overlay, then

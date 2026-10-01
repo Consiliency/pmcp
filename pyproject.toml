@@ -161,8 +161,13 @@ addopts = "-m 'not live and not slow'"
 # 60.22 s. (Both land on almost exactly 60 s, which looks like an internal
 # timeout rather than real work -- noted, not in scope here.)
 #
-#   faulthandler_timeout = 120  -- 2x the slowest test. Zero-risk half: it
-#     kills nothing, it dumps every thread's stack and lets the run continue.
+#   faulthandler_timeout = 120  -- 2x the slowest test. It dumps every
+#     thread's stack and lets the run continue -- but it is NOT zero-risk:
+#     the dump walks a thread that is still running Python, and on 2026-10-01
+#     that walk segfaulted three `test (3.11)` jobs (exit 139, the dump cut off
+#     mid-line) when a slow test crossed 120 s under coverage. Keep every
+#     non-hanging test well under 120 s; a slow test is a crash risk here, not
+#     just a slow job.
 #   timeout              = 700  -- >=10x the slowest test (10 x 60.25 = 602.5,
 #     so 600 would have been 9.96x and short of the bar). The fail-fast half,
 #     via pytest-timeout. The dump therefore lands ~9.7 minutes before the
