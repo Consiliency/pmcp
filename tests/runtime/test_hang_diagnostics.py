@@ -372,7 +372,7 @@ def test_a_wedge_the_kill_cannot_reach_is_dumped_and_ends_the_run(
     """Fail closed: a hang pytest-timeout cannot interrupt still ends red.
 
     Without `faulthandler_exit_on_timeout` this would dump and then sit until
-    the job's 25-minute cap -- the silent cancel Consiliency/pmcp#200 exists to
+    the job's cap -- the silent cancel Consiliency/pmcp#200 exists to
     replace. With it, the stacks are printed and the process exits non-zero,
     so the sentinel after the wedge never runs.
     """
@@ -384,6 +384,16 @@ def test_a_wedge_the_kill_cannot_reach_is_dumped_and_ends_the_run(
     assert "test_wedged_where_the_signal_cannot_land" in output, output
     assert "passed" not in output, output
     assert result.returncode != 0, output
+
+
+def _test_job_timeout_minutes(workflow_text: str) -> int:
+    """The `test` job's `timeout-minutes` in .github/workflows/test.yml."""
+    import yaml
+
+    jobs = yaml.safe_load(workflow_text)["jobs"]
+    value = jobs["test"]["timeout-minutes"]
+    assert isinstance(value, int) and not isinstance(value, bool)
+    return value
 
 
 def test_faulthandler_is_a_last_resort_above_the_kill_timeout(
@@ -406,9 +416,12 @@ def test_faulthandler_is_a_last_resort_above_the_kill_timeout(
     assert pytestconfig.getini("timeout_method") == "signal"
     assert 0 < kill_timeout < faulthandler_timeout
     assert pytestconfig.getini("faulthandler_exit_on_timeout") is True
-    # Both must fit inside the `test` job's `timeout-minutes: 25`, or the
-    # 25-minute silent cancel this change exists to replace happens anyway.
-    assert faulthandler_timeout < 25 * 60
+    # Both must fit inside the `test` job's cap, or the silent job-cap cancel
+    # this change exists to replace happens anyway. Read the real cap rather
+    # than restating it, so the two cannot drift apart.
+    workflow = Path(__file__).resolve().parents[2] / ".github/workflows/test.yml"
+    cap = _test_job_timeout_minutes(workflow.read_text())
+    assert faulthandler_timeout < cap * 60
 
 
 # The shape the real hang is believed to have: a coroutine suspended on an
