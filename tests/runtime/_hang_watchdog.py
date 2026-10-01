@@ -14,19 +14,29 @@ awaits an `Event` through two coroutine frames:
     E   Failed: Timeout (>3.0s) from pytest-timeout.
 
 `epoll.poll` — the stuck await is invisible. Without this module #200's
-diagnostics would turn a 25-minute silent cancel into a 700-second failure
+diagnostics would turn a silent job-cap cancel into a 700-second failure
 that still could not tell `_tap()` from `connect_server()` from
 `disconnect_all()`, which is the entire question the change exists to answer.
 
 So: a watchdog thread that, when the current test item has been running too
 long, dumps every pending `asyncio.Task` on that item's event loop.
 
-Three ordered thresholds, each strictly below the next:
+Ordered per-test thresholds, each strictly below the next:
 
     60 s   this watchdog        -> async stacks, names the awaiting coroutine
-    120 s  faulthandler_timeout -> every thread's stack, the run continues
-    700 s  pytest-timeout       -> the item fails and the run moves on
-    25 min the job's cap        -> what used to happen instead of all of this
+    700 s  pytest-timeout       -> thread stacks (under the GIL); the item
+                                   fails and the run moves on
+    720 s  faulthandler_timeout -> last resort for a thread the kill could not
+                                   reach: C-level stacks, then the process exits
+
+The `test` job's `timeout-minutes` (30) caps the whole job, not one test, so a
+hang that starts within 720 s of the cap is cancelled with no dump; the cap is
+set to exceed the slowest job plus that margin (see pyproject.toml).
+
+faulthandler sits ABOVE the kill on purpose: its C watchdog walks a running
+thread's frames without the GIL, and below the kill that walk segfaulted CI
+(exit 139) whenever a slow test crossed it. This watchdog does not share that
+hazard -- it is a Python thread and renders under the GIL.
 
 60 s is the threshold because the slowest item in `tests/runtime` is 26.16 s
 (`--durations=25`, 2026-09-02), so this has >2x headroom over anything here

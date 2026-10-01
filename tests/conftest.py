@@ -271,6 +271,42 @@ def approve_project_file() -> Callable[[Path], None]:
 
 
 @pytest.fixture(autouse=True)
+def _restore_root_logger() -> Iterator[None]:
+    """Undo whatever a test adds to the root logger. **Autouse.**
+
+    ``pmcp.cli.setup_logging`` adds a ``StreamHandler`` and a
+    ``RotatingFileHandler`` to the root logger on every call, and
+    ``tests/test_cli.py`` drives it many times. Nothing removed them: after
+    ``test_cli.py`` and ``test_scoped_advisor_audit.py`` the root logger held 90
+    handlers, every later WARNING fanned out to all of them (stream handlers
+    bound to long-dead captured stderr printed ``--- Logging error ---``), and
+    the warning-heavy pin-precedence tests ran ~7x slower -- enough, with
+    coverage, to push one past ``faulthandler_timeout`` and segfault CI.
+
+    Only handlers that appeared during the test are removed (and closed, so the
+    file handlers release their descriptors). pytest's own capture handlers are
+    swapped per phase by its logging plugin, so they are left to it.
+    """
+    import logging
+
+    root = logging.getLogger()
+    before_handlers = list(root.handlers)
+    before_level = root.level
+    yield
+    for handler in list(root.handlers):
+        if handler in before_handlers:
+            continue
+        if type(handler).__module__.startswith("_pytest"):
+            continue
+        root.removeHandler(handler)
+        try:
+            handler.close()
+        except Exception:
+            pass
+    root.setLevel(before_level)
+
+
+@pytest.fixture(autouse=True)
 def _reset_dotenv_provenance() -> Iterator[None]:
     """Keep the dotenv provenance registry from leaking between tests.
 
