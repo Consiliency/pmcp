@@ -2961,7 +2961,12 @@ class ClientManager:
                 return
             # The downstream's own non-protocol output (a banner, a log line),
             # logged as it is by design.
-            logger.debug(f"[{name}] Non-JSON output: {_output_text(text)}")
+            shown = _output_text(text)
+            if shown.endswith(_OMITTED):
+                # A frame began after the banner: what follows, until a line
+                # parses, may be the rest of it (rev 10).
+                managed.stdio_frame_broken = True
+            logger.debug(f"[{name}] Non-JSON output: {shown}")
             return
         except (ValueError, RecursionError) as e:
             # Parses as neither JSON nor a JSONDecodeError: an integer over

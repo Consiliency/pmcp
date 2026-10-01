@@ -1037,6 +1037,7 @@ def test_a_banner_stays_useful_on_stdio(caplog: pytest.LogCaptureFixture) -> Non
         ("warning: value is 'quoted'", "warning: value is 'quoted'"),
         ('warning: value is "quoted"', "warning: value is (rest omitted)"),
     ):
+        managed.stdio_frame_broken = False  # each control is a fresh stream
         start = len(caplog.records)
         manager._handle_stdout_line("srv", managed, line.encode(), time.time())
         messages = [r.getMessage() for r in caplog.records[start:]]
@@ -1132,6 +1133,7 @@ def _broken_frame_streams(s: str) -> list[tuple[str, list[bytes]]]:
         f'{{"jsonrpc":"2.0","id":7,"result":{{"text":"Config loaded\nAPI_KEY={s}\nDB={s}"}}}}',
         f'{{"jsonrpc":"2.0","id":7,"result":{{"text":"you sent: abc\n{s}"}}}}',
         f'{{"jsonrpc":"2.0","id":7,"result":{{"a":[1,\n], {s}]}}}}',
+        f'ready {{"jsonrpc":"2.0","id":7,"result":{{"text":"abc\n{s}"}}}}',
     ]
     streams = []
     for index, text in enumerate(tails):
@@ -1176,8 +1178,13 @@ def test_a_frame_broken_across_lines_shows_none_of_it(
             for r in records
             if r.getMessage().startswith("[srv] Non-JSON output: ")
         ]
-        # Only the banner after the well-formed frame is shown.
-        assert shown == ["[srv] Non-JSON output: server ready banner-ok-7f3a"], (
+        # Only the banner after the well-formed frame is shown (and, for the
+        # stream whose frame began after a banner, that banner's prefix).
+        assert shown[-1:] == ["[srv] Non-JSON output: server ready banner-ok-7f3a"], (
+            label,
+            shown,
+        )
+        assert shown[:-1] in ([], ["[srv] Non-JSON output: ready (rest omitted)"]), (
             label,
             shown,
         )
