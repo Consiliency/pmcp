@@ -340,3 +340,90 @@ def test_pmcp_refresh_logs_no_downstream_value(tmp_path: Any, kind: str) -> None
             kind,
             result.stderr,
         )
+
+
+# --- rev 10: a JSON-RPC message renders as its structure ------------------------
+
+
+def _sdk_messages(s: str) -> list[tuple[str, object]]:
+    import mcp.types as mcp_types
+    from mcp.shared.message import SessionMessage
+
+    adapter = mcp_types.jsonrpc_message_adapter
+    frames = {
+        "response": {"jsonrpc": "2.0", "id": 7, "result": {"task": {"ttl": s}}},
+        "request": {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {"name": "run", "arguments": {"q": s}},
+        },
+        "notification": {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"data": s},
+        },
+        "error": {
+            "jsonrpc": "2.0",
+            "id": 9,
+            "error": {"code": -1, "message": s, "data": {"k": s}},
+        },
+        "undeclared method": {"jsonrpc": "2.0", "method": f"notifications/{s}"},
+        "id carries it": {"jsonrpc": "2.0", "id": s, "result": {}},
+    }
+    from mcp.shared.message import ClientMessageMetadata
+
+    out: list[tuple[str, object]] = []
+    for label, frame in frames.items():
+        message = adapter.validate_python(frame, by_name=False)
+        out.append((label, message))
+        out.append((f"{label} in a SessionMessage", SessionMessage(message)))
+    # `Mcp-Param-*` headers carry tool-argument values (`x-mcp-header`).
+    headers = ClientMessageMetadata(
+        headers={"Mcp-Param-Q": s, "Mcp-Method": "tools/call"}
+    )
+    out.append(("metadata headers", SessionMessage(out[2][1], headers)))  # type: ignore[arg-type]
+    out.append(("metadata alone", headers))
+    return out
+
+
+@pytest.mark.parametrize("family", sorted(_FAMILIES))
+def test_a_jsonrpc_message_renders_as_its_structure(family: str) -> None:
+    """Every rendering of an MCP SDK message object -- f-string, `%s`, `%r`,
+    a containing `SessionMessage` -- shows its structure, never its payload,
+    an undeclared method or an id's value (rev 10). A method the SDK
+    declares is shown."""
+    import pmcp  # noqa: F401 -- installs the rendering
+    from pmcp.argument_errors import describe_jsonrpc_message
+
+    s = _FAMILIES[family][1]
+    forbidden = _forbidden(s)
+    for label, message in _sdk_messages(s):
+        for text in (f"{message}", "%s" % (message,), "%r" % (message,), repr(message)):
+            assert not any(form in text for form in forbidden), (label, text)
+            assert "<JSON-RPC " in text or label == "metadata alone", (label, text)
+    request = _sdk_messages(s)[2][1]
+    assert describe_jsonrpc_message(request) == (
+        "<JSON-RPC request: method 'tools/call', id: int, params: object (2 keys)>"
+    )
+    assert "an undeclared method" in str(_sdk_messages(s)[8][1])
+
+
+@pytest.mark.parametrize("family", sorted(_FAMILIES))
+def test_a_dict_shaped_message_in_log_arguments_is_described(
+    caplog: pytest.LogCaptureFixture, family: str
+) -> None:
+    """A dict shaped like a JSON-RPC message, passed to any logger as a
+    `%`-argument -- alone, as the single mapping, inside a tuple, list or
+    dict -- is described, whatever logger logs it (rev 10)."""
+    caplog.set_level(logging.DEBUG)
+    s = _FAMILIES[family][1]
+    frame = {"jsonrpc": "2.0", "id": 1, "result": {"secret": s}}
+    logger = logging.getLogger("mcp.client.future_transport")
+    logger.debug("received %s", frame)
+    logger.debug("received %r and %s", frame, [frame])
+    logger.debug("received %s", {"wrapped": frame})
+    logger.debug("received %(method)s %(result)s", {**frame, "method": "ping"})
+    text = "\n".join(_record_text(r) for r in caplog.records)
+    assert not any(form in text for form in _forbidden(s)), text
+    assert text.count("<JSON-RPC response") >= 4, text

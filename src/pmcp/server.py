@@ -43,6 +43,7 @@ from pmcp.argument_errors import (
     describe_schema_error,
     exception_text,
     install_log_scrubber,
+    safe_exc_info,
 )
 from pmcp.client.manager import ClientManager
 from pmcp.config.guidance import GuidanceConfig, load_guidance_config
@@ -107,6 +108,40 @@ def _env_int(name: str, default: int, *, minimum: int) -> int:
         return max(minimum, int(raw))
     except ValueError:
         return default
+
+
+def _described_errors(handler: Any) -> Any:
+    """Wrap a request handler so an exception it lets escape never carries a
+    validation or parse error's text to the caller (Consiliency/pmcp#297,
+    rev 10).
+
+    The SDK answers an escaping exception with ``ErrorData(message=str(e))``
+    (`mcp/shared/jsonrpc_dispatcher.py`), so a pydantic error raised while a
+    handler builds its result from downstream data -- ``resources/read``'s
+    ``TextResourceContents``, ``prompts/get``'s ``PromptMessage`` -- sent its
+    ``input_value`` back to the caller. Such an exception (its chain holds a
+    validation or parse error) is re-raised as ``ValueError`` of its
+    :func:`exception_text`, outside the ``except``, so it chains nothing.
+    Every other exception passes unchanged.
+    """
+    import functools
+    import inspect
+
+    if inspect.isasyncgenfunction(handler):
+        return handler
+
+    @functools.wraps(handler)
+    async def wrapper(*args: Any, **kwargs: Any) -> Any:
+        described: str | None = None
+        try:
+            return await handler(*args, **kwargs)
+        except Exception as error:
+            if safe_exc_info(error) is not None:
+                raise
+            described = exception_text(error)
+        raise ValueError(described)
+
+    return wrapper
 
 
 class GatewayServer:
@@ -235,12 +270,14 @@ class GatewayServer:
         self._server = Server(
             "mcp-gateway",
             instructions=instructions,
-            on_list_tools=self._handle_list_tools,
-            on_call_tool=self._handle_call_tool,
-            on_list_resources=self._handle_list_resources,
-            on_read_resource=self._handle_read_resource,
-            on_list_prompts=self._handle_list_prompts,
-            on_get_prompt=self._handle_get_prompt,
+            on_list_tools=_described_errors(self._handle_list_tools),
+            on_call_tool=_described_errors(self._handle_call_tool),
+            on_list_resources=_described_errors(self._handle_list_resources),
+            on_read_resource=_described_errors(self._handle_read_resource),
+            on_list_prompts=_described_errors(self._handle_list_prompts),
+            on_get_prompt=_described_errors(self._handle_get_prompt),
+            # A `ListenHandler` object the SDK drives as a stream, not a
+            # coroutine; it renders its own failures (Consiliency/pmcp#287).
             on_subscriptions_listen=self._listen_handler,
         )
 

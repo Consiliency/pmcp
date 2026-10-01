@@ -688,12 +688,204 @@ def safe_traceback_text(error: BaseException) -> str:
 # --- every log record, whoever logs it (rev 3, widened in rev 4) ------------
 
 
+# --- JSON-RPC messages rendered as their structure (rev 10) -------------------
+
+_MESSAGE_CLASS_NAMES = (
+    "JSONRPCRequest",
+    "JSONRPCNotification",
+    "JSONRPCResponse",
+    "JSONRPCError",
+)
+_KNOWN_METHODS: frozenset[str] | None = None
+
+
+def _known_methods() -> frozenset[str]:
+    """Every method name the MCP SDK's own types declare (a `Literal` on a
+    model's `method` field). A method outside this set is a downstream's or
+    a caller's string, and is not shown."""
+    global _KNOWN_METHODS
+    if _KNOWN_METHODS is None:
+        import importlib
+        import inspect
+        import pkgutil
+        import typing
+
+        from pydantic import BaseModel
+
+        found: set[str] = set()
+        try:
+            import mcp_types
+
+            for info in pkgutil.walk_packages(mcp_types.__path__, "mcp_types."):
+                module = importlib.import_module(info.name)
+                for value in vars(module).values():
+                    if not (inspect.isclass(value) and issubclass(value, BaseModel)):
+                        continue
+                    field = value.model_fields.get("method")
+                    if (
+                        field is not None
+                        and typing.get_origin(field.annotation) is typing.Literal
+                    ):
+                        found |= {
+                            arg
+                            for arg in typing.get_args(field.annotation)
+                            if isinstance(arg, str)
+                        }
+        except Exception:  # pragma: no cover - no SDK types: show no method
+            found = set()
+        _KNOWN_METHODS = frozenset(found)
+    return _KNOWN_METHODS
+
+
+def _shape(value: Any) -> str:
+    """A value's structure, never its content: an object's key count, an
+    array's length, or a scalar's type."""
+    if isinstance(value, dict):
+        return f"object ({len(value)} key{'' if len(value) == 1 else 's'})"
+    if isinstance(value, (list, tuple)):
+        return f"array ({len(value)} item{'' if len(value) == 1 else 's'})"
+    return "null" if value is None else type(value).__name__
+
+
+def _message_fields(message: Any) -> dict[str, Any] | None:
+    """The JSON-RPC fields of an SDK message object or a dict shaped like
+    one, or None when `message` is neither."""
+    if isinstance(message, dict):
+        if "jsonrpc" in message and any(
+            key in message for key in ("method", "result", "error", "params", "id")
+        ):
+            return message
+        return None
+    if type(message).__name__ in _MESSAGE_CLASS_NAMES and type(
+        message
+    ).__module__.startswith(("mcp", "mcp_types")):
+        return {
+            name: getattr(message, name)
+            for name in ("method", "id", "params", "result", "error")
+            if hasattr(message, name)
+        }
+    return None
+
+
+def describe_jsonrpc_message(message: Any) -> str:
+    """A JSON-RPC message as its structure (Consiliency/pmcp#297, rev 10):
+    the kind, the method when the SDK declares it, the id's type and the
+    shape of `params` / `result` / `error` -- never their content, and never
+    an id's value. Every SDK log line that renders a message, incoming or
+    outgoing, shows this instead of the payload."""
+    fields = _message_fields(message) or {}
+    method = fields.get("method")
+    if method is not None:
+        kind = "request" if fields.get("id") is not None else "notification"
+    elif fields.get("error") is not None:
+        kind = "error"
+    else:
+        kind = "response"
+    parts = []
+    if method is not None:
+        parts.append(
+            f"method {method!r}"
+            if isinstance(method, str) and method in _known_methods()
+            else "an undeclared method"
+        )
+    if fields.get("id") is not None:
+        parts.append(f"id: {_shape(fields['id'])}")
+    for name in ("params", "result"):
+        if fields.get(name) is not None:
+            value = fields[name]
+            dumped = value.model_dump() if hasattr(value, "model_dump") else value
+            parts.append(f"{name}: {_shape(dumped)}")
+    error = fields.get("error")
+    if error is not None:
+        code = getattr(error, "code", None)
+        if code is None and isinstance(error, dict):
+            code = error.get("code")
+        parts.append(f"error code: {_shape(code)}")
+    return f"<JSON-RPC {kind}" + (": " + ", ".join(parts) if parts else "") + ">"
+
+
+def _render_message(self: Any) -> str:
+    try:
+        return describe_jsonrpc_message(self)
+    except Exception:  # a log call must never fail because of the render
+        return "<JSON-RPC message>"
+
+
+def _install_message_rendering() -> None:
+    """Make every rendering of an MCP SDK JSON-RPC message object -- an
+    f-string, `%s`, `%r`, a containing `SessionMessage`'s dataclass repr --
+    its structure. The SDK's transports log each message they receive and
+    send at DEBUG (`mcp/client/sse.py` "Received server message: {message}"
+    and "Sending client message: {session_message}",
+    `mcp/client/streamable_http.py` "SSE message: {message}" and "Sending
+    client message: {message}"): after the envelope is accepted, but before
+    pmcp validates the payload -- and outgoing ones carry the caller's
+    arguments. A preformatted f-string leaves no object for a record
+    scrubber to find, so the object renders itself. Idempotent."""
+    try:
+        import mcp.types as mcp_types_module
+    except Exception:  # pragma: no cover - the SDK is a dependency
+        return
+    for name in _MESSAGE_CLASS_NAMES:
+        cls = getattr(mcp_types_module, name, None)
+        if cls is None or getattr(cls, "pmcp_structural_render", False):
+            continue
+        cls.__repr__ = _render_message  # type: ignore[method-assign]
+        cls.__str__ = _render_message  # type: ignore[method-assign]
+        cls.pmcp_structural_render = True
+    # The transport wrapper and its metadata: `ClientMessageMetadata.headers`
+    # can carry `Mcp-Param-*` headers, which hold tool-argument values
+    # (`mcp/shared/inbound.py`, `x-mcp-header`), and the SDK logs a whole
+    # `SessionMessage` ("Sending client message: {session_message}").
+    try:
+        from mcp.shared import message as session_module
+    except Exception:  # pragma: no cover
+        return
+    for name, render in (
+        ("SessionMessage", _render_session_message),
+        ("ClientMessageMetadata", _render_metadata),
+        ("ServerMessageMetadata", _render_metadata),
+    ):
+        cls = getattr(session_module, name, None)
+        if cls is None or getattr(cls, "pmcp_structural_render", False):
+            continue
+        cls.__repr__ = render  # type: ignore[method-assign]
+        cls.__str__ = render  # type: ignore[method-assign]
+        cls.pmcp_structural_render = True
+
+
+def _render_metadata(self: Any) -> str:
+    """A transport metadata object as its type and header *names*."""
+    try:
+        headers = getattr(self, "headers", None)
+        names = sorted(headers) if isinstance(headers, dict) else []
+        shown = f" headers: {', '.join(names)}" if names else ""
+        return f"<{type(self).__name__}{shown}>"
+    except Exception:  # a log call must never fail because of the render
+        return "<message metadata>"
+
+
+def _render_session_message(self: Any) -> str:
+    try:
+        metadata = getattr(self, "metadata", None)
+        tail = "" if metadata is None else f", {_render_metadata(metadata)}"
+        return (
+            f"SessionMessage({_render_message(getattr(self, 'message', None))}{tail})"
+        )
+    except Exception:  # a log call must never fail because of the render
+        return "SessionMessage(<JSON-RPC message>)"
+
+
 def _scrubbed(value: Any, depth: int = 0) -> Any:
     """`value` with every exception whose chain holds a validation error
-    replaced by its :func:`exception_text`, looking inside tuples, lists,
-    sets and dicts (keys and values)."""
+    replaced by its :func:`exception_text`, and every JSON-RPC message (an
+    SDK object or a dict shaped like one) by
+    :func:`describe_jsonrpc_message`, looking inside tuples, lists, sets and
+    dicts (keys and values)."""
     if isinstance(value, BaseException):
         return exception_text(value) if safe_exc_info(value) is None else value
+    if _message_fields(value) is not None:
+        return describe_jsonrpc_message(value)
     if depth > 8:
         return value
     if isinstance(value, tuple):
@@ -728,7 +920,26 @@ def scrub_record(record: logging.LogRecord) -> logging.LogRecord:
         if isinstance(record.msg, BaseException):
             record.msg = _scrubbed(record.msg)
         if record.args:
-            record.args = _scrubbed(record.args)
+            if (
+                isinstance(record.args, dict)
+                and _message_fields(record.args) is not None
+            ):
+                # A single mapping argument that is itself a message: keep
+                # `%(name)s` keys working, but with no payload in them.
+                described = describe_jsonrpc_message(record.args)
+                if "%(" in str(record.msg):
+                    record.args = {
+                        key: (
+                            "<omitted>"
+                            if key in ("params", "result", "error", "id")
+                            else value
+                        )
+                        for key, value in record.args.items()
+                    }
+                else:
+                    record.args = (described,)
+            else:
+                record.args = _scrubbed(record.args)
         error = record.exc_info[1] if isinstance(record.exc_info, tuple) else None
         if isinstance(error, BaseException) and safe_exc_info(error) is None:
             try:
@@ -772,6 +983,7 @@ def install_log_scrubber() -> None:
     _install_excepthook()
     _install_threading_excepthook()
     _install_handle_error()
+    _install_message_rendering()
 
 
 def _install_handle_error() -> None:

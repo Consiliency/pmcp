@@ -684,7 +684,11 @@ def _entry_label(entry: Any, key: str = "name") -> str:
         identifier = entry.get(key)
         if isinstance(identifier, str) and identifier:
             return repr(identifier)
-    return repr(entry)[:120]
+        # No usable identifier: describe the entry's structure, never its
+        # content -- the downstream's data that failed validation
+        # (Consiliency/pmcp#297, rev 10; it was `repr(entry)[:120]`).
+        return f"(an entry with {len(entry)} key{'' if len(entry) == 1 else 's'})"
+    return f"(a {type(entry).__name__} entry)"
 
 
 def _required_identity(entry: Any, key: str) -> str:
@@ -1097,6 +1101,12 @@ class ManagedClient:
     # after publishing its streams. Set by `_close_remote_transport` to ask the
     # owner to unwind its own stack, in its own task.
     transport_shutdown: asyncio.Event | None = None
+    #: Set when a stdio line was described as a rejected frame, until a line
+    #: parses: a frame a downstream broke across lines (a raw newline in a
+    #: string, or a UTF-16 code unit holding byte 0x0A) continues on the
+    #: following lines, which are frame data, not output (Consiliency/pmcp#297,
+    #: rev 10).
+    stdio_frame_broken: bool = False
     status: ServerStatus = field(
         default_factory=lambda: ServerStatus(
             name="",
@@ -2936,11 +2946,14 @@ class ClientManager:
             message = load_json(text, source="downstream stdio frame")
         except json.JSONDecodeError as error:
             # Already counted as a heartbeat by the caller.
-            if not _is_downstream_output(text):
+            if managed.stdio_frame_broken or not _is_downstream_output(text):
+                managed.stdio_frame_broken = True
                 # A frame the parser rejected -- a syntax error, or a parser
                 # limit (nesting depth, an integer's digit count) on otherwise
                 # valid JSON -- is the downstream's data, not its output:
-                # described, never echoed (Consiliency/pmcp#297, rev 8).
+                # described, never echoed (Consiliency/pmcp#297, rev 8). So is
+                # every unparseable line after it until one parses: the rest
+                # of a frame the downstream broke across lines (rev 10).
                 logger.debug(
                     f"[{name}] downstream sent a JSON-RPC frame that could not "
                     f"be parsed: {exception_text(error)}"
@@ -2958,6 +2971,7 @@ class ClientManager:
             # the line is attacker-sized (Consiliency/pmcp#287).
             logger.debug(f"[{name}] dropped unparseable frame ({type(e).__name__})")
             return
+        managed.stdio_frame_broken = False
         self._dispatch_downstream_frame(name, managed, message, now)
 
     def _dispatch_downstream_frame(
