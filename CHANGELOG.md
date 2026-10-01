@@ -136,6 +136,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged. See [#230](https://github.com/Consiliency/pmcp/issues/230).
 
 ### Security
+- **Unknown-`kid` tokens can no longer drive an outbound JWKS fetch per request.**
+  A token whose `kid` is not in the cached key set forced a JWKS refresh every
+  time, before rate limiting runs, so an unauthenticated caller sending random
+  `kid`s could make the gateway fetch at will. Forced refreshes are now limited
+  to one per 10 s window, checked under the refresh lock so a concurrent burst
+  shares one fetch; within the window an unknown `kid` is checked against the
+  cached keys and gets a `401`. The first unknown `kid` in each window still
+  refreshes, so a rotated key is picked up within about one window (review
+  finding S-07). See [Consiliency/pmcp#231](https://github.com/Consiliency/pmcp/issues/231).
+- **A slow or failing JWKS endpoint no longer stalls refresh for every waiting
+  request.** The fetch had no timeout (aiohttp's default is 300 s) and ran under
+  the refresh lock. It now has a 5 s total timeout, and a failed refresh opens a
+  short (5 s) backoff that the requests queued behind it share, so the last of N
+  concurrent requests waits about one timeout rather than N of them and gets a
+  `503`. Keys are never served past their TTL. A refresh rejected by the backoff
+  does not use up the unknown-`kid` window (review finding S-08). See
+  [Consiliency/pmcp#231](https://github.com/Consiliency/pmcp/issues/231).
+- **The protected-resource metadata no longer echoes the request `Host`.**
+  `/.well-known/oauth-protected-resource` built its `resource` from the request,
+  so a forged `Host` was advertised back as the resource, even with the Host
+  allowlist configured (that route never checked it). `resource` is now the
+  operator-configured `resource_server_audience` (`--oauth-audience`), or, when
+  that is unset, the origin of the configured protected-resource metadata URL
+  plus `/mcp` (scheme-default port dropped; any path prefix in the metadata URL
+  is not carried over, because the app serves MCP at `/mcp`) (review finding
+  S-10). See [Consiliency/pmcp#231](https://github.com/Consiliency/pmcp/issues/231).
+- **A forged token can no longer turn a resource-server request into a 500.**
+  The token's header chooses the algorithm and its `kid` chooses the key, so an
+  unauthenticated caller could pair an allowed algorithm with a key of another
+  type (for example `ES256` against a published RSA key). pyjwt then raised
+  `TypeError`, `ValueError` or `InvalidKeyError` while preparing the key, and
+  nothing caught it. Those now give the usual `401` `invalid_token`. Token
+  errors whose pyjwt text can quote the token back (such as an unknown `crit`
+  extension) now get a fixed description. See
+  [Consiliency/pmcp#231](https://github.com/Consiliency/pmcp/issues/231).
 - **pyjwt raised to 2.15.** The dependency floor is now `pyjwt[crypto]>=2.15.0`
   (was `>=2.13.0`) and the lock resolves 2.15.1, picking up the fixes for the
   12 advisories `pip-audit` reports against 2.13.0 (GHSA-w6j9-cwv2-h6wq,
@@ -402,6 +437,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+- **A JWKS with no usable keys is a `503`, not a `500`.** An issuer serving an
+  empty key set, or one whose keys are all unusable, made `PyJWKSet` raise
+  `PyJWKSetError`, which no handler caught. It now takes the existing
+  key-set-unavailable path (`503`, `error="temporarily_unavailable"`); the
+  response and logs carry no JWKS content and no token. See
+  [Consiliency/pmcp#320](https://github.com/Consiliency/pmcp/issues/320).
+- **Every failed JWKS fetch is a shared `503`, not a per-request `500`.** A
+  failure other than the ones the fetch already mapped (for example a deeply
+  nested JSON body raising `RecursionError`) escaped as a `500` and skipped the
+  shared failure backoff, so each queued request fetched again. Any failure now
+  opens the backoff and returns the key-set-unavailable `503`. A cancelled fetch
+  deliberately does not open the backoff, because the caller went away, not the
+  endpoint; the next waiter fetches. See
+  [Consiliency/pmcp#231](https://github.com/Consiliency/pmcp/issues/231).
 - **Version pinning: the invalid-pin warning now names the right consequence, and the
   README says when `[PINNED]` becomes `[FAILED]`.** The warning used to say "a pin from an
   earlier source, if any, stands" for every refused pin, which was false whenever a

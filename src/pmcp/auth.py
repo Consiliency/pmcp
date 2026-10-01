@@ -388,11 +388,25 @@ class AsyncJWKS:
         *,
         ttl_seconds: float = 300,
         max_bytes: int = 512 * 1024,
+        forced_refresh_cooldown_seconds: float = 10.0,
+        fetch_timeout_seconds: float = 5.0,
+        refresh_failure_backoff_seconds: float = 5.0,
     ) -> None:
         self.url = sanitize_public_auth_url(url)
         self._raw_url = url
         self._ttl_seconds = ttl_seconds
         self._max_bytes = max_bytes
+        # S-07 (Consiliency/pmcp#231): at most one *forced* (unknown-kid) refresh
+        # per window, so an unauthenticated caller sending random kids cannot
+        # drive an outbound fetch per request.
+        self._forced_refresh_cooldown_seconds = forced_refresh_cooldown_seconds
+        # S-08: a total bound on one fetch (connect + headers + body) ...
+        self._fetch_timeout_seconds = fetch_timeout_seconds
+        # ... and a shared failure window, so the waiters queued behind a failed
+        # fetch fail at once instead of each re-attempting it in turn.
+        self._refresh_failure_backoff_seconds = refresh_failure_backoff_seconds
+        self._last_forced_refresh: float = float("-inf")
+        self._last_refresh_failure: float = float("-inf")
         self._lock: asyncio.Lock | None = None
         self._jwks: Mapping[str, Any] | None = None
         self._expires_at = 0.0
@@ -403,15 +417,75 @@ class AsyncJWKS:
             self._lock = asyncio.Lock()
         return self._lock
 
+    def _cached(self, now: float) -> Mapping[str, Any] | None:
+        """The cached JWKS while it is unexpired, else ``None``. Expired keys are
+        never served."""
+        if self._jwks is not None and now < self._expires_at:
+            return self._jwks
+        return None
+
+    def _serve_cache_instead(
+        self, now: float, *, force_refresh: bool
+    ) -> Mapping[str, Any] | None:
+        """The unexpired cache when it answers this call without a fetch --
+        always for a plain call, and for a forced one while the cooldown is
+        active -- else ``None``."""
+        cached = self._cached(now)
+        if cached is None or not force_refresh:
+            return cached
+        if now - self._last_forced_refresh < self._forced_refresh_cooldown_seconds:
+            return cached
+        return None
+
     async def get(self, *, force_refresh: bool = False) -> Mapping[str, Any]:
         now = time.monotonic()
-        if not force_refresh and self._jwks is not None and now < self._expires_at:
-            return self._jwks
+        # Fast path only: keeps on-cooldown callers off the lock. Not
+        # authoritative -- the stamp is written under the lock, so only a check
+        # made under the lock is ordered against every stamp (S-07 concurrency).
+        served = self._serve_cache_instead(now, force_refresh=force_refresh)
+        if served is not None:
+            return served
         async with self._refresh_lock:
             now = time.monotonic()
-            if not force_refresh and self._jwks is not None and now < self._expires_at:
-                return self._jwks
-            jwks = await self._fetch()
+            # (1) Authoritative cache/cooldown re-check: a waiter that queued
+            # before another forced caller stamped sees that stamp and its keys.
+            served = self._serve_cache_instead(now, force_refresh=force_refresh)
+            if served is not None:
+                return served
+            # (2) S-08 backoff gate: a refresh failed moments ago, so do not
+            # stack another fetch behind it. Never stamps the forced-refresh
+            # window -- nothing was fetched, so no cooldown is consumed.
+            if now - self._last_refresh_failure < self._refresh_failure_backoff_seconds:
+                cached = self._cached(now)
+                if cached is not None:
+                    return cached
+                raise ResourceServerJWKSUnavailable(
+                    f"JWKS refresh recently failed for {self.url}; backing off."
+                )
+            # (3) A fetch is about to be attempted: the only place the
+            # forced-refresh window advances (success or failure alike).
+            if force_refresh:
+                self._last_forced_refresh = now
+            # (4) Fetch; a failure opens the shared backoff window.
+            try:
+                jwks = await self._fetch()
+            except ResourceServerJWKSUnavailable:
+                self._last_refresh_failure = time.monotonic()
+                raise
+            except Exception as exc:
+                # Any other failure is still a failed refresh: it opens the
+                # shared backoff and is the same value-free 503, never a 500
+                # that each queued waiter re-earns with its own fetch.
+                # Cancellation (a BaseException) is deliberately not caught:
+                # it says the caller went away, not that the endpoint failed,
+                # so it must not 503 everyone else for the backoff window. The
+                # lock and cache are left as they were; the cooldown stamp
+                # stays, because the attempt was made.
+                self._last_refresh_failure = time.monotonic()
+                raise ResourceServerJWKSUnavailable(
+                    f"JWKS fetch failed for {self.url}."
+                ) from exc
+            self._last_refresh_failure = float("-inf")
             self._jwks = jwks
             self._expires_at = time.monotonic() + self._ttl_seconds
             return jwks
@@ -423,12 +497,15 @@ class AsyncJWKS:
         except jwt.InvalidTokenError:
             return jwks
         if isinstance(kid, str) and not _jwks_has_kid(jwks, kid):
+            # get() decides whether this forced refresh actually fetches (the
+            # S-07 cooldown and the S-08 backoff both live there, under the lock).
             jwks = await self.get(force_refresh=True)
         return jwks
 
     async def _fetch(self) -> Mapping[str, Any]:
+        timeout = aiohttp.ClientTimeout(total=self._fetch_timeout_seconds)
         try:
-            async with aiohttp.ClientSession() as session:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.get(
                     self._raw_url, allow_redirects=False
                 ) as response:
@@ -451,7 +528,9 @@ class AsyncJWKS:
             )
         try:
             jwks = json.loads(content.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        except (ValueError, RecursionError) as exc:
+            # ValueError covers JSONDecodeError and UnicodeDecodeError; a
+            # deeply nested body under the size cap raises RecursionError.
             raise ResourceServerJWKSUnavailable(
                 f"Invalid JWKS JSON from {self.url}."
             ) from exc
@@ -470,7 +549,17 @@ def _jwks_has_kid(jwks: Mapping[str, Any], kid: str) -> bool:
 def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
     header = jwt.get_unverified_header(token)
     kid = header.get("kid")
-    key_set = PyJWKSet.from_dict(dict(jwks))
+    try:
+        key_set = PyJWKSet.from_dict(dict(jwks))
+    except jwt.PyJWKSetError as exc:
+        # An empty set, or one with no usable key, is a key-set availability
+        # problem (503), not a bad token -- and PyJWKSetError is not an
+        # InvalidTokenError, so unmapped it escaped as a 500 (see
+        # Consiliency/pmcp#320). Fixed text: never echo pyjwt's message or any
+        # JWKS content.
+        raise ResourceServerJWKSUnavailable(
+            "JWKS contains no usable signing keys."
+        ) from exc
     keys = key_set.keys
     if kid:
         for key in keys:
@@ -490,6 +579,55 @@ def _claim_scopes(claims: Mapping[str, Any]) -> list[str]:
     if isinstance(raw_scp, list):
         scopes.update(part for part in raw_scp if isinstance(part, str) and part)
     return sorted(scopes)
+
+
+# pyjwt claim-validation errors whose message is fixed text.
+_FIXED_TEXT_CLAIM_ERRORS: tuple[type[jwt.InvalidTokenError], ...] = (
+    jwt.ExpiredSignatureError,
+    jwt.ImmatureSignatureError,
+    jwt.InvalidIssuerError,
+    jwt.InvalidIssuedAtError,
+    jwt.MissingRequiredClaimError,
+    jwt.InvalidAlgorithmError,
+)
+
+
+def _decode_with_key(
+    token: str,
+    signing_key: Any,
+    *,
+    algorithms: list[str],
+    audience: str,
+    issuer: str,
+) -> dict[str, Any]:
+    """``jwt.decode`` with key-preparation failures mapped to ``invalid_token``.
+
+    The token's header picks the algorithm and its ``kid`` picks the key, so an
+    unauthenticated caller can pair any allowed algorithm with any published
+    key. When they do not fit, pyjwt/cryptography raise from key preparation or
+    verification -- ``TypeError`` ("Expecting a PEM-formatted key."),
+    ``ValueError``, or ``jwt.InvalidKeyError`` (a ``PyJWTError`` that is not an
+    ``InvalidTokenError``) -- which escaped as a 500 (see
+    Consiliency/pmcp#231, PR review F1). The ``try`` wraps only this one call,
+    whose inputs are the attacker's token and a published key, so a ``TypeError``
+    or ``ValueError`` from PMCP's own code elsewhere still surfaces.
+    ``InvalidTokenError`` passes through for the caller's own mapping.
+    """
+    try:
+        return jwt.decode(
+            token,
+            signing_key,
+            algorithms=algorithms,
+            audience=audience,
+            issuer=issuer,
+            options={"require": ["iss", "exp", "nbf", "aud"]},
+        )
+    except jwt.InvalidTokenError:
+        raise
+    except (jwt.PyJWTError, TypeError, ValueError) as exc:
+        raise ResourceServerAuthError(
+            "invalid_token", "Token could not be verified with the published key."
+        ) from exc
 
 
 def validate_resource_server_token(
@@ -514,20 +652,25 @@ def validate_resource_server_token(
         if jwks is None:
             raise ResourceServerAuthError("invalid_token", "JWKS URL is required.")
         signing_key = _select_jwk_key(token, jwks)
-        claims = jwt.decode(
+        claims = _decode_with_key(
             token,
             signing_key,
             algorithms=list(allowed_algorithms),
             audience=audience,
             issuer=issuer,
-            options={"require": ["iss", "exp", "nbf", "aud"]},
         )
     except ResourceServerAuthError:
         raise
     except jwt.InvalidAudienceError as exc:
         raise ResourceServerAuthError("invalid_token", "Invalid audience.") from exc
-    except jwt.InvalidTokenError as exc:
+    except _FIXED_TEXT_CLAIM_ERRORS as exc:
+        # pyjwt's text for these is fixed (or names a claim from PMCP's own
+        # required list), so it is safe to keep as the description.
         raise ResourceServerAuthError("invalid_token", str(exc)) from exc
+    except jwt.InvalidTokenError as exc:
+        # Every other token error may quote the token back (pyjwt names an
+        # unknown `crit` extension, for one), so the description is fixed.
+        raise ResourceServerAuthError("invalid_token", "Invalid token.") from exc
 
     scopes = _claim_scopes(claims)
     missing_scopes = sorted(set(required_scopes or []) - set(scopes))

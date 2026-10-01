@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import base64
+import json
 import stat
 import time
 import asyncio
 from pathlib import Path
-from typing import get_args
+from types import SimpleNamespace
+from typing import Any, get_args
 
 import jwt
 import pytest
@@ -1337,3 +1340,572 @@ def test_is_verified_public_auth_url(url: str, expected: bool) -> None:
     that gap between accepted and checked is the whole of #211.
     """
     assert is_verified_public_auth_url(url) is expected
+
+
+# ---------------------------------------------------------------------------
+# S-07 / S-08 (see Consiliency/pmcp#231): JWKS refresh amplifier and fetch bound
+# ---------------------------------------------------------------------------
+
+_JWKS_URL = "https://issuer.example/jwks.json"
+
+
+def _kid_token(kid: str) -> str:
+    """An unsigned-in-effect token whose only job is to carry a ``kid`` header."""
+    return jwt.encode({}, "x" * 32, algorithm="HS256", headers={"kid": kid})
+
+
+class _FakeClock:
+    """A monotonic clock the test moves by hand. Patched onto ``pmcp.auth.time``
+    (the module attribute), never onto ``time.monotonic`` itself, which the
+    event loop also reads."""
+
+    def __init__(self, now: float = 1000.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.mark.asyncio
+async def test_s07_random_unknown_kids_do_not_each_force_a_fetch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jwks = AsyncJWKS(_JWKS_URL, ttl_seconds=30)
+    calls = 0
+
+    async def fake_fetch() -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"keys": [{"kid": "known"}]}
+
+    monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+
+    # Two distinct random kids: the attacker's shape. The first unknown kid
+    # may force one refresh; the second, inside the cooldown, must not.
+    await jwks.get_for_token(_kid_token("random-1"))
+    await jwks.get_for_token(_kid_token("random-2"))
+
+    assert calls <= 2, f"unknown kids each forced a fetch: calls={calls}"
+
+
+@pytest.mark.asyncio
+async def test_s07_concurrent_unknown_kids_share_one_forced_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jwks = AsyncJWKS(_JWKS_URL, ttl_seconds=300)
+    fetched = {"keys": [{"kid": "known"}]}
+    release_first_fetch = asyncio.Event()
+    fetches = 0
+
+    async def fake_fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            # Hold the cache-filling fetch until the whole burst is queued.
+            await release_first_fetch.wait()
+        return fetched
+
+    monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+
+    n = 5
+    tasks = [
+        asyncio.create_task(jwks.get_for_token(_kid_token(f"unknown-{i}")))
+        for i in range(n)
+    ]
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert fetches == 1 and jwks._refresh_lock.locked(), (
+        "the burst was not queued behind the first fetch"
+    )
+
+    release_first_fetch.set()
+    results = await asyncio.gather(*tasks)
+
+    assert all(result is fetched for result in results)
+    assert fetches <= 2, (
+        "concurrent unknown kids amplified the refresh: "
+        f"fetches={fetches} (1 initial + {fetches - 1} forced for {n} "
+        "concurrent requests)"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_duration", [0.0, 5.0], ids=["immediate", "timeout"])
+async def test_s07_s08_recovery_after_failed_forced_refresh_waits_out_the_cooldown(
+    monkeypatch: pytest.MonkeyPatch, failure_duration: float
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr("pmcp.auth.time", SimpleNamespace(monotonic=clock))
+    cooldown, backoff = 10.0, 5.0  # the default relationship, C > B, on purpose
+    jwks = AsyncJWKS(
+        _JWKS_URL,
+        ttl_seconds=300,
+        forced_refresh_cooldown_seconds=cooldown,
+        refresh_failure_backoff_seconds=backoff,
+    )
+    old = {"keys": [{"kid": "old"}]}
+    rotated = {"keys": [{"kid": "rotated"}]}
+    jwks._jwks = old
+    jwks._expires_at = clock() + 300
+    endpoint_down = True
+    fetches = 0
+
+    async def fake_fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        if endpoint_down:
+            clock.advance(failure_duration)
+            raise ResourceServerJWKSUnavailable("JWKS fetch failed.")
+        return rotated
+
+    monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+    token = _kid_token("rotated")
+
+    t0 = clock()
+    with pytest.raises(ResourceServerJWKSUnavailable):
+        await jwks.get_for_token(token)
+    assert fetches == 1
+    endpoint_down = False
+
+    eligible_at = t0 + max(cooldown, failure_duration + backoff)
+    clock.now = eligible_at - 1.0
+    served = await jwks.get_for_token(token)
+    assert fetches == 1, (
+        f"a forced fetch ran at t={clock.now - t0:.1f}s, before "
+        f"max(C, d+B)={eligible_at - t0:.1f}s: fetches={fetches}"
+    )
+    assert served is old
+
+    clock.now = eligible_at
+    served = await jwks.get_for_token(token)
+    assert fetches == 2, f"no forced fetch at max(C, d+B): fetches={fetches}"
+    assert served is rotated
+
+
+@pytest.mark.asyncio
+async def test_s07_s08_backoff_rejection_does_not_consume_the_cooldown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = _FakeClock()
+    monkeypatch.setattr("pmcp.auth.time", SimpleNamespace(monotonic=clock))
+    # Backoff outlasting the cooldown, deliberately: the composition bug only
+    # exists when d + B > C.
+    jwks = AsyncJWKS(
+        _JWKS_URL,
+        ttl_seconds=300,
+        forced_refresh_cooldown_seconds=0.4,
+        refresh_failure_backoff_seconds=0.5,
+    )
+    old = {"keys": [{"kid": "old"}]}
+    rotated = {"keys": [{"kid": "rotated"}]}
+    jwks._jwks = old
+    jwks._expires_at = clock() + 300
+    endpoint_down = True
+    fetches = 0
+
+    async def fake_fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        if endpoint_down:
+            raise ResourceServerJWKSUnavailable("JWKS fetch failed.")
+        return rotated
+
+    monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+    token = _kid_token("rotated")
+
+    t0 = clock()
+    with pytest.raises(ResourceServerJWKSUnavailable):
+        await jwks.get_for_token(token)
+    assert fetches == 1
+    endpoint_down = False
+
+    clock.now = t0 + 0.45  # cooldown elapsed, backoff still active
+    served = await jwks.get_for_token(token)
+    assert fetches == 1, f"a fetch ran inside the backoff window: fetches={fetches}"
+    assert served is old
+
+    clock.now = t0 + 0.55  # first forced attempt after backoff expiry
+    served = await jwks.get_for_token(token)
+    assert fetches == 2, (
+        f"rotated key not accepted at backoff expiry: fetches={fetches}"
+    )
+    assert served is rotated
+
+
+@pytest.mark.asyncio
+async def test_s08_fetch_is_bounded_by_a_timeout() -> None:
+    assert AsyncJWKS(_JWKS_URL)._fetch_timeout_seconds == 5.0
+
+    release = asyncio.Event()
+
+    async def hang(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        # Accept the connection and never answer.
+        await release.wait()
+        writer.close()
+
+    server = await asyncio.start_server(hang, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        jwks = AsyncJWKS(_JWKS_URL, fetch_timeout_seconds=0.5)
+        jwks._raw_url = f"http://127.0.0.1:{port}/jwks"  # bypass URL policy
+        # The internal 0.5 s total timeout must fire well before the 5 s
+        # outer bound; without it aiohttp's 300 s default would win.
+        with pytest.raises(ResourceServerJWKSUnavailable):
+            await asyncio.wait_for(jwks._fetch(), timeout=5)
+    finally:
+        release.set()
+        server.close()
+        await server.wait_closed()
+
+
+@pytest.mark.asyncio
+async def test_s08_concurrent_get_bounds_the_last_waiter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Deterministic form of "the last of N waiters waits ~one timeout, not
+    # N x timeout": every fetch is (already) timeout-bounded, so the bound is
+    # the number of fetches the burst performs. One failure must be shared.
+    jwks = AsyncJWKS(_JWKS_URL, ttl_seconds=300)
+    release_first_fetch = asyncio.Event()
+    fetches = 0
+
+    async def fake_fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            await release_first_fetch.wait()
+        raise ResourceServerJWKSUnavailable("JWKS fetch failed.")
+
+    monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+
+    n = 5
+    tasks = [asyncio.create_task(jwks.get()) for _ in range(n)]
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert fetches == 1 and jwks._refresh_lock.locked(), (
+        "the waiters were not queued behind the first fetch"
+    )
+
+    release_first_fetch.set()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    assert all(isinstance(r, ResourceServerJWKSUnavailable) for r in results)
+    assert fetches == 1, (
+        "last waiter not bounded: each waiter re-attempted the failed fetch: "
+        f"fetches={fetches} for {n} waiters (~{fetches} x timeout)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# A JWKS with no usable keys is "key set unavailable", not a crash
+# (see Consiliency/pmcp#320)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "jwks_doc",
+    [
+        {"keys": []},
+        {"keys": [{"kty": "RSA", "kid": "malformed-key-kid"}]},
+    ],
+    ids=["empty", "malformed_only"],
+)
+def test_jwks_no_usable_keys_is_unavailable_not_a_crash(
+    jwks_doc: dict[str, object],
+) -> None:
+    token, _ = _signed_token_fixture()
+
+    with pytest.raises(ResourceServerJWKSUnavailable) as exc_info:
+        validate_resource_server_token(
+            token,
+            issuer="https://issuer.example",
+            audience="https://pmcp.example/mcp",
+            jwks=jwks_doc,
+        )
+
+    assert exc_info.value.error == "temporarily_unavailable"
+    message = str(exc_info.value)
+    for leak in ("malformed-key-kid", "RSA", "cryptography", token):
+        assert leak not in message
+
+
+# ---------------------------------------------------------------------------
+# S-08 failure accounting (PR review F2/F3, see Consiliency/pmcp#231): every
+# non-cancellation fetch failure opens the shared backoff; cancellation does not.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_s08_any_fetch_exception_opens_the_shared_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    jwks = AsyncJWKS(_JWKS_URL, ttl_seconds=300)
+    release_first_fetch = asyncio.Event()
+    fetches = 0
+
+    async def fake_fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            await release_first_fetch.wait()
+        raise RecursionError("maximum recursion depth exceeded SENTINEL-F3")
+
+    monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+
+    n = 5
+    tasks = [asyncio.create_task(jwks.get()) for _ in range(n)]
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert fetches == 1 and jwks._refresh_lock.locked()
+
+    release_first_fetch.set()
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    kinds = sorted({type(r).__name__ for r in results})
+    assert all(isinstance(r, ResourceServerJWKSUnavailable) for r in results), (
+        f"a non-JWKSUnavailable fetch failure escaped: {kinds}"
+    )
+    assert all("SENTINEL-F3" not in str(r) for r in results)
+    assert fetches == 1, (
+        f"the failure did not open the shared backoff: fetches={fetches} "
+        f"for {n} waiters"
+    )
+
+
+@pytest.mark.asyncio
+async def test_s08_deeply_nested_jwks_body_is_unavailable() -> None:
+    body = b"[" * 100_000 + b"]" * 100_000  # under the 512 KiB cap
+
+    async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        await reader.readuntil(b"\r\n\r\n")
+        writer.write(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
+            + body
+        )
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        jwks = AsyncJWKS(_JWKS_URL, fetch_timeout_seconds=5)
+        jwks._raw_url = f"http://127.0.0.1:{port}/jwks"  # bypass URL policy
+        with pytest.raises(ResourceServerJWKSUnavailable) as exc_info:
+            await jwks._fetch()
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    assert "Invalid JWKS JSON" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_s08_cancelled_fetch_does_not_open_the_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Decision: cancellation means the caller went away, not that the endpoint
+    # failed, so it must not 503 the other waiters for the backoff window. The
+    # lock is released and the cache is untouched; the next waiter fetches.
+    jwks = AsyncJWKS(_JWKS_URL, ttl_seconds=300)
+    fetched = {"keys": [{"kid": "known"}]}
+    hang_first_fetch = asyncio.Event()  # never set
+    fetches = 0
+
+    async def fake_fetch() -> dict[str, object]:
+        nonlocal fetches
+        fetches += 1
+        if fetches == 1:
+            await hang_first_fetch.wait()
+        return fetched
+
+    monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+
+    holder = asyncio.create_task(jwks.get())
+    for _ in range(10):
+        await asyncio.sleep(0)
+    waiter = asyncio.create_task(jwks.get())
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert fetches == 1 and jwks._refresh_lock.locked()
+
+    holder.cancel()
+    holder_result, waiter_result = await asyncio.gather(
+        holder, waiter, return_exceptions=True
+    )
+
+    assert waiter_result is fetched, (
+        f"a cancelled fetch opened the backoff: waiter got {waiter_result!r}"
+    )
+    assert isinstance(holder_result, asyncio.CancelledError)
+    assert fetches == 2
+    assert jwks._last_refresh_failure == float("-inf")
+    assert not jwks._refresh_lock.locked()
+
+
+# ---------------------------------------------------------------------------
+# Forged-token matrix (PR review F1, see Consiliency/pmcp#231): whatever an
+# unauthenticated caller puts in a token, validation ends in invalid_token
+# with a value-free description -- never another exception.
+# ---------------------------------------------------------------------------
+
+_SENTINEL = "SENTINELF1"
+
+
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _forge_token(
+    header: object = None,
+    *,
+    raw_header: bytes | None = None,
+    raw_payload: bytes | None = None,
+) -> str:
+    """An unsigned token with an arbitrary header/payload and a junk signature;
+    the sentinel is planted in the payload and signature of every case."""
+    h = raw_header if raw_header is not None else json.dumps(header).encode()
+    p = (
+        raw_payload
+        if raw_payload is not None
+        else json.dumps({"sub": _SENTINEL, "iss": "https://issuer.example"}).encode()
+    )
+    return f"{_b64(h)}.{_b64(p)}.{_b64(b'sig-' + _SENTINEL.encode())}"
+
+
+def _forged_token_keys() -> dict[str, dict[str, object]]:
+    from cryptography.hazmat.primitives.asymmetric import ec, ed25519
+    from jwt.algorithms import ECAlgorithm, OKPAlgorithm, RSAAlgorithm
+
+    def jwk(algorithm: Any, public_key: Any, kid: str) -> dict[str, object]:
+        data = algorithm.to_jwk(public_key, as_dict=True)
+        data["kid"] = kid
+        return data
+
+    rsa_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    return {
+        "rsa": jwk(RSAAlgorithm, rsa_key.public_key(), f"rsa-{_SENTINEL}"),
+        "ec256": jwk(
+            ECAlgorithm,
+            ec.generate_private_key(ec.SECP256R1()).public_key(),
+            f"ec256-{_SENTINEL}",
+        ),
+        "ec384": jwk(
+            ECAlgorithm,
+            ec.generate_private_key(ec.SECP384R1()).public_key(),
+            f"ec384-{_SENTINEL}",
+        ),
+        "okp": jwk(
+            OKPAlgorithm,
+            ed25519.Ed25519PrivateKey.generate().public_key(),
+            f"okp-{_SENTINEL}",
+        ),
+        "oct": {"kty": "oct", "kid": f"oct-{_SENTINEL}", "k": _b64(b"k" * 32)},
+    }
+
+
+FORGED_TOKEN_KEYS = _forged_token_keys()
+FORGED_TOKEN_ALGS = [
+    "RS256", "RS384", "RS512", "PS256", "PS384", "PS512",
+    "ES256", "ES256K", "ES384", "ES512", "EdDSA", "Ed25519", "HS256",
+    "none", "NONE", "bogus", _SENTINEL,
+]  # fmt: skip
+# The default allow-list, and every algorithm pyjwt can verify with a public key.
+FORGED_TOKEN_ALLOW_LISTS = {
+    "default": ("RS256", "ES256"),
+    "wide": (
+        "RS256", "RS384", "RS512", "PS256", "PS384", "PS512",
+        "ES256", "ES256K", "ES384", "ES512", "EdDSA",
+    ),
+}  # fmt: skip
+
+
+def forged_tokens_for(key: dict[str, object]) -> dict[str, str]:
+    """Every allowed-or-not alg against this key, with and without its kid,
+    plus the header/payload shapes the validator parses before decoding."""
+    kid = key["kid"]
+    tokens: dict[str, str] = {}
+    for alg in FORGED_TOKEN_ALGS:
+        tokens[f"{alg}/kid"] = _forge_token({"alg": alg, "typ": "JWT", "kid": kid})
+        tokens[f"{alg}/no-kid"] = _forge_token({"alg": alg, "typ": "JWT"})
+    odd_headers: dict[str, object] = {
+        "kid-int": {"alg": "RS256", "kid": 5},
+        "kid-list": {"alg": "RS256", "kid": [_SENTINEL]},
+        "kid-object": {"alg": "RS256", "kid": {"x": _SENTINEL}},
+        "alg-list": {"alg": ["RS256"], "kid": kid},
+        "alg-missing": {"kid": kid},
+        "huge-header": {"alg": "RS256", "kid": kid, "x": _SENTINEL * 20_000},
+        "crit-unknown": {"alg": "RS256", "kid": kid, "crit": [_SENTINEL]},
+        "crit-not-list": {"alg": "RS256", "kid": kid, "crit": _SENTINEL},
+        "crit-b64": {"alg": "RS256", "kid": kid, "crit": ["b64"], "b64": False},
+        "jku": {"alg": "RS256", "kid": kid, "jku": f"https://evil/{_SENTINEL}"},
+        "x5u": {"alg": "RS256", "kid": kid, "x5u": f"https://evil/{_SENTINEL}"},
+        "embedded-jwk": {"alg": "RS256", "jwk": key},
+    }
+    for name, header in odd_headers.items():
+        tokens[name] = _forge_token(header)
+    raw_headers = {
+        "header-array": b"[1, 2]",
+        "header-string": b'"RS256"',
+        "header-not-json": b"{" + _SENTINEL.encode(),
+        "header-not-utf8": b"\xff\xfe" + _SENTINEL.encode(),
+        "header-nested": b"[" * 5_000 + b"]" * 5_000,
+        "header-nested-object": b'{"a":' * 3_000 + b"1" + b"}" * 3_000,
+    }
+    for name, raw in raw_headers.items():
+        tokens[name] = _forge_token(raw_header=raw)
+    good_header = json.dumps({"alg": "RS256", "kid": kid}).encode()
+    raw_payloads = {
+        "payload-array": b"[1]",
+        "payload-string": b'"x"',
+        "payload-not-json": _SENTINEL.encode(),
+        "payload-nested": b"[" * 5_000 + b"]" * 5_000,
+    }
+    for name, raw in raw_payloads.items():
+        tokens[name] = _forge_token(raw_header=good_header, raw_payload=raw)
+    tokens["two-segments"] = f"{_SENTINEL}.{_SENTINEL}"
+    tokens["four-segments"] = f"a.b.c.{_SENTINEL}"
+    tokens["bad-base64"] = f"!!!.???.{_SENTINEL}"
+    tokens["empty-segments"] = ".."
+    return tokens
+
+
+@pytest.mark.parametrize("allow_list", sorted(FORGED_TOKEN_ALLOW_LISTS))
+@pytest.mark.parametrize("key_name", [*sorted(FORGED_TOKEN_KEYS), "all"])
+def test_forged_tokens_are_invalid_token_and_value_free(
+    allow_list: str, key_name: str
+) -> None:
+    keys = (
+        list(FORGED_TOKEN_KEYS.values())
+        if key_name == "all"
+        else [FORGED_TOKEN_KEYS[key_name]]
+    )
+    probe_key = keys[0]
+    escaped: list[str] = []
+    leaked: list[str] = []
+    for case, token in forged_tokens_for(probe_key).items():
+        try:
+            validate_resource_server_token(
+                token,
+                issuer="https://issuer.example",
+                audience="https://pmcp.example/mcp",
+                jwks={"keys": keys},
+                allowed_algorithms=FORGED_TOKEN_ALLOW_LISTS[allow_list],
+            )
+        except ResourceServerJWKSUnavailable as exc:
+            escaped.append(f"{case}: JWKS unavailable ({exc})")
+        except ResourceServerAuthError as exc:
+            if exc.error != "invalid_token":
+                escaped.append(f"{case}: error={exc.error}")
+            if _SENTINEL in str(exc) or _SENTINEL in exc.description:
+                leaked.append(case)
+        except Exception as exc:  # noqa: BLE001 -- the assertion target
+            escaped.append(f"{case}: {type(exc).__name__}")
+        else:
+            escaped.append(f"{case}: ACCEPTED")
+
+    assert not escaped, f"forged tokens not mapped to invalid_token: {escaped}"
+    assert not leaked, f"token/key content in the error description: {leaked}"

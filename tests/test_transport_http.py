@@ -17,6 +17,7 @@ def _make_app(
     rate_limit_rpm: int = 0,
     request_timeout: int = 60,
     protected_resource_metadata_url: str | None = None,
+    resource_server_audience: str | None = None,
 ) -> TestClient:
     """Create a TestClient wrapping a minimal create_http_app instance."""
     mcp_server = MagicMock()
@@ -45,6 +46,7 @@ def _make_app(
                 else None
             ),
             declared_scopes=["read"] if protected_resource_metadata_url else None,
+            resource_server_audience=resource_server_audience,
         )
         return TestClient(app, raise_server_exceptions=False)
 
@@ -677,4 +679,90 @@ class TestTimingSafeAuth:
 
         assert len(calls) >= 1, (
             "hmac.compare_digest was not called — timing-safe check missing"
+        )
+
+
+# ---------------------------------------------------------------------------
+# S-10 (see Consiliency/pmcp#231): metadata `resource` is operator-configured,
+# never derived from the request Host
+# ---------------------------------------------------------------------------
+
+
+class TestProtectedResourceMetadataResource:
+    def test_s10_metadata_resource_does_not_reflect_forged_host(self) -> None:
+        client = _make_app(
+            protected_resource_metadata_url=(
+                "https://testserver/.well-known/oauth-protected-resource"
+            ),
+        )
+
+        r = client.get(
+            "/.well-known/oauth-protected-resource",
+            headers={"host": "evil.example"},
+        )
+
+        assert r.status_code == 200
+        resource = r.json()["resource"]
+        assert resource == "https://testserver/mcp", (
+            f"metadata reflected attacker Host: resource={resource!r}"
+        )
+
+    def test_s10_metadata_resource_uses_configured_audience(self) -> None:
+        client = _make_app(
+            protected_resource_metadata_url=(
+                "https://testserver/.well-known/oauth-protected-resource"
+            ),
+            resource_server_audience="https://canonical.example/mcp",
+        )
+
+        r = client.get(
+            "/.well-known/oauth-protected-resource",
+            headers={"host": "evil.example"},
+        )
+
+        assert r.status_code == 200
+        resource = r.json()["resource"]
+        assert resource == "https://canonical.example/mcp", (
+            f"resource did not use the configured audience: resource={resource!r}"
+        )
+
+    def test_s10_metadata_resource_fallback_keeps_ipv6_brackets(self) -> None:
+        client = _make_app(
+            protected_resource_metadata_url=(
+                "https://[2606:4700::1]:8443/.well-known/oauth-protected-resource"
+            ),
+        )
+
+        r = client.get(
+            "/.well-known/oauth-protected-resource",
+            headers={"host": "evil.example"},
+        )
+
+        assert r.status_code == 200
+        resource = r.json()["resource"]
+        assert resource == "https://[2606:4700::1]:8443/mcp", (
+            f"fallback resource wrong: resource={resource!r}"
+        )
+
+    def test_s10_metadata_resource_fallback_drops_default_port_and_prefix(
+        self,
+    ) -> None:
+        # The app routes MCP at `/mcp` and the metadata route at the metadata
+        # URL's literal path, so the fallback is origin + `/mcp`: no path
+        # prefix, and a scheme-default port is dropped (PR review F4).
+        client = _make_app(
+            protected_resource_metadata_url=(
+                "https://gw.example:443/tenant/a/.well-known/oauth-protected-resource"
+            ),
+        )
+
+        r = client.get(
+            "/tenant/a/.well-known/oauth-protected-resource",
+            headers={"host": "evil.example"},
+        )
+
+        assert r.status_code == 200
+        resource = r.json()["resource"]
+        assert resource == "https://gw.example/mcp", (
+            f"fallback resource not canonical: resource={resource!r}"
         )

@@ -170,7 +170,19 @@ signatures are only accepted for the operator-configured
 `resource_server_allowed_algorithms` allowlist (default `RS256`/`ES256`); the
 token's own `alg` header is never trusted. JWKS is fetched
 asynchronously and cached, so validation never blocks the event loop; an
-unreachable JWKS endpoint returns `503` while an invalid token returns `401`.
+unreachable JWKS endpoint, or a key set with no usable keys, returns `503`
+while an invalid token returns `401`. Each JWKS fetch has a 5 s total timeout,
+and a failed fetch opens a 5 s backoff shared by the requests waiting on it. A
+token with an unknown `kid` forces at most one refresh per 10 s; others in that
+window are checked against the cached keys. The `resource` published at
+`/.well-known/oauth-protected-resource` is the configured
+`resource_server_audience`, or, when that is unset, the origin of the configured
+protected-resource metadata URL plus `/mcp`, with a scheme-default port such as
+`:443` dropped. A path prefix in the metadata URL is not carried over, because
+PMCP serves MCP at `/mcp`. If MCP is reachable at a different public URL, set
+`--oauth-audience` to publish it. The `resource` is never taken from the
+request `Host`. A forged token, including one whose algorithm does not match
+the published key's type, gets `401`, never `500`.
 In public auth metadata URLs it rejects hosts written as non-public **IP
 literals** — private, CGNAT, link-local, loopback, multicast, site-local, and
 unspecified — including IPv4 addresses embedded in IPv6 literals and legacy
