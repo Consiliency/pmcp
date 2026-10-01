@@ -415,6 +415,35 @@ def create_http_app(
     def _resource_audience() -> str:
         return resource_server_audience or ""
 
+    def _canonical_resource() -> str:
+        """The resource this gateway publishes in its protected-resource metadata.
+
+        Operator configuration only, never the request (S-10, see
+        Consiliency/pmcp#231): a Host-derived value would advertise whatever Host
+        an attacker sent. ``resource_server_audience`` (the RFC 8707 canonical
+        identifier tokens are validated against) wins; otherwise the origin of
+        the normalized metadata URL. Its ``netloc`` is already userinfo-free and
+        keeps IPv6 brackets (``redact_auth_url``) -- rebuilding from
+        ``hostname``/``port`` would drop the brackets.
+        """
+        if resource_server_audience:
+            return resource_server_audience
+        metadata_url = auth_metadata.protected_resource_metadata_url
+        if metadata_url:
+            parsed_metadata = urlparse(metadata_url)
+            if parsed_metadata.scheme and parsed_metadata.netloc:
+                netloc = parsed_metadata.netloc
+                # Drop a port that is the scheme's default: `:443` names the
+                # same origin as none, so publish the canonical form.
+                default_port = {"https": 443, "http": 80}.get(parsed_metadata.scheme)
+                if default_port is not None and parsed_metadata.port == default_port:
+                    netloc = netloc.rsplit(":", 1)[0]
+                # `/mcp` with no path prefix: this app routes MCP at `/mcp`
+                # and the metadata route at the URL's literal path, so a
+                # prefix in the metadata URL is not a prefix of `/mcp`.
+                return f"{parsed_metadata.scheme}://{netloc}/mcp"
+        return ""
+
     def _auth_headers(
         request: Request | None = None,
         *,
@@ -480,7 +509,7 @@ def create_http_app(
     async def handle_protected_resource_metadata(request: Request) -> Response:
         """Public OAuth protected-resource metadata for this PMCP endpoint."""
         payload: dict[str, object] = {
-            "resource": str(request.url_for("mcp")),
+            "resource": _canonical_resource(),
         }
         if auth_metadata.authorization_server_metadata_url:
             payload["authorization_servers"] = [
