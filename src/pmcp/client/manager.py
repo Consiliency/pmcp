@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import random
 import re
+import unicodedata
 import signal
 import string
 import time
@@ -230,33 +231,62 @@ _PARSE_ERROR = -32700
 _PARSE_ERROR_MESSAGE = "downstream sent a response that could not be parsed"
 _MALFORMED_ERROR_MESSAGE = "downstream sent a malformed JSON-RPC error"
 
-#: JSON's insignificant whitespace, plus a byte-order mark, which `json`
-#: rejects at position 0 ("Unexpected UTF-8 BOM") on an otherwise valid frame.
-_JSON_LEAD = " \t\r\n\ufeff"
+#: Every character that can begin a JSON value (RFC 8259 section 3: object,
+#: array, string, number, `true`/`false`/`null`), plus the `NaN` and
+#: `Infinity` that Python's `json` also accepts.
+_JSON_VALUE_START = frozenset('{["-0123456789tfnNI')
+#: Characters that open a JSON object, array or string: where a frame's
+#: content can begin inside a line.
+_FRAME_OPENERS = ("{", "[", '"')
+_OMITTED = " (rest omitted)"
 
 
-def _is_downstream_output(text: str, error: BaseException) -> bool:
-    """Whether a stdio line the parser rejected is the downstream's own
-    output (a banner, a log line), which is logged as it is -- as opposed to
-    a frame: JSON that is malformed or hits a parser limit, whose content is
-    the downstream's data and is never logged (Consiliency/pmcp#297, rev 8).
-
-    The parser draws the line. It is output only when the parser rejected
-    its very first significant character on syntax, and that character does
-    not open a JSON object or array. Anything that began as JSON -- a syntax
-    error past the first token, or any limit (nesting depth, an integer's
-    digit count) -- is a frame.
-    """
-    body = text.lstrip(_JSON_LEAD)
-    if body[:1] in ("{", "["):
-        return False
-    start = len(text) - len(body)
+def _carries_nothing(char: str) -> bool:
+    """A lead character that shows nothing a reader needs: whitespace (all
+    that `str.strip` removes, including NBSP and U+2028), a control or format
+    character (NUL, ESC, a byte-order mark, ZWSP) or U+FFFD, the replacement
+    for an undecodable byte (a UTF-16/32 BOM, say)."""
     return (
-        getattr(error, "cause", None) == "JSONDecodeError"
-        and getattr(error, "lineno", None) == 1
-        and getattr(error, "colno", None) == start + 1
-        and not text[:start].count("\ufeff")
+        char.isspace() or char == "\ufffd" or unicodedata.category(char) in ("Cc", "Cf")
     )
+
+
+def _significant_start(text: str) -> int:
+    """The index of the line's first character that is not `_carries_nothing`."""
+    for index, char in enumerate(text):
+        if not _carries_nothing(char):
+            return index
+    return len(text)
+
+
+def _is_downstream_output(text: str) -> bool:
+    """Whether a stdio line the parser rejected is the downstream's own
+    output (a banner, a log line), as opposed to a frame, whose content is
+    the downstream's data and is never logged (Consiliency/pmcp#297).
+
+    Decided by where JSON could start, not by where the parser failed (rev 9:
+    an unterminated string fails AT its opening quote): the line is output
+    only if its first significant character cannot begin any JSON value. A
+    banner that starts like a value (`true story`, `-v`, `[INFO]`) is
+    therefore described rather than shown -- the price of never echoing a
+    malformed frame.
+    """
+    start = _significant_start(text)
+    return start == len(text) or text[start] not in _JSON_VALUE_START
+
+
+def _output_text(text: str) -> str:
+    """What is shown of a line that is output: its significant text up to the
+    first character that could open an embedded frame (`{`, `[`, `"`), then a
+    fixed marker. A banner written without a newline before a frame
+    (`ready{...}`), or a frame behind a stray prefix character (`,{...}`,
+    `\x1b[0m{...}`), shows its prefix only. Digits are kept: a port number
+    carries no frame."""
+    body = text[_significant_start(text) :]
+    cuts = [index for index in (body.find(c) for c in _FRAME_OPENERS) if index >= 0]
+    if not cuts:
+        return body.rstrip()
+    return body[: min(cuts)].rstrip() + _OMITTED
 
 
 def _downstream_error(error: Any) -> DownstreamError:
@@ -2906,7 +2936,7 @@ class ClientManager:
             message = load_json(text, source="downstream stdio frame")
         except json.JSONDecodeError as error:
             # Already counted as a heartbeat by the caller.
-            if not _is_downstream_output(text, error):
+            if not _is_downstream_output(text):
                 # A frame the parser rejected -- a syntax error, or a parser
                 # limit (nesting depth, an integer's digit count) on otherwise
                 # valid JSON -- is the downstream's data, not its output:
@@ -2918,9 +2948,7 @@ class ClientManager:
                 return
             # The downstream's own non-protocol output (a banner, a log line),
             # logged as it is by design.
-            logger.debug(
-                f"[{name}] Non-JSON output: {line.decode(errors='replace').strip()}"
-            )
+            logger.debug(f"[{name}] Non-JSON output: {_output_text(text)}")
             return
         except (ValueError, RecursionError) as e:
             # Parses as neither JSON nor a JSONDecodeError: an integer over

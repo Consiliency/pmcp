@@ -38,6 +38,7 @@ import sys
 import textwrap
 import threading
 import typing
+import unicodedata
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -379,33 +380,52 @@ _CLOSE_TIMEOUT = re.compile(
 _NON_JSON_PREFIX = "[frames] Non-JSON output: "
 
 
-def _is_output(line: str) -> bool:
-    """The test's own oracle for "the downstream's output, not a frame"
-    (rev 8): the real parser rejects the line's first significant character
-    on syntax, and that character opens no object or array and follows no
-    byte-order mark. Everything else began as JSON."""
-    body = line.lstrip(" \t\r\n\ufeff")
-    if body[:1] in ("{", "[") or "\ufeff" in line[: len(line) - len(body)]:
-        return False
-    try:
-        json.loads(line)
-    except json.JSONDecodeError as error:
-        return error.pos == len(line) - len(body)
-    except Exception:  # noqa: BLE001 -- a parser limit: it began as JSON
-        return False
+#: The test's own statement of the JSON grammar (RFC 8259 section 3), not
+#: the reader's: a value begins with one of these -- object, array, string,
+#: number, `true`/`false`/`null` -- plus Python's `NaN`/`Infinity`.
+_GRAMMAR_VALUE_START = '{["-0123456789tfnNI'
+#: What opens a container or a string, where frame content can begin.
+_GRAMMAR_OPENERS = '{["'
+
+
+def _first_significant(line: str) -> str:
+    """The first character a reader would see, written independently of the
+    reader: skip whatever `str.isspace` calls space (all `.strip` removes),
+    control and format characters (NUL, ESC, a BOM, ZWSP) and U+FFFD (an
+    undecodable byte)."""
+    for char in line:
+        if not (
+            char.isspace()
+            or char == "\ufffd"
+            or unicodedata.category(char) in ("Cc", "Cf")
+        ):
+            return char
+    return ""
+
+
+def _json_shaped(line: str) -> bool:
+    """Rev 9's rule, from the grammar: a line whose first significant
+    character can begin a JSON value is protocol data, never shown."""
+    return _first_significant(line) in tuple(_GRAMMAR_VALUE_START)
+
+
+def _carries_no_frame(shown: str) -> bool:
+    """A shown text can be exempt only if it holds no character that could
+    open frame content -- whatever the reader decided."""
+    return not any(opener in shown for opener in _GRAMMAR_OPENERS)
     return False
 
 
 def _non_json_line(record: logging.LogRecord) -> bool:
     """Exactly stdio's DEBUG line for a downstream's non-JSON output -- and
-    only for a line that is output by `_is_output` (rev 8): a frame the parser
-    rejected is the downstream's data, and its record is never exempt."""
+    only when what it shows holds no frame-opening character (rev 9): a
+    record that could carry frame content is never exempt."""
     message = record.getMessage()
     return (
         record.name == "pmcp.client.manager"
         and record.levelno == logging.DEBUG
         and message.startswith(_NON_JSON_PREFIX)
-        and _is_output(message[len(_NON_JSON_PREFIX) :])
+        and _carries_no_frame(message[len(_NON_JSON_PREFIX) :])
         and not record.exc_info
     )
 
@@ -715,10 +735,6 @@ def _rejected_frames(s: str) -> list[tuple[str, bytes]]:
             ("\ufeff", "", "bom"),
         ):
             line = prefix + text + suffix
-            # The class is every line that began as JSON; a line the parser
-            # rejects at its first significant character is output.
-            if _is_output(line):
-                continue
             try:
                 json.loads(line)
             except Exception:  # noqa: BLE001 -- any rejection counts
@@ -793,10 +809,198 @@ def test_no_rejected_json_rpc_frame_reaches_the_log(
         r.getMessage() == f"[srv] Non-JSON output: server ready {s}"
         for r in caplog.records[start:]
     )
-    for described_line in (f"[INFO] {s}", f"\ufeffready {s}"):
+    for described_line in (f"[INFO] {s}", f"true {s}"):
         start = len(caplog.records)
         manager._handle_stdout_line(
             "srv", managed, described_line.encode(), time.time()
         )
         text = "\n".join(_record_text(r) for r in caplog.records[start:])
         assert not any(form in text for form in forbidden), (described_line, text)
+
+
+# --- rev 9: where JSON starts, and what a shown line may hold -----------------
+
+#: Lead characters a line can start with before its first significant one:
+#: plain and Unicode whitespace (all of which `.strip` removes), control and
+#: format characters, and the byte-order mark.
+_LEADS = (
+    "",
+    " ",
+    "   ",
+    "\t",
+    "\r",
+    "\x0c",
+    "\x0b",
+    " ",
+    " ",
+    "　",
+    "​",
+    "﻿",
+    "\x00",
+    "\x1b",
+    " ﻿\t",
+)
+#: Prefixes a downstream might write before a whole frame on the same line
+#: (round-8 claude N1), each a different class of first character.
+_FRAME_PREFIXES = (
+    ",",
+    "}",
+    ":",
+    "+",
+    "ready",
+    "ready ",
+    "ready\r",
+    "server ready: ",
+    "\x1b[0m",
+    "[INFO] ",
+    "true ",
+    "42 ",
+)
+
+
+def _line_cases(s: str) -> list[tuple[str, bytes]]:
+    """Lines a stdio downstream could write, each carrying `s` only as JSON
+    content (a string value, after an opener, or where a value begins):
+    - every value-start character followed by the sentinel, and an
+      unterminated string (round-8 codex P1), behind every lead;
+    - a number or literal prefix followed by the sentinel;
+    - every prefix class followed by a whole frame, behind every lead;
+    - the whole frame in UTF-8 with a BOM, UTF-16 and UTF-32 (with and
+      without a BOM, both byte orders), a non-UTF-8 byte before it;
+    - CR-only separation and several frames on one line."""
+    spelled = json.dumps(s)[1:-1]
+    frame = json.dumps({"jsonrpc": "2.0", "id": 7, "result": {"k": s}})
+    out: list[tuple[str, bytes]] = []
+    for lead in _LEADS:
+        tag = repr(lead)
+        for char in _GRAMMAR_VALUE_START:
+            out.append(
+                (f"{tag} value-start {char!r}", (lead + char + spelled).encode())
+            )
+        out.append((f"{tag} unterminated string", (lead + '"' + spelled).encode()))
+        out.append((f"{tag} unterminated key", (lead + '{"' + spelled).encode()))
+        for literal in (
+            "42 ",
+            "-1 ",
+            "0.5",
+            "true ",
+            "false",
+            "null ",
+            "NaN ",
+            "Infinity ",
+        ):
+            out.append(
+                (f"{tag} {literal!r} then data", (lead + literal + spelled).encode())
+            )
+        for prefix in _FRAME_PREFIXES:
+            out.append((f"{tag} {prefix!r} + frame", (lead + prefix + frame).encode()))
+    out.append(("\\xff + frame", b"\xff" + frame.encode()))
+    out.append(("\\xfe\\xff + frame", b"\xfe\xff" + frame.encode()))
+    for codec in (
+        "utf-8-sig",
+        "utf-16",
+        "utf-16-le",
+        "utf-16-be",
+        "utf-32",
+        "utf-32-le",
+        "utf-32-be",
+    ):
+        out.append((f"frame in {codec}", frame.encode(codec)))
+    out.append(("CR-only", ("ready\r" + frame + "\r" + frame).encode()))
+    out.append(("two frames", (frame + frame).encode()))
+    out.append(("two frames, spaced", (frame + " " + frame).encode()))
+    out.append(("frame + trailing banner", (frame + " done").encode()))
+    return out
+
+
+def _stdio_manager() -> tuple[Any, Any]:
+    from unittest.mock import MagicMock
+
+    from pmcp.client.manager import ClientManager, ManagedClient
+    from pmcp.types import ServerStatus, ServerStatusEnum
+
+    return ClientManager(), ManagedClient(
+        config=MagicMock(),
+        process=MagicMock(),
+        status=ServerStatus(name="srv", status=ServerStatusEnum.ONLINE, tool_count=0),
+    )
+
+
+@pytest.mark.parametrize("family", sorted(_FAMILIES))
+def test_no_stdio_line_shows_frame_content(
+    caplog: pytest.LogCaptureFixture, family: str
+) -> None:
+    """Rev 9 (round-8 codex P1 and claude N1): no line a downstream writes
+    shows frame content in the log. The expectation is the grammar's, not
+    the reader's: a line whose first significant character can begin a
+    JSON value is described; any other line is shown only up to its first
+    frame-opening character. No record is exempt from the leak check."""
+    import time
+
+    caplog.set_level(logging.DEBUG)
+    s = _FAMILIES[family][1]
+    forbidden = _forbidden(s) | _forbidden(json.dumps(s)[1:-1])
+    manager, managed = _stdio_manager()
+    cases = _line_cases(s)
+    shaped = 0
+    for label, line in cases:
+        decoded = line.decode("utf-8", "replace")
+        start = len(caplog.records)
+        manager._handle_stdout_line("srv", managed, line, time.time())
+        records = caplog.records[start:]
+        text = "\n".join(_record_text(r) for r in records)
+        # No record exempt: the sentinel, and its NUL-interleaved UTF-16/32
+        # spelling, appear nowhere.
+        flat = text.replace("\x00", "")
+        assert not any(form in text or form in flat for form in forbidden), (
+            label,
+            text[:300],
+        )
+        shown = [
+            r.getMessage()[len("[srv] Non-JSON output: ") :]
+            for r in records
+            if r.getMessage().startswith("[srv] Non-JSON output: ")
+        ]
+        described = any(
+            "sent a JSON-RPC frame that could not be parsed" in r.getMessage()
+            for r in records
+        )
+        try:
+            json.loads(line)
+            parsed = True
+        except Exception:  # noqa: BLE001 -- any rejection
+            parsed = False
+        if parsed:
+            continue  # valid JSON: the dispatcher's business, not this test's
+        if _json_shaped(decoded):
+            shaped += 1
+            assert described and not shown, (label, [r.getMessage() for r in records])
+        else:
+            assert shown and not described, (label, [r.getMessage() for r in records])
+            assert all(_carries_no_frame(text) for text in shown), (label, shown)
+    # No vacuous pass: both sides of the boundary are exercised.
+    assert shaped > 100 and len(cases) - shaped > 20, (shaped, len(cases))
+
+
+def test_a_banner_stays_useful_on_stdio(caplog: pytest.LogCaptureFixture) -> None:
+    """The operator-facing controls: plain output is shown as it is, digits
+    included; a BOM or a control character before it is dropped; a banner
+    before a frame keeps its own text."""
+    import time
+
+    caplog.set_level(logging.DEBUG)
+    manager, managed = _stdio_manager()
+    frame = json.dumps({"jsonrpc": "2.0", "id": 7, "result": {"k": "frame-secret-9x"}})
+    for line, shown in (
+        ("server ready banner-ok-7f3a", "server ready banner-ok-7f3a"),
+        ("listening on port 8080", "listening on port 8080"),
+        ("﻿ready banner-ok-7f3a", "ready banner-ok-7f3a"),
+        ("\x00  ready", "ready"),
+        ("ready banner-ok-7f3a " + frame, "ready banner-ok-7f3a (rest omitted)"),
+        ("warning: value is 'quoted'", "warning: value is 'quoted'"),
+        ('warning: value is "quoted"', "warning: value is (rest omitted)"),
+    ):
+        start = len(caplog.records)
+        manager._handle_stdout_line("srv", managed, line.encode(), time.time())
+        messages = [r.getMessage() for r in caplog.records[start:]]
+        assert messages == [f"[srv] Non-JSON output: {shown}"], (line, messages)
