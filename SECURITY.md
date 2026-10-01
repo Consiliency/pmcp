@@ -38,8 +38,16 @@ PMCP is a local-first MCP gateway. Its default security posture assumes:
   fails closed at startup without an issuer, JWKS URL, and audience, and the
   JWKS URL must be `https` and is rejected when its host is a non-public IP
   literal (see the DNS-name limitation below). JWKS is fetched asynchronously and
-  cached so validation never blocks the event loop; an unreachable JWKS endpoint
-  returns `503` while an invalid or wrong-audience token returns `401`.
+  cached so validation never blocks the event loop; an unreachable JWKS endpoint,
+  or a key set with no usable keys, returns `503` while an invalid or
+  wrong-audience token returns `401`. The fetch is bounded by a total timeout,
+  and a failed refresh is shared across the requests waiting on it through a
+  short backoff, so the last of them waits about one timeout, not one per
+  request. Refreshes forced by an unknown `kid` are limited to one per cooldown
+  window, so an unauthenticated caller cannot drive outbound JWKS fetches. The
+  protected-resource metadata `resource` is likewise operator-configured
+  (`resource_server_audience`, else the configured metadata URL's origin) and
+  never derived from the request Host header.
 - Timing oracle attacks on token comparison (`hmac.compare_digest`)
 - Request floods via per-source-IP sliding-window rate limiting (`--rate-limit`
   / `PMCP_RATE_LIMIT`) on `/mcp`

@@ -6,6 +6,7 @@ through ``GatewayServer`` and the CLI, not just via a direct ``create_http_app``
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -279,3 +280,44 @@ class TestCliWiresAuthParams:
             "https://app.example",
             "https://admin.example",
         ]
+
+
+class TestJWKSWithoutUsableKeys:
+    """A JWKS the issuer serves with no usable key is a 503 key-set-unavailable
+    response, not an uncaught 500 (see Consiliency/pmcp#320). The real
+    AsyncJWKS / validator path runs; only the network fetch is patched."""
+
+    @pytest.mark.parametrize(
+        "jwks_doc",
+        [
+            {"keys": []},
+            {"keys": [{"kty": "RSA", "kid": "malformed-key-kid"}]},
+        ],
+        ids=["empty", "malformed_only"],
+    )
+    def test_jwks_no_usable_keys_is_503_value_free(
+        self, jwks_doc: dict[str, object], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        token, _ = _signed_token()
+        client = _resource_server_client()
+
+        with (
+            caplog.at_level(logging.DEBUG),
+            patch(
+                "pmcp.transport.http.AsyncJWKS._fetch",
+                new=AsyncMock(return_value=jwks_doc),
+            ),
+        ):
+            response = client.post(
+                "/mcp",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"jsonrpc": "2.0", "method": "notifications/initialized"},
+            )
+
+        assert response.status_code == 503
+        assert 'error="temporarily_unavailable"' in response.headers.get(
+            "www-authenticate", ""
+        )
+        rendered = "\n".join([response.text, str(dict(response.headers)), caplog.text])
+        for leak in ("malformed-key-kid", '"kty"', token):
+            assert leak not in rendered

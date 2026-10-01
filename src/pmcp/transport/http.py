@@ -404,6 +404,26 @@ def create_http_app(
     def _resource_audience() -> str:
         return resource_server_audience or ""
 
+    def _canonical_resource() -> str:
+        """The resource this gateway publishes in its protected-resource metadata.
+
+        Operator configuration only, never the request (S-10, see
+        Consiliency/pmcp#231): a Host-derived value would advertise whatever Host
+        an attacker sent. ``resource_server_audience`` (the RFC 8707 canonical
+        identifier tokens are validated against) wins; otherwise the origin of
+        the normalized metadata URL. Its ``netloc`` is already userinfo-free and
+        keeps IPv6 brackets (``redact_auth_url``) -- rebuilding from
+        ``hostname``/``port`` would drop the brackets.
+        """
+        if resource_server_audience:
+            return resource_server_audience
+        metadata_url = auth_metadata.protected_resource_metadata_url
+        if metadata_url:
+            parsed_metadata = urlparse(metadata_url)
+            if parsed_metadata.scheme and parsed_metadata.netloc:
+                return f"{parsed_metadata.scheme}://{parsed_metadata.netloc}/mcp"
+        return ""
+
     def _auth_headers(
         request: Request | None = None,
         *,
@@ -469,7 +489,7 @@ def create_http_app(
     async def handle_protected_resource_metadata(request: Request) -> Response:
         """Public OAuth protected-resource metadata for this PMCP endpoint."""
         payload: dict[str, object] = {
-            "resource": str(request.url_for("mcp")),
+            "resource": _canonical_resource(),
         }
         if auth_metadata.authorization_server_metadata_url:
             payload["authorization_servers"] = [
