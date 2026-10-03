@@ -1096,9 +1096,9 @@ async def test_a_wrapped_handler_keeps_the_wire_code(family: str) -> None:
 
     async def mcp_data_carries() -> None:
         error = invalid()
-        raise MCPError(
-            -32602, "bad input", {"input": error.errors()[0]["input"]}
-        ) from error
+        # The value alone, though the rejected input was `{"v": <s>}`: a
+        # string inside a container input is matched too (rev 13).
+        raise MCPError(-32602, "bad input", {"input": s}) from error
 
     async def mcp_partial_message() -> None:
         error = invalid()
