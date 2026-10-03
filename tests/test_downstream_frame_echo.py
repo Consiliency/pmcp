@@ -1528,6 +1528,10 @@ async def test_no_malformed_envelope_reaches_its_waiting_caller(
         assert not any(f in text for f in forbidden), (consumer, label, text[:600])
         shown = _windows(malformed.decode()) & (_windows(text))
         assert not shown, (consumer, label, sorted(shown)[:3])
+        # A part of the value: `describe_exception` elides a long message to
+        # its two ends, which the whole-value forms above do not match.
+        part = _windows(s, 8) & _windows(text, 8)
+        assert not part, (consumer, label, sorted(part)[:3])
         # The valid reply answered the caller: the malformed frame did not.
         assert "Error" not in outcome.split(":")[0], (consumer, label, outcome)
 
