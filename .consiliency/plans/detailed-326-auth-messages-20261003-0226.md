@@ -32,6 +32,22 @@
 > `raise <name>`, and refuses any name with a binding other than one plain
 > assignment; the log test is behavioural. All numbers re-measured on the
 > round-3 spike.
+>
+> **Round 4** (after the round-3 panel; claude DISAGREE, codex 3 blocking):
+> four more shapes beat the static collector -- a subclass whose message is a
+> class constant or a `self.` attribute, a `+=` on a constructor parameter, a
+> comprehension walrus that rebinds the enclosing name, and an alias resolved
+> in the wrong scope. This was the fourth round in which a collector was
+> beaten, so round 4 **changes the design so the bad state cannot exist**:
+> every fixed operator-facing text lives in one registry, `pmcp.auth.
+> AuthMessage`, and the code cannot pass anything else -- the auth error
+> classes and the 401/403/503 response helper raise `TypeError` for a
+> non-member, and a syntax-only check (no resolver) requires every raise and
+> `_reject` site to name `AuthMessage.<NAME>`. The resolver, scope walker,
+> exemption multiset and pins are gone (Design decision 2). Logs are checked
+> end to end (claude N3). All numbers below are re-measured on the round-4
+> spike, which now changes source in `auth.py` and `transport/http.py` beyond
+> the four rewordings.
 
 ## Task
 
@@ -104,7 +120,7 @@ Measured by reading every sink, because round 1 disagreed on it:
 | `describe_exception(exc)` (used by `ClientManager`, `cli.py`, tool handlers for `last_error`, warnings, CLI output) | the whole exception text | `manager.py:111` and callers |
 | CLI and `doctor` output | the values interpolated through `sanitize_auth_diagnostic(...)` at each call site | `cli.py:1050-1520`, `cli_commands/doctor.py:66, 87` |
 | `policy.py` output | `redact_additive` on its result | `policy.py:794-799` |
-| **log records** | **nothing as a whole.** Measured behaviourally (round 3): the real `setup_logging` in `text` and `json` mode installs two handlers (stderr and a `RotatingFileHandler`), and each of the 16 pinned log templates, rendered with sample args, comes out of each handler's filters and formatter verbatim. `pmcp logs` (`cli.py:1575`) prints the file raw. A log line is redacted only where its call site sanitises an interpolated value. | — |
+| **log records** | **nothing as a whole.** Measured end to end (round 4, claude N3): the real `setup_logging` in `text` and `json` mode, every one of the 16 log templates logged through the real `pmcp.transport.http` logger, and the text that reached stderr and the rotating log file read back -- each template appears verbatim. That covers a filter, a record factory, a formatter and a handler's own `emit()`. `pmcp logs` (`cli.py:1575`) prints the file raw. A log line is redacted only where its call site sanitises an interpolated value. | — |
 
 So the claude seat was right that pmcp never sanitises a log record, and
 codex's `Streamable-HTTP session [REDACTED] started` is what the text becomes
@@ -119,64 +135,17 @@ Raised `ValueError`s from `create_http_app` and `auth.py` reach an operator
 through `describe_exception` (sanitised) or a traceback (raw); they are
 checked as if sanitised, the conservative choice.
 
-### The class, derived from the code
+### The class: every fixed message, and why a collector could not hold it
 
-The walk (`_Walk` in the test module) reads `auth.py` and `transport/http.py`
-with the imported module's globals as its namespace:
-- **Message calls, discovered at test time (round 3):** every call whose
-  callee resolves -- directly, through an attribute chain, or through an
-  alias assigned once -- to an exception class (builtin, imported, or a class
-  defined in the walked module), plus the two response calls `_reject`
-  (arg 1 or `body=`) and `Response` (arg 0 or `content=`). Message position:
-  `_KNOWN_SPECS` for the three classes that do not take it first
-  (`ResourceServerAuthError` arg 1 / `description=`,
-  `ResourceServerJWKSUnavailable` arg 0 / `description=`, urllib's
-  `HTTPError` arg 2 / `msg=`), arg 0 for a class that does not override
-  `__init__`, and for a class defined in the module the parameter its
-  `__init__` passes to `super().__init__`. An imported class that overrides
-  `__init__` without a known spec is unclassified. Positional **and**
-  keyword arguments are read.
-- **`super().__init__(...)` inside an exception subclass** is a message call
-  at the base class's position (round 3, claude F2b). A pass-through (an
-  `__init__` parameter, or `self.<attr>`) is not a message -- the
-  constructor's callers are collected instead; a class whose `__init__`
-  passes a literal is "message-carried", so `raise _TokenRejected()` is
-  neither unrendered nor unclassified, and its text is checked at the
-  `super().__init__` call. A subclass whose `__init__` never calls super is
-  unclassified.
-- **Every `raise`:** `raise <Call>` must be an exception call; `raise <name>`
-  is either a re-raise of a name bound only by an `except ... as name`, or
-  resolves to its one constructing assignment, whose call must be an
-  exception call (round 3, codex). Anything else -- an unknown callee, a
-  parameter, an attribute -- is unclassified and fails.
-- **Logger calls:** `logger|log|logging.<level>(msg, ...)`, positional or
-  `msg=`; collected as templates and pinned (see the sinks section).
-- **Rendering:** string constants; f-strings; `+`; `%` with a constant
-  template; `.format` with a constant template; and a name. **A name is
-  resolved only if, in the innermost scope that binds it, its only binding is
-  one plain `x = ...` or `x: T = ...` (round 3).** Any other binding --
-  `+=`, a parameter, a `for`/`with` target, `:=`, tuple unpacking,
-  `global`/`nonlocal`, an import, an `except` name, a second assignment --
-  makes it unrenderable, so the walk refuses rather than renders a guess.
-  Holes filled from config (`{self.url}`, `" ".join(missing_scopes)`) take a
-  sample from `_HOLE_SAMPLES`.
-- **Fail-closed:** everything the walk cannot render is recorded as (module,
-  function, source) and must equal a reviewed exemption list, as a multiset.
-  On the spike it is seven entries: `str(exc)` in
-  `validate_resource_server_token` (pyjwt's text, checked by the pyjwt half);
-  `body` in `_reject` (its callers' literals are collected);
-  `_generate_latest()` and `'\n'.join(lines) + '\n'` in `handle_metrics`
-  (Prometheus exposition); and three body-less responses in `handle_mcp`
-  (`Response(status_code=202)` and two `_NullResponse()`s -- a `Response`
-  subclass, which the round-3 discovery now sees).
-- **Pinned:** the derived (module, text) multiset must equal `_PINNED_FIXED`
-  exactly (39 texts), and the log templates `_PINNED_LOGS` (16).
-
-pyjwt's own texts are generated from pyjwt itself for every class in
-`_FIXED_TEXT_CLAIM_ERRORS` (`auth.py:585`), whose text pmcp keeps verbatim:
-9 texts. Round 2 adds to the walk `auth.py`'s own `ValueError`s (5 URL texts),
-`HTTPError`'s `Redirects are not allowed.`, and the round-2 startup text; all
-pass. **On main, 4 texts are rewritten**, and 3 of them predate #325:
+On main the operator-facing texts in `auth.py` and `transport/http.py` are
+string literals and f-strings at 29 sites: 15 `ResourceServerAuthError` /
+`ResourceServerJWKSUnavailable` descriptions (7 of them with a `{self.url}`
+and one with `+ " ".join(missing_scopes)`), 8 startup or URL-validation
+`ValueError`s, urllib's `HTTPError("Redirects are not allowed.")`, and the
+`_reject` bodies `Unauthorized` / `Forbidden` / `Service Unavailable`. pyjwt's
+own text is kept verbatim for the classes in `_FIXED_TEXT_CLAIM_ERRORS`
+(9 texts, generated from pyjwt). **On main, 4 texts are rewritten**, 3 of them
+predating #325:
 
 | Site (main) | Text | Rewritten by | Comes out as |
 |---|---|---|---|
@@ -185,19 +154,17 @@ pass. **On main, 4 texts are rewritten**, and 3 of them predate #325:
 | `auth.py:649` | `Unsupported token algorithm.` | base keyword rule | `Unsupported token [REDACTED]` |
 | `http.py:316` | `shared-secret auth mode requires auth_token.` | base keyword rule (`secret <word>`) | `shared-secret [REDACTED] mode requires auth_token.` |
 
-The additive layer rewrites none of them. Its own comments exclude `Missing
-bearer token` and a challenge's parameters (`redaction_additive.py:646-660`),
-but the base rules run first. Every other text, including all 9 pyjwt texts
-(`Token is missing the "iss" claim`, `The token is not yet valid (nbf)`, …),
-passes both layers unchanged. The walk finds no other mangled message in any
-shape (the claude seat's independent walk of every string literal in both
-modules agrees: the only other rewritten literals are the log lines above
-and the in-memory `f"Bearer {auth_token}"` comparison value).
+The additive layer rewrites none of them; every other text, and all 9 pyjwt
+texts, pass both layers unchanged.
 
-Not walked, and measured clean by the round-1 claude seat:
-`normalize_auth_metadata`'s `"<field> ignored: …"` / `"… is relayed
-unverified: …"` diagnostics for all five field names, and
-`UNVERIFIED_URL_CAVEAT`.
+Rounds 1–3 kept the texts inline and tried to *derive* them from the code by
+static analysis. Each round, a reviewer wrote a shape the analysis read
+wrongly: a keyword argument, a variable, a `%` template, a non-`ValueError`
+refusal (round 1); `+=`, a raise by name, an alias, a subclass's
+`super().__init__` (round 2); a subclass class constant or `self.` attribute,
+a `+=` on a parameter, a comprehension walrus, an alias resolved in the
+wrong scope (round 3). An analyser that must model Python's binding rules
+fails open on the next shape. Round 4 removes the need to model them.
 
 ### `WWW-Authenticate`, measured through the app
 
@@ -280,7 +247,8 @@ URL the proxy turns into a 404, so OAuth discovery fails.
 | `auth.py:649` | `The token's algorithm is not supported.` | `Token algorithm not supported.` is still mangled (measured); the possessive is not |
 | `http.py:316` | `auth_token is required when auth_mode is shared-secret.` | `Shared-secret auth needs auth_token.` and `... for shared-secret auth.` are both mangled (measured); `secret` must end the sentence |
 
-Each change carries a one-line comment naming the rule that bit it. **Not
+Round 4: the four texts are registry members, with one comment in the
+registry naming the rule that bit each one. **Not
 changing the sanitiser** is deliberate. Making the base keyword or `Bearer`
 rule spare these words would loosen a credential rule (the fail-open
 direction), and the base rules are frozen (#234 additive-only). The texts
@@ -291,71 +259,67 @@ over `tests src *.md`). The only hit, `tests/test_redaction_additive.py:82`,
 is corpus prose that contains the words "Missing bearer token". None of the
 four reaches the wire, so no client sees a change.
 
-### 2. The class test is a fail-closed walk with an exact pin
+### 2. One registry; the code cannot pass anything else (round 4)
 
-Round 1's walk failed open: it could not see a keyword argument, a variable,
-a `%`/`.format` template or a non-`ValueError` startup refusal, and the
-`>= 28` floor hid the count dropping from 80 to 78. The round-2 walk
-(Research summary) fixes that as a class:
-- **positional and keyword** message arguments, for every message call;
-- **every `raise`** of a call is classified or fails
-  (`test_every_raised_callee_is_classified`);
-- **templates and single-assignment names are rendered**; anything else is
-  recorded, and the recorded set must equal the reviewed exemptions as a
-  multiset (`test_every_message_the_walk_cannot_render_is_reviewed`) -- a
-  second unrenderable message in a function that already has an exempt one
-  is caught;
-- **exact pins** for the derived texts and the log templates
-  (`test_the_derived_set_is_exactly_the_pinned_set`,
-  `test_the_log_templates_are_exactly_the_pinned_set`), with the comparison
-  itself tested (`test_the_pin_and_the_exemptions_are_exact_not_floors`);
-- **every shape from round 1 is a regression test** on a synthetic module
-  (`test_the_walk_renders_every_message_shape[keyword|variable|percent|format|runtime_error]`,
-  each carrying a text the sanitiser really rewrites), plus
-  `test_the_walk_fails_closed_on_what_it_cannot_render` (an f-string with an
-  unknown hole, an opaque call, an unknown exception class, a log line);
-- `test_every_kept_pyjwt_class_has_a_producer` fails when a class is added
-  to `_FIXED_TEXT_CLAIM_ERRORS` without a generator.
+**Decision:** every fixed operator-facing text in `auth.py` and
+`transport/http.py` becomes a member of one registry, `pmcp.auth.AuthMessage`
+(29 members), and the paths that carry them accept only members.
 
-**Round 3 closes the shapes the round-2 panel found, as classes, not
-instances:**
-- **Which calls are messages** is no longer a hand-written table of names: it
-  is every call that resolves to an exception class at test time (aliases,
-  attribute chains and module-defined subclasses included), so `raise
-  LookupError(...)`, `_Err = ResourceServerAuthError` and a new subclass are
-  all seen without anyone listing them.
-- **Where a subclass keeps its message** is followed into `super().__init__`.
-  Claude's trap -- registering `_TokenRejected` leaves a message-less
-  `_TokenRejected()` call that an exemption would then hide for good -- cannot
-  happen: the class is classified as message-carried and its literal is
-  checked at the super call; nothing needs exempting.
-- **`raise <name>`** resolves to its one constructing assignment or fails.
-- **The resolver refuses rather than guesses.** It renders a name only when
-  the innermost binding scope has exactly one plain assignment of it.
-  Round 2's resolver took the first `Assign` it found, so `message = "Empty
-  token."` followed by `message += " Token expired."` rendered as `Empty
-  token.` -- the pin showed that text, and a developer updating the pin got a
-  green test while the stored text was `Empty token. Token [REDACTED]`.
-- Regression tests on synthetic modules:
-  `test_the_walk_renders_every_message_shape` (8: the five round-1 shapes plus
-  `raise_name`, `alias`, `subclass_super`),
-  `test_the_walk_refuses_a_name_it_cannot_resolve_exactly` (8: `augmented`,
-  `for_target`, `walrus`, `unpacked`, `with_target`,
-  `parameter_shadows_module`, `global`, `reassigned`),
-  `test_the_walk_reports_every_raise_it_cannot_classify` (5:
-  `unknown_callee`, `unresolved_name`, `built_by_unknown`, `attribute`,
-  `subclass_without_super`) and
-  `test_re_raising_a_caught_exception_is_not_a_message`.
+- **`AuthText(str)`** is the member type; members exist only as `AuthMessage`
+  attributes. Being a `str` subclass, a member works unchanged wherever a
+  string did (`ValueError(AuthMessage.X)` prints the text).
+- **Runtime-valued messages stay in the registry as templates.** Seven JWKS
+  texts carry the configured JWKS URL and one carries the missing scope
+  names, which are runtime values. They are members with `{url}` /
+  `{scopes}` placeholders, filled by the constructor
+  (`ResourceServerJWKSUnavailable(AuthMessage.JWKS_FETCH_FAILED,
+  url=self.url)`), so the fixed words are still checked; only configuration
+  is interpolated. No message needed to leave the registry for this.
+- **One narrow pass-through:** `pyjwt_text(exc)` returns a `PyJwtText` only
+  for an instance of `_FIXED_TEXT_CLAIM_ERRORS`, and `TypeError` otherwise
+  (`auth.py:676`'s `str(exc)` becomes `pyjwt_text(exc)`). The pyjwt half of
+  the tests keeps generating and checking those 9 texts.
+- **The constructors refuse anything else, always.**
+  `ResourceServerAuthError.__init__` renders through
+  `render_auth_message(description, **fields)`, which raises `TypeError` for
+  anything that is not an `AuthText` or `PyJwtText`; `ResourceServerJWKSUnavailable`
+  passes through it; `_reject` now calls a module-level `_auth_response`,
+  which raises `TypeError` for a non-member body. A subclass cannot avoid
+  it: whatever it passes to `super().__init__` -- a class constant, a
+  `self.` attribute, a `+=`-built parameter -- arrives at the same check.
+  **Always on, not test-only:** these are internal APIs with a handful of
+  call sites, the check is one `isinstance` per error, and a test-only check
+  would let a production-only code path (an error raised under load, say)
+  carry a mangled text unseen.
+- **A syntax-only static check covers sites no test reaches.** In `auth.py`
+  and `transport/http.py`:
+  - every `raise` is bare, a re-raise of an `except ... as` name, or a call
+    of `ResourceServerAuthError`, `ResourceServerJWKSUnavailable`,
+    `ValueError` or `HTTPError` (plus `TypeError` inside the three guard
+    functions only);
+  - the message argument of those calls and of every `_reject` /
+    `_auth_response` call is **literally** `AuthMessage.<NAME>` for an
+    existing member (or `pyjwt_text(<name>)` for `ResourceServerAuthError`);
+  - the error code of `ResourceServerAuthError` is one of the three RFC 6750
+    codes;
+  - no class in the two modules subclasses an exception other than the two
+    auth error classes;
+  - `AuthText(...)` / `PyJwtText(...)` are built only inside the registry and
+    `pyjwt_text`.
 
-Pinning texts means a PR that adds or rewords a message in these two files
-updates `_PINNED_FIXED` (or `_PINNED_LOGS`). That is deliberate: it is the
-one-line review step that makes the derivation unable to shrink silently.
-Line numbers are never pinned.
+  The check reads syntax only -- no name resolution, no scopes -- so a
+  walrus, an alias, an augmented assignment or a subclass constant is simply
+  "not `AuthMessage.<NAME>`" and fails. `test_the_site_check_sees_every_site`
+  pins that it visits all 31 raises and 7 `_reject` calls.
+- **What went away:** the resolver, the scope walker, the exemption multiset,
+  the derived-text and log-template pins, and the K-family of collector
+  mutants. There is nothing to derive: the registry *is* the list.
 
-Every text is checked against all three of `_sanitize_base`,
-`redact_additive` and the composed `sanitize_auth_diagnostic`, and every
-stored auth description is built through `ResourceServerAuthError` and
-compared, end to end.
+**Why not keep the collector and add rules for the four new shapes:** each
+rule would close one shape and leave Python's binding rules to the next
+reviewer. Construction-time refusal holds for any shape that reaches a
+constructor, and the static check is a pattern match that does not need to
+understand what a shape means.
 
 ### 3. `WWW-Authenticate`: parameters, not the whole header
 
@@ -457,51 +421,75 @@ embedders, and the working configuration uses `resource_server_audience`
 
 ## Changes
 
-The spike diff (unchanged since round 2; round 3 changes only the test
-module) is 3 files, 47 insertions and 9 deletions: `auth.py`
-13 lines, `transport/http.py` 14 lines and `README.md` 29 lines. It also
-adds a new test module.
+The round-4 spike diff is 6 files, 240 insertions and 62 deletions:
+`auth.py` 201 lines (the registry is most of it), `transport/http.py` 48 and
+`README.md` 29 (unchanged since round 2) and three existing test files
+(15 lines). It also adds a new test module.
 
 ### `src/pmcp/auth.py` (modify)
-- `_decode_with_key` (`auth.py:628-630`): the new 401 text, with a comment.
-- `validate_resource_server_token` (`auth.py:644`): `"Empty token."`, with a
-  comment.
-- the same function (`auth.py:649-651`): `"The token's algorithm is not
-  supported."`, with a comment.
+- After the imports: `AuthText(str)`, `PyJwtText(str)`, the registry
+  `AuthMessage` (29 members, with a comment on the four rewordings),
+  `auth_messages()`, `pyjwt_text(exc)` and `render_auth_message(message,
+  **fields)` (Design decision 2).
+- `ResourceServerAuthError.__init__(error, description, **fields)` renders
+  through `render_auth_message` (a `TypeError` for a non-member), then
+  sanitises as before; `ResourceServerJWKSUnavailable(description, **fields)`.
+- Every raise site: the literal or f-string becomes `AuthMessage.<NAME>`
+  (with `url=self.url` / `scopes=" ".join(missing_scopes)` where it had
+  them); `str(exc)` becomes `pyjwt_text(exc)`; `HTTPError`'s message and the
+  five URL-validation `ValueError`s use members. The four reworded texts are
+  members `KEY_CANNOT_VERIFY_TOKEN`, `EMPTY_TOKEN`,
+  `TOKEN_ALGORITHM_UNSUPPORTED` and (in http.py's use)
+  `SHARED_SECRET_NEEDS_TOKEN`.
 
 ### `src/pmcp/transport/http.py` (modify)
-- `create_http_app` (`http.py:316`): the shared-secret refusal reworded, with
-  a comment.
-- `create_http_app` metadata-route block (`http.py:740-750`): the startup check
-  of Design decision 5, with a comment; its text names
-  `resource_server_audience` and `protected_resource_metadata_url`.
+- Import `AuthMessage`, `AuthText`. New module-level `_auth_response(status,
+  body, headers)` refuses a non-member body; the `_reject` closure keeps its
+  metric and calls it.
+- The four startup `ValueError`s, the `RS_JWKS_NOT_CONFIGURED` description
+  and the seven `_reject` bodies use members.
+- The metadata-route startup check of Design decision 5 (unchanged since
+  round 2, now `ValueError(AuthMessage.METADATA_NEEDS_RESOURCE)`).
 
 ### `README.md` (modify)
 - The `resource` paragraph (`README.md:177-184`): rewritten into two
   paragraphs (CLI, then embedding applications) as described in Design
   decision 4 (verbatim below).
 
+### `tests/test_auth.py`, `tests/test_http_transport.py`, `tests/test_scoped_advisor_audit.py` (modify)
+Measured by the full suite, not foreseen: these construct the auth errors
+with plain strings, which the always-on check now refuses (28 failures in
+the first full run: 2 in `test_http_transport.py`, 26 parametrized cases in
+`test_scoped_advisor_audit.py`). Each site now passes a member:
+- `test_auth.py`: four fake `_fetch`es raise
+  `ResourceServerJWKSUnavailable(AuthMessage.JWKS_FETCH_FAILED, url=...)`.
+  They passed even with plain strings, because `AsyncJWKS.get` re-wraps any
+  other exception as `JWKS_FETCH_FAILED` -- so a `TypeError` there was
+  silently absorbed; with members they test what they say again.
+- `test_http_transport.py`: the 403 and 503 contract tests use
+  `AuthMessage.MISSING_SCOPES, scopes="write"` and `JWKS_FETCH_FAILED`.
+- `test_scoped_advisor_audit.py`: `_EXCEPTION_ARGS` gives both auth error
+  classes member arguments (it instantiates every exception class `src/pmcp`
+  raises).
+
 ### `tests/test_auth_operator_messages.py` (create)
-117 tests on 3.10 (about 0.3–1.0 s), no network, no timed sleeps:
+123 tests on 3.10 (about 0.3 s), no network, no timed sleeps:
 
 | Test | Count | Pins |
 |---|---|---|
-| `test_every_fixed_message_survives_the_sanitiser[<module>:<line>]` | 39 | the class: each derived text through base, additive and composed |
-| `test_a_stored_description_is_the_text_written[...]` | 16 | the end-to-end `.description` for each distinct auth-error description (the `{self.url}` texts with the sample URL filled in) |
-| `test_the_derived_set_is_exactly_the_pinned_set`, `test_the_log_templates_are_exactly_the_pinned_set`, `test_the_pin_and_the_exemptions_are_exact_not_floors` | 3 | exact pins, as multisets |
-| `test_every_message_the_walk_cannot_render_is_reviewed`, `test_every_raised_callee_is_classified` | 2 | fail-closed walk |
-| `test_the_walk_renders_every_message_shape[...]`, `test_the_walk_refuses_a_name_it_cannot_resolve_exactly[...]`, `test_the_walk_reports_every_raise_it_cannot_classify[...]`, `test_re_raising_a_caught_exception_is_not_a_message`, `test_the_walk_fails_closed_on_what_it_cannot_render` | 8 + 8 + 5 + 1 + 1 | the shapes of rounds 1 and 2, on synthetic modules |
-| `test_no_log_sink_applies_the_sanitiser[text, json]` | 2 | behavioural: the real `setup_logging`, every handler, every pinned template verbatim |
-| `test_no_redacting_log_hook_in_the_source` | 1 | supplement: no `addFilter`/`logging.Filter`/`setLogRecordFactory` |
+| `test_the_registry_is_complete_and_typed` | 1 | 29 distinct `AuthText` members |
+| `test_every_registry_message_survives_the_sanitiser[NAME]` | 29 | each member, rendered with sample `url`/`scopes`, through base, additive and composed |
+| `test_a_stored_description_is_the_text_written[NAME]` | 29 | end to end through `ResourceServerAuthError` |
+| `test_a_message_outside_the_registry_is_refused_at_construction[shape]` | 12 | `TypeError` for: literal, keyword, `%`, `.format`, f-string, `JWKSUnavailable(str)`, a plain-`str` copy of a member, and round 3's class constant, `self.` attribute, `+=` parameter, comprehension walrus and shadowed alias |
+| `test_an_auth_response_body_outside_the_registry_is_refused`, `test_the_pyjwt_pass_through_is_narrow` | 2 | the other two guards |
+| `test_every_message_site_names_a_registry_member`, `test_the_site_check_sees_every_site`, `test_auth_text_is_built_only_in_the_registry` | 3 | the static check on the real modules |
+| `test_the_site_check_refuses_every_shape[shape]` | 12 | the static check on the rounds 1–3 shapes as source |
+| `test_the_log_templates_are_collected`, `test_no_log_sink_applies_the_sanitiser[text, json]`, `test_no_redacting_log_hook_in_the_source` | 1 + 2 + 1 | logs, end to end |
 | `test_every_kept_pyjwt_class_has_a_producer`, `test_every_kept_pyjwt_text_survives_the_sanitiser[...]` | 1 + 9 | pyjwt's kept texts |
 | `test_the_challenges_cover_401_403_503`, `test_challenge_parameters_survive_the_sanitiser[...]`, `test_pmcp_reads_its_own_challenge_back[...]` | 1 + 8 + 8 | `WWW-Authenticate` |
 | `test_the_whole_header_is_redacted_by_the_base_bearer_rule_by_design` | 1 | the deliberate exception |
 | `test_metadata_route_refuses_to_start_without_a_canonical_resource` | 1 | Design decision 5 |
-| `test_readme_prefixed_metadata_url_404s_behind_a_stripping_proxy` (404 stripped, 200 literal), `test_readme_rfc9728_form_with_audience_serves_the_public_resource` | 2 | the README's claims |
-
-The f-string texts are checked with the sample URL filled in. The URL rule
-leaves a clean URL unchanged, so a mangled result can only come from the
-fixed words around it.
+| `test_readme_prefixed_metadata_url_404s_behind_a_stripping_proxy`, `test_readme_rfc9728_form_with_audience_serves_the_public_resource` | 2 | the README's claims |
 
 ## Documentation impact
 
@@ -550,11 +538,12 @@ Apply *Verbatim bodies*: `git apply` both patches, write the test module, and
 add the CHANGELOG bullet by hand. Then:
 
 ```bash
-# 1. the new module (round-3 spike: 117 passed, ~0.3-1.0 s)
+# 1. the new module (round-4 spike: 123 passed, ~0.3 s)
 uv run pytest tests/test_auth_operator_messages.py --cov-fail-under=0 -p no:cacheprovider -q
-# 2. the suites that touch auth, the HTTP transport and the redactor (round-3 spike: 663 passed, 55 deselected, 0 failed, 61 s)
+# 2. the suites that touch auth, the HTTP transport and the redactor (round-4 spike: 877 passed, 55 deselected, 0 failed, 103 s)
 uv run pytest tests/test_auth.py tests/test_transport_http.py tests/test_auth_origin_wiring.py \
   tests/test_redaction_additive.py tests/test_auth_operator_messages.py tests/test_cli.py tests/test_server.py \
+  tests/test_http_transport.py tests/test_scoped_advisor_audit.py \
   --cov-fail-under=0 -p no:cacheprovider -q
 # 3. CI gates (spike: all clean)
 uv run ruff check src tests && uv run ruff format --check src tests
@@ -563,53 +552,41 @@ python3 scripts/check_security_claims.py          # expect OK, 129 cited node id
 python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-326-auth-messages-20261003-0226.md
 #   measured on this file: "consistent ... blocking inconsistencies: 0", exit 0 (a detailed plan has no roadmap pin)
 # 4. the full suite: once, detached, with a notifying waiter (memory on dev0 is shared)
-#    (round-3 spike, run alone: 5046 passed, 3 skipped, 80 deselected, 0 failed, 579 s)
+#    (round-4 spike, run alone: 5052 passed, 3 skipped, 80 deselected, 0 failed, 585 s;
+#     the first run, before the three existing test files were moved onto
+#     members, had 28 failures -- see Changes)
 nohup uv run pytest -q -p no:cacheprovider > "$WORKTREE_ROOT/pmcp-326-full.log" 2>&1 &
 ```
 
-**Red on main.** The module against `89559db`'s `auth.py` and `http.py`
-(README is not imported): **9 failed, 107 passed** (the derivation finds no
-metadata startup text on main, so one fewer case). The ids below are main's
-line numbers (`auth.py:628`). The mutation table uses the spike's
-(`auth.py:631`), because the comments the patch adds move the lines. Both are
-correct for their tree.
-
-| Test | First assertion on main |
-|---|---|
-| `test_every_fixed_message_survives_the_sanitiser[auth.py:628]` | `'Token could not be verified with the published key.' is rewritten: {'base': 'Token [REDACTED] not be verified…', 'composed': …}` |
-| `…[auth.py:644]` | `'Missing bearer token.' is rewritten: {'base': 'Missing bearer [REDACTED]', …}` |
-| `…[auth.py:649]` | `'Unsupported token algorithm.' is rewritten: {'base': 'Unsupported token [REDACTED]', …}` |
-| `…[http.py:316]` | `'shared-secret auth mode requires auth_token.' is rewritten: {'base': 'shared-secret [REDACTED] mode requires auth_token.', …}` |
-| `test_a_stored_description_is_the_text_written` ×3 | e.g. `assert 'Token [REDAC...ublished key.' == 'Token could ...ublished key.'` |
-| `test_the_derived_set_is_exactly_the_pinned_set` | `new: [('auth.py', 'Missing bearer token.'), …]; gone: […]` (main's four texts against the pin) |
-| `test_metadata_route_refuses_to_start_without_a_canonical_resource` | `DID NOT RAISE ValueError` (main serves `200 {"resource": ""}`) |
-
-The README tests, the challenge tests, the pyjwt tests, the walk's own
-guards and the log tests **pass on main**. That is by design: they pin
-behaviour this plan keeps, and the mutants below show each can fail.
+**Red on main.** The round-4 module imports `AuthMessage` from `pmcp.auth`,
+so on `89559db` it fails at collection (`ImportError: cannot import name
+'AuthMessage'`): every test is red. The texts themselves were measured on
+main by the round-3 module, which needs no registry: **9 failed, 107 passed**
+-- the four mangled texts (`Token [REDACTED] not be verified…`, `Missing
+bearer [REDACTED]`, `Unsupported token [REDACTED]`, `shared-secret
+[REDACTED] mode…`), their three stored descriptions, the pin, and the
+metadata guard (`DID NOT RAISE ValueError`; main serves `200 {"resource":
+""}`).
 
 ## Acceptance criteria
 
-- [ ] Every fixed message in `auth.py` and `transport/http.py`, derived from
-  the code by a fail-closed walk (39 on the spike, pinned exactly), comes
-  through `_sanitize_base`, `redact_additive`
-  and `sanitize_auth_diagnostic` unchanged. Proven by
-  `test_every_fixed_message_survives_the_sanitiser`.
-- [ ] A `ResourceServerAuthError` stores each fixed description exactly as
-  written. Proven by `test_a_stored_description_is_the_text_written`.
-- [ ] The walk reads positional and keyword message arguments, renders
-  names, f-strings, `%` and `.format`, classifies every `raise`, and fails on
-  any message it cannot render outside the reviewed exemptions. Proven by
-  the walk-guard tests and the five shape tests; mutants C1–C9 and K1–K9.
-- [ ] The walk discovers exception classes at test time (aliases and
-  module-defined subclasses included), follows a subclass's message into
-  `super().__init__`, resolves `raise <name>`, and refuses any name with a
-  binding other than one plain assignment. Proven by the three synthetic
-  shape families; mutants R1–R5 and K10–K13.
-- [ ] No log sink applies the sanitiser, measured through the real
-  `setup_logging` in text and JSON mode, and the log templates are pinned.
-  Proven by `test_no_log_sink_applies_the_sanitiser[text|json]` and
-  `test_the_log_templates_are_exactly_the_pinned_set`; mutant R6.
+- [ ] Every fixed operator-facing message in `auth.py` and
+  `transport/http.py` is an `AuthMessage` member (29), and each, rendered
+  with sample configuration fields, comes through `_sanitize_base`,
+  `redact_additive` and `sanitize_auth_diagnostic` unchanged and is stored as
+  written. Proven by `test_every_registry_message_survives_the_sanitiser`
+  and `test_a_stored_description_is_the_text_written`.
+- [ ] The auth error classes and `_auth_response` raise `TypeError` for any
+  message that is not a member (or the narrow `pyjwt_text` pass-through),
+  including every shape the panel found in rounds 1–3. Proven by the
+  refusal tests; mutants G1, G2, G5.
+- [ ] Every raise and `_reject` site in the two modules names
+  `AuthMessage.<NAME>` literally, no other exception class is defined, and
+  `AuthText` is built only in the registry -- a syntax check with no
+  resolver. Proven by the site-check tests; mutants G3, G4, S1–S5.
+- [ ] No log sink applies the sanitiser, measured end to end through the
+  real logger, stderr and the log file in text and JSON mode. Proven by
+  `test_no_log_sink_applies_the_sanitiser[text|json]`; mutants L1–L3.
 - [ ] Every pyjwt text pmcp keeps comes through unchanged, and every kept class
   has a producer. Proven by the two pyjwt tests.
 - [ ] Every `WWW-Authenticate` parameter of the eight 401/403/503 challenges
@@ -628,60 +605,42 @@ behaviour this plan keeps, and the mutants below show each can fail.
   embedding-only premise (Design decision 4).
 - [ ] Verification steps 1–3 pass. The CHANGELOG entry is present, with no
   closing keyword.
-- [ ] Every mutant below is red, except K7 and K14, which delete an assertion
-  and are shown by their double mutants.
+- [ ] Every mutant below is red.
 
 ## Mutation table
 
-Each mutant was measured on the round-3 spike (`mutants3.py`: apply one or
-more string edits to a source file, `cli.py` or the test module, run
-`tests/test_auth_operator_messages.py` under `-o timeout=60` and a 300 s cap,
-restore every touched file from its saved copy in a `finally`). **34 of 36 are
-red; K7 and K14 survive by construction** (each deletes an assertion; their
-double mutants below show what they would hide). After the run, every file
-was byte-identical to the spike. Ids in brackets are the spike's line numbers.
+Each mutant was measured on the round-4 spike (`mutants4.py`: apply one or
+more string edits to `auth.py`, `transport/http.py`, `cli.py` or the test
+module, run `tests/test_auth_operator_messages.py` under `-o timeout=60` and a
+300 s cap, restore every touched file from its saved copy in a `finally`).
+**All 20 are red.** After the run, every file was byte-identical to the
+spike.
 
 | # | Rule | Mutant | Red tests (measured) |
 |---|---|---|---|
-| B1 | the 401 text is clean | revert to `Token could not be verified…` | 3: the pin, `…survives_the_sanitiser[auth.py:631]`, `…stored_description…` |
-| B2 | the empty-token text is clean | revert to `Missing bearer token.` | 3 |
-| B3 | the algorithm text is clean | revert to `Unsupported token algorithm.` | 3 |
-| B4 | the shared-secret text is clean | revert | 2: the pin, `…[transport/http.py:318]` |
+| G1 | constructors refuse non-members | drop `render_auth_message`'s `isinstance` check | 12: every `…refused_at_construction[shape]` |
+| G2 | `_auth_response` refuses non-members | drop its check | `test_an_auth_response_body_outside_the_registry_is_refused` |
+| G3 | the static check wants `AuthMessage.<NAME>` | `_is_member` → always true | 8 `…site_check_refuses_every_shape[...]` |
+| G4 | the static check classifies raise callees | skip the unknown-callee rule | 2: `…[alias]`, `…[runtime_error]` |
+| G5 | the pyjwt pass-through is narrow | `pyjwt_text` accepts any exception | `test_the_pyjwt_pass_through_is_narrow` |
+| W1 | 401 key-mismatch text clean | registry value back to `Token could not be verified…` | 3: registry completeness (spot value), sanitiser, stored |
+| W2 | empty-token text clean | back to `Missing bearer token.` | 2: sanitiser, stored |
+| W3 | algorithm text clean | back to `Unsupported token algorithm.` | 2 |
+| W4 | shared-secret text clean | back to `shared-secret auth mode requires auth_token.` | 2 |
+| S1 | sites name a member (claude/codex rounds 1–3) | `…("invalid_token", "Token audience mismatch.")` at the audience site | `test_every_message_site_names_a_registry_member` |
+| S2 | `AuthText` minted only in the registry | `AuthText("Token audience mismatch.")` at that site | 2: the site check, `test_auth_text_is_built_only_in_the_registry` |
+| S3 | no new exception class (claude r3 B1) | append `class _TokenRejected(ResourceServerAuthError)` with `message = "Token could not be verified."` | the site check (new exception class; its `super().__init__` would also raise `TypeError`) |
+| S4 | no aliased raise (codex r3 3) | `_AuthErrAlias = ResourceServerAuthError`; `raise _AuthErrAlias(...)` | 2: the site check (unknown callee), the site count |
+| S5 | `_reject` bodies are members | `_reject(403, "Forbidden")` | the site check |
+| L1 | logs, through a formatter (codex r2) | `_RedactingFormatter` in `setup_logging`'s text mode | `test_no_log_sink_applies_the_sanitiser[text]` |
+| L2 | logs, through `emit()` (claude r3 N3) | stderr handler `_RedactingStream.emit` sanitises `record.msg` | `…[text]`, `…[json]` |
+| L3 | log templates are constants | `logger.info(f"Streamable-HTTP session manager {'started'}")` | `test_the_log_templates_are_collected` |
 | B5 | no empty `resource` | the startup check → `if False:` | `test_metadata_route_refuses_to_start_without_a_canonical_resource` |
-| B6 | a new positional description is checked | `Invalid audience.` → `Token audience mismatch.` | 3 |
-| B7 | challenge parameters are covered | `_auth_headers` adds `error_description="token expired"` | 6 challenge cases |
-| C1 | keyword argument (codex r1) | `…(…, description="Token audience mismatch.")` | 3 |
-| C2 | text in a variable (claude r1) | `message = "Token could not be verified."` then `…(…, message)` | 3 |
-| C3 | `%` template (claude r1) | `"JWKS URL is required for token %s." % "checks"` | 3 |
-| C4 | non-`ValueError` refusal (claude r1) | `raise RuntimeError("Unsupported secret mode.")` | 2 |
-| C5 | unknown callee | `raise ConfigError("Unsupported auth mode.")` | 2: the pin, `test_every_raised_callee_is_classified` |
-| C6 | unrenderable message | `f"Invalid token {exc}."` | 3: the pin, the exemption check, `…exact_not_floors` |
-| C7 | a message hidden from the walk | `_reject(*(403, "Forbidden"))` | 2: the pin, the exemption check |
-| C8 | a new log line (codex r1) | add `logger.info("Streamable-HTTP session manager ready")` | the log pin |
-| C9 | a message moves to an unknown callee | `Response(…)` → `PlainTextResponse(…)` | the pin **only** |
-| R1 | augmented assignment (codex r2) | `message = "Empty token."`; `message += " Token expired."`; raise with `message` | 3: the pin, the exemption check, `…exact_not_floors` (refused, not rendered as `Empty token.`) |
-| R2 | built, then raised by name (codex r2) | `error = LookupError("Token expired.")`; `raise error` | 2: the pin, `…survives_the_sanitiser[transport/http.py:314]` |
-| R3 | alias raised by name (claude r2 F2a) | `_AuthErr = ResourceServerAuthError` at module level; `err = _AuthErr("invalid_token", "Token expired.")`; `raise err from exc` | 3: the pin, `…survives…[auth.py:680]`, `…stored_description…` |
-| R4 | subclass with the message in `super().__init__` (claude r2 F2b) | `class _TokenRejected(ResourceServerAuthError)` whose `__init__` passes `"Token expired."`; `raise _TokenRejected() from exc` | 3: the pin, `…survives…[auth.py:1062]` (the super call), `…stored_description…` |
-| R5 | `for`-target binding (claude r2 F2c) | `for message in ("Token expired.",): raise …(…, message)` | 3: the pin, the exemption check, `…exact_not_floors` |
-| R6 | redacting text formatter (codex r2) | `_RedactingFormatter.format` returns `sanitize_auth_diagnostic(super().format(record))`, used by `setup_logging`'s text mode | `test_no_log_sink_applies_the_sanitiser[text]` |
-| K1 | walk reads keywords | ignore `call.keywords` | `…renders_every_message_shape[keyword]` |
-| K2 | walk resolves names | skip `ast.Name` in `_render` | `…[variable]` |
-| K3 | walk renders `%` | match `Pow` instead of `Mod` | `…[percent]` |
-| K4 | walk renders `.format` | match `.never` | `…[format]` |
-| K5 | raises are classified | the classification check → `if False:` | 3: `…reports_every_raise…[built_by_unknown, subclass_without_super, unknown_callee]` |
-| K6 | comparison counts multiplicity | compare `set(found)` | 2: the pin, the exemption check |
-| K7 | the pin is exact | pin assertion → `len(...) >= 28` | **survives**; double mutant K7 + C9: **116 passed** -- a message moving to an unknown callee goes unseen, the round-1 defect |
-| K8 | log calls collected | drop `self.logs.append` | 2: the log pin, `…fails_closed…` |
-| K9 | comparison is equality | report only missing items | `…exact_not_floors` |
-| K10 | resolver refuses multiple bindings | drop the `len(found) != 1` refusal | 2: `…refuses…[global, reassigned]` |
-| K11 | `raise <name>` resolved | return before resolving | 2: `…reports_every_raise…[built_by_unknown, unresolved_name]` |
-| K12 | `super().__init__` collected | skip the super branch | `…renders_every_message_shape[subclass_super]` |
-| K13 | exception classes discovered at run time | non-known classes → `("ignore",)` | 5: the pin, `test_every_raised_callee_is_classified`, `…renders…[format, raise_name, runtime_error]` |
-| K14 | the log test is behavioural | `return` before `setup_logging` | **survives**; double mutant K14 + R6: **117 passed** -- with only the source check, the redacting text formatter goes unseen, which is exactly what codex reported |
+| B7 | challenge parameters covered | `_auth_headers` adds `error_description="token expired"` | 6 challenge cases |
 
-The implementer re-runs all 36 (and the two double mutants) on the final
-tree, restoring from a saved copy (never `git checkout --`).
+Rounds 1–3's shapes are now regression *tests* rather than mutants (the 12
+refusal shapes and the 12 static shapes), and the collector mutants (the
+K-family) are gone with the collector.
 
 ## Non-goals
 
@@ -696,11 +655,15 @@ tree, restoring from a saved copy (never `git checkout --`).
   summary). `Streamable-HTTP session manager started/stopped` would be
   rewritten if one did; `test_no_log_sink_applies_the_sanitiser` is the
   tripwire for that.
-- **Walking `normalize_auth_metadata`'s list-appended diagnostics and
-  `UNVERIFIED_URL_CAVEAT`.** They are not message calls; the round-1 claude
-  seat measured all of them clean. Adding `list.append` as a sink would need
-  a sample for each hole (field names, sanitised URLs) for no current
-  finding.
+- **Moving `normalize_auth_metadata`'s list-appended diagnostics and
+  `UNVERIFIED_URL_CAVEAT` into the registry.** They are diagnostics built
+  from sanitised parts and appended to a list, not raised or sent; the
+  round-1 claude seat measured all of them clean. They can join the registry
+  later; nothing here depends on it.
+- **Plain `Response(...)` bodies** (`Too Many Requests`, `Payload Too Large`,
+  `Gateway Timeout`). They go on the wire as written and never pass through
+  the sanitiser, so they are not operator diagnostics; only the auth
+  `_reject` bodies are routed through the registry.
 
 ## Unverified
 
@@ -708,16 +671,20 @@ tree, restoring from a saved copy (never `git checkout --`).
   `TestClient` sending the path a stripping proxy would forward, not with
   nginx.
 - **Python 3.11 / 3.12.** The module was run on 3.10 only. It is pure string
-  and AST work plus `TestClient`, with no version-specific asyncio.
-- **The full suite** was run once on the round-3 spike, alone and detached
-  (5046 passed, 3 skipped, 80 deselected, 0 failed, 579 s).
+  and AST work plus `TestClient`, with no version-specific asyncio. (On 3.11+
+  a `str`-mixin `Enum` would print `AuthMessage.X`; the registry uses a plain
+  `str` subclass for exactly that reason, so a member prints its text on
+  every version.)
+- **The full suite** was run once on the round-4 spike, alone and detached
+  (5052 passed, 3 skipped, 80 deselected, 0 failed, 585 s).
 
 ## Execution Policy
 
 - execute: effort=low.
-- reason: four string changes, one startup check and two README paragraphs.
-  The fail-closed walk is the substance, and its pins are what a later PR
-  touching these two files will meet.
+- reason: a registry and the call-site changes in two files (about 225/53
+  lines), three existing test files moved onto members, one startup check
+  and two README paragraphs. Any later PR that adds an auth message meets
+  the `TypeError` and the site check, by design.
 - Re-run the mutation table, ruff and mypy before requesting review.
 - Get a cross-vendor panel CR before merge, as for every PR to main.
 
@@ -725,8 +692,9 @@ tree, restoring from a saved copy (never `git checkout --`).
 
 ### How to apply
 
-1. Save the source patch below to `326-src.patch` and the README patch to
-   `326-readme.patch`, then run `git apply 326-src.patch 326-readme.patch` on
+1. Save the source patch, the README patch and the existing-tests patch
+   below to `326-src.patch`, `326-readme.patch` and `326-tests.patch`, then
+   run `git apply 326-src.patch 326-readme.patch 326-tests.patch` on
    `89559db`.
 2. Write the test module below to `tests/test_auth_operator_messages.py`.
 3. Add the `CHANGELOG.md` bullet by hand.
@@ -735,58 +703,485 @@ tree, restoring from a saved copy (never `git checkout --`).
 
 ````diff
 diff --git a/src/pmcp/auth.py b/src/pmcp/auth.py
-index e929470..198c4c7 100644
+index e929470..8f3fced 100644
 --- a/src/pmcp/auth.py
 +++ b/src/pmcp/auth.py
-@@ -625,8 +625,11 @@ def _decode_with_key(
-     except jwt.InvalidTokenError:
+@@ -24,6 +24,127 @@ from pmcp.redaction_additive import redact_additive
+ from pmcp.types import AuthChallengeInfo, AuthMetadataInfo, UrlElicitationInfo
+ 
+ 
++class AuthText(str):
++    """One fixed operator-facing auth/HTTP message. Instances exist only as
++    `AuthMessage` attributes (Consiliency/pmcp#326): the auth error classes
++    and the HTTP 401/403/503 response helper refuse anything else, so a
++    message cannot be written inline in a shape a review cannot see."""
++
++    __slots__ = ()
++
++
++class PyJwtText(str):
++    """pyjwt's own text for an error class pmcp keeps verbatim
++    (`_FIXED_TEXT_CLAIM_ERRORS`). Built only by `pyjwt_text`."""
++
++    __slots__ = ()
++
++
++class AuthMessage:
++    """The registry of every fixed operator-facing message in `pmcp.auth`
++    and `pmcp.transport.http` (Consiliency/pmcp#326).
++
++    Each one comes through `sanitize_auth_diagnostic` -- the redactor's own
++    rules and the additive rules (#234) -- unchanged; the test module checks
++    every member. `{url}` and `{scopes}` are filled from configuration by the
++    constructor that takes them (`ResourceServerAuthError(..., url=...)`).
++    Add a message here, never inline: the auth error classes and
++    `_auth_response` raise `TypeError` for anything that is not a member, and
++    a static check in the test module requires every raise and `_reject`
++    site to name one.
++    """
++
++    # -- token validation (401 `invalid_token` / 403 `insufficient_scope`) --
++    # Four texts were reworded because the sanitiser rewrote them (#326):
++    # "Missing bearer token." -> "Missing bearer [REDACTED]" (Bearer rule);
++    # "Unsupported token algorithm." -> "Unsupported token [REDACTED]";
++    # "Token could not be verified with the published key." -> "Token
++    # [REDACTED] not be verified..." (keyword rule, `token <word>`); and
++    # "shared-secret auth mode requires auth_token." -> "shared-secret
++    # [REDACTED] mode..." (keyword rule, `secret <word>`).
++    EMPTY_TOKEN = AuthText("Empty token.")
++    TOKEN_ALGORITHM_UNSUPPORTED = AuthText("The token's algorithm is not supported.")
++    JWKS_URL_REQUIRED = AuthText("JWKS URL is required.")
++    KEY_CANNOT_VERIFY_TOKEN = AuthText("The published key cannot verify this token.")
++    NO_MATCHING_JWK = AuthText("No matching JWK found.")
++    INVALID_AUDIENCE = AuthText("Invalid audience.")
++    INVALID_TOKEN = AuthText("Invalid token.")
++    MISSING_SCOPES = AuthText("Missing required scope(s): {scopes}")
++    RS_JWKS_NOT_CONFIGURED = AuthText("Resource Server JWKS is not configured.")
++    # -- JWKS availability (503 `temporarily_unavailable`) --
++    JWKS_BACKING_OFF = AuthText("JWKS refresh recently failed for {url}; backing off.")
++    JWKS_FETCH_FAILED = AuthText("JWKS fetch failed for {url}.")
++    JWKS_REDIRECT_REFUSED = AuthText(
++        "JWKS endpoint returned a redirect for {url}; refusing to follow."
++    )
++    JWKS_TOO_LARGE = AuthText("JWKS response too large for {url}.")
++    JWKS_INVALID_JSON = AuthText("Invalid JWKS JSON from {url}.")
++    JWKS_INVALID_OBJECT = AuthText("Invalid JWKS object from {url}.")
++    JWKS_NO_USABLE_KEYS = AuthText("JWKS contains no usable signing keys.")
++    # -- public auth URL validation --
++    REDIRECTS_NOT_ALLOWED = AuthText("Redirects are not allowed.")
++    PUBLIC_URL_INVALID = AuthText("Invalid public auth URL.")
++    PUBLIC_URL_NOT_ABSOLUTE = AuthText(
++        "Public auth URL must be an absolute HTTP(S) URL."
++    )
++    PUBLIC_URL_HTTP_LOOPBACK_ONLY = AuthText(
++        "Public auth URL only allows http:// URLs for loopback hosts."
++    )
++    PUBLIC_URL_NOT_PUBLIC = AuthText(
++        "Public auth URL host is a non-public IP literal or loopback name."
++    )
++    ELICITATION_URL_INVALID = AuthText("Invalid URL-mode elicitation URL.")
++    # -- HTTP transport startup refusals --
++    UNSUPPORTED_AUTH_MODE = AuthText("Unsupported auth mode.")
++    SHARED_SECRET_NEEDS_TOKEN = AuthText(
++        "auth_token is required when auth_mode is shared-secret."
++    )
++    RESOURCE_SERVER_NEEDS_CONFIG = AuthText(
++        "resource-server auth mode requires issuer, JWKS URL, and audience."
++    )
++    METADATA_NEEDS_RESOURCE = AuthText(
++        "Protected-resource metadata needs a canonical resource: set "
++        "resource_server_audience (--oauth-audience) or an absolute "
++        "protected_resource_metadata_url."
++    )
++    # -- HTTP 401/403/503 response bodies (`_auth_response`) --
++    UNAUTHORIZED = AuthText("Unauthorized")
++    FORBIDDEN = AuthText("Forbidden")
++    SERVICE_UNAVAILABLE = AuthText("Service Unavailable")
++
++
++def auth_messages() -> dict[str, AuthText]:
++    """Every registry member, by name."""
++    return {
++        name: value
++        for name, value in vars(AuthMessage).items()
++        if isinstance(value, AuthText)
++    }
++
++
++def pyjwt_text(exc: BaseException) -> PyJwtText:
++    """The one narrow pass-through: pyjwt's text for a class in
++    `_FIXED_TEXT_CLAIM_ERRORS`, whose texts are fixed (the test module
++    generates and checks every one). Anything else is a `TypeError`."""
++    if not isinstance(exc, _FIXED_TEXT_CLAIM_ERRORS):
++        raise TypeError(
++            f"pyjwt_text() takes a fixed-text pyjwt error, not {type(exc).__name__}"
++        )
++    return PyJwtText(str(exc))
++
++
++def render_auth_message(message: AuthText | PyJwtText, **fields: str) -> str:
++    """The text of a registry member with its configuration fields filled,
++    or a pyjwt pass-through. `TypeError` for anything else."""
++    if isinstance(message, PyJwtText):
++        return str(message)
++    if not isinstance(message, AuthText):
++        raise TypeError(
++            f"auth messages must be an AuthMessage member, not {type(message).__name__}"
++        )
++    return message.format(**fields) if fields else str(message)
++
++
+ class _NoRedirectHandler(HTTPRedirectHandler):
+     """Refuse HTTP redirects so a public URL cannot 3xx to an internal host."""
+ 
+@@ -36,7 +157,7 @@ class _NoRedirectHandler(HTTPRedirectHandler):
+         headers: Any,
+         newurl: str,
+     ) -> Request | None:
+-        raise HTTPError(newurl, code, "Redirects are not allowed.", headers, fp)
++        raise HTTPError(newurl, code, AuthMessage.REDIRECTS_NOT_ALLOWED, headers, fp)
+ 
+ 
+ _NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler)
+@@ -332,22 +453,20 @@ def sanitize_public_auth_url(url: str, *, allow_loopback_http: bool = False) ->
+         hostname = parsed.hostname
+         _ = parsed.port
+     except ValueError as exc:
+-        raise ValueError("Invalid public auth URL.") from exc
++        raise ValueError(AuthMessage.PUBLIC_URL_INVALID) from exc
+ 
+     if parsed.scheme not in {"https", "http"} or not parsed.netloc or not hostname:
+-        raise ValueError("Public auth URL must be an absolute HTTP(S) URL.")
++        raise ValueError(AuthMessage.PUBLIC_URL_NOT_ABSOLUTE)
+ 
+     if parsed.scheme == "http" and (
+         not allow_loopback_http or not _is_loopback_host(hostname)
+     ):
+-        raise ValueError("Public auth URL only allows http:// URLs for loopback hosts.")
++        raise ValueError(AuthMessage.PUBLIC_URL_HTTP_LOOPBACK_ONLY)
+     if not (
+         allow_loopback_http and parsed.scheme == "http" and _is_loopback_host(hostname)
+     ):
+         if not _is_public_auth_host(hostname):
+-            raise ValueError(
+-                "Public auth URL host is a non-public IP literal or loopback name."
+-            )
++            raise ValueError(AuthMessage.PUBLIC_URL_NOT_PUBLIC)
+ 
+     return redact_auth_url(url)
+ 
+@@ -364,19 +483,29 @@ class ResourceServerTokenClaims:
+ 
+ 
+ class ResourceServerAuthError(Exception):
+-    """Raised for failed Resource Server token validation."""
++    """Raised for failed Resource Server token validation.
+ 
+-    def __init__(self, error: str, description: str) -> None:
++    ``description`` must be an `AuthMessage` member (with its ``url`` /
++    ``scopes`` fields as keywords) or a `pyjwt_text` pass-through; anything
++    else is a `TypeError` at construction (Consiliency/pmcp#326), which a
++    subclass cannot avoid either -- whatever it passes up arrives here.
++    """
++
++    def __init__(
++        self, error: str, description: AuthText | PyJwtText, **fields: str
++    ) -> None:
+         self.error = error
+-        self.description = sanitize_auth_diagnostic(description)
++        self.description = sanitize_auth_diagnostic(
++            render_auth_message(description, **fields)
++        )
+         super().__init__(self.description)
+ 
+ 
+ class ResourceServerJWKSUnavailable(ResourceServerAuthError):
+     """Raised when Resource Server JWKS cannot be fetched."""
+ 
+-    def __init__(self, description: str) -> None:
+-        super().__init__("temporarily_unavailable", description)
++    def __init__(self, description: AuthText, **fields: str) -> None:
++        super().__init__("temporarily_unavailable", description, **fields)
+ 
+ 
+ class AsyncJWKS:
+@@ -460,7 +589,7 @@ class AsyncJWKS:
+                 if cached is not None:
+                     return cached
+                 raise ResourceServerJWKSUnavailable(
+-                    f"JWKS refresh recently failed for {self.url}; backing off."
++                    AuthMessage.JWKS_BACKING_OFF, url=self.url
+                 )
+             # (3) A fetch is about to be attempted: the only place the
+             # forced-refresh window advances (success or failure alike).
+@@ -483,7 +612,7 @@ class AsyncJWKS:
+                 # stays, because the attempt was made.
+                 self._last_refresh_failure = time.monotonic()
+                 raise ResourceServerJWKSUnavailable(
+-                    f"JWKS fetch failed for {self.url}."
++                    AuthMessage.JWKS_FETCH_FAILED, url=self.url
+                 ) from exc
+             self._last_refresh_failure = float("-inf")
+             self._jwks = jwks
+@@ -511,8 +640,7 @@ class AsyncJWKS:
+                 ) as response:
+                     if 300 <= response.status < 400:
+                         raise ResourceServerJWKSUnavailable(
+-                            f"JWKS endpoint returned a redirect for {self.url}; "
+-                            "refusing to follow."
++                            AuthMessage.JWKS_REDIRECT_REFUSED, url=self.url
+                         )
+                     response.raise_for_status()
+                     content = await response.content.read(self._max_bytes + 1)
+@@ -520,11 +648,11 @@ class AsyncJWKS:
+             raise
+         except Exception as exc:
+             raise ResourceServerJWKSUnavailable(
+-                f"JWKS fetch failed for {self.url}."
++                AuthMessage.JWKS_FETCH_FAILED, url=self.url
+             ) from exc
+         if len(content) > self._max_bytes:
+             raise ResourceServerJWKSUnavailable(
+-                f"JWKS response too large for {self.url}."
++                AuthMessage.JWKS_TOO_LARGE, url=self.url
+             )
+         try:
+             jwks = json.loads(content.decode("utf-8"))
+@@ -532,10 +660,12 @@ class AsyncJWKS:
+             # ValueError covers JSONDecodeError and UnicodeDecodeError; a
+             # deeply nested body under the size cap raises RecursionError.
+             raise ResourceServerJWKSUnavailable(
+-                f"Invalid JWKS JSON from {self.url}."
++                AuthMessage.JWKS_INVALID_JSON, url=self.url
+             ) from exc
+         if not isinstance(jwks, dict) or not isinstance(jwks.get("keys"), list):
+-            raise ResourceServerJWKSUnavailable(f"Invalid JWKS object from {self.url}.")
++            raise ResourceServerJWKSUnavailable(
++                AuthMessage.JWKS_INVALID_OBJECT, url=self.url
++            )
+         return jwks
+ 
+ 
+@@ -557,9 +687,7 @@ def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
+         # InvalidTokenError, so unmapped it escaped as a 500 (see
+         # Consiliency/pmcp#320). Fixed text: never echo pyjwt's message or any
+         # JWKS content.
+-        raise ResourceServerJWKSUnavailable(
+-            "JWKS contains no usable signing keys."
+-        ) from exc
++        raise ResourceServerJWKSUnavailable(AuthMessage.JWKS_NO_USABLE_KEYS) from exc
+     keys = key_set.keys
+     if kid:
+         for key in keys:
+@@ -567,7 +695,7 @@ def _select_jwk_key(token: str, jwks: Mapping[str, Any]) -> Any:
+                 return key.key
+     if len(keys) == 1:
+         return keys[0].key
+-    raise ResourceServerAuthError("invalid_token", "No matching JWK found.")
++    raise ResourceServerAuthError("invalid_token", AuthMessage.NO_MATCHING_JWK)
+ 
+ 
+ def _claim_scopes(claims: Mapping[str, Any]) -> list[str]:
+@@ -626,7 +754,7 @@ def _decode_with_key(
          raise
      except (jwt.PyJWTError, TypeError, ValueError) as exc:
-+        # Worded so `sanitize_auth_diagnostic` passes it through unchanged: the
-+        # keyword rule reads `Token <word>` as a credential and redacted this
-+        # as "Token [REDACTED] not be verified..." (Consiliency/pmcp#326).
          raise ResourceServerAuthError(
 -            "invalid_token", "Token could not be verified with the published key."
-+            "invalid_token", "The published key cannot verify this token."
++            "invalid_token", AuthMessage.KEY_CANNOT_VERIFY_TOKEN
          ) from exc
  
  
-@@ -641,13 +644,17 @@ def validate_resource_server_token(
+@@ -641,16 +769,18 @@ def validate_resource_server_token(
  ) -> ResourceServerTokenClaims:
      """Validate an AS-issued JWT for PMCP Resource Server mode."""
      if not token:
 -        raise ResourceServerAuthError("invalid_token", "Missing bearer token.")
-+        # Not "Missing bearer token.": the Bearer rule redacts the word after
-+        # `bearer` (Consiliency/pmcp#326).
-+        raise ResourceServerAuthError("invalid_token", "Empty token.")
++        raise ResourceServerAuthError("invalid_token", AuthMessage.EMPTY_TOKEN)
      try:
          header = jwt.get_unverified_header(token)
          algorithm = header.get("alg")
          if not isinstance(algorithm, str) or algorithm.lower() == "none":
-+            # Not "Unsupported token algorithm.": the keyword rule redacted
-+            # `algorithm` (Consiliency/pmcp#326).
              raise ResourceServerAuthError(
 -                "invalid_token", "Unsupported token algorithm."
-+                "invalid_token", "The token's algorithm is not supported."
++                "invalid_token", AuthMessage.TOKEN_ALGORITHM_UNSUPPORTED
              )
          if jwks is None:
-             raise ResourceServerAuthError("invalid_token", "JWKS URL is required.")
+-            raise ResourceServerAuthError("invalid_token", "JWKS URL is required.")
++            raise ResourceServerAuthError(
++                "invalid_token", AuthMessage.JWKS_URL_REQUIRED
++            )
+         signing_key = _select_jwk_key(token, jwks)
+         claims = _decode_with_key(
+             token,
+@@ -662,22 +792,27 @@ def validate_resource_server_token(
+     except ResourceServerAuthError:
+         raise
+     except jwt.InvalidAudienceError as exc:
+-        raise ResourceServerAuthError("invalid_token", "Invalid audience.") from exc
++        raise ResourceServerAuthError(
++            "invalid_token", AuthMessage.INVALID_AUDIENCE
++        ) from exc
+     except _FIXED_TEXT_CLAIM_ERRORS as exc:
+         # pyjwt's text for these is fixed (or names a claim from PMCP's own
+         # required list), so it is safe to keep as the description.
+-        raise ResourceServerAuthError("invalid_token", str(exc)) from exc
++        raise ResourceServerAuthError("invalid_token", pyjwt_text(exc)) from exc
+     except jwt.InvalidTokenError as exc:
+         # Every other token error may quote the token back (pyjwt names an
+         # unknown `crit` extension, for one), so the description is fixed.
+-        raise ResourceServerAuthError("invalid_token", "Invalid token.") from exc
++        raise ResourceServerAuthError(
++            "invalid_token", AuthMessage.INVALID_TOKEN
++        ) from exc
+ 
+     scopes = _claim_scopes(claims)
+     missing_scopes = sorted(set(required_scopes or []) - set(scopes))
+     if missing_scopes:
+         raise ResourceServerAuthError(
+             "insufficient_scope",
+-            "Missing required scope(s): " + " ".join(missing_scopes),
++            AuthMessage.MISSING_SCOPES,
++            scopes=" ".join(missing_scopes),
+         )
+     raw_audience = claims.get("aud")
+     audiences = raw_audience if isinstance(raw_audience, list) else [raw_audience]
+@@ -718,7 +853,7 @@ def sanitize_url_elicitation_url(
+             url, allow_loopback_http=provenance == "operator"
+         )
+     except ValueError as exc:
+-        raise ValueError("Invalid URL-mode elicitation URL.") from exc
++        raise ValueError(AuthMessage.ELICITATION_URL_INVALID) from exc
+ 
+ 
+ def sanitize_auth_diagnostic(value: object, *, max_length: int | None = 400) -> str:
 diff --git a/src/pmcp/transport/http.py b/src/pmcp/transport/http.py
-index 41af495..c5b4b5d 100644
+index 41af495..1f90712 100644
 --- a/src/pmcp/transport/http.py
 +++ b/src/pmcp/transport/http.py
-@@ -313,7 +313,9 @@ def create_http_app(
+@@ -36,6 +36,8 @@ from starlette.routing import Route
+ from pmcp import __version__
+ from pmcp.auth import (
+     AsyncJWKS,
++    AuthMessage,
++    AuthText,
+     ResourceServerAuthError,
+     ResourceServerJWKSUnavailable,
+     normalize_auth_metadata,
+@@ -172,6 +174,18 @@ class _NullResponse(Response):
+         pass  # response was already sent by session_manager.handle_request
+ 
+ 
++def _auth_response(
++    status_code: int, body: AuthText, headers: dict[str, str] | None = None
++) -> Response:
++    """A 401/403/503 auth response. ``body`` must be an `AuthMessage`
++    member; anything else is a `TypeError` (Consiliency/pmcp#326)."""
++    if not isinstance(body, AuthText):
++        raise TypeError(
++            f"auth response bodies must be an AuthMessage member, not {type(body).__name__}"
++        )
++    return Response(str(body), status_code=status_code, headers=headers or {})
++
++
+ async def _check_rate_limit(client_ip: str, max_rpm: int) -> bool:
+     """Return True if the request is allowed, False if rate-limited.
+ 
+@@ -311,9 +325,9 @@ def create_http_app(
+     if effective_auth_mode is None:
+         effective_auth_mode = "shared-secret" if auth_token is not None else "none"
      if effective_auth_mode not in {"none", "shared-secret", "resource-server"}:
-         raise ValueError("Unsupported auth mode.")
+-        raise ValueError("Unsupported auth mode.")
++        raise ValueError(AuthMessage.UNSUPPORTED_AUTH_MODE)
      if effective_auth_mode == "shared-secret" and auth_token is None:
 -        raise ValueError("shared-secret auth mode requires auth_token.")
-+        # Not "shared-secret auth mode requires ...": the keyword rule reads
-+        # `secret <word>` as a credential (Consiliency/pmcp#326).
-+        raise ValueError("auth_token is required when auth_mode is shared-secret.")
++        raise ValueError(AuthMessage.SHARED_SECRET_NEEDS_TOKEN)
      resource_jwks: AsyncJWKS | None = None
      if effective_auth_mode == "resource-server":
          if (
-@@ -769,6 +771,16 @@ def create_http_app(
+@@ -321,9 +335,7 @@ def create_http_app(
+             or not resource_server_jwks_url
+             or not resource_server_audience
+         ):
+-            raise ValueError(
+-                "resource-server auth mode requires issuer, JWKS URL, and audience."
+-            )
++            raise ValueError(AuthMessage.RESOURCE_SERVER_NEEDS_CONFIG)
+         sanitize_public_auth_url(resource_server_jwks_url)
+         resource_jwks = AsyncJWKS(resource_server_jwks_url)
+     diagnostics = GatewayDiagnosticsInfo(
+@@ -461,10 +473,10 @@ def create_http_app(
+         return token
+ 
+     def _reject(
+-        status_code: int, body: str, headers: dict[str, str] | None = None
++        status_code: int, body: AuthText, headers: dict[str, str] | None = None
+     ) -> Response:
+         _inc(f"requests_{status_code}")
+-        return Response(body, status_code=status_code, headers=headers or {})
++        return _auth_response(status_code, body, headers)
+ 
+     async def handle_health(request: Request) -> Response:
+         """Unauthenticated health check — safe for load-balancers and container probes."""
+@@ -541,11 +553,11 @@ def create_http_app(
+ 
+         if _origin_rejected(request):
+             logger.debug("handle_mcp [%s]: 403 invalid origin", request_id)
+-            return _reject(403, "Forbidden")
++            return _reject(403, AuthMessage.FORBIDDEN)
+ 
+         if _host_rejected(request):
+             logger.debug("handle_mcp [%s]: 403 invalid host", request_id)
+-            return _reject(403, "Forbidden")
++            return _reject(403, AuthMessage.FORBIDDEN)
+ 
+         if effective_auth_mode == "shared-secret":
+             incoming = request.headers.get("authorization", "")
+@@ -559,16 +571,16 @@ def create_http_app(
+                 f"Bearer {auth_token}".encode(),
+             ):
+                 logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)
+-                return _reject(401, "Unauthorized", _auth_headers(request))
++                return _reject(401, AuthMessage.UNAUTHORIZED, _auth_headers(request))
+         elif effective_auth_mode == "resource-server":
+             token = _bearer_token(request)
+             if token is None:
+                 logger.debug("handle_mcp [%s]: 401 missing bearer", request_id)
+-                return _reject(401, "Unauthorized", _auth_headers(request))
++                return _reject(401, AuthMessage.UNAUTHORIZED, _auth_headers(request))
+             try:
+                 if resource_jwks is None:
+                     raise ResourceServerAuthError(
+-                        "invalid_token", "Resource Server JWKS is not configured."
++                        "invalid_token", AuthMessage.RS_JWKS_NOT_CONFIGURED
+                     )
+                 jwks = await resource_jwks.get_for_token(token)
+                 claims = validate_resource_server_token(
+@@ -589,7 +601,7 @@ def create_http_app(
+                 logger.debug("handle_mcp [%s]: 503 jwks unavailable", request_id)
+                 return _reject(
+                     503,
+-                    "Service Unavailable",
++                    AuthMessage.SERVICE_UNAVAILABLE,
+                     _auth_headers(request, error=exc.error),
+                 )
+             except ResourceServerAuthError as exc:
+@@ -598,13 +610,13 @@ def create_http_app(
+                     logger.debug("handle_mcp [%s]: 403 insufficient scope", request_id)
+                     return _reject(
+                         403,
+-                        "Forbidden",
++                        AuthMessage.FORBIDDEN,
+                         _auth_headers(request, error=exc.error, scope=scope),
+                     )
+                 logger.debug("handle_mcp [%s]: 401 invalid token", request_id)
+                 return _reject(
+                     401,
+-                    "Unauthorized",
++                    AuthMessage.UNAUTHORIZED,
+                     _auth_headers(request, error=exc.error),
+                 )
+ 
+@@ -769,6 +781,12 @@ def create_http_app(
      if auth_metadata.protected_resource_metadata_url:
          metadata_path = urlparse(auth_metadata.protected_resource_metadata_url).path
          if metadata_path:
@@ -795,11 +1190,7 @@ index 41af495..c5b4b5d 100644
 +            # always absolute -- so this fails closed at startup, not per
 +            # request, if a later change makes it reachable (Consiliency/pmcp#326).
 +            if not _canonical_resource():
-+                raise ValueError(
-+                    "Protected-resource metadata needs a canonical resource: "
-+                    "set resource_server_audience (--oauth-audience) or an "
-+                    "absolute protected_resource_metadata_url."
-+                )
++                raise ValueError(AuthMessage.METADATA_NEEDS_RESOURCE)
              routes.append(
                  Route(
                      metadata_path,
@@ -850,6 +1241,121 @@ index 8af5061..4d22d09 100644
  unspecified — including IPv4 addresses embedded in IPv6 literals and legacy
 ````
 
+### Patch — `tests/test_auth.py`, `tests/test_http_transport.py`, `tests/test_scoped_advisor_audit.py`
+
+````diff
+diff --git a/tests/test_auth.py b/tests/test_auth.py
+index d5dc937..3fe8007 100644
+--- a/tests/test_auth.py
++++ b/tests/test_auth.py
+@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
+ 
+ from pmcp.auth import (
+     AsyncJWKS,
++    AuthMessage,
+     ResourceServerAuthError,
+     ResourceServerJWKSUnavailable,
+     fetch_json_metadata,
+@@ -423,7 +424,8 @@ async def test_async_jwks_fetch_failures_are_sanitized(
+ 
+     async def fake_fetch() -> dict[str, object]:
+         raise ResourceServerJWKSUnavailable(
+-            "JWKS fetch failed for https://issuer.example/jwks.json?token=secret."
++            AuthMessage.JWKS_FETCH_FAILED,
++            url="https://issuer.example/jwks.json?token=secret",
+         )
+ 
+     monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+@@ -1458,7 +1460,7 @@ async def test_s07_s08_recovery_after_failed_forced_refresh_waits_out_the_cooldo
+         fetches += 1
+         if endpoint_down:
+             clock.advance(failure_duration)
+-            raise ResourceServerJWKSUnavailable("JWKS fetch failed.")
++            raise ResourceServerJWKSUnavailable(AuthMessage.JWKS_FETCH_FAILED, url="")
+         return rotated
+ 
+     monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+@@ -1510,7 +1512,7 @@ async def test_s07_s08_backoff_rejection_does_not_consume_the_cooldown(
+         nonlocal fetches
+         fetches += 1
+         if endpoint_down:
+-            raise ResourceServerJWKSUnavailable("JWKS fetch failed.")
++            raise ResourceServerJWKSUnavailable(AuthMessage.JWKS_FETCH_FAILED, url="")
+         return rotated
+ 
+     monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+@@ -1577,7 +1579,7 @@ async def test_s08_concurrent_get_bounds_the_last_waiter(
+         fetches += 1
+         if fetches == 1:
+             await release_first_fetch.wait()
+-        raise ResourceServerJWKSUnavailable("JWKS fetch failed.")
++        raise ResourceServerJWKSUnavailable(AuthMessage.JWKS_FETCH_FAILED, url="")
+ 
+     monkeypatch.setattr(jwks, "_fetch", fake_fetch)
+ 
+diff --git a/tests/test_http_transport.py b/tests/test_http_transport.py
+index e83214a..b5ccf90 100644
+--- a/tests/test_http_transport.py
++++ b/tests/test_http_transport.py
+@@ -388,7 +388,7 @@ class TestHttpObservabilityContracts:
+         )
+ 
+     def test_resource_server_insufficient_scope_gets_403_challenge(self) -> None:
+-        from pmcp.auth import ResourceServerAuthError
++        from pmcp.auth import AuthMessage, ResourceServerAuthError
+ 
+         with (
+             patch(
+@@ -398,7 +398,7 @@ class TestHttpObservabilityContracts:
+             patch(
+                 "pmcp.transport.http.validate_resource_server_token",
+                 side_effect=ResourceServerAuthError(
+-                    "insufficient_scope", "Missing required scope(s): write"
++                    "insufficient_scope", AuthMessage.MISSING_SCOPES, scopes="write"
+                 ),
+             ),
+         ):
+@@ -441,12 +441,13 @@ class TestHttpObservabilityContracts:
+             )
+ 
+     def test_resource_server_jwks_failure_gets_503_challenge(self) -> None:
+-        from pmcp.auth import ResourceServerJWKSUnavailable
++        from pmcp.auth import AuthMessage, ResourceServerJWKSUnavailable
+ 
+         with patch(
+             "pmcp.transport.http.AsyncJWKS.get_for_token",
+             side_effect=ResourceServerJWKSUnavailable(
+-                "JWKS fetch failed for https://issuer.example/jwks.json?token=secret."
++                AuthMessage.JWKS_FETCH_FAILED,
++                url="https://issuer.example/jwks.json?token=secret",
+             ),
+         ):
+             client = _make_contract_client(
+diff --git a/tests/test_scoped_advisor_audit.py b/tests/test_scoped_advisor_audit.py
+index 138e06a..edf4db0 100644
+--- a/tests/test_scoped_advisor_audit.py
++++ b/tests/test_scoped_advisor_audit.py
+@@ -22,6 +22,7 @@ from mcp.server.session import ServerSession
+ from mcp.types import CallToolRequestParams, PaginatedRequestParams
+ from pydantic import ValidationError
+ 
++from pmcp.auth import AuthMessage
+ from pmcp.policy.policy import PolicyManager
+ from pmcp.identity import acquire_singleton_lock, release_singleton_lock
+ from pmcp.scoped_advisor_audit import (
+@@ -1501,7 +1502,9 @@ def _open_containers(tool: Any, baseline: dict[str, Any]) -> list[str]:
+ #: more than a message. A new such class fails `_raised_exceptions` loudly.
+ _EXCEPTION_ARGS: dict[str, tuple[Any, ...]] = {
+     "HTTPError": ("https://example.invalid/", 500, "stub handler failed", None, None),
+-    "ResourceServerAuthError": ("invalid_token", "stub handler failed"),
++    # The auth errors take only `AuthMessage` members (Consiliency/pmcp#326).
++    "ResourceServerAuthError": ("invalid_token", AuthMessage.INVALID_TOKEN),
++    "ResourceServerJWKSUnavailable": (AuthMessage.JWKS_NO_USABLE_KEYS,),
+     "MissingRemoteHeaderAuthError": ("stub", ["STUB_VAR"]),
+     "MissingApiKeyError": ("STUB_VAR", "stub", "stub"),
+ }
+````
+
 ### File — `tests/test_auth_operator_messages.py`
 
 ````python
@@ -858,21 +1364,25 @@ pmcp's own diagnostic sanitiser unchanged.
 
 `ResourceServerAuthError.__init__` runs its description through
 `sanitize_auth_diagnostic`, so a fixed text the sanitiser reads as a
-credential is stored mangled: "Token could not be verified with the
+credential was stored mangled: "Token could not be verified with the
 published key." became "Token [REDACTED] not be verified with the published
-key.". The list below is DERIVED from the code: an AST walk of `auth.py` and
-`transport/http.py` that reads every message-carrying call (every `raise`,
-the auth error classes, the response constructors), positional and keyword
-arguments, resolving single-assignment variables, f-strings, `%` and
-`.format` templates. Whatever it cannot render must be in a reviewed
-exemption list, a `raise` of an unknown callee fails, and the derived set is
-pinned exactly -- so the walk fails closed rather than skipping a shape it
-does not know. The pyjwt classes `_FIXED_TEXT_CLAIM_ERRORS` keeps the text of
-are generated and checked separately.
+key.".
 
-Each text must survive both layers separately and together: the redactor's
-own rules (`_sanitize_base`), the additive rules (`redact_additive`,
-Consiliency/pmcp#234), and the composed `sanitize_auth_diagnostic`.
+Round 4: the texts live in ONE registry, `pmcp.auth.AuthMessage`, and the
+code cannot use anything else -- the class fix after three rounds in which a
+static collector was beaten by a new code shape. So:
+
+1. every registry member, rendered with sample configuration fields,
+   survives the redactor's own rules (`_sanitize_base`), the additive rules
+   (`redact_additive`, #234) and the composed `sanitize_auth_diagnostic`;
+2. the auth error classes and `_auth_response` raise `TypeError` for a
+   message that is not a member (or the narrow `pyjwt_text` pass-through),
+   whatever shape produced it -- a literal, a variable, a subclass constant,
+   a walrus, an alias;
+3. a static check -- syntax only, no resolver -- requires every raise and
+   `_reject` site in `auth.py` and `transport/http.py` to name
+   `AuthMessage.<NAME>` directly, which covers sites no test reaches;
+4. logs are checked end to end through the real `setup_logging`.
 
 A whole `WWW-Authenticate` header is the one deliberate exception, pinned
 below: the base `Bearer` rule redacts the challenge's first parameter (it
@@ -880,18 +1390,13 @@ cannot tell `Bearer resource="..."` from `Bearer <token>`), the base rules
 are frozen (additive-only, #234), and pmcp never runs its own challenge
 through the sanitiser. Its parameters must survive one by one, and pmcp's own
 challenge parser must read them back intact.
-
-The challenges are collected once, at import, through the real app: a wiring
-change there is a collection error for this module, not one red test.
 """
 
 from __future__ import annotations
 
 import ast
-import builtins
 from pathlib import Path
 import time
-import urllib.error
 from typing import Any, Callable
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -901,758 +1406,27 @@ from starlette.testclient import TestClient
 
 from pmcp import auth as auth_mod
 from pmcp.auth import (
+    AuthMessage,
+    AuthText,
     ResourceServerAuthError,
     ResourceServerJWKSUnavailable,
     _sanitize_base,
+    auth_messages,
     parse_www_authenticate,
+    pyjwt_text,
+    render_auth_message,
     sanitize_auth_diagnostic,
 )
 from pmcp.redaction_additive import redact_additive
 from pmcp.transport import http as http_mod
-from pmcp.transport.http import create_http_app
+from pmcp.transport.http import _auth_response, create_http_app
 
-_SAMPLE_URL = "https://issuer.example/.well-known/jwks.json"
-
-# A message part filled from config at run time, keyed by `ast.unparse` of the
-# expression. A new hole fails the derivation until it gets a sample here.
-_HOLE_SAMPLES = {
-    "self.url": _SAMPLE_URL,
-    "' '.join(missing_scopes)": "mcp:read mcp:write",
+_SAMPLE_FIELDS = {
+    "url": "https://issuer.example/.well-known/jwks.json",
+    "scopes": "mcp:read mcp:write",
 }
-
-# Exception classes whose constructor does not take the message first.
-# Every other exception class -- builtin, imported, or defined in the walked
-# module, found at test time, aliases included -- is classified by
-# `_Walk._spec`; one it cannot classify fails the walk.
-_KNOWN_SPECS: dict[type[BaseException], tuple[int, tuple[str, ...]]] = {
-    ResourceServerAuthError: (1, ("description",)),
-    ResourceServerJWKSUnavailable: (0, ("description",)),
-    urllib.error.HTTPError: (2, ("msg",)),  # (url, code, msg, hdrs, fp)
-}
-# Non-exception calls that put a fixed text on the wire.
-_RESPONSE_CALLS: dict[str, tuple[int, tuple[str, ...]]] = {
-    "_reject": (1, ("body",)),  # http.py: the 401/403/503 response body
-    "Response": (0, ("content",)),  # http.py: 413/429/504 bodies
-}
-
-_LOG_LEVELS = {"debug", "info", "warning", "warn", "error", "exception", "critical"}
-_LOGGERS = {"logger", "log", "logging"}
-
-# Messages the walk cannot render, each reviewed. Keyed by (module, enclosing
-# function, `ast.unparse` of the argument) -- never by line number.
-_EXEMPT_UNRENDERED = sorted(
-    [
-        # pyjwt's own text; `_FIXED_TEXT_CLAIM_ERRORS` keeps it, and the pyjwt half
-        # below generates and checks every one.
-        ("auth.py", "validate_resource_server_token", "str(exc)"),
-        # `_reject`'s pass-through: every caller's literal body is collected.
-        ("transport/http.py", "create_http_app._reject", "body"),
-        # Prometheus exposition text, not a message.
-        ("transport/http.py", "create_http_app.handle_metrics", "_generate_latest()"),
-        (
-            "transport/http.py",
-            "create_http_app.handle_metrics",
-            "'\\n'.join(lines) + '\\n'",
-        ),
-        # `202 Accepted` with no body, and the two body-less `_NullResponse()`s
-        # (a `Response` subclass, so the walk sees them as response calls).
-        ("transport/http.py", "create_http_app.handle_mcp", "<no message>"),
-        ("transport/http.py", "create_http_app.handle_mcp", "<no message>"),
-        ("transport/http.py", "create_http_app.handle_mcp", "<no message>"),
-    ]
-)
-
+_MESSAGES = auth_messages()
 _MODULES = {"auth.py": auth_mod, "transport/http.py": http_mod}
-
-
-_Spec = tuple  # ("call", index, keywords, stored) | ("carried",) | ("ignore",) | ("unclassified", why)
-_SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
-
-
-class _Walk:
-    """One pass over a module: the messages it renders, the ones it cannot,
-    the `raise`s it cannot classify, and the log templates.
-
-    ``namespace`` resolves callee names at test time (the imported module's
-    globals for the real modules; a chosen mapping for synthetic ones)."""
-
-    def __init__(
-        self, rel: str, tree: ast.Module, namespace: dict[str, Any] | None = None
-    ) -> None:
-        self.rel = rel
-        self.tree = tree
-        self.namespace = dict(namespace or {})
-        self.classes = {n.name: n for n in tree.body if isinstance(n, ast.ClassDef)}
-        self.fixed: list[tuple[str, bool, str]] = []  # (where, stored, text)
-        self.unrendered: list[tuple[str, str, str]] = []
-        self.unclassified: list[str] = []
-        self.logs: list[str] = []
-        self._visit(tree, [], [tree], None)
-
-    # -- classification ---------------------------------------------------------
-
-    def _spec(self, func: ast.expr, frames: list[ast.AST], depth: int = 0) -> _Spec:
-        if depth > 8:
-            return ("unclassified", "alias chain too deep")
-        if isinstance(func, ast.Name):
-            name = func.id
-            if name in _RESPONSE_CALLS:
-                return ("call", *_RESPONSE_CALLS[name], False)
-            obj = self.namespace.get(name, getattr(builtins, name, None))
-            if isinstance(obj, type) and obj in _KNOWN_SPECS:
-                return self._runtime_spec(obj)
-            if name in self.classes:
-                return self._class_spec(self.classes[name], depth)
-            if obj is not None:
-                return self._runtime_spec(obj)
-            value = _resolve(name, frames)
-            if isinstance(value, (ast.Name, ast.Attribute)):
-                return self._spec(value, frames, depth + 1)  # an alias
-            return ("ignore",)
-        if isinstance(func, ast.Attribute):
-            obj: Any = None
-            chain: list[str] = []
-            node: ast.expr = func
-            while isinstance(node, ast.Attribute):
-                chain.insert(0, node.attr)
-                node = node.value
-            if isinstance(node, ast.Name) and node.id in self.namespace:
-                obj = self.namespace[node.id]
-                for attr in chain:
-                    obj = getattr(obj, attr, None)
-            return self._runtime_spec(obj)
-        return ("ignore",)
-
-    def _runtime_spec(self, obj: Any) -> _Spec:
-        if not (isinstance(obj, type) and issubclass(obj, BaseException)):
-            return ("ignore",)
-        stored = issubclass(obj, ResourceServerAuthError)
-        for klass in obj.__mro__:
-            if klass in _KNOWN_SPECS:
-                if klass is not obj and "__init__" in vars(obj):
-                    return ("unclassified", f"{obj.__name__} overrides __init__")
-                return ("call", *_KNOWN_SPECS[klass], stored)
-        if "__init__" in vars(obj) and obj.__module__ != "builtins":
-            return ("unclassified", f"{obj.__name__} overrides __init__")
-        return ("call", 0, (), stored)
-
-    def _class_spec(self, cls: ast.ClassDef, depth: int) -> _Spec:
-        """A class defined in the walked module: follow its `__init__`'s
-        `super().__init__` to see where the message comes from."""
-        if not cls.bases:
-            return ("ignore",)
-        base = self._spec(cls.bases[0], [self.tree], depth + 1)
-        init = next(
-            (
-                n
-                for n in cls.body
-                if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and n.name == "__init__"
-            ),
-            None,
-        )
-        if base[0] != "call" or init is None:
-            return base
-        params = [a.arg for a in init.args.args[1:]]
-        sup = next((c for c in ast.walk(init) if _is_super_init(c)), None)
-        if sup is None:
-            return ("unclassified", f"{cls.name}.__init__ never calls super")
-        arg = _message_arg(sup, base[1], base[2])
-        if isinstance(arg, ast.Name) and arg.id in params:
-            return ("call", params.index(arg.id), (arg.id,), base[3])
-        return ("carried",)  # its message is in `super().__init__`, collected there
-
-    # -- the walk ------------------------------------------------------------
-
-    def _visit(
-        self, node: ast.AST, scope: list[str], frames: list[ast.AST], cls: Any
-    ) -> None:
-        for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                self._visit(child, [*scope, child.name], [*frames, child], cls)
-                continue
-            if isinstance(child, ast.ClassDef):
-                self._visit(child, [*scope, child.name], frames, child)
-                continue
-            if isinstance(child, ast.Raise) and child.exc is not None:
-                self._raise(child, frames)
-            if isinstance(child, ast.Call):
-                self._call(child, scope, frames, cls)
-            self._visit(child, scope, frames, cls)
-
-    def _raise(self, node: ast.Raise, frames: list[ast.AST]) -> None:
-        exc = node.exc
-        assert exc is not None
-        where = f"{self.rel}:{node.lineno}"
-        if isinstance(exc, ast.Name):
-            if _bound_by_except(exc.id, frames):
-                return  # re-raising a caught exception
-            value = _resolve(exc.id, frames)
-            if not isinstance(value, ast.Call):
-                self.unclassified.append(f"{where} raise {exc.id}: unresolved")
-                return
-            exc = value
-        if not isinstance(exc, ast.Call):
-            self.unclassified.append(f"{where} raise {ast.unparse(exc)}")
-            return
-        spec = self._spec(exc.func, frames)
-        if spec[0] not in ("call", "carried"):
-            why = spec[1] if spec[0] == "unclassified" else "not an exception class"
-            self.unclassified.append(f"{where} raise {ast.unparse(exc.func)}: {why}")
-
-    def _call(
-        self, call: ast.Call, scope: list[str], frames: list[ast.AST], cls: Any
-    ) -> None:
-        func = call.func
-        where = ".".join(scope)
-        if (
-            isinstance(func, ast.Attribute)
-            and isinstance(func.value, ast.Name)
-            and func.value.id in _LOGGERS
-            and func.attr in _LOG_LEVELS
-        ):
-            arg = _message_arg(call, 0, ("msg",))
-            self.logs.append(ast.unparse(arg) if arg is not None else "<no message>")
-            return
-        if _is_super_init(call):
-            if cls is None or not cls.bases:
-                return
-            base = self._spec(cls.bases[0], [self.tree])
-            if base[0] != "call":
-                return
-            arg = _message_arg(call, base[1], base[2])
-            fn = frames[-1]
-            params = (
-                {a.arg for a in fn.args.args}
-                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef))
-                else set()
-            )
-            if (isinstance(arg, ast.Name) and arg.id in params) or (
-                isinstance(arg, ast.Attribute)
-                and isinstance(arg.value, ast.Name)
-                and arg.value.id == "self"
-            ):
-                return  # pass-through: the constructor's callers are collected
-            self._record(call, arg, base[3], where, frames)
-            return
-        spec = self._spec(func, frames)
-        if spec[0] != "call":
-            return
-        self._record(call, _message_arg(call, spec[1], spec[2]), spec[3], where, frames)
-
-    def _record(
-        self,
-        call: ast.Call,
-        arg: ast.expr | None,
-        stored: bool,
-        where: str,
-        frames: list[ast.AST],
-    ) -> None:
-        if arg is None:
-            self.unrendered.append((self.rel, where, "<no message>"))
-            return
-        text = _render(arg, frames)
-        if text is None:
-            self.unrendered.append((self.rel, where, ast.unparse(arg)))
-        else:
-            self.fixed.append((f"{self.rel}:{call.lineno}", stored, text))
-
-
-def _is_super_init(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "__init__"
-        and isinstance(node.func.value, ast.Call)
-        and isinstance(node.func.value.func, ast.Name)
-        and node.func.value.func.id == "super"
-    )
-
-
-def _callee(call: ast.Call) -> str:
-    func = call.func
-    return func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
-
-
-def _message_arg(
-    call: ast.Call, index: int, keywords: tuple[str, ...]
-) -> ast.expr | None:
-    for keyword in call.keywords:
-        if keyword.arg in keywords:
-            return keyword.value
-    if len(call.args) > index and not isinstance(call.args[index], ast.Starred):
-        return call.args[index]
-    return None
-
-
-def _scope_nodes(frame: ast.AST) -> list[ast.AST]:
-    """Every node in ``frame``'s own scope: nested functions, lambdas, classes
-    and comprehensions are their own scopes and are not entered (their
-    names, which bind here, are still reported)."""
-    out: list[ast.AST] = []
-    todo = list(ast.iter_child_nodes(frame))
-    while todo:
-        node = todo.pop()
-        out.append(node)
-        if isinstance(
-            node, (*_SCOPES, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
-        ):
-            continue
-        todo.extend(ast.iter_child_nodes(node))
-    return out
-
-
-def _bindings(name: str, frame: ast.AST) -> list[ast.AST]:
-    """Every node that binds ``name`` in ``frame``'s own scope, of any kind."""
-    found: list[ast.AST] = []
-    if isinstance(frame, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        a = frame.args
-        params = [*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg]
-        found += [p for p in params if p is not None and p.arg == name]
-    for node in _scope_nodes(frame):
-        if (
-            isinstance(node, ast.Name)
-            and node.id == name
-            and isinstance(node.ctx, (ast.Store, ast.Del))
-        ):
-            found.append(node)
-        elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
-            found.append(node)
-        elif isinstance(node, (ast.Import, ast.ImportFrom)) and any(
-            (al.asname or al.name.split(".")[0]) == name for al in node.names
-        ):
-            found.append(node)
-        elif isinstance(node, ast.ExceptHandler) and node.name == name:
-            found.append(node)
-        elif isinstance(node, _SCOPES) and getattr(node, "name", None) == name:
-            found.append(node)
-    return found
-
-
-def _resolve(name: str, frames: list[ast.AST]) -> ast.expr | None:
-    """The value of ``name`` if, in the innermost scope that binds it, the
-    ONLY binding is one plain assignment (`x = ...` or `x: T = ...`). Any
-    other binding -- `+=`, a parameter, a `for`/`with` target, `:=`,
-    unpacking, `global`/`nonlocal`, an import, a second assignment -- and
-    the resolver refuses (None) rather than guess."""
-    for frame in reversed(frames):
-        found = _bindings(name, frame)
-        if not found:
-            continue
-        if len(found) != 1:
-            return None
-        parent = next(
-            (
-                n
-                for n in _scope_nodes(frame)
-                if isinstance(n, (ast.Assign, ast.AnnAssign))
-                and (n.targets if isinstance(n, ast.Assign) else [n.target])
-                == [found[0]]
-            ),
-            None,
-        )
-        if parent is None or parent.value is None:
-            return None
-        return parent.value
-    return None
-
-
-def _bound_by_except(name: str, frames: list[ast.AST]) -> bool:
-    found = _bindings(name, frames[-1])
-    return bool(found) and all(isinstance(n, ast.ExceptHandler) for n in found)
-
-
-def _render(node: ast.expr, frames: list[ast.AST]) -> str | None:
-    """The text a message expression produces, holes filled from
-    `_HOLE_SAMPLES`. `None` means it cannot be rendered."""
-    source = ast.unparse(node)
-    if source in _HOLE_SAMPLES:
-        return _HOLE_SAMPLES[source]
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
-    if isinstance(node, ast.Name):
-        value = _resolve(node.id, frames)
-        return None if value is None else _render(value, frames)
-    if isinstance(node, ast.JoinedStr):
-        parts: list[str] = []
-        for value in node.values:
-            if isinstance(value, ast.Constant):
-                parts.append(str(value.value))
-                continue
-            assert isinstance(value, ast.FormattedValue)
-            part = _render(value.value, frames)
-            if part is None:
-                return None
-            parts.append(part)
-        return "".join(parts)
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left, right = _render(node.left, frames), _render(node.right, frames)
-        return None if left is None or right is None else left + right
-    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
-        template = _render(node.left, frames)
-        items = node.right.elts if isinstance(node.right, ast.Tuple) else [node.right]
-        values = [_render(item, frames) for item in items]
-        if template is None or any(v is None for v in values):
-            return None
-        return template % tuple(values)
-    if (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "format"
-        and not node.keywords
-    ):
-        template = _render(node.func.value, frames)
-        values = [_render(a, frames) for a in node.args]
-        if template is None or any(v is None for v in values):
-            return None
-        return template.format(*values)
-    return None
-
-
-def _walk_all() -> list[_Walk]:
-    walks = []
-    for rel, module in _MODULES.items():
-        path = Path(module.__file__ or "")
-        walks.append(_Walk(rel, ast.parse(path.read_text()), vars(module)))
-    return walks
-
-
-_WALKS = _walk_all()
-_FIXED = [(where, text) for w in _WALKS for where, _stored, text in w.fixed]
-
-# The exact derived set, as (module, text) with multiplicity. A message that
-# drops out of the walk -- or a new one -- changes this, so the derivation
-# cannot shrink silently. Update it when a message is added or reworded.
-_PINNED_FIXED = sorted(
-    [
-        ("auth.py", "Empty token."),
-        ("auth.py", "Invalid JWKS JSON from " + _SAMPLE_URL + "."),
-        ("auth.py", "Invalid JWKS object from " + _SAMPLE_URL + "."),
-        ("auth.py", "Invalid URL-mode elicitation URL."),
-        ("auth.py", "Invalid audience."),
-        ("auth.py", "Invalid public auth URL."),
-        ("auth.py", "Invalid token."),
-        ("auth.py", "JWKS URL is required."),
-        ("auth.py", "JWKS contains no usable signing keys."),
-        (
-            "auth.py",
-            "JWKS endpoint returned a redirect for "
-            + _SAMPLE_URL
-            + "; refusing to follow.",
-        ),
-        ("auth.py", "JWKS fetch failed for " + _SAMPLE_URL + "."),
-        ("auth.py", "JWKS fetch failed for " + _SAMPLE_URL + "."),
-        (
-            "auth.py",
-            "JWKS refresh recently failed for " + _SAMPLE_URL + "; backing off.",
-        ),
-        ("auth.py", "JWKS response too large for " + _SAMPLE_URL + "."),
-        ("auth.py", "Missing required scope(s): mcp:read mcp:write"),
-        ("auth.py", "No matching JWK found."),
-        (
-            "auth.py",
-            "Public auth URL host is a non-public IP literal or loopback name.",
-        ),
-        ("auth.py", "Public auth URL must be an absolute HTTP(S) URL."),
-        ("auth.py", "Public auth URL only allows http:// URLs for loopback hosts."),
-        ("auth.py", "Redirects are not allowed."),
-        ("auth.py", "The published key cannot verify this token."),
-        ("auth.py", "The token's algorithm is not supported."),
-        ("transport/http.py", "Forbidden"),
-        ("transport/http.py", "Forbidden"),
-        ("transport/http.py", "Forbidden"),
-        ("transport/http.py", "Gateway Timeout"),
-        ("transport/http.py", "Gateway Timeout"),
-        ("transport/http.py", "Payload Too Large"),
-        ("transport/http.py", "Payload Too Large"),
-        (
-            "transport/http.py",
-            "Protected-resource metadata needs a canonical resource: set "
-            "resource_server_audience (--oauth-audience) or an absolute "
-            "protected_resource_metadata_url.",
-        ),
-        ("transport/http.py", "Resource Server JWKS is not configured."),
-        ("transport/http.py", "Service Unavailable"),
-        ("transport/http.py", "Too Many Requests"),
-        ("transport/http.py", "Unauthorized"),
-        ("transport/http.py", "Unauthorized"),
-        ("transport/http.py", "Unauthorized"),
-        ("transport/http.py", "Unsupported auth mode."),
-        (
-            "transport/http.py",
-            "auth_token is required when auth_mode is shared-secret.",
-        ),
-        (
-            "transport/http.py",
-            "resource-server auth mode requires issuer, JWKS URL, and audience.",
-        ),
-    ]
-)
-
-# Log templates, pinned the same way so the walk is proven to see them. They
-# are NOT checked against the sanitiser: no log record passes through it (see
-# `test_no_log_sink_applies_the_sanitiser`). Several would be rewritten if one
-# did -- `Streamable-HTTP session manager started` becomes `Streamable-HTTP
-# session [REDACTED] started` -- which is why that test exists.
-_PINNED_LOGS = sorted(
-    [
-        "'Streamable-HTTP session manager started'",
-        "'Streamable-HTTP session manager stopped'",
-        "'handle_mcp [%s]: %s method=%s session=%s accept=%r'",
-        "'handle_mcp [%s]: 401 invalid token'",
-        "'handle_mcp [%s]: 401 missing bearer'",
-        "'handle_mcp [%s]: 401 unauthorized'",
-        "'handle_mcp [%s]: 403 insufficient scope'",
-        "'handle_mcp [%s]: 403 invalid host'",
-        "'handle_mcp [%s]: 403 invalid origin'",
-        "'handle_mcp [%s]: 413 Content-Length over cap'",
-        "'handle_mcp [%s]: 413 body exceeded cap during read'",
-        "'handle_mcp [%s]: 429 rate limited ip=%s'",
-        "'handle_mcp [%s]: 503 jwks unavailable'",
-        "'handle_mcp [%s]: body read timed out after %ss'",
-        "'handle_mcp [%s]: request timed out after %ss'",
-        "'handle_mcp [%s]: rmcp-compat accepted notifications/initialized "
-        "without session ID'",
-    ]
-)
-
-
-def _multiset_diff(found: list[Any], expected: list[Any]) -> str:
-    """'' when `found` equals `expected` as a multiset, else what differs.
-    Multiplicity counts: a second `<no message>` in a function that already
-    has a reviewed one is a new, unreviewed entry."""
-    extra, missing = list(found), []
-    for item in expected:
-        if item in extra:
-            extra.remove(item)
-        else:
-            missing.append(item)
-    return "" if not extra and not missing else f"new: {extra}; gone: {missing}"
-
-
-def _derived() -> list[tuple[str, str]]:
-    return sorted((where.rsplit(":", 1)[0], text) for where, text in _FIXED)
-
-
-def _unrendered() -> list[tuple[str, str, str]]:
-    return sorted(u for w in _WALKS for u in w.unrendered)
-
-
-def test_the_derived_set_is_exactly_the_pinned_set() -> None:
-    assert _multiset_diff(_derived(), _PINNED_FIXED) == ""
-
-
-def test_every_message_the_walk_cannot_render_is_reviewed() -> None:
-    assert _multiset_diff(_unrendered(), _EXEMPT_UNRENDERED) == ""
-
-
-def test_the_pin_and_the_exemptions_are_exact_not_floors() -> None:
-    """The comparison itself: one more, one fewer, or one duplicated entry
-    each fails (a floor such as `>= 28` let the round-1 list shrink)."""
-    for found, expected in (
-        (_derived(), _PINNED_FIXED),
-        (_unrendered(), _EXEMPT_UNRENDERED),
-    ):
-        assert _multiset_diff(found + [found[0]], expected) != ""
-        assert _multiset_diff(found[1:], expected) != ""
-        assert (
-            _multiset_diff([*found[1:], ("x", "y", "z")[: len(found[0])]], expected)
-            != ""
-        )
-
-
-def test_every_raised_callee_is_classified() -> None:
-    assert [u for w in _WALKS for u in w.unclassified] == []
-
-
-def test_the_log_templates_are_exactly_the_pinned_set() -> None:
-    assert sorted(t for w in _WALKS for t in w.logs) == _PINNED_LOGS
-
-
-def _log_messages() -> list[str]:
-    """Each pinned log template rendered with representative args."""
-    out = []
-    for source in _PINNED_LOGS:
-        template = ast.literal_eval(source)
-        holes = template.count("%s") + template.count("%r")
-        out.append(template % tuple(["req-1"] * holes) if holes else template)
-    return out
-
-
-@pytest.mark.parametrize("log_format", ["text", "json"])
-def test_no_log_sink_applies_the_sanitiser(
-    log_format: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Behavioural (round 3): run the real `setup_logging` and send every
-    pinned log template through every handler it installs (stderr and the
-    rotating file), with their filters and formatters. Each message must come
-    out verbatim. Any sink that redacts -- a filter, a record factory, a
-    formatter subclass, whatever its shape -- turns this red, and then the log
-    templates must join the sanitiser check (and the two `session manager`
-    lines be reworded: through the sanitiser they read `session [REDACTED]`).
-    Today no sink redacts a record; values are sanitised only where a call
-    site interpolates them (`describe_exception`, `sanitize_auth_diagnostic`)."""
-    import json
-    import logging
-
-    from pmcp import cli
-
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(cli, "LOG_DIR", tmp_path / "logs")
-    monkeypatch.setattr(cli, "LOG_FILE", tmp_path / "logs" / "gateway.log")
-    root = logging.getLogger()
-    before, level = list(root.handlers), root.level
-    try:
-        cli.setup_logging("DEBUG", log_to_file=True, log_format=log_format)
-        added = [h for h in root.handlers if h not in before]
-        assert len(added) == 2, added  # stderr + rotating file
-        factory = logging.getLogRecordFactory()
-        for message in _log_messages():
-            record = factory(
-                "pmcp.transport.http", logging.INFO, __file__, 1, message, None, None
-            )
-            assert root.filter(record) and logging.getLogger(
-                "pmcp.transport.http"
-            ).filter(record)
-            for handler in added:
-                assert handler.filter(record), f"{handler} dropped {message!r}"
-                out = handler.format(record)
-                shown = json.loads(out)["msg"] if log_format == "json" else out
-                assert message in shown, f"{type(handler).__name__}: {out!r}"
-    finally:
-        for handler in [h for h in root.handlers if h not in before]:
-            root.removeHandler(handler)
-            handler.close()
-        root.setLevel(level)
-
-
-def test_no_redacting_log_hook_in_the_source() -> None:
-    """Supplement to the behavioural test: the hooks that would redact a
-    record without going through `setup_logging`."""
-    src = Path(auth_mod.__file__ or "").parent
-    hits = [
-        f"{p.relative_to(src)}: {needle}"
-        for p in sorted(src.rglob("*.py"))
-        for needle in ("addFilter(", "logging.Filter", "setLogRecordFactory(")
-        if needle in p.read_text()
-    ]
-    assert hits == []
-
-
-# Module-level source shapes. Each carries a text the sanitiser really
-# rewrites, so on the real tree it would turn
-# `test_every_fixed_message_survives_the_sanitiser` red -- provided the walk
-# renders it. Rounds 1 and 2 of the panel each found shapes the walk skipped.
-_RENDERED_SHAPES = {
-    # round 1 (claude, codex)
-    "keyword": 'def f():\n    raise ResourceServerAuthError("invalid_token", '
-    'description="Token audience mismatch.")\n',
-    "variable": 'def f():\n    message = "Token could not be verified."\n'
-    '    raise ResourceServerAuthError("invalid_token", message)\n',
-    "percent": 'def f():\n    raise ResourceServerAuthError("invalid_token", '
-    '"JWKS URL is required for token %s." % "checks")\n',
-    "format": 'def f():\n    raise ValueError("Token {} rejected.".format("checks"))\n',
-    "runtime_error": 'def f():\n    raise RuntimeError("Unsupported secret mode.")\n',
-    # round 2 (codex F-raise-name; claude F2a, F2b)
-    "raise_name": 'def f():\n    error = LookupError("Token expired.")\n'
-    "    raise error\n",
-    "alias": "_Err = ResourceServerAuthError\n"
-    'def f():\n    err = _Err("invalid_token", "Token expired.")\n    raise err\n',
-    "subclass_super": "class _TokenRejected(ResourceServerAuthError):\n"
-    "    def __init__(self):\n"
-    '        super().__init__("invalid_token", "Token expired.")\n'
-    "def f():\n    raise _TokenRejected()\n",
-}
-
-# Shapes the walk must REFUSE to render: each binds the message name in a way
-# a single-assignment resolver would get wrong (round 2: codex's `+=`; claude
-# F2c). Refused means recorded as unrendered, which fails the real-tree
-# exemption check -- never rendered as the wrong text.
-_REFUSED_SHAPES = {
-    "augmented": 'def f():\n    message = "Empty token."\n'
-    '    message += " Token expired."\n'
-    '    raise ResourceServerAuthError("invalid_token", message)\n',
-    "for_target": 'def f():\n    for message in ("Token expired.",):\n'
-    '        raise ResourceServerAuthError("invalid_token", message)\n',
-    "walrus": 'def f():\n    if (message := "Token expired."):\n'
-    '        raise ResourceServerAuthError("invalid_token", message)\n',
-    "unpacked": 'def f():\n    message, _ = "Token expired.", 1\n'
-    '    raise ResourceServerAuthError("invalid_token", message)\n',
-    "with_target": "def f(cm):\n    with cm as message:\n"
-    '        raise ResourceServerAuthError("invalid_token", message)\n',
-    "parameter_shadows_module": 'message = "Fine."\n'
-    'def f(message="Token expired."):\n'
-    '    raise ResourceServerAuthError("invalid_token", message)\n',
-    "global": 'message = "Fine."\ndef f():\n    global message\n'
-    '    message = "Token expired."\n'
-    '    raise ResourceServerAuthError("invalid_token", message)\n',
-    "reassigned": 'def f(x):\n    message = "Fine."\n    if x:\n'
-    '        message = "Token expired."\n'
-    '    raise ResourceServerAuthError("invalid_token", message)\n',
-}
-
-# `raise`s the walk must report as unclassified.
-_UNCLASSIFIED_RAISES = {
-    "unknown_callee": "def f():\n    raise make_error('Token expired.')\n",
-    "unresolved_name": "def f(error):\n    raise error\n",
-    "built_by_unknown": "def f():\n    error = make_error('Token expired.')\n"
-    "    raise error\n",
-    "attribute": "def f(self):\n    raise self.error\n",
-    "subclass_without_super": "class _Bad(ResourceServerAuthError):\n"
-    "    def __init__(self):\n        self.description = 'Token expired.'\n"
-    "def f():\n    raise _Bad()\n",
-}
-
-
-def _walk_source(source: str) -> _Walk:
-    return _Walk("auth.py", ast.parse(source), vars(auth_mod))
-
-
-@pytest.mark.parametrize("shape", sorted(_RENDERED_SHAPES))
-def test_the_walk_renders_every_message_shape(shape: str) -> None:
-    walk = _walk_source(_RENDERED_SHAPES[shape])
-    assert walk.unclassified == [] and walk.unrendered == [], (
-        walk.unclassified,
-        walk.unrendered,
-    )
-    [(_where, _stored, text)] = walk.fixed
-    assert _layers(text) != {k: text for k in ("base", "additive", "composed")}, (
-        f"{shape}: the sample text {text!r} should be one the sanitiser rewrites"
-    )
-
-
-@pytest.mark.parametrize("shape", sorted(_REFUSED_SHAPES))
-def test_the_walk_refuses_a_name_it_cannot_resolve_exactly(shape: str) -> None:
-    walk = _walk_source(_REFUSED_SHAPES[shape])
-    assert walk.fixed == [], f"{shape}: rendered a guess: {walk.fixed}"
-    assert [u[2] for u in walk.unrendered] == ["message"]
-
-
-@pytest.mark.parametrize("shape", sorted(_UNCLASSIFIED_RAISES))
-def test_the_walk_reports_every_raise_it_cannot_classify(shape: str) -> None:
-    walk = _walk_source(_UNCLASSIFIED_RAISES[shape])
-    assert len(walk.unclassified) == 1, walk.unclassified
-
-
-def test_re_raising_a_caught_exception_is_not_a_message() -> None:
-    walk = _walk_source(
-        "def f():\n    try:\n        g()\n    except ValueError as exc:\n"
-        "        raise exc\n"
-    )
-    assert (walk.unclassified, walk.unrendered, walk.fixed) == ([], [], [])
-
-
-def test_the_walk_fails_closed_on_what_it_cannot_render() -> None:
-    walk = _walk_source(
-        "def f(x):\n"
-        "    raise ResourceServerAuthError('invalid_token', f'bad {x}')\n"
-        "    raise ResourceServerAuthError('invalid_token', compute())\n"
-        "    logger.info('Streamable-HTTP session manager started')\n"
-    )
-    assert sorted(walk.unrendered) == sorted(
-        [("auth.py", "f", "f'bad {x}'"), ("auth.py", "f", "compute()")]
-    )
-    assert walk.logs == ["'Streamable-HTTP session manager started'"]
 
 
 def _layers(text: str) -> dict[str, str]:
@@ -1663,21 +1437,412 @@ def _layers(text: str) -> dict[str, str]:
     }
 
 
-@pytest.mark.parametrize(("where", "text"), _FIXED, ids=[w for w, _ in _FIXED])
-def test_every_fixed_message_survives_the_sanitiser(where: str, text: str) -> None:
-    mangled = {k: v for k, v in _layers(text).items() if v != text}
-    assert mangled == {}, f"{where}: {text!r} is rewritten: {mangled}"
+def _rendered(member: AuthText) -> str:
+    return render_auth_message(member, **_SAMPLE_FIELDS)
 
 
-@pytest.mark.parametrize(
-    "description",
-    sorted({text for w in _WALKS for _, stored, text in w.fixed if stored}),
-)
-def test_a_stored_description_is_the_text_written(description: str) -> None:
-    """End to end through the class that stores it."""
-    assert ResourceServerAuthError("invalid_token", description).description == (
-        description
+# --- 1. the registry: every member survives the sanitiser -----------------------
+
+
+def test_the_registry_is_complete_and_typed() -> None:
+    """The registry is the list now (no derivation to shrink): 29 members on
+    the round-4 spike, each an `AuthText`, no two with the same text."""
+    assert len(_MESSAGES) == 29, sorted(_MESSAGES)
+    assert len(set(_MESSAGES.values())) == len(_MESSAGES)
+    assert all(type(v) is AuthText for v in _MESSAGES.values())
+    assert _MESSAGES["KEY_CANNOT_VERIFY_TOKEN"] == (
+        "The published key cannot verify this token."
     )
+
+
+@pytest.mark.parametrize("name", sorted(_MESSAGES))
+def test_every_registry_message_survives_the_sanitiser(name: str) -> None:
+    text = _rendered(_MESSAGES[name])
+    mangled = {k: v for k, v in _layers(text).items() if v != text}
+    assert mangled == {}, f"AuthMessage.{name}: {text!r} is rewritten: {mangled}"
+
+
+@pytest.mark.parametrize("name", sorted(_MESSAGES))
+def test_a_stored_description_is_the_text_written(name: str) -> None:
+    """End to end through the class that stores it (and sanitises it)."""
+    text = _rendered(_MESSAGES[name])
+    exc = ResourceServerAuthError("invalid_token", _MESSAGES[name], **_SAMPLE_FIELDS)
+    assert exc.description == text and str(exc) == text
+
+
+# --- 2. the constructors refuse anything else -----------------------------------
+
+
+class _ClassConstant(ResourceServerAuthError):
+    message = "Token could not be verified."  # claude round 3 B1 / codex 1
+
+    def __init__(self) -> None:
+        super().__init__("invalid_token", self.message)  # type: ignore[arg-type]
+
+
+class _InitAttribute(ResourceServerAuthError):
+    def __init__(self) -> None:
+        self.message = "Token expired."
+        super().__init__("invalid_token", self.message)  # type: ignore[arg-type]
+
+
+class _AugmentedParameter(ResourceServerAuthError):
+    def __init__(self, message: str = "Empty token.") -> None:
+        message += " Token expired."
+        super().__init__("invalid_token", message)  # type: ignore[arg-type]
+
+
+def _walrus_message() -> ResourceServerAuthError:
+    message = "Empty token."
+    [(message := "Token expired.") for _ in range(1)]  # codex round 3 (2)
+    return ResourceServerAuthError("invalid_token", message)  # type: ignore[arg-type]
+
+
+_INNER = ResourceServerAuthError
+_OUTER = _INNER  # codex round 3 (3): an alias raised from a shadowing scope
+
+
+def _aliased_message() -> ResourceServerAuthError:
+    _INNER = ValueError  # noqa: F841 - the shadow the static resolver got wrong
+    return _OUTER("invalid_token", "Token expired.")  # type: ignore[arg-type]
+
+
+_REFUSED: dict[str, Callable[[], Any]] = {
+    # rounds 1-3 shapes
+    "literal": lambda: ResourceServerAuthError("invalid_token", "Token expired."),
+    "keyword": lambda: ResourceServerAuthError(
+        "invalid_token", description="Token audience mismatch."
+    ),
+    "percent": lambda: ResourceServerAuthError(
+        "invalid_token", "JWKS URL is required for token %s." % "checks"
+    ),
+    "format": lambda: ResourceServerAuthError(
+        "invalid_token", "Token {} rejected.".format("checks")
+    ),
+    "f_string": lambda: ResourceServerAuthError("invalid_token", f"Token {1}"),
+    "jwks_unavailable_str": lambda: ResourceServerJWKSUnavailable("Token expired."),
+    "plain_str_subclass_of_str": lambda: ResourceServerAuthError(
+        "invalid_token", str(AuthMessage.EMPTY_TOKEN)
+    ),
+    # round 3 shapes
+    "class_constant": _ClassConstant,
+    "init_attribute": _InitAttribute,
+    "augmented_parameter": _AugmentedParameter,
+    "comprehension_walrus": _walrus_message,
+    "shadowed_alias": _aliased_message,
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_REFUSED))
+def test_a_message_outside_the_registry_is_refused_at_construction(shape: str) -> None:
+    with pytest.raises(TypeError, match="AuthMessage member"):
+        _REFUSED[shape]()  # type: ignore[no-untyped-call]
+
+
+def test_an_auth_response_body_outside_the_registry_is_refused() -> None:
+    with pytest.raises(TypeError, match="AuthMessage member"):
+        _auth_response(401, "Unauthorized")  # type: ignore[arg-type]
+    assert _auth_response(401, AuthMessage.UNAUTHORIZED).body == b"Unauthorized"
+
+
+def test_the_pyjwt_pass_through_is_narrow() -> None:
+    with pytest.raises(TypeError, match="fixed-text pyjwt error"):
+        pyjwt_text(jwt.InvalidTokenError("Token payload: secret"))
+    with pytest.raises(TypeError):
+        pyjwt_text(ValueError("Token expired."))
+    kept = jwt.ExpiredSignatureError("Signature has expired")
+    exc = ResourceServerAuthError("invalid_token", pyjwt_text(kept))
+    assert exc.description == "Signature has expired"
+
+
+# --- 3. every site names a registry member: a static check, no resolver ----------
+
+# Callee -> (index, keyword) of its message argument. A `raise` of any other
+# callee in these two modules fails the check.
+_SITES: dict[str, tuple[int, str | None]] = {
+    "ResourceServerAuthError": (1, "description"),
+    "ResourceServerJWKSUnavailable": (0, "description"),
+    "ValueError": (0, None),
+    "HTTPError": (2, "msg"),
+    "_reject": (1, "body"),
+    "_auth_response": (1, "body"),
+}
+# The only exception classes these modules may define.
+_EXCEPTION_CLASSES = {"ResourceServerAuthError", "ResourceServerJWKSUnavailable"}
+_ERROR_CODES = {"invalid_token", "insufficient_scope", "temporarily_unavailable"}
+# The registry's guards, the only functions that may raise `TypeError`.
+_GUARDS = {"render_auth_message", "pyjwt_text", "_auth_response"}
+
+
+def _is_member(node: ast.expr | None) -> bool:
+    return (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "AuthMessage"
+        and node.attr in _MESSAGES
+    )
+
+
+def _is_pyjwt_pass_through(node: ast.expr | None) -> bool:
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "pyjwt_text"
+        and len(node.args) == 1
+        and isinstance(node.args[0], ast.Name)
+    )
+
+
+def _site_violations(rel: str, tree: ast.Module) -> list[str]:
+    """Syntax only: every raise/`_reject` site passes `AuthMessage.<NAME>`
+    directly. No resolver, so no scope rule to get wrong."""
+    out: list[str] = []
+    handler_names: set[str] = set()
+    guard_raises = {
+        id(n)
+        for fn in ast.walk(tree)
+        if isinstance(fn, ast.FunctionDef) and fn.name in _GUARDS
+        for n in ast.walk(fn)
+        if isinstance(n, ast.Raise)
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and node.name:
+            handler_names.add(node.name)
+        if isinstance(node, ast.ClassDef):
+            bases = {ast.unparse(b) for b in node.bases}
+            if node.name not in _EXCEPTION_CLASSES and (
+                bases & _EXCEPTION_CLASSES
+                or any(b.endswith(("Error", "Exception")) for b in bases)
+            ):
+                out.append(
+                    f"{rel}:{node.lineno} class {node.name}: new exception class"
+                )
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise) and node.exc is not None:
+            exc = node.exc
+            if isinstance(exc, ast.Name):
+                if exc.id not in handler_names:
+                    out.append(f"{rel}:{node.lineno} raise {exc.id}: not a re-raise")
+                continue
+            if not (isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name)):
+                out.append(f"{rel}:{node.lineno} raise {ast.unparse(exc)[:40]}")
+                continue
+            if exc.func.id == "TypeError" and id(node) in guard_raises:
+                continue  # the registry's own refusal, a programmer error
+            if exc.func.id not in _SITES:
+                out.append(f"{rel}:{node.lineno} raise {exc.func.id}: unknown callee")
+        if isinstance(node, ast.Call):
+            name = getattr(node.func, "id", None) or getattr(node.func, "attr", None)
+            if name not in _SITES:
+                continue
+            index, keyword = _SITES[name]
+            arg = next((k.value for k in node.keywords if k.arg == keyword), None)
+            if arg is None and len(node.args) > index:
+                arg = node.args[index]
+            ok = _is_member(arg) or (
+                name == "ResourceServerAuthError" and _is_pyjwt_pass_through(arg)
+            )
+            if name in ("_reject", "_auth_response") and isinstance(arg, ast.Name):
+                ok = ok or arg.id == "body"  # the helper's own parameter
+            if not ok:
+                out.append(
+                    f"{rel}:{node.lineno} {name}(...) message is "
+                    f"{ast.unparse(arg) if arg is not None else '<missing>'}"
+                )
+            if name == "ResourceServerAuthError" and node.args:
+                code = node.args[0]
+                if not (isinstance(code, ast.Constant) and code.value in _ERROR_CODES):
+                    if not (isinstance(code, ast.Name) and code.id == "error"):
+                        out.append(
+                            f"{rel}:{node.lineno} error code {ast.unparse(code)}"
+                        )
+    return sorted(set(out))
+
+
+def _module_trees() -> list[tuple[str, ast.Module]]:
+    return [
+        (rel, ast.parse(Path(module.__file__ or "").read_text()))
+        for rel, module in _MODULES.items()
+    ]
+
+
+def test_every_message_site_names_a_registry_member() -> None:
+    violations = [
+        v for rel, tree in _module_trees() for v in _site_violations(rel, tree)
+    ]
+    assert violations == [], violations
+
+
+def test_the_site_check_sees_every_site() -> None:
+    """Guards the check itself: it visits every raise and `_reject` in the
+    two modules (counted on the round-4 spike: 31 raises, 3 of them the
+    guards' own `TypeError`s, and 7 `_reject` calls)."""
+    counts = {"raise": 0, "_reject": 0}
+    for _rel, tree in _module_trees():
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+                counts["raise"] += 1
+            if isinstance(node, ast.Call) and getattr(node.func, "id", "") == "_reject":
+                counts["_reject"] += 1
+    assert counts == {"raise": 31, "_reject": 7}, counts
+
+
+_STATIC_SHAPES = {
+    # every shape the panel found in rounds 1-3, as source the check reads
+    "literal": 'def f():\n    raise ResourceServerAuthError("invalid_token", "Token x.")\n',
+    "keyword": "def f():\n    raise ResourceServerAuthError("
+    '"invalid_token", description="Token x.")\n',
+    "variable": 'def f():\n    message = AuthMessage.EMPTY_TOKEN + " Token x."\n'
+    '    raise ResourceServerAuthError("invalid_token", message)\n',
+    "percent": "def f():\n    raise ValueError(\"Token %s.\" % 'x')\n",
+    "runtime_error": 'def f():\n    raise RuntimeError("Unsupported secret mode.")\n',
+    "raise_name": 'def f():\n    error = LookupError("Token expired.")\n    raise error\n',
+    "alias": "_OUTER = ResourceServerAuthError\n"
+    'def f():\n    raise _OUTER("invalid_token", AuthMessage.EMPTY_TOKEN)\n',
+    "subclass": "class _TokenRejected(ResourceServerAuthError):\n"
+    "    message = 'Token expired.'\n",
+    "walrus": "def f():\n    raise ResourceServerAuthError("
+    "'invalid_token', [(m := 'Token x.') for _ in range(1)][0])\n",
+    "reject_literal": 'def f():\n    return _reject(401, "Unauthorized")\n',
+    "attribute_not_member": "def f(self):\n    raise ResourceServerAuthError("
+    "'invalid_token', self.message)\n",
+    "unknown_member": "def f():\n    raise ValueError(AuthMessage.NOT_A_MEMBER)\n",
+}
+
+
+@pytest.mark.parametrize("shape", sorted(_STATIC_SHAPES))
+def test_the_site_check_refuses_every_shape(shape: str) -> None:
+    assert _site_violations("x.py", ast.parse(_STATIC_SHAPES[shape])) != []
+
+
+def test_auth_text_is_built_only_in_the_registry() -> None:
+    """`AuthText(...)` outside `AuthMessage` would mint a member-typed value
+    the static check cannot see."""
+    misplaced = []
+    for rel, tree in _module_trees():
+        allowed: set[int] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ClassDef) and node.name == "AuthMessage":
+                allowed |= {id(n) for n in ast.walk(node)}
+            if isinstance(node, ast.FunctionDef) and node.name == "pyjwt_text":
+                allowed |= {id(n) for n in ast.walk(node)}
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "id", "") in ("AuthText", "PyJwtText")
+                and id(node) not in allowed
+            ):
+                misplaced.append(f"{rel}:{node.lineno}")
+    assert misplaced == [], misplaced
+
+
+# --- 4. logs: no sink applies the sanitiser, end to end ---------------------------
+
+
+_NON_CONSTANT_LOGS: list[str] = []
+
+
+def _log_templates() -> list[str]:
+    """Every `logger.<level>("constant", ...)` template in the two modules. A
+    non-constant template is recorded and fails
+    `test_the_log_templates_are_collected` (the only static rule logs
+    need)."""
+    out: list[str] = []
+    for rel, tree in _module_trees():
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in ("logger", "log", "logging")
+                and node.func.attr
+                in (
+                    "debug",
+                    "info",
+                    "warning",
+                    "warn",
+                    "error",
+                    "exception",
+                    "critical",
+                )
+            ):
+                arg = node.args[0] if node.args else None
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    out.append(arg.value)
+                else:
+                    _NON_CONSTANT_LOGS.append(f"{rel}:{node.lineno}")
+    return out
+
+
+_LOG_TEMPLATES = _log_templates()
+
+
+def test_the_log_templates_are_collected() -> None:
+    assert _NON_CONSTANT_LOGS == [], f"non-constant log templates: {_NON_CONSTANT_LOGS}"
+    assert len(_LOG_TEMPLATES) == 16, _LOG_TEMPLATES
+    assert "Streamable-HTTP session manager started" in _LOG_TEMPLATES
+
+
+@pytest.mark.parametrize("log_format", ["text", "json"])
+def test_no_log_sink_applies_the_sanitiser(
+    log_format: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end (round 4, claude N3): run the real `setup_logging`, log
+    every template through the real `pmcp.transport.http` logger, and read
+    what actually reached stderr and the log file. Any redaction -- a filter,
+    a record factory, a formatter, or a handler's own `emit()` -- shows up
+    here. Today none applies, so the log templates are not reworded (two of
+    them, `Streamable-HTTP session manager started/stopped`, would read
+    `session [REDACTED]` through the sanitiser)."""
+    import io
+    import logging
+    import sys
+
+    from pmcp import cli
+
+    stderr = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", stderr)
+    monkeypatch.chdir(tmp_path)
+    log_file = tmp_path / "logs" / "gateway.log"
+    monkeypatch.setattr(cli, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setattr(cli, "LOG_FILE", log_file)
+    root = logging.getLogger()
+    before, level = list(root.handlers), root.level
+    logger = logging.getLogger("pmcp.transport.http")
+    expected = []
+    try:
+        cli.setup_logging("DEBUG", log_to_file=True, log_format=log_format)
+        added = [h for h in root.handlers if h not in before]
+        assert len(added) == 2, added  # stderr + rotating file
+        for template in _LOG_TEMPLATES:
+            holes = template.count("%s") + template.count("%r")
+            args = ("req-1",) * holes
+            expected.append(template % args if holes else template)
+            logger.warning(template, *args)
+        for handler in added:
+            handler.flush()
+    finally:
+        for handler in [h for h in root.handlers if h not in before]:
+            root.removeHandler(handler)
+            handler.close()
+        root.setLevel(level)
+    outputs = {"stderr": stderr.getvalue(), "file": log_file.read_text()}
+    for sink, text in outputs.items():
+        missing = [m for m in expected if m not in text]
+        assert missing == [], f"{sink} rewrote: {missing}"
+
+
+def test_no_redacting_log_hook_in_the_source() -> None:
+    """Supplement: the hooks that would redact a record outside
+    `setup_logging`."""
+    src = Path(auth_mod.__file__ or "").parent
+    hits = [
+        f"{p.relative_to(src)}: {needle}"
+        for p in sorted(src.rglob("*.py"))
+        for needle in ("addFilter(", "logging.Filter", "setLogRecordFactory(")
+        if needle in p.read_text()
+    ]
+    assert hits == []
 
 
 # --- pyjwt's fixed texts, kept verbatim by `_FIXED_TEXT_CLAIM_ERRORS` ----------
@@ -1761,7 +1926,7 @@ def _client(**overrides: Any) -> TestClient:
         kwargs: dict[str, Any] = {
             "auth_mode": "resource-server",
             "resource_server_issuer": _ISSUER,
-            "resource_server_jwks_url": _SAMPLE_URL,
+            "resource_server_jwks_url": _SAMPLE_FIELDS["url"],
             "resource_server_audience": _AUDIENCE,
         }
         kwargs.update(overrides)
@@ -1778,10 +1943,14 @@ def _challenges() -> list[tuple[str, int, str]]:
         label = "metadata" if meta else "audience"
         plain = _client(**extra)
         scoped = _client(required_scopes=["admin"], **extra)
-        unavailable = AsyncMock(side_effect=ResourceServerJWKSUnavailable("down"))
+        unavailable = AsyncMock(
+            side_effect=ResourceServerJWKSUnavailable(
+                AuthMessage.JWKS_FETCH_FAILED, url="https://issuer.example/jwks"
+            )
+        )
         missing_scope = AsyncMock(
             side_effect=ResourceServerAuthError(
-                "insufficient_scope", "Missing required scope(s): admin"
+                "insufficient_scope", AuthMessage.MISSING_SCOPES, scopes="admin"
             )
         )
         cases: list[tuple[str, TestClient, dict[str, str], Any, Any]] = [
