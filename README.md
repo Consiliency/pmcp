@@ -1156,7 +1156,9 @@ closed: the credential stays required.
 
 Overlay loading is **fail-soft**: a missing file is skipped silently, and a
 malformed file or a single bad entry logs a warning and is skipped without
-crashing the gateway — the shipped manifest always still loads.
+crashing the gateway — the shipped manifest always still loads. pmcp re-reads
+overlay files on every manifest load, so edits apply without a restart, and
+logs each warning once per change rather than on every load.
 
 > **Security:** a manifest entry can specify an arbitrary `command`/`args` to
 > run when provisioned — treat an overlay file with the same trust as your own

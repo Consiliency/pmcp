@@ -55,6 +55,7 @@ import pytest
 
 from pmcp import trust_store
 from pmcp.manifest import npm_resolver, package_identity, registry, version_checker
+from pmcp.manifest import loader as manifest_loader
 from pmcp.transport import http as transport_http
 from pmcp.env_store import reset_dotenv_keys, reset_pmcp_introduced_keys
 from pmcp.policy.policy import PolicyManager
@@ -376,6 +377,9 @@ def _reset_process_global_state() -> Iterator[None]:
     * ``npm_resolver._resolver`` -- a process-wide singleton holding a spawned
       node child, with sticky-failure and warned flags that must not be
       inherited.
+    * ``loader._manifest_cache`` -- the parsed manifest (and its last-served
+      keys); a cached result would hide a later test's once-per-transition
+      warnings.
 
     Composition lives here rather than in a ``src/`` aggregator by rule, not by
     taste: ``tests/test_feedback_provenance.py:226`` AST-walks ``src/pmcp`` and
@@ -396,6 +400,7 @@ def _reset_process_global_state() -> Iterator[None]:
         transport_http.reset_rate_limit_state()
         transport_http.reset_request_metrics()
         npm_resolver.reset_resolver_for_tests()
+        manifest_loader.clear_manifest_cache()
 
     _reset()
     yield

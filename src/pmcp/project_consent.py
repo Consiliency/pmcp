@@ -40,9 +40,10 @@ would make consent decorative.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -92,6 +93,13 @@ class ConsentDecision:
     ``path`` is always absolute and resolved -- the same key the trust store
     records under, so the path in a refusal message is the path an operator
     approves. ``remediation`` is empty only when ``allowed``.
+
+    ``content_sha256`` is the sha256 of the bytes ``read_and_gate`` judged --
+    set for a refusal too, ``None`` when the file could not be read or the
+    decision came from ``gate_bytes``. It lets a caller that is never handed a
+    refused file's bytes still tell that they changed, and so owes the
+    operator a fresh refusal, without re-opening or parsing them
+    (Consiliency/pmcp#233). It identifies content; it is not for display.
     """
 
     allowed: bool
@@ -99,6 +107,7 @@ class ConsentDecision:
     kind: ProjectSourceKind
     reason: ConsentReason
     remediation: str
+    content_sha256: str | None = None
 
 
 def _resolve(path: Path) -> Path:
@@ -276,7 +285,10 @@ def read_and_gate(
         # discovery and here: an absent answer is never assent.
         return None, _refusal(target, kind, "unreadable", path)
 
-    decision = _gate_resolved(target, content, kind, source=path)
+    decision = replace(
+        _gate_resolved(target, content, kind, source=path),
+        content_sha256=hashlib.sha256(content).hexdigest(),
+    )
     return (content if decision.allowed else None), decision
 
 
