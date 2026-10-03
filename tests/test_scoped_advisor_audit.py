@@ -22,6 +22,7 @@ from mcp.server.session import ServerSession
 from mcp.types import CallToolRequestParams, PaginatedRequestParams
 from pydantic import ValidationError
 
+from pmcp.auth import AuthMessage
 from pmcp.policy.policy import PolicyManager
 from pmcp.identity import acquire_singleton_lock, release_singleton_lock
 from pmcp.scoped_advisor_audit import (
@@ -1501,7 +1502,9 @@ def _open_containers(tool: Any, baseline: dict[str, Any]) -> list[str]:
 #: more than a message. A new such class fails `_raised_exceptions` loudly.
 _EXCEPTION_ARGS: dict[str, tuple[Any, ...]] = {
     "HTTPError": ("https://example.invalid/", 500, "stub handler failed", None, None),
-    "ResourceServerAuthError": ("invalid_token", "stub handler failed"),
+    # The auth errors take only `AuthMessage` members (Consiliency/pmcp#326).
+    "ResourceServerAuthError": ("invalid_token", AuthMessage.INVALID_TOKEN),
+    "ResourceServerJWKSUnavailable": (AuthMessage.JWKS_NO_USABLE_KEYS,),
     "MissingRemoteHeaderAuthError": ("stub", ["STUB_VAR"]),
     "MissingApiKeyError": ("STUB_VAR", "stub", "stub"),
 }
