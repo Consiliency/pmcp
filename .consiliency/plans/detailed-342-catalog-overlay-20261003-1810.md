@@ -362,10 +362,17 @@ That is by design: a candidate needs a query to match. A test pins it.
 
 ## Dependencies & order
 
-1. Independent of in-flight work. It applies to `c9206a9` as is. It touches
-   `_parse_server_config` and `Manifest`. Nothing open in Consiliency/pmcp#297 or
-   Consiliency/pmcp#298 edits those, and the #233 cache stores the new field without
-   change.
+1. Applies to `c9206a9` as is. Consiliency/pmcp#298 is already on main (PR 337). The
+   other open change in this area is Consiliency/pmcp#297. Its plan branch,
+   `origin/plan/297-validation-echo` @ `48b7a89`, was compared this session. Its
+   `loader.py` patch touches the YAML parse sites, `_shipped_manifest_entries`, and the
+   overlay skip warnings (`{exc}` → `exception_text(exc)`). It has no hunk in
+   `_parse_server_config`, `Manifest`, `_build_manifest`'s server loop, `matcher.py` or
+   `_build_manifest_with_config_servers`. The one meeting point is the overlay's
+   "Skipping invalid server entry" warning, which will render this plan's `ValueError`.
+   Its messages carry only a field name and a type name, so they pass through
+   `exception_text` unchanged. Whichever lands second re-runs M12 and the R2 table. The
+   #233 cache stores the new `Manifest` field without change.
 2. Within the plan, apply the patch and the test module together. The R1 and R2 halves are
    separable: R2 is the `_require_*`/`_STR_LIST_FIELDS` hunk plus its tests (M5–M18), and
    R1 is the rest (M1–M4). Land them together; they are one issue's two causes.
