@@ -26,6 +26,17 @@
 > hurry ContextVar, re-cancel loop), so round 3 **removes the machinery**
 > instead of patching it (Design decision 1). All numbers below are
 > re-measured on the round-3 spike on 3.10, 3.11 and 3.12.
+>
+> **Round 4** (after the round-3 panel: claude and gemini AGREE; codex found
+> two places the synchronous pattern was not yet applied): a
+> `disconnect_all()` cancelled before its per-server workers start now kills
+> every tree from a parent-level fallback (Design decision 7), and the remote
+> pre-handoff path abandons the owner through `_abandon_owner` like every
+> other owner cancel, which a structural test now enforces (Design decision
+> 6). Claude's round-3 notes are taken: the `SingletonLock` sentence is
+> corrected (Design decision 1), the census is restated, and the two nits are
+> addressed. All numbers below are re-measured on the round-4 spike on 3.10,
+> 3.11 and 3.12.
 
 ## Task
 
@@ -203,7 +214,8 @@ lock. Round 3 changes the design so that state cannot exist:
     so nothing in this can be cancelled before it runs or hold the caller.
     The graceful close is abandoned, so a streamable-HTTP session-ending
     `DELETE` may not be sent; the server reaps the session on its own timeout
-    (round-2 N4 accepted that);
+    (round-2 N4 accepted that). An owner is never cancelled any other way on a
+cancel path (Design decision 6);
   - a failure in any step is caught and logged **by type only**, so the
     caller's cancellation is always what propagates (round-1 B1, now by
     construction).
@@ -233,12 +245,23 @@ task cancelled before its first instruction) has no fix inside the task --
 only a synchronous path in the cancelled caller can run after it. That path
 is the design.
 
-**What a cancelled caller gives up**, stated: the SIGTERM grace (a stdio
-server is SIGKILLed; a browser it launched loses its graceful shutdown, but
-the group kill still removes it, so no `SingletonLock` survives a dead
-process), the remote session `DELETE`, and waiting for its child tasks to
-end (they end on their own; each is cancel-responsive, which the census keeps
-true).
+**What a cancelled caller gives up**, stated: the SIGTERM grace -- a stdio
+server is SIGKILLed, also mid-grace when the cancel lands during
+`_terminate_process_tree` (the round-3 claude seat measured `flushed=False`
+for a server that needs 1 s to exit, against `flushed=True` on main). For a
+browser server (Playwright, browser-use) that means an unflushed profile --
+recent cookie and session writes in a persistent context are lost -- and a
+"didn't shut down correctly" restore state on the next launch. It does
+**not** leave a stuck lock: Chrome's `SingletonLock` is a symlink a SIGKILL
+leaves on disk, which ProcessSingleton treats as stale (dead pid, same host)
+and takes over on the next launch (round-1 of this plan said "no
+`SingletonLock` survives", which was wrong; this is from Chrome's documented
+behaviour, not measured -- there is no Chrome on dev0). Keeping the grace
+(SIGTERM now plus a scheduled SIGKILL) would reopen the shutdown leak of
+round-1 B2 whenever the loop closes inside the grace window, so the trade is
+kept. Also given up: the remote session `DELETE`, and waiting for the child
+tasks to end (they end on their own; each is cancel-responsive, which the
+census keeps true).
 
 ### 2. Where the synchronous path is, and the census
 
@@ -247,19 +270,22 @@ true).
 | `_connect_stdio`: cancel *during* the handshake | `_abandon_client_io` + `_drop_client`, `last_error = "Connection cancelled"`, raise |
 | `_connect_stdio`: cancel during the graceful teardown of a *failed* handshake (`_abort_stdio_handshake`) | `_abandon_client_io`, raise; `_drop_client` in the `finally` |
 | `_connect_remote_stream`: the same two handlers | same, with the owner abandoned |
-| `_connect_remote_stream`: pre-handoff `except BaseException` | `_cancel_without_waiting(owner_task)`, raise (no longer `await gather(owner)`) |
+| `_connect_remote_stream`: pre-handoff `except BaseException` | `_abandon_owner(owner_task, shutdown)`, raise (round 4; was `await gather(owner)` on main, a single cancel in round 3) |
 | `adopt_process`: cancel during the handshake | `_abandon_client_io` + `_forget_client`, raise |
 | `disconnect_server` | `_abandon_client_io`, `_cancel_background_tasks_now`, `_forget_disconnected`, raise |
 | `_cleanup_client` | `_abandon_client_io`, raise; `_forget_client` in the `finally` |
 | `_disconnect_all_unlocked._shutdown_one` | `_abandon_client_io`, raise (the gather re-raises) |
+| `_disconnect_all_unlocked` itself (round 4) | for **every** registered client `_abandon_client_io`, then `_cancel_background_tasks_now`, raise; the registry clears run in a `finally` |
 | `_close_remote_transport` | cancel the owner without waiting (a done-callback logs a genuine unwind failure, sanitised, as before), raise |
 | `_terminate_process_tree` | `_kill_process_tree_now(process, group_pgid=...)`, raise |
 | `tools/handlers.py` `_run_update_probe_command` | `_kill_process_tree_now(process)`, raise (was `await _terminate_process_tree`) |
 
 The census of `CancelledError`/`BaseException` handlers in `src/pmcp`: **23**
 on main (round 1 said 22: the last row covers four sync sites). On the
-round-3 patch: **23**, every one in `manager.py` re-raising except the
-health monitor's task root; no handler absorbs a caller's cancel. Three
+round-4 patch: **25** (round 3 had 24, as the round-3 claude seat
+counted; round 4 adds the `disconnect_all` fallback), every one in
+`manager.py` re-raising except the health monitor's task root; no handler
+absorbs a caller's cancel. Three
 class tests pin it:
 - `test_every_cancellation_handler_is_classified`: every handler, with its
   count, matches a reasoned allowlist;
@@ -317,7 +343,7 @@ private task, `current_task()` is the caller again, and the round-1/2
 `exclude={caller}` parameter is gone; `test_disconnect_server_does_not_cancel_its_own_caller`
 stays.
 
-### 6. `_close_remote_transport`: unambiguous waits, no wait after a cancel
+### 6. `_close_remote_transport`: unambiguous waits, no wait after a cancel; every owner cancel goes through `_abandon_owner`
 
 The graceful wait and the escalation wait both use `asyncio.wait({owner})`
 (was `wait_for(shield(owner))` and `await owner`), so a `CancelledError` there
@@ -326,17 +352,62 @@ callbacks until it ends) with a done-callback that logs a genuine unwind
 failure (the sanitised traceback the method has always logged), and
 re-raise -- never wait for the owner. This is
 codex's round-2 B2: an owner whose `__aexit__` blocks in a `finally` can no
-longer hold the caller or the lifecycle lock. On the non-cancelled path the
+longer hold the caller or the lifecycle lock.
+
+**Round 4:** the remote pre-handoff handler in `_connect_remote_stream` used
+a single immediate cancel, the failure M21 pins. Codex's repro: the caller is
+cancelled while the transport is being entered (`call_soon(connect.cancel)`
+inside `__aenter__`); the owner publishes `ready` and parks on
+`shutdown.wait()`, the one cancel is consumed there, and its `__aexit__` then
+blocks uncancelled -- owner pending, HTTP client unclosed, on 3.10–3.12. It
+now calls `_abandon_owner(owner_task, shutdown)`. `_abandon_owner` cancels at
+once *and* re-cancels from loop callbacks (next iteration, then every 0.5 s)
+until the owner ends; the immediate cancel ends an owner that is still
+entering its transport without waiting a loop iteration.
+`test_an_owner_is_cancelled_only_through_abandon_owner` pins that no other
+cancel of an owner exists in `manager.py`. On the non-cancelled path the
 behaviour is as on main: graceful wait, then one cancel and an unbounded wait
 for the owner (the documented pre-existing hang class for an `__aexit__` that
 ignores cancellation), and a genuine unwind failure propagates.
 
-### 7. `_shutdown_one` now abandons too
+### 7. Fan-outs: `disconnect_all` has a parent-level fallback (round 4)
 
-Round 1 left `_shutdown_one` absorbing (the gather re-raised). Under the class
-rule it now abandons and re-raises, so when `server.py:1017`'s 10 s
-`wait_for(disconnect_all(), ...)` runs out, every tree is SIGKILLed at once
-instead of each continuing its graceful terminate under a cancelled gather.
+`_shutdown_one` abandons and re-raises like every other teardown, so when
+`server.py:1017`'s 10 s `wait_for(disconnect_all(), ...)` runs out, every tree
+is SIGKILLed at once. **But a per-worker handler only runs once its worker has
+started.** Codex's round-3 repro: `task = create_task(mgr.disconnect_all())`
+then `loop.call_soon(task.cancel)` -- the gather's workers are cancelled
+before their first instruction, no handler runs, and on round 3 (and main)
+the subprocess stayed alive with no kill invoked. **Decision:** the parent,
+`_disconnect_all_unlocked`, wraps its gather and sweep in `except
+asyncio.CancelledError:` that, synchronously and whether or not the workers
+ran, calls `_abandon_client_io` for every client it snapshotted (repeating it
+for a worker that did run is harmless: a done task is not re-cancelled, a
+second SIGKILL of a not-yet-reaped pid hits the same process, a second owner
+kick chain stops when the owner ends), then `_cancel_background_tasks_now`,
+then re-raises; the old registry clears move into a `finally` of the same
+method, so they run on the cancelled path too. They stay inline there:
+`tests/runtime/test_publisher_coverage.py`'s AST guard pins catalog writes to
+`_disconnect_all_unlocked` (the full suite caught a first version that
+factored them into a helper).
+Measured with real processes: two SIGTERM-ignoring servers, cancel before the
+workers start -> both `returncode == -SIGKILL`, `_clients == {}`, lock free;
+on round 3 the test fails.
+
+**The other fan-outs, checked:**
+- `refresh()` and server shutdown go through `_disconnect_all_unlocked`:
+  covered.
+- `_connect_all_unlocked` gathers connect workers. A worker cancelled before
+  its first instruction has spawned nothing; one cancelled at any later
+  await runs its own handler, and a cancel inside `create_subprocess_exec`
+  is handled by asyncio itself (it closes and waits the half-made
+  transport). So it needs no parent kill -- and must not have one, since a
+  cancelled `connect_all` keeps the servers that did connect.
+  `test_connect_all_cancelled_before_its_workers_start_spawns_nothing`
+  pins it with a real command (no process spawned, `_clients` empty).
+- `_fetch_server_listings`' gather and the reconcile tasks own no process or
+  transport; the background sweep is `_cancel_background_tasks`, already
+  `asyncio.wait` plus a synchronous twin.
 
 ### 8. Not lost, not doubled, and `asyncio.timeout()` still works
 
@@ -447,8 +518,8 @@ and `src/pmcp/tools/handlers.py` (7 in, 7 out).
 
 ### `tests/test_cancel_teardown.py` (create)
 
-The module in *Verbatim bodies*: **41 tests** (39 on 3.10, where the two
-3.11+ tests skip); ~3–5 s per run, most of it the four real-subprocess tests.
+The module in *Verbatim bodies*: **45 tests** (43 on 3.10, where the two
+3.11+ tests skip); ~4–6 s per run, most of it the real-subprocess tests.
 
 | Test | Pins |
 |---|---|
@@ -467,6 +538,10 @@ The module in *Verbatim bodies*: **41 tests** (39 on 3.10, where the two
 | `test_a_timeout_scope_around_the_teardown_still_reports_timeout`, `test_a_taskgroup_sibling_failure_kills_the_tree` (3.11+) | Design decision 8 |
 | `test_disconnect_all_redelivers_a_cancel_and_kills_now` | Design decision 7 |
 | `test_a_cancelled_terminate_kills_a_sigterm_ignoring_tree` (real process) | `_terminate_process_tree`'s own cancel path: `returncode == -SIGKILL` |
+| **round 4:** `test_disconnect_all_cancelled_before_its_workers_start_kills_every_tree` (real processes) | codex round-3 (1): two SIGTERM-ignoring servers, `call_soon(task.cancel)` before the workers start: both `-SIGKILL`, `_clients == {}`, lock free |
+| **round 4:** `test_connect_all_cancelled_before_its_workers_start_spawns_nothing` (real command) | the other process-owning fan-out needs no parent kill: nothing spawned |
+| **round 4:** `test_a_cancel_at_remote_handoff_abandons_the_owner` | codex round-3 (2): the owner's `__aexit__` is cancelled and the owner ends |
+| **round 4:** `test_an_owner_is_cancelled_only_through_abandon_owner` | structural: no other cancel of an owner in `manager.py` |
 | `test_loop_shutdown_kills_the_process_tree[mid-handshake, just-failed, mid-terminate]` (real processes) | Design decision 9, including **codex round-2 B1** and claude N2 |
 | `test_every_cancellation_handler_is_classified`, `test_no_cancellation_handler_awaits`, `test_every_teardown_abandons_synchronously_on_cancel`, `test_abandon_is_synchronous_and_child_waits_never_absorb` | the class guard |
 
@@ -526,7 +601,7 @@ CHANGELOG bullet by hand), then:
 
 ```bash
 # 1+2. the new module plus the client-manager suites, on all three Pythons
-#      (round-3 spike: 313 passed, 2 skipped on 3.10; 315 passed on 3.11; 315 passed on 3.12)
+#      (round-4 spike: 317 passed, 2 skipped on 3.10; 319 passed on 3.11; 319 passed on 3.12)
 for v in 3.10 3.11 3.12; do E=.venv; [ $v != 3.10 ] && E=.venv-$v
   $E/bin/python -m pytest tests/test_cancel_teardown.py tests/test_client_manager.py \
     tests/test_client_manager_reconnect.py --cov-fail-under=0 -p no:cacheprovider -q -o timeout=60; done
@@ -537,7 +612,8 @@ python3 scripts/check_security_claims.py          # expect OK, 129 cited node id
 python3 scripts/check_plan_consistency.py .consiliency/plans/detailed-324-cancel-teardown-20261003-0213.md
 #   measured on this file: "consistent ... blocking inconsistencies: 0", exit 0
 # 4. the full suite: once, alone, detached, with a notifying waiter (memory on dev0 is shared)
-#    (round-3 spike, run alone on 3.10: 4968 passed, 5 skipped, 80 deselected, 0 failed, 629 s)
+#    (round-4 spike, run alone on 3.10: 4972 passed, 5 skipped, 80 deselected, 0 failed, 565 s;
+#     a first run caught the publisher-coverage AST guard, see Design decision 7)
 nohup .venv/bin/python -m pytest -q -p no:cacheprovider > "$WORKTREE_ROOT/pmcp-324-full.log" 2>&1 &
 ```
 
@@ -551,29 +627,24 @@ their own `subprocess.run(timeout=60)`. Every mutant below ran under
 `-o timeout=60` and a 300 s cap. The 60 s watchdog, 700 s pytest-timeout and
 720 s faulthandler are never approached by the patched tree.
 
-**Red on main and on round 2.** The final module against `89559db`'s
-`manager.py`/`handlers.py`, and against the round-2 spike (run with
-`-o timeout=30`, since a tree that waits after a cancel hits the hang
-guards):
+**Red on main and on round 3.** The final module (run with `-o timeout=30`,
+since a tree that waits after a cancel hits the hang guards):
 
 | Tree | 3.10 | 3.11 | 3.12 |
 |---|---|---|---|
-| main `89559db` | 35 failed, 4 passed, 2 skipped | 37 failed, 4 passed | 37 failed, 4 passed |
-| round-2 spike (`b7a5b2d`) | 31 failed, 8 passed, 2 skipped | 33 failed, 8 passed | 33 failed, 8 passed |
-| round-3 spike | 39 passed, 2 skipped | 41 passed | 41 passed |
+| main `89559db` | 38 failed, 5 passed, 2 skipped | 40 failed, 5 passed | 40 failed, 5 passed |
+| round-3 spike (`c85b60f`) | 5 failed, 38 passed, 2 skipped | 5 failed, 40 passed | 5 failed, 40 passed |
+| round-4 spike | 43 passed, 2 skipped | 45 passed | 45 passed |
 
-The 4 that pass on main are the ones that must: the two "child
-cancellation is still absorbed" tests (the graceful path is unchanged),
-`test_disconnect_server_does_not_cancel_its_own_caller`, and
-`test_a_cancel_caught_in_the_handshake_is_not_retried` (main never catches a
-handshake cancel, so it never retries; the test guards against round 1's
-regression). Against the round-2 spike, among the failures are exactly the
-round-2 defects: `test_a_cancelled_disconnect_does_not_wait_on_a_hung_escalation`
-(codex B2, hang guard), `test_loop_shutdown_kills_the_process_tree[just-failed]`
-(codex B1, tree alive) and `[mid-handshake]` (claude N2:
-`terminate_entered=True`), `[sweep]`, and every per-point case (the round-2
-caller waits for its teardown, so it hits the hang guard with the gate still
-closed).
+On main the 5 that pass are the ones that must: the two "child cancellation
+is still absorbed" tests, `test_disconnect_server_does_not_cancel_its_own_caller`,
+`test_a_cancel_caught_in_the_handshake_is_not_retried`, and
+`test_connect_all_cancelled_before_its_workers_start_spawns_nothing` (main
+spawns nothing there either). On round 3 the 5 failures are exactly codex's
+two round-3 findings: the `disconnect_all` repro, the handoff repro, the
+owner structural test, and the census and entry-point class tests (the new
+fallback handler). The round-2 spike measured in round 3 (31/33/33 failed)
+is unchanged in substance.
 
 ## Acceptance criteria
 
@@ -600,6 +671,11 @@ closed).
 - [ ] Loop shutdown in each of the three phases leaves no process and no
   client entry, with real processes; mid-handshake shutdown never enters the
   graceful terminate.
+- [ ] A `disconnect_all()` cancelled before any worker starts kills every
+  registered tree and drops the registries (real processes); a cancelled
+  `connect_all()` before its workers start spawns nothing.
+- [ ] A cancel at remote handoff abandons the owner, whose `__aexit__` is
+  cancelled; no owner is cancelled other than through `_abandon_owner`.
 - [ ] Verification steps 1–4 pass on 3.10, and 1–2 on 3.11 and 3.12.
 - [ ] Every mutant below is red, for the reason stated, on all three Pythons.
 
@@ -608,35 +684,38 @@ closed).
 Each mutant was measured on the round-3 spike (`mutants3.py`: one or more
 string edits to `manager.py` or `handlers.py`, run
 `tests/test_cancel_teardown.py` with the target version's own interpreter
-under `-o timeout=60` and a 300 s cap, restore in a `finally`). **All 21 are red on 3.10, 3.11 and 3.12**; none
+under `-o timeout=60` and a 300 s cap, restore in a `finally`). **All 24 are red on 3.10, 3.11 and 3.12**; none
 hung. After each run the two files were byte-identical to the spike.
 Red tests are 3.10's.
 
 | # | Mutant | Red tests (3.10) |
 |---|---|---|
-| M1 | stdio cancel-during-handshake handler without `_abandon_client_io` | 3 red -- stdio_cancel_during_handshake_kills_without_a_graceful_teard, a_failing_kill_cannot_replace_the_cancel[stdio], loop_shutdown_kills_the_process_tree[mid-handshake] |
-| M2 | stdio graceful-teardown handler without `_abandon_client_io` | 6 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer], stdio_handshake_teardown[terminate] (+2) |
-| M3 | remote cancel-during-handshake handler without `_abandon_client_io` | 1 red -- remote_cancel_during_handshake_abandons_the_owner |
-| M4 | remote graceful-teardown handler without `_abandon_client_io` | 3 red -- remote_handshake_teardown[read_task], remote_handshake_teardown[outbound_writer], remote_handshake_teardown[close_transport] |
-| M5 | adopt handler without `_abandon_client_io` | 3 red -- adopt_cancel_during_handshake_kills_without_a_graceful_teard, a_failing_kill_cannot_replace_the_cancel[adopt], every_teardown_abandons_synchronously_on_cancel |
-| M6 | `disconnect_server` cancel path without `_abandon_client_io` | 5 red -- disconnect_server[read_task], disconnect_server[outbound_writer], disconnect_server[terminate], disconnect_server[sweep] (+1) |
-| M7 | `disconnect_server` cancel path without `_forget_disconnected` | 5 red -- disconnect_server[read_task], disconnect_server[outbound_writer], disconnect_server[terminate], disconnect_server[sweep] (+1) |
-| M8 | `_cleanup_client` cancel path without `_abandon_client_io` | 5 red -- cleanup_client[read_task], cleanup_client[stderr_task], cleanup_client[outbound_writer], cleanup_client[terminate] (+1) |
-| M9 | `_shutdown_one` cancel path without `_abandon_client_io` | 2 red -- disconnect_all_redelivers_a_cancel_and_kills_now, every_teardown_abandons_synchronously_on_cancel |
-| M10 | `_reap_child` back to `wait_for(shield(...))` + `except (CancelledError, Exception): pass` (the original defect) | 17 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer], remote_handshake_teardown[read_task] (+13) |
-| M12 | background sweep back to `gather` | 1 red -- disconnect_server[sweep] |
-| M13 | `_abandon_client_io` does not kill | 20 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer], stdio_handshake_teardown[terminate] (+16) |
-| M14 | `_kill_process_tree_now` skips the group | 3 red -- loop_shutdown_kills_the_process_tree[mid-handshake], loop_shutdown_kills_the_process_tree[just-failed], loop_shutdown_kills_the_process_tree[mid-terminate] |
-| M15 | `_terminate_process_tree`'s cancel path does not kill (round-1 B2) | 2 red -- a_cancelled_terminate_kills_a_sigterm_ignoring_tree, every_teardown_abandons_synchronously_on_cancel |
+| M1 | stdio: cancel during the handshake not abandoned | 3 red -- stdio_cancel_during_handshake_kills_without_a_graceful_teard, a_failing_kill_cannot_replace_the_cancel[stdio], loop_shutdown_kills_the_process_tree[mid-handshake] |
+| M2 | stdio: cancel during the graceful teardown not abandoned | 6 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer] (+3) |
+| M3 | remote: cancel during the handshake not abandoned | 1 red -- remote_cancel_during_handshake_abandons_the_owner |
+| M4 | remote: cancel during the graceful teardown not abandoned | 3 red -- remote_handshake_teardown[read_task], remote_handshake_teardown[outbound_writer], remote_handshake_teardown[close_transport] |
+| M5 | adopt: cancel during the handshake not abandoned | 3 red -- adopt_cancel_during_handshake_kills_without_a_graceful_teard, a_failing_kill_cannot_replace_the_cancel[adopt], every_teardown_abandons_synchronously_on_cancel |
+| M6 | disconnect: cancel not abandoned | 5 red -- disconnect_server[read_task], disconnect_server[outbound_writer], disconnect_server[terminate] (+2) |
+| M7 | disconnect: registries not reset on cancel | 5 red -- disconnect_server[read_task], disconnect_server[outbound_writer], disconnect_server[terminate] (+2) |
+| M8 | _cleanup_client: cancel not abandoned | 5 red -- cleanup_client[read_task], cleanup_client[stderr_task], cleanup_client[outbound_writer] (+2) |
+| M9 | _shutdown_one: cancel not abandoned | 1 red -- every_teardown_abandons_synchronously_on_cancel |
+| M10 | child waits back to shield + absorb (the original defect) | 17 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer] (+14) |
+| M12 | background sweep back to gather | 1 red -- disconnect_server[sweep] |
+| M13 | abandon does not kill | 21 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer] (+18) |
+| M14 | synchronous kill skips the group | 3 red -- loop_shutdown_kills_the_process_tree[mid-handshake], loop_shutdown_kills_the_process_tree[just-failed], loop_shutdown_kills_the_process_tree[mid-terminate] |
+| M15 | cancelled terminate does not kill (round-1 B2) | 2 red -- a_cancelled_terminate_kills_a_sigterm_ignoring_tree, every_teardown_abandons_synchronously_on_cancel |
 | M16 | abandon failure logged with its value | 2 red -- a_failing_kill_cannot_replace_the_cancel[stdio], a_failing_kill_cannot_replace_the_cancel[adopt] |
 | M17 | abandon lets a kill failure escape | 3 red -- a_failing_kill_cannot_replace_the_cancel[stdio], a_failing_kill_cannot_replace_the_cancel[adopt], a_cancel_caught_in_the_handshake_is_not_retried |
-| M18 | stdio stale entry dropped only on success (`finally` → `else`) | 7 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer], stdio_handshake_teardown[terminate] (+3) |
-| M19 | update probe's cancel handler awaits `_terminate_process_tree` | 1 red -- no_cancellation_handler_awaits |
-| M20 | `_abandon_owner` only signals, never cancels | 4 red -- remote_handshake_teardown[read_task], remote_handshake_teardown[outbound_writer], remote_handshake_teardown[close_transport], remote_cancel_during_handshake_abandons_the_owner |
-| M21 | `_abandon_owner` cancels once, immediately | 4 red -- remote_handshake_teardown[read_task], remote_handshake_teardown[outbound_writer], remote_handshake_teardown[close_transport], remote_cancel_during_handshake_abandons_the_owner |
-| M22 | cancelled close awaits the owner after abandoning it (round-2 B2) | 2 red -- a_cancelled_disconnect_does_not_wait_on_a_hung_escalation, no_cancellation_handler_awaits |
+| M18 | stdio stale entry dropped only on success | 7 red -- stdio_handshake_teardown[read_task], stdio_handshake_teardown[stderr_task], stdio_handshake_teardown[outbound_writer] (+4) |
+| M19 | update-probe cancel awaits terminate | 1 red -- no_cancellation_handler_awaits |
+| M20 | abandoned owner only signalled, never cancelled | 5 red -- remote_handshake_teardown[read_task], remote_handshake_teardown[outbound_writer], remote_handshake_teardown[close_transport] (+2) |
+| M21 | abandoned owner cancelled once, immediately (no re-cancel chain) | 5 red -- remote_handshake_teardown[read_task], remote_handshake_teardown[outbound_writer], remote_handshake_teardown[close_transport] (+2) |
+| M22 | cancelled close waits for the owner after abandoning it (round-2 B2) | 2 red -- a_cancelled_disconnect_does_not_wait_on_a_hung_escalation, no_cancellation_handler_awaits |
+| M23 | disconnect_all fallback does not abandon (codex r3, 1) | 2 red -- disconnect_all_cancelled_before_its_workers_start_kills_ever, every_teardown_abandons_synchronously_on_cancel |
+| M24 | disconnect_all drops the registries only on success | 1 red -- disconnect_all_cancelled_before_its_workers_start_kills_ever |
+| M25 | handoff cancels the owner once (codex r3, 2) | 2 red -- a_cancel_at_remote_handoff_abandons_the_owner, an_owner_is_cancelled_only_through_abandon_owner |
 
-The implementer re-runs all 21 on the final tree on all three Pythons, with
+The implementer re-runs all 24 on the final tree on all three Pythons, with
 `mutants3.py`'s `finally`-restore (never `git checkout --`).
 
 ## Non-goals
@@ -654,6 +733,15 @@ The implementer re-runs all 21 on the final tree on all three Pythons, with
 - **The auto-reconnect revival** (Design decision 10).
 - **The PID-reuse window** inherent in asyncio's child-watcher ordering
   (Design decision 4).
+- **`adopt_process`'s cancelled `last_error`** (claude round-3 nit): its
+  cancel path uses `_forget_client`, which pops `_servers[name]`, so the
+  `"Connection cancelled"` it sets is discarded -- as `adopt_process`'s
+  failure path already does via `_cleanup_client`. Unchanged on purpose.
+- **`_reap_child`'s test-double branch** (claude round-3 nit): a real task
+  always takes the `asyncio.wait` path; the branch exists because
+  `tests/test_client_manager.py`'s `TestCleanupClient` passes `MagicMock`
+  read tasks, on which `asyncio.wait` blocks forever on 3.11+. Converting
+  those tests to real futures is a cleanup for another change.
 
 ## Unverified
 
@@ -694,10 +782,10 @@ The implementer re-runs all 21 on the final tree on all three Pythons, with
 
 ````diff
 diff --git a/src/pmcp/client/manager.py b/src/pmcp/client/manager.py
-index 57a563e..2b3875d 100644
+index 57a563e..9b15554 100644
 --- a/src/pmcp/client/manager.py
 +++ b/src/pmcp/client/manager.py
-@@ -144,6 +144,134 @@ def describe_exception(exc: BaseException) -> str:
+@@ -144,6 +144,136 @@ def describe_exception(exc: BaseException) -> str:
  
  _TaskT = TypeVar("_TaskT", bound=asyncio.Task[Any])
  
@@ -748,12 +836,13 @@ index 57a563e..2b3875d 100644
 +) -> None:
 +    """Abandon a remote transport owner without awaiting it.
 +
-+    Signal its shutdown, then cancel it from loop callbacks -- first on the
-+    next iteration, after the owner has woken from `shutdown.wait()` and
++    Signal its shutdown and cancel it now (an owner still entering its
++    transport ends at once), then cancel it again from loop callbacks -- on
++    the next iteration, after the owner has woken from `shutdown.wait()` and
 +    entered its transport's `__aexit__`, then every `_OWNER_RECANCEL_S` until
-+    it ends. A single immediate `cancel()` would be consumed while the owner
-+    is still parked on `shutdown.wait()`, and a dead peer's `__aexit__` would
-+    then block uncancelled (measured). Callbacks only, no task: nothing here
++    it ends. The immediate cancel alone is consumed while the owner is parked
++    on `shutdown.wait()`, and a dead peer's `__aexit__` would then block
++    uncancelled (measured). Callbacks only, no task: nothing here
 +    can be cancelled before it runs or hold its caller (Consiliency/pmcp#324).
 +    """
 +    if task is None or task.done():
@@ -768,6 +857,7 @@ index 57a563e..2b3875d 100644
 +            task.cancel()
 +            loop.call_later(_OWNER_RECANCEL_S, kick)
 +
++    task.cancel()  # ends an owner still entering its transport at once
 +    loop.call_soon(kick)
 +
 +
@@ -832,7 +922,7 @@ index 57a563e..2b3875d 100644
  # The three catalog kinds, in the order reconciliation fetches and applies them.
  # Iterating this rather than three hand-written branches is what keeps
  # "each kind is handled independently" true as kinds are added.
-@@ -241,6 +369,42 @@ class _NullCatalogEventSink:
+@@ -241,6 +371,42 @@ class _NullCatalogEventSink:
          pass
  
  
@@ -875,7 +965,7 @@ index 57a563e..2b3875d 100644
  async def _terminate_process_tree(
      process: asyncio.subprocess.Process | None, name: str
  ) -> None:
-@@ -309,39 +473,46 @@ async def _terminate_process_tree(
+@@ -309,39 +475,46 @@ async def _terminate_process_tree(
  
      _signal(kill=False)
      try:
@@ -952,7 +1042,7 @@ index 57a563e..2b3875d 100644
  
  
  # Heartbeat thresholds for health monitoring
-@@ -1185,11 +1356,38 @@ class ClientManager:
+@@ -1185,11 +1358,38 @@ class ClientManager:
          # task: a connect/reconnect task scoped to this server name must never
          # cancel a gather() containing itself (that self-cancel recurses until
          # RecursionError and leaves the server stuck in ERROR).
@@ -992,7 +1082,7 @@ index 57a563e..2b3875d 100644
              task
              for task in self._background_tasks
              if task not in exclude
-@@ -1201,14 +1399,6 @@ class ClientManager:
+@@ -1201,14 +1401,6 @@ class ClientManager:
                  or task is self._connect_tasks.get(server_name)
              )
          ]
@@ -1007,7 +1097,7 @@ index 57a563e..2b3875d 100644
  
      def _next_request_id(self, server_name: str) -> int:
          request_id = self._request_counters.get(server_name, 0) + 1
-@@ -1394,68 +1584,80 @@ class ClientManager:
+@@ -1394,68 +1586,80 @@ class ClientManager:
              managed.status.status = ServerStatusEnum.OFFLINE
              managed.status.pending_request_count = 0
  
@@ -1147,7 +1237,7 @@ index 57a563e..2b3875d 100644
      async def restart_server(
          self, config: ResolvedServerConfig, force: bool = False
      ) -> tuple[bool, int, list[str]]:
-@@ -2458,27 +2660,84 @@ class ClientManager:
+@@ -2458,27 +2662,84 @@ class ClientManager:
                  f"{resource_count} resources, {prompt_count} prompts indexed"
              )
  
@@ -1248,7 +1338,7 @@ index 57a563e..2b3875d 100644
      async def _connect_sse(self, config: ResolvedServerConfig) -> None:
          """Connect to a remote SSE MCP server."""
          if not isinstance(config.config, RemoteMcpServerConfig):
-@@ -2623,67 +2882,40 @@ class ClientManager:
+@@ -2623,67 +2884,40 @@ class ClientManager:
                      raise exc
              return
          try:
@@ -1347,7 +1437,7 @@ index 57a563e..2b3875d 100644
          # NOTE: no `except Exception` here, deliberately. A transport exit
          # that genuinely fails must propagate, or disconnect_server's
          # `except Exception -> return (False, cancelled, str(e))` can never
-@@ -2758,9 +2990,9 @@ class ClientManager:
+@@ -2758,9 +2992,9 @@ class ClientManager:
              # signal-and-wait -- a cancelled caller must not linger, and the
              # peer reaps its own session on timeout. The owner's `async
              # with` unwinds in the owner, as always -- never touch its stack
@@ -1356,11 +1446,11 @@ index 57a563e..2b3875d 100644
 -            await asyncio.gather(owner_task, return_exceptions=True)
 +            # from this task. Not awaited either (Consiliency/pmcp#324): an
 +            # owner whose enter ignores cancellation must not hold us.
-+            _cancel_without_waiting(owner_task)
++            _abandon_owner(owner_task, shutdown)
              raise
  
          try:
-@@ -2786,24 +3018,35 @@ class ClientManager:
+@@ -2786,24 +3020,35 @@ class ClientManager:
                  f"{resource_count} resources, {prompt_count} prompts indexed"
              )
  
@@ -1409,7 +1499,7 @@ index 57a563e..2b3875d 100644
      async def _read_stderr(self, name: str, stderr: asyncio.StreamReader) -> None:
          """Read stderr from a server process."""
          try:
-@@ -3258,16 +3501,10 @@ class ClientManager:
+@@ -3258,16 +3503,10 @@ class ClientManager:
          writer = managed.outbound_writer
          managed.outbound = None
          managed.outbound_writer = None
@@ -1430,7 +1520,7 @@ index 57a563e..2b3875d 100644
  
      async def _drain_outbound(self, managed: ManagedClient) -> None:
          """The one writer task per client: drain the bounded outbound queue.
-@@ -3577,14 +3814,7 @@ class ClientManager:
+@@ -3577,14 +3816,7 @@ class ClientManager:
                  managed.status.pending_request_count = 0
  
                  # Cancel read task
@@ -1446,7 +1536,7 @@ index 57a563e..2b3875d 100644
  
                  # Close transport. _close_remote_transport itself never
                  # swallows a genuine transport-exit failure; the swallow
-@@ -3596,6 +3826,13 @@ class ClientManager:
+@@ -3596,6 +3828,13 @@ class ClientManager:
                      await self._close_remote_transport(name, managed)
                  else:
                      await _terminate_process_tree(managed.process, name)
@@ -1460,7 +1550,104 @@ index 57a563e..2b3875d 100644
              except Exception as e:
                  logger.warning(
                      f"Error disconnecting from {name}: {describe_exception(e)}"
-@@ -3652,8 +3889,11 @@ class ClientManager:
+@@ -3608,52 +3847,70 @@ class ClientManager:
+         # unsignalled — orphaning browsers (issue #79/1c) at shutdown. Concurrent
+         # reaping makes total time ≈ the slowest single server.
+         clients = list(self._clients.items())
+-        if clients:
+-            await asyncio.gather(
+-                *(_shutdown_one(name, managed) for name, managed in clients),
+-                return_exceptions=True,
+-            )
+-
+         current = asyncio.current_task()
+         exclude = {current} if current is not None else set()
+-        await self._cancel_background_tasks(exclude=exclude)
+-        self._connect_tasks.clear()
+-        self._reconnect_tasks.clear()
+-        self._reconcile_tasks.clear()
+-        self._reconcile_reruns.clear()
+-        self._catalog_suppressed.clear()
+-        self._clients.clear()
+-        # Capture non-empty immediately before each clear (not after — the
+-        # clear must happen first for the dict to actually be empty
+-        # afterward, but the check must be the pre-clear state) so a
+-        # wholesale teardown still announces what it emptied. Without this,
+-        # refresh([]) (disconnect-all + no reconnect) empties every catalog
+-        # and publishes nothing — the listener-with-no-publishers failure
+-        # this phase exists to prevent. Deliberately NOT routed through
+-        # _remove_server_indexes: that method is per-server-name, this is a
+-        # wholesale clear, and rewriting it as a loop over names would
+-        # change shutdown semantics for no benefit.
+-        had_tools = bool(self._tools)
+-        had_resources = bool(self._resources)
+-        had_prompts = bool(self._prompts)
+-        self._tools.clear()
+-        self._resources.clear()
+-        self._prompts.clear()
+-        self._tasks.clear()
+-        self._servers.clear()
+-        self._lazy_configs.clear()
+-        if had_tools:
+-            self._catalog_events.note_tools_changed()
+-        if had_resources:
+-            self._catalog_events.note_resources_changed()
+-        if had_prompts:
+-            self._catalog_events.note_prompts_changed()
++        try:
++            if clients:
++                await asyncio.gather(
++                    *(_shutdown_one(name, managed) for name, managed in clients),
++                    return_exceptions=True,
++                )
++            await self._cancel_background_tasks(exclude=exclude)
++        except asyncio.CancelledError:
++            # Parent-level fallback (Consiliency/pmcp#324): a cancel that lands
++            # before a `_shutdown_one` worker has run its first instruction
++            # never reaches that worker's own handler, so kill and abandon
++            # every client here, synchronously, whether or not its worker ran
++            # (repeating it for one that did is harmless), then drop the
++            # registries and re-raise.
++            for name, managed in clients:
++                self._abandon_client_io(name, managed)
++            self._cancel_background_tasks_now()
++            raise
++        finally:
++            # The registry clears are synchronous, so the cancelled path runs
++            # them too; they stay in this method, which the publisher-coverage
++            # AST guard (tests/runtime/test_publisher_coverage.py) requires.
++            self._connect_tasks.clear()
++            self._reconnect_tasks.clear()
++            self._reconcile_tasks.clear()
++            self._reconcile_reruns.clear()
++            self._catalog_suppressed.clear()
++            self._clients.clear()
++            # Capture non-empty immediately before each clear (not after — the
++            # clear must happen first for the dict to actually be empty
++            # afterward, but the check must be the pre-clear state) so a
++            # wholesale teardown still announces what it emptied. Without this,
++            # refresh([]) (disconnect-all + no reconnect) empties every catalog
++            # and publishes nothing — the listener-with-no-publishers failure
++            # this phase exists to prevent. Deliberately NOT routed through
++            # _remove_server_indexes: that method is per-server-name, this is a
++            # wholesale clear, and rewriting it as a loop over names would
++            # change shutdown semantics for no benefit.
++            had_tools = bool(self._tools)
++            had_resources = bool(self._resources)
++            had_prompts = bool(self._prompts)
++            self._tools.clear()
++            self._resources.clear()
++            self._prompts.clear()
++            self._tasks.clear()
++            self._servers.clear()
++            self._lazy_configs.clear()
++            if had_tools:
++                self._catalog_events.note_tools_changed()
++            if had_resources:
++                self._catalog_events.note_resources_changed()
++            if had_prompts:
++                self._catalog_events.note_prompts_changed()
+ 
      async def _cleanup_client(self, name: str, managed: ManagedClient) -> None:
          """Cancel a client's read task, kill its process, and remove it from registries.
  
@@ -1474,7 +1661,7 @@ index 57a563e..2b3875d 100644
  
          Cancels only *this* client's own read/stderr tasks — not every background
          task scoped to the server name. A reconnect runs its connect inside a task
-@@ -3665,13 +3905,24 @@ class ClientManager:
+@@ -3665,13 +3922,24 @@ class ClientManager:
          # `while True` writer is not a background-task sweep target on this path
          # (`_cleanup_client` deliberately does NOT call `_cancel_background_tasks`),
          # so without this it leaked one writer task per reconnect generation.
@@ -1505,7 +1692,7 @@ index 57a563e..2b3875d 100644
          # Reset the outbound path so nothing survives onto a next generation.
          # The writer was cancelled above, but the Queue -- and any reply /
          # notifications/cancelled frames the dead connection left buffered,
-@@ -3705,9 +3956,6 @@ class ClientManager:
+@@ -3705,9 +3973,6 @@ class ClientManager:
                  )
          else:
              await _terminate_process_tree(managed.process, name)
@@ -1515,7 +1702,7 @@ index 57a563e..2b3875d 100644
  
      async def refresh(self, configs: list[ResolvedServerConfig]) -> list[str]:
          """Refresh connections (disconnect + reconnect)."""
-@@ -3814,6 +4062,13 @@ class ClientManager:
+@@ -3814,6 +4079,13 @@ class ClientManager:
  
              logger.info(f"Adopted {name}: {indexed} tools indexed")
  
@@ -2461,7 +2648,8 @@ async def test_disconnect_all_redelivers_a_cancel_and_kills_now() -> None:
             await _drain(mgr, gate)
 
     assert kind == "cancelled", f"{kind} {detail!r}"
-    assert record == ["killed"]
+    # The worker's handler and the parent-level fallback both kill (harmless).
+    assert set(record) == {"killed"}, record
 
 
 # --- real processes -------------------------------------------------------------------
@@ -2493,6 +2681,152 @@ async def test_a_cancelled_terminate_kills_a_sigterm_ignoring_tree() -> None:
             process.kill()
     assert kind == "cancelled"
     assert returncode == -signal.SIGKILL
+
+
+# --- round 3 of the panel (codex): fan-out and handoff ------------------------------
+
+
+async def _sigterm_ignoring_process() -> asyncio.subprocess.Process:
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+        "print('ready', flush=True); time.sleep(300)",
+        stdout=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    await asyncio.wait_for(process.stdout.readline(), _HANG_GUARD_S)
+    return process
+
+
+async def test_disconnect_all_cancelled_before_its_workers_start_kills_every_tree() -> (
+    None
+):
+    """Codex, round 3: `call_soon(task.cancel)` right after creating the
+    `disconnect_all` task cancels the gather's `_shutdown_one` workers before
+    their first instruction, so no per-server handler runs. The parent-level
+    fallback kills every tree anyway (real processes)."""
+    mgr = ClientManager()
+    processes = [await _sigterm_ignoring_process() for _ in range(2)]
+    try:
+        for i, process in enumerate(processes):
+            status = ServerStatus(
+                name=f"s{i}", status=ServerStatusEnum.ONLINE, tool_count=0
+            )
+            managed = ManagedClient(config=MagicMock(), process=process, status=status)
+            managed.is_remote = False
+            mgr._clients[f"s{i}"] = managed
+            mgr._servers[f"s{i}"] = status
+        task = asyncio.create_task(mgr.disconnect_all())
+        asyncio.get_running_loop().call_soon(task.cancel)
+        kind, detail = await _outcome(task)
+        codes = [await asyncio.wait_for(p.wait(), _HANG_GUARD_S) for p in processes]
+    finally:
+        for p in processes:
+            if p.returncode is None:
+                p.kill()
+    assert kind == "cancelled", f"{kind} {detail!r}"
+    assert codes == [-signal.SIGKILL, -signal.SIGKILL], codes
+    assert mgr._clients == {} and not mgr._lifecycle_lock.locked()
+
+
+async def test_connect_all_cancelled_before_its_workers_start_spawns_nothing(
+    tmp_path: Path,
+) -> None:
+    """The other fan-out that owns processes. A connect worker cancelled
+    before its first instruction has spawned nothing, and one cancelled at
+    any later await runs its own handler (asyncio's own subprocess creation
+    kills a half-made process if cancelled), so connect_all needs no
+    parent-level kill -- and must not tear down servers that did connect."""
+    mgr = ClientManager()
+    pidfile = tmp_path / "pid"
+    config = ResolvedServerConfig(
+        name="srv",
+        source="project",
+        config=LocalMcpServerConfig(
+            command=sys.executable,
+            args=["-c", f"open({str(pidfile)!r}, 'w').write('x')"],
+        ),
+    )
+    task = asyncio.create_task(mgr.connect_all([config], retry=False))
+    asyncio.get_running_loop().call_soon(task.cancel)
+    kind, detail = await _outcome(task)
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert kind == "cancelled", f"{kind} {detail!r}"
+    assert mgr._clients == {} and not pidfile.exists()
+
+
+async def test_a_cancel_at_remote_handoff_abandons_the_owner() -> None:
+    """Codex, round 3: the caller is cancelled while the transport is
+    being entered. The owner publishes `ready`, parks on `shutdown.wait()`,
+    and a single immediate cancel is consumed there -- its `__aexit__` then
+    blocks uncancelled. `_abandon_owner` re-cancels until it ends."""
+    mgr = ClientManager()
+    holder: dict[str, Any] = {}
+    exit_cancelled: list[bool] = []
+
+    class _Transport:
+        async def __aenter__(self) -> tuple[Any, Any]:
+            asyncio.get_running_loop().call_soon(holder["connect"].cancel)
+            return (MagicMock(), MagicMock())
+
+        async def __aexit__(self, *exc_info: Any) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                exit_cancelled.append(True)
+                raise
+
+    owners: list[asyncio.Task[Any]] = []
+    real_own = mgr._own_remote_transport
+
+    async def _own(*args: Any) -> None:
+        task = asyncio.current_task()
+        assert task is not None
+        owners.append(task)
+        await real_own(*args)
+
+    mgr._own_remote_transport = _own  # type: ignore[method-assign]
+    task = asyncio.create_task(
+        mgr._connect_remote_stream(_remote_config(), _Transport(), transport_name="t")
+    )
+    holder["connect"] = task
+    try:
+        kind, detail = await _outcome(task)
+        owner_ended = await _ends_within_yields(owners[0])
+    finally:
+        await _drain(mgr)
+    assert kind == "cancelled", f"{kind} {detail!r}"
+    assert owner_ended and exit_cancelled == [True], "owner left in its __aexit__"
+    assert "remote" not in mgr._clients
+
+
+def test_an_owner_is_cancelled_only_through_abandon_owner() -> None:
+    """Every cancel of a remote transport owner on a cancel path goes through
+    `_abandon_owner` (a single immediate cancel is consumed before the
+    owner's `__aexit__`). The graceful escalation in `_close_remote_transport`
+    cancels its local `task` and then waits for it, on the uncancelled path."""
+    tree = dict(_modules())["client/manager.py"]
+    bad: list[str] = []
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if fn.name == "_abandon_owner":
+            continue
+        for call in (n for n in ast.walk(fn) if isinstance(n, ast.Call)):
+            if _callee(call) == "_cancel_without_waiting" and any(
+                "owner" in ast.unparse(a) for a in call.args
+            ):
+                bad.append(f"{fn.name}: {ast.unparse(call)}")
+            if (
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "cancel"
+                and "owner" in ast.unparse(call.func.value)
+            ):
+                bad.append(f"{fn.name}: {ast.unparse(call)}")
+    assert bad == [], bad
 
 
 # --- real processes: loop shutdown in every phase ----------------------------------
@@ -2641,6 +2975,10 @@ _CANCEL_HANDLERS: dict[tuple[str, str, str], tuple[int, str]] = {
         1,
         "escalates to the owner without waiting, then re-raises",
     ),
+    ("client/manager.py", "ClientManager._disconnect_all_unlocked", "reraises"): (
+        1,
+        "parent-level fallback: abandons every client, then re-raises",
+    ),
     ("client/manager.py", "ClientManager._cleanup_client", "reraises"): (
         1,
         "abandons synchronously, then re-raises",
@@ -2775,6 +3113,7 @@ _TEARDOWN_ENTRIES = {
     "ClientManager.disconnect_server": "_abandon_client_io",
     "ClientManager._cleanup_client": "_abandon_client_io",
     "ClientManager._disconnect_all_unlocked._shutdown_one": "_abandon_client_io",
+    "ClientManager._disconnect_all_unlocked": "_abandon_client_io",
     "_terminate_process_tree": "_kill_process_tree_now",
 }
 
