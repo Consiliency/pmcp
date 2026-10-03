@@ -437,6 +437,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 
 ### Fixed
+- **Auth operator messages come through pmcp's own sanitiser intact, and
+  invalid auth configuration refuses startup.** Four auth and startup
+  messages were reworded because pmcp's own sanitiser rewrote them (`Token
+  could not be verified with the published key.` was stored as `Token
+  [REDACTED] not be verified…`; likewise `Missing bearer token.`,
+  `Unsupported token algorithm.` and the shared-secret startup error). Every
+  fixed message `pmcp.auth` and the HTTP transport raise or send as an auth
+  rejection -- error descriptions, 401/403/503 bodies, startup refusals --
+  now comes from one registry, `AuthMessage`, and is rendered through a
+  runtime guard that refuses anything else; a test checks each through the
+  sanitiser. (Out of scope: the metadata diagnostics lists,
+  `UNVERIFIED_URL_CAVEAT`, `fetch_json_metadata`'s strings, the plain
+  413/429/504 bodies and log templates.) Behaviour changes: with the HTTP
+  transport in resource-server mode, PMCP now refuses to start on a JWKS
+  URL, metadata URL or required scope that an auth message could not carry
+  (a stray value in another mode is ignored, as before); and on the
+  programmatic path, `create_http_app` refuses a protected-resource
+  metadata URL that normalisation used to drop silently, omitting the
+  metadata route -- relative, non-http(s), plain http to a non-loopback
+  host, or a non-public IP literal. The metadata route also refuses to
+  start rather than publish an empty `resource`, which no shipped
+  configuration reaches. The README now documents deployments behind a
+  prefix-stripping proxy; the metadata `404` there is a known follow-up,
+  [Consiliency/pmcp#334](https://github.com/Consiliency/pmcp/issues/334).
+  See [Consiliency/pmcp#326](https://github.com/Consiliency/pmcp/issues/326).
 - **A JWKS with no usable keys is a `503`, not a `500`.** An issuer serving an
   empty key set, or one whose keys are all unusable, made `PyJWKSet` raise
   `PyJWKSetError`, which no handler caught. It now takes the existing
