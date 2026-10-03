@@ -104,10 +104,27 @@ def _yaml_position(error: BaseException) -> tuple[int | None, int | None]:
     return None, None
 
 
-def load_yaml(stream: str | bytes | IO[Any], *, source: str) -> Any:
-    """``yaml.safe_load(stream)``; any failure is a :class:`YAMLParseError`."""
+def safe_yaml_loader(*, fast: bool) -> Any:
+    """A safe YAML loader class for :func:`load_yaml`: with ``fast``, libyaml's
+    ``CSafeLoader`` when PyYAML was built with it, else ``SafeLoader``."""
+    if fast:
+        return getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+    return yaml.SafeLoader
+
+
+def load_yaml(stream: str | bytes | IO[Any], *, source: str, loader: Any = None) -> Any:
+    """``yaml.safe_load(stream)``; any failure is a :class:`YAMLParseError`.
+
+    ``loader`` picks a safe loader class -- ``yaml.SafeLoader`` or libyaml's
+    ``yaml.CSafeLoader`` (the shipped manifest's fast path) -- and nothing
+    else."""
+    safe = {yaml.SafeLoader, getattr(yaml, "CSafeLoader", yaml.SafeLoader)}
+    if loader is not None and loader not in safe:
+        raise ValueError("load_yaml takes only a safe YAML loader")
     failure: tuple[int | None, int | None, str] | None = None
     try:
+        if loader is not None:
+            return yaml.load(stream, Loader=loader)  # noqa: S506 -- safe loaders only
         return yaml.safe_load(stream)
     except Exception as error:  # noqa: BLE001 -- classified by origin
         line, column = _yaml_position(error)

@@ -22,7 +22,7 @@ import hmac
 import ipaddress
 import logging
 import uuid
-from collections.abc import AsyncIterator, MutableMapping
+from collections.abc import AsyncIterator, Mapping, MutableMapping
 from typing import TYPE_CHECKING, Any, Callable, Literal
 from urllib.parse import urlparse
 
@@ -35,9 +35,13 @@ from starlette.routing import Route
 from pmcp import __version__
 from pmcp.auth import (
     AsyncJWKS,
+    AuthMessage,
+    AuthText,
     ResourceServerAuthError,
     ResourceServerJWKSUnavailable,
+    check_auth_config,
     normalize_auth_metadata,
+    render_auth_message,
     sanitize_public_auth_url,
     validate_resource_server_token,
 )
@@ -170,6 +174,21 @@ class _NullResponse(Response):
 
     async def __call__(self, scope, receive, send) -> None:  # type: ignore[override]
         pass  # response was already sent by session_manager.handle_request
+
+
+def _auth_response(
+    status_code: int, body: AuthText, *, headers: dict[str, str] | None = None
+) -> Response:
+    """A 401/403/503 auth response. ``body`` must be an `AuthMessage`
+    member: it goes through the registry's one guard, `render_auth_message`
+    (identity, not type), so anything else is a `TypeError`. ``headers`` is
+    keyword-only and must be a mapping, so no second message can ride along
+    as an extra argument (Consiliency/pmcp#326)."""
+    if headers is not None and not isinstance(headers, Mapping):
+        raise TypeError("auth response headers must be a mapping")
+    return Response(
+        render_auth_message(body), status_code=status_code, headers=headers or {}
+    )
 
 
 async def _check_rate_limit(client_ip: str, max_rpm: int) -> bool:
@@ -322,9 +341,9 @@ def create_http_app(
     if effective_auth_mode is None:
         effective_auth_mode = "shared-secret" if auth_token is not None else "none"
     if effective_auth_mode not in {"none", "shared-secret", "resource-server"}:
-        raise ValueError("Unsupported auth mode.")
+        raise ValueError(render_auth_message(AuthMessage.UNSUPPORTED_AUTH_MODE))
     if effective_auth_mode == "shared-secret" and auth_token is None:
-        raise ValueError("shared-secret auth mode requires auth_token.")
+        raise ValueError(render_auth_message(AuthMessage.SHARED_SECRET_NEEDS_TOKEN))
     resource_jwks: AsyncJWKS | None = None
     if effective_auth_mode == "resource-server":
         if (
@@ -333,10 +352,23 @@ def create_http_app(
             or not resource_server_audience
         ):
             raise ValueError(
-                "resource-server auth mode requires issuer, JWKS URL, and audience."
+                render_auth_message(AuthMessage.RESOURCE_SERVER_NEEDS_CONFIG)
             )
         sanitize_public_auth_url(resource_server_jwks_url)
         resource_jwks = AsyncJWKS(resource_server_jwks_url)
+    # Every value a rejection may carry in a registry field must have that
+    # field's shape, checked here at startup by the renderer's own validators
+    # (Consiliency/pmcp#326): a request can then never fail to build its
+    # 401/403/503. The metadata URL is checked as configured, not as
+    # normalised: normalisation turns a relative or non-http(s) URL into None
+    # and the route would be silently omitted (codex round 7).
+    check_auth_config(
+        metadata_url=protected_resource_metadata_url or None,
+        # read only in resource-server mode, so checked only there (round 8)
+        required_scopes=(
+            required_scopes if effective_auth_mode == "resource-server" else None
+        ),
+    )
     diagnostics = GatewayDiagnosticsInfo(
         transport="http",
         header_compatibility={
@@ -472,10 +504,10 @@ def create_http_app(
         return token
 
     def _reject(
-        status_code: int, body: str, headers: dict[str, str] | None = None
+        status_code: int, body: AuthText, *, headers: dict[str, str] | None = None
     ) -> Response:
         _inc(f"requests_{status_code}")
-        return Response(body, status_code=status_code, headers=headers or {})
+        return _auth_response(status_code, body, headers=headers)
 
     async def handle_health(request: Request) -> Response:
         """Unauthenticated health check — safe for load-balancers and container probes."""
@@ -552,11 +584,11 @@ def create_http_app(
 
         if _origin_rejected(request):
             logger.debug("handle_mcp [%s]: 403 invalid origin", request_id)
-            return _reject(403, "Forbidden")
+            return _reject(403, AuthMessage.FORBIDDEN)
 
         if _host_rejected(request):
             logger.debug("handle_mcp [%s]: 403 invalid host", request_id)
-            return _reject(403, "Forbidden")
+            return _reject(403, AuthMessage.FORBIDDEN)
 
         if effective_auth_mode == "shared-secret":
             incoming = request.headers.get("authorization", "")
@@ -570,16 +602,20 @@ def create_http_app(
                 f"Bearer {auth_token}".encode(),
             ):
                 logger.debug("handle_mcp [%s]: 401 unauthorized", request_id)
-                return _reject(401, "Unauthorized", _auth_headers(request))
+                return _reject(
+                    401, AuthMessage.UNAUTHORIZED, headers=_auth_headers(request)
+                )
         elif effective_auth_mode == "resource-server":
             token = _bearer_token(request)
             if token is None:
                 logger.debug("handle_mcp [%s]: 401 missing bearer", request_id)
-                return _reject(401, "Unauthorized", _auth_headers(request))
+                return _reject(
+                    401, AuthMessage.UNAUTHORIZED, headers=_auth_headers(request)
+                )
             try:
                 if resource_jwks is None:
                     raise ResourceServerAuthError(
-                        "invalid_token", "Resource Server JWKS is not configured."
+                        "invalid_token", AuthMessage.RS_JWKS_NOT_CONFIGURED
                     )
                 jwks = await resource_jwks.get_for_token(token)
                 claims = validate_resource_server_token(
@@ -600,8 +636,8 @@ def create_http_app(
                 logger.debug("handle_mcp [%s]: 503 jwks unavailable", request_id)
                 return _reject(
                     503,
-                    "Service Unavailable",
-                    _auth_headers(request, error=exc.error),
+                    AuthMessage.SERVICE_UNAVAILABLE,
+                    headers=_auth_headers(request, error=exc.error),
                 )
             except ResourceServerAuthError as exc:
                 if exc.error == "insufficient_scope":
@@ -609,14 +645,14 @@ def create_http_app(
                     logger.debug("handle_mcp [%s]: 403 insufficient scope", request_id)
                     return _reject(
                         403,
-                        "Forbidden",
-                        _auth_headers(request, error=exc.error, scope=scope),
+                        AuthMessage.FORBIDDEN,
+                        headers=_auth_headers(request, error=exc.error, scope=scope),
                     )
                 logger.debug("handle_mcp [%s]: 401 invalid token", request_id)
                 return _reject(
                     401,
-                    "Unauthorized",
-                    _auth_headers(request, error=exc.error),
+                    AuthMessage.UNAUTHORIZED,
+                    headers=_auth_headers(request, error=exc.error),
                 )
 
         # Per-IP rate limiting (optional — only when rate_limit_rpm > 0)
@@ -780,6 +816,14 @@ def create_http_app(
     if auth_metadata.protected_resource_metadata_url:
         metadata_path = urlparse(auth_metadata.protected_resource_metadata_url).path
         if metadata_path:
+            # RFC 9728 makes `resource` REQUIRED, so never serve the route with
+            # an empty one. Unreachable today -- a normalized metadata URL is
+            # always absolute -- so this fails closed at startup, not per
+            # request, if a later change makes it reachable (Consiliency/pmcp#326).
+            if not _canonical_resource():
+                raise ValueError(
+                    render_auth_message(AuthMessage.METADATA_NEEDS_RESOURCE)
+                )
             routes.append(
                 Route(
                     metadata_path,

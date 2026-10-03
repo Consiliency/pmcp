@@ -178,11 +178,43 @@ window are checked against the cached keys. The `resource` published at
 `/.well-known/oauth-protected-resource` is the configured
 `resource_server_audience`, or, when that is unset, the origin of the configured
 protected-resource metadata URL plus `/mcp`, with a scheme-default port such as
-`:443` dropped. A path prefix in the metadata URL is not carried over, because
-PMCP serves MCP at `/mcp`. If MCP is reachable at a different public URL, set
-`--oauth-audience` to publish it. The `resource` is never taken from the
-request `Host`. A forged token, including one whose algorithm does not match
-the published key's type, gets `401`, never `500`.
+`:443` dropped. A path prefix in the metadata URL is not carried over: PMCP
+serves MCP at `/mcp` on the address it listens on, and that is the public URL
+only when nothing in front of PMCP rewrites the path. Behind a reverse proxy
+that strips a path prefix (for example nginx
+`location /pmcp/ { proxy_pass http://127.0.0.1:3344/; }`), MCP's public URL
+is `https://<host>/pmcp/mcp`; set `--oauth-audience` to that URL so the token
+audience names it. That is all a `pmcp` CLI deployment needs: the CLI does
+not publish protected-resource metadata, so it serves no metadata route.
+
+The metadata URL is a `create_http_app` parameter
+(`protected_resource_metadata_url`) for applications that embed PMCP. There,
+set `resource_server_audience` to the public MCP URL as well, so the published
+`resource` names it, and pick a metadata URL whose path reaches PMCP
+unchanged: PMCP serves the metadata at the URL's literal path, so
+`https://<host>/pmcp/.well-known/oauth-protected-resource` behind that proxy
+arrives as `/.well-known/oauth-protected-resource` and returns `404`
+([Consiliency/pmcp#334](https://github.com/Consiliency/pmcp/issues/334)
+tracks that case). Use the
+RFC 9728 form for a resource with a path,
+`https://<host>/.well-known/oauth-protected-resource/pmcp/mcp`, and forward
+that path to PMCP unchanged. An application that mounts PMCP under a
+`root_path` must route that path to the mounted app as well: mounted at
+`/pmcp`, it answers at `/pmcp/.well-known/oauth-protected-resource/pmcp/mcp`,
+not at the URL's own path. The `resource` is never taken from the request
+`Host`. A forged token, including one whose algorithm does not match the
+published key's type, gets `401`, never `500`. In resource-server mode over
+HTTP, PMCP refuses to start, with a one-line error, if the JWKS URL or
+metadata URL -- after the cleanup PMCP applies when it stores a URL, which
+drops a trailing newline or a leading space -- is not a public absolute
+http(s) URL without whitespace, or if a required scope is not a single RFC
+6749 scope (printable ASCII with no space, quote or backslash;
+`--required-scope` and `PMCP_REQUIRED_SCOPES` alike), so every
+`401`/`403`/`503` it later sends can be built. An embedding application
+that passes `protected_resource_metadata_url` gets the same refusal, in
+any auth mode, for a relative, non-http(s), plain-http non-loopback or
+non-public-IP URL, which was previously dropped with the metadata route
+silently omitted.
 In public auth metadata URLs it rejects hosts written as non-public **IP
 literals** — private, CGNAT, link-local, loopback, multicast, site-local, and
 unspecified — including IPv4 addresses embedded in IPv6 literals and legacy
@@ -1124,7 +1156,9 @@ closed: the credential stays required.
 
 Overlay loading is **fail-soft**: a missing file is skipped silently, and a
 malformed file or a single bad entry logs a warning and is skipped without
-crashing the gateway — the shipped manifest always still loads.
+crashing the gateway — the shipped manifest always still loads. pmcp re-reads
+overlay files on every manifest load, so edits apply without a restart, and
+logs each warning once per change rather than on every load.
 
 > **Security:** a manifest entry can specify an arbitrary `command`/`args` to
 > run when provisioned — treat an overlay file with the same trust as your own

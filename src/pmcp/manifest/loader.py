@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import functools
+import hashlib
 import logging
 import os
+import pickle
 import re
 import tempfile
+import threading
+from collections import OrderedDict
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -15,7 +19,7 @@ from typing import Any, Literal, cast
 import yaml
 
 from pmcp.argument_errors import exception_text
-from pmcp.parsing import load_yaml
+from pmcp.parsing import load_yaml, safe_yaml_loader
 from pmcp.project_consent import log_refusal, read_and_gate
 from pmcp.validation import (
     NPM_FILE_TYPE_RE,
@@ -26,6 +30,50 @@ from pmcp.validation import (
 logger = logging.getLogger(__name__)
 
 
+_SHIPPED_MANIFEST_PATH = Path(__file__).parent / "manifest.yaml"
+
+
+def _trusted_yaml_loader() -> Any:
+    """libyaml's ``CSafeLoader`` when PyYAML was built with it, else ``SafeLoader``.
+
+    Both use the same ``SafeConstructor`` and ``Resolver``; only the scanner and
+    parser differ, so pmcp's own shipped manifest yields the same data either way
+    (a test pins that). Overlays are operator- and repository-supplied and keep
+    the pure-Python ``SafeLoader``: the two parsers do disagree on some input (a
+    tab after ``key:``, deep nesting), and a performance change must not change
+    which overlays are accepted (Consiliency/pmcp#233).
+    """
+    return safe_yaml_loader(fast=True)
+
+
+def _parse_trusted_yaml(content: bytes) -> Any:
+    """Parse pmcp's OWN shipped manifest bytes, with libyaml when available."""
+    # Through the parse helper (Consiliency/pmcp#297): a failure is value-free.
+    return load_yaml(content, source="shipped manifest", loader=_trusted_yaml_loader())
+
+
+# The parsed shipped document, by sha256 of its bytes: a pure function of the
+# bytes, so it is never stale and is not reset between tests. Pickled, so each
+# reader gets its own copy of the raw data.
+_trusted_document: tuple[bytes, bytes] | None = None
+
+
+def _parse_trusted_document(content: bytes) -> Any:
+    """``_parse_trusted_yaml(content)``, parsed once per distinct ``content``."""
+    global _trusted_document
+    digest = hashlib.sha256(content).digest()
+    cached = _trusted_document
+    if cached is not None and cached[0] == digest:
+        data = _deserialize(cached[1])
+        if data is not None:
+            return data
+    data = _parse_trusted_yaml(content)
+    blob = _serialize(data)
+    if blob is not None:
+        _trusted_document = (digest, blob)
+    return data
+
+
 @functools.lru_cache(maxsize=1)
 def _shipped_manifest_entries() -> dict[str, dict[str, Any]]:
     """pmcp's OWN shipped ``manifest.yaml``, read directly.
@@ -34,10 +82,9 @@ def _shipped_manifest_entries() -> dict[str, dict[str, Any]]:
     or ``$PMCP_MANIFEST_PATH`` overlay can add a name or a declared key here.
     The file ships with pmcp and does not change under a running process.
     """
-    path = Path(__file__).parent / "manifest.yaml"
+    path = _SHIPPED_MANIFEST_PATH
     try:
-        shipped = load_yaml(path.read_bytes(), source="shipped manifest")
-        servers = (shipped or {}).get("servers") or {}
+        servers = (_parse_trusted_yaml(path.read_bytes()) or {}).get("servers") or {}
     except (OSError, yaml.YAMLError, AttributeError):
         return {}
     return {
@@ -1066,7 +1113,9 @@ def _find_project_manifest() -> Path | None:
     return None
 
 
-def _overlay_manifest_paths() -> list[tuple[str, Path]]:
+def _overlay_manifest_paths(
+    notices: list[str] | None = None,
+) -> list[tuple[str, Path]]:
     """Return existing overlay manifest paths in precedence order (low → high).
 
     Order: user (``~/.pmcp/manifest.yaml``), then project
@@ -1111,9 +1160,11 @@ def _overlay_manifest_paths() -> list[tuple[str, Path]]:
             if env_path.exists():
                 paths.append(("env", env_path))
         else:
-            logger.warning(
-                describe_ignored_trust_env_var("PMCP_MANIFEST_PATH", env_value)
-            )
+            notice = describe_ignored_trust_env_var("PMCP_MANIFEST_PATH", env_value)
+            if notices is None:
+                logger.warning(notice)
+            else:
+                notices.append(notice)
 
     return paths
 
@@ -1126,25 +1177,9 @@ _OverlayDocument = tuple[
 ]
 
 
-def _load_overlay_file(path: Path) -> _OverlayDocument:
-    """Read and parse an overlay manifest file, fail-soft.
-
-    For the **ungated** overlay sources only -- the user's own
-    ``~/.pmcp/manifest.yaml`` and ``$PMCP_MANIFEST_PATH``. The project overlay
-    must not come through here: it is read once by ``read_and_gate``, and
-    reading it again would parse bytes the operator never approved. See
-    ``load_manifest``.
-    """
-    try:
-        content = path.read_bytes()
-    except OSError as exc:
-        logger.warning(f"Skipping unreadable manifest overlay {path}: {exc}")
-        return {}, {}, {}, {}
-
-    return _parse_overlay_document(path, content)
-
-
-def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
+def _parse_overlay_document(
+    path: Path, content: bytes, failures: list[str] | None = None
+) -> _OverlayDocument:
     """Parse overlay bytes, fail-soft. ``path`` is for messages only.
 
     Returns ``(servers, cli_alternatives, server_env, server_version)``. A YAML error or a
@@ -1170,12 +1205,16 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
         logger.warning(
             f"Skipping unreadable manifest overlay {path}: {exception_text(exc)}"
         )
+        if failures is not None:
+            failures.append("parse")
         return {}, {}, {}, {}
 
     if not isinstance(data, dict):
         logger.warning(
             f"Skipping manifest overlay {path}: top-level document is not a mapping"
         )
+        if failures is not None:
+            failures.append("not-a-mapping")
         return {}, {}, {}, {}
 
     servers: dict[str, ServerConfig] = {}
@@ -1238,6 +1277,171 @@ def _parse_overlay_document(path: Path, content: bytes) -> _OverlayDocument:
     return servers, cli_alternatives, server_env, server_version
 
 
+# A parsed manifest, cached by EVERYTHING it was built from (Consiliency/pmcp#233).
+# The key is the bytes of every source (sha256), not their mtimes: each call
+# re-reads every source anyway -- the consent gate must judge the bytes it
+# hands over -- so a content key costs one hash and cannot be fooled by a
+# same-size rewrite inside the filesystem's timestamp granularity or by an
+# mtime set back. Values are pickled bytes, so no caller can reach the cached
+# state, and every call gets its own deep copy (0.3 ms, against 2.4 ms for
+# copy.deepcopy). The pickles are made in this process from pmcp's own
+# Manifest objects and never leave it: nothing untrusted is ever unpickled.
+_MANIFEST_CACHE_SLOTS = 8
+_manifest_cache: OrderedDict[tuple[Any, ...], bytes] = OrderedDict()
+_manifest_cache_lock = threading.RLock()
+# The key of the state the previous call served, per caller stream: the
+# default load (slot None) and each explicit path. Warnings are owed per TRANSITION,
+# not per retained entry: a call whose key differs from its slot's is rebuilt
+# (about 1.2 ms with the shipped document cached) even when its key is still in
+# the LRU, so returning to an earlier state -- trust revoked again, a pin broken
+# again with the same bytes -- warns exactly as main does. Separate slots keep
+# an explicit-path caller (or two) from turning every load into a transition.
+# Bounded like the cache: the oldest explicit-path slot goes first.
+_last_served_keys: dict[str | None, tuple[Any, ...]] = {}
+# Whether this process has already said, at WARNING, that the cache could not
+# store or read back a result for a reason other than recursion depth.
+_cache_failure_reported = False
+
+
+def clear_manifest_cache() -> None:
+    """Drop every cached manifest (tests; never needed for correctness)."""
+    global _cache_failure_reported
+    with _manifest_cache_lock:
+        _manifest_cache.clear()
+        _last_served_keys.clear()
+        _cache_failure_reported = False
+
+
+def _report_cache_failure(what: str, kind: type[BaseException]) -> None:
+    """Log a cache failure by exception class only, never a value.
+
+    ``RecursionError`` is expected -- a deeply aliased overlay nests deeper
+    than pickle recurses on some Pythons -- and only bypasses the cache for that
+    result: DEBUG. Anything else means the cache may be off for every load, so
+    the first one in the process is a WARNING an operator can see.
+    """
+    global _cache_failure_reported
+    # The class only, never the exception (Consiliency/pmcp#297's sink rule).
+    name = kind.__name__
+    if issubclass(kind, RecursionError) or _cache_failure_reported:
+        logger.debug("Manifest cache: %s failed (%s); not cached", what, name)
+        return
+    _cache_failure_reported = True
+    logger.warning(
+        "Manifest cache: %s failed (%s); manifests load uncached when this "
+        "happens. Further failures are logged at DEBUG.",
+        what,
+        name,
+    )
+
+
+def _serialize(value: Any) -> bytes | None:
+    """``pickle.dumps(value)``, or None when it cannot be serialized.
+
+    A result that loads fine must never fail because of the cache: a deeply
+    aliased overlay (500 chained YAML anchors, 11 KB) parses with SafeLoader
+    but exceeds pickle's recursion limit on Python 3.10/3.11. Such a result is
+    returned uncached. The log line names only the exception class.
+    """
+    try:
+        return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception as exc:  # noqa: BLE001 - any failure means "do not cache"
+        _report_cache_failure("storing a result", type(exc))
+        return None
+
+
+def _deserialize(blob: bytes) -> Any | None:
+    """``pickle.loads(blob)``, or None when it fails (the caller rebuilds)."""
+    try:
+        return pickle.loads(blob)
+    except Exception as exc:  # noqa: BLE001 - any failure means "rebuild"
+        _report_cache_failure("reading back a result", type(exc))
+        return None
+
+
+@dataclass(frozen=True)
+class _OverlaySource:
+    label: str
+    path: Path
+    content: bytes | None
+    # "read" | "approved" | a consent refusal reason | "unreadable"
+    state: str
+    decision: Any = None
+    error: str | None = None
+    # sha256 of the bytes the consent gate read, refused or not. A refused
+    # file's content is never handed over, but an edit to it is a new state
+    # that owes the operator a fresh refusal.
+    gated_digest: str | None = None
+
+
+def _gather_overlay_sources(notices: list[str]) -> list[_OverlaySource]:
+    """Read every overlay source ONCE, in precedence order.
+
+    The bytes read here are both the cache key and what gets parsed: a source is
+    never re-opened, so a rewrite between the read and the parse cannot put
+    bytes in the cache under another version's key.
+    """
+    sources: list[_OverlaySource] = []
+    for label, overlay_path in _overlay_manifest_paths(notices):
+        if label == "project":
+            # A repository-supplied overlay is gated: unapproved, it must
+            # contribute nothing at all -- not a replacement, not an
+            # insertion, not a server_env patch -- so that
+            # `get_server("<added>")`, the manifest-backed predicate in
+            # tools/handlers.py, still answers None for it. User and env
+            # scope are the operator's own files and stay ungated. The gate
+            # reads the file once; its bytes are the ones keyed and parsed.
+            content, decision = read_and_gate(overlay_path, "project_manifest")
+            sources.append(
+                _OverlaySource(
+                    label,
+                    overlay_path,
+                    content,
+                    "approved" if content is not None else str(decision.reason),
+                    decision,
+                    gated_digest=decision.content_sha256,
+                )
+            )
+            continue
+        try:
+            content = overlay_path.read_bytes()
+        except OSError as exc:
+            sources.append(
+                _OverlaySource(label, overlay_path, None, "unreadable", error=str(exc))
+            )
+            continue
+        sources.append(_OverlaySource(label, overlay_path, content, "read"))
+    return sources
+
+
+def _digest(content: bytes | None) -> bytes | None:
+    return None if content is None else hashlib.sha256(content).digest()
+
+
+def _source_key(source: _OverlaySource) -> tuple[Any, ...]:
+    """One overlay's part of the cache key.
+
+    A project overlay's consent decision is keyed by its identity -- the
+    resolved path the gate judged, the reason and the remediation -- not only
+    its state: retargeting a symlink from one unapproved file to another is a
+    new refusal with a new remediation, and must be told (SECURITY C-12).
+    """
+    decision = source.decision
+    identity = (
+        None
+        if decision is None
+        else (str(decision.path), str(decision.reason), decision.remediation)
+    )
+    return (
+        source.label,
+        str(source.path),
+        source.state,
+        _digest(source.content),
+        source.gated_digest,
+        identity,
+    )
+
+
 def load_manifest(manifest_path: Path | None = None) -> Manifest:
     """Load and parse the manifest.yaml file.
 
@@ -1249,16 +1453,75 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
     ``extra_env`` on an existing server without replacing it. An explicit
     ``manifest_path`` loads only that file and applies no overlays. Overlay
     parsing is fail-soft and never raises.
+
+    The result is cached by the bytes of every source, each overlay's consent
+    decision (with the refusal's identity), the ignored-redirect notice and the
+    platform; a change to any of them is a miss. Warnings are emitted once per
+    transition: whenever the inputs differ from those of the previous call,
+    even if that state is still cached. A result in which a source could not be
+    read or parsed, or that cannot be serialized, is never cached, and an
+    exception is never cached. Every call returns its own deep copy.
     """
     apply_overlays = manifest_path is None
-    if manifest_path is None:
-        # Default to manifest.yaml in the same directory as this module
-        manifest_path = Path(__file__).parent / "manifest.yaml"
+    base_path = _SHIPPED_MANIFEST_PATH if manifest_path is None else manifest_path
+    base = base_path.read_bytes()
+    notices: list[str] = []
+    overlays = _gather_overlay_sources(notices) if apply_overlays else []
+    key = (
+        str(base_path),
+        apply_overlays,
+        _digest(base),
+        tuple(_source_key(o) for o in overlays),
+        tuple(notices),
+        _on_windows(),
+    )
+    with _manifest_cache_lock:
+        # One slot per caller stream: the default load, and each explicit path
+        # (keyed as given). Two different explicit paths alternating are two
+        # steady states, not a transition on every call.
+        slot = None if apply_overlays else str(base_path)
+        steady = key == _last_served_keys.get(slot)
+        _last_served_keys[slot] = key
+        while len(_last_served_keys) > _MANIFEST_CACHE_SLOTS:
+            oldest = next(k for k in _last_served_keys if k is not None)
+            del _last_served_keys[oldest]
+        blob = _manifest_cache.get(key)
+        if blob is not None and steady:
+            _manifest_cache.move_to_end(key)
+            cached = _deserialize(blob)
+            if cached is not None:
+                return cast(Manifest, cached)
+        # A miss, or a transition into a state the LRU still holds: build, so
+        # every warning for this state is emitted once, now.
+        _manifest_cache.pop(key, None)
+        for notice in notices:
+            logger.warning(notice)
+        manifest, cacheable = _build_manifest(
+            base_path, base, overlays, trusted=manifest_path is None
+        )
+        stored = _serialize(manifest) if cacheable else None
+        if stored is not None:
+            _manifest_cache[key] = stored
+            while len(_manifest_cache) > _MANIFEST_CACHE_SLOTS:
+                _manifest_cache.popitem(last=False)
+        return manifest
 
+
+def _build_manifest(
+    manifest_path: Path,
+    base: bytes,
+    overlays: list[_OverlaySource],
+    *,
+    trusted: bool,
+) -> tuple[Manifest, bool]:
+    """Build a Manifest from bytes already read. Returns (manifest, cacheable)."""
+    cacheable = True
+    apply_overlays = trusted
     logger.info(f"Loading manifest from {manifest_path}")
 
-    with open(manifest_path, "r") as f:
-        data = load_yaml(f, source="manifest")
+    data = (
+        _parse_trusted_document(base) if trusted else load_yaml(base, source="manifest")
+    )
 
     # Parse CLI alternatives
     cli_alternatives: dict[str, CLIAlternative] = {}
@@ -1272,36 +1535,34 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
 
     # Merge private/custom overlays over the shipped manifest (default path only).
     if apply_overlays:
-        for label, overlay_path in _overlay_manifest_paths():
-            if label == "project":
-                # A repository-supplied overlay is gated: unapproved, it must
-                # contribute nothing at all -- not a replacement, not an
-                # insertion, not a server_env patch -- so that
-                # `get_server("<added>")`, the manifest-backed predicate in
-                # tools/handlers.py, still answers None for it. User and env
-                # scope are the operator's own files and stay ungated.
-                content, decision = read_and_gate(overlay_path, "project_manifest")
-                if content is None:
+        for source in overlays:
+            label, overlay_path = source.label, source.path
+            if source.content is None:
+                if source.label == "project":
                     # One WARNING for one refusal: returning before the parser
                     # runs keeps an unreadable overlay from also logging
                     # "Skipping unreadable manifest overlay".
-                    log_refusal(decision, logger)
-                    continue
-                # Parse the bytes the gate judged. Re-opening `overlay_path`
-                # here would apply content nobody approved.
-                (
-                    overlay_servers,
-                    overlay_clis,
-                    overlay_server_env,
-                    overlay_server_version,
-                ) = _parse_overlay_document(overlay_path, content)
-            else:
-                (
-                    overlay_servers,
-                    overlay_clis,
-                    overlay_server_env,
-                    overlay_server_version,
-                ) = _load_overlay_file(overlay_path)
+                    log_refusal(source.decision, logger)
+                else:
+                    logger.warning(
+                        f"Skipping unreadable manifest overlay {overlay_path}: "
+                        f"{source.error}"
+                    )
+                if source.state == "unreadable":
+                    cacheable = False
+                continue
+            failures: list[str] = []
+            # Parse the bytes that were read (and, for the project overlay,
+            # judged by the gate). Re-opening `overlay_path` here would apply
+            # content nobody approved.
+            (
+                overlay_servers,
+                overlay_clis,
+                overlay_server_env,
+                overlay_server_version,
+            ) = _parse_overlay_document(overlay_path, source.content, failures)
+            if failures:
+                cacheable = False
             if (
                 overlay_servers
                 or overlay_clis
@@ -1373,4 +1634,4 @@ def load_manifest(manifest_path: Path | None = None) -> Manifest:
         f"{len(servers)} servers ({len(manifest.get_auto_start_servers())} auto-start)"
     )
 
-    return manifest
+    return manifest, cacheable

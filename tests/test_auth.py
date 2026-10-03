@@ -17,6 +17,7 @@ from cryptography.hazmat.primitives.asymmetric import rsa
 
 from pmcp.auth import (
     AsyncJWKS,
+    AuthMessage,
     ResourceServerAuthError,
     ResourceServerJWKSUnavailable,
     fetch_json_metadata,
@@ -423,7 +424,8 @@ async def test_async_jwks_fetch_failures_are_sanitized(
 
     async def fake_fetch() -> dict[str, object]:
         raise ResourceServerJWKSUnavailable(
-            "JWKS fetch failed for https://issuer.example/jwks.json?token=secret."
+            AuthMessage.JWKS_FETCH_FAILED,
+            url="https://issuer.example/jwks.json?token=secret",
         )
 
     monkeypatch.setattr(jwks, "_fetch", fake_fetch)
@@ -1458,7 +1460,9 @@ async def test_s07_s08_recovery_after_failed_forced_refresh_waits_out_the_cooldo
         fetches += 1
         if endpoint_down:
             clock.advance(failure_duration)
-            raise ResourceServerJWKSUnavailable("JWKS fetch failed.")
+            raise ResourceServerJWKSUnavailable(
+                AuthMessage.JWKS_FETCH_FAILED, url="https://issuer.example/jwks.json"
+            )
         return rotated
 
     monkeypatch.setattr(jwks, "_fetch", fake_fetch)
@@ -1510,7 +1514,9 @@ async def test_s07_s08_backoff_rejection_does_not_consume_the_cooldown(
         nonlocal fetches
         fetches += 1
         if endpoint_down:
-            raise ResourceServerJWKSUnavailable("JWKS fetch failed.")
+            raise ResourceServerJWKSUnavailable(
+                AuthMessage.JWKS_FETCH_FAILED, url="https://issuer.example/jwks.json"
+            )
         return rotated
 
     monkeypatch.setattr(jwks, "_fetch", fake_fetch)
@@ -1577,7 +1583,9 @@ async def test_s08_concurrent_get_bounds_the_last_waiter(
         fetches += 1
         if fetches == 1:
             await release_first_fetch.wait()
-        raise ResourceServerJWKSUnavailable("JWKS fetch failed.")
+        raise ResourceServerJWKSUnavailable(
+            AuthMessage.JWKS_FETCH_FAILED, url="https://issuer.example/jwks.json"
+        )
 
     monkeypatch.setattr(jwks, "_fetch", fake_fetch)
 

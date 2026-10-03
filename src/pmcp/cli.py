@@ -2329,6 +2329,28 @@ def resolve_env_config_and_policy(args: argparse.Namespace) -> None:
             )
 
 
+def _check_auth_args(args: argparse.Namespace) -> None:
+    """Exit with the registry's message if the resolved auth arguments fail
+    `check_auth_config` (Consiliency/pmcp#326)."""
+    from pmcp.auth import check_auth_config
+
+    # Only where the values are used: the HTTP transport in resource-server
+    # mode. A stray PMCP_REQUIRED_SCOPES under stdio, or a JWKS URL under auth
+    # mode `none`, is never read, and starts as it does on main (round 8).
+    if getattr(args, "transport", None) != "http" or (
+        getattr(args, "auth_mode", None) != "resource-server"
+    ):
+        return
+    jwks_url = getattr(args, "oauth_jwks_url", None)
+    try:
+        if jwks_url:
+            check_auth_config(jwks_url=jwks_url)
+        check_auth_config(required_scopes=getattr(args, "required_scopes", None))
+    except ValueError as exc:
+        print(f"error: {exception_text(exc)}", file=sys.stderr)
+        sys.exit(1)
+
+
 async def run_server(args: argparse.Namespace) -> None:
     """Run the MCP gateway server."""
     from pmcp.server import GatewayServer
@@ -2404,6 +2426,10 @@ async def run_server(args: argparse.Namespace) -> None:
             for s in os.environ["PMCP_REQUIRED_SCOPES"].split(",")
             if s.strip()
         ]
+    # Refuse, before anything starts, a JWKS URL or required scope a
+    # rejection could not carry (Consiliency/pmcp#326): the same validators
+    # `create_http_app` and the renderer use, for the CLI and env paths alike.
+    _check_auth_args(args)
     if not getattr(args, "allowed_origins", None) and os.environ.get(
         "PMCP_ALLOWED_ORIGINS"
     ):
